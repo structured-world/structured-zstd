@@ -600,7 +600,7 @@ fn a_reset_clears_a_digest_written_around_the_hashing_flag() {
     buf.set_compute_hash(false);
     let mut digest = twox_hash::XxHash64::with_seed(0);
     digest.write(b"the previous frame");
-    buf.hash = digest;
+    buf.set_hash(digest);
 
     buf.reset(1024);
 

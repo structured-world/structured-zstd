@@ -34,7 +34,7 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     pub window_size: usize,
     total_output_counter: u64,
     #[cfg(feature = "hash")]
-    pub hash: twox_hash::XxHash64,
+    pub(crate) hash: twox_hash::XxHash64,
     /// Whether drain hashes the bytes it emits into `hash`. `false` lets a
     /// `FrameDecoder` set to [`ContentChecksum::None`](crate::decoding::ContentChecksum::None)
     /// skip the XXH64 pass on the streaming path. Persists across `reset`
@@ -42,6 +42,12 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     /// layer re-applies it before each decode.
     #[cfg(feature = "hash")]
     compute_hash: bool,
+    /// Whether anything has been written into `hash` since it was last seeded.
+    /// Tracked rather than inferred from `compute_hash`, because the direct
+    /// decode path hashes its own output and assigns the finished digest
+    /// without that flag ever being set.
+    #[cfg(feature = "hash")]
+    hash_dirty: bool,
 }
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
@@ -91,6 +97,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             hash: twox_hash::XxHash64::with_seed(0),
             #[cfg(feature = "hash")]
             compute_hash: true,
+            #[cfg(feature = "hash")]
+            hash_dirty: false,
         }
     }
 
@@ -116,6 +124,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             hash: twox_hash::XxHash64::with_seed(0),
             #[cfg(feature = "hash")]
             compute_hash: true,
+            #[cfg(feature = "hash")]
+            hash_dirty: false,
         }
     }
 
@@ -126,6 +136,17 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     #[inline]
     pub(crate) fn set_compute_hash(&mut self, compute: bool) {
         self.compute_hash = compute;
+    }
+
+    /// Install a digest computed elsewhere — the direct decode path hashes its
+    /// own output, which never passes through drain. Going through here is what
+    /// records that the digest is no longer pristine, so the next frame's reset
+    /// knows to seed it afresh.
+    #[cfg(feature = "hash")]
+    #[inline]
+    pub(crate) fn set_hash(&mut self, hash: twox_hash::XxHash64) {
+        self.hash = hash;
+        self.hash_dirty = true;
     }
 
     /// Arm the per-block decompressed-output ceiling for the block about to
@@ -168,15 +189,16 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.set_max_capacity(usize::MAX);
         #[cfg(feature = "hash")]
         {
-            // Unconditionally, not under `compute_hash`: the direct decode
-            // path hashes its own output and assigns the finished digest here
+            // On what was actually written, not on `compute_hash`: the direct
+            // decode path hashes its own output and assigns the finished digest
             // without ever setting that flag, so a frame that leaves the flag
-            // false can still have dirtied the digest. Conditioning the reset
-            // on the flag let the next checksummed frame accumulate on top of
-            // the previous frame's digest and reject a valid checksum. Seeding
-            // a fresh hasher is a handful of stores, which is not what the
-            // flag was ever guarding — that is the per-byte hashing.
-            self.hash = twox_hash::XxHash64::with_seed(0);
+            // false can still have dirtied the digest, and the next checksummed
+            // frame then accumulated on top of it and rejected a valid
+            // checksum. A frame that hashed nothing still re-seeds nothing.
+            if self.hash_dirty {
+                self.hash = twox_hash::XxHash64::with_seed(0);
+                self.hash_dirty = false;
+            }
         }
     }
 
@@ -1011,6 +1033,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         if self.compute_hash {
             self.hash.write(slice1);
             self.hash.write(slice2);
+            self.hash_dirty = true;
         }
 
         let mut vec = Vec::with_capacity(slice1.len() + slice2.len());
@@ -1076,6 +1099,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             #[cfg(feature = "hash")]
             if self.compute_hash {
                 self.hash.write(&slice1[..written1]);
+                self.hash_dirty = true;
             }
             drain_guard.amount += written1;
 
@@ -1089,6 +1113,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
                 #[cfg(feature = "hash")]
                 if self.compute_hash {
                     self.hash.write(&slice2[..written2]);
+                    self.hash_dirty = true;
                 }
                 drain_guard.amount += written2;
 
