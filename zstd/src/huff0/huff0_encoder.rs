@@ -437,15 +437,21 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             return false;
         }
 
-        // Reserve to the widest description the format admits, not to this
-        // table's weight count. The buffer is reused across rebuilds, so
-        // sizing it to the table in hand means a later table with a larger
-        // alphabet reallocates it; the bound is a couple of hundred bytes and
-        // reserves nothing on every call after the first. It sits after the
-        // early-outs above on purpose: a table whose weights are not encodable
-        // never reaches here, so it never pays for a buffer it will not write.
-        if encoded.capacity() < MAX_HUFFMAN_ALPHABET {
-            encoded.reserve(MAX_HUFFMAN_ALPHABET - encoded.len());
+        // With a cache to reuse, reserve to the widest description the format
+        // admits rather than to this table's weight count: sizing it to the
+        // table in hand means a later table with a larger alphabet reallocates
+        // it, the bound is a couple of hundred bytes, and every call after the
+        // first reserves nothing. Without one the buffer is built and dropped
+        // per call, so it takes only what this description can need. Either sits
+        // after the early-outs above on purpose: a table whose weights are not
+        // encodable never reaches here, so it never pays for a buffer it will
+        // not write.
+        #[cfg(feature = "std")]
+        let want = MAX_HUFFMAN_ALPHABET;
+        #[cfg(not(feature = "std"))]
+        let want = weights.len();
+        if encoded.capacity() < want {
+            encoded.reserve(want - encoded.len());
         }
         {
             let mut writer = BitWriter::from(&mut *encoded);

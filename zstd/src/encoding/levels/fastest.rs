@@ -7,8 +7,8 @@ use crate::{
         blocks::{compress_block, compress_block_with_post_split},
         frame_compressor::CompressState,
         incompressible::{
-            block_looks_incompressible, block_looks_incompressible_dict,
-            block_looks_incompressible_strict, compression_level_allows_raw_fast_path,
+            block_looks_incompressible, block_looks_incompressible_strict,
+            compression_level_allows_raw_fast_path,
         },
         match_generator::MatchGeneratorDriver,
     },
@@ -132,7 +132,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     let looks_incompressible = rle_byte_opt.is_none()
         && !dict_rejects_raw
         && compression_level_allows_raw_fast_path(compression_level, window_size)
-        && should_emit_raw_fast_path(compression_level, window_size, bytes, dict_active);
+        && should_emit_raw_fast_path(compression_level, bytes);
     let repeats_earlier_content = if looks_incompressible {
         state
             .seen_content
@@ -378,7 +378,7 @@ pub(crate) fn compress_block_encoded_borrowed(
     let looks_incompressible = !is_rle
         && !dict_rejects_raw
         && compression_level_allows_raw_fast_path(compression_level, window_size)
-        && should_emit_raw_fast_path(compression_level, window_size, block, dict_active);
+        && should_emit_raw_fast_path(compression_level, block);
     let repeats_earlier_content = if looks_incompressible {
         state
             .seen_content
@@ -528,31 +528,13 @@ pub(crate) fn compress_block_encoded_borrowed(
 
 /// Whether this block may go out raw without being searched.
 ///
-/// The classifier answers from the block's own bytes, which cannot see a
-/// repeat that lives in the history, so the caller pairs it with a probe of
-/// the match table before acting on it.
+/// The classifier answers from the block's own bytes, which cannot see a repeat
+/// that lives in the history, so the caller pairs it with a probe of the match
+/// table before acting on it. Callers ask it only after the level and window
+/// admit a raw skip at all, and only with no dictionary attached — one keeps the
+/// block on the search whatever its own bytes look like.
 #[inline]
-fn should_emit_raw_fast_path(
-    level: CompressionLevel,
-    window_size: u64,
-    block: &[u8],
-    has_dict: bool,
-) -> bool {
-    if !compression_level_allows_raw_fast_path(level, window_size) {
-        return false;
-    }
-    // With a dictionary attached, a high-entropy-looking block is NOT
-    // necessarily incompressible: the dict can supply matches the block's own
-    // content gives no hint of (e.g. structured records drawn from the trained
-    // dict). So raise the bar to the STRICT head/mid/tail probe before skipping
-    // the scan — the same conservative check `Best` uses. The plain no-dict
-    // heuristic stays for the no-dict path, where it classifies incompressible
-    // blocks very well. Without this, an over-cutoff dict frame whose first
-    // block matches the dict gets emitted raw and ignores the dictionary
-    // entirely.
-    if has_dict {
-        return block_looks_incompressible_dict(block);
-    }
+fn should_emit_raw_fast_path(level: CompressionLevel, block: &[u8]) -> bool {
     if matches!(level, CompressionLevel::Best) {
         return block_looks_incompressible_strict(block);
     }

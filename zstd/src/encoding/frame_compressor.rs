@@ -1148,12 +1148,15 @@ impl<M: Matcher> CompressState<M> {
     /// Clears `last_huff_table`, parking the table's buffers in
     /// `huff_table_spare` for reuse instead of dropping them.
     #[inline]
-    /// Heap bytes the entropy state keeps between blocks and frames: the FSE
-    /// tables both slots of each axis hold, and the two rollback slots the emit
-    /// paths copy a Huffman table into before a block that may not be kept.
+    /// Heap bytes the compressor keeps between blocks and frames beyond the
+    /// match finder: the FSE tables both slots of each axis hold, the rollback
+    /// slot the emit paths copy a Huffman table into before a block that may not
+    /// be kept, and the block scratch with everything it holds — its literal and
+    /// sequence buffers, the splitter's workspace, and the nested estimator
+    /// scratch.
     ///
     /// All of it survives a frame, so a caller sizing a context has to see it.
-    pub(crate) fn retained_entropy_heap_size(&self) -> usize {
+    pub(crate) fn retained_scratch_heap_size(&self) -> usize {
         self.fse_tables.heap_size()
             + self
                 .huff_rollback
@@ -2041,7 +2044,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // The weight builder's buffers are kept between blocks and frames, so
         // a reused compressor holds them for as long as it lives.
         total += self.state.huff_weights.heap_size();
-        total += self.state.retained_entropy_heap_size();
+        total += self.state.retained_scratch_heap_size();
         total += self.state.seen_content.heap_size();
         total += self
             .dictionary

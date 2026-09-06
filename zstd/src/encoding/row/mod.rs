@@ -3447,14 +3447,26 @@ impl RowMatchGenerator {
             // same fill the separate vectors paid and saves an allocation.
             if self.hc_split != hash_len || self.tables.len() != hash_len + chain_len || relayout {
                 let total = hash_len + chain_len;
-                // One `vec![empty; total]`, never `clear` + `resize`. The tree
-                // finder's sentinel is zero, so this asks the allocator for
-                // zeroed memory and a large request comes back as pages the
-                // kernel has not had to write; resizing writes every element,
-                // which for a matcher taken fresh per frame meant faulting and
-                // zeroing the whole table every time. It also releases an
-                // oversized buffer, which a level downgrade needs anyway.
-                self.tables = alloc::vec![empty; total];
+                // A zero sentinel is worth a fresh allocation: the request comes
+                // back as pages the kernel has not had to write, where resizing
+                // writes every element — for a matcher taken fresh per frame
+                // that meant faulting and zeroing the whole table every time.
+                // The chain finder's sentinel is not zero, so it pays the fill
+                // either way and an allocation on top; it keeps the buffer it
+                // has. Either way an oversized one is released, which a level
+                // downgrade needs anyway.
+                if empty == 0
+                    || super::match_table::storage::capacity_is_oversized(
+                        self.tables.capacity(),
+                        total,
+                    )
+                {
+                    self.tables = alloc::vec![empty; total];
+                } else {
+                    self.tables.clear();
+                    self.tables.reserve_exact(total);
+                    self.tables.resize(total, empty);
+                }
                 self.hc_split = hash_len;
             }
             self.hc_layout = self.finder;

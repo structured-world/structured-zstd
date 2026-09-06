@@ -312,6 +312,7 @@ fn bench_compress(c: &mut Criterion) {
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
             group.bench_function("pure_rust", |b| {
+                release_freed_memory();
                 // One output buffer for the whole sample, exactly as the c_ffi
                 // arm below keeps one `dst`. The compressor is still fresh per
                 // iteration on both sides.
@@ -323,6 +324,7 @@ fn bench_compress(c: &mut Criterion) {
             });
 
             group.bench_function("c_ffi", |b| {
+                release_freed_memory();
                 // One output buffer for the whole sample (the C caller's
                 // `dst`); see `ffi_encode_into`.
                 let mut output = Vec::new();
@@ -450,6 +452,7 @@ fn bench_decompress_source(
     };
 
     group.bench_function("pure_rust", |b| {
+        release_freed_memory();
         let compressed = materialize();
         // Target sized with WILDCOPY_OVERLENGTH slack so `decode_all`
         // routes through the direct-write path (decode straight into
@@ -471,6 +474,7 @@ fn bench_decompress_source(
     });
 
     group.bench_function("c_ffi", |b| {
+        release_freed_memory();
         // Reuse one DCtx + target buffer across iterations so the
         // timing sample reflects decode steady-state — matches the
         // pure-Rust loop above which reuses one `FrameDecoder` and
@@ -639,6 +643,7 @@ fn bench_dictionary(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(total_training_bytes as u64));
 
         group.bench_function("pure_rust", |b| {
+            release_freed_memory();
             b.iter(|| {
                 let (raw_dict, tuned) = train_fastcover_raw_from_slice(
                     scenario.bytes.as_slice(),
@@ -658,6 +663,7 @@ fn bench_dictionary(c: &mut Criterion) {
         });
 
         group.bench_function("c_ffi", |b| {
+            release_freed_memory();
             b.iter(|| {
                 black_box(
                     zstd::dict::from_samples(&ffi_samples, dict_size)
@@ -787,6 +793,7 @@ fn bench_dictionary(c: &mut Criterion) {
             // no `set_drain`/`set_source` — sidestepping the lifetime issue
             // (PR #277) that forced the old per-iter shape.
             group.bench_function("c_ffi_with_dict", |b| {
+                release_freed_memory();
                 let mut compressor =
                     zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
                         .unwrap();
@@ -819,6 +826,7 @@ fn bench_dictionary(c: &mut Criterion) {
                 && EncoderDictionary::from_bytes(&ffi_dictionary).is_ok()
             {
                 group.bench_function("pure_rust_with_dict", |b| {
+                    release_freed_memory();
                     // `compress_independent_frame_into` reads input in
                     // place + takes the output buffer per call, so neither
                     // the source `R` nor drain `W` generic is ever bound by
@@ -939,6 +947,7 @@ fn bench_dictionary(c: &mut Criterion) {
             }
 
             group.bench_function("pure_rust_with_dict", |b| {
+                release_freed_memory();
                 let mut decoder = FrameDecoder::new();
                 let mut output = vec![0u8; expected_len];
                 b.iter(|| {
@@ -955,6 +964,7 @@ fn bench_dictionary(c: &mut Criterion) {
             });
 
             group.bench_function("c_ffi_with_dict", |b| {
+                release_freed_memory();
                 let mut decompressor =
                     zstd::bulk::Decompressor::with_dictionary(&ffi_dictionary).unwrap();
                 let mut output = vec![0u8; expected_len];
@@ -1060,7 +1070,6 @@ fn configure_group<M: criterion::measurement::Measurement>(
     group.measurement_time(measurement);
     group.warm_up_time(warm_up);
     group.sampling_mode(SamplingMode::Flat);
-    release_freed_memory();
 }
 
 /// Hand memory the previous group freed back to the kernel, so every group
@@ -1074,8 +1083,12 @@ fn configure_group<M: criterion::measurement::Measurement>(
 /// code being measured, and the reason a row could drift fourfold between
 /// sweeps.
 ///
-/// Once per GROUP, so the trim itself is far below anything a measurement can
-/// see; the per-iteration loop never touches it.
+/// Once per ARM, not once per group: within a group the first arm runs first
+/// and frees everything it allocated, so the second one would inherit a heap the
+/// first one warmed — which is exactly the run-order effect this removes, only
+/// now between the two sides of the comparison rather than between levels. A
+/// trim per arm is still far below anything a measurement can see; the
+/// per-iteration loop never touches it.
 fn release_freed_memory() {
     // glibc only: `malloc_trim` is a GNU extension, and musl neither provides
     // it nor keeps the per-arena free lists it exists to return. Declared here

@@ -374,8 +374,9 @@ fn a_skipped_block_is_indexed_for_the_chain_finder_too() {
     // 16 KiB window puts Row on the chain finder rather than rows.
     const WINDOW_LOG: u32 = 14;
     const BLOCK: usize = 128 * 1024;
-    // Two blocks: the second opens with the first's tail, so the repeat is
-    // inside a 16 KiB window and a search would code most of it as one match.
+    // Two 128 KiB segments of source, which the window cuts into 16 KiB blocks:
+    // the second segment opens with the first's tail, so the repeat is inside a
+    // 16 KiB window and a search would code most of it as one match.
     let first = deterministic_bytes(0x51DE, BLOCK);
     let mut input = first.clone();
     input.extend_from_slice(&first[BLOCK - 8 * 1024..]);

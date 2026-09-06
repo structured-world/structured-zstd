@@ -168,15 +168,29 @@ pub(crate) struct CompressedBlockScratch {
 
 impl CompressedBlockScratch {
     /// Heap bytes this scratch keeps between blocks, for a caller sizing a
-    /// context. The rollback table, and the nested estimator scratch: that one
-    /// is a `Box`, so its own allocation counts as well as whatever it reports
-    /// — the owner's `size_of` covers the pointer, not what it points at, and
-    /// leaving the box out understated a context that has taken the post-split
-    /// path by the whole struct.
+    /// context. Every buffer here is kept on purpose — the scratch is taken and
+    /// put back around a block rather than rebuilt — so all of them count, not
+    /// only the two that are behind an `Option`. The nested estimator scratch is
+    /// a `Box`, so its own allocation counts as well as whatever it reports: the
+    /// owner's `size_of` covers the pointer, not what it points at, and leaving
+    /// the box out understated a context that has taken the post-split path by
+    /// the whole struct.
     pub(crate) fn retained_heap_size(&self) -> usize {
-        self.huff_rollback
-            .as_ref()
-            .map_or(0, |table| table.heap_size())
+        self.parts.literals.capacity()
+            + self.parts.sequences.capacity() * core::mem::size_of::<RawSequence>()
+            + self.partitions.capacity() * core::mem::size_of::<usize>()
+            + self.prefix_sums.heap_size()
+            + self.compressed.capacity()
+            + self.estimator_sequences.capacity()
+                * core::mem::size_of::<crate::blocks::sequence_section::Sequence>()
+            + self
+                .estimator_workspace
+                .as_ref()
+                .map_or(0, EstimatorWorkspace::heap_size)
+            + self
+                .huff_rollback
+                .as_ref()
+                .map_or(0, |table| table.heap_size())
             + self.estimator_inner.as_ref().map_or(0, |inner| {
                 core::mem::size_of::<CompressedBlockScratch>() + inner.retained_heap_size()
             })
@@ -194,6 +208,10 @@ struct SequencePrefixSums {
 }
 
 impl SequencePrefixSums {
+    fn heap_size(&self) -> usize {
+        (self.lit.capacity() + self.ml.capacity()) * core::mem::size_of::<usize>()
+    }
+
     fn rebuild(&mut self, sequences: &[RawSequence]) {
         self.lit.clear();
         self.ml.clear();
@@ -799,6 +817,16 @@ struct EstimatorWorkspace {
     ml_counts: Box<[usize; 256]>,
     of_counts: Box<[usize; 256]>,
     sequences: Vec<crate::blocks::sequence_section::Sequence>,
+}
+
+impl EstimatorWorkspace {
+    /// The four boxed count tables plus whatever the sequence buffer has grown
+    /// to. All four boxes are always present once the workspace exists.
+    fn heap_size(&self) -> usize {
+        4 * core::mem::size_of::<[usize; 256]>()
+            + self.sequences.capacity()
+                * core::mem::size_of::<crate::blocks::sequence_section::Sequence>()
+    }
 }
 
 impl Default for EstimatorWorkspace {

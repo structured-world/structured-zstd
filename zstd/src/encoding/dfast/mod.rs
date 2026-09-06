@@ -1808,36 +1808,49 @@ impl DfastMatchGenerator {
         // `bits` bits set. `position_base` and `history_abs_start`
         // are constant across the loop after the single `ensure_room_for`
         // call above. `packed` fits in `u32` by that same gate.
-        let mut pos = start;
-        while pos < long_safe_end {
-            unsafe {
-                let idx = pos - history_abs_start;
-                let packed = ((pos - position_base) as u32) + 1;
-                let load_ptr = history_base_ptr.add(history_start + idx);
-                let v8 = (load_ptr as *const u64).read_unaligned();
-                // Upstream zstd parity (`zstd_compress_internal.h:923-924`):
-                // scalar `* prime8bytes` then shift to high bits. Drops
-                // the CRC32d-based kernel dispatch (3-4 instructions) for
-                // a single mul on the per-byte insert path. Short hash keys
-                // on the upstream zstd 5-byte window (`v8 << 24`, ZSTD_hash5 shape).
-                let mixed_short = (v8 << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
-                let mixed_long = v8.wrapping_mul(0xCF1BBCDCB7A56463_u64);
-                let short_idx = (mixed_short >> short_shift) as usize;
-                *short_hash_ptr.add(short_idx) = packed;
-                // A block written off without being searched is indexed only
-                // so a LATER duplicate can find it, and the short table alone
-                // does that: the search probes it first and the long table is
-                // an accelerator on top. Writing both scattered a store across
-                // twice the pages of a table this frame otherwise never
-                // touches, and those pages are faulted in one by one — on a
-                // mebibyte of noise at level 3 the sparse insert alone took
-                // ninety page faults per frame.
-                if step == 1 {
-                    let long_idx = (mixed_long >> long_shift) as usize;
-                    *long_hash_ptr.add(long_idx) = packed;
+        // A block written off without being searched is indexed only so a LATER
+        // duplicate can find it, and the short table alone does that: the search
+        // probes it first and the long table is an accelerator on top. Writing
+        // both scattered a store across twice the pages of a table this frame
+        // otherwise never touches, and those pages are faulted in one by one —
+        // on a mebibyte of noise at level 3 the sparse insert alone took ninety
+        // page faults per frame.
+        //
+        // Which of the two the range wants is decided by `step`, and it is
+        // decided ONCE here rather than at every position: the sparse walk then
+        // carries neither the gate nor the long key it would throw away, and the
+        // dense one advances by a constant.
+        macro_rules! insert_long_range {
+            ($pos:ident, $dense:literal, $step:expr) => {
+                while $pos < long_safe_end {
+                    unsafe {
+                        let idx = $pos - history_abs_start;
+                        let packed = (($pos - position_base) as u32) + 1;
+                        let load_ptr = history_base_ptr.add(history_start + idx);
+                        let v8 = (load_ptr as *const u64).read_unaligned();
+                        // Upstream zstd parity (`zstd_compress_internal.h:923-924`):
+                        // scalar `* prime8bytes` then shift to high bits. Drops
+                        // the CRC32d-based kernel dispatch (3-4 instructions) for
+                        // a single mul on the per-byte insert path. Short hash keys
+                        // on the upstream zstd 5-byte window (`v8 << 24`, ZSTD_hash5 shape).
+                        let mixed_short = (v8 << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
+                        let short_idx = (mixed_short >> short_shift) as usize;
+                        *short_hash_ptr.add(short_idx) = packed;
+                        if $dense {
+                            let mixed_long = v8.wrapping_mul(0xCF1BBCDCB7A56463_u64);
+                            let long_idx = (mixed_long >> long_shift) as usize;
+                            *long_hash_ptr.add(long_idx) = packed;
+                        }
+                    }
+                    $pos += $step;
                 }
-            }
-            pos += step;
+            };
+        }
+        let mut pos = start;
+        if step == 1 {
+            insert_long_range!(pos, true, 1);
+        } else {
+            insert_long_range!(pos, false, step);
         }
         while pos < short_safe_end {
             unsafe {

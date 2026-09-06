@@ -57,7 +57,18 @@ fn the_reported_footprint_covers_what_compressing_retained() {
     // Checked by removal rather than by comparison: the match-finder's share
     // alone exceeds it, so any "total is at least the parts" assertion would
     // pass with the term missing entirely.
-    let entropy = enc.state.retained_entropy_heap_size();
+    let entropy = enc.state.fse_tables.heap_size()
+        + enc
+            .state
+            .huff_rollback
+            .as_ref()
+            .map_or(0, |table| table.heap_size())
+        + enc
+            .state
+            .block_scratch
+            .huff_rollback
+            .as_ref()
+            .map_or(0, |table| table.heap_size());
     assert!(
         entropy > 0,
         "compressing should have left entropy state retained",

@@ -577,31 +577,6 @@ pub(crate) fn block_looks_incompressible(block: &[u8]) -> bool {
     sample_looks_incompressible(block)
 }
 
-/// Dict-aware incompressibility check: stricter than the plain no-dict
-/// heuristic. With a dictionary attached, a block that LOOKS high-entropy in a
-/// small fixed sample can still compress — either against the dict, or via a
-/// long-range internal repeat the capped sample never spans. So sample the WHOLE
-/// block, which surfaces those repeats; only blocks that stay high-entropy
-/// across their full length are skipped to raw. Truly random data is still
-/// classified incompressible (no repeats anywhere), so the no-dict-quality
-/// rejection of incompressible input is preserved — it is only harder to trip on
-/// the dict path, never weaker.
-///
-/// This covers INTERNAL repeats only. EXTERNAL dict matches (a dict segment
-/// embedded in otherwise-incompressible input — content this content-only sample
-/// can never see) are caught by a SEPARATE layer at the call site: the raw skip
-/// fires only when this returns `true` AND `Matcher::block_samples_match_dict`
-/// finds no extendable dict match. So a block that matches the dictionary is
-/// never emitted raw, even though this function, by design, does not probe the
-/// dict itself.
-#[inline]
-pub(crate) fn block_looks_incompressible_dict(block: &[u8]) -> bool {
-    if block.len() < RAW_FAST_PATH_MIN_BLOCK_LEN {
-        return false;
-    }
-    sample_looks_incompressible_capped(block, block.len())
-}
-
 #[inline]
 pub(crate) fn block_looks_incompressible_strict(block: &[u8]) -> bool {
     if block.len() < RAW_FAST_PATH_MIN_BLOCK_LEN {
