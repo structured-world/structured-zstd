@@ -626,7 +626,10 @@ fn presplit_record_fingerprint(
     sampling_rate: usize,
     hash_log: usize,
 ) {
-    fp.events.fill(0);
+    // Only the slots this hash can reach. The table is sized for the widest
+    // hash the splitter uses; a tier on a narrower one was clearing four times
+    // the memory it then touched, sixteen times a block.
+    fp.events[..1usize << hash_log].fill(0);
     fp.nb_events = 0;
     if src.len() < 2 {
         return;
@@ -659,14 +662,32 @@ fn presplit_record_byte_histogram(fp: &mut PreSplitFingerprint, src: &[u8]) {
 
 fn presplit_distance(lhs: &PreSplitFingerprint, rhs: &PreSplitFingerprint, hash_log: usize) -> u64 {
     let slots = 1usize << hash_log;
-    let mut distance = 0u64;
-    for idx in 0..slots {
-        let left = lhs.events[idx] as i128 * rhs.nb_events as i128;
-        let right = rhs.events[idx] as i128 * lhs.nb_events as i128;
-        // Plain `+`: events/nb_events are per-block sample counts (<= block
-        // size), so each |left-right| <= (2^17)^2 and the sum over <= 2^hash_log
-        // slots stays far under u64::MAX — no overflow.
-        distance += left.abs_diff(right) as u64;
+    // 64-bit, as upstream's `fpDistance` is (`zstd_preSplit.c`). Both factors
+    // are per-block sample counts bounded by the block size, so each product is
+    // under 2^34 and the sum over at most 2^10 slots is under 2^44 — the 128-bit
+    // arithmetic this used to do could not overflow either, it just cost several
+    // instructions a slot on a loop the splitter runs sixteen times a block.
+    let rn = rhs.nb_events as u64;
+    let ln = lhs.nb_events as u64;
+    // Four accumulators over slices the optimiser can see the length of, which
+    // is what lets this go wide: the splitter runs this loop once per chunk and
+    // sixteen times a block, so it counts more slots than the sampling reads
+    // bytes.
+    let (l, r) = (&lhs.events[..slots], &rhs.events[..slots]);
+    let mut acc = [0u64; 4];
+    let mut idx = 0;
+    while idx + 4 <= slots {
+        for lane in 0..4 {
+            let left = u64::from(l[idx + lane]) * rn;
+            let right = u64::from(r[idx + lane]) * ln;
+            acc[lane] += left.abs_diff(right);
+        }
+        idx += 4;
+    }
+    let mut distance = acc[0] + acc[1] + acc[2] + acc[3];
+    while idx < slots {
+        distance += (u64::from(l[idx]) * rn).abs_diff(u64::from(r[idx]) * ln);
+        idx += 1;
     }
     distance
 }
@@ -688,12 +709,22 @@ fn presplit_fingerprints_differ(
     deviation >= threshold
 }
 
-fn presplit_merge_events(acc: &mut PreSplitFingerprint, new_fp: &PreSplitFingerprint) {
+fn presplit_merge_events(
+    acc: &mut PreSplitFingerprint,
+    new_fp: &PreSplitFingerprint,
+    hash_log: usize,
+) {
     // Plain `+`: `acc` accumulates only the chunks of a single block (caller
     // loops within one block, <= MAX_BLOCK_SIZE), so the merged sample counts
     // stay far under u32 / usize bounds — no overflow.
-    for idx in 0..PRESPLIT_HASH_TABLE_SIZE {
-        acc.events[idx] += new_fp.events[idx];
+    //
+    // Only the slots this tier's hash reaches: the rest are never recorded into
+    // and never read, so merging them is a quarter of the table for nothing.
+    // Paired slices rather than indices, so the bound is one check instead of
+    // one per slot and the adds can go wide.
+    let slots = 1usize << hash_log;
+    for (into, from) in acc.events[..slots].iter_mut().zip(&new_fp.events[..slots]) {
+        *into += *from;
     }
     acc.nb_events += new_fp.nb_events;
 }
@@ -735,7 +766,7 @@ fn split_block_by_chunks(block: &[u8], level: usize) -> usize {
         if presplit_fingerprints_differ(&past, &new_events, penalty, hash_log) {
             return pos;
         }
-        presplit_merge_events(&mut past, &new_events);
+        presplit_merge_events(&mut past, &new_events, hash_log);
         if penalty > 0 {
             penalty -= 1;
         }
