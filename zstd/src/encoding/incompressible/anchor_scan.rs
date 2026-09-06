@@ -153,11 +153,29 @@ unsafe fn fill_anchors_neon(
     // SAFETY: every load is bounded by the loop condition.
     unsafe {
         let want = vdupq_n_u8(needle);
+        // Four vectors, one horizontal reduce. `vmaxvq_u8` has the latency of a
+        // cross-lane operation and sits on the loop's critical path, so paying
+        // it once per sixty-four bytes rather than once per sixteen is what
+        // makes the compare the cost rather than the reduce.
+        while at + 64 <= n_bytes {
+            let e0 = vceqq_u8(vld1q_u8(base.add(at)), want);
+            let e1 = vceqq_u8(vld1q_u8(base.add(at + 16)), want);
+            let e2 = vceqq_u8(vld1q_u8(base.add(at + 32)), want);
+            let e3 = vceqq_u8(vld1q_u8(base.add(at + 48)), want);
+            let any = vorrq_u8(vorrq_u8(e0, e1), vorrq_u8(e2, e3));
+            if vmaxvq_u8(any) != 0 {
+                for (i, e) in [e0, e1, e2, e3].into_iter().enumerate() {
+                    if vmaxvq_u8(e) != 0 {
+                        let narrowed = vshrn_n_u16(vreinterpretq_u16_u8(e), 4);
+                        let bits = vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);
+                        drain_mask!(bits, at + i * 16, 4, out, n);
+                    }
+                }
+            }
+            at += 64;
+        }
         while at + 16 <= n_bytes {
             let eq = vceqq_u8(vld1q_u8(base.add(at)), want);
-            // The common answer is "none of these sixteen", and `vmaxvq_u8`
-            // settles that in one instruction; the narrowing below is only paid
-            // when there is something to report.
             if vmaxvq_u8(eq) != 0 {
                 // Four bits per lane, so a matching byte is a set nibble.
                 let narrowed = vshrn_n_u16(vreinterpretq_u16_u8(eq), 4);
@@ -192,6 +210,23 @@ unsafe fn fill_anchors_sse2(
     // form.
     unsafe {
         let want = _mm_set1_epi8(needle as i8);
+        // Four vectors, one move to a general register — see the AVX2 body.
+        while at + 64 <= n_bytes {
+            let c0 = _mm_cmpeq_epi8(_mm_loadu_si128(base.add(at).cast()), want);
+            let c1 = _mm_cmpeq_epi8(_mm_loadu_si128(base.add(at + 16).cast()), want);
+            let c2 = _mm_cmpeq_epi8(_mm_loadu_si128(base.add(at + 32).cast()), want);
+            let c3 = _mm_cmpeq_epi8(_mm_loadu_si128(base.add(at + 48).cast()), want);
+            let any = _mm_or_si128(_mm_or_si128(c0, c1), _mm_or_si128(c2, c3));
+            if _mm_movemask_epi8(any) != 0 {
+                for (i, c) in [c0, c1, c2, c3].into_iter().enumerate() {
+                    let mask = _mm_movemask_epi8(c) as u32;
+                    if mask != 0 {
+                        drain_mask!(u64::from(mask), at + i * 16, 1, out, n);
+                    }
+                }
+            }
+            at += 64;
+        }
         while at + 16 <= n_bytes {
             let chunk = _mm_loadu_si128(base.add(at).cast());
             let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, want)) as u32;
@@ -226,6 +261,27 @@ unsafe fn fill_anchors_avx2(
     // form.
     unsafe {
         let want = _mm256_set1_epi8(needle as i8);
+        // Four vectors, then ONE move to a general register. The compare is
+        // cheap and the move is not: at one per thirty-two bytes it sat on the
+        // loop's critical path and was a third of the scan. The common answer
+        // is "none of these hundred and twenty-eight bytes", and an OR of the
+        // four compares answers that as well as four separate moves would.
+        while at + 128 <= n_bytes {
+            let c0 = _mm256_cmpeq_epi8(_mm256_loadu_si256(base.add(at).cast()), want);
+            let c1 = _mm256_cmpeq_epi8(_mm256_loadu_si256(base.add(at + 32).cast()), want);
+            let c2 = _mm256_cmpeq_epi8(_mm256_loadu_si256(base.add(at + 64).cast()), want);
+            let c3 = _mm256_cmpeq_epi8(_mm256_loadu_si256(base.add(at + 96).cast()), want);
+            let any = _mm256_or_si256(_mm256_or_si256(c0, c1), _mm256_or_si256(c2, c3));
+            if _mm256_movemask_epi8(any) != 0 {
+                for (i, c) in [c0, c1, c2, c3].into_iter().enumerate() {
+                    let mask = _mm256_movemask_epi8(c) as u32;
+                    if mask != 0 {
+                        drain_mask!(u64::from(mask), at + i * 32, 1, out, n);
+                    }
+                }
+            }
+            at += 128;
+        }
         while at + 32 <= n_bytes {
             let chunk = _mm256_loadu_si256(base.add(at).cast());
             let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, want)) as u32;
