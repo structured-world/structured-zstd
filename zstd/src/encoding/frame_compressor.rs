@@ -889,6 +889,12 @@ pub(crate) fn optimal_block_size_with(
     // `split_level == 0` → cheap borders heuristic;
     // `split_level == 1..=4` → byChunks with internal sampling level
     // `split_level - 1`.
+    // NOTE: gating the sampling tier behind the cheap borders tier (run it
+    // only when the block's ends already disagree) was measured and REJECTED:
+    // it costs 2.8-3.4% of the decode corpus across levels 3-15, because the
+    // boundaries the sampling finds are mostly inside blocks whose ends look
+    // alike. The cost of the sampling on uniform input has to come off some
+    // other way.
     let raw_split = if split_level == 0 {
         split_block_from_borders(&block[..MAX_BLOCK_SIZE as usize])
     } else {
