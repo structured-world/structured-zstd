@@ -47,7 +47,7 @@ pub(crate) struct SeenContentGrid {
     /// Which frame the live slots belong to. Starts at 0 with a freshly
     /// allocated (all-zero) table, and every frame increments it first, so no
     /// frame ever runs under the epoch a zeroed slot carries.
-    epoch: u32,
+    epoch: u16,
     /// Bytes of this frame recorded so far. `u64` on every target: a frame can
     /// be longer than a 16- or 32-bit address space, and only this counter
     /// would notice.
@@ -60,9 +60,16 @@ pub(crate) struct SeenContentGrid {
 /// widening any of them costs a byte of table for every slot.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct SeenSample {
-    fingerprint: u32,
-    epoch: u32,
-    at: u64,
+    /// Sixteen bits here and eight more in the tag table: a coincidence costs a
+    /// search that finds nothing, never a wrong answer, and at twenty-four bits
+    /// over the few thousand probes a frame makes that is one frame in
+    /// thousands.
+    fingerprint: u16,
+    epoch: u16,
+    /// The record's offset in units of [`SeenContentGrid::RECORD_STEP`], which
+    /// is what every record sits on. A frame would have to run past two
+    /// tebibytes for this to be too narrow.
+    at_step: u32,
 }
 
 impl SeenContentGrid {
@@ -100,8 +107,8 @@ impl SeenContentGrid {
     /// actually records into it.
     pub(crate) fn reset_for_frame(&mut self) {
         // The wrap lands on 0, which is the epoch a freshly allocated slot
-        // carries, so the table is cleared on that one frame in four billion
-        // rather than letting a stale slot read as live.
+        // carries, so the table is cleared on that one frame in sixty-five
+        // thousand rather than letting a stale slot read as live.
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.slots.fill(SeenSample::default());
@@ -130,7 +137,7 @@ impl SeenContentGrid {
 
     /// The mixed key at `at`, and the slot it belongs in.
     #[inline]
-    fn key_at(&self, block: &[u8], at: usize, mask: usize) -> (usize, u32, u8) {
+    fn key_at(&self, block: &[u8], at: usize, mask: usize) -> (usize, u16, u8) {
         let key = u64::from_le_bytes(
             block[at..at + Self::KEY_LEN]
                 .try_into()
@@ -141,8 +148,8 @@ impl SeenContentGrid {
         // has written cannot read as a match.
         (
             (mixed >> 32) as usize & mask,
-            (mixed as u32) | 1,
-            (mixed >> 24) as u8 | 1,
+            (mixed as u16) | 1,
+            (mixed >> 16) as u8 | 1,
         )
     }
 
@@ -161,12 +168,13 @@ impl SeenContentGrid {
         if held.epoch != self.epoch || held.fingerprint != fingerprint {
             return false;
         }
+        let recorded = u64::from(held.at_step) * Self::RECORD_STEP as u64;
         // A record is never ahead of a probe that meets it: records for a run go
         // in before the run, and both walk the block forwards. The subtraction
         // is checked all the same — the alternative is a wrap in release that
         // reads as a repeat at a distance of eighteen exabytes.
-        debug_assert!(held.at <= here, "a record ahead of the probe that met it");
-        here.checked_sub(held.at)
+        debug_assert!(recorded <= here, "a record ahead of the probe that met it");
+        here.checked_sub(recorded)
             .is_some_and(|apart| apart <= reach)
     }
 
@@ -181,10 +189,15 @@ impl SeenContentGrid {
     fn record_key(&mut self, block: &[u8], at: usize, mask: usize) {
         let (slot, fingerprint, tag) = self.key_at(block, at, mask);
         self.tags[slot] = tag;
+        let here = self.frame_offset + at as u64;
+        debug_assert!(
+            here.is_multiple_of(Self::RECORD_STEP as u64),
+            "records sit on the grid, which is what lets the offset be stored in steps",
+        );
         self.slots[slot] = SeenSample {
             fingerprint,
             epoch: self.epoch,
-            at: self.frame_offset + at as u64,
+            at_step: (here / Self::RECORD_STEP as u64) as u32,
         };
     }
 

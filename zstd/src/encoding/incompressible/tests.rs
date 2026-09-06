@@ -138,7 +138,11 @@ fn the_content_grid_keeps_reporting_a_run_of_the_same_block() {
     let stale = grid
         .slots
         .iter()
-        .filter(|slot| slot.fingerprint != 0 && slot.at < block.len() as u64)
+        .filter(|slot| {
+            slot.fingerprint != 0
+                && u64::from(slot.at_step) * (SeenContentGrid::RECORD_STEP as u64)
+                    < block.len() as u64
+        })
         .count();
     assert_eq!(
         stale, 0,
