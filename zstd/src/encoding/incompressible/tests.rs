@@ -57,6 +57,28 @@ fn the_content_grid_reports_a_repeat_that_is_shifted() {
     );
 }
 
+/// A block that repeats its own content has to be found wherever the copy
+/// landed, not only where a run happens to be placed.
+///
+/// A block of noise carrying a big verbatim copy of itself reads as
+/// incompressible to any sample of it, and the copy is a block-sized match the
+/// search would have found. Runs at the start and the middle answer a copy that
+/// begins at the middle; a copy that begins anywhere else is the same match and
+/// has to be answered too.
+#[test]
+fn the_content_grid_reports_a_repeat_that_is_not_at_the_midpoint() {
+    let mut block = deterministic_bytes(0xBEEF, 128 * 1024);
+    let (source, destination) = (8 * 1024, 76 * 1024);
+    let span = block.len() - destination;
+    block.copy_within(source..source + span, destination);
+    let mut grid = SeenContentGrid::default();
+    grid.reset_for_frame();
+    assert!(
+        grid.record_and_report_repeat(&block, 8 * 1024 * 1024),
+        "a {span}-byte copy inside the block is a match worth searching for",
+    );
+}
+
 /// Content still inside the window must keep reading as a repeat, and content
 /// the window has passed must stop.
 ///

@@ -96,6 +96,12 @@ impl SeenContentGrid {
     /// offsets exactly one is a multiple of the step, so a copy at ANY distance
     /// from its original has exactly one probe that meets a recorded key.
     const PROBE_RUN: usize = Self::RECORD_STEP;
+    /// How far apart the runs sit. A copy is answered when a run begins inside
+    /// it, so this is the length of copy the grid can still miss — and a block
+    /// carrying a copy this size is worth the search whatever the samples said.
+    /// Blocks smaller than twice this keep the two runs that a block of two
+    /// identical halves needs.
+    const PROBE_SPACING: usize = 16 * 1024;
     /// How far past a hit the search stays on: two maximum blocks, so an
     /// isolated miss inside repeating content cannot cost a block, while a frame
     /// that stops repeating returns to skipping within a block or two.
@@ -261,18 +267,20 @@ impl SeenContentGrid {
         // where the raw path is little more than a copy. This touches about
         // eight kilobytes of a hundred-and-twenty-eight-kilobyte block.
         //
-        // Two probe runs, not one: the run at the start answers a duplicate of
-        // anything recorded earlier, and the run at the midpoint answers a block
-        // whose own first half is the original — a hundred and twenty-eight
-        // kilobytes of two identical halves reads as incompressible by any
-        // sample of it and halves if the search runs.
+        // Several runs, not one: the run at the start answers a duplicate of
+        // anything recorded earlier, and every later run answers a block that
+        // carries a copy of its own earlier content — a hundred and twenty-eight
+        // kilobytes holding a fifty-kilobyte copy of itself reads as
+        // incompressible by any sample of it and is a block-sized match if the
+        // search runs. A run only answers a copy that it begins inside, so runs
+        // every [`Self::PROBE_SPACING`] bound what a copy has to be to hide.
         //
-        // Dropping the midpoint run on every block after a frame's first was
+        // Dropping the second run on every block after a frame's first was
         // tried, for half the grid's cost: it loses ratio. Four megabytes
         // repeated at a shifted distance went from 4,129,240 bytes to 4,194,762
-        // at level 17. The second run is not only about a block's own halves —
-        // it is a second independent chance for the one aligned probe to meet a
-        // record that the first run's slot has since been written over.
+        // at level 17. The later runs are not only about a block's own copies —
+        // each is another independent chance for the one aligned probe to meet a
+        // record that an earlier run's slot has since been written over.
         let step = Self::RECORD_STEP as u64;
         // A full run covers every distance a copy could sit at, and on a block
         // of any size it is a rounding error. On a block of a couple of
@@ -293,7 +301,9 @@ impl SeenContentGrid {
         }
         let mut abs = self.frame_offset.next_multiple_of(step);
         let block_end = self.frame_offset + last as u64;
-        for (idx, start) in [0usize, block.len() / 2].into_iter().enumerate() {
+        let runs = (block.len() / Self::PROBE_SPACING).max(2);
+        for idx in 0..runs {
+            let start = idx * (block.len() / runs);
             // Records for everything before this run go in FIRST, because
             // meeting them is the run's whole job — a block whose own first half
             // is the original is invisible to a run that probes before that half
@@ -316,7 +326,7 @@ impl SeenContentGrid {
                 }
             }
             // The rest of the block, once no run is left to probe it.
-            if idx == 1 {
+            if idx + 1 == runs {
                 while abs <= block_end {
                     let at = (abs - self.frame_offset) as usize;
                     self.record_key(block, at, mask);

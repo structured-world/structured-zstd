@@ -3083,9 +3083,24 @@ impl RowMatchGenerator {
             // `INCOMPRESSIBLE_SKIP_STEP` positions is met long before the stride
             // matters. The tree finder keeps the old behaviour — its nodes are
             // sorted on insertion and seeding them here is not a sparse write.
-            if self.finder == LazyFinder::Chain {
+            // The hint means the same thing here as it does for the rows below:
+            // nothing for `None`, every `INCOMPRESSIBLE_SKIP_STEP` position for
+            // a block written off, and every position when a dictionary is
+            // being primed. Seeding sparsely for all three indexes what `None`
+            // asked to be left alone and leaves a dictionary with one position
+            // in eight, whose four-byte keys a later block then cannot meet.
+            if self.finder == LazyFinder::Chain
+                && let Some(incompressible) = incompressible_hint
+            {
+                let step = if incompressible {
+                    INCOMPRESSIBLE_SKIP_STEP
+                } else {
+                    1
+                };
                 let ctx = self.scan_ctx();
                 let chain_mask = (1usize << self.hc_chain_log) - 1;
+                // Only the last window's worth: nothing older can be matched
+                // from the next block anyway.
                 let from = current_abs_start
                     .max(current_abs_end.saturating_sub(self.search_window))
                     .max(self.low_limit);
@@ -3095,7 +3110,7 @@ impl RowMatchGenerator {
                     let (hash, chain) = self.hc_tables_mut();
                     chain[idx & chain_mask] = hash[h];
                     hash[h] = idx as u32;
-                    idx += INCOMPRESSIBLE_SKIP_STEP;
+                    idx += step;
                 }
             }
             self.lazy_next_to_update = current_abs_end.saturating_sub(ROW_HASH_KEY_LEN - 1);
