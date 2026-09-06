@@ -47,7 +47,7 @@
     "pure-rust"
   ],
   "license": "Apache-2.0",
-  "author": "Structured World Foundation <foundation@sw.foundation>",
+  "author": "Dmitry Prudnikov <mail@polaz.com>",
   "homepage": "https://github.com/structured-world/structured-zstd#readme",
   "repository": {
     "type": "git",

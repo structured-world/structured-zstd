@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.50](https://github.com/structured-world/structured-zstd/compare/v0.0.49...v0.0.50) - 2026-09-05
+
+### Added
+
+- *(encoder)* [**breaking**] gate encoder SIMD on the kernel features, drop the dead hash mix ([#473](https://github.com/structured-world/structured-zstd/pull/473))
+
+### Fixed
+
+- *(encode)* search blocks that only look incompressible, and trim the dfast scan ([#483](https://github.com/structured-world/structured-zstd/pull/483))
+
+### Performance
+
+- *(encode)* take the matcher's buffers once per frame, not by growth ([#482](https://github.com/structured-world/structured-zstd/pull/482))
+- *(encoder)* hold each backend's index tables in one buffer ([#479](https://github.com/structured-world/structured-zstd/pull/479))
+- *(encoder)* [**breaking**] read owned blocks straight into the matcher history ([#477](https://github.com/structured-world/structured-zstd/pull/477))
+- *(row)* port the lazy parse, row/chain search and dictionary plan from upstream; match upstream CDict fill for the fast dict scan ([#467](https://github.com/structured-world/structured-zstd/pull/467))
+
 ## [0.0.49](https://github.com/structured-world/structured-zstd/compare/v0.0.48...v0.0.49) - 2026-07-01
 
 ### Performance
