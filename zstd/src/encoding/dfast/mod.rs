@@ -1823,9 +1823,19 @@ impl DfastMatchGenerator {
                 let mixed_short = (v8 << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
                 let mixed_long = v8.wrapping_mul(0xCF1BBCDCB7A56463_u64);
                 let short_idx = (mixed_short >> short_shift) as usize;
-                let long_idx = (mixed_long >> long_shift) as usize;
                 *short_hash_ptr.add(short_idx) = packed;
-                *long_hash_ptr.add(long_idx) = packed;
+                // A block written off without being searched is indexed only
+                // so a LATER duplicate can find it, and the short table alone
+                // does that: the search probes it first and the long table is
+                // an accelerator on top. Writing both scattered a store across
+                // twice the pages of a table this frame otherwise never
+                // touches, and those pages are faulted in one by one — on a
+                // mebibyte of noise at level 3 the sparse insert alone took
+                // ninety page faults per frame.
+                if step == 1 {
+                    let long_idx = (mixed_long >> long_shift) as usize;
+                    *long_hash_ptr.add(long_idx) = packed;
+                }
             }
             pos += step;
         }
