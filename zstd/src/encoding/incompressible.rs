@@ -45,6 +45,9 @@ pub(crate) struct SeenContentGrid {
     frame_offset: u64,
     /// Frame offset up to which the search stays on after a hit.
     repeat_until: u64,
+    /// The anchor scan's tier, resolved once. `None` until the first block, so
+    /// a grid that is never consulted never pays the detection.
+    kernel: Option<crate::encoding::fastpath::FastpathKernel>,
 }
 
 /// Sixteen bytes, which is what the three fields pack into with no padding:
@@ -119,6 +122,51 @@ impl SeenContentGrid {
         self.frame_offset += block_len as u64;
     }
 
+    /// One anchor's worth of work: key, thin, look up, record. Shared by the
+    /// content scan and the two endpoints so they cannot answer differently,
+    /// and kept out of line so the scan loop that calls it stays small.
+    #[inline(never)]
+    fn probe_anchor(
+        &mut self,
+        block: &[u8],
+        anchor: usize,
+        thinned: bool,
+        reach: u64,
+        mask: usize,
+    ) -> bool {
+        let key = u64::from_le_bytes(
+            block[anchor..anchor + Self::KEY_LEN]
+                .try_into()
+                .expect("the slice is KEY_LEN bytes"),
+        );
+        let mixed = Self::avalanche(key);
+        // The byte alone anchors one position in 256, which fills the table
+        // several times over within a window and evicts the older half of it. A
+        // slice of the mixed key thins that to `ANCHOR_IN`, the density at which
+        // a block still carries several anchors while the window's worth of them
+        // fits. The endpoints are not thinned: they are the block's guarantee.
+        if thinned && mixed >> Self::THIN_SHIFT != 0 {
+            return false;
+        }
+        let slot = (mixed >> 32) as usize & mask;
+        let fingerprint = (mixed as u32) | 1;
+        let here = self.frame_offset + anchor as u64;
+        let held = self.slots[slot];
+        let repeat =
+            held.epoch == self.epoch && held.fingerprint == fingerprint && here - held.at <= reach;
+        // Written whether or not it hit, so a run of the same content keeps
+        // reporting. Leaving a hit slot dated to the FIRST occurrence makes the
+        // third measure its distance from there, which a one-block window reads
+        // as out of reach even though the block right behind it is exactly what
+        // the matcher would find — every other block of the run would go out raw.
+        self.slots[slot] = SeenSample {
+            fingerprint,
+            epoch: self.epoch,
+            at: here,
+        };
+        repeat
+    }
+
     pub(crate) fn record_and_report_repeat(&mut self, block: &[u8], window_size: usize) -> bool {
         // Too short to key on. The offset still advances, so the ages of what
         // follows stay true distances in the stream.
@@ -140,101 +188,52 @@ impl SeenContentGrid {
         };
         let mut repeat = false;
         let last = block.len() - Self::KEY_LEN;
-        // Candidate anchors are the positions carrying one chosen byte, found
-        // eight at a time by the classic zero-byte word trick. Reading every
-        // position instead costs a load and a multiply per byte, which on the
-        // levels where the search is cheap outweighs the search it saves; this
-        // scan is a handful of register ops per WORD and the key work below runs
-        // at the one position in `ANCHOR_IN` that survives both tests.
-        const ONES: u64 = 0x0101_0101_0101_0101;
-        const HIGHS: u64 = 0x8080_8080_8080_8080;
-        const SPREAD: u64 = ONES * SeenContentGrid::ANCHOR_BYTE as u64;
         // Both ends of the block rather than all of it, on the same reasoning
         // the classifier samples by: a duplicate is block-sized, so its ends
         // hold the same bytes as the original's and anchor at the same content.
         // Reading the whole block was four times the classifier's own cost and,
         // on the levels where the search is cheap, most of the encode.
-        // One anchor's worth of work, shared by the content scan and the two
-        // endpoints below so they cannot answer differently.
-        macro_rules! probe_at {
-            ($anchor:expr, $thinned:expr) => {{
-                let anchor = $anchor;
-                let key = u64::from_le_bytes(
-                    block[anchor..anchor + Self::KEY_LEN]
-                        .try_into()
-                        .expect("the slice is KEY_LEN bytes"),
-                );
-                let mixed = Self::avalanche(key);
-                // The byte alone anchors one position in 256, which fills the
-                // table several times over within a window and evicts the older
-                // half of it. A slice of the mixed key thins that to
-                // `ANCHOR_IN`, the density at which a block still carries
-                // several anchors while the window's worth of them fits. The
-                // endpoints are not thinned: they are the block's guarantee.
-                if !$thinned || mixed >> Self::THIN_SHIFT == 0 {
-                    let slot = (mixed >> 32) as usize & mask;
-                    let fingerprint = (mixed as u32) | 1;
-                    let here = self.frame_offset + anchor as u64;
-                    let held = self.slots[slot];
-                    if held.epoch == self.epoch
-                        && held.fingerprint == fingerprint
-                        && here - held.at <= reach
-                    {
-                        repeat = true;
-                    }
-                    // Written whether or not it hit, so a run of the same
-                    // content keeps reporting. Leaving a hit slot dated to the
-                    // FIRST occurrence makes the third measure its distance
-                    // from there, which a one-block window reads as out of
-                    // reach even though the block right behind it is exactly
-                    // what the matcher would find — every other block of the
-                    // run would go out raw.
-                    self.slots[slot] = SeenSample {
-                        fingerprint,
-                        epoch: self.epoch,
-                        at: here,
-                    };
-                }
-            }};
-        }
         // The block's two endpoints, always. Anchoring on one byte value leaves
         // a block that happens to contain none of it with nothing recorded at
         // all, and its exact copy then goes out raw with a block-sized match
         // sitting right there. A block-aligned duplicate has the same bytes at
         // both ends, so these two keys are what guarantee it is recognised;
         // everything else the scan finds is what makes a SHIFTED copy work.
-        probe_at!(0, false);
+        repeat |= self.probe_anchor(block, 0, false, reach, mask);
         if last > 0 {
-            probe_at!(last, false);
+            repeat |= self.probe_anchor(block, last, false, reach, mask);
         }
         // The WHOLE block, not a sample of it. Reading only its ends is much
         // cheaper and answers a block-aligned duplicate, but a copy shifted by
         // half a block puts the original's middle where the copy's ends are:
         // four megabytes repeated at a 64 KiB-shifted distance stopped being
-        // recognised at all and went out raw in full. The scan itself is a
-        // handful of register operations per WORD; what it costs is the probes,
-        // and `ANCHOR_IN` is what bounds those.
-        {
-            let mut at = 0usize;
-            while at <= last {
-                let word = u64::from_le_bytes(
-                    block[at..at + Self::KEY_LEN]
-                        .try_into()
-                        .expect("the slice is KEY_LEN bytes"),
-                );
-                let marked = word ^ SPREAD;
-                let mut hits = marked.wrapping_sub(ONES) & !marked & HIGHS;
-                while hits != 0 {
-                    let byte = (hits.trailing_zeros() / 8) as usize;
-                    hits &= hits - 1;
-                    let anchor = at + byte;
-                    if anchor > last {
-                        break;
-                    }
-                    probe_at!(anchor, true);
-                }
-                at += Self::KEY_LEN;
+        // recognised at all and went out raw in full.
+        //
+        // The probe body stays OUT of this loop. Inlined here it was most of a
+        // fast-level encode on incompressible input — a quarter of a nanosecond
+        // per byte, against the handful of register operations per WORD the
+        // scan itself needs. One position in 256 carries the anchor byte, so
+        // the call is rare and the loop stays a load, an xor, a subtract and a
+        // test.
+        let kernel = *self
+            .kernel
+            .get_or_insert_with(crate::encoding::fastpath::select_kernel);
+        let mut anchors = [0u32; anchor_scan::ANCHOR_BATCH];
+        let mut at = 0usize;
+        while at <= last {
+            let (found, consumed) = anchor_scan::fill_anchors(
+                kernel,
+                &block[at..=last],
+                Self::ANCHOR_BYTE,
+                &mut anchors,
+            );
+            for &off in &anchors[..found] {
+                repeat |= self.probe_anchor(block, at + off as usize, true, reach, mask);
             }
+            if consumed == 0 {
+                break;
+            }
+            at += consumed;
         }
         self.frame_offset += block.len() as u64;
         // Content that repeats does not repeat in every block, and the sampling
@@ -291,12 +290,6 @@ pub(crate) const RAW_FAST_PATH_MIN_SAMPLE_LEN: usize = 32;
 /// eight bytes a megabyte of incompressible input costs 131,000 stores it had
 /// no use for, which measured as a four-fold slowdown on the fast levels.
 pub(crate) const RAW_SKIP_INDEX_STEP: usize = 512;
-
-/// Highest numeric level that may take the skip. Above it the block goes to
-/// the deeper search the level was chosen for: writing it off unsearched costs
-/// 3.7% of the corpus at level 13 and 5.1% at 17, which is more than the skip
-/// can ever save there.
-const RAW_FAST_PATH_MAX_LEVEL: i32 = 9;
 
 /// Window-size ceiling (8 MiB) above which a numeric level does not take the
 /// skip whatever its number: the further back a match may reach, the more a
@@ -376,16 +369,17 @@ pub(crate) fn compression_level_allows_raw_fast_path(
     window_size: u64,
 ) -> bool {
     match level {
-        // The named variants resolve to levels 1 / 3 / 7, all inside the band
-        // where a misjudged block is cheap; `Best` is level 13, which is not.
+        // The window is the whole question, at every level. A level ceiling was
+        // tried here — the high levels are where a block written off unsearched
+        // costs the most — and it cost 12 to 32 times the encode on
+        // incompressible input at levels 16 and up while buying nothing: what
+        // the ceiling was guarding against is a repeat written off, and the
+        // grid catches those on its own. Four megabytes repeated at nearly the
+        // window distance comes out at 4,129,240 bytes against the reference's
+        // 4,129,258 with the skip live at level 17.
         CompressionLevel::Fastest | CompressionLevel::Default | CompressionLevel::Better => true,
-        // Level 13, and outside the band whatever the window: a block written
-        // off here never reaches the deeper search the level was chosen for,
-        // and the misjudgement costs 3.7% of the corpus at level 13 and 5.1%
-        // at 17. A small window does not make that cheaper.
-        CompressionLevel::Best => false,
-        CompressionLevel::Level(level) => {
-            level <= RAW_FAST_PATH_MAX_LEVEL && window_size <= RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES
+        CompressionLevel::Best | CompressionLevel::Level(_) => {
+            window_size <= RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES
         }
         CompressionLevel::Uncompressed => false,
     }
@@ -597,6 +591,8 @@ fn sample_looks_incompressible_capped(block: &[u8], max_sample_len: usize) -> bo
         && max_freq <= max_symbol_guard
         && repeats <= repeat_guard
 }
+
+mod anchor_scan;
 
 #[cfg(test)]
 mod tests;

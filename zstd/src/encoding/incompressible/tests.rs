@@ -228,7 +228,12 @@ fn scan_sample_region_early_exits_on_repetitive_input() {
 /// further back is worth more than one written off unsearched.
 #[test]
 fn the_window_ceiling_is_what_closes_the_raw_fast_path() {
-    for level in [CompressionLevel::Level(1), CompressionLevel::Level(9)] {
+    for level in [
+        CompressionLevel::Best,
+        CompressionLevel::Level(1),
+        CompressionLevel::Level(9),
+        CompressionLevel::Level(22),
+    ] {
         assert!(
             compression_level_allows_raw_fast_path(level, RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES),
             "{level:?} at the ceiling",
@@ -236,18 +241,6 @@ fn the_window_ceiling_is_what_closes_the_raw_fast_path() {
         assert!(
             !compression_level_allows_raw_fast_path(level, RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1),
             "{level:?} past the ceiling",
-        );
-    }
-    // Above the band the window is beside the point: the block goes to the
-    // search the level was chosen for whatever distance it may reach over.
-    for level in [
-        CompressionLevel::Best,
-        CompressionLevel::Level(10),
-        CompressionLevel::Level(22),
-    ] {
-        assert!(
-            !compression_level_allows_raw_fast_path(level, 1),
-            "{level:?} is outside the band",
         );
     }
     // The three named levels below the ceiling never consult it.
