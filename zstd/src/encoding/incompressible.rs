@@ -45,9 +45,6 @@ pub(crate) struct SeenContentGrid {
     frame_offset: u64,
     /// Frame offset up to which the search stays on after a hit.
     repeat_until: u64,
-    /// The anchor scan's tier, resolved once. `None` until the first block, so
-    /// a grid that is never consulted never pays the detection.
-    kernel: Option<crate::encoding::fastpath::FastpathKernel>,
 }
 
 /// Sixteen bytes, which is what the three fields pack into with no padding:
@@ -60,23 +57,29 @@ pub(crate) struct SeenSample {
 }
 
 impl SeenContentGrid {
-    const SLOTS: usize = 4096;
+    /// Ceiling on the table. Sized so a window's worth of records fits without
+    /// evicting: a probe run meets exactly ONE recorded key, so an evicted
+    /// record is a repeat missed outright, where the previous scheme had a
+    /// couple of hundred chances per block and could afford to lose most of
+    /// them. At sixteen bytes a slot this is a megabyte, and only a frame whose
+    /// window is that large ever allocates it.
+    const SLOTS: usize = 64 * 1024;
     /// Floor on the table, so a tiny window still has room for a few anchors
     /// without a slot collision reading as a repeat on every one.
     const MIN_SLOTS: usize = 64;
     /// Bytes read per sample.
     const KEY_LEN: usize = 8;
-    /// The byte whose positions are candidate anchors: one in 256 of random
-    /// bytes, and the scan for it costs a few operations per word.
-    const ANCHOR_BYTE: u8 = 0x9E;
-    /// One position in this many anchors, after the mixed key thins the
-    /// candidates: ~128 per 128 KiB block, so a duplicate collides many times
-    /// over, while a 4 MiB window's worth of anchors still fits the table
-    /// without evicting most of itself.
-    const ANCHOR_IN: u64 = 512;
-    /// Top bits of the mixed key that must be zero for a candidate to anchor,
-    /// which thins the one-in-256 byte hits to [`Self::ANCHOR_IN`].
-    const THIN_SHIFT: u32 = 64 - (Self::ANCHOR_IN / 256).trailing_zeros();
+    /// Stream offsets that get recorded: every one that is a multiple of this,
+    /// in the frame's own coordinates rather than the block's, so the same
+    /// content lands on the same offsets however the blocks are cut. 256 records
+    /// per 128 KiB block, and a 4 MiB window's worth fits the table without
+    /// evicting most of itself.
+    const RECORD_STEP: usize = 512;
+    /// Consecutive positions probed per run. Equal to [`Self::RECORD_STEP`] by
+    /// construction, not by coincidence: among that many consecutive stream
+    /// offsets exactly one is a multiple of the step, so a copy at ANY distance
+    /// from its original has exactly one probe that meets a recorded key.
+    const PROBE_RUN: usize = Self::RECORD_STEP;
     /// How far past a hit the search stays on: two maximum blocks, so an
     /// isolated miss inside repeating content cannot cost a block, while a frame
     /// that stops repeating returns to skipping within a block or two.
@@ -122,49 +125,45 @@ impl SeenContentGrid {
         self.frame_offset += block_len as u64;
     }
 
-    /// One anchor's worth of work: key, thin, look up, record. Shared by the
-    /// content scan and the two endpoints so they cannot answer differently,
-    /// and kept out of line so the scan loop that calls it stays small.
-    #[inline(never)]
-    fn probe_anchor(
-        &mut self,
-        block: &[u8],
-        anchor: usize,
-        thinned: bool,
-        reach: u64,
-        mask: usize,
-    ) -> bool {
+    /// The mixed key at `at`, and the slot it belongs in.
+    #[inline]
+    fn key_at(&self, block: &[u8], at: usize, mask: usize) -> (usize, u32) {
         let key = u64::from_le_bytes(
-            block[anchor..anchor + Self::KEY_LEN]
+            block[at..at + Self::KEY_LEN]
                 .try_into()
                 .expect("the slice is KEY_LEN bytes"),
         );
         let mixed = Self::avalanche(key);
-        // The byte alone anchors one position in 256, which fills the table
-        // several times over within a window and evicts the older half of it. A
-        // slice of the mixed key thins that to `ANCHOR_IN`, the density at which
-        // a block still carries several anchors while the window's worth of them
-        // fits. The endpoints are not thinned: they are the block's guarantee.
-        if thinned && mixed >> Self::THIN_SHIFT != 0 {
-            return false;
-        }
-        let slot = (mixed >> 32) as usize & mask;
-        let fingerprint = (mixed as u32) | 1;
-        let here = self.frame_offset + anchor as u64;
+        // Fingerprint is never zero, so a zeroed slot cannot read as a match.
+        ((mixed >> 32) as usize & mask, (mixed as u32) | 1)
+    }
+
+    /// Whether the content at `at` was recorded within `reach`. Reads only: the
+    /// probe run sweeps consecutive positions, and recording every one of them
+    /// would fill the table with keys no later probe can align with.
+    #[inline]
+    fn probe_key(&self, block: &[u8], at: usize, reach: u64, mask: usize) -> bool {
+        let (slot, fingerprint) = self.key_at(block, at, mask);
         let held = self.slots[slot];
-        let repeat =
-            held.epoch == self.epoch && held.fingerprint == fingerprint && here - held.at <= reach;
-        // Written whether or not it hit, so a run of the same content keeps
-        // reporting. Leaving a hit slot dated to the FIRST occurrence makes the
-        // third measure its distance from there, which a one-block window reads
-        // as out of reach even though the block right behind it is exactly what
-        // the matcher would find — every other block of the run would go out raw.
+        let here = self.frame_offset + at as u64;
+        held.epoch == self.epoch && held.fingerprint == fingerprint && here - held.at <= reach
+    }
+
+    /// Put the content at `at` in the table, dated here.
+    ///
+    /// Written whether or not the slot was occupied by the same content: leaving
+    /// a slot dated to the FIRST occurrence of a repeating run makes the third
+    /// block measure its distance from there, which a one-block window reads as
+    /// out of reach even though the block right behind it is exactly what the
+    /// matcher would find — every other block of the run would go out raw.
+    #[inline]
+    fn record_key(&mut self, block: &[u8], at: usize, mask: usize) {
+        let (slot, fingerprint) = self.key_at(block, at, mask);
         self.slots[slot] = SeenSample {
             fingerprint,
             epoch: self.epoch,
-            at: here,
+            at: self.frame_offset + at as u64,
         };
-        repeat
     }
 
     pub(crate) fn record_and_report_repeat(&mut self, block: &[u8], window_size: usize) -> bool {
@@ -188,52 +187,56 @@ impl SeenContentGrid {
         };
         let mut repeat = false;
         let last = block.len() - Self::KEY_LEN;
-        // Both ends of the block rather than all of it, on the same reasoning
-        // the classifier samples by: a duplicate is block-sized, so its ends
-        // hold the same bytes as the original's and anchor at the same content.
-        // Reading the whole block was four times the classifier's own cost and,
-        // on the levels where the search is cheap, most of the encode.
-        // The block's two endpoints, always. Anchoring on one byte value leaves
-        // a block that happens to contain none of it with nothing recorded at
-        // all, and its exact copy then goes out raw with a block-sized match
-        // sitting right there. A block-aligned duplicate has the same bytes at
-        // both ends, so these two keys are what guarantee it is recognised;
-        // everything else the scan finds is what makes a SHIFTED copy work.
-        repeat |= self.probe_anchor(block, 0, false, reach, mask);
-        if last > 0 {
-            repeat |= self.probe_anchor(block, last, false, reach, mask);
-        }
-        // The WHOLE block, not a sample of it. Reading only its ends is much
-        // cheaper and answers a block-aligned duplicate, but a copy shifted by
-        // half a block puts the original's middle where the copy's ends are:
-        // four megabytes repeated at a 64 KiB-shifted distance stopped being
-        // recognised at all and went out raw in full.
+        // Neither side reads the whole block. Recording lands on a FIXED grid in
+        // the frame's own coordinates — every `RECORD_STEP` bytes of stream, so
+        // the same content recorded once is recorded at the same stream offsets
+        // however the blocks around it are cut. Probing takes `RECORD_STEP`
+        // CONSECUTIVE positions, and that is what makes any shift work: a copy
+        // sits at some distance D from its original, the probed positions map to
+        // original positions D lower, and among `RECORD_STEP` consecutive values
+        // exactly one is a multiple of `RECORD_STEP` — so exactly one probe
+        // meets a recorded key, whatever D is.
         //
-        // The probe body stays OUT of this loop. Inlined here it was most of a
-        // fast-level encode on incompressible input — a quarter of a nanosecond
-        // per byte, against the handful of register operations per WORD the
-        // scan itself needs. One position in 256 carries the anchor byte, so
-        // the call is rare and the loop stays a load, an xor, a subtract and a
-        // test.
-        let kernel = *self
-            .kernel
-            .get_or_insert_with(crate::encoding::fastpath::select_kernel);
-        let mut anchors = [0u32; anchor_scan::ANCHOR_BATCH];
-        let mut at = 0usize;
-        while at <= last {
-            let (found, consumed) = anchor_scan::fill_anchors(
-                kernel,
-                &block[at..=last],
-                Self::ANCHOR_BYTE,
-                &mut anchors,
-            );
-            for &off in &anchors[..found] {
-                repeat |= self.probe_anchor(block, at + off as usize, true, reach, mask);
+        // The pass this replaces read every byte looking for content-defined
+        // anchors. It was correct and it was the cost: on a fast level a whole
+        // extra pass over the block doubles the encode of incompressible input,
+        // where the raw path is little more than a copy. This touches about
+        // eight kilobytes of a hundred-and-twenty-eight-kilobyte block.
+        //
+        // Two probe runs, not one: the run at the start answers a duplicate of
+        // anything recorded earlier, and the run at the midpoint answers a block
+        // whose own first half is the original — a hundred and twenty-eight
+        // kilobytes of two identical halves reads as incompressible by any
+        // sample of it and halves if the search runs.
+        let step = Self::RECORD_STEP as u64;
+        let mut abs = self.frame_offset.next_multiple_of(step);
+        let mut halves = [0usize, block.len() / 2].into_iter().peekable();
+        while let Some(start) = halves.next() {
+            // Records for everything before this run go in FIRST, because the
+            // midpoint run's whole job is to meet them: a block whose own first
+            // half is the original is invisible to a run that probes before that
+            // half has been recorded.
+            // Strictly before the run: a grid point recorded at a position the
+            // run then probes answers itself, and every block reads as a repeat
+            // of itself.
+            let until = self.frame_offset + start as u64;
+            while abs < until && abs <= self.frame_offset + last as u64 {
+                let at = (abs - self.frame_offset) as usize;
+                self.record_key(block, at, mask);
+                abs += step;
             }
-            if consumed == 0 {
-                break;
+            let end = (start + Self::PROBE_RUN).min(last + 1);
+            for at in start..end {
+                repeat |= self.probe_key(block, at, reach, mask);
             }
-            at += consumed;
+            if halves.peek().is_none() {
+                // The rest of the block, once no run is left to probe it.
+                while abs <= self.frame_offset + last as u64 {
+                    let at = (abs - self.frame_offset) as usize;
+                    self.record_key(block, at, mask);
+                    abs += step;
+                }
+            }
         }
         self.frame_offset += block.len() as u64;
         // Content that repeats does not repeat in every block, and the sampling
@@ -260,8 +263,8 @@ impl SeenContentGrid {
         if window_size == 0 {
             return Self::SLOTS;
         }
-        let anchors = (window_size as u64 / Self::ANCHOR_IN).max(1);
-        let wanted = (anchors * 4).next_power_of_two();
+        let records = (window_size / Self::RECORD_STEP).max(1) as u64;
+        let wanted = (records * 4).next_power_of_two();
         (wanted as usize).clamp(Self::MIN_SLOTS, Self::SLOTS)
     }
 
@@ -591,8 +594,6 @@ fn sample_looks_incompressible_capped(block: &[u8], max_sample_len: usize) -> bo
         && max_freq <= max_symbol_guard
         && repeats <= repeat_guard
 }
-
-mod anchor_scan;
 
 #[cfg(test)]
 mod tests;

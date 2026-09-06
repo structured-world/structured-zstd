@@ -87,21 +87,22 @@ fn the_content_grid_expires_a_sample_with_the_window_not_before() {
     );
 }
 
-/// Content the anchor byte never appears in must still record a key.
+/// Recording must not depend on what bytes the content happens to contain.
 ///
-/// Anchoring on one byte value leaves a block that happens to contain none of
-/// it with nothing recorded, and its exact copy then goes out raw with a
-/// block-sized match sitting right there. The endpoints cover that: they are
-/// the same content in both copies of a block-aligned duplicate.
+/// The scheme this replaced keyed on the positions carrying one chosen byte
+/// value, so a block containing none of it recorded nothing at all and its
+/// exact copy went out raw with a block-sized match sitting right there. The
+/// grid is fixed stream offsets now, which no content can be missing.
 #[test]
-fn the_content_grid_records_a_block_without_the_anchor_byte() {
+fn the_content_grid_records_a_block_whatever_bytes_it_holds() {
     let mut block = deterministic_bytes(0xC0DE, 64 * 1024);
+    // One byte value removed entirely, the case that broke the old scheme.
     for byte in &mut block {
-        if *byte == SeenContentGrid::ANCHOR_BYTE {
-            *byte = SeenContentGrid::ANCHOR_BYTE.wrapping_add(1);
+        if *byte == 0x9E {
+            *byte = 0x9F;
         }
     }
-    assert!(!block.contains(&SeenContentGrid::ANCHOR_BYTE));
+    assert!(!block.contains(&0x9E));
     const WIDE: usize = 8 * 1024 * 1024;
     let mut grid = SeenContentGrid::default();
     grid.reset_for_frame();
