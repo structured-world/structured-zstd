@@ -326,3 +326,39 @@ fn capped_sample_probes_middle_and_blocks_raw_fast_path_for_mixed_entropy() {
         "mixed-entropy block should not look incompressible for default fast-path gate"
     );
 }
+
+/// A repeat the grid reports must be a repeat the matcher can then FIND.
+///
+/// The two halves of that contract live apart: the grid decides a block is worth
+/// searching, and the backend has to have indexed the earlier block for the
+/// search to land on anything. A window small enough to put the Row backend on
+/// its hash chain took a path that indexed nothing at all when a block was
+/// skipped, so the search ran over an empty chain and both copies went out raw.
+#[test]
+fn a_skipped_block_is_indexed_for_the_chain_finder_too() {
+    use crate::encoding::{CompressionParameters, compress_with_parameters};
+
+    // 16 KiB window puts Row on the chain finder rather than rows.
+    const WINDOW_LOG: u32 = 14;
+    const BLOCK: usize = 128 * 1024;
+    // Two blocks: the second opens with the first's tail, so the repeat is
+    // inside a 16 KiB window and a search would code most of it as one match.
+    let first = deterministic_bytes(0x51DE, BLOCK);
+    let mut input = first.clone();
+    input.extend_from_slice(&first[BLOCK - 8 * 1024..]);
+    input.extend_from_slice(&deterministic_bytes(0xF00D, BLOCK - 8 * 1024));
+
+    let params = CompressionParameters::builder(CompressionLevel::Level(5))
+        .window_log(WINDOW_LOG)
+        .build()
+        .expect("level 5 with a 16 KiB window is a valid configuration");
+    let out = compress_with_parameters(&input, &params);
+
+    // The repeated 8 KiB has to come back as a match, not as 8 KiB of literals.
+    assert!(
+        out.len() < input.len() - 6 * 1024,
+        "{} bytes from {}: the repeated tail was not found",
+        out.len(),
+        input.len(),
+    );
+}

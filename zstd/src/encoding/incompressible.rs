@@ -13,13 +13,15 @@ use alloc::vec::Vec;
 /// grid position of every block that reaches the decision, and reports whether
 /// the block in hand collides with one; a collision sends it to the search.
 ///
-/// Which positions are sampled is decided by the CONTENT at them, not by where
-/// they fall: a position is an anchor when its eight bytes hash into a chosen
-/// slice of the hash space. The same content therefore anchors at the same
-/// places wherever it appears, so a duplicate is recognised however it is
-/// shifted — sampling on a position grid instead would see a repeat only at
-/// distances that happen to be a multiple of the step, and miss, say, a block
-/// that repeats the previous one after two inserted bytes.
+/// Recording lands on a fixed grid of stream offsets and probing sweeps a run
+/// of CONSECUTIVE positions, which is what makes a shifted duplicate findable
+/// without reading the whole block: a copy sits some distance from its
+/// original, the probed positions map to original positions that far lower, and
+/// among [`Self::PROBE_RUN`] consecutive values exactly one is a multiple of
+/// [`Self::RECORD_STEP`] — so exactly one probe meets a recorded key, whatever
+/// the distance is. Probing on the same grid it records on would instead see a
+/// repeat only at distances that happen to be a multiple of the step, and miss,
+/// say, a block that repeats the previous one after two inserted bytes.
 ///
 /// Each slot carries the frame offset it was recorded at, so a fingerprint is
 /// consulted only while the matcher could still reach that far back and expires
@@ -106,13 +108,6 @@ impl SeenContentGrid {
         self.slots.capacity() * core::mem::size_of::<SeenSample>()
     }
 
-    /// Record `block`'s anchors and report whether any was already there.
-    ///
-    /// Recording happens whatever the answer: a block that goes out raw is
-    /// still content a later block may duplicate, and one that gets searched
-    /// is indexed by the matcher but only for as long as the window holds it.
-    /// `window_size` is that reach; pass `0` when it is unknown, which keeps
-    /// every fingerprint for the frame.
     /// Account for a block the grid does not scan. Ages here are distances in
     /// the stream, and the reach test compares them against the matcher's
     /// window, so a block that skips the scan — RLE, compressible, or ruled out
@@ -146,7 +141,16 @@ impl SeenContentGrid {
         let (slot, fingerprint) = self.key_at(block, at, mask);
         let held = self.slots[slot];
         let here = self.frame_offset + at as u64;
-        held.epoch == self.epoch && held.fingerprint == fingerprint && here - held.at <= reach
+        if held.epoch != self.epoch || held.fingerprint != fingerprint {
+            return false;
+        }
+        // A record is never ahead of a probe that meets it: records for a run go
+        // in before the run, and both walk the block forwards. The subtraction
+        // is checked all the same — the alternative is a wrap in release that
+        // reads as a repeat at a distance of eighteen exabytes.
+        debug_assert!(held.at <= here, "a record ahead of the probe that met it");
+        here.checked_sub(held.at)
+            .is_some_and(|apart| apart <= reach)
     }
 
     /// Put the content at `at` in the table, dated here.
@@ -166,6 +170,14 @@ impl SeenContentGrid {
         };
     }
 
+    /// Record this block on the grid and report whether it duplicates content
+    /// still within `window_size` of here.
+    ///
+    /// Recording happens whatever the answer: a block that goes out raw is still
+    /// content a later block may duplicate, and one that gets searched is
+    /// indexed by the matcher but only for as long as the window holds it.
+    /// `window_size` is that reach; pass `0` when it is unknown, which keeps
+    /// every record for the frame.
     pub(crate) fn record_and_report_repeat(&mut self, block: &[u8], window_size: usize) -> bool {
         // Too short to key on. The offset still advances, so the ages of what
         // follows stay true distances in the stream.

@@ -3069,8 +3069,35 @@ impl RowMatchGenerator {
         let (current_abs_start, current_len) = self.current_block_range();
         let current_abs_end = current_abs_start + current_len;
         if self.finder != LazyFinder::Rows {
-            // The chain / tree hold no rows to seed; the next lazy block
-            // links the skipped block's tail from the carried cursor.
+            // The chain holds no rows to seed, but it still has to hold the
+            // skipped content: the grid can report that a later block repeats
+            // this one, and the search that decision buys then runs over a
+            // chain this block never entered — both copies go out raw. The next
+            // block's catch-up cannot cover it either, because upstream's
+            // limited-update clamp indexes at most the last few hundred
+            // positions of a gap.
+            //
+            // Only the last window's worth, and only sparsely: nothing older
+            // than the window can be matched from the next block anyway, and a
+            // duplicate is block-sized, so an entry every
+            // `INCOMPRESSIBLE_SKIP_STEP` positions is met long before the stride
+            // matters. The tree finder keeps the old behaviour — its nodes are
+            // sorted on insertion and seeding them here is not a sparse write.
+            if self.finder == LazyFinder::Chain {
+                let ctx = self.scan_ctx();
+                let chain_mask = (1usize << self.hc_chain_log) - 1;
+                let from = current_abs_start
+                    .max(current_abs_end.saturating_sub(self.search_window))
+                    .max(self.low_limit);
+                let mut idx = from;
+                while idx + ROW_HASH_KEY_LEN <= current_abs_end {
+                    let h = self.hc_hash_at(ctx, idx);
+                    let (hash, chain) = self.hc_tables_mut();
+                    chain[idx & chain_mask] = hash[h];
+                    hash[h] = idx as u32;
+                    idx += INCOMPRESSIBLE_SKIP_STEP;
+                }
+            }
             self.lazy_next_to_update = current_abs_end.saturating_sub(ROW_HASH_KEY_LEN - 1);
             return;
         }

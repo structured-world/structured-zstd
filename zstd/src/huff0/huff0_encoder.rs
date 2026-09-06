@@ -63,8 +63,18 @@ impl WeightDescription {
 #[cfg(feature = "std")]
 impl Clone for WeightDescription {
     fn clone(&self) -> Self {
+        // Only a description a reader will look at. `NotComputed` keeps whatever
+        // the table's previous contents produced and `NotEncodable` keeps the
+        // bytes the rejected FSE encode wrote; neither is ever read, and the
+        // split estimator clones a table's description once per probe, so
+        // copying them is an allocation and a memcpy per probe for nothing.
+        let buf = if matches!(self.state, DescriptionState::Encoded(_)) {
+            self.buf.clone()
+        } else {
+            Vec::new()
+        };
         Self {
-            buf: self.buf.clone(),
+            buf,
             state: self.state,
         }
     }

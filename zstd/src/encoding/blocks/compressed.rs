@@ -168,17 +168,18 @@ pub(crate) struct CompressedBlockScratch {
 
 impl CompressedBlockScratch {
     /// Heap bytes this scratch keeps between blocks, for a caller sizing a
-    /// context. Only the rollback table so far: the count tables are boxed
-    /// arrays the owner's `size_of` already covers, and the nested estimator
-    /// scratch reports through the same path when it exists.
+    /// context. The rollback table, and the nested estimator scratch: that one
+    /// is a `Box`, so its own allocation counts as well as whatever it reports
+    /// — the owner's `size_of` covers the pointer, not what it points at, and
+    /// leaving the box out understated a context that has taken the post-split
+    /// path by the whole struct.
     pub(crate) fn retained_heap_size(&self) -> usize {
         self.huff_rollback
             .as_ref()
             .map_or(0, |table| table.heap_size())
-            + self
-                .estimator_inner
-                .as_ref()
-                .map_or(0, |inner| inner.retained_heap_size())
+            + self.estimator_inner.as_ref().map_or(0, |inner| {
+                core::mem::size_of::<CompressedBlockScratch>() + inner.retained_heap_size()
+            })
     }
 
     pub(crate) fn new() -> Self {

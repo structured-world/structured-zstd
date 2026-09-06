@@ -379,16 +379,32 @@ impl FseTables {
             (&mut self.of_previous, &mut self.of_next, saved_of),
         ] {
             let discarded = core::mem::replace(previous, restored);
-            match discarded {
-                // The table the block built. Whatever `next` held was the
-                // outgoing previous, which is what was just restored, so it is
-                // a duplicate; this one is free and unique.
-                Some(PreviousFseTable::Custom(built)) => *next = Some(built),
-                // The block settled on a predefined or RLE table, so
-                // confirmation may have parked the outgoing custom one. If
-                // that is the table now back in `previous`, holding it here
-                // too is what keeps the next build from writing into it.
-                _ => {
+            // The table the block built, and it is not the one just restored:
+            // whatever `next` held was the outgoing previous, which is what was
+            // restored, so it is a duplicate and this one is free and unique.
+            //
+            // The exception is `RepeatLast`, where confirmation never replaced
+            // `previous` at all — the discarded handle IS the restored one.
+            // Parking it in `next` then leaves the two sharing a handle, and the
+            // next custom build cannot write into a table `previous` still
+            // holds, so it allocates another one.
+            let built = match discarded {
+                Some(PreviousFseTable::Custom(built))
+                    if !matches!(previous.as_ref(), Some(PreviousFseTable::Custom(back))
+                        if SharedFseTable::ptr_eq(&built, back)) =>
+                {
+                    Some(built)
+                }
+                _ => None,
+            };
+            match built {
+                Some(built) => *next = Some(built),
+                // Nothing new to park. The block settled on a predefined or RLE
+                // table, or repeated the last one, so confirmation may have
+                // parked the outgoing custom table here — and if that is the
+                // table now back in `previous`, holding it here too is what
+                // keeps the next build from writing into it.
+                None => {
                     if let (Some(spare), Some(PreviousFseTable::Custom(back))) =
                         (next.as_ref(), previous.as_ref())
                         && SharedFseTable::ptr_eq(spare, back)
