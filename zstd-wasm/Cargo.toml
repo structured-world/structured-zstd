@@ -2,7 +2,7 @@
 name = "structured-zstd-wasm"
 version = "0.0.30"
 rust-version = "1.92"
-authors = ["Structured World Foundation <foundation@sw.foundation>"]
+authors = ["Dmitry Prudnikov <mail@polaz.com>"]
 edition = "2024"
 license = "Apache-2.0"
 homepage = "https://github.com/structured-world/structured-zstd"

@@ -1,41 +1,135 @@
 name: Dependabot Auto-Merge
 
+# `pull_request_target`, not `pull_request`, because of how Dependabot runs are
+# isolated: a workflow triggered by Dependabot on `pull_request` receives
+# Dependabot secrets rather than Actions secrets, so the organisation's
+# RELEASER_APP_* secrets resolve to empty strings and the App token step fails
+# before it does anything. `pull_request_target` runs in the base branch's
+# context, where those secrets are available, which is also GitHub's own
+# recommendation for this pattern.
+#
+# That context carries write-capable credentials, so this workflow must never
+# execute code from the pull request. It does not: there is no checkout, and
+# every step either reads PR metadata through the API or drives `gh`. Do not add
+# a checkout here; if one ever becomes necessary, it must not use the head ref.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened]
 
 permissions:
-  pull-requests: write
-  contents: write
+  # Only what the default token needs: `dependabot/fetch-metadata` reads the
+  # pull request. Approving, disarming and merging are done with the App token
+  # below, so nothing here needs write access to the repository contents.
+  pull-requests: read
+
+# One run per pull request, and a new push cancels the run it superseded rather
+# than leaving it racing toward a head that no longer exists.
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
+    # Only the author here. Who triggered the run decides what the job does, not
+    # whether it runs at all: a push by anyone else is the case that has to be
+    # handled, and a job that skips it cannot handle anything.
     if: github.event.pull_request.user.login == 'dependabot[bot]'
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Dependabot metadata
-        id: metadata
-        uses: dependabot/fetch-metadata@v3
-        with:
-          github-token: "${{ secrets.GITHUB_TOKEN }}"
-
+      # Pinned to commit SHAs, not tags, because `pull_request_target` puts the
+      # App's private key within reach of whatever these resolve to: retargeting
+      # a mutable tag would be enough to take it. Dependabot updates a pinned
+      # SHA the same way it updates a tag, so this costs nothing to maintain.
       - name: Generate App Token
         id: app-token
-        if: steps.metadata.outputs.update-type == 'version-update:semver-minor' || steps.metadata.outputs.update-type == 'version-update:semver-patch'
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+          # Without these the token carries everything the App installation has.
+          # These two are what the job uses: `pull-requests` to approve, to read
+          # whether auto-merge is armed and to disarm it, and `contents` because
+          # merging writes to the branch.
+          permission-contents: write
+          permission-pull-requests: write
 
+      # Auto-merge, once enabled, outlives the head it was enabled for. GitHub
+      # turns it off by itself only when the pusher lacks write access, so a
+      # maintainer adding commits to an open Dependabot pull request leaves it
+      # armed, and it then merges those commits. `--match-head-commit` does not
+      # cover this: it is a precondition checked when the command runs, not a
+      # standing binding to that SHA.
+      #
+      # So the run a foreign push triggers disarms rather than skips. The
+      # approval is left to the repository's stale-review dismissal, which is
+      # the setting that exists for it.
+      #
+      # A rerun is not a push. Rerunning a Dependabot run leaves `actor` as
+      # dependabot and makes `triggering_actor` whoever asked, the same shape a
+      # foreign push has, except that nothing moved. Only a first attempt is a
+      # real event, and only a real event can have moved anything; without that
+      # check a maintainer rerunning checks would disarm the auto-merge
+      # Dependabot armed, with nothing to arm it again.
+      - name: Disarm auto-merge when someone else moved the head
+        if: >-
+          github.run_attempt == 1
+          && (github.actor != 'dependabot[bot]'
+              || github.triggering_actor != 'dependabot[bot]')
+        # The head is checked because disarming has no precondition of its own:
+        # `--match-head-commit` maps to `expectedHeadOid`, which the mutation
+        # behind `--disable-auto` does not take. Without the check, a slow run
+        # from one push can disable the auto-merge a later Dependabot run
+        # legitimately armed.
+        #
+        # Every value the script reads arrives through the environment. An
+        # expression interpolated into `run:` is expanded before the shell sees
+        # the line, so its contents become script rather than data.
+        run: |
+          state=$(gh pr view "$PR_NUMBER" --json autoMergeRequest,headRefOid \
+            --jq '"\(.autoMergeRequest != null) \(.headRefOid)"')
+          armed=${state%% *}
+          current=${state##* }
+          if [ "$current" != "$HEAD_SHA" ]; then
+            echo "head is now $current, not the $HEAD_SHA this run saw;"
+            echo "a later run owns this pull request, leaving its state alone"
+          elif [ "$armed" = "true" ]; then
+            gh pr merge --disable-auto "$PR_NUMBER"
+            echo "auto-merge disarmed: the head moved under a push by $PUSHER"
+          else
+            echo "auto-merge was not armed; nothing to disarm"
+          fi
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PUSHER: ${{ github.triggering_actor }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+      # No token passed: the action's `github-token` already defaults to
+      # `github.token`, which the permissions block above scopes to reading the
+      # pull request.
+      - name: Dependabot metadata
+        id: metadata
+        if: >-
+          github.actor == 'dependabot[bot]'
+          && github.triggering_actor == 'dependabot[bot]'
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.1
+
+      # The metadata step is skipped for a foreign push, so its outputs are
+      # empty there and this condition is false: approval happens only on a run
+      # Dependabot itself triggered.
       - name: Approve and enable auto-merge for minor/patch updates
         if: steps.metadata.outputs.update-type == 'version-update:semver-minor' || steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        # Both operations name the head this run actually inspected, rather than
+        # just the pull request: the approval is recorded against a commit id,
+        # and the merge refuses outright if the head has moved.
         run: |
-          gh pr review --approve "$PR_NUMBER"
-          gh pr merge --auto --squash "$PR_NUMBER"
+          gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" \
+            -f event=APPROVE -f commit_id="$HEAD_SHA" --silent
+          gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_NUMBER"
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
