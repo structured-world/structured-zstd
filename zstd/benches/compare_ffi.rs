@@ -1026,25 +1026,26 @@ fn configure_group<M: criterion::measurement::Measurement>(
     release_freed_memory();
 }
 
-/// Hand memory the previous group freed back to the kernel, so this one starts
-/// from the same state a fresh process would.
+/// Hand memory the previous group freed back to the kernel, so every group
+/// starts from the state a fresh process would have.
 ///
-/// Without it a group inherits whatever the group before it released, and a
+/// Without this a group inherits whatever the group before it released, and a
 /// level that allocates tens of megabytes of tables hands the next level a warm
-/// heap: the same benchmark then reads four times faster inside a sweep than it
-/// does alone, and which side of an A/B gets that gift depends on what its
-/// previous level happened to free. Trimming is not free, so it is opt-in
-/// through `STRUCTURED_ZSTD_BENCH_COLD`, and once per GROUP rather than per
-/// iteration it costs nothing a measurement can see.
+/// heap. One level-16 row read 4.69 ms inside a sweep and 18.99 ms on its own,
+/// and which side of a comparison receives that gift depends on what its
+/// PREVIOUS level happened to free — a property of the run order, not of the
+/// code being measured, and the reason a row could drift fourfold between
+/// sweeps.
+///
+/// Once per GROUP, so the trim itself is far below anything a measurement can
+/// see; the per-iteration loop never touches it.
 fn release_freed_memory() {
-    if std::env::var_os("STRUCTURED_ZSTD_BENCH_COLD").is_some() {
-        #[cfg(target_os = "linux")]
-        // SAFETY: `malloc_trim` takes no pointers and only returns free pages
-        // to the kernel; nothing live is touched, and it is a no-op on
-        // allocators that do not implement it.
-        unsafe {
-            libc::malloc_trim(0);
-        }
+    #[cfg(target_os = "linux")]
+    // SAFETY: `malloc_trim` takes no pointers and only returns free pages to
+    // the kernel; nothing live is touched, and it is a no-op on allocators
+    // that do not implement it.
+    unsafe {
+        libc::malloc_trim(0);
     }
 }
 
