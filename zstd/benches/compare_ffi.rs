@@ -1023,6 +1023,29 @@ fn configure_group<M: criterion::measurement::Measurement>(
     group.measurement_time(measurement);
     group.warm_up_time(warm_up);
     group.sampling_mode(SamplingMode::Flat);
+    release_freed_memory();
+}
+
+/// Hand memory the previous group freed back to the kernel, so this one starts
+/// from the same state a fresh process would.
+///
+/// Without it a group inherits whatever the group before it released, and a
+/// level that allocates tens of megabytes of tables hands the next level a warm
+/// heap: the same benchmark then reads four times faster inside a sweep than it
+/// does alone, and which side of an A/B gets that gift depends on what its
+/// previous level happened to free. Trimming is not free, so it is opt-in
+/// through `STRUCTURED_ZSTD_BENCH_COLD`, and once per GROUP rather than per
+/// iteration it costs nothing a measurement can see.
+fn release_freed_memory() {
+    if std::env::var_os("STRUCTURED_ZSTD_BENCH_COLD").is_some() {
+        #[cfg(target_os = "linux")]
+        // SAFETY: `malloc_trim` takes no pointers and only returns free pages
+        // to the kernel; nothing live is touched, and it is a no-op on
+        // allocators that do not implement it.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
 }
 
 /// Ceiling on every criterion measurement budget, in seconds, or `None` when
