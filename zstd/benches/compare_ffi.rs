@@ -791,7 +791,19 @@ fn bench_dictionary(c: &mut Criterion) {
                     zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
                         .unwrap();
                 configure_ffi_bulk_compressor(&mut compressor, &level);
-                b.iter(|| black_box(compressor.compress(&scenario.bytes).unwrap()))
+                // One output buffer across iterations, as the Rust arm below
+                // keeps: `compress` would hand back a fresh `Vec` every time
+                // and measure this side's allocator rather than its encoder.
+                let mut compressed = Vec::with_capacity(
+                    rust_with_dict_len.unwrap_or_else(|| scenario.bytes.len() + (1 << 16)),
+                );
+                b.iter(|| {
+                    compressed.clear();
+                    compressor
+                        .compress_to_buffer(&scenario.bytes, &mut compressed)
+                        .expect("dictionary compression should succeed");
+                    black_box(&compressed);
+                })
             });
 
             // Gate pure_rust_with_dict registration on the same
