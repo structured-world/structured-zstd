@@ -794,9 +794,12 @@ fn bench_dictionary(c: &mut Criterion) {
                 // One output buffer across iterations, as the Rust arm below
                 // keeps: `compress` would hand back a fresh `Vec` every time
                 // and measure this side's allocator rather than its encoder.
-                let mut compressed = Vec::with_capacity(
-                    rust_with_dict_len.unwrap_or_else(|| scenario.bytes.len() + (1 << 16)),
-                );
+                // `compress_to_buffer` writes into the vector's spare capacity
+                // and fails outright if that is smaller than the bound, so this
+                // is sized from the bound rather than from what our side
+                // happened to produce.
+                let mut compressed =
+                    Vec::with_capacity(zstd::zstd_safe::compress_bound(scenario.bytes.len()));
                 b.iter(|| {
                     compressed.clear();
                     compressor
