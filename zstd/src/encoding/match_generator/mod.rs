@@ -102,7 +102,17 @@ pub(crate) const DFAST_REBASE_GUARD_BAND: u32 = 1u32 << 30;
 // `#167`-disabled path must use the upstream 8 to stay byte-identical.
 pub(crate) const DFAST_SKIP_SEARCH_STRENGTH: usize = 8;
 pub(crate) const DFAST_SKIP_STEP_GROWTH_INTERVAL: usize = 1 << DFAST_SKIP_SEARCH_STRENGTH;
-pub(crate) const DFAST_INCOMPRESSIBLE_SKIP_STEP: usize = 16;
+/// How densely dfast indexes a block it wrote off without searching.
+///
+/// The block is not searched, so the only reason to index it at all is that a
+/// LATER block may duplicate it, and a duplicate is block-sized: the search
+/// that scans it meets an indexed position within one step, which is far inside
+/// what it scans anyway. Indexing at every sixteenth position instead cost a
+/// third of the encode on incompressible input — two tables, sixty-five
+/// thousand stores per mebibyte — for a proximity nothing needs. Fast reads the
+/// same reasoning from [`RAW_SKIP_INDEX_STEP`].
+pub(crate) const DFAST_INCOMPRESSIBLE_SKIP_STEP: usize =
+    crate::encoding::incompressible::RAW_SKIP_INDEX_STEP;
 pub(crate) const ROW_HASH_BITS: usize = 20;
 pub(crate) const ROW_LOG: usize = 5;
 pub(crate) const ROW_SEARCH_DEPTH: usize = 16;

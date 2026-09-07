@@ -102,3 +102,32 @@ fn marginal_compressibility_at_level22() {
         "Possible incompressibility false-positive: mixed gap {mix_pct:+.2}% (>5%) — investigate"
     );
 }
+
+/// The very FIRST block, with nothing recorded before it, still has to find a
+/// repeat contained inside itself: two identical pseudorandom halves read as
+/// incompressible by any sample of them, and skipping the search on that
+/// verdict would send a block out raw that halves.
+#[test]
+fn a_block_whose_halves_repeat_is_never_written_off_as_incompressible() {
+    let mut rng = SmallRng::seed_from_u64(0x5EED_1234);
+    let mut half = vec![0u8; 64 * 1024];
+    rng.fill(&mut half[..]);
+    let mut block = half.clone();
+    block.extend_from_slice(&half);
+
+    for level in [1, 2, 3, 5] {
+        let ours = rust_size(&block, level);
+        assert!(
+            ours < block.len() * 3 / 4,
+            "level {level}: {ours} bytes from {} — the second half was not matched",
+            block.len()
+        );
+        // Within frame overhead of what the reference manages on the same
+        // input, so this cannot pass on a merely-partial match.
+        let theirs = c_size(&block, level);
+        assert!(
+            ours as i64 - theirs as i64 <= 64,
+            "level {level}: {ours} bytes against the reference's {theirs}"
+        );
+    }
+}

@@ -1148,8 +1148,38 @@ impl DfastMatchGenerator {
         incompressible_hint: Option<bool>,
     ) {
         self.stage_borrowed_block(block_start, block_end);
-        if incompressible_hint == Some(false) {
-            self.ensure_hash_tables();
+        if incompressible_hint.is_none() {
+            return;
+        }
+        self.ensure_hash_tables();
+        // Seam before the block, as on the owned skip path: the preceding
+        // block's last few positions were hashed under a source that ended
+        // there, so without re-seeding them a match starting just before this
+        // block has no entry to find.
+        let seam_start = block_start.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+        if seam_start < block_start {
+            self.insert_positions(seam_start, block_start);
+        }
+        // Written off as noise without being searched — index it sparsely so a
+        // later block duplicating it has something to match against, which is
+        // what the owned path already does.
+        if incompressible_hint == Some(true) {
+            // The same step the owned skip path uses, and through the same
+            // entry point, so the stream-headroom bound its assert pins
+            // still holds: the insert loop advances with an unchecked
+            // `pos += step` in ABSOLUTE stream coordinates, which the
+            // headroom reserve is sized for at this step and no wider.
+            self.insert_positions_with_step(block_start, block_end, DFAST_INCOMPRESSIBLE_SKIP_STEP);
+            // And densely at the end, so the next block can match across the
+            // boundary without the sparse step having thinned out exactly the
+            // positions it will look for first.
+            let tail_start = block_end
+                .saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN)
+                .max(block_start);
+            if tail_start < block_end {
+                self.insert_positions(tail_start, block_end);
+            }
+        } else {
             self.insert_positions(block_start, block_end);
         }
     }
@@ -1709,10 +1739,6 @@ impl DfastMatchGenerator {
         &self.history[self.history_start..self.history.len() - self.uncommitted_len]
     }
 
-    pub(crate) fn history_abs_end(&self) -> usize {
-        self.history_abs_start + self.live_history().len()
-    }
-
     #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
     pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
         self.insert_range(start, end, 1);
@@ -1782,26 +1808,49 @@ impl DfastMatchGenerator {
         // `bits` bits set. `position_base` and `history_abs_start`
         // are constant across the loop after the single `ensure_room_for`
         // call above. `packed` fits in `u32` by that same gate.
+        // A block written off without being searched is indexed only so a LATER
+        // duplicate can find it, and the short table alone does that: the search
+        // probes it first and the long table is an accelerator on top. Writing
+        // both scattered a store across twice the pages of a table this frame
+        // otherwise never touches, and those pages are faulted in one by one —
+        // on a mebibyte of noise at level 3 the sparse insert alone took ninety
+        // page faults per frame.
+        //
+        // Which of the two the range wants is decided by `step`, and it is
+        // decided ONCE here rather than at every position: the sparse walk then
+        // carries neither the gate nor the long key it would throw away, and the
+        // dense one advances by a constant.
+        macro_rules! insert_long_range {
+            ($pos:ident, $dense:literal, $step:expr) => {
+                while $pos < long_safe_end {
+                    unsafe {
+                        let idx = $pos - history_abs_start;
+                        let packed = (($pos - position_base) as u32) + 1;
+                        let load_ptr = history_base_ptr.add(history_start + idx);
+                        let v8 = (load_ptr as *const u64).read_unaligned();
+                        // Upstream zstd parity (`zstd_compress_internal.h:923-924`):
+                        // scalar `* prime8bytes` then shift to high bits. Drops
+                        // the CRC32d-based kernel dispatch (3-4 instructions) for
+                        // a single mul on the per-byte insert path. Short hash keys
+                        // on the upstream zstd 5-byte window (`v8 << 24`, ZSTD_hash5 shape).
+                        let mixed_short = (v8 << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
+                        let short_idx = (mixed_short >> short_shift) as usize;
+                        *short_hash_ptr.add(short_idx) = packed;
+                        if $dense {
+                            let mixed_long = v8.wrapping_mul(0xCF1BBCDCB7A56463_u64);
+                            let long_idx = (mixed_long >> long_shift) as usize;
+                            *long_hash_ptr.add(long_idx) = packed;
+                        }
+                    }
+                    $pos += $step;
+                }
+            };
+        }
         let mut pos = start;
-        while pos < long_safe_end {
-            unsafe {
-                let idx = pos - history_abs_start;
-                let packed = ((pos - position_base) as u32) + 1;
-                let load_ptr = history_base_ptr.add(history_start + idx);
-                let v8 = (load_ptr as *const u64).read_unaligned();
-                // Upstream zstd parity (`zstd_compress_internal.h:923-924`):
-                // scalar `* prime8bytes` then shift to high bits. Drops
-                // the CRC32d-based kernel dispatch (3-4 instructions) for
-                // a single mul on the per-byte insert path. Short hash keys
-                // on the upstream zstd 5-byte window (`v8 << 24`, ZSTD_hash5 shape).
-                let mixed_short = (v8 << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
-                let mixed_long = v8.wrapping_mul(0xCF1BBCDCB7A56463_u64);
-                let short_idx = (mixed_short >> short_shift) as usize;
-                let long_idx = (mixed_long >> long_shift) as usize;
-                *short_hash_ptr.add(short_idx) = packed;
-                *long_hash_ptr.add(long_idx) = packed;
-            }
-            pos += step;
+        if step == 1 {
+            insert_long_range!(pos, true, 1);
+        } else {
+            insert_long_range!(pos, false, step);
         }
         while pos < short_safe_end {
             unsafe {
@@ -1834,11 +1883,12 @@ impl DfastMatchGenerator {
              DFAST_INCOMPRESSIBLE_SKIP_STEP — raw `pos += step` would \
              eat into the STREAM_ABS_HEADROOM reserve"
         );
-        self.insert_range(
-            start.max(self.history_abs_start),
-            end.min(self.history_abs_end()),
-            step,
-        );
+        // Clamping happens inside `insert_range`, against the source it
+        // resolves — which is the borrowed window when one is staged. Clamping
+        // here against the OWNED bounds as well is redundant for an owned
+        // window (the two agree) and empties the range for a borrowed one,
+        // which is a window a borrowed frame never populates.
+        self.insert_range(start, end, step);
     }
 
     /// The four complementary insertions upstream makes after a match

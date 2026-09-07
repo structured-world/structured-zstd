@@ -215,9 +215,17 @@ A reviewer should not accept, and an author should not offer, any of these:
 - **A figure measured on a fixture that does not exercise the changed code.**
   Compressible, incompressible, dictionary-primed and tiny-frame inputs take
   different paths end to end.
+- **A figure given only against another revision of this codebase.** The
+  reference is upstream through the C bindings, measured in the same harness on
+  the same host and in the same run. A revision of our own can be fast because
+  it is doing less than the format asks for, so "faster than what we had" is
+  not a result on its own: state both, ours against upstream and ours against
+  the revision, and when the two disagree the upstream comparison is the one
+  that decides whether the change is good.
 
-Require instead: what changed, on which fixture, with cycles and instructions
-both, and for anything under a couple of percent, what the control arm said.
+Require instead: what changed, on which fixture, against upstream, with cycles
+and instructions both, and for anything under a couple of percent, what the
+control arm said.
 
 ## 8. Correctness constraints a performance change must not break
 
@@ -240,8 +248,19 @@ both, and for anything under a couple of percent, what the control arm said.
   bounds; a folded base pointer that steps before the buffer needs
   `wrapping_offset` / `wrapping_add`, with the gate placing the final address
   back inside before the read.
-- **A heuristic that skips work belongs after the search it might spoil.** A
-  sample cannot see a repeat that spans more than the sample, so a pre-search
-  check writes off input that would have compressed, and the cost is a factor
-  rather than a percent. Move it behind the search, where being wrong costs
-  microseconds.
+- **A heuristic that skips the search must be paired with what makes being
+  wrong survivable.** A sample cannot see a repeat that spans more than the
+  sample, so a check reading only the block's own bytes writes off input that
+  would have compressed, and the cost is a factor rather than a percent. Two
+  things make the trade sound, and both are load-bearing: a probe of what the
+  frame has already emitted, so a block duplicating an earlier one is searched
+  however random it looks; and indexing whatever is skipped, so the later
+  duplicate has something to match against — skipping without indexing loses
+  the repeat on both blocks and no probe can recover it.
+
+  Confining the skip to a band of levels on top of that is NOT part of the
+  rule, and has been measured twice: it costs more than an order of magnitude
+  on incompressible input at the upper levels and recovers nothing, including
+  on input built specifically to make the classifier answer wrongly. If a
+  reviewer proposes it again, re-measure rather than reason — the numbers live
+  in the commit that removed it, not here.

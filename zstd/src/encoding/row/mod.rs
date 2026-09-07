@@ -76,6 +76,33 @@ pub(crate) const ROW_HASH_SALT: u64 = zstd_bitmix(0, 8) ^ zstd_bitmix(0, 4);
 const BT_IDX_BASE: usize = 2;
 /// Upstream `ZSTD_DUBT_UNSORTED_MARK`.
 const BT_UNSORTED_MARK: u32 = 1;
+/// How far one node's sort compares before the tree gives up ordering it.
+///
+/// Sorting a node asks only which side of another node it falls on, and every
+/// byte past the first difference is spent on a question already answered. On
+/// ordinary data the answer arrives within tens of bytes and this bound is
+/// never approached. On input that repeats at a short period there IS no first
+/// difference: the comparison runs to the end of the loaded input, and since it
+/// runs per inserted node the parse turns quadratic in the stream. Measured on
+/// 8 MiB of a repeated 48-byte line at level 15, sorting compared 2.29 GB
+/// across 1,487 nodes — an average of 1.5 MB per node, to place nodes whose
+/// order no longer distinguishes anything.
+///
+/// A node that reaches the bound is dropped from the tree, which is what
+/// upstream already does for one that reaches the end of the input ("no way to
+/// know if inf or sup", `zstd_opt.c`). Dropping ends the two pending child
+/// links, so whatever hung below the abandoned node leaves this bucket, and a
+/// later string that would have matched one of those branches past the bound
+/// can in principle settle for a shorter match — the bound is not free the way
+/// the input's end is. What it costs was measured rather than assumed: across
+/// the level and fixture matrix no compressed size moved, and on the 8 MiB
+/// repeated line above the frame is within three bytes of the reference's at
+/// every level in the band. The alternative is not "keep the branch" — the
+/// links belong to the node being placed, and leaving them is leaving whatever
+/// the slot held before — but ordering the node by an arbitrary tiebreak, which
+/// keeps the tree connected by misplacing nodes in it.
+const DUBT_SORT_COMPARE_CAP: usize = 8 * 1024;
+
 /// A tree link "pointer" whose write is discarded (upstream `dummy32`).
 const BT_DISCARD: usize = usize::MAX;
 
@@ -899,6 +926,10 @@ macro_rules! dubt_insert1 {
         // below stops at `iend_rem`.
         let ip = unsafe { $ctx.base.add(cur_idx) };
         let iend_rem = $ctx.len - cur_idx;
+        // Where a compare stops, resolved once: it does not vary with the
+        // candidate, only with how far the carried common prefix already
+        // reached, which the loop handles.
+        let sort_end_cap = iend_rem.min(DUBT_SORT_COMPARE_CAP);
         let window_low = $ctx
             .low_limit
             .max(cur_abs.saturating_sub($ctx.search_window))
@@ -919,8 +950,19 @@ macro_rules! dubt_insert1 {
             // floor); the reads stop at `iend_rem`.
             let (smaller, at_end) = unsafe {
                 let mptr = $ctx.base.add(m_idx);
-                ml += $cpl(mptr.add(ml), ip.add(ml), iend_rem - ml);
-                if ml == iend_rem {
+                let seed = ml;
+                // Bounded by the cap as well as by the input: past it the
+                // ordering question is unanswerable in any useful sense and
+                // the node is dropped, exactly as it is at the input's end.
+                let sort_end = if seed < sort_end_cap {
+                    sort_end_cap
+                } else {
+                    // The carried prefix already reached the cap: one more byte
+                    // is all the ordering can still ask for.
+                    (seed + 1).min(iend_rem)
+                };
+                ml += $cpl(mptr.add(ml), ip.add(ml), sort_end - ml);
+                if ml == sort_end {
                     (false, true)
                 } else {
                     (*mptr.add(ml) < *ip.add(ml), false)
@@ -1552,6 +1594,20 @@ macro_rules! lazy_parse_body {
                 {
                     let concat = $m.live_history();
                     let literals = &concat[anchor - hist_start..start - hist_start];
+                    // The format allows an offset past the advertised window
+                    // ONLY into a dictionary that is still valid
+                    // (zstd_compression_format.md:918 and 1525-1528); every
+                    // other offset must stay inside it. The buffer now holds a
+                    // full window BEHIND the block, so what keeps an offset
+                    // legal is the per-candidate floor, not the buffer's — this
+                    // asserts the floor is actually being applied on every path
+                    // that reaches here.
+                    debug_assert!(
+                        offset_1 <= $m.max_window_size || $m.loaded_dict_end != 0,
+                        "offset {} exceeds the advertised window {} with no live dictionary",
+                        offset_1,
+                        $m.max_window_size,
+                    );
                     $handle(Sequence::Triple {
                         literals,
                         offset: offset_1,
@@ -1989,13 +2045,17 @@ macro_rules! row_probe_body {
                     continue;
                 }
                 let candidate_pos = raw_pos as usize;
-                // Lower bound = window low. Owned: `history_abs_start` (eviction
-                // floor) is always >= `abs_pos - max_window_size` (window_size <=
-                // max_window_size), so the `max` picks it — byte-identical to the
-                // pre-window_low check. Borrowed (history_abs_start forced to 0 in
-                // set_borrowed_window): the `max` picks `abs_pos - max_window_size`,
-                // capping the offset to the advertised window so an over-window
-                // in-place scan never emits an unresolvable offset.
+                // Lower bound = window low, and BOTH terms are load-bearing.
+                // The buffer keeps a full window behind the block START, so for
+                // a position inside the block its floor lies BELOW `abs_pos -
+                // max_window_size`; the per-candidate term is then what caps the
+                // offset at the advertised window, which the format requires of
+                // every offset that does not reach into a live dictionary
+                // (zstd_compression_format.md:918). Upstream applies the same
+                // per-position cap (`zstd_lazy.c:1203-1207`). The eviction floor
+                // still wins wherever the buffer holds less than a window — the
+                // start of a frame, and the borrowed window, whose
+                // `history_abs_start` is 0.
                 let window_low = $m
                     .history_abs_start
                     .max($abs_pos.saturating_sub($m.max_window_size));
@@ -2536,10 +2596,18 @@ impl RowMatchGenerator {
     }
 
     pub(crate) fn set_hash_bits(&mut self, bits: usize) {
-        // The level's (source-size-adjusted) hashLog as upstream applies it:
-        // a narrower table changes row assignment and eviction, and with it
-        // the candidate set every search sees.
-        let clamped = bits.max(self.row_log + 1);
+        // The level's source-size-adjusted hashLog, held to a width that stays
+        // resident in cache.
+        //
+        // Upstream carries 21 to 23 bits through the lazy band, and taking that
+        // literally makes a frame allocate and fill tens of megabytes of rows:
+        // at level 12 on eight mebibytes of repeated log lines that was 19.6 ms
+        // against 2.2 ms at 20 bits, two thirds of it faulting and zeroing the
+        // table. What the extra width buys is 142 bytes of 484 KiB on the
+        // decode corpus (0.03%), and on the log stream it does not buy even
+        // that: the wider table compressed to 910 bytes where the narrow one
+        // reached 848.
+        let clamped = bits.clamp(self.row_log + 1, ROW_HASH_BITS);
         let row_hash_log = clamped.saturating_sub(self.row_log);
         if self.row_hash_log != row_hash_log {
             self.row_hash_log = row_hash_log;
@@ -2791,7 +2859,27 @@ impl RowMatchGenerator {
         if self.history_abs_start + self.window_size + len >= u32::MAX as usize - 1 - BT_IDX_BASE {
             self.rebase_positions();
         }
-        if self.window_size + len > self.max_window_size {
+        // Evict down to a FULL window BEFORE this block, not to a window that
+        // has to include it. The floor a match is measured against is set from
+        // the block's START (upstream zstd `ZSTD_window_enforceMaxDist` takes
+        // `ip`, not `ip + blockSize`), so retaining only `window - block` left
+        // everything between those two distances unreachable however the floor
+        // was computed. The mirror therefore holds up to a block more than the
+        // window, which is the shape upstream's buffer has.
+        let evicted_from = self.history_start;
+        while self.window_size > self.max_window_size {
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
+        }
+        // Only once history actually left the window. Asking whether it WOULD
+        // leave once this block is added is a wider question than the eviction
+        // asks, and the gap between the two is a whole window's worth of state
+        // where the dictionary index was dropped although nothing had moved —
+        // and a dictionary match starting at the block's first byte is exactly
+        // what is legal there.
+        if self.history_start != evicted_from {
             self.dict.invalidate();
             // Same one-time ceiling as `add_data`: once eviction starts, grow
             // the mirror linearly to (window + window/4 + one block).
@@ -2801,12 +2889,6 @@ impl RowMatchGenerator {
             if target > self.history.len() && self.history.capacity() < target {
                 self.history.reserve_exact(target - self.history.len());
             }
-        }
-        while self.window_size + len > self.max_window_size {
-            let removed_len = self.chunk_lens.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
         }
         if self.low_limit < self.history_abs_start {
             self.low_limit = self.history_abs_start;
@@ -2843,9 +2925,21 @@ impl RowMatchGenerator {
         {
             self.rebase_positions();
         }
-        if self.window_size + data.len() > self.max_window_size {
-            // Eviction advances `history_start`, staling the dict row index's
+        // Same reach as `commit_block`: a full window stays behind the incoming
+        // block, because the floor is measured from the block's start.
+        let evicted_from = self.history_start;
+        while self.window_size > self.max_window_size {
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
+        }
+        if self.history_start != evicted_from {
+            // Eviction advanced `history_start`, staling the dict row index's
             // concat positions — drop the attach (dict slid within/out window).
+            // Conditioned on what the eviction DID, not on what adding this
+            // block would need: between the two the dictionary is still whole
+            // and still reachable from the block's first byte.
             self.dict.invalidate();
             // Cap the history buffer near the live window instead of letting
             // the Vec power-of-two double to ~2x window on long streams. Once
@@ -2861,12 +2955,6 @@ impl RowMatchGenerator {
             if target > self.history.len() && self.history.capacity() < target {
                 self.history.reserve_exact(target - self.history.len());
             }
-        }
-        while self.window_size + data.len() > self.max_window_size {
-            let removed_len = self.chunk_lens.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
         }
         // Evicted bytes are gone from `history`, so the valid-data floor
         // rises with them (upstream `window.lowLimit`: the oldest byte the
@@ -2981,8 +3069,50 @@ impl RowMatchGenerator {
         let (current_abs_start, current_len) = self.current_block_range();
         let current_abs_end = current_abs_start + current_len;
         if self.finder != LazyFinder::Rows {
-            // The chain / tree hold no rows to seed; the next lazy block
-            // links the skipped block's tail from the carried cursor.
+            // The chain holds no rows to seed, but it still has to hold the
+            // skipped content: the grid can report that a later block repeats
+            // this one, and the search that decision buys then runs over a
+            // chain this block never entered — both copies go out raw. The next
+            // block's catch-up cannot cover it either, because upstream's
+            // limited-update clamp indexes at most the last few hundred
+            // positions of a gap.
+            //
+            // Only the last window's worth, and only sparsely: nothing older
+            // than the window can be matched from the next block anyway, and a
+            // duplicate is block-sized, so an entry every
+            // `INCOMPRESSIBLE_SKIP_STEP` positions is met long before the stride
+            // matters. The tree finder keeps the old behaviour — its nodes are
+            // sorted on insertion and seeding them here is not a sparse write.
+            // The hint means the same thing here as it does for the rows below:
+            // nothing for `None`, every `INCOMPRESSIBLE_SKIP_STEP` position for
+            // a block written off, and every position when a dictionary is
+            // being primed. Seeding sparsely for all three indexes what `None`
+            // asked to be left alone and leaves a dictionary with one position
+            // in eight, whose four-byte keys a later block then cannot meet.
+            if self.finder == LazyFinder::Chain
+                && let Some(incompressible) = incompressible_hint
+            {
+                let step = if incompressible {
+                    INCOMPRESSIBLE_SKIP_STEP
+                } else {
+                    1
+                };
+                let ctx = self.scan_ctx();
+                let chain_mask = (1usize << self.hc_chain_log) - 1;
+                // Only the last window's worth: nothing older can be matched
+                // from the next block anyway.
+                let from = current_abs_start
+                    .max(current_abs_end.saturating_sub(self.search_window))
+                    .max(self.low_limit);
+                let mut idx = from;
+                while idx + ROW_HASH_KEY_LEN <= current_abs_end {
+                    let h = self.hc_hash_at(ctx, idx);
+                    let (hash, chain) = self.hc_tables_mut();
+                    chain[idx & chain_mask] = hash[h];
+                    hash[h] = idx as u32;
+                    idx += step;
+                }
+            }
             self.lazy_next_to_update = current_abs_end.saturating_sub(ROW_HASH_KEY_LEN - 1);
             return;
         }
@@ -3317,16 +3447,22 @@ impl RowMatchGenerator {
             // same fill the separate vectors paid and saves an allocation.
             if self.hc_split != hash_len || self.tables.len() != hash_len + chain_len || relayout {
                 let total = hash_len + chain_len;
-                if super::match_table::storage::capacity_is_oversized(self.tables.capacity(), total)
+                // A zero sentinel is worth a fresh allocation: the request comes
+                // back as pages the kernel has not had to write, where resizing
+                // writes every element — for a matcher taken fresh per frame
+                // that meant faulting and zeroing the whole table every time.
+                // The chain finder's sentinel is not zero, so it pays the fill
+                // either way and an allocation on top; it keeps the buffer it
+                // has. Either way an oversized one is released, which a level
+                // downgrade needs anyway.
+                if empty == 0
+                    || super::match_table::storage::capacity_is_oversized(
+                        self.tables.capacity(),
+                        total,
+                    )
                 {
-                    // Same release rule as the row branch: a level downgrade
-                    // must not pin the widest tables this compressor ever
-                    // used.
                     self.tables = alloc::vec![empty; total];
                 } else {
-                    // Reserved to the final width before filling, for the same
-                    // reason as the row branch above: `resize` from an empty
-                    // buffer climbs a doubling chain the frame then discards.
                     self.tables.clear();
                     self.tables.reserve_exact(total);
                     self.tables.resize(total, empty);

@@ -386,8 +386,17 @@ impl FastKernelMatcher {
     pub(crate) fn block_samples_match_dict(&self, block: &[u8]) -> bool {
         use super::fast_kernel::kernel::dict_lookup;
         const HASH_READ_SIZE: usize = 8;
-        if !self.dict.is_attached() || block.len() < HASH_READ_SIZE {
+        if block.len() < HASH_READ_SIZE {
             return false;
+        }
+        if !self.dict.is_attached() {
+            // A dictionary above the attach cutoff is COPIED into live history
+            // instead, leaving no dict table to probe. Its content can still
+            // supply a block-sized match, so the honest answer is that it
+            // might: say so, and the block stays on the scan rather than going
+            // out raw unsearched. With no dictionary at all there is nothing
+            // to match against and nothing to report.
+            return self.loaded_dict_end > 0;
         }
         let Some(dict_tab) = self.dict.table() else {
             return false;
@@ -1513,6 +1522,16 @@ impl FastKernelMatcher {
         // wrapping for short blocks (history shorter than HASH_READ_SIZE
         // is a legal post-prime state when the dictionary itself is
         // very small).
+        // Written off as noise without being searched. Index it sparsely all
+        // the same: a later block that duplicates this one has to have
+        // something to match against, or the repeat is thrown away on both
+        // sides. Same reasoning as the borrowed path.
+        if incompressible_hint == Some(true) {
+            self.prime_hash_table_for_range_stepped(
+                block_start,
+                crate::encoding::incompressible::RAW_SKIP_INDEX_STEP,
+            );
+        }
         if incompressible_hint == Some(false) {
             self.prime_hash_table_for_range(block_start);
             // Copy-mode dict prime: the dict now occupies `[0, history.len())`
@@ -1555,8 +1574,23 @@ impl FastKernelMatcher {
             "borrowed block bounds out of range: start={block_start} end={block_end} total={total_len}",
         );
         self.last_borrowed_block = Some((block_start, block_end));
-        if incompressible_hint == Some(false) {
-            self.prime_hash_table_for_range_borrowed(block_start, block_end);
+        match incompressible_hint {
+            // No verdict: unchanged, nothing is indexed.
+            None => {}
+            // Judged compressible: index every position, as before.
+            Some(false) => {
+                self.prime_hash_table_for_range_borrowed(block_start, block_end, 1);
+            }
+            // Written off as noise without being searched. It still has to be
+            // findable: a later block duplicating it must have something to
+            // match against, or the repeat is lost on both.
+            Some(true) => {
+                self.prime_hash_table_for_range_borrowed(
+                    block_start,
+                    block_end,
+                    crate::encoding::incompressible::RAW_SKIP_INDEX_STEP,
+                );
+            }
         }
     }
 
@@ -1566,7 +1600,12 @@ impl FastKernelMatcher {
     /// (not the full buffer) so only the just-committed block's positions
     /// are indexed — future blocks aren't matchable yet, mirroring the
     /// owned path where `history` ends at `block_end`.
-    fn prime_hash_table_for_range_borrowed(&mut self, range_start: usize, block_end: usize) {
+    fn prime_hash_table_for_range_borrowed(
+        &mut self,
+        range_start: usize,
+        block_end: usize,
+        step: usize,
+    ) {
         const HASH_READ_SIZE: usize = 8;
         if block_end < HASH_READ_SIZE {
             return;
@@ -1594,11 +1633,41 @@ impl FastKernelMatcher {
             "virtual position overflow: dict.region_len()={base_offset} + block_end={block_end} exceeds u32",
         );
         match self.hash_table.mls() {
-            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable, base_offset),
-            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable, base_offset),
-            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable, base_offset),
-            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable, base_offset),
-            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable, base_offset),
+            4 => self.prime_hash_table_stepped::<4>(
+                base,
+                backfill_start,
+                last_hashable,
+                base_offset,
+                step,
+            ),
+            5 => self.prime_hash_table_stepped::<5>(
+                base,
+                backfill_start,
+                last_hashable,
+                base_offset,
+                step,
+            ),
+            6 => self.prime_hash_table_stepped::<6>(
+                base,
+                backfill_start,
+                last_hashable,
+                base_offset,
+                step,
+            ),
+            7 => self.prime_hash_table_stepped::<7>(
+                base,
+                backfill_start,
+                last_hashable,
+                base_offset,
+                step,
+            ),
+            8 => self.prime_hash_table_stepped::<8>(
+                base,
+                backfill_start,
+                last_hashable,
+                base_offset,
+                step,
+            ),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
@@ -1663,6 +1732,11 @@ impl FastKernelMatcher {
     /// the inner body is monomorphised per matcher instance (no
     /// branch / mispredict in the hot path).
     fn prime_hash_table_for_range(&mut self, range_start: usize) {
+        self.prime_hash_table_for_range_stepped(range_start, 1);
+    }
+
+    /// [`Self::prime_hash_table_for_range`] taking every `step`-th position.
+    fn prime_hash_table_for_range_stepped(&mut self, range_start: usize, step: usize) {
         let history_len = self.history.len();
         // HASH_READ_SIZE = 8 is the kernel's load-width invariant
         // (upstream zstd `MEM_readST` cadence). Hashing a position with fewer
@@ -1688,11 +1762,11 @@ impl FastKernelMatcher {
         // coordinate (input is appended after the dict in `history`), so no
         // virtual rebase is needed.
         match self.hash_table.mls() {
-            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable, 0),
-            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable, 0),
-            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable, 0),
-            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable, 0),
-            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable, 0),
+            4 => self.prime_hash_table_stepped::<4>(base, backfill_start, last_hashable, 0, step),
+            5 => self.prime_hash_table_stepped::<5>(base, backfill_start, last_hashable, 0, step),
+            6 => self.prime_hash_table_stepped::<6>(base, backfill_start, last_hashable, 0, step),
+            7 => self.prime_hash_table_stepped::<7>(base, backfill_start, last_hashable, 0, step),
+            8 => self.prime_hash_table_stepped::<8>(base, backfill_start, last_hashable, 0, step),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
@@ -1710,24 +1784,81 @@ impl FastKernelMatcher {
     /// without this, a primed raw offset in `[1, dict_end)` would underflow the
     /// kernel's `main_idx - dict_end`. No-dict borrowed frames pass 0
     /// (`region_len() == 0`), so their raw offsets are unchanged.
-    fn prime_hash_table_impl<const MLS: u32>(
+    /// Index `[range_start, last_hashable]` taking every `step`-th position.
+    ///
+    /// A block emitted raw without being searched still has to be findable, or
+    /// a later block that duplicates it has nothing to match against and the
+    /// duplicate goes out raw as well — the whole repeat is lost. Indexing it
+    /// sparsely costs a few hundred stores per block and leaves a later search
+    /// hitting an indexed position within `step` bytes, which is well inside
+    /// what it scans anyway.
+    fn prime_hash_table_stepped<const MLS: u32>(
         &mut self,
         base: *const u8,
         range_start: usize,
         last_hashable: usize,
         base_offset: usize,
+        step: usize,
     ) {
-        for pos in range_start..=last_hashable {
-            // SAFETY: pos < history_len (by loop bound), and the load
-            // width HASH_READ_SIZE is the kernel's contractually
-            // required minimum, so `base.add(pos)` covers
-            // HASH_READ_SIZE readable bytes by `last_hashable`'s
-            // definition. The MLS const-generic is bound at the
-            // caller's match arm — `hash_ptr<MLS>` and `put` are
-            // constant-folded per MLS.
-            let ptr = unsafe { base.add(pos) };
-            let hash = unsafe { self.hash_table.hash_ptr::<MLS>(ptr) };
-            unsafe { self.hash_table.put(hash, (base_offset + pos) as u32) };
+        debug_assert!(step >= 1);
+        // The one position in a row a hash is taken at, shared by both loops
+        // below so the sparse path cannot drift from the dense one.
+        macro_rules! index_at {
+            ($pos:expr) => {{
+                // SAFETY: the position is within the loop bound, and the
+                // kernel's HASH_READ_SIZE load width is readable there by
+                // `last_hashable`'s definition. The MLS const-generic is bound
+                // at the caller's match arm, so both calls constant-fold.
+                let ptr = unsafe { base.add($pos) };
+                let hash = unsafe { self.hash_table.hash_ptr::<MLS>(ptr) };
+                unsafe { self.hash_table.put(hash, (base_offset + $pos) as u32) };
+            }};
+        }
+        // Dense is the ordinary path — every searched block primes through it —
+        // and it has to stay a plain counted loop. Running it as `step_by(1)`
+        // over an inclusive range keeps the iterator's stride and exhausted
+        // flag live, which the optimiser does not reduce back to an induction
+        // variable: that alone cost a factor of two on every fast-level frame.
+        if step == 1 {
+            for pos in range_start..=last_hashable {
+                index_at!(pos);
+            }
+            return;
+        }
+        {
+            // The two ends densely, whatever the step lands on. The head is the
+            // seam the caller backfilled for — the previous block's trailing
+            // positions read across the boundary, and a stride that skips them
+            // drops every seam-spanning match. The tail is the mirror case for
+            // the next block. Both are a handful of positions.
+            //
+            // The span between them stays sparse on purpose: it exists so a
+            // later block DUPLICATING this one can find it, and a duplicate is
+            // block-sized, so it meets a grid entry long before the stride
+            // matters. Indexing it densely is the cost the skip exists to
+            // avoid.
+            const SEAM: usize = 8;
+            let head_end = last_hashable.min(range_start + SEAM);
+            for pos in range_start..=head_end {
+                index_at!(pos);
+            }
+            let tail_start = last_hashable.saturating_sub(SEAM).max(range_start);
+            for pos in tail_start..=last_hashable {
+                index_at!(pos);
+            }
+        }
+        let mut pos = range_start;
+        while pos <= last_hashable {
+            index_at!(pos);
+            // The remaining distance, not the sum: `pos + step` is what would
+            // wrap when the last grid position sits within a step of the end of
+            // the address space, and a wrapped `pos` re-enters the loop at a
+            // small value and never leaves. `pos <= last_hashable` holds here,
+            // so the subtraction cannot underflow.
+            if last_hashable - pos < step {
+                break;
+            }
+            pos += step;
         }
     }
 

@@ -3311,12 +3311,22 @@ fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
     driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
     assert_eq!(driver.row_matcher().max_window_size, base_window + 24);
 
-    for block in [b"AAAAAAAA", b"BBBBBBBB"] {
+    // Three blocks, not two: a full window is retained BEHIND the incoming
+    // block, because the floor a match is measured against is set from the
+    // block's start. The block that fills the window therefore does not yet
+    // displace the dictionary; the one after it does.
+    for block in [b"AAAAAAAA", b"BBBBBBBB", b"CCCCCCCC"] {
         let mut space = driver.get_next_space();
         space.clear();
         space.extend_from_slice(block);
         driver.commit_space(space);
         driver.skip_matching_with_hint(None);
+        if block == b"AAAAAAAA" {
+            assert_eq!(
+                driver.dictionary_retained_budget, 24,
+                "a dictionary the window still reaches is still held",
+            );
+        }
     }
 
     assert_eq!(
@@ -5563,4 +5573,65 @@ fn upper_lazy_band_params_match_default_table() {
         assert_eq!(row.hash_bits, hlog, "L{level}: hash_log");
         assert_eq!(row.chain_log, clog, "L{level}: chain_log");
     }
+}
+
+/// A dictionary must still pay on a window small enough to put the Row backend
+/// on its hash chain, which is where a dictionary is most of the history.
+#[test]
+fn the_chain_finder_keeps_a_dictionary_worth_attaching() {
+    use crate::encoding::{CompressionLevel, CompressionParameters, compress_with_parameters};
+
+    // A dictionary of records, and input made of the same records in another
+    // order: everything it codes has to come from the dictionary.
+    // Each record is its own pseudo-random bytes, so the input repeats nothing
+    // of itself and everything it can code has to come from the dictionary.
+    fn record(seed: u64) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut out = Vec::with_capacity(64);
+        for _ in 0..64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.push(state as u8);
+        }
+        out
+    }
+    let records: Vec<Vec<u8>> = (0..64u64).map(record).collect();
+    let mut dictionary = Vec::new();
+    for r in &records {
+        dictionary.extend_from_slice(r);
+    }
+    let mut input = Vec::new();
+    for r in records.iter().rev() {
+        input.extend_from_slice(r);
+    }
+
+    let params = CompressionParameters::builder(CompressionLevel::Level(5))
+        // 16 KiB window puts the Row backend on its hash chain rather than rows.
+        .window_log(14)
+        .build()
+        .expect("level 5 with a 16 KiB window is a valid configuration");
+
+    let mut with_dict: crate::encoding::FrameCompressor =
+        crate::encoding::FrameCompressor::new(crate::encoding::CompressionLevel::Level(5));
+    with_dict.set_parameters(&params);
+    with_dict
+        .set_encoder_dictionary(
+            crate::encoding::EncoderDictionary::from_serialized_or_raw_content(&dictionary)
+                .expect("raw dictionary content loads"),
+        )
+        .expect("prepared dictionary should attach");
+    let primed = with_dict.compress_independent_frame(&input);
+    let bare = compress_with_parameters(&input, &params);
+
+    // The dictionary has to pay on a window this small, whichever path primed
+    // it. This does NOT prove the hint is read — priming reaches the chain
+    // through its own route, and the assertion holds with the skip path seeding
+    // sparsely as well; it guards the outcome the hint exists to protect.
+    assert!(
+        primed.len() < bare.len(),
+        "{} bytes primed against {} bare",
+        primed.len(),
+        bare.len(),
+    );
 }

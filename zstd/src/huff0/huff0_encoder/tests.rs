@@ -84,7 +84,7 @@ fn the_cached_weight_description_counts_as_retained() {
     for symbol in 0u8..=255 {
         sample.extend(core::iter::repeat_n(symbol, usize::from(symbol) + 1));
     }
-    let table = HuffmanTable::build_from_data(&sample);
+    let mut table = HuffmanTable::build_from_data(&sample);
     let before = table.heap_size();
 
     let cached_len = table
@@ -394,7 +394,7 @@ fn cheap_desc_size_proxy_is_conservative_vs_exact() {
     ];
     let mut exercised = 0usize;
     for (counts, label) in cases {
-        let table = HuffmanTable::build_from_counts(counts);
+        let mut table = HuffmanTable::build_from_counts(counts);
         let weights = table.weights();
         if weights.is_empty() {
             // Single-cardinality fallback path can produce empty
@@ -552,10 +552,10 @@ fn fse_weight_descriptions_roundtrip() {
             // changed). `encode_weight_description` returns Some(fse_bytes) only
             // for streams it actually FSE-encodes; None means it chose the raw
             // description (nothing to round-trip). Every Some MUST decode back.
-            let Some(encoded) = HuffmanEncoder::<Vec<u8>>::encode_weight_description(&weights)
-            else {
+            let mut encoded = Vec::new();
+            if !HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(&weights, &mut encoded) {
                 continue;
-            };
+            }
             let mut description = Vec::with_capacity(encoded.len() + 1);
             description.push(encoded.len() as u8);
             description.extend_from_slice(&encoded);
@@ -606,8 +606,11 @@ fn large_alphabet_weight_description_uses_fse_when_raw_is_unrepresentable() {
         "fixture must require an FSE table description"
     );
 
-    let encoded = HuffmanEncoder::<Vec<u8>>::encode_weight_description(&weights)
-        .expect("FSE weight description must be available when raw weights cannot be represented");
+    let mut encoded = Vec::new();
+    assert!(
+        HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(&weights, &mut encoded),
+        "FSE weight description must be available when raw weights cannot be represented",
+    );
     let mut description = Vec::with_capacity(encoded.len() + 1);
     description.push(encoded.len() as u8);
     description.extend_from_slice(&encoded);
@@ -639,16 +642,14 @@ fn cached_encoded_weight_description_is_reused_for_write_table() {
     for symbol in 0u8..=255 {
         data.extend(core::iter::repeat_n(symbol, usize::from(symbol) + 1));
     }
-    let table = HuffmanTable::build_from_data(&data);
+    let mut table = HuffmanTable::build_from_data(&data);
     let desc_size = table
         .writeable_table_description_size()
         .expect("table description must be writable");
     let cached = table
-        .cached_encoded_weight_description
-        .get()
-        .and_then(Option::as_ref)
+        .cached_encoded_weight_description()
         .expect("large alphabet fixture must cache FSE description")
-        .clone();
+        .to_vec();
     assert_eq!(desc_size, cached.len() + 1);
 
     let mut encoded = Vec::new();
@@ -671,18 +672,26 @@ fn flat_wide_alphabet_has_no_writeable_description() {
     // Every one of the 256 symbols exactly once: all code lengths are 8, so all
     // weights are equal.
     let alphabet: Vec<u8> = (0u8..=255).collect();
-    let table = HuffmanTable::build_from_data(&alphabet);
+    let mut table = HuffmanTable::build_from_data(&alphabet);
     assert!(
         table.writeable_table_description_size().is_none(),
         "a table this wide and this flat has no representation to write"
     );
 }
 
+/// A table whose FSE description is rejected must emit the raw nibble form,
+/// and the rejection must be RECORDED rather than rediscovered: the encode
+/// costs the same whether it is accepted or refused, so repeating it per write
+/// would pay for the refusal twice.
 #[cfg(feature = "std")]
 #[test]
-fn write_table_raw_path_initializes_none_cache() {
-    let table = HuffmanTable::build_from_weights(&[1, 1]);
-    assert!(table.cached_encoded_weight_description.get().is_none());
+fn a_rejected_description_is_recorded_and_the_raw_form_written() {
+    let mut table = HuffmanTable::build_from_weights(&[1, 1]);
+    assert_eq!(
+        table.weight_description_state(),
+        DescriptionState::NotComputed,
+        "nothing should be encoded before anyone asks",
+    );
 
     let mut expected = Vec::new();
     let weights = {
@@ -700,6 +709,14 @@ fn write_table_raw_path_initializes_none_cache() {
         writer.flush();
     }
 
+    // The size query is what encodes, and it is what a writer is preceded by.
+    assert!(table.writeable_table_description_size().is_some());
+    assert_eq!(
+        table.weight_description_state(),
+        DescriptionState::NotEncodable,
+        "the refusal must be recorded, not rediscovered on the next write",
+    );
+
     let mut encoded = Vec::new();
     {
         let mut writer = BitWriter::from(&mut encoded);
@@ -708,8 +725,4 @@ fn write_table_raw_path_initializes_none_cache() {
         writer.flush();
     }
     assert_eq!(encoded, expected);
-    assert!(matches!(
-        table.cached_encoded_weight_description.get(),
-        Some(None)
-    ));
 }
