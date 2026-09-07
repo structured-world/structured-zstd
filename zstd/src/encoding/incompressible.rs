@@ -518,6 +518,16 @@ impl SeenContentGrid {
             // Nothing to ask once the answer is in: a probe is read-only and
             // the run reports one bool, so every lookup after the first hit is
             // a random table access for a verdict already reached.
+            //
+            // Skipping the runs entirely while the sticky range already forces
+            // the search was tried on top of this and is not worth it: on eight
+            // mebibytes repeating at a shifted distance — the shape the sticky
+            // range exists for — it took 1.9 M instructions off 6,555 M and left
+            // cycles higher in all three interleaved pairs. This early exit has
+            // already taken that saving, because a block that duplicates the one
+            // before it is answered in the first few probes. And it would cost
+            // something real: a hit inside the range EXTENDS it, so a run that
+            // never happens lets the range lapse where today it grows.
             if probe && !repeat && (self.frame_offset != 0 || start != 0) {
                 let end = (start + run).min(last + 1);
                 for at in start..end {
