@@ -3126,10 +3126,17 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// parse. To reject anything but a serialized dictionary, parse with
     /// [`EncoderDictionary::from_bytes`] (upstream `ZSTD_dct_fullDict`) and
     /// attach the result.
+    ///
+    /// An empty buffer is how the same upstream entry point is told there is
+    /// no dictionary: it clears whatever was attached and succeeds, returning
+    /// it, rather than reporting a dictionary too small to use.
     pub fn set_dictionary_from_bytes(
         &mut self,
         raw_dictionary: &[u8],
     ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
+        if raw_dictionary.is_empty() {
+            return Ok(self.clear_dictionary());
+        }
         self.attach_dictionary(EncoderDictionary::from_serialized_or_raw_content(
             raw_dictionary,
         )?)

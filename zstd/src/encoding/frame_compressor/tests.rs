@@ -1290,6 +1290,51 @@ fn set_dictionary_from_bytes_takes_unmagicked_bytes_as_raw_content() {
     );
 }
 
+/// An empty buffer is how `ZSTD_CCtx_loadDictionary` is told there is no
+/// dictionary: it clears whatever was attached and succeeds
+/// (`ZSTD_clearAllDicts` then `return 0`, zstd_compress.c:1293-1295). Ours
+/// refused it, so a caller could neither say "no dictionary" nor undo an
+/// earlier one through the setter.
+#[test]
+fn set_dictionary_from_bytes_with_an_empty_buffer_clears_the_dictionary() {
+    let raw_dict = b"tenant=demo table=orders op=put value=aaaaabbbbbcccccdddddeeeee\n".repeat(16);
+    let payload = b"tenant=demo table=orders op=put value=aaaaabbbbbcccccdddddeeeee\n".repeat(4);
+
+    let mut compressor: FrameCompressor<&[u8], Vec<u8>> =
+        FrameCompressor::new(super::CompressionLevel::Default);
+    compressor
+        .set_dictionary_from_bytes(&raw_dict)
+        .expect("the dictionary attaches");
+    let cleared = compressor
+        .set_dictionary_from_bytes(&[])
+        .expect("an empty buffer is how a caller says there is no dictionary");
+    assert!(
+        cleared.is_some(),
+        "clearing hands back the dictionary that was attached",
+    );
+
+    // What it compresses is now what a compressor that never saw a dictionary
+    // compresses — the attach is gone, not merely emptied.
+    let mut after_clear = Vec::new();
+    let mut c = FrameCompressor::new(super::CompressionLevel::Default);
+    c.set_dictionary_from_bytes(&raw_dict).expect("attach");
+    c.set_dictionary_from_bytes(&[]).expect("clear");
+    c.set_source(payload.as_slice());
+    c.set_drain(&mut after_clear);
+    c.compress();
+
+    let mut never_had_one = Vec::new();
+    let mut plain = FrameCompressor::new(super::CompressionLevel::Default);
+    plain.set_source(payload.as_slice());
+    plain.set_drain(&mut never_had_one);
+    plain.compress();
+
+    assert_eq!(
+        after_clear, never_had_one,
+        "a cleared dictionary must leave the frame a plain one",
+    );
+}
+
 /// Taking either kind is not taking anything: a blob that claims to be a
 /// serialized dictionary by carrying the magic, and then does not parse, is a
 /// corrupt dictionary and must be refused rather than quietly re-read as raw

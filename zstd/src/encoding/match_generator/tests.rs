@@ -816,6 +816,12 @@ fn dfast_dictionary_all_kernel_tiers_emit_identical_sequences() {
         feature = "kernel-neon"
     ))]
     tiers.push(FastpathKernel::Neon);
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    tiers.push(FastpathKernel::Simd128);
 
     let dict: Vec<u8> = (0..20 * 1024u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)

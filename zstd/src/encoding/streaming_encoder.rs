@@ -334,6 +334,19 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     /// bytes explicitly. Must be called before the first
     /// [`write`](Write::write); repeat offsets must be non-zero.
     pub fn set_dictionary_from_bytes(&mut self, raw_dictionary: &[u8]) -> Result<(), Error> {
+        if raw_dictionary.is_empty() {
+            // An empty buffer is how the same upstream entry point is told
+            // there is no dictionary: it clears and succeeds. Still refused
+            // once the frame is open, like any other attach.
+            self.ensure_open()?;
+            if self.frame_started {
+                return Err(invalid_input_error(
+                    "dictionary must be attached before the first write",
+                ));
+            }
+            self.dictionary = None;
+            return Ok(());
+        }
         let dict = EncoderDictionary::from_serialized_or_raw_content(raw_dictionary)
             .map_err(|err| invalid_input_error(&alloc::format!("invalid dictionary: {err:?}")))?;
         self.set_encoder_dictionary(dict)

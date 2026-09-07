@@ -192,3 +192,16 @@ fn dict_2segment_rejects_a_cursor_past_the_input() {
     let inp = [1u8, 2, 3];
     let _ = count_forward_dict_2segment(&dict, 0, &inp, 4, 0);
 }
+
+/// The established-prefix bound has to hold without adding to the cursor:
+/// `cur + known` wraps in a release build, and a wrapped sum passes a bound it
+/// should have failed, after which the pointer arithmetic below leaves the
+/// input. Expressed as a subtraction from a length already known to be at
+/// least the cursor, there is nothing to wrap.
+#[test]
+#[should_panic(expected = "count_forward_dict_2segment requires")]
+fn dict_2segment_rejects_a_known_prefix_that_would_wrap() {
+    let dict = [1u8, 2, 3];
+    let inp = [1u8];
+    let _ = count_forward_dict_2segment(&dict, 0, &inp, 1, usize::MAX);
+}

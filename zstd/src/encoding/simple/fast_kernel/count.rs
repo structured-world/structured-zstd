@@ -228,8 +228,13 @@ pub(crate) fn count_forward_dict_2segment(
     // Bounded in release for the same reason as the two above: `cur + known`
     // feeds a subtraction and a raw-pointer `add`, so a caller that overstated
     // what it established would read outside the input.
+    //
+    // Phrased as a subtraction, not as `cur + known <= inp_len`: that sum wraps
+    // in a release build, and a wrapped sum passes the bound it should have
+    // failed. `cur <= inp_len` is established directly above, so the difference
+    // cannot underflow.
     assert!(
-        cur + known <= inp_len,
+        known <= inp_len - cur,
         "count_forward_dict_2segment requires cur ({cur}) + known ({known}) <= inp.len() ({inp_len})",
     );
     if cand + known >= dict_len {

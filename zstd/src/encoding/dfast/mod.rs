@@ -3589,11 +3589,24 @@ impl DfastMatchGenerator {
             target_feature = "simd128",
             feature = "kernel-simd128"
         ))]
-        unsafe {
-            dispatch_dict!(
-                start_matching_fast_loop_simd128,
-                start_matching_dict_loop_simd128
-            )
+        {
+            // Same `cfg(test)` door as the NEON arm: simd128 is resolved at
+            // compile time here, so without it this target could never run the
+            // scalar dictionary loop to check the SIMD one against.
+            #[cfg(test)]
+            if use_dict && self.kernel == crate::encoding::fastpath::FastpathKernel::Scalar {
+                return self.start_matching_dict_loop_scalar(
+                    current_abs_start,
+                    current_len,
+                    handle_sequence,
+                );
+            }
+            unsafe {
+                dispatch_dict!(
+                    start_matching_fast_loop_simd128,
+                    start_matching_dict_loop_simd128
+                )
+            }
         }
         #[cfg(not(any(
             all(
