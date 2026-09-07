@@ -51,6 +51,19 @@ const HASH_READ_SIZE: usize = 8;
 /// rep emissions that upstream produces.
 const DFAST_REP_MIN_MATCH_LEN: usize = 4;
 
+/// Upstream `kSearchStrength` (`zstd_compress_internal.h`): the dictionary
+/// scan loop advances by `((ip - anchor) >> kSearchStrength) + 1`, so the
+/// stride grows by one for every `1 << kSearchStrength` bytes travelled since
+/// the last match. Expressed as the shift because that loop applies it per
+/// position; the two-cursor loop counts the same distance out in
+/// `DFAST_SKIP_STEP_GROWTH_INTERVAL`-sized intervals instead, and the two must
+/// agree.
+const DFAST_SKIP_STEP_SHIFT: usize = DFAST_SKIP_STEP_GROWTH_INTERVAL.trailing_zeros() as usize;
+const _: () = assert!(
+    DFAST_SKIP_STEP_GROWTH_INTERVAL == 1 << DFAST_SKIP_STEP_SHIFT,
+    "the step-growth interval must be a power of two to express it as a shift",
+);
+
 /// Cached `DFTRACE` env flag for the dfast commit-path diagnostic (read once;
 /// see the `DFTRACE` gate in the fast-loop commit handler).
 #[cfg(feature = "std")]
@@ -2094,7 +2107,7 @@ impl DfastMatchGenerator {
 /// cpl calls inline under one umbrella and `select_kernel()` is resolved ONCE
 /// per block in the bare dispatcher, never per cpl call.
 macro_rules! start_matching_fast_loop_body {
-    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path, $use_dict:expr, $borrowed:expr) => {{
+    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path, $borrowed:expr) => {{
         // Behaviour change vs the pre-refactor `start_matching_general`:
         // this fast loop deliberately drops the strict-incompressible
         // early-skip path (the `block_looks_incompressible_strict` short
@@ -2192,57 +2205,6 @@ macro_rules! start_matching_fast_loop_body {
         let long_shift = 64 - $self.long_hash_bits;
         let mut pos = 1usize;
         let mut literals_start = 0usize;
-
-        // Dict dual-probe (upstream zstd `ZSTD_dictMatchState`): snapshot the immutable
-        // dict tables ONCE. Unlike the live tables (which `emit_candidate` may
-        // grow / rebase), the dict tables are never mutated during matching, so
-        // one snapshot before the outer loop stays valid every iteration. The
-        // raw pointers hold no borrow, so the per-iter `&$self`/`&mut $self`
-        // accesses below coexist. `use_dict` gates every probe so the no-dict
-        // hot path keeps its exact instruction shape. `dict_end` is the
-        // dict/input boundary as a CONCAT index (history_start-relative); the
-        // dict is invalidated on any history eviction, so concat indices stay
-        // valid for the snapshot's lifetime.
-        // `use_dict` MUST track table presence, NOT `is_attached()`:
-        // `prime_dict_tables_for_range` records the dict region (so
-        // `is_attached()` is true) but returns before allocating the
-        // tables when the hashable region is shorter than the short-hash
-        // lookahead. Gating on `table().is_some()` keeps the null dict
-        // pointers out of the probe below, which dereferences them before
-        // the `dict_end` bound is consulted.
-        // Dict probe pointers are materialised ONLY on the `USE_DICT` kernel.
-        // The dispatcher monomorphises a separate no-dict kernel
-        // (`$use_dict == false`, a compile-time const) in which this block and
-        // every `if $use_dict` probe below const-fold away — so the hot no-dict
-        // loop carries zero dict code and zero per-position dict check, instead
-        // of branching on a loop-invariant flag every position (upstream zstd keeps the
-        // no-dict and dictMatchState loops as separate functions for the same
-        // reason). `$use_dict == true` is dispatched only when the table is
-        // present, so the `expect` never fires.
-        // The dictionary tables have their own widths (the CDict's), so the
-        // probes below hash the position at `dict_*_shift`, not the live
-        // tables' shifts.
-        let (dict_long_ptr, dict_short_ptr, dict_end, dict_long_shift, dict_short_shift): (
-            *const u32,
-            *const u32,
-            usize,
-            usize,
-            usize,
-        ) = if $use_dict {
-            let d = $self
-                .dict
-                .table()
-                .expect("USE_DICT kernel dispatched without a dict table");
-            (
-                d.long.as_ptr(),
-                d.short.as_ptr(),
-                $self.dict.region_len(),
-                64 - d.long_bits,
-                64 - d.short_bits,
-            )
-        } else {
-            (core::ptr::null(), core::ptr::null(), 0, 64, 64)
-        };
 
         // Advertised window cap = `1 << window_log`. Owned mode evicts, so
         // `history_abs_start` already bounds candidates to the live window;
@@ -2804,81 +2766,6 @@ macro_rules! start_matching_fast_loop_body {
                     }
                 }
 
-                // Dict long fallback (upstream zstd `dictMatchState`): the live long
-                // missed (empty / out-of-window / 8-byte mismatch). Probe the
-                // immutable dict long table at the SAME `hl0_idx`. Flat model:
-                // the dict sits in the contiguous history before the input, so
-                // a dict match is `offset = abs_ip0 - dict_abs` and the forward
-                // count crosses the dict→input boundary like any in-window
-                // match (no `dictBase`/`count_2segments`).
-                if $use_dict {
-                    // SAFETY: when `use_dict`, `dict_long_ptr` is non-null and
-                    // sized `1 << long_hash_bits`; `hl0_idx < 1 << long_hash_bits`.
-                    let dmix0 = v8_0.wrapping_mul(PRIME);
-                    // SAFETY: `dmix0 >> dict_long_shift < 1 << long_bits`, the
-                    // dict long table's length.
-                    let dl = unsafe { *dict_long_ptr.add((dmix0 >> dict_long_shift) as usize) };
-                    // Tag check first (upstream `dictTagsMatchL`): a
-                    // colliding slot never loads the dictionary bytes.
-                    if dl != DFAST_EMPTY_SLOT
-                        && (dl & DFAST_DICT_TAG_MASK) == dfast_dict_tag(dmix0, dict_long_shift)
-                    {
-                        let dp = ((dl >> DFAST_DICT_TAG_BITS) as usize) - 1;
-                        // Dict long slots were only written for positions with
-                        // 8-byte lookahead, so `dp + 8 <= dict_len <= concat_len`;
-                        // `dp < dict_end` keeps the match inside the dict region.
-                        if dp < dict_end {
-                            debug_assert!(
-                                dp + HASH_READ_SIZE <= concat_len,
-                                "dict long load OOB: dp={dp} concat_len={concat_len}",
-                            );
-                            // SAFETY: `dp + 8 <= concat_len` (above) ⇒ the 8-byte
-                            // load at concat `dp` is in-bounds for live history.
-                            let dcand_v8 = unsafe {
-                                (history_base_ptr.add(history_start_offset + dp) as *const u64)
-                                    .read_unaligned()
-                            };
-                            if dcand_v8 == v8_0 {
-                                let mut match_len = 8usize;
-                                let max_fwd = block_len - (ip0 + 8);
-                                // SAFETY: both ptrs in the same buffer; `max_fwd`
-                                // caps the scan to the live region.
-                                unsafe {
-                                    let lhs = history_base_ptr.add(history_start_offset + dp + 8);
-                                    let rhs = block_ptr.add(ip0 + 8);
-                                    let ext =
-                                        $cpl(
-                                            lhs, rhs, max_fwd,
-                                        );
-                                    match_len += ext;
-                                }
-                                let cand_pos = history_abs_start + dp;
-                                // SAFETY: `history_base_ptr + history_start_offset` is the live
-                                // source start (owned `history[history_start..]` or the
-                                // borrowed input slice) and `concat_len` its readable byte
-                                // count, both from `scan_source()` at the top of this outer
-                                // iter; `extend_backwards_shared` only indexes within the
-                                // candidate/cursor range it is handed, all `< concat_len`.
-                                let concat = unsafe {
-                                    core::slice::from_raw_parts(
-                                        history_base_ptr.add(history_start_offset),
-                                        concat_len,
-                                    )
-                                };
-                                let cand = extend_backwards_shared(
-                                    concat,
-                                    history_abs_start,
-                                    cand_pos,
-                                    abs_ip0,
-                                    match_len,
-                                    ip0 - literals_start,
-                                );
-                                break 'inner InnerExit::Committed(cand, 3, abs_ip0);
-                            }
-                        }
-                    }
-                }
-
                 let idxl1 = unsafe { *long_hash_ptr.add(hl1_idx) };
 
                 // Short match check at ip0 with idxs0 — 4-byte gate
@@ -2958,7 +2845,6 @@ macro_rules! start_matching_fast_loop_body {
                             // If it produces a strictly longer match, use it.
                             let mut chosen = short_cand;
                             let mut retry_upgraded = false;
-                            let mut live_l1_hit = false;
                             if idxl1 != DFAST_EMPTY_SLOT {
                                 let cand_pos_l1 = position_base + (idxl1 as usize) - 1;
                                 if cand_pos_l1 >= wlow1 && cand_pos_l1 < abs_ip1 {
@@ -2969,7 +2855,6 @@ macro_rules! start_matching_fast_loop_body {
                                             .read_unaligned()
                                     };
                                     if cand_v8_l1 == v8_1 {
-                                        live_l1_hit = true;
                                         let mut l1_match_len = 8usize;
                                         let max_fwd_l1 = block_len - (ip1 + 8);
                                         unsafe {
@@ -3015,82 +2900,6 @@ macro_rules! start_matching_fast_loop_body {
                                     }
                                 }
                             }
-                            // Dict long match at ip1 (upstream zstd `_search_next_long`
-                            // dict arm, zstd_double_fast.c:472-483): probed ONLY
-                            // when the live long+1 missed, mirroring upstream zstd's
-                            // `else if dictTagsMatchL3`. Attach-mode keeps the
-                            // dict in a SEPARATE table, so the live long+1 probe
-                            // above never sees dict positions; without this the
-                            // dict-long upgrade the old dense-reprime path got
-                            // for free (dict positions lived in the live table)
-                            // is lost and the loop emits the shorter short match.
-                            if !live_l1_hit && $use_dict {
-                                // SAFETY: `use_dict` ⇒ `dict_long_ptr` non-null,
-                                // sized `1 << long_hash_bits`; `hl1_idx` is in range.
-                                let dmix1 = v8_1.wrapping_mul(PRIME);
-                                // SAFETY: the index is below the dict long table's length.
-                                let dl1 = unsafe {
-                                    *dict_long_ptr.add((dmix1 >> dict_long_shift) as usize)
-                                };
-                                if dl1 != DFAST_EMPTY_SLOT
-                                    && (dl1 & DFAST_DICT_TAG_MASK)
-                                        == dfast_dict_tag(dmix1, dict_long_shift)
-                                {
-                                    let dp1 = ((dl1 >> DFAST_DICT_TAG_BITS) as usize) - 1;
-                                    if dp1 < dict_end {
-                                        debug_assert!(
-                                            dp1 + HASH_READ_SIZE <= concat_len,
-                                            "dict long+1 load OOB: dp1={dp1} concat_len={concat_len}",
-                                        );
-                                        // SAFETY: `dp1 + 8 <= concat_len` ⇒ the
-                                        // 8-byte load at concat `dp1` is in-bounds.
-                                        let dcand_v8_l1 = unsafe {
-                                            (history_base_ptr.add(history_start_offset + dp1)
-                                                as *const u64)
-                                                .read_unaligned()
-                                        };
-                                        if dcand_v8_l1 == v8_1 {
-                                            let mut dl1_match_len = 8usize;
-                                            let max_fwd = block_len - (ip1 + 8);
-                                            // SAFETY: same buffer; `max_fwd` caps
-                                            // the scan to the live region.
-                                            unsafe {
-                                                let lhs = history_base_ptr
-                                                    .add(history_start_offset + dp1 + 8);
-                                                let rhs = block_ptr.add(ip1 + 8);
-                                                let ext = $cpl(
-                                                    lhs, rhs, max_fwd,
-                                                );
-                                                dl1_match_len += ext;
-                                            }
-                                            if dl1_match_len > short_cand.match_len {
-                                                let cand_pos = history_abs_start + dp1;
-                                                // SAFETY: `history_base_ptr + history_start_offset` is the live
-                                // source start (owned `history[history_start..]` or the
-                                // borrowed input slice) and `concat_len` its readable byte
-                                // count, both from `scan_source()` at the top of this outer
-                                // iter; `extend_backwards_shared` only indexes within the
-                                // candidate/cursor range it is handed, all `< concat_len`.
-                                let concat = unsafe {
-                                    core::slice::from_raw_parts(
-                                        history_base_ptr.add(history_start_offset),
-                                        concat_len,
-                                    )
-                                };
-                                                chosen = extend_backwards_shared(
-                                                    concat,
-                                                    history_abs_start,
-                                                    cand_pos,
-                                                    abs_ip1,
-                                                    dl1_match_len,
-                                                    ip1 - literals_start,
-                                                );
-                                                retry_upgraded = true;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
                             if short_hit_valid || retry_upgraded {
                                 // Upstream zstd `_match_found` (zstd_double_fast.c:287):
                                 // `if (step < 4) hashLong[hl1] = ip1`.
@@ -3115,76 +2924,6 @@ macro_rules! start_matching_fast_loop_body {
                             // literals).
                         }
                     }
-                    }
-                }
-
-                // Dict short fallback (upstream zstd `dictMatchState`): the live short
-                // missed / was below floor. Probe the immutable dict short
-                // table at the SAME `hs0_idx`, 4-byte gate, forward count, then
-                // enforce the same `DFAST_MIN_MATCH_LEN` floor the live short
-                // path uses (a sub-floor non-rep match mints a wire offset that
-                // costs more than emitting the bytes as literals). No
-                // `_search_next_long` retry: the dict long fallback already
-                // covers the long-upgrade case at `ip0`.
-                if $use_dict {
-                    // SAFETY: `use_dict` ⇒ `dict_short_ptr` non-null, sized
-                    // `1 << short_hash_bits`; `hs0_idx < 1 << short_hash_bits`.
-                    let dsmix0 = (v8_0 << 24).wrapping_mul(PRIME);
-                    // SAFETY: the index is below the dict short table's length.
-                    let ds = unsafe { *dict_short_ptr.add((dsmix0 >> dict_short_shift) as usize) };
-                    if ds != DFAST_EMPTY_SLOT
-                        && (ds & DFAST_DICT_TAG_MASK) == dfast_dict_tag(dsmix0, dict_short_shift)
-                    {
-                        let dp = ((ds >> DFAST_DICT_TAG_BITS) as usize) - 1;
-                        if dp < dict_end {
-                            debug_assert!(
-                                dp + 4 <= concat_len,
-                                "dict short load OOB: dp={dp} concat_len={concat_len}",
-                            );
-                            // SAFETY: short slots were only written with 4 bytes
-                            // of lookahead ⇒ `dp + 4 <= dict_len <= concat_len`.
-                            let dcand4 = unsafe {
-                                (history_base_ptr.add(history_start_offset + dp) as *const u32)
-                                    .read_unaligned()
-                            };
-                            if dcand4 == v4_0 as u32 {
-                                let mut s_match_len = 4usize;
-                                let max_fwd = block_len - (ip0 + 4);
-                                unsafe {
-                                    let lhs = history_base_ptr.add(history_start_offset + dp + 4);
-                                    let rhs = block_ptr.add(ip0 + 4);
-                                    let ext =
-                                        $cpl(
-                                            lhs, rhs, max_fwd,
-                                        );
-                                    s_match_len += ext;
-                                }
-                                let cand_pos = history_abs_start + dp;
-                                // SAFETY: `history_base_ptr + history_start_offset` is the live
-                                // source start (owned `history[history_start..]` or the
-                                // borrowed input slice) and `concat_len` its readable byte
-                                // count, both from `scan_source()` at the top of this outer
-                                // iter; `extend_backwards_shared` only indexes within the
-                                // candidate/cursor range it is handed, all `< concat_len`.
-                                let concat = unsafe {
-                                    core::slice::from_raw_parts(
-                                        history_base_ptr.add(history_start_offset),
-                                        concat_len,
-                                    )
-                                };
-                                let dcand = extend_backwards_shared(
-                                    concat,
-                                    history_abs_start,
-                                    cand_pos,
-                                    abs_ip0,
-                                    s_match_len,
-                                    ip0 - literals_start,
-                                );
-                                if dcand.match_len >= DFAST_MIN_MATCH_LEN {
-                                    break 'inner InnerExit::Committed(dcand, 4, abs_ip0);
-                                }
-                            }
-                        }
                     }
                 }
 
@@ -3270,6 +3009,481 @@ macro_rules! start_matching_fast_loop_body {
     }};
 }
 
+/// The dictionary scan loop, in the shape upstream gives its dictionary
+/// variant (`ZSTD_compressBlock_doubleFast_dictMatchState_generic`,
+/// zstd_double_fast.c:328-545) rather than the shape of its no-dictionary one.
+///
+/// Upstream keeps the two apart, and the difference is not decoration. The
+/// no-dictionary loop carries TWO cursors: it scans at `ip0`, precomputes the
+/// long hash of `ip1` so the `_search_next_long` retry and the next iteration
+/// both find it ready, and carries `hl1`/`idxl1` across iterations. That trade
+/// buys a hash per two positions at the price of keeping the second cursor's
+/// index, slot, position and window bound live the whole way round. The
+/// dictionary loop cannot afford it: it must also keep two table pointers, the
+/// dictionary's own two hash shifts and its region bound live, and the machine
+/// has no registers left. Bolting the dictionary probes onto the two-cursor
+/// loop is what this replaces; the profile of that arrangement had the loop
+/// reloading its own invariants from the stack at every probe.
+///
+/// So this scans one cursor, hashes each position once, and steps the way the
+/// reference's dictionary loop steps — `ip += ((ip - anchor) >> 8) + 1`,
+/// accelerating with the distance from the last match rather than from the
+/// block start. The probe ORDER is the reference's too, and one part of it
+/// matters for more than register pressure: the dictionary's short table is
+/// consulted only when the live short slot is EMPTY or out of window
+/// (zstd_double_fast.c:437-449, an `else if` on the slot, not on the compare).
+/// With the tables a small dictionary sizes, every slot is occupied within a
+/// few hundred positions, so that arm all but stops firing — which is the work
+/// the two-cursor arrangement was doing on every single position.
+///
+/// A borrowed window never carries a dictionary (`borrowed_eligible` rejects
+/// `use_dictionary_state`), so this kernel is owned-coordinates only and needs
+/// no `BORROWED` axis.
+macro_rules! start_matching_dict_loop_body {
+    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path) => {{
+        debug_assert!($current_len > 0, "dict_loop precondition: $current_len > 0");
+        $self.ensure_room_for($current_abs_start + $current_len - 1);
+        const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
+        let short_shift = 64 - $self.short_hash_bits;
+        let long_shift = 64 - $self.long_hash_bits;
+        let mut pos = 1usize;
+        let mut literals_start = 0usize;
+
+        // The immutable dictionary tables, snapshotted once: nothing mutates
+        // them while matching, so unlike the live tables they need no
+        // re-snapshot per outer iteration.
+        let (dict_long_ptr, dict_short_ptr, dict_end, dict_long_shift, dict_short_shift) = {
+            let d = $self
+                .dict
+                .table()
+                .expect("dict kernel dispatched without a dict table");
+            (
+                d.long.as_ptr(),
+                d.short.as_ptr(),
+                $self.dict.region_len(),
+                64 - d.long_bits,
+                64 - d.short_bits,
+            )
+        };
+
+        'outer: loop {
+            if pos + HASH_READ_SIZE > $current_len {
+                break 'outer;
+            }
+            // Re-read every per-frame-mutable cursor: `emit_candidate` in the
+            // previous outer iteration may have rebased or grown history.
+            let (
+                history_base_ptr,
+                history_start_offset,
+                history_abs_start,
+                position_base,
+                concat_len,
+            ) = $self.owned_scan_descriptor();
+            let short_hash_ptr = $self.short_mut_ptr();
+            let long_hash_ptr = $self.long_mut_ptr();
+            let block_bias = $current_abs_start - history_abs_start;
+            // SAFETY: the block is part of live history, so its first byte is
+            // in bounds of the buffer.
+            let block_ptr = unsafe { history_base_ptr.add(history_start_offset + block_bias) };
+            let block_len = concat_len - block_bias;
+            debug_assert_eq!(block_len, $current_len);
+            let scan_limit = $current_len - HASH_READ_SIZE;
+            let packed_bias = (($current_abs_start - position_base) as u32) + 1;
+            // Slot payload to candidate bytes in one add, as in the two-cursor
+            // kernel: see the note there for why the four coordinate constants
+            // are folded into a pointer rather than kept live.
+            let slot_base_ptr = history_base_ptr
+                .wrapping_add(history_start_offset)
+                .wrapping_offset(position_base as isize - history_abs_start as isize - 1);
+            let min_slot = ((history_abs_start - position_base) as u32) + 1;
+
+            let mut ip = pos;
+            let inner_exit: DfastInnerExit = 'inner: loop {
+                let abs_ip = $current_abs_start + ip;
+                let packed_curr = (ip as u32) + packed_bias;
+                // SAFETY: the loop guard keeps `ip + 8 <= block_len`.
+                let v8 = unsafe { (block_ptr.add(ip) as *const u64).read_unaligned() };
+                let v4 = v8 as u32;
+                let hl_idx = (v8.wrapping_mul(PRIME) >> long_shift) as usize;
+                let hs_idx = ((v8 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
+                // SAFETY: both indices are below their table's length.
+                let (idxl, idxs) =
+                    unsafe { (*long_hash_ptr.add(hl_idx), *short_hash_ptr.add(hs_idx)) };
+                // Both tables updated at the cursor BEFORE the checks, as the
+                // reference does (zstd_double_fast.c:404): a self-collision on
+                // the `+1` long retry then resolves to a real match rather than
+                // to the slot's previous occupant.
+                // SAFETY: as above.
+                unsafe {
+                    *long_hash_ptr.add(hl_idx) = packed_curr;
+                    *short_hash_ptr.add(hs_idx) = packed_curr;
+                }
+
+                // Repcode at ip+1, 4-byte gate (zstd_double_fast.c:407-415).
+                // `ip + 8 <= block_len` from the loop guard covers the read.
+                let rep1 = $self.offset_hist[0] as usize;
+                let idx_rep = ip + 1 + block_bias;
+                if rep1 != 0 && rep1 <= idx_rep {
+                    let cand_idx_r = idx_rep - rep1;
+                    // SAFETY: `cand_idx_r < idx_rep < concat_len`, and the
+                    // 4-byte read at the cursor is inside the block.
+                    let (cand4, cur4) = unsafe {
+                        (
+                            (history_base_ptr.add(history_start_offset + cand_idx_r) as *const u32)
+                                .read_unaligned(),
+                            (block_ptr.add(ip + 1) as *const u32).read_unaligned(),
+                        )
+                    };
+                    if cand4 == cur4 {
+                        let mut match_len = 4usize;
+                        let max_fwd = block_len - (ip + 1 + 4);
+                        // SAFETY: same buffer; `max_fwd` caps the scan to the
+                        // live region.
+                        unsafe {
+                            let lhs = history_base_ptr.add(history_start_offset + cand_idx_r + 4);
+                            let rhs = block_ptr.add(ip + 1 + 4);
+                            match_len += $cpl(lhs, rhs, max_fwd);
+                        }
+                        // Rep coding mints no offset, so the reference accepts
+                        // a 4-byte hit here where a hash match needs 5.
+                        if match_len >= DFAST_REP_MIN_MATCH_LEN {
+                            // SAFETY: the source start and its readable length
+                            // both come from `owned_scan_descriptor()` above;
+                            // `extend_backwards_shared` indexes only within the
+                            // candidate/cursor range it is handed.
+                            let concat = unsafe {
+                                core::slice::from_raw_parts(
+                                    history_base_ptr.add(history_start_offset),
+                                    concat_len,
+                                )
+                            };
+                            let cand = extend_backwards_shared(
+                                concat,
+                                history_abs_start,
+                                history_abs_start + cand_idx_r,
+                                abs_ip + 1,
+                                match_len,
+                                ip + 1 - literals_start,
+                            );
+                            break 'inner DfastInnerExit::Committed(cand, 0, abs_ip);
+                        }
+                    }
+                }
+
+                // Long match at the cursor: live table first, dictionary only
+                // if that missed (zstd_double_fast.c:417-433, `else if
+                // dictTagsMatchL`).
+                if idxl >= min_slot && idxl < packed_curr {
+                    // SAFETY: the gates admit only slots naming a position at
+                    // or after the window floor and before the cursor, so this
+                    // lands inside live history.
+                    let cand_v8 = unsafe {
+                        (slot_base_ptr.wrapping_add(idxl as usize) as *const u64).read_unaligned()
+                    };
+                    if cand_v8 == v8 {
+                        let cand_idx = position_base + (idxl as usize) - 1 - history_abs_start;
+                        let mut match_len = 8usize;
+                        let max_fwd = block_len - (ip + 8);
+                        // SAFETY: same buffer; `max_fwd` caps the scan.
+                        unsafe {
+                            let lhs = history_base_ptr.add(history_start_offset + cand_idx + 8);
+                            let rhs = block_ptr.add(ip + 8);
+                            match_len += $cpl(lhs, rhs, max_fwd);
+                        }
+                        // SAFETY: as at the rep commit above.
+                        let concat = unsafe {
+                            core::slice::from_raw_parts(
+                                history_base_ptr.add(history_start_offset),
+                                concat_len,
+                            )
+                        };
+                        let cand = extend_backwards_shared(
+                            concat,
+                            history_abs_start,
+                            history_abs_start + cand_idx,
+                            abs_ip,
+                            match_len,
+                            ip - literals_start,
+                        );
+                        break 'inner DfastInnerExit::Committed(cand, 1, abs_ip);
+                    }
+                }
+                {
+                    let dmix = v8.wrapping_mul(PRIME);
+                    // SAFETY: the index is below the dict long table's length.
+                    let dl = unsafe { *dict_long_ptr.add((dmix >> dict_long_shift) as usize) };
+                    // The tag rejects a colliding slot without touching the
+                    // dictionary bytes (upstream `ZSTD_comparePackedTags`).
+                    if dl != DFAST_EMPTY_SLOT
+                        && (dl & DFAST_DICT_TAG_MASK) == dfast_dict_tag(dmix, dict_long_shift)
+                    {
+                        let dp = ((dl >> DFAST_DICT_TAG_BITS) as usize) - 1;
+                        if dp < dict_end {
+                            debug_assert!(dp + HASH_READ_SIZE <= concat_len);
+                            // SAFETY: dict long slots were written only for
+                            // positions with 8 bytes of lookahead inside the
+                            // dictionary region, so `dp + 8 <= concat_len`.
+                            let dcand_v8 = unsafe {
+                                (history_base_ptr.add(history_start_offset + dp) as *const u64)
+                                    .read_unaligned()
+                            };
+                            if dcand_v8 == v8 {
+                                let mut match_len = 8usize;
+                                let max_fwd = block_len - (ip + 8);
+                                // SAFETY: same buffer; `max_fwd` caps the scan.
+                                // The dictionary sits contiguously before the
+                                // input, so the count crosses the boundary like
+                                // any in-window match (no `count_2segments`).
+                                unsafe {
+                                    let lhs = history_base_ptr.add(history_start_offset + dp + 8);
+                                    let rhs = block_ptr.add(ip + 8);
+                                    match_len += $cpl(lhs, rhs, max_fwd);
+                                }
+                                // SAFETY: as at the rep commit above.
+                                let concat = unsafe {
+                                    core::slice::from_raw_parts(
+                                        history_base_ptr.add(history_start_offset),
+                                        concat_len,
+                                    )
+                                };
+                                let cand = extend_backwards_shared(
+                                    concat,
+                                    history_abs_start,
+                                    history_abs_start + dp,
+                                    abs_ip,
+                                    match_len,
+                                    ip - literals_start,
+                                );
+                                break 'inner DfastInnerExit::Committed(cand, 3, abs_ip);
+                            }
+                        }
+                    }
+                }
+
+                // Short match at the cursor. The dictionary's short table is
+                // consulted only when the live slot is EMPTY or out of window
+                // — the reference branches on the slot, not on the compare
+                // (zstd_double_fast.c:437-449) — so with a warm live table this
+                // arm all but stops firing.
+                let short_cand_idx: usize;
+                if idxs >= min_slot && idxs < packed_curr {
+                    // SAFETY: as for the long slot above.
+                    let cand4 = unsafe {
+                        (slot_base_ptr.wrapping_add(idxs as usize) as *const u32).read_unaligned()
+                    };
+                    if cand4 != v4 {
+                        ip += ((ip - literals_start) >> DFAST_SKIP_STEP_SHIFT) + 1;
+                        if ip > scan_limit {
+                            break 'inner DfastInnerExit::Tail(ip);
+                        }
+                        continue 'inner;
+                    }
+                    short_cand_idx = position_base + (idxs as usize) - 1 - history_abs_start;
+                } else {
+                    let dsmix = (v8 << 24).wrapping_mul(PRIME);
+                    // SAFETY: the index is below the dict short table's length.
+                    let ds = unsafe { *dict_short_ptr.add((dsmix >> dict_short_shift) as usize) };
+                    let mut found = usize::MAX;
+                    if ds != DFAST_EMPTY_SLOT
+                        && (ds & DFAST_DICT_TAG_MASK) == dfast_dict_tag(dsmix, dict_short_shift)
+                    {
+                        let dp = ((ds >> DFAST_DICT_TAG_BITS) as usize) - 1;
+                        if dp < dict_end {
+                            debug_assert!(dp + 4 <= concat_len);
+                            // SAFETY: dict short slots were written only for
+                            // positions with 4 bytes of lookahead inside the
+                            // dictionary region.
+                            let dcand4 = unsafe {
+                                (history_base_ptr.add(history_start_offset + dp) as *const u32)
+                                    .read_unaligned()
+                            };
+                            if dcand4 == v4 {
+                                found = dp;
+                            }
+                        }
+                    }
+                    if found == usize::MAX {
+                        ip += ((ip - literals_start) >> DFAST_SKIP_STEP_SHIFT) + 1;
+                        if ip > scan_limit {
+                            break 'inner DfastInnerExit::Tail(ip);
+                        }
+                        continue 'inner;
+                    }
+                    short_cand_idx = found;
+                }
+
+                // `_search_next_long` (zstd_double_fast.c:453-483): a short hit
+                // is held while the long tables are asked about `ip+1`, and a
+                // strictly longer answer there wins. Guarded on the lookahead
+                // the `+1` probe needs; the reference gets the same guard from
+                // its strict `ip < ilimit`.
+                let mut s_match_len = 4usize;
+                let max_fwd = block_len - (ip + 4);
+                // SAFETY: same buffer; `max_fwd` caps the scan.
+                unsafe {
+                    let lhs = history_base_ptr.add(history_start_offset + short_cand_idx + 4);
+                    let rhs = block_ptr.add(ip + 4);
+                    s_match_len += $cpl(lhs, rhs, max_fwd);
+                }
+                // SAFETY: as at the rep commit above.
+                let concat = unsafe {
+                    core::slice::from_raw_parts(
+                        history_base_ptr.add(history_start_offset),
+                        concat_len,
+                    )
+                };
+                let short_cand = extend_backwards_shared(
+                    concat,
+                    history_abs_start,
+                    history_abs_start + short_cand_idx,
+                    abs_ip,
+                    s_match_len,
+                    ip - literals_start,
+                );
+                // A bare 4-byte hash hit mints a wire offset that costs more
+                // than the four bytes buy, so it is only taken from 5 up; the
+                // `+1` upgrade below starts at 8 and is always above the floor.
+                let mut chosen = short_cand;
+                let mut upgraded = false;
+                if ip + 1 + HASH_READ_SIZE <= block_len {
+                    // SAFETY: guarded directly above.
+                    let v8_1 = unsafe { (block_ptr.add(ip + 1) as *const u64).read_unaligned() };
+                    let hl1_idx = (v8_1.wrapping_mul(PRIME) >> long_shift) as usize;
+                    // SAFETY: the index is below the long table's length.
+                    let idxl1 = unsafe { *long_hash_ptr.add(hl1_idx) };
+                    let packed_next = packed_curr + 1;
+                    let mut live_hit = false;
+                    if idxl1 >= min_slot && idxl1 < packed_next {
+                        // SAFETY: as for the long slot above.
+                        let cand_v8 = unsafe {
+                            (slot_base_ptr.wrapping_add(idxl1 as usize) as *const u64)
+                                .read_unaligned()
+                        };
+                        if cand_v8 == v8_1 {
+                            live_hit = true;
+                            let cand_idx = position_base + (idxl1 as usize) - 1 - history_abs_start;
+                            let mut l1_len = 8usize;
+                            let max_fwd = block_len - (ip + 1 + 8);
+                            // SAFETY: same buffer; `max_fwd` caps the scan.
+                            unsafe {
+                                let lhs = history_base_ptr.add(history_start_offset + cand_idx + 8);
+                                let rhs = block_ptr.add(ip + 1 + 8);
+                                l1_len += $cpl(lhs, rhs, max_fwd);
+                            }
+                            if l1_len > short_cand.match_len {
+                                chosen = extend_backwards_shared(
+                                    concat,
+                                    history_abs_start,
+                                    history_abs_start + cand_idx,
+                                    abs_ip + 1,
+                                    l1_len,
+                                    ip + 1 - literals_start,
+                                );
+                                upgraded = true;
+                            }
+                        }
+                    }
+                    if !live_hit {
+                        let dmix1 = v8_1.wrapping_mul(PRIME);
+                        // SAFETY: the index is below the dict long table's length.
+                        let dl1 =
+                            unsafe { *dict_long_ptr.add((dmix1 >> dict_long_shift) as usize) };
+                        if dl1 != DFAST_EMPTY_SLOT
+                            && (dl1 & DFAST_DICT_TAG_MASK) == dfast_dict_tag(dmix1, dict_long_shift)
+                        {
+                            let dp1 = ((dl1 >> DFAST_DICT_TAG_BITS) as usize) - 1;
+                            if dp1 < dict_end {
+                                debug_assert!(dp1 + HASH_READ_SIZE <= concat_len);
+                                // SAFETY: as for the dict long probe above.
+                                let dcand_v8 = unsafe {
+                                    (history_base_ptr.add(history_start_offset + dp1) as *const u64)
+                                        .read_unaligned()
+                                };
+                                if dcand_v8 == v8_1 {
+                                    let mut dl1_len = 8usize;
+                                    let max_fwd = block_len - (ip + 1 + 8);
+                                    // SAFETY: same buffer; `max_fwd` caps the scan.
+                                    unsafe {
+                                        let lhs =
+                                            history_base_ptr.add(history_start_offset + dp1 + 8);
+                                        let rhs = block_ptr.add(ip + 1 + 8);
+                                        dl1_len += $cpl(lhs, rhs, max_fwd);
+                                    }
+                                    if dl1_len > short_cand.match_len {
+                                        chosen = extend_backwards_shared(
+                                            concat,
+                                            history_abs_start,
+                                            history_abs_start + dp1,
+                                            abs_ip + 1,
+                                            dl1_len,
+                                            ip + 1 - literals_start,
+                                        );
+                                        upgraded = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if upgraded || short_cand.match_len >= DFAST_MIN_MATCH_LEN {
+                    break 'inner DfastInnerExit::Committed(chosen, 2, abs_ip);
+                }
+                // A below-floor short hit with no upgrade: keep scanning.
+                ip += ((ip - literals_start) >> DFAST_SKIP_STEP_SHIFT) + 1;
+                if ip > scan_limit {
+                    break 'inner DfastInnerExit::Tail(ip);
+                }
+            };
+
+            match inner_exit {
+                DfastInnerExit::Committed(candidate, _path_tag, scan_pos) => {
+                    #[cfg(feature = "std")]
+                    if *DFTRACE_ENABLED.get_or_init(|| std::env::var_os("DFTRACE").is_some()) {
+                        std::eprintln!(
+                            "DFT path={} off={} ml={} ll={}",
+                            _path_tag,
+                            candidate.offset,
+                            candidate.match_len,
+                            candidate.start - $current_abs_start - literals_start,
+                        );
+                    }
+                    let start = $self.emit_candidate(
+                        $current_abs_start,
+                        &mut literals_start,
+                        candidate,
+                        scan_pos,
+                        $handle_sequence,
+                    );
+                    pos = start + candidate.match_len;
+                    pos = $self.extend_with_repcode_after_match(
+                        $current_abs_start,
+                        $current_len,
+                        pos,
+                        &mut literals_start,
+                        $handle_sequence,
+                    );
+                }
+                DfastInnerExit::Tail(seed) => {
+                    pos = seed;
+                    break 'outer;
+                }
+            }
+        }
+
+        $self.seed_remaining_hashable_starts($current_abs_start, $current_len, pos);
+        $self.emit_trailing_literals($current_abs_start, literals_start, $handle_sequence);
+    }};
+}
+
+/// How the dictionary scan loop left its inner loop: with a match to emit
+/// (candidate, a path tag the `DFTRACE` gate prints, and the SCAN position the
+/// complementary insertion anchors on), or out of scan room at the first
+/// position it did not pack into the tables.
+enum DfastInnerExit {
+    Committed(MatchCandidate, u8, usize),
+    Tail(usize),
+}
+
 impl DfastMatchGenerator {
     /// Dispatcher for the per-kernel dfast fast loop: resolve the tier ONCE
     /// per block via `select_kernel()` and call the matching
@@ -3283,33 +3497,31 @@ impl DfastMatchGenerator {
         current_len: usize,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
-        // Resolve dict presence ONCE here, off the hot path, and select a
-        // const-monomorphised kernel (`USE_DICT` true/false) so the per-position
-        // dict probe is compiled in or out at the call shape — never a
-        // loop-invariant runtime check inside the scan. The no-dict kernel
-        // carries zero dict code (upstream zstd keeps the noDict / dictMatchState loops
-        // as separate functions for exactly this reason).
-        // Two orthogonal axes resolved ONCE here, off the hot path, into a
-        // const-monomorphised kernel:
-        //   * `USE_DICT` — dict probe compiled in or out (upstream zstd keeps noDict /
-        //     dictMatchState as separate functions for the same reason).
-        //   * `BORROWED` — borrowed-window scan vs owned history concat. The
-        //     borrowed kernel folds the rebase coordinates to literal `0`,
-        //     erasing the per-position abstraction arithmetic the owned path
-        //     needs (upstream zstd `base + index` shape).
-        // A borrowed block never carries a dict (`borrowed_eligible` rejects
-        // `use_dictionary_state`), so only three of the four combinations are
-        // ever instantiated; the `<true, true>` arm is unreachable.
+        // Which loop this block scans with is settled ONCE here, off the hot
+        // path, so nothing inside the scan branches on a block-invariant.
+        //
+        // A dictionary sends the block to its OWN loop, the way upstream keeps
+        // `noDict` and `dictMatchState` as separate functions: the shapes
+        // differ (one cursor against two) because the dictionary's tables,
+        // shifts and region bound leave no registers for a second cursor's
+        // state. See `start_matching_dict_loop_body!`.
+        //
+        // Without one, `BORROWED` picks between a borrowed-window scan and the
+        // owned history concat: the borrowed kernel folds the rebase
+        // coordinates to a literal `0`, erasing the per-position arithmetic the
+        // owned path needs (upstream `base + index` shape). A borrowed block
+        // never carries a dictionary (`borrowed_eligible` rejects
+        // `use_dictionary_state`), so the two axes never meet.
         let use_dict = self.dict.table().is_some();
         let borrowed = self.borrowed_block.is_some();
         macro_rules! dispatch_dict {
-            ($kernel:ident) => {
-                if borrowed {
-                    self.$kernel::<false, true>(current_abs_start, current_len, handle_sequence)
-                } else if use_dict {
-                    self.$kernel::<true, false>(current_abs_start, current_len, handle_sequence)
+            ($kernel:ident, $dict_kernel:ident) => {
+                if use_dict {
+                    self.$dict_kernel(current_abs_start, current_len, handle_sequence)
+                } else if borrowed {
+                    self.$kernel::<true>(current_abs_start, current_len, handle_sequence)
                 } else {
-                    self.$kernel::<false, false>(current_abs_start, current_len, handle_sequence)
+                    self.$kernel::<false>(current_abs_start, current_len, handle_sequence)
                 }
             };
         }
@@ -3319,7 +3531,7 @@ impl DfastMatchGenerator {
             feature = "kernel-neon"
         ))]
         unsafe {
-            dispatch_dict!(start_matching_fast_loop_neon)
+            dispatch_dict!(start_matching_fast_loop_neon, start_matching_dict_loop_neon)
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
@@ -3330,13 +3542,19 @@ impl DfastMatchGenerator {
             match self.kernel {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
-                    dispatch_dict!(start_matching_fast_loop_avx2_bmi2)
+                    dispatch_dict!(
+                        start_matching_fast_loop_avx2_bmi2,
+                        start_matching_dict_loop_avx2_bmi2
+                    )
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    dispatch_dict!(start_matching_fast_loop_sse2)
+                    dispatch_dict!(start_matching_fast_loop_sse2, start_matching_dict_loop_sse2)
                 },
-                FastpathKernel::Scalar => dispatch_dict!(start_matching_fast_loop_scalar),
+                FastpathKernel::Scalar => dispatch_dict!(
+                    start_matching_fast_loop_scalar,
+                    start_matching_dict_loop_scalar
+                ),
             }
         }
         #[cfg(all(
@@ -3345,7 +3563,10 @@ impl DfastMatchGenerator {
             feature = "kernel-simd128"
         ))]
         unsafe {
-            dispatch_dict!(start_matching_fast_loop_simd128)
+            dispatch_dict!(
+                start_matching_fast_loop_simd128,
+                start_matching_dict_loop_simd128
+            )
         }
         #[cfg(not(any(
             all(
@@ -3362,7 +3583,10 @@ impl DfastMatchGenerator {
             )
         )))]
         {
-            dispatch_dict!(start_matching_fast_loop_scalar)
+            dispatch_dict!(
+                start_matching_fast_loop_scalar,
+                start_matching_dict_loop_scalar
+            )
         }
     }
 
@@ -3372,7 +3596,7 @@ impl DfastMatchGenerator {
         feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
-    unsafe fn start_matching_fast_loop_neon<const USE_DICT: bool, const BORROWED: bool>(
+    unsafe fn start_matching_fast_loop_neon<const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -3384,7 +3608,6 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::neon::common_prefix_len_ptr,
-            USE_DICT,
             BORROWED
         )
     }
@@ -3394,7 +3617,7 @@ impl DfastMatchGenerator {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
-    unsafe fn start_matching_fast_loop_sse2<const USE_DICT: bool, const BORROWED: bool>(
+    unsafe fn start_matching_fast_loop_sse2<const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -3406,7 +3629,6 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::sse2::common_prefix_len_ptr,
-            USE_DICT,
             BORROWED
         )
     }
@@ -3416,7 +3638,7 @@ impl DfastMatchGenerator {
         feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
-    unsafe fn start_matching_fast_loop_avx2_bmi2<const USE_DICT: bool, const BORROWED: bool>(
+    unsafe fn start_matching_fast_loop_avx2_bmi2<const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -3428,7 +3650,6 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
-            USE_DICT,
             BORROWED
         )
     }
@@ -3439,7 +3660,7 @@ impl DfastMatchGenerator {
         feature = "kernel-simd128"
     ))]
     #[target_feature(enable = "simd128")]
-    unsafe fn start_matching_fast_loop_simd128<const USE_DICT: bool, const BORROWED: bool>(
+    unsafe fn start_matching_fast_loop_simd128<const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -3451,7 +3672,6 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::simd128::common_prefix_len_ptr,
-            USE_DICT,
             BORROWED
         )
     }
@@ -3469,7 +3689,7 @@ impl DfastMatchGenerator {
         )
     )))]
     #[allow(unused_unsafe)]
-    fn start_matching_fast_loop_scalar<const USE_DICT: bool, const BORROWED: bool>(
+    fn start_matching_fast_loop_scalar<const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -3481,8 +3701,117 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
-            USE_DICT,
             BORROWED
+        )
+    }
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    ))]
+    #[target_feature(enable = "neon")]
+    unsafe fn start_matching_dict_loop_neon(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_dict_loop_body!(
+            self,
+            current_abs_start,
+            current_len,
+            handle_sequence,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr
+        )
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
+    #[target_feature(enable = "sse2")]
+    unsafe fn start_matching_dict_loop_sse2(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_dict_loop_body!(
+            self,
+            current_abs_start,
+            current_len,
+            handle_sequence,
+            crate::encoding::fastpath::sse2::common_prefix_len_ptr
+        )
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn start_matching_dict_loop_avx2_bmi2(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_dict_loop_body!(
+            self,
+            current_abs_start,
+            current_len,
+            handle_sequence,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr
+        )
+    }
+
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    unsafe fn start_matching_dict_loop_simd128(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_dict_loop_body!(
+            self,
+            current_abs_start,
+            current_len,
+            handle_sequence,
+            crate::encoding::fastpath::simd128::common_prefix_len_ptr
+        )
+    }
+
+    #[cfg(not(any(
+        all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            feature = "kernel-neon"
+        ),
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel-simd128"
+        )
+    )))]
+    #[allow(unused_unsafe)]
+    fn start_matching_dict_loop_scalar(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_dict_loop_body!(
+            self,
+            current_abs_start,
+            current_len,
+            handle_sequence,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr
         )
     }
 }
