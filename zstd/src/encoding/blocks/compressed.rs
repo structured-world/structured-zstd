@@ -1423,6 +1423,16 @@ fn emit_single_sequence_block<M: Matcher>(
             // from the state; park it for the next build rather than freeing.
             state.clear_huff_table();
         }
+        // A partition that built a table and then chose raw or RLE literals
+        // parked it on the way there, so the swap above had nothing to give
+        // back: the slot would go into the next partition empty, which is the
+        // allocation of both code buffers it exists to avoid — on exactly the
+        // run of partitions that keeps failing the size test. Take the parked
+        // table; the slot is asked for one per partition, the spare's other
+        // reader once per frame.
+        if state.huff_rollback.is_none() {
+            state.huff_rollback = state.huff_table_spare.take();
+        }
         // The FSE decisions are simply not applied, so the previous tables are
         // whatever the last kept block left.
         let header = BlockHeader {
