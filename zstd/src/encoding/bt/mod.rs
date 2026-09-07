@@ -375,6 +375,7 @@ impl BtMatcher {
             mut candidates,
             store,
             price_arena,
+            candidates_searched_at: _,
         } = buffers;
         candidates.clear();
         self.opt_nodes_scratch = nodes;

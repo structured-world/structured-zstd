@@ -106,8 +106,16 @@ macro_rules! build_optimal_plan_impl_body {
             candidates,
             store,
             price_arena,
+            candidates_searched_at: searched_at,
         } = &mut *$buffers;
-        candidates.clear();
+        // The run this call re-enters on already searched this position and left
+        // its answer in `candidates`; searching again would insert the position
+        // into the binary tree a second time, so keep the buffer as it stands.
+        let carried_candidates = *searched_at == Some(($current_abs_start, initial_litlen));
+        *searched_at = None;
+        if !carried_candidates {
+            candidates.clear();
+        }
         store.clear();
         // Price-cache slices + monotonic stamps feed ONLY the priced paths (the
         // matched-seed block and the forward DP loop), both of which run only
@@ -134,6 +142,70 @@ macro_rules! build_optimal_plan_impl_body {
         // `!candidates.is_empty()` block before any reader.
         let mut ll0_price = 0u32;
         let mut ll1_price = 0u32;
+        // A position the search finds nothing at is one literal (upstream zstd
+        // `ZSTD_compressBlock_opt_generic`: `if (!nbMatches) { ip++; continue; }`
+        // — inside its own loop). We return it to the caller instead, and on
+        // input the search finds nothing in that is EVERY position, so the
+        // caller re-entered this body per literal and paid its stack frame each
+        // time. Walk the run here and hand back the whole run.
+        //
+        // The number of searches is unchanged: the run stops at the first
+        // position with candidates and those candidates are the ones the seed
+        // below then uses. The bound is the caller's own re-entry condition
+        // (it enters while more than `HASH_READ_SIZE` bytes remain), so the
+        // cursor lands exactly where the per-literal returns would have left it.
+        //
+        // Skipped when the LDM producer is active: its state machine is rebuilt
+        // per call from the segment's block offset, so advancing inside one call
+        // is not the same thing. `HAS_LDM` is a const generic, so this whole
+        // block folds away there.
+        let mut skipped_literals = 0usize;
+        let mut seed_candidates_ready = carried_candidates;
+        if !HAS_LDM && !seed_candidates_ready {
+            while $current_len - skipped_literals > 8 {
+                candidates.clear();
+                // SAFETY: as the seed below — the wrapper shares the `$collect`
+                // kernel's target_feature umbrella, entered under the runtime
+                // detector.
+                unsafe {
+                    $self.$collect::<$strategy_ty>(
+                        $current_abs_start + skipped_literals,
+                        current_abs_end,
+                        profile,
+                        HcCandidateQuery {
+                            reps: initial_reps,
+                            lit_len: initial_litlen + skipped_literals,
+                            ldm_candidate: None,
+                        },
+                        &mut *candidates,
+                    )
+                };
+                if !candidates.is_empty() {
+                    if skipped_literals > 0 {
+                        // Hand the answer to the call that re-enters here.
+                        *searched_at = Some((
+                            $current_abs_start + skipped_literals,
+                            initial_litlen + skipped_literals,
+                        ));
+                    } else {
+                        seed_candidates_ready = true;
+                    }
+                    break;
+                }
+                skipped_literals += 1;
+            }
+            if skipped_literals > 0 {
+                // Literals only: no sequence was emitted and the repcodes are
+                // untouched, exactly as the per-literal returns left them. The
+                // price is discarded by the caller.
+                return (
+                    0u32,
+                    initial_reps,
+                    initial_litlen + skipped_literals,
+                    skipped_literals,
+                );
+            }
+        }
         let mut pos = 1usize;
         let mut last_pos = 0usize;
         let mut forced_end: Option<usize> = None;
@@ -195,23 +267,28 @@ macro_rules! build_optimal_plan_impl_body {
             } else {
                 None
             };
-            candidates.clear();
-            // SAFETY: wrapper is in the same target_feature umbrella as the
-            // `$collect` kernel variant; the runtime kernel detector already
-            // gated entry into the wrapper.
-            unsafe {
-                $self.$collect::<$strategy_ty>(
-                    $current_abs_start,
-                    current_abs_end,
-                    profile,
-                    HcCandidateQuery {
-                        reps: initial_reps,
-                        lit_len: initial_litlen,
-                        ldm_candidate: seed_ldm,
-                    },
-                    &mut *candidates,
-                )
-            };
+            // The no-match run above already searched this exact position with
+            // this exact query and left its candidates in the buffer, so the
+            // seed reads them rather than repeating the search.
+            if !seed_candidates_ready {
+                candidates.clear();
+                // SAFETY: wrapper is in the same target_feature umbrella as the
+                // `$collect` kernel variant; the runtime kernel detector already
+                // gated entry into the wrapper.
+                unsafe {
+                    $self.$collect::<$strategy_ty>(
+                        $current_abs_start,
+                        current_abs_end,
+                        profile,
+                        HcCandidateQuery {
+                            reps: initial_reps,
+                            lit_len: initial_litlen,
+                            ldm_candidate: seed_ldm,
+                        },
+                        &mut *candidates,
+                    )
+                };
+            }
             if !candidates.is_empty() {
                 // Deferred price-cache setup: the arena slices are two disjoint
                 // STRIDE-wide regions of `price_arena` (LL, ML); the fixed STRIDE
@@ -1534,6 +1611,9 @@ impl HcMatchGenerator {
             candidates,
             store,
             price_arena,
+            // Nothing in the buffer answers a query yet: the block that filled
+            // it is over, and the parser is about to start another.
+            candidates_searched_at: None,
         }
     }
 
