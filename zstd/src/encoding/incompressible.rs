@@ -63,6 +63,22 @@ pub(crate) struct SeenContentGrid {
     frame_offset: u64,
     /// Frame offset up to which the search stays on after a hit.
     repeat_until: u64,
+    /// Whether this frame has asked the grid anything yet.
+    ///
+    /// Until it has, recording a searched block is work for an answer no one
+    /// will read: only a block the classifier calls incompressible ever probes,
+    /// and a frame where that never happens — structured text, a log stream,
+    /// anything the matcher codes well — would otherwise take the table and hash
+    /// a key every [`Self::RECORD_STEP`] bytes of every block for nothing. On a
+    /// mebibyte of patterned input at the fast levels that was measurable twice
+    /// over: the hashing itself, and the table it takes per frame, which is
+    /// enough to move the allocator off the fresh pages a much larger matcher
+    /// table was getting for free and onto zeroing a recycled one.
+    ///
+    /// What it gives up is a duplicate of a block searched BEFORE the frame's
+    /// first incompressible one. A duplicate of a block that compressed well is
+    /// itself compressible, so it is not at risk of the skip in the first place.
+    asked: bool,
 }
 
 /// One slot, unpacked from the eight bytes it is stored in. Widening any field
@@ -219,6 +235,7 @@ impl SeenContentGrid {
         }
         self.frame_offset = 0;
         self.repeat_until = 0;
+        self.asked = false;
     }
 
     pub(crate) fn heap_size(&self) -> usize {
@@ -301,6 +318,7 @@ impl SeenContentGrid {
     /// `window_size` is that reach; pass `0` when it is unknown, which keeps
     /// every record for the frame.
     pub(crate) fn record_and_report_repeat(&mut self, block: &[u8], window_size: usize) -> bool {
+        self.asked = true;
         self.take_block(block, window_size, true)
     }
 
@@ -314,7 +332,15 @@ impl SeenContentGrid {
     /// like noise, finds nothing, and goes out raw with an almost block-sized
     /// match sitting in history. The probe is what costs; recording is a key
     /// every `RECORD_STEP` bytes.
+    ///
+    /// Nothing is recorded until the frame has asked the grid something at least
+    /// once (see [`Self::asked`]); the offset still advances, so what follows
+    /// keeps its true distance in the stream.
     pub(crate) fn record_searched(&mut self, block: &[u8], window_size: usize) {
+        if !self.asked {
+            self.frame_offset += block.len() as u64;
+            return;
+        }
         self.take_block(block, window_size, false);
     }
 

@@ -112,7 +112,10 @@ fn the_content_grid_keeps_what_the_window_reaches_across_a_rebase() {
     // One block short of the limit, so the first call stays under it and the
     // second crosses.
     grid.frame_offset = limit - BLOCK as u64;
-    grid.record_searched(&block, WIDE);
+    assert!(
+        !grid.record_and_report_repeat(&block, WIDE),
+        "nothing is recorded yet for this one to repeat",
+    );
     assert!(
         grid.record_and_report_repeat(&block, WIDE),
         "the block right behind this one is exactly what the matcher would find",
