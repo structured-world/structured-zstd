@@ -189,6 +189,14 @@ impl SeenContentGrid {
     /// matcher still holds and has indexed its original. What is kept is the
     /// last [`Self::REBASE_RETAIN_BYTES`], which covers the widest window the
     /// format admits, so nothing droppable was reachable anyway.
+    ///
+    /// Out of line and cold: this walks the whole table and runs once per couple
+    /// of tebibytes of stream, while its callers run per block. Letting it inline
+    /// into the caller that skips a block cost 22% of the encode of a repeated
+    /// log stream at level 1 — 807-814 us against 983-986 us — for a body that
+    /// never executes there.
+    #[cold]
+    #[inline(never)]
     fn rebase_offsets(&mut self) {
         let step = Self::RECORD_STEP as u64;
         let retain_steps = Self::REBASE_RETAIN_BYTES / step;
