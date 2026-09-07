@@ -601,6 +601,53 @@ fn skip_matching_dict_prime_handles_exactly_hash_read_size_bytes() {
     // Reaching this line without unwinding is the test.
 }
 
+/// A copy-mode dictionary is indexed the way upstream indexes one: stride 3,
+/// where the step position wins its slot and the two positions after it are
+/// written only into a slot still empty (`ZSTD_fillHashTableForCDict`, whose
+/// table upstream installs as the live one after stripping the tags).
+///
+/// The check is the OCCURRENCE a bucket resolves to, not merely that something
+/// was indexed: a dense every-position fill leaves the LAST position of each
+/// bucket, which is a different (nearer) occurrence, and that is what fragments
+/// one long dictionary match into several short ones.
+#[test]
+fn copy_mode_dictionary_fill_keeps_the_upstream_occurrence_per_bucket() {
+    // A period-4 pattern with a 4-byte hash: positions 4 apart carry identical
+    // content, so they share a bucket and the bucket's final value tells the
+    // two policies apart. Under upstream's fill the winner is the last STRIDE
+    // position of that phase (a multiple of 12, since the phase repeats every 4
+    // and the stride is 3); a dense fill would leave the last position of the
+    // phase outright.
+    let dict: alloc::vec::Vec<u8> = b"abcd".iter().copied().cycle().take(96).collect();
+    let mut m = FastKernelMatcher::with_params(12, 12, 4, 2);
+    m.accept_data(dict);
+    m.skip_matching_for_dict_copy();
+
+    let base = m.history.as_ptr();
+    let last_hashable = m.history.len() - 8;
+    // SAFETY: position 0 has the kernel's load width readable (the dictionary
+    // is far longer than it), and `hash_ptr` bounds the slot to the table.
+    let phase_0 = unsafe {
+        let hash = m.hash_table.hash_ptr::<4>(base);
+        m.hash_table.get(hash)
+    };
+    let last_stride_of_phase = (0..=last_hashable)
+        .rfind(|p| p % 12 == 0)
+        .expect("the dictionary spans several stride groups");
+    let last_of_phase = (0..=last_hashable)
+        .rfind(|p| p % 4 == 0)
+        .expect("the dictionary spans several phase positions");
+    assert_ne!(
+        last_stride_of_phase, last_of_phase,
+        "the fixture must separate the two policies",
+    );
+    assert_eq!(
+        phase_0, last_stride_of_phase as u32,
+        "the bucket must hold the last stride position of its phase, not the \
+         last position ({last_of_phase}) a dense fill would leave",
+    );
+}
+
 /// Boundary: pending block too short to hash anything (less than
 /// `HASH_READ_SIZE` bytes). The dict-prime path must early-return
 /// without panicking on the `last_hashable` subtract.

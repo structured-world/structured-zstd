@@ -2258,10 +2258,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // `hint > 2^k`, so this is identical to the raw `hint > cutoff` on
             // 64-bit.
             let cutoff_log = match self.state.strategy_tag {
-                // Fast always attaches now (the copy-mode owned path memmoved the
-                // whole input into history every frame); keep the copy-snapshot
-                // gate in sync with the matcher's attach cutoff so Fast never
-                // captures/restores a copy snapshot it can no longer use.
+                // Keep the copy-snapshot gate in sync with the matcher's own
+                // attach cutoff, so Fast never captures or restores a snapshot
+                // for a mode it did not resolve.
                 crate::encoding::strategy::StrategyTag::Fast => {
                     crate::encoding::levels::config::FAST_ATTACH_DICT_CUTOFF_LOG
                 }

@@ -907,7 +907,7 @@ impl MatchGeneratorDriver {
                 if attach {
                     self.simple_mut().skip_matching_for_dict_prime(dict_len);
                 } else {
-                    self.simple_mut().skip_matching_with_hint(Some(false));
+                    self.simple_mut().skip_matching_for_dict_copy();
                 }
                 self.recycle_simple_space();
             }
