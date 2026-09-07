@@ -122,6 +122,36 @@ fn the_content_grid_keeps_what_the_window_reaches_across_a_rebase() {
     );
 }
 
+/// A frame whose compressible prefix runs past the step index must not carry an
+/// origin the index cannot hold.
+///
+/// Blocks the grid is never asked about advance the offset without going through
+/// the walk that moves the origin, so a long enough prefix — a couple of
+/// tebibytes of anything the matcher codes well — leaves an origin that the
+/// first probe after it then has to narrow by more than the index can express.
+#[test]
+fn the_content_grid_bounds_the_origin_across_an_unasked_prefix() {
+    const BLOCK: usize = 128 * 1024;
+    const WIDE: usize = 8 * 1024 * 1024;
+    let limit = (u64::from(u32::MAX) + 1) * SeenContentGrid::RECORD_STEP as u64;
+
+    let block = deterministic_bytes(0x51DE, BLOCK);
+    let mut grid = SeenContentGrid::default();
+    grid.reset_for_frame();
+    // Where a prefix of blocks nobody asked about would have left it: past the
+    // index by more than the span a rebase retains.
+    grid.frame_offset = limit + SeenContentGrid::REBASE_RETAIN_BYTES * 2;
+    grid.record_searched(&block, WIDE);
+    assert!(
+        !grid.record_and_report_repeat(&block, WIDE),
+        "nothing recorded before this can make it a repeat",
+    );
+    assert!(
+        grid.record_and_report_repeat(&block, WIDE),
+        "the block right behind this one is what the matcher would find",
+    );
+}
+
 /// Content still inside the window must keep reading as a repeat, and content
 /// the window has passed must stop.
 ///

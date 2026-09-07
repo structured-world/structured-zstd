@@ -243,13 +243,19 @@ impl SeenContentGrid {
     }
 
     /// The mixed key at `at`, and the slot it belongs in.
+    ///
+    /// # Safety
+    ///
+    /// `at + KEY_LEN` must be within the block `block_ptr` points into. Reading
+    /// through the pointer rather than slicing is what keeps the run cheap: a
+    /// probe run is [`Self::PROBE_RUN`] consecutive positions, and the slice
+    /// form pays a bounds check and a panic path at each of them for a bound the
+    /// loop already holds.
     #[inline]
-    fn key_at(&self, block: &[u8], at: usize, mask: usize) -> (usize, u16, u8) {
-        let key = u64::from_le_bytes(
-            block[at..at + Self::KEY_LEN]
-                .try_into()
-                .expect("the slice is KEY_LEN bytes"),
-        );
+    unsafe fn key_at(&self, block_ptr: *const u8, at: usize, mask: usize) -> (usize, u16, u8) {
+        // SAFETY: the caller guarantees `at + KEY_LEN` is inside the block, and
+        // an unaligned read is what the byte-oriented key needs.
+        let key = unsafe { block_ptr.add(at).cast::<u64>().read_unaligned() }.to_le();
         let mixed = Self::avalanche(key);
         // Neither the fingerprint nor the tag is ever zero, so a slot no frame
         // has written cannot read as a match.
@@ -263,14 +269,21 @@ impl SeenContentGrid {
     /// Whether the content at `at` was recorded within `reach`. Reads only: the
     /// probe run sweeps consecutive positions, and recording every one of them
     /// would fill the table with keys no later probe can align with.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::key_at`]: `at + KEY_LEN` must be inside the block.
     #[inline]
-    fn probe_key(&self, block: &[u8], at: usize, reach: u64, mask: usize) -> bool {
-        let (slot, fingerprint, tag) = self.key_at(block, at, mask);
+    unsafe fn probe_key(&self, block_ptr: *const u8, at: usize, reach: u64, mask: usize) -> bool {
+        // SAFETY: the caller's bound, forwarded.
+        let (slot, fingerprint, tag) = unsafe { self.key_at(block_ptr, at, mask) };
         // The byte first: this is the only line nearly every probe executes.
-        if self.tags[slot] != tag {
+        // SAFETY: `mask` is `len - 1` of both tables, which are the same power-of
+        // -two length, so a masked slot is in bounds for either.
+        if unsafe { *self.tags.get_unchecked(slot) } != tag {
             return false;
         }
-        let held = SeenSample::unpack(self.slots[slot]);
+        let held = SeenSample::unpack(unsafe { *self.slots.get_unchecked(slot) });
         let here = self.frame_offset + at as u64;
         if held.epoch != self.epoch || held.fingerprint != fingerprint {
             return false;
@@ -292,21 +305,33 @@ impl SeenContentGrid {
     /// block measure its distance from there, which a one-block window reads as
     /// out of reach even though the block right behind it is exactly what the
     /// matcher would find — every other block of the run would go out raw.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::key_at`]: `at + KEY_LEN` must be inside the block.
     #[inline]
-    fn record_key(&mut self, block: &[u8], at: usize, mask: usize) {
-        let (slot, fingerprint, tag) = self.key_at(block, at, mask);
-        self.tags[slot] = tag;
+    unsafe fn record_key(&mut self, block_ptr: *const u8, at: usize, mask: usize) {
+        // SAFETY: the caller's bound, forwarded.
+        let (slot, fingerprint, tag) = unsafe { self.key_at(block_ptr, at, mask) };
+        // SAFETY: a masked slot is in bounds for both tables; see `probe_key`.
+        unsafe {
+            *self.tags.get_unchecked_mut(slot) = tag;
+        }
         let here = self.frame_offset + at as u64;
         debug_assert!(
             here.is_multiple_of(Self::RECORD_STEP as u64),
             "records sit on the grid, which is what lets the offset be stored in steps",
         );
-        self.slots[slot] = SeenSample {
+        let packed = SeenSample {
             fingerprint,
             epoch: self.epoch,
             at_step: (here / Self::RECORD_STEP as u64) as u32,
         }
         .pack();
+        // SAFETY: a masked slot is in bounds for both tables; see `probe_key`.
+        unsafe {
+            *self.slots.get_unchecked_mut(slot) = packed;
+        }
     }
 
     /// Record this block on the grid and report whether it duplicates content
@@ -339,6 +364,18 @@ impl SeenContentGrid {
     pub(crate) fn record_searched(&mut self, block: &[u8], window_size: usize) {
         if !self.asked {
             self.frame_offset += block.len() as u64;
+            // The walk that moves the origin is in `take_block`, which this path
+            // does not enter, so a long enough prefix of blocks nobody asks
+            // about would leave an origin the step index cannot express — and
+            // the first probe after it would then try to narrow it by more than
+            // a `u32` holds. Nothing is recorded yet, so the origin can simply
+            // come back inside the index; the step is what a record is measured
+            // in, so moving by a whole number of index spans keeps every later
+            // record on the same grid.
+            let span = (u64::from(u32::MAX) + 1) * Self::RECORD_STEP as u64;
+            if self.frame_offset >= span {
+                self.frame_offset %= span;
+            }
             return;
         }
         self.take_block(block, window_size, false);
@@ -368,6 +405,11 @@ impl SeenContentGrid {
         };
         let mut repeat = false;
         let last = block.len() - Self::KEY_LEN;
+        // Taken once for the whole block. Every position this walk reads is at
+        // most `last`, which is the bound `key_at` needs, and the block is
+        // borrowed for the call — so the two walks below can read through it
+        // without re-deriving the same bound per position.
+        let block_ptr = block.as_ptr();
         // Neither side reads the whole block. Recording lands on a FIXED grid in
         // the frame's own coordinates — every `RECORD_STEP` bytes of stream, so
         // the same content recorded once is recorded at the same stream offsets
@@ -429,7 +471,9 @@ impl SeenContentGrid {
             let until = self.frame_offset + start as u64;
             while abs < until && abs <= block_end {
                 let at = (abs - self.frame_offset) as usize;
-                self.record_key(block, at, mask);
+                // SAFETY: `abs <= block_end` is `at <= last`, and `last` is
+                // `block.len() - KEY_LEN`.
+                unsafe { self.record_key(block_ptr, at, mask) };
                 abs += step;
             }
             // The start run on a frame's first block cannot hit anything: the
@@ -438,14 +482,17 @@ impl SeenContentGrid {
             if probe && (self.frame_offset != 0 || start != 0) {
                 let end = (start + run).min(last + 1);
                 for at in start..end {
-                    repeat |= self.probe_key(block, at, reach, mask);
+                    // SAFETY: `end <= last + 1`, so every `at` here is at most
+                    // `last`, which is `block.len() - KEY_LEN`.
+                    repeat |= unsafe { self.probe_key(block_ptr, at, reach, mask) };
                 }
             }
             // The rest of the block, once no run is left to probe it.
             if idx + 1 == runs {
                 while abs <= block_end {
                     let at = (abs - self.frame_offset) as usize;
-                    self.record_key(block, at, mask);
+                    // SAFETY: as the record walk above — `at <= last`.
+                    unsafe { self.record_key(block_ptr, at, mask) };
                     abs += step;
                 }
             }
