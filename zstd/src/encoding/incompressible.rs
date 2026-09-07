@@ -397,6 +397,16 @@ impl SeenContentGrid {
             // Zeroed slots carry epoch 0, so a frame must never run under it.
             self.epoch = self.epoch.max(1);
         }
+        // The width of the table as it stands, not the width this frame's window
+        // asks for. The table grows and is kept, so a compressor that once saw a
+        // wide window spreads a later small frame's keys across all of it — which
+        // looks like a defect and measures as the opposite. Masking at the
+        // frame's own width instead, on one compressor with a wide frame first
+        // and small ones after, three interleaved readings a side: 1 KiB frames
+        // 93.8-94.3 M cycles against 97.9-99.1 M, 10 KiB frames 144.1-144.5 M
+        // against 148.8-149.7 M, with instructions equal to five digits either
+        // way. Narrow means the record walk keeps rewriting the same few cache
+        // lines; wide gives each write its own.
         let mask = self.slots.len() - 1;
         let reach = if window_size == 0 {
             u64::MAX
