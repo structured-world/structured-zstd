@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788789734523,
+  "lastUpdate": 1788808720717,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -4487,6 +4487,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.188,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e1a802c0bfc4bbdd111eeb88d2c2187e8f053fa7",
+          "message": "fix(dictionary): load raw content where upstream does, and scan dictionary blocks the way it scans them (#492)\n\n* fix(dictionary): load raw content where upstream loads it\n\n`ZSTD_CCtx_loadDictionary` takes its buffer in `ZSTD_dct_auto` mode\n(`ZSTD_compress_insertDictionary`, zstd_compress.c:5216-5222): bytes that\ndo not start with `ZSTD_MAGIC_DICTIONARY` are raw content, which is why\nany file can be handed to `zstd -D`. Our two setters for that same entry\npoint rejected such a buffer as `BadMagicNum`, so a caller that works\nagainst libzstd failed here.\n\n- `FrameCompressor::set_dictionary_from_bytes` and the streaming\n  encoder's namesake now load either kind. `EncoderDictionary::from_bytes`\n  stays strict, so `ZSTD_dct_fullDict` remains reachable by parsing first\n  and attaching the result.\n- `DictionaryHandle::from_serialized_or_raw_content` mirrors the\n  `Dictionary` constructor, giving the decode side the same pair\n  (`ZSTD_createDDict` is auto too, zstd_ddict.c:102-107).\n- C ABI: a `fullDict` selector over bytes that are not a dictionary now\n  answers `dictionary_wrong` on the compression side, as upstream does\n  (zstd_compress.c:5207 and 5223); the decompression side keeps\n  `dictionary_corrupted` (zstd_ddict.c:99 and 105). A caller that\n  branches on the code saw the wrong one.\n\nEach fix carries the regression test that failed without it. The CLI and\nthe rest of the C ABI already classified on the magic, so `-D` over a\nplain file works in both directions and is left alone:\n`structured-zstd -6 -D rawdict4k` produces 3289 bytes where `zstd -6 -D`\nproduces 3368, and each decodes the other's frame.\n\nUpstream additionally skips the dictionary content entirely below 8\nbytes while still applying its dictionary-sized cParams, which costs it:\non a 64 KiB record fixture with a 6-byte `-D`, `zstd -6` emits 5256\nbytes against 3965 with no dictionary at all, while ours emits 3865 and\ndecodes there. Not copied — it would trade ratio for a byte-identity\nthat is not a goal.\n\nCloses #470\n\n* refactor(bench): let the dict harness take either dictionary kind\n\nThe raw-content fallback existed because `set_dictionary_from_bytes`\nrejected a blob without the magic; it now loads either kind, so the\nfallback was reachable only for a corrupt serialized dictionary, where\nre-reading the bytes as raw content with a made-up id is the wrong\nanswer anyway.\n\nPart of #470\n\n* perf(dfast): scan a dictionary block with one cursor, as upstream does\n\nThe dictionary path ran on the no-dictionary loop with the dictionary\nprobes bolted on. Upstream keeps the two apart\n(`ZSTD_compressBlock_doubleFast_dictMatchState_generic` against\n`..._noDict_generic`) and the difference is not decoration: the\nno-dictionary loop carries a second cursor, precomputing the long hash\nof ip+1 and carrying its index and slot across iterations, which buys a\nhash per two positions at the price of keeping that cursor's state live.\nThe dictionary loop cannot afford it — it must also keep two table\npointers, the dictionary's two hash shifts and its region bound live —\nand the profile showed exactly that: 93.4% of the dictionary path inside\nthis loop, reloading its own invariants from the stack at each probe.\n\nSo the dictionary gets its own kernel, scanning one cursor, hashing each\nposition once, and stepping the way upstream's dictionary loop steps\n(`ip += ((ip - anchor) >> 8) + 1`, accelerating with the distance from\nthe last match). The probe order is upstream's too, and one part of it\ndoes real work: the dictionary's short table is consulted only when the\nlive short slot is empty or out of window, an `else if` on the slot\nrather than on the compare, so with the tables a small dictionary sizes\nthat arm all but stops firing within a few hundred positions — where the\nold arrangement paid a hash, a load and a tag compare at every position.\n\nThe two-cursor loop loses its dictionary code and its USE_DICT axis with\nit; a borrowed window never carries a dictionary, so the new kernel\nneeds no BORROWED axis either.\n\nCompressed size across the whole dictionary matrix (93 scenario/level\nrows): one row moved, and downward — level_3_dfast/small-4k-log-lines\n56 -> 55 bytes. Total 15,896,896 -> 15,896,895; the ratio against\nlibzstd is unchanged at 1.01704.\n\nCloses #469\n\n* perf(fast): decide a dictionary candidate on four bytes before counting\n\nThe borrowed dictionary kernel called the segmented dict/input match\ncounter for every occupied dictionary slot and only then asked whether\nwhat came back reached four. On input the dictionary does not describe,\nalmost none of those candidates are matches, so the counter ran from\nbyte zero for each of them: a fifth of the whole path's time sat in it\n(`count_forward_dict_2segment`, 21.2% of a level-1 profile on 10 KiB of\nrandom input with a trained dictionary).\n\nCompare four bytes first, as upstream does (`MEM_read32(dictMatch) ==\nMEM_read32(ip0)` before `ZSTD_count_2segments`, zstd_fast.c:578-584),\non both dictionary-candidate arms: the main dict probe and the repcode\nprobe's dict-side candidate. The gate is exactly the condition the\ncaller already tested — a count reaches four only when the first four\nbytes agree — so nothing that was accepted is rejected now.\n\nThe counter then RESUMES past those four rather than re-reading them,\nwhich is why it takes what the caller established as a parameter. Doing\nthe gate without that resume made the fixtures a dictionary actually\ndescribes 2.3% slower, since there the count would have succeeded\nanyway and the four bytes were simply compared twice.\n\nA candidate within three bytes of the dictionary's end has four bytes\nonly by crossing into the input, which upstream reads across for free\n(one contiguous window) and we cannot (two buffers), so those positions\nkeep the plain counting form.\n\nByte-identical: all 93 scenario/level rows of the dictionary matrix\nunchanged, total 15,896,895 bytes.\n\nPart of #323\n\n* fix(cli): reduce an unnamed ultra level instead of refusing it\n\n`zstd -22` warns and compresses at 19 (\"Warning : compression level\nhigher than max, reduced to 19\", exit 0). We failed the run instead, so\na script that works against upstream broke against us. Verified against\nzstd 1.5.7 on the same host: with --ultra it compresses at 22; without\nit warns, reduces and exits 0.\n\nThe benchmark range reduces the same way, since `-b20` reaches an ultra\nlevel as surely as `-20` does.\n\nFound while evaluating both encoders over a real 32 MiB access log: the\nsweep's level-22 row came back empty against ours.\n\nPart of #128\n\n* test(encode): cover the dictionary paths the dispatch leaves cold\n\nThe dictionary scan loop has one monomorph per CPU tier and the runtime\ndispatch runs exactly one of them, so on any given machine the others\nnever execute. Forcing the cached tier runs each in turn over the same\ndictionary-primed block and pins what the dispatch assumes: every tier\nemits the same sequences, so the scalar fallback and the SIMD kernels\nagree bit for bit. Mirrors the binary-tree tiers' existing test.\n\nAlso covered, all of them boundaries the changed code introduced:\n\n- a Fast dictionary candidate in the last three bytes of the dictionary,\n  which cannot be judged on four bytes of its own and keeps the counting\n  form. The match crosses into the input and must still be found, which\n  is what the four-byte gate must not cost.\n- the counter resuming past an established prefix that reaches exactly\n  the end of the input, with and without dictionary left of its own.\n- its two contract assertions: it does raw pointer math from a safe\n  signature, so a caller that broke either bound would read outside the\n  buffers.\n- a magic-prefixed blob that does not parse, which is a corrupt\n  dictionary and must be refused rather than re-read as raw content.\n\n* test(fast): cover a repcode whose candidate is in the dictionary\n\nA repeat offset can point into the dictionary rather than the input —\nwhat a dictionary's own repeat offsets are for on the first block — and\nthe probe then reads its candidate from the other buffer, through the\nfour-byte gate the previous commit added there. Empty dictionary table\nin the fixture, so the emitted sequence can only have come through that\narm.\n\n* fix(dictionary): take an empty buffer as a dictionary with no content\n\n`ZSTD_createDDict(NULL, 0)` builds a usable DDict that references no\ncontent (zstd_ddict.c:123-140), and an empty buffer is how\n`ZSTD_CCtx_loadDictionary` is told there is no dictionary. Loading\neither kind answered `DictionaryTooSmall` for that input, so a caller\nhanded an empty file got an error where upstream gives them nothing.\n\nThe constructor that names raw content still refuses it: there the\nemptiness is the caller asking for a dictionary that cannot exist.\n\nAlso bounds the counter's established-prefix argument in release, for\nthe same reason the two arguments beside it are bounded there: it feeds\na subtraction and a raw-pointer add from a safe signature.\n\n* perf(dfast): index the probed ip+1 position, as upstream does\n\nThe dictionary loop probes the long table at ip+1 and, unlike upstream,\nnever wrote that position back (`hashLong[hl3] = curr + 1`,\nzstd_double_fast.c:459). Nothing else covers it: the complementary\ninsertion after a match writes `curr + 2` and the two positions before\nthe match end, so the probed position was searched and then forgotten.\n\nCompressed size across the dictionary matrix: 15,896,895 -> 15,896,884,\nall of it on the one row where we were losing to libzstd —\nlevel_3_dfast/small-4k-log-lines 55 -> 44 bytes, which is exactly what\nlibzstd emits there.\n\n* docs(dfast): record what the dictionary loop's shape measured\n\nThe commit that introduced it reported microseconds, wall clock and\ninstructions; the cycle figures behind it now sit at the code they\njustify, with the control arm that makes them attributable.\n\n* test(dfast): check the NEON dictionary loop against the scalar one\n\nThe tier-parity test was x86-only, and aarch64 is where it was needed\nmost: the dispatch there resolves NEON at compile time, so the SIMD\nkernel always wins and nothing ever ran the scalar loop to compare it\nagainst — on that target the scalar dictionary wrapper was not even\nbuilt.\n\nIt is now built in test builds there, and the dispatcher keeps a\n`cfg(test)` branch that asks for it, which is the only way the target\ncan run both. The test covers every tier the running CPU may legally\nexecute, on whichever architecture it runs.\n\nProven to bite: with the scalar loop stubbed out to emit nothing, the\ntest fails on aarch64 with an empty sequence list rather than passing.\n\n* docs(fast): record what the dictionary gate measured in cycles\n\nThe commit that introduced it reported wall clock and instructions for\nthe Fast rows; the cycle figures now sit at the code they justify, with\nthe control arm that makes them attributable — 5387/5463/5373 ->\n3935/3939/3943 M on the fixture the gate is for, against 1.4% of drift\non a level that cannot run it.\n\n* fix(fast): bound the established prefix without a sum that can wrap\n\n`cur + known <= inp_len` computes the sum before comparing it, and that\nsum wraps in a release build: `known = usize::MAX` with any cursor\npasses a bound it should have failed, after which the pointer\narithmetic below leaves the input. `cur <= inp_len` is established\ndirectly above, so the same bound expressed as `known <= inp_len - cur`\ncannot wrap and cannot underflow.\n\nCarries the regression test: a one-byte input with `cur = 1` and\n`known = usize::MAX` must fail the contract, and before the fix it\nfailed the ADD instead — a different panic in a debug build, and none\nat all in a release one.\n\nAlso, an empty buffer now clears the encoder's dictionary instead of\nbeing reported as one too small to use, on both the one-shot and the\nstreaming setter. That is what the upstream entry point they mirror\ndoes (`ZSTD_clearAllDicts` then `return 0`, zstd_compress.c:1293-1295),\nso a caller could previously neither say \"no dictionary\" nor undo an\nearlier one through the setter. The decode side was fixed a commit\nearlier; the encoder kept its own copy of the branch.\n\nAnd the tier-parity test reaches wasm: simd128 is resolved at compile\ntime there, so without the same `cfg(test)` door the NEON arm has, that\ntarget ran its SIMD kernel under every tier name and compared it with\nitself. (The test does not build for wasm32 today — a dev-dependency\nfails to compile for that target — but the door and the tier are what\nmake it meaningful when it does.)\n\n* docs(encode): record the dictionary kernels against upstream's counters\n\nThe measurements so far compared our own before and after; the numbers\nnow sit beside libzstd's, taken in the same runs on the same fixture\nwith the same counters (a CDict parsed once, then 20 000 frames through\na reused context on each side).\n\nLevel 1 (Fast): 5675/5663/5689 -> 3883/3908/3901 M cycles against its\n2105/2103/2108, and 15,936 -> 9,936 M instructions against its 4,996 —\nthe gap goes 2.70x -> 1.85x in cycles.\n\nLevel 3 (dfast): 8161/8125/8412 -> 6594/6574/6626 M cycles against its\n5035/5044/5033, and 11,980 -> 9,292 M instructions against its 9,750 —\n1.62x -> 1.31x in cycles, and slightly FEWER instructions than it runs.\n\nAlso records what the Fast gate emits rather than only how much: frame\nmd5 over three dictionary fixture shapes x five Fast levels x (with\ndictionary, without) is unchanged, 30 rows. Equal compressed lengths\nwould not have shown that.\n\n* fix(stream): give back the dictionary's entropy tables when clearing\n\nClearing the stream dictionary dropped the dictionary and kept the\ntables built from it: the Huffman and FSE allocations stayed alive, and\nin `heap_size`, for as long as the encoder lived, though nothing could\nreach them again. Measured by the regression test that carries this: a\nserialized dictionary left 37,912 bytes behind a clear that should have\nreturned to zero.\n\nThe match-finder snapshot needs no matching call, and the code says why:\na dictionary is primed at the first write, which is also the point after\nwhich this setter refuses to run, so there is never one to drop.\n\nAlso exercises the paths this round's code introduced:\n\n- clearing after the frame is open, and on a stream whose write failed —\n  the two refusals a clear inherits from the attach it is.\n- a repcode candidate in the dictionary's last three bytes whose match\n  falls short of four bytes: no four bytes of its own to be gated on, so\n  it is counted, and the count rejects it. Both arms of that decision\n  are now exercised.\n\nThe three lines left in the dfast loop are the `DFTRACE` diagnostic,\ngated on an environment variable read into a process-wide latch: a test\nthat enabled it would make every other test in the binary write to\nstderr, so it stays off deliberately.",
+          "timestamp": "2026-09-07T21:38:40+03:00",
+          "tree_id": "6016294dd62e0e786fad9110f3445bc993a9f6e7",
+          "url": "https://github.com/structured-world/structured-zstd/commit/e1a802c0bfc4bbdd111eeb88d2c2187e8f053fa7"
+        },
+        "date": 1788808703416,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.082,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 189.775,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 225.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.484,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.209,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.791,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.966,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.822,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 10.48,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.886,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.091,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.189,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.548,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.151,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.727,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.25,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.172,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.167,
             "unit": "ms"
           }
         ]
