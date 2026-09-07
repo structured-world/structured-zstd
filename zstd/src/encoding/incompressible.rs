@@ -363,29 +363,37 @@ impl SeenContentGrid {
     /// keeps its true distance in the stream.
     pub(crate) fn record_searched(&mut self, block: &[u8], window_size: usize) {
         if !self.asked {
-            self.frame_offset += block.len() as u64;
-            // The walk that moves the origin is in `take_block`, which this path
-            // does not enter, so a long enough prefix of blocks nobody asks
-            // about would leave an origin the step index cannot express — and
-            // the first probe after it would then try to narrow it by more than
-            // a `u32` holds. Nothing is recorded yet, so the origin can simply
-            // come back inside the index; the step is what a record is measured
-            // in, so moving by a whole number of index spans keeps every later
-            // record on the same grid.
-            let span = (u64::from(u32::MAX) + 1) * Self::RECORD_STEP as u64;
-            if self.frame_offset >= span {
-                self.frame_offset %= span;
-            }
+            self.skip_block(block.len());
             return;
         }
         self.take_block(block, window_size, false);
+    }
+
+    /// Advance past a block the grid records nothing for, keeping the origin
+    /// inside what the step index can express.
+    ///
+    /// Two paths reach here — a block before the frame's first probe, and one
+    /// shorter than a key — and neither enters the walk that moves the origin.
+    /// Left alone, a frame made only of such blocks would carry an origin the
+    /// first walk after them cannot narrow, which is a panic rather than a lost
+    /// repeat. Nothing has been recorded at these offsets, so the origin can
+    /// come back by a whole number of index spans, and a whole number of spans
+    /// is a whole number of steps — every later record still lands on the same
+    /// grid.
+    #[inline]
+    fn skip_block(&mut self, len: usize) {
+        self.frame_offset += len as u64;
+        let span = (u64::from(u32::MAX) + 1) * Self::RECORD_STEP as u64;
+        if self.frame_offset >= span {
+            self.frame_offset %= span;
+        }
     }
 
     fn take_block(&mut self, block: &[u8], window_size: usize, probe: bool) -> bool {
         // Too short to key on. The offset still advances, so the ages of what
         // follows stay true distances in the stream.
         if block.len() < Self::KEY_LEN {
-            self.frame_offset += block.len() as u64;
+            self.skip_block(block.len());
             return false;
         }
         let wanted = Self::slots_for(window_size);

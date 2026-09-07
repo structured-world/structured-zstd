@@ -152,6 +152,37 @@ fn the_content_grid_bounds_the_origin_across_an_unasked_prefix() {
     );
 }
 
+/// Blocks too short to key on must not carry the origin past the step index
+/// either.
+///
+/// A streaming caller that writes and flushes a few bytes at a time reaches the
+/// grid with blocks under the key length, and those advance the offset without
+/// entering the walk that moves the origin — the same hole as an unasked
+/// prefix, on a path that is open after the frame's first probe as well.
+#[test]
+fn the_content_grid_bounds_the_origin_across_sub_key_blocks() {
+    const WIDE: usize = 8 * 1024 * 1024;
+    let limit = (u64::from(u32::MAX) + 1) * SeenContentGrid::RECORD_STEP as u64;
+
+    let block = deterministic_bytes(0x51DE, 128 * 1024);
+    let crumb = deterministic_bytes(0xF00D, SeenContentGrid::KEY_LEN - 1);
+    let mut grid = SeenContentGrid::default();
+    grid.reset_for_frame();
+    // A frame that has already asked once, then runs its offset past the index
+    // on blocks the grid cannot key.
+    assert!(!grid.record_and_report_repeat(&block, WIDE));
+    grid.frame_offset = limit + SeenContentGrid::REBASE_RETAIN_BYTES * 2;
+    grid.record_searched(&crumb, WIDE);
+    assert!(
+        !grid.record_and_report_repeat(&block, WIDE),
+        "the block recorded before the origin moved is far out of reach",
+    );
+    assert!(
+        grid.record_and_report_repeat(&block, WIDE),
+        "the block right behind this one is what the matcher would find",
+    );
+}
+
 /// Content still inside the window must keep reading as a repeat, and content
 /// the window has passed must stop.
 ///

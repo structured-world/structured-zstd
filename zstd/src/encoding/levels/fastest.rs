@@ -304,6 +304,16 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             } else if let Some(built) = state.last_huff_table.take() {
                 saved_huff_table = Some(built);
             }
+            // A block that built a table and then chose raw or RLE literals
+            // parked it on its way there, so the swap above had nothing to give
+            // back and the slot would go into the next block empty — which is
+            // the per-block allocation of both code buffers this slot exists to
+            // avoid, on exactly the run of blocks that keeps failing the size
+            // test. Take the parked table instead: the slot is asked for one
+            // per block, the spare's other reader once per frame.
+            if saved_huff_table.is_none() {
+                saved_huff_table = state.huff_table_spare.take();
+            }
             state.fse_tables.roll_back_confirmation([
                 saved_ll_previous,
                 saved_ml_previous,
@@ -508,6 +518,16 @@ pub(crate) fn compress_block_encoded_borrowed(
                 core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
             } else if let Some(built) = state.last_huff_table.take() {
                 saved_huff_table = Some(built);
+            }
+            // A block that built a table and then chose raw or RLE literals
+            // parked it on its way there, so the swap above had nothing to give
+            // back and the slot would go into the next block empty — which is
+            // the per-block allocation of both code buffers this slot exists to
+            // avoid, on exactly the run of blocks that keeps failing the size
+            // test. Take the parked table instead: the slot is asked for one
+            // per block, the spare's other reader once per frame.
+            if saved_huff_table.is_none() {
+                saved_huff_table = state.huff_table_spare.take();
             }
             state.fse_tables.roll_back_confirmation([
                 saved_ll_previous,
