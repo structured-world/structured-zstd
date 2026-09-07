@@ -1634,6 +1634,17 @@ fn compress_block_fast_dict_borrowed_impl<
                     // count from byte zero for every one of them, and it showed
                     // — a fifth of this path's time sat in that counter.
                     //
+                    // What it is worth, on 20 000 dictionary frames of a 10 KiB
+                    // random fixture (i9, three interleaved rounds of two
+                    // prebuilt binaries, with the dfast dictionary loop — which
+                    // cannot execute this code — as the control arm): 5387 /
+                    // 5463 / 5373 -> 3935 / 3939 / 3943 M cycles, a 27% cut
+                    // with no overlap, against 1.4% of drift on the control.
+                    // Structured input moves less (339 / 345 / 351 -> 333 /
+                    // 333 / 327 M) and input the dictionary describes is flat,
+                    // which is the expected shape: there the count would have
+                    // succeeded anyway.
+                    //
                     // The compare needs four bytes on the dictionary side. A
                     // candidate within three bytes of the dictionary's end has
                     // them only by crossing into the input, which is a
