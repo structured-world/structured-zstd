@@ -176,6 +176,37 @@ fn parse_size(text: &str) -> Result<u64> {
         .ok_or_else(|| eyre!("size `{text}` does not fit in 64 bits"))
 }
 
+/// Read the leading unsigned number the way upstream's argument reader does
+/// (`readU32FromCharChecked`, zstdcli.c:350-376): a run of decimal digits,
+/// then an optional `K` or `M` multiplier which may be spelled `KiB` / `MB`.
+/// Reading STOPS there and the remainder is handed back — no sign is accepted,
+/// and an empty digit run reads as zero, which every caller treats as invalid.
+fn read_leading_u32(text: &str) -> Result<(u32, &str)> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    let mut value: u32 = 0;
+    while at < bytes.len() && bytes[at].is_ascii_digit() {
+        value = value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u32::from(bytes[at] - b'0')))
+            .ok_or_else(|| eyre!("numeric value `{text}` overflows 32-bit unsigned int"))?;
+        at += 1;
+    }
+    if at < bytes.len() && matches!(bytes[at], b'K' | b'M') {
+        let shifts = if bytes[at] == b'M' { 2 } else { 1 };
+        for _ in 0..shifts {
+            value = value
+                .checked_mul(1024)
+                .ok_or_else(|| eyre!("numeric value `{text}` overflows 32-bit unsigned int"))?;
+        }
+        at += 1;
+        // `KiB` and `KB` are the same multiplier spelled longer.
+        at += usize::from(bytes.get(at) == Some(&b'i'));
+        at += usize::from(bytes.get(at) == Some(&b'B'));
+    }
+    Ok((value, &text[at..]))
+}
+
 /// Parse a `-M` / `--memory` value into bytes, or `None` for "the default".
 ///
 /// The default unit is MiB, as upstream documents, so `-M256` is 256 MiB. A
@@ -518,17 +549,22 @@ fn parse_args(
                         // `--fast` is the level -1 alias.
                         opts.level = -1;
                     } else if let Some(v) = long.strip_prefix("fast=") {
-                        // `--fast=N` is level -N for a positive N. Parse as
-                        // unsigned so `--fast=-5` is rejected rather than flipping
-                        // sign into a positive level. Exact-match the prefix so a
-                        // typo like `--faster` falls through to unknown-option.
-                        let n = v.parse::<u32>().wrap_err("invalid --fast level")?;
+                        // `--fast=N` is level -N (upstream zstd,
+                        // zstdcli.c:1133-1153). The factor is the LEADING
+                        // number only, so `--fast=3.5` is level -3 and the tail
+                        // is dropped; a factor past the minimum level clamps
+                        // rather than failing; only a zero factor is an error.
+                        // Exact-match the prefix so a typo like `--faster`
+                        // falls through to unknown-option.
+                        let (n, _tail) = read_leading_u32(v).wrap_err("invalid --fast level")?;
                         // Zero would negate to level 0, which is the ordinary
                         // default rather than a fast one.
                         if n == 0 {
                             bail!("--fast level must be at least 1, got 0");
                         }
-                        opts.level = -i32::try_from(n).wrap_err("--fast level too large")?;
+                        let capped = n.min(CompressionLevel::MIN_LEVEL.unsigned_abs());
+                        opts.level = -i32::try_from(capped)
+                            .expect("capped at |MIN_LEVEL|, which is an i32 magnitude");
                     } else if long.starts_with("use-dict=") {
                         opts.dict = Some(attached_path(arg_os, "--use-dict=".len()));
                     } else if let Some(v) = long.strip_prefix("maxdict=") {
