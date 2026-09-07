@@ -164,8 +164,31 @@ fn dict_2segment_resumes_past_an_established_prefix() {
     assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 4, 4), 6);
 
     // And when the established prefix reaches exactly the end of the input,
-    // there is nothing left to count.
+    // there is nothing left to count — whether or not the candidate still has
+    // dictionary left of its own.
     let dict = [5u8, 5, 5, 5];
     let inp = [5u8, 5, 5, 5];
     assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 0, 4), 4);
+    let dict = [5u8, 5, 5, 5, 5, 5];
+    let inp = [5u8, 5, 5, 5];
+    assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 0, 4), 4);
+}
+
+/// The counter does raw pointer math from a safe signature, so it enforces its
+/// contract rather than trusting it. Both bounds are release assertions; a
+/// caller that broke one would otherwise read outside the buffers.
+#[test]
+#[should_panic(expected = "cand")]
+fn dict_2segment_rejects_a_candidate_outside_the_dict() {
+    let dict = [1u8, 2, 3];
+    let inp = [1u8, 2, 3];
+    let _ = count_forward_dict_2segment(&dict, 3, &inp, 0, 0);
+}
+
+#[test]
+#[should_panic(expected = "cur")]
+fn dict_2segment_rejects_a_cursor_past_the_input() {
+    let dict = [1u8, 2, 3];
+    let inp = [1u8, 2, 3];
+    let _ = count_forward_dict_2segment(&dict, 0, &inp, 4, 0);
 }

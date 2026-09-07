@@ -776,6 +776,95 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
     }
 }
 
+/// The dictionary scan loop has one monomorph per CPU tier and the runtime
+/// dispatch runs exactly one of them, so the rest never execute on this
+/// machine unless a test asks for them. Forcing the cached tier runs each in
+/// turn over the same dictionary-primed block and pins what the dispatch
+/// assumes: every tier emits the same sequences, so the scalar fallback and
+/// the SIMD kernels agree bit for bit.
+///
+/// x86-only, as with the binary-tree tiers above: the aarch64 dispatch is
+/// unconditional NEON and never reads the cached field.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn dfast_dictionary_all_kernel_tiers_emit_identical_sequences() {
+    use crate::encoding::fastpath::FastpathKernel;
+
+    // Only tiers the running CPU may legally execute: each dispatch arm is
+    // `unsafe` and assumes its target feature is present.
+    #[allow(unused_mut)]
+    let mut tiers = alloc::vec![FastpathKernel::Scalar];
+    #[cfg(feature = "kernel-sse")]
+    if std::is_x86_feature_detected!("sse2") {
+        tiers.push(FastpathKernel::Sse2);
+    }
+    #[cfg(feature = "kernel-avx2")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
+        tiers.push(FastpathKernel::Avx2Bmi2);
+    }
+
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    // Dictionary slices for the dictionary probes, a repeat of one of them for
+    // the repcode path, and fresh bytes in between so the live tables fill and
+    // the live probes take over — all four commit paths of the loop.
+    let mut block = dict[1000..1200].to_vec();
+    block.extend_from_slice(&(0..300u32).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+    block.extend_from_slice(&dict[5000..5300]);
+    block.extend_from_slice(&dict[1000..1200]);
+    block.extend_from_slice(&(0..400u32).map(|i| (i % 241) as u8).collect::<Vec<_>>());
+    block.extend_from_slice(&dict[5000..5300]);
+
+    let run = |tier: FastpathKernel| -> Vec<(usize, usize, usize)> {
+        let mut driver = MatchGeneratorDriver::new(32, 2);
+        driver.set_source_size_hint(block.len() as u64);
+        driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+        driver.reset(CompressionLevel::Level(3));
+        driver.prime_with_dictionary(&dict, [1, 4, 8]);
+        assert_eq!(
+            driver.active_backend(),
+            super::super::strategy::BackendTag::Dfast,
+            "level 3 with a dictionary must run the dfast backend",
+        );
+        driver.dfast_matcher_mut().kernel = tier;
+        let mut space = driver.get_next_space();
+        space.clear();
+        space.extend_from_slice(&block);
+        driver.commit_space(space);
+        let mut seqs = Vec::new();
+        driver.start_matching(|seq| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => seqs.push((literals.len(), offset, match_len)),
+            Sequence::Literals { literals } => seqs.push((literals.len(), 0, 0)),
+        });
+        seqs
+    };
+
+    let reference = run(tiers[0]);
+    // The block is built from dictionary slices, so matches reaching past it
+    // must exist — otherwise every tier would agree on nothing at all.
+    let dict_matches = reference
+        .iter()
+        .filter(|(_, offset, len)| *offset > block.len() && *len > 0)
+        .count();
+    assert!(
+        dict_matches >= 2,
+        "the primed dictionary should be found (got {dict_matches} in {reference:?})",
+    );
+    for &tier in &tiers[1..] {
+        assert_eq!(
+            run(tier),
+            reference,
+            "kernel tier {tier:?} diverged from {:?} on the dictionary loop",
+            tiers[0],
+        );
+    }
+}
+
 /// Resolving positive levels across the source-size tiers drives every
 /// strategy arm of the cParams -> `LevelParams` derivation, and each resolved
 /// strategy must pair with the matching search method (Fast -> Fast,

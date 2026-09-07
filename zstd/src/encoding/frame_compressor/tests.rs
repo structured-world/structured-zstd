@@ -1290,6 +1290,26 @@ fn set_dictionary_from_bytes_takes_unmagicked_bytes_as_raw_content() {
     );
 }
 
+/// Taking either kind is not taking anything: a blob that claims to be a
+/// serialized dictionary by carrying the magic, and then does not parse, is a
+/// corrupt dictionary and must be refused rather than quietly re-read as raw
+/// content (upstream classifies on the magic alone and then fails the parse).
+#[test]
+fn set_dictionary_from_bytes_rejects_a_corrupt_serialized_dictionary() {
+    let mut corrupt = crate::decoding::DICTIONARY_MAGIC.to_vec();
+    corrupt.extend_from_slice(&[0xFF; 60]);
+
+    let mut compressor: FrameCompressor<
+        &[u8],
+        Vec<u8>,
+        crate::encoding::match_generator::MatchGeneratorDriver,
+    > = FrameCompressor::new(super::CompressionLevel::Fastest);
+    assert!(
+        compressor.set_dictionary_from_bytes(&corrupt).is_err(),
+        "a magic-prefixed blob that does not parse is corrupt, not raw content",
+    );
+}
+
 #[test]
 fn set_dictionary_rejects_zero_repeat_offsets() {
     let invalid = crate::decoding::Dictionary {
