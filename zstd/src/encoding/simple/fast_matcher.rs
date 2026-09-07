@@ -655,17 +655,11 @@ impl FastKernelMatcher {
             }
         } else {
             // Same shape — keep the allocation, zero the entries via
-            // `memset` (ZSTD_window_clear cadence).
+            // `memset` (ZSTD_window_clear cadence). A primed dict table
+            // is retained (see the epoch branch above for why that is
+            // sound); a copy-mode frame drops it when it primes, which is
+            // the only case that must not keep it.
             self.hash_table.clear();
-            // Drop the cached dict table with it. This frame is not an
-            // attach frame, so its dictionary (if any) goes into the LIVE
-            // table as raw positions — but the borrowed-scan dispatch reads
-            // `dict_is_attached()`, so a table left over from an earlier
-            // attach frame would send this frame's scan into the dual-base
-            // kernel, which reads every main-table entry as a virtual
-            // `dict_end + offset` position and would take raw ones for
-            // matches inside the dictionary.
-            self.dict.invalidate();
         }
         self.table_pos_high_water = 0;
         // No copy-mode dict is resident across a reset: attach mode re-borrows
@@ -1569,6 +1563,15 @@ impl FastKernelMatcher {
     /// `ms->loadedDictEnd`); a dictionary committed in several slices advances
     /// it to the running end each time, leaving the full size after the last.
     pub(crate) fn skip_matching_for_dict_copy(&mut self) {
+        // A dictionary table cached by an earlier ATTACH frame must not
+        // survive into this one. The borrowed-scan dispatch keys on
+        // `dict_is_attached()`, so leaving it would send this frame's scan
+        // into the dual-base kernel, which reads every main-table entry as a
+        // virtual `dict_end + offset` position — and this frame is writing
+        // raw ones. Dropping it here rather than at `reset` keeps the cache
+        // for the attach frames that live off it: rebuilding it per frame
+        // costs 12% on a reused 4 KiB dictionary frame (i9, wall clock).
+        self.dict.invalidate();
         self.extend_history_with_pending();
         self.prime_hash_table_for_dict_copy();
         self.loaded_dict_end = self.history.len();
