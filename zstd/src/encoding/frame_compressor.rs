@@ -642,26 +642,35 @@ fn reserve_for_next_block(
     out.reserve_exact(estimate.max(block_bound + produced as usize));
 }
 
-fn presplit_hash2(bytes: &[u8], hash_log: usize) -> usize {
-    debug_assert!(hash_log >= 8);
-    if hash_log == 8 {
+/// Const-generic on the hash width, as upstream's `hash2` is: at eight bits it
+/// is the byte itself with no hashing at all, and above that a two-byte read
+/// times Knuth's constant. Upstream notes that the speed of the sampling pass
+/// "relies on compile-time constant propagation" (`zstd_preSplit.c:32`) — with
+/// the width a parameter this branch runs per sample and the shift is variable.
+#[inline(always)]
+fn presplit_hash2<const HASH_LOG: usize>(bytes: &[u8]) -> usize {
+    const {
+        assert!(HASH_LOG >= 8 && HASH_LOG <= PRESPLIT_HASH_LOG_MAX);
+    }
+    if HASH_LOG == 8 {
         return bytes[0] as usize;
     }
-    debug_assert!(hash_log <= PRESPLIT_HASH_LOG_MAX);
     let value = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
-    (value.wrapping_mul(PRESPLIT_KNUTH) >> (32 - hash_log)) as usize
+    (value.wrapping_mul(PRESPLIT_KNUTH) >> (32 - HASH_LOG)) as usize
 }
 
-fn presplit_record_fingerprint(
+/// One tier's sampling pass, monomorphised on its rate and hash width the way
+/// upstream generates one function per tier (`ZSTD_GEN_RECORD_FINGERPRINT` at
+/// `zstd_preSplit.c:87`). The stride and the shift are then constants, and the
+/// eight-bit tier loses its hash entirely.
+fn presplit_record_fingerprint_tier<const RATE: usize, const HASH_LOG: usize>(
     fp: &mut PreSplitFingerprint,
     src: &[u8],
-    sampling_rate: usize,
-    hash_log: usize,
 ) {
     // Only the slots this hash can reach. The table is sized for the widest
     // hash the splitter uses; a tier on a narrower one was clearing four times
     // the memory it then touched, sixteen times a block.
-    fp.events[..1usize << hash_log].fill(0);
+    fp.events[..1usize << HASH_LOG].fill(0);
     fp.nb_events = 0;
     if src.len() < 2 {
         return;
@@ -669,12 +678,12 @@ fn presplit_record_fingerprint(
     let limit = src.len() - 1;
     let mut n = 0usize;
     while n < limit {
-        fp.events[presplit_hash2(&src[n..], hash_log)] += 1;
-        n += sampling_rate;
+        fp.events[presplit_hash2::<HASH_LOG>(&src[n..])] += 1;
+        n += RATE;
     }
     // Upstream zstd parity: zstd_preSplit.c records the integer division, not the
     // rounded-up number of sampled events from the loop above.
-    fp.nb_events += limit / sampling_rate;
+    fp.nb_events += limit / RATE;
 }
 
 /// Single-byte histogram pass — matches upstream zstd `HIST_add` over a small
@@ -764,22 +773,22 @@ fn presplit_merge_events(
 fn split_block_by_chunks(block: &[u8], level: usize) -> usize {
     debug_assert_eq!(block.len(), MAX_BLOCK_SIZE as usize);
     debug_assert!((1..=4).contains(&level));
-    let (sampling_rate, hash_log) = match level - 1 {
-        0 => (43, 8),
-        1 => (11, 9),
-        2 => (5, 10),
-        _ => (1, 10),
-    };
+    // One walk per tier, with the rate and the hash width constant inside it,
+    // which is the shape upstream generates. The tier is a per-block constant,
+    // so the choice is made once here rather than at every sample.
+    match level - 1 {
+        0 => split_block_by_chunks_tier::<43, 8>(block),
+        1 => split_block_by_chunks_tier::<11, 9>(block),
+        2 => split_block_by_chunks_tier::<5, 10>(block),
+        _ => split_block_by_chunks_tier::<1, 10>(block),
+    }
+}
 
+fn split_block_by_chunks_tier<const RATE: usize, const HASH_LOG: usize>(block: &[u8]) -> usize {
     let mut past = PreSplitFingerprint::default();
     let mut new_events = PreSplitFingerprint::default();
     let mut penalty = PRESPLIT_THRESHOLD_PENALTY;
-    presplit_record_fingerprint(
-        &mut past,
-        &block[..PRESPLIT_CHUNK_SIZE],
-        sampling_rate,
-        hash_log,
-    );
+    presplit_record_fingerprint_tier::<RATE, HASH_LOG>(&mut past, &block[..PRESPLIT_CHUNK_SIZE]);
     // No pre-check on the ends before the walk. It reads as free — two
     // fingerprints against the sixty-three the walk takes — but a sample of the
     // ends cannot stand in for the walk: an A-B-A block has matching ends and a
@@ -789,16 +798,14 @@ fn split_block_by_chunks(block: &[u8], level: usize) -> usize {
     // caller already applies.
     let mut pos = PRESPLIT_CHUNK_SIZE;
     while pos <= block.len() - PRESPLIT_CHUNK_SIZE {
-        presplit_record_fingerprint(
+        presplit_record_fingerprint_tier::<RATE, HASH_LOG>(
             &mut new_events,
             &block[pos..pos + PRESPLIT_CHUNK_SIZE],
-            sampling_rate,
-            hash_log,
         );
-        if presplit_fingerprints_differ(&past, &new_events, penalty, hash_log) {
+        if presplit_fingerprints_differ(&past, &new_events, penalty, HASH_LOG) {
             return pos;
         }
-        presplit_merge_events(&mut past, &new_events, hash_log);
+        presplit_merge_events(&mut past, &new_events, HASH_LOG);
         if penalty > 0 {
             penalty -= 1;
         }
