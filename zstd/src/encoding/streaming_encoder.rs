@@ -344,6 +344,14 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                     "dictionary must be attached before the first write",
                 ));
             }
+            // The entropy tables were built at attach time and go with it:
+            // holding them past the clear keeps Huffman and FSE allocations
+            // the encoder can no longer reach, for as long as it lives, and
+            // reports them in `heap_size`. The primed match-finder snapshot
+            // needs no such call — priming happens at the first write, which
+            // is also the point after which this setter refuses to run, so
+            // there is never one to drop here.
+            self.dictionary_entropy_cache = None;
             self.dictionary = None;
             return Ok(());
         }

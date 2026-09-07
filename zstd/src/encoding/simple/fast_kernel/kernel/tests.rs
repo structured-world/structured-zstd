@@ -798,6 +798,64 @@ fn borrowed_dict_kernel_takes_a_repcode_whose_candidate_is_in_the_dictionary() {
     );
 }
 
+/// The other side of the dictionary-tail case: a repcode candidate there has
+/// no four bytes of its own to be judged on, so it is counted instead — and
+/// when that count falls short of four the candidate is rejected, exactly as a
+/// failed four-byte gate would have rejected it.
+#[test]
+fn borrowed_dict_kernel_rejects_a_short_repcode_in_the_dictionary_tail() {
+    use crate::encoding::fastpath::FastpathKernel;
+
+    let hash_log = 12u32;
+    const MLS: u32 = 4;
+    let mut dict: Vec<u8> = (0u8..30).collect();
+    dict.extend_from_slice(b"AB");
+    // The probe is at `curr + 1`, and `rep_abs = dict_end + curr + 1 -
+    // offset_1`, so offset 3 puts it two bytes from the dictionary's end.
+    // `A` lines up, `Z` does not: one byte, short of the four a match needs.
+    let inp: Vec<u8> = b"\xffAZ-then-plain-literals-with-nothing-to-match".to_vec();
+
+    let mut main_table = FastHashTable::new(hash_log, MLS);
+    let dict_table = FastHashTable::new(hash_log, MLS);
+
+    let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+    let mut handle = |seq: Sequence<'_>| match seq {
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => tuples.push((literals.to_vec(), offset, match_len)),
+        Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
+    };
+
+    let result = compress_block_fast_dict_borrowed::<MLS, false>(
+        &inp,
+        &dict,
+        0,
+        inp.len(),
+        &mut main_table,
+        &dict_table,
+        PrefixBounds {
+            prefix_start_index: 1,
+            window_low: 0,
+        },
+        [3, 0],
+        2,
+        &mut handle,
+        FastpathKernel::Scalar,
+    );
+
+    assert!(
+        tuples.iter().all(|(_, _, m)| *m == 0),
+        "a one-byte dictionary-tail candidate is not a match: {tuples:?}",
+    );
+    assert_eq!(
+        result.tail_literals_len,
+        inp.len(),
+        "with nothing matched the whole block is literals",
+    );
+}
+
 /// A candidate in the last three bytes of the dictionary cannot be judged on
 /// four bytes of its own — the fourth would come from the input, a separate
 /// buffer here — so it keeps the counting form instead of the four-byte gate.
