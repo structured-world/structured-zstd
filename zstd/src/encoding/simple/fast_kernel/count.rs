@@ -224,7 +224,14 @@ pub(crate) fn count_forward_dict_2segment(
     // re-reading what the gate just compared (upstream counts from `+4` after
     // its `MEM_read32` for the same reason). A caller with nothing established
     // passes 0.
-    debug_assert!(cur + known <= inp_len, "known runs past the input");
+    //
+    // Bounded in release for the same reason as the two above: `cur + known`
+    // feeds a subtraction and a raw-pointer `add`, so a caller that overstated
+    // what it established would read outside the input.
+    assert!(
+        cur + known <= inp_len,
+        "count_forward_dict_2segment requires cur ({cur}) + known ({known}) <= inp.len() ({inp_len})",
+    );
     if cand + known >= dict_len {
         // The established bytes already carried the candidate out of the
         // dictionary and into the input that follows it in the logical

@@ -121,6 +121,21 @@ impl Dictionary {
     pub fn from_serialized_or_raw_content(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
         if raw.starts_with(&MAGIC_NUM) {
             Self::decode_dict(raw)
+        } else if raw.is_empty() {
+            // A zero-sized buffer is a dictionary with nothing in it rather
+            // than a malformed one: `ZSTD_createDDict(NULL, 0)` builds a
+            // usable `DDict` referencing no content, and
+            // `ZSTD_CCtx_loadDictionary` with an empty buffer is how a caller
+            // says "no dictionary". [`Self::from_raw_content`] still refuses
+            // it, because naming raw content and handing over none is the
+            // caller asking for a dictionary that cannot exist.
+            Ok(Dictionary {
+                id: 0,
+                fse: FSEScratch::new(),
+                huf: HuffmanScratch::new(),
+                dict_content: Vec::new(),
+                offset_hist: [1, 4, 8],
+            })
         } else {
             Self::from_raw_content(0, raw.to_vec())
         }
