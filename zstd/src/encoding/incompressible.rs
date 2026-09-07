@@ -198,7 +198,12 @@ impl SeenContentGrid {
             // limit, and that is far past the retained span.
             return;
         };
-        let base_steps32 = u32::try_from(base_steps).expect("the origin moves at the index limit");
+        // Every advance rebases as it crosses, so the origin is never more than
+        // a block past the index and this conversion always fits. Clamping
+        // rather than asserting keeps a caller that somehow arrives further
+        // along correct instead of panicking: a base beyond the index is older
+        // than every record, which is exactly what the clamp then drops.
+        let base_steps32 = u32::try_from(base_steps).unwrap_or(u32::MAX);
         for (word, tag) in self.slots.iter_mut().zip(self.tags.iter_mut()) {
             let mut held = SeenSample::unpack(*word);
             if held.epoch != self.epoch {
@@ -376,17 +381,22 @@ impl SeenContentGrid {
     /// shorter than a key — and neither enters the walk that moves the origin.
     /// Left alone, a frame made only of such blocks would carry an origin the
     /// first walk after them cannot narrow, which is a panic rather than a lost
-    /// repeat. Nothing has been recorded at these offsets, so the origin can
-    /// come back by a whole number of index spans, and a whole number of spans
-    /// is a whole number of steps — every later record still lands on the same
-    /// grid.
+    /// repeat.
+    ///
+    /// The origin moves through [`Self::rebase_offsets`], the same way the walk
+    /// does, and BEFORE the advance so the offset never leaves the index. Moving
+    /// the origin alone would be cheaper and is wrong: a record dated in the old
+    /// coordinates then sits AHEAD of everything after it, so the next probe
+    /// measures a negative distance, reads no repeat, and a duplicate the
+    /// matcher still holds goes out raw — and the sticky range would keep the
+    /// search on for most of an index span.
     #[inline]
     fn skip_block(&mut self, len: usize) {
-        self.frame_offset += len as u64;
-        let span = (u64::from(u32::MAX) + 1) * Self::RECORD_STEP as u64;
-        if self.frame_offset >= span {
-            self.frame_offset %= span;
+        let step = Self::RECORD_STEP as u64;
+        if (self.frame_offset + len as u64) / step > u64::from(u32::MAX) {
+            self.rebase_offsets();
         }
+        self.frame_offset += len as u64;
     }
 
     fn take_block(&mut self, block: &[u8], window_size: usize, probe: bool) -> bool {

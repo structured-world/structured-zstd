@@ -138,9 +138,9 @@ fn the_content_grid_bounds_the_origin_across_an_unasked_prefix() {
     let block = deterministic_bytes(0x51DE, BLOCK);
     let mut grid = SeenContentGrid::default();
     grid.reset_for_frame();
-    // Where a prefix of blocks nobody asked about would have left it: past the
-    // index by more than the span a rebase retains.
-    grid.frame_offset = limit + SeenContentGrid::REBASE_RETAIN_BYTES * 2;
+    // A prefix of blocks nobody asked about, walking the frame up to the index
+    // and one block past it.
+    grid.frame_offset = limit - BLOCK as u64 / 2;
     grid.record_searched(&block, WIDE);
     assert!(
         !grid.record_and_report_repeat(&block, WIDE),
@@ -152,34 +152,35 @@ fn the_content_grid_bounds_the_origin_across_an_unasked_prefix() {
     );
 }
 
-/// Blocks too short to key on must not carry the origin past the step index
-/// either.
+/// Crossing the index on blocks the grid records nothing for must carry the
+/// records with the origin, not just move the origin.
 ///
-/// A streaming caller that writes and flushes a few bytes at a time reaches the
-/// grid with blocks under the key length, and those advance the offset without
-/// entering the walk that moves the origin — the same hole as an unasked
-/// prefix, on a path that is open after the frame's first probe as well.
+/// A frame that has recorded something and then walks past the index on
+/// sub-key blocks keeps every record dated in the old coordinates: the next
+/// probe measures a distance from an offset AHEAD of itself, reads no repeat,
+/// and a duplicate the matcher still holds goes out raw.
 #[test]
-fn the_content_grid_bounds_the_origin_across_sub_key_blocks() {
+fn the_content_grid_carries_its_records_when_a_skip_crosses_the_index() {
+    const BLOCK: usize = 128 * 1024;
     const WIDE: usize = 8 * 1024 * 1024;
-    let limit = (u64::from(u32::MAX) + 1) * SeenContentGrid::RECORD_STEP as u64;
+    let step = SeenContentGrid::RECORD_STEP as u64;
+    let limit = (u64::from(u32::MAX) + 1) * step;
 
-    let block = deterministic_bytes(0x51DE, 128 * 1024);
+    let block = deterministic_bytes(0x51DE, BLOCK);
     let crumb = deterministic_bytes(0xF00D, SeenContentGrid::KEY_LEN - 1);
     let mut grid = SeenContentGrid::default();
     grid.reset_for_frame();
-    // A frame that has already asked once, then runs its offset past the index
-    // on blocks the grid cannot key.
+    // Just under the index, with a record in reach of what follows: after this
+    // block the frame sits four bytes short of the boundary.
+    grid.frame_offset = limit - BLOCK as u64 - 4;
     assert!(!grid.record_and_report_repeat(&block, WIDE));
-    grid.frame_offset = limit + SeenContentGrid::REBASE_RETAIN_BYTES * 2;
-    grid.record_searched(&crumb, WIDE);
-    assert!(
-        !grid.record_and_report_repeat(&block, WIDE),
-        "the block recorded before the origin moved is far out of reach",
-    );
+    // A few bytes carry the frame across the boundary.
+    for _ in 0..8 {
+        grid.record_searched(&crumb, WIDE);
+    }
     assert!(
         grid.record_and_report_repeat(&block, WIDE),
-        "the block right behind this one is what the matcher would find",
+        "the block recorded a few bytes ago is what the matcher would find",
     );
 }
 
