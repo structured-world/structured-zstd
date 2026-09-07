@@ -26,10 +26,24 @@ pub(crate) const MIN_MATCH_LEN: usize = 5;
 /// backfilling the suffix store. Upstream zstd parity: matches
 /// `ZSTD_FAST_HASH_FILL_STEP` in `zstd_fast.c`.
 pub(crate) const FAST_HASH_FILL_STEP: usize = 3;
-/// Sparse step used when a block was determined to be incompressible —
-/// every matcher inserts hash entries with this stride instead of the
-/// per-byte dense pattern so the rest of the block costs less CPU.
-pub(crate) const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
+/// Stride the lazy / row matchers index a block they wrote off unsearched at.
+///
+/// Same question, same answer as the fast path's [`RAW_SKIP_INDEX_STEP`], which
+/// this defers to: the block is not searched, so the only reason to index it is
+/// a LATER block duplicating it, that duplicate is recognised on the seen-content
+/// grid and then searched, and the search sweeps positions — so an entry every
+/// stride bytes is met within a stride of scanning, immaterial against a
+/// block-sized match. The two paths had drifted to different answers (8 here,
+/// 512 there) and it was the whole cost of a skip: an entry per eight bytes is
+/// 131,000 stores per mebibyte of input nothing will search.
+///
+/// Measured on the i9, wall clock, three interleaved rounds. Incompressible
+/// 1 MiB at level 5: 0.223 s -> 0.052 s (1343 -> 5627 MB/s). A 1 MiB block
+/// repeated verbatim at level 19: 0.0446 s -> 0.0142 s. Output is unchanged on
+/// 65 of 66 fixture-and-level rows, including the block-duplicate one at every
+/// level but 19, where it costs 506 bytes in 524,879 (0.1%).
+pub(crate) const INCOMPRESSIBLE_SKIP_STEP: usize =
+    crate::encoding::incompressible::RAW_SKIP_INDEX_STEP;
 
 /// Length of the common prefix of two byte slices, capped at
 /// `min(a.len(), b.len())`. Hot path on every match finder; dispatches to
