@@ -3039,6 +3039,13 @@ macro_rules! start_matching_fast_loop_body {
 /// A borrowed window never carries a dictionary (`borrowed_eligible` rejects
 /// `use_dictionary_state`), so this kernel is owned-coordinates only and needs
 /// no `BORROWED` axis.
+///
+/// What the shape is worth, on 20 000 dictionary frames of a 10 KiB random
+/// fixture (i9, three interleaved rounds of two prebuilt binaries, with the
+/// same harness minus the dictionary as the control arm): 8168 -> 6561 M
+/// cycles, 1.95 -> 1.60 s wall clock, 11,980 -> 9,171 M instructions. The
+/// control arm's instruction count is unchanged to the digit, so the delta is
+/// this loop's.
 macro_rules! start_matching_dict_loop_body {
     ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path) => {{
         debug_assert!($current_len > 0, "dict_loop precondition: $current_len > 0");
