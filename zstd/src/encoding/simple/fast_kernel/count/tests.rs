@@ -107,7 +107,7 @@ fn dict_2segment_within_dict_only() {
     let inp = [30u8, 40, 99];
     // cand=2: dict[2]=30 vs inp[0]=30 ✓; dict[3]=40 vs inp[1]=40 ✓;
     // cand_idx=4 == dict.len() → inp[0]=30 vs inp[2]=99 ✗ → len 2.
-    assert_eq!(count_forward_dict_2segment(&dict, 2, &inp, 0), 2);
+    assert_eq!(count_forward_dict_2segment(&dict, 2, &inp, 0, 0), 2);
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn dict_2segment_crosses_boundary_into_input() {
     let dict = [1u8, 2, 3];
     let inp = [1u8, 2, 3, 1, 2, 3, 9]; // cur=3 → [1,2,3,9...]
     // cand=0: dict[0..3] match inp[3..6]; cand_idx=3 → inp[0]=1 vs inp[6]=9 ✗ → 3.
-    assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 3), 3);
+    assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 3, 0), 3);
 }
 
 #[test]
@@ -128,12 +128,44 @@ fn dict_2segment_continues_word_at_a_time_past_boundary() {
     let inp = [1u8, 2, 3, 1, 2, 3, 1, 2]; // cur=3 → [1,2,3,1,2]
     // seg1: dict[0..3]=[1,2,3] vs inp[3..6]=[1,2,3] → m1=3 (dict exhausted).
     // seg2: inp[0..]=[1,2,...] vs inp[6..]=[1,2] → m2=2. total 5.
-    assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 3), 5);
+    assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 3, 0), 5);
 }
 
 #[test]
 fn dict_2segment_stops_at_input_end() {
     let dict = [7u8, 7];
     let inp = [7u8, 7, 7, 7]; // cur=2 → only 2 bytes left
-    assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 2), 2);
+    assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 2, 0), 2);
+}
+
+/// The caller's gate establishes a prefix, and the count must resume past it
+/// and still report the TOTAL length — every case a fresh count would report.
+#[test]
+fn dict_2segment_resumes_past_an_established_prefix() {
+    // Same three fixtures as above, each answered identically whether the
+    // caller established nothing or the four bytes its gate compared.
+    let dict = [1u8, 2, 3, 4, 5, 6];
+    let inp = [1u8, 2, 3, 4, 5, 6, 9];
+    for known in [0usize, 4] {
+        assert_eq!(
+            count_forward_dict_2segment(&dict, 0, &inp, 0, known),
+            6,
+            "established {known} bytes",
+        );
+    }
+
+    // A prefix that carries the candidate out of the dictionary: the rest of
+    // the match comes from the input that follows it in the window.
+    let dict = [1u8, 2, 3, 4];
+    let inp = [1u8, 2, 3, 4, 1, 2, 3, 4, 1, 2, 7];
+    // cand=0 against cur=4: four dict bytes, then the candidate continues at
+    // inp[0] against inp[8] — [1,2] more, then 3 vs 7 stops it.
+    assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 4, 0), 6);
+    assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 4, 4), 6);
+
+    // And when the established prefix reaches exactly the end of the input,
+    // there is nothing left to count.
+    let dict = [5u8, 5, 5, 5];
+    let inp = [5u8, 5, 5, 5];
+    assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 0, 4), 4);
 }

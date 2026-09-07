@@ -1424,7 +1424,24 @@ unsafe fn borrowed_candidate_len<C: Fn(*const u8, *const u8, usize) -> usize>(
             )
         }
     } else {
-        let l = count_forward_dict_2segment(dict, cand_abs, inp, cur_off);
+        // Same four-byte gate as the input-candidate arm above, and for the
+        // same reason: the count only ever survives when the first four bytes
+        // agree, so comparing them first keeps the segmented count off every
+        // rejected candidate. Only a candidate within three bytes of the
+        // dictionary's end lacks four bytes to compare on its own side (the
+        // rest of its match would come from the input, a different buffer
+        // here); those keep the counting form.
+        let known = if cand_abs + 4 <= dict_end {
+            // SAFETY: `cand_abs + 4 <= dict_end == dict.len()`, and the caller
+            // guarantees `cur_off + 4 <= block_end`.
+            if unsafe { read32(dict.as_ptr().add(cand_abs)) != read32(inp_base.add(cur_off)) } {
+                return 0;
+            }
+            4
+        } else {
+            0
+        };
+        let l = count_forward_dict_2segment(dict, cand_abs, inp, cur_off, known);
         if l >= 4 { l } else { 0 }
     }
 }
@@ -1609,7 +1626,36 @@ fn compress_block_fast_dict_borrowed_impl<
             if main_idx < prefix_start_index {
                 let dpos = dict_idx as usize;
                 if dict_idx >= 1 && dpos < dict_end && dpos >= window_low {
-                    let m0 = count_forward_dict_2segment(dict, dpos, inp, curr);
+                    // Four bytes decide it before anything counts, the way
+                    // upstream does (`MEM_read32(dictMatch) == MEM_read32(ip0)`,
+                    // zstd_fast.c:578). A tag hit is only a candidate, and on
+                    // input the dictionary does not describe most of them are
+                    // not matches at all: counting first ran the segmented
+                    // count from byte zero for every one of them, and it showed
+                    // — a fifth of this path's time sat in that counter.
+                    //
+                    // The compare needs four bytes on the dictionary side. A
+                    // candidate within three bytes of the dictionary's end has
+                    // them only by crossing into the input, which is a
+                    // different buffer here (upstream's window is contiguous,
+                    // so its `MEM_read32` reads across for free), so those few
+                    // positions keep the counting form.
+                    let m0 = if dpos + 4 <= dict_end {
+                        // SAFETY: `dpos + 4 <= dict_end == dict.len()`, and
+                        // `curr <= ilimit` leaves 8 readable bytes at `curr`.
+                        let (cand4, cur4) = unsafe {
+                            (read32(dict.as_ptr().add(dpos)), read32(inp_base.add(curr)))
+                        };
+                        if cand4 == cur4 {
+                            // Those four are established, so the count resumes
+                            // past them rather than re-reading them.
+                            count_forward_dict_2segment(dict, dpos, inp, curr, 4)
+                        } else {
+                            0
+                        }
+                    } else {
+                        count_forward_dict_2segment(dict, dpos, inp, curr, 0)
+                    };
                     if m0 >= 4 {
                         let mut match_ip = curr;
                         let mut match_pos = dpos;

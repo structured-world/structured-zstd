@@ -201,6 +201,7 @@ pub(crate) fn count_forward_dict_2segment(
     cand: usize,
     inp: &[u8],
     cur: usize,
+    known: usize,
 ) -> usize {
     // Release assertions: this is a safe `pub(crate)` fn that does raw pointer
     // math below. `cand >= dict.len()` would make the dict segment read OOB and
@@ -218,9 +219,37 @@ pub(crate) fn count_forward_dict_2segment(
     );
     let dict_len = dict.len();
     let inp_len = inp.len();
+    // `known` bytes at (`dict[cand..]`, `inp[cur..]`) are already established
+    // equal by the caller's gate, so the count resumes past them instead of
+    // re-reading what the gate just compared (upstream counts from `+4` after
+    // its `MEM_read32` for the same reason). A caller with nothing established
+    // passes 0.
+    debug_assert!(cur + known <= inp_len, "known runs past the input");
+    if cand + known >= dict_len {
+        // The established bytes already carried the candidate out of the
+        // dictionary and into the input that follows it in the logical
+        // `[dict][input]` window, so what remains is a single input segment.
+        let cand_in = cand + known - dict_len;
+        let cur2 = cur + known;
+        if cur2 >= inp_len {
+            return known;
+        }
+        // SAFETY: `cand_in < inp_len` (the candidate precedes the cursor in the
+        // window) and `cur2 < inp_len`; `count_forward` stops at `iend`.
+        return known
+            + unsafe {
+                count_forward(
+                    inp.as_ptr().add(cur2),
+                    inp.as_ptr().add(cand_in),
+                    inp.as_ptr().add(inp_len),
+                )
+            };
+    }
+    let cand = cand + known;
+    let cur = cur + known;
     let cur_avail = inp_len - cur;
     if cur_avail == 0 {
-        return 0;
+        return known;
     }
     // Segment 1: candidate reads `dict[cand..dict_len]`, current reads
     // `inp[cur..]`. Bounded by whichever side runs out first.
@@ -238,7 +267,7 @@ pub(crate) fn count_forward_dict_2segment(
     // Mismatch inside the dict segment, or the current input is exhausted →
     // the match ends here.
     if m1 < seg1 || seg1 == cur_avail {
-        return m1;
+        return known + m1;
     }
     // The candidate exhausted the dict (`m1 == dict_len - cand`) and the current
     // input still has bytes left. Segment 2: the candidate logically continues
@@ -255,7 +284,7 @@ pub(crate) fn count_forward_dict_2segment(
             inp.as_ptr().add(inp_len),
         )
     };
-    m1 + m2
+    known + m1 + m2
 }
 
 #[cfg(test)]
