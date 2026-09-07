@@ -201,6 +201,17 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
         .writeable_table_description_size()
         .expect("non-empty table emits a description");
 
+    // The decision reads its sizes off the histogram of the very literals it
+    // is deciding for, so build one per fixture here as the encoder does.
+    let counts_of = |bytes: &[u8]| -> [usize; 256] {
+        let mut counts = [0usize; 256];
+        for &b in bytes {
+            counts[b as usize] += 1;
+        }
+        counts
+    };
+    let skewed_counts = counts_of(&skewed_literals);
+
     // Distinguishing precondition: WITHOUT preferRepeat the
     // size comparison must prefer new (else the test isn't
     // exercising the override). Verify by running with a
@@ -212,6 +223,7 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
             Some(&prev),
             new_desc,
             &skewed_literals,
+            &skewed_counts,
             StrategyTag::Lazy,
         ),
         "fixture precondition: size-comparison must prefer new for Lazy on skewed literals"
@@ -226,6 +238,7 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
                 Some(&prev),
                 new_desc,
                 &skewed_literals,
+                &skewed_counts,
                 strategy,
             ),
             "{strategy:?} <= 1024 must short-circuit to reuse despite size-comparison favouring new"
@@ -247,6 +260,7 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
             Some(&prev),
             new_desc,
             &big_skewed,
+            &counts_of(&big_skewed),
             StrategyTag::Fast,
         ),
         "Fast at len > 1024 must NOT short-circuit (gate disabled), falls through to size heuristic"

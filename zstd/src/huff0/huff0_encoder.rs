@@ -936,6 +936,33 @@ impl HuffmanTable {
         bits.div_ceil(8) + usize::from(bits.is_multiple_of(8))
     }
 
+    /// [`Self::estimate_compressed_size`] read off the histogram instead of the
+    /// literals: the same sum, since a symbol contributes its code length once
+    /// per occurrence, but over at most 256 symbols rather than over every byte.
+    /// `None` when the table cannot encode a symbol that actually occurs, which
+    /// is the condition the per-literal form reports the same way.
+    ///
+    /// This is what upstream compares tables with (`HUF_estimateCompressedSize`
+    /// over `count`, huf_compress.c:1416-1417, after `HUF_validateCTable` has
+    /// checked representability off the same histogram).
+    pub(crate) fn estimate_compressed_size_from_counts_checked(
+        &self,
+        counts: &[usize],
+    ) -> Option<usize> {
+        let mut bits = 0usize;
+        for (symbol, &count) in counts.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let (_, num_bits) = *self.codes.get(symbol)?;
+            if num_bits == 0 {
+                return None;
+            }
+            bits += num_bits as usize * count;
+        }
+        Some(bits.div_ceil(8) + usize::from(bits.is_multiple_of(8)))
+    }
+
     pub fn build_from_weights(weights: &[usize]) -> Self {
         Self::build_from_weights_reusing(weights, None)
     }

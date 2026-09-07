@@ -1013,6 +1013,7 @@ fn estimate_literals_section_bytes(
         last_huff.as_ref(),
         new_desc,
         literals,
+        counts,
         strategy,
     );
     let reuse_payload = if !use_new {
@@ -1276,12 +1277,18 @@ fn decide_huff_reuse_like_encoder(
     last_table: Option<&huff0_encoder::HuffmanTable>,
     new_desc: usize,
     literals: &[u8],
+    counts: &[usize; 256],
     strategy: crate::encoding::strategy::StrategyTag,
 ) -> bool {
     let Some(prev) = last_table else {
         return true;
     };
-    let Some(old_estimate) = prev.estimate_compressed_size(literals) else {
+    // Off the histogram, not the literals: the same sum over at most 256
+    // symbols instead of over every byte of the section, which is where
+    // upstream reads it from too (huf_compress.c:1416-1417). On a 4 KiB
+    // dictionary frame the two per-literal walks this replaces were the
+    // largest single item outside the matcher.
+    let Some(old_estimate) = prev.estimate_compressed_size_from_counts_checked(counts) else {
         return true;
     };
     // Late-stage `HUF_flags_preferRepeat` mirror — kept here for
@@ -1296,7 +1303,7 @@ fn decide_huff_reuse_like_encoder(
         return false;
     }
     let new_estimate = new_table
-        .estimate_compressed_size(literals)
+        .estimate_compressed_size_from_counts_checked(counts)
         .unwrap_or(literals.len());
     !(old_estimate <= new_desc + new_estimate || new_desc + 12 >= literals.len())
 }
@@ -2819,6 +2826,7 @@ fn compress_literals(
         last_table,
         new_table_description_size,
         literals,
+        &counts,
         strategy,
     );
     let encoder_table = if new_table {
