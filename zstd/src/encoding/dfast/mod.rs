@@ -3041,11 +3041,13 @@ macro_rules! start_matching_fast_loop_body {
 /// no `BORROWED` axis.
 ///
 /// What the shape is worth, on 20 000 dictionary frames of a 10 KiB random
-/// fixture (i9, three interleaved rounds of two prebuilt binaries, with the
-/// same harness minus the dictionary as the control arm): 8168 -> 6561 M
-/// cycles, 1.95 -> 1.60 s wall clock, 11,980 -> 9,171 M instructions. The
-/// control arm's instruction count is unchanged to the digit, so the delta is
-/// this loop's.
+/// fixture (i9, three interleaved rounds of prebuilt binaries, with the same
+/// harness minus the dictionary as the control arm): 8161 / 8125 / 8412 ->
+/// 6594 / 6574 / 6626 M cycles and 11,980 -> 9,292 M instructions, against
+/// libzstd's 5035 / 5044 / 5033 M and 9,750 M measured in the same runs. The
+/// gap to it goes 1.62x -> 1.31x in cycles, and in instructions we now run
+/// slightly FEWER than it does — what is left there is execution density, not
+/// work.
 macro_rules! start_matching_dict_loop_body {
     ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path) => {{
         debug_assert!($current_len > 0, "dict_loop precondition: $current_len > 0");

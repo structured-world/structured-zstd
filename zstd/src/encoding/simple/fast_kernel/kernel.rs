@@ -1643,7 +1643,15 @@ fn compress_block_fast_dict_borrowed_impl<
                     // Structured input moves less (339 / 345 / 351 -> 333 /
                     // 333 / 327 M) and input the dictionary describes is flat,
                     // which is the expected shape: there the count would have
-                    // succeeded anyway.
+                    // succeeded anyway. Against libzstd on the same fixture
+                    // and the same counters, the level-1 gap went 2.70x -> 1.85x
+                    // in cycles and 3.19x -> 1.99x in instructions.
+                    //
+                    // The gate emits the same bytes it did without it: frame
+                    // md5 is unchanged over three dictionary fixture shapes x
+                    // five Fast levels x (with dictionary, without), 30 rows.
+                    // Equal compressed LENGTHS would not have shown that — two
+                    // different parses can weigh the same.
                     //
                     // The compare needs four bytes on the dictionary side. A
                     // candidate within three bytes of the dictionary's end has
