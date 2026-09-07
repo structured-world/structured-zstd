@@ -642,6 +642,14 @@ fn reserve_for_next_block(
     out.reserve_exact(estimate.max(block_bound + produced as usize));
 }
 
+/// The rate and the width stay ARGUMENTS here, though upstream generates one
+/// function per tier and says the speed of the pass relies on compile-time
+/// constant propagation (`zstd_preSplit.c:32`, `ZSTD_GEN_RECORD_FINGERPRINT` at
+/// `:87`). Monomorphising the walk on both was tried and measured on 8 MiB of
+/// repeated log lines at level 6, three interleaved readings a side: cycles
+/// overlapping (966-984 M against 973-997 M) and instructions UP, 1,252 M to
+/// 1,268 M. Rust inlines this into a walk the caller already picked a tier for,
+/// so the propagation is there without the four copies.
 fn presplit_hash2(bytes: &[u8], hash_log: usize) -> usize {
     debug_assert!(hash_log >= 8);
     if hash_log == 8 {
