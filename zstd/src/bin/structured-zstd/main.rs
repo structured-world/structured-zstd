@@ -66,6 +66,11 @@ macro_rules! info {
 
 const ZSTD_SUFFIX: &str = ".zst";
 
+/// Highest level the CLI compresses at when `--ultra` was not given (upstream
+/// `ZSTDCLI_CLEVEL_MAX`). Asking for more without naming `--ultra` reduces to
+/// this with a warning rather than failing.
+const CLI_MAX_LEVEL_WITHOUT_ULTRA: i32 = 19;
+
 /// Operation selected by mode flags / `argv[0]`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
@@ -781,8 +786,16 @@ fn parse_args(
     // read every input before the first pass refused it.
     validate_level(lowest_level)?;
     validate_level(highest_level)?;
-    if !ultra && highest_level > 19 {
-        bail!("level {highest_level} requires --ultra (levels 20-22)");
+    // Unnamed, an ultra level is not refused but reduced, with a warning, the
+    // way upstream reduces it — a script that runs `zstd -22` compresses at 19
+    // rather than failing, and refusing here is what would break it.
+    if !ultra && highest_level > CLI_MAX_LEVEL_WITHOUT_ULTRA {
+        info!(
+            "Warning : compression level higher than max, reduced to {CLI_MAX_LEVEL_WITHOUT_ULTRA} "
+        );
+        opts.level = opts.level.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
+        opts.bench_start = opts.bench_start.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
+        opts.bench_end = opts.bench_end.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
     }
     // Long-distance matching runs on the optimal parser here, so below it the
     // flag would widen the window and never run the matcher it names. Settled
