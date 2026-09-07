@@ -585,6 +585,40 @@ fn create_cdict_treats_unmagicked_bytes_as_raw_content() {
     assert!(cdict.is_null(), "corrupt full dict must fail");
 }
 
+/// The two sides report a `ZSTD_dct_fullDict` selector over bytes that are not
+/// a dictionary with DIFFERENT codes, and a caller that branches on the code
+/// sees the difference: the compression side answers `dictionary_wrong`
+/// (`ZSTD_compress_insertDictionary`, zstd_compress.c:5207 and 5223), the
+/// decompression side `dictionary_corrupted` (`ZSTD_loadEntropy_intoDDict`,
+/// zstd_ddict.c:99 and 105).
+#[test]
+fn full_dict_over_unmagicked_bytes_reports_the_side_it_came_from() {
+    let raw = [0xABu8; 64];
+    const FULL_DICT: c_int = 2;
+
+    let cctx = ZSTD_createCCtx();
+    let rc =
+        unsafe { ZSTD_CCtx_loadDictionary_advanced(cctx, raw.as_ptr(), raw.len(), 0, FULL_DICT) };
+    assert_ne!(ZSTD_isError(rc), 0);
+    assert_eq!(
+        ZSTD_getErrorCode(rc),
+        ZSTD_ErrorCode::ZSTD_error_dictionary_wrong,
+        "the compression side calls a non-dictionary under fullDict `wrong`",
+    );
+    unsafe { ZSTD_freeCCtx(cctx) };
+
+    let dctx = ZSTD_createDCtx();
+    let rc =
+        unsafe { ZSTD_DCtx_loadDictionary_advanced(dctx, raw.as_ptr(), raw.len(), 0, FULL_DICT) };
+    assert_ne!(ZSTD_isError(rc), 0);
+    assert_eq!(
+        ZSTD_getErrorCode(rc),
+        ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted,
+        "the decompression side calls the same bytes `corrupted`",
+    );
+    unsafe { ZSTD_freeDCtx(dctx) };
+}
+
 // ---- Phase 6.2: advanced parameters + streaming ----
 
 use crate::params::{

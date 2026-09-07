@@ -1340,16 +1340,30 @@ fn bare_numeric_flag_is_a_level() {
     assert_eq!(opts.inputs, vec![PathBuf::from("in.txt")]);
 }
 
+/// Levels 20-22 are expensive enough that they have to be asked for by name,
+/// but asking without `--ultra` is not an error: upstream warns and compresses
+/// at 19 ("Warning : compression level higher than max, reduced to 19", exit
+/// 0), so a script that runs `zstd -22` keeps working. Refusing instead breaks
+/// it against us.
 #[test]
-fn levels_above_19_require_ultra() {
-    assert!(parse(&["-22", "in.txt"]).is_err());
-    let opts = parse(&["--ultra", "-22", "in.txt"]).unwrap();
-    assert_eq!(opts.level, 22);
-    // Benchmarking compresses the range `-b`/`-e` name, so that is the range
-    // the gate has to read: `-b20` runs an ultra level as surely as `-20` does.
-    assert!(parse(&["-b20", "in.txt"]).is_err());
-    assert!(parse(&["-b3", "-e22", "in.txt"]).is_err());
-    assert!(parse(&["--ultra", "-b20", "in.txt"]).is_ok());
+fn levels_above_19_without_ultra_fall_back_to_19() {
+    assert_eq!(parse(&["-22", "in.txt"]).unwrap().level, 19);
+    assert_eq!(parse(&["-20", "in.txt"]).unwrap().level, 19);
+    // Named, they run as asked.
+    assert_eq!(parse(&["--ultra", "-22", "in.txt"]).unwrap().level, 22);
+    // Benchmarking compresses the range `-b`/`-e` name rather than the level
+    // `-N` sets, so the range is what gets clamped: `-b20` reaches an ultra
+    // level as surely as `-20` does.
+    let opts = parse(&["-b20", "in.txt"]).unwrap();
+    assert_eq!((opts.bench_start, opts.bench_end), (19, 19));
+    let opts = parse(&["-b3", "-e22", "in.txt"]).unwrap();
+    assert_eq!((opts.bench_start, opts.bench_end), (3, 19));
+    assert_eq!(
+        parse(&["--ultra", "-b20", "in.txt"]).unwrap().bench_start,
+        20
+    );
+    // Below the ultra band nothing moves.
+    assert_eq!(parse(&["-19", "in.txt"]).unwrap().level, 19);
 }
 
 #[test]

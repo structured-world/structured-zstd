@@ -3113,16 +3113,33 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.attach_dictionary(EncoderDictionary::from_dictionary(dictionary))
     }
 
-    /// Parse and attach a serialized dictionary blob.
+    /// Parse and attach a dictionary blob, in either of the two forms upstream
+    /// `ZSTD_CCtx_loadDictionary` takes (`ZSTD_dct_auto`): a blob prefixed with
+    /// [`DICTIONARY_MAGIC`](crate::decoding::DICTIONARY_MAGIC) is a serialized
+    /// dictionary, and anything else is raw content, which is why any file can
+    /// be handed to `zstd -D`. Raw content has no id, so the frame records none
+    /// and the decoder must be given the same bytes explicitly.
     ///
-    /// Parses with the encoder-only path (skips the FSE/HUF decode lookup-table
-    /// build the encoder never reads); the entropy ENCODER tables — and thus
-    /// the emitted frame — are identical to a full parse.
+    /// A serialized blob parses through the encoder-only path (skips the
+    /// FSE/HUF decode lookup-table build the encoder never reads); the entropy
+    /// ENCODER tables — and thus the emitted frame — are identical to a full
+    /// parse. To reject anything but a serialized dictionary, parse with
+    /// [`EncoderDictionary::from_bytes`] (upstream `ZSTD_dct_fullDict`) and
+    /// attach the result.
+    ///
+    /// An empty buffer is how the same upstream entry point is told there is
+    /// no dictionary: it clears whatever was attached and succeeds, returning
+    /// it, rather than reporting a dictionary too small to use.
     pub fn set_dictionary_from_bytes(
         &mut self,
         raw_dictionary: &[u8],
     ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
-        self.attach_dictionary(EncoderDictionary::from_bytes(raw_dictionary)?)
+        if raw_dictionary.is_empty() {
+            return Ok(self.clear_dictionary());
+        }
+        self.attach_dictionary(EncoderDictionary::from_serialized_or_raw_content(
+            raw_dictionary,
+        )?)
     }
 
     /// Attach an already-parsed [`EncoderDictionary`] without reparsing a raw

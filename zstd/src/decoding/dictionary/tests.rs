@@ -105,6 +105,46 @@ fn dictionary_handle_from_raw_content_supports_as_ref() {
     assert_eq!(dict_ref.dict_content.as_slice(), &[42]);
 }
 
+/// `ZSTD_createDDict` loads in `ZSTD_dct_auto` mode (zstd_ddict.c:102-107): a
+/// buffer without the magic is raw content with no id and no entropy tables.
+/// The handle is the shared form the decoder is handed, so it takes the same
+/// two kinds the `Dictionary` constructor does.
+#[test]
+fn dictionary_handle_takes_serialized_or_raw_content() {
+    let serialized = include_bytes!("../../../dict_tests/dictionary");
+    let parsed = DictionaryHandle::from_serialized_or_raw_content(serialized)
+        .expect("a magic-prefixed blob parses as a full dictionary");
+    assert_ne!(parsed.id(), 0, "a full dictionary carries its id");
+
+    let raw = b"tenant=demo table=orders op=put".repeat(8);
+    let handle = DictionaryHandle::from_serialized_or_raw_content(&raw)
+        .expect("anything else is raw content");
+    assert_eq!(handle.id(), 0, "raw content has no header to carry an id");
+    assert_eq!(handle.as_dict().dict_content.as_slice(), raw.as_slice());
+}
+
+/// A zero-sized buffer is a dictionary with nothing in it, not a malformed
+/// one: `ZSTD_createDDict(NULL, 0)` builds a usable `DDict` that references no
+/// content (zstd_ddict.c:123-140), and a caller handed an empty file gets the
+/// same nothing here rather than an error.
+#[test]
+fn an_empty_buffer_is_a_dictionary_with_no_content() {
+    let dict = Dictionary::from_serialized_or_raw_content(&[])
+        .expect("an empty buffer is a dictionary with no content");
+    assert_eq!(dict.id, 0);
+    assert!(dict.dict_content.is_empty());
+    assert_eq!(dict.offset_hist, [1, 4, 8]);
+
+    let handle = DictionaryHandle::from_serialized_or_raw_content(&[])
+        .expect("the handle takes it the same way");
+    assert_eq!(handle.id(), 0);
+    assert!(handle.as_dict().dict_content.is_empty());
+
+    // The constructor that names raw content still refuses it: there its
+    // emptiness is the caller asking for a dictionary that cannot exist.
+    assert!(Dictionary::from_raw_content(1, Vec::new()).is_err());
+}
+
 #[test]
 fn dictionary_handle_clones_share_inner() {
     let raw = include_bytes!("../../../dict_tests/dictionary");

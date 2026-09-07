@@ -1160,3 +1160,146 @@ fn raw_dictionary_leaves_the_id_out_of_the_streaming_header() {
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
 }
+
+/// The same entry point takes an empty buffer as "no dictionary" and clears,
+/// rather than reporting one too small to use.
+#[test]
+fn set_dictionary_from_bytes_with_an_empty_buffer_clears_the_dictionary() {
+    let content: Vec<u8> = b"tenant=demo region=eu table=orders payload="
+        .iter()
+        .copied()
+        .cycle()
+        .take(2048)
+        .collect();
+    let mut payload = Vec::new();
+    while payload.len() < 8192 {
+        payload.extend_from_slice(&content);
+    }
+
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Default);
+    encoder
+        .set_dictionary_from_bytes(&content)
+        .expect("the dictionary attaches");
+    encoder
+        .set_dictionary_from_bytes(&[])
+        .expect("an empty buffer is how a caller says there is no dictionary");
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    // Decodes with no dictionary supplied, which it could not do had the
+    // earlier attach survived.
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}
+
+/// Clearing is an attach like any other, and both of the attach's refusals
+/// hold for it: a frame already open has its dictionary decided, and a stream
+/// that failed a write answers with the failure it kept rather than pretending
+/// the change took.
+#[test]
+fn clearing_the_stream_dictionary_is_refused_where_attaching_is() {
+    let content: Vec<u8> = b"tenant=demo region=eu table=orders payload="
+        .iter()
+        .copied()
+        .cycle()
+        .take(1024)
+        .collect();
+
+    // Once the frame is open.
+    let mut enc = StreamingEncoder::new(Vec::new(), CompressionLevel::Default);
+    enc.set_dictionary_from_bytes(&content).expect("attach");
+    enc.write_all(b"the frame starts here").unwrap();
+    let err = enc
+        .set_dictionary_from_bytes(&[])
+        .expect_err("the frame's dictionary is already decided");
+    assert!(
+        alloc::format!("{err:?}").contains("before the first write"),
+        "unexpected error: {err:?}",
+    );
+
+    // On a stream whose write failed, the kept failure comes back instead.
+    let mut enc = StreamingEncoder::new(FailingWriteOnce::new(1), CompressionLevel::Fastest);
+    let big = vec![b'x'; 512 * 1024];
+    let _ = enc.write_all(&big);
+    let _ = enc.flush();
+    assert!(
+        enc.set_dictionary_from_bytes(&[]).is_err(),
+        "a poisoned stream answers with its failure, not with success",
+    );
+}
+
+/// Clearing has to give back what the attach took. The dictionary's entropy
+/// tables are built at attach time and reported by `heap_size`; dropping only
+/// the dictionary would leave the encoder holding Huffman and FSE allocations
+/// it can no longer reach, for as long as it lives.
+#[test]
+fn clearing_the_stream_dictionary_gives_back_what_it_allocated() {
+    // A SERIALIZED dictionary, not raw content: the entropy tables are what
+    // the attach allocates, and raw content has none — with it the cache is
+    // empty and this test could not tell a leak from a clean clear.
+    let content = include_bytes!("../../../dict_tests/dictionary").to_vec();
+
+    let mut enc = StreamingEncoder::new(Vec::new(), CompressionLevel::Default);
+    let empty = enc.heap_size();
+    enc.set_dictionary_from_bytes(&content)
+        .expect("the dictionary attaches");
+    let attached = enc.heap_size();
+    assert!(
+        attached > empty,
+        "attaching should have allocated something to give back: {empty} -> {attached}",
+    );
+
+    enc.set_dictionary_from_bytes(&[]).expect("clear");
+    assert_eq!(
+        enc.heap_size(),
+        empty,
+        "a cleared dictionary must leave the encoder holding no more than it did before",
+    );
+}
+
+/// The streaming setter is the same upstream entry point as the one-shot one
+/// (`ZSTD_CCtx_loadDictionary` on a streaming context), which loads in
+/// `ZSTD_dct_auto` mode: bytes without `ZSTD_MAGIC_DICTIONARY` are raw content.
+#[test]
+fn set_dictionary_from_bytes_takes_unmagicked_bytes_as_raw_content() {
+    use crate::decoding::Dictionary;
+
+    let content: Vec<u8> = b"tenant=demo region=eu table=orders payload="
+        .iter()
+        .copied()
+        .cycle()
+        .take(2048)
+        .collect();
+    assert_ne!(
+        content[..4],
+        crate::decoding::DICTIONARY_MAGIC,
+        "the fixture must not start with the dictionary magic",
+    );
+    let mut payload = Vec::new();
+    while payload.len() < 8192 {
+        payload.extend_from_slice(&content);
+    }
+
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Default);
+    encoder
+        .set_dictionary_from_bytes(&content)
+        .expect("raw content must load the way `zstd -D` loads it");
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    // No header field to advertise: a raw-content dictionary carries no id.
+    assert_eq!(compressed[4] & 0b11, 0);
+
+    let mut decoder = StreamingDecoder::new_with_dictionary_handle(
+        compressed.as_slice(),
+        &crate::decoding::DictionaryHandle::from_dictionary(
+            Dictionary::from_raw_content(0, content).expect("a raw dictionary has no id"),
+        ),
+    )
+    .unwrap();
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}

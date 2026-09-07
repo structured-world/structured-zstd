@@ -714,3 +714,235 @@ fn borrowed_dict_kernel_reconstructs_via_dual_base() {
         "expected at least one match reading from the dictionary region (dual-base path)",
     );
 }
+
+/// A repeat offset can point into the dictionary rather than the input — that
+/// is what a dictionary's own repeat offsets are for on the first block — and
+/// then the repcode probe reads its candidate from the other buffer. The
+/// four-byte gate has to hold there too: the match is real and must be found.
+#[test]
+fn borrowed_dict_kernel_takes_a_repcode_whose_candidate_is_in_the_dictionary() {
+    use crate::encoding::fastpath::FastpathKernel;
+
+    let hash_log = 12u32;
+    const MLS: u32 = 4;
+    let dict: Vec<u8> = (0u8..40).collect();
+    let dict_end = dict.len();
+    // The repcode is probed at `curr + 1`, so the byte that lines up with the
+    // dictionary's start is the input's SECOND one.
+    let mut inp: Vec<u8> = alloc::vec![0xFF];
+    inp.extend_from_slice(&dict[0..24]);
+    inp.extend_from_slice(b"tail");
+
+    // `rep_abs = (dict_end + curr) + 1 - offset_1`, so this offset puts the
+    // candidate at dictionary position 0 for the very first probe.
+    let offset_1 = (dict_end + 1) as u32;
+
+    let mut main_table = FastHashTable::new(hash_log, MLS);
+    // Empty dictionary table: nothing but the repcode may match, so the
+    // sequence below can only have come through the repcode's dictionary arm.
+    let dict_table = FastHashTable::new(hash_log, MLS);
+
+    let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+    let mut handle = |seq: Sequence<'_>| match seq {
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => tuples.push((literals.to_vec(), offset, match_len)),
+        Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
+    };
+
+    let result = compress_block_fast_dict_borrowed::<MLS, false>(
+        &inp,
+        &dict,
+        0,
+        inp.len(),
+        &mut main_table,
+        &dict_table,
+        PrefixBounds {
+            prefix_start_index: 1,
+            window_low: 0,
+        },
+        [offset_1, 0],
+        2,
+        &mut handle,
+        FastpathKernel::Scalar,
+    );
+
+    let mut window = dict.clone();
+    let mut saw_dict_repcode = false;
+    for (literals, offset, match_len) in &tuples {
+        window.extend_from_slice(literals);
+        if *match_len > 0 {
+            let start = window.len() - offset;
+            if start < dict_end {
+                saw_dict_repcode = true;
+            }
+            for i in 0..*match_len {
+                let b = window[start + i];
+                window.push(b);
+            }
+        }
+    }
+    let tail_start = inp.len() - result.tail_literals_len;
+    window.extend_from_slice(&inp[tail_start..]);
+
+    assert_eq!(
+        &window[dict_end..],
+        &inp[..],
+        "a repcode reading from the dictionary must reconstruct the input exactly",
+    );
+    assert!(
+        saw_dict_repcode,
+        "expected the repcode to be taken against the dictionary: {tuples:?}",
+    );
+}
+
+/// The other side of the dictionary-tail case: a repcode candidate there has
+/// no four bytes of its own to be judged on, so it is counted instead — and
+/// when that count falls short of four the candidate is rejected, exactly as a
+/// failed four-byte gate would have rejected it.
+#[test]
+fn borrowed_dict_kernel_rejects_a_short_repcode_in_the_dictionary_tail() {
+    use crate::encoding::fastpath::FastpathKernel;
+
+    let hash_log = 12u32;
+    const MLS: u32 = 4;
+    let mut dict: Vec<u8> = (0u8..30).collect();
+    dict.extend_from_slice(b"AB");
+    // The probe is at `curr + 1`, and `rep_abs = dict_end + curr + 1 -
+    // offset_1`, so offset 3 puts it two bytes from the dictionary's end.
+    // `A` lines up, `Z` does not: one byte, short of the four a match needs.
+    let inp: Vec<u8> = b"\xffAZ-then-plain-literals-with-nothing-to-match".to_vec();
+
+    let mut main_table = FastHashTable::new(hash_log, MLS);
+    let dict_table = FastHashTable::new(hash_log, MLS);
+
+    let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+    let mut handle = |seq: Sequence<'_>| match seq {
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => tuples.push((literals.to_vec(), offset, match_len)),
+        Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
+    };
+
+    let result = compress_block_fast_dict_borrowed::<MLS, false>(
+        &inp,
+        &dict,
+        0,
+        inp.len(),
+        &mut main_table,
+        &dict_table,
+        PrefixBounds {
+            prefix_start_index: 1,
+            window_low: 0,
+        },
+        [3, 0],
+        2,
+        &mut handle,
+        FastpathKernel::Scalar,
+    );
+
+    assert!(
+        tuples.iter().all(|(_, _, m)| *m == 0),
+        "a one-byte dictionary-tail candidate is not a match: {tuples:?}",
+    );
+    assert_eq!(
+        result.tail_literals_len,
+        inp.len(),
+        "with nothing matched the whole block is literals",
+    );
+}
+
+/// A candidate in the last three bytes of the dictionary cannot be judged on
+/// four bytes of its own — the fourth would come from the input, a separate
+/// buffer here — so it keeps the counting form instead of the four-byte gate.
+/// The match is real (it continues into the input across the boundary) and
+/// must still be found, which is what the gate must not cost.
+#[test]
+fn borrowed_dict_kernel_finds_a_match_starting_in_the_dictionary_tail() {
+    use crate::encoding::fastpath::FastpathKernel;
+
+    let hash_log = 12u32;
+    const MLS: u32 = 4;
+    // The dictionary ends with "AB"; the input is "ABAB…", so a candidate at
+    // `dict.len() - 2` matches two bytes of dictionary and then continues into
+    // the input itself.
+    let mut dict: Vec<u8> = (0u8..30).collect();
+    dict.extend_from_slice(b"AB");
+    let dict_end = dict.len();
+    let inp: Vec<u8> = b"AB".repeat(24);
+
+    let mut main_table = FastHashTable::new(hash_log, MLS);
+    let mut dict_table = FastHashTable::new(hash_log, MLS);
+    // Point the slot the input's first key looks up at that tail position. The
+    // ordinary fill stops `HASH_READ_SIZE` short of the end, so the only way to
+    // reach the tail case is to seed it — which is exactly the state a
+    // dictionary whose own tail was hashed elsewhere would leave.
+    let dpos = dict_end - 2;
+    // SAFETY: the input has more than 8 readable bytes; MLS matches the table.
+    let hat = unsafe { hash_ptr_raw::<MLS>(inp.as_ptr(), hash_log + DICT_TAG_BITS) };
+    unsafe {
+        dict_table.put(
+            hat >> DICT_TAG_BITS,
+            ((dpos as u32) << DICT_TAG_BITS) | (hat & DICT_TAG_MASK),
+        )
+    };
+
+    let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+    let mut handle = |seq: Sequence<'_>| match seq {
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => tuples.push((literals.to_vec(), offset, match_len)),
+        Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
+    };
+
+    let result = compress_block_fast_dict_borrowed::<MLS, false>(
+        &inp,
+        &dict,
+        0,
+        inp.len(),
+        &mut main_table,
+        &dict_table,
+        PrefixBounds {
+            prefix_start_index: 1,
+            window_low: 0,
+        },
+        [0, 0],
+        2,
+        &mut handle,
+        FastpathKernel::Scalar,
+    );
+
+    let mut window = dict.clone();
+    let mut saw_dict_tail_match = false;
+    for (literals, offset, match_len) in &tuples {
+        window.extend_from_slice(literals);
+        if *match_len > 0 {
+            let start = window.len() - offset;
+            if start >= dpos && start < dict_end {
+                saw_dict_tail_match = true;
+            }
+            for i in 0..*match_len {
+                let b = window[start + i];
+                window.push(b);
+            }
+        }
+    }
+    let tail_start = inp.len() - result.tail_literals_len;
+    window.extend_from_slice(&inp[tail_start..]);
+
+    assert_eq!(
+        &window[dict_end..],
+        &inp[..],
+        "a dictionary-tail match must still reconstruct the input exactly",
+    );
+    assert!(
+        saw_dict_tail_match,
+        "expected the match to start in the dictionary's last bytes: {tuples:?}",
+    );
+}
