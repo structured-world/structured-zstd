@@ -3544,8 +3544,21 @@ impl DfastMatchGenerator {
             target_endian = "little",
             feature = "kernel-neon"
         ))]
-        unsafe {
-            dispatch_dict!(start_matching_fast_loop_neon, start_matching_dict_loop_neon)
+        {
+            // NEON is resolved at compile time here, so the cached tier is not
+            // read and a release build carries no choice at all. Tests ask for
+            // the scalar dictionary loop through it, which is the only way this
+            // target can check the two against each other — the branch is
+            // `cfg(test)` and does not exist in a shipped build.
+            #[cfg(test)]
+            if use_dict && self.kernel == crate::encoding::fastpath::FastpathKernel::Scalar {
+                return self.start_matching_dict_loop_scalar(
+                    current_abs_start,
+                    current_len,
+                    handle_sequence,
+                );
+            }
+            unsafe { dispatch_dict!(start_matching_fast_loop_neon, start_matching_dict_loop_neon) }
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
@@ -3801,18 +3814,26 @@ impl DfastMatchGenerator {
         )
     }
 
-    #[cfg(not(any(
-        all(
-            target_arch = "aarch64",
-            target_endian = "little",
-            feature = "kernel-neon"
-        ),
-        all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel-simd128"
-        )
-    )))]
+    /// Also built in test builds on the targets whose dispatch is
+    /// unconditional (aarch64+NEON, wasm+simd128), where nothing would
+    /// otherwise compile it: without it those targets have no second kernel to
+    /// check the first against, and the scalar/SIMD agreement the dispatch
+    /// assumes would go untested exactly where the SIMD one always wins.
+    #[cfg(any(
+        not(any(
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                feature = "kernel-neon"
+            ),
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel-simd128"
+            )
+        )),
+        test
+    ))]
     #[allow(unused_unsafe)]
     fn start_matching_dict_loop_scalar(
         &mut self,

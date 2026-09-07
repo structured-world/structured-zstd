@@ -783,9 +783,11 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
 /// assumes: every tier emits the same sequences, so the scalar fallback and
 /// the SIMD kernels agree bit for bit.
 ///
-/// x86-only, as with the binary-tree tiers above: the aarch64 dispatch is
-/// unconditional NEON and never reads the cached field.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// Runs on every target that has a second kernel to compare against, aarch64
+/// included: there the dispatch resolves NEON at compile time, so the scalar
+/// loop is reachable only through the `cfg(test)` branch the dispatcher keeps
+/// for exactly this — otherwise the target where the SIMD kernel always wins
+/// would be the one target that never checks it.
 #[test]
 fn dfast_dictionary_all_kernel_tiers_emit_identical_sequences() {
     use crate::encoding::fastpath::FastpathKernel;
@@ -794,14 +796,26 @@ fn dfast_dictionary_all_kernel_tiers_emit_identical_sequences() {
     // `unsafe` and assumes its target feature is present.
     #[allow(unused_mut)]
     let mut tiers = alloc::vec![FastpathKernel::Scalar];
-    #[cfg(feature = "kernel-sse")]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
     if std::is_x86_feature_detected!("sse2") {
         tiers.push(FastpathKernel::Sse2);
     }
-    #[cfg(feature = "kernel-avx2")]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
         tiers.push(FastpathKernel::Avx2Bmi2);
     }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    ))]
+    tiers.push(FastpathKernel::Neon);
 
     let dict: Vec<u8> = (0..20 * 1024u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
