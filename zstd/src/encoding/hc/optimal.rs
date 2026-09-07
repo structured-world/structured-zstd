@@ -63,8 +63,16 @@ macro_rules! build_optimal_plan_impl_body {
         let initial_reps = $initial_state.reps;
         let initial_litlen = $initial_state.litlen;
         let ldm_block_offset = $initial_state.block_offset;
-        let mut profile = $initial_state.profile;
-        profile.sufficient_match_len = $self.hc.sufficient_match_len_for_pass(profile);
+        // `sufficient_match_len` arrives already clamped for the pass: it is a
+        // block constant (the profile's value against `target_len`), and this
+        // body runs once per LITERAL on input the search finds nothing in, so
+        // deriving it here was an out-of-line call per literal.
+        let profile = $initial_state.profile;
+        debug_assert_eq!(
+            profile.sufficient_match_len,
+            $self.hc.sufficient_match_len_for_pass(profile),
+            "the caller must clamp sufficient_match_len for the pass",
+        );
         // Const-fold from the strategy's associated `OPT_LEVEL`
         // (upstream zstd `optLevel`): BtOpt = 0, BtUltra / BtUltra2 = 2.
         // The two flags below are the only places the inner DP loop
@@ -1062,7 +1070,10 @@ impl HcMatchGenerator {
         // SUFFICIENT_MATCH_LEN / ACCURATE_PRICE / FAVOR_SMALL_OFFSETS),
         // so the optimiser produces the literal at codegen time
         // without a runtime match.
-        let profile = HcOptimalCostProfile::const_for_strategy::<S>();
+        let mut profile = HcOptimalCostProfile::const_for_strategy::<S>();
+        // Clamped here, once for the block, rather than inside the per-segment
+        // DP body (which on input without matches is entered per literal).
+        profile.sufficient_match_len = self.hc.sufficient_match_len_for_pass(profile);
         // The DP bodies read the strategy's `FAVOR_SMALL_OFFSETS` const directly;
         // verify the runtime profile (built from the same strategy) agrees.
         debug_assert_eq!(profile.favor_small_offsets, S::FAVOR_SMALL_OFFSETS);
@@ -1284,7 +1295,9 @@ impl HcMatchGenerator {
         // trait must be in scope to read its associated consts in
         // `run_seed_loop!`.
         use crate::encoding::strategy::Strategy;
-        let seed_profile = HcOptimalCostProfile::const_for_strategy::<S>();
+        let mut seed_profile = HcOptimalCostProfile::const_for_strategy::<S>();
+        // Same per-block clamp the main pass does; the DP body expects it done.
+        seed_profile.sufficient_match_len = self.hc.sufficient_match_len_for_pass(seed_profile);
         debug_assert_eq!(seed_profile.favor_small_offsets, S::FAVOR_SMALL_OFFSETS);
         let mut opt_state =
             core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
