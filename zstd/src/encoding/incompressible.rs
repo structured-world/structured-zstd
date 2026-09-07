@@ -36,7 +36,16 @@ use alloc::vec::Vec;
 pub(crate) struct SeenContentGrid {
     /// A slot belongs to the frame whose `epoch` it carries; one from an
     /// earlier frame reads as empty, which is what makes starting a frame free.
-    slots: Vec<SeenSample>,
+    ///
+    /// Packed into a plain integer rather than held as [`SeenSample`] so that
+    /// taking the table is a zeroed allocation: `vec![0u64; n]` asks the
+    /// allocator for zeroed memory, which a large request gets as pages the
+    /// kernel has not had to write, while `vec![Struct::default(); n]` writes
+    /// every element. A compressor is built per frame in the shape this is for,
+    /// so that write was a whole table memset per frame — on a mebibyte of
+    /// patterned input at the fast levels it was most of the gap against the
+    /// release before this one.
+    slots: Vec<u64>,
     /// One byte of each slot's key, in a table of its own. A probe run is 512
     /// lookups and nearly all of them miss, so the miss has to be cheap: a byte
     /// per slot keeps a window's worth of them in cache where the same number of
@@ -56,8 +65,8 @@ pub(crate) struct SeenContentGrid {
     repeat_until: u64,
 }
 
-/// Sixteen bytes, which is what the three fields pack into with no padding:
-/// widening any of them costs a byte of table for every slot.
+/// One slot, unpacked from the eight bytes it is stored in. Widening any field
+/// costs a byte of table for every slot, and takes the packed form past a word.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct SeenSample {
     /// Sixteen bits here and eight more in the tag table: a coincidence costs a
@@ -70,6 +79,27 @@ pub(crate) struct SeenSample {
     /// is what every record sits on. A frame would have to run past two
     /// tebibytes for this to be too narrow.
     at_step: u32,
+}
+
+impl SeenSample {
+    /// Fingerprint in the low sixteen bits, epoch above it, offset in the high
+    /// half. A zeroed word is epoch 0, which no frame ever runs under, so an
+    /// untouched slot reads as empty without being written first.
+    #[inline]
+    fn pack(self) -> u64 {
+        u64::from(self.fingerprint)
+            | (u64::from(self.epoch) << 16)
+            | (u64::from(self.at_step) << 32)
+    }
+
+    #[inline]
+    fn unpack(word: u64) -> Self {
+        Self {
+            fingerprint: word as u16,
+            epoch: (word >> 16) as u16,
+            at_step: (word >> 32) as u32,
+        }
+    }
 }
 
 impl SeenContentGrid {
@@ -153,15 +183,19 @@ impl SeenContentGrid {
             return;
         };
         let base_steps32 = u32::try_from(base_steps).expect("the origin moves at the index limit");
-        for (slot, tag) in self.slots.iter_mut().zip(self.tags.iter_mut()) {
-            if slot.epoch != self.epoch {
+        for (word, tag) in self.slots.iter_mut().zip(self.tags.iter_mut()) {
+            let mut held = SeenSample::unpack(*word);
+            if held.epoch != self.epoch {
                 continue;
             }
-            match slot.at_step.checked_sub(base_steps32) {
-                Some(rebased) => slot.at_step = rebased,
+            match held.at_step.checked_sub(base_steps32) {
+                Some(rebased) => {
+                    held.at_step = rebased;
+                    *word = held.pack();
+                }
                 // Older than the widest window: no probe could have used it.
                 None => {
-                    *slot = SeenSample::default();
+                    *word = 0;
                     *tag = 0;
                 }
             }
@@ -179,7 +213,7 @@ impl SeenContentGrid {
         // thousand rather than letting a stale slot read as live.
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
-            self.slots.fill(SeenSample::default());
+            self.slots.fill(0);
             self.tags.fill(0);
             self.epoch = 1;
         }
@@ -188,7 +222,7 @@ impl SeenContentGrid {
     }
 
     pub(crate) fn heap_size(&self) -> usize {
-        self.slots.capacity() * core::mem::size_of::<SeenSample>() + self.tags.capacity()
+        self.slots.capacity() * core::mem::size_of::<u64>() + self.tags.capacity()
     }
 
     /// The mixed key at `at`, and the slot it belongs in.
@@ -219,7 +253,7 @@ impl SeenContentGrid {
         if self.tags[slot] != tag {
             return false;
         }
-        let held = self.slots[slot];
+        let held = SeenSample::unpack(self.slots[slot]);
         let here = self.frame_offset + at as u64;
         if held.epoch != self.epoch || held.fingerprint != fingerprint {
             return false;
@@ -254,7 +288,8 @@ impl SeenContentGrid {
             fingerprint,
             epoch: self.epoch,
             at_step: (here / Self::RECORD_STEP as u64) as u32,
-        };
+        }
+        .pack();
     }
 
     /// Record this block on the grid and report whether it duplicates content
@@ -292,7 +327,9 @@ impl SeenContentGrid {
         }
         let wanted = Self::slots_for(window_size);
         if self.slots.len() < wanted {
-            self.slots = vec![SeenSample::default(); wanted];
+            // Both zeroed allocations, which the allocator can serve as pages
+            // the kernel has not written; see the field's own note.
+            self.slots = vec![0u64; wanted];
             self.tags = vec![0u8; wanted];
             // Zeroed slots carry epoch 0, so a frame must never run under it.
             self.epoch = self.epoch.max(1);

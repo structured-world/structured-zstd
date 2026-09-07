@@ -200,6 +200,7 @@ fn the_content_grid_keeps_reporting_a_run_of_the_same_block() {
     let stale = grid
         .slots
         .iter()
+        .map(|word| SeenSample::unpack(*word))
         .filter(|slot| {
             slot.fingerprint != 0
                 && u64::from(slot.at_step) * (SeenContentGrid::RECORD_STEP as u64)
