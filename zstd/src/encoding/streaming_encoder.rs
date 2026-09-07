@@ -323,14 +323,18 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         Ok(())
     }
 
-    /// Attach a serialized dictionary blob to the frame (upstream zstd
-    /// `ZSTD_CCtx_loadDictionary` on a streaming context). The dictionary primes
-    /// the match-finder and seeds the first block's entropy tables + repeat
-    /// offsets, and its ID is written into the frame header. Must be called
-    /// before the first [`write`](Write::write); the parsed dictionary must have
-    /// a non-zero ID and non-zero repeat offsets.
+    /// Attach a dictionary blob to the frame (upstream zstd
+    /// `ZSTD_CCtx_loadDictionary` on a streaming context, which loads in
+    /// `ZSTD_dct_auto` mode): a blob prefixed with
+    /// [`DICTIONARY_MAGIC`](crate::decoding::DICTIONARY_MAGIC) is a serialized
+    /// dictionary, anything else is raw content. The dictionary primes the
+    /// match-finder and seeds the first block's entropy tables + repeat
+    /// offsets; a serialized one's ID is written into the frame header, while
+    /// raw content has none to write, so the decoder must be given the same
+    /// bytes explicitly. Must be called before the first
+    /// [`write`](Write::write); repeat offsets must be non-zero.
     pub fn set_dictionary_from_bytes(&mut self, raw_dictionary: &[u8]) -> Result<(), Error> {
-        let dict = EncoderDictionary::from_bytes(raw_dictionary)
+        let dict = EncoderDictionary::from_serialized_or_raw_content(raw_dictionary)
             .map_err(|err| invalid_input_error(&alloc::format!("invalid dictionary: {err:?}")))?;
         self.set_encoder_dictionary(dict)
     }

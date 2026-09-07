@@ -1227,6 +1227,69 @@ fn set_dictionary_accepts_a_dictionary_without_an_id() {
     );
 }
 
+/// Upstream loads a dictionary buffer in `ZSTD_dct_auto` mode
+/// (`ZSTD_CCtx_loadDictionary` -> `ZSTD_compress_insertDictionary`,
+/// zstd_compress.c:5216-5222): a buffer whose first four bytes are not
+/// `ZSTD_MAGIC_DICTIONARY` is raw content, not a malformed dictionary. Any file
+/// can therefore be handed to `zstd -D`, and the same has to hold here, or a
+/// caller that works against libzstd fails against this one.
+#[test]
+fn set_dictionary_from_bytes_takes_unmagicked_bytes_as_raw_content() {
+    // Record-shaped, so the payload below actually matches into it: a blob the
+    // encoder cannot use would round-trip even with the dictionary silently
+    // dropped, and the frame-size check at the end would not hold.
+    let raw_dict = b"tenant=demo table=orders op=put value=aaaaabbbbbcccccdddddeeeee\n".repeat(16);
+    assert_ne!(
+        &raw_dict[..4],
+        &crate::decoding::DICTIONARY_MAGIC,
+        "the fixture must not start with the dictionary magic",
+    );
+    let payload = b"tenant=demo table=orders op=put value=aaaaabbbbbcccccdddddeeeee\n".repeat(4);
+
+    let mut with_dict = Vec::new();
+    let mut compressor = FrameCompressor::new(super::CompressionLevel::Default);
+    compressor
+        .set_dictionary_from_bytes(&raw_dict)
+        .expect("raw content must load the way `zstd -D` loads it");
+    compressor.set_source(payload.as_slice());
+    compressor.set_drain(&mut with_dict);
+    compressor.compress();
+
+    // A raw-content dictionary has no header to carry an id, so the frame
+    // records none (upstream: `dictID = 0` is not written).
+    let (header, _) = crate::decoding::frame::read_frame_header(with_dict.as_slice())
+        .expect("the frame header should read back");
+    assert_eq!(
+        header.dictionary_id(),
+        None,
+        "a raw-content dictionary has no id to advertise",
+    );
+
+    let handle = crate::decoding::Dictionary::from_raw_content(0, raw_dict.clone())
+        .expect("raw content is a valid dictionary")
+        .into_handle();
+    let mut decoded = vec![0u8; payload.len()];
+    let written = FrameDecoder::new()
+        .decode_all_with_dict_handle(&with_dict, &mut decoded, &handle)
+        .expect("the frame decodes against the same bytes");
+    assert_eq!(&decoded[..written], payload.as_slice());
+
+    // And the dictionary was worth attaching: the same payload without it is
+    // larger, which is what proves the content was primed rather than parsed
+    // and discarded.
+    let mut without_dict = Vec::new();
+    let mut plain = FrameCompressor::new(super::CompressionLevel::Default);
+    plain.set_source(payload.as_slice());
+    plain.set_drain(&mut without_dict);
+    plain.compress();
+    assert!(
+        with_dict.len() < without_dict.len(),
+        "the raw content should have been primed: {} vs {} bytes without it",
+        with_dict.len(),
+        without_dict.len(),
+    );
+}
+
 #[test]
 fn set_dictionary_rejects_zero_repeat_offsets() {
     let invalid = crate::decoding::Dictionary {

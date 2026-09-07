@@ -1160,3 +1160,48 @@ fn raw_dictionary_leaves_the_id_out_of_the_streaming_header() {
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
 }
+
+/// The streaming setter is the same upstream entry point as the one-shot one
+/// (`ZSTD_CCtx_loadDictionary` on a streaming context), which loads in
+/// `ZSTD_dct_auto` mode: bytes without `ZSTD_MAGIC_DICTIONARY` are raw content.
+#[test]
+fn set_dictionary_from_bytes_takes_unmagicked_bytes_as_raw_content() {
+    use crate::decoding::Dictionary;
+
+    let content: Vec<u8> = b"tenant=demo region=eu table=orders payload="
+        .iter()
+        .copied()
+        .cycle()
+        .take(2048)
+        .collect();
+    assert_ne!(
+        content[..4],
+        crate::decoding::DICTIONARY_MAGIC,
+        "the fixture must not start with the dictionary magic",
+    );
+    let mut payload = Vec::new();
+    while payload.len() < 8192 {
+        payload.extend_from_slice(&content);
+    }
+
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Default);
+    encoder
+        .set_dictionary_from_bytes(&content)
+        .expect("raw content must load the way `zstd -D` loads it");
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    // No header field to advertise: a raw-content dictionary carries no id.
+    assert_eq!(compressed[4] & 0b11, 0);
+
+    let mut decoder = StreamingDecoder::new_with_dictionary_handle(
+        compressed.as_slice(),
+        &crate::decoding::DictionaryHandle::from_dictionary(
+            Dictionary::from_raw_content(0, content).expect("a raw dictionary has no id"),
+        ),
+    )
+    .unwrap();
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}

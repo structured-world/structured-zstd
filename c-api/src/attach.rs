@@ -159,7 +159,13 @@ fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<bool, ZSTD_Err
         ZSTD_DCT_RAW_CONTENT => Ok(true),
         ZSTD_DCT_FULL_DICT => {
             if !has_magic {
-                return Err(ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted);
+                // `dictionary_wrong`, not `corrupted`: on the compression side
+                // fullDict over bytes that are not a dictionary is the caller
+                // having named the wrong kind (`ZSTD_compress_insertDictionary`,
+                // zstd_compress.c:5223). The decode side answers `corrupted`
+                // for the same bytes (`ZSTD_loadEntropy_intoDDict`,
+                // zstd_ddict.c:105) — see `parse_decode_dict`.
+                return Err(ZSTD_ErrorCode::ZSTD_error_dictionary_wrong);
             }
             Ok(false)
         }

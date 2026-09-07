@@ -313,6 +313,14 @@ impl DictionaryHandle {
         Dictionary::decode_dict(raw).map(Self::from_dictionary)
     }
 
+    /// Load whichever kind of dictionary `raw` holds, as `ZSTD_createDDict`
+    /// does: a blob starting with [`MAGIC_NUM`] is a serialized dictionary,
+    /// anything else is raw content. See
+    /// [`Dictionary::from_serialized_or_raw_content`].
+    pub fn from_serialized_or_raw_content(raw: &[u8]) -> Result<Self, DictionaryDecodeError> {
+        Dictionary::from_serialized_or_raw_content(raw).map(Self::from_dictionary)
+    }
+
     pub fn id(&self) -> u32 {
         self.inner.id
     }

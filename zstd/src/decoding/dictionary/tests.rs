@@ -105,6 +105,24 @@ fn dictionary_handle_from_raw_content_supports_as_ref() {
     assert_eq!(dict_ref.dict_content.as_slice(), &[42]);
 }
 
+/// `ZSTD_createDDict` loads in `ZSTD_dct_auto` mode (zstd_ddict.c:102-107): a
+/// buffer without the magic is raw content with no id and no entropy tables.
+/// The handle is the shared form the decoder is handed, so it takes the same
+/// two kinds the `Dictionary` constructor does.
+#[test]
+fn dictionary_handle_takes_serialized_or_raw_content() {
+    let serialized = include_bytes!("../../../dict_tests/dictionary");
+    let parsed = DictionaryHandle::from_serialized_or_raw_content(serialized)
+        .expect("a magic-prefixed blob parses as a full dictionary");
+    assert_ne!(parsed.id(), 0, "a full dictionary carries its id");
+
+    let raw = b"tenant=demo table=orders op=put".repeat(8);
+    let handle = DictionaryHandle::from_serialized_or_raw_content(&raw)
+        .expect("anything else is raw content");
+    assert_eq!(handle.id(), 0, "raw content has no header to carry an id");
+    assert_eq!(handle.as_dict().dict_content.as_slice(), raw.as_slice());
+}
+
 #[test]
 fn dictionary_handle_clones_share_inner() {
     let raw = include_bytes!("../../../dict_tests/dictionary");
