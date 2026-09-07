@@ -664,16 +664,25 @@ impl MatchTable {
         // re-lays out all three. That costs the same fill the separate vectors
         // paid for the region that changed, and saves two allocations.
         if self.chain_off != hash_size || self.hash3_off != hash_size + chain_size {
-            // One `vec![HC_EMPTY; total]`, never `clear` + `resize`. The
-            // sentinel is zero, so this asks the allocator for zeroed memory
-            // and a large request comes back as pages the kernel has not had
-            // to write and this frame does not touch until it indexes them.
-            // Resizing writes every element instead, which for a matcher taken
-            // fresh per frame meant faulting and zeroing the whole table on
-            // every frame: at level 22 on eight mebibytes it was 40% of the
-            // encode in `memset` and half of it in the kernel. It also hands
-            // back an oversized buffer, which levelling down from the tree
-            // finder needs anyway.
+            // Two shapes want opposite things here, so the buffer it already
+            // has decides which one this is.
+            //
+            // A matcher taken FRESH per frame has none, and then the fresh
+            // `vec![HC_EMPTY; total]` is what matters: the sentinel is zero, so
+            // the allocator is asked for zeroed memory and a large request comes
+            // back as pages the kernel has not had to write and this frame does
+            // not touch until it indexes them. Resizing writes every element
+            // instead, which for that shape meant faulting and zeroing the whole
+            // table every frame — at level 22 on eight mebibytes, 40% of the
+            // encode in `memset` and half of it in the kernel.
+            //
+            // A REUSED one alternating between layouts — levels 16 and 18 on the
+            // same compressor — has a buffer that fits, and taking a fresh one
+            // there is an allocate and free per frame. Refilling it instead, on
+            // forty frames of a mebibyte, ran 267/265/231 ms against 253/239/219
+            // and halved the page faults, 23,640 to 11,263, for 1.8 M more
+            // instructions. The oversize test keeps the release a level-down
+            // from the tree finder needs.
             if self.tables.capacity() >= total
                 && !capacity_is_oversized(self.tables.capacity(), total)
             {
