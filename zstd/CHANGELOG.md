@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.51](https://github.com/structured-world/structured-zstd/compare/v0.0.50...v0.0.51) - 2026-09-07
+
+### Fixed
+
+- *(dictionary)* load raw content where upstream does, and scan dictionary blocks the way it scans them ([#492](https://github.com/structured-world/structured-zstd/pull/492))
+
+### Performance
+
+- *(encode)* keep the buffers a frame holds, and restore the raw skip with its repeat probe ([#485](https://github.com/structured-world/structured-zstd/pull/485))
+
 ## [0.0.50](https://github.com/structured-world/structured-zstd/compare/v0.0.49...v0.0.50) - 2026-09-05
 
 ### Added
