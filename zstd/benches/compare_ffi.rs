@@ -1098,7 +1098,10 @@ fn release_freed_memory() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         unsafe extern "C" {
-            fn malloc_trim(pad: core::ffi::c_int) -> core::ffi::c_int;
+            // `int malloc_trim(size_t pad)` — the argument is a size, not an
+            // int, and declaring it narrower is wrong however the two happen to
+            // be passed on this ABI.
+            fn malloc_trim(pad: usize) -> core::ffi::c_int;
         }
         // SAFETY: takes no pointers and only returns free pages to the kernel;
         // nothing live is touched.

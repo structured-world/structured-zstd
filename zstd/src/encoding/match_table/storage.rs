@@ -2479,6 +2479,12 @@ impl MatchTable {
     ///
     /// `concat_ptr` / `concat_len` must describe the current live history, and
     /// it must not be reallocated for the duration of the call.
+    ///
+    /// The hash3 table must also be at its configured width — `hash3_table()`
+    /// exactly `1 << hash3_log` slots, which [`Self::ensure_tables`] is what
+    /// establishes. The writes below are masked to that many bits and go
+    /// through a raw pointer, so a caller that reaches here with a table left
+    /// at another level's width writes out of bounds in release.
     #[inline]
     pub(crate) unsafe fn fill_hash3_from(
         &mut self,

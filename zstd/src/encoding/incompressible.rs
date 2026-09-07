@@ -515,12 +515,18 @@ impl SeenContentGrid {
             // The start run on a frame's first block cannot hit anything: the
             // table is empty until that block records into it, and a frame of a
             // few kilobytes is one block.
-            if probe && (self.frame_offset != 0 || start != 0) {
+            // Nothing to ask once the answer is in: a probe is read-only and
+            // the run reports one bool, so every lookup after the first hit is
+            // a random table access for a verdict already reached.
+            if probe && !repeat && (self.frame_offset != 0 || start != 0) {
                 let end = (start + run).min(last + 1);
                 for at in start..end {
                     // SAFETY: `end <= last + 1`, so every `at` here is at most
                     // `last`, which is `block.len() - KEY_LEN`.
-                    repeat |= unsafe { self.probe_key(block_ptr, at, reach, mask) };
+                    if unsafe { self.probe_key(block_ptr, at, reach, mask) } {
+                        repeat = true;
+                        break;
+                    }
                 }
             }
             // The rest of the block, once no run is left to probe it.
