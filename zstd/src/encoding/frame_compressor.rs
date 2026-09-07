@@ -297,6 +297,16 @@ pub(crate) type SharedFseTable = alloc::sync::Arc<FSETable>;
 #[cfg(not(target_has_atomic = "ptr"))]
 pub(crate) type SharedFseTable = alloc::rc::Rc<FSETable>;
 
+/// Bytes a [`SharedFseTable`] allocation carries in FRONT of the table: the two
+/// reference counts, then whatever padding the table's alignment adds. One
+/// allocation holds both, so a caller sizing a context is told about the whole
+/// of it rather than the payload alone.
+const fn shared_table_overhead() -> usize {
+    let counts = 2 * core::mem::size_of::<usize>();
+    let align = core::mem::align_of::<FSETable>();
+    counts.div_ceil(align) * align
+}
+
 #[derive(Clone)]
 pub(crate) enum PreviousFseTable {
     // Default tables are immutable and already stored alongside the state, so
@@ -338,11 +348,173 @@ pub(crate) struct FseTables {
     pub(crate) ml_previous: Option<PreviousFseTable>,
     pub(crate) of_default: crate::fse::fse_encoder::FseDefaultTable,
     pub(crate) of_previous: Option<PreviousFseTable>,
+    /// Where a block builds the table it is about to emit, before that table
+    /// becomes the axis's `*_previous`.
+    ///
+    /// Upstream's `ZSTD_blockState_t` keeps `prevCBlock` and `nextCBlock` for
+    /// exactly this: the entropy build reads the previous tables and writes the
+    /// next ones, so the two never alias and committing a block is a pointer
+    /// swap (`ZSTD_blockState_confirmRepcodesAndEntropyTables`). A block that
+    /// ends up raw simply does not swap. Holding the slot here is what lets a
+    /// table be built in place instead of on the stack.
+    /// `None` until an axis first builds a table. Lazy because a state that
+    /// never emits a custom table must not pay for a slot: the block splitter
+    /// makes one of these per probe, and eagerly giving each three tables
+    /// faulted in pages for buffers most probes never wrote to.
+    pub(crate) ll_next: Option<SharedFseTable>,
+    pub(crate) ml_next: Option<SharedFseTable>,
+    pub(crate) of_next: Option<SharedFseTable>,
 }
 
 impl FseTables {
+    /// Undo a block's table confirmation, keeping the tables it built as the
+    /// next block's buffers.
+    ///
+    /// A block that loses to a raw one has already had its tables confirmed
+    /// into the previous slots, and the caller holds a clone of what they
+    /// were. Restoring only that clone leaves the axis holding the SAME table
+    /// in both slots — the restored one in `previous` and the one confirmation
+    /// displaced into `next` — so the next block finds its buffer shared and
+    /// allocates eleven kilobytes instead of writing into it, on every block
+    /// of a run that keeps falling back.
+    ///
+    /// Handing the discarded table to `next` fixes both halves at once: the
+    /// restored table is unique again, and the buffer the block just filled is
+    /// exactly what the next one wants to build into.
+    pub(crate) fn roll_back_confirmation(&mut self, saved: [Option<PreviousFseTable>; 3]) {
+        let [saved_ll, saved_ml, saved_of] = saved;
+        for (previous, next, restored) in [
+            (&mut self.ll_previous, &mut self.ll_next, saved_ll),
+            (&mut self.ml_previous, &mut self.ml_next, saved_ml),
+            (&mut self.of_previous, &mut self.of_next, saved_of),
+        ] {
+            let discarded = core::mem::replace(previous, restored);
+            // The table the block built, and it is not the one just restored:
+            // whatever `next` held was the outgoing previous, which is what was
+            // restored, so it is a duplicate and this one is free and unique.
+            //
+            // The exception is `RepeatLast`, where confirmation never replaced
+            // `previous` at all — the discarded handle IS the restored one.
+            // Parking it in `next` then leaves the two sharing a handle, and the
+            // next custom build cannot write into a table `previous` still
+            // holds, so it allocates another one.
+            let built = match discarded {
+                Some(PreviousFseTable::Custom(built))
+                    if !matches!(previous.as_ref(), Some(PreviousFseTable::Custom(back))
+                        if SharedFseTable::ptr_eq(&built, back)) =>
+                {
+                    Some(built)
+                }
+                _ => None,
+            };
+            match built {
+                Some(built) => *next = Some(built),
+                // Nothing new to park. The block settled on a predefined or RLE
+                // table, or repeated the last one, so confirmation may have
+                // parked the outgoing custom table here — and if that is the
+                // table now back in `previous`, holding it here too is what
+                // keeps the next build from writing into it.
+                None => {
+                    if let (Some(spare), Some(PreviousFseTable::Custom(back))) =
+                        (next.as_ref(), previous.as_ref())
+                        && SharedFseTable::ptr_eq(spare, back)
+                    {
+                        *next = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keep the frame's tables as buffers before the next frame overwrites
+    /// them.
+    ///
+    /// A frame start replaces every previous slot — with the dictionary's
+    /// seed, or with nothing — and dropping the table that was there costs a
+    /// reused compressor an eleven-kilobyte allocation per axis on the next
+    /// frame that builds one. The slot the axis builds into is exactly where
+    /// it belongs. Only an unshared table is worth keeping: one still held by
+    /// the dictionary entropy cache cannot be built into anyway.
+    pub(crate) fn park_previous_before_frame(&mut self) {
+        for (previous, next) in [
+            (&mut self.ll_previous, &mut self.ll_next),
+            (&mut self.ml_previous, &mut self.ml_next),
+            (&mut self.of_previous, &mut self.of_next),
+        ] {
+            // Decided before taking: a handle the cache still holds stays
+            // where it is rather than being pulled out and dropped.
+            let worth_keeping = matches!(
+                previous.as_ref(),
+                Some(PreviousFseTable::Custom(handle))
+                    if SharedFseTable::strong_count(handle) == 1
+            );
+            // An occupied slot is not the same as a usable one. A frame that
+            // settled on a predefined table parks the dictionary cache's handle
+            // here, and a shared handle cannot be built into — so leaving it
+            // there while the uniquely owned table is dropped costs the
+            // allocation this exists to avoid, on the first custom build of
+            // every frame.
+            let next_is_a_buffer = next
+                .as_ref()
+                .is_some_and(|handle| SharedFseTable::strong_count(handle) == 1);
+            if !next_is_a_buffer
+                && worth_keeping
+                && let Some(PreviousFseTable::Custom(handle)) = previous.take()
+            {
+                *next = Some(handle);
+            }
+        }
+    }
+
+    /// Heap bytes the retained encoder tables hold.
+    ///
+    /// Both slots of an axis count: the previous table is what the next block
+    /// reads, the next slot is the buffer it builds into, and each lives as
+    /// long as the compressor. A handle shared with the dictionary entropy
+    /// cache is left out, because that cache reports its own tables and the
+    /// caller would otherwise be told about the same allocation twice.
+    pub(crate) fn heap_size(&self) -> usize {
+        // The table AND the reference counts in front of it: a shared handle is
+        // one allocation holding both, and reporting only the payload
+        // understates every retained table by the control block and whatever
+        // padding its alignment adds.
+        let per_table = core::mem::size_of::<FSETable>() + shared_table_overhead();
+        let mut total = 0;
+        for previous in [&self.ll_previous, &self.ml_previous, &self.of_previous] {
+            if let Some(PreviousFseTable::Custom(handle)) = previous
+                && SharedFseTable::strong_count(handle) == 1
+            {
+                total += per_table;
+            }
+        }
+        for next in [&self.ll_next, &self.ml_next, &self.of_next] {
+            // Same ownership test as the previous slots, and for the same
+            // reason: a dictionary-seeded axis that settles on a predefined
+            // table parks the CACHE's handle here, and that cache reports the
+            // table itself.
+            if let Some(handle) = next
+                && SharedFseTable::strong_count(handle) == 1
+            {
+                total += per_table;
+            }
+        }
+        // Where there is neither a pointer atomic nor `critical-section` to
+        // guard a process-wide cache, each default table is an owned box built
+        // per compressor, so it is this struct's allocation to report. With the
+        // cache it is a `&'static` shared by every compressor and counts as
+        // nothing.
+        #[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
+        {
+            total += 3 * core::mem::size_of::<FSETable>();
+        }
+        total
+    }
+
     pub fn new() -> Self {
         Self {
+            ll_next: None,
+            ml_next: None,
+            of_next: None,
             ll_default: default_ll_table(),
             ll_previous: None,
             ml_default: default_ml_table(),
@@ -352,7 +524,14 @@ impl FseTables {
         }
     }
 
-    /// Borrow the LL default table as `&FSETable`. Abstracts the cfg
+    /// Borrow the LL default table as `&FSETable`.
+    ///
+    /// Test-only now: the encoder and the estimator both destructure
+    /// `FseTables` so they can hold a `*_next` slot mutably, and a method
+    /// borrowing the whole struct cannot coexist with that. Tests keep it
+    /// because they touch one table at a time.
+    ///
+    /// Abstracts the cfg
     /// split in [`crate::fse::fse_encoder::FseDefaultTable`] —
     /// `&'static FSETable` (atomic / `critical-section`) auto-derefs
     /// directly; `Box<FSETable>` (cache-less no-atomic) derefs
@@ -360,6 +539,7 @@ impl FseTables {
     /// downstream consumers can stay cfg-agnostic.
     #[inline]
     #[allow(clippy::borrow_deref_ref)]
+    #[cfg(test)]
     pub(crate) fn ll_default_ref(&self) -> &FSETable {
         &*self.ll_default
     }
@@ -367,6 +547,7 @@ impl FseTables {
     /// Borrow the ML default table as `&FSETable`. See [`Self::ll_default_ref`].
     #[inline]
     #[allow(clippy::borrow_deref_ref)]
+    #[cfg(test)]
     pub(crate) fn ml_default_ref(&self) -> &FSETable {
         &*self.ml_default
     }
@@ -374,6 +555,7 @@ impl FseTables {
     /// Borrow the OF default table as `&FSETable`. See [`Self::ll_default_ref`].
     #[inline]
     #[allow(clippy::borrow_deref_ref)]
+    #[cfg(test)]
     pub(crate) fn of_default_ref(&self) -> &FSETable {
         &*self.of_default
     }
@@ -460,6 +642,14 @@ fn reserve_for_next_block(
     out.reserve_exact(estimate.max(block_bound + produced as usize));
 }
 
+/// The rate and the width stay ARGUMENTS here, though upstream generates one
+/// function per tier and says the speed of the pass relies on compile-time
+/// constant propagation (`zstd_preSplit.c:32`, `ZSTD_GEN_RECORD_FINGERPRINT` at
+/// `:87`). Monomorphising the walk on both was tried and measured on 8 MiB of
+/// repeated log lines at level 6, three interleaved readings a side: cycles
+/// overlapping (966-984 M against 973-997 M) and instructions UP, 1,252 M to
+/// 1,268 M. Rust inlines this into a walk the caller already picked a tier for,
+/// so the propagation is there without the four copies.
 fn presplit_hash2(bytes: &[u8], hash_log: usize) -> usize {
     debug_assert!(hash_log >= 8);
     if hash_log == 8 {
@@ -476,7 +666,10 @@ fn presplit_record_fingerprint(
     sampling_rate: usize,
     hash_log: usize,
 ) {
-    fp.events.fill(0);
+    // Only the slots this hash can reach. The table is sized for the widest
+    // hash the splitter uses; a tier on a narrower one was clearing four times
+    // the memory it then touched, sixteen times a block.
+    fp.events[..1usize << hash_log].fill(0);
     fp.nb_events = 0;
     if src.len() < 2 {
         return;
@@ -509,14 +702,32 @@ fn presplit_record_byte_histogram(fp: &mut PreSplitFingerprint, src: &[u8]) {
 
 fn presplit_distance(lhs: &PreSplitFingerprint, rhs: &PreSplitFingerprint, hash_log: usize) -> u64 {
     let slots = 1usize << hash_log;
-    let mut distance = 0u64;
-    for idx in 0..slots {
-        let left = lhs.events[idx] as i128 * rhs.nb_events as i128;
-        let right = rhs.events[idx] as i128 * lhs.nb_events as i128;
-        // Plain `+`: events/nb_events are per-block sample counts (<= block
-        // size), so each |left-right| <= (2^17)^2 and the sum over <= 2^hash_log
-        // slots stays far under u64::MAX — no overflow.
-        distance += left.abs_diff(right) as u64;
+    // 64-bit, as upstream's `fpDistance` is (`zstd_preSplit.c`). Both factors
+    // are per-block sample counts bounded by the block size, so each product is
+    // under 2^34 and the sum over at most 2^10 slots is under 2^44 — the 128-bit
+    // arithmetic this used to do could not overflow either, it just cost several
+    // instructions a slot on a loop the splitter runs sixteen times a block.
+    let rn = rhs.nb_events as u64;
+    let ln = lhs.nb_events as u64;
+    // Four accumulators over slices the optimiser can see the length of, which
+    // is what lets this go wide: the splitter runs this loop once per chunk and
+    // sixteen times a block, so it counts more slots than the sampling reads
+    // bytes.
+    let (l, r) = (&lhs.events[..slots], &rhs.events[..slots]);
+    let mut acc = [0u64; 4];
+    let mut idx = 0;
+    while idx + 4 <= slots {
+        for lane in 0..4 {
+            let left = u64::from(l[idx + lane]) * rn;
+            let right = u64::from(r[idx + lane]) * ln;
+            acc[lane] += left.abs_diff(right);
+        }
+        idx += 4;
+    }
+    let mut distance = acc[0] + acc[1] + acc[2] + acc[3];
+    while idx < slots {
+        distance += (u64::from(l[idx]) * rn).abs_diff(u64::from(r[idx]) * ln);
+        idx += 1;
     }
     distance
 }
@@ -538,12 +749,22 @@ fn presplit_fingerprints_differ(
     deviation >= threshold
 }
 
-fn presplit_merge_events(acc: &mut PreSplitFingerprint, new_fp: &PreSplitFingerprint) {
+fn presplit_merge_events(
+    acc: &mut PreSplitFingerprint,
+    new_fp: &PreSplitFingerprint,
+    hash_log: usize,
+) {
     // Plain `+`: `acc` accumulates only the chunks of a single block (caller
     // loops within one block, <= MAX_BLOCK_SIZE), so the merged sample counts
     // stay far under u32 / usize bounds — no overflow.
-    for idx in 0..PRESPLIT_HASH_TABLE_SIZE {
-        acc.events[idx] += new_fp.events[idx];
+    //
+    // Only the slots this tier's hash reaches: the rest are never recorded into
+    // and never read, so merging them is a quarter of the table for nothing.
+    // Paired slices rather than indices, so the bound is one check instead of
+    // one per slot and the adds can go wide.
+    let slots = 1usize << hash_log;
+    for (into, from) in acc.events[..slots].iter_mut().zip(&new_fp.events[..slots]) {
+        *into += *from;
     }
     acc.nb_events += new_fp.nb_events;
 }
@@ -567,6 +788,13 @@ fn split_block_by_chunks(block: &[u8], level: usize) -> usize {
         sampling_rate,
         hash_log,
     );
+    // No pre-check on the ends before the walk. It reads as free — two
+    // fingerprints against the sixty-three the walk takes — but a sample of the
+    // ends cannot stand in for the walk: an A-B-A block has matching ends and a
+    // boundary in the middle, and four megabytes repeated at nearly the window
+    // distance lost 13% to exactly that. Upstream has no such check either; the
+    // cheap gate that keeps the walk off hopeless input is `savings`, which the
+    // caller already applies.
     let mut pos = PRESPLIT_CHUNK_SIZE;
     while pos <= block.len() - PRESPLIT_CHUNK_SIZE {
         presplit_record_fingerprint(
@@ -578,7 +806,7 @@ fn split_block_by_chunks(block: &[u8], level: usize) -> usize {
         if presplit_fingerprints_differ(&past, &new_events, penalty, hash_log) {
             return pos;
         }
-        presplit_merge_events(&mut past, &new_events);
+        presplit_merge_events(&mut past, &new_events, hash_log);
         if penalty > 0 {
             penalty -= 1;
         }
@@ -755,6 +983,12 @@ pub(crate) fn optimal_block_size_with(
     // `split_level == 0` → cheap borders heuristic;
     // `split_level == 1..=4` → byChunks with internal sampling level
     // `split_level - 1`.
+    // NOTE: gating the sampling tier behind the cheap borders tier (run it
+    // only when the block's ends already disagree) was measured and REJECTED:
+    // it costs 2.8-3.4% of the decode corpus across levels 3-15, because the
+    // boundaries the sampling finds are mostly inside blocks whose ends look
+    // alike. The cost of the sampling on uniform input has to come off some
+    // other way.
     let raw_split = if split_level == 0 {
         split_block_from_borders(&block[..MAX_BLOCK_SIZE as usize])
     } else {
@@ -842,6 +1076,10 @@ pub(crate) fn resolve_frame_params(
 
 pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
+    /// Grid fingerprints of the frame's blocks, which is what tells the
+    /// raw-skip that a block duplicating an earlier one is not the noise it
+    /// looks like. See [`SeenContentGrid`](crate::encoding::incompressible::SeenContentGrid).
+    pub(crate) seen_content: crate::encoding::incompressible::SeenContentGrid,
     /// Widest literal-copy kernel this CPU can run, resolved once when the
     /// compressor is built. The emit path reads it; it never re-probes.
     pub(crate) copy_tier: crate::decoding::simd_copy::ExactCopyTier,
@@ -852,6 +1090,14 @@ pub(crate) struct CompressState<M: Matcher> {
     /// allocations. Without this, every dict-seeded frame whose last block
     /// ended raw/RLE paid a fresh two-Vec table clone per frame.
     pub(crate) huff_table_spare: Option<crate::huff0::huff0_encoder::HuffmanTable>,
+    /// Where a block copies `last_huff_table` before encoding, so it can be put
+    /// back if the compressed form loses to a raw block.
+    ///
+    /// A slot rather than a local because the copy is per block: cloning into a
+    /// fresh `Option` took two `Vec`s every time, while cloning into one that
+    /// already holds a table reuses them. Restoring is a swap, which also hands
+    /// the discarded table back here as the next block's buffer.
+    pub(crate) huff_rollback: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     /// The Huffman weight builder's three buffers, kept across blocks and
     /// frames. The cheap build path takes a tree and two weight buffers per
     /// call, and it runs once per block plus once per split candidate wherever
@@ -928,6 +1174,23 @@ impl<M: Matcher> CompressState<M> {
     /// Clears `last_huff_table`, parking the table's buffers in
     /// `huff_table_spare` for reuse instead of dropping them.
     #[inline]
+    /// Heap bytes the compressor keeps between blocks and frames beyond the
+    /// match finder: the FSE tables both slots of each axis hold, the rollback
+    /// slot the emit paths copy a Huffman table into before a block that may not
+    /// be kept, and the block scratch with everything it holds — its literal and
+    /// sequence buffers, the splitter's workspace, and the nested estimator
+    /// scratch.
+    ///
+    /// All of it survives a frame, so a caller sizing a context has to see it.
+    pub(crate) fn retained_scratch_heap_size(&self) -> usize {
+        self.fse_tables.heap_size()
+            + self
+                .huff_rollback
+                .as_ref()
+                .map_or(0, |table| table.heap_size())
+            + self.block_scratch.retained_heap_size()
+    }
+
     pub(crate) fn clear_huff_table(&mut self) {
         if let Some(table) = self.last_huff_table.take() {
             self.park_huff_table(table);
@@ -1178,7 +1441,9 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: None,
                 huff_table_spare: None,
+                huff_rollback: None,
                 huff_weights: Default::default(),
+                seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
@@ -1552,13 +1817,17 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if self.content_checksum {
                 self.hasher.write(block);
             }
+            let dict_active =
+                self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
             crate::encoding::levels::compress_block_encoded_borrowed(
                 &mut self.state,
+                self.compression_level,
                 last_block,
                 block,
                 start,
                 end,
                 out,
+                dict_active,
                 #[cfg(feature = "lsm")]
                 Some(&mut self.block_decompressed_sizes),
                 #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -1585,7 +1854,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: None,
                 huff_table_spare: None,
+                huff_rollback: None,
                 huff_weights: Default::default(),
+                seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
@@ -1799,6 +2070,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // The weight builder's buffers are kept between blocks and frames, so
         // a reused compressor holds them for as long as it lives.
         total += self.state.huff_weights.heap_size();
+        total += self.state.retained_scratch_heap_size();
+        total += self.state.seen_content.heap_size();
         total += self
             .dictionary
             .as_ref()
@@ -1873,6 +2146,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     }
 
     fn prepare_frame(&mut self) -> FramePrep {
+        // The raw-skip's memory of what this frame has already emitted. Frames
+        // are independent, so carrying it over would let one frame's content
+        // hold the skip off for the next; the allocation is kept.
+        self.state.seen_content.reset_for_frame();
         // Reset per-frame introspection state so a re-used compressor
         // doesn't carry over the previous frame's layout/checksums.
         #[cfg(feature = "lsm")]
@@ -2047,6 +2324,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         } else {
             self.state.clear_huff_table();
         }
+        // Whatever the last frame ended on is about to be replaced. Keep it as
+        // this frame's build buffer rather than dropping it, or a reused
+        // compressor that emits one custom-table block per frame allocates a
+        // table per axis every frame.
+        self.state.fse_tables.park_previous_before_frame();
         // `clone_from` keeps frame-to-frame seeding cheap for reused compressors by
         // reusing existing allocations where possible instead of reallocating every frame.
         if let Some(cache) = cached_entropy {
@@ -2425,12 +2707,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     } else {
                         crate::encoding::levels::BlockInput::Staged(uncompressed_data)
                     };
+                    let dict_active = self.dictionary.is_some()
+                        && self.state.matcher.supports_dictionary_priming();
                     compress_block_encoded(
                         &mut self.state,
                         self.compression_level,
                         last_block,
                         block_input,
                         out,
+                        dict_active,
                         #[cfg(feature = "lsm")]
                         Some(&mut self.block_decompressed_sizes),
                         #[cfg(all(feature = "lsm", feature = "hash"))]

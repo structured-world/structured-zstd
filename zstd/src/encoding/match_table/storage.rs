@@ -664,19 +664,17 @@ impl MatchTable {
         // re-lays out all three. That costs the same fill the separate vectors
         // paid for the region that changed, and saves two allocations.
         if self.chain_off != hash_size || self.hash3_off != hash_size + chain_size {
-            if capacity_is_oversized(self.tables.capacity(), total) {
-                // Levelling down: `clear` + `resize` would keep the largest
-                // allocation this compressor ever made resident for every
-                // later frame, so hand the buffer back instead.
-                self.tables = alloc::vec![HC_EMPTY; total];
-            } else {
-                // Reserved to the final width first: from an empty buffer
-                // `resize` walks a doubling chain whose steps the frame throws
-                // away, and a fresh matcher starts empty on every frame.
-                self.tables.clear();
-                self.tables.reserve_exact(total);
-                self.tables.resize(total, HC_EMPTY);
-            }
+            // One `vec![HC_EMPTY; total]`, never `clear` + `resize`. The
+            // sentinel is zero, so this asks the allocator for zeroed memory
+            // and a large request comes back as pages the kernel has not had
+            // to write and this frame does not touch until it indexes them.
+            // Resizing writes every element instead, which for a matcher taken
+            // fresh per frame meant faulting and zeroing the whole table on
+            // every frame: at level 22 on eight mebibytes it was 40% of the
+            // encode in `memset` and half of it in the kernel. It also hands
+            // back an oversized buffer, which levelling down from the tree
+            // finder needs anyway.
+            self.tables = alloc::vec![HC_EMPTY; total];
             self.chain_off = hash_size;
             self.hash3_off = hash_size + chain_size;
         } else if self.tables.len() != total {
@@ -2402,6 +2400,18 @@ impl MatchTable {
         if self.next_to_update3 >= abs_pos {
             return;
         }
+        // Upstream's catch-up is `hashTable3[hash3(base+idx)] = idx; idx++`
+        // over a table pointer, a base pointer and a log resolved before the
+        // loop (`ZSTD_insertAndFindFirstIndexHash3`, zstd_opt.c:423). Ours
+        // reached the same two operations through a per-position call that
+        // re-derived the live-history slice, re-read `hash3_log`,
+        // `history_abs_start`, `position_base` and `index_shift` from the
+        // struct, and wrapped the stored index in an `Option`. None of that
+        // varies while the loop runs, so resolve it once and write the loop in
+        // the shape the reference does.
+        if self.fill_hash3_hoisted(abs_pos) {
+            return;
+        }
         while self.next_to_update3 < abs_pos {
             if !self.can_skip_rebase_check_at(self.next_to_update3, abs_pos, is_btultra2) {
                 self.maybe_rebase_positions(self.next_to_update3);
@@ -2411,6 +2421,95 @@ impl MatchTable {
             // `+ 1` cannot overflow within encode block sizes.
             self.next_to_update3 += 1;
         }
+    }
+
+    /// The hash3 catch-up with every loop-invariant resolved once, for the
+    /// case where the rebase guard provably cannot fire.
+    ///
+    /// Returns `false` when a precondition does not hold, leaving the cursor
+    /// untouched for the caller's general loop.
+    ///
+    /// The guard `can_skip_rebase_check_at` asks four things, and only one of
+    /// them moves with the cursor: an untranslated table (`position_base` and
+    /// `index_shift` both zero), a target inside the no-rebase range, and the
+    /// cursor being past `history_abs_start`. The first three are settled
+    /// here; the last is true for every position after the first, so the fast
+    /// loop starts one past it and the boundary position is left to the
+    /// general path. A cursor above `history_abs_start` also cannot be the
+    /// unrepresentable zero relative position, so the stored index is the
+    /// cursor itself and needs no `Option`.
+    fn fill_hash3_hoisted(&mut self, abs_pos: usize) -> bool {
+        // The slice holds no borrow, so the table write can take `&mut self`
+        // (the same reborrow the collect body uses).
+        let (concat_ptr, concat_len) = {
+            let live = self.live_history();
+            (live.as_ptr(), live.len())
+        };
+        // SAFETY: the pair describes the live history, which this call does
+        // not reallocate.
+        unsafe { self.fill_hash3_from(concat_ptr, concat_len, abs_pos) }
+    }
+
+    /// [`Self::fill_hash3_hoisted`] against a live-history pair the caller
+    /// already holds.
+    ///
+    /// The match finder has both the pointer and the length in registers by
+    /// the time it needs this, and upstream's equivalent is inlined into the
+    /// finder for exactly that reason (`ZSTD_insertAndFindFirstIndexHash3` is
+    /// static, and the parser advances one position at a time, so the loop
+    /// almost always runs once and the call boundary is the whole cost).
+    ///
+    /// # Safety
+    ///
+    /// `concat_ptr` / `concat_len` must describe the current live history, and
+    /// it must not be reallocated for the duration of the call.
+    #[inline]
+    pub(crate) unsafe fn fill_hash3_from(
+        &mut self,
+        concat_ptr: *const u8,
+        concat_len: usize,
+        abs_pos: usize,
+    ) -> bool {
+        // `can_skip_rebase_check_at`'s position-independent conjuncts.
+        let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
+        if self.hash3_log == 0
+            || self.position_base != 0
+            || self.index_shift != 0
+            || abs_pos > max_rel_no_rebase
+        {
+            return false;
+        }
+        let history_abs_start = self.history_abs_start;
+        let start = self.next_to_update3;
+        if start <= history_abs_start {
+            // The boundary position needs the `allow_zero` / btultra2 clause,
+            // and it is one position: let the general loop have it.
+            return false;
+        }
+        let hash3_log = self.hash3_log;
+        // `idx + 4 <= concat_len` for every inserted position, so the loop
+        // stops where the general path would start early-returning; positions
+        // past that insert nothing, which is why the cursor still lands on
+        // `abs_pos`.
+        let last_insertable = history_abs_start + concat_len.saturating_sub(3);
+        let end = abs_pos.min(last_insertable);
+        let table = self.hash3_table_mut();
+        debug_assert_eq!(table.len(), 1usize << hash3_log);
+        let table_ptr = table.as_mut_ptr();
+        for cursor in start..end {
+            let idx = cursor - history_abs_start;
+            // SAFETY: `idx + 4 <= concat_len` by the `end` bound above, so the
+            // four-byte read stays inside the live history.
+            let value = unsafe { Self::read_le_u32_ptr(concat_ptr.add(idx)) };
+            let hash = Self::hash_value_with_mls(value, hash3_log, 3);
+            debug_assert!(hash < 1usize << hash3_log);
+            // SAFETY: the hash is masked to `hash3_log` bits and the table
+            // holds `1 << hash3_log` slots (asserted above); `cursor` is below
+            // `abs_pos <= u32::MAX - 2`, so `cursor + 1` fits.
+            unsafe { *table_ptr.add(hash) = cursor as u32 + 1 };
+        }
+        self.next_to_update3 = abs_pos;
+        true
     }
 
     /// Hot wrapper for the rebase guard. Fast path is a single

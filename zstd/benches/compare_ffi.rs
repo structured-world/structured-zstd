@@ -68,12 +68,27 @@ fn configure_ffi_bulk_compressor(compressor: &mut zstd::bulk::Compressor<'_>, le
 /// `configure_ffi_bulk_compressor` enable `ZSTD_c_checksumFlag`, all under
 /// the same `hash` feature.
 fn rust_encode_to_vec(input: &[u8], level: &LevelConfig) -> Vec<u8> {
+    let mut output = Vec::new();
+    rust_encode_into(input, level, &mut output);
+    output
+}
+
+/// The same encode, writing into a caller-owned buffer.
+///
+/// The timing loop uses THIS one, because the C arm it is compared against
+/// keeps one `dst` for the whole sample: a fresh context per iteration (both
+/// sides do that) but a reused output. Allocating and freeing a
+/// megabyte-sized output every iteration on our side alone is not a property
+/// of the encoder — on a fresh heap the allocator maps and unmaps it, which
+/// measured as four times the encode on incompressible input and made the
+/// comparison against upstream a comparison of allocator behaviour.
+fn rust_encode_into(input: &[u8], level: &LevelConfig, output: &mut Vec<u8>) {
     let mut enc: FrameCompressor = FrameCompressor::new(level.rust_level);
     if let Some(params) = ldm_parameters(level) {
         enc.set_parameters(&params);
     }
     enc.set_content_checksum(cfg!(feature = "hash"));
-    enc.compress_independent_frame(input)
+    enc.compress_independent_frame_into(input, output);
 }
 
 /// FFI encode helper used by criterion's timing loop: one-shot
@@ -297,10 +312,19 @@ fn bench_compress(c: &mut Criterion) {
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
             group.bench_function("pure_rust", |b| {
-                b.iter(|| black_box(rust_encode_to_vec(&scenario.bytes[..], &level)))
+                release_freed_memory();
+                // One output buffer for the whole sample, exactly as the c_ffi
+                // arm below keeps one `dst`. The compressor is still fresh per
+                // iteration on both sides.
+                let mut output = Vec::new();
+                b.iter(|| {
+                    rust_encode_into(&scenario.bytes[..], &level, &mut output);
+                    black_box(&output);
+                })
             });
 
             group.bench_function("c_ffi", |b| {
+                release_freed_memory();
                 // One output buffer for the whole sample (the C caller's
                 // `dst`); see `ffi_encode_into`.
                 let mut output = Vec::new();
@@ -428,6 +452,7 @@ fn bench_decompress_source(
     };
 
     group.bench_function("pure_rust", |b| {
+        release_freed_memory();
         let compressed = materialize();
         // Target sized with WILDCOPY_OVERLENGTH slack so `decode_all`
         // routes through the direct-write path (decode straight into
@@ -449,6 +474,7 @@ fn bench_decompress_source(
     });
 
     group.bench_function("c_ffi", |b| {
+        release_freed_memory();
         // Reuse one DCtx + target buffer across iterations so the
         // timing sample reflects decode steady-state — matches the
         // pure-Rust loop above which reuses one `FrameDecoder` and
@@ -617,6 +643,7 @@ fn bench_dictionary(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(total_training_bytes as u64));
 
         group.bench_function("pure_rust", |b| {
+            release_freed_memory();
             b.iter(|| {
                 let (raw_dict, tuned) = train_fastcover_raw_from_slice(
                     scenario.bytes.as_slice(),
@@ -636,6 +663,7 @@ fn bench_dictionary(c: &mut Criterion) {
         });
 
         group.bench_function("c_ffi", |b| {
+            release_freed_memory();
             b.iter(|| {
                 black_box(
                     zstd::dict::from_samples(&ffi_samples, dict_size)
@@ -765,11 +793,27 @@ fn bench_dictionary(c: &mut Criterion) {
             // no `set_drain`/`set_source` — sidestepping the lifetime issue
             // (PR #277) that forced the old per-iter shape.
             group.bench_function("c_ffi_with_dict", |b| {
+                release_freed_memory();
                 let mut compressor =
                     zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
                         .unwrap();
                 configure_ffi_bulk_compressor(&mut compressor, &level);
-                b.iter(|| black_box(compressor.compress(&scenario.bytes).unwrap()))
+                // One output buffer across iterations, as the Rust arm below
+                // keeps: `compress` would hand back a fresh `Vec` every time
+                // and measure this side's allocator rather than its encoder.
+                // `compress_to_buffer` writes into the vector's spare capacity
+                // and fails outright if that is smaller than the bound, so this
+                // is sized from the bound rather than from what our side
+                // happened to produce.
+                let mut compressed =
+                    Vec::with_capacity(zstd::zstd_safe::compress_bound(scenario.bytes.len()));
+                b.iter(|| {
+                    compressed.clear();
+                    compressor
+                        .compress_to_buffer(&scenario.bytes, &mut compressed)
+                        .expect("dictionary compression should succeed");
+                    black_box(&compressed);
+                })
             });
 
             // Gate pure_rust_with_dict registration on the same
@@ -782,6 +826,7 @@ fn bench_dictionary(c: &mut Criterion) {
                 && EncoderDictionary::from_bytes(&ffi_dictionary).is_ok()
             {
                 group.bench_function("pure_rust_with_dict", |b| {
+                    release_freed_memory();
                     // `compress_independent_frame_into` reads input in
                     // place + takes the output buffer per call, so neither
                     // the source `R` nor drain `W` generic is ever bound by
@@ -902,6 +947,7 @@ fn bench_dictionary(c: &mut Criterion) {
             }
 
             group.bench_function("pure_rust_with_dict", |b| {
+                release_freed_memory();
                 let mut decoder = FrameDecoder::new();
                 let mut output = vec![0u8; expected_len];
                 b.iter(|| {
@@ -918,6 +964,7 @@ fn bench_dictionary(c: &mut Criterion) {
             });
 
             group.bench_function("c_ffi_with_dict", |b| {
+                release_freed_memory();
                 let mut decompressor =
                     zstd::bulk::Decompressor::with_dictionary(&ffi_dictionary).unwrap();
                 let mut output = vec![0u8; expected_len];
@@ -1006,6 +1053,15 @@ fn configure_group<M: criterion::measurement::Measurement>(
             Duration::from_secs(3)
         }
     };
+    // A whole-matrix sweep across every level and fixture is dominated by the
+    // Large budget above, which is sized for CI's regression signal rather than
+    // for a local A/B of two revisions. `STRUCTURED_ZSTD_BENCH_MAX_SECS` caps
+    // every budget so such a sweep finishes; both sides of an A/B must be run
+    // with the same value, and the dashboard leaves it unset.
+    let measurement = match max_measurement_secs() {
+        Some(cap) if measurement > cap => cap,
+        _ => measurement,
+    };
     let (samples, warm_up) = match scenario.class {
         ScenarioClass::Small => (30, Duration::from_millis(200)),
         _ => (10, Duration::from_millis(500)),
@@ -1014,6 +1070,52 @@ fn configure_group<M: criterion::measurement::Measurement>(
     group.measurement_time(measurement);
     group.warm_up_time(warm_up);
     group.sampling_mode(SamplingMode::Flat);
+}
+
+/// Hand memory the previous group freed back to the kernel, so every group
+/// starts from the state a fresh process would have.
+///
+/// Without this a group inherits whatever the group before it released, and a
+/// level that allocates tens of megabytes of tables hands the next level a warm
+/// heap. One level-16 row read 4.69 ms inside a sweep and 18.99 ms on its own,
+/// and which side of a comparison receives that gift depends on what its
+/// PREVIOUS level happened to free — a property of the run order, not of the
+/// code being measured, and the reason a row could drift fourfold between
+/// sweeps.
+///
+/// Once per ARM, not once per group: within a group the first arm runs first
+/// and frees everything it allocated, so the second one would inherit a heap the
+/// first one warmed — which is exactly the run-order effect this removes, only
+/// now between the two sides of the comparison rather than between levels. A
+/// trim per arm is still far below anything a measurement can see; the
+/// per-iteration loop never touches it.
+fn release_freed_memory() {
+    // glibc only: `malloc_trim` is a GNU extension, and musl neither provides
+    // it nor keeps the per-arena free lists it exists to return. Declared here
+    // rather than pulled from a binding crate — one symbol with a trivial
+    // signature is not worth a workspace dependency, and it keeps this harness
+    // droppable into an older revision for a paired measurement.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: core::ffi::c_int) -> core::ffi::c_int;
+        }
+        // SAFETY: takes no pointers and only returns free pages to the kernel;
+        // nothing live is touched.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
+
+/// Ceiling on every criterion measurement budget, in seconds, or `None` when
+/// `STRUCTURED_ZSTD_BENCH_MAX_SECS` is unset or unparseable.
+fn max_measurement_secs() -> Option<Duration> {
+    std::env::var("STRUCTURED_ZSTD_BENCH_MAX_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
 }
 
 fn emit_frame_header_report(

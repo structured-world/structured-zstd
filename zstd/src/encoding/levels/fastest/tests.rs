@@ -63,7 +63,9 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
         last_huff_table: None,
         huff_table_spare: None,
+        huff_rollback: None,
         huff_weights: Default::default(),
+        seen_content: Default::default(),
         fse_tables: FseTables::new(),
         block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
         offset_hist: [1, 4, 8],
@@ -80,6 +82,7 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         true,
         super::BlockInput::Staged(vec![0xAB; 1024]),
         &mut output,
+        false,
         #[cfg(feature = "lsm")]
         None,
         #[cfg(all(feature = "lsm", feature = "hash"))]

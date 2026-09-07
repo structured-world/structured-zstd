@@ -8,7 +8,8 @@ use crate::{
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
     encoding::{Matcher, Sequence},
     fse::fse_encoder::{
-        FSETable, build_seq_ctable, build_table_from_symbol_counts, fse_header_bits_for_counts,
+        FSETable, build_seq_ctable_into, build_table_from_symbol_counts_into,
+        fse_header_bits_for_counts,
     },
     huff0::huff0_encoder,
 };
@@ -166,6 +167,35 @@ pub(crate) struct CompressedBlockScratch {
 }
 
 impl CompressedBlockScratch {
+    /// Heap bytes this scratch keeps between blocks, for a caller sizing a
+    /// context. Every buffer here is kept on purpose — the scratch is taken and
+    /// put back around a block rather than rebuilt — so all of them count, not
+    /// only the two that are behind an `Option`. The nested estimator scratch is
+    /// a `Box`, so its own allocation counts as well as whatever it reports: the
+    /// owner's `size_of` covers the pointer, not what it points at, and leaving
+    /// the box out understated a context that has taken the post-split path by
+    /// the whole struct.
+    pub(crate) fn retained_heap_size(&self) -> usize {
+        self.parts.literals.capacity()
+            + self.parts.sequences.capacity() * core::mem::size_of::<RawSequence>()
+            + self.partitions.capacity() * core::mem::size_of::<usize>()
+            + self.prefix_sums.heap_size()
+            + self.compressed.capacity()
+            + self.estimator_sequences.capacity()
+                * core::mem::size_of::<crate::blocks::sequence_section::Sequence>()
+            + self
+                .estimator_workspace
+                .as_ref()
+                .map_or(0, EstimatorWorkspace::heap_size)
+            + self
+                .huff_rollback
+                .as_ref()
+                .map_or(0, |table| table.heap_size())
+            + self.estimator_inner.as_ref().map_or(0, |inner| {
+                core::mem::size_of::<CompressedBlockScratch>() + inner.retained_heap_size()
+            })
+    }
+
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -178,6 +208,10 @@ struct SequencePrefixSums {
 }
 
 impl SequencePrefixSums {
+    fn heap_size(&self) -> usize {
+        (self.lit.capacity() + self.ml.capacity()) * core::mem::size_of::<usize>()
+    }
+
     fn rebuild(&mut self, sequences: &[RawSequence]) {
         self.lit.clear();
         self.ml.clear();
@@ -260,13 +294,16 @@ impl Matcher for EntropyOnlyMatcher {
 pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
     let mut scratch = core::mem::take(&mut state.block_scratch);
     collect_block_parts(state, &mut scratch.parts);
-    encode_block_parts_with_sequence_scratch(
+    let decisions = encode_block_parts_with_sequence_scratch(
         state,
         &scratch.parts.literals,
         &scratch.parts.sequences,
         output,
         &mut scratch.estimator_sequences,
     );
+    // This path writes the block it just encoded, so the tables it chose are
+    // what the next block reads.
+    remember_last_used_tables(&mut state.fse_tables, decisions);
     state.block_scratch = scratch;
 }
 
@@ -341,11 +378,15 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         },
         scratch_state: CompressState {
             matcher: EntropyOnlyMatcher,
+            // The splitter's scratch state never reaches the raw-skip, which
+            // is decided one level up on the whole block.
+            seen_content: Default::default(),
             // Inherited rather than re-resolved: this scratch state stands in
             // for the same compressor on the same CPU.
             copy_tier: state.copy_tier,
             last_huff_table: state.last_huff_table.clone(),
             huff_table_spare: None,
+            huff_rollback: None,
             // Lent, not created: the estimator builds a table per split
             // candidate, and a fresh scratch here would take its buffers again
             // on every post-split block and drop them at the end of it. Handed
@@ -553,7 +594,12 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     raw_sequences: &[RawSequence],
     output: &mut Vec<u8>,
     sequences: &mut Vec<crate::blocks::sequence_section::Sequence>,
-) {
+    // What each axis decided, for the caller to apply once it knows the block
+    // is kept. LL, ML, OF.
+) -> [LastUsedTable; 3] {
+    // A block with no sequences writes no tables, so every axis keeps what it
+    // had whatever the caller decides.
+    let mut decisions = [LastUsedTable::Keep; 3];
     encode_raw_sequences_into(
         raw_sequences,
         &mut state.offset_hist,
@@ -682,35 +728,55 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             )
         });
 
+        // Destructured because the default-table accessors borrow the whole of
+        // `FseTables`, which would collide with taking a `*_next` slot mutably.
+        let FseTables {
+            ll_previous,
+            ml_previous,
+            of_previous,
+            ll_next,
+            ml_next,
+            of_next,
+            ll_default,
+            ml_default,
+            of_default,
+        } = &mut state.fse_tables;
+        let ll_default: &FSETable = ll_default;
+        let ml_default: &FSETable = ml_default;
+        let of_default: &FSETable = of_default;
+
         let ll_mode = choose_table_from_counts(
-            state.fse_tables.ll_previous.as_ref(),
-            state.fse_tables.ll_default_ref(),
+            ll_previous.as_ref(),
+            ll_default,
             &mut ll_counts,
             total,
             ll_max,
             9,
             state.strategy_tag,
             Some(last_ll),
+            ll_next,
         );
         let ml_mode = choose_table_from_counts(
-            state.fse_tables.ml_previous.as_ref(),
-            state.fse_tables.ml_default_ref(),
+            ml_previous.as_ref(),
+            ml_default,
             &mut ml_counts,
             total,
             ml_max,
             9,
             state.strategy_tag,
             Some(last_ml),
+            ml_next,
         );
         let of_mode = choose_table_from_counts(
-            state.fse_tables.of_previous.as_ref(),
-            state.fse_tables.of_default_ref(),
+            of_previous.as_ref(),
+            of_default,
             &mut of_counts,
             total,
             of_max,
             8,
             state.strategy_tag,
             Some(last_of),
+            of_next,
         );
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
@@ -725,15 +791,22 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             &ll_mode,
             &ml_mode,
             &of_mode,
-            &state.fse_tables,
+            [ll_default, ml_default, of_default],
         );
 
-        let ll_last = into_last_used_table(ll_mode);
-        let ml_last = into_last_used_table(ml_mode);
-        let of_last = into_last_used_table(of_mode);
-        remember_last_used_tables(&mut state.fse_tables, ll_last, ml_last, of_last);
+        // Consuming the modes ends their borrow of the slots. The decisions go
+        // back to the caller rather than being applied here: a block that
+        // loses to a raw one must leave the previous tables alone, and
+        // upstream expresses that by not swapping (`out:` in
+        // `ZSTD_compressBlock_internal`) rather than by undoing anything.
+        decisions = [
+            into_last_used_table(ll_mode),
+            into_last_used_table(ml_mode),
+            into_last_used_table(of_mode),
+        ];
     }
     writer.flush();
+    decisions
 }
 
 /// Workspace shared across estimator probes so per-probe cost computation never
@@ -744,6 +817,16 @@ struct EstimatorWorkspace {
     ml_counts: Box<[usize; 256]>,
     of_counts: Box<[usize; 256]>,
     sequences: Vec<crate::blocks::sequence_section::Sequence>,
+}
+
+impl EstimatorWorkspace {
+    /// The four boxed count tables plus whatever the sequence buffer has grown
+    /// to. All four boxes are always present once the workspace exists.
+    fn heap_size(&self) -> usize {
+        4 * core::mem::size_of::<[usize; 256]>()
+            + self.sequences.capacity()
+                * core::mem::size_of::<crate::blocks::sequence_section::Sequence>()
+    }
 }
 
 impl Default for EstimatorWorkspace {
@@ -895,7 +978,9 @@ fn estimate_literals_section_bytes(
         *last_huff = None;
         return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     }
-    let new_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
+    // Mutable because the size query is what encodes the weight description
+    // into the table's own buffer, so the emitter that follows reads it.
+    let mut new_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
         &counts[..=max_sym],
         huf_search,
         weight_scratch,
@@ -1004,36 +1089,53 @@ fn estimate_sequences_section_bytes(
         extra_bits += ll_bits + ml_bits + of as usize;
     }
 
+    // Destructured for the same reason as the emitter: the default accessors
+    // borrow the whole struct, which would collide with the `*_next` slots.
+    let FseTables {
+        ll_previous,
+        ml_previous,
+        of_previous,
+        ll_next,
+        ml_next,
+        of_next,
+        ll_default,
+        ml_default,
+        of_default,
+    } = fse_tables;
+    let ll_default: &FSETable = ll_default;
+    let ml_default: &FSETable = ml_default;
+    let of_default: &FSETable = of_default;
+
     // Same `choose_table` calls as the real encoder — counts the iterator
     // internally, identical decision path.
     let ll_mode = choose_table(
-        fse_tables.ll_previous.as_ref(),
-        fse_tables.ll_default_ref(),
+        ll_previous.as_ref(),
+        ll_default,
         sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
         9,
         strategy,
+        ll_next,
     );
     let ml_mode = choose_table(
-        fse_tables.ml_previous.as_ref(),
-        fse_tables.ml_default_ref(),
+        ml_previous.as_ref(),
+        ml_default,
         sequences.iter().map(|seq| encode_match_len(seq.ml).0),
         9,
         strategy,
+        ml_next,
     );
     let of_mode = choose_table(
-        fse_tables.of_previous.as_ref(),
-        fse_tables.of_default_ref(),
+        of_previous.as_ref(),
+        of_default,
         sequences.iter().map(|seq| encode_offset(seq.of).0),
         8,
         strategy,
+        of_next,
     );
 
-    let ll_bits_chosen =
-        fse_section_bits_for_mode(&ll_mode, ll_counts, fse_tables.ll_default_ref());
-    let ml_bits_chosen =
-        fse_section_bits_for_mode(&ml_mode, ml_counts, fse_tables.ml_default_ref());
-    let of_bits_chosen =
-        fse_section_bits_for_mode(&of_mode, of_counts, fse_tables.of_default_ref());
+    let ll_bits_chosen = fse_section_bits_for_mode(&ll_mode, ll_counts, ll_default);
+    let ml_bits_chosen = fse_section_bits_for_mode(&ml_mode, ml_counts, ml_default);
+    let of_bits_chosen = fse_section_bits_for_mode(&of_mode, of_counts, of_default);
 
     let ll_table_desc_bytes = mode_table_description_bytes(&ll_mode);
     let ml_table_desc_bytes = mode_table_description_bytes(&ml_mode);
@@ -1058,10 +1160,20 @@ fn estimate_sequences_section_bytes(
     let stream_bytes = (bit_content + padding_bits) / 8;
 
     // Mirror state mutation done by `encode_block_parts_with_sequence_scratch`.
-    let ll_last = into_last_used_table(ll_mode);
-    let ml_last = into_last_used_table(ml_mode);
-    let of_last = into_last_used_table(of_mode);
-    remember_last_used_tables(fse_tables, ll_last, ml_last, of_last);
+    let decisions = [
+        into_last_used_table(ll_mode),
+        into_last_used_table(ml_mode),
+        into_last_used_table(of_mode),
+    ];
+    remember_last_used_tables(fse_tables, decisions);
+    // The emitter keeps the handle a commit displaces, to build the next
+    // block's table into. A probe must not: the splitter holds many of these
+    // states at once, and a spare per axis per probe doubles the tables alive
+    // at any moment. Dropping it leaves a probe with exactly what it needs,
+    // which is what the allocate-per-table form gave it.
+    fse_tables.ll_next = None;
+    fse_tables.ml_next = None;
+    fse_tables.of_next = None;
 
     nb_seq_header
         + mode_byte
@@ -1275,12 +1387,24 @@ fn emit_single_sequence_block<M: Matcher>(
     buffers: &mut SingleSequenceEmitBuffers<'_>,
 ) -> bool {
     let saved_offset_hist = state.offset_hist;
-    let saved_huff_table = state.last_huff_table.clone();
-    let saved_ll_previous = state.fse_tables.ll_previous.clone();
-    let saved_ml_previous = state.fse_tables.ml_previous.clone();
-    let saved_of_previous = state.fse_tables.of_previous.clone();
+    // Copy into the rollback slot rather than a fresh `Option`: the slot keeps
+    // its buffers between blocks, so this reuses them instead of taking two
+    // `Vec`s per block. `had_huff_table` carries what an `Option` copy would
+    // have carried, without discarding the buffer when there is nothing to
+    // copy.
+    let had_huff_table = state.last_huff_table.is_some();
+    if let Some(src) = &state.last_huff_table {
+        match &mut state.huff_rollback {
+            Some(dst) => dst.clone_from(src),
+            slot => *slot = Some(src.clone()),
+        }
+    }
+    // The FSE tables need no copy: the block builds into the `*_next` slots and
+    // the previous ones are only read, so rolling back is simply not applying
+    // the decisions below. Copying them was also what kept the built table's
+    // handle shared, which forced a fresh one per block.
     buffers.compressed.clear();
-    encode_block_parts_with_sequence_scratch(
+    let fse_decisions = encode_block_parts_with_sequence_scratch(
         state,
         literals,
         sequences,
@@ -1290,10 +1414,17 @@ fn emit_single_sequence_block<M: Matcher>(
     let min_gain = (source_len >> 8) + 2;
     if buffers.compressed.len() >= source_len.saturating_sub(min_gain) {
         state.offset_hist = saved_offset_hist;
-        state.last_huff_table = saved_huff_table;
-        state.fse_tables.ll_previous = saved_ll_previous;
-        state.fse_tables.ml_previous = saved_ml_previous;
-        state.fse_tables.of_previous = saved_of_previous;
+        if had_huff_table {
+            // Swap, not assign: the table this block built goes back into the
+            // rollback slot and becomes the next block's copy buffer.
+            core::mem::swap(&mut state.last_huff_table, &mut state.huff_rollback);
+        } else {
+            // Nothing was carried in, so whatever this block built is dropped
+            // from the state; park it for the next build rather than freeing.
+            state.clear_huff_table();
+        }
+        // The FSE decisions are simply not applied, so the previous tables are
+        // whatever the last kept block left.
         let header = BlockHeader {
             last_block,
             block_type: BlockType::Raw,
@@ -1302,6 +1433,9 @@ fn emit_single_sequence_block<M: Matcher>(
         header.serialize(buffers.output);
         true
     } else {
+        // The block is kept, so its tables become what the next one reads.
+        // Upstream's confirm step, at the same point in the decision.
+        remember_last_used_tables(&mut state.fse_tables, fse_decisions);
         let header = BlockHeader {
             last_block,
             block_type: BlockType::Compressed,
@@ -1387,6 +1521,12 @@ fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
         #[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
         of_default: fse_tables.of_default.clone(),
         of_previous: fse_tables.of_previous.clone(),
+        // Empty, not blank tables: a probe gets its own slots so it cannot
+        // overwrite what the emitter is describing, but most probes never
+        // build a custom table and must not pay for one.
+        ll_next: None,
+        ml_next: None,
+        of_next: None,
     }
 }
 
@@ -1581,9 +1721,16 @@ impl SplitEstimator<'_> {
 
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
+/// What a block decided to do for one FSE axis, mirroring upstream's
+/// `ZSTD_symbolEncodingType_e`.
+///
+/// `Encoded` borrows the table rather than owning it. The table itself is built
+/// into the axis's `*_next` slot, the way upstream builds its CTable straight
+/// into the block state, so this enum stays two words instead of carrying
+/// eleven kilobytes through every call that passes a mode along.
 enum FseTableMode<'a> {
     Predefined(&'a FSETable),
-    Encoded(FSETable),
+    Encoded(&'a FSETable),
     Rle(u8),
     RepeatLast(&'a PreviousFseTable),
 }
@@ -1684,6 +1831,7 @@ fn choose_table<'a>(
     data: impl Iterator<Item = u8>,
     max_log: u8,
     strategy: crate::encoding::strategy::StrategyTag,
+    next: &'a mut Option<SharedFseTable>,
 ) -> FseTableMode<'a> {
     // Collect symbol distribution, tracking the highest code so the selector
     // skips the full-256 reverse scan (see `choose_table_from_counts`).
@@ -1707,6 +1855,7 @@ fn choose_table<'a>(
         // Estimator-only path (no emitted table): price the unadjusted histogram,
         // matching upstream's `ZSTD_NCountCost`.
         None,
+        next,
     )
 }
 
@@ -1754,6 +1903,10 @@ fn choose_table_from_counts<'a>(
     // the cost-estimator call sites, which — like upstream's `ZSTD_NCountCost` —
     // price the unadjusted histogram.
     last_code: Option<usize>,
+    // Where a chosen custom table is built. Borrowed for the returned mode's
+    // lifetime, so the slot stays put while the block writes the table it
+    // describes.
+    next: &'a mut Option<SharedFseTable>,
 ) -> FseTableMode<'a> {
     if total == 0 {
         return FseTableMode::Predefined(default_table);
@@ -1861,22 +2014,42 @@ fn choose_table_from_counts<'a>(
         // place the state tables are constructed). `distinct_symbols > 1`
         // held when `new_total_cost` was computed, so the histogram has the
         // two-sample minimum `build_table_from_symbol_counts` requires.
-        Some(Choice::New) => FseTableMode::Encoded(match last_code {
-            Some(lc) => build_seq_ctable(&mut counts[..=max_symbol], max_log, lc),
-            None => {
-                build_table_from_symbol_counts(&counts[..=max_symbol], max_log, use_low_prob_count)
-            }
-        }),
+        // The custom table won the cost comparison, so build it into the slot
+        // it will occupy rather than on the stack.
+        Some(Choice::New) => {
+            build_into_slot(next, |dest| match last_code {
+                Some(lc) => build_seq_ctable_into(&mut counts[..=max_symbol], max_log, lc, dest),
+                None => build_table_from_symbol_counts_into(
+                    &counts[..=max_symbol],
+                    max_log,
+                    use_low_prob_count,
+                    dest,
+                ),
+            });
+            FseTableMode::Encoded(slot_table(next))
+        }
         None => {
             let fallback_counts = [counts[0], 0];
-            let fallback = if max_symbol == 0 {
-                // `build_table_from_symbol_counts` needs at least two entries, so
-                // single-symbol streams use a phantom zero-count second slot here.
-                build_table_from_symbol_counts(&fallback_counts, max_log, use_low_prob_count)
-            } else {
-                build_table_from_symbol_counts(&counts[..=max_symbol], max_log, use_low_prob_count)
-            };
-            FseTableMode::Encoded(fallback)
+            build_into_slot(next, |dest| {
+                if max_symbol == 0 {
+                    // The builder needs at least two entries, so single-symbol
+                    // streams use a phantom zero-count second slot here.
+                    build_table_from_symbol_counts_into(
+                        &fallback_counts,
+                        max_log,
+                        use_low_prob_count,
+                        dest,
+                    );
+                } else {
+                    build_table_from_symbol_counts_into(
+                        &counts[..=max_symbol],
+                        max_log,
+                        use_low_prob_count,
+                        dest,
+                    );
+                }
+            });
+            FseTableMode::Encoded(slot_table(next))
         }
     }
 }
@@ -1908,13 +2081,23 @@ fn encode_fse_table_modes(
 
 fn remember_last_used_tables(
     fse_tables: &mut FseTables,
-    ll_last: Option<PreviousFseTable>,
-    ml_last: Option<PreviousFseTable>,
-    of_last: Option<PreviousFseTable>,
+    [ll_last, ml_last, of_last]: [LastUsedTable; 3],
 ) {
-    remember_last_used_table(&mut fse_tables.ll_previous, ll_last);
-    remember_last_used_table(&mut fse_tables.ml_previous, ml_last);
-    remember_last_used_table(&mut fse_tables.of_previous, of_last);
+    commit_last_used_table(
+        &mut fse_tables.ll_previous,
+        &mut fse_tables.ll_next,
+        ll_last,
+    );
+    commit_last_used_table(
+        &mut fse_tables.ml_previous,
+        &mut fse_tables.ml_next,
+        ml_last,
+    );
+    commit_last_used_table(
+        &mut fse_tables.of_previous,
+        &mut fse_tables.of_next,
+        of_last,
+    );
 }
 
 #[cfg(test)]
@@ -1925,18 +2108,104 @@ fn previous_table<'a>(
     previous.and_then(|previous| previous.as_table(default))
 }
 
-fn remember_last_used_table(slot: &mut Option<PreviousFseTable>, next: Option<PreviousFseTable>) {
-    if let Some(next) = next {
-        *slot = Some(next);
+/// The slot a block builds its table into, made writable.
+///
+/// Normally nothing else holds the handle parked here, so it is written in
+/// place. A dictionary-seeded frame shares its tables with the entropy cache,
+/// and one of those can end up parked here; a shared handle cannot be written
+/// under its other holder, so the slot takes a fresh one and leaves it alone.
+fn build_into_slot(slot: &mut Option<SharedFseTable>, build: impl FnOnce(&mut FSETable)) {
+    // Reuse the handle parked here when nothing else holds it. Otherwise build
+    // the table on the stack and move it into a handle, which is what the
+    // allocate-per-block path did: taking a handle to a zeroed table and then
+    // filling it writes every page twice and, on a compressor that does not
+    // outlive its frame, faults them all in.
+    if let Some(dest) = slot.as_mut().and_then(SharedFseTable::get_mut) {
+        build(dest);
+        return;
+    }
+    let mut built = FSETable::blank();
+    build(&mut built);
+    *slot = Some(SharedFseTable::new(built));
+}
+
+/// The table an axis just built, for the mode to borrow.
+fn slot_table(slot: &Option<SharedFseTable>) -> &FSETable {
+    slot.as_deref()
+        .expect("a build always leaves the slot filled")
+}
+
+/// What a block decided for one axis, once its mode is no longer borrowing the
+/// slot the table was built into.
+#[derive(Clone, Copy, Debug)]
+enum LastUsedTable {
+    /// The axis repeated what was already there, so the slot keeps it.
+    Keep,
+    Default,
+    Rle(u8),
+    /// The table is in the axis's `*_next` slot, waiting to be committed.
+    Encoded,
+}
+
+fn into_last_used_table(mode: FseTableMode<'_>) -> LastUsedTable {
+    match mode {
+        FseTableMode::Encoded(_) => LastUsedTable::Encoded,
+        FseTableMode::Predefined(_) => LastUsedTable::Default,
+        FseTableMode::Rle(symbol) => LastUsedTable::Rle(symbol),
+        FseTableMode::RepeatLast(_) => LastUsedTable::Keep,
     }
 }
 
-fn into_last_used_table(mode: FseTableMode<'_>) -> Option<PreviousFseTable> {
-    match mode {
-        FseTableMode::Encoded(table) => Some(PreviousFseTable::Custom(SharedFseTable::new(table))),
-        FseTableMode::Predefined(_) => Some(PreviousFseTable::Default),
-        FseTableMode::Rle(symbol) => Some(PreviousFseTable::Rle(symbol)),
-        FseTableMode::RepeatLast(_) => None,
+/// Make the block's decision for one axis the state the next block reads,
+/// upstream's `ZSTD_blockState_confirmRepcodesAndEntropyTables` for one stream.
+///
+/// For a built table this is a handle swap: what the block wrote into the slot
+/// becomes the previous table, and the handle the previous table was using
+/// becomes the slot for the next block. Two handles per axis, alternating, so
+/// after the first block no axis allocates again.
+/// Keep a table handle a commit displaced, if it was one and the slot is free.
+///
+/// The slot already holding a handle wins: that one is the buffer the block
+/// just built into, and it is the fresher of the two.
+fn park_displaced_handle(displaced: Option<PreviousFseTable>, next: &mut Option<SharedFseTable>) {
+    if next.is_none()
+        && let Some(PreviousFseTable::Custom(handle)) = displaced
+    {
+        *next = Some(handle);
+    }
+}
+
+fn commit_last_used_table(
+    previous: &mut Option<PreviousFseTable>,
+    next: &mut Option<SharedFseTable>,
+    decision: LastUsedTable,
+) {
+    match decision {
+        LastUsedTable::Keep => {}
+        // These two do not swap, so the handle the previous table was using
+        // would go out with the assignment. Park it: a distribution that moves
+        // between custom and predefined from block to block would otherwise
+        // build into a freshly allocated table every time it came back, which
+        // is the per-block allocation the two slots exist to remove.
+        LastUsedTable::Default => {
+            park_displaced_handle(previous.replace(PreviousFseTable::Default), next);
+        }
+        LastUsedTable::Rle(symbol) => {
+            park_displaced_handle(previous.replace(PreviousFseTable::Rle(symbol)), next);
+        }
+        LastUsedTable::Encoded => {
+            // Take the outgoing handle out first, so the swap needs no third
+            // one; the slot is left empty when there was none, and the next
+            // build fills it rather than a blank being made here for a block
+            // that may not need one.
+            let outgoing = match previous.take() {
+                Some(PreviousFseTable::Custom(old)) => Some(old),
+                _ => None,
+            };
+            let built = core::mem::replace(next, outgoing)
+                .expect("Encoded means the slot holds the table just built");
+            *previous = Some(PreviousFseTable::Custom(built));
+        }
     }
 }
 
@@ -1946,7 +2215,10 @@ fn encode_sequences(
     ll_mode: &FseTableMode<'_>,
     ml_mode: &FseTableMode<'_>,
     of_mode: &FseTableMode<'_>,
-    defaults: &FseTables,
+    // The three predefined tables, in LL / ML / OF order. Passed rather than
+    // read off `FseTables`, whose accessors borrow the whole struct while the
+    // caller is holding its slots.
+    defaults: [&FSETable; 3],
 ) {
     fn mode_table<'a>(mode: &'a FseTableMode<'_>, default: &'a FSETable) -> Option<&'a FSETable> {
         mode.as_table(default)
@@ -1956,9 +2228,10 @@ fn encode_sequences(
     let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
     let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
     let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
-    let ll_table = mode_table(ll_mode, defaults.ll_default_ref());
-    let ml_table = mode_table(ml_mode, defaults.ml_default_ref());
-    let of_table = mode_table(of_mode, defaults.of_default_ref());
+    let [ll_default, ml_default, of_default] = defaults;
+    let ll_table = mode_table(ll_mode, ll_default);
+    let ml_table = mode_table(ml_mode, ml_default);
+    let of_table = mode_table(of_mode, of_default);
     // Carried as bare indices, not `Option`s. A component has a state exactly
     // when it has a table, and the tables are resolved once above the loop, so
     // wrapping the state too meant re-asking the same question three times per
@@ -2512,7 +2785,10 @@ fn compress_literals(
         return HuffmanTableUpdate::Cleared;
     }
 
-    let new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
+    // Mutable because the size query encodes the weight description into the
+    // table's buffer; `write_table` below then reads it rather than repeating
+    // the encode.
+    let mut new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
         &counts[..=max_symbol],
         huf_search,
         weight_scratch,

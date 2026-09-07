@@ -6,6 +6,10 @@ use crate::{
         block_header::BlockHeader,
         blocks::{compress_block, compress_block_with_post_split},
         frame_compressor::CompressState,
+        incompressible::{
+            block_looks_incompressible, block_looks_incompressible_strict,
+            compression_level_allows_raw_fast_path,
+        },
         match_generator::MatchGeneratorDriver,
     },
 };
@@ -82,6 +86,10 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     last_block: bool,
     uncompressed_data: BlockInput,
     output: &mut Vec<u8>,
+    // Whether a dictionary is primed for this frame. A high-entropy block is
+    // not necessarily incompressible when one is, so the raw-skip below raises
+    // its bar rather than trusting the block's own bytes.
+    dict_active: bool,
     // Per-physical-block decompressed (regenerated) size sidecar, in
     // block-emit order — 1:1 with `FrameEmitInfo.blocks`, same cardinality
     // discipline as the XXH64 checksum sidecar. Captured under `lsm` alone
@@ -99,6 +107,54 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         .first()
         .copied()
         .filter(|f| bytes.iter().all(|x| x == f));
+    // Order is by cost, cheapest question first, because every one of these
+    // runs on every block: an RLE block and a window that forbids the skip are
+    // constants; the dict probe is a constant `true` for the conservative
+    // backends and a small table probe for Fast; the classifier reads a sample;
+    // the repeat grid reads the WHOLE block.
+    //
+    // The grid is therefore asked last, and only about blocks the classifier
+    // already called incompressible — the only blocks a repeat could save from
+    // going out raw. That is also why recording there is enough: a block
+    // duplicating a COMPRESSIBLE one is compressible itself, so it is never at
+    // risk of being skipped and never needs to find its original here.
+    let window_size = state.matcher.window_size();
+    // An attached dictionary keeps the block on the search, full stop. Asking a
+    // sample of thirty-odd positions whether the dictionary is relevant is the
+    // wrong shape for a gate that DISCARDS the search: dictionary matches are
+    // external to the block, so nothing else in this chain can see them, and a
+    // block whose dictionary runs happen to fall between the sampled offsets
+    // goes out raw although the search would have coded nearly all of it from
+    // the dictionary. The classifier's own sample is safe in a way this one is
+    // not — it measures the block against itself, and a repeat is what the grid
+    // then catches.
+    let dict_rejects_raw = dict_active;
+    // The level and the window decide this for the whole frame, so it also says
+    // whether the grid is worth keeping at all: nothing it records can be acted
+    // on where no block may go out raw, and recording there would take its
+    // tables and hash a run of every block for an answer no one asks for.
+    let raw_skip_reachable = compression_level_allows_raw_fast_path(compression_level, window_size);
+    let looks_incompressible = rle_byte_opt.is_none()
+        && !dict_rejects_raw
+        && raw_skip_reachable
+        && should_emit_raw_fast_path(compression_level, bytes);
+    let repeats_earlier_content = if looks_incompressible {
+        state
+            .seen_content
+            .record_and_report_repeat(bytes, window_size as usize)
+    } else {
+        // Searched, so the matcher will hold it for as long as the window does.
+        // It still has to be RECORDED, or a later block made mostly of this one
+        // finds nothing on the grid and goes out raw with the match sitting in
+        // history. Recording without probing: the probe is what costs.
+        if raw_skip_reachable {
+            state
+                .seen_content
+                .record_searched(bytes, window_size as usize);
+        }
+        false
+    };
+    let raw_fast_path = looks_incompressible && !repeats_earlier_content;
     // Hashed once, from the pre-commit view, and reused by whichever branch
     // wins — the compressed branch covers the same bytes as the RLE and raw
     // ones. This is a whole-block pass, so it is skipped whenever nothing will
@@ -107,6 +163,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // physical blocks and records a checksum per partition of its own.
     #[cfg(all(feature = "lsm", feature = "hash"))]
     let post_split_path = rle_byte_opt.is_none()
+        && !raw_fast_path
         && matches!(compression_level, CompressionLevel::Level(16..=22))
         && state.matcher.window_size() >= (1 << 17);
     #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -136,6 +193,25 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         header.serialize(output);
         output.push(rle_byte);
         BlockType::RLE
+    } else if raw_fast_path {
+        #[cfg(feature = "lsm")]
+        if let Some(sink) = block_decompressed_sizes {
+            sink.push(block_size);
+        }
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        if let Some(sink) = block_checksums {
+            sink.push(precomputed_checksum.expect("checksum is hashed whenever a sink exists"));
+        }
+        uncompressed_data.commit(&mut state.matcher);
+        state.matcher.skip_matching_with_hint(Some(true));
+        let header = BlockHeader {
+            last_block,
+            block_type: BlockType::Raw,
+            block_size,
+        };
+        header.serialize(output);
+        output.extend_from_slice(state.matcher.get_last_space());
+        BlockType::Raw
     } else {
         // Compress as a standard compressed block
         uncompressed_data.commit(&mut state.matcher);
@@ -183,7 +259,17 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         // every block). FSE previous tables are `SharedFseTable` handles —
         // their clone is a refcount bump, no slot needed.
         let mut saved_huff_table = core::mem::take(&mut state.block_scratch.huff_rollback);
-        saved_huff_table.clone_from(&state.last_huff_table);
+        // Only when there IS a table to snapshot. `Option::clone_from` from a
+        // `None` source drops what the slot holds, which is every buffer this
+        // persistent slot exists to keep: a run of blocks that build a table and
+        // then lose the size test would free and rebuild it every time.
+        let had_prior_huff_table = state.last_huff_table.is_some();
+        if let Some(prior) = state.last_huff_table.as_ref() {
+            match saved_huff_table.as_mut() {
+                Some(slot) => slot.clone_from(prior),
+                None => saved_huff_table = Some(prior.clone()),
+            }
+        }
         let saved_ll_previous = state.fse_tables.ll_previous.clone();
         let saved_ml_previous = state.fse_tables.ml_previous.clone();
         let saved_of_previous = state.fse_tables.of_previous.clone();
@@ -210,11 +296,19 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             output.truncate(hdr_off);
             state.offset_hist = saved_offset_hist;
             // Swap (not move) so the slot keeps owning a reusable table
-            // allocation for the next block's snapshot.
-            core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
-            state.fse_tables.ll_previous = saved_ll_previous;
-            state.fse_tables.ml_previous = saved_ml_previous;
-            state.fse_tables.of_previous = saved_of_previous;
+            // allocation for the next block's snapshot. With no prior table
+            // there is nothing to restore, and the table this block built goes
+            // into the slot rather than being dropped.
+            if had_prior_huff_table {
+                core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
+            } else if let Some(built) = state.last_huff_table.take() {
+                saved_huff_table = Some(built);
+            }
+            state.fse_tables.roll_back_confirmation([
+                saved_ll_previous,
+                saved_ml_previous,
+                saved_of_previous,
+            ]);
             state.block_scratch.huff_rollback = saved_huff_table;
             let header = BlockHeader {
                 last_block,
@@ -257,11 +351,13 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_block_encoded_borrowed(
     state: &mut CompressState<MatchGeneratorDriver>,
+    compression_level: CompressionLevel,
     last_block: bool,
     block: &[u8],
     block_start: usize,
     block_end: usize,
     output: &mut Vec<u8>,
+    dict_active: bool,
     #[cfg(feature = "lsm")] block_decompressed_sizes: Option<&mut Vec<u32>>,
     #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
 ) -> BlockType {
@@ -278,7 +374,36 @@ pub(crate) fn compress_block_encoded_borrowed(
         "borrowed one-shot path reached for an unsupported backend/search config",
     );
     let block_size = block.len() as u32;
-    if !block.is_empty() && block.iter().all(|x| block[0].eq(x)) {
+    // Same order as the owned path, cheapest question first: the whole-block
+    // grid is asked last and only about blocks the classifier already called
+    // incompressible.
+    let is_rle = !block.is_empty() && block.iter().all(|x| block[0].eq(x));
+    let window_size = state.matcher.window_size();
+    // As on the owned path: an attached dictionary keeps the block on the
+    // search rather than trusting a sample to say the dictionary is irrelevant.
+    let dict_rejects_raw = dict_active;
+    // As on the owned path: where no block may go out raw, the grid has nothing
+    // to answer and is left alone.
+    let raw_skip_reachable = compression_level_allows_raw_fast_path(compression_level, window_size);
+    let looks_incompressible = !is_rle
+        && !dict_rejects_raw
+        && raw_skip_reachable
+        && should_emit_raw_fast_path(compression_level, block);
+    let repeats_earlier_content = if looks_incompressible {
+        state
+            .seen_content
+            .record_and_report_repeat(block, window_size as usize)
+    } else {
+        // As on the owned path: a searched block is recorded, not merely
+        // stepped over.
+        if raw_skip_reachable {
+            state
+                .seen_content
+                .record_searched(block, window_size as usize);
+        }
+        false
+    };
+    if is_rle {
         let rle_byte = block[0];
         #[cfg(feature = "lsm")]
         if let Some(sink) = block_decompressed_sizes {
@@ -298,6 +423,25 @@ pub(crate) fn compress_block_encoded_borrowed(
         header.serialize(output);
         output.push(rle_byte);
         BlockType::RLE
+    } else if looks_incompressible && !repeats_earlier_content {
+        #[cfg(feature = "lsm")]
+        if let Some(sink) = block_decompressed_sizes {
+            sink.push(block_size);
+        }
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        if let Some(sink) = block_checksums {
+            sink.push(crate::encoding::frame_compressor::xxh64_block_low32(block));
+        }
+        state.matcher.set_borrowed_block(block_start, block_end);
+        state.matcher.skip_matching_with_hint(Some(true));
+        let header = BlockHeader {
+            last_block,
+            block_type: BlockType::Raw,
+            block_size,
+        };
+        header.serialize(output);
+        output.extend_from_slice(block);
+        BlockType::Raw
     } else {
         // Stage the borrowed range so `compress_block`'s internal
         // `start_matching` scans it in place (no `commit_space` copy).
@@ -323,7 +467,17 @@ pub(crate) fn compress_block_encoded_borrowed(
         // Persistent rollback slot — same allocation-reuse rationale as the
         // owned `compress_block_encoded` snapshot above.
         let mut saved_huff_table = core::mem::take(&mut state.block_scratch.huff_rollback);
-        saved_huff_table.clone_from(&state.last_huff_table);
+        // Only when there IS a table to snapshot. `Option::clone_from` from a
+        // `None` source drops what the slot holds, which is every buffer this
+        // persistent slot exists to keep: a run of blocks that build a table and
+        // then lose the size test would free and rebuild it every time.
+        let had_prior_huff_table = state.last_huff_table.is_some();
+        if let Some(prior) = state.last_huff_table.as_ref() {
+            match saved_huff_table.as_mut() {
+                Some(slot) => slot.clone_from(prior),
+                None => saved_huff_table = Some(prior.clone()),
+            }
+        }
         let saved_ll_previous = state.fse_tables.ll_previous.clone();
         let saved_ml_previous = state.fse_tables.ml_previous.clone();
         let saved_of_previous = state.fse_tables.of_previous.clone();
@@ -347,11 +501,19 @@ pub(crate) fn compress_block_encoded_borrowed(
             output.truncate(hdr_off);
             state.offset_hist = saved_offset_hist;
             // Swap (not move) so the slot keeps owning a reusable table
-            // allocation for the next block's snapshot.
-            core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
-            state.fse_tables.ll_previous = saved_ll_previous;
-            state.fse_tables.ml_previous = saved_ml_previous;
-            state.fse_tables.of_previous = saved_of_previous;
+            // allocation for the next block's snapshot. With no prior table
+            // there is nothing to restore, and the table this block built goes
+            // into the slot rather than being dropped.
+            if had_prior_huff_table {
+                core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
+            } else if let Some(built) = state.last_huff_table.take() {
+                saved_huff_table = Some(built);
+            }
+            state.fse_tables.roll_back_confirmation([
+                saved_ll_previous,
+                saved_ml_previous,
+                saved_of_previous,
+            ]);
             state.block_scratch.huff_rollback = saved_huff_table;
             let header = BlockHeader {
                 last_block,
@@ -374,6 +536,21 @@ pub(crate) fn compress_block_encoded_borrowed(
             BlockType::Compressed
         }
     }
+}
+
+/// Whether this block may go out raw without being searched.
+///
+/// The classifier answers from the block's own bytes, which cannot see a repeat
+/// that lives in the history, so the caller pairs it with a probe of the match
+/// table before acting on it. Callers ask it only after the level and window
+/// admit a raw skip at all, and only with no dictionary attached — one keeps the
+/// block on the search whatever its own bytes look like.
+#[inline]
+fn should_emit_raw_fast_path(level: CompressionLevel, block: &[u8]) -> bool {
+    if matches!(level, CompressionLevel::Best) {
+        return block_looks_incompressible_strict(block);
+    }
+    block_looks_incompressible(block)
 }
 
 #[cfg(test)]

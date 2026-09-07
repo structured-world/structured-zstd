@@ -3151,8 +3151,8 @@ impl FrameDecoder {
                             let mut h = twox_hash::XxHash64::with_seed(0);
                             h.write(&output[..n]);
                             match &mut state.decoder_scratch {
-                                DecoderScratchKind::Flat(s) => s.buffer.hash = h,
-                                DecoderScratchKind::Ring(s) => s.buffer.hash = h,
+                                DecoderScratchKind::Flat(s) => s.buffer.set_hash(h),
+                                DecoderScratchKind::Ring(s) => s.buffer.set_hash(h),
                             }
                         }
                     }
@@ -3440,8 +3440,8 @@ impl FrameDecoder {
             // `ContentChecksum::None` — nothing to verify there, and
             // `get_calculated_checksum()` returns `None`, matching the skip.
             match &mut state.decoder_scratch {
-                DecoderScratchKind::Flat(s) => s.buffer.hash = hasher,
-                DecoderScratchKind::Ring(s) => s.buffer.hash = hasher,
+                DecoderScratchKind::Flat(s) => s.buffer.set_hash(hasher),
+                DecoderScratchKind::Ring(s) => s.buffer.set_hash(hasher),
             }
         }
         Ok(written)

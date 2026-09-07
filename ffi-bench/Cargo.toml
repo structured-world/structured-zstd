@@ -35,7 +35,9 @@ dhat = "0.3"
 # Third-party pure-Rust zstd codec, for the cross-implementation comparison
 # example (`zrip_compare`). Encode-focused (levels -7..4, Fast/DFast).
 zrip = "0.8"
-
+# Only to hand freed memory back to the kernel between benchmark groups, so a
+# group cannot inherit the pages the previous one released. Measurement
+# plumbing; nothing the codec builds against.
 [features]
 # Forward the structured-zstd features the bench/test/example sources gate on
 # via `#[cfg(feature = ...)]`. None are in `default`: each target that needs
@@ -168,6 +170,15 @@ name = "alloc_audit_fresh"
 path = "../zstd/examples/alloc_audit_fresh.rs"
 
 [[example]]
+name = "alloc_census_warm"
+path = "../zstd/examples/alloc_census_warm.rs"
+
+[[example]]
+name = "alloc_sites_warm"
+path = "../zstd/examples/alloc_sites_warm.rs"
+required-features = ["dhat-heap"]
+
+[[example]]
 name = "huf_matrix"
 path = "../zstd/examples/huf_matrix.rs"
 required-features = ["bench-internals"]
@@ -216,6 +227,10 @@ path = "../zstd/examples/encode_loop_reuse_z000033.rs"
 [[example]]
 name = "encode_loop_z000033"
 path = "../zstd/examples/encode_loop_z000033.rs"
+
+[[example]]
+name = "oneshot_loop"
+path = "../zstd/examples/oneshot_loop.rs"
 
 [[example]]
 name = "ffi_compress_z000033"

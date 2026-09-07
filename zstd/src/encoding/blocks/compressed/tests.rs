@@ -1,7 +1,7 @@
 use super::{
-    FseTableMode, RawSequence, choose_table, emit_single_sequence_block, encode_literal_length,
-    encode_match_len, encode_offset_with_history, min_gain, min_literals_to_compress,
-    previous_table, remember_last_used_tables,
+    FseTableMode, LastUsedTable, RawSequence, choose_table, emit_single_sequence_block,
+    encode_literal_length, encode_match_len, encode_offset_with_history, min_gain,
+    min_literals_to_compress, previous_table, remember_last_used_tables,
 };
 use crate::encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable};
 use crate::encoding::strategy::StrategyTag;
@@ -196,7 +196,7 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
     let mut skewed_literals: Vec<u8> = Vec::with_capacity(256);
     skewed_literals.extend(core::iter::repeat_n(0u8, 240));
     skewed_literals.extend((0..16u8).map(|i| 200 + i));
-    let new_tbl = huff0_encoder::HuffmanTable::build_from_data(&skewed_literals);
+    let mut new_tbl = huff0_encoder::HuffmanTable::build_from_data(&skewed_literals);
     let new_desc = new_tbl
         .writeable_table_description_size()
         .expect("non-empty table emits a description");
@@ -339,7 +339,9 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: seed_table.clone(),
                 huff_table_spare: None,
+                huff_rollback: None,
                 huff_weights: Default::default(),
+                seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
@@ -353,7 +355,9 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: seed_table,
                 huff_table_spare: None,
+                huff_rollback: None,
                 huff_weights: Default::default(),
+                seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
@@ -415,7 +419,9 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
         copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
         last_huff_table: None,
         huff_table_spare: None,
+        huff_rollback: None,
         huff_weights: Default::default(),
+        seen_content: Default::default(),
         fse_tables: FseTables::new(),
         block_scratch: CompressedBlockScratch::new(),
         offset_hist: [1, 4, 8],
@@ -473,7 +479,9 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
         last_huff_table: None,
         huff_table_spare: None,
+        huff_rollback: None,
         huff_weights: Default::default(),
+        seen_content: Default::default(),
         fse_tables: FseTables::new(),
         block_scratch: super::CompressedBlockScratch::new(),
         offset_hist: [10, 20, 30],
@@ -521,15 +529,118 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
     );
 }
 
+/// A block that goes predefined or RLE must park the custom table it replaces,
+/// not drop it.
+///
+/// Distributions move between custom and predefined from block to block, and
+/// dropping the handle on the way out means the next custom block builds into a
+/// freshly allocated table. That is the per-block allocation the two-buffer
+/// design removes, coming back through the one transition that does not go
+/// through the swap.
+#[test]
+fn a_predefined_or_rle_block_parks_the_custom_table_it_replaces() {
+    use crate::encoding::frame_compressor::SharedFseTable;
+    use crate::fse::fse_encoder::FSETable;
+
+    for decision in [LastUsedTable::Default, LastUsedTable::Rle(7)] {
+        let mut previous = Some(PreviousFseTable::Custom(SharedFseTable::new(
+            FSETable::blank(),
+        )));
+        let mut next = None;
+        super::commit_last_used_table(&mut previous, &mut next, decision);
+        assert!(
+            next.is_some(),
+            "{decision:?}: the displaced custom table is the next block's buffer",
+        );
+    }
+}
+
+/// A block that loses to a raw one must leave the axis exactly as it found
+/// it: the restored table unique, and a buffer free to build into.
+///
+/// The caller holds a CLONE of what `previous` was, so restoring only that
+/// leaves the same table in both slots — `previous` restored and `next` where
+/// confirmation displaced it — and the next block finds its buffer shared and
+/// allocates a fresh eleven-kilobyte table. On a run of blocks that keep
+/// falling back to raw that is a per-axis allocation per block, which is the
+/// cost this pair of slots exists to remove.
+#[test]
+fn a_block_that_falls_back_to_raw_leaves_its_axis_reusable() {
+    use crate::encoding::frame_compressor::SharedFseTable;
+    use crate::fse::fse_encoder::FSETable;
+
+    let mut fse_tables = FseTables::new();
+    let before = SharedFseTable::new(FSETable::blank());
+    fse_tables.ll_previous = Some(PreviousFseTable::Custom(before));
+    // What the caller keeps across the attempt.
+    let saved = fse_tables.ll_previous.clone();
+
+    // The attempt builds into the axis's spare slot, then confirms it, which
+    // displaces the old table into that slot.
+    fse_tables.ll_next = Some(SharedFseTable::new(FSETable::blank()));
+    super::commit_last_used_table(
+        &mut fse_tables.ll_previous,
+        &mut fse_tables.ll_next,
+        LastUsedTable::Encoded,
+    );
+
+    fse_tables.roll_back_confirmation([saved, None, None]);
+
+    let Some(PreviousFseTable::Custom(restored)) = fse_tables.ll_previous.as_ref() else {
+        panic!("the restored table must be the custom one the axis started with");
+    };
+    assert_eq!(
+        SharedFseTable::strong_count(restored),
+        1,
+        "the restored table must be unique, or the next block cannot build into its slot",
+    );
+    assert!(
+        fse_tables.ll_next.is_some(),
+        "the discarded table is exactly the buffer the next block wants",
+    );
+}
+
+/// A frame start replaces the previous slots, and the table that was there is
+/// the next frame's buffer — dropping it costs a reused compressor an
+/// allocation per axis on every frame that builds a custom table.
+#[test]
+fn a_frame_start_keeps_the_last_frames_table_as_a_buffer() {
+    use crate::encoding::frame_compressor::SharedFseTable;
+    use crate::fse::fse_encoder::FSETable;
+
+    let mut fse_tables = FseTables::new();
+    fse_tables.ll_previous = Some(PreviousFseTable::Custom(SharedFseTable::new(
+        FSETable::blank(),
+    )));
+    // Shared with the dictionary entropy cache: parking it would hand the axis
+    // a buffer it cannot build into.
+    let shared = SharedFseTable::new(FSETable::blank());
+    let _cache_holds_it = shared.clone();
+    fse_tables.ml_previous = Some(PreviousFseTable::Custom(shared));
+
+    fse_tables.park_previous_before_frame();
+
+    assert!(
+        fse_tables.ll_next.is_some(),
+        "the frame's own table is what the next one builds into",
+    );
+    assert!(
+        fse_tables.ml_next.is_none(),
+        "a table the dictionary cache still holds is not a free buffer",
+    );
+}
+
 #[test]
 fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
     let mut fse_tables = FseTables::new();
 
     remember_last_used_tables(
         &mut fse_tables,
-        Some(PreviousFseTable::Default),
-        Some(PreviousFseTable::Default),
-        Some(PreviousFseTable::Default),
+        [
+            LastUsedTable::Default,
+            LastUsedTable::Default,
+            LastUsedTable::Default,
+        ],
     );
 
     assert!(tables_match(
@@ -549,12 +660,18 @@ fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
     // Lazy is a non-fast-band strategy, so this exercises the cost-based
     // repeat decision (not the fast-band shortcut).
     let strat = crate::encoding::strategy::StrategyTag::Lazy;
+    // Slots for a table these calls are expected NOT to build; the assertions
+    // below are that every axis repeats instead.
+    let mut ll_slot = None;
+    let mut ml_slot = None;
+    let mut of_slot = None;
     let ll_repeat = choose_table(
         fse_tables.ll_previous.as_ref(),
         fse_tables.ll_default_ref(),
         sample_codes.iter().copied(),
         9,
         strat,
+        &mut ll_slot,
     );
     let ml_repeat = choose_table(
         fse_tables.ml_previous.as_ref(),
@@ -562,6 +679,7 @@ fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
         sample_codes.iter().copied(),
         9,
         strat,
+        &mut ml_slot,
     );
     let of_repeat = choose_table(
         fse_tables.of_previous.as_ref(),
@@ -569,6 +687,7 @@ fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
         sample_codes.iter().copied(),
         8,
         strat,
+        &mut of_slot,
     );
 
     assert!(matches!(ll_repeat, FseTableMode::RepeatLast(_)));
@@ -598,6 +717,8 @@ fn fast_band_strategies_prefer_repeat_fse_table() {
     // reuse the covering previous table; cover every eligible arm so an
     // enum-arm regression in the implementation branch is caught.
     for strategy in [StrategyTag::Fast, StrategyTag::Dfast, StrategyTag::Greedy] {
+        // A slot the reuse path must leave alone.
+        let mut slot = None;
         let mode = super::choose_table_from_counts(
             Some(&previous),
             fse_tables.ll_default_ref(),
@@ -607,6 +728,7 @@ fn fast_band_strategies_prefer_repeat_fse_table() {
             9,
             strategy,
             None,
+            &mut slot,
         );
         assert!(
             matches!(mode, FseTableMode::RepeatLast(_)),
@@ -629,9 +751,11 @@ fn remember_last_used_tables_reuses_existing_custom_slot_for_repeat() {
 
     remember_last_used_tables(
         &mut fse_tables,
-        None,
-        Some(PreviousFseTable::Default),
-        Some(PreviousFseTable::Default),
+        [
+            LastUsedTable::Keep,
+            LastUsedTable::Default,
+            LastUsedTable::Default,
+        ],
     );
 
     let after = core::ptr::from_ref(
@@ -648,12 +772,14 @@ fn remember_last_used_tables_reuses_existing_custom_slot_for_repeat() {
 #[test]
 fn choose_table_handles_single_symbol_distribution() {
     let fse_tables = FseTables::new();
+    let mut slot = None;
     let mode = choose_table(
         None,
         fse_tables.ll_default_ref(),
         core::iter::repeat_n(0u8, 32),
         9,
         crate::encoding::strategy::StrategyTag::Lazy,
+        &mut slot,
     );
     assert!(matches!(mode, FseTableMode::Rle(0)));
 }
@@ -743,12 +869,14 @@ fn match_length_coding_agrees_with_the_ranges_over_every_length() {
 #[test]
 fn choose_table_without_previous_does_not_unwrap_none() {
     let only_zero_one_table = build_table_from_symbol_counts(&[1, 1], 5, false);
+    let mut slot = None;
     let mode = choose_table(
         None,
         &only_zero_one_table,
         [1u8, 2].into_iter().cycle().take(32),
         5,
         crate::encoding::strategy::StrategyTag::Lazy,
+        &mut slot,
     );
     assert!(matches!(mode, FseTableMode::Encoded(_)));
 }
