@@ -147,10 +147,17 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         // It still has to be RECORDED, or a later block made mostly of this one
         // finds nothing on the grid and goes out raw with the match sitting in
         // history. Recording without probing: the probe is what costs.
-        if raw_skip_reachable {
+        //
+        // A block of one repeated byte is the exception: anything that
+        // duplicates it is itself one repeated byte, and such a block is
+        // answered as RLE above without ever asking the grid. Recording it is a
+        // key every `RECORD_STEP` bytes for a question nobody puts.
+        if raw_skip_reachable && rle_byte_opt.is_none() {
             state
                 .seen_content
                 .record_searched(bytes, window_size as usize);
+        } else if raw_skip_reachable {
+            state.seen_content.skip_recording(bytes.len());
         }
         false
     };
@@ -405,11 +412,14 @@ pub(crate) fn compress_block_encoded_borrowed(
             .record_and_report_repeat(block, window_size as usize)
     } else {
         // As on the owned path: a searched block is recorded, not merely
-        // stepped over.
-        if raw_skip_reachable {
+        // stepped over — except a block of one repeated byte, which nothing
+        // will ever ask the grid about.
+        if raw_skip_reachable && !is_rle {
             state
                 .seen_content
                 .record_searched(block, window_size as usize);
+        } else if raw_skip_reachable {
+            state.seen_content.skip_recording(block.len());
         }
         false
     };

@@ -382,6 +382,12 @@ impl SeenContentGrid {
         self.take_block(block, window_size, false);
     }
 
+    /// Advance past a block the caller has decided not to record, keeping every
+    /// later record at its true distance in the stream.
+    pub(crate) fn skip_recording(&mut self, len: usize) {
+        self.skip_block(len);
+    }
+
     /// Advance past a block the grid records nothing for, keeping the origin
     /// inside what the step index can express.
     ///

@@ -452,8 +452,15 @@ fn bench_decompress_source(
     };
 
     group.bench_function("pure_rust", |b| {
-        release_freed_memory();
+        // Materialize BEFORE the trim, in both arms. Compressing the fixture is
+        // what fills the input cell, and it allocates and frees the encoder's
+        // contexts on the way — so an arm that trims first and materializes
+        // second starts on the free lists that work left behind, while the arm
+        // that finds the cell already full starts clean. Which arm gets which
+        // then depends on the order they run in, and that is the run-order
+        // effect the trim exists to remove.
         let compressed = materialize();
+        release_freed_memory();
         // Target sized with WILDCOPY_OVERLENGTH slack so `decode_all`
         // routes through the direct-write path (decode straight into
         // `target`, no FlatBuf drain copy). The slack is the
@@ -474,13 +481,14 @@ fn bench_decompress_source(
     });
 
     group.bench_function("c_ffi", |b| {
+        // Materialize then trim, as the arm above; see the note there.
+        let compressed = materialize();
         release_freed_memory();
         // Reuse one DCtx + target buffer across iterations so the
         // timing sample reflects decode steady-state — matches the
         // pure-Rust loop above which reuses one `FrameDecoder` and
         // one `target`. Creating a fresh DCtx per iteration would
         // dominate sub-millisecond samples.
-        let compressed = materialize();
         let mut dctx = FfiDCtxHandle::new();
         let mut target = vec![0u8; expected_len];
         pretouch_pages(&mut target);
