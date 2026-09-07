@@ -674,7 +674,14 @@ impl MatchTable {
             // encode in `memset` and half of it in the kernel. It also hands
             // back an oversized buffer, which levelling down from the tree
             // finder needs anyway.
-            self.tables = alloc::vec![HC_EMPTY; total];
+            if self.tables.capacity() >= total
+                && !capacity_is_oversized(self.tables.capacity(), total)
+            {
+                self.tables.clear();
+                self.tables.resize(total, HC_EMPTY);
+            } else {
+                self.tables = alloc::vec![HC_EMPTY; total];
+            }
             self.chain_off = hash_size;
             self.hash3_off = hash_size + chain_size;
         } else if self.tables.len() != total {
