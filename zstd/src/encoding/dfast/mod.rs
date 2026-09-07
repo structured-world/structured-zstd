@@ -3352,6 +3352,13 @@ macro_rules! start_matching_dict_loop_body {
                     // SAFETY: the index is below the long table's length.
                     let idxl1 = unsafe { *long_hash_ptr.add(hl1_idx) };
                     let packed_next = packed_curr + 1;
+                    // The probed position is indexed as upstream indexes it
+                    // (`hashLong[hl3] = curr + 1`, zstd_double_fast.c:459):
+                    // nothing else writes it, since the complementary
+                    // insertion after a match covers `curr + 2` and the two
+                    // positions before the match end.
+                    // SAFETY: as for the read above.
+                    unsafe { *long_hash_ptr.add(hl1_idx) = packed_next };
                     let mut live_hit = false;
                     if idxl1 >= min_slot && idxl1 < packed_next {
                         // SAFETY: as for the long slot above.
