@@ -44,6 +44,12 @@ pub(crate) struct DictAttach<T> {
     /// stride phase continuous and closes the seam gap. `0` until the first
     /// fill; reset by [`Self::invalidate`].
     next_to_update: usize,
+    /// A built table set aside by [`Self::deactivate`], with the state that
+    /// described it, so a later frame can take it back instead of hashing the
+    /// same dictionary again. Every reader sees the same thing as after
+    /// [`Self::invalidate`] while it sits here — the table is out of reach, not
+    /// merely flagged — so a frame that must not search it cannot.
+    spare: Option<(T, usize, bool, usize)>,
 }
 
 impl<T: Clone> Clone for DictAttach<T> {
@@ -53,6 +59,7 @@ impl<T: Clone> Clone for DictAttach<T> {
             region_len: self.region_len,
             primed: self.primed,
             next_to_update: self.next_to_update,
+            spare: self.spare.clone(),
         }
     }
 
@@ -63,6 +70,7 @@ impl<T: Clone> Clone for DictAttach<T> {
         self.region_len = source.region_len;
         self.primed = source.primed;
         self.next_to_update = source.next_to_update;
+        self.spare.clone_from(&source.spare);
     }
 }
 
@@ -73,6 +81,7 @@ impl<T> DictAttach<T> {
             region_len: 0,
             primed: false,
             next_to_update: 0,
+            spare: None,
         }
     }
 
@@ -158,6 +167,43 @@ impl<T> DictAttach<T> {
         self.region_len = 0;
         self.primed = false;
         self.next_to_update = 0;
+        // A stashed table describes the dictionary this one was built for; if
+        // that is being thrown away, so is the stash.
+        self.spare = None;
+    }
+
+    /// Put the built table out of reach without discarding it: readers see
+    /// exactly what [`Self::invalidate`] leaves, and a later frame that wants
+    /// the same dictionary can take it back with [`Self::reactivate`] instead of
+    /// hashing it again.
+    ///
+    /// For a frame that must NOT search through the attached table — one that
+    /// primes the dictionary into its live table instead — while a compressor
+    /// whose source sizes cross the attach cutoff keeps coming back to frames
+    /// that do.
+    pub(crate) fn deactivate(&mut self) {
+        if let Some(table) = self.table.take() {
+            self.spare = Some((table, self.region_len, self.primed, self.next_to_update));
+        }
+        self.region_len = 0;
+        self.primed = false;
+        self.next_to_update = 0;
+    }
+
+    /// Take back a table put aside by [`Self::deactivate`], with the state that
+    /// described it. Does nothing when a table is already attached or none was
+    /// stashed. The caller checks the shape afterwards exactly as it does for a
+    /// table that was never away.
+    pub(crate) fn reactivate(&mut self) {
+        if self.table.is_some() {
+            return;
+        }
+        if let Some((table, region_len, primed, next_to_update)) = self.spare.take() {
+            self.table = Some(table);
+            self.region_len = region_len;
+            self.primed = primed;
+            self.next_to_update = next_to_update;
+        }
     }
 }
 

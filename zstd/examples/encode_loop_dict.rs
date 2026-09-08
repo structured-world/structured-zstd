@@ -82,8 +82,18 @@ fn main() {
     let iters: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);
     let input_spec: &str = args.get(3).map(|s| s.as_str()).unwrap_or("logs4096");
     let dict_path: Option<&str> = args.get(4).map(|s| s.as_str());
+    // 6th arg `alt<N>`: alternate each frame between the input and its first N
+    // bytes. A dictionary resolves attach-vs-copy from the source size, so two
+    // sizes either side of that cutoff make the compressor switch modes every
+    // frame — the shape that shows what switching costs, and the one a caller
+    // with variable-sized records actually has.
+    let alt_len: Option<usize> = args
+        .get(5)
+        .and_then(|s| s.strip_prefix("alt"))
+        .and_then(|n| n.parse().ok());
 
     let src = resolve_input(input_spec);
+    let alt = alt_len.map(|n| src[..n.min(src.len())].to_vec());
 
     // One reused compressor: matcher tables + any dictionary parse happen
     // once here, mirroring a consumer that reuses a context across N
@@ -104,8 +114,12 @@ fn main() {
     // zero output allocation.
     let mut out: Vec<u8> = Vec::new();
     let mut sink: usize = 0;
-    for _ in 0..iters {
-        cctx.compress_independent_frame_into(&src, &mut out);
+    for i in 0..iters {
+        let frame = match (&alt, i % 2) {
+            (Some(short), 1) => short.as_slice(),
+            _ => src.as_slice(),
+        };
+        cctx.compress_independent_frame_into(frame, &mut out);
         sink = sink.wrapping_add(out.len());
         core::hint::black_box(&out);
     }
