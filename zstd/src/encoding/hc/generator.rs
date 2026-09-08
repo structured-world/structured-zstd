@@ -508,9 +508,16 @@ macro_rules! bt_insert_and_collect_matches_body {
         // this frame (inlining the same probes into the DP caller regressed). =====
         let mut skip_further_match_search = false;
         let mut rep_len_candidate_found = false;
-        if idx + 4 <= concat.len() {
-            let rbase = concat.as_ptr();
-            let rlen = concat.len();
+        // Shared by both probes below. The history origin and the live-history
+        // pointer/length are fixed for this position but live on the match
+        // table, which the tree walk further down writes through, so each
+        // reader was fetching them again.
+        let hist_start = $table.history_abs_start;
+        let cbase = concat.as_ptr();
+        let clen = concat.len();
+        if idx + 4 <= clen {
+            let rbase = cbase;
+            let rlen = clen;
             // Upstream walks the three repeat offsets as plain indices with the
             // litLength-0 rotation applied to the INDEX, not to a materialised
             // list (zstd_opt.c:646-649): `repCode` runs from `ll0` to
@@ -524,14 +531,10 @@ macro_rules! bt_insert_and_collect_matches_body {
             // discards it too (its `repOffset-1` underflows past the bound).
             // Everything the three probes share is taken once. The current
             // position's gate word does not depend on which repeat offset is
-            // being tried, and neither does the history origin or the tail
-            // length, but all three sat inside the loop: the word was re-read
-            // and re-masked on every repeat, and the origin came off the table
-            // through the `&mut` that the walk below writes through, so the
-            // optimizer had to reload it. Upstream reads its own `ip` word
-            // through a plain local pointer nothing aliases, which is what
-            // hoisting these amounts to.
-            let hist_start = $table.history_abs_start;
+            // being tried, and neither does the tail length, but both sat
+            // inside the loop: the word was re-read and re-masked on every
+            // repeat. Upstream reads its own `ip` word through a plain local
+            // pointer nothing aliases, which is what hoisting these amounts to.
             let cur_tail = rlen - idx;
             // SAFETY: `idx + 4 <= rlen` from the guard above.
             let cur_word = unsafe { rbase.add(idx).cast::<u32>().read_unaligned().to_le() };
@@ -609,23 +612,25 @@ macro_rules! bt_insert_and_collect_matches_body {
             // call): table lookup + one common-prefix scan via `$cpl`, reusing
             // the BT collect's `concat` / `idx` / `tail_limit`. Labeled block so
             // the probe's early-outs yield None without returning from the walk.
+            let h3_log = $table.hash3_log;
             let h3_candidate: Option<$crate::encoding::opt::types::MatchCandidate> =
-                if $table.hash3_log == 0 || idx + 4 > concat.len() {
+                if h3_log == 0 || idx + 4 > clen {
                     None
                 } else {
                     'h3: {
                         let hh =
                             $crate::encoding::match_table::storage::MatchTable::hash_position_at(
-                                concat,
-                                idx,
-                                $table.hash3_log,
-                                3,
+                                concat, idx, h3_log, 3,
                             );
-                        let entry = $table
-                            .hash3_table()
-                            .get(hh)
-                            .copied()
-                            .unwrap_or($crate::encoding::match_table::storage::HC_EMPTY);
+                        // The hash is masked to `h3_log` bits and the table is
+                        // `1 << h3_log` slots wide, so the slot is in range by
+                        // construction and the bounds-checked slice read plus
+                        // its empty-slot fallback were paying for a case that
+                        // cannot arise. Upstream indexes `hashTable3[hash3]`
+                        // directly for the same reason.
+                        debug_assert_eq!($table.hash3_table().len(), 1usize << h3_log);
+                        // SAFETY: `hh < 1 << h3_log == hash3_table().len()`.
+                        let entry = unsafe { *$table.hash3_table().get_unchecked(hh) };
                         let Some(cand_abs) =
                             $crate::encoding::match_table::storage::MatchTable::stored_abs_position_fast(
                                 entry,
@@ -635,17 +640,34 @@ macro_rules! bt_insert_and_collect_matches_body {
                         else {
                             break 'h3 None;
                         };
-                        if cand_abs < $table.history_abs_start || cand_abs >= $abs_pos {
+                        if cand_abs < hist_start || cand_abs >= $abs_pos {
                             break 'h3 None;
                         }
                         let off = $abs_pos - cand_abs;
                         if off >= $crate::encoding::bt::HC3_MAX_OFFSET {
                             break 'h3 None;
                         }
-                        let cand_idx = cand_abs - $table.history_abs_start;
-                        let hbase = concat.as_ptr();
+                        let cand_idx = cand_abs - hist_start;
+                        // The bucket is keyed on three bytes and the shortest
+                        // match this parser accepts is three, so three bytes
+                        // that differ cannot produce a candidate: check them
+                        // before entering the vector compare, which on input
+                        // that mismatches immediately costs more than the
+                        // answer. Upstream reaches the same early exit through
+                        // the first word its `ZSTD_count` loads.
+                        // SAFETY: `cand_idx < idx` and `idx + 4 <= clen`, so
+                        // both four-byte reads stay inside the live history.
+                        let (cand_head, cur_head) = unsafe {
+                            (
+                                cbase.add(cand_idx).cast::<u32>().read_unaligned().to_le(),
+                                cbase.add(idx).cast::<u32>().read_unaligned().to_le(),
+                            )
+                        };
+                        if (cand_head ^ cur_head) & 0x00FF_FFFF != 0 {
+                            break 'h3 None;
+                        }
                         // SAFETY: cand_idx/idx within history; tail_limit bounds the scan.
-                        let ml = unsafe { $cpl(hbase.add(cand_idx), hbase.add(idx), tail_limit) };
+                        let ml = unsafe { $cpl(cbase.add(cand_idx), cbase.add(idx), tail_limit) };
                         (ml >= $min_match_len).then_some(
                             $crate::encoding::opt::types::MatchCandidate {
                                 start: $abs_pos,
