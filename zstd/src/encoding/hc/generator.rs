@@ -522,6 +522,24 @@ macro_rules! bt_insert_and_collect_matches_body {
             // their own lines. The zero that the `then_some` used to filter is
             // discarded by the `rep == 0` gate below, which is where upstream
             // discards it too (its `repOffset-1` underflows past the bound).
+            // Everything the three probes share is taken once. The current
+            // position's gate word does not depend on which repeat offset is
+            // being tried, and neither does the history origin or the tail
+            // length, but all three sat inside the loop: the word was re-read
+            // and re-masked on every repeat, and the origin came off the table
+            // through the `&mut` that the walk below writes through, so the
+            // optimizer had to reload it. Upstream reads its own `ip` word
+            // through a plain local pointer nothing aliases, which is what
+            // hoisting these amounts to.
+            let hist_start = $table.history_abs_start;
+            let cur_tail = rlen - idx;
+            // SAFETY: `idx + 4 <= rlen` from the guard above.
+            let cur_word = unsafe { rbase.add(idx).cast::<u32>().read_unaligned().to_le() };
+            let cur_gate = if $min_match_len == 3 {
+                cur_word & 0x00FF_FFFF
+            } else {
+                cur_word
+            };
             let ll0 = usize::from($lit_len == 0);
             for rep_code in ll0..3 + ll0 {
                 let rep = if rep_code == 3 {
@@ -533,25 +551,23 @@ macro_rules! bt_insert_and_collect_matches_body {
                     continue;
                 }
                 let candidate_pos = $abs_pos - rep;
-                if candidate_pos < $table.history_abs_start {
+                if candidate_pos < hist_start {
                     continue;
                 }
-                let candidate_idx = candidate_pos - $table.history_abs_start;
-                // SAFETY: `idx + 4 <= rlen` (guard above) and `candidate_idx < idx`
-                // (rep >= 1), so both 4-byte reads stay inside `concat`.
-                let gate_matches = unsafe {
-                    let cand = rbase.add(candidate_idx).cast::<u32>().read_unaligned();
-                    let cur = rbase.add(idx).cast::<u32>().read_unaligned();
-                    if $min_match_len == 3 {
-                        (cand.to_le() & 0x00FF_FFFF) == (cur.to_le() & 0x00FF_FFFF)
-                    } else {
-                        cand == cur
-                    }
+                let candidate_idx = candidate_pos - hist_start;
+                // SAFETY: `candidate_idx < idx` (rep >= 1) and `idx + 4 <= rlen`,
+                // so the 4-byte read stays inside `concat`.
+                let cand_word =
+                    unsafe { rbase.add(candidate_idx).cast::<u32>().read_unaligned().to_le() };
+                let cand_gate = if $min_match_len == 3 {
+                    cand_word & 0x00FF_FFFF
+                } else {
+                    cand_word
                 };
-                if !gate_matches {
+                if cand_gate != cur_gate {
                     continue;
                 }
-                let rmax = (rlen - candidate_idx).min(rlen - idx).min(tail_limit);
+                let rmax = (rlen - candidate_idx).min(cur_tail).min(tail_limit);
                 // SAFETY: same umbrella; both pointers + `rmax` stay in `concat`.
                 let match_len = unsafe { $cpl(rbase.add(candidate_idx), rbase.add(idx), rmax) };
                 if match_len < $min_match_len {
