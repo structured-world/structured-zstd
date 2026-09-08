@@ -546,6 +546,22 @@ macro_rules! bt_insert_and_collect_matches_body {
             };
             let ll0 = usize::from($lit_len == 0);
             for rep_code in ll0..3 + ll0 {
+                // The synthetic slot's wrap is deliberate and measured. Guarding
+                // `reps[0] <= 1` before a plain subtraction, so the slot is
+                // rejected at its origin rather than through a value the bound
+                // below discards, is the shape this codebase asks for on a
+                // per-position path — and here it costs: +7.4% cycles at level
+                // 13 and +5.9% at level 19 on 10 KiB random with a dictionary,
+                // +2.5% on the corpus at level 17, with retired instructions up
+                // 2% alongside them and the control arm flat, so it is added
+                // work rather than layout. One extra branch in one of three
+                // slots stops the three from folding together.
+                //
+                // Upstream writes the same rejection the same way, as an
+                // intentional unsigned overflow that "discards 0 and -1"
+                // (zstd_opt.c:653). The outcome is identical either way: a
+                // `reps[0]` of 0 wraps past `abs_pos` and one of 1 becomes the
+                // zero the next line rejects.
                 let rep = if rep_code == 3 {
                     ($reps[0] as usize).wrapping_sub(1)
                 } else {
