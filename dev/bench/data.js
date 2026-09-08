@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788872566518,
+  "lastUpdate": 1788895153550,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -5507,6 +5507,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.188,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "439b69565e30965c777071d86f521b559468ccac",
+          "message": "perf(opt): close a third of the optimal finder's gap to libzstd on the dictionary band (#498)\n\n* perf(opt): walk the repeat offsets as indices, not as a list of options\n\nUpstream's optimal finder takes the three repeat offsets by index, with the\nlitLength-0 rotation applied to the INDEX rather than to a materialised list\n(zstd_opt.c:646-649): repCode runs from ll0 to ZSTD_REP_NUM + ll0, and reads\nrep[repCode] except for the last slot, which is rep[0] - 1. The zero that\nslot can hold is discarded by the same bound that discards an out-of-window\noffset, through an intentional unsigned underflow.\n\nOurs built the same three candidates as an [Option<usize>; 3] and flattened\nit. The parser visits nearly every position on input it finds no matches in,\nso the option machinery ran 9,135 times a frame on the measured fixture and\nstood in the profile as its own lines (the flatten and its discriminant\nchecks, about 6% of the encode between them). The rotation is now an index\nand the zero is discarded by the gate that was already there.\n\n209,035 fewer retired instructions a frame, 4,950,812 -> 4,741,777 (-4.2%),\non a 10 KiB random payload at level 13 with a 1,280-byte dictionary, musl,\ni9, three rounds, the count identical to the digit every run. That is 22.9\ninstructions a position, which is the shape of what was removed.\n\nNOT a speed claim: cycles read +1.85%, but the control arm for that pair --\nlevel 1, whose Fast backend never enters this finder, and whose instruction\ncount is bit-identical between the two binaries -- moved -10.8% on its own,\nso code layout swamps anything the clock could say here. Kept for the\noperations that are provably gone.\n\nOutput is byte-identical over 30 fixture-and-level rows, and the dictionary\npath emits the same 9,179 bytes a frame as before and as the reference.\n\nThe note above the dictionary descent now states what the code does: it\nspends what the live walk left of the compare budget, as upstream does\n(zstd_opt.c:724 spends it, :777 admits the dictionary walk only on the\nremainder, :782 keeps spending the same counter).\n\nPart of #493.\n\n* test(bench): let the cparams probe take a dictionary size\n\nThe probe hardcoded dictSize 0, so it could not be asked what the reference\nselects for a dictionary-primed case. Upstream folds the dictionary into the\nsize hint, which can widen the window and with it the chain and hash logs,\nso 0 is the one case that cannot stand in for the others. It is now the\nthird argument and still defaults to 0.\n\n* perf(opt): take the rep probe's shared inputs once, not once per offset\n\nThe three repeat-offset probes share three things and were recomputing all\nof them on every one of the three: the current position's four-byte gate\nword (read and masked again each time), the history origin (read off the\nmatch table through the same `&mut` the tree walk below writes through, so\nthe optimizer had to reload it rather than keep it), and the tail length\nfrom the current position. Upstream reads its own `ip` word through a plain\nlocal pointer that nothing aliases, which is what taking these into locals\nabove the loop amounts to.\n\n58,050 fewer retired instructions a frame, 4,741,777 -> 4,683,727 (-1.22%),\non 10 KiB random at level 13 with a 1,280-byte dictionary, musl, i9. The\ncount is identical to the digit across runs. Output is byte-identical over\n30 fixture-and-level rows and the dictionary path emits the same 9,179 bytes\na frame.\n\nNo speed claim: the session that measured cycles was not quiet enough to\ncarry one, the reference arm alone spreading 9.6% across its own readings.\nKept for the operations that are provably gone.\n\nWhere the rest of this finder's work sits, measured by ablation on the same\nfixture (retired instructions are deterministic, so one run an arm is\nexact): the rep probe is 859,410 a frame, 18.1% of the encode, and on this\ninput it changes the output by not one byte; the hash3 probe is 795,248,\n16.8%; the tree walk and its insert are about 1,190,547. That is 94\ninstructions a position for the rep probe against roughly 35 for upstream's,\nso most of that gap is still there.\n\nPart of #493.\n\n* perf(opt): gate the hash3 probe before the vector compare, and share the table reads\n\nThe short-match probe entered the vector prefix compare on every position it\nhad a bucket hit for. The bucket is keyed on three bytes and the shortest\nmatch this parser accepts is three, so three bytes that differ cannot produce\na candidate: they are now checked with one four-byte load and a masked xor\nbefore the compare runs. Upstream reaches the same early exit through the\nfirst word its ZSTD_count loads, which is why its probe costs a fraction of\nwhat ours did.\n\nTwo smaller things go with it. The bucket read was a bounds-checked slice\nget with an empty-slot fallback, for a slot the hash cannot put out of range\n(it is masked to hash3_log bits and the table is 1 << hash3_log wide); it is\nnow a direct read under a debug assertion, as upstream indexes\nhashTable3[hash3]. And the history origin and the live-history pointer and\nlength, which both probes and the walk all wanted, came off the match table\neach time through the same &mut the walk writes through; they are taken once\nat the top of the body.\n\nPer frame on 10 KiB random with a 1,280-byte dictionary, musl, i9, arms\nalternating in one session, three rounds, ranges not overlapping:\n\n  level 13   2,104,123 -> 1,984,634 cycles   -5.68%\n             4,683,578 -> 4,607,622 insn     -1.62%\n  level 19   2,218,754 -> 2,096,793 cycles   -5.50%\n             4,931,907 -> 4,853,487 insn     -1.59%\n\nAgainst libzstd on the same runs, level 13 goes from 1.358x to 1.281x of its\ncycles. Cycles fall three times faster than the instruction count, which is\nthe point: what the gate removes is the vector compare's setup on input that\nmismatches immediately, not a couple of scalar operations.\n\nOutput byte-identical over 30 fixture-and-level rows, and the dictionary path\nemits the same 9,179 bytes a frame.\n\nCosts 2.43% at level 1 on an 8 MiB access log (131,756,579 -> 134,957,977\ncycles), where retired instructions are bit-identical between the two\nbinaries and the Fast backend never enters this finder at all. It is code\nlayout: the level-1 hot function moves from a 32-byte boundary to 48 mod 64.\nStable across three sessions, so it is real time and it is reported, but it\nis not work this change added.\n\nPart of #493.\n\n* perf(opt): stop marshalling the cost profile into the finder every position\n\nThe per-position finder took a 24-byte cost profile by value. System V passes\na struct that size in memory, so its prologue copied it into the frame with a\nvector move plus a third load before any work started, on every one of the\n9,135 positions a frame this fixture searches. It read two of the four fields.\n\nOne of those two is an associated const of the strategy the finder is already\nmonomorphized for, so it needs no argument at all and now arrives as a\nliteral. The other is not a const despite the profile's own docs saying every\nfield is: the pass rewrites \"sufficient_match_len\" before the parse\n(\"sufficient_match_len_for_pass\", so btultra2's seed pass runs a different\nlength from its main pass), and it now crosses as one scalar in a register.\nThe profile itself no longer crosses at all.\n\nPer frame on 10 KiB random at level 13 with a 1,280-byte dictionary, musl,\ni9, three runs at +-0.05%: 1,984,634 -> 1,962,640 cycles (-1.11%) and\n4,607,622 -> 4,552,000 retired instructions (-1.21%). Against libzstd on the\nsame fixture that is 1.281x -> 1.267x of its cycles.\n\nOutput byte-identical over 30 fixture-and-level rows.\n\nReading BOTH values off the strategy's consts measured better still, -3.06%,\nand was wrong: it replaced the per-pass length with the raw const and moved\nthe output on four of those thirty rows. The byte check is what caught it,\nwhich is the whole reason it runs before the timer.\n\nTwo tests set the chain depth through the profile they handed in. Production\nnever varied that value, so they now set \"table.search_depth\", which is the\nknob the walk actually reads and the one production does vary.\n\nPart of #493.\n\n* docs(build): record that pinning function alignment is slower on the grid\n\nAn edit to code one compression level never executes can still move that\nlevel's timing by a few percent with the retired instruction count\nbit-identical, because the encoder's hot functions are large enough that\nanything added or removed shifts the ones after it across cache lines.\nForcing every function onto a 64-byte boundary looks like the cure.\n\nIt is not. The same commit built with and without\n\"-C llvm-args=-align-all-functions=6\", i9, three rounds each, per frame:\n\n  decodecorpus z000033, level 5      62.41 M -> 67.68 M cycles  (+8.4%)\n  8 MiB access log, level 9         679.19 M -> 710.21 M        (+4.6%)\n  8 MiB access log, level 1         131.85 M -> 134.53 M        (+2.0%)\n  z000033 at levels 1 / 13 / 19                                 (+0.6..1.3%)\n  2 MiB incompressible, level 1                                 (-0.1%)\n\nSlower on everything that moves at all. Two hand-picked cases had said the\nopposite, and the grid is what corrected them.\n\nThe note also records the second half of it: the layout shift is a property\nof the binary, not of the change. The same two encoders that differ by up to\n10% at level 5 in the small loop example differ by 0.02-0.8% in the CLI. So a\ncycle delta with identical instruction counts belongs to the binary it was\nmeasured in, and the instruction count is what says whether a change altered\nthe work.\n\nPart of #493.\n\n* fix(opt): pass the sufficient length to the wasm and portable dispatch arms\n\nThe finder's dispatcher has six arms and no host compiles more than half of\nthem. Threading the sufficient match length through it reached the NEON arm\nand the three x86 ones, which is everything an aarch64 or x86 check builds,\nand left the wasm simd128 arm and the portable fallback calling with one\nargument short. Both are compile errors on their own targets, and the wasm CI\njob is where it surfaced.\n\nVerified by running what CI runs: clippy for wasm32-unknown-unknown with\nkernel-simd128 and +simd128, the same for kernel-scalar, and the embedded\n--no-default-features --features kernel-scalar,hash build. All clean.\n\nThe dispatcher now says in its docs that its arms have to be updated by\nreading rather than by compiling, and which two commands cover the ones a\ndevelopment host cannot see.\n\n* docs(opt): record what the litLength-0 slot's wrap costs as a branch\n\nRejecting the synthetic `rep[0] - 1` slot at its origin, with a plain\nsubtraction behind a `reps[0] <= 1` guard, is the shape a per-position gate is\nsupposed to take here: a branch rather than a value the following bound\nhappens to discard.\n\nMeasured, it is the more expensive shape. Per frame, arms alternating in one\nsession, three rounds:\n\n  10 KiB random + 1,280 B dict, level 13   1,964,624 -> 2,109,753  (+7.39%)\n  10 KiB random + 1,280 B dict, level 19   2,077,461 -> 2,199,987  (+5.90%)\n  decodecorpus + 16 KiB dict, level 17       646.51 M ->  662.77 M  (+2.52%)\n  incompressible, level 1 (control)                            (-0.87%)\n\nRetired instructions rise with the cycles, about 2% on the small fixture, and\nthe control arm's are bit-identical, so this is added work and not layout: one\nmore branch in one of three slots stops the three folding together.\n\nOutput is byte-identical either way, over sixty fixture, level and\ndictionary rows.\n\nSo the wrap stays, and the reason is now at the code with its numbers.\nUpstream writes the same rejection the same way, as an intentional unsigned\noverflow that \"discards 0 and -1\" (zstd_opt.c:653).\n\nPart of #493.",
+          "timestamp": "2026-09-08T21:32:22+03:00",
+          "tree_id": "defdcc997d183f2ea4dbeb9bf4220a92b51b7221",
+          "url": "https://github.com/structured-world/structured-zstd/commit/439b69565e30965c777071d86f521b559468ccac"
+        },
+        "date": 1788895140340,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.077,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 192.734,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 247.143,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.507,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.241,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.778,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.969,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.805,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 6.381,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 3.541,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.078,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.099,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.144,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.923,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.251,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.995,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.021,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.021,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.109,
             "unit": "ms"
           }
         ]
