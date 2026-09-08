@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788812663112,
+  "lastUpdate": 1788864041759,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -4890,6 +4890,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.188,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e06ac221d271a666d9202c26441fe6ff60d1ef38",
+          "message": "fix(encode): copy the dictionary where the reference copies it, index it the way it does, and stop re-entering the parser per literal (#494)\n\n* fix(cli): read --fast the way the reference reads it\n\nThe acceleration factor is the LEADING number of the argument: upstream\ntakes a run of decimal digits plus an optional K/M multiplier and stops,\nnever looking at what follows, clamps a factor past the minimum level\ninstead of refusing it, and treats only a zero factor as an error\n(zstdcli.c:1133-1153 -> readU32FromCharChecked, 350-376).\n\nFour spellings behaved differently here, so a working command line\nfailed against a drop-in build:\n\n- `--fast=3.5` / `--fast=3x` were refused; they are level -3.\n- `--fast=1K` / `--fast=2KiB` were refused; the multipliers are real.\n- `--fast=200000` was refused; it clamps to the minimum level.\n- `--fast=+3` was ACCEPTED, because Rust's integer parser takes a sign;\n  a sign is not a digit, so the factor reads as zero and is an error.\n\nEvery accepted and refused form now agrees with the reference across the\nwhole surface, including the ones that already did.\n\n* fix(encode): copy the dictionary above the size the reference copies it at\n\nA dictionary made our ultra-fast frames BIGGER than our own no-dict frames\non a 1 MiB corpus file (+1.9 to +2.2%), while it made the reference's\nsmaller (-3.7 to -4.3%). Without a dictionary the two sides emit the\nidentical 20,159 sequences on that file; with one the reference emits\n27,546 to our 21,897, and only 0.1% of its extra sequences reach back\ninto the dictionary at all. They are ordinary near matches, found\neverywhere because its table already holds the dictionary.\n\nThe Fast attach cutoff was 2 GiB, so every source attached: a separate\ndictionary table, reached only where the scan's step happens to land,\nwith the live table starting empty. The reference copies above 8 KiB\n(attachDictSizeCutoffs[ZSTD_fast], zstd_compress.c:2296) and takes the\ncutoff back to that. It had been raised on a speed argument with no byte\ncolumn beside it, which is how a 6% ratio hole went unnoticed; the\nconstant now carries both columns.\n\nCopy mode then had to index the dictionary the way the reference does.\nIt builds the table once with ZSTD_fillHashTableForCDict (stride 3, the\nstep position winning its slot and the two after it filling only an empty\none) and installs it by stripping the tags. We were filling densely,\nwhich keeps a nearer occurrence per bucket and fragments one long\ndictionary match into several short ones. On log-shaped input that alone\nwas 78 bytes against the reference's 71; with the fill it is 73.\n\nAlternating the two modes on one compressor then hit a stale table: the\ncached dictionary table survived a copy frame, and the borrowed-scan\ndispatch reads exactly that flag, so a copy frame's scan went to the\ndual-base kernel and read raw positions as virtual ones. A frame that is\nnot an attach frame now drops the cached table with the live one. The\nexisting alternation test covers it and had never run before, because at\na 2 GiB cutoff its 64 KiB payload attached like everything else.\n\nBytes, on z000033 (1,022,035 B) with its 16 KiB dictionary, ours against\nthe reference: --fast=7 +5.95% -> -0.08%, --fast=5 +6.15% -> -0.04%,\n--fast=3 +6.43% -> -0.01%. Every level is now at or under it. No-dict\noutput is byte-identical across 27 fixture-and-level rows, as are all\ndictionary frames at or under the cutoff and every non-Fast level.\n\n* fix(encode): drop the attach dictionary cache where copy mode primes it away\n\nInvalidating it in `reset` also hit ATTACH frames, whose whole point is\nliving off that cache: rebuilding the dictionary table every frame cost\n12% on a reused 4 KiB dictionary frame (i9, wall clock, three\ninterleaved rounds, 0.623 s -> 0.706 s). That size is below the attach\ncutoff, so it is a path this work does not otherwise touch — the\nregression showed up as a control arm that would not stay flat.\n\nThe copy prime is the only place that must not keep the cache, so it\ndrops it there.\n\n* perf(encode): size the huffman reuse decision off the histogram\n\nThe decision walked the literals TWICE, a byte and a dependent table load\nat a time, once for the previous table and once for the new one. It is\nthe same sum read off the histogram the frame has already built: a symbol\ncontributes its code length once per occurrence, so summing over at most\n256 symbols gives the identical number. That is where upstream reads it\nfrom as well (HUF_estimateCompressedSize over count, huf_compress.c:1416-1417,\nafter HUF_validateCTable checks representability off the same histogram).\n\nThe two walks were the largest single item outside the matcher in a 4 KiB\ndictionary frame's profile. Output is byte-identical over 80 frames (five\nfixture shapes x eight levels x with and without a dictionary).\n\n* perf(opt): clamp the pass match-length once per block, not per segment\n\n`sufficient_match_len_for_pass` is a block constant (the profile's value\nagainst `target_len`), and the DP body derived it on entry. On input the\nsearch finds nothing in, that body is entered once per LITERAL, so the\nclamp was an out-of-line call per literal — it shows up as its own symbol\nat 2.4% of a level-13 dictionary frame on random input. Both passes now\nclamp before their segment loop, and the body asserts the caller did.\n\nByte-identical over 36 frames across the optimal band.\n\n* perf(row): index a written-off block at the stride the fast path uses\n\nThe two paths had drifted to different answers for one question. A block\nthe driver wrote off is not searched; the only reason to index it at all\nis that a LATER block may duplicate it, that duplicate is recognised on\nthe seen-content grid and then searched, and the search sweeps positions\n— so an entry every stride bytes is met within a stride of scanning,\nimmaterial against a block-sized match. The fast path reasons exactly\nthat way and indexes every 512th position; the lazy/row path was still\nindexing every 8th, which is 131,000 stores per mebibyte of input that\nnothing will search, and it was 82% of the encode on a high-entropy\nmegabyte.\n\nWall clock, i9, three interleaved rounds:\n\n  incompressible 1 MiB, level 5   0.223 s -> 0.052 s   (1343 -> 5627 MB/s)\n  1 MiB repeated verbatim, L19    0.0446 s -> 0.0142 s\n\nLevel 5 on that input is 287 us per frame against the reference's 400.\n\nOutput is unchanged on 65 of 66 fixture-and-level rows — including the\nblock-duplicate fixture at every level but 19, where the wider stride\ncosts 506 bytes in 524,879 (0.1%). That fixture is a megabyte of random\nbytes repeated exactly; input that genuinely repeats compresses, so it\nnever reaches this path at all.\n\n* perf(opt): walk a run of no-match positions inside the parser\n\nUpstream's optimal loop takes a position the search finds nothing at as\none literal and moves on INSIDE its own loop (ZSTD_compressBlock_opt_generic,\nif (!nbMatches) { ip++; continue; }). Ours returned it to the caller, so on\ninput the search finds nothing in — which is every position there — the\ncaller re-entered the DP body per literal and paid its 440-byte frame each\ntime. The hot instructions of that body on such input were its prologue and\nepilogue, not any loop in it.\n\nThe run is now walked in place and handed back whole. The number of\nsearches is unchanged: the run stops at the first position with candidates\nand the caller re-enters there. That position must NOT be searched twice —\nthe search inserts it into the binary tree, and inserting one position\ntwice corrupts the tree — so the run records what it searched and the\nre-entry reads the answer out of the candidate buffer instead of asking\nagain.\n\nSkipped when the LDM producer is active: its state machine is rebuilt per\ncall from the segment's block offset, so advancing inside one call is not\nthe same thing. HAS_LDM is a const generic, so that folds away.\n\nByte-identical over 36 fixture-and-level rows across the optimal band.\n\n* perf(bt): fold the window-floor helper into its caller\n\nTwo field reads and a clamp, taken once per searched position the way\nupstream takes ZSTD_getLowestMatchIndex — but it was standing in the\nprofile as its own symbol, so it was paying a call and a return for four\ninstructions of work. Its neighbours in the same file already carry the\nattribute; this one had been missed.\n\nByte-identical over 24 fixture-and-level rows.\n\n* fix(opt): advance the tree cursor from where a dictionary match ends\n\nAfter a search the parser jumps its lazy tree-insert cursor to where the\nmatch it found ENDS, on the reasoning that positions inside a match are\ncovered. That end is the end of the match in the SOURCE (upstream\n`matchEndIdx = matchIndex + matchLength`, zstd_opt.c:747-748 for the live\nwalk and :794-795 for the dictionary one), and the live walk here already\nused that form. The dictionary walk measured it from the position being\nSEARCHED instead.\n\nA dictionary candidate sits before that position, so the cursor ran ahead\nby the offset and the positions it passed never entered the tree. A later\nsearch then finds an empty bucket where the reference finds a long match.\nIt shows only with a dictionary attached, because only a dictionary\ncandidate reaches back far enough, and hardest where the search is\nshallowest: upstream resolves level 11 at 4 KiB to btopt with `searchLog`\n3, so a search gets eight candidates and cannot afford an empty bucket.\n\nTraced on the benchmark's `small-4k-log-lines` scenario: a dictionary\nmatch at position 319 (offset 161, length 42) moved the cursor to 353\nwhere upstream moves it to 192, so positions 200-353 were never indexed,\nand the search at 701 walked one node and stopped. The reference codes the\nrest of that block as a single 3695-byte match; we spent four sequences on\nthe same span.\n\n`compare_ffi` REPORT_DICT on that scenario, ours against the reference:\nlevel_11_lazy 52 -> 45 bytes against 46, level_12_lazy 51 -> 45 against\n46. Both now come in under it; level_10 and level_13 are unchanged. No-dict\noutput is byte-identical over 24 fixture-and-level rows, and no dictionary\nrow anywhere in the sweep grew.\n\nAlso widened the cparams parity grid to every level: the sampled list\nskipped 11 and 13, and a level row is exactly the kind of thing that can be\nwrong on its own while its neighbours are right. It passes, which is what\nruled the resolved parameters out as the cause here.\n\nCloses #495\n\n* docs(decode): record why the dictionary repeat path stays cold\n\nTaking the attribute off is worth 2.7% on a dictionary decode, where it is\nthe common path (23 matches a frame on the benchmark's small-10k-random\nscenario), and costs 3.5% on an ordinary decode, where it is not taken at\nall and only its placement matters. Measured on the i9, wall clock, three\ninterleaved rounds of prebuilt binaries, with instruction counts unchanged\neither way — so the difference is code placement, and the ordinary decode\nis the path that runs far more often.\n\n* perf(decode): outline the dictionary match tail (measurement pending)\n\n* fix(opt): keep the dictionary match end in absolute coordinates\n\n`dict_idx` indexes the live history, while `match_end_abs` and the tree's\ninsert cursor are absolute. A reused dictionary context advances\n`history_abs_start` between frames, so from the second frame on the\ncomparison put a small relative end against an absolute one, the cursor\nnever advanced, and the parser went back to inserting every covered\nposition: the work this was meant to skip. The first frame hid it, because\nthe base is zero there.\n\nThe invariant is now asserted in debug beside the computation, and it\nfires on the reused-context test with the relative form restored, so the\nwhole debug suite carries the check rather than one fixture.\n\nThe optimal-band ratio test also compresses three frames on ONE\ncompressor now, which is the shape that moves the base.\n\n* docs(match): record the skip stride against the reference, not just against us\n\nThe evidence for the wider stride was ours-before against ours-after: no\nsame-run reference figure, and no instruction counts, on either fixture —\nincluding the repeated-block one whose output the change grows.\n\nTaken now, three arms in one session (before, after, and the C reference\nthrough `ffi_encode_loop_z000033`), `perf stat -r 3`, three rounds each.\nIncompressible 1 MiB at level 5: cycles 1.66 G -> 0.34 G against the\nreference's 1.03 G, instructions 1.93 G -> 0.30 G against 0.83 G — from\n1.58x of the reference to 0.33x. The 1 MiB block repeated verbatim at\nlevel 19: 0.82 G -> 0.083 G cycles against the reference's 12.7 G, and it\nis the row that costs bytes: 524,365 -> 524,871 against the reference's\n524,361, so 510 bytes in 524,871 (0.1%) while running 150 times faster\nthan it.\n\nThe constant now carries those tables instead of the internal\nbefore/after pair.\n\n* test(encode): cover the copy-mode dictionary fill's boundaries and widths\n\nThe coverage report named four lines in the copy-mode fill that nothing\nreached: its two early returns and the hash-width arms past 4.\n\n- A dictionary shorter than one hash read leaves instead of computing\n  `history.len() - HASH_READ_SIZE`, and still records the boundary.\n- A slice carrying nothing hashable past the stride cursor indexes\n  nothing, rather than walking the same positions again. That is also\n  the shape a history shrunk by eviction leaves behind.\n- The fill runs at every width the table accepts (4 through 8): the\n  widths are a `match`, so only the ones a test builds are exercised,\n  and 4 alone left the rest cold.\n\nWhat remains uncovered there is the `unreachable!()` arm, which the\ntable's constructor makes unreachable by rejecting any other width.\n\n* perf(encode): set the attach dictionary table aside on a copy frame\n\nA copy-mode frame must not reach the attached table, and said so by\ndiscarding it. A compressor whose source sizes cross the attach cutoff\nthen rebuilt that table on every attach frame it came back to, which the\nneighbouring note already prices at 12% of a reused 4 KiB dictionary\nframe.\n\nIt is set aside instead: while it is away every reader sees exactly the\nstate a discard leaves, so no frame's output can depend on it still\nexisting, and the next attach prime takes it back and runs the same shape\ncheck it would have run on a table that never left. A dictionary change\nstill goes through `invalidate`, which drops the stash with it.\n\nByte-identical over 24 fixture-and-level rows against the branch tip.\n\nThe dictionary encode loop grows an `alt<N>` argument that alternates each\nframe between the input and its first N bytes, so the mode-switching shape\nthis is about can be measured rather than argued about.\n\n* perf(encode): drop the dictionary-table stash, it measured as nothing\n\nSetting the attached table aside on a copy frame, so the next attach frame\nwould not hash the dictionary again, was built and then measured on the\nshape it exists for: frames alternating either side of the attach cutoff\non one compressor (`encode_loop_dict … alt<N>`, 20 000 frames of 64 KiB\nand 4 KiB with a 16 KiB dictionary, i9, `perf stat -r 3`, three rounds).\n\nRetired instructions came out identical — 30,163,334,509 against\n30,163,334,255, a difference of 254 in 30 billion. So the attach frame\nthat follows a copy frame is not rebuilding anything to begin with, and\nthe 0.9% of cycles that moved is the size of a code-layout change. The\nstash was state and two methods for no work removed, so it goes.\n\nThe measurement is recorded where the discard happens, so the next reader\ndoes not build it again to find out.\n\n* perf(decode): outline the tail of a match that continues past the dictionary\n\n`repeat_inner` is `inline(always)`, so calling it from the dictionary path\npulled the whole copy machinery — overlapping copies, the wildcopy\nvariants, their error paths — into that path's body, and every dictionary\nmatch paid the prologue and epilogue of a frame sized for code most of\nthem never run. On a dictionary-heavy frame that is the common path: 23\nmatches a frame at 112 instructions a call on the benchmark's\nsmall-10k-random scenario. Behind a call the frame belongs to the tail.\n\n13.2 million retired instructions on 200 000 frames of that scenario\n(3.1032 -> 3.0900 G, i9, `perf stat -r 3`). Cycles and wall clock did not\nmove with it (1245-1266 -> 1259-1266 ns a frame, ranges overlapping), so\nthis is fewer operations and not a speed claim.\n\nIt was dropped a commit ago for exactly that reason, which was wrong: a\ntimer too coarse to resolve a fraction of a percent is not evidence\nagainst work that is provably gone. Only a measured increase in cycles\nwould be.\n\n* docs(perf): record the measurements behind three hot-path changes\n\nThe Fast attach-vs-copy cutoff, the parser's literal-run walk and the\nfolded window-floor helper each landed with an argument and an incomplete\nnumber. All three are now measured the same way: two prebuilt binaries and\nlibzstd alternated in one ssh session, perf stat -r 3 for cycles AND\nretired instructions, three rounds, plus a control arm the change cannot\nexecute.\n\nThe cutoff table gains its two missing cycle cells, an instruction column\nand absolute byte counts. Copy takes 18-28% fewer cycles and 22-27% fewer\ninstructions at the positive levels and matches or beats the reference's\nbytes there; at the ultra-fast levels it spends 9-21% more cycles to save\n5.5-6.0% of the bytes, which is the trade the cutoff exists to make.\n\nThe parser's literal-run walk is a speed win and is now stated as one:\n-29.5% cycles and -22.8% instructions per frame on near-random input at\nlevel 19, 1.94x -> 1.37x of libzstd, byte-identical.\n\nThe folded window floor is NOT a speed win and no longer reads like one.\nIt removes 164,648 retired instructions a frame on that fixture, but the\ncontrol arm moves 3.6% of cycles on its own, so the clock cannot resolve\nit. Kept for the operations that are provably gone.\n\nAlso fixes the encode loop reporting src.len() x iters as its input total\nunder alt<N>, where the frames are two different sizes.",
+          "timestamp": "2026-09-08T12:52:22+03:00",
+          "tree_id": "8039e9c1e735cacbf957195d54a41d70e99517ad",
+          "url": "https://github.com/structured-world/structured-zstd/commit/e06ac221d271a666d9202c26441fe6ff60d1ef38"
+        },
+        "date": 1788864021926,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.082,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.086,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 217.178,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 214.903,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.522,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.409,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.93,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.01,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.972,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.042,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.03,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.173,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.03,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.173,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 10.236,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 6.442,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.176,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.56,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.233,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.719,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.294,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.156,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.026,
             "unit": "ms"
           },
           {
