@@ -475,7 +475,8 @@ macro_rules! bt_insert_and_collect_matches_body {
         $search_depth:expr,
         $abs_pos:ident,
         $current_abs_end:ident,
-        $profile:ident,
+        $sufficient_len:expr,
+        $max_chain_depth:expr,
         $min_match_len:ident,
         $best_len_for_skip:ident,
         $out:ident,
@@ -508,46 +509,85 @@ macro_rules! bt_insert_and_collect_matches_body {
         // this frame (inlining the same probes into the DP caller regressed). =====
         let mut skip_further_match_search = false;
         let mut rep_len_candidate_found = false;
-        if idx + 4 <= concat.len() {
-            let rep_offsets: [Option<usize>; 3] = if $lit_len == 0 {
-                [
-                    Some($reps[1] as usize),
-                    Some($reps[2] as usize),
-                    ($reps[0] > 1).then_some(($reps[0] - 1) as usize),
-                ]
+        // Shared by both probes below. The history origin and the live-history
+        // pointer/length are fixed for this position but live on the match
+        // table, which the tree walk further down writes through, so each
+        // reader was fetching them again.
+        let hist_start = $table.history_abs_start;
+        let cbase = concat.as_ptr();
+        let clen = concat.len();
+        if idx + 4 <= clen {
+            let rbase = cbase;
+            let rlen = clen;
+            // Upstream walks the three repeat offsets as plain indices with the
+            // litLength-0 rotation applied to the INDEX, not to a materialised
+            // list (zstd_opt.c:646-649): `repCode` runs from `ll0` to
+            // `ZSTD_REP_NUM + ll0`, taking `rep[repCode]` except for the last
+            // slot, which is `rep[0] - 1`. Building the same three candidates as
+            // `[Option<_>; 3]` and flattening them paid the option machinery on
+            // every position, and this parser visits nearly every position, so
+            // the flatten and its discriminant checks stood in the profile as
+            // their own lines. The zero that the `then_some` used to filter is
+            // discarded by the `rep == 0` gate below, which is where upstream
+            // discards it too (its `repOffset-1` underflows past the bound).
+            // Everything the three probes share is taken once. The current
+            // position's gate word does not depend on which repeat offset is
+            // being tried, and neither does the tail length, but both sat
+            // inside the loop: the word was re-read and re-masked on every
+            // repeat. Upstream reads its own `ip` word through a plain local
+            // pointer nothing aliases, which is what hoisting these amounts to.
+            let cur_tail = rlen - idx;
+            // SAFETY: `idx + 4 <= rlen` from the guard above.
+            let cur_word = unsafe { rbase.add(idx).cast::<u32>().read_unaligned().to_le() };
+            let cur_gate = if $min_match_len == 3 {
+                cur_word & 0x00FF_FFFF
             } else {
-                [
-                    Some($reps[0] as usize),
-                    Some($reps[1] as usize),
-                    Some($reps[2] as usize),
-                ]
+                cur_word
             };
-            let rbase = concat.as_ptr();
-            let rlen = concat.len();
-            for rep in rep_offsets.into_iter().flatten() {
+            let ll0 = usize::from($lit_len == 0);
+            for rep_code in ll0..3 + ll0 {
+                // The synthetic slot's wrap is deliberate and measured. Guarding
+                // `reps[0] <= 1` before a plain subtraction, so the slot is
+                // rejected at its origin rather than through a value the bound
+                // below discards, is the shape this codebase asks for on a
+                // per-position path — and here it costs: +7.4% cycles at level
+                // 13 and +5.9% at level 19 on 10 KiB random with a dictionary,
+                // +2.5% on the corpus at level 17, with retired instructions up
+                // 2% alongside them and the control arm flat, so it is added
+                // work rather than layout. One extra branch in one of three
+                // slots stops the three from folding together.
+                //
+                // Upstream writes the same rejection the same way, as an
+                // intentional unsigned overflow that "discards 0 and -1"
+                // (zstd_opt.c:653). The outcome is identical either way: a
+                // `reps[0]` of 0 wraps past `abs_pos` and one of 1 becomes the
+                // zero the next line rejects.
+                let rep = if rep_code == 3 {
+                    ($reps[0] as usize).wrapping_sub(1)
+                } else {
+                    $reps[rep_code] as usize
+                };
                 if rep == 0 || rep > $abs_pos {
                     continue;
                 }
                 let candidate_pos = $abs_pos - rep;
-                if candidate_pos < $table.history_abs_start {
+                if candidate_pos < hist_start {
                     continue;
                 }
-                let candidate_idx = candidate_pos - $table.history_abs_start;
-                // SAFETY: `idx + 4 <= rlen` (guard above) and `candidate_idx < idx`
-                // (rep >= 1), so both 4-byte reads stay inside `concat`.
-                let gate_matches = unsafe {
-                    let cand = rbase.add(candidate_idx).cast::<u32>().read_unaligned();
-                    let cur = rbase.add(idx).cast::<u32>().read_unaligned();
-                    if $min_match_len == 3 {
-                        (cand.to_le() & 0x00FF_FFFF) == (cur.to_le() & 0x00FF_FFFF)
-                    } else {
-                        cand == cur
-                    }
+                let candidate_idx = candidate_pos - hist_start;
+                // SAFETY: `candidate_idx < idx` (rep >= 1) and `idx + 4 <= rlen`,
+                // so the 4-byte read stays inside `concat`.
+                let cand_word =
+                    unsafe { rbase.add(candidate_idx).cast::<u32>().read_unaligned().to_le() };
+                let cand_gate = if $min_match_len == 3 {
+                    cand_word & 0x00FF_FFFF
+                } else {
+                    cand_word
                 };
-                if !gate_matches {
+                if cand_gate != cur_gate {
                     continue;
                 }
-                let rmax = (rlen - candidate_idx).min(rlen - idx).min(tail_limit);
+                let rmax = (rlen - candidate_idx).min(cur_tail).min(tail_limit);
                 // SAFETY: same umbrella; both pointers + `rmax` stay in `concat`.
                 let match_len = unsafe { $cpl(rbase.add(candidate_idx), rbase.add(idx), rmax) };
                 if match_len < $min_match_len {
@@ -564,7 +604,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                     },
                     $min_match_len,
                 );
-                if match_len > $profile.sufficient_match_len
+                if match_len > $sufficient_len
                     || $abs_pos + match_len >= $current_abs_end
                 {
                     skip_further_match_search = true;
@@ -589,23 +629,25 @@ macro_rules! bt_insert_and_collect_matches_body {
             // call): table lookup + one common-prefix scan via `$cpl`, reusing
             // the BT collect's `concat` / `idx` / `tail_limit`. Labeled block so
             // the probe's early-outs yield None without returning from the walk.
+            let h3_log = $table.hash3_log;
             let h3_candidate: Option<$crate::encoding::opt::types::MatchCandidate> =
-                if $table.hash3_log == 0 || idx + 4 > concat.len() {
+                if h3_log == 0 || idx + 4 > clen {
                     None
                 } else {
                     'h3: {
                         let hh =
                             $crate::encoding::match_table::storage::MatchTable::hash_position_at(
-                                concat,
-                                idx,
-                                $table.hash3_log,
-                                3,
+                                concat, idx, h3_log, 3,
                             );
-                        let entry = $table
-                            .hash3_table()
-                            .get(hh)
-                            .copied()
-                            .unwrap_or($crate::encoding::match_table::storage::HC_EMPTY);
+                        // The hash is masked to `h3_log` bits and the table is
+                        // `1 << h3_log` slots wide, so the slot is in range by
+                        // construction and the bounds-checked slice read plus
+                        // its empty-slot fallback were paying for a case that
+                        // cannot arise. Upstream indexes `hashTable3[hash3]`
+                        // directly for the same reason.
+                        debug_assert_eq!($table.hash3_table().len(), 1usize << h3_log);
+                        // SAFETY: `hh < 1 << h3_log == hash3_table().len()`.
+                        let entry = unsafe { *$table.hash3_table().get_unchecked(hh) };
                         let Some(cand_abs) =
                             $crate::encoding::match_table::storage::MatchTable::stored_abs_position_fast(
                                 entry,
@@ -615,17 +657,34 @@ macro_rules! bt_insert_and_collect_matches_body {
                         else {
                             break 'h3 None;
                         };
-                        if cand_abs < $table.history_abs_start || cand_abs >= $abs_pos {
+                        if cand_abs < hist_start || cand_abs >= $abs_pos {
                             break 'h3 None;
                         }
                         let off = $abs_pos - cand_abs;
                         if off >= $crate::encoding::bt::HC3_MAX_OFFSET {
                             break 'h3 None;
                         }
-                        let cand_idx = cand_abs - $table.history_abs_start;
-                        let hbase = concat.as_ptr();
+                        let cand_idx = cand_abs - hist_start;
+                        // The bucket is keyed on three bytes and the shortest
+                        // match this parser accepts is three, so three bytes
+                        // that differ cannot produce a candidate: check them
+                        // before entering the vector compare, which on input
+                        // that mismatches immediately costs more than the
+                        // answer. Upstream reaches the same early exit through
+                        // the first word its `ZSTD_count` loads.
+                        // SAFETY: `cand_idx < idx` and `idx + 4 <= clen`, so
+                        // both four-byte reads stay inside the live history.
+                        let (cand_head, cur_head) = unsafe {
+                            (
+                                cbase.add(cand_idx).cast::<u32>().read_unaligned().to_le(),
+                                cbase.add(idx).cast::<u32>().read_unaligned().to_le(),
+                            )
+                        };
+                        if (cand_head ^ cur_head) & 0x00FF_FFFF != 0 {
+                            break 'h3 None;
+                        }
                         // SAFETY: cand_idx/idx within history; tail_limit bounds the scan.
-                        let ml = unsafe { $cpl(hbase.add(cand_idx), hbase.add(idx), tail_limit) };
+                        let ml = unsafe { $cpl(cbase.add(cand_idx), cbase.add(idx), tail_limit) };
                         (ml >= $min_match_len).then_some(
                             $crate::encoding::opt::types::MatchCandidate {
                                 start: $abs_pos,
@@ -643,7 +702,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                     $min_match_len,
                 );
                 if !rep_len_candidate_found
-                    && (h3.match_len > $profile.sufficient_match_len
+                    && (h3.match_len > $sufficient_len
                         || $abs_pos + h3.match_len >= $current_abs_end)
                 {
                     $table.skip_insert_until_abs = $abs_pos + 1;
@@ -767,7 +826,15 @@ macro_rules! bt_insert_and_collect_matches_body {
         // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
         // cap in `MatchTable::add_data`.
         let mut match_end_abs = $abs_pos + 9;
-        let mut compares_left = $profile.max_chain_depth.min($search_depth);
+        // Both of these are associated consts of the strategy the caller is
+        // monomorphized for, so they arrive as literals rather than as fields
+        // of a 24-byte profile the caller had to marshal through memory on
+        // every position: System V passes a struct that size in memory, and the
+        // prologue was copying it into the frame with a vector move before any
+        // work started. Upstream reads the same values off `cParams` through a
+        // pointer it already holds, and its finder is inlined into the parser
+        // loop, so it never marshals anything per position either.
+        let mut compares_left = ($max_chain_depth).min($search_depth);
         let mut common_length_smaller = 0usize;
         let mut common_length_larger = 0usize;
         let pair_idx = $table.bt_pair_index_for_abs($abs_pos);
@@ -896,8 +963,9 @@ macro_rules! bt_insert_and_collect_matches_body {
 
         // Dict dual-probe (upstream zstd `ZSTD_dictMatchState`, zstd_opt.c:777-813):
         // after the live tree, descend the immutable dictionary BINARY TREE
-        // (built in `prime_dms_bt`) with its OWN compare budget and push any
-        // dict match longer than the live best into the ladder. The DUBT
+        // (built in `prime_dms_bt`) on what the live walk left of the compare
+        // budget, and push any dict match longer than the live best into the
+        // ladder. The DUBT
         // descent reaches the longest dict match efficiently (a hash-chain
         // surfaced only the few same-bucket candidates and left most of the
         // dict savings unrealised at btlazy2 / btopt). Dict positions are

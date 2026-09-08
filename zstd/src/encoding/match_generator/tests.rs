@@ -1403,23 +1403,23 @@ fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
     // BT strategy (BtOpt shares Lazy's OPT_LEVEL=0 / USE_HASH3=false consts).
     hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
     hc.hc.search_depth = 0;
+    // The finder caps its walk at `table.search_depth`, and takes the other
+    // half of that bound from the strategy's associated const rather than from
+    // a value a caller hands it. So zero depth has to be set where the walk
+    // reads it; `hc.search_depth` above is the configure-time source and does
+    // not reach the walk on its own.
+    hc.table.search_depth = 0;
     hc.table.history = b"xyzxyzxyzxyz".to_vec();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
 
     let abs_pos = 6usize;
     let current_abs_end = hc.table.history.len();
-    let profile = HcOptimalCostProfile {
-        max_chain_depth: 0,
-        sufficient_match_len: usize::MAX / 2,
-        accurate: false,
-        favor_small_offsets: false,
-    };
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         abs_pos,
         current_abs_end,
-        profile,
+        usize::MAX / 2,
         HcCandidateQuery {
             reps: [3, 6, 9],
             lit_len: 1,
@@ -1449,17 +1449,11 @@ fn hc_collect_optimal_candidates_panics_for_non_bt_strategy() {
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
     hc.table.ensure_tables();
-    let profile = HcOptimalCostProfile {
-        max_chain_depth: 0,
-        sufficient_match_len: usize::MAX / 2,
-        accurate: false,
-        favor_small_offsets: false,
-    };
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         6,
         hc.table.history.len(),
-        profile,
+        usize::MAX / 2,
         HcCandidateQuery {
             reps: [1, 2, 3],
             lit_len: 1,
@@ -1496,18 +1490,13 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
         hc.table.chain_log = 8;
         hc.table.hash3_log = 8;
         hc.table.ensure_tables();
+        hc.table.search_depth = 8;
         let abs_pos = 12usize;
-        let profile = HcOptimalCostProfile {
-            max_chain_depth: 8,
-            sufficient_match_len: usize::MAX / 2,
-            accurate: false,
-            favor_small_offsets: false,
-        };
         let mut out = Vec::new();
         hc.collect_optimal_candidates(
             abs_pos,
             hc.table.history.len(),
-            profile,
+            usize::MAX / 2,
             HcCandidateQuery {
                 // Reps past abs_pos are skipped, so the only candidate source is
                 // the (hash3 / BT) match finder — keeping the observable clean.
@@ -1540,17 +1529,12 @@ fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
     hc.table.ensure_tables();
     hc.table.insert_positions(0, abs_pos);
 
-    let profile = HcOptimalCostProfile {
-        max_chain_depth: 32,
-        sufficient_match_len: usize::MAX / 2,
-        accurate: true,
-        favor_small_offsets: false,
-    };
+    hc.table.search_depth = 32;
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         abs_pos,
         hc.table.history.len(),
-        profile,
+        usize::MAX / 2,
         HcCandidateQuery {
             reps: [1, 4, 8],
             lit_len: 1,
@@ -1580,17 +1564,12 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
     hc.table.insert_positions(0, abs_pos);
     hc.table.skip_insert_until_abs = 0;
 
-    let profile = HcOptimalCostProfile {
-        max_chain_depth: 32,
-        sufficient_match_len: usize::MAX / 2,
-        accurate: true,
-        favor_small_offsets: false,
-    };
+    hc.table.search_depth = 32;
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         abs_pos,
         hc.table.history.len(),
-        profile,
+        usize::MAX / 2,
         HcCandidateQuery {
             reps: [1, 4, 8],
             lit_len: 1,
@@ -1618,18 +1597,12 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
 
     let abs_pos = 8usize;
     hc.table.skip_insert_until_abs = 0;
-
-    let profile = HcOptimalCostProfile {
-        max_chain_depth: 0,
-        sufficient_match_len: usize::MAX / 2,
-        accurate: true,
-        favor_small_offsets: false,
-    };
+    hc.table.search_depth = 0;
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         abs_pos,
         hc.table.history.len(),
-        profile,
+        usize::MAX / 2,
         HcCandidateQuery {
             reps: [1, 4, 8],
             lit_len: 1,
@@ -1673,17 +1646,12 @@ fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
         match_len: 40,
     };
 
-    let profile = HcOptimalCostProfile {
-        max_chain_depth: 0,
-        sufficient_match_len: usize::MAX / 2,
-        accurate: true,
-        favor_small_offsets: false,
-    };
+    hc.table.search_depth = 0;
     let mut out = Vec::new();
     hc.collect_optimal_candidates(
         abs_pos,
         current_abs_end,
-        profile,
+        usize::MAX / 2,
         HcCandidateQuery {
             reps: [1, 4, 8],
             lit_len: 1,
@@ -1739,12 +1707,6 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
         hc.table.skip_insert_until_abs = 0;
     };
 
-    let profile = HcOptimalCostProfile {
-        max_chain_depth: 32,
-        sufficient_match_len: usize::MAX / 2,
-        accurate: true,
-        favor_small_offsets: false,
-    };
     let abs_pos = 96usize;
     let mut out = Vec::new();
 
@@ -1754,7 +1716,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     hc.collect_optimal_candidates(
         abs_pos,
         160,
-        profile,
+        usize::MAX / 2,
         HcCandidateQuery {
             reps: [1, 4, 8],
             lit_len: 1,
@@ -1773,7 +1735,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     hc.collect_optimal_candidates(
         abs_pos,
         160,
-        profile,
+        usize::MAX / 2,
         HcCandidateQuery {
             reps: [1, 4, 8],
             lit_len: 1,
