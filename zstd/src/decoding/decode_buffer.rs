@@ -919,7 +919,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
-        self.repeat_inner::<false>(dict, offset, match_length)
+        self.repeat(dict, offset, match_length)
     }
 
     /// Check if and how many bytes can currently be drawn from the buffer

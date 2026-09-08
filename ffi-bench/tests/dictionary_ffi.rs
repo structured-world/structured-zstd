@@ -180,20 +180,26 @@ fn dict_frames_on_the_optimal_band_are_no_larger_than_the_reference() {
             Dictionary::from_serialized_or_raw_content(dict.as_slice()).expect("dictionary parses"),
         )
         .expect("attach dict");
-        cctx.set_source_size_hint(payload.len() as u64);
-        let ours = cctx.compress_independent_frame(&payload);
-
         let mut reference = zstd::bulk::Compressor::with_dictionary(level, dict.as_slice())
             .expect("reference accepts the dictionary");
         let theirs = reference
             .compress(&payload)
             .expect("reference compresses the payload");
 
-        assert!(
-            ours.len() <= theirs.len(),
-            "level {level}: {} bytes against the reference's {}",
-            ours.len(),
-            theirs.len(),
-        );
+        // Three frames on the SAME compressor. A reused dictionary context
+        // advances the history base between frames, so anything the parser
+        // keeps in absolute coordinates has to carry that base: a value left
+        // relative to the live history reads correctly on the first frame and
+        // silently stops working on the second.
+        for frame in 0..3 {
+            cctx.set_source_size_hint(payload.len() as u64);
+            let ours = cctx.compress_independent_frame(&payload);
+            assert!(
+                ours.len() <= theirs.len(),
+                "level {level} frame {frame}: {} bytes against the reference's {}",
+                ours.len(),
+                theirs.len(),
+            );
+        }
     }
 }
