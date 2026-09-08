@@ -722,9 +722,9 @@ fn encode_block_parts<M: Matcher>(
         // here because these modes are written to the frame.
         let (last_ll, last_ml, last_of) = raw_sequences.last().map_or((0, 0, 0), |seq| {
             (
-                literal_length_code(seq.ll) as usize,
-                match_len_code(seq.ml) as usize,
-                seq.off_base.ilog2() as usize,
+                encode_literal_length(seq.ll).0 as usize,
+                encode_match_len(seq.ml).0 as usize,
+                encode_offset(seq.off_base).0 as usize,
             )
         });
 
@@ -1092,7 +1092,7 @@ fn estimate_sequences_section_bytes(
     for seq in sequences {
         let (ll, _, ll_bits) = encode_literal_length(seq.ll);
         let (ml, _, ml_bits) = encode_match_len(seq.ml);
-        let of = seq.off_base.ilog2() as u8;
+        let (of, _, _) = encode_offset(seq.off_base);
         ll_counts[ll as usize] += 1;
         ml_counts[ml as usize] += 1;
         of_counts[of as usize] += 1;
@@ -1122,7 +1122,7 @@ fn estimate_sequences_section_bytes(
     let ll_mode = choose_table(
         ll_previous.as_ref(),
         ll_default,
-        sequences.iter().map(|seq| literal_length_code(seq.ll)),
+        sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
         9,
         strategy,
         ll_next,
@@ -1130,7 +1130,7 @@ fn estimate_sequences_section_bytes(
     let ml_mode = choose_table(
         ml_previous.as_ref(),
         ml_default,
-        sequences.iter().map(|seq| match_len_code(seq.ml)),
+        sequences.iter().map(|seq| encode_match_len(seq.ml).0),
         9,
         strategy,
         ml_next,
@@ -1138,7 +1138,7 @@ fn estimate_sequences_section_bytes(
     let of_mode = choose_table(
         of_previous.as_ref(),
         of_default,
-        sequences.iter().map(|seq| seq.off_base.ilog2() as u8),
+        sequences.iter().map(|seq| encode_offset(seq.off_base).0),
         8,
         strategy,
         of_next,
@@ -1538,9 +1538,9 @@ fn fill_and_count<const FAST_REPCODE: bool>(
             encode_offset_with_history(seq.off_base, seq.ll, &mut hist)
         };
         seq.off_base = off_base;
-        let ll_code = literal_length_code(seq.ll) as usize;
-        let ml_code = match_len_code(seq.ml) as usize;
-        let of_code = off_base.ilog2() as usize;
+        let ll_code = encode_literal_length(seq.ll).0 as usize;
+        let ml_code = encode_match_len(seq.ml).0 as usize;
+        let of_code = encode_offset(off_base).0 as usize;
         ll_counts[ll_code] += 1;
         ml_counts[ml_code] += 1;
         of_counts[of_code] += 1;
@@ -2577,28 +2577,14 @@ const ML_EXTRA_BITS: [u8; 53] = [
 /// compiled to a chain of comparisons; upstream reaches the same answer with a
 /// table index. Every code's baseline is a multiple of its own extra-bit width,
 /// so masking off those bits is the same subtraction the ranges spelled out.
-// `inline(always)`: as a hint it was left out of line at the histogram's call
-// site, and a call per sequence costs more than the table lookup this split
-// removes.
-#[inline(always)]
-fn literal_length_code(len: u32) -> u8 {
+#[inline]
+fn encode_literal_length(len: u32) -> (u8, u32, usize) {
     debug_assert!(len < 131_072, "literal length {len} out of encodable range");
-    if len < 64 {
+    let code = if len < 64 {
         LL_CODE[len as usize]
     } else {
         (len.ilog2() + LL_DELTA_CODE) as u8
-    }
-}
-
-/// [`literal_length_code`] plus the extra bits it carries.
-///
-/// Separate from the code alone because the extra-bit lookup is a bounds
-/// check, which can panic and so cannot be dropped as dead: a caller that
-/// wants only the symbol — the histogram pass — was paying the load and the
-/// check for a value it discarded.
-#[inline]
-fn encode_literal_length(len: u32) -> (u8, u32, usize) {
-    let code = literal_length_code(len);
+    };
     let bits = LL_EXTRA_BITS[code as usize] as usize;
     (code, len & ((1u32 << bits) - 1), bits)
 }
@@ -2608,28 +2594,20 @@ fn encode_literal_length(len: u32) -> (u8, u32, usize) {
 /// does). Codes are keyed on `len - 3`, the form the sequence section stores.
 ///
 /// Table-driven for the same reason as [`encode_literal_length`].
-// `inline(always)` for the same reason as [`literal_length_code`].
-#[inline(always)]
-fn match_len_code(len: u32) -> u8 {
+#[inline]
+fn encode_match_len(len: u32) -> (u8, u32, usize) {
     debug_assert!(
         (3..131_075).contains(&len),
         "match length {len} out of encodable range",
     );
     let base = len - 3;
-    if base < 128 {
+    let code = if base < 128 {
         ML_CODE[base as usize]
     } else {
         (base.ilog2() + ML_DELTA_CODE) as u8
-    }
-}
-
-/// [`match_len_code`] plus the extra bits it carries. Split for the same
-/// reason as [`encode_literal_length`].
-#[inline]
-fn encode_match_len(len: u32) -> (u8, u32, usize) {
-    let code = match_len_code(len);
+    };
     let bits = ML_EXTRA_BITS[code as usize] as usize;
-    (code, (len - 3) & ((1u32 << bits) - 1), bits)
+    (code, base & ((1u32 << bits) - 1), bits)
 }
 
 /// Convert an actual byte offset into the encoded offset code, using repeat offset
