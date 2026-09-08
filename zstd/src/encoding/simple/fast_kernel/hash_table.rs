@@ -231,6 +231,28 @@ impl FastHashTable {
         self.bias = 0;
     }
 
+    /// Slide every stored position down by `drop_n`, the way upstream's
+    /// `ZSTD_reduceIndex` does when the window moves: the table keeps naming
+    /// the same bytes, and a position that named part of the dropped prefix
+    /// becomes the empty sentinel.
+    ///
+    /// This is what a window slide costs when the caller does not rebuild the
+    /// table: one pass over the table's own entries, against a pass over every
+    /// byte the window kept. It also leaves the table holding exactly what it
+    /// held before the slide, where a rebuild adds entries for positions the
+    /// matcher had skipped and never indexed.
+    ///
+    /// `saturating_sub` is the semantics on both lines, not a guard: below the
+    /// bias a slot is already empty, and at or under `drop_n` the position it
+    /// names is gone. Both floor at the sentinel.
+    pub(crate) fn reduce_indices(&mut self, drop_n: u32) {
+        let bias = self.bias;
+        for slot in self.table.iter_mut() {
+            *slot = slot.saturating_sub(bias).saturating_sub(drop_n);
+        }
+        self.bias = 0;
+    }
+
     /// Continue-mode frame reset (upstream zstd `ZSTD_continueCCtx` cadence): keep
     /// the table contents and advance the epoch bias past every entry the
     /// previous frame stored, so all of them read back as the empty

@@ -963,16 +963,20 @@ impl FastKernelMatcher {
     /// 2. Reset `prefix_start_index` to `INITIAL_PREFIX_START_INDEX = 1`
     ///    — drain re-indexes the retained tail; the sentinel-0
     ///    filter restores via this fixed baseline.
-    /// 3. Clear the hash table — entries hold pre-drain absolute
-    ///    positions that no longer reference live bytes.
+    /// 3. Slide the hash table's stored positions down by `drop_n`
+    ///    ([`FastHashTable::reduce_indices`], upstream `ZSTD_reduceIndex`)
+    ///    so they keep naming the same bytes, with anything that named
+    ///    the dropped prefix falling to the empty sentinel.
     /// 4. `saturating_sub` `last_block_start` by `drop_n`.
-    /// 5. Rehash retained tail starting at the sentinel-0 floor
-    ///    ([`INITIAL_PREFIX_START_INDEX`] = 1) so block N+1 can find
-    ///    matches against the kept bytes (without this they'd be
-    ///    "dead history" — visible in the Vec but unlookupable).
-    ///    Starting from index 1 instead of 0 avoids hashing a position
-    ///    that the kernel's `match_idx >= prefix_start_index` filter
-    ///    would reject anyway.
+    ///
+    /// Step 3 replaced a clear plus a dense rehash of the whole retained
+    /// tail, which was a pass over every byte the window kept — at level 1
+    /// on an 8 MiB input the rehash alone was a fifth of the encode, for a
+    /// window that slides every `max_window_size` bytes. Sliding the indices
+    /// is a pass over the table instead, and it is also the more faithful
+    /// state: the rehash indexed every position, including the ones the
+    /// matcher's step had skipped and never stored, so the table came out of
+    /// a slide holding more than it held going in.
     fn drain_real_prefix(&mut self, drop_n: usize) {
         let drain_end = HISTORY_DRAIN_BASE + drop_n;
         self.history.drain(HISTORY_DRAIN_BASE..drain_end);
@@ -991,12 +995,11 @@ impl FastKernelMatcher {
         // prefix floor reverts to the windowed value (upstream zstd
         // `ZSTD_window_enforceMaxDist` zeroing `loadedDictEnd`).
         self.loaded_dict_end = 0;
-        self.hash_table.clear();
+        // `drop_n` is a length inside `history`, which the window ceiling
+        // (`window_log <= 30`, retained at most `2 * max_window_size`) keeps
+        // under 2^31.
+        self.hash_table.reduce_indices(drop_n as u32);
         self.last_block_start = self.last_block_start.saturating_sub(drop_n);
-        // Skip position 0 — `prefix_start_index = 1` means the kernel
-        // rejects any match resolving to index 0, so populating that
-        // slot would just pollute the table with an unreachable entry.
-        self.prime_hash_table_for_range(INITIAL_PREFIX_START_INDEX as usize);
     }
 
     /// Internal: drain `self.pending` into `self.history`, applying
