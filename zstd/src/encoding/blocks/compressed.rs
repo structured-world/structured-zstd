@@ -2327,11 +2327,21 @@ fn encode_sequences(
             // per-sequence flush in this loop (≤ 16 bytes per
             // sequence, plus the 32-byte slack on top of the 64-byte
             // header reserve).
+            //
+            // What the three diffs actually put in the accumulator, tallied so
+            // the budget below is checked against the widths the FSE tables
+            // produced rather than against the ceiling its derivation assumed.
+            #[cfg(debug_assertions)]
+            let mut state_diff_bits = 0usize;
             if let Some(table) = of_table {
                 let next = table.next_state(of_code, of_state);
                 let diff = crate::fse::fse_encoder::transition_bits(of_state, next.num_bits);
                 unsafe {
                     writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                }
+                #[cfg(debug_assertions)]
+                {
+                    state_diff_bits += next.num_bits as usize;
                 }
                 of_state = next.index;
             }
@@ -2341,6 +2351,10 @@ fn encode_sequences(
                 unsafe {
                     writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 }
+                #[cfg(debug_assertions)]
+                {
+                    state_diff_bits += next.num_bits as usize;
+                }
                 ml_state = next.index;
             }
             if let Some(table) = ll_table {
@@ -2348,6 +2362,10 @@ fn encode_sequences(
                 let diff = crate::fse::fse_encoder::transition_bits(ll_state, next.num_bits);
                 unsafe {
                     writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                }
+                #[cfg(debug_assertions)]
+                {
+                    state_diff_bits += next.num_bits as usize;
                 }
                 ll_state = next.index;
             }
@@ -2363,6 +2381,32 @@ fn encode_sequences(
             // shift on every sequence, and a level-1 block has hundreds of
             // thousands of them.
             let extra_bits_total = of_num_bits + ml_num_bits + ll_num_bits;
+            // The thresholds are arithmetic on widths, so they are only right
+            // while the widths are what they were derived from. Pinned here,
+            // where the arithmetic happens, so a widened encoder fails at its
+            // cause rather than as an accumulator overflow further down or, in
+            // a release build, as a corrupted stream with nothing to point at.
+            #[cfg(debug_assertions)]
+            {
+                debug_assert!(
+                    state_diff_bits <= 26,
+                    "state diffs took {state_diff_bits} bits; the thresholds below are \
+                     derived from a 26-bit ceiling (LLFSELog 9 + MLFSELog 9 + OffFSELog 8)",
+                );
+                debug_assert!(
+                    ll_num_bits <= 16 && ml_num_bits <= 16 && of_num_bits <= 31,
+                    "extra-bit widths ll={ll_num_bits} ml={ml_num_bits} of={of_num_bits} \
+                     exceed the 16 / 16 / 31 the thresholds are derived from",
+                );
+                // The bound the branch itself rests on: without a flush, the
+                // leftover, the diffs and all three extra fields have to fit.
+                debug_assert!(
+                    extra_bits_total >= 31 || 7 + state_diff_bits + extra_bits_total <= 64,
+                    "no flush at {extra_bits_total} extra bits, but 7 leftover + \
+                     {state_diff_bits} diff bits + {extra_bits_total} would overflow the \
+                     64-bit accumulator",
+                );
+            }
             if extra_bits_total >= 31 {
                 unsafe {
                     writer.flush_bulk();
