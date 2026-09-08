@@ -2358,8 +2358,11 @@ fn encode_sequences(
         unsafe {
             writer.flush_bulk();
         }
-        for sequence in (0..=sequences.len() - 2).rev() {
-            let sequence = sequences[sequence];
+        // Walked as a slice rather than by index: the same order, without the
+        // bounds check and the index arithmetic that `sequences[i]` pays on
+        // every sequence. The last one is coded through the FSE init states
+        // above, so it is not in this range.
+        for &sequence in sequences[..sequences.len() - 1].iter().rev() {
             let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
             let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.off_base);
             let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
