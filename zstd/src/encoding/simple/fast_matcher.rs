@@ -1566,13 +1566,19 @@ impl FastKernelMatcher {
         // This frame searches through the live table, so nothing may reach the
         // attached one: the dual-base kernel it dispatches reads every
         // main-table entry as a virtual `dict_end + offset` position, and this
-        // frame is writing raw ones. Set aside rather than discarded — a
-        // compressor whose source sizes cross the attach cutoff comes back to
-        // attach frames, and rebuilding that table is worth 12% on a reused
-        // 4 KiB dictionary frame (i9, wall clock). Every reader sees the same
-        // state as a discard while it is away, so the frame's output does not
-        // depend on the table still existing.
-        self.dict.deactivate();
+        // frame is writing raw ones.
+        //
+        // Setting the table aside instead of dropping it, so the next attach
+        // frame need not hash the dictionary again, was tried and measured on
+        // the shape it would pay off in: frames alternating either side of the
+        // attach cutoff on one compressor (`encode_loop_dict … alt<N>`, 20 000
+        // frames of 64 KiB and 4 KiB with a 16 KiB dictionary, i9). Retired
+        // instructions came out IDENTICAL — 30,163,334,509 against
+        // 30,163,334,255, a difference of 254 in 30 billion — so the attach
+        // frame after a copy frame is not rebuilding anything to begin with,
+        // and the 0.9% of cycles that moved is the size of a code-layout
+        // change. The stash bought nothing and is not here.
+        self.dict.invalidate();
         self.extend_history_with_pending();
         self.prime_hash_table_for_dict_copy();
         self.loaded_dict_end = self.history.len();
@@ -2035,12 +2041,6 @@ impl FastKernelMatcher {
     /// main table's `mls`, so one hash keys both.
     fn prime_dict_table_for_range(&mut self, range_start: usize, dict_len: usize) {
         const HASH_READ_SIZE: usize = 8;
-        // Take back a table a copy-mode frame set aside, if there is one: this
-        // is an attach frame again, and the dictionary it was built for has not
-        // changed (a change goes through `invalidate`, which drops the stash).
-        // The shape check below then treats it exactly like a table that never
-        // went away, so a mismatched one is still rebuilt.
-        self.dict.reactivate();
         let history_len = self.history.len();
         // Record the dict/input boundary regardless of whether any position
         // is hashable (a sub-8-byte dict still bounds the input floor).
