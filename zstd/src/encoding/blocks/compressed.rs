@@ -144,7 +144,6 @@ pub(crate) struct CompressedBlockScratch {
     partitions: Vec<usize>,
     prefix_sums: SequencePrefixSums,
     compressed: Vec<u8>,
-    estimator_sequences: Vec<crate::blocks::sequence_section::Sequence>,
     /// Lazily allocated: only the block-split estimator path uses it, and
     /// `compress_block`'s `mem::take` constructs a throwaway `Default`
     /// scratch every block — an eager workspace made that default pay four
@@ -181,8 +180,6 @@ impl CompressedBlockScratch {
             + self.partitions.capacity() * core::mem::size_of::<usize>()
             + self.prefix_sums.heap_size()
             + self.compressed.capacity()
-            + self.estimator_sequences.capacity()
-                * core::mem::size_of::<crate::blocks::sequence_section::Sequence>()
             + self
                 .estimator_workspace
                 .as_ref()
@@ -247,11 +244,24 @@ impl SequencePrefixSums {
     }
 }
 
+/// One collected sequence, carrying both the offset the matcher found and the
+/// wire code it encodes to.
+///
+/// The code is filled by a pass over the collected sequences rather than at
+/// collection time, because it depends on the repeat-offset history and that
+/// history must not advance across a partition the emitter ends up writing raw.
+/// Filling it in place, in the same array the matcher wrote, is what keeps the
+/// encoder from copying every sequence into a second one; upstream likewise
+/// stores its `offBase` in the sequence it already has (`ZSTD_storeSeq`) and
+/// never rebuilds the array.
 #[derive(Clone, Copy)]
 struct RawSequence {
     ll: u32,
     ml: u32,
     offset: u32,
+    /// Wire offset code: 1/2/3 are the repeat offsets, N+3 an explicit N.
+    /// Meaningless until the fill pass has run over this sequence.
+    of: u32,
 }
 
 struct EntropyOnlyMatcher;
@@ -294,12 +304,11 @@ impl Matcher for EntropyOnlyMatcher {
 pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
     let mut scratch = core::mem::take(&mut state.block_scratch);
     collect_block_parts(state, &mut scratch.parts);
-    let decisions = encode_block_parts_with_sequence_scratch(
+    let decisions = encode_block_parts(
         state,
         &scratch.parts.literals,
-        &scratch.parts.sequences,
+        &mut scratch.parts.sequences,
         output,
-        &mut scratch.estimator_sequences,
     );
     // This path writes the block it just encoded, so the tables it chose are
     // what the next block reads.
@@ -338,14 +347,13 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         let mut emit_buffers = SingleSequenceEmitBuffers {
             output,
             compressed: &mut scratch.compressed,
-            sequence_scratch: &mut scratch.estimator_sequences,
         };
         let emitted_raw = emit_single_sequence_block(
             state,
             last_block,
             source_len,
             &scratch.parts.literals,
-            &scratch.parts.sequences,
+            &mut scratch.parts.sequences,
             &mut emit_buffers,
         );
         if emitted_raw {
@@ -448,14 +456,13 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         let mut emit_buffers = SingleSequenceEmitBuffers {
             output,
             compressed: &mut scratch.compressed,
-            sequence_scratch: &mut scratch.estimator_sequences,
         };
         let emitted_raw = emit_single_sequence_block(
             state,
             last_block && last_partition,
             src_size,
             &scratch.parts.literals[lit_start..lit_end],
-            &scratch.parts.sequences[seq_start..seq_end],
+            &mut scratch.parts.sequences[seq_start..seq_end],
             &mut emit_buffers,
         );
         if emitted_raw {
@@ -583,32 +590,35 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
                 ll,
                 ml: match_len as u32,
                 offset: offset as u32,
+                // Filled by `fill_wire_offsets` once the partition this
+                // sequence lands in is about to be encoded, since the code
+                // depends on a history that partition boundaries can rewind.
+                of: 0,
             });
         }
     });
 }
 
-fn encode_block_parts_with_sequence_scratch<M: Matcher>(
+fn encode_block_parts<M: Matcher>(
     state: &mut CompressState<M>,
     literals_vec: &[u8],
-    raw_sequences: &[RawSequence],
+    raw_sequences: &mut [RawSequence],
     output: &mut Vec<u8>,
-    sequences: &mut Vec<crate::blocks::sequence_section::Sequence>,
     // What each axis decided, for the caller to apply once it knows the block
     // is kept. LL, ML, OF.
 ) -> [LastUsedTable; 3] {
     // A block with no sequences writes no tables, so every axis keeps what it
     // had whatever the caller decides.
     let mut decisions = [LastUsedTable::Keep; 3];
-    encode_raw_sequences_into(
+    fill_wire_offsets(
         raw_sequences,
         &mut state.offset_hist,
-        sequences,
         matches!(
             state.strategy_tag,
             crate::encoding::strategy::StrategyTag::Fast
         ),
     );
+    let raw_sequences: &[RawSequence] = raw_sequences;
 
     // literals section
 
@@ -684,10 +694,10 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
 
     // sequences section
 
-    if sequences.is_empty() {
+    if raw_sequences.is_empty() {
         writer.write_bits(0u8, 8);
     } else {
-        encode_seqnum(sequences.len(), &mut writer);
+        encode_seqnum(raw_sequences.len(), &mut writer);
 
         // Single-pass histogram of ll/ml/of codes across all sequences.
         // Previously did three separate `sequences.iter().map(...)`
@@ -703,7 +713,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
         let mut ll_max = 0usize;
         let mut ml_max = 0usize;
         let mut of_max = 0usize;
-        for seq in sequences.iter() {
+        for seq in raw_sequences.iter() {
             let ll_code = encode_literal_length(seq.ll).0 as usize;
             let ml_code = encode_match_len(seq.ml).0 as usize;
             let of_code = encode_offset(seq.of).0 as usize;
@@ -714,13 +724,13 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             ml_max = ml_max.max(ml_code);
             of_max = of_max.max(of_code);
         }
-        let total = sequences.len();
+        let total = raw_sequences.len();
 
         // Stream codes of the LAST sequence: upstream zstd codes the final symbol
         // of each stream via the FSE init-state and drops one occurrence of it
         // from the emitted table's histogram (see `build_seq_ctable`). `Some`
         // here because these modes are written to the frame.
-        let (last_ll, last_ml, last_of) = sequences.last().map_or((0, 0, 0), |seq| {
+        let (last_ll, last_ml, last_of) = raw_sequences.last().map_or((0, 0, 0), |seq| {
             (
                 encode_literal_length(seq.ll).0 as usize,
                 encode_match_len(seq.ml).0 as usize,
@@ -786,7 +796,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
         encode_table(&ml_mode, &mut writer);
 
         encode_sequences(
-            sequences,
+            raw_sequences,
             &mut writer,
             &ll_mode,
             &ml_mode,
@@ -816,7 +826,7 @@ struct EstimatorWorkspace {
     ll_counts: Box<[usize; 256]>,
     ml_counts: Box<[usize; 256]>,
     of_counts: Box<[usize; 256]>,
-    sequences: Vec<crate::blocks::sequence_section::Sequence>,
+    sequences: Vec<RawSequence>,
 }
 
 impl EstimatorWorkspace {
@@ -824,8 +834,7 @@ impl EstimatorWorkspace {
     /// to. All four boxes are always present once the workspace exists.
     fn heap_size(&self) -> usize {
         4 * core::mem::size_of::<[usize; 256]>()
-            + self.sequences.capacity()
-                * core::mem::size_of::<crate::blocks::sequence_section::Sequence>()
+            + self.sequences.capacity() * core::mem::size_of::<RawSequence>()
     }
 }
 
@@ -841,7 +850,7 @@ impl Default for EstimatorWorkspace {
     }
 }
 
-/// Dry-run analog of [`encode_block_parts_with_sequence_scratch`]: mirrors the
+/// Dry-run analog of [`encode_block_parts`]: mirrors the
 /// real encoder's `compress_literals` and `choose_table` decisions byte-for-byte
 /// (same `last_huff_table` lookup, same FSE mode selection, same
 /// `remember_last_used_tables` mutation), and computes the would-be output size
@@ -855,10 +864,21 @@ fn estimate_block_parts_size<M: Matcher>(
     raw_sequences: &[RawSequence],
     workspace: &mut EstimatorWorkspace,
 ) -> usize {
-    encode_raw_sequences_into(
-        raw_sequences,
-        &mut state.offset_hist,
+    // The probe cannot fill in place: it walks sub-ranges of the block's
+    // sequences repeatedly, from a scratch history, while the array itself is
+    // borrowed immutably by the estimator for the whole search. So it keeps a
+    // copy — which costs nothing that matters, since block splitting only runs
+    // from level 11 up and never on the band this array's copy was hurting.
+    workspace.sequences.clear();
+    if workspace.sequences.capacity() < raw_sequences.len() {
+        workspace
+            .sequences
+            .reserve_exact(raw_sequences.len() - workspace.sequences.len());
+    }
+    workspace.sequences.extend_from_slice(raw_sequences);
+    fill_wire_offsets(
         &mut workspace.sequences,
+        &mut state.offset_hist,
         matches!(
             state.strategy_tag,
             crate::encoding::strategy::StrategyTag::Fast
@@ -907,7 +927,7 @@ fn estimate_literals_section_bytes(
     weight_scratch: &mut huff0_encoder::WeightScratch,
     suspected_incompressible: bool,
 ) -> usize {
-    // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches
+    // Mirror `encode_block_parts` literal-mode branches
     // **in the same order**. The disabled gate (negative levels: raw literals,
     // no Huffman) is checked FIRST exactly as the emitter does.
     if lit_disabled {
@@ -1068,7 +1088,7 @@ fn estimate_literals_section_bytes(
 }
 
 fn estimate_sequences_section_bytes(
-    sequences: &[crate::blocks::sequence_section::Sequence],
+    sequences: &[RawSequence],
     fse_tables: &mut FseTables,
     ll_counts: &mut [usize; 256],
     ml_counts: &mut [usize; 256],
@@ -1160,7 +1180,7 @@ fn estimate_sequences_section_bytes(
     };
     let stream_bytes = (bit_content + padding_bits) / 8;
 
-    // Mirror state mutation done by `encode_block_parts_with_sequence_scratch`.
+    // Mirror state mutation done by `encode_block_parts`.
     let decisions = [
         into_last_used_table(ll_mode),
         into_last_used_table(ml_mode),
@@ -1397,7 +1417,6 @@ fn compressed_literals_header_bytes(lit_size: usize) -> usize {
 struct SingleSequenceEmitBuffers<'a> {
     output: &'a mut Vec<u8>,
     compressed: &'a mut Vec<u8>,
-    sequence_scratch: &'a mut Vec<crate::blocks::sequence_section::Sequence>,
 }
 
 fn emit_single_sequence_block<M: Matcher>(
@@ -1405,7 +1424,7 @@ fn emit_single_sequence_block<M: Matcher>(
     last_block: bool,
     source_len: usize,
     literals: &[u8],
-    sequences: &[RawSequence],
+    sequences: &mut [RawSequence],
     buffers: &mut SingleSequenceEmitBuffers<'_>,
 ) -> bool {
     let saved_offset_hist = state.offset_hist;
@@ -1426,13 +1445,7 @@ fn emit_single_sequence_block<M: Matcher>(
     // the decisions below. Copying them was also what kept the built table's
     // handle shared, which forced a fresh one per block.
     buffers.compressed.clear();
-    let fse_decisions = encode_block_parts_with_sequence_scratch(
-        state,
-        literals,
-        sequences,
-        buffers.compressed,
-        buffers.sequence_scratch,
-    );
+    let fse_decisions = encode_block_parts(state, literals, sequences, buffers.compressed);
     let min_gain = (source_len >> 8) + 2;
     if buffers.compressed.len() >= source_len.saturating_sub(min_gain) {
         state.offset_hist = saved_offset_hist;
@@ -1479,18 +1492,25 @@ fn emit_single_sequence_block<M: Matcher>(
     }
 }
 
-fn encode_raw_sequences_into(
-    raw_sequences: &[RawSequence],
+/// Fill each sequence's wire offset code in place, advancing the repeat-offset
+/// history across the run.
+///
+/// This ran as a copy into a second array of the same length, which is a read
+/// and a twelve-byte write per sequence for the sake of one field; the encoder
+/// now writes the four bytes it computes into the sequence it already has.
+/// Upstream never builds the second array either: `ZSTD_storeSeq` puts
+/// `offBase` in the `SeqDef` at match time, and `ZSTD_seqToCodes` writes three
+/// small byte arrays rather than copying the sequences.
+///
+/// Per PARTITION, not per block: the emitter can write a partition raw, and
+/// when it does it restores the history, so the partition after it must be
+/// filled from the restored one. Filling here, just before each partition is
+/// encoded, is what keeps that true.
+fn fill_wire_offsets(
+    raw_sequences: &mut [RawSequence],
     offset_hist: &mut [u32; 3],
-    out: &mut Vec<crate::blocks::sequence_section::Sequence>,
     fast_repcode: bool,
 ) {
-    out.clear();
-    // `reserve_exact` argument is the increment over LENGTH, not capacity —
-    // see `SequencePrefixSums::rebuild` for the full rationale.
-    if out.capacity() < raw_sequences.len() {
-        out.reserve_exact(raw_sequences.len() - out.len());
-    }
     // The strategy branch is hoisted out of the per-sequence loop so the
     // offBase-policy choice is paid once per block, not per sequence. Upstream
     // zstd's fast matcher emits only offBase 1 (rep[0] when litLength > 0,
@@ -1498,25 +1518,13 @@ fn encode_raw_sequences_into(
     // offset — it never emits offBase 2/3. greedy+ search all three repeat
     // offsets, which is what the full `encode_offset_with_history` mirrors.
     if fast_repcode {
-        out.extend(
-            raw_sequences
-                .iter()
-                .map(|seq| crate::blocks::sequence_section::Sequence {
-                    ll: seq.ll,
-                    ml: seq.ml,
-                    of: encode_offset_with_history_fast(seq.offset, seq.ll, offset_hist),
-                }),
-        );
+        for seq in raw_sequences.iter_mut() {
+            seq.of = encode_offset_with_history_fast(seq.offset, seq.ll, offset_hist);
+        }
     } else {
-        out.extend(
-            raw_sequences
-                .iter()
-                .map(|seq| crate::blocks::sequence_section::Sequence {
-                    ll: seq.ll,
-                    ml: seq.ml,
-                    of: encode_offset_with_history(seq.offset, seq.ll, offset_hist),
-                }),
-        );
+        for seq in raw_sequences.iter_mut() {
+            seq.of = encode_offset_with_history(seq.offset, seq.ll, offset_hist);
+        }
     }
 }
 
@@ -2242,7 +2250,7 @@ fn commit_last_used_table(
 }
 
 fn encode_sequences(
-    sequences: &[crate::blocks::sequence_section::Sequence],
+    sequences: &[RawSequence],
     writer: &mut BitWriter<&mut Vec<u8>>,
     ll_mode: &FseTableMode<'_>,
     ml_mode: &FseTableMode<'_>,

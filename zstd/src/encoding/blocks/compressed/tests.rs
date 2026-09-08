@@ -270,8 +270,8 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
 #[test]
 fn estimator_literals_section_mirrors_emit_for_short_inputs() {
     use super::{
-        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace,
-        encode_block_parts_with_sequence_scratch, estimate_block_parts_size,
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, encode_block_parts,
+        estimate_block_parts_size,
     };
     // For each strategy at boundary literal lengths around `min_lits`
     // and across the all-identical RLE pre-check (fires for any
@@ -383,14 +383,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             let mut workspace = EstimatorWorkspace::default();
             let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
             let mut emitted: Vec<u8> = Vec::new();
-            let mut scratch: Vec<crate::blocks::sequence_section::Sequence> = Vec::new();
-            encode_block_parts_with_sequence_scratch(
-                &mut emit_state,
-                &literals,
-                &[],
-                &mut emitted,
-                &mut scratch,
-            );
+            encode_block_parts(&mut emit_state, &literals, &mut [], &mut emitted);
             assert_eq!(
                 est,
                 emitted.len(),
@@ -409,8 +402,8 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
 #[test]
 fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
     use super::{
-        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace,
-        encode_block_parts_with_sequence_scratch, estimate_block_parts_size,
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, encode_block_parts,
+        estimate_block_parts_size,
     };
     // The shape the end-sample shortcut exists for, and the one where the
     // estimator and the emitter can disagree: both ends look random, the
@@ -450,14 +443,7 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
     let mut workspace = EstimatorWorkspace::default();
     let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
     let mut emitted: Vec<u8> = Vec::new();
-    let mut scratch: Vec<crate::blocks::sequence_section::Sequence> = Vec::new();
-    encode_block_parts_with_sequence_scratch(
-        &mut emit_state,
-        &literals,
-        &[],
-        &mut emitted,
-        &mut scratch,
-    );
+    encode_block_parts(&mut emit_state, &literals, &mut [], &mut emitted);
 
     assert_eq!(
         est,
@@ -505,26 +491,25 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         literal_compression_disabled: false,
     };
     let source = [0xA5; 8];
-    let sequences = [RawSequence {
+    let mut sequences = [RawSequence {
         ll: 0,
         ml: 5,
         offset: 20,
+        of: 0,
     }];
     let mut output = Vec::new();
     let mut compressed_scratch = Vec::new();
-    let mut sequence_scratch = Vec::new();
 
     let mut emit_buffers = super::SingleSequenceEmitBuffers {
         output: &mut output,
         compressed: &mut compressed_scratch,
-        sequence_scratch: &mut sequence_scratch,
     };
     let emitted_raw = emit_single_sequence_block(
         &mut state,
         true,
         source.len(),
         &[],
-        &sequences,
+        &mut sequences,
         &mut emit_buffers,
     );
     if emitted_raw {
