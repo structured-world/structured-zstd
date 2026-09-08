@@ -2280,15 +2280,15 @@ fn encode_sequences(
     // Upstream zstd-faithful sequence loop: write state diffs + extras via
     // unchecked fast-path adds with explicit `flush_bulk` calls at
     // safe burst boundaries. Per-sequence bit budget:
-    //   state diffs: of (<=8) + ml (<=9) + ll (<=9) = 26 bits → one
-    //                burst between flushes.
-    //   extras:      ll (<=16) + ml (<=16) + of (<=24) = 56 bits →
-    //                one burst between flushes.
+    //   state diffs: of (<=8) + ml (<=9) + ll (<=9) = 26 bits.
+    //   extras:      ll (<=16) + ml (<=16) + of (<=31).
     //
-    // Total per sequence: 82 bits ⇒ at least 2 flushes (one per burst).
-    // Mirrors upstream zstd `ZSTD_encodeSequences_body`
-    // (`zstd_compress_sequences.c:303-360`) which uses BIT_addBitsFast
-    // + BIT_flushBitsFast at the same burst boundaries.
+    // One flush per sequence is the common case: the two inside the body are
+    // conditional on the extras not fitting beside the diffs, which is
+    // upstream's own accounting in `ZSTD_encodeSequences_body`
+    // (`zstd_compress_sequences.c:303-367`), and the one at the end of the
+    // body is what leaves the accumulator with under a byte for the next
+    // round.
     //
     // Pre-reserve output capacity for the worst-case sequence section
     // size (~10 bytes/sequence + 32 byte slack) so the per-flush
@@ -2351,33 +2351,44 @@ fn encode_sequences(
                 }
                 ll_state = next.index;
             }
-            unsafe {
-                writer.flush_bulk();
+            // The three state diffs and the three extra-bit fields share one
+            // 64-bit accumulator, and a flush here is only needed when the
+            // extras that follow would not fit beside them. Upstream asks
+            // exactly that question (`zstd_compress_sequences.c:350`):
+            // `ofBits + mlBits + llBits >= 64 - 7 - (LLFSELog + MLFSELog +
+            // OffFSELog)`, which with our accumulator logs (9 + 9 + 8 = 26) is
+            // 31. Below it the accumulator holds at most 7 leftover + 26 diff
+            // bits + 30 extra bits = 63, so nothing has to leave yet. Flushing
+            // unconditionally instead cost a second store, length commit and
+            // shift on every sequence, and a level-1 block has hundreds of
+            // thousands of them.
+            let extra_bits_total = of_num_bits + ml_num_bits + ll_num_bits;
+            if extra_bits_total >= 31 {
+                unsafe {
+                    writer.flush_bulk();
+                }
             }
 
-            // Extras burst: ll (≤16) + ml (≤16) + of (≤ window_log,
-            // up to 30 for our max window_log). With ≤ 7 leftover from
-            // the prior flush_bulk, total ll+ml+of+partial can exceed
-            // 64 once of_num_bits > 25. Upstream zstd handles this via
-            // `longOffsets` mode that splits high offsets across two
-            // BIT_addBits calls; we instead drain the partial after ml
-            // and write of into a fresh container. The branch matches
-            // upstream zstd's `MEM_32bits()` flush-between-each-component
-            // shape on the 32-bit build (which has the same 64-bit
-            // container constraint).
+            // Extras burst: ll (≤16) + ml (≤16) + of (≤ 31). Whether the
+            // accumulator was drained above or not, ll and ml fit: after a
+            // flush it holds ≤ 7 + 32 = 39, and without one the three extras
+            // together were under 31.
             //
             // SAFETY: `encode_literal_length` / `encode_match_len`
             // bound `*_num_bits ≤ 16` and return a clean `*_add_bits`
             // (low `num_bits` bits only). `encode_offset` bounds
-            // `of_num_bits ≤ ilog2(of)`, capped at the encoder's
-            // `window_log` ≤ 30; the conditional flush_bulk above
-            // drains the partial when of_num_bits crosses the 24-bit
-            // threshold where the sum could exceed 64.
+            // `of_num_bits ≤ ilog2(of) ≤ 31`, and the two conditionals
+            // (`>= 31` above, `> 56` below) are upstream's own accounting for
+            // when the offset field still fits beside what is already there.
             unsafe {
                 writer.write_bits_64_no_check(ll_add_bits as u64, ll_num_bits);
                 writer.write_bits_64_no_check(ml_add_bits as u64, ml_num_bits);
             }
-            if of_num_bits > 24 {
+            // Upstream `zstd_compress_sequences.c:355`: with the accumulator
+            // drained before the diffs, 7 leftover plus all three extra fields
+            // must stay under 64, so the offset needs its own container only
+            // past 56 bits of extras.
+            if extra_bits_total > 56 {
                 unsafe {
                     writer.flush_bulk();
                 }
