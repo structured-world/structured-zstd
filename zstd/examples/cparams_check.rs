@@ -1,13 +1,16 @@
 //! One-shot diagnostic: ask upstream zstd which cParams it selects for a
-//! given (level, srcSize, dictSize=0) tuple via `ZSTD_getCParams`. Useful
+//! given (level, srcSize, dictSize) tuple via `ZSTD_getCParams`. Useful
 //! for checking our per-level table widths (windowLog / hashLog / chainLog)
 //! against upstream's source-size-adjusted values.
 //!
 //! Build: cargo build --release -p ffi-bench --example cparams_check
-//! Run:   ./target/release/examples/cparams_check [level] [src_size]
-//!        level    compression level (default 1)
-//!        src_size source size in bytes for the size hint (default 1022035,
-//!                 the decodecorpus-z000033 fixture; 0 = unknown/unbounded)
+//! Run:   ./target/release/examples/cparams_check [level] [src_size] [dict_size]
+//!        level     compression level (default 1)
+//!        src_size  source size in bytes for the size hint (default 1022035,
+//!                  the decodecorpus-z000033 fixture; 0 = unknown/unbounded)
+//!        dict_size dictionary size in bytes (default 0). Upstream folds it
+//!                  into the size hint, so a dictionary can widen the window
+//!                  and with it the chain and hash logs.
 
 use zstd::zstd_safe::zstd_sys;
 
@@ -15,7 +18,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let level: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
     let src_size: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1022035);
-    let dict_size = 0usize;
+    let dict_size: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     // SAFETY: standard libzstd query.
     let cp = unsafe { zstd_sys::ZSTD_getCParams(level, src_size, dict_size) };
