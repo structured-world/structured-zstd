@@ -244,24 +244,22 @@ impl SequencePrefixSums {
     }
 }
 
-/// One collected sequence, carrying both the offset the matcher found and the
-/// wire code it encodes to.
+/// One collected sequence.
 ///
-/// The code is filled by a pass over the collected sequences rather than at
-/// collection time, because it depends on the repeat-offset history and that
-/// history must not advance across a partition the emitter ends up writing raw.
-/// Filling it in place, in the same array the matcher wrote, is what keeps the
-/// encoder from copying every sequence into a second one; upstream likewise
-/// stores its `offBase` in the sequence it already has (`ZSTD_storeSeq`) and
-/// never rebuilds the array.
+/// `off_base` holds the offset the matcher found until [`fill_wire_offsets`]
+/// runs over the sequence, and the wire code from then on: 1/2/3 for the repeat
+/// offsets, N+3 for an explicit N. It is one field rather than two because the
+/// found offset has no reader once its code exists, and a fourth word would
+/// widen every sequence in the block for a value with a lifetime of one pass.
+/// Upstream keeps the same single slot, filled at match time
+/// (`SeqDef::offBase`, written by `ZSTD_storeSeq`); ours cannot be filled that
+/// early because the code depends on a repeat-offset history that must not
+/// advance across a partition the emitter ends up writing raw.
 #[derive(Clone, Copy)]
 struct RawSequence {
     ll: u32,
     ml: u32,
-    offset: u32,
-    /// Wire offset code: 1/2/3 are the repeat offsets, N+3 an explicit N.
-    /// Meaningless until the fill pass has run over this sequence.
-    of: u32,
+    off_base: u32,
 }
 
 struct EntropyOnlyMatcher;
@@ -589,11 +587,11 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
             parts.sequences.push(RawSequence {
                 ll,
                 ml: match_len as u32,
-                offset: offset as u32,
-                // Filled by `fill_wire_offsets` once the partition this
-                // sequence lands in is about to be encoded, since the code
-                // depends on a history that partition boundaries can rewind.
-                of: 0,
+                // The found offset. `fill_wire_offsets` replaces it with its
+                // code once the partition this sequence lands in is about to be
+                // encoded, since the code depends on a history that partition
+                // boundaries can rewind.
+                off_base: offset as u32,
             });
         }
     });
@@ -716,7 +714,7 @@ fn encode_block_parts<M: Matcher>(
         for seq in raw_sequences.iter() {
             let ll_code = encode_literal_length(seq.ll).0 as usize;
             let ml_code = encode_match_len(seq.ml).0 as usize;
-            let of_code = encode_offset(seq.of).0 as usize;
+            let of_code = encode_offset(seq.off_base).0 as usize;
             ll_counts[ll_code] += 1;
             ml_counts[ml_code] += 1;
             of_counts[of_code] += 1;
@@ -734,7 +732,7 @@ fn encode_block_parts<M: Matcher>(
             (
                 encode_literal_length(seq.ll).0 as usize,
                 encode_match_len(seq.ml).0 as usize,
-                encode_offset(seq.of).0 as usize,
+                encode_offset(seq.off_base).0 as usize,
             )
         });
 
@@ -1102,7 +1100,7 @@ fn estimate_sequences_section_bytes(
     for seq in sequences {
         let (ll, _, ll_bits) = encode_literal_length(seq.ll);
         let (ml, _, ml_bits) = encode_match_len(seq.ml);
-        let (of, _, _) = encode_offset(seq.of);
+        let (of, _, _) = encode_offset(seq.off_base);
         ll_counts[ll as usize] += 1;
         ml_counts[ml as usize] += 1;
         of_counts[of as usize] += 1;
@@ -1148,7 +1146,7 @@ fn estimate_sequences_section_bytes(
     let of_mode = choose_table(
         of_previous.as_ref(),
         of_default,
-        sequences.iter().map(|seq| encode_offset(seq.of).0),
+        sequences.iter().map(|seq| encode_offset(seq.off_base).0),
         8,
         strategy,
         of_next,
@@ -1519,11 +1517,11 @@ fn fill_wire_offsets(
     // offsets, which is what the full `encode_offset_with_history` mirrors.
     if fast_repcode {
         for seq in raw_sequences.iter_mut() {
-            seq.of = encode_offset_with_history_fast(seq.offset, seq.ll, offset_hist);
+            seq.off_base = encode_offset_with_history_fast(seq.off_base, seq.ll, offset_hist);
         }
     } else {
         for seq in raw_sequences.iter_mut() {
-            seq.of = encode_offset_with_history(seq.offset, seq.ll, offset_hist);
+            seq.off_base = encode_offset_with_history(seq.off_base, seq.ll, offset_hist);
         }
     }
 }
@@ -2266,7 +2264,7 @@ fn encode_sequences(
 
     let sequence = sequences[sequences.len() - 1];
     let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
-    let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
+    let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.off_base);
     let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
     let [ll_default, ml_default, of_default] = defaults;
     let ll_table = mode_table(ll_mode, ll_default);
@@ -2316,7 +2314,7 @@ fn encode_sequences(
         for sequence in (0..=sequences.len() - 2).rev() {
             let sequence = sequences[sequence];
             let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
-            let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
+            let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.off_base);
             let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
 
             // State diffs burst: max 30 bits (10+10+9 worst case for

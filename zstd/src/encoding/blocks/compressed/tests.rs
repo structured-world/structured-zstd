@@ -494,8 +494,7 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
     let mut sequences = [RawSequence {
         ll: 0,
         ml: 5,
-        offset: 20,
-        of: 0,
+        off_base: 20,
     }];
     let mut output = Vec::new();
     let mut compressed_scratch = Vec::new();
