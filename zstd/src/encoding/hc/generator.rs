@@ -509,22 +509,26 @@ macro_rules! bt_insert_and_collect_matches_body {
         let mut skip_further_match_search = false;
         let mut rep_len_candidate_found = false;
         if idx + 4 <= concat.len() {
-            let rep_offsets: [Option<usize>; 3] = if $lit_len == 0 {
-                [
-                    Some($reps[1] as usize),
-                    Some($reps[2] as usize),
-                    ($reps[0] > 1).then_some(($reps[0] - 1) as usize),
-                ]
-            } else {
-                [
-                    Some($reps[0] as usize),
-                    Some($reps[1] as usize),
-                    Some($reps[2] as usize),
-                ]
-            };
             let rbase = concat.as_ptr();
             let rlen = concat.len();
-            for rep in rep_offsets.into_iter().flatten() {
+            // Upstream walks the three repeat offsets as plain indices with the
+            // litLength-0 rotation applied to the INDEX, not to a materialised
+            // list (zstd_opt.c:646-649): `repCode` runs from `ll0` to
+            // `ZSTD_REP_NUM + ll0`, taking `rep[repCode]` except for the last
+            // slot, which is `rep[0] - 1`. Building the same three candidates as
+            // `[Option<_>; 3]` and flattening them paid the option machinery on
+            // every position, and this parser visits nearly every position, so
+            // the flatten and its discriminant checks stood in the profile as
+            // their own lines. The zero that the `then_some` used to filter is
+            // discarded by the `rep == 0` gate below, which is where upstream
+            // discards it too (its `repOffset-1` underflows past the bound).
+            let ll0 = usize::from($lit_len == 0);
+            for rep_code in ll0..3 + ll0 {
+                let rep = if rep_code == 3 {
+                    ($reps[0] as usize).wrapping_sub(1)
+                } else {
+                    $reps[rep_code] as usize
+                };
                 if rep == 0 || rep > $abs_pos {
                     continue;
                 }
@@ -896,8 +900,9 @@ macro_rules! bt_insert_and_collect_matches_body {
 
         // Dict dual-probe (upstream zstd `ZSTD_dictMatchState`, zstd_opt.c:777-813):
         // after the live tree, descend the immutable dictionary BINARY TREE
-        // (built in `prime_dms_bt`) with its OWN compare budget and push any
-        // dict match longer than the live best into the ladder. The DUBT
+        // (built in `prime_dms_bt`) on what the live walk left of the compare
+        // budget, and push any dict match longer than the live best into the
+        // ladder. The DUBT
         // descent reaches the longest dict match efficiently (a hash-chain
         // surfaced only the few same-bucket candidates and left most of the
         // dict savings unrealised at btlazy2 / btopt). Dict positions are
