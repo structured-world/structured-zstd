@@ -1525,27 +1525,13 @@ fn fill_and_count<const FAST_REPCODE: bool>(
     let mut ll_max = 0usize;
     let mut ml_max = 0usize;
     let mut of_max = 0usize;
-    // Counting into four interleaved tables per stream, as upstream's
-    // `HIST_count_parallel_wksp` does. Consecutive sequences share a code often
-    // enough that a single table serialises the loop on store-to-load
-    // forwarding of the same slot; rotating over four breaks that chain.
-    //
-    // They are also the counts the caller wants, in a narrower form: the three
-    // sequence alphabets top out at 35, 52 and 31, so four `[u32; 64]` tables a
-    // stream are 3 KiB in total against the 6 KiB the caller's three
-    // `[usize; 256]` arrays already occupy.
-    const LANES: usize = 4;
-    const CODES: usize = 64;
-    let mut ll_lanes = [[0u32; CODES]; LANES];
-    let mut ml_lanes = [[0u32; CODES]; LANES];
-    let mut of_lanes = [[0u32; CODES]; LANES];
     // The history is rotated by every sequence and read by the next one. Held
     // behind the caller's reference it was three stores into the compressor per
     // sequence, because the loop also writes through the sequence slice and the
     // optimiser would not keep the array in registers across that. A local copy
     // written back once is the same three words, moved once.
     let mut hist = *offset_hist;
-    for (index, seq) in raw_sequences.iter_mut().enumerate() {
+    for seq in raw_sequences.iter_mut() {
         let off_base = if FAST_REPCODE {
             encode_offset_with_history_fast(seq.off_base, seq.ll, &mut hist)
         } else {
@@ -1555,28 +1541,14 @@ fn fill_and_count<const FAST_REPCODE: bool>(
         let ll_code = encode_literal_length(seq.ll).0 as usize;
         let ml_code = encode_match_len(seq.ml).0 as usize;
         let of_code = encode_offset(off_base).0 as usize;
-        let lane = index % LANES;
-        ll_lanes[lane][ll_code] += 1;
-        ml_lanes[lane][ml_code] += 1;
-        of_lanes[lane][of_code] += 1;
+        ll_counts[ll_code] += 1;
+        ml_counts[ml_code] += 1;
+        of_counts[of_code] += 1;
         ll_max = ll_max.max(ll_code);
         ml_max = ml_max.max(ml_code);
         of_max = of_max.max(of_code);
     }
     *offset_hist = hist;
-    // Plain `+`: the four lanes of one code sum to at most the block's sequence
-    // count, which a block header caps well under `u32::MAX`.
-    for code in 0..CODES {
-        ll_counts[code] =
-            (ll_lanes[0][code] + ll_lanes[1][code] + ll_lanes[2][code] + ll_lanes[3][code])
-                as usize;
-        ml_counts[code] =
-            (ml_lanes[0][code] + ml_lanes[1][code] + ml_lanes[2][code] + ml_lanes[3][code])
-                as usize;
-        of_counts[code] =
-            (of_lanes[0][code] + of_lanes[1][code] + of_lanes[2][code] + of_lanes[3][code])
-                as usize;
-    }
     (ll_max, ml_max, of_max)
 }
 
