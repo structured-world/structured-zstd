@@ -37,11 +37,31 @@ pub(crate) const FAST_HASH_FILL_STEP: usize = 3;
 /// 512 there) and it was the whole cost of a skip: an entry per eight bytes is
 /// 131,000 stores per mebibyte of input nothing will search.
 ///
-/// Measured on the i9, wall clock, three interleaved rounds. Incompressible
-/// 1 MiB at level 5: 0.223 s -> 0.052 s (1343 -> 5627 MB/s). A 1 MiB block
-/// repeated verbatim at level 19: 0.0446 s -> 0.0142 s. Output is unchanged on
-/// 65 of 66 fixture-and-level rows, including the block-duplicate one at every
-/// level but 19, where it costs 506 bytes in 524,879 (0.1%).
+/// Measured on the i9, three arms in one session (before, after, and the C
+/// reference through `ffi_encode_loop_z000033`), `perf stat -r 3`, three rounds
+/// each. Per run, cycles / instructions / wall clock:
+///
+/// Incompressible 1 MiB at level 5, 300 frames:
+///
+/// | arm | cycles | instructions | wall |
+/// |---|---|---|---|
+/// | before | 1.653-1.670 G | 1.9287 G | 0.402-0.408 s |
+/// | after | 0.337-0.347 G | 0.3028 G | 0.087-0.089 s |
+/// | reference | 1.007-1.068 G | 0.8330 G | 0.247-0.267 s |
+///
+/// A 1 MiB block repeated verbatim at level 19, 30 frames — the case the wider
+/// stride costs bytes on:
+///
+/// | arm | cycles | instructions | wall | bytes |
+/// |---|---|---|---|---|
+/// | before | 0.807-0.839 G | 0.6231 G | 0.206-0.213 s | 524,365 |
+/// | after | 0.082-0.084 G | 0.0776 G | 0.029-0.030 s | 524,871 |
+/// | reference | 12.20-13.08 G | 5.5298 G | 2.95-3.16 s | 524,361 |
+///
+/// So the stride takes us from 1.58x of the reference to 0.33x on the first,
+/// and the second costs 510 bytes in 524,871 (0.1%) against the reference while
+/// running 150 times faster than it. Output is unchanged on 65 of 66
+/// fixture-and-level rows; that level-19 row is the only one that moves.
 pub(crate) const INCOMPRESSIBLE_SKIP_STEP: usize =
     crate::encoding::incompressible::RAW_SKIP_INDEX_STEP;
 
