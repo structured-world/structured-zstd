@@ -475,7 +475,8 @@ macro_rules! bt_insert_and_collect_matches_body {
         $search_depth:expr,
         $abs_pos:ident,
         $current_abs_end:ident,
-        $profile:ident,
+        $sufficient_len:expr,
+        $max_chain_depth:expr,
         $min_match_len:ident,
         $best_len_for_skip:ident,
         $out:ident,
@@ -587,7 +588,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                     },
                     $min_match_len,
                 );
-                if match_len > $profile.sufficient_match_len
+                if match_len > $sufficient_len
                     || $abs_pos + match_len >= $current_abs_end
                 {
                     skip_further_match_search = true;
@@ -685,7 +686,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                     $min_match_len,
                 );
                 if !rep_len_candidate_found
-                    && (h3.match_len > $profile.sufficient_match_len
+                    && (h3.match_len > $sufficient_len
                         || $abs_pos + h3.match_len >= $current_abs_end)
                 {
                     $table.skip_insert_until_abs = $abs_pos + 1;
@@ -809,7 +810,15 @@ macro_rules! bt_insert_and_collect_matches_body {
         // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
         // cap in `MatchTable::add_data`.
         let mut match_end_abs = $abs_pos + 9;
-        let mut compares_left = $profile.max_chain_depth.min($search_depth);
+        // Both of these are associated consts of the strategy the caller is
+        // monomorphized for, so they arrive as literals rather than as fields
+        // of a 24-byte profile the caller had to marshal through memory on
+        // every position: System V passes a struct that size in memory, and the
+        // prologue was copying it into the frame with a vector move before any
+        // work started. Upstream reads the same values off `cParams` through a
+        // pointer it already holds, and its finder is inlined into the parser
+        // loop, so it never marshals anything per position either.
+        let mut compares_left = ($max_chain_depth).min($search_depth);
         let mut common_length_smaller = 0usize;
         let mut common_length_larger = 0usize;
         let pair_idx = $table.bt_pair_index_for_abs($abs_pos);

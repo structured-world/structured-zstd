@@ -185,7 +185,7 @@ macro_rules! build_optimal_plan_impl_body {
                     $self.$collect::<$strategy_ty>(
                         $current_abs_start + skipped_literals,
                         current_abs_end,
-                        profile,
+                        profile.sufficient_match_len,
                         HcCandidateQuery {
                             reps: initial_reps,
                             lit_len: initial_litlen + skipped_literals,
@@ -293,7 +293,7 @@ macro_rules! build_optimal_plan_impl_body {
                     $self.$collect::<$strategy_ty>(
                         $current_abs_start,
                         current_abs_end,
-                        profile,
+                        profile.sufficient_match_len,
                         HcCandidateQuery {
                             reps: initial_reps,
                             lit_len: initial_litlen,
@@ -651,7 +651,7 @@ macro_rules! build_optimal_plan_impl_body {
                 $self.$collect::<$strategy_ty>(
                     abs_pos,
                     current_abs_end,
-                    profile,
+                    profile.sufficient_match_len,
                     HcCandidateQuery {
                         reps: nodes.get_unchecked(pos).reps,
                         lit_len: nodes.get_unchecked(pos).litlen as usize,
@@ -976,7 +976,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $strategy_ty:ty,
         $abs_pos:ident,
         $current_abs_end:ident,
-        $profile:ident,
+        $sufficient_match_len:ident,
         $query:ident,
         $out:ident,
         $bt_insert_step:ident,
@@ -1072,7 +1072,12 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 bt_search_depth,
                 $abs_pos,
                 $current_abs_end,
-                $profile,
+                // Not a strategy const: the pass adjusts it (btultra2's seed
+                // pass runs a different sufficient length from its main pass),
+                // so it arrives as a scalar. The chain depth beside it IS the
+                // strategy's own const and needs no argument at all.
+                $sufficient_match_len,
+                <$strategy_ty as crate::encoding::strategy::Strategy>::MAX_CHAIN_DEPTH,
                 min_match_len,
                 best_len_ref,
                 $out,
@@ -1884,7 +1889,7 @@ impl HcMatchGenerator {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        sufficient_match_len: usize,
         query: HcCandidateQuery,
         out: &mut Vec<MatchCandidate>,
     ) {
@@ -1900,7 +1905,7 @@ impl HcMatchGenerator {
                 .collect_optimal_candidates_initialized::<strategy::BtUltra2>(
                     abs_pos,
                     current_abs_end,
-                    profile,
+                    sufficient_match_len,
                     query,
                     out,
                 ),
@@ -1908,7 +1913,7 @@ impl HcMatchGenerator {
                 .collect_optimal_candidates_initialized::<strategy::BtUltra>(
                     abs_pos,
                     current_abs_end,
-                    profile,
+                    sufficient_match_len,
                     query,
                     out,
                 ),
@@ -1916,14 +1921,14 @@ impl HcMatchGenerator {
                 .collect_optimal_candidates_initialized::<strategy::Btlazy2>(
                     abs_pos,
                     current_abs_end,
-                    profile,
+                    sufficient_match_len,
                     query,
                     out,
                 ),
             StrategyTag::BtOpt => self.collect_optimal_candidates_initialized::<strategy::BtOpt>(
                 abs_pos,
                 current_abs_end,
-                profile,
+                sufficient_match_len,
                 query,
                 out,
             ),
@@ -1957,7 +1962,7 @@ impl HcMatchGenerator {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        sufficient_match_len: usize,
         query: HcCandidateQuery,
         out: &mut Vec<MatchCandidate>,
     ) {
@@ -1970,7 +1975,7 @@ impl HcMatchGenerator {
             self.collect_optimal_candidates_initialized_neon::<S>(
                 abs_pos,
                 current_abs_end,
-                profile,
+                sufficient_match_len,
                 query,
                 out,
             )
@@ -1984,7 +1989,7 @@ impl HcMatchGenerator {
                     self.collect_optimal_candidates_initialized_avx2_bmi2::<S>(
                         abs_pos,
                         current_abs_end,
-                        profile,
+                        sufficient_match_len,
                         query,
                         out,
                     )
@@ -1994,7 +1999,7 @@ impl HcMatchGenerator {
                     self.collect_optimal_candidates_initialized_sse2::<S>(
                         abs_pos,
                         current_abs_end,
-                        profile,
+                        sufficient_match_len,
                         query,
                         out,
                     )
@@ -2004,7 +2009,7 @@ impl HcMatchGenerator {
                     self.collect_optimal_candidates_initialized_sse42::<S>(
                         abs_pos,
                         current_abs_end,
-                        profile,
+                        sufficient_match_len,
                         query,
                         out,
                     )
@@ -2012,7 +2017,7 @@ impl HcMatchGenerator {
                 FastpathKernel::Scalar => self.collect_optimal_candidates_initialized_scalar::<S>(
                     abs_pos,
                     current_abs_end,
-                    profile,
+                    sufficient_match_len,
                     query,
                     out,
                 ),
@@ -2031,7 +2036,6 @@ impl HcMatchGenerator {
             self.collect_optimal_candidates_initialized_simd128::<S>(
                 abs_pos,
                 current_abs_end,
-                profile,
                 query,
                 out,
             )
@@ -2054,7 +2058,6 @@ impl HcMatchGenerator {
             self.collect_optimal_candidates_initialized_scalar::<S>(
                 abs_pos,
                 current_abs_end,
-                profile,
                 query,
                 out,
             )
@@ -2078,7 +2081,7 @@ impl HcMatchGenerator {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        sufficient_match_len: usize,
         query: HcCandidateQuery,
         out: &mut Vec<MatchCandidate>,
     ) {
@@ -2087,7 +2090,7 @@ impl HcMatchGenerator {
             S,
             abs_pos,
             current_abs_end,
-            profile,
+            sufficient_match_len,
             query,
             out,
             bt_insert_step_no_rebase_neon,
@@ -2107,7 +2110,7 @@ impl HcMatchGenerator {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        sufficient_match_len: usize,
         query: HcCandidateQuery,
         out: &mut Vec<MatchCandidate>,
     ) {
@@ -2116,7 +2119,7 @@ impl HcMatchGenerator {
             S,
             abs_pos,
             current_abs_end,
-            profile,
+            sufficient_match_len,
             query,
             out,
             bt_insert_step_no_rebase_sse2,
@@ -2142,7 +2145,7 @@ impl HcMatchGenerator {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        sufficient_match_len: usize,
         query: HcCandidateQuery,
         out: &mut Vec<MatchCandidate>,
     ) {
@@ -2151,7 +2154,7 @@ impl HcMatchGenerator {
             S,
             abs_pos,
             current_abs_end,
-            profile,
+            sufficient_match_len,
             query,
             out,
             bt_insert_step_no_rebase_sse2,
@@ -2171,7 +2174,7 @@ impl HcMatchGenerator {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        sufficient_match_len: usize,
         query: HcCandidateQuery,
         out: &mut Vec<MatchCandidate>,
     ) {
@@ -2180,7 +2183,7 @@ impl HcMatchGenerator {
             S,
             abs_pos,
             current_abs_end,
-            profile,
+            sufficient_match_len,
             query,
             out,
             bt_insert_step_no_rebase_avx2_bmi2,
@@ -2207,7 +2210,7 @@ impl HcMatchGenerator {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        sufficient_match_len: usize,
         query: HcCandidateQuery,
         out: &mut Vec<MatchCandidate>,
     ) {
@@ -2216,7 +2219,7 @@ impl HcMatchGenerator {
             S,
             abs_pos,
             current_abs_end,
-            profile,
+            sufficient_match_len,
             query,
             out,
             bt_insert_step_no_rebase_simd128,
@@ -2239,7 +2242,7 @@ impl HcMatchGenerator {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        sufficient_match_len: usize,
         query: HcCandidateQuery,
         out: &mut Vec<MatchCandidate>,
     ) {
@@ -2248,7 +2251,7 @@ impl HcMatchGenerator {
             S,
             abs_pos,
             current_abs_end,
-            profile,
+            sufficient_match_len,
             query,
             out,
             bt_insert_step_no_rebase_scalar,
