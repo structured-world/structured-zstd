@@ -1925,12 +1925,15 @@ impl FastKernelMatcher {
             }};
         }
         // Dense is the ordinary path — every searched block primes through it —
-        // and it has to stay a plain counted loop. Running it as `step_by(1)`
-        // over an inclusive range keeps the iterator's stride and exhausted
-        // flag live, which the optimiser does not reduce back to an induction
-        // variable: that alone cost a factor of two on every fast-level frame.
+        // and it has to stay a plain counted loop. Two shapes have cost it that:
+        // running it as `step_by(1)` keeps the iterator's stride live, and an
+        // INCLUSIVE range keeps its exhausted flag live. Neither is reduced back
+        // to an induction variable, and both show up as `next` / `lt` frames
+        // inside this function's profile. The half-open range is the one that
+        // compiles to a counted loop. The bound cannot overflow: `last_hashable`
+        // is `history.len() - HASH_READ_SIZE`.
         if step == 1 {
-            for pos in range_start..=last_hashable {
+            for pos in range_start..last_hashable + 1 {
                 index_at!(pos);
             }
             return;
@@ -1949,11 +1952,11 @@ impl FastKernelMatcher {
             // avoid.
             const SEAM: usize = 8;
             let head_end = last_hashable.min(range_start + SEAM);
-            for pos in range_start..=head_end {
+            for pos in range_start..head_end + 1 {
                 index_at!(pos);
             }
             let tail_start = last_hashable.saturating_sub(SEAM).max(range_start);
-            for pos in tail_start..=last_hashable {
+            for pos in tail_start..last_hashable + 1 {
                 index_at!(pos);
             }
         }
