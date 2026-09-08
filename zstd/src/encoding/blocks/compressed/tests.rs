@@ -383,7 +383,13 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             let mut workspace = EstimatorWorkspace::default();
             let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
             let mut emitted: Vec<u8> = Vec::new();
-            encode_block_parts(&mut emit_state, &literals, &mut [], &mut emitted);
+            encode_block_parts(
+                &mut emit_state,
+                &literals,
+                &mut [],
+                &mut Vec::new(),
+                &mut emitted,
+            );
             assert_eq!(
                 est,
                 emitted.len(),
@@ -443,7 +449,13 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
     let mut workspace = EstimatorWorkspace::default();
     let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
     let mut emitted: Vec<u8> = Vec::new();
-    encode_block_parts(&mut emit_state, &literals, &mut [], &mut emitted);
+    encode_block_parts(
+        &mut emit_state,
+        &literals,
+        &mut [],
+        &mut Vec::new(),
+        &mut emitted,
+    );
 
     assert_eq!(
         est,
@@ -499,9 +511,11 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
     let mut output = Vec::new();
     let mut compressed_scratch = Vec::new();
 
+    let mut code_scratch = Vec::new();
     let mut emit_buffers = super::SingleSequenceEmitBuffers {
         output: &mut output,
         compressed: &mut compressed_scratch,
+        codes: &mut code_scratch,
     };
     let emitted_raw = emit_single_sequence_block(
         &mut state,
