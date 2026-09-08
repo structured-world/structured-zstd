@@ -21,7 +21,13 @@ fn reference_cparams(level: i32, src: u64, dict: usize) -> (u32, u32, u32, u32, 
 
 #[test]
 fn cparams_match_reference_over_grid() {
-    let levels = [-7, -5, -3, -1, 0, 1, 2, 3, 4, 5, 7, 10, 12, 15, 17, 19, 22];
+    // Every level, not a sample of them: the sampled list skipped 11 and 13,
+    // and a level row is exactly the kind of thing that can be wrong on its own
+    // while its neighbours are right.
+    let levels = [
+        -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+        18, 19, 20, 21, 22,
+    ];
     let srcs: [u64; 9] = [0, 1, 100, 4096, 6806, 16_384, 100_000, 131_072, 5_000_000];
     let dicts: [usize; 5] = [0, 437, 2048, 65_536, 1_000_000];
     let mut mismatches = 0usize;

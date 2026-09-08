@@ -442,27 +442,48 @@ pub(crate) fn source_size_ceil_log(size: u64) -> u8 {
 /// immutable table scanned in place via the borrowed dual-base kernel); a larger
 /// hint would COPY it into the live table.
 ///
-/// We set this to `31` so every dictionary source up to 2 GiB attaches,
-/// diverging from upstream zstd's 8 KiB `ZSTD_shouldAttachDict` cutoff ON
-/// PURPOSE: upstream copy mode copies the small CDict TABLES into the cctx and
-/// still scans the input in place, but our flat-history copy path memmoves the
-/// whole INPUT into history every frame (profiled at 30% `__memmove` + 14%
-/// `__memset` on a reused 1 MiB dict encode). Attach mode scans the caller's
-/// input in place with the dict as a separate prefix base, so it is strictly
-/// faster for every frame size here (measured: 1 MiB dict frame 167 us -> 52 us,
-/// 0.42x of C; 10 KiB 20.4 us -> 4.4 us, 0.17x of C). The dual-base kernel
-/// carries `window_low`, so over-window inputs stay in-window and C-decodable.
+/// `13` is upstream zstd's Fast cutoff (`attachDictSizeCutoffs[ZSTD_fast]` is
+/// 8 KB, zstd_compress.c:2296; `ZSTD_shouldAttachDict`, :2309). Above it the
+/// dictionary is COPIED, and the copy is what makes the dictionary pay on a
+/// larger source: the scan then runs over a table already holding the
+/// dictionary's positions, so ordinary NEAR matches improve everywhere. Attach
+/// mode starts with an empty table and reaches the dictionary only through the
+/// separate exact table, at the positions the step happens to land on.
 ///
-/// `31` is also the largest bucket the borrowed kernel can attach: it stores
-/// virtual positions as `u32` (`cur_abs as u32`), so the maximum attached source
-/// `1 << 31` (plus the dict prefix) stays below `u32::MAX`; the next bucket `32`
-/// (4 GiB) would wrap that arithmetic. Sources past 2 GiB therefore fall back to
-/// copy mode — rare in practice, and the relative copy cost shrinks as the
-/// source grows. Per the drop-in-not-binary-parity contract, we make this match
-/// decision ourselves.
+/// This was `31` (attach every source up to 2 GiB) on a speed argument alone,
+/// and the missing byte column is where it went wrong. Per frame, `z000033`
+/// (1,022,035 B) and its leading 10 KiB, with a 16 KiB dictionary trained over
+/// its 10 KiB chunks, on the i9: two prebuilt binaries and libzstd alternated
+/// in one session, `perf stat -r 3`, three rounds, ranges non-overlapping.
+///
+/// | case | bytes attach | bytes copy | reference | cycles attach | cycles copy | insn attach | insn copy |
+/// |---|---|---|---|---|---|---|---|
+/// | 10 KiB, L1 | 6,976 | 7,122 | 7,122 | 236,355 (1.95x) | 169,116 (1.39x) | 633,127 (1.78x) | 478,066 (1.34x) |
+/// | 10 KiB, L-5 | 9,660 | 9,124 | 9,130 | 51,678 (1.22x) | 56,444 (1.33x) | 152,281 (1.14x) | 153,369 (1.15x) |
+/// | 1 MiB, L1 | 550,810 | 551,584 | 570,765 | 19.84M (1.76x) | 16.21M (1.44x) | 54.01M (1.91x) | 39.60M (1.40x) |
+/// | 1 MiB, L-5 | 689,127 | 647,735 | 669,826 | 8.80M (1.46x) | 10.67M (1.77x) | 21.62M (1.54x) | 22.81M (1.63x) |
+///
+/// Copy is the better arm on both axes at the positive levels: it takes 18-28%
+/// fewer cycles and 22-27% fewer instructions, and its bytes are the
+/// reference's exactly on the small frame and 3.4% under the reference on the
+/// large one. At the ultra-fast levels it buys ratio with time: 21% more cycles
+/// on the 1 MiB frame for 6.0% fewer bytes, 9% more on the small one for 5.5%
+/// fewer. That trade is what the cutoff is for. Attach put us 2.9% ABOVE the
+/// reference on the 1 MiB ultra-fast frame — the dictionary made our frame
+/// bigger than our own no-dict frame there, while it made the reference's
+/// smaller — because it found 21,897 sequences where the reference finds
+/// 27,546. Copy puts us 3.3% under it.
+///
+/// The remaining gap is now a same-mode one: the reference does this copy in
+/// 1.0x where we take 1.3-1.8x, which is a target with an apples-to-apples
+/// reference rather than a mode the reference never runs.
+///
+/// The borrowed attach kernel stores virtual positions as `u32`
+/// (`cur_abs as u32`), so it could not attach past bucket `31` regardless; that
+/// ceiling is now far above the cutoff and no longer the binding constraint.
 /// Shared by `reset` (records the mode in the primed-snapshot key) and
 /// `prime_with_dictionary` (acts on it).
-pub(crate) const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 31;
+pub(crate) const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
 
 /// Largest dictionary region (bytes) the Fast attach path can index. The tagged
 /// dict table packs each position into `32 - DICT_TAG_BITS` (= 24) bits, so a

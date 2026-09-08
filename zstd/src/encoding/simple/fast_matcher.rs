@@ -282,6 +282,10 @@ pub(crate) struct FastKernelMatcher {
     /// and a plain frame has none). Cleared on reset / eviction (the dict has
     /// slid out of the window, so the windowed floor takes over).
     loaded_dict_end: usize,
+    /// Where the copy-mode dictionary fill resumes its stride, carried across
+    /// the slices one dictionary is committed in so the phase stays continuous.
+    /// See [`Self::prime_hash_table_for_dict_copy`]. Reset with the table.
+    dict_copy_fill_next: usize,
 }
 
 impl Clone for FastKernelMatcher {
@@ -307,6 +311,7 @@ impl Clone for FastKernelMatcher {
             dict_resident: self.dict_resident,
             dict_table_hash_log: self.dict_table_hash_log,
             loaded_dict_end: self.loaded_dict_end,
+            dict_copy_fill_next: self.dict_copy_fill_next,
         }
     }
 
@@ -334,6 +339,7 @@ impl Clone for FastKernelMatcher {
         self.table_pos_high_water = source.table_pos_high_water;
         self.dict_resident = source.dict_resident;
         self.loaded_dict_end = source.loaded_dict_end;
+        self.dict_copy_fill_next = source.dict_copy_fill_next;
     }
 }
 
@@ -556,6 +562,7 @@ impl FastKernelMatcher {
             dict_resident: false,
             dict_table_hash_log: None,
             loaded_dict_end: 0,
+            dict_copy_fill_next: 0,
         }
     }
 
@@ -650,7 +657,8 @@ impl FastKernelMatcher {
             // Same shape — keep the allocation, zero the entries via
             // `memset` (ZSTD_window_clear cadence). A primed dict table
             // is retained (see the epoch branch above for why that is
-            // sound).
+            // sound); a copy-mode frame drops it when it primes, which is
+            // the only case that must not keep it.
             self.hash_table.clear();
         }
         self.table_pos_high_water = 0;
@@ -658,6 +666,9 @@ impl FastKernelMatcher {
         // its separate dict table (handled above), and the copy path re-primes
         // (and re-records `loaded_dict_end`) during this frame's dict prime.
         self.loaded_dict_end = 0;
+        // The copy-mode fill starts over with the frame: its stride is anchored
+        // at the dictionary's first byte in the new history.
+        self.dict_copy_fill_next = 0;
         if let Some(region) = reborrow_region {
             // Keep `[0, region)` (the resident dict); drop the previous input.
             self.history.truncate(region);
@@ -1534,16 +1545,43 @@ impl FastKernelMatcher {
         }
         if incompressible_hint == Some(false) {
             self.prime_hash_table_for_range(block_start);
-            // Copy-mode dict prime: the dict now occupies `[0, history.len())`
-            // at the front of history (this is the only caller of the
-            // `Some(false)` hint — see the doc above). Record the dict/input
-            // boundary so `start_matching` floors the block prefix at the dict
-            // start while the dict stays within the window (upstream zstd
-            // `ms->loadedDictEnd`). A multi-slice dict advances this to the
-            // running end on each slice; the final slice leaves the full
-            // dict size.
-            self.loaded_dict_end = self.history.len();
         }
+    }
+
+    /// Commit one slice of a COPY-mode dictionary: append it to history, index
+    /// it into the LIVE table with upstream's dictionary fill, and carry the
+    /// dictionary boundary.
+    ///
+    /// Separate from the `Some(false)` skip hint because the two want different
+    /// fills. A block emitted verbatim (RLE / raw) is ordinary window history
+    /// and is indexed densely; a dictionary is indexed the way upstream indexes
+    /// one — see [`Self::prime_hash_table_for_dict_copy`].
+    ///
+    /// `loaded_dict_end` records the dictionary/input boundary so
+    /// `start_matching` floors the block prefix at the dictionary start while
+    /// the dictionary is still within the window (upstream zstd
+    /// `ms->loadedDictEnd`); a dictionary committed in several slices advances
+    /// it to the running end each time, leaving the full size after the last.
+    pub(crate) fn skip_matching_for_dict_copy(&mut self) {
+        // This frame searches through the live table, so nothing may reach the
+        // attached one: the dual-base kernel it dispatches reads every
+        // main-table entry as a virtual `dict_end + offset` position, and this
+        // frame is writing raw ones.
+        //
+        // Setting the table aside instead of dropping it, so the next attach
+        // frame need not hash the dictionary again, was tried and measured on
+        // the shape it would pay off in: frames alternating either side of the
+        // attach cutoff on one compressor (`encode_loop_dict … alt<N>`, 20 000
+        // frames of 64 KiB and 4 KiB with a 16 KiB dictionary, i9). Retired
+        // instructions came out IDENTICAL — 30,163,334,509 against
+        // 30,163,334,255, a difference of 254 in 30 billion — so the attach
+        // frame after a copy frame is not rebuilding anything to begin with,
+        // and the 0.9% of cycles that moved is the size of a code-layout
+        // change. The stash bought nothing and is not here.
+        self.dict.invalidate();
+        self.extend_history_with_pending();
+        self.prime_hash_table_for_dict_copy();
+        self.loaded_dict_end = self.history.len();
     }
 
     /// Borrowed-window equivalent of [`Self::skip_matching_with_hint`]:
@@ -1733,6 +1771,78 @@ impl FastKernelMatcher {
     /// branch / mispredict in the hot path).
     fn prime_hash_table_for_range(&mut self, range_start: usize) {
         self.prime_hash_table_for_range_stepped(range_start, 1);
+    }
+
+    /// Fill the LIVE table with a copy-mode dictionary, the way upstream's
+    /// copy-mode context ends up filled.
+    ///
+    /// Upstream builds the dictionary's table once with
+    /// `ZSTD_fillHashTableForCDict` (zstd_fast.c:16-49) and installs it as the
+    /// live table by stripping the short-cache tags out of it
+    /// (`ZSTD_copyCDictTableIntoCCtx`, zstd_compress.c:2386-2400). So the live
+    /// table holds that fill's occurrence set: stride 3, where the step
+    /// position overwrites its slot and the two positions after it are written
+    /// only into a slot still empty. A dense every-position fill keeps a
+    /// different (nearer) occurrence per bucket, which fragments one long
+    /// dictionary match into several short ones — the same defect measured on
+    /// the attach table, and the reason copy mode was losing to the reference
+    /// on repetitive input where attach was beating it.
+    ///
+    /// The stride is anchored at [`Self::dict_copy_fill_next`], carried across
+    /// dictionary slices, so a dictionary committed in several pieces keeps one
+    /// continuous phase (and the positions whose hash read straddles a slice
+    /// seam are reached by the next slice) exactly as the attach fill does.
+    fn prime_hash_table_for_dict_copy(&mut self) {
+        const HASH_READ_SIZE: usize = 8;
+        let history_len = self.history.len();
+        if history_len < HASH_READ_SIZE {
+            return;
+        }
+        let last_hashable = history_len - HASH_READ_SIZE;
+        let fill_start = self.dict_copy_fill_next;
+        if fill_start > last_hashable {
+            return;
+        }
+        let base = self.history.as_ptr();
+        self.dict_copy_fill_next = match self.hash_table.mls() {
+            4 => self.prime_hash_table_dict_copy_impl::<4>(base, fill_start, last_hashable),
+            5 => self.prime_hash_table_dict_copy_impl::<5>(base, fill_start, last_hashable),
+            6 => self.prime_hash_table_dict_copy_impl::<6>(base, fill_start, last_hashable),
+            7 => self.prime_hash_table_dict_copy_impl::<7>(base, fill_start, last_hashable),
+            8 => self.prime_hash_table_dict_copy_impl::<8>(base, fill_start, last_hashable),
+            _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
+        };
+    }
+
+    /// Monomorphised body of [`Self::prime_hash_table_for_dict_copy`];
+    /// returns where the next slice resumes the stride.
+    fn prime_hash_table_dict_copy_impl<const MLS: u32>(
+        &mut self,
+        base: *const u8,
+        range_start: usize,
+        last_hashable: usize,
+    ) -> usize {
+        const FILL_STEP: usize = 3;
+        let mut s = range_start;
+        // Same bound as upstream (`ip + step < iend + 2`, `iend` being the last
+        // hashable position), so the trailing partial group is left to the next
+        // slice rather than stepping past the readable region.
+        while s + FILL_STEP < last_hashable + 2 {
+            // SAFETY: `s <= last_hashable = history.len() - 8`, so the position
+            // has the kernel's full load width readable; MLS is the table's own.
+            let hash = unsafe { self.hash_table.hash_ptr::<MLS>(base.add(s)) };
+            unsafe { self.hash_table.put(hash, s as u32) };
+            for p in 1..FILL_STEP {
+                let pos = s + p;
+                // SAFETY: `pos <= s + 2 <= last_hashable` by the loop bound.
+                let hash = unsafe { self.hash_table.hash_ptr::<MLS>(base.add(pos)) };
+                if unsafe { self.hash_table.get(hash) } == 0 {
+                    unsafe { self.hash_table.put(hash, pos as u32) };
+                }
+            }
+            s += FILL_STEP;
+        }
+        s
     }
 
     /// [`Self::prime_hash_table_for_range`] taking every `step`-th position.

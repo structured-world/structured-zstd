@@ -26,10 +26,44 @@ pub(crate) const MIN_MATCH_LEN: usize = 5;
 /// backfilling the suffix store. Upstream zstd parity: matches
 /// `ZSTD_FAST_HASH_FILL_STEP` in `zstd_fast.c`.
 pub(crate) const FAST_HASH_FILL_STEP: usize = 3;
-/// Sparse step used when a block was determined to be incompressible —
-/// every matcher inserts hash entries with this stride instead of the
-/// per-byte dense pattern so the rest of the block costs less CPU.
-pub(crate) const INCOMPRESSIBLE_SKIP_STEP: usize = 8;
+/// Stride the lazy / row matchers index a block they wrote off unsearched at.
+///
+/// Same question, same answer as the fast path's [`RAW_SKIP_INDEX_STEP`], which
+/// this defers to: the block is not searched, so the only reason to index it is
+/// a LATER block duplicating it, that duplicate is recognised on the seen-content
+/// grid and then searched, and the search sweeps positions — so an entry every
+/// stride bytes is met within a stride of scanning, immaterial against a
+/// block-sized match. The two paths had drifted to different answers (8 here,
+/// 512 there) and it was the whole cost of a skip: an entry per eight bytes is
+/// 131,000 stores per mebibyte of input nothing will search.
+///
+/// Measured on the i9, three arms in one session (before, after, and the C
+/// reference through `ffi_encode_loop_z000033`), `perf stat -r 3`, three rounds
+/// each. Per run, cycles / instructions / wall clock:
+///
+/// Incompressible 1 MiB at level 5, 300 frames:
+///
+/// | arm | cycles | instructions | wall |
+/// |---|---|---|---|
+/// | before | 1.653-1.670 G | 1.9287 G | 0.402-0.408 s |
+/// | after | 0.337-0.347 G | 0.3028 G | 0.087-0.089 s |
+/// | reference | 1.007-1.068 G | 0.8330 G | 0.247-0.267 s |
+///
+/// A 1 MiB block repeated verbatim at level 19, 30 frames — the case the wider
+/// stride costs bytes on:
+///
+/// | arm | cycles | instructions | wall | bytes |
+/// |---|---|---|---|---|
+/// | before | 0.807-0.839 G | 0.6231 G | 0.206-0.213 s | 524,365 |
+/// | after | 0.082-0.084 G | 0.0776 G | 0.029-0.030 s | 524,871 |
+/// | reference | 12.20-13.08 G | 5.5298 G | 2.95-3.16 s | 524,361 |
+///
+/// So the stride takes us from 1.58x of the reference to 0.33x on the first,
+/// and the second costs 510 bytes in 524,871 (0.1%) against the reference while
+/// running 150 times faster than it. Output is unchanged on 65 of 66
+/// fixture-and-level rows; that level-19 row is the only one that moves.
+pub(crate) const INCOMPRESSIBLE_SKIP_STEP: usize =
+    crate::encoding::incompressible::RAW_SKIP_INDEX_STEP;
 
 /// Length of the common prefix of two byte slices, capped at
 /// `min(a.len(), b.len())`. Hot path on every match finder; dispatches to

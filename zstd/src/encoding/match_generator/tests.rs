@@ -3157,51 +3157,48 @@ fn primed_snapshot_restored_across_level22_tier_hints() {
 }
 
 #[test]
-fn fast_dict_attaches_within_cutoff_bounds() {
-    // Within the attach bounds, every Fast dict frame attaches (the copy-mode
-    // owned path memmoved the whole input into history each frame; attach scans
-    // the input in place via the borrowed dual-base kernel). All hints here sit
-    // far below `FAST_ATTACH_DICT_CUTOFF_LOG` (2 GiB source) and the dict is far
-    // below `MAX_FAST_ATTACH_DICT_REGION` (16 MiB), so a hint that used to cross
-    // the old 8 KiB cutoff (8193 B) and a small one (8192 B) BOTH resolve to
-    // attach, and the Simple backend reports a borrowed (in-place) dict scan for
-    // both. This guards `FAST_ATTACH_DICT_CUTOFF_LOG` staying high enough that no
-    // in-bounds Fast hint falls back to the input-copy path; the OUT-of-bounds
-    // fallbacks are covered by `fast_attach_cutoff_keeps_virtual_positions_within_u32`
-    // (source) and `oversized_dict_hint_routes_fast_to_copy_mode` (dict size).
+fn fast_dict_attach_follows_the_source_size_cutoff() {
+    // The cutoff is the 8 KiB one upstream uses for the Fast strategy, and it is
+    // the SOURCE size that decides: at or under it the dictionary is attached (a
+    // separate table, scanned in place by the borrowed dual-base kernel), over it
+    // it is copied into the live table so ordinary near matches see it too. The
+    // pair 8192 / 8193 pins the boundary itself; the dict here is far below
+    // `MAX_FAST_ATTACH_DICT_REGION`, so only the source size is in play. The
+    // out-of-bounds fallbacks are covered by
+    // `fast_attach_cutoff_keeps_virtual_positions_within_u32` (source) and
+    // `oversized_dict_hint_routes_fast_to_copy_mode` (dict size).
     let level = CompressionLevel::Level(1);
-    for hint in [8192u64, 8193, 1 << 20] {
+    for (hint, attaches) in [(8192u64, true), (8193, false), (1 << 20, false)] {
         let mut driver = MatchGeneratorDriver::new(8, 1);
         driver.set_source_size_hint(hint);
         driver.reset(level);
         driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
-        assert!(
+        assert_eq!(
             driver.borrowed_dict_supported(),
-            "Fast dict frame with hint {hint} must attach (borrowed in-place \
-             dict scan), never fall back to the copy-mode input-copy path"
+            attaches,
+            "Fast dict frame with hint {hint} resolved the wrong dictionary mode",
         );
     }
 }
 
 #[test]
 fn fast_attach_cutoff_keeps_virtual_positions_within_u32() {
-    // The cutoff is 31, NOT the full u64 source-size range, because the borrowed
-    // dict kernel stores virtual positions as u32 (`cur_abs as u32`). The largest
-    // attached source `1 << CUTOFF` (plus the dict prefix) must stay below
-    // u32::MAX or that arithmetic wraps; the next bucket (4 GiB) would. This pins
-    // the bound so a future "just raise it to attach everything" change cannot
-    // silently reintroduce the overflow — raising the cutoff requires widening
-    // the kernel's position type first.
+    // Two independent bounds meet on this constant. The upstream one decides it:
+    // the Fast strategy copies above 8 KiB (`attachDictSizeCutoffs[ZSTD_fast]`),
+    // and the ratio measurements behind the constant say the same. The second is
+    // a hard ceiling from our own borrowed kernel, which stores virtual positions
+    // as `u32` (`cur_abs as u32`): the largest attached source plus the dict
+    // prefix has to stay under `u32::MAX`, so a future "just attach everything"
+    // change cannot raise the cutoff past 31 without widening that type first.
+    assert_eq!(
+        FAST_ATTACH_DICT_CUTOFF_LOG, 13,
+        "the Fast attach cutoff is upstream's 8 KiB source size",
+    );
     let max_attached: u64 = 1u64 << FAST_ATTACH_DICT_CUTOFF_LOG;
     assert!(
         max_attached <= u32::MAX as u64,
         "the largest attached source 2^{FAST_ATTACH_DICT_CUTOFF_LOG} must fit u32 \
          virtual positions",
-    );
-    assert!(
-        (1u64 << (FAST_ATTACH_DICT_CUTOFF_LOG + 1)) > u32::MAX as u64,
-        "the next bucket 2^{} would overflow u32 virtual positions",
-        FAST_ATTACH_DICT_CUTOFF_LOG + 1,
     );
 }
 

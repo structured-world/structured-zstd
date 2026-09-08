@@ -1716,7 +1716,7 @@ fn compress_block_fast_dict_borrowed_impl<
             // — no per-candidate range check is needed on the hot path.
             debug_assert!(
                 main_idx == 0 || main_idx as usize >= dict_end,
-                "main-table entry must be the sentinel or a virtual input position (>= dict_end)",
+                "main-table entry must be the sentinel or a virtual input position (>= dict_end): got {main_idx}, dict_end={dict_end}, bias={main_bias}",
             );
             let main_valid = if USE_CMOV {
                 let in_range = main_idx >= prefix_start_index;

@@ -601,6 +601,112 @@ fn skip_matching_dict_prime_handles_exactly_hash_read_size_bytes() {
     // Reaching this line without unwinding is the test.
 }
 
+/// A copy-mode dictionary is indexed the way upstream indexes one: stride 3,
+/// where the step position wins its slot and the two positions after it are
+/// written only into a slot still empty (`ZSTD_fillHashTableForCDict`, whose
+/// table upstream installs as the live one after stripping the tags).
+///
+/// The check is the OCCURRENCE a bucket resolves to, not merely that something
+/// was indexed: a dense every-position fill leaves the LAST position of each
+/// bucket, which is a different (nearer) occurrence, and that is what fragments
+/// one long dictionary match into several short ones.
+#[test]
+fn copy_mode_dictionary_fill_keeps_the_upstream_occurrence_per_bucket() {
+    // A period-4 pattern with a 4-byte hash: positions 4 apart carry identical
+    // content, so they share a bucket and the bucket's final value tells the
+    // two policies apart. Under upstream's fill the winner is the last STRIDE
+    // position of that phase (a multiple of 12, since the phase repeats every 4
+    // and the stride is 3); a dense fill would leave the last position of the
+    // phase outright.
+    let dict: alloc::vec::Vec<u8> = b"abcd".iter().copied().cycle().take(96).collect();
+    let mut m = FastKernelMatcher::with_params(12, 12, 4, 2);
+    m.accept_data(dict);
+    m.skip_matching_for_dict_copy();
+
+    let base = m.history.as_ptr();
+    let last_hashable = m.history.len() - 8;
+    // SAFETY: position 0 has the kernel's load width readable (the dictionary
+    // is far longer than it), and `hash_ptr` bounds the slot to the table.
+    let phase_0 = unsafe {
+        let hash = m.hash_table.hash_ptr::<4>(base);
+        m.hash_table.get(hash)
+    };
+    let last_stride_of_phase = (0..=last_hashable)
+        .rfind(|p| p % 12 == 0)
+        .expect("the dictionary spans several stride groups");
+    let last_of_phase = (0..=last_hashable)
+        .rfind(|p| p % 4 == 0)
+        .expect("the dictionary spans several phase positions");
+    assert_ne!(
+        last_stride_of_phase, last_of_phase,
+        "the fixture must separate the two policies",
+    );
+    assert_eq!(
+        phase_0, last_stride_of_phase as u32,
+        "the bucket must hold the last stride position of its phase, not the \
+         last position ({last_of_phase}) a dense fill would leave",
+    );
+}
+
+/// A dictionary shorter than one hash read indexes nothing, and says so by
+/// leaving rather than by computing `history.len() - HASH_READ_SIZE` and
+/// underflowing.
+#[test]
+fn copy_mode_dictionary_fill_leaves_a_dictionary_too_short_to_hash() {
+    let mut m = FastKernelMatcher::with_params(12, 12, 4, 2);
+    m.accept_data(alloc::vec![0xABu8; 5]);
+    m.skip_matching_for_dict_copy();
+    assert_eq!(
+        m.dict_copy_fill_next, 0,
+        "nothing is hashable, so the stride has nowhere to resume from",
+    );
+    // The boundary is still recorded: the bytes ARE the dictionary, whether or
+    // not any position in them could be indexed.
+    assert_eq!(m.loaded_dict_end, m.history.len());
+}
+
+/// A dictionary committed in slices resumes its stride where the last slice
+/// left it, and a slice that carries nothing hashable past that point indexes
+/// nothing rather than walking the same positions again.
+#[test]
+fn copy_mode_dictionary_fill_indexes_nothing_when_the_stride_is_already_past() {
+    let dict: alloc::vec::Vec<u8> = b"abcd".iter().copied().cycle().take(64).collect();
+    let mut m = FastKernelMatcher::with_params(12, 12, 4, 2);
+    m.accept_data(dict);
+    m.skip_matching_for_dict_copy();
+    let after_first = m.dict_copy_fill_next;
+    assert!(
+        after_first > m.history.len() - 8,
+        "the last stride group was partial, so the cursor sits past the last \
+         hashable position (at {after_first})",
+    );
+
+    // A further slice that adds no bytes: the cursor is already past what the
+    // history makes hashable, which is the guard's case. It is also what a
+    // history that shrank under eviction would leave behind.
+    m.accept_data(alloc::vec::Vec::new());
+    m.skip_matching_for_dict_copy();
+    assert_eq!(m.dict_copy_fill_next, after_first);
+}
+
+/// Every hash width the Fast table accepts gets the same fill. The widths are
+/// a `match` over `mls`, so only the ones a test actually builds are compiled
+/// through — 4 alone would leave the rest unexercised.
+#[test]
+fn copy_mode_dictionary_fill_runs_at_every_hash_width() {
+    for mls in 4u32..=8 {
+        let dict: alloc::vec::Vec<u8> = (0..96u8).map(|b| b.wrapping_mul(7)).collect();
+        let mut m = FastKernelMatcher::with_params(12, 14, mls, 2);
+        m.accept_data(dict);
+        m.skip_matching_for_dict_copy();
+        assert!(
+            m.dict_copy_fill_next > 0,
+            "mls {mls}: the fill must have advanced its stride",
+        );
+        assert_eq!(m.loaded_dict_end, m.history.len(), "mls {mls}");
+    }
+}
+
 /// Boundary: pending block too short to hash anything (less than
 /// `HASH_READ_SIZE` bytes). The dict-prime path must early-return
 /// without panicking on the `last_hashable` subtract.

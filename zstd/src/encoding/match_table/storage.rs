@@ -1339,6 +1339,26 @@ impl MatchTable {
     /// Lower bound (in absolute positions) of the window that's still
     /// reachable from `target_abs`. Upstream zstd parity: `windowLow` in
     /// `ZSTD_compressBlock_*`.
+    ///
+    /// Two field reads and a clamp, called once per searched position as
+    /// upstream calls `ZSTD_getLowestMatchIndex` — and it was being called, not
+    /// folded: it stood in the profile as its own symbol, paying a call and a
+    /// return for four instructions of work.
+    ///
+    /// What folding it removes, per frame on the i9 (10 KiB frames at level 19
+    /// with a 16 KiB dictionary, two prebuilt binaries alternated in one
+    /// session, `perf stat -r 3`, three rounds): 164,648 retired instructions on
+    /// near-random input (4,896,201 -> 4,731,553, -3.4%) and 147,017 on
+    /// compressible input (10,140,594 -> 9,993,577, -1.5%). The counts are
+    /// deterministic and repeat to single digits across rounds.
+    ///
+    /// It is NOT a speed claim. Cycles moved -3.8% and -1.7% on those two, but
+    /// the control arm — level 1, whose Fast backend never reaches this
+    /// function, and whose instruction count is bit-identical between the two
+    /// binaries at 71,276 — moved 3.6% by itself, so code layout accounts for
+    /// as much as the measurement shows. Kept for the operations that are
+    /// provably gone, not for a clock that cannot resolve them.
+    #[inline(always)]
     pub(crate) fn window_low_abs_for_target(&self, target_abs: usize) -> usize {
         let history_low = self.history_abs_start;
         let window_low = target_abs.saturating_sub(self.max_window_size);

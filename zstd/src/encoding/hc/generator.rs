@@ -957,7 +957,36 @@ macro_rules! bt_insert_and_collect_matches_body {
                     );
                     if accepted {
                         best_len = match_len;
-                        let candidate_end = $abs_pos + match_len;
+                        // Where the match ends in the SOURCE, not at the
+                        // position being searched (upstream zstd
+                        // `matchEndIdx = matchIndex + matchLength`,
+                        // zstd_opt.c:794-795, the same form the live walk above
+                        // uses). This value becomes the tree's insert cursor,
+                        // and a dictionary candidate sits BEFORE the searched
+                        // position: measuring from the searched position
+                        // instead pushes the cursor forward by the offset, and
+                        // every position it skipped never enters the tree. A
+                        // later search then finds an empty bucket where the
+                        // reference finds a long match. Only a dictionary
+                        // candidate reaches back far enough for it to show.
+                        //
+                        // In ABSOLUTE coordinates, which is what `match_end_abs`
+                        // and the cursor are in: `dict_idx` indexes the live
+                        // history, and a reused dictionary context advances
+                        // `history_abs_start`, so without the base this compares
+                        // a small relative end against an absolute one and never
+                        // advances the cursor at all from the second frame on.
+                        let candidate_end = $table.history_abs_start + dict_idx + match_len;
+                        // Same coordinate space as `match_end_abs` and the
+                        // cursor it feeds. A value left relative to the live
+                        // history satisfies this only while the base is zero,
+                        // which is exactly the first frame of a context — the
+                        // case where a reused dictionary context hides the
+                        // mistake until the base moves.
+                        debug_assert!(
+                            candidate_end >= $table.history_abs_start + match_len,
+                            "dictionary match end must be absolute",
+                        );
                         if candidate_end > match_end_abs {
                             match_end_abs = candidate_end;
                         }

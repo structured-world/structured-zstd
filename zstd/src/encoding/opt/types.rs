@@ -108,4 +108,15 @@ pub(crate) struct HcOptimalPlanBuffers {
     /// `frontier_limit`-dependent) so the generation stamps land in the
     /// same cell across calls with different frontiers.
     pub(crate) price_arena: alloc::boxed::Box<[[u32; 2]]>,
+    /// `(position, literal length)` the candidates in [`Self::candidates`] were
+    /// searched for, when they are still the answer to that exact query.
+    ///
+    /// The parser walks a run of positions the search finds nothing at inside
+    /// one call and hands the run back to its caller, which re-enters at the
+    /// position that DID have candidates. Searching it a second time is not
+    /// merely wasted: the search inserts the position into the binary tree, and
+    /// inserting one position twice corrupts it. So the run records what it
+    /// searched and the re-entry reads the answer instead of asking again.
+    /// `None` whenever the buffer's contents do not answer any query.
+    pub(crate) candidates_searched_at: Option<(usize, usize)>,
 }

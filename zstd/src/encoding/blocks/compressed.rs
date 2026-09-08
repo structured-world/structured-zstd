@@ -1013,6 +1013,7 @@ fn estimate_literals_section_bytes(
         last_huff.as_ref(),
         new_desc,
         literals,
+        counts,
         strategy,
     );
     let reuse_payload = if !use_new {
@@ -1276,12 +1277,33 @@ fn decide_huff_reuse_like_encoder(
     last_table: Option<&huff0_encoder::HuffmanTable>,
     new_desc: usize,
     literals: &[u8],
+    counts: &[usize; 256],
     strategy: crate::encoding::strategy::StrategyTag,
 ) -> bool {
     let Some(prev) = last_table else {
         return true;
     };
-    let Some(old_estimate) = prev.estimate_compressed_size(literals) else {
+    // Off the histogram, not the literals: the same sum over at most 256
+    // symbols instead of over every byte of the section, which is where
+    // upstream reads it from too (huf_compress.c:1416-1417). On a 4 KiB
+    // dictionary frame the two per-literal walks this replaces were the
+    // largest single item outside the matcher.
+    //
+    // Three arms in one session on the i9 (before, after, and the C reference
+    // through `ffi_loop_dict`), `perf stat -r 3`, three rounds, 20 000 frames
+    // of the corpus fixture with its dictionary — cycles / instructions / wall:
+    //
+    //             4 KiB frame                    10 KiB frame
+    //   before    2.92-2.94 G / 8.035 G / 0.70 s  4.81-4.83 G / 12.837 G / 1.15 s
+    //   after     2.27-2.31 G / 6.664 G / 0.54 s  3.41-3.46 G /  9.556 G / 0.82 s
+    //   reference 1.35-1.37 G / 4.307 G / 0.32 s  2.53-2.54 G /  7.128 G / 0.61 s
+    //
+    // So 22% of the cycles and 17% of the instructions on the 4 KiB frame, 29%
+    // and 26% on the 10 KiB one, taking this path from 2.16x of the reference
+    // to 1.68x and from 1.90x to 1.36x. On input the literal stage writes off
+    // as incompressible the decision never runs, and the change measures as
+    // nothing there (instructions 4.8813 G against 4.8843 G) — as expected.
+    let Some(old_estimate) = prev.estimate_compressed_size_from_counts_checked(counts) else {
         return true;
     };
     // Late-stage `HUF_flags_preferRepeat` mirror — kept here for
@@ -1296,7 +1318,7 @@ fn decide_huff_reuse_like_encoder(
         return false;
     }
     let new_estimate = new_table
-        .estimate_compressed_size(literals)
+        .estimate_compressed_size_from_counts_checked(counts)
         .unwrap_or(literals.len());
     !(old_estimate <= new_desc + new_estimate || new_desc + 12 >= literals.len())
 }
@@ -2819,6 +2841,7 @@ fn compress_literals(
         last_table,
         new_table_description_size,
         literals,
+        &counts,
         strategy,
     );
     let encoder_table = if new_table {

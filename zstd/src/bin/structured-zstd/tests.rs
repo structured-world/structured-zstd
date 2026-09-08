@@ -1377,6 +1377,44 @@ fn fast_flag_maps_to_negative_level() {
 }
 
 #[test]
+fn fast_level_reads_a_digit_run_and_ignores_the_tail() {
+    // upstream zstd (zstdcli.c:1139 -> readU32FromCharChecked, 350-376): the
+    // acceleration factor is the LEADING digit run; the parser stops at the
+    // first byte that is neither a digit nor a K/M multiplier and `--fast`
+    // never looks at what is left. `zstd --fast=3.5` compresses at level -3,
+    // so refusing it turns a working command line into an error.
+    assert_eq!(parse(&["--fast=3.5"]).unwrap().level, -3);
+    assert_eq!(parse(&["--fast=3x"]).unwrap().level, -3);
+    assert_eq!(parse(&["--fast=3G"]).unwrap().level, -3);
+    // A sign is not a digit, so the run is empty and the factor is zero —
+    // which upstream rejects. Rust's own integer parser accepts `+3`, and
+    // accepting it here would take a level upstream refuses.
+    assert!(parse(&["--fast=+3"]).is_err());
+}
+
+#[test]
+fn fast_level_honours_the_k_and_m_multipliers() {
+    // Same reader, suffix half (zstdcli.c:362-373): `K` shifts by 10, `M` by
+    // 20, each with an optional `i` and `B` spelling.
+    assert_eq!(parse(&["--fast=1K"]).unwrap().level, -1024);
+    assert_eq!(parse(&["--fast=2KiB"]).unwrap().level, -2048);
+    // A bare multiplier has no digits before it, so it reads as zero.
+    assert!(parse(&["--fast=K"]).is_err());
+}
+
+#[test]
+fn fast_level_clamps_to_the_minimum_level() {
+    // upstream zstd (zstdcli.c:1136-1140): a factor past `-ZSTD_minCLevel()`
+    // is CLAMPED, not refused — `zstd --fast=200000` compresses at the
+    // lowest level rather than failing.
+    let min = structured_zstd::encoding::CompressionLevel::MIN_LEVEL;
+    assert_eq!(parse(&["--fast=200000"]).unwrap().level, min);
+    assert_eq!(parse(&["--fast=1M"]).unwrap().level, min);
+    // The digit run itself still has to fit 32 bits (zstdcli.c:356-359).
+    assert!(parse(&["--fast=99999999999"]).is_err());
+}
+
+#[test]
 fn clustered_short_flags() {
     // -d (decompress) + -c (stdout) + -k (keep) in one token.
     let opts = parse(&["-dck", "a.zst"]).unwrap();
