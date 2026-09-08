@@ -608,15 +608,6 @@ fn encode_block_parts<M: Matcher>(
     // A block with no sequences writes no tables, so every axis keeps what it
     // had whatever the caller decides.
     let mut decisions = [LastUsedTable::Keep; 3];
-    fill_wire_offsets(
-        raw_sequences,
-        &mut state.offset_hist,
-        matches!(
-            state.strategy_tag,
-            crate::encoding::strategy::StrategyTag::Fast
-        ),
-    );
-    let raw_sequences: &[RawSequence] = raw_sequences;
 
     // literals section
 
@@ -705,23 +696,24 @@ fn encode_block_parts<M: Matcher>(
         let mut ll_counts = [0usize; 256];
         let mut ml_counts = [0usize; 256];
         let mut of_counts = [0usize; 256];
-        // Track the highest code per stream while histogramming so the table
-        // selector skips the full-256 reverse scan for `max_symbol` (the small
-        // sequence-code alphabets leave ~200 high slots permanently zero).
-        let mut ll_max = 0usize;
-        let mut ml_max = 0usize;
-        let mut of_max = 0usize;
-        for seq in raw_sequences.iter() {
-            let ll_code = encode_literal_length(seq.ll).0 as usize;
-            let ml_code = encode_match_len(seq.ml).0 as usize;
-            let of_code = encode_offset(seq.off_base).0 as usize;
-            ll_counts[ll_code] += 1;
-            ml_counts[ml_code] += 1;
-            of_counts[of_code] += 1;
-            ll_max = ll_max.max(ll_code);
-            ml_max = ml_max.max(ml_code);
-            of_max = of_max.max(of_code);
-        }
+        // The offset codes are derived in this same pass rather than by a
+        // walk of their own ahead of the literals section: both passes read
+        // every sequence, and the second one was reading back what the first
+        // had just written.
+        let counts = SequenceCodeCounts {
+            ll: &mut ll_counts,
+            ml: &mut ml_counts,
+            of: &mut of_counts,
+        };
+        let (ll_max, ml_max, of_max) = if matches!(
+            state.strategy_tag,
+            crate::encoding::strategy::StrategyTag::Fast
+        ) {
+            fill_and_count::<true>(raw_sequences, &mut state.offset_hist, counts)
+        } else {
+            fill_and_count::<false>(raw_sequences, &mut state.offset_hist, counts)
+        };
+        let raw_sequences: &[RawSequence] = raw_sequences;
         let total = raw_sequences.len();
 
         // Stream codes of the LAST sequence: upstream zstd codes the final symbol
@@ -1490,31 +1482,76 @@ fn emit_single_sequence_block<M: Matcher>(
     }
 }
 
+/// The three sequence-code histograms, passed as one argument so the pass that
+/// fills them stays under the register-pressure of six.
+struct SequenceCodeCounts<'a> {
+    ll: &'a mut [usize; 256],
+    ml: &'a mut [usize; 256],
+    of: &'a mut [usize; 256],
+}
+
 /// Fill each sequence's wire offset code in place, advancing the repeat-offset
-/// history across the run.
+/// history across the run, and histogram the three code streams while the
+/// sequence is in hand. Returns the highest code seen per stream, which the
+/// table selector needs and would otherwise find by scanning ~200 always-zero
+/// slots.
 ///
-/// This ran as a copy into a second array of the same length, which is a read
-/// and a twelve-byte write per sequence for the sake of one field; the encoder
-/// now writes the four bytes it computes into the sequence it already has.
-/// Upstream never builds the second array either: `ZSTD_storeSeq` puts
-/// `offBase` in the `SeqDef` at match time, and `ZSTD_seqToCodes` writes three
-/// small byte arrays rather than copying the sequences.
+/// One pass, not two: deriving the offset codes and counting them both read
+/// every sequence, and the counting pass was reading back what the filling pass
+/// had just written. Upstream splits them (`ZSTD_seqToCodes` then
+/// `HIST_countFast_wksp`) because its codes go to three separate byte arrays;
+/// ours are already where they belong.
+///
+/// `FAST_REPCODE` picks the offBase policy once per block instead of per
+/// sequence. Upstream's fast matcher emits only offBase 1 (rep[0] when
+/// litLength > 0, rep[1] when litLength == 0 via the secondary-position check)
+/// or an explicit offset, and never 2/3; greedy and above search all three
+/// repeat offsets, which is what the full `encode_offset_with_history` mirrors.
 ///
 /// Per PARTITION, not per block: the emitter can write a partition raw, and
 /// when it does it restores the history, so the partition after it must be
 /// filled from the restored one. Filling here, just before each partition is
 /// encoded, is what keeps that true.
+fn fill_and_count<const FAST_REPCODE: bool>(
+    raw_sequences: &mut [RawSequence],
+    offset_hist: &mut [u32; 3],
+    counts: SequenceCodeCounts<'_>,
+) -> (usize, usize, usize) {
+    let SequenceCodeCounts {
+        ll: ll_counts,
+        ml: ml_counts,
+        of: of_counts,
+    } = counts;
+    let mut ll_max = 0usize;
+    let mut ml_max = 0usize;
+    let mut of_max = 0usize;
+    for seq in raw_sequences.iter_mut() {
+        let off_base = if FAST_REPCODE {
+            encode_offset_with_history_fast(seq.off_base, seq.ll, offset_hist)
+        } else {
+            encode_offset_with_history(seq.off_base, seq.ll, offset_hist)
+        };
+        seq.off_base = off_base;
+        let ll_code = encode_literal_length(seq.ll).0 as usize;
+        let ml_code = encode_match_len(seq.ml).0 as usize;
+        let of_code = encode_offset(off_base).0 as usize;
+        ll_counts[ll_code] += 1;
+        ml_counts[ml_code] += 1;
+        of_counts[of_code] += 1;
+        ll_max = ll_max.max(ll_code);
+        ml_max = ml_max.max(ml_code);
+        of_max = of_max.max(of_code);
+    }
+    (ll_max, ml_max, of_max)
+}
+
+/// [`fill_and_count`] without the histogram, for the block-split estimator: it
+/// prices sub-ranges repeatedly from a scratch history and counts them itself.
 fn fill_wire_offsets(
     raw_sequences: &mut [RawSequence],
     offset_hist: &mut [u32; 3],
     fast_repcode: bool,
 ) {
-    // The strategy branch is hoisted out of the per-sequence loop so the
-    // offBase-policy choice is paid once per block, not per sequence. Upstream
-    // zstd's fast matcher emits only offBase 1 (rep[0] when litLength > 0,
-    // rep[1] when litLength == 0 via the secondary-position check) or an explicit
-    // offset — it never emits offBase 2/3. greedy+ search all three repeat
-    // offsets, which is what the full `encode_offset_with_history` mirrors.
     if fast_repcode {
         for seq in raw_sequences.iter_mut() {
             seq.off_base = encode_offset_with_history_fast(seq.off_base, seq.ll, offset_hist);
