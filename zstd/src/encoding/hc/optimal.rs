@@ -1956,6 +1956,16 @@ impl HcMatchGenerator {
     /// calls the matching `_<kernel>` variant directly. This entry is kept
     /// for the cfg(test)-only `collect_optimal_candidates` shim and any
     /// future caller that isn't already inside a kernel umbrella.
+    ///
+    /// Six arms, and no host compiles more than half of them: aarch64 sees the
+    /// NEON one, x86 sees three behind a runtime match, and the wasm and
+    /// portable ones are only reachable on their own targets. So a change to
+    /// this function's argument list has to be applied to every arm by reading,
+    /// not by compiling — a local `cargo check` on either development
+    /// architecture will happily accept a call that is missing an argument in
+    /// the arms it cannot see. `cargo clippy --target wasm32-unknown-unknown`
+    /// and a `--no-default-features --features kernel-scalar` build are what
+    /// cover the rest.
     #[allow(dead_code)]
     #[inline(always)]
     pub(crate) fn collect_optimal_candidates_initialized<S: crate::encoding::strategy::Strategy>(
@@ -2036,6 +2046,7 @@ impl HcMatchGenerator {
             self.collect_optimal_candidates_initialized_simd128::<S>(
                 abs_pos,
                 current_abs_end,
+                sufficient_match_len,
                 query,
                 out,
             )
@@ -2058,6 +2069,7 @@ impl HcMatchGenerator {
             self.collect_optimal_candidates_initialized_scalar::<S>(
                 abs_pos,
                 current_abs_end,
+                sufficient_match_len,
                 query,
                 out,
             )
