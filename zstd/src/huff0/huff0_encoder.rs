@@ -1193,13 +1193,26 @@ fn huffman_weight_sum_is_power_of_two(weights: &[usize]) -> bool {
     sum.is_power_of_two()
 }
 
-#[derive(Clone)]
+/// A leaf or internal node of the Huffman tree, sized like upstream's
+/// `nodeElt`: the table is `2 * leaf_count - 1` entries and is walked several
+/// times per block, so its width is what decides whether it stays in L1
+/// alongside the histogram. In `usize` fields it was forty bytes a node,
+/// twenty kilobytes for a full alphabet.
+///
+/// Every field's range is bounded by the block: counts sum to the literal
+/// count, symbols index a 256-entry alphabet, and node indices reach
+/// `2 * 256 - 1`. [`NO_PARENT`] is the root's parent.
+#[derive(Clone, Copy)]
 struct HuffNode {
-    count: usize,
-    symbol: usize,
-    parent: Option<usize>,
-    nb_bits: usize,
+    count: u32,
+    symbol: u16,
+    parent: u16,
+    nb_bits: u8,
 }
+
+/// `parent` of a node with no parent yet, and of the root once the tree is
+/// built. Out of range for a real node index, which is under `2 * 256 - 1`.
+const NO_PARENT: u16 = u16::MAX;
 
 /// Build the count-sorted Huffman leaves with their natural (unlimited) code
 /// lengths in `nb_bits`. The tree shape is independent of any maximum-length
@@ -1230,9 +1243,9 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
     if leaf_count == 1 {
         let (symbol, &count) = counts.iter().enumerate().find(|&(_, &c)| c > 0).unwrap();
         nodes.push(HuffNode {
-            count,
-            symbol,
-            parent: None,
+            count: count as u32,
+            symbol: symbol as u16,
+            parent: NO_PARENT,
             nb_bits: 0,
         });
         return;
@@ -1278,7 +1291,7 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
         HuffNode {
             count: 0,
             symbol: 0,
-            parent: None,
+            parent: NO_PARENT,
             nb_bits: 0,
         },
     );
@@ -1290,9 +1303,9 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
         let pos = cursor[bucket] as usize;
         cursor[bucket] += 1;
         nodes[pos] = HuffNode {
-            count,
-            symbol,
-            parent: None,
+            count: count as u32,
+            symbol: symbol as u16,
+            parent: NO_PARENT,
             nb_bits: 0,
         };
     }
@@ -1309,12 +1322,16 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
         }
     }
 
+    // The unbuilt internal nodes start at the maximum count so the merge loop
+    // below never selects one: it always takes the smaller of the next leaf and
+    // the next built node, and a count no real subtree can reach is what keeps
+    // an unbuilt slot out of that comparison.
     nodes.resize(
         2 * leaf_count - 1,
         HuffNode {
-            count: usize::MAX,
-            symbol: usize::MAX,
-            parent: None,
+            count: u32::MAX,
+            symbol: u16::MAX,
+            parent: NO_PARENT,
             nb_bits: 0,
         },
     );
@@ -1326,13 +1343,13 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
 
     // Plain `+`: node counts are symbol frequencies whose tree-wide sum is the
     // block's symbol count (<= MAX_BLOCK_SIZE), so a merged parent count cannot
-    // overflow usize. Saturation would only mask a corrupt frequency table.
+    // overflow u32. Saturation would only mask a corrupt frequency table.
     nodes[node_nb].count = nodes[low_s as usize].count + nodes[(low_s - 1) as usize].count;
     nodes[node_nb].symbol = nodes[(low_s - 1) as usize]
         .symbol
         .min(nodes[low_s as usize].symbol);
-    nodes[low_s as usize].parent = Some(node_nb);
-    nodes[(low_s - 1) as usize].parent = Some(node_nb);
+    nodes[low_s as usize].parent = node_nb as u16;
+    nodes[(low_s - 1) as usize].parent = node_nb as u16;
     node_nb += 1;
     low_s -= 2;
 
@@ -1341,7 +1358,7 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
             let leaf_count = if low_s >= 0 {
                 nodes[low_s as usize].count
             } else {
-                usize::MAX
+                u32::MAX
             };
             let node_count = nodes[low_n].count;
             if leaf_count < node_count {
@@ -1358,7 +1375,7 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
             let leaf_count = if low_s >= 0 {
                 nodes[low_s as usize].count
             } else {
-                usize::MAX
+                u32::MAX
             };
             let node_count = nodes[low_n].count;
             if leaf_count < node_count {
@@ -1374,17 +1391,17 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
         // Plain `+`: see the leaf-merge above — counts sum to <= MAX_BLOCK_SIZE.
         nodes[node_nb].count = nodes[first].count + nodes[second].count;
         nodes[node_nb].symbol = nodes[first].symbol.min(nodes[second].symbol);
-        nodes[first].parent = Some(node_nb);
-        nodes[second].parent = Some(node_nb);
+        nodes[first].parent = node_nb as u16;
+        nodes[second].parent = node_nb as u16;
         node_nb += 1;
     }
 
     for leaf_idx in 0..leaf_count {
-        let mut depth = 0usize;
+        let mut depth = 0u8;
         let mut parent = nodes[leaf_idx].parent;
-        while let Some(parent_idx) = parent {
+        while parent != NO_PARENT {
             depth += 1;
-            parent = nodes[parent_idx].parent;
+            parent = nodes[parent as usize].parent;
         }
         nodes[leaf_idx].nb_bits = depth;
     }
@@ -1418,7 +1435,7 @@ fn limited_weights_into(
     out.resize(counts_len, 0);
     if leaves.len() <= 1 {
         if let Some(leaf) = leaves.first() {
-            out[leaf.symbol] = 1;
+            out[leaf.symbol as usize] = 1;
         }
         return true;
     }
@@ -1433,19 +1450,19 @@ fn limited_weights_into(
     // upstream), leaving the code under- or over-full, which projects to a
     // non-power-of-two weight sum the table builder rejects; detect that here
     // and fall back to the distributed-weight construction.
-    if work.iter().any(|leaf| leaf.nb_bits > max_nb_bits) {
+    if work.iter().any(|leaf| leaf.nb_bits as usize > max_nb_bits) {
         return false;
     }
     let kraft_sum = work
         .iter()
-        .map(|leaf| 1usize << (max_nb_bits - leaf.nb_bits))
+        .map(|leaf| 1usize << (max_nb_bits - leaf.nb_bits as usize))
         .sum::<usize>();
     if kraft_sum != 1usize << max_nb_bits {
         return false;
     }
 
     for leaf in work.iter() {
-        out[leaf.symbol] = max_nb_bits - leaf.nb_bits + 1;
+        out[leaf.symbol as usize] = max_nb_bits - leaf.nb_bits as usize + 1;
     }
     true
 }
@@ -1547,7 +1564,7 @@ fn legacy_distributed_weights(counts: &[usize]) -> Vec<usize> {
 }
 
 fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
-    let Some(largest_bits) = nodes.iter().map(|node| node.nb_bits).max() else {
+    let Some(largest_bits) = nodes.iter().map(|node| node.nb_bits as usize).max() else {
         return;
     };
     if largest_bits <= target_nb_bits {
@@ -1569,15 +1586,15 @@ fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
     let base_cost = 1usize << (largest_bits - target_nb_bits);
     let mut total_cost = 0isize;
     let mut n = nodes.len() - 1;
-    while nodes[n].nb_bits > target_nb_bits {
-        total_cost += (base_cost - (1usize << (largest_bits - nodes[n].nb_bits))) as isize;
-        nodes[n].nb_bits = target_nb_bits;
+    while nodes[n].nb_bits as usize > target_nb_bits {
+        total_cost += (base_cost - (1usize << (largest_bits - nodes[n].nb_bits as usize))) as isize;
+        nodes[n].nb_bits = target_nb_bits as u8;
         if n == 0 {
             break;
         }
         n -= 1;
     }
-    while n > 0 && nodes[n].nb_bits == target_nb_bits {
+    while n > 0 && nodes[n].nb_bits as usize == target_nb_bits {
         n -= 1;
     }
     total_cost >>= largest_bits - target_nb_bits;
@@ -1594,10 +1611,10 @@ fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
     let mut rank_last = [NO_SYMBOL; 14];
     let mut current_nb_bits = target_nb_bits;
     for pos in (0..=n).rev() {
-        if nodes[pos].nb_bits >= current_nb_bits {
+        if nodes[pos].nb_bits as usize >= current_nb_bits {
             continue;
         }
-        current_nb_bits = nodes[pos].nb_bits;
+        current_nb_bits = nodes[pos].nb_bits as usize;
         rank_last[target_nb_bits - current_nb_bits] = pos;
     }
 
@@ -1636,7 +1653,7 @@ fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
         } else {
             let next = pos - 1;
             rank_last[bits_to_decrease] =
-                if nodes[next].nb_bits == target_nb_bits - bits_to_decrease {
+                if nodes[next].nb_bits as usize == target_nb_bits - bits_to_decrease {
                     next
                 } else {
                     NO_SYMBOL
@@ -1656,7 +1673,7 @@ fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
     while total_cost < 0 {
         if rank_last[1] == NO_SYMBOL {
             // No rank-1 symbol yet: create one from the largest rank-0 node.
-            while n > 0 && nodes[n].nb_bits == target_nb_bits {
+            while n > 0 && nodes[n].nb_bits as usize == target_nb_bits {
                 n -= 1;
             }
             // Upstream relies on an over-sized node buffer here and reads into
@@ -1664,7 +1681,7 @@ fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
             // is no real rank-0 node left to borrow, the distribution is too
             // degenerate to height-limit, so stop and let the caller fall back
             // to the distributed-weight construction.
-            if nodes[n].nb_bits == target_nb_bits || n + 1 >= nodes.len() {
+            if nodes[n].nb_bits as usize == target_nb_bits || n + 1 >= nodes.len() {
                 break;
             }
             nodes[n + 1].nb_bits -= 1;
