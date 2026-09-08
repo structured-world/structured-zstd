@@ -879,7 +879,11 @@ impl<B: BufferBackend> DecodeBuffer<B> {
                 self.buffer.extend(dict_slice);
 
                 self.total_output_counter += bytes_from_dict as u64;
-                return self.repeat(dict, self.buffer.len(), match_length - bytes_from_dict);
+                return self.repeat_tail_after_dict(
+                    dict,
+                    self.buffer.len(),
+                    match_length - bytes_from_dict,
+                );
             } else {
                 let low = dict_len - bytes_from_dict;
                 let high = low + match_length;
@@ -895,6 +899,27 @@ impl<B: BufferBackend> DecodeBuffer<B> {
                 buf_len: self.buffer.len(),
             })
         }
+    }
+
+    /// The part of a match that continues out of the dictionary and into the
+    /// output already produced.
+    ///
+    /// Its own function, and deliberately not inlined: `repeat_inner` is
+    /// `inline(always)`, so calling it from the dictionary path pulled the whole
+    /// copy machinery — overlapping copies, the wildcopy variants, their error
+    /// paths — into that path's body. Every dictionary match then paid the
+    /// prologue and epilogue of a frame sized for code most of them never run,
+    /// and on a dictionary-heavy frame that is the common path (23 matches a
+    /// frame on the benchmark's small-10k-random scenario, at 112 instructions
+    /// a call). Behind a call the frame belongs to the tail alone.
+    #[inline(never)]
+    fn repeat_tail_after_dict(
+        &mut self,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), DecodeBufferError> {
+        self.repeat_inner::<false>(dict, offset, match_length)
     }
 
     /// Check if and how many bytes can currently be drawn from the buffer
