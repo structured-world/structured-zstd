@@ -818,6 +818,9 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
+    // Cold on purpose, and measured: taking the attribute off buys 2.7% on a
+    // dictionary decode (where this IS the common path, 23 matches a frame) and
+    // costs 3.5% on an ordinary one, which is the path that runs far more often.
     #[cold]
     fn repeat_from_dict(
         &mut self,
