@@ -957,7 +957,19 @@ macro_rules! bt_insert_and_collect_matches_body {
                     );
                     if accepted {
                         best_len = match_len;
-                        let candidate_end = $abs_pos + match_len;
+                        // Where the match ends in the SOURCE, not at the
+                        // position being searched (upstream zstd
+                        // `matchEndIdx = matchIndex + matchLength`,
+                        // zstd_opt.c:794-795, the same form the live walk above
+                        // uses). This value becomes the tree's insert cursor,
+                        // and a dictionary candidate sits BEFORE the searched
+                        // position: measuring from the searched position
+                        // instead pushes the cursor forward by the offset, and
+                        // every position it skipped never enters the tree. A
+                        // later search then finds an empty bucket where the
+                        // reference finds a long match. Only a dictionary
+                        // candidate reaches back far enough for it to show.
+                        let candidate_end = dict_idx + match_len;
                         if candidate_end > match_end_abs {
                             match_end_abs = candidate_end;
                         }

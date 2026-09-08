@@ -122,3 +122,78 @@ fn dict_frames_decode_with_c_across_levels_and_reuse() {
         }
     }
 }
+
+/// A dictionary frame on the optimal band must not come out LARGER than the
+/// reference's, on input the dictionary describes well.
+///
+/// The parser walks a binary tree it fills lazily: after a search it jumps its
+/// insert cursor to where the match it found ENDS, on the reasoning that the
+/// positions inside a match are covered. That end is the end of the match in
+/// the SOURCE (upstream `matchEndIdx = matchIndex + matchLength`,
+/// zstd_opt.c:747-748 and :794-795), and for a candidate drawn from the
+/// dictionary the source lies BEFORE the position being searched. Measuring the
+/// jump from the searched position instead skips the positions in between, they
+/// never enter the tree, and a later search finds an empty bucket where the
+/// reference finds a long match. It only shows with a dictionary attached,
+/// because only a dictionary candidate sits that far back.
+///
+/// Level 11 at 4 KiB is where it bites hardest: upstream resolves it to btopt
+/// with `searchLog` 3, so a search gets eight candidates and cannot afford to
+/// look in an empty bucket.
+#[test]
+fn dict_frames_on_the_optimal_band_are_no_larger_than_the_reference() {
+    use structured_zstd::decoding::Dictionary;
+    use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+
+    // The benchmark's `small-4k-log-lines` scenario, byte for byte: its lines
+    // carry a region field the shorter fixture above does not, and which long
+    // matches the dictionary offers is exactly what this pins.
+    const LINES: &[&str] = &[
+        "ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders region=eu-west\n",
+        "ts=2026-03-26T21:39:29Z level=INFO msg=\"rotate segment\" tenant=demo table=orders region=eu-west\n",
+        "ts=2026-03-26T21:39:30Z level=INFO msg=\"compact level\" tenant=demo table=orders region=eu-west\n",
+        "ts=2026-03-26T21:39:31Z level=INFO msg=\"write block\" tenant=demo table=orders region=eu-west\n",
+    ];
+    let payload = {
+        let mut bytes = Vec::with_capacity(4 * 1024);
+        while bytes.len() < 4 * 1024 {
+            for line in LINES {
+                let remaining = (4 * 1024) - bytes.len();
+                if remaining == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&line.as_bytes()[..line.len().min(remaining)]);
+            }
+        }
+        bytes
+    };
+    // Trained the way the benchmark trains it: 256-byte samples, an eighth of
+    // the input as the size request.
+    let samples: Vec<&[u8]> = payload.chunks(256).collect();
+    let dict = zstd::dict::from_samples(&samples, payload.len() / 8)
+        .expect("dictionary should train from the log-line samples");
+
+    for level in [10i32, 11, 12, 13] {
+        let mut cctx: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(level));
+        cctx.set_dictionary_id_flag(false);
+        cctx.set_dictionary(
+            Dictionary::from_serialized_or_raw_content(dict.as_slice()).expect("dictionary parses"),
+        )
+        .expect("attach dict");
+        cctx.set_source_size_hint(payload.len() as u64);
+        let ours = cctx.compress_independent_frame(&payload);
+
+        let mut reference = zstd::bulk::Compressor::with_dictionary(level, dict.as_slice())
+            .expect("reference accepts the dictionary");
+        let theirs = reference
+            .compress(&payload)
+            .expect("reference compresses the payload");
+
+        assert!(
+            ours.len() <= theirs.len(),
+            "level {level}: {} bytes against the reference's {}",
+            ours.len(),
+            theirs.len(),
+        );
+    }
+}
