@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.52](https://github.com/structured-world/structured-zstd/compare/v0.0.51...v0.0.52) - 2026-09-08
+
+### Fixed
+
+- *(encode)* copy the dictionary where the reference copies it, index it the way it does, and stop re-entering the parser per literal ([#494](https://github.com/structured-world/structured-zstd/pull/494))
+
+### Performance
+
+- *(encode)* flush the sequence bitstream where upstream flushes it ([#497](https://github.com/structured-world/structured-zstd/pull/497))
+
 ## [0.0.51](https://github.com/structured-world/structured-zstd/compare/v0.0.50...v0.0.51) - 2026-09-07
 
 ### Fixed
