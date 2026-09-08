@@ -1525,11 +1525,17 @@ fn fill_and_count<const FAST_REPCODE: bool>(
     let mut ll_max = 0usize;
     let mut ml_max = 0usize;
     let mut of_max = 0usize;
+    // The history is rotated by every sequence and read by the next one. Held
+    // behind the caller's reference it was three stores into the compressor per
+    // sequence, because the loop also writes through the sequence slice and the
+    // optimiser would not keep the array in registers across that. A local copy
+    // written back once is the same three words, moved once.
+    let mut hist = *offset_hist;
     for seq in raw_sequences.iter_mut() {
         let off_base = if FAST_REPCODE {
-            encode_offset_with_history_fast(seq.off_base, seq.ll, offset_hist)
+            encode_offset_with_history_fast(seq.off_base, seq.ll, &mut hist)
         } else {
-            encode_offset_with_history(seq.off_base, seq.ll, offset_hist)
+            encode_offset_with_history(seq.off_base, seq.ll, &mut hist)
         };
         seq.off_base = off_base;
         let ll_code = encode_literal_length(seq.ll).0 as usize;
@@ -1542,6 +1548,7 @@ fn fill_and_count<const FAST_REPCODE: bool>(
         ml_max = ml_max.max(ml_code);
         of_max = of_max.max(of_code);
     }
+    *offset_hist = hist;
     (ll_max, ml_max, of_max)
 }
 
@@ -1552,15 +1559,18 @@ fn fill_wire_offsets(
     offset_hist: &mut [u32; 3],
     fast_repcode: bool,
 ) {
+    // Local copy for the same reason as `fill_and_count`.
+    let mut hist = *offset_hist;
     if fast_repcode {
         for seq in raw_sequences.iter_mut() {
-            seq.off_base = encode_offset_with_history_fast(seq.off_base, seq.ll, offset_hist);
+            seq.off_base = encode_offset_with_history_fast(seq.off_base, seq.ll, &mut hist);
         }
     } else {
         for seq in raw_sequences.iter_mut() {
-            seq.off_base = encode_offset_with_history(seq.off_base, seq.ll, offset_hist);
+            seq.off_base = encode_offset_with_history(seq.off_base, seq.ll, &mut hist);
         }
     }
+    *offset_hist = hist;
 }
 
 fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
