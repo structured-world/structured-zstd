@@ -124,9 +124,21 @@ fn main() {
         core::hint::black_box(&out);
     }
 
+    // Under `alt<N>` the frames are not all `src.len()` long, so the total is
+    // counted from the schedule rather than multiplied out. Odd iterations take
+    // the short frame, which is `iters / 2` of them. Counting it here instead of
+    // accumulating inside the loop keeps the timed body exactly as it is
+    // measured.
+    let short_frames = (iters / 2) as usize;
+    let long_frames = iters as usize - short_frames;
+    let input_bytes = match &alt {
+        Some(short) => long_frames * src.len() + short_frames * short.len(),
+        None => iters as usize * src.len(),
+    };
+
     eprintln!(
-        "encoded {} bytes × {} iters at level {} dict={}; last-out-sum={}",
-        src.len(),
+        "encoded {} input bytes in {} iters at level {} dict={}; last-out-sum={}",
+        input_bytes,
         iters,
         level,
         dict_path.unwrap_or("none"),

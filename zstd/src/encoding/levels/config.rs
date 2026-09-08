@@ -451,24 +451,31 @@ pub(crate) fn source_size_ceil_log(size: u64) -> u8 {
 /// separate exact table, at the positions the step happens to land on.
 ///
 /// This was `31` (attach every source up to 2 GiB) on a speed argument alone,
-/// and the missing byte column is where it went wrong. `z000033` (1,022,035 B)
-/// with its 16 KiB dictionary, attach → copy, against libzstd on the same host:
+/// and the missing byte column is where it went wrong. Per frame, `z000033`
+/// (1,022,035 B) and its leading 10 KiB, with a 16 KiB dictionary trained over
+/// its 10 KiB chunks, on the i9: two prebuilt binaries and libzstd alternated
+/// in one session, `perf stat -r 3`, three rounds, ranges non-overlapping.
 ///
-/// | case | bytes attach | bytes copy | reference | cycles attach | cycles copy |
-/// |---|---|---|---|---|---|
-/// | 10 KiB frames, L1 | 6,976 | 7,123 | 7,123 | 2.06x | 1.68x |
-/// | 10 KiB frames, L-5 | 9,659 | 9,123 | 9,129 | — | — |
-/// | 1 MiB, L1 | -0.24% | -0.09% | — | 1.96x | 1.71x |
-/// | 1 MiB, L-5 | +5.95% | -0.08% | — | 1.48x | 1.78x |
+/// | case | bytes attach | bytes copy | reference | cycles attach | cycles copy | insn attach | insn copy |
+/// |---|---|---|---|---|---|---|---|
+/// | 10 KiB, L1 | 6,976 | 7,122 | 7,122 | 236,355 (1.95x) | 169,116 (1.39x) | 633,127 (1.78x) | 478,066 (1.34x) |
+/// | 10 KiB, L-5 | 9,660 | 9,124 | 9,130 | 51,678 (1.22x) | 56,444 (1.33x) | 152,281 (1.14x) | 153,369 (1.15x) |
+/// | 1 MiB, L1 | 550,810 | 551,584 | 570,765 | 19.84M (1.76x) | 16.21M (1.44x) | 54.01M (1.91x) | 39.60M (1.40x) |
+/// | 1 MiB, L-5 | 689,127 | 647,735 | 669,826 | 8.80M (1.46x) | 10.67M (1.77x) | 21.62M (1.54x) | 22.81M (1.63x) |
 ///
-/// So attach was losing 6% of the ratio across the ultra-fast band — the
-/// dictionary made our frame BIGGER than our own no-dict frame there, while it
-/// made the reference's smaller — and the cycles it appeared to save in that
-/// band were bought by finding 21,897 sequences where the reference finds
-/// 27,546. At the positive levels copy is the cheaper arm as well.
+/// Copy is the better arm on both axes at the positive levels: it takes 18-28%
+/// fewer cycles and 22-27% fewer instructions, and its bytes are the
+/// reference's exactly on the small frame and 3.4% under the reference on the
+/// large one. At the ultra-fast levels it buys ratio with time: 21% more cycles
+/// on the 1 MiB frame for 6.0% fewer bytes, 9% more on the small one for 5.5%
+/// fewer. That trade is what the cutoff is for. Attach put us 2.9% ABOVE the
+/// reference on the 1 MiB ultra-fast frame — the dictionary made our frame
+/// bigger than our own no-dict frame there, while it made the reference's
+/// smaller — because it found 21,897 sequences where the reference finds
+/// 27,546. Copy puts us 3.3% under it.
 ///
 /// The remaining gap is now a same-mode one: the reference does this copy in
-/// 1.0x where we take 1.7-1.8x, which is a target with an apples-to-apples
+/// 1.0x where we take 1.3-1.8x, which is a target with an apples-to-apples
 /// reference rather than a mode the reference never runs.
 ///
 /// The borrowed attach kernel stores virtual positions as `u32`

@@ -159,6 +159,20 @@ macro_rules! build_optimal_plan_impl_body {
         // per call from the segment's block offset, so advancing inside one call
         // is not the same thing. `HAS_LDM` is a const generic, so this whole
         // block folds away there.
+        //
+        // What the walk is worth, per frame on the i9 (10 KiB frames at level 19
+        // with a 16 KiB dictionary, two prebuilt binaries and libzstd alternated
+        // in one session, `perf stat -r 3`, three rounds, ranges
+        // non-overlapping). Near-random input, the shape this exists for:
+        // 2,380,845 -> 1,679,325 cycles (-29.5%) and 6,132,013 -> 4,731,553
+        // retired instructions (-22.8%), which is 1.94x -> 1.37x of libzstd on
+        // cycles and 2.04x -> 1.57x on instructions. Compressible input, where
+        // the search finds matches and the run is short: 4,616,838 -> 4,390,463
+        // cycles (-4.9%) and 10,291,065 -> 9,993,577 instructions (-2.9%). The
+        // control arm is level 1, whose Fast backend never enters this parser:
+        // its instruction count is bit-identical between the two binaries
+        // (71,276), and its cycles differ by 3.4%, which bounds what code layout
+        // alone can account for. Output is byte-identical on both fixtures.
         let mut skipped_literals = 0usize;
         let mut seed_candidates_ready = carried_candidates;
         if !HAS_LDM && !seed_candidates_ready {
