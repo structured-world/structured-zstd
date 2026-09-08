@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788864041759,
+  "lastUpdate": 1788869167125,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -5099,6 +5099,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.188,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a3d112b5384be756e4838c8ea660bcb7ffd2231f",
+          "message": "perf(encode): flush the sequence bitstream where upstream flushes it (#497)\n\n* perf(encode): flush the sequence bitstream where upstream flushes it\n\nThe sequence loop wrote the three FSE state diffs, drained the accumulator,\nthen wrote the three extra-bit fields and drained it again. Upstream drains\nonce, and asks before the first one whether the extras that follow would\nactually fail to fit beside the diffs: ofBits + mlBits + llBits >= 64 - 7 -\n(LLFSELog + MLFSELog + OffFSELog), which with our accumulator logs is 31\n(zstd_compress_sequences.c:350). Under it nothing has to leave, because 7\nleftover bits plus 26 of state diffs plus 30 of extras is 63. The second\nconditional is upstream's too: past 56 bits of extras the offset field needs\nits own container (:355).\n\nSo the common sequence now costs one drain instead of two, and the drain is a\nstore, a length commit and a shift.\n\nPer frame on an 8 MiB access log at level 1 (i9, two prebuilt binaries\nalternated in one session, perf stat -r 3, three rounds, ranges not\noverlapping): 124.26 M cycles becomes 118.50 M, -4.6%. Retired instructions\nwent the other way, 260.90 -> 262.57 M (+0.6%), which is the compare and the\nsum that replaced the unconditional drain: fewer stores, slightly more\narithmetic, and the clock prefers it. Level 9 on the same fixture moved\n+0.36%, inside what the control arm drifted by. The control is incompressible\ninput, whose blocks are written raw so this loop never runs; its instruction\ncount is identical between the two binaries and its cycles moved 0.6%.\n\nOutput is byte-identical over 30 fixture-and-level rows (three shapes, ten\nlevels from --fast=5 to 22), which is the whole claim: only the flush timing\nchanged, never a written bit.\n\n* test(encode): pin the sequence loop's bit budget where it is computed\n\nThe 31 and 56 thresholds are arithmetic on three widths: the FSE state\ndiffs at most 26 bits together, the literal-length and match-length extras\nat most 16 each, the offset extras at most 31. Those bounds lived only in\nthe comment, so an encoder that widened its output would first show up as\nan accumulator assertion further down, or in a release build as a corrupted\nstream with nothing pointing at the cause.\n\nThey are now asserted where the arithmetic happens, including the aggregate\nthe no-flush branch actually rests on: 7 leftover bits plus the diffs\nactually written plus all three extra fields must fit in 64. The diff widths\nare tallied per sequence for it, under cfg(debug_assertions), so release\nbuilds carry none of this. The whole suite exercises it on every fixture and\nlevel.\n\nAlso records the upstream arm the flush-schedule commit was missing. Same\nfixture, same session, same three rounds, per frame of the 8 MiB access log:\n\n  level 1   ours before 123.99 M cycles / 260.90 M insn\n            ours after  118.69 M cycles / 262.57 M insn\n            libzstd      75.22 M cycles / 149.85 M insn\n            so 1.648x -> 1.578x of upstream on cycles\n\n  level 9   ours before 663.00 M / 1,603.91 M\n            ours after  662.97 M / 1,604.81 M\n            libzstd     501.13 M / 1,038.51 M\n            1.323x either way\n\nBytes on the same runs: 1,467,854 against upstream's 1,469,809 at level 1,\n1,161,999 against 1,158,646 at level 9.",
+          "timestamp": "2026-09-08T14:25:21+03:00",
+          "tree_id": "dbb66882e24015743cf7a63c09f98eb97e8b0682",
+          "url": "https://github.com/structured-world/structured-zstd/commit/a3d112b5384be756e4838c8ea660bcb7ffd2231f"
+        },
+        "date": 1788869143944,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.079,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 190.739,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 228.295,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.56,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.177,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.794,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.968,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.824,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.997,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 10.251,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.919,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.09,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.189,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.554,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.158,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.74,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.255,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.172,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.167,
             "unit": "ms"
           }
         ]
