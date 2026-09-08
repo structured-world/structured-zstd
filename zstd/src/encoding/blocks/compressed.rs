@@ -2577,7 +2577,10 @@ const ML_EXTRA_BITS: [u8; 53] = [
 /// compiled to a chain of comparisons; upstream reaches the same answer with a
 /// table index. Every code's baseline is a multiple of its own extra-bit width,
 /// so masking off those bits is the same subtraction the ranges spelled out.
-#[inline]
+// `inline(always)`: as a hint it was left out of line at the histogram's call
+// site, and a call per sequence costs more than the table lookup this split
+// removes.
+#[inline(always)]
 fn literal_length_code(len: u32) -> u8 {
     debug_assert!(len < 131_072, "literal length {len} out of encodable range");
     if len < 64 {
@@ -2605,7 +2608,8 @@ fn encode_literal_length(len: u32) -> (u8, u32, usize) {
 /// does). Codes are keyed on `len - 3`, the form the sequence section stores.
 ///
 /// Table-driven for the same reason as [`encode_literal_length`].
-#[inline]
+// `inline(always)` for the same reason as [`literal_length_code`].
+#[inline(always)]
 fn match_len_code(len: u32) -> u8 {
     debug_assert!(
         (3..131_075).contains(&len),
