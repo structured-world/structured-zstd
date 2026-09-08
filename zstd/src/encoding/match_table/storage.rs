@@ -1339,6 +1339,12 @@ impl MatchTable {
     /// Lower bound (in absolute positions) of the window that's still
     /// reachable from `target_abs`. Upstream zstd parity: `windowLow` in
     /// `ZSTD_compressBlock_*`.
+    ///
+    /// Two field reads and a clamp, called once per searched position as
+    /// upstream calls `ZSTD_getLowestMatchIndex` — and it was being called, not
+    /// folded: it stood in the profile as its own symbol, paying a call and a
+    /// return for four instructions of work.
+    #[inline(always)]
     pub(crate) fn window_low_abs_for_target(&self, target_abs: usize) -> usize {
         let history_low = self.history_abs_start;
         let window_low = target_abs.saturating_sub(self.max_window_size);
