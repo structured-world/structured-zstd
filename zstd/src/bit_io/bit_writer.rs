@@ -157,23 +157,13 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// pays.
     #[inline(always)]
     pub unsafe fn write_bits_64_no_check(&mut self, bits: u64, num_bits: usize) {
-        // num_bits == 0 short-circuit: matches upstream zstd `BIT_addBits` no-op
-        // semantics AND guards the `bits << self.bits_in_partial` below
-        // from a `<< 64` undefined-behaviour evaluation when the
-        // accumulator is already full (`bits_in_partial == 64`). Callers
-        // that legitimately drain a full container (e.g. the FSE encoder
-        // hitting a state-diff burst boundary) can call this with
-        // `num_bits = 0` as a no-op without tripping UB.
-        if num_bits == 0 {
-            return;
-        }
         debug_assert!(
             num_bits + self.bits_in_partial <= 64,
             "write_bits_64_no_check would overflow partial: would push to {} bits",
             num_bits + self.bits_in_partial,
         );
         debug_assert!(
-            self.bits_in_partial < 64,
+            self.bits_in_partial < 64 || num_bits == 0,
             "write_bits_64_no_check called with full accumulator and num_bits>0; \
              caller must flush_bulk before adding more bits",
         );
@@ -181,7 +171,19 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
             num_bits == 64 || bits >> num_bits == 0,
             "value has dirty high bits beyond num_bits={num_bits}",
         );
-        self.partial |= bits << self.bits_in_partial;
+        // Masked so a full accumulator cannot make this a shift by 64, which is
+        // undefined for `u64`. It is not a guard costing anything: x86 and
+        // AArch64 shift instructions mask the count themselves, so the mask
+        // disappears. It replaces a `num_bits == 0` early return, which was a
+        // branch on every call, and there are six a sequence. Upstream needs
+        // neither, because its `BIT_addBitsFast` keeps `bitPos` strictly under
+        // 64 and can shift unconditionally.
+        //
+        // Correct in the one case the mask changes: the accumulator is full
+        // only where the caller passes `num_bits == 0`, and the second
+        // precondition then forces `bits == 0`, so the OR contributes nothing
+        // whatever the shift count.
+        self.partial |= bits << (self.bits_in_partial & 63);
         self.bits_in_partial += num_bits;
     }
 
