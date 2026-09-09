@@ -1604,9 +1604,6 @@ fn fill_and_count<const FAST_REPCODE: bool>(
         ml: ml_counts,
         of: of_counts,
     } = counts;
-    let mut ll_max = 0usize;
-    let mut ml_max = 0usize;
-    let mut of_max = 0usize;
     // Written through the spare capacity rather than pushed: the length is
     // known, so a push's capacity test per sequence buys nothing, and resizing
     // first would zero the buffer only to overwrite all of it.
@@ -1635,9 +1632,6 @@ fn fill_and_count<const FAST_REPCODE: bool>(
         ll_counts[ll_code as usize] += 1;
         ml_counts[ml_code as usize] += 1;
         of_counts[of_code as usize] += 1;
-        ll_max = ll_max.max(ll_code as usize);
-        ml_max = ml_max.max(ml_code as usize);
-        of_max = of_max.max(of_code as usize);
     }
     *offset_hist = hist;
     // SAFETY: the loop wrote every one of the `raw_sequences.len()` slots it
@@ -1645,7 +1639,29 @@ fn fill_and_count<const FAST_REPCODE: bool>(
     unsafe {
         codes.set_len(raw_sequences.len());
     }
-    (ll_max, ml_max, of_max)
+    (
+        highest_used_code(ll_counts),
+        highest_used_code(ml_counts),
+        highest_used_code(of_counts),
+    )
+}
+
+/// The highest code with a non-zero count, which the table selector needs and
+/// would otherwise find by scanning all 256 slots.
+///
+/// Carried as a running maximum through the counting loop until it was three
+/// compares a sequence there against one bounded scan a stream a block. The
+/// bound is the format's: the three sequence alphabets end at 35, 52 and 31, so
+/// nothing above 63 is ever counted.
+fn highest_used_code(counts: &[usize; 256]) -> usize {
+    debug_assert!(
+        counts[64..].iter().all(|&count| count == 0),
+        "a sequence code above 63 was counted; the alphabets end at 35 / 52 / 31",
+    );
+    counts[..64]
+        .iter()
+        .rposition(|&count| count != 0)
+        .unwrap_or(0)
 }
 
 /// [`fill_and_count`] without the histogram, for the block-split estimator: it
