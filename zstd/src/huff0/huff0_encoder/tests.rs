@@ -742,11 +742,24 @@ fn build_from_counts_rejects_a_histogram_wider_than_a_node_count() {
 }
 
 /// The cheap path skips the table-log search but reaches the same tree
-/// builder, so it needs the same bound.
+/// builder, so it needs the same bound. It also reads the histogram on the way
+/// there — its table-log pick sums the counts in a `usize`, which overflows on
+/// this input on a 32-bit target — so the bound has to be stated at the entry,
+/// not at the narrowing.
 #[test]
 #[should_panic(expected = "symbol counts sum to")]
 fn build_from_counts_gated_rejects_a_histogram_wider_than_a_node_count() {
     let counts = [u32::MAX as usize, 1, 1];
+    let _ = HuffmanTable::build_from_counts_gated(&counts, false);
+}
+
+/// The alphabet bound belongs at the entry too: the search path asserted it,
+/// the cheap path did not, and the weight buffers and node indices are sized
+/// for 256 symbols on both.
+#[test]
+#[should_panic(expected = "more than the 256")]
+fn build_from_counts_gated_rejects_an_alphabet_wider_than_a_huffman_table() {
+    let counts = alloc::vec![1usize; 257];
     let _ = HuffmanTable::build_from_counts_gated(&counts, false);
 }
 

@@ -636,6 +636,7 @@ impl HuffmanTable {
         use_search: bool,
         scratch: &mut WeightScratch,
     ) -> Self {
+        assert_histogram_fits_nodes(counts);
         if use_search {
             Self::build_from_counts(counts)
         } else {
@@ -649,7 +650,7 @@ impl HuffmanTable {
     }
 
     pub fn build_from_counts(counts: &[usize]) -> Self {
-        assert!(counts.len() <= 256);
+        assert_histogram_fits_nodes(counts);
         let symbol_cardinality = counts.iter().filter(|&&count| count > 0).count();
         if symbol_cardinality <= 1 {
             return Self::build_from_weights(&build_limited_weights(counts, 11));
@@ -1214,6 +1215,41 @@ struct HuffNode {
 /// built. Out of range for a real node index, which is under `2 * 256 - 1`.
 const NO_PARENT: u16 = u16::MAX;
 
+/// Refuse a histogram the tree cannot describe, before anything reads it.
+///
+/// The encoder's own inputs always fit: a literals section is at most 128 KiB
+/// over at most 256 symbols. The entry points are public, though, and a
+/// histogram outside those bounds would not fail — it would build a wrong
+/// tree. Counts wider than a node's `u32` truncate on the way into a leaf and
+/// overflow at the first merge that crosses the boundary, and one of exactly
+/// `u32::MAX` is indistinguishable from the sentinel marking a node the tree
+/// has not built yet, which the merge loop would then take as a child. More
+/// than 256 symbols overruns what the weight buffers and the node indices are
+/// sized for.
+///
+/// Called at the entry points rather than at the narrowing itself, because
+/// what runs in between reads the histogram too: the cheap path's table-log
+/// pick sums the counts in a `usize`, which on a 32-bit target overflows on
+/// the same input this exists to reject, before the tree is ever built.
+///
+/// The total accumulates in `u64` so the bound reads the same on 32- and
+/// 64-bit targets, and saturates rather than wrapping — a total that saturates
+/// is far past the bound and is refused either way.
+fn assert_histogram_fits_nodes(counts: &[usize]) {
+    assert!(
+        counts.len() <= MAX_HUFFMAN_ALPHABET,
+        "histogram has {} symbols, more than the {MAX_HUFFMAN_ALPHABET} a Huffman table describes",
+        counts.len(),
+    );
+    let total = counts
+        .iter()
+        .fold(0u64, |sum, &count| sum.saturating_add(count as u64));
+    assert!(
+        total < u32::MAX as u64,
+        "symbol counts sum to {total}, which a tree node's count cannot hold",
+    );
+}
+
 /// Build the count-sorted Huffman leaves with their natural (unlimited) code
 /// lengths in `nb_bits`. The tree shape is independent of any maximum-length
 /// limit, so this is computed once per block and shared across every
@@ -1231,32 +1267,13 @@ fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
 /// that builds a tree per block reuses one allocation instead of taking a fresh
 /// one every time.
 fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
-    // The leaves and the total in one pass, since both walk the histogram.
-    //
-    // A node carries its count in a `u32` ([`HuffNode`]), which the encoder's
-    // own inputs cannot overflow: a literals section is at most 128 KiB, so its
-    // counts sum to that. The entry points are public, though, and a histogram
-    // that does not fit would truncate on the way into a leaf, overflow at the
-    // first merge that crosses the boundary, and — at exactly `u32::MAX` —
-    // produce a leaf indistinguishable from the sentinel that marks a node the
-    // tree has not built yet, which the merge loop would then select as a
-    // child. Refuse the histogram instead of producing a tree from any of the
-    // three. Strictly under `u32::MAX` so the sentinel stays unambiguous, and
-    // checked so the total itself cannot wrap on the way to the comparison.
-    let mut leaf_count = 0usize;
-    let mut total = 0usize;
-    for &count in counts {
-        if count > 0 {
-            leaf_count += 1;
-            total = total
-                .checked_add(count)
-                .expect("symbol counts sum to more than a histogram can describe");
-        }
-    }
-    assert!(
-        total < u32::MAX as usize,
-        "symbol counts sum to {total}, which a tree node's count cannot hold",
+    // Held by construction: both entry points run `assert_histogram_fits_nodes`
+    // before anything reads the histogram.
+    debug_assert!(
+        counts.iter().map(|&count| count as u64).sum::<u64>() < u32::MAX as u64,
+        "histogram reached the tree builder without passing the entry check",
     );
+    let leaf_count = counts.iter().filter(|&&count| count > 0).count();
     // Pre-size to the final node count (`2 * leaf_count - 1`) so the tree
     // build's resize never reallocates.
     nodes.clear();
