@@ -977,6 +977,20 @@ impl FastKernelMatcher {
     /// state: the rehash indexed every position, including the ones the
     /// matcher's step had skipped and never stored, so the table came out of
     /// a slide holding more than it held going in.
+    ///
+    /// The two costs scale differently — the slide with the table's entries,
+    /// the rehash with the window's bytes — so the choice between them would
+    /// matter if a table could be much larger than the window it indexes. It
+    /// cannot: a frame without a dictionary caps `hash_log` at
+    /// `window_log + 1` (upstream `ZSTD_adjustCParams_internal`), which bounds
+    /// the table at two entries per window byte, and a dictionary frame takes
+    /// its table width from the dictionary's own cParams rather than from a
+    /// caller's `hashLog`. Measured over `windowLog` 10 to 16 with `hashLog`
+    /// pinned at 20 (`examples/slide_oversized_table.rs`): identical time
+    /// without a dictionary, and up to twice as fast with one. So there is no
+    /// size-dependent choice here to make, and adding one would buy a branch
+    /// and two code paths for a configuration the parameter resolution does
+    /// not produce.
     fn drain_real_prefix(&mut self, drop_n: usize) {
         let drain_end = HISTORY_DRAIN_BASE + drop_n;
         self.history.drain(HISTORY_DRAIN_BASE..drain_end);

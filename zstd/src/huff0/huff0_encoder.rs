@@ -636,10 +636,13 @@ impl HuffmanTable {
         use_search: bool,
         scratch: &mut WeightScratch,
     ) -> Self {
-        assert_histogram_fits_nodes(counts);
         if use_search {
+            // Validated by the delegate, which is an entry point of its own.
+            // Checking here as well would walk the histogram a second time on
+            // every searched build, including each splitter candidate.
             Self::build_from_counts(counts)
         } else {
+            assert_histogram_fits_nodes(counts);
             // Match upstream's cheap path: tableLog = FSE_optimalTableLog(11,
             // srcSize, maxSV, minus=1) (huf_compress.c:1286), height-limit to it,
             // not the raw natural height (11) which can cost a few bytes vs C.
