@@ -726,3 +726,43 @@ fn a_rejected_description_is_recorded_and_the_raw_form_written() {
     }
     assert_eq!(encoded, expected);
 }
+
+/// The tree node carries its count in a `u32`, which the encoder's own inputs
+/// can never overflow: a literals section is at most 128 KiB, so its counts sum
+/// to that. The entry point is public, though, and a caller handing it a
+/// histogram whose counts do not fit gets a merge that overflows, a count that
+/// truncates on the way into a node, and — at exactly `u32::MAX` — a leaf
+/// indistinguishable from the sentinel that marks a node the tree has not built
+/// yet. Say so at the boundary rather than let any of the three happen.
+#[test]
+#[should_panic(expected = "symbol counts sum to")]
+fn build_from_counts_rejects_a_histogram_wider_than_a_node_count() {
+    let counts = [u32::MAX as usize, 1, 1];
+    let _ = HuffmanTable::build_from_counts(&counts);
+}
+
+/// The cheap path skips the table-log search but reaches the same tree
+/// builder, so it needs the same bound.
+#[test]
+#[should_panic(expected = "symbol counts sum to")]
+fn build_from_counts_gated_rejects_a_histogram_wider_than_a_node_count() {
+    let counts = [u32::MAX as usize, 1, 1];
+    let _ = HuffmanTable::build_from_counts_gated(&counts, false);
+}
+
+/// The bound is on the SUM, and the largest histogram the encoder can produce
+/// has to stay well inside it: a full 128 KiB literals section over one symbol.
+#[test]
+fn build_from_counts_accepts_the_largest_section_the_encoder_can_produce() {
+    let mut counts = [0usize; 256];
+    counts[b'a' as usize] = 128 * 1024 - 2;
+    counts[b'b' as usize] = 1;
+    counts[b'c' as usize] = 1;
+    let table = HuffmanTable::build_from_counts(&counts);
+    // Three symbols so the depths can differ at all — a two-symbol alphabet
+    // gives both a one-bit code whatever their counts. The frequent one taking
+    // the shorter code is the tree having been built from these counts rather
+    // than from truncated ones.
+    assert!(table.codes[b'a' as usize].1 < table.codes[b'b' as usize].1);
+    assert_eq!(table.codes[b'b' as usize].1, table.codes[b'c' as usize].1);
+}

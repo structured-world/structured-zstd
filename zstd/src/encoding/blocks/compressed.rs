@@ -182,6 +182,7 @@ impl CompressedBlockScratch {
     pub(crate) fn retained_heap_size(&self) -> usize {
         self.parts.literals.capacity()
             + self.parts.sequences.capacity() * core::mem::size_of::<RawSequence>()
+            + self.sequence_codes.capacity() * core::mem::size_of::<u32>()
             + self.partitions.capacity() * core::mem::size_of::<usize>()
             + self.prefix_sums.heap_size()
             + self.compressed.capacity()

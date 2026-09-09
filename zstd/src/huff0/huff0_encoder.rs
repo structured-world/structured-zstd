@@ -1231,7 +1231,32 @@ fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
 /// that builds a tree per block reuses one allocation instead of taking a fresh
 /// one every time.
 fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
-    let leaf_count = counts.iter().filter(|&&count| count > 0).count();
+    // The leaves and the total in one pass, since both walk the histogram.
+    //
+    // A node carries its count in a `u32` ([`HuffNode`]), which the encoder's
+    // own inputs cannot overflow: a literals section is at most 128 KiB, so its
+    // counts sum to that. The entry points are public, though, and a histogram
+    // that does not fit would truncate on the way into a leaf, overflow at the
+    // first merge that crosses the boundary, and — at exactly `u32::MAX` —
+    // produce a leaf indistinguishable from the sentinel that marks a node the
+    // tree has not built yet, which the merge loop would then select as a
+    // child. Refuse the histogram instead of producing a tree from any of the
+    // three. Strictly under `u32::MAX` so the sentinel stays unambiguous, and
+    // checked so the total itself cannot wrap on the way to the comparison.
+    let mut leaf_count = 0usize;
+    let mut total = 0usize;
+    for &count in counts {
+        if count > 0 {
+            leaf_count += 1;
+            total = total
+                .checked_add(count)
+                .expect("symbol counts sum to more than a histogram can describe");
+        }
+    }
+    assert!(
+        total < u32::MAX as usize,
+        "symbol counts sum to {total}, which a tree node's count cannot hold",
+    );
     // Pre-size to the final node count (`2 * leaf_count - 1`) so the tree
     // build's resize never reallocates.
     nodes.clear();
