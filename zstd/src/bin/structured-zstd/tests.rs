@@ -31,7 +31,7 @@ fn benchmark_budget(input_len: u64, levels: std::ops::RangeInclusive<i32>) -> u6
 /// The same blob a `-D` run would hand the codecs, parsed for both directions
 /// so one helper serves a compressing test and a decoding one alike.
 fn prepared_dict(raw: &[u8]) -> Dictionaries {
-    Dictionaries::prepare(Some(raw), true, true).expect("the fixture dictionary must parse")
+    Dictionaries::prepare(Some(raw), false, true, true).expect("the fixture dictionary must parse")
 }
 
 /// What a plain `zstd` invocation presets, before any flag.
@@ -1691,18 +1691,19 @@ fn training_refuses_to_overwrite_without_force() {
 }
 
 /// The trainer flags name algorithms, and the algorithm decides what the
-/// dictionary contains. Only FastCOVER is implemented here, so the flags that
-/// ask for COVER or the legacy trainer have to say no — running FastCOVER under
-/// their name returns a dictionary the caller did not ask for.
+/// dictionary contains. FastCOVER and COVER are here; the legacy trainer is
+/// not, so its flag has to say no rather than run another trainer under its
+/// name.
 #[test]
-fn unimplemented_trainers_are_refused_not_substituted() {
+fn the_legacy_trainer_is_refused_not_substituted() {
     assert_eq!(parse(&["--train", "s1"]).unwrap().mode, Mode::Train);
     assert_eq!(
         parse(&["--train-fastcover", "s1"]).unwrap().mode,
         Mode::Train
     );
-    assert!(parse(&["--train-cover", "s1"]).is_err());
+    assert_eq!(parse(&["--train-cover", "s1"]).unwrap().mode, Mode::Train);
     assert!(parse(&["--train-legacy", "s1"]).is_err());
+    assert!(parse(&["--train-legacy=s=8", "s1"]).is_err());
 }
 
 /// A window is a promise about how much memory decoding will need, so it is
@@ -2264,7 +2265,6 @@ fn unimplemented_output_changing_flags_are_rejected() {
     for args in [
         &["--format=gzip", "f"][..],
         &["--format=xz", "f"][..],
-        &["--patch-from=ref", "f"][..],
         &["--rsyncable", "f"][..],
     ] {
         assert!(
@@ -2427,7 +2427,7 @@ fn the_memory_limit_counts_what_a_benchmark_holds() {
     let path = dir.join(format!("szstd-benchmem-{}.bin", std::process::id()));
     fs::write(&path, vec![0u8; 64 * 1024]).unwrap();
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![path.clone()];
     // 64 KiB in and 64 KiB back out, against a limit with 32 KiB of headroom
     // above the decoder's own floor.
@@ -2467,7 +2467,7 @@ fn separate_benchmarking_measures_one_file_at_a_time() {
     // Measured one at a time, only one file is in memory at once — so a limit
     // that fits a single file is enough, while the concatenation needs both.
     // Sized the way the run sizes what it holds, for one file.
-    let mut opts = parse(&["-b3", "-S", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-S", "-i1", "f"]).unwrap();
     opts.inputs = vec![one.clone(), two.clone()];
     opts.memory_limit = Some(benchmark_budget(32 * 1024, 3..=3));
     let separately = run_benchmark(&opts, None);
@@ -2500,7 +2500,7 @@ fn benchmarking_refuses_inputs_that_are_not_regular_files() {
         return;
     }
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![fifo.clone()];
     let refused = run_benchmark(&opts, None);
     let _ = fs::remove_file(&fifo);
@@ -2578,7 +2578,7 @@ fn the_memory_limit_counts_the_compressed_benchmark_buffer() {
         .collect();
     fs::write(&path, &payload).unwrap();
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![path.clone()];
     // Room for two 64 KiB buffers above the decoder's floor, not for three.
     opts.memory_limit =
@@ -2606,7 +2606,7 @@ fn benchmarking_refuses_the_stdin_marker() {
     let dash = dir.join("-");
     fs::write(&dash, vec![1u8; 4096]).unwrap();
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     // Exactly as the command line spells it, with the file there to be found.
     opts.inputs = vec![PathBuf::from("-")];
     let previous = std::env::current_dir().unwrap();
@@ -2780,7 +2780,7 @@ fn the_memory_limit_counts_the_encoder_the_benchmark_builds() {
         "a compression pass allocates something to match with"
     );
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
 
     // Room for everything but the encoder: it still has to fit beside them.
@@ -2809,7 +2809,7 @@ fn the_memory_limit_counts_every_copy_of_the_dictionary() {
 
     let buffers = benchmark_budget(32 * 1024, 3..=3);
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
 
     // Room for the buffers and two dictionaries: still one short.
@@ -2835,7 +2835,7 @@ fn the_memory_limit_counts_the_dictionary_and_the_benchmark_together() {
     fs::write(&input, vec![0u8; 32 * 1024]).unwrap();
     let dictionary = vec![0u8; 32 * 1024];
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
     // Room for exactly what the benchmark holds, and so none to spare for a
     // dictionary beside it.
@@ -3304,15 +3304,6 @@ fn stdout_and_output_follow_last_option_wins() {
     assert_eq!(stdout_last.output, None);
 }
 
-/// `--[no-]compress-literals` forces literals compressed or stored, which
-/// changes the emitted frame. The encoder has no such switch here, so
-/// accepting the flag would hand back a frame laid out the other way.
-#[test]
-fn literal_mode_flags_are_rejected_until_wired() {
-    assert!(parse(&["--compress-literals", "f"]).is_err());
-    assert!(parse(&["--no-compress-literals", "f"]).is_err());
-}
-
 /// Concatenating frames is a documented property of the format: `cat a.zst
 /// b.zst` decodes to `a` followed by `b`, which is how `tar` archives and
 /// append-style logs are built. Stopping at the first frame loses the rest
@@ -3402,7 +3393,7 @@ fn the_memory_limit_counts_the_encoder_the_dictionary_asks_for() {
          64 KiB file: {with_dict} vs {plain}"
     );
 
-    let mut opts = parse(&["-b5", "f"]).unwrap();
+    let mut opts = parse(&["-b5", "-i1", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
 
     // Everything the run holds, with the encoder weighed on the file alone:
@@ -3420,4 +3411,407 @@ fn the_memory_limit_counts_the_encoder_the_dictionary_asks_for() {
     refused
         .expect_err("a ceiling weighed on the file alone does not cover the dictionary's tables");
     accepted.expect("weighed on the dictionary's own parameters, the run fits");
+}
+
+/// `--zstd=` takes the reference command's keys in both spellings, reads each
+/// value as a leading number, treats zero as "the level's value", and refuses
+/// a key it does not have or a value that is not a number.
+#[test]
+fn advanced_parameters_parse_the_reference_spellings() {
+    let short =
+        parse_advanced_params("wlog=23,clog=23,hlog=22,slog=6,mml=3,tlen=48,strat=6").unwrap();
+    assert_eq!(
+        short,
+        AdvancedParams {
+            window_log: Some(23),
+            chain_log: Some(23),
+            hash_log: Some(22),
+            search_log: Some(6),
+            min_match: Some(3),
+            target_length: Some(48),
+            strategy: Some(Strategy::Btlazy2),
+            ..AdvancedParams::default()
+        }
+    );
+    let long = parse_advanced_params(
+        "windowLog=23,chainLog=23,hashLog=22,searchLog=6,minMatch=3,targetLength=48,strategy=6",
+    )
+    .unwrap();
+    assert_eq!(short, long, "the long spellings are the same knobs");
+    let ldm = parse_advanced_params("lhlog=20,lmml=64,lblog=3,lhrlog=7,ovlog=5").unwrap();
+    assert_eq!(ldm.ldm_hash_log, Some(20));
+    assert_eq!(ldm.ldm_min_match, Some(64));
+    assert_eq!(ldm.ldm_bucket_size_log, Some(3));
+    assert_eq!(ldm.ldm_hash_rate_log, Some(7));
+    assert!(
+        parse_advanced_params("wlog=0,strat=0")
+            .unwrap()
+            .is_default(),
+        "zero is the level's own value"
+    );
+    assert_eq!(
+        parse_advanced_params("tlen=1K").unwrap().target_length,
+        Some(1024),
+        "the reference reader's K multiplier applies"
+    );
+    assert!(parse_advanced_params("").unwrap().is_default());
+    assert!(
+        parse_advanced_params("strat=10").is_err(),
+        "no tenth strategy"
+    );
+    assert!(parse_advanced_params("nope=1").is_err(), "unknown key");
+    assert!(parse_advanced_params("wlog").is_err(), "no value");
+    assert!(parse_advanced_params("wlog=abc").is_err(), "not a number");
+    assert!(parse_advanced_params("wlog=23x").is_err(), "trailing junk");
+    assert!(parse_advanced_params("wlog=23,").is_err(), "trailing comma");
+}
+
+/// The knobs reach the encoder: a `--zstd=wlog=` window is what the frame
+/// declares, it wins over the window `--long` would set, and a window the
+/// decoder cannot read back is refused at the command line like `--long=N`.
+#[test]
+fn advanced_parameters_reach_the_frame() {
+    use structured_zstd::decoding::read_frame_header_info;
+
+    let opts = parse(&["--zstd=wlog=20,strat=7", "f"]).unwrap();
+    assert_eq!(opts.advanced.window_log, Some(20));
+    assert_eq!(opts.advanced.strategy, Some(Strategy::Btopt));
+    assert!(
+        parse(&["--zstd=wlog=28", "f"]).is_err(),
+        "beyond what decodes"
+    );
+    assert!(
+        parse(&["--zstd=mml=9", "f"]).is_err(),
+        "out of the knob's range"
+    );
+
+    // Big enough that the window is not capped by the source.
+    let payload = vec![0u8; 3 << 20];
+    let mut frame = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut frame,
+        &FrameSettings {
+            level: 3,
+            pledged_size: Some(payload.len() as u64),
+            advanced: AdvancedParams {
+                window_log: Some(20),
+                ..AdvancedParams::default()
+            },
+            ..FrameSettings::default()
+        },
+        &no_dict(),
+    )
+    .unwrap();
+    assert_eq!(
+        read_frame_header_info(&frame, false).unwrap().window_size,
+        1 << 20,
+        "the frame declares the window --zstd asked for"
+    );
+    let mut frame = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut frame,
+        &FrameSettings {
+            level: 16,
+            long: true,
+            long_window_log: Some(27),
+            pledged_size: Some(payload.len() as u64),
+            advanced: AdvancedParams {
+                window_log: Some(21),
+                ..AdvancedParams::default()
+            },
+            ..FrameSettings::default()
+        },
+        &no_dict(),
+    )
+    .unwrap();
+    assert_eq!(
+        read_frame_header_info(&frame, false).unwrap().window_size,
+        1 << 21,
+        "--zstd=wlog wins over the window --long would set"
+    );
+}
+
+/// `--long` below level 16 is refused because the matcher does not run there,
+/// unless `--zstd=strat=` moves the level onto a parser where it does.
+#[test]
+fn a_strategy_override_onto_the_optimal_parser_admits_long() {
+    assert!(parse(&["-3", "--long", "f"]).is_err());
+    assert!(parse(&["-3", "--long", "--zstd=strat=7", "f"]).is_ok());
+    assert!(parse(&["-3", "--long", "--zstd=strat=9", "f"]).is_ok());
+    assert!(parse(&["-3", "--long", "--zstd=strat=6", "f"]).is_err());
+}
+
+/// `--[no-]compress-literals` decides whether literal sections are
+/// entropy-coded: forced raw, a literal-heavy input compresses worse than the
+/// level's default; forced on at a negative level, where the default is raw,
+/// it compresses better.
+#[test]
+fn literal_compression_flags_reach_the_frame() {
+    assert_eq!(
+        parse(&["--no-compress-literals", "f"]).unwrap().literals,
+        LiteralCompressionMode::Disable
+    );
+    assert_eq!(
+        parse(&["--compress-literals", "f"]).unwrap().literals,
+        LiteralCompressionMode::Enable
+    );
+    assert_eq!(
+        parse(&["f"]).unwrap().literals,
+        LiteralCompressionMode::Auto
+    );
+
+    let payload: Vec<u8> = (0..8192u32)
+        .map(|i| b'a' + (i.wrapping_mul(2_654_435_761) >> 27) as u8)
+        .collect();
+    let frame_with = |level: i32, literals: LiteralCompressionMode| {
+        let mut frame = Vec::new();
+        compress_stream(
+            payload.as_slice(),
+            &mut frame,
+            &FrameSettings {
+                level,
+                literals,
+                ..FrameSettings::default()
+            },
+            &no_dict(),
+        )
+        .unwrap();
+        frame
+    };
+    let auto = frame_with(3, LiteralCompressionMode::Auto);
+    let raw = frame_with(3, LiteralCompressionMode::Disable);
+    assert!(raw.len() > auto.len(), "{} vs {}", raw.len(), auto.len());
+    assert_eq!(decoded(&raw).unwrap(), payload);
+    let fast_auto = frame_with(-3, LiteralCompressionMode::Auto);
+    let fast_coded = frame_with(-3, LiteralCompressionMode::Enable);
+    assert!(
+        fast_coded.len() < fast_auto.len(),
+        "{} vs {}",
+        fast_coded.len(),
+        fast_auto.len()
+    );
+    assert_eq!(decoded(&fast_coded).unwrap(), payload);
+}
+
+/// The trainer flags take their tuning the way the reference command reads
+/// it, and the FastCOVER options built from it follow the reference's rules:
+/// both `k` and `d` fix the parameters, `steps` widens the search over `k`,
+/// and a value the trainer cannot take is refused.
+#[test]
+fn trainer_parameters_parse_and_build_options() {
+    let params = parse_trainer_params("k=200,d=8,f=20,steps=4,split=75,accel=2", true).unwrap();
+    assert_eq!(
+        params,
+        TrainerParams {
+            k: Some(200),
+            d: Some(8),
+            f: Some(20),
+            steps: Some(4),
+            split_percent: Some(75),
+            accel: Some(2),
+            shrink: false,
+        }
+    );
+    assert!(parse_trainer_params("shrink", false).unwrap().shrink);
+    assert!(parse_trainer_params("k=50,shrink=2", false).unwrap().shrink);
+    assert!(
+        parse_trainer_params("f=20", false).is_err(),
+        "cover has no f"
+    );
+    assert!(parse_trainer_params("accel=2", false).is_err(), "nor accel");
+    assert!(parse_trainer_params("k", true).is_err(), "no value");
+    assert!(parse_trainer_params("k=x", true).is_err(), "not a number");
+    assert!(parse_trainer_params("zzz=1", true).is_err(), "unknown key");
+
+    let fixed = fastcover_options(&params).unwrap();
+    assert!(!fixed.optimize, "k and d given: nothing to search");
+    assert_eq!((fixed.k, fixed.d, fixed.f, fixed.accel), (200, 8, 20, 2));
+    assert_eq!(fixed.split_point, 0.75);
+
+    let searched = fastcover_options(&TrainerParams {
+        steps: Some(10),
+        ..TrainerParams::default()
+    })
+    .unwrap();
+    assert!(searched.optimize);
+    assert_eq!(
+        searched.k_candidates.len(),
+        11,
+        "50..=2000 in strides of 195"
+    );
+    assert_eq!(searched.k_candidates[0], 50);
+
+    let bad = |params: TrainerParams| fastcover_options(&params).is_err();
+    assert!(bad(TrainerParams {
+        d: Some(7),
+        ..TrainerParams::default()
+    }));
+    assert!(bad(TrainerParams {
+        f: Some(32),
+        ..TrainerParams::default()
+    }));
+    assert!(bad(TrainerParams {
+        accel: Some(0),
+        ..TrainerParams::default()
+    }));
+    assert!(bad(TrainerParams {
+        k: Some(4),
+        d: Some(8),
+        ..TrainerParams::default()
+    }));
+    assert!(bad(TrainerParams {
+        split_percent: Some(101),
+        ..TrainerParams::default()
+    }));
+    assert!(bad(TrainerParams {
+        shrink: true,
+        ..TrainerParams::default()
+    }));
+
+    let opts = parse(&["--train-fastcover=k=200,d=8", "s1"]).unwrap();
+    assert_eq!(opts.mode, Mode::Train);
+    assert_eq!(opts.trainer, Trainer::FastCover);
+    assert_eq!(opts.trainer_params.k, Some(200));
+    let opts = parse(&["--train-cover", "s1"]).unwrap();
+    assert_eq!(opts.trainer, Trainer::Cover);
+    assert!(opts.trainer_params.is_default());
+    assert!(parse(&["--train-legacy", "s1"]).is_err());
+}
+
+/// `--train-cover` trains with the COVER trainer and writes a real dictionary;
+/// its reference-side tuning names knobs this trainer does not have, so a
+/// tuned request is refused rather than trained under other terms.
+#[test]
+fn cover_training_writes_a_dictionary_and_refuses_tuning() {
+    let scratch = Scratch::new("cover");
+    let corpus: Vec<u8> = (0..60_000u32)
+        .flat_map(|i| format!("record {} value {}\n", i % 500, (i * 7919) % 1000).into_bytes())
+        .collect();
+    let sample = scratch.file("samples.txt", &corpus);
+    let output = scratch.path().join("cover.dict");
+
+    let mut opts = parse(&["--train-cover", "-q", "--maxdict=8192", "s"]).unwrap();
+    opts.inputs = vec![sample.clone()];
+    opts.output = Some(output.clone());
+    train_dictionary(&opts).expect("COVER training succeeds");
+    let dictionary = fs::read(&output).unwrap();
+    assert!(dictionary.len() <= 8192);
+    structured_zstd::decoding::Dictionary::decode_dict(&dictionary)
+        .expect("the output is a finalized dictionary");
+
+    let mut tuned = parse(&["--train-cover=k=50", "-q", "-f", "s"]).unwrap();
+    tuned.inputs = vec![sample];
+    tuned.output = Some(output);
+    let err = train_dictionary(&tuned)
+        .expect_err("tuning the reference's COVER has no meaning here")
+        .to_string();
+    assert!(err.contains("takes no tuning"), "{err}");
+}
+
+/// `--patch-from REF` compresses against the reference as raw content with a
+/// window wide enough to reach all of it, unlocks the ultra levels, and takes
+/// the reference back on decompression. A patch of a file against a near
+/// copy of itself is far smaller than the file compressed alone.
+#[test]
+fn patch_from_compresses_against_the_reference() {
+    let scratch = Scratch::new("patch");
+    let old: Vec<u8> = (0..4000u32)
+        .flat_map(|i| format!("line {i}: the quick brown fox {}\n", i * 31 % 977).into_bytes())
+        .collect();
+    let mut new = old.clone();
+    new.extend_from_slice(b"an appended line that the reference lacks\n");
+    new[1000..1010].copy_from_slice(b"EDITEDHERE");
+    let reference = scratch.file("old.txt", &old);
+    let input = scratch.file("new.txt", &new);
+    let patch = scratch.path().join("new.patch");
+
+    let opts = parse(&["--patch-from", "old", "-22", "f"]).unwrap();
+    assert_eq!(opts.patch_from, Some(PathBuf::from("old")));
+    assert_eq!(opts.level, 22, "--patch-from unlocks the ultra levels");
+    assert!(parse(&["--patch-from=old", "-D", "dict", "f"]).is_err());
+
+    for level in [3, 19] {
+        let mut opts = parse(&["-q", "-f", "--patch-from", "r", "f"]).unwrap();
+        opts.level = level;
+        opts.patch_from = Some(reference.clone());
+        opts.inputs = vec![input.clone()];
+        opts.output = Some(patch.clone());
+        assert_eq!(run(opts).expect("patching runs"), 0, "level {level}");
+        let patch_bytes = fs::read(&patch).unwrap();
+        assert!(
+            patch_bytes.len() * 4 < frame_of(&new).len(),
+            "level {level}: a patch ({} bytes) is far smaller than the file compressed alone ({})",
+            patch_bytes.len(),
+            frame_of(&new).len()
+        );
+
+        let restored = scratch.path().join("restored.txt");
+        let mut opts = parse(&["-d", "-q", "-f", "--patch-from", "r", "f"]).unwrap();
+        opts.patch_from = Some(reference.clone());
+        opts.inputs = vec![patch.clone()];
+        opts.output = Some(restored.clone());
+        assert_eq!(run(opts).expect("applying the patch runs"), 0);
+        assert_eq!(fs::read(&restored).unwrap(), new, "level {level}");
+    }
+
+    // One input against one reference, and stdin only with a declared length.
+    let mut two = parse(&["-q", "--patch-from", "r", "a", "b"]).unwrap();
+    two.patch_from = Some(reference.clone());
+    two.inputs = vec![input.clone(), input.clone()];
+    assert!(run(two).is_err());
+    let mut stdin = parse(&["-q", "--patch-from", "r"]).unwrap();
+    stdin.patch_from = Some(reference);
+    let err = run(stdin)
+        .expect_err("stdin needs --stream-size")
+        .to_string();
+    assert!(err.contains("--stream-size"), "{err}");
+}
+
+/// The patch window covers the input (`highbit(size) + 1`), is never below the
+/// smallest window the format allows, and stops where the decoder would refuse
+/// the frame.
+#[test]
+fn the_patch_window_covers_the_input_within_what_decodes() {
+    assert_eq!(patch_window_log(0).unwrap(), 10);
+    assert_eq!(patch_window_log(1).unwrap(), 10);
+    assert_eq!(patch_window_log(2000).unwrap(), 11);
+    assert_eq!(patch_window_log(1 << 20).unwrap(), 21);
+    assert_eq!(patch_window_log((1 << 27) - 1).unwrap(), 27);
+    assert!(patch_window_log(1 << 27).is_err());
+}
+
+/// `-b` prints its result in the reference command's layout, at the default
+/// level and under `-q`, with the file name cut to its last 17 characters.
+#[test]
+fn benchmark_lines_follow_the_reference_layout() {
+    let result = BenchResult {
+        level: 3,
+        input: 7692,
+        output: 255,
+        compress_mb_s: 123.456,
+        decompress_mb_s: 1234.5,
+    };
+    assert_eq!(
+        result.line("a.txt"),
+        " 3#a.txt            :      7692 ->       255 (x30.16),  123.5 MB/s, 1234.5 MB/s"
+    );
+    assert_eq!(
+        result.quiet_line("a.txt"),
+        "-3          255 (30.165) 123.46 MB/s 1234.5 MB/s  a.txt"
+    );
+    let slow = BenchResult {
+        compress_mb_s: 1.5,
+        output: 7000,
+        ..result
+    };
+    assert!(slow.line("a.txt").contains("(x1.099),   1.50 MB/s"));
+    assert_eq!(bench_display_name("dir/a.txt"), "a.txt");
+    assert_eq!(
+        bench_display_name("a-very-long-file-name.txt"),
+        "ong-file-name.txt",
+        "the last 17 characters"
+    );
+    assert_eq!(bench_display_name(" 3 files"), " 3 files");
 }

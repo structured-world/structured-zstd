@@ -65,7 +65,11 @@ others, and the exit status is 1 when any input failed and 2 on an interrupt,
 which also removes the partial output.
 
 The wire-format switches take effect: `--[no-]check` (`--no-check` also skips
-checksum verification when decoding), `--[no-]content-size` and `--no-dictID`.
+checksum verification when decoding), `--[no-]content-size`, `--no-dictID` and
+`--[no-]compress-literals`. `--zstd=wlog=#,clog=#,hlog=#,slog=#,mml=#,tlen=#,strat=#`
+overrides the level's parameters knob by knob (the `ldm*` knobs apply with
+`--long`). `--patch-from REF` compresses against a reference as raw content
+with the window sized to the input, and applies the patch back on `-d`.
 `--[no-]pass-through` copies non-zstd input through unchanged when
 decompressing, on by default for `zstdcat` and `zstd -dcf` as upstream has it,
 and `--exclude-compressed` skips inputs whose extension names an
@@ -84,17 +88,18 @@ source can fill, so a small file compressed with `--long` does not ask its
 decoders to reserve 128 MiB.
 
 Flags that would change the result are refused instead: `--format=` for
-anything but zstd, `--patch-from`, `--rsyncable` and
-`--[no-]compress-literals`. `-M` is treated as the safety promise it is: on the
+anything but zstd and `--rsyncable`, which needs the worker threads this build
+does not have. `-M` is treated as the safety promise it is: on the
 runs that decode, a limit covering the 128 MiB window, the decoder's buffers
 and the `-D` dictionary is kept and a tighter one is refused rather than
 ignored. Compressing, listing and training allocate no decoder, so the flag is
 accepted there and describes nothing, as upstream has it.
 
-`--train` and `--train-fastcover` both train with FastCOVER, the algorithm
-upstream also defaults to. `--train-cover` and `--train-legacy` name algorithms
-this build does not have, so they are refused rather than quietly served by
-FastCOVER. `-D` takes either a dictionary produced by `--train` or any file at
+`--train` and `--train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#]` train
+with FastCOVER, the algorithm upstream also defaults to, and `--train-cover`
+with the COVER trainer (whose reference-side tuning does not apply here, so it
+is refused rather than misread). `--train-legacy` names an algorithm this build
+does not have and is refused. `-D` takes either a dictionary produced by `--train` or any file at
 all, which is then used as raw content the way upstream does — such a
 dictionary has no ID, so the same bytes must be supplied when decoding.
 
