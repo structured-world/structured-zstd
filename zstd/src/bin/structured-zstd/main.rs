@@ -14,7 +14,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
-use structured_zstd::encoding::CompressionLevel;
+use structured_zstd::encoding::{
+    CompressionLevel, CompressionParameters, LiteralCompressionMode, Strategy,
+};
 
 /// Error type for the tool: a boxed message, which is all a command-line
 /// program does with an error — print it and exit non-zero. Written against
@@ -198,10 +200,82 @@ struct Options {
     output_dir_mirror: Option<PathBuf>,
     /// Whether the progress counter is drawn (`--[no-]progress`).
     progress: Progress,
+    /// Per-knob compression parameters from `--zstd=...`.
+    advanced: AdvancedParams,
+    /// Whether literals are entropy-coded (`--[no-]compress-literals`).
+    literals: LiteralCompressionMode,
+    /// Reference file for `--patch-from`: raw-content dictionary compression
+    /// with the window sized to the input, so the whole reference is
+    /// reachable.
+    patch_from: Option<PathBuf>,
+    /// Which dictionary trainer `--train*` runs.
+    trainer: Trainer,
+    /// The trainer's tuning from `--train-fastcover=...` / `--train-cover=...`.
+    trainer_params: TrainerParams,
+}
+
+/// The dictionary trainers `--train` selects between.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Trainer {
+    /// `--train` / `--train-fastcover`: FastCOVER, the reference default.
+    FastCover,
+    /// `--train-cover`: the segment-scoring COVER trainer.
+    Cover,
+}
+
+/// Tuning from `--train-fastcover=k=#,d=#,f=#,steps=#,split=#,accel=#` and
+/// `--train-cover=k=#,d=#,steps=#,split=#`, each knob `None` until given.
+/// `shrink` is parsed so the command line is validated, and refused at
+/// training time: no trainer here shrinks the dictionary afterwards.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct TrainerParams {
+    k: Option<u32>,
+    d: Option<u32>,
+    f: Option<u32>,
+    steps: Option<u32>,
+    split_percent: Option<u32>,
+    accel: Option<u32>,
+    shrink: bool,
+}
+
+impl TrainerParams {
+    /// Whether any tuning was given at all.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Per-knob compression parameters from `--zstd=wlog=#,clog=#,...`
+/// (upstream `parseCompressionParameters`). Every knob is optional and
+/// overrides the level's own value when set; zero, as there, means "the
+/// level's value".
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct AdvancedParams {
+    window_log: Option<u32>,
+    chain_log: Option<u32>,
+    hash_log: Option<u32>,
+    search_log: Option<u32>,
+    min_match: Option<u32>,
+    target_length: Option<u32>,
+    strategy: Option<Strategy>,
+    ldm_hash_log: Option<u32>,
+    ldm_min_match: Option<u32>,
+    ldm_bucket_size_log: Option<u32>,
+    ldm_hash_rate_log: Option<u32>,
+}
+
+impl AdvancedParams {
+    /// Whether any knob overrides the level.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Upstream `zstd --maxdict` default (110 KiB).
 const DEFAULT_MAX_DICT: usize = 112_640;
+
+/// Least time `-b` measures each level for (upstream `BMK_TIMETEST_DEFAULT_S`).
+const DEFAULT_BENCH_SECONDS: f64 = 3.0;
 
 /// Window log a bare `--long` selects, as upstream documents (128 MiB).
 const DEFAULT_LONG_WINDOW_LOG: u32 = 27;
@@ -378,7 +452,7 @@ fn check_window_log(log: u32) -> Result<()> {
     let upper = bounds.upper_bound.min(i64::from(decodable));
     if i64::from(log) < bounds.lower_bound || i64::from(log) > upper {
         bail!(
-            "--long window log {log} is outside the supported range {}..={upper} \
+            "window log {log} is outside the supported range {}..={upper} \
              (above {decodable} the frame would declare a window this build \
              refuses to decode)",
             bounds.lower_bound,
@@ -409,6 +483,99 @@ fn parse_adapt_params(params: &str) -> Result<()> {
             .map_err(|_| eyre!("--adapt {key} must be a number, got `{value}`"))?;
     }
     Ok(())
+}
+
+/// Parse `--zstd=wlog=#,clog=#,hlog=#,slog=#,mml=#,tlen=#,strat=#,...` the
+/// way the reference command does (`zstdcli.c`, `parseCompressionParameters`):
+/// each key in its long or short spelling, a value read as a leading number
+/// with an optional `K` / `M`, commas between. `overlapLog` / `ovlog` is a
+/// multi-threading knob, accepted and without effect. Zero leaves the knob at
+/// the level's value, as it does there.
+fn parse_advanced_params(text: &str) -> Result<AdvancedParams> {
+    let mut params = AdvancedParams::default();
+    if text.is_empty() {
+        return Ok(params);
+    }
+    for field in text.split(',') {
+        let (key, value) = field
+            .split_once('=')
+            .ok_or_else(|| eyre!("--zstd parameter `{field}` is not `key=value`"))?;
+        let (number, tail) = read_leading_u32(value)
+            .wrap_err_with(|| format!("--zstd parameter `{key}` has an invalid value"))?;
+        if !tail.is_empty() {
+            bail!("--zstd parameter `{key}` has an invalid value `{value}`");
+        }
+        let set = (number != 0).then_some(number);
+        match key {
+            "windowLog" | "wlog" => params.window_log = set,
+            "chainLog" | "clog" => params.chain_log = set,
+            "hashLog" | "hlog" => params.hash_log = set,
+            "searchLog" | "slog" => params.search_log = set,
+            "minMatch" | "mml" => params.min_match = set,
+            "targetLength" | "tlen" => params.target_length = set,
+            "strategy" | "strat" => {
+                params.strategy = match set {
+                    None => None,
+                    Some(ordinal) => {
+                        Some(Strategy::from_ordinal(ordinal).ok_or_else(|| {
+                            eyre!("--zstd strategy {ordinal} is out of range 1..=9")
+                        })?)
+                    }
+                }
+            }
+            "overlapLog" | "ovlog" => {}
+            "ldmHashLog" | "lhlog" => params.ldm_hash_log = set,
+            "ldmMinMatch" | "lmml" => params.ldm_min_match = set,
+            "ldmBucketSizeLog" | "lblog" => params.ldm_bucket_size_log = set,
+            "ldmHashRateLog" | "lhrlog" => params.ldm_hash_rate_log = set,
+            _ => bail!("--zstd has no `{key}` parameter"),
+        }
+    }
+    Ok(params)
+}
+
+/// Parse the tuning of `--train-fastcover=...` (`fastcover` true: `f=` and
+/// `accel=` are accepted as well) or `--train-cover=...`, the way the
+/// reference command's `parseFastCoverParameters` / `parseCoverParameters`
+/// read them. `shrink` takes an optional `=#` regression bound.
+fn parse_trainer_params(text: &str, fastcover: bool) -> Result<TrainerParams> {
+    let flag = if fastcover {
+        "--train-fastcover"
+    } else {
+        "--train-cover"
+    };
+    let mut params = TrainerParams::default();
+    for field in text.split(',') {
+        if field == "shrink" || field.starts_with("shrink=") {
+            if let Some(bound) = field.strip_prefix("shrink=") {
+                let (_, tail) = read_leading_u32(bound)
+                    .wrap_err_with(|| format!("{flag} shrink bound `{bound}` is invalid"))?;
+                if !tail.is_empty() {
+                    bail!("{flag} shrink bound `{bound}` is invalid");
+                }
+            }
+            params.shrink = true;
+            continue;
+        }
+        let (key, value) = field
+            .split_once('=')
+            .ok_or_else(|| eyre!("{flag} parameter `{field}` is not `key=value`"))?;
+        let (number, tail) = read_leading_u32(value)
+            .wrap_err_with(|| format!("{flag} parameter `{key}` has an invalid value"))?;
+        if !tail.is_empty() {
+            bail!("{flag} parameter `{key}` has an invalid value `{value}`");
+        }
+        match key {
+            "k" => params.k = Some(number),
+            "d" => params.d = Some(number),
+            "steps" => params.steps = Some(number),
+            "split" => params.split_percent = Some(number),
+            "f" if fastcover => params.f = Some(number),
+            "accel" if fastcover => params.accel = Some(number),
+            _ => bail!("{flag} has no `{key}` parameter"),
+        }
+    }
+    Ok(params)
 }
 
 /// Refuse to write binary output into an interactive terminal unless forced.
@@ -702,7 +869,7 @@ fn parse_args_into(
         bench: false,
         bench_start: default_level,
         bench_end: 0,
-        bench_secs: 1.0,
+        bench_secs: DEFAULT_BENCH_SECONDS,
         bench_separately: false,
         long: false,
         long_window_log: None,
@@ -723,6 +890,11 @@ fn parse_args_into(
         output_dir: None,
         output_dir_mirror: None,
         progress: Progress::Auto,
+        advanced: AdvancedParams::default(),
+        literals: LiteralCompressionMode::Auto,
+        patch_from: None,
+        trainer: Trainer::FastCover,
+        trainer_params: TrainerParams::default(),
     };
     let mut ultra = false;
     let mut iter = args.iter().enumerate().peekable();
@@ -750,15 +922,24 @@ fn parse_args_into(
                 "test" => select_mode(&mut opts, Mode::Test),
                 "list" => select_mode(&mut opts, Mode::List),
                 // Plain `--train` selects the same default upstream does,
-                // FastCOVER, so the two spellings agree.
-                "train" | "train-fastcover" => select_mode(&mut opts, Mode::Train),
-                // The other trainers produce different dictionaries. Accepting
-                // the flag and running FastCOVER anyway would hand back a
-                // dictionary the caller did not ask for, with nothing to say so.
-                "train-cover" | "train-legacy" => {
-                    bail!(
-                        "--{long} is not implemented; --train / --train-fastcover trains with FastCOVER"
-                    )
+                // FastCOVER, so the two spellings agree. Bare `--train-fastcover`
+                // resets the tuning, as upstream's does.
+                "train" => select_mode(&mut opts, Mode::Train),
+                "train-fastcover" => {
+                    select_mode(&mut opts, Mode::Train);
+                    opts.trainer = Trainer::FastCover;
+                    opts.trainer_params = TrainerParams::default();
+                }
+                "train-cover" => {
+                    select_mode(&mut opts, Mode::Train);
+                    opts.trainer = Trainer::Cover;
+                    opts.trainer_params = TrainerParams::default();
+                }
+                // The legacy trainer produces a different dictionary. Accepting
+                // the flag and running another trainer would hand back one the
+                // caller did not ask for, with nothing to say so.
+                "train-legacy" => {
+                    bail!("--{long} is not implemented; --train-cover and --train-fastcover are")
                 }
                 // `-c` and `-o` name competing destinations, so each clears the
                 // other and the later one on the command line wins, as upstream
@@ -818,12 +999,8 @@ fn parse_args_into(
                 | "no-mmap-dict"
                 | "row-match-finder"
                 | "no-row-match-finder" => {}
-                // Forces literals compressed or stored, which changes the
-                // frame that comes out. The encoder has no such switch here,
-                // so accepting the flag would hand back the other layout.
-                "compress-literals" | "no-compress-literals" => {
-                    bail!("--{long} is not implemented");
-                }
+                "compress-literals" => opts.literals = LiteralCompressionMode::Enable,
+                "no-compress-literals" => opts.literals = LiteralCompressionMode::Disable,
                 _ => {
                     if long == "fast" {
                         // `--fast` is the level -1 alias.
@@ -928,10 +1105,28 @@ fn parse_args_into(
                         if v != "zstd" {
                             bail!("--format={v} is not supported; this build only writes zstd");
                         }
-                    } else if long == "rsyncable" || long.starts_with("patch-from") {
-                        // Both change the emitted frame, so silence would be a
-                        // wrong answer rather than a slower one.
-                        bail!("--{long} is not implemented");
+                    } else if let Some(v) = long.strip_prefix("zstd=") {
+                        opts.advanced = parse_advanced_params(v)?;
+                    } else if let Some(v) = long.strip_prefix("train-cover=") {
+                        select_mode(&mut opts, Mode::Train);
+                        opts.trainer = Trainer::Cover;
+                        opts.trainer_params = parse_trainer_params(v, false)?;
+                    } else if let Some(v) = long.strip_prefix("train-fastcover=") {
+                        select_mode(&mut opts, Mode::Train);
+                        opts.trainer = Trainer::FastCover;
+                        opts.trainer_params = parse_trainer_params(v, true)?;
+                    } else if let Some(reference) =
+                        option_value(long, "patch-from", arg_os, &mut iter)?
+                    {
+                        // A patch needs the levels that reach far back, so the
+                        // reference command unlocks the ultra levels with it.
+                        opts.patch_from = Some(reference);
+                        ultra = true;
+                    } else if long == "rsyncable" {
+                        // Synchronisation points are cut between the jobs of a
+                        // multi-threaded run, which this build does not have;
+                        // the reference command refuses the pair too.
+                        bail!("--rsyncable is not compatible with single-thread mode");
                     } else if long == "long" {
                         // Bare `--long` is `--long=27` upstream. The window is
                         // the point of the flag, so leaving the level's own one
@@ -1161,11 +1356,32 @@ fn parse_args_into(
     } else {
         opts.level
     };
-    if opts.long && compresses(&opts) && long_level < MIN_LONG_LEVEL {
+    // A `--zstd=strat=` override onto the optimal parser carries the matcher
+    // whatever the level says.
+    let optimal_strategy = opts
+        .advanced
+        .strategy
+        .is_some_and(|strategy| strategy >= Strategy::Btopt);
+    if opts.long && compresses(&opts) && long_level < MIN_LONG_LEVEL && !optimal_strategy {
         bail!(
             "--long needs level {MIN_LONG_LEVEL} or above, where long-distance \
              matching runs; at level {long_level} it would only widen the window",
         );
+    }
+    // `--zstd=` knobs are validated here, before any file is opened: a window
+    // the decoder cannot read back is refused like `--long=N` is, and a knob
+    // out of its range is a broken command line.
+    if let Some(log) = opts.advanced.window_log {
+        check_window_log(log)?;
+    }
+    if compresses(&opts) {
+        frame_parameters(
+            CompressionLevel::from_level(opts.level),
+            &FrameSettings::from_options(&opts),
+        )?;
+    }
+    if opts.patch_from.is_some() && opts.dict.is_some() {
+        bail!("error : can't use -D and --patch-from=# at the same time");
     }
     Ok(Parsed::Run(Box::new(opts)))
 }
@@ -1353,8 +1569,12 @@ Advanced compression options:
   --ultra                       Enable levels beyond 19, up to 22; requires more memory.
   --fast[=#]                    Use to very fast compression levels. [Default: 1]
   --long[=#]                    Enable long distance matching with window log #. [Default: 27]
-                                Available from level 16 up, where long-distance matching runs;
-                                capped at 27, the window this build can read back.
+                                Available from level 16 up (or with --zstd=strat=7..9), where
+                                long-distance matching runs; capped at 27, the window this
+                                build can read back.
+  --patch-from=REF              Use REF as the reference point for Zstandard's diff engine.
+  --zstd=wlog=#,clog=#,hlog=#,slog=#,mml=#,tlen=#,strat=#[,lhlog=#,lmml=#,lblog=#,lhrlog=#]
+                                Override the level's compression parameters knob by knob.
   --exclude-compressed          Only compress files that are not already compressed.
 
   --stream-size=#               Specify size of streaming input from STDIN.
@@ -1364,6 +1584,7 @@ Advanced compression options:
 
   --no-dictID                   Don't write `dictID` into the header (dictionary compression only).
   --[no-]content-size           Write the input size into the frame header when it is known. [Default: Write]
+  --[no-]compress-literals      Force (un)compressed literals.
 
   --format=zstd                 Compress files to the `.zst` format. [Default]
 
@@ -1375,7 +1596,9 @@ Advanced decompression options:
 
 Dictionary builder:
   --train                       Create a dictionary from a training set of files.
-  --train-fastcover             Use the fast cover algorithm (the trainer --train also runs).
+  --train-cover                 Use the cover algorithm (takes no tuning here).
+  --train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#]
+                                Use the fast cover algorithm (with optional arguments).
   -o NAME                       Use NAME as dictionary name. [Default: dictionary]
   --maxdict=#                   Limit dictionary to specified size #. [Default: 112640]
   --dictID=#                    Force dictionary ID to #. [Default: Random]
@@ -1383,21 +1606,50 @@ Dictionary builder:
 Benchmark options:
   -b#                           Perform benchmarking with compression level #. [Default: 3]
   -e#                           Test all compression levels up to #; starting level is `-b#`. [Default: 1]
-  -i#                           Set the minimum evaluation to time # seconds. [Default: 1]
+  -i#                           Set the minimum evaluation to time # seconds. [Default: 3]
   -S                            Output one benchmark result per input file. [Default: Consolidated result]
   -D dictionary                 Benchmark using dictionary
 
 Environment: ZSTD_CLEVEL sets the default compression level; ZSTD_NBTHREADS is read and validated.
 
 Accepted for compatibility, with no effect here: -T#/--threads=#, --single-thread,
---auto-threads, -B#, --block-size=#, --adapt, --[no-]sparse, --[no-]asyncio,
---[no-]mmap-dict, --[no-]row-match-finder (compression runs single-threaded).
+--auto-threads, -B#, --block-size=#, --adapt, --zstd=ovlog=#, --[no-]sparse,
+--[no-]asyncio, --[no-]mmap-dict, --[no-]row-match-finder (compression runs
+single-threaded).
 
 Rejected rather than ignored, because they would change the result: --format=
-other than zstd, --patch-from, --rsyncable, --[no-]compress-literals,
---train-cover, --train-legacy, and -M/--memory below the enforced ceiling when
-decoding. A new output file keeps its source's permissions.
+other than zstd, --rsyncable (needs worker threads), --train-legacy, shrink in
+the trainer tuning, and -M/--memory below the enforced ceiling when decoding.
+A new output file keeps its source's permissions.
 ";
+
+/// The file the run's dictionary comes from: `-D`, or the `--patch-from`
+/// reference, which is a dictionary by another name. The command line refuses
+/// both at once, so at most one is set.
+fn dictionary_path(opts: &Options) -> Option<&Path> {
+    opts.dict.as_deref().or(opts.patch_from.as_deref())
+}
+
+/// The window a `--patch-from` compression runs with: wide enough to reach
+/// back over the whole input (`highbit(size) + 1`, as the reference command
+/// sizes it), within what this build can read back. A larger input cannot be
+/// patched here, since the frame would declare a window the decoder refuses.
+fn patch_window_log(source_size: u64) -> Result<u32> {
+    use structured_zstd::encoding::CParameter;
+
+    let file_window_log = u64::BITS - source_size.max(1).leading_zeros();
+    let lower = u32::try_from(CParameter::WindowLog.bounds().lower_bound)
+        .expect("the window log lower bound is a small positive number");
+    let decodable = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE.ilog2();
+    if file_window_log > decodable {
+        bail!(
+            "Can't handle files larger than {} MiB with --patch-from: the patch would \
+             declare a window this build refuses to decode",
+            structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE >> 20
+        );
+    }
+    Ok(file_window_log.max(lower))
+}
 
 /// Read the `-D` dictionary, if there is one, without breaking `-M` to do it.
 ///
@@ -1408,7 +1660,7 @@ decoding. A new output file keeps its source's permissions.
 /// then bounded by that same size, and a file that grew in between is an error
 /// rather than a silent truncation, which would corrupt the dictionary.
 fn load_dictionary(opts: &Options) -> Result<Option<Vec<u8>>> {
-    let Some(path) = &opts.dict else {
+    let Some(path) = dictionary_path(opts) else {
         return Ok(None);
     };
     // Listing walks frame headers and training builds a dictionary from its
@@ -1506,7 +1758,19 @@ impl Dictionaries {
     /// An empty file is no dictionary rather than a broken one — loading a
     /// zero-size dictionary returns to no-dictionary mode — so `-D` on an empty
     /// file compresses plainly instead of failing.
-    fn prepare(raw: Option<&[u8]>, for_compression: bool, for_decoding: bool) -> Result<Self> {
+    ///
+    /// `raw_content` is `--patch-from`: the reference is content whatever it
+    /// starts with, the way `ZSTD_CCtx_refPrefix` takes it, so a reference that
+    /// happens to begin with the dictionary magic is not parsed as one.
+    fn prepare(
+        raw: Option<&[u8]>,
+        raw_content: bool,
+        for_compression: bool,
+        for_decoding: bool,
+    ) -> Result<Self> {
+        use structured_zstd::decoding::{Dictionary, DictionaryHandle};
+        use structured_zstd::encoding::EncoderDictionary;
+
         let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
             return Ok(Self::default());
         };
@@ -1517,18 +1781,25 @@ impl Dictionaries {
             // parsing first and handing over the content would key it on the
             // wrong size. Whatever `-D` was pointed at: a trained dictionary,
             // or any file at all, taken as raw content the way upstream does.
-            prepared.encoder = Some(
-                structured_zstd::encoding::EncoderDictionary::from_serialized_or_raw_content(raw)
-                    .map_err(|err| eyre!("invalid dictionary: {err:?}"))?,
-            );
+            // Raw content has no tables, so its content length is its length.
+            let dictionary = if raw_content {
+                Dictionary::from_raw_content(0, raw.to_vec())
+                    .map(EncoderDictionary::from_dictionary)
+            } else {
+                EncoderDictionary::from_serialized_or_raw_content(raw)
+            };
+            prepared.encoder =
+                Some(dictionary.map_err(|err| eyre!("invalid dictionary: {err:?}"))?);
         }
         if for_decoding {
-            prepared.decoder = Some(
-                structured_zstd::decoding::DictionaryHandle::from_dictionary(
-                    structured_zstd::decoding::Dictionary::from_serialized_or_raw_content(raw)
-                        .map_err(|err| eyre!("failed to parse dictionary: {err:?}"))?,
-                ),
-            );
+            let dictionary = if raw_content {
+                Dictionary::from_raw_content(0, raw.to_vec())
+            } else {
+                Dictionary::from_serialized_or_raw_content(raw)
+            };
+            prepared.decoder = Some(DictionaryHandle::from_dictionary(
+                dictionary.map_err(|err| eyre!("failed to parse dictionary: {err:?}"))?,
+            ));
         }
         Ok(prepared)
     }
@@ -1604,6 +1875,35 @@ fn run(mut opts: Options) -> Result<usize> {
     if opts.mode == Mode::Test {
         opts.remove_source = false;
     }
+    if opts.patch_from.is_some() {
+        // A patch is one input against one reference: the reference command
+        // refuses several, and stdin only with a declared length, since the
+        // window is sized from it.
+        if opts.inputs.len() > 1 {
+            bail!("error : can't use --patch-from=# on multiple files");
+        }
+        if compresses(&opts) {
+            let source_size = match (opts.pledged_size, opts.inputs.first()) {
+                (Some(size), _) => size,
+                (None, Some(input)) if input != Path::new("-") => fs::metadata(input)
+                    .map_err(|err| eyre!("can't stat {} : {err}", input.display()))?
+                    .len(),
+                _ => bail!("Using --patch-from with stdin requires --stream-size"),
+            };
+            opts.advanced.window_log = Some(patch_window_log(source_size)?);
+            // Long-distance matching is what finds the reference across a
+            // window this wide; it runs on the optimal parser here, so it is
+            // switched on where that parser runs.
+            let optimal = opts.level >= MIN_LONG_LEVEL
+                || opts
+                    .advanced
+                    .strategy
+                    .is_some_and(|strategy| strategy >= Strategy::Btopt);
+            if optimal {
+                opts.long = true;
+            }
+        }
+    }
 
     let dict_bytes = load_dictionary(&opts)?;
 
@@ -1615,7 +1915,12 @@ fn run(mut opts: Options) -> Result<usize> {
         run_benchmark(&opts, dict_bytes)?;
         return Ok(0);
     }
-    let dicts = Dictionaries::prepare(dict_bytes.as_deref(), compresses(&opts), decodes(&opts))?;
+    let dicts = Dictionaries::prepare(
+        dict_bytes.as_deref(),
+        opts.patch_from.is_some(),
+        compresses(&opts),
+        decodes(&opts),
+    )?;
     // Everything from here on primes from the parsed form, so the blob it was
     // parsed out of is released rather than held for the length of the run
     // beside the thing that replaced it.
@@ -1644,7 +1949,7 @@ fn run(mut opts: Options) -> Result<usize> {
     // by the time anything is written, and what it writes is plaintext that
     // never needed it: the reference command permits that, and refusing would
     // break a working script to protect nothing.
-    if let (Some(output), Some(dict)) = (&opts.output, &opts.dict)
+    if let (Some(output), Some(dict)) = (&opts.output, dictionary_path(&opts))
         && !opts.to_stdout
         && opts.mode == Mode::Compress
         && names_the_same_file(output, dict)?
@@ -1852,7 +2157,7 @@ fn process_separately(opts: &Options, dicts: &Dictionaries, total: usize) -> Res
             // `./foo.zst` and `dir/../dir/foo.zst` name one file, and a match
             // on the string alone would miss two of the three. Compression
             // only, for the reason given at the `-o` check in `run`.
-            if let Some(dict) = &opts.dict
+            if let Some(dict) = dictionary_path(opts)
                 && opts.mode == Mode::Compress
                 && names_the_same_file(&output, dict)?
             {
@@ -1870,7 +2175,7 @@ fn process_separately(opts: &Options, dicts: &Dictionaries, total: usize) -> Res
             // there to be compared, so identity is asked of the filesystem as
             // well: a hard link is a second name for one file, and no amount of
             // resolving either name tells them apart.
-            if let Some(dict) = &opts.dict
+            if let Some(dict) = dictionary_path(opts)
                 && opts.remove_source
                 && !opts.keep
                 && (names_the_same_file(input, dict)?
@@ -2182,7 +2487,7 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     // here, once, rather than inside the timed loops below. The blob is then
     // done with: it is released before the measuring starts rather than held
     // beside the two forms parsed out of it for the rest of the run.
-    let dicts = &Dictionaries::prepare(dict.as_deref(), true, true)?;
+    let dicts = &Dictionaries::prepare(dict.as_deref(), opts.patch_from.is_some(), true, true)?;
     drop(dict);
 
     if opts.bench_separately {
@@ -2195,12 +2500,12 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     }
 
     let data = read_inputs_bounded(&opts.inputs, &sizes)?;
-    let label = opts
-        .inputs
-        .iter()
-        .map(|input| input.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+    // Several inputs are one measurement, named by their count as the
+    // reference command names it.
+    let label = match opts.inputs.as_slice() {
+        [only] => only.display().to_string(),
+        many => format!(" {} files", many.len()),
+    };
     benchmark_one(opts, dicts, &label, &data)
 }
 
@@ -2259,12 +2564,23 @@ fn benchmark_one(opts: &Options, dicts: &Dictionaries, label: &str, data: &[u8])
     }
     // Per-level time budget; best (fastest) pass wins, like upstream's -i loop.
     let mb = data.len() as f64 / 1e6;
-    println!(
-        "benchmarking {label} ({})  levels {}..={}",
-        HumanSize::new(data.len() as u64, false),
+    let name = bench_display_name(label);
+    display!(
+        opts.verbosity,
+        3,
+        "Benchmarking {label} from level {} to {}",
         opts.bench_start,
-        opts.bench_end,
+        opts.bench_end
     );
+    if opts.verbosity == 1 {
+        // The reference command's machine-readable header, for scripts that
+        // drive `-b -q`.
+        println!(
+            "bench {UPSTREAM_VERSION} : input {} bytes, {} seconds, 0 KB blocks",
+            data.len(),
+            opts.bench_secs as u64
+        );
+    }
 
     // The two buffers the measurement fills, sized once from what they will
     // hold: the frame can be no larger than `compress_bound` says, and the
@@ -2317,7 +2633,6 @@ fn benchmark_one(opts: &Options, dicts: &Dictionaries, label: &str, data: &[u8])
             }
         }
 
-        let ratio = data.len() as f64 / compressed.len() as f64;
         let c_speed = if best_compress > 0.0 {
             mb / best_compress
         } else {
@@ -2328,12 +2643,84 @@ fn benchmark_one(opts: &Options, dicts: &Dictionaries, label: &str, data: &[u8])
         } else {
             f64::INFINITY
         };
-        println!(
-            "{level:>3}  {:>10}  {ratio:>7.3}  {c_speed:>7.1} MB/s comp  {d_speed:>8.1} MB/s decomp",
-            HumanSize::new(compressed.len() as u64, false),
-        );
+        let result = BenchResult {
+            level,
+            input: data.len() as u64,
+            output: compressed.len() as u64,
+            compress_mb_s: c_speed,
+            decompress_mb_s: d_speed,
+        };
+        if opts.verbosity >= DEFAULT_LEVEL {
+            println!("{}", result.line(&name));
+        } else if opts.verbosity == 1 {
+            println!("{}", result.quiet_line(&name));
+        }
     }
     Ok(())
+}
+
+/// What one level of a benchmark measured.
+struct BenchResult {
+    level: i32,
+    input: u64,
+    output: u64,
+    compress_mb_s: f64,
+    decompress_mb_s: f64,
+}
+
+impl BenchResult {
+    /// Compression ratio, as the reference command computes it.
+    fn ratio(&self) -> f64 {
+        self.input as f64 / self.output as f64
+    }
+
+    /// The reference command's result line at the default display level:
+    /// `%2i#%-17.17s :%10u ->%10u (x%5.*f), %6.*f MB/s, %6.1f MB/s`, the ratio
+    /// shown to three significant figures and the compression speed to two
+    /// decimals below 10 MB/s.
+    fn line(&self, name: &str) -> String {
+        let ratio = self.ratio();
+        let ratio_digits = 1 + usize::from(ratio < 100.0) + usize::from(ratio < 10.0);
+        let speed_digits = if self.compress_mb_s < 10.0 { 2 } else { 1 };
+        format!(
+            "{:>2}#{:<17}:{:>10} ->{:>10} (x{:>5.ratio_digits$}), {:>6.speed_digits$} MB/s, {:>6.1} MB/s",
+            self.level,
+            name,
+            self.input,
+            self.output,
+            ratio,
+            self.compress_mb_s,
+            self.decompress_mb_s,
+        )
+    }
+
+    /// The reference command's line under `-q`, which its own speed scripts
+    /// parse: `-%-3i%11i (%5.3f) %6.2f MB/s %6.1f MB/s  %s`.
+    fn quiet_line(&self, name: &str) -> String {
+        format!(
+            "-{:<3}{:>11} ({:>5.3}) {:>6.2} MB/s {:>6.1} MB/s  {}",
+            self.level,
+            self.output,
+            self.ratio(),
+            self.compress_mb_s,
+            self.decompress_mb_s,
+            name,
+        )
+    }
+}
+
+/// The name a benchmark line carries: the file's own name, cut to its last
+/// 17 characters as the reference command cuts it.
+fn bench_display_name(label: &str) -> String {
+    let name = Path::new(label)
+        .file_name()
+        .map_or(label, |name| name.to_str().unwrap_or(label));
+    let chars = name.chars().count();
+    if chars > 17 {
+        name.chars().skip(chars - 17).collect()
+    } else {
+        name.to_string()
+    }
 }
 
 /// `--train`: build a FastCOVER dictionary from the concatenated sample files
@@ -2341,7 +2728,8 @@ fn benchmark_one(opts: &Options, dicts: &Dictionaries, label: &str, data: &[u8])
 /// `zstd --train FILEs -o dict --maxdict=N [--dictID=N]`.
 fn train_dictionary(opts: &Options) -> Result<()> {
     use structured_zstd::dictionary::{
-        FastCoverOptions, FinalizeOptions, create_fastcover_dict_from_slice,
+        FinalizeOptions, create_fastcover_dict_from_slice, create_raw_dict_from_source,
+        finalize_raw_dict,
     };
 
     if opts.inputs.iter().any(|input| input == Path::new("-")) {
@@ -2445,19 +2833,50 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         samples.push(metadata);
     }
 
+    let finalize = FinalizeOptions {
+        dict_id: opts.dict_id,
+    };
     let mut dict = Vec::new();
-    // From the slice, not through a reader: the corpus is the largest thing
-    // this run holds, and the reader path buffers it a second time inside.
-    create_fastcover_dict_from_slice(
-        corpus.as_slice(),
-        &mut dict,
-        opts.max_dict,
-        &FastCoverOptions::default(),
-        FinalizeOptions {
-            dict_id: opts.dict_id,
-        },
-    )
-    .map_err(|err| eyre!("dictionary training failed: {err}"))?;
+    match opts.trainer {
+        Trainer::FastCover => {
+            let options = fastcover_options(&opts.trainer_params)?;
+            // From the slice, not through a reader: the corpus is the largest
+            // thing this run holds, and the reader path buffers it a second
+            // time inside.
+            create_fastcover_dict_from_slice(
+                corpus.as_slice(),
+                &mut dict,
+                opts.max_dict,
+                &options,
+                finalize,
+            )
+            .map_err(|err| eyre!("dictionary training failed: {err}"))?;
+        }
+        Trainer::Cover => {
+            // The COVER trainer here scores segments by k-mer frequency, as the
+            // reference's does, but is not parameterised the same way: `k`,
+            // `d`, `steps` and `split` name knobs it does not have, and
+            // `shrink` a pass it does not run. Running it anyway would return
+            // a dictionary trained under different terms than the ones typed.
+            if !opts.trainer_params.is_default() {
+                bail!(
+                    "--train-cover takes no tuning here (k, d, steps, split, shrink); \
+                     use --train-fastcover=... for a tunable trainer"
+                );
+            }
+            let mut raw = Vec::new();
+            create_raw_dict_from_source(corpus.as_slice(), corpus.len(), &mut raw, opts.max_dict)
+                .map_err(|err| eyre!("dictionary training failed: {err}"))?;
+            if raw.is_empty() {
+                bail!("dictionary training failed: the samples yield no dictionary content");
+            }
+            // The trainer writes its most valuable segment last, and
+            // finalizing keeps the tail when the header leaves less room than
+            // was asked for, so the best content survives the cut.
+            dict = finalize_raw_dict(raw.as_slice(), corpus.as_slice(), opts.max_dict, finalize)
+                .map_err(|err| eyre!("dictionary training failed: {err}"))?;
+        }
+    }
 
     // A trained dictionary is an output file like any other, so it is written
     // through a temporary that is renamed into place: an interrupted run
@@ -2500,6 +2919,74 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         opts.inputs.len()
     );
     Ok(())
+}
+
+/// The FastCOVER tuning `--train-fastcover=...` asked for, checked the way the
+/// reference trainer checks it: `d` is 6 or 8, `f` lies in `1..=31`, `accel`
+/// in `1..=10`, `k` is at least `d`, `split` is a percentage. Naming both `k`
+/// and `d` fixes them and skips the parameter search; naming `steps` widens
+/// or narrows the search over `k` instead.
+fn fastcover_options(
+    params: &TrainerParams,
+) -> Result<structured_zstd::dictionary::FastCoverOptions> {
+    use structured_zstd::dictionary::FastCoverOptions;
+
+    if params.shrink {
+        bail!("--train-fastcover shrink is not implemented");
+    }
+    let mut options = FastCoverOptions::default();
+    if let Some(d) = params.d {
+        if d != 6 && d != 8 {
+            bail!("--train-fastcover d must be 6 or 8, got {d}");
+        }
+        options.d = d as usize;
+        options.d_candidates = vec![d as usize];
+    }
+    if let Some(f) = params.f {
+        if f == 0 || f > 31 {
+            bail!("--train-fastcover f must be in 1..=31, got {f}");
+        }
+        options.f = f;
+        options.f_candidates = vec![f];
+    }
+    if let Some(accel) = params.accel {
+        if accel == 0 || accel > 10 {
+            bail!("--train-fastcover accel must be in 1..=10, got {accel}");
+        }
+        options.accel = accel as usize;
+    }
+    if let Some(split) = params.split_percent {
+        if split > 100 {
+            bail!("--train-fastcover split is a percentage, got {split}");
+        }
+        // Zero asks for the default, as it does there.
+        if split > 0 {
+            options.split_point = f64::from(split) / 100.0;
+        }
+    }
+    match (params.k, params.steps) {
+        (Some(k), _) => {
+            if (k as usize) < options.d {
+                bail!(
+                    "--train-fastcover k must be at least d, got k={k} d={}",
+                    options.d
+                );
+            }
+            options.k = k as usize;
+            options.k_candidates = vec![k as usize];
+        }
+        (None, Some(steps)) => {
+            // The reference searches `k` over 50..=2000 in `steps` strides.
+            const K_MIN: usize = 50;
+            const K_MAX: usize = 2000;
+            let stride = ((K_MAX - K_MIN) / steps.max(1) as usize).max(1);
+            options.k_candidates = (K_MIN..=K_MAX).step_by(stride).collect();
+        }
+        (None, None) => {}
+    }
+    // With both `k` and `d` given there is nothing left to search for.
+    options.optimize = !(params.k.is_some() && params.d.is_some());
+    Ok(options)
 }
 
 /// The permissions a file made from all of `samples` may carry: every bit that
@@ -3437,6 +3924,10 @@ struct FrameSettings {
     content_size_flag: bool,
     /// Whether a dictionary frame records the dictionary's ID (`--no-dictID`).
     dict_id_flag: bool,
+    /// Per-knob overrides from `--zstd=...`.
+    advanced: AdvancedParams,
+    /// Whether literals are entropy-coded (`--[no-]compress-literals`).
+    literals: LiteralCompressionMode,
 }
 
 impl Default for FrameSettings {
@@ -3455,6 +3946,8 @@ impl Default for FrameSettings {
             checksum: true,
             content_size_flag: true,
             dict_id_flag: true,
+            advanced: AdvancedParams::default(),
+            literals: LiteralCompressionMode::Auto,
         }
     }
 }
@@ -3474,8 +3967,71 @@ impl FrameSettings {
             checksum: opts.checksum,
             content_size_flag: opts.content_size_flag,
             dict_id_flag: opts.dict_id_flag,
+            advanced: opts.advanced,
+            literals: opts.literals,
         }
     }
+}
+
+/// The fine-grained parameters a frame runs under, or `None` when nothing
+/// overrides the level: `--zstd=` knobs, `--long` (whose window yields to a
+/// `--zstd=wlog=`, as the reference command has it), and the literal mode.
+/// The long-distance knobs from `--zstd=` reach the encoder only with
+/// `--long`, since there they tune a matcher that otherwise does not run.
+fn frame_parameters(
+    level: CompressionLevel,
+    settings: &FrameSettings,
+) -> Result<Option<CompressionParameters>> {
+    let advanced = settings.advanced;
+    if !settings.long && advanced.is_default() && settings.literals == LiteralCompressionMode::Auto
+    {
+        return Ok(None);
+    }
+    let mut builder = CompressionParameters::builder(level);
+    let window_log = advanced
+        .window_log
+        .or(settings.long.then_some(settings.long_window_log).flatten());
+    if let Some(log) = window_log {
+        builder = builder.window_log(log);
+    }
+    if let Some(log) = advanced.chain_log {
+        builder = builder.chain_log(log);
+    }
+    if let Some(log) = advanced.hash_log {
+        builder = builder.hash_log(log);
+    }
+    if let Some(log) = advanced.search_log {
+        builder = builder.search_log(log);
+    }
+    if let Some(length) = advanced.min_match {
+        builder = builder.min_match(length);
+    }
+    if let Some(length) = advanced.target_length {
+        builder = builder.target_length(length);
+    }
+    if let Some(strategy) = advanced.strategy {
+        builder = builder.strategy(strategy);
+    }
+    if settings.long {
+        builder = builder.enable_long_distance_matching(true);
+        if let Some(log) = advanced.ldm_hash_log {
+            builder = builder.ldm_hash_log(log);
+        }
+        if let Some(length) = advanced.ldm_min_match {
+            builder = builder.ldm_min_match(length);
+        }
+        if let Some(log) = advanced.ldm_bucket_size_log {
+            builder = builder.ldm_bucket_size_log(log);
+        }
+        if let Some(log) = advanced.ldm_hash_rate_log {
+            builder = builder.ldm_hash_rate_log(log);
+        }
+    }
+    builder = builder.literal_compression(settings.literals);
+    builder
+        .build()
+        .map(Some)
+        .map_err(|err| eyre!("invalid compression parameters: {err}"))
 }
 
 /// How a stream is decoded: whether a stored checksum is compared, and what
@@ -3524,12 +4080,11 @@ fn compress_stream<R: Read, W: Write>(
         store,
         pledged_size,
         size_hint,
-        long,
-        long_window_log,
         target_block_size,
         checksum,
         content_size_flag,
         dict_id_flag,
+        ..
     } = settings;
     let compression_level = if store {
         CompressionLevel::Uncompressed
@@ -3558,23 +4113,13 @@ fn compress_stream<R: Read, W: Write>(
             .set_target_block_size(Some(target))
             .wrap_err("failed to set the block-size target")?;
     }
-    // Long-distance matching (`--long`) is a per-knob override applied via the
-    // compression-parameters API; skip it for `--store` (raw frames don't match).
-    if long && !store {
-        let mut builder =
-            structured_zstd::encoding::CompressionParameters::builder(compression_level)
-                .enable_long_distance_matching(true);
-        // `--long=N` asked for a specific back-reference distance; without it
-        // the level's own window stands.
-        if let Some(log) = long_window_log {
-            builder = builder.window_log(log);
-        }
-        let params = builder
-            .build()
-            .map_err(|err| eyre!("failed to build LDM parameters: {err:?}"))?;
+    // `--long`, `--zstd=` and the literal mode are per-knob overrides applied
+    // via the compression-parameters API; skipped for `--store`, whose raw
+    // frames match nothing.
+    if !store && let Some(params) = frame_parameters(compression_level, settings)? {
         encoder
             .set_parameters(&params)
-            .wrap_err("failed to enable long-distance matching")?;
+            .wrap_err("failed to apply the compression parameters")?;
     }
     if let Some(size) = pledged_size {
         // The size is known exactly (a regular file, or `--stream-size`), so
