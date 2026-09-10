@@ -43,6 +43,93 @@ fn builder_records_each_knob() {
     assert!(!o.is_empty());
 }
 
+/// The literal mode is a knob like the others: recorded by the builder, read
+/// back from the parameters, and an override of the level when it is not
+/// `Auto`, since a non-empty override set is what the reset path acts on.
+#[test]
+fn literal_compression_mode_is_recorded_and_counts_as_an_override() {
+    let auto = CompressionParameters::builder(CompressionLevel::Level(3))
+        .build()
+        .unwrap();
+    assert_eq!(
+        auto.literal_compression_mode(),
+        LiteralCompressionMode::Auto
+    );
+    assert!(auto.overrides().is_empty());
+
+    for mode in [
+        LiteralCompressionMode::Enable,
+        LiteralCompressionMode::Disable,
+    ] {
+        let p = CompressionParameters::builder(CompressionLevel::Level(3))
+            .literal_compression(mode)
+            .build()
+            .unwrap();
+        assert_eq!(p.literal_compression_mode(), mode);
+        assert!(!p.overrides().is_empty(), "{mode:?} overrides the level");
+    }
+}
+
+/// `Disable` stores every literal raw, so text compresses worse than the
+/// level's default; `Enable` on a negative level, where the default is raw,
+/// compresses better. Both frames still decode to the input.
+#[test]
+fn literal_compression_mode_changes_the_frame() {
+    use crate::decoding::StreamingDecoder;
+    use crate::encoding::compress_with_parameters;
+    use crate::io::Read;
+
+    // Literal-heavy input: 32 distinct symbols in a sequence with no repeats
+    // for the match finder, so the frame is all literals and only their
+    // entropy coding can shrink it (5 bits a symbol against 8 raw).
+    let text: alloc::vec::Vec<u8> = (0..8192u32)
+        .map(|i| b'a' + (i.wrapping_mul(2_654_435_761) >> 27) as u8)
+        .collect();
+    let frame_with = |level: i32, mode: LiteralCompressionMode| {
+        let params = CompressionParameters::builder(CompressionLevel::Level(level))
+            .literal_compression(mode)
+            .build()
+            .unwrap();
+        compress_with_parameters(&text[..], &params)
+    };
+    let decoded = |frame: &[u8]| {
+        let mut source = frame;
+        let mut out = alloc::vec::Vec::new();
+        StreamingDecoder::new(&mut source)
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    };
+
+    let auto_l3 = frame_with(3, LiteralCompressionMode::Auto);
+    let raw_l3 = frame_with(3, LiteralCompressionMode::Disable);
+    assert!(
+        raw_l3.len() > auto_l3.len(),
+        "raw literals cost bytes on text: {} vs {}",
+        raw_l3.len(),
+        auto_l3.len()
+    );
+    assert_eq!(decoded(&raw_l3), text);
+
+    let auto_fast = frame_with(-3, LiteralCompressionMode::Auto);
+    let coded_fast = frame_with(-3, LiteralCompressionMode::Enable);
+    assert!(
+        coded_fast.len() < auto_fast.len(),
+        "compressed literals save bytes at a negative level: {} vs {}",
+        coded_fast.len(),
+        auto_fast.len()
+    );
+    assert_eq!(decoded(&coded_fast), text);
+    // `Auto` at a negative level is raw literals, which is what `Disable`
+    // spells out, so the two agree there.
+    assert_eq!(
+        auto_fast,
+        frame_with(-3, LiteralCompressionMode::Disable),
+        "the negative level's default is raw literals"
+    );
+}
+
 #[test]
 fn enable_ldm_sets_override_block() {
     let p = CompressionParameters::builder(CompressionLevel::Level(19))

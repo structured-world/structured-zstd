@@ -138,6 +138,23 @@ impl Strategy {
     }
 }
 
+/// Whether literals are entropy-coded, the drop-in equivalent of C zstd's
+/// `ZSTD_c_literalCompressionMode` (`ZSTD_ps_auto` / `ZSTD_ps_enable` /
+/// `ZSTD_ps_disable`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum LiteralCompressionMode {
+    /// The level decides: literals are stored raw on the fast strategy's
+    /// acceleration (negative) levels, where the Huffman pass costs more
+    /// speed than it saves, and compressed everywhere else.
+    #[default]
+    Auto,
+    /// Compress literals on every level, the negative ones included. A
+    /// block whose literals do not shrink still stores them raw.
+    Enable,
+    /// Never compress literals: every literal section is stored raw.
+    Disable,
+}
+
 /// One tunable compression parameter — the analogue of a C zstd
 /// `ZSTD_cParameter`. Used to query bounds via [`CParameter::bounds`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -288,6 +305,8 @@ pub(crate) struct ParamOverrides {
     /// `Some` when `enable_long_distance_matching(true)` was set; carries
     /// the (possibly empty) LDM knob overrides.
     pub(crate) ldm: Option<LdmOverride>,
+    /// Whether literals are entropy-coded; `Auto` leaves it to the level.
+    pub(crate) literal_compression: LiteralCompressionMode,
 }
 
 impl ParamOverrides {
@@ -303,6 +322,7 @@ impl ParamOverrides {
             && self.target_length.is_none()
             && self.strategy.is_none()
             && self.ldm.is_none()
+            && self.literal_compression == LiteralCompressionMode::Auto
     }
 }
 
@@ -335,6 +355,7 @@ impl CompressionParameters {
             strategy: None,
             enable_ldm: false,
             ldm: LdmOverride::default(),
+            literal_compression: LiteralCompressionMode::Auto,
         }
     }
 
@@ -346,6 +367,11 @@ impl CompressionParameters {
     /// Whether long-distance matching is enabled.
     pub fn long_distance_matching_enabled(&self) -> bool {
         self.overrides.ldm.is_some()
+    }
+
+    /// How literals are entropy-coded (see [`LiteralCompressionMode`]).
+    pub fn literal_compression_mode(&self) -> LiteralCompressionMode {
+        self.overrides.literal_compression
     }
 
     pub(crate) fn overrides(&self) -> ParamOverrides {
@@ -367,9 +393,42 @@ pub struct CompressionParametersBuilder {
     strategy: Option<Strategy>,
     enable_ldm: bool,
     ldm: LdmOverride,
+    literal_compression: LiteralCompressionMode,
 }
 
 impl CompressionParametersBuilder {
+    /// Decide whether literals are entropy-coded, overriding the level's own
+    /// choice. C `ZSTD_c_literalCompressionMode`.
+    ///
+    /// ```rust
+    /// use structured_zstd::encoding::{
+    ///     compress_with_parameters, CompressionLevel, CompressionParameters,
+    ///     LiteralCompressionMode,
+    /// };
+    ///
+    /// // Literal-heavy input: 32 distinct symbols and nothing for the match
+    /// // finder to repeat, so only entropy-coding the literals shrinks it.
+    /// let text: Vec<u8> = (0..8192u32)
+    ///     .map(|i| b'a' + (i.wrapping_mul(2_654_435_761) >> 27) as u8)
+    ///     .collect();
+    /// // Level -3 stores literals raw by default; asking for compression
+    /// // makes the frame smaller on input like this.
+    /// let compressed_literals = CompressionParameters::builder(CompressionLevel::Level(-3))
+    ///     .literal_compression(LiteralCompressionMode::Enable)
+    ///     .build()
+    ///     .unwrap();
+    /// let plain = compress_with_parameters(
+    ///     &text[..],
+    ///     &CompressionParameters::builder(CompressionLevel::Level(-3)).build().unwrap(),
+    /// );
+    /// let coded = compress_with_parameters(&text[..], &compressed_literals);
+    /// assert!(coded.len() < plain.len());
+    /// ```
+    pub fn literal_compression(mut self, mode: LiteralCompressionMode) -> Self {
+        self.literal_compression = mode;
+        self
+    }
+
     /// Override the maximum back-reference distance (`log2`). C
     /// `ZSTD_c_windowLog`.
     pub fn window_log(mut self, value: u32) -> Self {
@@ -495,6 +554,7 @@ impl CompressionParametersBuilder {
                 target_length: self.target_length,
                 strategy: self.strategy,
                 ldm,
+                literal_compression: self.literal_compression,
             },
         })
     }
