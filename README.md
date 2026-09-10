@@ -53,12 +53,27 @@ in nothing extra.
 
 The binary speaks the upstream `zstd`
 command line: levels (`-1`..`-19`, `--ultra` for `-20`..`-22`, `--fast[=N]`),
-`-d`, `-c`, `-o`, `-t`, `-l`, `-D`, `--train`, `-b`, and the usual
-`-f`/`-k`/`--rm` file handling.
+`-d`, `-c`, `-o`, `-t`, `-l` (`-lv` for the per-archive block), `-D`,
+`--train`, `-b`, the usual `-f`/`-k`/`--rm` file handling, the `-q`/`-v`
+display levels, and file selection with `-r`, `--filelist`,
+`--output-dir-flat` and `--output-dir-mirror`. `ZSTD_CLEVEL` sets the default
+level and `ZSTD_NBTHREADS` is validated, both read as upstream reads them.
+Several inputs into one `-o` or `-c` are concatenated after upstream's
+warning, an existing output is asked about unless `-f` is given (and refused
+under `-q`, where nothing can be asked), one failing input does not stop the
+others, and the exit status is 1 when any input failed and 2 on an interrupt,
+which also removes the partial output.
 
-Flags that only steer how the work is done (`-T`, `-B`, `--adapt`,
-`--[no-]progress`, …) are accepted and ignored — their values are still
-validated, so a typo is an error rather than silence.
+The wire-format switches take effect: `--[no-]check` (`--no-check` also skips
+checksum verification when decoding), `--[no-]content-size` and `--no-dictID`.
+`--[no-]pass-through` copies non-zstd input through unchanged when
+decompressing, on by default for `zstdcat` and `zstd -dcf` as upstream has it,
+and `--exclude-compressed` skips inputs whose extension names an
+already-compressed format.
+
+Flags that only steer how the work is done (`-T`, `-B`, `--adapt`, ...) are
+accepted and ignored; their values are still validated, so a typo is an error
+rather than silence.
 `--target-compressed-block-size` does take effect: it bounds what goes into a
 block, so blocks flush sooner. `--long` means `--long=27`, as upstream
 documents, and is capped there: a larger window would produce frames this
@@ -69,9 +84,8 @@ source can fill, so a small file compressed with `--long` does not ask its
 decoders to reserve 128 MiB.
 
 Flags that would change the result are refused instead: `--format=` for
-anything but zstd, `--patch-from`, `--rsyncable`, `--no-check`,
-`--[no-]compress-literals`, and the not-yet-implemented `--pass-through` /
-`--exclude-compressed`. `-M` is treated as the safety promise it is: on the
+anything but zstd, `--patch-from`, `--rsyncable` and
+`--[no-]compress-literals`. `-M` is treated as the safety promise it is: on the
 runs that decode, a limit covering the 128 MiB window, the decoder's buffers
 and the `-D` dictionary is kept and a tighter one is refused rather than
 ignored. Compressing, listing and training allocate no decoder, so the flag is
@@ -90,7 +104,8 @@ familiar names works:
 
 ```bash
 ln -s "$(command -v structured-zstd)" ~/.local/bin/unzstd    # defaults to -d
-ln -s "$(command -v structured-zstd)" ~/.local/bin/zstdcat   # defaults to -d -c
+ln -s "$(command -v structured-zstd)" ~/.local/bin/zstdcat   # -d -c -f, pass-through, quiet
+ln -s "$(command -v structured-zstd)" ~/.local/bin/zstdmt    # compresses like zstd
 ```
 
 Distributions should register it with their alternatives mechanism rather than

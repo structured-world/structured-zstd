@@ -1,57 +1,74 @@
-use std::time::Duration;
+use std::io::{self, Read};
 
-use super::{fmt_duration, fmt_size};
+use super::ProgressMonitor;
 
+/// The monitor is done when the reader is done, and "done" is the reader
+/// saying so, not the byte count matching a number from a directory entry. A
+/// FIFO reports zero, a file can shrink after it was measured, and in both
+/// cases a monitor that waits for the two to meet waits forever.
 #[test]
-fn human_readable_filesize() {
-    // Bytes
-    assert_eq!(&fmt_size(100.0), "100B");
-    // Kibibytes
-    assert_eq!(&fmt_size(12.0 * 2.0_f64.powi(10)), "12.00KiB");
-    // Mebibytes
-    assert_eq!(&fmt_size(7.0 * 2.0_f64.powi(20)), "7.00MiB");
-    // Gibibytes
-    assert_eq!(&fmt_size(123.0 * 2.0_f64.powi(30)), "123.00GiB");
+fn progress_finishes_when_the_reader_does_not_when_the_count_matches() {
+    // A reader with more bytes than the total it was created with.
+    let mut monitor = ProgressMonitor::new(&b"bytes that were not counted"[..], 0, false);
+    let mut sink = Vec::new();
+    io::copy(&mut monitor, &mut sink).expect("copying must succeed");
+    assert!(
+        monitor.finished,
+        "the reader reached its end, so the monitor has to be finished too"
+    );
+    assert_eq!(monitor.read, sink.len() as u64, "and count what it read");
 }
 
+/// `Read::read` answers `Ok(0)` for an empty buffer as well as for the end of
+/// the stream, as the contract says. Treating the first as the second finishes
+/// the monitor before any bytes have moved.
 #[test]
-fn human_readable_duration() {
-    assert_eq!(&fmt_duration(Duration::from_millis(7)), "7.00ms");
-    assert_eq!(&fmt_duration(Duration::from_millis(1500)), "1.50s");
-    assert_eq!(&fmt_duration(Duration::from_secs(30)), "30.0s");
-    assert_eq!(&fmt_duration(Duration::from_secs(90)), "1m 30s");
-    assert_eq!(&fmt_duration(Duration::from_secs(5 * 60)), "5m");
-    assert_eq!(&fmt_duration(Duration::from_secs(3 * 60 * 60)), "3h");
+fn an_empty_buffer_read_is_not_the_end_of_the_stream() {
+    let mut monitor = ProgressMonitor::new(&b"payload"[..], 7, false);
+    assert_eq!(monitor.read(&mut []).unwrap(), 0);
+    assert!(
+        !monitor.finished,
+        "an empty buffer says nothing about the reader"
+    );
+
+    let mut buf = [0u8; 7];
+    assert_eq!(monitor.read(&mut buf).unwrap(), 7);
+    assert!(
+        !monitor.finished,
+        "a total taken from a directory entry does not end the stream"
+    );
+    assert_eq!(monitor.read(&mut buf).unwrap(), 0);
+    assert!(monitor.finished, "the reader saying so does");
+}
+
+/// Both directions stream, so a file only has to fit the window, never memory.
+/// Measuring its length in `usize` puts a 4 GiB ceiling on 32-bit targets that
+/// has nothing to do with what the work needs: the progress counter would be
+/// deciding which archives the tool can open.
+#[test]
+fn a_file_length_is_not_narrowed_to_the_pointer_width() {
+    let huge = u64::from(u32::MAX) + 1;
+    let monitor = ProgressMonitor::new(&b""[..], huge, false);
     assert_eq!(
-        &fmt_duration(Duration::from_secs(60 * 60 + 20 * 60 + 30)),
-        "1h 20m 30s"
+        monitor.total, huge,
+        "a length larger than a 32-bit pointer must survive"
     );
 }
 
-/// Hours are the largest unit this prints, so they count on rather than wrap.
-/// Wrapping them at 60 leaves a two-and-a-half-day run with nothing at all to
-/// show: no hours, no minutes, no seconds, an empty summary.
+/// A read error is the reader's to report; the monitor passes it through
+/// without counting bytes that never arrived or declaring the stream done.
 #[test]
-fn hours_do_not_wrap() {
-    assert_eq!(&fmt_duration(Duration::from_secs(60 * 60 * 60)), "60h");
-    assert_eq!(
-        &fmt_duration(Duration::from_secs(61 * 60 * 60 + 5 * 60)),
-        "61h 5m"
-    );
-}
-
-/// The seconds are shown rounded, and a value that rounds up to a full minute
-/// belongs in the minutes: printed as it stands it reads `1m 60s`, a duration
-/// no clock shows. The carry runs all the way up, so 59m 59.6s is an hour.
-#[test]
-fn rounded_seconds_carry_into_the_next_minute() {
-    assert_eq!(&fmt_duration(Duration::from_millis(119_500)), "2m");
-    // Under a minute the seconds carry a decimal, so the carry is what that
-    // decimal rounds to: 59.96 shown to one place is a minute.
-    assert_eq!(&fmt_duration(Duration::from_millis(59_960)), "1m");
-    assert_eq!(
-        &fmt_duration(Duration::from_millis(3_599_600)),
-        "1h",
-        "the carry runs past the minutes as well"
-    );
+fn a_read_error_passes_through_uncounted() {
+    struct Broken;
+    impl Read for Broken {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("disk on fire"))
+        }
+    }
+    let mut monitor = ProgressMonitor::new(Broken, 10, false);
+    let mut buf = [0u8; 4];
+    let err = monitor.read(&mut buf).expect_err("the error must surface");
+    assert_eq!(err.to_string(), "disk on fire");
+    assert_eq!(monitor.read, 0, "nothing was read");
+    assert!(!monitor.finished, "an error is not the end of the stream");
 }
