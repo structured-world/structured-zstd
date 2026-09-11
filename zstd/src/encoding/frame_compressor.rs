@@ -9,8 +9,8 @@ use twox_hash::XxHash64;
 use core::hash::Hasher;
 
 use super::{
-    CompressionLevel, Matcher, block_header::BlockHeader, frame_header::FrameHeader, levels::*,
-    match_generator::MatchGeneratorDriver,
+    CompressionLevel, LiteralCompressionMode, Matcher, block_header::BlockHeader,
+    frame_header::FrameHeader, levels::*, match_generator::MatchGeneratorDriver,
 };
 use crate::common::MAX_BLOCK_SIZE;
 use crate::fse::fse_encoder::{FSETable, default_ll_table, default_ml_table, default_of_table};
@@ -233,6 +233,10 @@ pub struct FrameCompressor<
     /// after `set_parameters` flips whether the override applies (the
     /// matcher drops it on a dictionary frame).
     target_length_override: Option<u32>,
+    /// Public literal-compression mode (upstream `ZSTD_c_literalCompressionMode`),
+    /// persisted beside the target-length override for the same per-frame
+    /// recomputation of the raw-literals gate.
+    literal_compression_mode: LiteralCompressionMode,
 }
 
 #[derive(Clone, Default)]
@@ -1029,8 +1033,9 @@ pub(crate) fn sync_effective_strategy<M: Matcher>(
     }
 }
 
-/// Upstream `ZSTD_literalsCompressionIsDisabled` (`ps_auto`): raw literals
-/// iff the EFFECTIVE cParams are the fast strategy with `targetLength > 0`.
+/// Upstream `ZSTD_literalsCompressionIsDisabled`: an explicit
+/// [`LiteralCompressionMode`] decides outright; under `Auto`, raw literals iff
+/// the EFFECTIVE cParams are the fast strategy with `targetLength > 0`.
 /// The effective strategy tag gates this (a strategy override can move a
 /// negative level off fast). For the fast strategy the level table sets
 /// `targetLength > 0` exactly on the negative (acceleration) rows, so absent
@@ -1041,12 +1046,19 @@ pub(crate) fn literal_compression_disabled(
     strategy_tag: crate::encoding::strategy::StrategyTag,
     level: CompressionLevel,
     target_length_override: Option<u32>,
+    mode: LiteralCompressionMode,
 ) -> bool {
-    strategy_tag == crate::encoding::strategy::StrategyTag::Fast
-        && target_length_override.map_or_else(
-            || matches!(level, CompressionLevel::Level(n) if n < 0),
-            |tl| tl > 0,
-        )
+    match mode {
+        LiteralCompressionMode::Disable => true,
+        LiteralCompressionMode::Enable => false,
+        LiteralCompressionMode::Auto => {
+            strategy_tag == crate::encoding::strategy::StrategyTag::Fast
+                && target_length_override.map_or_else(
+                    || matches!(level, CompressionLevel::Level(n) if n < 0),
+                    |tl| tl > 0,
+                )
+        }
+    }
 }
 
 /// The level params the matcher's reset resolves for a frame: through the
@@ -1476,6 +1488,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             block_decompressed_sizes: alloc::vec::Vec::new(),
             strategy_override: None,
             target_length_override: None,
+            literal_compression_mode: LiteralCompressionMode::Auto,
         }
     }
 
@@ -1506,6 +1519,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         let overrides = params.overrides();
         self.strategy_override = overrides.strategy.map(|s| (s.tag(), s.lazy_depth()));
         self.target_length_override = overrides.target_length;
+        self.literal_compression_mode = overrides.literal_compression;
         // Keep `state.strategy_tag` consistent immediately so the borrowed
         // one-shot eligibility gate (`borrowed_eligible`) and literal gates
         // are correct even before the next `compress()` re-sync. Resolve it
@@ -1526,6 +1540,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             self.state.strategy_tag,
             self.compression_level,
             overrides.target_length.filter(|_| !dict_frame),
+            self.literal_compression_mode,
         );
         self.state.matcher.set_param_overrides(Some(overrides));
     }
@@ -1890,6 +1905,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             block_decompressed_sizes: alloc::vec::Vec::new(),
             strategy_override: None,
             target_length_override: None,
+            literal_compression_mode: LiteralCompressionMode::Auto,
         }
     }
 
@@ -2225,6 +2241,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             self.state.strategy_tag,
             self.compression_level,
             self.target_length_override.filter(|_| !planned),
+            self.literal_compression_mode,
         );
         let cached_entropy = if use_dictionary_state {
             self.dictionary_entropy_cache.as_ref()
@@ -3071,7 +3088,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// This also clears any fine-grained parameter overrides installed via
     /// [`set_parameters`](Self::set_parameters): reverting to a bare level
     /// means plain level-based tuning, not the previous frame's customized
-    /// strategy / LDM / log overrides. To keep overriding, call
+    /// strategy / LDM / log / literal-mode overrides. To keep overriding, call
     /// [`set_parameters`](Self::set_parameters) again with the new base level.
     pub fn set_compression_level(
         &mut self,
@@ -3087,9 +3104,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             compression_level,
             CompressionLevel::Level(n) if n < 0
         );
-        // Drop sticky overrides so the level switch yields plain geometry.
+        // Drop sticky overrides so the level switch yields plain geometry,
+        // the literal mode included: the gate above is the bare level's rule.
         self.strategy_override = None;
         self.target_length_override = None;
+        self.literal_compression_mode = LiteralCompressionMode::Auto;
         self.state.matcher.clear_param_overrides();
         old
     }

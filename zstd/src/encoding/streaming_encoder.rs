@@ -65,6 +65,9 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// resolved at frame start reads the value the matcher runs (dropped on a
     /// dictionary frame, where the CDict's targetLength applies).
     target_length_override: Option<u32>,
+    /// Public literal-compression mode (upstream `ZSTD_c_literalCompressionMode`),
+    /// read by the same gate; mirrors `FrameCompressor`'s field.
+    literal_compression_mode: crate::encoding::LiteralCompressionMode,
     /// `ZSTD_f_zstd1_magicless` — omit the 4-byte magic number prefix.
     /// Default false. See [`Self::set_magicless`].
     magicless: bool,
@@ -127,6 +130,7 @@ impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
         // resync does not discard it (matching `FrameCompressor::set_parameters`).
         self.strategy_override = overrides.strategy.map(|s| (s.tag(), s.lazy_depth()));
         self.target_length_override = overrides.target_length;
+        self.literal_compression_mode = overrides.literal_compression;
         self.state.strategy_tag = self.strategy_override.map_or_else(
             || {
                 crate::encoding::strategy::StrategyTag::for_compression_level(
@@ -189,6 +193,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             savings: 0,
             strategy_override: None,
             target_length_override: None,
+            literal_compression_mode: crate::encoding::LiteralCompressionMode::Auto,
             magicless: false,
             content_checksum: false,
             dictionary: None,
@@ -658,6 +663,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 self.state.strategy_tag,
                 self.compression_level,
                 self.target_length_override.filter(|_| !dict_frame),
+                self.literal_compression_mode,
             );
         self.savings = 0;
         #[cfg(feature = "hash")]
