@@ -2517,6 +2517,47 @@ fn set_compression_level_resyncs_literal_disable_for_negatives() {
     );
 }
 
+/// Regression: `set_compression_level` must forget a literal compression mode
+/// installed by `set_parameters` along with the other overrides, so a
+/// compressor switched back to a bare level emits the frame that level emits
+/// on its own, not one carrying the previous parameters' raw literals.
+#[cfg(feature = "std")]
+#[test]
+fn set_compression_level_forgets_the_literal_compression_mode() {
+    use super::CompressionLevel;
+    use crate::encoding::{CompressionParameters, LiteralCompressionMode};
+
+    // Literal-heavy input: 32 symbols with nothing for the match finder, so
+    // whether the literals are Huffman-coded decides the frame size.
+    let text: Vec<u8> = (0..8192u32)
+        .map(|i| b'a' + (i.wrapping_mul(2_654_435_761) >> 27) as u8)
+        .collect();
+    let level = CompressionLevel::Level(3);
+    let raw_literals = CompressionParameters::builder(level)
+        .literal_compression(LiteralCompressionMode::Disable)
+        .build()
+        .unwrap();
+
+    let mut reused: FrameCompressor = FrameCompressor::new(level);
+    reused.set_parameters(&raw_literals);
+    let with_raw = reused.compress_independent_frame(&text);
+    reused.set_compression_level(level);
+    let after_switch = reused.compress_independent_frame(&text);
+
+    let mut fresh: FrameCompressor = FrameCompressor::new(level);
+    let plain = fresh.compress_independent_frame(&text);
+    assert!(
+        with_raw.len() > plain.len(),
+        "the fixture must make the mode visible: {} vs {} bytes",
+        with_raw.len(),
+        plain.len()
+    );
+    assert_eq!(
+        after_switch, plain,
+        "a bare level after set_parameters must compress as that level alone does"
+    );
+}
+
 /// Regression: `set_compression_level` followed by `compress()` must
 /// refresh `state.strategy_tag` through the reset-time sync so the
 /// literal-compression gates (`min_literals_to_compress`,
