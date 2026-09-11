@@ -270,8 +270,8 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
 #[test]
 fn estimator_literals_section_mirrors_emit_for_short_inputs() {
     use super::{
-        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace,
-        encode_block_parts_with_sequence_scratch, estimate_block_parts_size,
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, encode_block_parts,
+        estimate_block_parts_size,
     };
     // For each strategy at boundary literal lengths around `min_lits`
     // and across the all-identical RLE pre-check (fires for any
@@ -383,13 +383,12 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             let mut workspace = EstimatorWorkspace::default();
             let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
             let mut emitted: Vec<u8> = Vec::new();
-            let mut scratch: Vec<crate::blocks::sequence_section::Sequence> = Vec::new();
-            encode_block_parts_with_sequence_scratch(
+            encode_block_parts(
                 &mut emit_state,
                 &literals,
-                &[],
+                &mut [],
+                &mut Vec::new(),
                 &mut emitted,
-                &mut scratch,
             );
             assert_eq!(
                 est,
@@ -409,8 +408,8 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
 #[test]
 fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
     use super::{
-        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace,
-        encode_block_parts_with_sequence_scratch, estimate_block_parts_size,
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, encode_block_parts,
+        estimate_block_parts_size,
     };
     // The shape the end-sample shortcut exists for, and the one where the
     // estimator and the emitter can disagree: both ends look random, the
@@ -450,13 +449,12 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
     let mut workspace = EstimatorWorkspace::default();
     let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
     let mut emitted: Vec<u8> = Vec::new();
-    let mut scratch: Vec<crate::blocks::sequence_section::Sequence> = Vec::new();
-    encode_block_parts_with_sequence_scratch(
+    encode_block_parts(
         &mut emit_state,
         &literals,
-        &[],
+        &mut [],
+        &mut Vec::new(),
         &mut emitted,
-        &mut scratch,
     );
 
     assert_eq!(
@@ -486,6 +484,117 @@ fn encode_match_len_uses_correct_upper_range_base() {
     assert_eq!(encode_match_len(131074), (52, 65535, 16));
 }
 
+/// The scratch is taken and put back around a block, so every buffer it keeps
+/// is retained allocation a context reports through `ZSTD_sizeof_CCtx`. The
+/// per-sequence code buffer is one of them, and a caller budgeting memory sees
+/// whatever this sum leaves out.
+#[test]
+fn retained_heap_size_counts_the_sequence_code_buffer() {
+    let mut scratch = super::CompressedBlockScratch::new();
+    let before = scratch.retained_heap_size();
+    let codes = 1024;
+    scratch.sequence_codes.reserve_exact(codes);
+    let after = scratch.retained_heap_size();
+    assert!(
+        after - before >= codes * core::mem::size_of::<u32>(),
+        "reserving {codes} sequence codes grew the reported retained size by only {} bytes",
+        after - before,
+    );
+}
+
+/// The estimator prices a block the splitter is thinking about; the emitter
+/// writes the one it chose. They walk the sequences by different routes: the
+/// emitter derives each offset code, packs it with the extra-bit widths and
+/// runs the FSE writer, while the estimator counts from a scratch history and
+/// prices the streams from a per-symbol cost model. The parity tests above use
+/// empty sequence arrays; this one carries sequences through both.
+///
+/// The two agree EXACTLY on the literals section, whose Huffman code lengths
+/// are known per symbol. They cannot on the sequences section, and are not
+/// meant to: the FSE cost model prices a symbol at its average width from the
+/// normalised probability (upstream does the same in `ZSTD_fseBitCost`), where
+/// the writer pays what the state trajectory actually costs. What must hold is
+/// that the two stay within that model's rounding of each other, and that they
+/// walked the same sequences — a wrong offset code on either side moves the
+/// histogram, the table choice and the price by far more than rounding.
+#[test]
+fn estimator_and_emitter_agree_on_a_block_with_sequences() {
+    use super::{
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, encode_block_parts,
+        estimate_block_parts_size,
+    };
+    // Enough sequences for the section to carry real FSE tables rather than
+    // the degenerate single-symbol shapes, with repeats among the offsets so
+    // the repeat-offset codes are exercised beside the explicit ones.
+    let literals: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+    let sequences: Vec<RawSequence> = (0..64u32)
+        .map(|i| RawSequence {
+            ll: i % 8,
+            ml: 4 + i % 13,
+            off_base: 1 + (i % 5) * 7,
+        })
+        .collect();
+
+    for strat in [StrategyTag::Fast, StrategyTag::Lazy, StrategyTag::BtUltra2] {
+        let make_state = || CompressState::<EntropyOnlyMatcher> {
+            matcher: EntropyOnlyMatcher,
+            copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
+            last_huff_table: None,
+            huff_table_spare: None,
+            huff_rollback: None,
+            huff_weights: Default::default(),
+            seen_content: Default::default(),
+            fse_tables: FseTables::new(),
+            block_scratch: CompressedBlockScratch::new(),
+            offset_hist: [1, 4, 8],
+            strategy_tag: strat,
+            pre_split: None,
+            huf_optimal_search: true,
+            literal_compression_disabled: false,
+        };
+        let mut est_state = make_state();
+        let mut emit_state = make_state();
+
+        let mut workspace = EstimatorWorkspace::default();
+        let est = estimate_block_parts_size(&mut est_state, &literals, &sequences, &mut workspace);
+
+        let mut emitted: Vec<u8> = Vec::new();
+        let mut to_emit = sequences.clone();
+        encode_block_parts(
+            &mut emit_state,
+            &literals,
+            &mut to_emit,
+            &mut Vec::new(),
+            &mut emitted,
+        );
+
+        // Both sides must have advanced the repeat-offset history the same
+        // way. This is the assertion that catches a wrong offset code: the
+        // byte counts could coincide, the histories cannot.
+        assert_eq!(
+            est_state.offset_hist, emit_state.offset_hist,
+            "estimator and emitter disagree on the repeat-offset history at {strat:?}",
+        );
+        // The block really did carry a sequence section — otherwise the rest
+        // of this test would be passing on the literals path alone.
+        assert!(emitted.len() > literals.len() / 2);
+        // One byte per sixteen sequences plus four, against a model that
+        // rounds each symbol's width down from a 256-scale log table. The
+        // measured divergence for this fixture is two bytes on every strategy;
+        // the bound leaves room for the rounding to accumulate without letting
+        // a real divergence through, which moves the price by tens of bytes.
+        let allowed = 4 + sequences.len() / 16;
+        let diff = est.abs_diff(emitted.len());
+        assert!(
+            diff <= allowed,
+            "estimator priced {est} bytes against {} emitted for {} sequences at {strat:?}: \
+             off by {diff}, more than the {allowed} the cost model can round away",
+            emitted.len(),
+            sequences.len(),
+        );
+    }
+}
+
 #[test]
 fn raw_partition_fallback_restores_repeat_offset_history() {
     let mut state = CompressState {
@@ -505,26 +614,26 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         literal_compression_disabled: false,
     };
     let source = [0xA5; 8];
-    let sequences = [RawSequence {
+    let mut sequences = [RawSequence {
         ll: 0,
         ml: 5,
-        offset: 20,
+        off_base: 20,
     }];
     let mut output = Vec::new();
     let mut compressed_scratch = Vec::new();
-    let mut sequence_scratch = Vec::new();
 
+    let mut code_scratch = Vec::new();
     let mut emit_buffers = super::SingleSequenceEmitBuffers {
         output: &mut output,
         compressed: &mut compressed_scratch,
-        sequence_scratch: &mut sequence_scratch,
+        codes: &mut code_scratch,
     };
     let emitted_raw = emit_single_sequence_block(
         &mut state,
         true,
         source.len(),
         &[],
-        &sequences,
+        &mut sequences,
         &mut emit_buffers,
     );
     if emitted_raw {

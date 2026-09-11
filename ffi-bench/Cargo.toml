@@ -161,6 +161,10 @@ name = "incompressibility_falsepos"
 path = "../zstd/tests/incompressibility_falsepos.rs"
 
 [[example]]
+name = "slide_oversized_table"
+path = "../zstd/examples/slide_oversized_table.rs"
+
+[[example]]
 name = "alloc_audit_decode"
 path = "../zstd/examples/alloc_audit_decode.rs"
 required-features = ["dhat-heap"]

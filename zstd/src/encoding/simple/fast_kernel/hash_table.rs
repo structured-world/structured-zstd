@@ -231,6 +231,41 @@ impl FastHashTable {
         self.bias = 0;
     }
 
+    /// Slide every stored position down by `drop_n`, the way upstream's
+    /// `ZSTD_reduceIndex` does when the window moves: the table keeps naming
+    /// the same bytes, and a position that named part of the dropped prefix
+    /// becomes the empty sentinel.
+    ///
+    /// This is what a window slide costs when the caller does not rebuild the
+    /// table: one pass over the table's own entries, against a pass over every
+    /// byte the window kept. It also leaves the table holding exactly what it
+    /// held before the slide, where a rebuild adds entries for positions the
+    /// matcher had skipped and never indexed.
+    ///
+    /// `saturating_sub` is the semantics here, not a guard: below the bias a
+    /// slot is already empty, and at or under `drop_n` the position it names is
+    /// gone. Both floor at the sentinel, and both floor at the same place, so
+    /// the two are one subtraction of their sum — which is what the loop does,
+    /// since it runs once per table entry and both terms are fixed for the
+    /// whole slide.
+    pub(crate) fn reduce_indices(&mut self, drop_n: u32) {
+        // Plain `+`: [`Self::advance_epoch`] keeps `bias <= u32::MAX - 2^31`,
+        // and `drop_n` is a length inside a history the matcher caps at
+        // `2 * max_window_size <= 2^31`, so the sum lands at `u32::MAX` at the
+        // very most. Asserted rather than assumed, because a wrap here would
+        // not fail — it would quietly resurrect dropped positions.
+        debug_assert!(
+            self.bias.checked_add(drop_n).is_some(),
+            "epoch bias {} plus a {drop_n}-byte slide overflows a stored position",
+            self.bias,
+        );
+        let correction = self.bias + drop_n;
+        for slot in self.table.iter_mut() {
+            *slot = slot.saturating_sub(correction);
+        }
+        self.bias = 0;
+    }
+
     /// Continue-mode frame reset (upstream zstd `ZSTD_continueCCtx` cadence): keep
     /// the table contents and advance the epoch bias past every entry the
     /// previous frame stored, so all of them read back as the empty
