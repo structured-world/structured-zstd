@@ -90,6 +90,43 @@ fn named_symlinks_are_skipped_unless_links_are_followed() {
     assert!(err.contains("symbolic link"), "the refusal says why: {err}");
 }
 
+/// A run whose named inputs were all links still has the inputs its
+/// `--filelist` names: the "nothing left" refusal is judged on the merged set,
+/// not on the command line alone.
+#[cfg(unix)]
+#[test]
+fn a_filelist_keeps_the_run_alive_when_every_named_input_is_a_link() {
+    let scratch = Scratch::new("linklist");
+    let target = scratch.file("target.txt");
+    let link = scratch.path().join("link.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let list = scratch.path().join("list.txt");
+    fs::write(&list, format!("{}\n", target.display())).unwrap();
+
+    let selection = select_inputs(vec![link], &[list], false, false, 0)
+        .expect("the list still supplies an input");
+    assert_eq!(selection.files, vec![target]);
+}
+
+/// Under `-f` a link back to an ancestor directory is entered once and then
+/// recognised: the walk reports the loop and does not descend again, so each
+/// file is listed once instead of once per nesting level until the path runs
+/// out of room.
+#[cfg(unix)]
+#[test]
+fn a_link_back_into_the_tree_is_not_walked_twice_under_f() {
+    let scratch = Scratch::new("loop");
+    let leaf = scratch.file("tree/inner/leaf.txt");
+    std::os::unix::fs::symlink(
+        scratch.path().join("tree"),
+        scratch.path().join("tree/inner/up"),
+    )
+    .unwrap();
+
+    let selection = select_inputs(vec![scratch.path().join("tree")], &[], true, true, 0).unwrap();
+    assert_eq!(selection.files, vec![leaf]);
+}
+
 /// The same rule inside a walked tree: a link found by `-r` is skipped without
 /// `-f`, so a tree with a link back into itself does not loop, and a link to a
 /// directory is not descended into.
