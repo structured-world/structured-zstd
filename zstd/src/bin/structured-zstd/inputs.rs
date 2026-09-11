@@ -6,7 +6,9 @@
 //! `--output-dir-mirror`. The reference command does this in `zstdcli.c` and
 //! `util.c`, and the order of the steps is kept: symbolic links are dropped
 //! from the NAMED inputs before the file lists are merged, and directories are
-//! expanded after.
+//! expanded after. One departure: whether anything is left to do is judged
+//! once the file lists are in. The reference command judges the named inputs
+//! alone, which fails a run whose list still names usable inputs.
 
 use std::ffi::OsString;
 use std::fs;
@@ -56,25 +58,88 @@ pub fn select_inputs(
         }
         files.push(input);
     }
-    if files.is_empty() && named_count > 0 {
-        bail!("every named input is a symbolic link; pass -f to follow them");
-    }
     for list in filelists {
         files.extend(read_filelist(list)?);
+    }
+    if files.is_empty() && named_count > 0 {
+        bail!("every named input is a symbolic link; pass -f to follow them");
     }
     let named = files.len();
     if recursive {
         let mut expanded = Vec::with_capacity(files.len());
         for input in files {
-            if fs::metadata(&input).is_ok_and(|m| m.is_dir()) {
-                walk_directory(&input, follow_links, verbosity, &mut expanded);
-            } else {
-                expanded.push(input);
+            match fs::metadata(&input) {
+                Ok(metadata) if metadata.is_dir() => {
+                    let mut ancestors = Vec::new();
+                    descend(
+                        &input,
+                        &metadata,
+                        follow_links,
+                        verbosity,
+                        &mut expanded,
+                        &mut ancestors,
+                    );
+                }
+                _ => expanded.push(input),
             }
         }
         files = expanded;
     }
     Ok(Selection { files, named })
+}
+
+/// What identifies a directory whatever name reaches it, so a walk notices
+/// when a link has led it back to a directory it is already inside.
+#[cfg(unix)]
+type DirId = (u64, u64);
+#[cfg(not(unix))]
+type DirId = PathBuf;
+
+/// The identity of the directory at `path`, whose `metadata` (links followed)
+/// is already in hand; the device and inode where the file system has them,
+/// the canonical path elsewhere.
+#[cfg(unix)]
+fn dir_id(path: &Path, metadata: &fs::Metadata) -> Option<DirId> {
+    use std::os::unix::fs::MetadataExt;
+    let _ = path;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn dir_id(path: &Path, metadata: &fs::Metadata) -> Option<DirId> {
+    let _ = metadata;
+    fs::canonicalize(path).ok()
+}
+
+/// Walk `dir` unless the walk is already inside it. A link followed under
+/// `-f`, or a bind mount, can lead back to an ancestor; entering it again
+/// would list the tree once more per nesting level until the path ran out of
+/// room, so the loop is reported and not descended. `ancestors` holds the
+/// directories on the way down to `dir`.
+fn descend(
+    dir: &Path,
+    metadata: &fs::Metadata,
+    follow_links: bool,
+    verbosity: i32,
+    out: &mut Vec<PathBuf>,
+    ancestors: &mut Vec<DirId>,
+) {
+    let Some(id) = dir_id(dir, metadata) else {
+        walk_directory(dir, follow_links, verbosity, out, ancestors);
+        return;
+    };
+    if ancestors.contains(&id) {
+        display!(
+            verbosity,
+            2,
+            "Warning : {} leads back into a directory being walked, ignoring",
+            dir.display()
+        );
+        return;
+    }
+    ancestors.push(id);
+    walk_directory(dir, follow_links, verbosity, out, ancestors);
+    ancestors.pop();
 }
 
 /// Whether `path` itself is a symbolic link, whatever it points at.
@@ -160,8 +225,15 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 /// Entries are taken in name order so two runs over one tree process it the
 /// same way; the reference command takes them in directory order, which the
 /// filesystem does not promise to keep. A directory that cannot be read is
-/// reported and contributes nothing, as there too.
-fn walk_directory(dir: &Path, follow_links: bool, verbosity: i32, out: &mut Vec<PathBuf>) {
+/// reported and contributes nothing, as there too. Subdirectories go through
+/// [`descend`], which keeps a link from leading the walk round in a circle.
+fn walk_directory(
+    dir: &Path,
+    follow_links: bool,
+    verbosity: i32,
+    out: &mut Vec<PathBuf>,
+    ancestors: &mut Vec<DirId>,
+) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) => {
@@ -196,10 +268,11 @@ fn walk_directory(dir: &Path, follow_links: bool, verbosity: i32, out: &mut Vec<
             );
             continue;
         }
-        if fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
-            walk_directory(&path, follow_links, verbosity, out);
-        } else {
-            out.push(path);
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {
+                descend(&path, &metadata, follow_links, verbosity, out, ancestors);
+            }
+            _ => out.push(path),
         }
     }
 }
@@ -286,14 +359,20 @@ fn create_dir_if_missing(dir: &Path, permissions: Option<fs::Permissions>) -> st
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
-    let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
-    if let Some(permissions) = &permissions {
+    let builder = {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        builder.mode(permissions.mode() & 0o7777);
-    }
+        let mut builder = fs::DirBuilder::new();
+        if let Some(permissions) = &permissions {
+            builder.mode(permissions.mode() & 0o7777);
+        }
+        builder
+    };
     #[cfg(not(unix))]
-    let _ = permissions;
+    let builder = {
+        let _ = permissions;
+        fs::DirBuilder::new()
+    };
     builder.create(dir)
 }
 
