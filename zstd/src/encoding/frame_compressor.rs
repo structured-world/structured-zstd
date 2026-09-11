@@ -3088,7 +3088,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// This also clears any fine-grained parameter overrides installed via
     /// [`set_parameters`](Self::set_parameters): reverting to a bare level
     /// means plain level-based tuning, not the previous frame's customized
-    /// strategy / LDM / log overrides. To keep overriding, call
+    /// strategy / LDM / log / literal-mode overrides. To keep overriding, call
     /// [`set_parameters`](Self::set_parameters) again with the new base level.
     pub fn set_compression_level(
         &mut self,
@@ -3104,9 +3104,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             compression_level,
             CompressionLevel::Level(n) if n < 0
         );
-        // Drop sticky overrides so the level switch yields plain geometry.
+        // Drop sticky overrides so the level switch yields plain geometry,
+        // the literal mode included: the gate above is the bare level's rule.
         self.strategy_override = None;
         self.target_length_override = None;
+        self.literal_compression_mode = LiteralCompressionMode::Auto;
         self.state.matcher.clear_param_overrides();
         old
     }
