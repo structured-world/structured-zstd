@@ -28,7 +28,7 @@ path = "src/lib.rs"
 # in per-target via `required-features` below, so a bench built in isolation
 # (`cargo bench --bench compare_ffi`) never links them.
 structured-zstd = { version = "0.0", path = "../zstd", features = ["dict-builder"] }
-zstd = { version = "0.13.3", features = ["zdict_builder", "experimental"] }
+zstd = { version = "0.14.0", features = ["zdict_builder", "experimental"] }
 criterion = "0.8"
 rand = "0.10"
 dhat = "0.3"
