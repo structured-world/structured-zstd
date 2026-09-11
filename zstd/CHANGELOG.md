@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.53](https://github.com/structured-world/structured-zstd/compare/v0.0.52...v0.0.53) - 2026-09-11
+
+### Performance
+
+- *(opt)* close a third of the optimal finder's gap to libzstd on the dictionary band ([#498](https://github.com/structured-world/structured-zstd/pull/498))
+
 ## [0.0.52](https://github.com/structured-world/structured-zstd/compare/v0.0.51...v0.0.52) - 2026-09-08
 
 ### Fixed
