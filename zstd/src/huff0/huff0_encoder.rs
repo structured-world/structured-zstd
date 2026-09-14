@@ -642,7 +642,7 @@ impl HuffmanTable {
             // every searched build, including each splitter candidate.
             Self::build_from_counts(counts)
         } else {
-            let total = assert_histogram_fits_nodes(counts);
+            let total = assert_histogram_fits_nodes::<false>(counts).total;
             // Match upstream's cheap path: tableLog = FSE_optimalTableLog(11,
             // srcSize, maxSV, minus=1) (huf_compress.c:1286), height-limit to it,
             // not the raw natural height (11) which can cost a few bytes vs C.
@@ -653,12 +653,10 @@ impl HuffmanTable {
     }
 
     pub fn build_from_counts(counts: &[usize]) -> Self {
-        let total = assert_histogram_fits_nodes(counts);
-        // Read only by the measurement-only cheap override below; the search
-        // does not need it.
-        #[cfg(not(feature = "bench-internals"))]
-        let _ = total;
-        let symbol_cardinality = counts.iter().filter(|&&count| count > 0).count();
+        // One pass validates the histogram and counts its symbols; the total it
+        // also carries is read only by the measurement-only cheap override.
+        let shape = assert_histogram_fits_nodes::<true>(counts);
+        let symbol_cardinality = shape.symbols;
         if symbol_cardinality <= 1 {
             return Self::build_from_weights(&build_limited_weights(counts, 11));
         }
@@ -670,7 +668,7 @@ impl HuffmanTable {
         if FORCE_CHEAP_HUF.load(core::sync::atomic::Ordering::Relaxed) {
             return Self::build_from_weights(&build_limited_weights(
                 counts,
-                cheap_huf_table_log(counts, total),
+                cheap_huf_table_log(counts, shape.total),
             ));
         }
 
@@ -1244,23 +1242,47 @@ const NO_PARENT: u16 = u16::MAX;
 /// 64-bit targets, and saturates rather than wrapping — a total that saturates
 /// is far past the bound and is refused either way.
 ///
-/// Returns that total, so a caller that needs it (the cheap path's table-log
-/// pick) does not walk the histogram a second time to get the same number.
-fn assert_histogram_fits_nodes(counts: &[usize]) -> usize {
+/// Returns what the pass learned, so no caller walks the histogram a second
+/// time for it: the total (the cheap path's table-log pick) and, with
+/// `COUNT_SYMBOLS`, how many symbols occur (the search path's degenerate-table
+/// gate and its first candidate log). The cheap path does not ask for the
+/// count and pays nothing for it.
+fn assert_histogram_fits_nodes<const COUNT_SYMBOLS: bool>(counts: &[usize]) -> HistogramShape {
     assert!(
         counts.len() <= MAX_HUFFMAN_ALPHABET,
         "histogram has {} symbols, more than the {MAX_HUFFMAN_ALPHABET} a Huffman table describes",
         counts.len(),
     );
-    let total = counts
+    let (total, symbols) = counts
         .iter()
-        .fold(0u64, |sum, &count| sum.saturating_add(count as u64));
+        .fold((0u64, 0usize), |(sum, symbols), &count| {
+            // At most one per slot of an alphabet asserted to 256 slots.
+            let symbols = if COUNT_SYMBOLS {
+                symbols + usize::from(count != 0)
+            } else {
+                symbols
+            };
+            (sum.saturating_add(count as u64), symbols)
+        });
     assert!(
         total < u32::MAX as u64,
         "symbol counts sum to {total}, which a tree node's count cannot hold",
     );
-    // Under `u32::MAX` by the assert above, so it fits a 32-bit `usize`.
-    total as usize
+    HistogramShape {
+        // Under `u32::MAX` by the assert above, so it fits a 32-bit `usize`.
+        total: total as usize,
+        symbols,
+    }
+}
+
+/// What [`assert_histogram_fits_nodes`] learns about a histogram in its one
+/// pass over it.
+#[derive(Clone, Copy)]
+struct HistogramShape {
+    /// The sum of the counts.
+    total: usize,
+    /// How many symbols have a non-zero count; 0 unless the caller asked.
+    symbols: usize,
 }
 
 /// Build the count-sorted Huffman leaves with their natural (unlimited) code

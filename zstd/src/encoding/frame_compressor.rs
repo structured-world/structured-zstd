@@ -1541,7 +1541,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     ///
     /// No window-size gate: over-window inputs are handled too. The owned
     /// path bounds matches to the last `advertised_window` bytes via
-    /// `window_low` and evicts/rehashes its history; the borrowed path
+    /// `window_low` and evicts its history, sliding the table's stored
+    /// positions down with it; the borrowed path
     /// computes the identical `window_low = block_end - advertised_window`
     /// and the kernel rejects any hash candidate below it, while the
     /// per-position `put` during the scan keeps in-window slots current,

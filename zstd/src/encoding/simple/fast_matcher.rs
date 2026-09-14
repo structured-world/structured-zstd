@@ -748,7 +748,7 @@ impl FastKernelMatcher {
     /// window borrow stays a disjoint field projection alongside the
     /// `&mut self.hash_table` borrow (a `&self` accessor call would
     /// borrow all of `self` and collide). Owned-only mutation paths
-    /// (append, drain, rehash) keep accessing the backing buffer
+    /// (append, drain, index slide) keep accessing the backing buffer
     /// directly.
     #[inline(always)]
     fn history_bytes(&self) -> &[u8] {
@@ -1273,8 +1273,8 @@ impl FastKernelMatcher {
     /// are supported: matches are bounded by `window_low = block_end -
     /// advertised_window` (the same bound the owned evicting path applies),
     /// and the per-position `put` during the scan keeps in-window hash
-    /// slots current — so an out-of-window stale slot is rejected exactly
-    /// where the owned rehash would have left the slot empty, giving
+    /// slots current, so an out-of-window stale slot is rejected exactly
+    /// where the owned index slide would have left the slot empty, giving
     /// identical match decisions with or without eviction.
     pub(crate) fn start_matching_borrowed(
         &mut self,
