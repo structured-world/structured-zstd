@@ -7,12 +7,16 @@
 //! million entries over a window of a kilobyte, sliding once per kilobyte of
 //! input, and reports what the parameter resolution actually built.
 //!
-//! It does not build that table in either mode. Without a dictionary `hashLog`
-//! is capped at `windowLog + 1`, two entries per window byte. With one, the
-//! frame runs the dictionary's own table geometry and the requested `hashLog`
-//! is not read at all. The `heap=` figure shows which table was built, and
-//! running the same arguments with a smaller `hash_log` must print the same
-//! figure in both modes.
+//! Neither mode builds that table; each is a benchmark of the table the
+//! resolution does build, and the output line names which one ran:
+//!
+//! - `mode=capped` (no `dict_path`, the default): `hashLog` is capped at
+//!   `windowLog + 1`, two entries per window byte.
+//! - `mode=dictionary` (with `dict_path`): the frame runs the dictionary's own
+//!   table geometry, and the requested `hashLog` is not read at all.
+//!
+//! The `heap=` figure shows the table that was built; the same arguments with
+//! a smaller `hash_log` print the same figure in both modes.
 //!
 //! Build: cargo build --profile bench -p ffi-bench --example slide_oversized_table
 //! Run:   ./target/release/examples/slide_oversized_table
@@ -79,9 +83,14 @@ fn main() {
         core::hint::black_box(&out);
     }
 
+    let mode = if dict_path.is_some() {
+        "dictionary"
+    } else {
+        "capped"
+    };
     eprintln!(
-        "windowLog={window_log} hashLog={hash_log} frame={frame_bytes} iters={iters} \
-         dict={} out={} sum={sink} heap={}",
+        "mode={mode} windowLog={window_log} hashLog={hash_log} frame={frame_bytes} \
+         iters={iters} dict={} out={} sum={sink} heap={}",
         dict_path.unwrap_or("none"),
         out.len(),
         cctx.heap_size(),

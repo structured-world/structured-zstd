@@ -642,18 +642,22 @@ impl HuffmanTable {
             // every searched build, including each splitter candidate.
             Self::build_from_counts(counts)
         } else {
-            assert_histogram_fits_nodes(counts);
+            let total = assert_histogram_fits_nodes(counts);
             // Match upstream's cheap path: tableLog = FSE_optimalTableLog(11,
             // srcSize, maxSV, minus=1) (huf_compress.c:1286), height-limit to it,
             // not the raw natural height (11) which can cost a few bytes vs C.
-            build_limited_weights_into(counts, cheap_huf_table_log(counts), scratch);
+            build_limited_weights_into(counts, cheap_huf_table_log(counts, total), scratch);
             let spare = scratch.spare_table.take();
             Self::build_from_weights_reusing(&scratch.weights, spare)
         }
     }
 
     pub fn build_from_counts(counts: &[usize]) -> Self {
-        assert_histogram_fits_nodes(counts);
+        let total = assert_histogram_fits_nodes(counts);
+        // Read only by the measurement-only cheap override below; the search
+        // does not need it.
+        #[cfg(not(feature = "bench-internals"))]
+        let _ = total;
         let symbol_cardinality = counts.iter().filter(|&&count| count > 0).count();
         if symbol_cardinality <= 1 {
             return Self::build_from_weights(&build_limited_weights(counts, 11));
@@ -666,7 +670,7 @@ impl HuffmanTable {
         if FORCE_CHEAP_HUF.load(core::sync::atomic::Ordering::Relaxed) {
             return Self::build_from_weights(&build_limited_weights(
                 counts,
-                cheap_huf_table_log(counts),
+                cheap_huf_table_log(counts, total),
             ));
         }
 
@@ -1232,13 +1236,17 @@ const NO_PARENT: u16 = u16::MAX;
 ///
 /// Called at the entry points rather than at the narrowing itself, because
 /// what runs in between reads the histogram too: the cheap path's table-log
-/// pick sums the counts in a `usize`, which on a 32-bit target overflows on
-/// the same input this exists to reject, before the tree is ever built.
+/// pick needs the total, and summing it in a `usize` would overflow on a
+/// 32-bit target on the same input this exists to reject, before the tree is
+/// ever built.
 ///
 /// The total accumulates in `u64` so the bound reads the same on 32- and
 /// 64-bit targets, and saturates rather than wrapping — a total that saturates
 /// is far past the bound and is refused either way.
-fn assert_histogram_fits_nodes(counts: &[usize]) {
+///
+/// Returns that total, so a caller that needs it (the cheap path's table-log
+/// pick) does not walk the histogram a second time to get the same number.
+fn assert_histogram_fits_nodes(counts: &[usize]) -> usize {
     assert!(
         counts.len() <= MAX_HUFFMAN_ALPHABET,
         "histogram has {} symbols, more than the {MAX_HUFFMAN_ALPHABET} a Huffman table describes",
@@ -1251,6 +1259,8 @@ fn assert_histogram_fits_nodes(counts: &[usize]) {
         total < u32::MAX as u64,
         "symbol counts sum to {total}, which a tree node's count cannot hold",
     );
+    // Under `u32::MAX` by the assert above, so it fits a 32-bit `usize`.
+    total as usize
 }
 
 /// Build the count-sorted Huffman leaves with their natural (unlimited) code
@@ -1517,9 +1527,10 @@ fn limited_weights_into(
 /// probe is gated off: the single-shot
 /// `FSE_optimalTableLog_internal(HUF_TABLELOG_DEFAULT = 11, srcSize, maxSV, minus = 1)`.
 /// Degenerate `srcSize <= 1` (RLE-shaped, where `ilog2(srcSize - 1)` is undefined)
-/// falls back to the natural-height cap of 11.
-fn cheap_huf_table_log(counts: &[usize]) -> usize {
-    let total: usize = counts.iter().sum();
+/// falls back to the natural-height cap of 11. `total` is the sum of `counts`,
+/// as [`assert_histogram_fits_nodes`] returns it.
+fn cheap_huf_table_log(counts: &[usize], total: usize) -> usize {
+    debug_assert_eq!(total, counts.iter().sum::<usize>());
     if total <= 1 {
         return 11;
     }
