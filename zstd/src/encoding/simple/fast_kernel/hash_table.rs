@@ -346,10 +346,11 @@ impl FastHashTable {
         (self.table.as_mut_slice(), self.hash_log)
     }
 
-    /// Like [`hot_state`] but also exposes the epoch `bias`, so a hot loop on a
-    /// POSSIBLY-biased table (the dict-attach kernels) can hoist the backing
-    /// slice + `hash_log` and apply the bias inline — `slot.saturating_sub(bias)`
-    /// on read, `pos + bias` on write — exactly as [`get`]/[`put`] do, without
+    /// Like [`Self::hot_state`] but also exposes the epoch `bias`, so a hot
+    /// loop on a POSSIBLY-biased table (the dict-attach kernels) can hoist the
+    /// backing slice + `hash_log` and apply the bias inline —
+    /// `slot.saturating_sub(bias)` on read, `pos + bias` on write — exactly as
+    /// [`Self::get`]/[`Self::put`] do, without
     /// re-reading the `Vec` header / `hash_log` / `bias` through `&mut self` on
     /// every access. On a bias-0 table this is identical to `hot_state` + raw
     /// access (`saturating_sub(0)` / `+ 0` fold away).
@@ -365,7 +366,7 @@ impl FastHashTable {
     ///
     /// # Safety
     ///
-    /// `hash` MUST be a value returned by [`hash_ptr`] on this table
+    /// `hash` MUST be a value returned by [`Self::hash_ptr`] on this table
     /// (or on another table with the same `hash_log`), so that
     /// `hash < 1 << hash_log = table.len()`.
     #[inline(always)]
@@ -383,11 +384,11 @@ impl FastHashTable {
     }
 
     /// Direct table write — `table[hash] = pos`. Same bounds reasoning
-    /// as [`get`].
+    /// as [`Self::get`].
     ///
     /// # Safety
     ///
-    /// `hash` MUST be a value returned by [`hash_ptr`] on this table.
+    /// `hash` MUST be a value returned by [`Self::hash_ptr`] on this table.
     #[inline(always)]
     pub(crate) unsafe fn put(&mut self, hash: u32, pos: u32) {
         debug_assert!((hash as usize) < self.table.len());

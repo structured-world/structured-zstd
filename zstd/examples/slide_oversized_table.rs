@@ -1,20 +1,22 @@
-//! Window slides with a hash table far larger than the window.
+//! Window slides under a small window with the widest `hashLog` a caller can
+//! request.
 //!
-//! `hashLog` is capped at `windowLog + 1` for a frame with no dictionary, so
-//! the table is at most twice the window there. The cap is lifted when a
-//! dictionary is attached, because the main and dictionary tables share one
-//! `hashLog` — which leaves a configuration the advanced API can ask for and
-//! the level presets never produce: a table of a million entries over a window
-//! of a kilobyte, sliding once per kilobyte of input.
+//! Sliding the table's indices costs a pass over the table; rebuilding it from
+//! the retained bytes costs a pass over the window. The two diverge only when
+//! the table is much larger than the window, so this asks for a table of a
+//! million entries over a window of a kilobyte, sliding once per kilobyte of
+//! input, and reports what the parameter resolution actually built.
 //!
-//! That is the shape where sliding the table's indices and rebuilding it from
-//! the retained bytes cost very different amounts, so it is the fixture for
-//! deciding between them.
+//! It does not build that table in either mode. Without a dictionary `hashLog`
+//! is capped at `windowLog + 1`, two entries per window byte. With one, the
+//! frame runs the dictionary's own table geometry and the requested `hashLog`
+//! is not read at all. The `heap=` figure shows which table was built, and
+//! running the same arguments with a smaller `hash_log` must print the same
+//! figure in both modes.
 //!
-//! Build: cargo build --profile bench -p structured-zstd
-//!          --example slide_oversized_table --features hash,std,dict-builder
+//! Build: cargo build --profile bench -p ffi-bench --example slide_oversized_table
 //! Run:   ./target/release/examples/slide_oversized_table
-//!          <window_log> <hash_log> <frame_bytes> <iters> <dict_path>
+//!          <window_log> <hash_log> <frame_bytes> <iters> [dict_path]
 
 use std::env;
 

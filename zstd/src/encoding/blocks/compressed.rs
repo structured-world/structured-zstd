@@ -304,7 +304,7 @@ impl Matcher for EntropyOnlyMatcher {
     }
 }
 
-/// A block of [`crate::common::BlockType::Compressed`]
+/// A block of [`crate::blocks::block::BlockType::Compressed`]
 pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
     let mut scratch = core::mem::take(&mut state.block_scratch);
     collect_block_parts(state, &mut scratch.parts);
@@ -1585,8 +1585,8 @@ struct SequenceCodeCounts<'a> {
 /// ours are already where they belong.
 ///
 /// `FAST_REPCODE` picks the offBase policy once per block instead of per
-/// sequence. Upstream's fast matcher emits only offBase 1 (rep[0] when
-/// litLength > 0, rep[1] when litLength == 0 via the secondary-position check)
+/// sequence. Upstream's fast matcher emits only offBase 1 (`rep[0]` when
+/// litLength > 0, `rep[1]` when litLength == 0 via the secondary-position check)
 /// or an explicit offset, and never 2/3; greedy and above search all three
 /// repeat offsets, which is what the full `encode_offset_with_history` mirrors.
 ///
