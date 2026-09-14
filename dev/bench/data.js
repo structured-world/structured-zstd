@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788895153550,
+  "lastUpdate": 1789420242892,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -5711,6 +5711,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.109,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d1b4a3097ff38849625f4eead3fecd25a3afd5c6",
+          "message": "perf(encode): close a third of the level-1 gap to libzstd (#501)\n\n* perf(encode): write the wire offset into the sequence instead of copying it\n\nThe emitter built a second array of the same length as the block's\nsequences, whose only new content was the four-byte offset code, then read\nthat array back to histogram and to write the bit stream. On a level-1\nprofile the copy pass was over half of the block-parts stage.\n\n`RawSequence` now carries the code itself, filled in place just before the\npartition it belongs to is encoded, so the history a raw partition restores\nstill governs the partition after it. The histogram, the last-sequence\nlookup and the bit writer read the same array the matcher filled.\n\nUpstream never builds the second array either: `ZSTD_storeSeq` puts\n`offBase` in the `SeqDef` at match time, and `ZSTD_seqToCodes` writes three\nsmall byte arrays rather than copying the sequences.\n\nThe splitter's estimator still copies, because it prices sub-ranges\nrepeatedly from a scratch history while the array itself has to stay as the\nmatcher left it. It runs only on the levels that probe a split.\n\nOutput byte-identical over 60 rows: three fixture shapes against ten\nlevels, each run both plain and dictionary-primed.\n\nPart of #493.\n\n* perf(encode): keep the sequence at three words by reusing the offset slot\n\nThe wire code went into a fourth field, which widened every sequence in the\nblock from twelve bytes to sixteen. Measured on the i9, that cost more in\nmemory traffic than the copy pass it removed: retired instructions flat to\nwithin a tenth of a percent, cycles up 10.3% on the access log at level 5\nand 2.3% at level 9 and on decodecorpus at level 5.\n\nThe found offset has no reader once its code exists, so the code goes into\nthat slot instead of beside it, which is the single slot upstream keeps\n(`SeqDef::offBase`, written by `ZSTD_storeSeq`).\n\nPart of #493.\n\n* perf(encode): make the dense hash-table prime a counted loop again\n\nA call-graph profile of a level-1 encode puts a fifth of the whole frame in\nthe prime, and half of that inside `RangeInclusive::next` and its `lt`: the\niterator's exhausted flag, live across every position, on a loop whose body\nis one hash and one store.\n\nThe comment above it already recorded that `step_by(1)` had cost a factor of\ntwo here for the same reason and had been removed; the inclusive range it\nwas removed in favour of carries the other half of the same problem. A\nhalf-open range is what compiles to a counted loop.\n\nPart of #493.\n\n* perf(huff0): size the tree node like upstream's\n\nThe node was four `usize` fields plus an `Option`: forty bytes, twenty\nkilobytes of node table for a full alphabet, walked several times per block\nbeside a six-kilobyte histogram. Upstream's `nodeElt` is eight bytes, and\nthe difference showed up as eight-byte moves and a forty-byte stride\nthroughout the build's profile.\n\nEvery field is bounded by the block, so none of them needed a machine word:\ncounts sum to the literal count, symbols index a 256-entry alphabet, node\nindices reach `2 * 256 - 1`, and a natural code depth is under the leaf\ncount. The root's absent parent is a sentinel index rather than an `Option`,\nwhich is what the `Option<usize>` was costing sixteen bytes for.\n\nPart of #493.\n\n* perf(encode): derive and count the sequence codes in one pass\n\nDeriving each sequence's offset code and histogramming the three code\nstreams were two walks of the same array, and the second read back what the\nfirst had just written. On a level-1 profile the derivation pass alone was\n6.2% of the frame.\n\nThey are now one pass, with the offBase policy a const-generic so the\nstrategy branch stays out of the loop body. Upstream splits the two\n(`ZSTD_seqToCodes` then `HIST_countFast_wksp`) because its codes go to three\nbyte arrays of their own; ours are already in the sequence.\n\nThe pass moves after the literals section, which reads none of what it\nwrites. The block-split estimator keeps a fill-only version: it prices\nsub-ranges repeatedly from a scratch history and counts them itself.\n\nPart of #493.\n\n* perf(encode): slide the fast table's indices instead of rebuilding it\n\nEvery window slide cleared the hash table and rehashed the whole retained\ntail, a pass over every byte the window kept. The window slides once per\n`max_window_size` bytes, so on an 8 MiB access log at level 1 that rehash\nwas a fifth of the encode, in the CLI as much as in the loop harness.\n\nUpstream does not rebuild: `ZSTD_reduceIndex` walks the table and subtracts\nthe correction from each stored position. That is a pass over the table's\nown entries rather than over the window's bytes, and it is also the more\nfaithful state -- the rehash indexed every position, including the ones the\nmatcher's step had skipped and never stored, so the table came out of a\nslide holding more than it held going in.\n\nOutput changes on the Fast band of inputs long enough to slide, in both\ndirections and by under a tenth of a percent, and stays smaller than\nlibzstd's on every one. On the 8 MiB access log: --fast=5 2,298,225 ->\n2,297,015 bytes, --fast=1 1,926,093 -> 1,924,368, level 1 1,466,481 ->\n1,467,858, level 2 1,515,569 -> 1,516,103, against libzstd's 2,300,531 /\n1,927,913 / 1,468,937 / 1,517,054. Level 3 and above are a different\nbackend and unchanged; incompressible input is unchanged at every level.\n\nPart of #493.\n\n* perf(encode): keep the repeat-offset history in registers across the pass\n\nThe pass that derives the offset codes rotates the repeat-offset history on\nevery sequence and reads it back on the next one. Held behind the caller's\nreference it compiled to three stores into the compressor per sequence: the\nloop also writes through the sequence slice, and the optimiser would not\nkeep the array in registers across that. They are the second, third and\nfourth hottest instructions in the function's own profile, after the offset\ncode's bit scan.\n\nA local copy, written back once when the pass ends, is the same three words\nmoved once instead of once per sequence.\n\nPart of #493.\n\n* perf(encode): count the sequence codes into four interleaved tables\n\nOne table a stream serialises the counting loop: consecutive sequences\nshare a code often enough that the increment waits on store-to-load\nforwarding of the slot the previous one just wrote. Upstream counts into\nfour tables and sums them at the end (`HIST_count_parallel_wksp`), which\nbreaks the chain.\n\nFour narrow tables are also smaller than one wide one here. The three\nsequence alphabets top out at 35, 52 and 31, so four `[u32; 64]` tables a\nstream come to 3 KiB against the 6 KiB the caller's three `[usize; 256]`\narrays already take; the sum writes the caller's arrays at the end and the\nslots above the alphabets stay zero, as they were.\n\nPart of #493.\n\n* perf(encode): count into one table per stream after all\n\nFour interleaved count tables, upstream's `HIST_count_parallel_wksp` shape,\ncost more than the store-forwarding chain they remove. Measured on the i9,\narms alternating, three rounds, against the commit before them:\n\n  8 MiB access log, level 1     +1.14% cycles, +2.26% instructions\n  decodecorpus z000033, level 4 +2.18%,        +0.75%\n  decodecorpus z000033, level 5 +1.75%,        +0.39%\n  8 MiB access log, level 9     +1.33%,        +0.20%\n\nThe lane index, the three extra address computations it forces, and the\n192-entry fold at the end of each block are more work than the chain is\nworth at these sequence counts. Upstream pays neither: it counts over\nprepared byte arrays, where the loop carries nothing else.\n\nRecorded so it is not tried again from the same reasoning.\n\n* perf(encode): let the histogram ask for the code without the extra bits\n\n`encode_literal_length` and `encode_match_len` return the symbol together\nwith the extra bits it carries, and the extra-bit width comes from a table\nindexed by the symbol. A caller that wants only the symbol cannot have that\nlookup optimised away: its bounds check can panic, which makes it\nobservable. So the counting pass paid two loads, two compares and two\nbranches per sequence for two values it dropped -- they are four of the ten\nhottest instructions in the function.\n\nThe symbol alone is now its own function, and the three call sites that want\nonly the symbol call it. The offset code is `ilog2` with no table at all, so\nthose sites take it directly rather than through the triple.\n\nPart of #493.\n\n* perf(encode): inline the code-only helpers into their call sites\n\nAs a hint the split-out symbol functions were left out of line at the\nhistogram's call site, so the pass paid a call per sequence for a table\nlookup it had stopped doing: retired instructions went up rather than down,\nby 1.71% at level 1 on the access log. Forcing the inline is what the split\nwas for.\n\nPart of #493.\n\n* perf(encode): keep the one code-plus-bits helper after all\n\nSplitting the symbol out of `encode_literal_length` / `encode_match_len` so\nthe histogram could skip the extra-bit lookup did remove the two bounds\nchecks from its loop -- they are gone from the disassembly -- and still\nmeasured worse, twice, on the i9 with arms alternating:\n\n  8 MiB access log, level 1     +1.18% cycles, +1.71% instructions\n  decodecorpus z000033, level 4 +2.00%,        +0.50%\n  decodecorpus z000033, level 5 +0.69%,        +0.26%\n  8 MiB access log, level 9     +3.12%,        +0.16%\n\n`inline(always)` on the split helpers changed the instruction count by two\nin fifteen billion, so they were already inlined and the call-overhead\nexplanation was wrong. Whatever the compiler does differently with the\nnarrower helper costs more than the lookup it saves, and the lookup is not\nwhere the loop's time goes -- the offset code's bit scan is, at four times\nthe share.\n\nRecorded so the same reasoning does not produce the same patch again.\n\n* perf(encode): walk the sequence writer's loop as a slice\n\nThe bit-writing loop counted down over indices and read `sequences[i]`,\npaying a bounds check and the index arithmetic on every sequence. Iterating\nthe slice in reverse is the same order and the same last-sequence exclusion,\nas a pointer walk.\n\nPart of #493.\n\n* perf(encode): carry the sequence codes from the derivation pass to the writer\n\nThe bit writer is a quarter of a level-1 frame and two and a half times\nlibzstd's; a fifth of what it spends goes on re-deriving the three FSE\nsymbols and their extra-bit widths, which the pass that ran a moment earlier\nalready had in hand. Upstream keeps them between the same two passes -- the\nbyte arrays `ZSTD_seqToCodes` writes.\n\nThe five values are packed into one word a sequence: the two codes at six\nbits, the offset code at five, and the two extra-bit widths at five, with\nthe offset's width being its own code. The derivation pass writes it through\nthe buffer's spare capacity, so the store costs no capacity test and no\nzeroing pass, and the writer reads one word instead of two bounds-checked\ntable lookups, a bit scan and the branches that pick between the\nsmall-value tables and the logarithmic form.\n\nPart of #493.\n\n* perf(bitio): drop the zero-width branch from the unchecked bit add\n\nThe unchecked add returned early on a zero width, to keep a full\naccumulator from shifting a `u64` by 64. That is a branch on every call and\nthere are six a sequence in the FSE writer, which is a quarter of a level-1\nframe. Upstream's `BIT_addBitsFast` has no such branch: it keeps `bitPos`\nstrictly under 64 and shifts unconditionally.\n\nMasking the shift count says the same thing without the branch, and costs\nnothing to say -- x86 and AArch64 shift instructions mask the count\nthemselves. The one case where the mask changes the arithmetic is the case\nthe early return existed for, and there the caller's own precondition forces\nthe value to zero, so the accumulator takes nothing either way.\n\nPart of #493.\n\n* perf(encode): find the highest sequence code from the counts, not per sequence\n\nThe table selector needs the highest code with a non-zero count in each\nstream. It was carried as a running maximum through the counting loop --\nthree compares a sequence -- because deriving it afterwards meant a reverse\nscan of all 256 slots, which is the dominant cost on a small frame.\n\nThe scan does not have to be 256 slots. The format's three sequence\nalphabets end at 35, 52 and 31, so nothing above 63 is ever counted, and 64\nslots a stream a block is cheaper than three compares a sequence at any\nblock worth encoding. The bound is asserted in debug builds against the\ncounts themselves.\n\nPart of #493.\n\n* fix(encode): count the sequence-code buffer and bound the Huffman histogram\n\nTwo defects this branch introduced, each with the regression test that\ncatches it.\n\nThe per-sequence code buffer is retained in the block scratch across blocks,\nlike every other buffer there, but it was left out of `retained_heap_size`.\nA context therefore under-reported itself through `ZSTD_sizeof_CCtx` by four\nbytes per sequence of retained capacity, which is exactly the number a\ncaller budgeting memory is given.\n\nThe tree node's count narrowed from a machine word to a `u32`, which the\nencoder's own inputs cannot overflow — a literals section is at most 128\nKiB. The entry points are public, though, and a histogram that does not fit\ntruncated on the way into a leaf, overflowed at the first merge that crossed\nthe boundary, and at exactly `u32::MAX` produced a leaf indistinguishable\nfrom the sentinel marking a node the tree has not built yet, which the merge\nloop would then take as a child. The bound is now stated where the narrowing\nhappens, folded into the pass that already counts the leaves, so every entry\npoint reaches it.\n\nAlso adds the estimator/emitter case the parity tests were missing: they ran\nempty sequence arrays, so nothing compared the two on the path this branch\nrewrote. The two agree exactly on the literals section and cannot on the\nsequences one — the FSE cost model prices a symbol at its average width from\nthe normalised probability, as upstream's `ZSTD_fseBitCost` does, where the\nwriter pays what the state trajectory costs. The test asserts what does\nhold: the same repeat-offset history out of both, and a price within the\nmodel's rounding, measured at two bytes for its fixture on every strategy.\n\nOutput byte-identical over 60 rows: three fixture shapes against ten levels,\neach run both plain and dictionary-primed.\n\n* fix(huff0): bound the histogram at the entry points, not at the narrowing\n\nThe previous commit put the bound in the tree builder, reasoning that both\nentry points reach it so one check covers them by construction. It does not:\nthe cheap path picks its table log first, and that sums the counts in a\n`usize`, which on a 32-bit target overflows on the very input the bound\nexists to reject. The i686 job caught it — the panic arrived from the sum\nrather than from the check, with a different message.\n\nThe check moves to where the reviewer said it belonged, ahead of anything\nthat reads the histogram, and the builder keeps a `debug_assert` for the\ninvariant it now holds by construction. The total accumulates in a `u64`, so\nthe bound and its message read the same on 32- and 64-bit targets, and\nsaturates rather than wrapping: a total that saturates is far past the bound\nand refused either way.\n\nThe alphabet bound moves with it. Only the search path asserted it; the\ncheap path reached the weight buffers and the node indices — both sized for\n256 symbols — without one. Carries the test.\n\nOutput byte-identical over 60 rows.\n\n* perf(encode): one correction per slid slot, one histogram walk per build\n\nThe window slide subtracted the epoch bias and the drop separately from every\ntable entry, though both are fixed for the whole slide and their sum lands at\n`u32::MAX` at the very most — the epoch keeps the bias under `u32::MAX - 2^31`\nand the drop is a length inside a history capped at `2 * max_window_size`.\nSummed once before the loop, it is one saturating subtraction a slot instead\nof two, on a loop that runs once per table entry. The bound is asserted rather\nthan assumed: a wrap there would not fail, it would quietly resurrect dropped\npositions.\n\nThe gated Huffman build validated the histogram and then delegated to\n`build_from_counts`, which validated it again — a second walk on every\nsearched build, including each block-split candidate. Only the branch that\ndoes not delegate needs the check.\n\nAlso adds the harness the window-slide question was settled with. Sliding the\ntable's indices costs a pass over its entries where rebuilding costs a pass\nover the window's bytes, so the choice between them would matter if a table\ncould be much larger than the window it indexes. It cannot, and the reasoning\nis now recorded at `drain_real_prefix`: a frame without a dictionary caps\n`hash_log` at `window_log + 1`, and a dictionary frame takes its table width\nfrom the dictionary's own cParams. Measured over `windowLog` 10 to 16 with\n`hashLog` pinned at 20: identical time without a dictionary, up to twice as\nfast with one, same output bytes on every row.\n\nOutput byte-identical over 60 rows.\n\n* docs(encode): describe the index slide and fix doc links\n\n- The slide_oversized_table header claimed a dictionary lifts the hashLog\n  cap and yields a million-entry table over a 1 KiB window. It does not:\n  a dictionary frame runs the dictionary's own table geometry, and runs\n  at hashLog 11 and 20 print the same heap and output in both modes. The\n  header now says what the example measures; its build command names\n  ffi-bench, the package that registers it, without the feature list\n  ffi-bench does not have.\n- extend_history_with_pending and trim_to_window still described the\n  eviction as a table clear plus rehash; the drain slides stored\n  positions down instead.\n- Repair 17 broken intra-doc links in the touched files (moved kernels,\n  Self:: paths, the private MatcherStorage enum, rep[0] parsed as a link).\n\nPart of #493\n\n* perf(huff0): sum the histogram once on the cheap path\n\n- assert_histogram_fits_nodes already folds the counts to bound them; it\n  now returns that total, and cheap_huf_table_log takes it instead of\n  summing the same slice again. One pass less on every cheap table build,\n  which is every block below btultra and every block-splitter candidate.\n  Output is unchanged: a debug assertion checks the passed total against\n  the sum over the whole debug suite.\n- slide_oversized_table names its two modes: its header describes the\n  capped run (the default) and the dictionary run as separate\n  benchmarks, and the output line starts with mode=capped or\n  mode=dictionary.\n\nPart of #493\n\n* perf(huff0): count the symbols in the validating pass\n\n- The searched table build walked the histogram twice: once to validate\n  it and once for its symbol count. assert_histogram_fits_nodes now\n  returns both from one pass, the count behind a const parameter so the\n  cheap path, which needs only the total, pays nothing for it. Output is\n  unchanged.\n- The owned Fast eviction slides stored positions rather than\n  rehashing; three comments that still said rehash now say so.\n\nPart of #493\n\n* perf(encode): size the sequence-code maxima scan to the block\n\nA block with one to sixteen sequences, which the post-split sends here\nwith one to four and which a small frame's only block usually is, paid\nthree fixed 64-slot scans to find the highest code of each stream. It now\ntakes the maxima from the codes it just wrote, three compares a sequence;\nlonger slices scan each histogram from its own alphabet's last code (35,\n52, 31), where upstream's HIST_count_simple starts, instead of from 63.\n\nMeasured on the i9 against the previous commit, quiet host, prebuilt\nbinaries interleaved, perf stat -r 5, three passes, retired instructions:\n\n  fixture           short-slice max  bounded scans  both (kept)\n  logs200 L1        -0.480%          -0.424%        -0.498%\n  logs200 L3        -0.442%          -0.367%        -0.472%\n  logs200 L9        -0.394%          -0.309%        -0.384%\n  logs1000 L3       -0.293%          -0.313%        -0.285%\n  z000033 L3        +0.002%          -0.024%        -0.022%\n  z000033 L19        0.000%          -0.003%        -0.003%\n\nCycles stay inside the builds' layout noise: every arm moves under 1.5%,\nand the decode-only control moves 0.4 to 0.6%. On the tiny-block arms the\nkept variant and the short-slice-only one execute the same path, yet they\ndiffer by 1.1 to 1.4% in cycles, which is that noise. Output is\nbyte-identical over three fixtures at nine levels.\n\nPart of #493",
+          "timestamp": "2026-09-14T23:28:38+03:00",
+          "tree_id": "2d9f51b9ad2435684f9a17305880f6844f375914",
+          "url": "https://github.com/structured-world/structured-zstd/commit/d1b4a3097ff38849625f4eead3fecd25a3afd5c6"
+        },
+        "date": 1789420228487,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.079,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 187.542,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 229.384,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.564,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.221,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.764,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.966,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.792,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.988,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 10.13,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.76,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.089,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.19,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.556,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.726,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.257,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.172,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.167,
             "unit": "ms"
           }
         ]
