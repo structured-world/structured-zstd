@@ -1,3 +1,10 @@
+//! These tests set the process's `SIGINT` disposition and the guard's
+//! statics, which every output-writing test of this binary also touches
+//! through `guard` / `clear`. They are sound only with a process per test,
+//! which is how nextest runs them (every CI job that runs them uses it); a
+//! lock around these four alone would not stop the writers racing them under
+//! the plain harness.
+
 use std::path::Path;
 
 use super::imp::is_guarded;

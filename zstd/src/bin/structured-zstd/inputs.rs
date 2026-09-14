@@ -58,6 +58,10 @@ pub fn select_inputs(
         }
         files.push(input);
     }
+    // List entries are not link-filtered: the reference command filters the
+    // named inputs only and merges the lists after (`zstdcli.c`), so a link
+    // handed over through a list is processed, and a link to a directory is
+    // walked by `-r` below. Links met inside that walk are still skipped.
     for list in filelists {
         files.extend(read_filelist(list)?);
     }

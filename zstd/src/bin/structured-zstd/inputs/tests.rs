@@ -211,6 +211,39 @@ fn filelist_entries_are_expanded_recursively_too() {
     assert_eq!(selection.named, 1);
 }
 
+/// Links named by a `--filelist` are taken as given, without `-f`: a link to a
+/// file stays an input and a link to a directory is walked by `-r`. Only the
+/// command-line names are filtered, before the lists are merged, which is the
+/// order the reference command applies (`zstdcli.c`), and a script that hands
+/// links over through a list expects them processed. Links found INSIDE the
+/// walked directory still follow the walk's own rule and are skipped.
+#[cfg(unix)]
+#[test]
+fn filelist_links_are_kept_and_walked_without_f() {
+    let scratch = Scratch::new("listlinks");
+    let target = scratch.file("target.txt");
+    scratch.file("real/inner.txt");
+    let elsewhere = scratch.file("elsewhere/other.txt");
+    std::os::unix::fs::symlink(&elsewhere, scratch.path().join("real/nested-link.txt")).unwrap();
+    let file_link = scratch.path().join("linkfile");
+    let dir_link = scratch.path().join("linkdir");
+    std::os::unix::fs::symlink(&target, &file_link).unwrap();
+    std::os::unix::fs::symlink(scratch.path().join("real"), &dir_link).unwrap();
+    let list = scratch.path().join("list.txt");
+    fs::write(
+        &list,
+        format!("{}\n{}\n", dir_link.display(), file_link.display()),
+    )
+    .unwrap();
+
+    let selection = select_inputs(Vec::new(), &[list], true, false, 0).unwrap();
+    assert_eq!(
+        selection.files,
+        vec![dir_link.join("inner.txt"), file_link],
+        "the listed links are processed; the link inside the walked tree is not"
+    );
+}
+
 /// `--output-dir-flat` drops the source's directory and keeps its name.
 #[test]
 fn flat_output_keeps_only_the_file_name() {

@@ -629,7 +629,11 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov -p structured-zstd --features hash,std,dict-builder --lcov --output-path lcov.info
+      - uses: taiki-e/install-action@nextest
+      # Through nextest, as the test job runs: a process per test. Some tests
+      # set process-wide state (the CLI's SIGINT disposition), and the plain
+      # harness would run them as threads of one process.
+      - run: cargo llvm-cov nextest --profile ci -p structured-zstd --features hash,std,dict-builder --lcov --output-path lcov.info
         working-directory: zstd
       - uses: codecov/codecov-action@v7
         with:
