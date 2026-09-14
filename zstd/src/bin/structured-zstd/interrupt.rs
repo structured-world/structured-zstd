@@ -100,11 +100,16 @@ mod imp {
         /// since past `MAX_PATH` only the `\\?\` form reaches the file, and
         /// that is the form the standard library created it through.
         pub fn units(path: &Path) -> Vec<PathUnit> {
-            // With no working directory to resolve against, the name as given
-            // is all there is, and it still reaches a path under `MAX_PATH`.
-            let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-            let wide: Vec<PathUnit> = absolute.as_os_str().encode_wide().collect();
-            super::verbatim(&wide)
+            match std::path::absolute(path) {
+                Ok(absolute) => {
+                    let wide: Vec<PathUnit> = absolute.as_os_str().encode_wide().collect();
+                    super::verbatim(&wide)
+                }
+                // With no working directory to resolve against, the name as
+                // given is all there is: not verbatim, which a relative name
+                // cannot be, and still enough for a path under `MAX_PATH`.
+                Err(_) => path.as_os_str().encode_wide().collect(),
+            }
         }
 
         /// # Safety
@@ -214,10 +219,15 @@ mod imp {
     /// Remove `path` if the process is interrupted before [`clear`] is called.
     pub fn guard(path: &Path) {
         ARTEFACT.store(ptr::null_mut(), Ordering::SeqCst);
+        // An empty name names nothing. Asked of the name as given, before
+        // `units` turns it into the form the handler needs: on Windows that
+        // form carries a prefix even when there is nothing after it.
+        if path.as_os_str().is_empty() {
+            return;
+        }
         let units = sys::units(path);
-        // An empty name names nothing, and one with a terminator inside is not
-        // a name the handler can be given.
-        if units.is_empty() || units.contains(&0) {
+        // A terminator inside the name is not a name the handler can be given.
+        if units.contains(&0) {
             return;
         }
         let needed = units.len() + 1;
