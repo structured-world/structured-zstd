@@ -61,8 +61,8 @@ level and `ZSTD_NBTHREADS` is validated, both read as upstream reads them.
 Several inputs into one `-o` or `-c` are concatenated after upstream's
 warning, an existing output is asked about unless `-f` is given (and refused
 under `-q`, where nothing can be asked), one failing input does not stop the
-others, and the exit status is 1 when any input failed and 2 on an interrupt,
-which also removes the partial output.
+others, and the exit status is 1 when any input failed and 2 on an interrupt
+while an output file is being written, which also removes the partial file.
 
 The wire-format switches take effect: `--[no-]check` (`--no-check` also skips
 checksum verification when decoding), `--[no-]content-size`, `--no-dictID` and

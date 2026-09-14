@@ -75,6 +75,59 @@ fn the_estimate_saturates_rather_than_wrapping() {
     );
 }
 
+/// Parameters that override nothing are the level itself, so the estimate for
+/// them is the level's own over every level and source size, with a dictionary
+/// or without; and each knob that resizes what the frame builds moves it.
+/// Both estimates resolve through the path the matcher's reset takes, so a
+/// disagreement here is one of them building something the encoder does not.
+#[test]
+fn the_parameters_estimate_is_the_levels_until_a_knob_resizes_the_frame() {
+    use crate::encoding::{CompressionParameters, DictionarySizes, Strategy};
+    for level in -7..=22 {
+        for source in [None, Some(4 << 10), Some(300 << 10), Some(64 << 20)] {
+            for dictionary in [None, Some(DictionarySizes::raw_content(32 << 10))] {
+                let plain = CompressionParameters::builder(CompressionLevel::Level(level))
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    super::estimated_compression_workspace_bytes_for_parameters(
+                        &plain, source, dictionary
+                    ),
+                    super::estimated_compression_workspace_bytes_for_run(
+                        CompressionLevel::Level(level),
+                        source,
+                        None,
+                        false,
+                        dictionary,
+                    ),
+                    "level {level}, source {source:?}, dictionary {dictionary:?}"
+                );
+            }
+        }
+    }
+
+    let source = Some(32 << 10);
+    let base = CompressionParameters::builder(CompressionLevel::Level(1))
+        .build()
+        .unwrap();
+    let wider = CompressionParameters::builder(CompressionLevel::Level(1))
+        .hash_log(16)
+        .build()
+        .unwrap();
+    let optimal = CompressionParameters::builder(CompressionLevel::Level(1))
+        .strategy(Strategy::Btultra2)
+        .build()
+        .unwrap();
+    let estimate = |p: &CompressionParameters| {
+        super::estimated_compression_workspace_bytes_for_parameters(p, source, None)
+    };
+    assert!(estimate(&wider) > estimate(&base), "a wider hash table");
+    assert!(
+        estimate(&optimal) > estimate(&base),
+        "the optimal parser's tables and scratch"
+    );
+}
+
 /// Regression: a dictionary whose content cannot be indexed by the tagged
 /// attach tables (Fast / Dfast position fields hold at most 2^24 bytes) is
 /// primed in COPY mode, so the frame must run the CDict's verbatim table

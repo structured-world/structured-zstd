@@ -2796,6 +2796,33 @@ fn the_memory_limit_counts_the_encoder_the_benchmark_builds() {
     accepted.expect("with room for both it runs");
 }
 
+/// `--zstd=` knobs resize what a compression pass builds: a wider hash table,
+/// or a strategy that moves the level onto the optimal parser with its scratch
+/// arenas. The ceiling has to weigh the frame as the encoder will build it,
+/// not the level's preset, or it admits a run that then allocates past it.
+#[test]
+fn the_memory_limit_counts_the_advanced_parameters() {
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("szstd-advmem-{}.bin", std::process::id()));
+    fs::write(&input, vec![0u8; 32 * 1024]).unwrap();
+
+    let mut admitted = Vec::new();
+    for knobs in ["--zstd=hlog=16", "--zstd=strat=9"] {
+        let mut opts = parse(&["-b1", "-i1", knobs, "f"]).unwrap();
+        opts.inputs = vec![input.clone()];
+        // What level 1 holds with nothing overridden.
+        opts.memory_limit = Some(benchmark_budget(32 * 1024, 1..=1));
+        if run_benchmark(&opts, None).is_ok() {
+            admitted.push(knobs);
+        }
+    }
+    let _ = fs::remove_file(&input);
+    assert!(
+        admitted.is_empty(),
+        "the preset's figure does not cover {admitted:?}"
+    );
+}
+
 /// A benchmark holds the dictionary more than once: it measures both
 /// directions, so the blob is parsed into an encoder's tables and a decoder's,
 /// and the blob itself is still there while they are built from it. Counting it
@@ -3028,6 +3055,41 @@ fn a_single_input_into_a_named_output_is_removed_on_request() {
     assert!(!input.exists(), "--rm removes the one source");
 }
 
+/// `-o /dev/null` is written in place, as the reference command opens any
+/// destination that is not a regular file: no temporary, no rename (which
+/// would replace the device with a file) and no overwrite question, which is
+/// asked only about a regular file. Both directions take it. A directory as
+/// the destination is still refused.
+#[cfg(unix)]
+#[test]
+fn an_existing_device_output_is_written_in_place() {
+    let scratch = Scratch::new("devnull");
+    let input = scratch.file("in.txt", b"bytes for the bit bucket");
+    let mut opts = parse(&["-q", "-o", "x", "a"]).unwrap();
+    opts.inputs = vec![input.clone()];
+    opts.output = Some(PathBuf::from("/dev/null"));
+    assert_eq!(run(opts).expect("/dev/null takes the frame"), 0);
+
+    let frame = scratch.path().join("in.txt.zst");
+    fs::write(
+        &frame,
+        structured_zstd::encoding::compress_slice_to_vec(
+            b"bytes for the bit bucket",
+            CompressionLevel::Default,
+        ),
+    )
+    .unwrap();
+    let mut opts = parse(&["-q", "-d", "-o", "x", "a"]).unwrap();
+    opts.inputs = vec![frame];
+    opts.output = Some(PathBuf::from("/dev/null"));
+    assert_eq!(run(opts).expect("/dev/null takes the plaintext"), 0);
+
+    let mut opts = parse(&["-q", "-f", "-o", "x", "a"]).unwrap();
+    opts.inputs = vec![input];
+    opts.output = Some(scratch.path().to_path_buf());
+    assert!(run(opts).is_err(), "a directory is not a destination");
+}
+
 /// A run pointed only at empty directories has nothing to do: it says so and
 /// succeeds, rather than falling back to reading stdin.
 #[test]
@@ -3183,6 +3245,35 @@ fn binary_output_to_a_terminal_needs_force() {
     // A terminal: refused, unless forced.
     assert!(guard_binary_stdout(true, false).is_err());
     assert!(guard_binary_stdout(true, true).is_ok());
+}
+
+/// Compressing stdin with stdout on a terminal writes the frame into the
+/// session, so the reference command refuses it without `-f`: with no input
+/// named, with an explicit `-`, and with `-` among several inputs and no `-o`.
+/// A named `-o` file, `-f`, decompression and a stdout that is not a terminal
+/// all proceed.
+#[test]
+fn compressing_stdin_into_a_terminal_needs_force() {
+    let refused = |args: &[&str]| refuse_console_stdout(&parse(args).unwrap(), true).is_err();
+    assert!(refused(&[]), "no input: stdin to the terminal");
+    assert!(refused(&["-"]), "an explicit -");
+    assert!(
+        refused(&["-c", "-"]),
+        "-c changes nothing about where it goes"
+    );
+    assert!(refused(&["a", "-", "b"]), "- among inputs with no -o");
+    let err = refuse_console_stdout(&parse(&[]).unwrap(), true).unwrap_err();
+    assert_eq!(err.to_string(), "stdout is a console, aborting");
+
+    assert!(!refused(&["-f"]), "-f forces it");
+    assert!(!refused(&["-d"]), "decompressed text may go to a terminal");
+    assert!(!refused(&["-o", "out.zst"]), "the frame goes to a file");
+    assert!(!refused(&["a.txt"]), "no stdin among the inputs");
+    assert!(!refused(&["-t"]), "testing writes nothing");
+    assert!(
+        refuse_console_stdout(&parse(&[]).unwrap(), false).is_ok(),
+        "stdout is not a terminal"
+    );
 }
 
 /// Ignoring what a flag *does* is not the same as ignoring what it *says*: a

@@ -82,7 +82,7 @@ pub fn select_inputs(
                         verbosity,
                         &mut expanded,
                         &mut ancestors,
-                    );
+                    )?;
                 }
                 _ => expanded.push(input),
             }
@@ -127,10 +127,9 @@ fn descend(
     verbosity: i32,
     out: &mut Vec<PathBuf>,
     ancestors: &mut Vec<DirId>,
-) {
+) -> Result<()> {
     let Some(id) = dir_id(dir, metadata) else {
-        walk_directory(dir, follow_links, verbosity, out, ancestors);
-        return;
+        return walk_directory(dir, follow_links, verbosity, out, ancestors);
     };
     if ancestors.contains(&id) {
         display!(
@@ -139,11 +138,12 @@ fn descend(
             "Warning : {} leads back into a directory being walked, ignoring",
             dir.display()
         );
-        return;
+        return Ok(());
     }
     ancestors.push(id);
-    walk_directory(dir, follow_links, verbosity, out, ancestors);
+    let walked = walk_directory(dir, follow_links, verbosity, out, ancestors);
     ancestors.pop();
+    walked
 }
 
 /// Whether `path` itself is a symbolic link, whatever it points at.
@@ -186,11 +186,23 @@ fn read_filelist(list: &Path) -> Result<Vec<PathBuf>> {
     }
     let file =
         fs::File::open(list).wrap_err_with(|| format!("error reading {}", list.display()))?;
+    parse_filelist(file, FILELIST_MAX_BYTES, list)
+}
+
+/// The names in a `--filelist`, reading no more than `limit` bytes of it.
+///
+/// The size was checked before the list was opened, but a file can grow after
+/// that and a pseudo-file can report less than it holds, so the limit is kept
+/// on what is read as well: one byte past it is enough to know the list is too
+/// large, and nothing beyond that is taken into memory.
+fn parse_filelist(file: impl std::io::Read, limit: u64, list: &Path) -> Result<Vec<PathBuf>> {
     let mut names = Vec::new();
     // Lines are bytes, like the names in them: a filename need not be UTF-8,
     // and reading the list as text would reject or rename such an entry.
-    let mut reader = BufReader::new(file);
+    // `limit` is a list-size cap (50 MiB in the run), far from `u64::MAX`.
+    let mut reader = BufReader::new(file.take(limit + 1));
     let mut line = Vec::new();
+    let mut total: u64 = 0;
     loop {
         line.clear();
         let read = reader
@@ -198,6 +210,15 @@ fn read_filelist(list: &Path) -> Result<Vec<PathBuf>> {
             .wrap_err_with(|| format!("error reading {}", list.display()))?;
         if read == 0 {
             break;
+        }
+        // `read` is at most `limit + 1` over the whole list, so the sum stays in
+        // range.
+        total += read as u64;
+        if total > limit {
+            bail!(
+                "error reading {}: file list is larger than {limit} bytes",
+                list.display()
+            );
         }
         if line.last() == Some(&b'\n') {
             line.pop();
@@ -228,16 +249,21 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 ///
 /// Entries are taken in name order so two runs over one tree process it the
 /// same way; the reference command takes them in directory order, which the
-/// filesystem does not promise to keep. A directory that cannot be read is
-/// reported and contributes nothing, as there too. Subdirectories go through
+/// filesystem does not promise to keep. Subdirectories go through
 /// [`descend`], which keeps a link from leading the walk round in a circle.
+///
+/// The two read failures end differently, as they do in the reference command
+/// (`util.c`, `UTIL_prepareFileList`): a directory that cannot be opened is
+/// reported and contributes nothing while the run goes on with exit status 0,
+/// but a listing that fails part-way is an error that ends the run, since the
+/// tree it would leave behind is incomplete in a way nothing reports.
 fn walk_directory(
     dir: &Path,
     follow_links: bool,
     verbosity: i32,
     out: &mut Vec<PathBuf>,
     ancestors: &mut Vec<DirId>,
-) {
+) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) => {
@@ -247,22 +273,23 @@ fn walk_directory(
                 "Cannot open directory '{}': {err}",
                 dir.display()
             );
-            return;
+            return Ok(());
         }
     };
     let mut names: Vec<OsString> = Vec::new();
     for entry in entries {
         match entry {
             Ok(entry) => names.push(entry.file_name()),
-            Err(err) => {
-                display!(verbosity, 1, "readdir({}) error: {err}", dir.display());
-                return;
-            }
+            Err(err) => bail!("readdir({}) error: {err}", dir.display()),
         }
     }
     names.sort();
     for name in names {
         let path = dir.join(name);
+        // Every link is skipped here without `-f`, a link to a named pipe
+        // included: the FIFO exemption applies to names given on the command
+        // line, where a link is how a pipe is handed over, and the reference
+        // command's walk drops links without looking at what they point at.
         if !follow_links && is_symlink(&path) {
             display!(
                 verbosity,
@@ -274,11 +301,12 @@ fn walk_directory(
         }
         match fs::metadata(&path) {
             Ok(metadata) if metadata.is_dir() => {
-                descend(&path, &metadata, follow_links, verbosity, out, ancestors);
+                descend(&path, &metadata, follow_links, verbosity, out, ancestors)?;
             }
             _ => out.push(path),
         }
     }
+    Ok(())
 }
 
 /// Where `--output-dir-flat DIR` puts the output of `src`: under `DIR`, by
@@ -331,10 +359,17 @@ pub fn create_mirrored_dirs(src: &Path, root: &Path) -> Result<()> {
     // The source directory that each mirrored level stands for, rebuilt from
     // the source path as given so its permissions can be read: for
     // `/var/tmp/abc` the levels are `/var` and `/var/tmp`.
-    let stripped: usize = src
-        .components()
-        .count()
-        .saturating_sub(relative.components().count());
+    //
+    // `relative` holds the `Normal` components of `src` and nothing else, and
+    // the ones it drops (a prefix, the root, a leading `.`) can only open a
+    // path, so the difference is the count of those leading components.
+    let source_count = src.components().count();
+    let relative_count = relative.components().count();
+    debug_assert!(
+        relative_count <= source_count,
+        "the mirrored path is a subset of the source's components"
+    );
+    let stripped = source_count - relative_count;
     let source_root: PathBuf = src.components().take(stripped).collect();
     let mut source_level = source_root;
     let mut destination = root.to_path_buf();

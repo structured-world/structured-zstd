@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     create_mirrored_dirs, flat_output_path, has_compressed_extension, mirrored_output_dir,
-    select_inputs, shared_file_names,
+    parse_filelist, select_inputs, shared_file_names,
 };
 
 /// A scratch directory unique to the test, removed when dropped.
@@ -146,6 +146,30 @@ fn symlinks_inside_a_walked_tree_are_skipped_unless_followed() {
     assert_eq!(followed.files, vec![dir.join("link.txt"), real]);
 }
 
+/// A directory `-r` cannot open is reported and skipped, and the rest of the
+/// tree is still selected: the reference command does the same and exits 0,
+/// so a run over a tree with one private directory keeps working the way a
+/// script written against it expects.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_is_skipped_and_the_walk_goes_on() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("locked");
+    let readable = scratch.file("tree/ok/a.txt");
+    scratch.file("tree/locked/b.txt");
+    let locked = scratch.path().join("tree/locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    // A process that permissions do not bind (root) opens it anyway, and then
+    // there is no unreadable directory to test.
+    let binding = fs::read_dir(&locked).is_err();
+
+    let selection = select_inputs(vec![scratch.path().join("tree")], &[], true, false, 0);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    if binding {
+        assert_eq!(selection.expect("the walk goes on").files, vec![readable]);
+    }
+}
+
 /// `--filelist` names inputs one per line, in the shape `ls` prints them.
 /// Blank lines carry no name and are skipped; a Windows line ending is
 /// stripped like a Unix one, since the list may have been written elsewhere.
@@ -191,6 +215,27 @@ fn a_missing_or_irregular_filelist_is_an_error() {
     .expect_err("a directory is not a list")
     .to_string();
     assert!(err.contains("not a regular file"), "{err}");
+}
+
+/// The size limit holds for what is read, not only for what `stat` reported:
+/// a list that grew after the check, or a pseudo-file whose reported length
+/// understates its contents, is refused once it passes the limit instead of
+/// being read without end. A list exactly at the limit is fine.
+#[test]
+fn a_filelist_past_the_limit_is_refused_while_reading() {
+    let list = Path::new("list.txt");
+    let at_limit = b"first\nsecond\n";
+    let names = parse_filelist(&at_limit[..], at_limit.len() as u64, list)
+        .expect("a list at the limit is read whole");
+    assert_eq!(names, vec![PathBuf::from("first"), PathBuf::from("second")]);
+
+    let err = parse_filelist(&at_limit[..], at_limit.len() as u64 - 1, list)
+        .expect_err("one byte past the limit is refused")
+        .to_string();
+    assert!(
+        err.contains("larger than"),
+        "the refusal names the limit: {err}"
+    );
 }
 
 /// Names from a list are expanded by `-r` like names from the command line:

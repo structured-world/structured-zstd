@@ -594,6 +594,30 @@ fn guard_binary_stdout(stdout_is_terminal: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Refuse to compress stdin into a terminal unless forced.
+///
+/// The reference command's own check (`zstdcli.c`, "stdout is a console"):
+/// stdin among the inputs, no `-o` file, stdout a terminal, no `-f`, and an
+/// operation that writes a frame. Decompression is exempt, since plaintext on
+/// a terminal is what the user asked to see. Taken before any input is read,
+/// so a run that would paint a frame into the session never starts.
+fn refuse_console_stdout(opts: &Options, stdout_is_terminal: bool) -> Result<()> {
+    // No `-o`, or `-c`: several inputs without `-o` count too, since `-` among
+    // them streams to stdout, and the reference command asks the same question
+    // of a missing output name.
+    let to_stdout = opts.to_stdout || opts.output.is_none();
+    if opts.mode == Mode::Compress
+        && !opts.bench
+        && to_stdout
+        && reads_stdin(&opts.inputs)
+        && stdout_is_terminal
+        && !opts.force
+    {
+        bail!("stdout is a console, aborting");
+    }
+    Ok(())
+}
+
 /// Outcome of argument parsing: either run with `Options`, or a terminal
 /// message already handled (help / version).
 enum Parsed {
@@ -885,6 +909,10 @@ fn parse_args_into(
         exclude_compressed: false,
         recursive: false,
         follow_links: preset.force,
+        // Not from the preset: `zstdcat` / `zcat` force the output side only
+        // (`zstdcli.c` sets `forceStdout`, never `forceStdin`), so run with a
+        // terminal on stdin they refuse, as the reference command does. Only
+        // an explicit `-f` lifts that.
         force_stdin: false,
         filelists: Vec::new(),
         output_dir: None,
@@ -1852,6 +1880,7 @@ fn run(mut opts: Options) -> Result<usize> {
     if streams && reads_stdin(&opts.inputs) && !opts.force_stdin && io::stdin().is_terminal() {
         bail!("stdin is a console, aborting");
     }
+    refuse_console_stdout(&opts, io::stdout().is_terminal())?;
     let has_stdout_output = matches!(opts.mode, Mode::Compress | Mode::Decompress)
         && !opts.bench
         && writes_stdout(&opts);
@@ -2041,6 +2070,10 @@ fn process_concatenated(
     };
     match output {
         None => {
+            // No interrupt guard on this path: there is no file of ours to
+            // remove, and the reference command installs its handler only for
+            // a regular-file destination (`fileio.c`, `addHandler`), so an
+            // interruption here takes the default action as it does there.
             let stdout = io::stdout();
             // Only compression produces binary; `-d` to a terminal is text the
             // user asked for, which the reference command also allows.
@@ -2426,11 +2459,12 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         // MiB where the buffers are tens. It is sized by the level, by the
         // source (both cap the window and the tables) and by what the run has
         // asked for on top: `--long` widens the window and adds a matcher with
-        // a table of its own, neither of them in the level's own figures. So it
-        // is asked for the levels this run will measure, the input it will
-        // measure them on, and the parameters it will measure them with. One
-        // level runs at a time and its encoder is dropped before the next, so
-        // the largest of them is what stands at the peak.
+        // a table of its own, and every `--zstd=` knob resizes a table or moves
+        // the level to another backend, none of it in the level's own figures.
+        // So it is asked for the levels this run will measure, the input it
+        // will measure them on, and the very parameters `compress_stream` will
+        // set for each. One level runs at a time and its encoder is dropped
+        // before the next, so the largest of them is what stands at the peak.
         //
         // The dictionary is one of those parameters, and the one that moves the
         // figure most: past the size at which it stops being searched in place,
@@ -2444,21 +2478,41 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         let dictionary = dict
             .as_ref()
             .map(|bytes| structured_zstd::encoding::DictionarySizes::raw_content(bytes.len()));
-        let encoder = (opts.bench_start..=opts.bench_end)
-            .map(|level| {
-                structured_zstd::encoding::estimated_compression_workspace_bytes_for_run(
-                    structured_zstd::encoding::CompressionLevel::Level(level),
+        let mut encoder = 0u64;
+        for level in opts.bench_start..=opts.bench_end {
+            let settings = FrameSettings {
+                level,
+                ..FrameSettings::from_options(opts)
+            };
+            let compression_level = if opts.store {
+                CompressionLevel::Uncompressed
+            } else {
+                CompressionLevel::from_level(level)
+            };
+            // `--store` sets no parameters, as `compress_stream` does not.
+            let parameters = if opts.store {
+                None
+            } else {
+                frame_parameters(compression_level, &settings)?
+            };
+            let bytes = match parameters {
+                Some(parameters) => {
+                    structured_zstd::encoding::estimated_compression_workspace_bytes_for_parameters(
+                        &parameters,
+                        Some(inputs),
+                        dictionary,
+                    )
+                }
+                None => structured_zstd::encoding::estimated_compression_workspace_bytes_for_run(
+                    compression_level,
                     Some(inputs),
-                    opts.long
-                        .then_some(opts.long_window_log)
-                        .flatten()
-                        .and_then(|log| u8::try_from(log).ok()),
-                    opts.long && !opts.store,
+                    None,
+                    false,
                     dictionary,
-                ) as u64
-            })
-            .max()
-            .unwrap_or(0);
+                ),
+            };
+            encoder = encoder.max(bytes as u64);
+        }
         let buffers = frame
             .and_then(|frame| {
                 inputs
@@ -2770,9 +2824,13 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // Settled before the corpus is read: whether this run may write at all is
     // knowable now, and a command that is going to be refused should not first
     // load every sample and spend minutes training a dictionary to throw away.
-    ensure_regular_output_destination(&output)?;
-    if output.exists() && !opts.force {
-        bail!("{} already exists; use -f to overwrite", output.display());
+    // A device or pipe is written in place, as for any other output.
+    let in_place = writes_in_place(&output)?;
+    if !in_place {
+        ensure_regular_output_destination(&output)?;
+        if output.exists() && !opts.force {
+            bail!("{} already exists; use -f to overwrite", output.display());
+        }
     }
     // The default destination is a plain `dictionary`, which a sample can
     // easily be named: the run would read that file and then replace it with
@@ -2881,35 +2939,16 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // A trained dictionary is an output file like any other, so it is written
     // through a temporary that is renamed into place: an interrupted run
     // leaves the previous dictionary intact rather than a half-written one.
-    // The overwrite gate ran before the corpus was read.
-    let (temp_path, mut temp_file) = create_temporary_output_file(&output)?;
-    // And like any other output it is no more readable than what it was made
-    // from. A dictionary carries stretches of its corpus verbatim, so training
-    // on private samples and leaving the result at whatever the umask allows
-    // hands those stretches to everyone; with several samples the strictest
-    // decides, since the bytes of each are in there. Applied to the temporary
-    // file so the dictionary is never briefly readable under the old mode, and
-    // handed to the replace below so a `-f` retrain over a permissive name does
-    // not restore it.
-    // Asked of the temporary file, which is the one that gets renamed into
-    // place: it is where the group the dictionary will belong to is decided.
-    let sample_permissions = strictest_sample_permissions(&samples, &temp_path)?;
-    if let Some(permissions) = sample_permissions.clone()
-        && let Err(err) = fs::set_permissions(&temp_path, permissions)
-    {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err).wrap_err("failed to apply the samples' permissions to the dictionary");
+    // The overwrite gate ran before the corpus was read. A device or pipe has
+    // no previous content to keep and is written straight through.
+    if in_place {
+        let mut sink = open_in_place(&output)?;
+        sink.write_all(&dict)
+            .and_then(|()| sink.flush())
+            .wrap_err_with(|| format!("failed to write dictionary {}", output.display()))?;
+    } else {
+        place_trained_dictionary(&output, &dict, &samples)?;
     }
-    let written = temp_file
-        .write_all(&dict)
-        .and_then(|()| temp_file.flush())
-        .wrap_err_with(|| format!("failed to write dictionary {}", output.display()));
-    if let Err(err) = written {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err);
-    }
-    drop(temp_file);
-    replace_output_file(&temp_path, &output, sample_permissions)?;
     display!(
         opts.verbosity,
         2,
@@ -2919,6 +2958,54 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         opts.inputs.len()
     );
     Ok(())
+}
+
+/// Write a trained dictionary to the regular file `output` through a
+/// temporary renamed into place, no more readable than the strictest of the
+/// `samples` (their metadata) it was trained on.
+fn place_trained_dictionary(output: &Path, dict: &[u8], samples: &[fs::Metadata]) -> Result<()> {
+    let (temp_path, mut temp_file) = create_temporary_output_file(output)?;
+    // Until it is in place, an interruption removes the temporary rather than
+    // leaving it beside the dictionary's name, as for every other output.
+    interrupt::guard(&temp_path);
+    let placed = (|| {
+        // And like any other output it is no more readable than what it was
+        // made from. A dictionary carries stretches of its corpus verbatim, so
+        // training on private samples and leaving the result at whatever the
+        // umask allows hands those stretches to everyone; with several samples
+        // the strictest decides, since the bytes of each are in there. Applied
+        // to the temporary file so the dictionary is never briefly readable
+        // under the old mode, and handed to the replace below so a `-f`
+        // retrain over a permissive name does not restore it.
+        // Asked of the temporary file, which is the one that gets renamed into
+        // place: it is where the group the dictionary will belong to is decided.
+        let sample_permissions = match strictest_sample_permissions(samples, &temp_path) {
+            Ok(permissions) => permissions,
+            Err(err) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(err);
+            }
+        };
+        if let Some(permissions) = sample_permissions.clone()
+            && let Err(err) = fs::set_permissions(&temp_path, permissions)
+        {
+            let _ = fs::remove_file(&temp_path);
+            return Err(err).wrap_err("failed to apply the samples' permissions to the dictionary");
+        }
+        let written = temp_file
+            .write_all(dict)
+            .and_then(|()| temp_file.flush())
+            .wrap_err_with(|| format!("failed to write dictionary {}", output.display()));
+        if let Err(err) = written {
+            let _ = fs::remove_file(&temp_path);
+            return Err(err);
+        }
+        drop(temp_file);
+        // Removes the temporary itself when it fails.
+        replace_output_file(&temp_path, output, sample_permissions)
+    })();
+    interrupt::clear();
+    placed
 }
 
 /// The FastCOVER tuning `--train-fastcover=...` asked for, checked the way the
@@ -3726,12 +3813,22 @@ fn stream_input_to<W: Write>(
 /// no question can be asked, and asked about at it. `Ok(None)` is such a
 /// refusal, already reported. `source` is the file whose permissions the
 /// output takes; `None` (stdin, a concatenation) leaves the umask to decide.
+///
+/// A destination that already exists and is not a regular file (`/dev/null`,
+/// a pipe, `/dev/stdout`) is opened and written in place instead; see
+/// [`writes_in_place`].
 fn write_output_file<T>(
     opts: &Options,
     output: &Path,
     source: Option<&fs::Metadata>,
     fill: impl FnOnce(&mut File) -> Result<T>,
 ) -> Result<Option<T>> {
+    if writes_in_place(output)? {
+        let mut sink = open_in_place(output)?;
+        let value = fill(&mut sink)?;
+        sink.flush().wrap_err("failed to flush output")?;
+        return Ok(Some(value));
+    }
     ensure_regular_output_destination(output)?;
     if output.exists() && !opts.force {
         if opts.verbosity <= 1 {
@@ -4491,6 +4588,36 @@ fn output_destination_kind(output: &Path) -> Result<Option<std::fs::FileType>> {
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).wrap_err("failed to inspect existing output path"),
     }
+}
+
+/// Whether `output` is written in place rather than through a temporary: it
+/// exists, links followed, and is neither a regular file nor a directory: a
+/// device, a pipe or a socket.
+///
+/// The reference command opens every destination with `fopen(.., "wb")`, and
+/// asks about overwriting and installs its interrupt handler only for a
+/// regular file (`fileio.c`, `FIO_openDstFile`, `addHandler`). The temporary
+/// and rename that give a regular output its atomicity would, for a device,
+/// replace the device node with a file, so those destinations take the
+/// reference command's path: no question, no temporary, no handler. A link to
+/// a regular file is not among them; the rename would replace the link, so it
+/// stays refused below.
+fn writes_in_place(output: &Path) -> Result<bool> {
+    match fs::metadata(output) {
+        Ok(metadata) => Ok(!metadata.is_file() && !metadata.is_dir()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).wrap_err("failed to inspect existing output path"),
+    }
+}
+
+/// Open a destination [`writes_in_place`] accepted, as the reference command
+/// does: for writing, truncated where truncation means anything.
+fn open_in_place(output: &Path) -> Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(output)
+        .wrap_err_with(|| output.display().to_string())
 }
 
 fn ensure_regular_output_destination(output: &Path) -> Result<()> {

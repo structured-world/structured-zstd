@@ -1089,73 +1089,15 @@ impl Matcher for MatchGeneratorDriver {
         // of the level-resolved params. A strategy override re-routes the
         // backend, so this must precede `next_backend` selection. The
         // all-`None` case is skipped so default level geometry stays
-        // byte-identical to plain level-based compression.
-        if let Some(ov) = self.param_overrides
-            && !ov.is_empty()
-            && dict_hint.is_some()
-        {
-            // A dictionary frame runs the CDict's cParams whatever its
-            // strategy (upstream `ZSTD_resetCCtx_byAttachingCDict` /
-            // `byCopyingCDict`: "cdict overrides"); only the caller's
-            // windowLog is kept. Reshaping the live search would probe the
-            // dictionary's tables with another geometry / key width than they
-            // were indexed with.
-            //
-            // The window still answers to the source, as it does for every
-            // other frame: `ZSTD_adjustCParams_internal` caps it by the source
-            // and dictionary extent, and a window neither can fill only makes
-            // decoders reserve memory the frame never uses. Capped here rather
-            // than through the full adjuster, which would reshape the search.
-            if let Some(window_log) = ov.window_log {
-                params.window_log = match hint {
-                    // The source caps the window even here, and even with an
-                    // explicit request: the reference command declares 2 KiB
-                    // for `--ultra -22 --long=27 -D dict` on a 2 KiB file, and
-                    // a window the content cannot fill only makes every decoder
-                    // reserve memory the frame never uses. The floor that
-                    // travels with the cap in `adjust_cparams` applies too, or
-                    // a hint of a few dozen bytes asks for a window smaller
-                    // than the format's smallest.
-                    //
-                    // The dictionary's own size is NOT part of that cap: the
-                    // reference declares the same 2 KiB whether the dictionary
-                    // is 4 KiB or 256 KiB, because a small window does not put
-                    // the dictionary out of reach — sequences may reference it
-                    // at offsets beyond the window while the output so far is
-                    // within it (RFC 8878, Dictionary_Content). Counting it
-                    // made our frames ask decoders for up to 256x what the
-                    // reference asks.
-                    Some(src) => (crate::encoding::cparams::adjusted_window_log(
-                        u32::from(window_log),
-                        src,
-                        0,
-                    ) as u8)
-                        .max(MIN_WINDOW_LOG),
-                    None => window_log,
-                };
-            }
-        } else if let Some(ov) = self.param_overrides
-            && !ov.is_empty()
-        {
-            apply_param_overrides(&mut params, &ov);
-            // `Self::level_params(level, hint)` applied the source-size cap
-            // for the LEVEL's native backend. If a strategy override moved
-            // the frame onto a different backend, `apply_param_overrides`
-            // synthesized that backend's DEFAULT config (FAST_L1 /
-            // HC_OVERRIDE_DEFAULT) with full-size table logs AFTER that cap
-            // ran. Re-apply the hint cap so a tiny hinted frame doesn't
-            // allocate the new backend's full-size tables.
-            //
-            // The cap covers an explicit `window_log` too, as
-            // `ZSTD_adjustCParams_internal` does upstream: the window is a
-            // promise about the memory decoding will need, and a source that
-            // cannot fill it makes that promise for nothing — every decoder
-            // opening the frame would reserve the whole declared window to
-            // read a few bytes. The override still raises the window as far as
-            // the source can use.
-            if let Some(hint_size) = hint {
-                params = adjust_params_for_source_size(params, hint_size);
-            }
+        // byte-identical to plain level-based compression. Shared with the
+        // workspace estimate, which has to build what this builds.
+        if let Some(ov) = self.param_overrides {
+            crate::encoding::levels::config::apply_frame_overrides(
+                &mut params,
+                &ov,
+                dict_hint.is_some(),
+                hint,
+            );
         }
         // A dictionary frame's hash-chain / binary-tree widths are the CDict's
         // (`resolve_level_params_with_dict`): verbatim when the dictionary is
@@ -1526,23 +1468,7 @@ impl Matcher for MatchGeneratorDriver {
                 .param_overrides
                 .as_ref()
                 .and_then(|ov| ov.ldm)
-                .map(|ldm_ov| {
-                    let strategy_ord = ldm_strategy_ordinal(params.strategy_tag, params.lazy_depth);
-                    // Seed the caller-pinned knobs, then run the upstream zstd
-                    // derivation over the seed so the remaining (zero)
-                    // fields are filled with cross-field consistency
-                    // (e.g. `hash_rate_log = window_log - hash_log`).
-                    // Clobbering after `adjust_for` would break that and
-                    // hand the producer an inconsistent set.
-                    let seed = super::ldm::params::LdmParams {
-                        window_log: params.window_log as u32,
-                        hash_log: ldm_ov.hash_log.unwrap_or(0),
-                        hash_rate_log: ldm_ov.hash_rate_log.unwrap_or(0),
-                        min_match_length: ldm_ov.min_match.unwrap_or(0),
-                        bucket_size_log: ldm_ov.bucket_size_log.unwrap_or(0),
-                    };
-                    seed.derive(strategy_ord)
-                });
+                .map(|ldm_ov| crate::encoding::levels::config::frame_ldm_params(&params, &ldm_ov));
             if let MatcherStorage::HashChain(hc) = &mut self.storage {
                 // Reuse the existing producer's hash-table allocation when the
                 // derived params are unchanged: only `clear()` (re-zero the

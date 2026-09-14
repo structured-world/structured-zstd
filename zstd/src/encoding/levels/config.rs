@@ -740,6 +740,103 @@ pub(crate) fn adjust_params_for_source_size(mut params: LevelParams, src_size: u
     params
 }
 
+/// Apply the caller's parameter overrides to the level params a frame
+/// resolved to: the step the matcher's reset takes after the level (and a
+/// dictionary's CDict tier) is resolved, kept in one place so the workspace
+/// estimate builds exactly what the encoder does. An all-`None` set leaves the
+/// params untouched, which keeps plain level-based geometry byte-identical.
+pub(crate) fn apply_frame_overrides(
+    params: &mut LevelParams,
+    ov: &crate::encoding::parameters::ParamOverrides,
+    dictionary_frame: bool,
+    hint: Option<u64>,
+) {
+    if ov.is_empty() {
+        return;
+    }
+    if dictionary_frame {
+        // A dictionary frame runs the CDict's cParams whatever its
+        // strategy (upstream `ZSTD_resetCCtx_byAttachingCDict` /
+        // `byCopyingCDict`: "cdict overrides"); only the caller's
+        // windowLog is kept. Reshaping the live search would probe the
+        // dictionary's tables with another geometry / key width than they
+        // were indexed with.
+        //
+        // The window still answers to the source, as it does for every
+        // other frame: `ZSTD_adjustCParams_internal` caps it by the source
+        // and dictionary extent, and a window neither can fill only makes
+        // decoders reserve memory the frame never uses. Capped here rather
+        // than through the full adjuster, which would reshape the search.
+        if let Some(window_log) = ov.window_log {
+            params.window_log = match hint {
+                // The source caps the window even here, and even with an
+                // explicit request: the reference command declares 2 KiB
+                // for `--ultra -22 --long=27 -D dict` on a 2 KiB file, and
+                // a window the content cannot fill only makes every decoder
+                // reserve memory the frame never uses. The floor that
+                // travels with the cap in `adjust_cparams` applies too, or
+                // a hint of a few dozen bytes asks for a window smaller
+                // than the format's smallest.
+                //
+                // The dictionary's own size is NOT part of that cap: the
+                // reference declares the same 2 KiB whether the dictionary
+                // is 4 KiB or 256 KiB, because a small window does not put
+                // the dictionary out of reach: sequences may reference it
+                // at offsets beyond the window while the output so far is
+                // within it (RFC 8878, Dictionary_Content). Counting it
+                // made our frames ask decoders for up to 256x what the
+                // reference asks.
+                Some(src) => {
+                    (crate::encoding::cparams::adjusted_window_log(u32::from(window_log), src, 0)
+                        as u8)
+                        .max(MIN_WINDOW_LOG)
+                }
+                None => window_log,
+            };
+        }
+    } else {
+        apply_param_overrides(params, ov);
+        // The level's own resolution applied the source-size cap for the
+        // LEVEL's native backend. If a strategy override moved the frame
+        // onto a different backend, `apply_param_overrides` synthesized that
+        // backend's DEFAULT config (FAST_L1 / HC_OVERRIDE_DEFAULT) with
+        // full-size table logs AFTER that cap ran. Re-apply the hint cap so a
+        // tiny hinted frame doesn't allocate the new backend's full-size
+        // tables.
+        //
+        // The cap covers an explicit `window_log` too, as
+        // `ZSTD_adjustCParams_internal` does upstream: the window is a
+        // promise about the memory decoding will need, and a source that
+        // cannot fill it makes that promise for nothing: every decoder
+        // opening the frame would reserve the whole declared window to read
+        // a few bytes. The override still raises the window as far as the
+        // source can use.
+        if let Some(hint_size) = hint {
+            *params = adjust_params_for_source_size(*params, hint_size);
+        }
+    }
+}
+
+/// The long-distance matcher's parameters for a frame: the caller-pinned knobs
+/// seeded first, then the upstream derivation fills the rest so the set stays
+/// consistent (`hash_rate_log = window_log - hash_log`, and so on); clobbering
+/// after the derivation would hand the producer an inconsistent set. Shared by
+/// the matcher's reset and the workspace estimate.
+#[cfg(feature = "ldm")]
+pub(crate) fn frame_ldm_params(
+    params: &LevelParams,
+    ldm: &crate::encoding::parameters::LdmOverride,
+) -> crate::encoding::ldm::params::LdmParams {
+    let seed = crate::encoding::ldm::params::LdmParams {
+        window_log: params.window_log as u32,
+        hash_log: ldm.hash_log.unwrap_or(0),
+        hash_rate_log: ldm.hash_rate_log.unwrap_or(0),
+        min_match_length: ldm.min_match.unwrap_or(0),
+        bucket_size_log: ldm.bucket_size_log.unwrap_or(0),
+    };
+    seed.derive(ldm_strategy_ordinal(params.strategy_tag, params.lazy_depth))
+}
+
 /// Estimated steady-state heap footprint of a one-shot compression context
 /// at `level` (window history + match-finder tables + block staging), in
 /// bytes. Computed from the same per-level tuning table the encoder
@@ -790,7 +887,6 @@ pub fn estimated_compression_workspace_bytes_for_run(
     long_distance_matching: bool,
     dictionary: Option<crate::encoding::DictionarySizes>,
 ) -> usize {
-    use crate::encoding::strategy::StrategyTag;
     let mut params = match dictionary.filter(|sizes| sizes.content != 0) {
         Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes).0,
         None => resolve_level_params(level, src_size_hint),
@@ -833,6 +929,70 @@ pub fn estimated_compression_workspace_bytes_for_run(
         let _ = long_distance_matching;
         0
     };
+    workspace_bytes(&params, ldm)
+}
+
+/// The workspace estimate for a frame run under `parameters`: the level, every
+/// knob that overrides it, the source size and the dictionary, resolved the way
+/// the encoder resolves them at frame start.
+///
+/// [`estimated_compression_workspace_bytes_for_run`] answers for a level with a
+/// window and long-distance matching on top; a caller that also sets `hashLog`,
+/// `chainLog`, a strategy or the long-distance matcher's own table sizes needs
+/// this one, since each of those resizes what the frame allocates. A dictionary
+/// frame runs the dictionary's own geometry and keeps only the requested window,
+/// as the encoder does.
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::encoding::{
+///     estimated_compression_workspace_bytes_for_parameters, CompressionLevel,
+///     CompressionParameters,
+/// };
+///
+/// let level = CompressionParameters::builder(CompressionLevel::Level(3)).build().unwrap();
+/// let wide = CompressionParameters::builder(CompressionLevel::Level(3))
+///     .window_log(27)
+///     .hash_log(24)
+///     .build()
+///     .unwrap();
+/// let source = Some(512 << 20);
+/// assert!(
+///     estimated_compression_workspace_bytes_for_parameters(&wide, source, None)
+///         > estimated_compression_workspace_bytes_for_parameters(&level, source, None)
+/// );
+/// ```
+pub fn estimated_compression_workspace_bytes_for_parameters(
+    parameters: &crate::encoding::CompressionParameters,
+    src_size_hint: Option<u64>,
+    dictionary: Option<crate::encoding::DictionarySizes>,
+) -> usize {
+    let level = parameters.level();
+    let overrides = parameters.overrides();
+    let dictionary = dictionary.filter(|sizes| sizes.content != 0);
+    let mut params = match dictionary {
+        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes).0,
+        None => resolve_level_params(level, src_size_hint),
+    };
+    apply_frame_overrides(&mut params, &overrides, dictionary.is_some(), src_size_hint);
+    #[cfg(feature = "ldm")]
+    let ldm = overrides.ldm.map_or(0, |ldm| {
+        let ldm_params = frame_ldm_params(&params, &ldm);
+        crate::encoding::ldm::table::LdmHashTable::estimated_workspace_bytes(
+            ldm_params.hash_log,
+            ldm_params.bucket_size_log,
+        )
+    });
+    #[cfg(not(feature = "ldm"))]
+    let ldm = 0;
+    workspace_bytes(&params, ldm)
+}
+
+/// Window, match-finder tables, optimal-parser scratch and block staging for a
+/// frame resolved to `params`, plus `ldm` bytes of long-distance table.
+fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
+    use crate::encoding::strategy::StrategyTag;
     // A 30-bit window is a gibibyte, which a 32-bit `usize` cannot count: the
     // widest window is more memory than such a machine has, so the figure is
     // pinned rather than wrapped.
