@@ -51,7 +51,7 @@ fn recursion_walks_directories_depth_first_in_name_order() {
     // Name order at each level: `d.txt` sorts before the `deeper` directory
     // (`.` before `e`), so the sibling file comes before the nested one.
     assert_eq!(selection.files, vec![a, b, sibling, nested]);
-    assert_eq!(selection.named, 1, "one input was named before expansion");
+    assert!(selection.explicit, "the directory was named");
 }
 
 /// Without `-r` a directory stays a directory: the caller reports it as one
@@ -191,7 +191,26 @@ fn a_filelist_adds_one_input_per_line() {
         ],
         "command-line inputs come first, then the list, blank lines dropped"
     );
-    assert_eq!(selection.named, 4, "list entries count as named inputs");
+    assert!(selection.explicit, "a name and a list were both given");
+}
+
+/// A `--filelist` that lists nothing is still a source the command line gave:
+/// the run has no files, and must not fall back to reading stdin, which with
+/// a redirected stdin would compress data the caller never pointed it at.
+#[test]
+fn an_empty_filelist_is_an_explicit_empty_selection() {
+    let scratch = Scratch::new("emptylist");
+    let list = scratch.path().join("list.txt");
+    fs::write(&list, "\n\n").unwrap();
+    let selection = select_inputs(Vec::new(), &[list], false, false, 0).unwrap();
+    assert!(selection.files.is_empty());
+    assert!(
+        selection.explicit,
+        "a list was given, so stdin is not the input"
+    );
+
+    let nothing = select_inputs(Vec::new(), &[], false, false, 0).unwrap();
+    assert!(!nothing.explicit, "no name and no list: stdin is the input");
 }
 
 /// A list that is not there is an error, not an empty list: a mistyped
@@ -253,7 +272,7 @@ fn filelist_entries_are_expanded_recursively_too() {
 
     let selection = select_inputs(Vec::new(), &[list], true, false, 0).unwrap();
     assert_eq!(selection.files, vec![inside]);
-    assert_eq!(selection.named, 1);
+    assert!(selection.explicit, "the list is the source");
 }
 
 /// Links named by a `--filelist` are taken as given, without `-f`: a link to a

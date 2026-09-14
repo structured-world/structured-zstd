@@ -909,11 +909,12 @@ fn parse_args_into(
         exclude_compressed: false,
         recursive: false,
         follow_links: preset.force,
-        // Not from the preset: `zstdcat` / `zcat` force the output side only
-        // (`zstdcli.c` sets `forceStdout`, never `forceStdin`), so run with a
-        // terminal on stdin they refuse, as the reference command does. Only
-        // an explicit `-f` lifts that.
-        force_stdin: false,
+        // `zstdcat` / `zcat` read a terminal on stdin the way `cat` does. The
+        // reference command's preset forces only the output side
+        // (`zstdcli.c` sets `forceStdout`, not `forceStdin`) and refuses the
+        // terminal; that refusal protects nothing a script relies on, so the
+        // preset's force covers both sides here.
+        force_stdin: preset.force,
         filelists: Vec::new(),
         output_dir: None,
         output_dir_mirror: None,
@@ -1853,16 +1854,20 @@ fn writes_stdout(opts: &Options) -> bool {
 /// exit status is 1 when it is not zero, as the reference command's is,
 /// while an error that ends the run early is returned outright.
 fn run(mut opts: Options) -> Result<usize> {
-    let Selection { files, named } = inputs::select_inputs(
+    let Selection {
+        files, explicit, ..
+    } = inputs::select_inputs(
         std::mem::take(&mut opts.inputs),
         &opts.filelists,
         opts.recursive,
         opts.follow_links,
         opts.verbosity,
     )?;
-    if files.is_empty() && named > 0 {
-        // Pointed at empty directories: nothing to do, and not a request to
-        // read stdin. The reference command says so and exits 0.
+    if files.is_empty() && explicit {
+        // Pointed at empty directories or an empty list: nothing to do, and not
+        // a request to read stdin. The reference command says so for empty
+        // directories and exits 0; for an empty list it reads stdin, which
+        // would compress data the caller never pointed it at.
         display!(
             opts.verbosity,
             1,
@@ -1988,6 +1993,33 @@ fn run(mut opts: Options) -> Result<usize> {
             output.display(),
             dict.display(),
         );
+    }
+    // And no `-o` may name one of the inputs: the input would be read through
+    // its open descriptor while the finished frame is renamed over it, and
+    // `--rm` would then delete even that. The reference command refuses an
+    // output that would overwrite its input; the per-input check in
+    // `process_separately` covers derived outputs, this one the named output.
+    // Compared as files, as there: another spelling or a hard link is the
+    // same input. An input that is not there cannot be overwritten, and is
+    // left to fail on its own when it is opened.
+    if let Some(output) = &opts.output
+        && !opts.to_stdout
+        && opts.mode != Mode::Test
+    {
+        for input in &opts.inputs {
+            if input != Path::new("-")
+                && (names_the_same_file(output, input)?
+                    || (output.exists()
+                        && input.exists()
+                        && paths_point_to_same_file(input, output)?))
+            {
+                bail!(
+                    "{} would be written over {}, which is also an input",
+                    output.display(),
+                    input.display(),
+                );
+            }
+        }
     }
     let total = opts.inputs.len().max(1);
     match (opts.to_stdout, &opts.output) {
@@ -2136,21 +2168,31 @@ fn process_concatenated(
                     None => tally.record(Outcome::Refused),
                 }
             } else {
-                let written = write_output_file(opts, output, None, |sink| {
-                    let mut tally = Tally::default();
-                    for input in &inputs {
-                        let outcome = stream_input_to(
-                            opts,
-                            dicts,
-                            input,
-                            &mut *sink,
-                            &output.display().to_string(),
-                            total,
-                        )?;
-                        tally.record(outcome);
-                    }
-                    Ok(tally)
-                })?;
+                // An existing output is replaced only by a concatenation that
+                // holds something: when no input could be read, the file keeps
+                // what it had rather than becoming empty, and the failures are
+                // still counted.
+                let written = write_output_file_if(
+                    opts,
+                    output,
+                    None,
+                    |sink| {
+                        let mut tally = Tally::default();
+                        for input in &inputs {
+                            let outcome = stream_input_to(
+                                opts,
+                                dicts,
+                                input,
+                                &mut *sink,
+                                &output.display().to_string(),
+                                total,
+                            )?;
+                            tally.record(outcome);
+                        }
+                        Ok(tally)
+                    },
+                    |tally| tally.processed > 0,
+                )?;
                 match written {
                     Some(inner) => tally = inner,
                     None => tally.failed = total,
@@ -3823,6 +3865,22 @@ fn write_output_file<T>(
     source: Option<&fs::Metadata>,
     fill: impl FnOnce(&mut File) -> Result<T>,
 ) -> Result<Option<T>> {
+    write_output_file_if(opts, output, source, fill, |_| true)
+}
+
+/// [`write_output_file`], with `keep` deciding from what `fill` returned
+/// whether the result replaces the output at all. When it does not, the
+/// temporary is removed and whatever `output` held stays as it was; the value
+/// is still returned, since the caller's accounting comes from it. A device
+/// or pipe written in place has no earlier content to keep, so `keep` is not
+/// asked there.
+fn write_output_file_if<T>(
+    opts: &Options,
+    output: &Path,
+    source: Option<&fs::Metadata>,
+    fill: impl FnOnce(&mut File) -> Result<T>,
+    keep: impl FnOnce(&T) -> bool,
+) -> Result<Option<T>> {
     if writes_in_place(output)? {
         let mut sink = open_in_place(output)?;
         let value = fill(&mut sink)?;
@@ -3894,6 +3952,10 @@ fn write_output_file<T>(
             return Err(err);
         }
     };
+    if !keep(&value) {
+        abandon(&temp_path);
+        return Ok(Some(value));
+    }
     // `replace_output_file` removes the temporary itself when it fails.
     let replaced = replace_output_file(&temp_path, output, source_permissions);
     interrupt::clear();

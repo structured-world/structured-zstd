@@ -3055,6 +3055,85 @@ fn a_single_input_into_a_named_output_is_removed_on_request() {
     assert!(!input.exists(), "--rm removes the one source");
 }
 
+/// `zstdcat` and `zcat` behave like `cat`: with a terminal on stdin they read
+/// it, which is what `-dcf` does. The reference command's preset forces only
+/// the output side and refuses the terminal ("stdin is a console"), a refusal
+/// no script can rely on, so ours reads. Plain `zstd` still needs `-f` for it.
+#[test]
+fn zstdcat_reads_a_terminal_on_stdin() {
+    for name in ["zstdcat", "zcat"] {
+        let opts = parse_as(&program_preset(name), CompressionLevel::DEFAULT_LEVEL, &[]).unwrap();
+        assert!(opts.force_stdin, "{name} reads a terminal like cat");
+    }
+    assert!(
+        !parse(&[]).unwrap().force_stdin,
+        "plain zstd still refuses it"
+    );
+    assert!(parse(&["-f"]).unwrap().force_stdin, "unless forced");
+}
+
+/// Several inputs into an existing `-o` file, none of which can be read: the
+/// run has nothing to write, so the output keeps what it held instead of
+/// being replaced by an empty file, and the exit status still counts every
+/// input that failed.
+#[test]
+fn an_output_is_kept_when_no_concatenated_input_is_processed() {
+    let scratch = Scratch::new("keepout");
+    let output = scratch.file("existing.zst", b"what was there");
+    let mut opts = parse(&["-qq", "-f", "-o", "x", "a", "b"]).unwrap();
+    opts.inputs = vec![
+        scratch.path().join("missing-1"),
+        scratch.path().join("missing-2"),
+    ];
+    opts.output = Some(output.clone());
+    assert_eq!(
+        run(opts).expect("failed inputs are counted, not an error"),
+        2,
+        "both inputs failed"
+    );
+    assert_eq!(fs::read(&output).unwrap(), b"what was there");
+    let leftovers: Vec<_> = fs::read_dir(scratch.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().contains(".tmp."))
+        .collect();
+    assert!(leftovers.is_empty(), "no temporary is left: {leftovers:?}");
+}
+
+/// `-o` naming one of the inputs would read that input through its open
+/// descriptor and rename the finished frame over it, and `--rm` would then
+/// delete even the frame. The run is refused before anything is written, as
+/// the reference command refuses an output that would overwrite its input,
+/// whether the input is the only one, is spelled another way, or is one of
+/// several being concatenated.
+#[test]
+fn an_output_that_is_also_an_input_is_refused() {
+    let scratch = Scratch::new("oalias");
+    let input = scratch.file("data.txt", b"original bytes");
+    let other = scratch.file("other.txt", b"other bytes");
+    let respelled = scratch.path().join(".").join("data.txt");
+    for (inputs, output) in [
+        (vec![input.clone()], input.clone()),
+        (vec![input.clone()], respelled),
+        (vec![other.clone(), input.clone()], input.clone()),
+    ] {
+        let mut opts = parse(&["-q", "-f", "--rm", "-o", "x", "a"]).unwrap();
+        opts.inputs = inputs;
+        opts.output = Some(output.clone());
+        let err = run(opts)
+            .expect_err("an output that is an input is refused")
+            .to_string();
+        assert!(err.contains("also an input"), "the refusal says why: {err}");
+        assert_eq!(
+            fs::read(&input).unwrap(),
+            b"original bytes",
+            "{}",
+            output.display()
+        );
+        assert!(other.exists(), "--rm removed nothing");
+    }
+}
+
 /// `-o /dev/null` is written in place, as the reference command opens any
 /// destination that is not a regular file: no temporary, no rename (which
 /// would replace the device with a file) and no overwrite question, which is

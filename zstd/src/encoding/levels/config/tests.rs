@@ -128,6 +128,26 @@ fn the_parameters_estimate_is_the_levels_until_a_knob_resizes_the_frame() {
     );
 }
 
+/// An override the builder accepts can ask for a table no 32-bit machine can
+/// hold: `hashLog` 30 is four GiB of Fast table. The estimate has to say so
+/// rather than let the shift lose its high bits and report the table as free,
+/// or a memory ceiling weighed against it admits a run that cannot allocate.
+/// On a 64-bit host the figure is the table's; on a 32-bit one it is pinned.
+#[test]
+fn a_table_wider_than_the_address_space_is_not_estimated_as_nothing() {
+    use crate::encoding::CompressionParameters;
+    let wide = CompressionParameters::builder(CompressionLevel::Level(1))
+        .hash_log(30)
+        .build()
+        .unwrap();
+    let estimate = super::estimated_compression_workspace_bytes_for_parameters(&wide, None, None);
+    let table = (4u64 << 30).min(usize::MAX as u64) as usize;
+    assert!(
+        estimate >= table,
+        "a 2^30-entry table is counted, not shifted away: {estimate}"
+    );
+}
+
 /// Regression: a dictionary whose content cannot be indexed by the tagged
 /// attach tables (Fast / Dfast position fields hold at most 2^24 bytes) is
 /// primed in COPY mode, so the frame must run the CDict's verbatim table

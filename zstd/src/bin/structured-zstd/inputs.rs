@@ -25,10 +25,11 @@ pub const FILELIST_MAX_BYTES: u64 = 50 << 20;
 pub struct Selection {
     /// Every file to process, in command-line order, directories expanded.
     pub files: Vec<PathBuf>,
-    /// How many inputs were named before directories were expanded. A run
-    /// that named some and ended up with none was pointed at empty
-    /// directories, which is not a request to read stdin.
-    pub named: usize,
+    /// Whether the command line gave a source of inputs at all: a name, or a
+    /// `--filelist`, even one that lists nothing. A run that was given one and
+    /// ended up with no files was pointed at empty directories or an empty
+    /// list, which is not a request to read stdin.
+    pub explicit: bool,
 }
 
 /// Resolve the command line's inputs to the files a run processes.
@@ -68,7 +69,7 @@ pub fn select_inputs(
     if files.is_empty() && named_count > 0 {
         bail!("every named input is a symbolic link; pass -f to follow them");
     }
-    let named = files.len();
+    let explicit = named_count > 0 || !filelists.is_empty();
     if recursive {
         let mut expanded = Vec::with_capacity(files.len());
         for input in files {
@@ -89,7 +90,7 @@ pub fn select_inputs(
         }
         files = expanded;
     }
-    Ok(Selection { files, named })
+    Ok(Selection { files, explicit })
 }
 
 /// What identifies a directory whatever name reaches it, so a walk notices

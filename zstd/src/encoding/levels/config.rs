@@ -989,6 +989,17 @@ pub fn estimated_compression_workspace_bytes_for_parameters(
     workspace_bytes(&params, ldm)
 }
 
+/// `entry` bytes for each of `1 << log` slots, pinned at `usize::MAX` where
+/// the table is more than a `usize` counts: the estimate is a budget, and a
+/// figure that wrapped would call an impossible table affordable.
+fn table_bytes(entry: usize, log: usize) -> usize {
+    u32::try_from(log)
+        .ok()
+        .and_then(|log| 1usize.checked_shl(log))
+        .and_then(|slots| slots.checked_mul(entry))
+        .unwrap_or(usize::MAX)
+}
+
 /// Window, match-finder tables, optimal-parser scratch and block staging for a
 /// frame resolved to `params`, plus `ldm` bytes of long-distance table.
 fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
@@ -1014,34 +1025,45 @@ fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
     // The lazy backend's chain / tree finders (window <= 2^14, or a btlazy2
     // level) use a plain hash table (`4 << hash_bits`) plus the chain / tree
     // table (`4 << chain_log`) instead of the row tables.
+    // Every term goes through `table_bytes` and every sum saturates: an
+    // override can ask for a table past what a 32-bit `usize` counts, and a
+    // shift that dropped its high bits would report that table as free.
     let row_chain = params
         .row
         .filter(|r| r.bt || params.window_log <= 14)
-        .map_or(0, |r| (4usize << r.hash_bits) + (4usize << r.chain_log));
-    let tables = params.fast.map(|f| 4usize << f.hash_log).unwrap_or(0)
-        + row_chain
-        + params
-            .dfast
-            .map(|d| (4usize << d.long_hash_log) + (4usize << d.short_hash_log))
-            .unwrap_or(0)
-        + params
-            .hc
-            .map(|h| {
-                let hash3 = if wants_hash3 {
-                    4usize
-                        << crate::encoding::match_table::storage::HC3_HASH_LOG
-                            .min(params.window_log as usize)
-                } else {
-                    0
-                };
-                (4usize << h.hash_log) + (4usize << h.chain_log) + hash3
-            })
-            .unwrap_or(0)
-        + params
-            .row
-            .filter(|r| !(r.bt || params.window_log <= 14))
-            .map(|r| (4usize << r.hash_bits) + (2usize << r.hash_bits))
-            .unwrap_or(0);
+        .map_or(0, |r| {
+            table_bytes(4, r.hash_bits).saturating_add(table_bytes(4, r.chain_log))
+        });
+    let tables = params
+        .fast
+        .map_or(0, |f| table_bytes(4, f.hash_log as usize))
+        .saturating_add(row_chain)
+        .saturating_add(params.dfast.map_or(0, |d| {
+            table_bytes(4, usize::from(d.long_hash_log))
+                .saturating_add(table_bytes(4, usize::from(d.short_hash_log)))
+        }))
+        .saturating_add(params.hc.map_or(0, |h| {
+            let hash3 = if wants_hash3 {
+                table_bytes(
+                    4,
+                    crate::encoding::match_table::storage::HC3_HASH_LOG
+                        .min(params.window_log as usize),
+                )
+            } else {
+                0
+            };
+            table_bytes(4, h.hash_log)
+                .saturating_add(table_bytes(4, h.chain_log))
+                .saturating_add(hash3)
+        }))
+        .saturating_add(
+            params
+                .row
+                .filter(|r| !(r.bt || params.window_log <= 14))
+                .map_or(0, |r| {
+                    table_bytes(4, r.hash_bits).saturating_add(table_bytes(2, r.hash_bits))
+                }),
+        );
     // BT modes box a `BtMatcher`; its retained scratch layout is budgeted
     // next to the struct so estimator and allocator evolve together.
     let bt = if uses_bt {
