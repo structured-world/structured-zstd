@@ -194,6 +194,9 @@ pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
 /// the dictionary. The provided reader need not be buffered, but callers should avoid
 /// sources too large to fit comfortably in memory.
 ///
+/// A corpus already in memory trains without this copy through
+/// [`create_raw_dict_from_slice`].
+///
 /// # API note
 /// This public API returns `io::Result<()>` and propagates source/output I/O failures.
 pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
@@ -208,7 +211,36 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     let prealloc = source_size.min(MAX_TRAINING_PREALLOC_BYTES);
     let mut all = Vec::with_capacity(prealloc);
     source.read_to_end(&mut all)?;
-    if all.is_empty() {
+    create_raw_dict_from_slice(&all, output, dict_size)
+}
+
+/// Create a "raw content" dictionary of at most `dict_size` bytes from a
+/// corpus already in memory, writing it to `output`.
+///
+/// The same training as [`create_raw_dict_from_source`], reading `source` in
+/// place: a caller that holds the samples anyway does not pay for a second
+/// copy of them.
+///
+/// # Errors
+/// Returns the error `output` reports while the dictionary is written.
+///
+/// # Examples
+/// ```
+/// use structured_zstd::dictionary::create_raw_dict_from_slice;
+///
+/// let corpus: Vec<u8> = (0..20_000u32)
+///     .flat_map(|i| format!("record {} value {}\n", i % 100, i % 7).into_bytes())
+///     .collect();
+/// let mut dict = Vec::new();
+/// create_raw_dict_from_slice(&corpus, &mut dict, 4096).unwrap();
+/// assert!(!dict.is_empty() && dict.len() <= 4096);
+/// ```
+pub fn create_raw_dict_from_slice<W: io::Write>(
+    all: &[u8],
+    output: &mut W,
+    dict_size: usize,
+) -> io::Result<()> {
+    if dict_size == 0 || all.is_empty() {
         return Ok(());
     }
 
@@ -231,7 +263,7 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     let mut sample_size = source_size / sample_scale;
     sample_size = usize::max(sample_size, usize::min(source_size, 16));
     vprintln!("create_dict: creating {sample_size} byte sample of collection");
-    let mut sample_reader = all.as_slice();
+    let mut sample_reader = all;
     let collection_sample = create_sample(&mut sample_reader, sample_size);
 
     // A collection of segments to be used in the final dictionary.

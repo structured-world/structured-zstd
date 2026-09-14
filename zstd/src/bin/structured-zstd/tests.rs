@@ -1400,6 +1400,23 @@ fn list_file_refuses_a_content_size_total_that_overflows() {
     result.expect_err("a total that cannot be represented must be reported, not wrapped");
 }
 
+/// `-lv` reports the window a decoder has to hold to read the whole archive,
+/// which is the largest any frame declares, not the last frame's: a small
+/// frame after a large one does not lower what decoding needs.
+#[test]
+fn the_listed_window_is_the_largest_a_frame_declares() {
+    let scratch = Scratch::new("listwindow");
+    // `frame_declaring` declares a 1 MiB window; the second frame's
+    // descriptor is rewritten to exponent 0, a 1 KiB window.
+    let mut archive = frame_declaring(1);
+    let mut small = frame_declaring(1);
+    small[5] = 0;
+    archive.extend_from_slice(&small);
+    let path = scratch.file("windows.zst", &archive);
+    let summary = summarize_archive(&path).unwrap();
+    assert_eq!(summary.window_size, 1 << 20);
+}
+
 /// The closing row of `-l` adds up every listed archive, and the content
 /// sizes it adds are the same declarations: two tiny files can each claim
 /// nearly 2^64 bytes. That sum is checked like the one inside an archive, so
@@ -3293,7 +3310,11 @@ fn decoding_counts_its_output_and_no_check_ignores_the_checksum() {
 
 /// Input that is not a zstd stream is copied through under `--pass-through`,
 /// bytes intact, and refused otherwise; a stream too short to hold a magic
-/// number is treated the same way, as the reference command treats it.
+/// number is treated the same way, as the reference command treats it. Bytes
+/// that follow a frame and are not a frame themselves are a damaged or
+/// truncated archive, not plain input: they are refused with pass-through on,
+/// as xz refuses them, rather than copied into the output with success as the
+/// reference command and gzip copy them.
 #[test]
 fn plain_input_is_passed_through_or_refused() {
     let pass = DecodeSettings {
@@ -3330,12 +3351,33 @@ fn plain_input_is_passed_through_or_refused() {
     assert!(err.contains("unknown header"), "{err}");
 
     // A real frame followed by plain bytes: the frame decodes, and the tail
-    // is passed through after it, as the reference command's loop does.
+    // is refused rather than passed through after it.
     let mut mixed = frame_of(b"framed");
     mixed.extend_from_slice(b" then plain");
     let mut out = Vec::new();
-    decompress_stream(mixed.as_slice(), &mut out, &no_dict(), &pass).unwrap();
-    assert_eq!(out, b"framed then plain");
+    let err = decompress_stream(mixed.as_slice(), &mut out, &no_dict(), &pass)
+        .expect_err("data after a frame is not plain input")
+        .to_string();
+    assert!(err.contains("unsupported format"), "{err}");
+    assert_eq!(out, b"framed", "only the frame reaches the output");
+
+    // A second frame whose header lost its first byte is the damage this
+    // guards against: its raw bytes must not land in the output as if they
+    // were content.
+    let first = frame_of(b"first");
+    let mut damaged = first.clone();
+    damaged.extend_from_slice(&frame_of(b"second")[1..]);
+    let mut out = Vec::new();
+    decompress_stream(damaged.as_slice(), &mut out, &no_dict(), &pass)
+        .expect_err("a damaged frame after a good one is refused");
+    assert_eq!(out, b"first");
+
+    // A skippable frame is a frame too: plain bytes after one are refused.
+    let mut after_skippable = 0x184D_2A50u32.to_le_bytes().to_vec();
+    after_skippable.extend_from_slice(&0u32.to_le_bytes());
+    after_skippable.extend_from_slice(b"plain");
+    decompress_stream(after_skippable.as_slice(), io::sink(), &no_dict(), &pass)
+        .expect_err("plain bytes after a skippable frame are refused");
 
     // The default follows the reference command: on when forced and writing
     // to stdout (`zstd -dcf`), off otherwise.
@@ -3504,7 +3546,7 @@ fn rm_keeps_the_source_when_output_went_to_stdout() {
 
     let mut opts = parse(&["--rm", "-c", "f"]).unwrap();
     opts.inputs = vec![path.clone()];
-    let result = remove_source_if_requested(&opts, &path);
+    let result = remove_source_if_requested(&opts, &path, Placement::File);
 
     let survived = path.exists();
     let _ = fs::remove_file(&path);
@@ -3513,6 +3555,29 @@ fn rm_keeps_the_source_when_output_went_to_stdout() {
         survived,
         "--rm with -c must keep the input: the output went somewhere we cannot verify"
     );
+}
+
+/// `--rm` removes a source once a regular file holds what it became. A device
+/// or pipe written in place (`-o /dev/null`, a FIFO) keeps nothing, so the
+/// source stays, as it does for stdout; the reference command deletes it and
+/// leaves no copy anywhere.
+#[cfg(unix)]
+#[test]
+fn a_source_written_only_to_a_device_is_not_removed() {
+    let scratch = Scratch::new("rmdevice");
+    let source = scratch.file("data.txt", b"the only copy of this data");
+    let mut opts = parse(&["--rm", "-q", "-o", "/dev/null", "x"]).unwrap();
+    opts.inputs = vec![source.clone()];
+    assert_eq!(run(opts).unwrap(), 0);
+    assert!(source.exists(), "nothing else holds these bytes");
+
+    // And a regular output still lets `--rm` do its job.
+    let archive = scratch.path().join("data.txt.zst");
+    let mut opts = parse(&["--rm", "-q", "-o", "x", "x"]).unwrap();
+    opts.inputs = vec![source.clone()];
+    opts.output = Some(archive.clone());
+    assert_eq!(run(opts).unwrap(), 0);
+    assert!(archive.exists() && !source.exists());
 }
 
 /// `-c` and `-o` name competing destinations, so the later one on the command

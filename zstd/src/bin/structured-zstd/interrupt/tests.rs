@@ -26,23 +26,44 @@ fn a_guard_is_set_by_guard_and_removed_by_clear() {
     assert!(!is_guarded());
 }
 
-/// A path the buffer cannot hold is not guarded rather than guarded under a
-/// truncated name, which would be some other file's.
+/// The guard holds a path of any length: a Windows path in its `\\?\` form
+/// runs to 32767 units, and a guard that gave up on a long one would leave
+/// that run's temporary behind on an interruption. A name that names nothing
+/// is not guarded.
 #[cfg(any(unix, windows))]
 #[test]
-fn a_path_that_does_not_fit_is_left_unguarded() {
+fn a_long_path_is_guarded_and_an_empty_one_is_not() {
     super::imp::forget_inherited();
     super::imp::take_default_action();
     clear();
-    let long = "x".repeat(super::imp::PATH_CAPACITY);
+    let long = "x".repeat(5000);
     guard(Path::new(&long));
-    assert!(
-        !is_guarded(),
-        "a name that would not fit must not be guarded"
-    );
-    guard(Path::new(""));
-    assert!(!is_guarded(), "nor an empty one");
+    assert!(is_guarded(), "a path past 4096 units is guarded");
     clear();
+    guard(Path::new("short"));
+    assert!(is_guarded(), "and a short one after it, in the same buffer");
+    clear();
+    guard(Path::new(""));
+    assert!(!is_guarded(), "an empty name is not");
+    clear();
+}
+
+/// `_wunlink` reaches a path past `MAX_PATH` only in the verbatim `\\?\` form,
+/// which is how the standard library created the temporary: a drive path and
+/// a UNC share each gain their prefix, and a path already verbatim or naming
+/// a device is left alone.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_windows_path_is_guarded_in_its_verbatim_form() {
+    let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+    let verbatim = |text: &str| super::imp::verbatim(&wide(text));
+    assert_eq!(verbatim(r"C:\dir\a.zst.tmp"), wide(r"\\?\C:\dir\a.zst.tmp"));
+    assert_eq!(
+        verbatim(r"\\server\share\a.zst.tmp"),
+        wide(r"\\?\UNC\server\share\a.zst.tmp")
+    );
+    assert_eq!(verbatim(r"\\?\C:\a.zst.tmp"), wide(r"\\?\C:\a.zst.tmp"));
+    assert_eq!(verbatim(r"\\.\pipe\name"), wide(r"\\.\pipe\name"));
 }
 
 /// A process started with `SIGINT` ignored (a background job of a

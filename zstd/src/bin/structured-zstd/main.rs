@@ -2140,7 +2140,7 @@ fn process_concatenated(
                         None => stream_stdin(opts, dicts, sink),
                     })?;
                 match written {
-                    Some(processed) => {
+                    Some((processed, placement)) => {
                         file_summary(
                             opts,
                             total,
@@ -2149,7 +2149,7 @@ fn process_concatenated(
                             &processed,
                         );
                         if remove_source && input != Path::new("-") {
-                            remove_source_if_requested(opts, input)?;
+                            remove_source_if_requested(opts, input, placement)?;
                         }
                         tally.record(Outcome::Done(processed));
                     }
@@ -2181,8 +2181,9 @@ fn process_concatenated(
                     },
                     |tally| tally.processed > 0,
                 )?;
+                // A concatenation removes no source, wherever it went.
                 match written {
-                    Some(inner) => tally = inner,
+                    Some((inner, _)) => tally = inner,
                     None => tally.failed = total,
                 }
             }
@@ -2831,7 +2832,7 @@ fn bench_display_name(label: &str) -> String {
 /// `zstd --train FILEs -o dict --maxdict=N [--dictID=N]`.
 fn train_dictionary(opts: &Options) -> Result<()> {
     use structured_zstd::dictionary::{
-        FinalizeOptions, create_fastcover_dict_from_slice, create_raw_dict_from_source,
+        FinalizeOptions, create_fastcover_dict_from_slice, create_raw_dict_from_slice,
         finalize_raw_dict,
     };
 
@@ -2980,8 +2981,11 @@ fn train_dictionary(opts: &Options) -> Result<()> {
             .map_err(|err| eyre!("dictionary training failed: {err}"))?;
         }
         None => {
+            // From the slice, as FastCOVER is: the reader path would buffer
+            // the whole corpus a second time, and `corpus` has to stay alive
+            // for the finalizing pass below anyway.
             let mut raw = Vec::new();
-            create_raw_dict_from_source(corpus.as_slice(), corpus.len(), &mut raw, opts.max_dict)
+            create_raw_dict_from_slice(corpus.as_slice(), &mut raw, opts.max_dict)
                 .map_err(|err| eyre!("dictionary training failed: {err}"))?;
             if raw.is_empty() {
                 bail!("dictionary training failed: the samples yield no dictionary content");
@@ -3422,8 +3426,8 @@ struct ArchiveSummary {
     /// Whether the data frames named one dictionary between them. False makes
     /// the id above absent rather than wrong.
     dict_ids_agree: bool,
-    /// The window the last data frame declares, which is what a decoder will
-    /// need in memory to read it.
+    /// The largest window any data frame declares, which is what a decoder
+    /// needs in memory to read the whole archive.
     window_size: u64,
     /// The stored checksum of the last data frame that carries one; shown
     /// under `-lv` for a single-frame archive, as the reference command
@@ -3545,7 +3549,10 @@ fn summarize_archive(path: &Path) -> Result<ArchiveSummary> {
         } else {
             block_offset
         };
-        window_size = info.window_size;
+        // The largest, not the last: a small frame after a large one does not
+        // lower what decoding the archive needs. The reference command shows
+        // the last frame's, which understates it.
+        window_size = window_size.max(info.window_size);
 
         match info.content_size {
             // Declared, not measured: a handful of header bytes can claim any
@@ -3676,19 +3683,33 @@ fn list_file(path: &Path, verbose: bool, verbosity: i32) -> Result<ArchiveSummar
 }
 
 /// Remove the source file after a successful (de)compression when `--rm` is set
-/// (and `-k` was not). A no-op otherwise.
-fn remove_source_if_requested(opts: &Options, input: &Path) -> Result<()> {
+/// (and `-k` was not) and a regular file now holds the output (`placement`).
+/// A no-op otherwise.
+fn remove_source_if_requested(opts: &Options, input: &Path, placement: Placement) -> Result<()> {
     // Never when the output went to stdout: that may have been a pipe whose
     // reader is gone, a terminal, or anything else we cannot read back, so
     // there is no saved copy to justify deleting the original. Upstream keeps
     // the file for `-c` too.
-    if opts.remove_source && !opts.keep && !opts.to_stdout {
-        // Removing the source is past the point where an interruption should
-        // delete anything: the output is in place, and the guard would take
-        // it along with the source.
-        interrupt::clear();
-        fs::remove_file(input).wrap_err("failed to remove source file after success")?;
+    if !opts.remove_source || opts.keep || opts.to_stdout {
+        return Ok(());
     }
+    // Nor when a device or pipe took the output in place (`-o /dev/null`, a
+    // FIFO), for the same reason: it keeps nothing, and the source is the only
+    // copy left. The reference command removes it there as well.
+    if placement != Placement::File {
+        display!(
+            opts.verbosity,
+            3,
+            "Note: {} is not removed: its output is not a regular file",
+            input.display()
+        );
+        return Ok(());
+    }
+    // Removing the source is past the point where an interruption should
+    // delete anything: the output is in place, and the guard would take it
+    // along with the source.
+    interrupt::clear();
+    fs::remove_file(input).wrap_err("failed to remove source file after success")?;
     Ok(())
 }
 
@@ -3893,6 +3914,18 @@ fn stream_input_to<W: Write>(
     Ok(Outcome::Done(processed))
 }
 
+/// Where an output's bytes went, which decides whether its source may go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Placement {
+    /// A regular file holds them: the source has a durable replacement.
+    File,
+    /// A device or pipe took them in place and keeps nothing.
+    Stream,
+    /// Nothing was placed: the result was turned down and the output left as
+    /// it was.
+    Discarded,
+}
+
 /// Fill `output` atomically: `fill` writes into a sibling temporary, which is
 /// renamed into place on success and removed on failure or interruption.
 ///
@@ -3904,13 +3937,13 @@ fn stream_input_to<W: Write>(
 ///
 /// A destination that already exists and is not a regular file (`/dev/null`,
 /// a pipe, `/dev/stdout`) is opened and written in place instead; see
-/// [`writes_in_place`].
+/// [`writes_in_place`]. The [`Placement`] returned says which happened.
 fn write_output_file<T>(
     opts: &Options,
     output: &Path,
     source: Option<&fs::Metadata>,
     fill: impl FnOnce(&mut File) -> Result<T>,
-) -> Result<Option<T>> {
+) -> Result<Option<(T, Placement)>> {
     write_output_file_if(opts, output, source, fill, |_| true)
 }
 
@@ -3926,12 +3959,12 @@ fn write_output_file_if<T>(
     source: Option<&fs::Metadata>,
     fill: impl FnOnce(&mut File) -> Result<T>,
     keep: impl FnOnce(&T) -> bool,
-) -> Result<Option<T>> {
+) -> Result<Option<(T, Placement)>> {
     if writes_in_place(output)? {
         let mut sink = open_in_place(output)?;
         let value = fill(&mut sink)?;
         sink.flush().wrap_err("failed to flush output")?;
-        return Ok(Some(value));
+        return Ok(Some((value, Placement::Stream)));
     }
     ensure_regular_output_destination(output)?;
     if output.exists() && !opts.force {
@@ -4000,12 +4033,12 @@ fn write_output_file_if<T>(
     };
     if !keep(&value) {
         abandon(&temp_path);
-        return Ok(Some(value));
+        return Ok(Some((value, Placement::Discarded)));
     }
     // `replace_output_file` removes the temporary itself when it fails.
     let replaced = replace_output_file(&temp_path, output, source_permissions);
     interrupt::clear();
-    replaced.map(|()| Some(value))
+    replaced.map(|()| Some((value, Placement::File)))
 }
 
 /// Resolve the output path for a file input under the current mode: the
@@ -4086,7 +4119,7 @@ fn process_file(
     if let Some(root) = &opts.output_dir_mirror {
         inputs::create_mirrored_dirs(input, root)?;
     }
-    let Some(processed) = write_output_file(opts, &output, Some(&metadata), |sink| {
+    let Some((processed, placement)) = write_output_file(opts, &output, Some(&metadata), |sink| {
         stream_opened(opts, dicts, source, &metadata, sink)
     })?
     else {
@@ -4099,7 +4132,7 @@ fn process_file(
         &output.display().to_string(),
         &processed,
     );
-    remove_source_if_requested(opts, input)?;
+    remove_source_if_requested(opts, input, placement)?;
     Ok(Outcome::Done(processed))
 }
 
@@ -4377,7 +4410,8 @@ const SKIPPABLE_MAGIC_BASE: u32 = 0x184D_2A50;
 /// Each frame is recognised by its magic number before a decoder is built on
 /// it, the way the reference command looks before it decodes: input that is
 /// not a zstd stream is then copied through under `--pass-through`, or
-/// refused as an unknown format.
+/// refused as an unknown format. Bytes after a frame that are not a frame are
+/// refused either way.
 fn decompress_stream<R: Read, W: Write>(
     reader: R,
     mut writer: W,
@@ -4413,7 +4447,12 @@ fn decompress_stream<R: Read, W: Write>(
             magic == FRAME_MAGIC || magic & 0xFFFF_FFF0 == SKIPPABLE_MAGIC_BASE
         };
         if !is_frame {
-            if settings.pass_through {
+            // Only input that is not zstd from its first byte is passed
+            // through. What follows a frame and is not one is a damaged or
+            // truncated archive, and copying it would hand its raw bytes on as
+            // content with success; xz refuses it the same way, where the
+            // reference command and gzip copy it.
+            if settings.pass_through && frames == 0 {
                 writer
                     .write_all(&magic[..read])
                     .wrap_err("failed to write the passed-through input")?;

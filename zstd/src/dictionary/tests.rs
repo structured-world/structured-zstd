@@ -129,6 +129,32 @@ fn create_raw_dict_from_source_treats_source_size_as_hint() {
     assert!(!out.is_empty());
 }
 
+/// Training from a slice is the reader path without its buffering copy, so
+/// the two must write the same dictionary, byte for byte, at every size the
+/// tiny-source and epoch paths take.
+#[test]
+fn create_raw_dict_from_slice_matches_the_reader_path() {
+    let sample = training_data();
+    for (corpus, dict_size) in [
+        (sample.as_slice(), 1024),
+        (sample.as_slice(), 0),
+        (&b"short"[..], 3),
+        (&b""[..], 64),
+    ] {
+        let mut from_reader = Vec::new();
+        create_raw_dict_from_source(
+            Cursor::new(corpus),
+            corpus.len(),
+            &mut from_reader,
+            dict_size,
+        )
+        .unwrap();
+        let mut from_slice = Vec::new();
+        create_raw_dict_from_slice(corpus, &mut from_slice, dict_size).unwrap();
+        assert_eq!(from_slice, from_reader, "dict_size {dict_size}");
+    }
+}
+
 #[test]
 fn create_raw_dict_from_source_handles_tiny_source_without_epochs() {
     let sample = b"short";

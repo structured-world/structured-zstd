@@ -50,8 +50,8 @@ mod imp {
         }
 
         /// The path's units in the order `unlink` reads them.
-        pub fn units(path: &Path) -> impl Iterator<Item = PathUnit> + '_ {
-            path.as_os_str().as_bytes().iter().copied()
+        pub fn units(path: &Path) -> Vec<PathUnit> {
+            path.as_os_str().as_bytes().to_vec()
         }
 
         /// # Safety
@@ -96,9 +96,15 @@ mod imp {
             pub fn _exit(status: c_int) -> !;
         }
 
-        /// The path's units in the order `_wunlink` reads them.
-        pub fn units(path: &Path) -> impl Iterator<Item = PathUnit> + '_ {
-            path.as_os_str().encode_wide()
+        /// The path as `_wunlink` has to be given it: absolute and verbatim,
+        /// since past `MAX_PATH` only the `\\?\` form reaches the file, and
+        /// that is the form the standard library created it through.
+        pub fn units(path: &Path) -> Vec<PathUnit> {
+            // With no working directory to resolve against, the name as given
+            // is all there is, and it still reaches a path under `MAX_PATH`.
+            let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            let wide: Vec<PathUnit> = absolute.as_os_str().encode_wide().collect();
+            super::verbatim(&wide)
         }
 
         /// # Safety
@@ -119,15 +125,38 @@ mod imp {
         }
     }
 
-    /// Longest path the guard covers, terminator included. A longer temporary
-    /// is not guarded rather than truncated to a name that is not the file's.
-    pub const PATH_CAPACITY: usize = 4096;
+    /// `absolute` in the verbatim `\\?\` form, which Windows hands to the
+    /// filesystem without the `MAX_PATH` limit: `C:\x` becomes `\\?\C:\x` and
+    /// `\\server\share\x` becomes `\\?\UNC\server\share\x`, while a path
+    /// already verbatim, or one naming a device (`\\.\`), is kept as it is.
+    #[cfg(any(windows, test))]
+    pub fn verbatim(absolute: &[u16]) -> Vec<u16> {
+        const SEPARATOR: u16 = b'\\' as u16;
+        let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+        if absolute.starts_with(&wide(r"\\?\")) || absolute.starts_with(&wide(r"\\.\")) {
+            return absolute.to_vec();
+        }
+        let mut verbatim = wide(r"\\?\");
+        match absolute.strip_prefix(&[SEPARATOR, SEPARATOR][..]) {
+            Some(share) => {
+                verbatim.extend(wide(r"UNC\"));
+                verbatim.extend_from_slice(share);
+            }
+            None => verbatim.extend_from_slice(absolute),
+        }
+        verbatim
+    }
 
-    /// The guarded path, NUL-terminated, or all zeros. Written only while
-    /// `ARTEFACT` is null, so the handler never reads a half-written name.
-    static mut PATH: [PathUnit; PATH_CAPACITY] = [0; PATH_CAPACITY];
+    /// Where the guarded path is kept, NUL-terminated, for the handler: a
+    /// buffer that only grows, of `CAPACITY` units. Written only while
+    /// `ARTEFACT` is null, so the handler never reads a half-written name. An
+    /// outgrown buffer is leaked rather than freed, because on Windows the
+    /// handler runs on a thread of its own and may still hold it; capacity
+    /// doubles, so what is leaked stays below the longest path guarded.
+    static BUFFER: AtomicPtr<PathUnit> = AtomicPtr::new(ptr::null_mut());
+    static CAPACITY: AtomicUsize = AtomicUsize::new(0);
 
-    /// Points into `PATH` while a file is guarded, null otherwise.
+    /// Points at `BUFFER` while a file is guarded, null otherwise.
     static ARTEFACT: AtomicPtr<PathUnit> = AtomicPtr::new(ptr::null_mut());
 
     /// What `SIGINT` was before the handler first went in, `SIG_ERR` until
@@ -138,9 +167,10 @@ mod imp {
     /// only, no allocation, no locks, no formatting.
     extern "C" fn on_interrupt(_signum: c_int) {
         let path = ARTEFACT.load(Ordering::SeqCst);
-        // SAFETY: a non-null `path` points at `PATH`, which holds a
-        // NUL-terminated string from the moment the pointer was published
-        // and is not rewritten until the pointer has been cleared.
+        // SAFETY: a non-null `path` points at a buffer that holds a
+        // NUL-terminated string from the moment the pointer was published,
+        // is not rewritten until the pointer has been cleared, and is never
+        // freed.
         if !path.is_null() {
             unsafe {
                 sys::remove(path);
@@ -184,28 +214,27 @@ mod imp {
     /// Remove `path` if the process is interrupted before [`clear`] is called.
     pub fn guard(path: &Path) {
         ARTEFACT.store(ptr::null_mut(), Ordering::SeqCst);
-        let buffer = (&raw mut PATH).cast::<PathUnit>();
-        let mut len = 0;
-        for unit in sys::units(path) {
-            // A terminator inside the name, or a name that would not leave
-            // room for one, is not a name the handler can be given.
-            if unit == 0 || len >= PATH_CAPACITY - 1 {
-                return;
-            }
-            // SAFETY: the handler reads `PATH` only through `ARTEFACT`, which
-            // is null for the length of this write; raw pointer access keeps
-            // no reference to the static alive, and `len` is in range.
-            unsafe {
-                *buffer.add(len) = unit;
-            }
-            len += 1;
-        }
-        if len == 0 {
+        let units = sys::units(path);
+        // An empty name names nothing, and one with a terminator inside is not
+        // a name the handler can be given.
+        if units.is_empty() || units.contains(&0) {
             return;
         }
-        // SAFETY: `len < PATH_CAPACITY`, and as above.
+        let needed = units.len() + 1;
+        let mut buffer = BUFFER.load(Ordering::SeqCst);
+        if needed > CAPACITY.load(Ordering::SeqCst) {
+            // Paths are bounded by the platform far below where doubling
+            // could overflow.
+            let capacity = needed.next_power_of_two();
+            buffer = Box::into_raw(vec![0; capacity].into_boxed_slice()).cast::<PathUnit>();
+            BUFFER.store(buffer, Ordering::SeqCst);
+            CAPACITY.store(capacity, Ordering::SeqCst);
+        }
+        // SAFETY: `buffer` holds `CAPACITY >= needed` units, and the handler
+        // reads it only through `ARTEFACT`, which is null for this write.
         unsafe {
-            *buffer.add(len) = 0;
+            ptr::copy_nonoverlapping(units.as_ptr(), buffer, units.len());
+            *buffer.add(units.len()) = 0;
         }
         if !install() {
             return;

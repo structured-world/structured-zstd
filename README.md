@@ -63,6 +63,9 @@ warning, an existing output is asked about unless `-f` is given (and refused
 under `-q`, where nothing can be asked), one failing input does not stop the
 others, and the exit status is 1 when any input failed and 2 on an interrupt
 while an output file is being written, which also removes the partial file.
+`--rm` keeps a source whose output went to stdout, a device or a pipe
+(`-o /dev/null`, a FIFO), since nothing there holds a copy; upstream removes
+it in the last two cases.
 
 The wire-format switches take effect: `--[no-]check` (`--no-check` also skips
 checksum verification when decoding), `--[no-]content-size`, `--no-dictID` and
@@ -71,8 +74,11 @@ overrides the level's parameters knob by knob (the `ldm*` knobs apply with
 `--long`). `--patch-from REF` compresses against a reference as raw content
 with the window sized to the input, and applies the patch back on `-d`.
 `--[no-]pass-through` copies non-zstd input through unchanged when
-decompressing, on by default for `zstdcat` and `zstd -dcf` as upstream has it,
-and `--exclude-compressed` skips inputs whose extension names an
+decompressing, on by default for `zstdcat` and `zstd -dcf` as upstream has it.
+Only input that is not zstd from its first byte is copied: bytes after a frame
+that are not a frame are a damaged archive and fail the run, as xz treats
+them, where upstream and gzip copy them into the output and report success.
+`--exclude-compressed` skips inputs whose extension names an
 already-compressed format.
 
 Flags that only steer how the work is done (`-T`, `-B`, `--adapt`, ...) are
@@ -97,11 +103,12 @@ accepted there and describes nothing, as upstream has it.
 
 `--train` and `--train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#]` train
 with FastCOVER, the algorithm upstream also defaults to (a knob set to zero
-keeps its default, as upstream reads it), and `--train-cover`
-with the COVER trainer (whose reference-side tuning does not apply here, so it
-is refused rather than misread). `--train-legacy` names an algorithm this build
-does not have and is refused. `-D` takes either a dictionary produced by `--train` or any file at
-all, which is then used as raw content the way upstream does — such a
+keeps its default, as upstream reads it), and a bare `--train-cover` trains
+with the COVER trainer. Its tuning, `--train-cover=...`, is refused rather
+than misread: the reference-side parameters name knobs this trainer does not
+have. `--train-legacy` names an algorithm this build does not have and is
+refused. `-D` takes either a dictionary produced by `--train` or any file at
+all, which is then used as raw content the way upstream does; such a
 dictionary has no ID, so the same bytes must be supplied when decoding.
 
 It is deliberately **not** installed as `zstd`, so it never shadows the system
