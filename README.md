@@ -96,7 +96,8 @@ ignored. Compressing, listing and training allocate no decoder, so the flag is
 accepted there and describes nothing, as upstream has it.
 
 `--train` and `--train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#]` train
-with FastCOVER, the algorithm upstream also defaults to, and `--train-cover`
+with FastCOVER, the algorithm upstream also defaults to (a knob set to zero
+keeps its default, as upstream reads it), and `--train-cover`
 with the COVER trainer (whose reference-side tuning does not apply here, so it
 is refused rather than misread). `--train-legacy` names an algorithm this build
 does not have and is refused. `-D` takes either a dictionary produced by `--train` or any file at

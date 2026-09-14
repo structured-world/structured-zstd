@@ -416,10 +416,8 @@ fn create_dir_if_missing(dir: &Path, permissions: Option<fs::Permissions>) -> st
     builder.create(dir)
 }
 
-/// The file names that more than one of `files` share.
-///
-/// Under `--output-dir-flat` two such inputs land on one output, the second
-/// replacing the first; the reference command warns about it after the run.
+/// The file names that more than one of `files` share, each once: given the
+/// outputs of an `--output-dir-flat` run, the ones a later input replaces.
 pub fn shared_file_names(files: &[PathBuf]) -> Vec<OsString> {
     let mut names: Vec<&std::ffi::OsStr> =
         files.iter().filter_map(|file| file.file_name()).collect();

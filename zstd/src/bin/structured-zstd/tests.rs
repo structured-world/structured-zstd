@@ -1367,28 +1367,28 @@ fn list_file_walks_past_skippable_frames() {
     assert_eq!((summary.frames, summary.skips), (3, 1));
 }
 
+/// A frame declaring `content_size` bytes but holding one RLE block.
+fn frame_declaring(content_size: u64) -> Vec<u8> {
+    let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD];
+    // Descriptor: 8-byte Frame_Content_Size, no dictionary, no checksum,
+    // window descriptor present (not single-segment).
+    frame.push(0b11 << 6);
+    // Window descriptor: exponent 10, i.e. a 1 MiB window.
+    frame.push(10 << 3);
+    frame.extend_from_slice(&content_size.to_le_bytes());
+    // One RLE block, last of the frame: size 1, type 1, last-block bit set.
+    let block_header = (1u32 << 3) | (1 << 1) | 1;
+    frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
+    frame.push(b'x');
+    frame
+}
+
 /// Frame_Content_Size is a declaration, not a measurement: a few bytes of
 /// header can claim any size at all. Summing those declarations unchecked lets
 /// a tiny crafted file either crash `-l` or have it report a wrapped-around
 /// total as fact.
 #[test]
 fn list_file_refuses_a_content_size_total_that_overflows() {
-    /// A frame declaring `content_size` bytes but holding one RLE block.
-    fn frame_declaring(content_size: u64) -> Vec<u8> {
-        let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD];
-        // Descriptor: 8-byte Frame_Content_Size, no dictionary, no checksum,
-        // window descriptor present (not single-segment).
-        frame.push(0b11 << 6);
-        // Window descriptor: exponent 10, i.e. a 1 MiB window.
-        frame.push(10 << 3);
-        frame.extend_from_slice(&content_size.to_le_bytes());
-        // One RLE block, last of the frame: size 1, type 1, last-block bit set.
-        let block_header = (1u32 << 3) | (1 << 1) | 1;
-        frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
-        frame.push(b'x');
-        frame
-    }
-
     let mut archive = frame_declaring(u64::MAX);
     archive.extend_from_slice(&frame_declaring(u64::MAX));
 
@@ -1398,6 +1398,25 @@ fn list_file_refuses_a_content_size_total_that_overflows() {
     let result = list_file(&path, false, 0);
     let _ = fs::remove_file(&path);
     result.expect_err("a total that cannot be represented must be reported, not wrapped");
+}
+
+/// The closing row of `-l` adds up every listed archive, and the content
+/// sizes it adds are the same declarations: two tiny files can each claim
+/// nearly 2^64 bytes. That sum is checked like the one inside an archive, so
+/// the run reports it and fails instead of panicking or printing a wrapped
+/// total.
+#[test]
+fn a_list_total_that_overflows_is_reported_not_wrapped() {
+    let scratch = Scratch::new("listtotal");
+    let first = scratch.file("one.zst", &frame_declaring(u64::MAX));
+    let second = scratch.file("two.zst", &frame_declaring(u64::MAX));
+    let mut opts = parse(&["-l", "-q", "x"]).unwrap();
+    opts.inputs = vec![first, second];
+    assert_eq!(
+        list_files(&opts).expect("each archive lists; only the total fails"),
+        1,
+        "a total that cannot be represented fails the run"
+    );
 }
 
 #[test]
@@ -2040,6 +2059,20 @@ fn the_environment_level_is_the_default_the_command_line_overrides() {
     );
     // An environment level above the ceiling is reduced like a typed one.
     assert_eq!(parse_as(&plain(), 22, &["f"]).unwrap().level, 19);
+}
+
+/// A bare `-b` benchmarks the default level alone, a negative one from
+/// `ZSTD_CLEVEL` included: with no `-e` the range ends where it starts. An
+/// `-e` that was typed still sets the end, and one below the start is raised
+/// to it.
+#[test]
+fn a_bare_benchmark_of_a_negative_default_ends_at_its_start() {
+    let bare = parse_as(&plain(), -3, &["-b", "f"]).unwrap();
+    assert_eq!((bare.bench_start, bare.bench_end), (-3, -3));
+    let ranged = parse_as(&plain(), -3, &["-b", "-e0", "f"]).unwrap();
+    assert_eq!((ranged.bench_start, ranged.bench_end), (-3, 0));
+    let reversed = parse(&["-b5", "-e2", "f"]).unwrap();
+    assert_eq!((reversed.bench_start, reversed.bench_end), (5, 5));
 }
 
 /// `ZSTD_CLEVEL` is read the way the reference command reads it: a sign,
@@ -2881,6 +2914,39 @@ fn the_memory_limit_counts_the_dictionary_and_the_benchmark_together() {
     );
 }
 
+/// Under `--output-dir-flat` two inputs collide when their outputs share a
+/// name, which for decompression is the name with its suffix gone: `a/foo.zst`
+/// and `b/foo.zstd` both become `out/foo`, and the second would replace the
+/// first unannounced if the inputs' own names were compared. Outputs that the
+/// mirror keeps apart, or that land beside their inputs, never collide.
+#[test]
+fn flat_output_collisions_are_judged_by_the_output_names() {
+    let decompress = parse(&[
+        "-d",
+        "--output-dir-flat",
+        "out",
+        "a/foo.zst",
+        "b/foo.zstd",
+        "c/bar.tzst",
+        "d/bar.tar.zst",
+        "e/unknown.bin",
+    ])
+    .unwrap();
+    assert_eq!(
+        flat_output_collisions(&decompress),
+        vec![OsString::from("bar.tar"), OsString::from("foo")]
+    );
+    let compress = parse(&["--output-dir-flat", "out", "a/foo", "b/foo", "c/foo.zst"]).unwrap();
+    assert_eq!(
+        flat_output_collisions(&compress),
+        vec![OsString::from("foo.zst")]
+    );
+    let mirrored = parse(&["--output-dir-mirror", "tree", "a/foo", "b/foo"]).unwrap();
+    assert!(flat_output_collisions(&mirrored).is_empty());
+    let beside = parse(&["a/foo", "b/foo"]).unwrap();
+    assert!(flat_output_collisions(&beside).is_empty());
+}
+
 /// Outputs land where the directory flags say: `--output-dir-flat` beside
 /// nothing but the file name, `--output-dir-mirror` under the replayed source
 /// directory, and the mirror wins when both are given, as it does in the
@@ -3312,38 +3378,28 @@ fn parameterised_adapt_is_accepted() {
     assert!(parse(&["--adapt=min=1,max=9", "f"]).is_ok());
 }
 
-/// The help text promises that `-f` is what allows output to a terminal, and
-/// upstream refuses without it. Writing a compressed frame into an interactive
-/// terminal corrupts the session and loses the data, so the guard has to exist
-/// rather than just be advertised.
-#[test]
-fn binary_output_to_a_terminal_needs_force() {
-    // Not a terminal: always fine, `-f` or not.
-    assert!(guard_binary_stdout(false, false).is_ok());
-    assert!(guard_binary_stdout(false, true).is_ok());
-    // A terminal: refused, unless forced.
-    assert!(guard_binary_stdout(true, false).is_err());
-    assert!(guard_binary_stdout(true, true).is_ok());
-}
-
 /// Compressing stdin with stdout on a terminal writes the frame into the
-/// session, so the reference command refuses it without `-f`: with no input
-/// named, with an explicit `-`, and with `-` among several inputs and no `-o`.
-/// A named `-o` file, `-f`, decompression and a stdout that is not a terminal
-/// all proceed.
+/// session when nobody asked for stdout, so the reference command refuses it
+/// unless `-c` or `-f` says otherwise: with no input named, with an explicit
+/// `-`, and with `-` among several inputs and no `-o`. `-c` is the request
+/// for stdout "even if it is a console", and is what `ssh -t` and
+/// `docker run -t` pipelines rely on, since their stdout is a terminal on the
+/// far side of the redirect. A named `-o` file, decompression and a stdout
+/// that is not a terminal all proceed.
 #[test]
-fn compressing_stdin_into_a_terminal_needs_force() {
+fn compressing_stdin_into_a_terminal_needs_c_or_f() {
     let refused = |args: &[&str]| refuse_console_stdout(&parse(args).unwrap(), true).is_err();
     assert!(refused(&[]), "no input: stdin to the terminal");
     assert!(refused(&["-"]), "an explicit -");
-    assert!(
-        refused(&["-c", "-"]),
-        "-c changes nothing about where it goes"
-    );
     assert!(refused(&["a", "-", "b"]), "- among inputs with no -o");
     let err = refuse_console_stdout(&parse(&[]).unwrap(), true).unwrap_err();
     assert_eq!(err.to_string(), "stdout is a console, aborting");
 
+    assert!(
+        !refused(&["-c", "-"]),
+        "-c asks for stdout, a console included"
+    );
+    assert!(!refused(&["--stdout"]), "and so does --stdout");
     assert!(!refused(&["-f"]), "-f forces it");
     assert!(!refused(&["-d"]), "decompressed text may go to a terminal");
     assert!(!refused(&["-o", "out.zst"]), "the frame goes to a file");
@@ -3823,7 +3879,7 @@ fn trainer_parameters_parse_and_build_options() {
         ..TrainerParams::default()
     }));
     assert!(bad(TrainerParams {
-        accel: Some(0),
+        accel: Some(11),
         ..TrainerParams::default()
     }));
     assert!(bad(TrainerParams {
@@ -3848,6 +3904,65 @@ fn trainer_parameters_parse_and_build_options() {
     assert_eq!(opts.trainer, Trainer::Cover);
     assert!(opts.trainer_params.is_default());
     assert!(parse(&["--train-legacy", "s1"]).is_err());
+}
+
+/// Zero is how the reference's trainer options say "the default": its parser
+/// starts from a zeroed structure and its trainer fills in every zero
+/// (`zdict.h`, `ZDICT_optimizeTrainFromBuffer_fastCover`). So
+/// `k=0,d=0,f=0,steps=0,split=0,accel=0` tunes nothing and trains as the bare
+/// flag does, rather than being refused or narrowing the search.
+#[test]
+fn zero_trainer_knobs_ask_for_the_defaults() {
+    use structured_zstd::dictionary::FastCoverOptions;
+
+    let zeros = parse_trainer_params("k=0,d=0,f=0,steps=0,split=0,accel=0", true).unwrap();
+    assert!(zeros.is_default(), "{zeros:?}");
+    let options = fastcover_options(&zeros).expect("zero knobs are valid");
+    let defaults = FastCoverOptions::default();
+    assert!(options.optimize);
+    assert_eq!(options.k_candidates, defaults.k_candidates);
+    assert_eq!(options.d_candidates, defaults.d_candidates);
+    assert_eq!(options.f_candidates, defaults.f_candidates);
+    assert_eq!(
+        (options.accel, options.split_point),
+        (defaults.accel, defaults.split_point)
+    );
+    // A zero beside a real value leaves that value in force.
+    let mixed = parse_trainer_params("k=0,d=6", true).unwrap();
+    assert_eq!((mixed.k, mixed.d), (None, Some(6)));
+    assert!(
+        parse(&["--train-cover=k=0,d=0,steps=0", "s"])
+            .unwrap()
+            .trainer_params
+            .is_default(),
+        "for COVER too, zero is no tuning"
+    );
+}
+
+/// Whether a trainer takes the tuning it was given is known from the command
+/// line alone, so it is answered before any sample is read: a run over a large
+/// corpus that is bound to be refused does not read it first. A sample that is
+/// not there shows the order, since the refusal names the tuning rather than
+/// the missing file.
+#[test]
+fn trainer_tuning_is_refused_before_the_samples_are_read() {
+    let scratch = Scratch::new("tuneearly");
+    let missing = scratch.path().join("absent-sample");
+    for (args, expected) in [
+        (&["--train-cover=k=50", "-q", "s"][..], "takes no tuning"),
+        (
+            &["--train-fastcover=d=7", "-q", "s"][..],
+            "d must be 6 or 8",
+        ),
+    ] {
+        let mut opts = parse(args).unwrap();
+        opts.inputs = vec![missing.clone()];
+        opts.output = Some(scratch.path().join("dict"));
+        let err = train_dictionary(&opts)
+            .expect_err("the tuning is refused")
+            .to_string();
+        assert!(err.contains(expected), "{args:?}: {err}");
+    }
 }
 
 /// `--train-cover` trains with the COVER trainer and writes a real dictionary;

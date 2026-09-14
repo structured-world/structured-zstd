@@ -224,7 +224,8 @@ enum Trainer {
 }
 
 /// Tuning from `--train-fastcover=k=#,d=#,f=#,steps=#,split=#,accel=#` and
-/// `--train-cover=k=#,d=#,steps=#,split=#`, each knob `None` until given.
+/// `--train-cover=k=#,d=#,steps=#,split=#`, each knob `None` until given a
+/// value other than zero; zero, as there, asks for the default.
 /// `shrink` is parsed so the command line is validated, and refused at
 /// training time: no trainer here shrinks the dictionary afterwards.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -565,50 +566,38 @@ fn parse_trainer_params(text: &str, fastcover: bool) -> Result<TrainerParams> {
         if !tail.is_empty() {
             bail!("{flag} parameter `{key}` has an invalid value `{value}`");
         }
+        let set = (number != 0).then_some(number);
         match key {
-            "k" => params.k = Some(number),
-            "d" => params.d = Some(number),
-            "steps" => params.steps = Some(number),
-            "split" => params.split_percent = Some(number),
-            "f" if fastcover => params.f = Some(number),
-            "accel" if fastcover => params.accel = Some(number),
+            "k" => params.k = set,
+            "d" => params.d = set,
+            "steps" => params.steps = set,
+            "split" => params.split_percent = set,
+            "f" if fastcover => params.f = set,
+            "accel" if fastcover => params.accel = set,
             _ => bail!("{flag} has no `{key}` parameter"),
         }
     }
     Ok(params)
 }
 
-/// Refuse to write binary output into an interactive terminal unless forced.
-///
-/// A compressed frame painted into a terminal scrambles the session and the
-/// data is lost either way, so upstream requires `-f` for it and so do we. The
-/// decision is a pure function of the two inputs, which is what makes it
-/// testable: the caller supplies whether stdout is a terminal.
-fn guard_binary_stdout(stdout_is_terminal: bool, force: bool) -> Result<()> {
-    if stdout_is_terminal && !force {
-        bail!(
-            "refusing to write compressed data to a terminal; \
-             redirect the output, use -o FILE, or pass -f to force it"
-        );
-    }
-    Ok(())
-}
-
-/// Refuse to compress stdin into a terminal unless forced.
+/// Refuse to compress stdin into a terminal nobody asked to write to.
 ///
 /// The reference command's own check (`zstdcli.c`, "stdout is a console"):
-/// stdin among the inputs, no `-o` file, stdout a terminal, no `-f`, and an
-/// operation that writes a frame. Decompression is exempt, since plaintext on
-/// a terminal is what the user asked to see. Taken before any input is read,
-/// so a run that would paint a frame into the session never starts.
+/// stdin among the inputs, no `-o` file, stdout a terminal, neither `-c` nor
+/// `-f`, and an operation that writes a frame. `-c` asks for stdout "even if
+/// it is a console", as the help says, and a terminal is what `ssh -t` and
+/// `docker run -t` hand the command on the far side of a redirect. Decompression
+/// is exempt, since plaintext on a terminal is what the user asked to see.
+/// Taken before any input is read, so a run that would paint a frame into the
+/// session never starts.
 fn refuse_console_stdout(opts: &Options, stdout_is_terminal: bool) -> Result<()> {
-    // No `-o`, or `-c`: several inputs without `-o` count too, since `-` among
-    // them streams to stdout, and the reference command asks the same question
-    // of a missing output name.
-    let to_stdout = opts.to_stdout || opts.output.is_none();
+    // Several inputs without `-o` count too, since `-` among them streams to
+    // stdout, and the reference command asks the same question of a missing
+    // output name.
     if opts.mode == Mode::Compress
         && !opts.bench
-        && to_stdout
+        && opts.output.is_none()
+        && !opts.to_stdout
         && reads_stdin(&opts.inputs)
         && stdout_is_terminal
         && !opts.force
@@ -892,7 +881,7 @@ fn parse_args_into(
         dict_id: None,
         bench: false,
         bench_start: default_level,
-        bench_end: 0,
+        bench_end: default_level,
         bench_secs: DEFAULT_BENCH_SECONDS,
         bench_separately: false,
         long: false,
@@ -926,6 +915,10 @@ fn parse_args_into(
         trainer_params: TrainerParams::default(),
     };
     let mut ultra = false;
+    // `-e`, when typed. Without it the benchmark ends where it starts, so no
+    // value can stand in for it: the start may come from `ZSTD_CLEVEL` and be
+    // negative, below any fixed default end.
+    let mut bench_end = None;
     let mut iter = args.iter().enumerate().peekable();
     let mut positional_only = false;
 
@@ -1208,7 +1201,7 @@ fn parse_args_into(
                         }
                         'e' => {
                             if let Some(v) = value {
-                                opts.bench_end = v;
+                                bench_end = Some(v);
                             }
                         }
                         // `-i[N]`: per-level benchmark time budget in seconds.
@@ -1341,9 +1334,8 @@ fn parse_args_into(
         check_memory_limit(limit, 0, 0)?;
     }
     validate_level(opts.level)?;
-    if opts.bench && opts.bench_end < opts.bench_start {
-        opts.bench_end = opts.bench_start;
-    }
+    // An end below the start is raised to it, as upstream raises `cLevelLast`.
+    opts.bench_end = bench_end.map_or(opts.bench_start, |end: i32| end.max(opts.bench_start));
     // The levels 20-22 are expensive enough that upstream asks for them by
     // name. Benchmarking compresses the range `-b`/`-e` give rather than the
     // level `-N` set, so the gate reads the range's top when there is one —
@@ -2106,13 +2098,9 @@ fn process_concatenated(
             // remove, and the reference command installs its handler only for
             // a regular-file destination (`fileio.c`, `addHandler`), so an
             // interruption here takes the default action as it does there.
-            let stdout = io::stdout();
-            // Only compression produces binary; `-d` to a terminal is text the
-            // user asked for, which the reference command also allows.
-            if opts.mode == Mode::Compress {
-                guard_binary_stdout(stdout.is_terminal(), opts.force)?;
-            }
-            let mut sink = stdout.lock();
+            // Reached only under `-c`, which asks for stdout whatever it is, so
+            // a terminal is written like any other stream.
+            let mut sink = io::stdout().lock();
             for input in inputs {
                 let outcome = stream_input_to(opts, dicts, input, &mut sink, STDOUT_MARK, total)?;
                 tally.record(outcome);
@@ -2299,21 +2287,40 @@ fn process_separately(opts: &Options, dicts: &Dictionaries, total: usize) -> Res
         };
         tally.record(outcome);
     }
-    // Under `--output-dir-flat` two inputs with one name land on one output,
-    // the later replacing the earlier; the reference command warns after the
-    // run, once per shared name.
-    if opts.output_dir.is_some() && opts.output_dir_mirror.is_none() {
-        for name in inputs::shared_file_names(&opts.inputs) {
-            display!(
-                opts.verbosity,
-                2,
-                "WARNING: Two files have same filename: {}",
-                Path::new(&name).display()
-            );
-        }
+    for name in flat_output_collisions(opts) {
+        display!(
+            opts.verbosity,
+            2,
+            "WARNING: Two files have same filename: {}",
+            Path::new(&name).display()
+        );
     }
     multi_summary(opts, total, &tally);
     Ok(tally.failed)
+}
+
+/// The output names that more than one input lands on under
+/// `--output-dir-flat`, where the later output replaces the earlier; the run
+/// warns once per name, as the reference command does.
+///
+/// Judged by the derived output names rather than the inputs' own, which the
+/// reference command compares: decompression drops a suffix, so `a/foo.zst`
+/// and `b/foo.zstd` are two names for one `out/foo`. An input whose output
+/// cannot be derived writes nothing and collides with nothing.
+fn flat_output_collisions(opts: &Options) -> Vec<OsString> {
+    if opts.output_dir.is_none()
+        || opts.output_dir_mirror.is_some()
+        || !matches!(opts.mode, Mode::Compress | Mode::Decompress)
+    {
+        return Vec::new();
+    }
+    let outputs: Vec<PathBuf> = opts
+        .inputs
+        .iter()
+        .filter(|input| input.as_path() != Path::new("-"))
+        .filter_map(|input| derive_output_path(opts, input).ok())
+        .collect();
+    inputs::shared_file_names(&outputs)
 }
 
 /// What became of one input.
@@ -2859,6 +2866,27 @@ fn train_dictionary(opts: &Options) -> Result<()> {
             structured_zstd::dictionary::MIN_TRAINED_DICT_SIZE
         );
     }
+    // Whether the trainer takes the tuning it was given is a question about the
+    // command line alone, so it is answered before any sample is touched: a run
+    // bound to be refused does not first read a corpus that may be large.
+    // `Some` holds the FastCOVER options, `None` stands for COVER.
+    let fastcover = match opts.trainer {
+        Trainer::FastCover => Some(fastcover_options(&opts.trainer_params)?),
+        Trainer::Cover => {
+            // The COVER trainer here scores segments by k-mer frequency, as the
+            // reference's does, but is not parameterised the same way: `k`,
+            // `d`, `steps` and `split` name knobs it does not have, and
+            // `shrink` a pass it does not run. Running it anyway would return
+            // a dictionary trained under different terms than the ones typed.
+            if !opts.trainer_params.is_default() {
+                bail!(
+                    "--train-cover takes no tuning here (k, d, steps, split, shrink); \
+                     use --train-fastcover=... for a tunable trainer"
+                );
+            }
+            None
+        }
+    };
     let output = opts
         .output
         .clone()
@@ -2937,9 +2965,8 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         dict_id: opts.dict_id,
     };
     let mut dict = Vec::new();
-    match opts.trainer {
-        Trainer::FastCover => {
-            let options = fastcover_options(&opts.trainer_params)?;
+    match fastcover {
+        Some(options) => {
             // From the slice, not through a reader: the corpus is the largest
             // thing this run holds, and the reader path buffers it a second
             // time inside.
@@ -2952,18 +2979,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
             )
             .map_err(|err| eyre!("dictionary training failed: {err}"))?;
         }
-        Trainer::Cover => {
-            // The COVER trainer here scores segments by k-mer frequency, as the
-            // reference's does, but is not parameterised the same way: `k`,
-            // `d`, `steps` and `split` name knobs it does not have, and
-            // `shrink` a pass it does not run. Running it anyway would return
-            // a dictionary trained under different terms than the ones typed.
-            if !opts.trainer_params.is_default() {
-                bail!(
-                    "--train-cover takes no tuning here (k, d, steps, split, shrink); \
-                     use --train-fastcover=... for a tunable trainer"
-                );
-            }
+        None => {
             let mut raw = Vec::new();
             create_raw_dict_from_source(corpus.as_slice(), corpus.len(), &mut raw, opts.max_dict)
                 .map_err(|err| eyre!("dictionary training failed: {err}"))?;
@@ -3088,10 +3104,7 @@ fn fastcover_options(
         if split > 100 {
             bail!("--train-fastcover split is a percentage, got {split}");
         }
-        // Zero asks for the default, as it does there.
-        if split > 0 {
-            options.split_point = f64::from(split) / 100.0;
-        }
+        options.split_point = f64::from(split) / 100.0;
     }
     match (params.k, params.steps) {
         (Some(k), _) => {
@@ -3266,18 +3279,32 @@ fn list_files(opts: &Options) -> Result<usize> {
     if !verbose {
         println!("Frames  Skips  Compressed  Uncompressed  Ratio  Check  Filename");
     }
-    let mut total = ListTotal::default();
+    let mut total = Some(ListTotal::default());
     let mut failed = 0;
     for input in &opts.inputs {
         match list_file(input, verbose, opts.verbosity) {
-            Ok(summary) => total.add(&summary),
+            Ok(summary) => {
+                // A total past 64 bits has no row to be printed in, so the
+                // closing row is dropped and the run fails; each archive's own
+                // row stands.
+                if let Some(sum) = total.as_mut()
+                    && let Err(err) = sum.add(&summary)
+                {
+                    display!(opts.verbosity, 1, "zstd: {}: {err}", input.display());
+                    failed += 1;
+                    total = None;
+                }
+            }
             Err(err) => {
                 display!(opts.verbosity, 1, "zstd: {err}");
                 failed += 1;
             }
         }
     }
-    if opts.inputs.len() > 1 && !verbose {
+    if let Some(total) = total
+        && opts.inputs.len() > 1
+        && !verbose
+    {
         total.print();
     }
     Ok(failed)
@@ -3298,16 +3325,35 @@ struct ListTotal {
 }
 
 impl ListTotal {
-    fn add(&mut self, summary: &ArchiveSummary) {
-        self.frames += summary.frames;
-        self.skips += summary.skips;
-        self.compressed += summary.compressed;
+    /// Add one archive to the totals. Fails when a total outgrows 64 bits: the
+    /// content sizes are declared by the headers, and two tiny crafted files
+    /// can claim nearly 2^64 bytes each.
+    fn add(&mut self, summary: &ArchiveSummary) -> Result<()> {
+        let overflow = || eyre!("the listed files total more than 2^64 bytes");
+        self.frames = self
+            .frames
+            .checked_add(summary.frames)
+            .ok_or_else(overflow)?;
+        self.skips = self.skips.checked_add(summary.skips).ok_or_else(overflow)?;
+        self.compressed = self
+            .compressed
+            .checked_add(summary.compressed)
+            .ok_or_else(overflow)?;
         match summary.decompressed {
-            Some(decompressed) => self.decompressed += decompressed,
+            // Once one archive's size is unknown so is the total, and no later
+            // declaration is added to it.
+            Some(decompressed) if !self.decompressed_unknown => {
+                self.decompressed = self
+                    .decompressed
+                    .checked_add(decompressed)
+                    .ok_or_else(overflow)?;
+            }
+            Some(_) => {}
             None => self.decompressed_unknown = true,
         }
         self.without_check |= !summary.check;
         self.files += 1;
+        Ok(())
     }
 
     fn print(&self) {

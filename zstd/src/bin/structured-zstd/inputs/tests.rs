@@ -391,8 +391,8 @@ fn an_unmirrorable_source_creates_no_directories() {
     assert!(!root.exists(), "no root is created for a refused source");
 }
 
-/// Two inputs with one file name land on one output under
-/// `--output-dir-flat`; the run warns about each such name once.
+/// Each file name that several paths share is reported once, whatever
+/// directories the paths are in.
 #[test]
 fn shared_names_are_reported_once_each() {
     let files = vec![
