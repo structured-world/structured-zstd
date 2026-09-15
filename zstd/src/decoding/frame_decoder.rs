@@ -2368,6 +2368,17 @@ impl FrameDecoder {
                     Some(s) => s,
                     None => panic!("Bug in library"),
                 };
+                // A frame that declares its size gets its buffer in one
+                // allocation on its first call, as upstream allocates its
+                // stream buffer at the frame header: growing it block by block
+                // cost a fresh decoder several reallocations, copies and
+                // page-fault passes per frame. The size is content-capped, so a
+                // small frame gets a small buffer; a frame of unknown size keeps
+                // growing lazily rather than paying for its whole window.
+                if state.block_counter == 0 && state.frame_header.fcs_declared() {
+                    let buffer_size = state.decoding_buffer_size();
+                    state.decoder_scratch.reserve_buffer(buffer_size);
+                }
                 let mut block_dec = decoding::block_decoder::new();
 
                 // Honour the content-checksum mode on this hand-rolled decode
