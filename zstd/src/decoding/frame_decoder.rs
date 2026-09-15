@@ -1663,6 +1663,13 @@ impl FrameDecoder {
         self.state.as_ref().is_some_and(|s| s.active_dict.is_some())
     }
 
+    /// The dictionary handle the decode state holds: the one the last
+    /// dictionary frame was decoded against (kept across frames that use
+    /// none, so reapplying it costs no clone).
+    pub(crate) fn active_dictionary(&self) -> Option<&DictionaryHandle> {
+        self.state.as_ref().and_then(|s| s.active_dict.as_ref())
+    }
+
     /// Whether the current frames last block has been decoded yet
     /// If this returns true you can call the drain* functions to get all content
     /// (the read() function will drain automatically if this returns true)

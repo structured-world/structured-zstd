@@ -1028,12 +1028,8 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 $self.table.skip_insert_until_abs = $self.table.history_abs_start;
             }
             let mut update_abs = $self.table.skip_insert_until_abs;
-            let is_btultra2 = $self.table.is_btultra2;
             while update_abs < $abs_pos {
-                if !$self
-                    .table
-                    .can_skip_rebase_check_at(update_abs, $abs_pos, is_btultra2)
-                {
+                if !$self.table.can_skip_rebase_check($abs_pos) {
                     $self.table.maybe_rebase_positions(update_abs);
                 }
                 let forward = unsafe {
@@ -1587,16 +1583,18 @@ impl HcMatchGenerator {
 
         // Upstream zstd initStats_ultra keeps the collected entropy statistics but
         // invalidates the first-pass matchfinder history before the real pass.
+        // The offset between stored and absolute positions grows past every
+        // entry the first pass stored, counted from the offset the frame
+        // started with: a reused compressor carries the previous frame's, and
+        // from any other start some first-pass entries would decode back into
+        // the window. From a fresh start this is `index_shift = current_len`.
+        debug_assert!(self.table.position_base <= current_abs_start);
+        let index_shift =
+            current_abs_start + current_len + self.table.index_shift - self.table.position_base;
         self.table.position_base = self.table.history_abs_start;
-        self.table.index_shift = current_len;
+        self.table.index_shift = index_shift;
         self.table.next_to_update3 = current_abs_start;
         self.table.skip_insert_until_abs = current_abs_start;
-        // Upstream zstd `ZSTD_initStats_ultra()` invalidates the first scan by moving
-        // `window.base` back by `srcSize`, making the real pass start at
-        // `curr == srcSize` instead of 0. Position 0 is therefore a valid
-        // table entry in the second pass even though raw C tables reserve
-        // value 0 as empty during an unshifted first pass.
-        self.table.allow_zero_relative_position = true;
     }
 
     /// Take the five DP scratch buffers out of the backend ONCE per block and

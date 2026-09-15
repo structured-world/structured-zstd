@@ -1,5 +1,263 @@
 use crate::decoding::StreamingDecoder;
-use crate::encoding::{CompressionLevel, Matcher, Sequence, StreamingEncoder};
+use crate::encoding::{
+    CompressionContext, CompressionLevel, EncoderDictionary, Matcher, Sequence, StreamingEncoder,
+};
+
+/// A context reused frame after frame writes exactly the frames a fresh
+/// encoder writes for each, at every band of levels, with a dictionary and
+/// without, pledged and not, small and past the dictionary attach cutoff:
+/// what `finish_frame` keeps (the settings, the dictionary resident in the
+/// match finder, its primed snapshot, the allocations, the entropy buffers)
+/// must never carry one frame's state into the next. Two unsized dictionary
+/// frames in a row are the case that once primed the resident dictionary into
+/// the window a second time.
+#[test]
+fn a_reused_context_writes_the_frames_fresh_encoders_write() {
+    fn write_all(context: &mut CompressionContext, frame: &mut Vec<u8>, mut data: &[u8]) {
+        while !data.is_empty() {
+            let taken = context.write(frame, data).expect("write");
+            data = &data[taken..];
+        }
+    }
+
+    let mut state = 0x9E37_79B9u32;
+    let mut noise = |len: usize, alphabet: u32| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 24) % alphabet) as u8
+            })
+            .collect()
+    };
+    let text: Vec<u8> = (0..3_000u32)
+        .flat_map(|i| alloc::format!("row {} key {} val {}\n", i % 97, i % 13, i % 7).into_bytes())
+        .collect();
+    let lines: Vec<u8> = (0..4_000u32)
+        .flat_map(|i| alloc::format!("line {} of {}\n", i % 89, i % 7).into_bytes())
+        .collect();
+    // Pledged at even indices: a large pledged frame follows the unsized ones
+    // so the copy-mode snapshot is captured and then restored.
+    let payloads: Vec<Vec<u8>> = vec![
+        text[..5_000].to_vec(),
+        noise(20_000, 256),
+        Vec::new(),
+        text.clone(),
+        noise(9_000, 16),
+        text[1_000..1_700].to_vec(),
+        text.clone(),
+        text[2_000..2_600].to_vec(),
+        text[..40_000].to_vec(),
+        // Its first line recurs, so the frame's first position is a match
+        // candidate the parse can take.
+        lines[..3_000].to_vec(),
+        lines.clone(),
+    ];
+    let dictionary = EncoderDictionary::from_serialized_or_raw_content(&text[..8_192])
+        .expect("raw content is a dictionary");
+
+    let mut diverged = Vec::new();
+    for level in [-3, 1, 2, 3, 5, 6, 9, 12, 14, 16, 17, 19, 22] {
+        for with_dictionary in [false, true] {
+            let compression_level = CompressionLevel::from_level(level);
+            let mut context = CompressionContext::new(compression_level);
+            context.set_content_checksum(true).unwrap();
+            if with_dictionary {
+                context.set_encoder_dictionary(dictionary.clone()).unwrap();
+            }
+            for (index, payload) in payloads.iter().enumerate() {
+                let pledged = index % 2 == 0;
+
+                let mut fresh = StreamingEncoder::new(Vec::new(), compression_level);
+                fresh.set_content_checksum(true).unwrap();
+                if with_dictionary {
+                    fresh.set_encoder_dictionary(dictionary.clone()).unwrap();
+                }
+                if pledged {
+                    fresh
+                        .set_pledged_content_size(payload.len() as u64)
+                        .unwrap();
+                }
+                fresh.write_all(payload).unwrap();
+                let expected = fresh.finish().unwrap();
+
+                let mut frame = Vec::new();
+                if pledged {
+                    context
+                        .set_pledged_content_size(payload.len() as u64)
+                        .unwrap();
+                }
+                write_all(&mut context, &mut frame, payload);
+                context.finish_frame(&mut frame).unwrap();
+                if frame != expected {
+                    diverged.push(alloc::format!(
+                        "level {level}, dictionary {with_dictionary}, frame {index}: \
+                         {} bytes reused against {} fresh",
+                        frame.len(),
+                        expected.len()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(diverged.is_empty(), "{diverged:#?}");
+}
+
+/// Unsized frames in a row keep one table geometry, so a reused context keeps
+/// the previous frame's table entries and only moves the floor past them,
+/// where the pledged frames above change geometry and start from cleared
+/// tables. At the btultra2 levels, which parse a frame's first block twice,
+/// the reused frames still have to be the ones a fresh encoder writes.
+#[test]
+fn consecutive_unsized_frames_reuse_a_btultra2_context_like_fresh_ones() {
+    let lines: Vec<u8> = (0..4_000u32)
+        .flat_map(|i| alloc::format!("line {} of {}\n", i % 89, i % 7).into_bytes())
+        .collect();
+    // Few symbols, so short matches abound and nearly every hash bucket holds
+    // an entry, which is what lets a stale one be read before it is replaced.
+    let mut state = 0x2545_F491u32;
+    let mut noise = |len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                b'a' + ((state >> 24) % 16) as u8
+            })
+            .collect()
+    };
+    let payloads = [noise(50_000), noise(60_000), lines, noise(30_000)];
+    let mut diverged = Vec::new();
+    for level in [19, 20, 22] {
+        let level = CompressionLevel::from_level(level);
+        let mut context = CompressionContext::new(level);
+        for (index, payload) in payloads.iter().enumerate() {
+            let mut fresh = StreamingEncoder::new(Vec::new(), level);
+            fresh.write_all(payload).unwrap();
+            let expected = fresh.finish().unwrap();
+
+            let mut frame = Vec::new();
+            let mut rest = payload.as_slice();
+            while !rest.is_empty() {
+                let taken = context.write(&mut frame, rest).unwrap();
+                rest = &rest[taken..];
+            }
+            context.finish_frame(&mut frame).unwrap();
+            if frame != expected {
+                diverged.push(alloc::format!(
+                    "{level:?}, frame {index}: {} bytes reused against {} fresh",
+                    frame.len(),
+                    expected.len()
+                ));
+            }
+        }
+    }
+    assert!(diverged.is_empty(), "{diverged:#?}");
+}
+
+/// The match finder keeps what it built from a dictionary across frames: the
+/// primed snapshot a large frame restores, and the dictionary left resident
+/// for the next small one. Replacing or removing the dictionary on a reused
+/// context has to drop both, or the next frame searches the old dictionary's
+/// tables while its header names the new one.
+#[test]
+fn a_replaced_dictionary_leaves_nothing_of_the_old_one_behind() {
+    let text: Vec<u8> = (0..3_000u32)
+        .flat_map(|i| alloc::format!("row {} key {} val {}\n", i % 97, i % 13, i % 7).into_bytes())
+        .collect();
+    let other: Vec<u8> = text.iter().rev().copied().collect();
+    let first = EncoderDictionary::from_serialized_or_raw_content(&text[..8_192]).unwrap();
+    let second = EncoderDictionary::from_serialized_or_raw_content(&other[..8_192]).unwrap();
+    // Past every attach cutoff, then small: one frame captures the snapshot,
+    // the next leaves the dictionary resident.
+    let payloads = [&text[..], &text[..900]];
+
+    let mut diverged = Vec::new();
+    for level in [1, 3, 5, 12, 16, 19] {
+        let level = CompressionLevel::from_level(level);
+        let mut context = CompressionContext::new(level);
+        context.set_encoder_dictionary(first.clone()).unwrap();
+        for payload in payloads {
+            context
+                .set_pledged_content_size(payload.len() as u64)
+                .unwrap();
+            context.write(&mut Vec::new(), payload).unwrap();
+            context.finish_frame(&mut Vec::new()).unwrap();
+        }
+        for replacement in [Some(&second), None] {
+            match replacement {
+                Some(dictionary) => context.set_encoder_dictionary(dictionary.clone()).unwrap(),
+                None => context.set_dictionary_from_bytes(&[]).unwrap(),
+            }
+            for (index, payload) in payloads.into_iter().enumerate() {
+                let mut fresh = StreamingEncoder::new(Vec::new(), level);
+                if let Some(dictionary) = replacement {
+                    fresh.set_encoder_dictionary(dictionary.clone()).unwrap();
+                }
+                fresh
+                    .set_pledged_content_size(payload.len() as u64)
+                    .unwrap();
+                fresh.write_all(payload).unwrap();
+                let expected = fresh.finish().unwrap();
+
+                let mut frame = Vec::new();
+                context
+                    .set_pledged_content_size(payload.len() as u64)
+                    .unwrap();
+                context.write(&mut frame, payload).unwrap();
+                context.finish_frame(&mut frame).unwrap();
+                if frame != expected {
+                    diverged.push(alloc::format!(
+                        "{level:?}, dictionary {}, frame {index}: {} bytes reused against {} fresh",
+                        replacement.is_some(),
+                        frame.len(),
+                        expected.len()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(diverged.is_empty(), "{diverged:#?}");
+}
+
+/// A level set on a reused context replaces the level and every override
+/// the previous frames ran under, so the frame is the one a fresh encoder at
+/// that level writes, whichever level and parameters came before.
+#[test]
+fn a_new_level_on_a_reused_context_drops_the_old_tuning() {
+    use crate::encoding::{CompressionParameters, Strategy};
+
+    let text: Vec<u8> = (0..3_000u32)
+        .flat_map(|i| alloc::format!("row {} key {} val {}\n", i % 97, i % 13, i % 7).into_bytes())
+        .collect();
+    let tuned = CompressionParameters::builder(CompressionLevel::from_level(3))
+        .strategy(Strategy::Btopt)
+        .window_log(17)
+        .build()
+        .unwrap();
+    let mut context = CompressionContext::new(CompressionLevel::from_level(3));
+    let mut diverged = Vec::new();
+    for level in [19, 1, 12, -2, 5, 22, 3] {
+        context.set_parameters(&tuned).unwrap();
+        context.write(&mut Vec::new(), &text).unwrap();
+        context.finish_frame(&mut Vec::new()).unwrap();
+
+        let level = CompressionLevel::from_level(level);
+        context.set_compression_level(level).unwrap();
+        let mut frame = Vec::new();
+        context.write(&mut frame, &text).unwrap();
+        context.finish_frame(&mut frame).unwrap();
+
+        let mut fresh = StreamingEncoder::new(Vec::new(), level);
+        fresh.write_all(&text).unwrap();
+        let expected = fresh.finish().unwrap();
+        if frame != expected {
+            diverged.push(alloc::format!(
+                "{level:?}: {} bytes reused against {} fresh",
+                frame.len(),
+                expected.len()
+            ));
+        }
+    }
+    assert!(diverged.is_empty(), "{diverged:#?}");
+}
 
 #[test]
 fn the_reported_footprint_covers_what_compressing_retained() {
@@ -34,7 +292,7 @@ fn the_reported_footprint_covers_what_compressing_retained() {
     // above would pass with the weight scratch missing from the sum entirely.
     // Prove it is a term: take it out and the reported total must fall by
     // exactly its own size.
-    let scratch = core::mem::take(&mut enc.state.huff_weights);
+    let scratch = core::mem::take(&mut enc.context.state.huff_weights);
     let scratch_heap = scratch.heap_size();
     assert!(
         scratch_heap > 0,
@@ -47,7 +305,7 @@ fn the_reported_footprint_covers_what_compressing_retained() {
         "the weight scratch is retained across blocks but is not counted in \
          the reported footprint",
     );
-    enc.state.huff_weights = scratch;
+    enc.context.state.huff_weights = scratch;
     assert_eq!(enc.heap_size(), after, "restoring must undo the removal");
 
     // The entropy state kept between blocks is the other half of the figure:
@@ -57,13 +315,15 @@ fn the_reported_footprint_covers_what_compressing_retained() {
     // Checked by removal rather than by comparison: the match-finder's share
     // alone exceeds it, so any "total is at least the parts" assertion would
     // pass with the term missing entirely.
-    let entropy = enc.state.fse_tables.heap_size()
+    let entropy = enc.context.state.fse_tables.heap_size()
         + enc
+            .context
             .state
             .huff_rollback
             .as_ref()
             .map_or(0, |table| table.heap_size())
         + enc
+            .context
             .state
             .block_scratch
             .huff_rollback
@@ -75,19 +335,19 @@ fn the_reported_footprint_covers_what_compressing_retained() {
     );
     let with_entropy = enc.heap_size();
     let saved_tables = core::mem::replace(
-        &mut enc.state.fse_tables,
+        &mut enc.context.state.fse_tables,
         crate::encoding::frame_compressor::FseTables::new(),
     );
-    let saved_rollback = enc.state.huff_rollback.take();
-    let saved_scratch_rollback = enc.state.block_scratch.huff_rollback.take();
+    let saved_rollback = enc.context.state.huff_rollback.take();
+    let saved_scratch_rollback = enc.context.state.block_scratch.huff_rollback.take();
     assert_eq!(
         with_entropy - enc.heap_size(),
         entropy,
         "the entropy state is retained but not counted in the reported footprint",
     );
-    enc.state.fse_tables = saved_tables;
-    enc.state.huff_rollback = saved_rollback;
-    enc.state.block_scratch.huff_rollback = saved_scratch_rollback;
+    enc.context.state.fse_tables = saved_tables;
+    enc.context.state.huff_rollback = saved_rollback;
+    enc.context.state.block_scratch.huff_rollback = saved_scratch_rollback;
     assert_eq!(enc.heap_size(), with_entropy, "restoring must undo removal");
 }
 use crate::io::{Error, ErrorKind, Read, Write};
@@ -293,10 +553,10 @@ fn streaming_encoder_matcher_and_gates_resolve_from_one_size() {
     enc.set_source_size_hint(1 << 20).unwrap();
     enc.write_all(&[0u8; 4096]).unwrap();
     assert_eq!(
-        enc.state.matcher.active_backend(),
-        enc.state.strategy_tag.backend(),
+        enc.context.state.matcher.active_backend(),
+        enc.context.state.strategy_tag.backend(),
         "matcher backend must match the synchronized strategy ({:?})",
-        enc.state.strategy_tag,
+        enc.context.state.strategy_tag,
     );
     enc.finish().unwrap();
 }
@@ -357,7 +617,7 @@ fn streaming_encoder_literal_gate_follows_the_effective_target_length() {
     let mut plain = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(1));
     plain.set_parameters(&params).unwrap();
     plain.write_all(b"plain frame payload").unwrap();
-    assert!(plain.state.literal_compression_disabled);
+    assert!(plain.context.state.literal_compression_disabled);
     let dict: Vec<u8> = (0..4096u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect();
@@ -369,7 +629,7 @@ fn streaming_encoder_literal_gate_follows_the_effective_target_length() {
         ))
         .unwrap();
     with_dict.write_all(b"dictionary frame payload").unwrap();
-    assert!(!with_dict.state.literal_compression_disabled);
+    assert!(!with_dict.context.state.literal_compression_disabled);
 }
 
 /// Pre-write `set_magicless(true)` → emitted frame omits the
@@ -709,14 +969,14 @@ fn encoded_scratch_capacity_is_reused_across_blocks() {
     );
 
     encoder.write_all(&payload[..64]).unwrap();
-    let first_capacity = encoder.encoded_scratch.capacity();
+    let first_capacity = encoder.context.encoded_scratch.capacity();
     assert!(
         first_capacity >= 67,
         "expected encoded scratch to keep block header + payload capacity",
     );
 
     encoder.write_all(&payload[64..128]).unwrap();
-    let second_capacity = encoder.encoded_scratch.capacity();
+    let second_capacity = encoder.context.encoded_scratch.capacity();
     assert!(
         second_capacity >= first_capacity,
         "encoded scratch capacity should be reused across block emits",
@@ -839,10 +1099,10 @@ fn ensure_frame_started_refreshes_stale_strategy_tag_at_reset() {
             expected, sentinel,
             "sentinel must differ from the legitimate tag at level {level:?}",
         );
-        encoder.state.strategy_tag = sentinel;
+        encoder.context.state.strategy_tag = sentinel;
         encoder.write_all(b"x").unwrap();
         assert_eq!(
-            encoder.state.strategy_tag, expected,
+            encoder.context.state.strategy_tag, expected,
             "reset-time strategy_tag sync missing at level {level:?}: \
                  sentinel survived `ensure_frame_started`",
         );
@@ -1066,7 +1326,7 @@ fn streaming_encoder_strategy_override_survives_frame_start() {
     encoder.set_parameters(&params).unwrap();
     encoder.write_all(payload).unwrap();
     assert_eq!(
-        encoder.state.strategy_tag, override_tag,
+        encoder.context.state.strategy_tag, override_tag,
         "strategy override was discarded when the frame started"
     );
 

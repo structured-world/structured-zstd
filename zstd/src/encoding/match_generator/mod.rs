@@ -412,6 +412,22 @@ struct PrimedKey {
     ldm: Option<super::parameters::LdmOverride>,
 }
 
+/// Whether a configured HashChain matcher attaches the dictionary for a frame
+/// of `size_log` (see [`MatchGeneratorDriver::hc_dict_attach_mode`]).
+fn hc_attaches_dictionary(hc: &HcMatchGenerator, size_log: Option<u8>) -> bool {
+    let cutoff = if hc.table.uses_bt {
+        match hc.strategy_tag {
+            super::strategy::StrategyTag::BtUltra | super::strategy::StrategyTag::BtUltra2 => {
+                BT_ULTRA_ATTACH_DICT_CUTOFF_LOG
+            }
+            _ => BT_OPT_ATTACH_DICT_CUTOFF_LOG,
+        }
+    } else {
+        HC_ATTACH_DICT_CUTOFF_LOG
+    };
+    size_log.is_none_or(|log| log <= cutoff)
+}
+
 impl MatchGeneratorDriver {
     /// See [`MatcherStorage::ingest_capacity`].
     #[cfg(test)]
@@ -873,17 +889,7 @@ impl MatchGeneratorDriver {
         let MatcherStorage::HashChain(hc) = &self.storage else {
             return true;
         };
-        let cutoff = if hc.table.uses_bt {
-            match hc.strategy_tag {
-                super::strategy::StrategyTag::BtUltra | super::strategy::StrategyTag::BtUltra2 => {
-                    BT_ULTRA_ATTACH_DICT_CUTOFF_LOG
-                }
-                _ => BT_OPT_ATTACH_DICT_CUTOFF_LOG,
-            }
-        } else {
-            HC_ATTACH_DICT_CUTOFF_LOG
-        };
-        self.reset_size_log.is_none_or(|log| log <= cutoff)
+        hc_attaches_dictionary(hc, self.reset_size_log)
     }
 
     fn skip_matching_for_dictionary_priming(&mut self, dict_len: usize) {
@@ -1428,6 +1434,13 @@ impl Matcher for MatchGeneratorDriver {
                     hc_cfg.chain_log = hc_cfg.chain_log.min(if uses_bt { wlog + 1 } else { wlog });
                 }
                 hc.configure(hc_cfg, strategy_tag, params.window_log);
+                // A copy-mode frame merges the dictionary into the live tables,
+                // so the previous attach frame's dms must not be re-borrowed
+                // under it (the same decision the prime makes, taken here
+                // because the reset below re-borrows on a primed dms alone).
+                if dict_hint.is_some() && !hc_attaches_dictionary(hc, self.reset_size_log) {
+                    hc.table.dms.invalidate();
+                }
                 let vec_pool = &mut self.vec_pool;
                 hc.reset(|mut data| {
                     data.resize(data.capacity(), 0);

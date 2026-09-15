@@ -2726,6 +2726,42 @@ fn compress_independent_frame_reuse_matches_fresh_and_roundtrips() {
     }
 }
 
+/// The same promise across the lazy and optimal bands, where the match
+/// finder carries the most state between blocks: a compressor reused frame
+/// after frame writes exactly what a fresh one writes for each input, so no
+/// frame's output depends on what came before it.
+#[test]
+fn compress_independent_frame_reuse_matches_fresh_on_the_optimal_band() {
+    use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+    let text: Vec<u8> = (0..3_000u32)
+        .flat_map(|i| alloc::format!("row {} key {} val {}\n", i % 97, i % 13, i % 7).into_bytes())
+        .collect();
+    let inputs: Vec<Vec<u8>> = vec![
+        text[..5_000].to_vec(),
+        generate_data(0xABCD, 20_000),
+        text.clone(),
+        generate_data(0x1234, 9_000),
+        text[1_000..1_700].to_vec(),
+    ];
+    let mut diverged = Vec::new();
+    for level in [12, 16, 17, 19, 22] {
+        let level = CompressionLevel::Level(level);
+        let mut cctx: FrameCompressor = FrameCompressor::new(level);
+        for (index, data) in inputs.iter().enumerate() {
+            let reused = cctx.compress_independent_frame(data);
+            let fresh = compress_slice_to_vec(data, level);
+            if reused != fresh {
+                diverged.push(alloc::format!(
+                    "{level:?} input {index}: {} bytes reused against {} fresh",
+                    reused.len(),
+                    fresh.len()
+                ));
+            }
+        }
+    }
+    assert!(diverged.is_empty(), "{diverged:#?}");
+}
+
 /// `compress_independent_frame_into` must replace (not append to) the
 /// caller's buffer each call, so a smaller frame after a larger one
 /// yields exactly the smaller frame, and the reused buffer's content

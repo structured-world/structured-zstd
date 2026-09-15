@@ -146,13 +146,11 @@ fn begin_rebase_clears_index_tables_and_resets_base() {
     t.history_abs_start = 50;
     t.position_base = 0;
     t.index_shift = 4;
-    t.allow_zero_relative_position = false;
 
     t.begin_rebase();
 
     assert_eq!(t.position_base, 50);
     assert_eq!(t.index_shift, 0);
-    assert!(t.allow_zero_relative_position);
     assert!(t.hash_table().iter().all(|&v| v == HC_EMPTY));
     assert!(t.chain_table().iter().all(|&v| v == HC_EMPTY));
     assert!(t.hash3_table().iter().all(|&v| v == HC_EMPTY));
@@ -179,15 +177,15 @@ fn the_hoisted_hash3_fill_matches_the_per_position_loop() {
         t.hash3_log = 6;
         t.is_btultra2 = true;
         t.ensure_tables();
-        // Both paths start past `history_abs_start`, which is where the fast
-        // one is allowed to take over; the general loop is reached by walking
+        // Both paths start at `history_abs_start`, whose first position is a
+        // candidate like any other; the general loop is reached by walking
         // one position at a time, since a single-position span whose start is
         // the cursor takes the same branch either way.
-        t.next_to_update3 = 1;
+        t.next_to_update3 = 0;
         if hoisted {
             assert!(t.fill_hash3_hoisted(30), "the fast path must apply here");
         } else {
-            for target in 2..=30 {
+            for target in 1..=30 {
                 t.next_to_update3 = target - 1;
                 let mut cursor = t.next_to_update3;
                 while cursor < target {

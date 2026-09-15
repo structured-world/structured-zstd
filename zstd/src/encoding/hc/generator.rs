@@ -1110,12 +1110,16 @@ impl HcMatchGenerator {
         let HcBackend::Bt(bt) = &self.backend else {
             return false;
         };
+        // The frame's first block, whatever absolute position the frame starts
+        // at (upstream `curr == ms->window.dictLimit`): the window holding
+        // only this block says so. A reused compressor starts each frame at
+        // the previous frame's end, so a test on the absolute origin would
+        // skip the seed there and make the frame depend on what came before.
         bt.opt_state.lit_length_sum == 0
             && bt.opt_state.dictionary_seed.is_none()
             && !self.table.dictionary_primed_for_frame
             && bt.ldm_sequences.is_empty()
             && self.table.window_size == current_len
-            && self.table.history_abs_start == 0
             && self.table.chunk_lens.len() == 1
             && current_len > HC_PREDEF_THRESHOLD
     }

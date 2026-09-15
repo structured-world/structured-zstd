@@ -2934,6 +2934,63 @@ fn primed_snapshot_not_restored_across_ldm_config_change() {
     );
 }
 
+/// btultra2 parses a frame's first block twice and hides the first pass from
+/// the second by re-encoding the stored positions. A reused matcher keeps the
+/// previous frame's entries below the floor, and the re-encoding has to leave
+/// them there too: an entry that decodes into the window names a position
+/// whose bytes hash to the entry's own bucket, never a stale one moved onto
+/// unrelated bytes.
+#[test]
+fn a_btultra2_second_pass_sees_no_entry_from_before_it() {
+    use crate::encoding::match_table::storage::MatchTable;
+
+    let mut state = 0x2545_F491u32;
+    let mut noise = |len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                b'a' + ((state >> 24) % 16) as u8
+            })
+            .collect()
+    };
+    let mut driver = MatchGeneratorDriver::new(128 * 1024, 1);
+    for (frame, payload) in [noise(50_000), noise(60_000), noise(40_000)]
+        .iter()
+        .enumerate()
+    {
+        driver.reset(CompressionLevel::Level(22));
+        let mut space = driver.get_next_space();
+        space.clear();
+        space.extend_from_slice(payload);
+        driver.commit_space(space);
+        driver.start_matching(|_| {});
+
+        let table = &driver.hc_matcher().table;
+        let live = table.live_history();
+        let floor = table.history_abs_start;
+        let mut misplaced = 0usize;
+        for (bucket, &stored) in table.hash_table().iter().enumerate() {
+            let Some(abs) = MatchTable::stored_abs_position_fast(
+                stored,
+                table.position_base,
+                table.index_shift,
+            ) else {
+                continue;
+            };
+            if abs < floor {
+                continue;
+            }
+            let hashed =
+                MatchTable::hash_position_at(live, abs - floor, table.hash_log, table.search_mls);
+            misplaced += usize::from(hashed != bucket);
+        }
+        assert_eq!(
+            misplaced, 0,
+            "frame {frame}: entries naming the wrong bytes"
+        );
+    }
+}
+
 #[test]
 fn hc_prime_with_dictionary_disables_btultra2_seed_pass() {
     let mut driver = MatchGeneratorDriver::new(8, 1);

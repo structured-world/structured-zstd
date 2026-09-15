@@ -1,6 +1,6 @@
 //! Zstandard encoder — frame compression, streaming, dictionary support.
 //!
-//! Four entry points cover the common use cases:
+//! Five entry points cover the common use cases:
 //!
 //! * [`compress`] — one-shot helper that builds a self-contained
 //!   Zstandard frame from a `Read` source to a `Write` sink. The
@@ -24,6 +24,10 @@
 //!   incrementally and flushes compressed output as blocks fill.
 //!   Requires `set_pledged_content_size` before the first write if
 //!   the Frame Content Size field is to be populated.
+//! * [`CompressionContext`] — the reusable state behind
+//!   [`StreamingEncoder`], with the output passed to each call: compresses
+//!   frame after frame with one set of settings, one attached dictionary and
+//!   one set of match-finder allocations, as upstream's `ZSTD_CCtx` does.
 //! * [`FrameCompressor`] — lower-level builder that owns the matcher and
 //!   the per-frame configuration; the streaming and one-shot helpers are
 //!   thin wrappers over it. Reach for it when you need to swap in a custom
@@ -106,7 +110,7 @@ pub use parameters::{
     Bounds, CParameter, CompressionParameters, CompressionParametersBuilder,
     LiteralCompressionMode, ParameterError, Strategy,
 };
-pub use streaming_encoder::StreamingEncoder;
+pub use streaming_encoder::{CompressionContext, StreamingEncoder};
 
 use crate::io::{Read, Write};
 use alloc::vec::Vec;

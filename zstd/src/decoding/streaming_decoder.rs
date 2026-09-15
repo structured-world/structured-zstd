@@ -48,12 +48,12 @@ use crate::io::{Error, Read};
 pub struct StreamingDecoder<READ: Read, DEC: BorrowMut<FrameDecoder>> {
     pub decoder: DEC,
     source: READ,
-    /// Dictionary the decoder was constructed with, if any. Retained so the
-    /// `read_to_end` paths can re-initialise FOLLOWING concatenated frames with
-    /// the same forced dictionary (a plain re-init resolves dictionaries by
-    /// frame id only and would lose a forced dict for frames omitting the id).
-    /// Cheap to hold: `DictionaryHandle` is an `Arc`/`Rc` handle.
-    dict: Option<DictionaryHandle>,
+    /// Whether the decoder was constructed with a dictionary it applies to
+    /// every frame. The `read_to_end` paths re-initialise FOLLOWING
+    /// concatenated frames with it (a plain re-init resolves dictionaries by
+    /// frame id only and would lose it for frames omitting the id); the
+    /// decoder already holds its handle, so this one keeps none of its own.
+    forced_dictionary: bool,
 }
 
 impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
@@ -65,8 +65,64 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
         Ok(StreamingDecoder {
             decoder,
             source,
-            dict: None,
+            forced_dictionary: false,
         })
+    }
+
+    /// [`new_with_decoder`](Self::new_with_decoder) with `dict` applied to
+    /// the frame even when its header omits the dictionary ID, as
+    /// [`new_with_dictionary_handle`](StreamingDecoder::new_with_dictionary_handle)
+    /// applies it (same warning). A decoder reused frame after frame keeps its
+    /// buffers and, for the same dictionary, the handle it already holds, so
+    /// after the first frame it allocates nothing and touches no reference
+    /// count.
+    ///
+    /// # Examples
+    /// ```
+    /// use std::io::Read;
+    /// use structured_zstd::decoding::{Dictionary, DictionaryHandle, FrameDecoder, StreamingDecoder};
+    /// use structured_zstd::encoding::{FrameCompressor, CompressionLevel};
+    ///
+    /// let content = b"a dictionary of words the frames reuse".to_vec();
+    /// let dictionary = DictionaryHandle::from_dictionary(
+    ///     Dictionary::from_raw_content(1, content.clone()).unwrap(),
+    /// );
+    /// let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    /// compressor.set_dictionary(Dictionary::from_raw_content(1, content).unwrap()).unwrap();
+    /// let frame = compressor.compress_independent_frame(b"the frames reuse words");
+    ///
+    /// let mut decoder = FrameDecoder::new();
+    /// for _ in 0..2 {
+    ///     let mut stream =
+    ///         StreamingDecoder::new_with_decoder_and_dictionary_handle(&frame[..], &mut decoder, &dictionary)
+    ///             .unwrap();
+    ///     let mut decoded = Vec::new();
+    ///     stream.read_to_end(&mut decoded).unwrap();
+    ///     assert_eq!(decoded, b"the frames reuse words");
+    /// }
+    /// ```
+    pub fn new_with_decoder_and_dictionary_handle(
+        mut source: READ,
+        mut decoder: DEC,
+        dict: &DictionaryHandle,
+    ) -> Result<StreamingDecoder<READ, DEC>, FrameDecoderError> {
+        decoder
+            .borrow_mut()
+            .init_with_dict_handle(&mut source, dict)?;
+        Ok(StreamingDecoder {
+            decoder,
+            source,
+            forced_dictionary: true,
+        })
+    }
+
+    /// The dictionary following frames are forced onto, if any: the one the
+    /// decoder holds for this frame.
+    fn forced_dictionary(&mut self) -> Option<DictionaryHandle> {
+        if !self.forced_dictionary {
+            return None;
+        }
+        self.decoder.borrow_mut().active_dictionary().cloned()
     }
 }
 
@@ -79,7 +135,7 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
         Ok(StreamingDecoder {
             decoder,
             source,
-            dict: None,
+            forced_dictionary: false,
         })
     }
 
@@ -93,16 +149,10 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
     /// with this dictionary; otherwise decoded output can be silently
     /// corrupted.
     pub fn new_with_dictionary_handle(
-        mut source: READ,
+        source: READ,
         dict: &DictionaryHandle,
     ) -> Result<StreamingDecoder<READ, FrameDecoder>, FrameDecoderError> {
-        let mut decoder = FrameDecoder::new();
-        decoder.init_with_dict_handle(&mut source, dict)?;
-        Ok(StreamingDecoder {
-            decoder,
-            source,
-            dict: Some(dict.clone()),
-        })
+        Self::new_with_decoder_and_dictionary_handle(source, FrameDecoder::new(), dict)
     }
 
     /// Create a streaming decoder using a serialized dictionary blob.
@@ -267,9 +317,9 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             let d = self.decoder.borrow_mut();
             d.is_at_frame_start() && d.can_collect() == 0
         };
-        // Clone the (cheap Arc/Rc) dict handle out so the `decoder` borrow below
-        // does not conflict with borrowing `self.dict`.
-        let dict = self.dict.clone();
+        // Cloned out (a cheap Arc/Rc handle) so the `decoder` borrow below does
+        // not conflict with the decoder holding it.
+        let dict = self.forced_dictionary();
         if at_start {
             let mut compressed = alloc::vec::Vec::new();
             self.source.read_to_end(&mut compressed)?;
@@ -321,8 +371,8 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             d.is_at_frame_start() && d.can_collect() == 0
         };
         // Cheap Arc/Rc clone so the `decoder` borrow does not conflict with
-        // borrowing `self.dict`.
-        let dict = self.dict.clone();
+        // the decoder holding it.
+        let dict = self.forced_dictionary();
         if at_start {
             let mut compressed = alloc::vec::Vec::new();
             self.source.read_to_end(&mut compressed)?;
