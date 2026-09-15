@@ -3815,10 +3815,8 @@ fn stream_opened<W: Write>(
     // a device or a socket reports something unrelated (commonly zero), and
     // pledging that turns a perfectly good stream into a length mismatch.
     let pledged_size = metadata.is_file().then_some(source_size);
-    let shown = opts
-        .progress
-        .shown(opts.verbosity, io::stderr().is_terminal());
-    let reader = ProgressMonitor::new(BufReader::new(source), source_size, shown);
+    // The same length is the counter's total, and a FIFO's has none to show.
+    let reader = progress_monitor(opts, BufReader::new(source), pledged_size);
     stream(opts, dicts, reader, pledged_size, sink)
 }
 
@@ -3827,8 +3825,22 @@ fn stream_opened<W: Write>(
 /// caller pledged travels in `opts`.
 fn stream_stdin<W: Write>(opts: &Options, dicts: &Dictionaries, sink: W) -> Result<Processed> {
     let stdin = io::stdin();
-    let reader = ProgressMonitor::new(stdin.lock(), 0, false);
-    stream(opts, dicts, reader, None, sink)
+    stream(opts, dicts, stdin_monitor(opts, stdin.lock()), None, sink)
+}
+
+/// The counter over `reader` expecting `total` bytes, drawn under the
+/// `--progress` rule every input shares.
+fn progress_monitor<R: Read>(opts: &Options, reader: R, total: Option<u64>) -> ProgressMonitor<R> {
+    let shown = opts
+        .progress
+        .shown(opts.verbosity, io::stderr().is_terminal());
+    ProgressMonitor::new(reader, total, shown)
+}
+
+/// The counter over stdin: drawn like a file's, over the `--stream-size`
+/// pledge when there is one, since stdin has no length of its own to stat.
+fn stdin_monitor<R: Read>(opts: &Options, reader: R) -> ProgressMonitor<R> {
+    progress_monitor(opts, reader, opts.pledged_size)
 }
 
 /// Run the mode's codec from `reader` into `sink` and count both sides.
@@ -4295,13 +4307,16 @@ impl Default for DecodeSettings {
 impl DecodeSettings {
     /// What the command line asked for. Pass-through defaults to the
     /// reference command's rule: on when forced and writing to stdout, which
-    /// is how `zstdcat` and `zstd -dcf` behave.
+    /// is how `zstdcat` and `zstd -dcf` behave. Never under `-t`, which asks
+    /// whether the input is a sound archive: passed through, plain input would
+    /// be reported as one, whichever flag or preset turned it on.
     fn from_options(opts: &Options) -> Self {
         Self {
             verify_checksum: opts.checksum,
-            pass_through: opts
-                .pass_through
-                .unwrap_or(opts.force && writes_stdout(opts)),
+            pass_through: opts.mode != Mode::Test
+                && opts
+                    .pass_through
+                    .unwrap_or(opts.force && writes_stdout(opts)),
         }
     }
 }

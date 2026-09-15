@@ -216,6 +216,49 @@ fn search_log_override_keeps_the_full_depth_for_chain_and_tree() {
     );
 }
 
+/// `targetLength` is the Fast strategy's step (upstream zstd_fast.c:
+/// `stepSize = targetLength + !targetLength + 1`), so an explicit one moves
+/// the step exactly as the level's own value does, and zero keeps the
+/// default step.
+#[test]
+fn a_target_length_override_sets_the_fast_step() {
+    use crate::encoding::parameters::ParamOverrides;
+    for (target_length, step) in [(8, 9), (1, 2), (0, 2)] {
+        let ov = ParamOverrides {
+            target_length: Some(target_length),
+            ..Default::default()
+        };
+        let mut params = resolve_level_params(CompressionLevel::Level(1), Some(1 << 20));
+        super::apply_param_overrides(&mut params, &ov);
+        assert_eq!(
+            params.fast.expect("level 1 is a Fast row").step_size,
+            step,
+            "targetLength {target_length}"
+        );
+    }
+}
+
+/// A strategy override moves a frame onto another matcher backend, and only
+/// that backend's tables are built: level 22 run as Fast holds the Fast table,
+/// not the hash-chain tables its own row sized. Its estimate is therefore
+/// level 1's at the same window, not the two added together.
+#[test]
+fn a_strategy_override_counts_only_the_backend_it_selects() {
+    use crate::encoding::{CompressionParameters, Strategy};
+    let as_fast = CompressionParameters::builder(CompressionLevel::Level(22))
+        .strategy(Strategy::Fast)
+        .build()
+        .unwrap();
+    let level_one = CompressionParameters::builder(CompressionLevel::Level(1))
+        .window_log(27)
+        .build()
+        .unwrap();
+    let estimate = |p: &CompressionParameters| {
+        super::estimated_compression_workspace_bytes_for_parameters(p, None, None)
+    };
+    assert_eq!(estimate(&as_fast), estimate(&level_one));
+}
+
 /// The parameters the encoder actually runs for a (level, source size) pair
 /// are upstream's `ZSTD_getCParams(level, size, 0)` for that pair: strategy,
 /// window / hash / chain widths, search depth, minMatch and targetLength, on

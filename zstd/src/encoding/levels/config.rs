@@ -322,6 +322,12 @@ pub(crate) fn apply_param_overrides(
                 if let Some(min_match) = ov.min_match {
                     fast.mls = min_match;
                 }
+                // targetLength is the Fast strategy's step, as it is on the
+                // level's own row: upstream zstd_fast.c `stepSize =
+                // targetLength + !targetLength + 1`.
+                if let Some(target_length) = ov.target_length {
+                    fast.step_size = (target_length as usize).max(1) + 1;
+                }
             }
         }
         SearchMethod::DoubleFast => {
@@ -1003,7 +1009,7 @@ fn table_bytes(entry: usize, log: usize) -> usize {
 /// Window, match-finder tables, optimal-parser scratch and block staging for a
 /// frame resolved to `params`, plus `ldm` bytes of long-distance table.
 fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
-    use crate::encoding::strategy::StrategyTag;
+    use crate::encoding::strategy::{SearchMethod, StrategyTag};
     // A 30-bit window is a gibibyte, which a 32-bit `usize` cannot count: the
     // widest window is more memory than such a machine has, so the figure is
     // pinned rather than wrapped.
@@ -1022,27 +1028,32 @@ fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
         params.strategy_tag,
         StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
     );
-    // The lazy backend's chain / tree finders (window <= 2^14, or a btlazy2
-    // level) use a plain hash table (`4 << hash_bits`) plus the chain / tree
-    // table (`4 << chain_log`) instead of the row tables.
+    // Only the backend `params.search` selects is built: `reset` swaps in one
+    // matcher storage per frame. A strategy override leaves the level's own
+    // row in place beside the one it synthesized, so summing every populated
+    // config would charge a frame for tables it never allocates.
     // Every term goes through `table_bytes` and every sum saturates: an
     // override can ask for a table past what a 32-bit `usize` counts, and a
     // shift that dropped its high bits would report that table as free.
-    let row_chain = params
-        .row
-        .filter(|r| r.bt || params.window_log <= 14)
-        .map_or(0, |r| {
-            table_bytes(4, r.hash_bits).saturating_add(table_bytes(4, r.chain_log))
-        });
-    let tables = params
-        .fast
-        .map_or(0, |f| table_bytes(4, f.hash_log as usize))
-        .saturating_add(row_chain)
-        .saturating_add(params.dfast.map_or(0, |d| {
+    let tables = match params.search {
+        SearchMethod::Fast => params
+            .fast
+            .map_or(0, |f| table_bytes(4, f.hash_log as usize)),
+        SearchMethod::DoubleFast => params.dfast.map_or(0, |d| {
             table_bytes(4, usize::from(d.long_hash_log))
                 .saturating_add(table_bytes(4, usize::from(d.short_hash_log)))
-        }))
-        .saturating_add(params.hc.map_or(0, |h| {
+        }),
+        // The lazy backend's chain / tree finders (window <= 2^14, or a
+        // btlazy2 level) use a plain hash table (`4 << hash_bits`) plus the
+        // chain / tree table (`4 << chain_log`) instead of the row tables.
+        SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => params.row.map_or(0, |r| {
+            if r.bt || params.window_log <= 14 {
+                table_bytes(4, r.hash_bits).saturating_add(table_bytes(4, r.chain_log))
+            } else {
+                table_bytes(4, r.hash_bits).saturating_add(table_bytes(2, r.hash_bits))
+            }
+        }),
+        SearchMethod::HashChain | SearchMethod::BinaryTree => params.hc.map_or(0, |h| {
             let hash3 = if wants_hash3 {
                 table_bytes(
                     4,
@@ -1055,15 +1066,8 @@ fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
             table_bytes(4, h.hash_log)
                 .saturating_add(table_bytes(4, h.chain_log))
                 .saturating_add(hash3)
-        }))
-        .saturating_add(
-            params
-                .row
-                .filter(|r| !(r.bt || params.window_log <= 14))
-                .map_or(0, |r| {
-                    table_bytes(4, r.hash_bits).saturating_add(table_bytes(2, r.hash_bits))
-                }),
-        );
+        }),
+    };
     // BT modes box a `BtMatcher`; its retained scratch layout is budgeted
     // next to the struct so estimator and allocator evolve together.
     let bt = if uses_bt {

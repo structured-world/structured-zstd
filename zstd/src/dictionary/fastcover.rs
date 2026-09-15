@@ -292,10 +292,17 @@ pub fn optimize_fastcover_raw(
         );
     }
 
-    let split = split_point.clamp(0.1, 0.95);
-    let split_idx = ((sample.len() as f64) * split) as usize;
-    let split_idx = split_idx.clamp(1, sample.len().saturating_sub(1));
-    let (train, eval) = sample.split_at(split_idx);
+    // Upstream's split (fastcover.c, `FASTCOVER_ctx_init`): below 1 the corpus
+    // trains on its leading share and is scored on the rest; at 1 it trains
+    // and scores on all of it. A split that is not positive keeps the 0.75
+    // default. The index stays inside the corpus so neither half is empty.
+    let (train, eval) = if split_point >= 1.0 {
+        (sample, sample)
+    } else {
+        let split = if split_point > 0.0 { split_point } else { 0.75 };
+        let split_idx = ((sample.len() as f64) * split) as usize;
+        sample.split_at(split_idx.clamp(1, sample.len() - 1))
+    };
 
     let mut best_dict = Vec::new();
     let mut best = FastCoverTuned {

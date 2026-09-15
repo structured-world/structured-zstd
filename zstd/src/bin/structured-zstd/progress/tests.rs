@@ -9,7 +9,7 @@ use super::ProgressMonitor;
 #[test]
 fn progress_finishes_when_the_reader_does_not_when_the_count_matches() {
     // A reader with more bytes than the total it was created with.
-    let mut monitor = ProgressMonitor::new(&b"bytes that were not counted"[..], 0, false);
+    let mut monitor = ProgressMonitor::new(&b"bytes that were not counted"[..], Some(0), false);
     let mut sink = Vec::new();
     io::copy(&mut monitor, &mut sink).expect("copying must succeed");
     assert!(
@@ -24,7 +24,7 @@ fn progress_finishes_when_the_reader_does_not_when_the_count_matches() {
 /// the monitor before any bytes have moved.
 #[test]
 fn an_empty_buffer_read_is_not_the_end_of_the_stream() {
-    let mut monitor = ProgressMonitor::new(&b"payload"[..], 7, false);
+    let mut monitor = ProgressMonitor::new(&b"payload"[..], Some(7), false);
     assert_eq!(monitor.read(&mut []).unwrap(), 0);
     assert!(
         !monitor.finished,
@@ -48,9 +48,10 @@ fn an_empty_buffer_read_is_not_the_end_of_the_stream() {
 #[test]
 fn a_file_length_is_not_narrowed_to_the_pointer_width() {
     let huge = u64::from(u32::MAX) + 1;
-    let monitor = ProgressMonitor::new(&b""[..], huge, false);
+    let monitor = ProgressMonitor::new(&b""[..], Some(huge), false);
     assert_eq!(
-        monitor.total, huge,
+        monitor.total,
+        Some(huge),
         "a length larger than a 32-bit pointer must survive"
     );
 }
@@ -65,7 +66,7 @@ fn a_read_error_passes_through_uncounted() {
             Err(io::Error::other("disk on fire"))
         }
     }
-    let mut monitor = ProgressMonitor::new(Broken, 10, false);
+    let mut monitor = ProgressMonitor::new(Broken, Some(10), false);
     let mut buf = [0u8; 4];
     let err = monitor.read(&mut buf).expect_err("the error must surface");
     assert_eq!(err.to_string(), "disk on fire");

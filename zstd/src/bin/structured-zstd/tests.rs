@@ -1175,7 +1175,7 @@ fn an_explicit_stream_size_survives_an_unstattable_input() {
     let processed = stream(
         &opts,
         &no_dict(),
-        ProgressMonitor::new(&payload[..], 0, false),
+        ProgressMonitor::new(&payload[..], None, false),
         None,
         &mut frame,
     )
@@ -3306,6 +3306,52 @@ fn decoding_counts_its_output_and_no_check_ignores_the_checksum() {
     assert!(
         !DecodeSettings::from_options(&parse(&["-d", "--no-check", "f"]).unwrap()).verify_checksum
     );
+}
+
+/// `-t` answers whether the input is a sound zstd archive, so it never passes
+/// anything through: not with `-f` on redirected stdin, where the forced
+/// default would otherwise turn on, and not with `--pass-through` named
+/// either, since either way plain input would be reported as intact. The
+/// reference command's `-t` writes to its null mark, which keeps the forced
+/// default off there too.
+#[test]
+fn testing_never_passes_input_through() {
+    for args in [
+        &["-tf"][..],
+        &["-t", "-f", "-"],
+        &["-t", "--pass-through", "f"],
+    ] {
+        assert!(
+            !DecodeSettings::from_options(&parse(args).unwrap()).pass_through,
+            "{args:?}"
+        );
+    }
+    let zstdcat_test = parse_as(
+        &program_preset("zstdcat"),
+        CompressionLevel::DEFAULT_LEVEL,
+        &["-t"],
+    )
+    .unwrap();
+    assert!(!DecodeSettings::from_options(&zstdcat_test).pass_through);
+    assert!(
+        DecodeSettings::from_options(&parse(&["-df"]).unwrap()).pass_through,
+        "decompressing stdin to stdout under -f still does"
+    );
+}
+
+/// stdin has no length to stat, so its counter runs over the `--stream-size`
+/// pledge when one is given, and `--progress` draws it as it draws a file's.
+/// Without a pledge the total is unknown rather than zero.
+#[test]
+fn progress_over_stdin_follows_the_flag_and_the_pledge() {
+    let pledged = parse(&["--progress", "--stream-size=100"]).unwrap();
+    let monitor = stdin_monitor(&pledged, io::empty());
+    assert!(monitor.is_shown(), "--progress draws it");
+    assert_eq!(monitor.total, Some(100));
+    let unpledged = parse(&["--progress"]).unwrap();
+    assert_eq!(stdin_monitor(&unpledged, io::empty()).total, None);
+    let quiet = parse(&["--no-progress"]).unwrap();
+    assert!(!stdin_monitor(&quiet, io::empty()).is_shown());
 }
 
 /// Input that is not a zstd stream is copied through under `--pass-through`,

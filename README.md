@@ -78,6 +78,8 @@ decompressing, on by default for `zstdcat` and `zstd -dcf` as upstream has it.
 Only input that is not zstd from its first byte is copied: bytes after a frame
 that are not a frame are a damaged archive and fail the run, as xz treats
 them, where upstream and gzip copy them into the output and report success.
+`-t` never passes anything through, since it asks whether the input is a
+sound archive.
 `--exclude-compressed` skips inputs whose extension names an
 already-compressed format.
 

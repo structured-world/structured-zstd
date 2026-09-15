@@ -109,8 +109,28 @@ fn fastcover_optimizer_handles_zero_dict_budget() {
     assert!([128, 256].contains(&tuned.k));
 }
 
+/// The split is honoured as given. At 1 the whole corpus both trains and
+/// scores, as upstream's `splitPoint == 1.0` does (fastcover.c,
+/// `FASTCOVER_ctx_init`), and a small share trains on that share, rather than
+/// either being pulled into a fixed band behind the caller's back.
 #[test]
-fn fastcover_optimizer_clamps_extreme_split_points() {
+fn fastcover_optimizer_honours_the_split_it_is_given() {
+    let sample = corpus();
+    let params = normalize_fastcover_params(FastCoverParams {
+        k: 128,
+        d: 6,
+        f: 18,
+        accel: 1,
+    });
+    let (whole, _) = optimize_fastcover_raw(sample.as_slice(), 2048, 1.0, 1, &[6], &[18], &[128]);
+    assert_eq!(whole, build_raw_dict(sample.as_slice(), 2048, params));
+    let share = (sample.len() as f64 * 0.05) as usize;
+    let (small, _) = optimize_fastcover_raw(sample.as_slice(), 2048, 0.05, 1, &[6], &[18], &[128]);
+    assert_eq!(small, build_raw_dict(&sample[..share], 2048, params));
+}
+
+#[test]
+fn fastcover_optimizer_handles_extreme_split_points() {
     let sample = corpus();
     let (dict_low, tuned_low) =
         optimize_fastcover_raw(sample.as_slice(), 2048, 0.0, 1, &[6], &[18], &[128]);

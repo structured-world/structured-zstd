@@ -26,11 +26,12 @@ const LINE_WIDTH: usize = BAR_WIDTH + 48;
 /// A reader that counts what passes through it and, when asked, draws how far
 /// along the total that is.
 pub struct ProgressMonitor<R: Read> {
-    /// The total amount that the reader will read. Counted in `u64` rather
-    /// than `usize`: both directions stream, so a file has to fit the window,
-    /// never memory, and a 32-bit counter would refuse archives the work
-    /// itself handles fine.
-    pub total: u64,
+    /// The total amount that the reader will read, `None` where nothing says
+    /// (stdin without `--stream-size`, a FIFO). Counted in `u64` rather than
+    /// `usize`: both directions stream, so a file has to fit the window, never
+    /// memory, and a 32-bit counter would refuse archives the work itself
+    /// handles fine.
+    pub total: Option<u64>,
     /// Amount read so far
     pub read: u64,
     /// Whether the reader has reported its end.
@@ -45,8 +46,9 @@ pub struct ProgressMonitor<R: Read> {
 }
 
 impl<R: Read> ProgressMonitor<R> {
-    /// Wrap `reader`, expecting `size` bytes; `shown` says whether to draw.
-    pub fn new(reader: R, size: u64, shown: bool) -> Self {
+    /// Wrap `reader`, expecting `size` bytes when that is known; `shown` says
+    /// whether to draw.
+    pub fn new(reader: R, size: Option<u64>, shown: bool) -> Self {
         Self {
             reader,
             total: size,
@@ -67,27 +69,42 @@ impl<R: Read> ProgressMonitor<R> {
             return;
         }
         self.last_draw = now;
-        let fraction = if self.total == 0 {
-            0.0
-        } else {
-            (self.read as f64 / self.total as f64).clamp(0.0, 1.0)
-        };
-        let filled = (fraction * BAR_WIDTH as f64).round() as usize;
         let mut line = String::with_capacity(LINE_WIDTH);
         line.push('\r');
-        line.push('[');
-        for i in 0..BAR_WIDTH {
-            line.push(if i < filled { '#' } else { '-' });
+        match self.total {
+            Some(total) => {
+                let fraction = if total == 0 {
+                    0.0
+                } else {
+                    (self.read as f64 / total as f64).clamp(0.0, 1.0)
+                };
+                let filled = (fraction * BAR_WIDTH as f64).round() as usize;
+                line.push('[');
+                for i in 0..BAR_WIDTH {
+                    line.push(if i < filled { '#' } else { '-' });
+                }
+                let _ = write!(
+                    &mut line,
+                    "] {}/{}",
+                    HumanSize::new(self.read, false),
+                    HumanSize::new(total, false)
+                );
+            }
+            // With no total there is no fraction to draw, only how far the
+            // read has come, as the reference command shows stdin.
+            None => {
+                let _ = write!(&mut line, "Read : {}", HumanSize::new(self.read, false));
+            }
         }
-        let _ = write!(
-            &mut line,
-            "] {}/{}",
-            HumanSize::new(self.read, false),
-            HumanSize::new(self.total, false)
-        );
         let mut err = std::io::stderr().lock();
         let _ = err.write_all(line.as_bytes());
         let _ = err.flush();
+    }
+
+    /// Whether the counter is drawn (for tests).
+    #[cfg(test)]
+    pub fn is_shown(&self) -> bool {
+        self.shown
     }
 
     /// Called after each read, with what that read returned.
