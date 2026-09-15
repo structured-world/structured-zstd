@@ -525,7 +525,15 @@ impl MatchTable {
     #[inline(always)]
     pub(crate) fn can_skip_rebase_check(&self, max_abs_pos: usize) -> bool {
         let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
-        self.position_base == 0 && self.index_shift == 0 && max_abs_pos <= max_rel_no_rebase
+        // `rel = abs - position_base + index_shift`, whatever the encoding a
+        // frame starts from: a reused compressor's carries the previous
+        // frame's. Every position in play lies at or above `position_base`
+        // (it is only ever set to the floor), so the distance cannot
+        // underflow, and the shift is compared against what is left rather
+        // than added, so nothing overflows either.
+        debug_assert!(self.position_base <= max_abs_pos);
+        let distance = max_abs_pos - self.position_base;
+        distance <= max_rel_no_rebase && self.index_shift <= max_rel_no_rebase - distance
     }
 
     /// Decide whether the table needs a cold rebase before `abs_pos`
@@ -2436,10 +2444,10 @@ impl MatchTable {
     /// Returns `false` when a precondition does not hold, leaving the cursor
     /// untouched for the caller's general loop.
     ///
-    /// The guard `can_skip_rebase_check` asks for an untranslated table
-    /// (`position_base` and `index_shift` both zero) and a target inside the
-    /// no-rebase range, none of it moving with the cursor, so it is settled
-    /// here once and the stored index is the cursor itself, with no `Option`.
+    /// The guard `can_skip_rebase_check` asks for a target whose stored
+    /// index is representable, which holds for every position below it too,
+    /// so it is settled here once and the stored index is the cursor plus a
+    /// hoisted offset, with no `Option`.
     fn fill_hash3_hoisted(&mut self, abs_pos: usize) -> bool {
         // The slice holds no borrow, so the table write can take `&mut self`
         // (the same reborrow the collect body uses).
@@ -2494,6 +2502,10 @@ impl MatchTable {
         // `abs_pos`.
         let last_insertable = history_abs_start + concat_len.saturating_sub(3);
         let end = abs_pos.min(last_insertable);
+        // `rel = cursor - position_base + index_shift`. Wrapping arithmetic is
+        // exact here: the true value is in range (the gate above), so the sum
+        // modulo the word size is that value.
+        let offset = self.index_shift.wrapping_sub(self.position_base);
         let table = self.hash3_table_mut();
         debug_assert_eq!(table.len(), 1usize << hash3_log);
         let table_ptr = table.as_mut_ptr();
@@ -2506,8 +2518,9 @@ impl MatchTable {
             debug_assert!(hash < 1usize << hash3_log);
             // SAFETY: the hash is masked to `hash3_log` bits and the table
             // holds `1 << hash3_log` slots (asserted above); `cursor` is below
-            // `abs_pos <= u32::MAX - 2`, so `cursor + 1` fits.
-            unsafe { *table_ptr.add(hash) = cursor as u32 + 1 };
+            // `abs_pos`, whose stored index is at most `u32::MAX - 2`, so
+            // `rel + 1` fits.
+            unsafe { *table_ptr.add(hash) = cursor.wrapping_add(offset) as u32 + 1 };
         }
         self.next_to_update3 = abs_pos;
         true
