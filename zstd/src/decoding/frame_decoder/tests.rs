@@ -955,7 +955,7 @@ fn implausible_content_size_skips_eager_alloc_direct_path() {
     dec.init(&mut src).expect("header must parse");
     // `src` now points past the header at the truncated 3-byte block.
     let mut out = Vec::new();
-    let err = dec.decode_current_frame_to_vec(src, &mut out, None);
+    let err = dec.decode_current_frame_to_vec(src, &mut out, false);
     assert!(
         err.is_err(),
         "truncated body must fail regardless of decode path"
@@ -987,7 +987,7 @@ fn implausible_single_segment_fcs_rejected_before_window_reservation() {
     dec.init(&mut src).expect("header must parse");
     let mut out = Vec::new();
     let err = dec
-        .decode_current_frame_to_vec(src, &mut out, None)
+        .decode_current_frame_to_vec(src, &mut out, false)
         .expect_err("implausible single-segment FCS must be rejected");
     match err {
         super::FrameDecoderError::FrameContentSizeMismatch { declared, .. } => {

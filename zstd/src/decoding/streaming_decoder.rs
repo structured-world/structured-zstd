@@ -115,15 +115,6 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
             forced_dictionary: true,
         })
     }
-
-    /// The dictionary following frames are forced onto, if any: the one the
-    /// decoder holds for this frame.
-    fn forced_dictionary(&mut self) -> Option<DictionaryHandle> {
-        if !self.forced_dictionary {
-            return None;
-        }
-        self.decoder.borrow_mut().active_dictionary().cloned()
-    }
 }
 
 impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
@@ -317,15 +308,16 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             let d = self.decoder.borrow_mut();
             d.is_at_frame_start() && d.can_collect() == 0
         };
-        // Cloned out (a cheap Arc/Rc handle) so the `decoder` borrow below does
-        // not conflict with the decoder holding it.
-        let dict = self.forced_dictionary();
+        // A forced dictionary is the one the decoder already holds; following
+        // frames are re-initialised with it in place, touching no reference
+        // count.
+        let keep_dictionary = self.forced_dictionary;
         if at_start {
             let mut compressed = alloc::vec::Vec::new();
             self.source.read_to_end(&mut compressed)?;
             self.decoder
                 .borrow_mut()
-                .decode_current_frame_to_vec(&compressed, output, dict.as_ref())
+                .decode_current_frame_to_vec(&compressed, output, keep_dictionary)
                 .map_err(Error::other)?;
             return Ok(output.len() - start_total);
         }
@@ -356,7 +348,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             let mut input = rest.as_slice();
             self.decoder
                 .borrow_mut()
-                .decode_concatenated_frames_to_vec(&mut input, output, dict.as_ref())
+                .decode_concatenated_frames_to_vec(&mut input, output, keep_dictionary)
                 .map_err(Error::other)?;
         }
         Ok(output.len() - start_total)
@@ -370,15 +362,14 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             let d = self.decoder.borrow_mut();
             d.is_at_frame_start() && d.can_collect() == 0
         };
-        // Cheap Arc/Rc clone so the `decoder` borrow does not conflict with
-        // the decoder holding it.
-        let dict = self.forced_dictionary();
+        // As in the std path: the decoder's own dictionary, reused in place.
+        let keep_dictionary = self.forced_dictionary;
         if at_start {
             let mut compressed = alloc::vec::Vec::new();
             self.source.read_to_end(&mut compressed)?;
             self.decoder
                 .borrow_mut()
-                .decode_current_frame_to_vec(&compressed, output, dict.as_ref())
+                .decode_current_frame_to_vec(&compressed, output, keep_dictionary)
                 .map_err(|e| Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)))?;
             return Ok(());
         }
@@ -407,7 +398,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             let mut input = rest.as_slice();
             self.decoder
                 .borrow_mut()
-                .decode_concatenated_frames_to_vec(&mut input, output, dict.as_ref())
+                .decode_concatenated_frames_to_vec(&mut input, output, keep_dictionary)
                 .map_err(|e| Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)))?;
         }
         Ok(())

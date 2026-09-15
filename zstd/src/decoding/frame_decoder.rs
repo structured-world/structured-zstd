@@ -1397,6 +1397,45 @@ impl FrameDecoder {
         source: impl Read,
         dict: &DictionaryHandle,
     ) -> Result<(), FrameDecoderError> {
+        self.reset_frame_for_dict(source, dict)?;
+        self.state
+            .as_mut()
+            .expect("state populated by reset_frame_for_dict")
+            .set_active_dict(dict);
+        Ok(())
+    }
+
+    /// [`reset_with_dict_handle`](Self::reset_with_dict_handle) with the
+    /// dictionary the decode state already holds, for the frames that follow
+    /// a forced-dictionary frame in one stream. The handle is moved out and
+    /// back rather than passed in, so no reference count is touched.
+    pub(crate) fn reset_with_active_dict(
+        &mut self,
+        source: impl Read,
+    ) -> Result<(), FrameDecoderError> {
+        let dict = self
+            .state
+            .as_mut()
+            .and_then(|state| state.active_dict.take())
+            .expect("a forced-dictionary stream's decoder holds its dictionary");
+        let reset = self.reset_frame_for_dict(source, &dict);
+        // Back in place whatever the outcome, so a failed header leaves the
+        // decoder holding its dictionary as before.
+        self.state
+            .as_mut()
+            .expect("the state the dictionary was taken from")
+            .active_dict = Some(dict);
+        reset
+    }
+
+    /// Everything [`reset_with_dict_handle`](Self::reset_with_dict_handle)
+    /// does except storing the handle: parse the header, check the ID, and
+    /// point the entropy tables at `dict`.
+    fn reset_frame_for_dict(
+        &mut self,
+        source: impl Read,
+        dict: &DictionaryHandle,
+    ) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
         // Fresh frame → drop the previous frame's per-block checksum
         // digests so the next decode starts with an empty vec.
@@ -1442,7 +1481,6 @@ impl FrameDecoder {
             });
         }
         state.decoder_scratch.init_from_dict(dict);
-        state.set_active_dict(dict);
         state.using_dict = Some(dict.id());
         Ok(())
     }
@@ -1661,13 +1699,6 @@ impl FrameDecoder {
     #[cfg(test)]
     pub(crate) fn active_dict_installed(&self) -> bool {
         self.state.as_ref().is_some_and(|s| s.active_dict.is_some())
-    }
-
-    /// The dictionary handle the decode state holds: the one the last
-    /// dictionary frame was decoded against (kept across frames that use
-    /// none, so reapplying it costs no clone).
-    pub(crate) fn active_dictionary(&self) -> Option<&DictionaryHandle> {
-        self.state.as_ref().and_then(|s| s.active_dict.as_ref())
     }
 
     /// Whether the current frames last block has been decoded yet
@@ -2588,25 +2619,25 @@ impl FrameDecoder {
         &mut self,
         mut input: &[u8],
         output: &mut Vec<u8>,
-        dict: Option<&DictionaryHandle>,
+        keep_dictionary: bool,
     ) -> Result<usize, FrameDecoderError> {
         let start_len = output.len();
         // The current frame is already initialised (its header consumed by the
-        // caller, WITH `dict` applied if the decoder was constructed with one).
-        // Decode it, then decode any FOLLOWING concatenated / skippable frames
-        // in `input` so the whole source is consumed to EOF and nothing is
-        // dropped (matching `read_to_end` semantics).
+        // caller, WITH the dictionary applied if the decoder was constructed
+        // with one). Decode it, then decode any FOLLOWING concatenated /
+        // skippable frames in `input` so the whole source is consumed to EOF
+        // and nothing is dropped (matching `read_to_end` semantics).
         self.decode_one_frame_to_vec(&mut input, output)?;
-        self.decode_concatenated_frames_to_vec(&mut input, output, dict)?;
+        self.decode_concatenated_frames_to_vec(&mut input, output, keep_dictionary)?;
         Ok(output.len() - start_len)
     }
 
     /// Initialise and decode every frame remaining in `input` (concatenated /
     /// skippable), APPENDING to `output`. `input` is advanced as frames are
-    /// consumed; on return it is empty. Re-initialisation honours `dict`: when
-    /// `Some`, each following frame is initialised via
-    /// [`Self::init_with_dict_handle`] so a forced dictionary is preserved even
-    /// for frames that omit the dictionary id (plain [`Self::init`] would
+    /// consumed; on return it is empty. With `keep_dictionary` each following
+    /// frame is initialised with the dictionary the decoder holds
+    /// ([`Self::reset_with_active_dict`]), so a forced dictionary is preserved
+    /// even for frames that omit the dictionary id (plain [`Self::init`] would
     /// resolve dictionaries by id only). Backs the `read_to_end` fast path (the
     /// frames after the current one) and its mid-frame fallback (the frames
     /// after the partially-read one).
@@ -2614,13 +2645,14 @@ impl FrameDecoder {
         &mut self,
         input: &mut &[u8],
         output: &mut Vec<u8>,
-        dict: Option<&DictionaryHandle>,
+        keep_dictionary: bool,
     ) -> Result<usize, FrameDecoderError> {
         let start_len = output.len();
         while !input.is_empty() {
-            let init_result = match dict {
-                Some(d) => self.init_with_dict_handle(&mut *input, d),
-                None => self.init(&mut *input),
+            let init_result = if keep_dictionary {
+                self.reset_with_active_dict(&mut *input)
+            } else {
+                self.init(&mut *input)
             };
             match init_result {
                 Ok(_) => {}
