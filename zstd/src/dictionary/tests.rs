@@ -260,6 +260,26 @@ fn train_fastcover_raw_from_slice_rejects_tiny_sample_with_empty_dict() {
     );
 }
 
+/// The widest frequency table the trainer takes (`f = 31`, 2^31 counts) is
+/// larger than a 32-bit target can lay out. Training at that width reports
+/// that as an error through the `io::Result` rather than panicking on the
+/// allocation.
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn a_frequency_table_too_wide_for_the_target_is_an_error() {
+    let sample = training_data();
+    let options = FastCoverOptions {
+        optimize: false,
+        k: 256,
+        d: 8,
+        f: 31,
+        ..FastCoverOptions::default()
+    };
+    let err = train_fastcover_raw_from_slice(sample.as_slice(), 4096, &options)
+        .expect_err("a table this wide does not fit a 32-bit target");
+    assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+}
+
 #[test]
 fn train_fastcover_raw_from_slice_normalizes_non_optimized_params() {
     let sample = training_data();

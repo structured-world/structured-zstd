@@ -67,6 +67,35 @@ fn clamp_table_bits(f: u32) -> u32 {
     f.clamp(1, 31)
 }
 
+/// A count table that does not fit in memory: larger than this target can lay
+/// out, or refused by the allocator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableTooLarge {
+    pub(crate) entries: usize,
+}
+
+/// `len` zeroed counts, allocated as `vec![0; len]` is (zero pages the
+/// allocator hands out lazily, so a wide table costs only what is touched),
+/// but reporting a table that does not fit rather than panicking on the layout
+/// or aborting on a refused allocation.
+fn zeroed_counts<C: WindowCount>(len: usize) -> Result<Vec<C>, TableTooLarge> {
+    let too_large = TableTooLarge { entries: len };
+    let layout = core::alloc::Layout::array::<C>(len).map_err(|_| too_large)?;
+    if layout.size() == 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: the layout has a non-zero size, checked above.
+    let pointer = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if pointer.is_null() {
+        return Err(too_large);
+    }
+    // SAFETY: `pointer` comes from the global allocator with the layout of
+    // `[C; len]`, which is what `Vec<C>` with capacity `len` frees it with, and
+    // every element is initialised: all-zero bytes are the value 0 of the
+    // integer counts `WindowCount` is implemented for (`u16`, `u32`).
+    Ok(unsafe { Vec::from_raw_parts(pointer.cast::<C>(), len, len) })
+}
+
 pub(crate) fn normalize_fastcover_params(mut params: FastCoverParams) -> FastCoverParams {
     params.d = params.d.clamp(4, 32);
     params.k = params.k.max(params.d).max(16);
@@ -75,17 +104,22 @@ pub(crate) fn normalize_fastcover_params(mut params: FastCoverParams) -> FastCov
     params
 }
 
-fn build_frequency_table(sample: &[u8], d: usize, f: u32, accel: usize) -> Vec<u32> {
+fn build_frequency_table(
+    sample: &[u8],
+    d: usize,
+    f: u32,
+    accel: usize,
+) -> Result<Vec<u32>, TableTooLarge> {
     let bits = clamp_table_bits(f);
     let size = 1usize << bits;
     // Upstream zstd accel table: `skip = accel - 1` dmers between counted dmers
     // (`FASTCOVER_defaultAccelParameters`), i.e. a stride of `accel`.
     let step = accel.max(1);
-    let mut table = vec![0u32; size];
+    let mut table = zeroed_counts::<u32>(size)?;
 
     let read_len = dmer_read_len(d);
     if sample.len() < read_len {
-        return table;
+        return Ok(table);
     }
 
     let mut i = 0usize;
@@ -95,12 +129,16 @@ fn build_frequency_table(sample: &[u8], d: usize, f: u32, accel: usize) -> Vec<u
         table[hash_dmer_index(sample, i, bits, d)] += 1;
         i += step;
     }
-    table
+    Ok(table)
 }
 
-fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> Vec<u8> {
+fn build_raw_dict(
+    sample: &[u8],
+    dict_size: usize,
+    params: FastCoverParams,
+) -> Result<Vec<u8>, TableTooLarge> {
     if sample.is_empty() || dict_size == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let params = normalize_fastcover_params(params);
@@ -111,7 +149,7 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     if sample.len() < read_len {
         // Too short for even one wide-read dmer: no trainable content.
         // Callers treat an empty raw dict as "sample too small".
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Upstream zstd `FASTCOVER_buildDictionary` epoch model: split the corpus into
@@ -126,7 +164,7 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     // order of magnitude slower than the reference trainer at equal
     // coverage quality.
     let nb_dmers = sample.len() - read_len + 1;
-    let mut freqs = build_frequency_table(sample, d, f, params.accel);
+    let mut freqs = build_frequency_table(sample, d, f, params.accel)?;
     let dmers_in_k = k - d + 1; // `normalize` guarantees k >= d
 
     // Upstream zstd `COVER_computeEpochs` (passes = 1): target one selection per
@@ -182,7 +220,7 @@ fn select_segments<C: WindowCount>(
     d: usize,
     freqs: &mut [u32],
     layout: EpochLayout,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, TableTooLarge> {
     let EpochLayout {
         dmers_in_k,
         epoch_size,
@@ -191,7 +229,7 @@ fn select_segments<C: WindowCount>(
     let zero = C::from(0);
     let one = C::from(1);
     // Per-window dmer occurrence counts (upstream zstd `segmentFreqs`).
-    let mut segment_freqs = vec![zero; 1usize << f];
+    let mut segment_freqs = zeroed_counts::<C>(1usize << f)?;
     // Fill from the back (upstream zstd layout) so the best segments sit at the end
     // of the dictionary and get referenced with the smallest offsets.
     let mut out = vec![0u8; dict_size];
@@ -266,7 +304,7 @@ fn select_segments<C: WindowCount>(
     }
 
     out.drain(..tail);
-    out
+    Ok(out)
 }
 
 fn coverage_score(dict: &[u8], eval: &[u8], d: usize, accel: usize) -> usize {
@@ -292,7 +330,11 @@ fn coverage_score(dict: &[u8], eval: &[u8], d: usize, accel: usize) -> usize {
     hits
 }
 
-pub fn train_fastcover_raw(sample: &[u8], dict_size: usize, params: FastCoverParams) -> Vec<u8> {
+pub fn train_fastcover_raw(
+    sample: &[u8],
+    dict_size: usize,
+    params: FastCoverParams,
+) -> Result<Vec<u8>, TableTooLarge> {
     build_raw_dict(sample, dict_size, params)
 }
 
@@ -304,7 +346,7 @@ pub fn optimize_fastcover_raw(
     d_candidates: &[usize],
     f_candidates: &[u32],
     k_values: &[usize],
-) -> (Vec<u8>, FastCoverTuned) {
+) -> Result<(Vec<u8>, FastCoverTuned), TableTooLarge> {
     let d_values = if d_candidates.is_empty() {
         DEFAULT_D_CANDIDATES
     } else {
@@ -328,12 +370,12 @@ pub fn optimize_fastcover_raw(
             f: f_values[0],
             accel,
         });
-        let mut dict = build_raw_dict(sample, dict_size, params);
+        let mut dict = build_raw_dict(sample, dict_size, params)?;
         if dict.is_empty() && dict_size > 0 {
             let take = sample.len().min(dict_size);
             dict.extend_from_slice(&sample[..take]);
         }
-        return (
+        return Ok((
             dict,
             FastCoverTuned {
                 k: params.k,
@@ -342,7 +384,7 @@ pub fn optimize_fastcover_raw(
                 accel: params.accel,
                 score: 0,
             },
-        );
+        ));
     }
 
     // Upstream's split (fastcover.c, `FASTCOVER_ctx_init`): below 1 the corpus
@@ -370,7 +412,7 @@ pub fn optimize_fastcover_raw(
         for &d in d_values {
             for &k in k_candidates {
                 let params = normalize_fastcover_params(FastCoverParams { k, d, f, accel });
-                let dict = build_raw_dict(train, dict_size, params);
+                let dict = build_raw_dict(train, dict_size, params)?;
                 let score = coverage_score(dict.as_slice(), eval, params.d, params.accel);
                 if best_dict.is_empty() || score > best.score {
                     best.score = score;
@@ -384,7 +426,7 @@ pub fn optimize_fastcover_raw(
         }
     }
 
-    (best_dict, best)
+    Ok((best_dict, best))
 }
 
 #[cfg(test)]

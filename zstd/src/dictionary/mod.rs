@@ -566,13 +566,14 @@ pub fn finalize_raw_dict(
     Ok(out)
 }
 
-/// Train a raw FastCOVER dictionary from a source stream.
+/// Train a raw FastCOVER dictionary from a source stream. A frequency table
+/// wider than memory allows is an `OutOfMemory` error.
 fn train_fastcover_internal(
     sample: &[u8],
     dict_size: usize,
     options: &FastCoverOptions,
-) -> (Vec<u8>, FastCoverTuned) {
-    if options.optimize {
+) -> io::Result<(Vec<u8>, FastCoverTuned)> {
+    let trained = if options.optimize {
         fastcover::optimize_fastcover_raw(
             sample,
             dict_size,
@@ -589,17 +590,28 @@ fn train_fastcover_internal(
             f: options.f,
             accel: options.accel,
         });
-        (
-            fastcover::train_fastcover_raw(sample, dict_size, params),
-            FastCoverTuned {
-                k: params.k,
-                d: params.d,
-                f: params.f,
-                accel: params.accel,
-                score: 0,
-            },
+        fastcover::train_fastcover_raw(sample, dict_size, params).map(|dict| {
+            (
+                dict,
+                FastCoverTuned {
+                    k: params.k,
+                    d: params.d,
+                    f: params.f,
+                    accel: params.accel,
+                    score: 0,
+                },
+            )
+        })
+    };
+    trained.map_err(|table| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!(
+                "a FastCOVER table of {} entries does not fit in memory; use a smaller f",
+                table.entries
+            ),
         )
-    }
+    })
 }
 
 /// Train a raw FastCOVER dictionary directly from an in-memory sample.
@@ -614,7 +626,7 @@ pub fn train_fastcover_raw_from_slice(
             "source stream is empty",
         ));
     }
-    let (dict, tuned) = train_fastcover_internal(sample, dict_size, options);
+    let (dict, tuned) = train_fastcover_internal(sample, dict_size, options)?;
     if dict.is_empty() && dict_size > 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -722,7 +734,8 @@ pub(crate) fn dict_roundtrip_fixture() -> (
             f: 20,
             accel: 1,
         },
-    );
+    )
+    .expect("a 2^20 table fits");
     let finalized = finalize_raw_dict(
         raw.as_slice(),
         sample.as_slice(),

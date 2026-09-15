@@ -24,7 +24,8 @@ fn fastcover_raw_produces_non_empty_dict() {
             f: 20,
             accel: 1,
         },
-    );
+    )
+    .unwrap();
     assert!(!dict.is_empty());
     assert!(dict.len() <= 4096);
 }
@@ -38,8 +39,12 @@ fn fastcover_raw_returns_empty_for_empty_or_zero_budget() {
         f: 20,
         accel: 1,
     };
-    assert!(train_fastcover_raw(&[], 1024, params).is_empty());
-    assert!(train_fastcover_raw(sample.as_slice(), 0, params).is_empty());
+    assert!(train_fastcover_raw(&[], 1024, params).unwrap().is_empty());
+    assert!(
+        train_fastcover_raw(sample.as_slice(), 0, params)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -53,7 +58,8 @@ fn fastcover_optimizer_selects_valid_params() {
         &[6, 8],
         &[18, 20],
         &[128, 256],
-    );
+    )
+    .unwrap();
     assert!(!dict.is_empty());
     assert!([6, 8].contains(&tuned.d));
     assert!([18, 20].contains(&tuned.f));
@@ -64,7 +70,7 @@ fn fastcover_optimizer_selects_valid_params() {
 fn fastcover_optimizer_falls_back_when_k_candidates_empty() {
     let sample = corpus();
     let (dict, tuned) =
-        optimize_fastcover_raw(sample.as_slice(), 4096, 0.75, 1, &[6, 8], &[18, 20], &[]);
+        optimize_fastcover_raw(sample.as_slice(), 4096, 0.75, 1, &[6, 8], &[18, 20], &[]).unwrap();
     assert!(!dict.is_empty());
     assert!(DEFAULT_K_CANDIDATES.contains(&tuned.k));
 }
@@ -72,7 +78,7 @@ fn fastcover_optimizer_falls_back_when_k_candidates_empty() {
 #[test]
 fn fastcover_optimizer_handles_one_byte_sample_without_panic() {
     let sample = [0xAB];
-    let (dict, tuned) = optimize_fastcover_raw(&sample, 16, 0.75, 1, &[], &[], &[]);
+    let (dict, tuned) = optimize_fastcover_raw(&sample, 16, 0.75, 1, &[], &[], &[]).unwrap();
     assert!(!dict.is_empty());
     assert!(dict.len() <= 16);
     assert!(DEFAULT_K_CANDIDATES.contains(&tuned.k));
@@ -83,7 +89,7 @@ fn fastcover_optimizer_handles_one_byte_sample_without_panic() {
 #[test]
 fn fastcover_optimizer_seeds_winner_when_all_scores_are_zero() {
     let sample = b"abcdefghijklmnopqrst";
-    let (dict, tuned) = optimize_fastcover_raw(sample, 16, 0.9, 1, &[6], &[16], &[8]);
+    let (dict, tuned) = optimize_fastcover_raw(sample, 16, 0.9, 1, &[6], &[16], &[8]).unwrap();
     assert!(!dict.is_empty());
     assert_eq!(tuned.k, 16);
     assert_eq!(tuned.d, 6);
@@ -102,7 +108,8 @@ fn fastcover_optimizer_handles_zero_dict_budget() {
         &[6, 8],
         &[18, 20],
         &[128, 256],
-    );
+    )
+    .unwrap();
     assert!(dict.is_empty());
     assert!([6, 8].contains(&tuned.d));
     assert!([18, 20].contains(&tuned.f));
@@ -122,20 +129,28 @@ fn fastcover_optimizer_honours_the_split_it_is_given() {
         f: 18,
         accel: 1,
     });
-    let (whole, _) = optimize_fastcover_raw(sample.as_slice(), 2048, 1.0, 1, &[6], &[18], &[128]);
-    assert_eq!(whole, build_raw_dict(sample.as_slice(), 2048, params));
+    let (whole, _) =
+        optimize_fastcover_raw(sample.as_slice(), 2048, 1.0, 1, &[6], &[18], &[128]).unwrap();
+    assert_eq!(
+        whole,
+        build_raw_dict(sample.as_slice(), 2048, params).unwrap()
+    );
     let share = (sample.len() as f64 * 0.05) as usize;
-    let (small, _) = optimize_fastcover_raw(sample.as_slice(), 2048, 0.05, 1, &[6], &[18], &[128]);
-    assert_eq!(small, build_raw_dict(&sample[..share], 2048, params));
+    let (small, _) =
+        optimize_fastcover_raw(sample.as_slice(), 2048, 0.05, 1, &[6], &[18], &[128]).unwrap();
+    assert_eq!(
+        small,
+        build_raw_dict(&sample[..share], 2048, params).unwrap()
+    );
 }
 
 #[test]
 fn fastcover_optimizer_handles_extreme_split_points() {
     let sample = corpus();
     let (dict_low, tuned_low) =
-        optimize_fastcover_raw(sample.as_slice(), 2048, 0.0, 1, &[6], &[18], &[128]);
+        optimize_fastcover_raw(sample.as_slice(), 2048, 0.0, 1, &[6], &[18], &[128]).unwrap();
     let (dict_high, tuned_high) =
-        optimize_fastcover_raw(sample.as_slice(), 2048, 1.0, 1, &[6], &[18], &[128]);
+        optimize_fastcover_raw(sample.as_slice(), 2048, 1.0, 1, &[6], &[18], &[128]).unwrap();
     assert!(!dict_low.is_empty());
     assert!(!dict_high.is_empty());
     assert_eq!(tuned_low.k, 128);
@@ -160,7 +175,8 @@ fn fastcover_trains_a_segment_longer_than_a_16_bit_count() {
             f: 20,
             accel: 1,
         },
-    );
+    )
+    .unwrap();
     assert_eq!(dict, [0u8; 8]);
 }
 
@@ -190,9 +206,25 @@ fn fastcover_uses_every_table_width_it_is_given() {
                 f,
                 accel: 1,
             },
-        );
+        )
+        .unwrap();
         assert!(!dict.is_empty(), "f={f}");
     }
+}
+
+/// A count table larger than the target can lay out is an error, not a panic
+/// on the layout or an abort on the allocation; one that fits comes back
+/// zeroed at the length asked for.
+#[test]
+fn a_count_table_that_does_not_fit_is_an_error() {
+    let entries = usize::MAX / 2;
+    assert_eq!(
+        zeroed_counts::<u32>(entries).unwrap_err(),
+        TableTooLarge { entries }
+    );
+    let table = zeroed_counts::<u16>(1 << 12).unwrap();
+    assert_eq!(table.len(), 1 << 12);
+    assert!(table.iter().all(|&count| count == 0));
 }
 
 /// A segment far longer than the corpus (a `k` near the top of `usize`, which
@@ -210,7 +242,8 @@ fn fastcover_trains_with_a_segment_longer_than_the_corpus() {
             f: 20,
             accel: 1,
         },
-    );
+    )
+    .unwrap();
     assert!(!dict.is_empty());
     assert!(dict.len() <= 4096);
 }
@@ -221,7 +254,8 @@ fn fastcover_optimizer_reports_normalized_params() {
     // A width below the trainer's range comes back at its lower end; the
     // upper end is checked without training, a table that wide being
     // gigabytes.
-    let (dict, tuned) = optimize_fastcover_raw(sample.as_slice(), 1024, 0.75, 1, &[64], &[0], &[8]);
+    let (dict, tuned) =
+        optimize_fastcover_raw(sample.as_slice(), 1024, 0.75, 1, &[64], &[0], &[8]).unwrap();
     assert!(!dict.is_empty());
     assert_eq!(tuned.d, 32);
     assert_eq!(tuned.f, 1);
