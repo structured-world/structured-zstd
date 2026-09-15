@@ -4017,6 +4017,27 @@ fn trainer_parameters_parse_and_build_options() {
     assert!(parse(&["--train-legacy", "s1"]).is_err());
 }
 
+/// `--train` selects the mode and the trainer flags select the trainer, in
+/// either order, as upstream reads them: a bare `--train` after
+/// `--train-cover` does not switch back to FastCOVER, nor drop a tuning.
+#[test]
+fn a_bare_train_keeps_the_trainer_a_flag_named() {
+    let cover_first = parse(&["--train-cover", "--train", "s"]).unwrap();
+    assert_eq!(cover_first.trainer, Trainer::Cover);
+    let cover_last = parse(&["--train", "--train-cover", "s"]).unwrap();
+    assert_eq!(cover_last.trainer, Trainer::Cover);
+    let tuned = parse(&["--train-fastcover=k=64,d=6", "--train", "s"]).unwrap();
+    assert_eq!(tuned.trainer, Trainer::FastCover);
+    assert_eq!(
+        (tuned.trainer_params.k, tuned.trainer_params.d),
+        (Some(64), Some(6))
+    );
+    assert_eq!(
+        parse(&["--train", "s"]).unwrap().trainer,
+        Trainer::FastCover
+    );
+}
+
 /// Zero is how the reference's trainer options say "the default": its parser
 /// starts from a zeroed structure and its trainer fills in every zero
 /// (`zdict.h`, `ZDICT_optimizeTrainFromBuffer_fastCover`). So

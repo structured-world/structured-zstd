@@ -943,9 +943,12 @@ fn parse_args_into(
                 "decompress" | "uncompress" => select_mode(&mut opts, Mode::Decompress),
                 "test" => select_mode(&mut opts, Mode::Test),
                 "list" => select_mode(&mut opts, Mode::List),
-                // Plain `--train` selects the same default upstream does,
-                // FastCOVER, so the two spellings agree. Bare `--train-fastcover`
-                // resets the tuning, as upstream's does.
+                // `--train` selects the mode and leaves the trainer alone, as
+                // upstream's does (`zstdcli.c` sets only the operation): the
+                // trainer is FastCOVER until a `--train-cover` /
+                // `--train-fastcover` names one, in whichever order the two
+                // flags come, so `--train-cover --train` still trains COVER.
+                // Bare `--train-fastcover` resets the tuning, as upstream's does.
                 "train" => select_mode(&mut opts, Mode::Train),
                 "train-fastcover" => {
                     select_mode(&mut opts, Mode::Train);
