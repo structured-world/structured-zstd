@@ -14,7 +14,7 @@
 #[cfg(any(unix, windows))]
 mod imp {
     use core::ffi::c_int;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::ptr;
     use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
@@ -154,7 +154,7 @@ mod imp {
 
     /// Where the guarded path is kept, NUL-terminated, for the handler: a
     /// buffer of `CAPACITY` units that grows to the longest path guarded.
-    /// Only `guard`, on the main thread, writes or replaces it, and only once
+    /// Only `publish`, on the main thread, writes or replaces it, and only once
     /// no handler can be reading it (see `HANDLING`).
     static BUFFER: AtomicPtr<PathUnit> = AtomicPtr::new(ptr::null_mut());
     static CAPACITY: AtomicUsize = AtomicUsize::new(0);
@@ -166,20 +166,44 @@ mod imp {
     /// the handler ends the process.
     ///
     /// On Windows the handler runs on a thread of its own, so it can hold the
-    /// published name while the main thread moves on to the next file. `guard`
-    /// clears `ARTEFACT` first and reads this second, the handler raises this
-    /// first and reads `ARTEFACT` second, all sequentially consistent: either
-    /// the handler finds no name, or `guard` finds it handling and leaves the
-    /// buffer as it is. So no name is rewritten, or freed, under the handler.
+    /// published name while the main thread moves on to the next file.
+    /// `publish` clears `ARTEFACT` first and reads this second, the handler
+    /// raises this first and reads `ARTEFACT` second, all sequentially
+    /// consistent: either the handler finds no name, or `publish` finds it
+    /// handling and leaves the buffer as it is. So no name is rewritten, or
+    /// freed, under the handler.
     static HANDLING: AtomicBool = AtomicBool::new(false);
 
     /// What `SIGINT` was before the handler first went in, `SIG_ERR` until
     /// then: the disposition `clear` puts back.
     static INHERITED: AtomicUsize = AtomicUsize::new(SIG_ERR);
 
-    /// Async-signal-safe by construction: `unlink`, `write` and `_exit`
-    /// only, no allocation, no locks, no formatting.
+    /// Up while `create_guarded` creates a temporary and publishes its name:
+    /// an interruption then is left to it, to handle once the name is there
+    /// to remove, rather than ending the process with the file unnamed.
+    static PUBLISHING: AtomicBool = AtomicBool::new(false);
+
+    /// Raised by every interruption, and never lowered: the process ends.
+    ///
+    /// The handler raises this and then reads `PUBLISHING`; `create_guarded`
+    /// lowers `PUBLISHING` and then reads this, all sequentially consistent.
+    /// So at least one of the two sees the other: an interruption during
+    /// publication is handled by the handler, by `create_guarded`, or by both,
+    /// which remove the same name and exit with the same status.
+    static DEFERRED: AtomicBool = AtomicBool::new(false);
+
+    /// Async-signal-safe by construction: atomics, `unlink`, `write` and
+    /// `_exit` only, no allocation, no locks, no formatting.
     extern "C" fn on_interrupt(_signum: c_int) {
+        DEFERRED.store(true, Ordering::SeqCst);
+        if PUBLISHING.load(Ordering::SeqCst) {
+            return;
+        }
+        end_interrupted();
+    }
+
+    /// Remove the published temporary, if any, and exit with status 2.
+    fn end_interrupted() -> ! {
         HANDLING.store(true, Ordering::SeqCst);
         let path = ARTEFACT.load(Ordering::SeqCst);
         // SAFETY: a non-null `path` points at a buffer that holds a
@@ -225,8 +249,40 @@ mod imp {
         }
     }
 
-    /// Remove `path` if the process is interrupted before [`clear`] is called.
+    /// Create a temporary through `create`, which names it, and remove it if
+    /// the process is interrupted before [`clear`] is called.
+    ///
+    /// No moment passes with the temporary on disk and no name for the handler
+    /// to remove: the handler is in place before the file is created, and an
+    /// interruption between the two steps waits for the name to be published.
+    pub fn create_guarded<T, E>(
+        create: impl FnOnce() -> Result<(PathBuf, T), E>,
+    ) -> Result<(PathBuf, T), E> {
+        if !install() {
+            return create();
+        }
+        PUBLISHING.store(true, Ordering::SeqCst);
+        let created = create();
+        if let Ok((path, _)) = &created {
+            publish(path);
+        }
+        PUBLISHING.store(false, Ordering::SeqCst);
+        if DEFERRED.load(Ordering::SeqCst) {
+            end_interrupted();
+        }
+        created
+    }
+
+    /// Guard an existing `path`, as [`create_guarded`] does the file it
+    /// creates (for tests).
+    #[cfg(test)]
     pub fn guard(path: &Path) {
+        let _guarded =
+            create_guarded(|| Ok::<_, core::convert::Infallible>((path.to_path_buf(), ())));
+    }
+
+    /// Hand `path` to the handler.
+    fn publish(path: &Path) {
         ARTEFACT.store(ptr::null_mut(), Ordering::SeqCst);
         // An interruption already being handled is ending the process, and its
         // handler may still be reading the last name; that name is left alone.
@@ -271,9 +327,6 @@ mod imp {
         unsafe {
             ptr::copy_nonoverlapping(units.as_ptr(), buffer, units.len());
             *buffer.add(units.len()) = 0;
-        }
-        if !install() {
-            return;
         }
         ARTEFACT.store(buffer, Ordering::SeqCst);
     }
@@ -380,9 +433,16 @@ mod imp {
 
 #[cfg(not(any(unix, windows)))]
 mod imp {
-    use std::path::Path;
+    use std::path::PathBuf;
 
-    pub fn guard(_path: &Path) {}
+    pub fn create_guarded<T, E>(
+        create: impl FnOnce() -> Result<(PathBuf, T), E>,
+    ) -> Result<(PathBuf, T), E> {
+        create()
+    }
+
+    #[cfg(test)]
+    pub fn guard(_path: &std::path::Path) {}
 
     pub fn clear() {}
 
@@ -392,7 +452,9 @@ mod imp {
     }
 }
 
-pub use imp::{clear, guard};
+#[cfg(test)]
+pub use imp::guard;
+pub use imp::{clear, create_guarded};
 
 #[cfg(test)]
 mod tests;

@@ -1949,11 +1949,16 @@ fn run(mut opts: Options) -> Result<usize> {
             bail!("error : can't use --patch-from=# on multiple files");
         }
         if compresses(&opts) {
-            let source_size = match (opts.pledged_size, opts.inputs.first()) {
-                (Some(size), _) => size,
-                (None, Some(input)) if input != Path::new("-") => fs::metadata(input)
+            // Sized as the frame will be: a named file at its own size, which
+            // it is compressed at whatever `--stream-size` says, and stdin at
+            // the declared one. Upstream zstd lets `--stream-size` win for a
+            // file too (fileio.c, `FIO_createCResources`), refusing a patch it
+            // could make or leaving the reference out of reach.
+            let source_size = match (opts.inputs.first(), opts.pledged_size) {
+                (Some(input), _) if input != Path::new("-") => fs::metadata(input)
                     .map_err(|err| eyre!("can't stat {} : {err}", input.display()))?
                     .len(),
+                (_, Some(size)) => size,
                 _ => bail!("Using --patch-from with stdin requires --stream-size"),
             };
             opts.advanced.window_log = Some(patch_window_log(source_size)?);
@@ -3066,10 +3071,10 @@ fn train_dictionary(opts: &Options) -> Result<()> {
 /// temporary renamed into place, no more readable than the strictest of the
 /// `samples` (their metadata) it was trained on.
 fn place_trained_dictionary(output: &Path, dict: &[u8], samples: &[fs::Metadata]) -> Result<()> {
-    let (temp_path, mut temp_file) = create_temporary_output_file(output)?;
     // Until it is in place, an interruption removes the temporary rather than
     // leaving it beside the dictionary's name, as for every other output.
-    interrupt::guard(&temp_path);
+    let (temp_path, mut temp_file) =
+        interrupt::create_guarded(|| create_temporary_output_file(output))?;
     let placed = (|| {
         // And like any other output it is no more readable than what it was
         // made from. A dictionary carries stretches of its corpus verbatim, so
@@ -4039,10 +4044,10 @@ fn write_output_file_if<T>(
             return Ok(None);
         }
     }
-    let (temp_path, temp_file) = create_temporary_output_file(output)?;
-    // From here until the rename, an interruption removes the temporary
-    // rather than leaving it beside the source.
-    interrupt::guard(&temp_path);
+    // From its creation until the rename, an interruption removes the
+    // temporary rather than leaving it beside the source.
+    let (temp_path, temp_file) =
+        interrupt::create_guarded(|| create_temporary_output_file(output))?;
     let abandon = |temp_path: &Path| {
         let _ = fs::remove_file(temp_path);
         interrupt::clear();

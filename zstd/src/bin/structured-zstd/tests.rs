@@ -4314,6 +4314,55 @@ fn patch_from_compresses_against_the_reference() {
     assert!(err.contains("--stream-size"), "{err}");
 }
 
+/// A named file is compressed at its own size whatever `--stream-size` says,
+/// so its patch window is sized from that too: a declared size far above it
+/// must not have the patch refused as too wide to decode, and one far below it
+/// must not leave the reference out of reach. Only stdin, which has no size of
+/// its own, takes the declared one.
+#[test]
+fn a_named_file_sizes_its_patch_window_from_the_file() {
+    let scratch = Scratch::new("patch-size");
+    let old: Vec<u8> = (0..4000u32)
+        .flat_map(|i| format!("line {i}: the quick brown fox {}\n", i * 31 % 977).into_bytes())
+        .collect();
+    let mut new = old.clone();
+    new[1000..1010].copy_from_slice(b"EDITEDHERE");
+    let reference = scratch.file("old.txt", &old);
+    let input = scratch.file("new.txt", &new);
+    let patch = scratch.path().join("new.patch");
+
+    for declared in [1u64 << 30, 16] {
+        let mut opts = parse(&["-q", "-f", "--patch-from", "r", "f"]).unwrap();
+        opts.pledged_size = Some(declared);
+        opts.patch_from = Some(reference.clone());
+        opts.inputs = vec![input.clone()];
+        opts.output = Some(patch.clone());
+        assert_eq!(
+            run(opts).expect("patching runs"),
+            0,
+            "--stream-size {declared}"
+        );
+        let patch_bytes = fs::read(&patch).unwrap();
+        assert!(
+            patch_bytes.len() * 4 < frame_of(&new).len(),
+            "--stream-size {declared}: a patch ({} bytes) reaches the reference",
+            patch_bytes.len()
+        );
+
+        let restored = scratch.path().join("restored.txt");
+        let mut opts = parse(&["-d", "-q", "-f", "--patch-from", "r", "f"]).unwrap();
+        opts.patch_from = Some(reference.clone());
+        opts.inputs = vec![patch.clone()];
+        opts.output = Some(restored.clone());
+        assert_eq!(run(opts).expect("applying the patch runs"), 0);
+        assert_eq!(
+            fs::read(&restored).unwrap(),
+            new,
+            "--stream-size {declared}"
+        );
+    }
+}
+
 /// The patch window covers the input (`highbit(size) + 1`), is never below the
 /// smallest window the format allows, and stops where the decoder would refuse
 /// the frame.

@@ -135,6 +135,50 @@ fn clear_restores_the_action_guard_replaced() {
     );
 }
 
+/// An interruption that lands after the temporary exists and before its name
+/// is published still removes it and exits with status 2. The process ends
+/// either way, so the scenario runs in a child: this test starts its own
+/// binary on itself with the directory to use, and the child raises `SIGINT`
+/// from inside the creation.
+#[cfg(unix)]
+#[test]
+fn an_interruption_while_the_temporary_is_created_still_removes_it() {
+    const CHILD: &str = "SZSTD_INTERRUPT_WHILE_CREATING";
+    unsafe extern "C" {
+        fn raise(signum: core::ffi::c_int) -> core::ffi::c_int;
+    }
+    if let Some(dir) = std::env::var_os(CHILD) {
+        super::imp::forget_inherited();
+        super::imp::take_default_action();
+        let path = std::path::PathBuf::from(dir).join("temporary");
+        let _created = super::create_guarded(|| -> std::io::Result<_> {
+            let file = std::fs::File::create(&path)?;
+            // SAFETY: a plain libc call with a valid signal number.
+            unsafe {
+                raise(2);
+            }
+            Ok((path.clone(), file))
+        });
+        // The interruption ends the process before this.
+        std::process::exit(0);
+    }
+
+    let dir = std::env::temp_dir().join(format!("szstd-interrupt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "interrupt::tests::an_interruption_while_the_temporary_is_created_still_removes_it",
+        ])
+        .env(CHILD, &dir)
+        .status()
+        .unwrap();
+    let left_behind = dir.join("temporary").exists();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(status.code(), Some(2), "{status}");
+    assert!(!left_behind, "the temporary was left behind");
+}
+
 #[cfg(not(any(unix, windows)))]
 #[test]
 fn the_no_op_guard_never_reports_a_guard() {
