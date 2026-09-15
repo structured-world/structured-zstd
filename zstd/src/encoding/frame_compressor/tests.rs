@@ -3887,3 +3887,24 @@ fn the_ingest_buffer_is_sized_from_the_hint_not_grown_into() {
         );
     }
 }
+
+/// A prepared dictionary's reported size covers the whole shared allocation:
+/// the parts it holds inline, the parsed dictionary's own heap (a fully
+/// decoded one carries decode tables) and the encoder entropy tables. The
+/// memory queries built on it would otherwise understate what a dictionary
+/// pins.
+#[test]
+fn a_prepared_dictionary_reports_everything_it_holds() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let parsed = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+    let parsed_heap = parsed.heap_bytes();
+    let prepared = super::EncoderDictionary::from_dictionary(parsed);
+    let floor = core::mem::size_of::<super::EncoderDictionaryParts>()
+        + parsed_heap
+        + prepared.inner.entropy.heap_size();
+    assert!(
+        prepared.heap_size() >= floor,
+        "{} < {floor}",
+        prepared.heap_size()
+    );
+}

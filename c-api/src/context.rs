@@ -186,15 +186,13 @@ impl ZSTD_CCtx {
     /// dictionary references, including the ones the kept compressors hold.
     pub(crate) fn reset_parameters(&mut self) {
         self.params = crate::params::CCtxParams::default();
-        self.attached_dict = crate::attach::CCtxDictAttach::None;
+        self.replace_attached_dict(crate::attach::CCtxDictAttach::None);
+        // A `*_usingCDict` call's dictionary is not an attachment, and goes too.
         if let Some((held, compressor)) = &mut self.compressor
             && *held != 0
         {
             compressor.clear_dictionary();
             *held = 0;
-        }
-        if let Some(stream) = &mut self.stream {
-            stream.release_dictionary();
         }
     }
 }
@@ -216,9 +214,14 @@ pub unsafe extern "C" fn ZSTD_freeCCtx(cctx: *mut ZSTD_CCtx) -> usize {
 ///
 /// Counts the inline struct, the reusable output `scratch`, and the kept
 /// one-shot compressor and streaming context once they exist: their
-/// match-finder tables / history, the recycled-buffer pool, the dictionary
-/// snapshot, and the dictionary they hold. Matches upstream
-/// `ZSTD_sizeof_CCtx`, which includes the CDict-copied working tables.
+/// match-finder tables / history, the recycled-buffer pool and the dictionary
+/// snapshot. Matches upstream `ZSTD_sizeof_CCtx`, which includes the
+/// CDict-copied working tables.
+///
+/// The dictionaries are shared rather than copied, so the attached one and
+/// the ones the compressors hold may be a single allocation. Each counts
+/// once, and only when the context alone keeps it alive: a referenced CDict's
+/// is the CDict's, as upstream leaves referenced dictionaries out.
 ///
 /// # Safety
 /// `cctx` must be a live pointer from [`ZSTD_createCCtx`], or `NULL`.
@@ -228,14 +231,34 @@ pub unsafe extern "C" fn ZSTD_sizeof_CCtx(cctx: *const ZSTD_CCtx) -> usize {
         return 0;
     }
     let cctx = unsafe { &*cctx };
+    let compressor = cctx.compressor.as_ref().map(|(_, compressor)| compressor);
+    let compressor_dictionary = compressor.and_then(FrameCompressor::dictionary);
+    let stream_dictionary = cctx
+        .stream
+        .as_ref()
+        .and_then(crate::streaming::CStreamState::dictionary);
+    // Each holder's own size carries the dictionary it holds; that share is
+    // taken back out and the dictionaries are counted once, below.
+    let dictionary_size =
+        |held: Option<&EncoderDictionary>| held.map_or(0, EncoderDictionary::heap_size);
     core::mem::size_of::<ZSTD_CCtx>()
         + cctx.scratch.capacity()
+        + compressor.map_or(0, FrameCompressor::heap_size)
+        - dictionary_size(compressor_dictionary)
         + cctx
-            .compressor
+            .stream
             .as_ref()
-            .map_or(0, |(_, compressor)| compressor.heap_size())
-        + cctx.stream.as_ref().map_or(0, |s| s.heap_size())
-        + cctx.attached_dict.heap_size()
+            .map_or(0, crate::streaming::CStreamState::heap_size)
+        - dictionary_size(stream_dictionary)
+        + EncoderDictionary::exclusive_heap_size(
+            [
+                cctx.attached_dict.owned(),
+                compressor_dictionary,
+                stream_dictionary,
+            ]
+            .into_iter()
+            .flatten(),
+        )
 }
 
 /// `size_t ZSTD_compressCCtx(ZSTD_CCtx* cctx, void* dst, size_t dstCapacity,

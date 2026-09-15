@@ -71,15 +71,13 @@ pub(crate) enum CCtxDictAttach {
 }
 
 impl CCtxDictAttach {
-    /// Heap bytes owned by the attach state. Referenced (`RefCDict`)
-    /// dictionaries are caller-owned and excluded, matching upstream's
-    /// `ZSTD_sizeof_CCtx` treatment of referenced dictionaries.
-    pub(crate) fn heap_size(&self) -> usize {
+    /// The dictionary the context itself holds through this attach: a loaded
+    /// one or a prefix. A referenced CDict's is the CDict's (upstream
+    /// `ZSTD_sizeof_CCtx` leaves referenced dictionaries out too).
+    pub(crate) fn owned(&self) -> Option<&EncoderDictionary> {
         match self {
-            CCtxDictAttach::None | CCtxDictAttach::RefCDict { .. } => 0,
-            CCtxDictAttach::Load { dict, .. } | CCtxDictAttach::Prefix { dict, .. } => {
-                dict.heap_size()
-            }
+            CCtxDictAttach::None | CCtxDictAttach::RefCDict { .. } => None,
+            CCtxDictAttach::Load { dict, .. } | CCtxDictAttach::Prefix { dict, .. } => Some(dict),
         }
     }
 
@@ -233,7 +231,29 @@ impl ZSTD_CCtx {
     /// Drop a single-use prefix after the frame that consumed it started.
     pub(crate) fn consume_prefix(&mut self) {
         if matches!(self.attached_dict, CCtxDictAttach::Prefix { .. }) {
-            self.attached_dict = CCtxDictAttach::None;
+            self.replace_attached_dict(CCtxDictAttach::None);
+        }
+    }
+
+    /// Attach `attach` in place of the current dictionary. The kept compressors
+    /// let the replaced one go as well, each as soon as it is between frames,
+    /// rather than pinning it until they next run or for the context's life. A
+    /// compressor holding another dictionary (a `*_usingCDict` call's) keeps
+    /// it: that is the cache the next such call reuses.
+    pub(crate) fn replace_attached_dict(&mut self, attach: CCtxDictAttach) {
+        let replaced = self.attach_serial();
+        self.attached_dict = attach;
+        if replaced == 0 || replaced == self.attach_serial() {
+            return;
+        }
+        if let Some((held, compressor)) = &mut self.compressor
+            && *held == replaced
+        {
+            compressor.clear_dictionary();
+            *held = 0;
+        }
+        if let Some(stream) = &mut self.stream {
+            stream.release_dictionary(replaced);
         }
     }
 
@@ -293,7 +313,7 @@ unsafe fn cctx_load_dictionary(
     let dict = unsafe { in_slice(dict, dict_size) };
     if dict.is_empty() {
         // Upstream: loading a NULL / empty dictionary clears the attach.
-        cctx.attached_dict = CCtxDictAttach::None;
+        cctx.replace_attached_dict(CCtxDictAttach::None);
         return 0;
     }
     let raw_content = match encode_raw_content(dict, content_type) {
@@ -305,11 +325,11 @@ unsafe fn cctx_load_dictionary(
     let Some(prepared) = prepare_compression_dictionary(dict, raw_content) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted);
     };
-    cctx.attached_dict = CCtxDictAttach::Load {
+    cctx.replace_attached_dict(CCtxDictAttach::Load {
         dict: prepared,
         raw_content,
         serial: next_dict_serial(),
-    };
+    });
     0
 }
 
@@ -379,11 +399,11 @@ pub unsafe extern "C" fn ZSTD_CCtx_refCDict(
         return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
     }
     if cdict.is_null() {
-        cctx.attached_dict = CCtxDictAttach::None;
+        cctx.replace_attached_dict(CCtxDictAttach::None);
         return 0;
     }
     let serial = unsafe { &*cdict }.serial;
-    cctx.attached_dict = CCtxDictAttach::RefCDict { cdict, serial };
+    cctx.replace_attached_dict(CCtxDictAttach::RefCDict { cdict, serial });
     0
 }
 
@@ -409,7 +429,7 @@ unsafe fn cctx_ref_prefix(
     // content type).
     let prefix = unsafe { in_slice(prefix, prefix_size) };
     if prefix.is_empty() {
-        cctx.attached_dict = CCtxDictAttach::None;
+        cctx.replace_attached_dict(CCtxDictAttach::None);
         return 0;
     }
     // A prefix is raw content by definition: only the auto / rawContent
@@ -421,10 +441,10 @@ unsafe fn cctx_ref_prefix(
     let Some(prepared) = prepare_compression_dictionary(prefix, true) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted);
     };
-    cctx.attached_dict = CCtxDictAttach::Prefix {
+    cctx.replace_attached_dict(CCtxDictAttach::Prefix {
         dict: prepared,
         serial: next_dict_serial(),
-    };
+    });
     0
 }
 

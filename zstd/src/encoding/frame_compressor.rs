@@ -137,8 +137,9 @@ impl EncoderDictionary {
         ))
     }
 
-    /// Heap bytes the prepared dictionary holds: its content and the entropy
-    /// tables it seeds. Clones share them, so this counts once however many
+    /// Heap bytes the prepared dictionary holds: the shared allocation itself,
+    /// the parsed dictionary's content and tables, and the entropy tables it
+    /// seeds. Clones share all of it, so this counts once however many
     /// compressors the dictionary is attached to.
     ///
     /// # Examples
@@ -150,7 +151,59 @@ impl EncoderDictionary {
     /// assert!(dictionary.heap_size() >= b"raw content, no header".len());
     /// ```
     pub fn heap_size(&self) -> usize {
-        self.inner.dict_content.capacity() + self.inner.entropy.heap_size()
+        // `Arc` and `Rc` both place two word-sized counts ahead of the value,
+        // padded to its alignment.
+        let shared = core::alloc::Layout::new::<[usize; 2]>()
+            .extend(core::alloc::Layout::new::<EncoderDictionaryParts>())
+            .expect("a fixed-size layout extends")
+            .0
+            .pad_to_align()
+            .size();
+        shared + self.inner.dictionary.heap_bytes() + self.inner.entropy.heap_size()
+    }
+
+    /// Heap bytes that `handles` alone keep alive: each distinct dictionary
+    /// among them once, and only when no handle outside them shares it.
+    ///
+    /// For an owner holding several handles, such as a context whose
+    /// compressors each keep the dictionary they last ran with: what it reports
+    /// should count one dictionary once, and none that someone else also holds.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::EncoderDictionary;
+    ///
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(b"some shared history").unwrap();
+    /// let copy = dictionary.clone();
+    /// // Both handles are in the set: counted once.
+    /// assert_eq!(
+    ///     EncoderDictionary::exclusive_heap_size([&dictionary, &copy]),
+    ///     dictionary.heap_size()
+    /// );
+    /// // `copy` is held elsewhere: nothing is this set's alone.
+    /// assert_eq!(EncoderDictionary::exclusive_heap_size([&dictionary]), 0);
+    /// ```
+    pub fn exclusive_heap_size<'a, I>(handles: I) -> usize
+    where
+        I: IntoIterator<Item = &'a EncoderDictionary>,
+        I::IntoIter: Clone,
+    {
+        let handles = handles.into_iter();
+        let mut total = 0;
+        for (position, handle) in handles.clone().enumerate() {
+            let same = |other: &&EncoderDictionary| {
+                SharedEncoderDictionary::ptr_eq(&handle.inner, &other.inner)
+            };
+            // The first handle to an allocation speaks for all of them.
+            if handles.clone().take(position).any(|other| same(&other)) {
+                continue;
+            }
+            let held_here = handles.clone().filter(same).count();
+            if SharedEncoderDictionary::strong_count(&handle.inner) == held_here {
+                total += handle.heap_size();
+            }
+        }
+        total
     }
 
     /// The content and serialized sizes the encoder's matcher is hinted with.
@@ -3252,6 +3305,22 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         dictionary: EncoderDictionary,
     ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
         self.attach_dictionary(dictionary)
+    }
+
+    /// The dictionary frames are compressed with, if one is attached.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
+    ///
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(b"some shared history").unwrap();
+    /// let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    /// assert!(compressor.dictionary().is_none());
+    /// compressor.set_encoder_dictionary(dictionary).unwrap();
+    /// assert_eq!(compressor.dictionary().map(EncoderDictionary::id), Some(0));
+    /// ```
+    pub fn dictionary(&self) -> Option<&EncoderDictionary> {
+        self.dictionary.as_ref()
     }
 
     /// Remove the attached dictionary, returning it as an [`EncoderDictionary`].

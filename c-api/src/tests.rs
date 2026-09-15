@@ -3200,3 +3200,158 @@ fn one_shot_entry_points_share_a_compressor_but_nothing_else() {
     unsafe { ZSTD_freeCCtx(reused) };
     unsafe { ZSTD_freeCDict(cdict) };
 }
+
+/// One `ZSTD_compress2` frame of `input`.
+unsafe fn one_shot_frame(cctx: *mut crate::context::ZSTD_CCtx, input: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0u8; ZSTD_compressBound(input.len())];
+    let n = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            input.as_ptr(),
+            input.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(n), 0, "compress2 errored");
+    frame.truncate(n);
+    frame
+}
+
+/// The dictionaries the one-shot compressor and the streaming context of
+/// `cctx` hold.
+fn held_dictionaries(
+    cctx: &crate::context::ZSTD_CCtx,
+) -> [Option<&codec::encoding::EncoderDictionary>; 2] {
+    [
+        cctx.compressor
+            .as_ref()
+            .and_then(|(_, compressor)| compressor.dictionary()),
+        cctx.stream.as_ref().and_then(|stream| stream.dictionary()),
+    ]
+}
+
+/// A context whose one-shot compressor and streaming context both run with
+/// the dictionary it has attached holds that dictionary three times over, and
+/// reports it once. A dictionary it only references, a CDict's, belongs to the
+/// CDict and is not reported at all.
+#[test]
+fn sizeof_cctx_counts_a_shared_dictionary_once_and_a_referenced_one_never() {
+    let dict = trained_dictionary();
+    let cdict = unsafe { ZSTD_createCDict(dict.as_ptr(), dict.len(), 3) };
+    let payload = dict_payload();
+    for referenced in [false, true] {
+        let cctx = ZSTD_createCCtx();
+        let attached = unsafe {
+            if referenced {
+                ZSTD_CCtx_refCDict(cctx, cdict)
+            } else {
+                ZSTD_CCtx_loadDictionary(cctx, dict.as_ptr(), dict.len())
+            }
+        };
+        assert_eq!(ZSTD_isError(attached), 0);
+        unsafe { one_shot_frame(cctx, &payload) };
+        unsafe { streamed_frame(cctx, &payload) };
+
+        let context = unsafe { &*cctx };
+        let [compressor_dictionary, stream_dictionary] = held_dictionaries(context);
+        let dictionary = compressor_dictionary.expect("the one-shot compressor holds it");
+        assert!(
+            stream_dictionary.is_some(),
+            "the streaming context holds it"
+        );
+        // Everything the context holds, its dictionary as many times as it is
+        // held there.
+        let every_holder = core::mem::size_of::<crate::context::ZSTD_CCtx>()
+            + context.scratch.capacity()
+            + context.compressor.as_ref().unwrap().1.heap_size()
+            + context.stream.as_ref().unwrap().heap_size();
+        let reported = unsafe { ZSTD_sizeof_CCtx(cctx) };
+        let counted_times = if referenced { 0 } else { 1 };
+        assert_eq!(
+            reported + (2 - counted_times) * dictionary.heap_size(),
+            every_holder,
+            "referenced: {referenced}"
+        );
+        unsafe { ZSTD_freeCCtx(cctx) };
+    }
+    unsafe { ZSTD_freeCDict(cdict) };
+}
+
+/// Replacing or clearing the attached dictionary lets go of it in the kept
+/// one-shot compressor and streaming context too, rather than pinning it until
+/// each next runs, and a spent prefix goes as soon as its frame is done.
+#[test]
+fn a_dictionary_the_context_moved_on_from_is_not_kept() {
+    let dict = trained_dictionary();
+    let cdict = unsafe { ZSTD_createCDict(dict.as_ptr(), dict.len(), 3) };
+    let payload = dict_payload();
+    type Replace<'a> = Box<dyn Fn(*mut crate::context::ZSTD_CCtx) -> usize + 'a>;
+    let replacements: [(&str, Replace); 5] = [
+        (
+            "loadDictionary(NULL)",
+            Box::new(|cctx| unsafe { ZSTD_CCtx_loadDictionary(cctx, core::ptr::null(), 0) }),
+        ),
+        (
+            "another loadDictionary",
+            Box::new(|cctx| unsafe {
+                ZSTD_CCtx_loadDictionary(cctx, payload.as_ptr(), payload.len())
+            }),
+        ),
+        (
+            "refCDict",
+            Box::new(|cctx| unsafe { ZSTD_CCtx_refCDict(cctx, cdict) }),
+        ),
+        (
+            "refPrefix",
+            Box::new(|cctx| unsafe { ZSTD_CCtx_refPrefix(cctx, payload.as_ptr(), payload.len()) }),
+        ),
+        (
+            "initCStream",
+            Box::new(|cctx| unsafe { crate::streaming::ZSTD_initCStream(cctx, 3) }),
+        ),
+    ];
+    for (name, replace) in &replacements {
+        let cctx = ZSTD_createCCtx();
+        let loaded = unsafe { ZSTD_CCtx_loadDictionary(cctx, dict.as_ptr(), dict.len()) };
+        assert_eq!(ZSTD_isError(loaded), 0);
+        unsafe { one_shot_frame(cctx, &payload) };
+        unsafe { streamed_frame(cctx, &payload) };
+        let old = unsafe { &*cctx }
+            .attached_dict
+            .prepared()
+            .expect("loaded")
+            .clone();
+
+        assert_eq!(ZSTD_isError(replace(cctx)), 0, "{name}");
+        // Held by nothing but the copy taken above.
+        assert_eq!(
+            codec::encoding::EncoderDictionary::exclusive_heap_size([&old]),
+            old.heap_size(),
+            "{name}: the context still holds the dictionary it replaced"
+        );
+        unsafe { ZSTD_freeCCtx(cctx) };
+    }
+
+    // A prefix is spent by the frame that uses it, on either path.
+    let cctx = ZSTD_createCCtx();
+    for streamed in [false, true] {
+        let prefixed = unsafe { ZSTD_CCtx_refPrefix(cctx, dict.as_ptr(), dict.len()) };
+        assert_eq!(ZSTD_isError(prefixed), 0);
+        unsafe {
+            if streamed {
+                streamed_frame(cctx, &payload);
+            } else {
+                one_shot_frame(cctx, &payload);
+            }
+        }
+        assert!(
+            held_dictionaries(unsafe { &*cctx })
+                .iter()
+                .all(Option::is_none),
+            "streamed: {streamed}: the spent prefix is still held"
+        );
+    }
+    unsafe { ZSTD_freeCCtx(cctx) };
+    unsafe { ZSTD_freeCDict(cdict) };
+}

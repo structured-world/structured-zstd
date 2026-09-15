@@ -81,16 +81,22 @@ impl CStreamState {
         self.pending.capacity() + self.context.heap_size()
     }
 
+    /// The dictionary the kept context holds, if any.
+    pub(crate) fn dictionary(&self) -> Option<&codec::encoding::EncoderDictionary> {
+        self.context.dictionary()
+    }
+
     /// Whether a frame is under way: taking input, or closed with part of
     /// it still to be copied out.
     pub(crate) fn in_frame(&self) -> bool {
         self.open || self.pending_remaining() > 0
     }
 
-    /// Detach the dictionary from the context between frames
-    /// (`ZSTD_CCtx_reset` with parameters).
-    pub(crate) fn release_dictionary(&mut self) {
-        if self.dictionary != 0 && !self.in_frame() {
+    /// Detach the dictionary `serial` names from the context, if that is the
+    /// one it holds and no frame is taking input. A closed frame whose tail is
+    /// still being copied out no longer reads it.
+    pub(crate) fn release_dictionary(&mut self, serial: u64) {
+        if serial != 0 && self.dictionary == serial && !self.open {
             // Clearing is refused only mid-frame, which was excluded above.
             let _cleared = self.context.set_dictionary_from_bytes(&[]);
             self.dictionary = 0;
@@ -289,6 +295,7 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
     if let Err(code) = cctx.ensure_stream() {
         return encode(code);
     }
+    let attached = cctx.attach_serial();
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<usize, ZSTD_ErrorCode> {
         let stream = cctx.stream.as_mut().expect("ensure_stream installed state");
         // Consume ALL remaining input: the in-memory output has no
@@ -330,7 +337,14 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
                     // Closed; the context stays for the next frame, and the
                     // stream counts as in progress only while the tail is
                     // still being copied out, however many calls that takes.
-                    Ok(()) => stream.open = false,
+                    // A dictionary that is no longer the attached one, a
+                    // prefix this frame spent, goes with the frame.
+                    Ok(()) => {
+                        stream.open = false;
+                        if stream.dictionary != attached {
+                            stream.release_dictionary(stream.dictionary);
+                        }
+                    }
                     // Pledge mismatch at frame end surfaces as InvalidInput;
                     // map it to the same srcSize_wrong the write() path
                     // reports so the error code does not depend on where the
@@ -371,9 +385,9 @@ pub unsafe extern "C" fn ZSTD_initCStream(zcs: *mut ZSTD_CCtx, compression_level
     }
     let cctx = unsafe { &mut *zcs };
     cctx.reset_session();
-    // Legacy init clears any previously loaded dictionary; the kept
-    // compressors drop it from the frame that next uses them.
-    cctx.attached_dict = crate::attach::CCtxDictAttach::None;
+    // Legacy init clears any previously loaded dictionary, in the kept
+    // compressors too.
+    cctx.replace_attached_dict(crate::attach::CCtxDictAttach::None);
     cctx.params.level = if compression_level == 0 {
         3
     } else {

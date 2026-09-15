@@ -599,6 +599,22 @@ impl<M: Matcher> CompressionContext<M> {
         Ok(())
     }
 
+    /// The dictionary each frame is compressed with, if one is attached.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel, EncoderDictionary};
+    ///
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(b"some shared history").unwrap();
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// assert!(context.dictionary().is_none());
+    /// context.set_encoder_dictionary(dictionary).unwrap();
+    /// assert!(context.dictionary().is_some());
+    /// ```
+    pub fn dictionary(&self) -> Option<&EncoderDictionary> {
+        self.dictionary.as_ref()
+    }
+
     /// Total heap bytes this context's allocations hold, excluding the inline
     /// struct: match-finder tables / history / recycled buffers, retained
     /// Huffman tables, the staging `pending` / `encoded_scratch` buffers, the
