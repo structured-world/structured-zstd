@@ -2946,3 +2946,257 @@ fn zdict_train_rejects_null_buffers_with_nonzero_lengths() {
     };
     assert_ne!(ZDICT_isError(n), 0, "NULL dictContent must error");
 }
+
+/// One frame through `ZSTD_compressStream2`, fed in 16 KiB slices and
+/// drained through a 1 KiB buffer, so it spans many calls.
+unsafe fn streamed_frame(cctx: *mut crate::context::ZSTD_CCtx, input: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    let mut out = [0u8; 1024];
+    let mut call = |inb: &mut ZSTD_inBuffer, end_op: c_int| {
+        let mut outb = ZSTD_outBuffer {
+            dst: out.as_mut_ptr().cast(),
+            size: out.len(),
+            pos: 0,
+        };
+        let rc = unsafe { ZSTD_compressStream2(cctx, &mut outb, inb, end_op) };
+        assert_eq!(ZSTD_isError(rc), 0, "compressStream2 errored");
+        frame.extend_from_slice(&out[..outb.pos]);
+        rc
+    };
+    for chunk in input.chunks(16 * 1024) {
+        let mut inb = ZSTD_inBuffer {
+            src: chunk.as_ptr().cast(),
+            size: chunk.len(),
+            pos: 0,
+        };
+        while inb.pos < inb.size {
+            call(&mut inb, 0);
+        }
+    }
+    let mut empty = ZSTD_inBuffer {
+        src: core::ptr::null(),
+        size: 0,
+        pos: 0,
+    };
+    while call(&mut empty, 2) != 0 {}
+    frame
+}
+
+/// How a step below attaches its dictionary.
+#[derive(Clone, Copy)]
+enum Attach {
+    None,
+    Load,
+    RefCDict,
+}
+
+/// A context streaming frame after frame, with the level, the checksum, the
+/// pledge and the dictionary changing between frames, writes each exactly as
+/// a context created for that frame alone does: the match finder, snapshot
+/// and dictionary it keeps from one frame to the next never reach the next.
+#[test]
+fn a_reused_stream_context_writes_what_a_fresh_one_would() {
+    let dict = trained_dictionary();
+    let cdict = unsafe { ZSTD_createCDict(dict.as_ptr(), dict.len(), 7) };
+    let large = sample(300_000);
+    let payload = dict_payload();
+    let steps: [(c_int, c_int, bool, Attach, &[u8]); 9] = [
+        (3, 0, false, Attach::None, &large),
+        (19, 1, true, Attach::None, &large[..5_000]),
+        (1, 0, true, Attach::Load, &payload),
+        (1, 0, false, Attach::Load, &large[..70_000]),
+        (12, 1, false, Attach::RefCDict, &payload),
+        (12, 0, true, Attach::RefCDict, &large[..40_000]),
+        (5, 0, false, Attach::None, &payload),
+        (22, 1, true, Attach::Load, &large[..90_000]),
+        (-3, 0, false, Attach::None, &[]),
+    ];
+    let configure = |cctx, level: c_int, checksum: c_int, pledge: Option<usize>, attach| unsafe {
+        assert_eq!(ZSTD_CCtx_reset(cctx, 2), 0);
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 100, level), 0);
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 201, checksum), 0);
+        if let Some(size) = pledge {
+            assert_eq!(ZSTD_CCtx_setPledgedSrcSize(cctx, size as u64), 0);
+        }
+        let attached = match attach {
+            Attach::None => 0,
+            Attach::Load => ZSTD_CCtx_loadDictionary(cctx, dict.as_ptr(), dict.len()),
+            Attach::RefCDict => ZSTD_CCtx_refCDict(cctx, cdict),
+        };
+        assert_eq!(ZSTD_isError(attached), 0);
+    };
+
+    let reused = ZSTD_createCCtx();
+    for (index, &(level, checksum, pledge, attach, input)) in steps.iter().enumerate() {
+        let pledge = pledge.then_some(input.len());
+        configure(reused, level, checksum, pledge, attach);
+        let frame = unsafe { streamed_frame(reused, input) };
+
+        let fresh = ZSTD_createCCtx();
+        configure(fresh, level, checksum, pledge, attach);
+        let expected = unsafe { streamed_frame(fresh, input) };
+        unsafe { ZSTD_freeCCtx(fresh) };
+        assert!(
+            frame == expected,
+            "step {index}: {} bytes from the reused context, {} from a fresh one",
+            frame.len(),
+            expected.len()
+        );
+    }
+    unsafe { ZSTD_freeCCtx(reused) };
+    unsafe { ZSTD_freeCDict(cdict) };
+}
+
+/// The one-shot entry points share one kept compressor, so each call follows
+/// others that ran at another level, with another dictionary or none, or
+/// with explicit frame parameters; each still writes what a context created
+/// for that call alone writes.
+#[test]
+fn one_shot_entry_points_share_a_compressor_but_nothing_else() {
+    let dict = trained_dictionary();
+    let cdict = unsafe { ZSTD_createCDict(dict.as_ptr(), dict.len(), 9) };
+    let large = sample(200_000);
+    let payload = dict_payload();
+    let compressed = |written: usize, mut frame: Vec<u8>| {
+        assert_eq!(ZSTD_isError(written), 0, "compression errored");
+        frame.truncate(written);
+        frame
+    };
+    let buffer = |input: &[u8]| vec![0u8; ZSTD_compressBound(input.len())];
+    type Call<'a> = Box<dyn Fn(*mut crate::context::ZSTD_CCtx) -> Vec<u8> + 'a>;
+    let calls: Vec<(&str, Call)> = vec![
+        (
+            "compressCCtx 19",
+            Box::new(|cctx| unsafe {
+                let mut frame = buffer(&large);
+                let n = ZSTD_compressCCtx(
+                    cctx,
+                    frame.as_mut_ptr(),
+                    frame.len(),
+                    large.as_ptr(),
+                    large.len(),
+                    19,
+                );
+                compressed(n, frame)
+            }),
+        ),
+        (
+            "compress2 3 + loaded dictionary",
+            Box::new(|cctx| unsafe {
+                assert_eq!(ZSTD_CCtx_reset(cctx, 2), 0);
+                assert_eq!(ZSTD_CCtx_setParameter(cctx, 100, 3), 0);
+                assert_eq!(ZSTD_CCtx_loadDictionary(cctx, dict.as_ptr(), dict.len()), 0);
+                let mut frame = buffer(&payload);
+                let n = ZSTD_compress2(
+                    cctx,
+                    frame.as_mut_ptr(),
+                    frame.len(),
+                    payload.as_ptr(),
+                    payload.len(),
+                );
+                compressed(n, frame)
+            }),
+        ),
+        (
+            "usingCDict",
+            Box::new(|cctx| unsafe {
+                let mut frame = buffer(&payload);
+                let n = ZSTD_compress_usingCDict(
+                    cctx,
+                    frame.as_mut_ptr(),
+                    frame.len(),
+                    payload.as_ptr(),
+                    payload.len(),
+                    cdict,
+                );
+                compressed(n, frame)
+            }),
+        ),
+        (
+            "compressCCtx 1",
+            Box::new(|cctx| unsafe {
+                let mut frame = buffer(&payload);
+                let n = ZSTD_compressCCtx(
+                    cctx,
+                    frame.as_mut_ptr(),
+                    frame.len(),
+                    payload.as_ptr(),
+                    payload.len(),
+                    1,
+                );
+                compressed(n, frame)
+            }),
+        ),
+        (
+            "usingCDict_advanced with a checksum",
+            Box::new(|cctx| unsafe {
+                let mut frame = buffer(&large);
+                let fparams = ZSTD_frameParameters {
+                    contentSizeFlag: 1,
+                    checksumFlag: 1,
+                    noDictIDFlag: 1,
+                };
+                let n = ZSTD_compress_usingCDict_advanced(
+                    cctx,
+                    frame.as_mut_ptr(),
+                    frame.len(),
+                    large.as_ptr(),
+                    large.len(),
+                    cdict,
+                    fparams,
+                );
+                compressed(n, frame)
+            }),
+        ),
+        (
+            "usingDict 12",
+            Box::new(|cctx| unsafe {
+                let mut frame = buffer(&payload);
+                let n = ZSTD_compress_usingDict(
+                    cctx,
+                    frame.as_mut_ptr(),
+                    frame.len(),
+                    payload.as_ptr(),
+                    payload.len(),
+                    dict.as_ptr(),
+                    dict.len(),
+                    12,
+                );
+                compressed(n, frame)
+            }),
+        ),
+        (
+            "compress2 without a dictionary",
+            Box::new(|cctx| unsafe {
+                assert_eq!(ZSTD_CCtx_reset(cctx, 2), 0);
+                assert_eq!(ZSTD_CCtx_setParameter(cctx, 100, 16), 0);
+                let mut frame = buffer(&large);
+                let n = ZSTD_compress2(
+                    cctx,
+                    frame.as_mut_ptr(),
+                    frame.len(),
+                    large.as_ptr(),
+                    large.len(),
+                );
+                compressed(n, frame)
+            }),
+        ),
+    ];
+
+    let reused = ZSTD_createCCtx();
+    // Twice through, so every call also follows every other one.
+    for (name, call) in calls.iter().chain(calls.iter()) {
+        let frame = call(reused);
+        let fresh = ZSTD_createCCtx();
+        let expected = call(fresh);
+        unsafe { ZSTD_freeCCtx(fresh) };
+        assert!(
+            frame == expected,
+            "{name}: {} bytes from the reused context, {} from a fresh one",
+            frame.len(),
+            expected.len()
+        );
+    }
+    unsafe { ZSTD_freeCCtx(reused) };
+    unsafe { ZSTD_freeCDict(cdict) };
+}

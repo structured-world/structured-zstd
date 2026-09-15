@@ -2,8 +2,8 @@ use super::*;
 
 /// What a run with no `-D` carries: the codecs take their dictionary already
 /// parsed, and "no dictionary" is a prepared set holding neither side.
-fn no_dict() -> Dictionaries {
-    Dictionaries::default()
+fn no_dict() -> Codecs {
+    Codecs::default()
 }
 
 /// What a benchmark of `input_len` bytes across `levels` actually holds: the
@@ -30,8 +30,8 @@ fn benchmark_budget(input_len: u64, levels: std::ops::RangeInclusive<i32>) -> u6
 
 /// The same blob a `-D` run would hand the codecs, parsed for both directions
 /// so one helper serves a compressing test and a decoding one alike.
-fn prepared_dict(raw: &[u8]) -> Dictionaries {
-    Dictionaries::prepare(Some(raw), false, true, true).expect("the fixture dictionary must parse")
+fn prepared_dict(raw: &[u8]) -> Codecs {
+    Codecs::prepare(Some(raw), false, true, true).expect("the fixture dictionary must parse")
 }
 
 /// What a plain `zstd` invocation presets, before any flag.
@@ -93,7 +93,7 @@ fn frame_of(payload: &[u8]) -> Vec<u8> {
             level: 3,
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing the fixture must succeed");
     frame
@@ -102,7 +102,7 @@ fn frame_of(payload: &[u8]) -> Vec<u8> {
 /// Decode `stream` with the default decode settings.
 fn decoded(stream: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    decompress_stream(stream, &mut out, &no_dict(), &DecodeSettings::default())?;
+    decompress_stream(stream, &mut out, &mut no_dict(), &DecodeSettings::default())?;
     Ok(out)
 }
 
@@ -344,7 +344,7 @@ fn target_block_size_reaches_the_encoder() {
         payload.as_slice(),
         &mut default_geometry,
         &level_only,
-        &no_dict(),
+        &mut no_dict(),
     )
     .unwrap();
     let mut small_blocks = Vec::new();
@@ -355,7 +355,7 @@ fn target_block_size_reaches_the_encoder() {
             target_block_size: Some(4096),
             ..level_only
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .unwrap();
 
@@ -859,7 +859,7 @@ fn a_new_output_inherits_the_source_permissions() {
 
     let mut opts = parse(&["-3", "-q", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
-    let result = process_file(&opts, &input, &no_dict(), 1);
+    let result = process_file(&opts, &input, &mut no_dict(), 1);
 
     let output = PathBuf::from(format!("{}.zst", input.display()));
     let mode = fs::metadata(&output).map(|m| m.permissions().mode() & 0o777);
@@ -1034,7 +1034,7 @@ fn compressing_a_setuid_file_does_not_produce_a_setuid_archive() {
     let mut opts = parse(&["-3", "-f", "-q", "s"]).unwrap();
     opts.inputs = vec![source.clone()];
     opts.output = Some(archive.clone());
-    let compressed = process_file(&opts, &source, &no_dict(), 1);
+    let compressed = process_file(&opts, &source, &mut no_dict(), 1);
     let mode = fs::metadata(&archive).map(|m| m.permissions().mode() & 0o7777);
 
     let _ = fs::remove_file(&source);
@@ -1106,7 +1106,7 @@ fn replacing_a_file_does_not_restore_its_old_permissions() {
     let mut opts = parse(&["-3", "-f", "-q", "s"]).unwrap();
     opts.inputs = vec![sample.clone()];
     opts.output = Some(archive.clone());
-    let compressed = process_file(&opts, &sample, &no_dict(), 1);
+    let compressed = process_file(&opts, &sample, &mut no_dict(), 1);
     let archive_mode = fs::metadata(&archive).map(|m| m.permissions().mode() & 0o777);
 
     let _ = fs::remove_file(&sample);
@@ -1174,7 +1174,7 @@ fn an_explicit_stream_size_survives_an_unstattable_input() {
     // `None` is what a FIFO or device yields: no reliable size from metadata.
     let processed = stream(
         &opts,
-        &no_dict(),
+        &mut no_dict(),
         ProgressMonitor::new(&payload[..], None, false),
         None,
         &mut frame,
@@ -1230,7 +1230,7 @@ fn a_serialized_dictionary_keeps_the_size_its_tier_is_chosen_by() {
             pledged_size: Some(payload.len() as u64),
             ..FrameSettings::default()
         },
-        &prepared_dict(&raw),
+        &mut prepared_dict(&raw),
     )
     .expect("compressing with the dictionary must succeed");
 
@@ -1267,7 +1267,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
             target_block_size: Some(0),
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing must succeed");
     let mut untargeted = Vec::new();
@@ -1278,7 +1278,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
             level: 3,
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing must succeed");
     assert_eq!(
@@ -1296,7 +1296,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
             size_hint: Some(0),
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing must succeed");
     assert_eq!(
@@ -1314,7 +1314,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
             level: 3,
             ..FrameSettings::default()
         },
-        &prepared_dict(&[]),
+        &mut prepared_dict(&[]),
     )
     .expect("an empty dictionary is no dictionary, not a broken one");
     assert_eq!(without, untargeted, "and produces the same frame");
@@ -1325,13 +1325,18 @@ fn zero_means_unset_where_the_api_says_it_does() {
 /// an archive; upstream calls it an unexpected end of file.
 #[test]
 fn an_empty_stream_is_not_a_valid_archive() {
-    decompress_stream(&b""[..], io::sink(), &no_dict(), &DecodeSettings::default())
-        .expect_err("an empty input carries no frame to decode");
+    decompress_stream(
+        &b""[..],
+        io::sink(),
+        &mut no_dict(),
+        &DecodeSettings::default(),
+    )
+    .expect_err("an empty input carries no frame to decode");
     // Even under pass-through: an empty file is not an archive either.
     decompress_stream(
         &b""[..],
         io::sink(),
-        &no_dict(),
+        &mut no_dict(),
         &DecodeSettings {
             verify_checksum: true,
             pass_through: true,
@@ -1677,7 +1682,7 @@ fn long_window_log_reaches_the_encoder() {
             long_window_log: Some(27),
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing with an explicit window log must succeed");
     let info = read_frame_header_info(&frame, false).expect("the frame header must parse");
@@ -1763,7 +1768,7 @@ fn an_explicit_window_is_capped_by_a_known_source_size() {
             pledged_size: Some(payload.len() as u64),
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing must succeed");
 
@@ -1789,7 +1794,7 @@ fn an_explicit_window_is_capped_by_a_known_source_size() {
             pledged_size: Some(payload.len() as u64),
             ..FrameSettings::default()
         },
-        &prepared_dict(raw),
+        &mut prepared_dict(raw),
     )
     .expect("compressing with a dictionary must succeed");
 
@@ -1950,7 +1955,7 @@ fn wire_format_flags_reach_the_frame_header() {
             content_size_flag: false,
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .unwrap();
     let info = read_frame_header_info(&bare, false).unwrap();
@@ -1970,7 +1975,7 @@ fn wire_format_flags_reach_the_frame_header() {
             pledged_size: Some(payload.len() as u64),
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .unwrap();
     let info = read_frame_header_info(&full, false).unwrap();
@@ -1988,7 +1993,7 @@ fn no_dict_id_leaves_the_id_out_of_a_dictionary_frame() {
     use structured_zstd::decoding::read_frame_header_info;
 
     let raw = include_bytes!("../../../dict_tests/dictionary");
-    let dicts = prepared_dict(raw);
+    let mut codecs = prepared_dict(raw);
     let payload: Vec<u8> = (0..4000u32).map(|i| (i % 97) as u8).collect();
     let mut with_id = Vec::new();
     compress_stream(
@@ -1998,7 +2003,7 @@ fn no_dict_id_leaves_the_id_out_of_a_dictionary_frame() {
             level: 3,
             ..FrameSettings::default()
         },
-        &dicts,
+        &mut codecs,
     )
     .unwrap();
     assert!(
@@ -2017,7 +2022,7 @@ fn no_dict_id_leaves_the_id_out_of_a_dictionary_frame() {
             dict_id_flag: false,
             ..FrameSettings::default()
         },
-        &dicts,
+        &mut codecs,
     )
     .unwrap();
     assert!(
@@ -2032,7 +2037,7 @@ fn no_dict_id_leaves_the_id_out_of_a_dictionary_frame() {
     decompress_stream(
         anonymous.as_slice(),
         &mut out,
-        &dicts,
+        &mut codecs,
         &DecodeSettings::default(),
     )
     .expect("an explicit dictionary decodes an anonymous frame");
@@ -3026,13 +3031,14 @@ fn already_compressed_inputs_are_skipped_and_directories_refused() {
 
     let mut opts = parse(&["--exclude-compressed", "-q", "f"]).unwrap();
     opts.inputs = vec![archive.clone(), plain.clone()];
-    let skipped = process_file(&opts, &archive, &no_dict(), 2).expect("skipping is not an error");
+    let skipped =
+        process_file(&opts, &archive, &mut no_dict(), 2).expect("skipping is not an error");
     assert!(matches!(skipped, Outcome::Skipped));
     assert!(
         !scratch.path().join("data.gz.zst").exists(),
         "nothing is written for a skipped input"
     );
-    let done = process_file(&opts, &plain, &no_dict(), 2).expect("the plain file compresses");
+    let done = process_file(&opts, &plain, &mut no_dict(), 2).expect("the plain file compresses");
     assert!(matches!(done, Outcome::Done(_)));
     assert!(scratch.path().join("data.txt.zst").exists());
 
@@ -3076,13 +3082,14 @@ fn an_existing_output_is_not_replaced_quietly() {
 
     let mut opts = parse(&["-q", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
-    let outcome = process_file(&opts, &input, &no_dict(), 1).expect("a refusal is not an error");
+    let outcome =
+        process_file(&opts, &input, &mut no_dict(), 1).expect("a refusal is not an error");
     assert!(matches!(outcome, Outcome::Refused));
     assert_eq!(fs::read(&existing).unwrap(), b"precious bytes");
 
     let mut forced = parse(&["-q", "-f", "f"]).unwrap();
     forced.inputs = vec![input.clone()];
-    let outcome = process_file(&forced, &input, &no_dict(), 1).expect("-f replaces it");
+    let outcome = process_file(&forced, &input, &mut no_dict(), 1).expect("-f replaces it");
     assert!(matches!(outcome, Outcome::Done(_)));
     assert_ne!(fs::read(&existing).unwrap(), b"precious bytes");
 }
@@ -3274,10 +3281,13 @@ fn empty_directories_are_nothing_to_do_not_a_request_for_stdin() {
 fn decoding_counts_its_output_and_no_check_ignores_the_checksum() {
     let payload = b"payload whose checksum will be corrupted";
     let mut frame = frame_of(payload);
+    // One set of codecs throughout, as a run decodes every input with one
+    // decoder: the failure in the middle must not reach the decode after it.
+    let mut codecs = no_dict();
     let written = decompress_stream(
         frame.as_slice(),
         io::sink(),
-        &no_dict(),
+        &mut codecs,
         &DecodeSettings::default(),
     )
     .unwrap();
@@ -3288,14 +3298,14 @@ fn decoding_counts_its_output_and_no_check_ignores_the_checksum() {
     decompress_stream(
         frame.as_slice(),
         io::sink(),
-        &no_dict(),
+        &mut codecs,
         &DecodeSettings::default(),
     )
     .expect_err("verified by default");
     let ignored = decompress_stream(
         frame.as_slice(),
         io::sink(),
-        &no_dict(),
+        &mut codecs,
         &DecodeSettings {
             verify_checksum: false,
             pass_through: false,
@@ -3368,19 +3378,24 @@ fn plain_input_is_passed_through_or_refused() {
         pass_through: true,
     };
     let mut out = Vec::new();
-    let written = decompress_stream(&b"plain text, not a frame"[..], &mut out, &no_dict(), &pass)
-        .expect("pass-through copies it");
+    let written = decompress_stream(
+        &b"plain text, not a frame"[..],
+        &mut out,
+        &mut no_dict(),
+        &pass,
+    )
+    .expect("pass-through copies it");
     assert_eq!(out, b"plain text, not a frame");
     assert_eq!(written, out.len() as u64);
 
     let mut short = Vec::new();
-    decompress_stream(&b"ab"[..], &mut short, &no_dict(), &pass).unwrap();
+    decompress_stream(&b"ab"[..], &mut short, &mut no_dict(), &pass).unwrap();
     assert_eq!(short, b"ab", "fewer than four bytes are passed through too");
 
     let err = decompress_stream(
         &b"plain text, not a frame"[..],
         io::sink(),
-        &no_dict(),
+        &mut no_dict(),
         &DecodeSettings::default(),
     )
     .expect_err("refused without pass-through")
@@ -3389,7 +3404,7 @@ fn plain_input_is_passed_through_or_refused() {
     let err = decompress_stream(
         &b"ab"[..],
         io::sink(),
-        &no_dict(),
+        &mut no_dict(),
         &DecodeSettings::default(),
     )
     .expect_err("a stump is refused too")
@@ -3401,7 +3416,7 @@ fn plain_input_is_passed_through_or_refused() {
     let mut mixed = frame_of(b"framed");
     mixed.extend_from_slice(b" then plain");
     let mut out = Vec::new();
-    let err = decompress_stream(mixed.as_slice(), &mut out, &no_dict(), &pass)
+    let err = decompress_stream(mixed.as_slice(), &mut out, &mut no_dict(), &pass)
         .expect_err("data after a frame is not plain input")
         .to_string();
     assert!(err.contains("unsupported format"), "{err}");
@@ -3414,7 +3429,7 @@ fn plain_input_is_passed_through_or_refused() {
     let mut damaged = first.clone();
     damaged.extend_from_slice(&frame_of(b"second")[1..]);
     let mut out = Vec::new();
-    decompress_stream(damaged.as_slice(), &mut out, &no_dict(), &pass)
+    decompress_stream(damaged.as_slice(), &mut out, &mut no_dict(), &pass)
         .expect_err("a damaged frame after a good one is refused");
     assert_eq!(out, b"first");
 
@@ -3422,8 +3437,13 @@ fn plain_input_is_passed_through_or_refused() {
     let mut after_skippable = 0x184D_2A50u32.to_le_bytes().to_vec();
     after_skippable.extend_from_slice(&0u32.to_le_bytes());
     after_skippable.extend_from_slice(b"plain");
-    decompress_stream(after_skippable.as_slice(), io::sink(), &no_dict(), &pass)
-        .expect_err("plain bytes after a skippable frame are refused");
+    decompress_stream(
+        after_skippable.as_slice(),
+        io::sink(),
+        &mut no_dict(),
+        &pass,
+    )
+    .expect_err("plain bytes after a skippable frame are refused");
 
     // The default follows the reference command: on when forced and writing
     // to stdout (`zstd -dcf`), off otherwise.
@@ -3558,7 +3578,7 @@ fn corrupted_checksum_is_reported_not_passed() {
             level: 3,
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing the fixture must succeed");
     // The trailing four bytes are the frame's XXH64 check field.
@@ -3568,7 +3588,7 @@ fn corrupted_checksum_is_reported_not_passed() {
     let err = decompress_stream(
         frame.as_slice(),
         io::sink(),
-        &no_dict(),
+        &mut no_dict(),
         &DecodeSettings::default(),
     )
     .expect_err("a corrupted checksum must fail the decode");
@@ -3648,6 +3668,8 @@ fn stdout_and_output_follow_last_option_wins() {
 #[test]
 fn concatenated_frames_are_all_decoded() {
     let mut stream = Vec::new();
+    // One set of codecs for both, as a run shares its context across inputs.
+    let mut codecs = no_dict();
     for payload in [&b"first frame payload"[..], &b"second frame payload"[..]] {
         compress_stream(
             payload,
@@ -3656,7 +3678,7 @@ fn concatenated_frames_are_all_decoded() {
                 level: 3,
                 ..FrameSettings::default()
             },
-            &no_dict(),
+            &mut codecs,
         )
         .expect("compressing a fixture frame must succeed");
     }
@@ -3666,6 +3688,89 @@ fn concatenated_frames_are_all_decoded() {
         out, b"first frame payloadsecond frame payload",
         "every frame in the stream has to reach the output"
     );
+}
+
+/// A run compresses every input with one context, as the reference command
+/// does, and each input still gets the frame a context of its own would write:
+/// nothing an earlier input left in the match finder, the dictionary snapshot
+/// or the entropy tables may reach a later frame. Sizes straddle the
+/// dictionary's attach cutoffs and alternate pledged with unsized frames, so
+/// the context moves between the ways a dictionary is loaded.
+#[test]
+fn a_shared_context_writes_what_a_fresh_one_would() {
+    let text: Vec<u8> = (0..4_000u32)
+        .flat_map(|i| format!("line {} of {}\n", i % 89, i % 7).into_bytes())
+        .collect();
+    let raw = include_bytes!("../../../dict_tests/dictionary");
+    let inputs: [&[u8]; 6] = [
+        &text[..3_000],
+        &text,
+        &[],
+        &text[500..20_000],
+        &text[..40_000],
+        &text[..900],
+    ];
+    for level in [-1, 1, 3, 5, 7, 12, 16, 19] {
+        for dictionary in [None, Some(&raw[..])] {
+            let fresh = || dictionary.map_or_else(no_dict, prepared_dict);
+            let mut shared = fresh();
+            for (index, input) in inputs.iter().enumerate() {
+                let settings = FrameSettings {
+                    level,
+                    pledged_size: (index % 2 == 0).then_some(input.len() as u64),
+                    ..FrameSettings::default()
+                };
+                let mut reused = Vec::new();
+                compress_stream(*input, &mut reused, &settings, &mut shared).unwrap();
+                let mut alone = Vec::new();
+                compress_stream(*input, &mut alone, &settings, &mut fresh()).unwrap();
+                assert!(
+                    reused == alone,
+                    "level {level}, dictionary {}, input {index}: {} bytes shared, {} alone",
+                    dictionary.is_some(),
+                    reused.len(),
+                    alone.len()
+                );
+            }
+        }
+    }
+}
+
+/// A frame that fails part-way, here an input that ends short of the length
+/// it pledged, must not leave the run's context inside it: the next input
+/// starts a frame of its own rather than continuing the broken one.
+#[test]
+fn a_failed_frame_does_not_reach_the_next_input() {
+    let mut codecs = no_dict();
+    let settings = FrameSettings {
+        level: 3,
+        ..FrameSettings::default()
+    };
+    // Past one block, so the failure comes after blocks were written.
+    let payload = vec![b'x'; 300_000];
+    compress_stream(
+        payload.as_slice(),
+        &mut Vec::new(),
+        &FrameSettings {
+            pledged_size: Some(payload.len() as u64 + 1),
+            ..settings
+        },
+        &mut codecs,
+    )
+    .expect_err("an input shorter than its pledge fails");
+
+    let mut next = Vec::new();
+    compress_stream(&b"the next input"[..], &mut next, &settings, &mut codecs)
+        .expect("the next input compresses");
+    let mut alone = Vec::new();
+    compress_stream(
+        &b"the next input"[..],
+        &mut alone,
+        &settings,
+        &mut no_dict(),
+    )
+    .unwrap();
+    assert_eq!(next, alone, "the next input is a frame of its own");
 }
 
 /// Skippable frames carry caller metadata inside an otherwise ordinary stream;
@@ -3678,7 +3783,7 @@ fn skippable_frames_are_stepped_over() {
         level: 3,
         ..FrameSettings::default()
     };
-    compress_stream(&b"payload"[..], &mut stream, &level_only, &no_dict())
+    compress_stream(&b"payload"[..], &mut stream, &level_only, &mut no_dict())
         .expect("compressing the fixture must succeed");
     // Magic 0x184D2A50 (little-endian) + a 4-byte length + that many bytes.
     stream.extend_from_slice(&0x184D_2A50_u32.to_le_bytes());
@@ -3686,7 +3791,7 @@ fn skippable_frames_are_stepped_over() {
     stream.extend_from_slice(b"meta");
     // A frame after it, so the skip has to land on the right byte rather than
     // merely being tolerated at the end of the stream.
-    compress_stream(&b" and more"[..], &mut stream, &level_only, &no_dict())
+    compress_stream(&b" and more"[..], &mut stream, &level_only, &mut no_dict())
         .expect("compressing the trailing fixture must succeed");
 
     let out = decoded(&stream).expect("a skippable frame must not fail the decode");
@@ -3837,7 +3942,7 @@ fn advanced_parameters_reach_the_frame() {
             },
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .unwrap();
     assert_eq!(
@@ -3860,7 +3965,7 @@ fn advanced_parameters_reach_the_frame() {
             },
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .unwrap();
     assert_eq!(
@@ -3912,7 +4017,7 @@ fn literal_compression_flags_reach_the_frame() {
                 literals,
                 ..FrameSettings::default()
             },
-            &no_dict(),
+            &mut no_dict(),
         )
         .unwrap();
         frame

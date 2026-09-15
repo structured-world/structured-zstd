@@ -10,7 +10,9 @@ use core::ffi::c_int;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use codec::decoding::{ContentChecksum, FrameDecoder};
-use codec::encoding::{CompressionLevel, FrameCompressor};
+use codec::encoding::{
+    CompressionLevel, CompressionParameters, EncoderDictionary, FrameCompressor,
+};
 
 use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
 use crate::ffi::{in_slice, out_slice};
@@ -51,36 +53,74 @@ pub(crate) unsafe fn free_boxed<T>(ptr: *mut T) {
     }
 }
 
-/// Opaque compression context. Carries a reusable output buffer so repeated
-/// `ZSTD_compressCCtx` calls amortise the destination allocation.
+/// Opaque compression context: what upstream keeps in a `ZSTD_CCtx`, kept
+/// here the same way, from one call to the next.
 ///
-/// For the dictionary path ([`ZSTD_compress_usingCDict`](crate::cdict::ZSTD_compress_usingCDict))
-/// it also caches a [`FrameCompressor`] with the dictionary already attached,
-/// keyed by the `ZSTD_CDict`'s never-reused serial + level, so back-to-back
-/// compressions with the same `CDict` reuse the parsed dictionary + primed
-/// match-finder snapshot instead of re-parsing and re-priming each call (the
-/// encoder-side analogue of upstream's `ZSTD_CCtx_refCDict` reuse).
+/// The one-shot entry points (`ZSTD_compressCCtx`, `ZSTD_compress2`, the
+/// `*_usingDict` / `*_usingCDict` family) share one [`FrameCompressor`] and the
+/// streaming entry point one compression context, each with its match-finder
+/// tables, buffers and dictionary snapshot, so a context compressing frame
+/// after frame allocates them once. Each holds the dictionary last attached to
+/// it, named by the dictionary's never-reused serial, so the same dictionary on
+/// the next call is neither parsed nor attached again; a serial rather than an
+/// address, so a freed-then-reallocated handle cannot alias.
 #[allow(non_camel_case_types)]
 pub struct ZSTD_CCtx {
     pub(crate) scratch: Vec<u8>,
     /// Sticky advanced parameters (`ZSTD_CCtx_setParameter` family).
     pub(crate) params: crate::params::CCtxParams,
-    /// In-flight streaming frame (`ZSTD_compressStream2`). `None` between
-    /// frames.
+    /// Streaming state (`ZSTD_compressStream2`), kept between frames; `None`
+    /// before the first streamed frame.
     pub(crate) stream: Option<crate::streaming::CStreamState>,
-    /// `FrameCompressor` with a dictionary attached, lazily built by the CDict
-    /// path. `None` until the first `ZSTD_compress_usingCDict`.
-    pub(crate) dict_compressor: Option<FrameCompressor>,
-    /// Identity of the `CDict` currently attached to `dict_compressor` (its
-    /// never-reused serial; `0` = none) plus the level it was built at, so a
-    /// different CDict or level rebuilds the cached compressor. Keyed by serial
-    /// rather than raw address so a freed-then-realloc'd handle can't alias.
-    pub(crate) dict_serial: u64,
-    pub(crate) dict_level: c_int,
+    /// The one-shot compressor and the serial of the dictionary it holds
+    /// (`0` = none); `None` before the first one-shot call.
+    pub(crate) compressor: Option<(u64, FrameCompressor)>,
     /// Context-attached dictionary (`ZSTD_CCtx_loadDictionary` /
     /// `ZSTD_CCtx_refCDict` / `ZSTD_CCtx_refPrefix`), applied at every frame
     /// start by `ZSTD_compress2` / `ZSTD_compressStream2`.
     pub(crate) attached_dict: crate::attach::CCtxDictAttach,
+}
+
+/// The one-shot compressor `slot` keeps, holding the dictionary `serial`
+/// names: `dictionary`, or none for serial `0`. Created on first use; kept as
+/// it is when it already holds that dictionary, otherwise given it.
+pub(crate) fn kept_compressor<'a>(
+    slot: &'a mut Option<(u64, FrameCompressor)>,
+    serial: u64,
+    dictionary: Option<&EncoderDictionary>,
+    level: c_int,
+) -> Result<&'a mut FrameCompressor, ZSTD_ErrorCode> {
+    let (held, compressor) =
+        slot.get_or_insert_with(|| (0, FrameCompressor::new(CompressionLevel::from_level(level))));
+    if *held != serial {
+        match dictionary {
+            Some(dictionary) => {
+                compressor
+                    .set_encoder_dictionary(dictionary.clone())
+                    .map_err(|_| ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted)?;
+            }
+            None => {
+                compressor.clear_dictionary();
+            }
+        }
+        *held = serial;
+    }
+    Ok(compressor)
+}
+
+/// Put `compressor` on what a frame runs under: its explicit `params`, or
+/// `level` with the level's own tuning.
+pub(crate) fn set_frame_parameters(
+    compressor: &mut FrameCompressor,
+    params: Option<&CompressionParameters>,
+    level: c_int,
+) {
+    match params {
+        Some(params) => compressor.set_parameters(params),
+        None => {
+            compressor.set_compression_level(CompressionLevel::from_level(level));
+        }
+    }
 }
 
 /// Opaque decompression context. Wraps a reusable [`FrameDecoder`] so its
@@ -117,9 +157,7 @@ pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
         scratch: Vec::new(),
         params: crate::params::CCtxParams::default(),
         stream: None,
-        dict_compressor: None,
-        dict_serial: 0,
-        dict_level: 0,
+        compressor: None,
         attached_dict: crate::attach::CCtxDictAttach::None,
     })
 }
@@ -128,25 +166,36 @@ impl ZSTD_CCtx {
     /// Whether a streaming frame is currently mid-flight (parameters are
     /// frozen until it finishes or the session is reset).
     pub(crate) fn stream_in_progress(&self) -> bool {
-        self.stream.is_some()
+        self.stream
+            .as_ref()
+            .is_some_and(crate::streaming::CStreamState::in_frame)
     }
 
     /// `ZSTD_reset_session_only`: abandon any in-flight frame and the
-    /// pledged size; sticky parameters and dictionary references survive.
+    /// pledged size; sticky parameters and dictionary references survive,
+    /// and so does the streaming context unless a frame was abandoned in it.
     pub(crate) fn reset_session(&mut self) {
         self.scratch.clear();
-        self.stream = None;
+        if self.stream_in_progress() {
+            self.stream = None;
+        }
         self.params.pledged_src_size = crate::params::CONTENTSIZE_UNKNOWN;
     }
 
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
-    /// dictionary references.
+    /// dictionary references, including the ones the kept compressors hold.
     pub(crate) fn reset_parameters(&mut self) {
         self.params = crate::params::CCtxParams::default();
-        self.dict_compressor = None;
-        self.dict_serial = 0;
-        self.dict_level = 0;
         self.attached_dict = crate::attach::CCtxDictAttach::None;
+        if let Some((held, compressor)) = &mut self.compressor
+            && *held != 0
+        {
+            compressor.clear_dictionary();
+            *held = 0;
+        }
+        if let Some(stream) = &mut self.stream {
+            stream.release_dictionary();
+        }
     }
 }
 
@@ -165,10 +214,10 @@ pub unsafe extern "C" fn ZSTD_freeCCtx(cctx: *mut ZSTD_CCtx) -> usize {
 /// `size_t ZSTD_sizeof_CCtx(const ZSTD_CCtx* cctx)` — current heap footprint,
 /// or 0 for `NULL`.
 ///
-/// Counts the inline struct, the reusable output `scratch`, and (after the
-/// first `ZSTD_compress_usingCDict`) the cached `dict_compressor`'s heap: its
-/// primed match-finder tables / history, the recycled-buffer pool, the
-/// dictionary snapshot, and the retained dictionary content. Matches upstream
+/// Counts the inline struct, the reusable output `scratch`, and the kept
+/// one-shot compressor and streaming context once they exist: their
+/// match-finder tables / history, the recycled-buffer pool, the dictionary
+/// snapshot, and the dictionary they hold. Matches upstream
 /// `ZSTD_sizeof_CCtx`, which includes the CDict-copied working tables.
 ///
 /// # Safety
@@ -182,9 +231,9 @@ pub unsafe extern "C" fn ZSTD_sizeof_CCtx(cctx: *const ZSTD_CCtx) -> usize {
     core::mem::size_of::<ZSTD_CCtx>()
         + cctx.scratch.capacity()
         + cctx
-            .dict_compressor
+            .compressor
             .as_ref()
-            .map_or(0, |enc| enc.heap_size())
+            .map_or(0, |(_, compressor)| compressor.heap_size())
         + cctx.stream.as_ref().map_or(0, |s| s.heap_size())
         + cctx.attached_dict.heap_size()
 }
@@ -210,16 +259,33 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
     }
     let cctx = unsafe { &mut *cctx };
     let src = unsafe { in_slice(src, src_size) };
-    let level = CompressionLevel::from_level(compression_level);
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        cctx.scratch.clear();
-        let mut enc: FrameCompressor = FrameCompressor::new(level);
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
+        let ZSTD_CCtx {
+            scratch,
+            compressor,
+            ..
+        } = cctx;
+        // Upstream `ZSTD_compressCCtx` is `ZSTD_compress_usingDict` with no
+        // dictionary: whatever the context has attached is not used.
+        let enc = kept_compressor(compressor, 0, None, compression_level)?;
+        enc.set_compression_level(CompressionLevel::from_level(compression_level));
         // Upstream ZSTD_compressCCtx defaults ZSTD_c_checksumFlag = 0; match it.
         enc.set_content_checksum(false);
-        enc.compress_independent_frame_into(src, &mut cctx.scratch);
+        enc.set_content_size_flag(true);
+        enc.set_target_block_size(None);
+        scratch.clear();
+        enc.compress_independent_frame_into(src, scratch);
+        Ok(())
     }));
-    if outcome.is_err() {
-        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(code)) => return encode(code),
+        Err(_) => {
+            // A panic can leave the kept compressor torn; the next call
+            // builds a new one.
+            cctx.compressor = None;
+            return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+        }
     }
     let len = cctx.scratch.len();
     if len > dst_capacity {
@@ -271,88 +337,46 @@ pub unsafe extern "C" fn ZSTD_compress2(
     // (upstream rule), so the sticky knobs are resolved — and can reject —
     // only when they will actually drive the frame; an unsupported sticky
     // combination must not break a valid RefCDict path.
-    let resolved = if cctx.attach_params_from_cdict() {
-        None
-    } else {
-        match cctx.params.resolve() {
-            Some(resolved) => Some(resolved),
-            None => {
-                return encode(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported);
-            }
-        }
+    let frame_params = match cctx.frame_parameters() {
+        Ok(frame_params) => frame_params,
+        Err(code) => return encode(code),
     };
     let params = cctx.params;
+    let level = cctx.attach_level();
+    let serial = cctx.attach_serial();
+    let suppress_id = cctx.attach_suppresses_dict_id();
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
-        cctx.scratch.clear();
-        if cctx.has_attached_dict() {
-            // Dictionary frames route through the context's cached
-            // dict-compressor (same cache as ZSTD_compress_usingCDict, keyed
-            // by attach serial + level) so repeated frames with the same
-            // attach skip the dictionary re-parse / re-prime.
-            let key = cctx.attach_serial();
-            let level = cctx.attach_level();
-            if cctx.dict_compressor.is_none() || cctx.dict_serial != key || cctx.dict_level != level
-            {
-                let mut enc: FrameCompressor =
-                    FrameCompressor::new(CompressionLevel::from_level(level));
-                cctx.apply_attached_dict(&mut enc)?;
-                cctx.dict_compressor = Some(enc);
-                cctx.dict_serial = key;
-                cctx.dict_level = level;
-            }
-            let suppress_id = cctx.attach_suppresses_dict_id();
-            let params_from_cdict = cctx.attach_params_from_cdict();
-            let ZSTD_CCtx {
-                scratch,
-                dict_compressor,
-                ..
-            } = cctx;
-            let enc = dict_compressor.as_mut().expect("just ensured Some");
-            // A referenced CDict's compression parameters win (upstream
-            // rule); every other attach honours the sticky knobs
-            // (`resolved` is `Some` exactly when they apply).
-            if !params_from_cdict && let Some(resolved) = &resolved {
-                enc.set_parameters(resolved);
-            }
-            enc.set_content_checksum(params.checksum_flag);
-            enc.set_content_size_flag(params.content_size_flag);
-            enc.set_dictionary_id_flag(params.dict_id_flag && !suppress_id);
-            // The cached compressor outlives parameter changes: clear the cap
-            // explicitly when the sticky knob is back at 0 (auto), or a cap
-            // set by an earlier call would silently survive.
-            enc.set_target_block_size(if params.target_cblock_size > 0 {
-                Some(params.target_cblock_size as u32)
-            } else {
-                None
-            });
-            enc.compress_independent_frame_into(src, scratch);
-        } else {
-            let mut enc: FrameCompressor =
-                FrameCompressor::new(CompressionLevel::from_level(params.level));
-            // No attach on this path, so the sticky knobs always resolved.
-            if let Some(resolved) = &resolved {
-                enc.set_parameters(resolved);
-            }
-            enc.set_content_checksum(params.checksum_flag);
-            enc.set_content_size_flag(params.content_size_flag);
-            enc.set_dictionary_id_flag(params.dict_id_flag);
-            if params.target_cblock_size > 0 {
-                enc.set_target_block_size(Some(params.target_cblock_size as u32));
-            }
-            enc.compress_independent_frame_into(src, &mut cctx.scratch);
-        }
+        let ZSTD_CCtx {
+            scratch,
+            compressor,
+            attached_dict,
+            ..
+        } = cctx;
+        // The kept compressor, holding the attached dictionary: the same one
+        // on the next call is neither parsed nor attached again.
+        let enc = kept_compressor(compressor, serial, attached_dict.prepared(), level)?;
+        set_frame_parameters(enc, frame_params.as_ref(), level);
+        enc.set_content_checksum(params.checksum_flag);
+        enc.set_content_size_flag(params.content_size_flag);
+        enc.set_dictionary_id_flag(params.dict_id_flag && !suppress_id);
+        // The kept compressor outlives parameter changes: clear the cap
+        // explicitly when the sticky knob is back at 0 (auto), or a cap set
+        // by an earlier call would silently survive.
+        enc.set_target_block_size(
+            (params.target_cblock_size > 0).then_some(params.target_cblock_size as u32),
+        );
+        scratch.clear();
+        enc.compress_independent_frame_into(src, scratch);
         Ok(())
     }));
     match outcome {
         Ok(Ok(())) => {}
-        Ok(Err(code)) => {
-            cctx.dict_compressor = None;
-            cctx.dict_serial = 0;
-            return encode(code);
-        }
+        // A refused dictionary leaves the kept compressor as it was.
+        Ok(Err(code)) => return encode(code),
         Err(_) => {
-            cctx.dict_compressor = None;
-            cctx.dict_serial = 0;
+            // A panic can leave the kept compressor torn; the next call
+            // builds a new one.
+            cctx.compressor = None;
             return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
         }
     }
@@ -495,10 +519,11 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     // streaming path consumes it only after a successful reset, so the
     // one-shot consumes it only on success (a garbage input must not eat
     // the prefix out from under the retry).
-    let attached = dctx.attached_handle();
-    let outcome = catch_unwind(AssertUnwindSafe(|| match &attached {
-        Some(handle) => dctx.decoder.decode_all_with_dict_handle(src, dst, handle),
-        None => dctx.decoder.decode_all(src, dst),
+    let decoder = &mut dctx.decoder;
+    let attached = dctx.attached_ddict.handle();
+    let outcome = catch_unwind(AssertUnwindSafe(|| match attached {
+        Some(handle) => decoder.decode_all_with_dict_handle(src, dst, handle),
+        None => decoder.decode_all(src, dst),
     }));
     match outcome {
         Ok(Ok(written)) => {

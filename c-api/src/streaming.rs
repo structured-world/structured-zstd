@@ -10,7 +10,7 @@
 use core::ffi::{c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use codec::encoding::{CompressionLevel, StreamingEncoder};
+use codec::encoding::{CompressionContext, CompressionLevel};
 
 use crate::context::{ZSTD_CCtx, ZSTD_DCtx};
 use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
@@ -44,51 +44,65 @@ const ZSTD_E_CONTINUE: c_int = 0;
 const ZSTD_E_FLUSH: c_int = 1;
 const ZSTD_E_END: c_int = 2;
 
-/// Streaming-compression state stored on the `ZSTD_CCtx` between
-/// `ZSTD_compressStream2` calls.
+/// Streaming-compression state stored on the `ZSTD_CCtx`, kept from one
+/// streamed frame to the next as upstream keeps its `ZSTD_CCtx`: the
+/// context's match-finder tables, buffers and dictionary are built once.
 pub(crate) struct CStreamState {
-    /// Push-side encoder writing compressed bytes into its owned `Vec`
-    /// drain. `None` after `ZSTD_e_end` finished the frame (the epilogue
-    /// then lives in `pending`).
-    encoder: Option<StreamingEncoder<Vec<u8>>>,
-    /// Frame bytes produced but not yet copied out to the caller (the
-    /// finished-frame tail after `ZSTD_e_end`, or `None`-encoder leftovers).
+    /// Compresses every streamed frame, writing straight into `pending`.
+    context: CompressionContext,
+    /// Serial of the dictionary attached to `context` (`0` = none), so the
+    /// same dictionary on the next frame is not attached again.
+    dictionary: u64,
+    /// Whether a frame is taking input: from its first call until
+    /// `ZSTD_e_end` closes it.
+    open: bool,
+    /// Frame bytes produced but not yet copied out to the caller.
     pending: Vec<u8>,
     /// Read offset into `pending`.
     pending_pos: usize,
 }
 
 impl CStreamState {
-    /// Heap bytes held by the in-flight stream: the encoder's tables and
-    /// staging buffers, its in-memory drain, and the flush-pending copy.
-    /// Feeds `ZSTD_sizeof_CCtx` so a context with an active stream
-    /// reports its true footprint.
+    fn new(level: CompressionLevel) -> Self {
+        Self {
+            context: CompressionContext::new(level),
+            dictionary: 0,
+            open: false,
+            pending: Vec::new(),
+            pending_pos: 0,
+        }
+    }
+
+    /// Heap bytes the stream holds: the context's tables, buffers and
+    /// dictionary, and the output not yet copied out. Feeds
+    /// `ZSTD_sizeof_CCtx` so a context that streams reports its true
+    /// footprint.
     pub(crate) fn heap_size(&self) -> usize {
-        self.pending.capacity()
-            + self
-                .encoder
-                .as_ref()
-                .map_or(0, |enc| enc.heap_size() + enc.get_ref().capacity())
+        self.pending.capacity() + self.context.heap_size()
+    }
+
+    /// Whether a frame is under way: taking input, or closed with part of
+    /// it still to be copied out.
+    pub(crate) fn in_frame(&self) -> bool {
+        self.open || self.pending_remaining() > 0
+    }
+
+    /// Detach the dictionary from the context between frames
+    /// (`ZSTD_CCtx_reset` with parameters).
+    pub(crate) fn release_dictionary(&mut self) {
+        if self.dictionary != 0 && !self.in_frame() {
+            // Clearing is refused only mid-frame, which was excluded above.
+            let _cleared = self.context.set_dictionary_from_bytes(&[]);
+            self.dictionary = 0;
+        }
     }
 
     fn pending_remaining(&self) -> usize {
         self.pending.len() - self.pending_pos
     }
 
-    /// Copy as much produced output as fits into `out`, draining the
-    /// encoder's accumulated drain bytes first into `pending`.
+    /// Copy as much produced output as fits into `out`.
     fn copy_out(&mut self, out: &mut ZSTD_outBuffer, dst: &mut [u8]) {
-        if let Some(enc) = self.encoder.as_mut() {
-            let drain = enc.get_mut();
-            if !drain.is_empty() {
-                if self.pending_pos == self.pending.len() {
-                    self.pending.clear();
-                    self.pending_pos = 0;
-                }
-                self.pending.extend_from_slice(drain);
-                drain.clear();
-            }
-        }
         let n = self.pending_remaining().min(dst.len() - out.pos);
         dst[out.pos..out.pos + n]
             .copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + n]);
@@ -102,66 +116,65 @@ impl CStreamState {
 }
 
 impl ZSTD_CCtx {
-    /// Lazily start a streaming frame from the sticky parameters. No-op if
-    /// one is already in flight.
+    /// Start a streaming frame from the sticky parameters on the kept
+    /// context. No-op if one is already in flight.
     fn ensure_stream(&mut self) -> Result<(), ZSTD_ErrorCode> {
-        if self.stream.is_some() {
+        if self.stream_in_progress() {
             return Ok(());
         }
         let params = self.params;
-        // A referenced CDict's compression parameters win over the sticky
-        // knobs (upstream rule); other attaches keep the context level. The
-        // sticky knobs are resolved — and can reject — only when they will
-        // actually drive the frame.
+        let frame_params = self.frame_parameters()?;
         let level = self.attach_level();
-        let params_from_cdict = self.attach_params_from_cdict();
-        let resolved = if params_from_cdict {
-            None
-        } else {
-            match params.resolve() {
-                Some(resolved) => Some(resolved),
-                None => {
-                    return Err(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported);
-                }
-            }
-        };
+        let serial = self.attach_serial();
         let suppress_id = self.attach_suppresses_dict_id();
-        let mut enc = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(level));
-        if self.has_attached_dict() {
-            self.apply_attached_dict_streaming(&mut enc)?;
-            if (suppress_id || !params.dict_id_flag) && enc.set_dictionary_id_flag(false).is_err() {
-                return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC);
-            }
-        }
+        let ZSTD_CCtx {
+            stream,
+            attached_dict,
+            ..
+        } = self;
+        let state =
+            stream.get_or_insert_with(|| CStreamState::new(CompressionLevel::from_level(level)));
         let mut setup = || -> Result<(), codec::io::Error> {
-            if let Some(resolved) = &resolved {
-                enc.set_parameters(resolved)?;
+            let context = &mut state.context;
+            // The attached dictionary goes onto the kept context only when it
+            // is not the one already there.
+            if state.dictionary != serial {
+                match attached_dict.prepared() {
+                    Some(dictionary) => context.set_encoder_dictionary(dictionary.clone())?,
+                    None => context.set_dictionary_from_bytes(&[])?,
+                }
+                state.dictionary = serial;
             }
-            enc.set_content_checksum(params.checksum_flag)?;
-            if params.target_cblock_size > 0 {
-                enc.set_target_block_size(Some(params.target_cblock_size as u32))?;
+            match &frame_params {
+                Some(frame_params) => context.set_parameters(frame_params)?,
+                None => context.set_compression_level(CompressionLevel::from_level(level))?,
             }
+            context.set_content_checksum(params.checksum_flag)?;
+            context.set_target_block_size(
+                (params.target_cblock_size > 0).then_some(params.target_cblock_size as u32),
+            )?;
             // The pledge is single-use (consumed by this frame). It is
             // always enforced against the bytes actually written; the
             // content-size flag only controls whether the header carries
             // the FCS field (upstream validates the pledge at frame end
             // regardless of the flag).
             if params.pledged_src_size != CONTENTSIZE_UNKNOWN {
-                enc.set_pledged_content_size(params.pledged_src_size)?;
+                context.set_pledged_content_size(params.pledged_src_size)?;
             }
-            enc.set_content_size_flag(params.content_size_flag)?;
+            context.set_content_size_flag(params.content_size_flag)?;
+            // A raw-content dictionary's synthetic ID never reaches the wire.
+            context.set_dictionary_id_flag(params.dict_id_flag && !suppress_id)?;
             Ok(())
         };
         if setup().is_err() {
+            // A context that refuses its settings is not trusted with the
+            // next frame either.
+            *stream = None;
             return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC);
         }
+        state.open = true;
         self.params.pledged_src_size = CONTENTSIZE_UNKNOWN;
         self.consume_prefix();
-        self.stream = Some(CStreamState {
-            encoder: Some(enc),
-            pending: Vec::new(),
-            pending_pos: 0,
-        });
         Ok(())
     }
 }
@@ -278,27 +291,26 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
     }
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<usize, ZSTD_ErrorCode> {
         let stream = cctx.stream.as_mut().expect("ensure_stream installed state");
-        // Consume ALL remaining input: the in-memory drain has no
-        // backpressure, so `Write` never short-counts.
+        // Consume ALL remaining input: the in-memory output has no
+        // backpressure, so a write never short-counts on its account.
         if inp.pos < inp.size {
-            let Some(enc) = stream.encoder.as_mut() else {
+            if !stream.open {
                 // Frame already ended but not fully flushed: only flush/end
                 // directives are legal (upstream stage_wrong).
                 return Err(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
-            };
-            use std::io::Write;
-            // Loop over partial writes instead of `write_all`: the encoder
-            // legally short-counts at the pledged-size boundary (accepts the
-            // remaining allowance, then errors on the next call), and
-            // `write_all` would discard that partial progress — leaving
-            // `inp.pos` claiming nothing was consumed when most of it was.
+            }
+            // Loop over partial writes: the context legally short-counts at
+            // the pledged-size boundary (accepts the remaining allowance,
+            // then errors on the next call), and stopping at the first
+            // short count would leave `inp.pos` claiming nothing was
+            // consumed when most of it was.
             while inp.pos < inp.size {
-                match enc.write(&src[inp.pos..]) {
+                match stream.context.write(&mut stream.pending, &src[inp.pos..]) {
                     Ok(0) => return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC),
                     Ok(n) => inp.pos += n,
-                    // The encoder reports pledge violations as InvalidInput
+                    // The context reports pledge violations as InvalidInput
                     // (the only InvalidInput reachable from `write` on the
-                    // in-memory drain); upstream's error for input past the
+                    // in-memory output); upstream's error for input past the
                     // pledged size is srcSize_wrong.
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
                         return Err(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
@@ -308,50 +320,31 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
             }
         }
         match end_op {
-            ZSTD_E_FLUSH => {
-                if let Some(enc) = stream.encoder.as_mut() {
-                    use std::io::Write;
-                    if enc.flush().is_err() {
-                        return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC);
-                    }
+            ZSTD_E_FLUSH if stream.open => {
+                if stream.context.flush(&mut stream.pending).is_err() {
+                    return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC);
                 }
             }
-            ZSTD_E_END => {
-                if let Some(enc) = stream.encoder.take() {
-                    match enc.finish() {
-                        Ok(drain) => {
-                            if stream.pending_pos == stream.pending.len() {
-                                stream.pending.clear();
-                                stream.pending_pos = 0;
-                            }
-                            stream.pending.extend_from_slice(&drain);
-                        }
-                        // Pledge mismatch at frame end surfaces as
-                        // InvalidInput; map it to the same srcSize_wrong
-                        // the write() path reports so the error code does
-                        // not depend on where the contract check fires.
-                        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-                            return Err(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
-                        }
-                        Err(_) => return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC),
+            ZSTD_E_END if stream.open => {
+                match stream.context.finish_frame(&mut stream.pending) {
+                    // Closed; the context stays for the next frame, and the
+                    // stream counts as in progress only while the tail is
+                    // still being copied out, however many calls that takes.
+                    Ok(()) => stream.open = false,
+                    // Pledge mismatch at frame end surfaces as InvalidInput;
+                    // map it to the same srcSize_wrong the write() path
+                    // reports so the error code does not depend on where the
+                    // contract check fires.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                        return Err(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
                     }
+                    Err(_) => return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC),
                 }
             }
             _ => {}
         }
         stream.copy_out(out, dst);
-        let remaining = stream.pending_remaining();
-        // Frame complete and fully flushed: drop the stream state so the
-        // next call starts a new frame from the sticky parameters. Keyed
-        // on the consumed encoder (taken by the e_end arm), NOT on which
-        // directive performed the FINAL drain — a tiny output buffer can
-        // split the end-drain across later e_flush/e_continue calls, and
-        // leaving `Some { encoder: None, pending: [] }` behind would wedge
-        // every next input-bearing call into stage_wrong.
-        if stream.encoder.is_none() && remaining == 0 {
-            cctx.stream = None;
-        }
-        Ok(remaining)
+        Ok(stream.pending_remaining())
     }));
     match outcome {
         Ok(Ok(remaining)) => remaining,
@@ -378,10 +371,8 @@ pub unsafe extern "C" fn ZSTD_initCStream(zcs: *mut ZSTD_CCtx, compression_level
     }
     let cctx = unsafe { &mut *zcs };
     cctx.reset_session();
-    // Legacy init clears any previously loaded dictionary.
-    cctx.dict_compressor = None;
-    cctx.dict_serial = 0;
-    cctx.dict_level = 0;
+    // Legacy init clears any previously loaded dictionary; the kept
+    // compressors drop it from the frame that next uses them.
     cctx.attached_dict = crate::attach::CCtxDictAttach::None;
     cctx.params.level = if compression_level == 0 {
         3
@@ -551,10 +542,11 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
                 // Context-attached dictionary (`ZSTD_DCtx_loadDictionary` /
                 // `refDDict` / `refPrefix`): start the frame against it; an
                 // attached prefix is single-use and consumed by this frame.
-                let attached = dctx.attached_handle();
-                let reset = catch_unwind(AssertUnwindSafe(|| match &attached {
-                    Some(handle) => dctx.decoder.reset_with_dict_handle(&mut reader, handle),
-                    None => dctx.decoder.reset(&mut reader),
+                let decoder = &mut dctx.decoder;
+                let attached = dctx.attached_ddict.handle();
+                let reset = catch_unwind(AssertUnwindSafe(|| match attached {
+                    Some(handle) => decoder.reset_with_dict_handle(&mut reader, handle),
+                    None => decoder.reset(&mut reader),
                 }));
                 match reset {
                     Ok(Ok(())) => {

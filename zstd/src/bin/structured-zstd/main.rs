@@ -15,7 +15,8 @@ use std::io::{self, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use structured_zstd::encoding::{
-    CompressionLevel, CompressionParameters, LiteralCompressionMode, Strategy,
+    CompressionContext, CompressionLevel, CompressionParameters, LiteralCompressionMode, Strategy,
+    StreamingEncoder,
 };
 
 /// Error type for the tool: a boxed message, which is all a command-line
@@ -1761,20 +1762,27 @@ fn load_dictionary(opts: &Options) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-/// The `-D` dictionary in the forms the two codecs take, parsed once per run.
+/// What the run compresses and decodes with, built once and used by every
+/// frame: the `-D` dictionary in the forms the two codecs take, and the
+/// compression context the frames share, as the reference command keeps one
+/// set of resources for a run (`fileio.c`, `FIO_createCResources`).
 ///
-/// Each side turns the blob into its own tables, and priming happens per frame
-/// — under `-b`, per timed iteration. Parsing there would put the dictionary's
-/// own setup inside the measurement and report it as throughput, which for a
-/// large dictionary over a small input is most of what the number would be.
-/// So the blob is parsed here, once, and every frame attaches what came out.
+/// Parsing the blob or building a context per frame would put that setup
+/// inside every frame and, under `-b`, inside the measurement, where for a
+/// large dictionary over a small input it is most of what the number would be.
 #[derive(Default)]
-struct Dictionaries {
+struct Codecs {
     encoder: Option<structured_zstd::encoding::EncoderDictionary>,
     decoder: Option<structured_zstd::decoding::DictionaryHandle>,
+    /// The context frames are compressed with and the settings it was built
+    /// for; absent before the first frame, and again after one fails.
+    compressor: Option<(FrameSettings, CompressionContext)>,
+    /// The decoder every frame is decoded with, its buffers allocated by the
+    /// first frame and reused by the rest.
+    decompressor: structured_zstd::decoding::FrameDecoder,
 }
 
-impl Dictionaries {
+impl Codecs {
     /// Parse the blob into the forms this run will use, and no others: a run
     /// that only compresses has no use for the decoder's tables. `-b` asks for
     /// both, since it measures the two directions in turn.
@@ -1826,6 +1834,31 @@ impl Dictionaries {
             ));
         }
         Ok(prepared)
+    }
+
+    /// The context a frame under `settings` is compressed with: the previous
+    /// frame's when it was built for the same settings, else a new one. Only
+    /// the pledge changes from frame to frame, and it is set per frame.
+    fn compressor(&mut self, settings: &FrameSettings) -> Result<&mut CompressionContext> {
+        let key = FrameSettings {
+            pledged_size: None,
+            ..*settings
+        };
+        if self
+            .compressor
+            .as_ref()
+            .is_none_or(|(built_for, _)| *built_for != key)
+        {
+            // The outgoing context is released first, so two are never held
+            // at once.
+            self.compressor = None;
+            self.compressor = Some((key, new_compressor(&key, self.encoder.as_ref())?));
+        }
+        let (_, context) = self
+            .compressor
+            .as_mut()
+            .expect("a context for these settings is in place");
+        Ok(context)
     }
 }
 
@@ -1948,7 +1981,7 @@ fn run(mut opts: Options) -> Result<usize> {
         run_benchmark(&opts, dict_bytes)?;
         return Ok(0);
     }
-    let dicts = Dictionaries::prepare(
+    let mut codecs = Codecs::prepare(
         dict_bytes.as_deref(),
         opts.patch_from.is_some(),
         compresses(&opts),
@@ -2022,12 +2055,12 @@ fn run(mut opts: Options) -> Result<usize> {
     }
     let total = opts.inputs.len().max(1);
     match (opts.to_stdout, &opts.output) {
-        (true, _) => process_concatenated(&opts, &dicts, None, total),
+        (true, _) => process_concatenated(&opts, &mut codecs, None, total),
         // `-t` writes nothing, so a destination it was given is set aside.
         (false, Some(output)) if opts.mode != Mode::Test => {
-            process_concatenated(&opts, &dicts, Some(output), total)
+            process_concatenated(&opts, &mut codecs, Some(output), total)
         }
-        _ => process_separately(&opts, &dicts, total),
+        _ => process_separately(&opts, &mut codecs, total),
     }
 }
 
@@ -2040,7 +2073,7 @@ fn run(mut opts: Options) -> Result<usize> {
 /// frame would already be in the shared output.
 fn process_concatenated(
     opts: &Options,
-    dicts: &Dictionaries,
+    codecs: &mut Codecs,
     output: Option<&Path>,
     total: usize,
 ) -> Result<usize> {
@@ -2109,7 +2142,7 @@ fn process_concatenated(
             // a terminal is written like any other stream.
             let mut sink = io::stdout().lock();
             for input in inputs {
-                let outcome = stream_input_to(opts, dicts, input, &mut sink, STDOUT_MARK, total)?;
+                let outcome = stream_input_to(opts, codecs, input, &mut sink, STDOUT_MARK, total)?;
                 tally.record(outcome);
             }
         }
@@ -2139,12 +2172,12 @@ fn process_concatenated(
                     write_output_file(opts, output, metadata.as_ref(), |sink| match source {
                         Some(source) => stream_opened(
                             opts,
-                            dicts,
+                            codecs,
                             source,
                             metadata.as_ref().expect("an opened input has metadata"),
                             sink,
                         ),
-                        None => stream_stdin(opts, dicts, sink),
+                        None => stream_stdin(opts, codecs, sink),
                     })?;
                 match written {
                     Some((processed, placement)) => {
@@ -2176,7 +2209,7 @@ fn process_concatenated(
                         for input in &inputs {
                             let outcome = stream_input_to(
                                 opts,
-                                dicts,
+                                codecs,
                                 input,
                                 &mut *sink,
                                 &output.display().to_string(),
@@ -2204,7 +2237,7 @@ fn process_concatenated(
 /// directory; stdin, when it is among them, goes to stdout. An input that
 /// fails is reported and the rest are still processed, as the reference
 /// command does; the count that failed decides the exit status.
-fn process_separately(opts: &Options, dicts: &Dictionaries, total: usize) -> Result<usize> {
+fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Result<usize> {
     // The inputs are processed one after another, so an output derived from an
     // early one can land on a file still waiting its turn: `-f foo foo.zst`
     // would replace `foo.zst` before it is ever read. The `-D` dictionary is a
@@ -2273,7 +2306,7 @@ fn process_separately(opts: &Options, dicts: &Dictionaries, total: usize) -> Res
     if opts.inputs.is_empty() {
         let outcome = stream_input_to(
             opts,
-            dicts,
+            codecs,
             Path::new("-"),
             io::stdout().lock(),
             STDOUT_MARK,
@@ -2283,9 +2316,9 @@ fn process_separately(opts: &Options, dicts: &Dictionaries, total: usize) -> Res
     }
     for input in &opts.inputs {
         let outcome = if input == Path::new("-") {
-            stream_input_to(opts, dicts, input, io::stdout().lock(), STDOUT_MARK, total)?
+            stream_input_to(opts, codecs, input, io::stdout().lock(), STDOUT_MARK, total)?
         } else {
-            match process_file(opts, input, dicts, total) {
+            match process_file(opts, input, codecs, total) {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     display!(opts.verbosity, 1, "zstd: {err}");
@@ -2598,14 +2631,14 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     // here, once, rather than inside the timed loops below. The blob is then
     // done with: it is released before the measuring starts rather than held
     // beside the two forms parsed out of it for the rest of the run.
-    let dicts = &Dictionaries::prepare(dict.as_deref(), opts.patch_from.is_some(), true, true)?;
+    let codecs = &mut Codecs::prepare(dict.as_deref(), opts.patch_from.is_some(), true, true)?;
     drop(dict);
 
     if opts.bench_separately {
         for (input, size) in opts.inputs.iter().zip(&sizes) {
             let data =
                 read_inputs_bounded(std::slice::from_ref(input), std::slice::from_ref(size))?;
-            benchmark_one(opts, dicts, &input.display().to_string(), &data)?;
+            benchmark_one(opts, codecs, &input.display().to_string(), &data)?;
         }
         return Ok(());
     }
@@ -2617,7 +2650,7 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         [only] => only.display().to_string(),
         many => format!(" {} files", many.len()),
     };
-    benchmark_one(opts, dicts, &label, &data)
+    benchmark_one(opts, codecs, &label, &data)
 }
 
 /// Read every input into one buffer, taking no more room — and no more bytes —
@@ -2667,7 +2700,7 @@ fn read_inputs_bounded(inputs: &[PathBuf], sizes: &[u64]) -> Result<Vec<u8>> {
 /// Measure one benchmark subject: the whole input as one stream, or a single
 /// file under `-S`. Split out so the two modes differ only in what they hand
 /// over, not in how the measurement is taken.
-fn benchmark_one(opts: &Options, dicts: &Dictionaries, label: &str, data: &[u8]) -> Result<()> {
+fn benchmark_one(opts: &Options, codecs: &mut Codecs, label: &str, data: &[u8]) -> Result<()> {
     use std::time::Instant;
 
     if data.is_empty() {
@@ -2719,7 +2752,7 @@ fn benchmark_one(opts: &Options, dicts: &Dictionaries, label: &str, data: &[u8])
                     size_hint: None,
                     ..FrameSettings::from_options(opts)
                 },
-                dicts,
+                codecs,
             )?;
             best_compress = best_compress.min(t.elapsed().as_secs_f64());
             if start.elapsed().as_secs_f64() >= opts.bench_secs {
@@ -2735,7 +2768,7 @@ fn benchmark_one(opts: &Options, dicts: &Dictionaries, label: &str, data: &[u8])
             decompress_stream(
                 compressed.as_slice(),
                 &mut decoded,
-                dicts,
+                codecs,
                 &DecodeSettings::from_options(opts),
             )?;
             best_decompress = best_decompress.min(t.elapsed().as_secs_f64());
@@ -3809,7 +3842,7 @@ fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata
 /// Stream one opened input through the codec into `sink`.
 fn stream_opened<W: Write>(
     opts: &Options,
-    dicts: &Dictionaries,
+    codecs: &mut Codecs,
     source: File,
     metadata: &fs::Metadata,
     sink: W,
@@ -3824,15 +3857,15 @@ fn stream_opened<W: Write>(
     let pledged_size = metadata.is_file().then_some(source_size);
     // The same length is the counter's total, and a FIFO's has none to show.
     let reader = progress_monitor(opts, BufReader::new(source), pledged_size);
-    stream(opts, dicts, reader, pledged_size, sink)
+    stream(opts, codecs, reader, pledged_size, sink)
 }
 
 /// Stream stdin through the codec into `sink`. stdin has no length to stat,
 /// which is exactly why `--stream-size` / `--size-hint` exist: whatever the
 /// caller pledged travels in `opts`.
-fn stream_stdin<W: Write>(opts: &Options, dicts: &Dictionaries, sink: W) -> Result<Processed> {
+fn stream_stdin<W: Write>(opts: &Options, codecs: &mut Codecs, sink: W) -> Result<Processed> {
     let stdin = io::stdin();
-    stream(opts, dicts, stdin_monitor(opts, stdin.lock()), None, sink)
+    stream(opts, codecs, stdin_monitor(opts, stdin.lock()), None, sink)
 }
 
 /// The counter over `reader` expecting `total` bytes, drawn under the
@@ -3856,7 +3889,7 @@ fn stdin_monitor<R: Read>(opts: &Options, reader: R) -> ProgressMonitor<R> {
 /// whatever sink it was handed.
 fn stream<R: Read, W: Write>(
     opts: &Options,
-    dicts: &Dictionaries,
+    codecs: &mut Codecs,
     mut reader: ProgressMonitor<R>,
     pledged_size: Option<u64>,
     mut sink: W,
@@ -3874,20 +3907,20 @@ fn stream<R: Read, W: Write>(
                     pledged_size: pledged_size.or(opts.pledged_size),
                     ..FrameSettings::from_options(opts)
                 },
-                dicts,
+                codecs,
             )?;
             counting.written
         }
         Mode::Decompress => decompress_stream(
             &mut reader,
             &mut sink,
-            dicts,
+            codecs,
             &DecodeSettings::from_options(opts),
         )?,
         Mode::Test => decompress_stream(
             &mut reader,
             io::sink(),
-            dicts,
+            codecs,
             &DecodeSettings::from_options(opts),
         )?,
         Mode::List | Mode::Train => unreachable!("list / train never stream"),
@@ -3905,7 +3938,7 @@ fn stream<R: Read, W: Write>(
 /// end the run on, since the shared output now holds a partial frame.
 fn stream_input_to<W: Write>(
     opts: &Options,
-    dicts: &Dictionaries,
+    codecs: &mut Codecs,
     input: &Path,
     mut sink: W,
     destination: &str,
@@ -3914,13 +3947,13 @@ fn stream_input_to<W: Write>(
     let (name, processed) = if input == Path::new("-") {
         (
             STDIN_MARK.to_string(),
-            stream_stdin(opts, dicts, &mut sink)?,
+            stream_stdin(opts, codecs, &mut sink)?,
         )
     } else {
         match open_input(opts, input) {
             Ok(Some((source, metadata))) => (
                 input.display().to_string(),
-                stream_opened(opts, dicts, source, &metadata, &mut sink)?,
+                stream_opened(opts, codecs, source, &metadata, &mut sink)?,
             ),
             Ok(None) => return Ok(Outcome::Skipped),
             Err(err) => {
@@ -4118,7 +4151,7 @@ fn derive_output_path(opts: &Options, input: &Path) -> Result<PathBuf> {
 fn process_file(
     opts: &Options,
     input: &Path,
-    dicts: &Dictionaries,
+    codecs: &mut Codecs,
     total: usize,
 ) -> Result<Outcome> {
     let Some((source, metadata)) = open_input(opts, input)? else {
@@ -4128,7 +4161,7 @@ fn process_file(
 
     // Test mode: decompress into the void, report what was there.
     if opts.mode == Mode::Test {
-        let processed = stream_opened(opts, dicts, source, &metadata, io::sink())?;
+        let processed = stream_opened(opts, codecs, source, &metadata, io::sink())?;
         file_summary(opts, total, &name, "", &processed);
         return Ok(Outcome::Done(processed));
     }
@@ -4139,7 +4172,7 @@ fn process_file(
         inputs::create_mirrored_dirs(input, root)?;
     }
     let Some((processed, placement)) = write_output_file(opts, &output, Some(&metadata), |sink| {
-        stream_opened(opts, dicts, source, &metadata, sink)
+        stream_opened(opts, codecs, source, &metadata, sink)
     })?
     else {
         return Ok(Outcome::Refused);
@@ -4160,7 +4193,7 @@ fn process_file(
 /// Grouped rather than passed one by one: these travel together through every
 /// compression entry point, and a positional list this long invites the caller
 /// to line the arguments up wrong.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct FrameSettings {
     /// Numeric compression level, ignored when `store` is set.
     level: i32,
@@ -4328,17 +4361,15 @@ impl DecodeSettings {
     }
 }
 
-/// Streaming compression core (file or stdout), optionally dictionary-primed.
-fn compress_stream<R: Read, W: Write>(
-    mut reader: R,
-    writer: W,
+/// A compression context configured for every frame under `settings`, less the
+/// pledge, which belongs to one frame and is set by [`compress_stream`].
+fn new_compressor(
     settings: &FrameSettings,
-    dicts: &Dictionaries,
-) -> Result<()> {
+    dictionary: Option<&structured_zstd::encoding::EncoderDictionary>,
+) -> Result<CompressionContext> {
     let &FrameSettings {
         level,
         store,
-        pledged_size,
         size_hint,
         target_block_size,
         checksum,
@@ -4351,17 +4382,17 @@ fn compress_stream<R: Read, W: Write>(
     } else {
         CompressionLevel::from_level(level)
     };
-    let mut encoder = structured_zstd::encoding::StreamingEncoder::new(writer, compression_level);
+    let mut context = CompressionContext::new(compression_level);
     // The reference `zstd` COMMAND defaults the content checksum ON (unlike
     // the library API, whose default is off and which our encoder mirrors), so
     // it is set explicitly either way: on by default, off under `--no-check`.
-    encoder
+    context
         .set_content_checksum(checksum)
         .wrap_err("failed to set the content checksum flag")?;
-    encoder
+    context
         .set_content_size_flag(content_size_flag)
         .wrap_err("failed to set the content size flag")?;
-    encoder
+    context
         .set_dictionary_id_flag(dict_id_flag)
         .wrap_err("failed to set the dictionary ID flag")?;
     // A smaller block target is what the caller asked for when they want
@@ -4369,7 +4400,7 @@ fn compress_stream<R: Read, W: Write>(
     // is the parameter's own way of saying "no target", so it stays off rather
     // than being clamped up into the smallest block the format allows.
     if let Some(target) = target_block_size.filter(|target| *target != 0) {
-        encoder
+        context
             .set_target_block_size(Some(target))
             .wrap_err("failed to set the block-size target")?;
     }
@@ -4377,11 +4408,59 @@ fn compress_stream<R: Read, W: Write>(
     // via the compression-parameters API; skipped for `--store`, whose raw
     // frames match nothing.
     if !store && let Some(params) = frame_parameters(compression_level, settings)? {
-        encoder
+        context
             .set_parameters(&params)
             .wrap_err("failed to apply the compression parameters")?;
     }
-    if let Some(size) = pledged_size {
+    // Only an estimate (`--size-hint`): it steers the encoder's geometry and
+    // must NOT reach the header, or a wrong guess would turn a successful
+    // compression into a failure. It holds for every frame, as upstream's
+    // `ZSTD_c_srcSizeHint` does, and a frame's exact pledge takes its place.
+    // Zero is not a hint (the parameter says so), and taking it as one would
+    // size the encoder for an empty source and shrink the window a real
+    // stream needs.
+    if let Some(size) = size_hint.filter(|size| *size != 0) {
+        context
+            .set_source_size_hint(size)
+            .wrap_err("failed to set source size hint")?;
+    }
+    // Parsed once for the whole run, and held by the context from here on:
+    // its frames reference it rather than taking a handle each.
+    if let Some(prepared) = dictionary {
+        context
+            .set_encoder_dictionary(prepared.clone())
+            .wrap_err("failed to load dictionary for compression")?;
+    }
+    Ok(context)
+}
+
+/// Streaming compression core (file or stdout), optionally dictionary-primed.
+fn compress_stream<R: Read, W: Write>(
+    reader: R,
+    writer: W,
+    settings: &FrameSettings,
+    codecs: &mut Codecs,
+) -> Result<()> {
+    let compressed = compress_frame(reader, writer, settings, codecs);
+    if compressed.is_err() {
+        // A frame that failed part-way leaves the context inside it, or
+        // refusing further work; the next input starts from a new one rather
+        // than continuing this frame.
+        codecs.compressor = None;
+    }
+    compressed
+}
+
+/// [`compress_stream`] on the run's context, which it leaves as the frame
+/// left it.
+fn compress_frame<R: Read, W: Write>(
+    mut reader: R,
+    writer: W,
+    settings: &FrameSettings,
+    codecs: &mut Codecs,
+) -> Result<()> {
+    let mut encoder = StreamingEncoder::with_context(writer, codecs.compressor(settings)?);
+    if let Some(size) = settings.pledged_size {
         // The size is known exactly (a regular file, or `--stream-size`), so
         // pledge it: the frame records Frame_Content_Size (decoders can
         // pre-allocate, `zstd -l` reports it) and the matcher sizes its tables
@@ -4389,23 +4468,6 @@ fn compress_stream<R: Read, W: Write>(
         encoder
             .set_pledged_content_size(size)
             .wrap_err("failed to set pledged content size")?;
-    } else if let Some(size) = size_hint.filter(|size| *size != 0) {
-        // Only an estimate (`--size-hint`): it steers the encoder's geometry
-        // and must NOT reach the header, or a wrong guess would turn a
-        // successful compression into a failure. Zero is not a hint — the
-        // parameter says so — and taking it as one would size the encoder for
-        // an empty source and shrink the window a real stream needs.
-        encoder
-            .set_source_size_hint(size)
-            .wrap_err("failed to set source size hint")?;
-    }
-    // Parsed once for the whole run; the encoder takes ownership of what it is
-    // primed with, so each frame gets a copy of those tables rather than
-    // building them again from the blob.
-    if let Some(prepared) = &dicts.encoder {
-        encoder
-            .set_encoder_dictionary(prepared.clone())
-            .wrap_err("failed to load dictionary for compression")?;
     }
     io::copy(&mut reader, &mut encoder).wrap_err("streaming compression failed")?;
     encoder.finish().wrap_err("failed to finalize zstd frame")?;
@@ -4437,15 +4499,20 @@ const SKIPPABLE_MAGIC_BASE: u32 = 0x184D_2A50;
 fn decompress_stream<R: Read, W: Write>(
     reader: R,
     mut writer: W,
-    dicts: &Dictionaries,
+    codecs: &mut Codecs,
     settings: &DecodeSettings,
 ) -> Result<u64> {
+    use structured_zstd::decoding::StreamingDecoder;
     use structured_zstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
 
-    // Parsed once for the whole run rather than per stream or per frame: every
-    // frame here is primed with the same dictionary, and the handle is shared,
-    // so priming costs a reference rather than a rebuild.
-    let handle = dicts.decoder.as_ref();
+    // Parsed once for the whole run rather than per stream or per frame, and
+    // decoded against by one decoder: the decoder keeps its buffers and, for
+    // this one dictionary, the handle it took on the first frame.
+    let Codecs {
+        decoder: handle,
+        decompressor,
+        ..
+    } = codecs;
     let mut source = BufReader::new(reader);
     let mut frames = 0u64;
     let mut written = 0u64;
@@ -4492,15 +4559,16 @@ fn decompress_stream<R: Read, W: Write>(
         let mut stream = io::Cursor::new(magic).chain(&mut source);
         // Borrowed, not moved: a frame that turns out to be skippable leaves
         // the reader with us to step over it and carry on.
-        let built = match &handle {
+        let built = match handle {
             // The dictionary constructors FORCE the supplied dictionary, which
             // the registration path does not: a frame may legitimately omit the
             // optional dictionary ID, and then nothing would select it.
-            Some(h) => structured_zstd::decoding::StreamingDecoder::new_with_dictionary_handle(
+            Some(h) => StreamingDecoder::new_with_decoder_and_dictionary_handle(
                 &mut stream,
+                &mut *decompressor,
                 h,
             ),
-            None => structured_zstd::decoding::StreamingDecoder::new(&mut stream),
+            None => StreamingDecoder::new_with_decoder(&mut stream, &mut *decompressor),
         };
         let mut decoder = match built {
             Ok(decoder) => decoder,
