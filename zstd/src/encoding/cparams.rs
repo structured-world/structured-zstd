@@ -244,8 +244,35 @@ pub(crate) fn get_cparams(compression_level: i32, src_size_hint: u64, dict_size:
 /// `minSrcSize` source. A frame compressed with the dictionary takes its
 /// strategy, table widths, search depth and match-finder from THESE, not
 /// from the level's plain row (`ZSTD_resetCCtx_usingCDict`).
-pub(crate) fn get_cdict_cparams(compression_level: i32, dict_size: usize) -> CParams {
-    get_cparams_mode(compression_level, CONTENTSIZE_UNKNOWN, dict_size, true)
+///
+/// A dictionary prepared under explicit parameters takes each knob the
+/// caller set in place of the row's and is down-sized again
+/// (`ZSTD_createCDict_advanced2` → `ZSTD_getCParamsFromCCtxParams`:
+/// `ZSTD_overrideCParams`, then `ZSTD_adjustCParams_internal`).
+pub(crate) fn get_cdict_cparams(
+    compression_level: i32,
+    dict_size: usize,
+    overrides: &crate::encoding::parameters::ParamOverrides,
+) -> CParams {
+    let mut cp = get_cparams_mode(compression_level, CONTENTSIZE_UNKNOWN, dict_size, true);
+    let mut overridden = false;
+    let mut set = |field: &mut u32, value: Option<u32>| {
+        if let Some(value) = value {
+            *field = value;
+            overridden = true;
+        }
+    };
+    set(&mut cp.window_log, overrides.window_log.map(u32::from));
+    set(&mut cp.chain_log, overrides.chain_log);
+    set(&mut cp.hash_log, overrides.hash_log);
+    set(&mut cp.search_log, overrides.search_log);
+    set(&mut cp.min_match, overrides.min_match);
+    set(&mut cp.target_length, overrides.target_length);
+    set(&mut cp.strategy, overrides.strategy.map(|s| s.ordinal()));
+    if overridden {
+        cp = adjust_cparams(cp, CONTENTSIZE_UNKNOWN, dict_size, true);
+    }
+    cp
 }
 
 /// `ZSTD_resetCCtx_byAttachingCDict` cParams: the CDict's cParams re-adjusted

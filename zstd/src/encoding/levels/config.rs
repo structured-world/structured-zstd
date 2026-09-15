@@ -761,12 +761,11 @@ pub(crate) fn apply_frame_overrides(
         return;
     }
     if dictionary_frame {
-        // A dictionary frame runs the CDict's cParams whatever its
-        // strategy (upstream `ZSTD_resetCCtx_byAttachingCDict` /
-        // `byCopyingCDict`: "cdict overrides"); only the caller's
-        // windowLog is kept. Reshaping the live search would probe the
-        // dictionary's tables with another geometry / key width than they
-        // were indexed with.
+        // A dictionary frame runs the CDict's cParams (upstream
+        // `ZSTD_resetCCtx_byAttachingCDict` / `byCopyingCDict`), and the
+        // search knobs are already part of them
+        // (`resolve_level_params_with_dict`); the frame's own knob is the
+        // window.
         //
         // The window still answers to the source, as it does for every
         // other frame: `ZSTD_adjustCParams_internal` caps it by the source
@@ -894,7 +893,15 @@ pub fn estimated_compression_workspace_bytes_for_run(
     dictionary: Option<crate::encoding::DictionarySizes>,
 ) -> usize {
     let mut params = match dictionary.filter(|sizes| sizes.content != 0) {
-        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes).0,
+        Some(sizes) => {
+            resolve_level_params_with_dict(
+                level,
+                src_size_hint,
+                sizes,
+                &crate::encoding::parameters::ParamOverrides::default(),
+            )
+            .0
+        }
         None => resolve_level_params(level, src_size_hint),
     };
     // The override is what the frame will keep, but never below the floor the
@@ -946,7 +953,7 @@ pub fn estimated_compression_workspace_bytes_for_run(
 /// window and long-distance matching on top; a caller that also sets `hashLog`,
 /// `chainLog`, a strategy or the long-distance matcher's own table sizes needs
 /// this one, since each of those resizes what the frame allocates. A dictionary
-/// frame runs the dictionary's own geometry and keeps only the requested window,
+/// frame runs the geometry the dictionary is prepared with, the knobs included,
 /// as the encoder does.
 ///
 /// # Examples
@@ -978,7 +985,7 @@ pub fn estimated_compression_workspace_bytes_for_parameters(
     let overrides = parameters.overrides();
     let dictionary = dictionary.filter(|sizes| sizes.content != 0);
     let mut params = match dictionary {
-        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes).0,
+        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes, &overrides).0,
         None => resolve_level_params(level, src_size_hint),
     };
     apply_frame_overrides(&mut params, &overrides, dictionary.is_some(), src_size_hint);
@@ -1230,11 +1237,14 @@ pub(crate) struct RowDictPlan {
 /// (`ZSTD_resetCCtx_byCopyingCDict`); only the frame's own `windowLog` is
 /// kept. The CDict's strategy is taken whatever backend family the plain
 /// level resolved to; a lazy-band CDict (greedy..btlazy2) also carries the
-/// lazy backend's [`RowDictPlan`].
+/// lazy backend's [`RowDictPlan`]. The caller's `overrides` are part of the
+/// CDict's cParams, as they are for a dictionary upstream loads into a context
+/// that carries them.
 pub(crate) fn resolve_level_params_with_dict(
     level: CompressionLevel,
     source_size: Option<u64>,
     sizes: crate::encoding::DictionarySizes,
+    overrides: &crate::encoding::parameters::ParamOverrides,
 ) -> (LevelParams, Option<RowDictPlan>) {
     use crate::encoding::cparams::{
         CONTENTSIZE_UNKNOWN, attach_cparams, copy_cparams, get_cdict_cparams, should_attach_dict,
@@ -1250,7 +1260,7 @@ pub(crate) fn resolve_level_params_with_dict(
     // btopt, but a 300 KiB CDict is btlazy2 and the frame runs btlazy2; L4
     // on a 1 MiB source is dfast, but a 4 KiB CDict is greedy. Only the
     // frame's own `windowLog` is kept.
-    let cdict = get_cdict_cparams(numeric_level(level), sizes.serialized);
+    let cdict = get_cdict_cparams(numeric_level(level), sizes.serialized, overrides);
     // `ZSTD_shouldAttachDict`, bounded by the backend's attach representability:
     // the Fast / Dfast attached tables pack the dict position next to a tag, so
     // they index at most 2^24 content bytes. A larger dictionary is primed in

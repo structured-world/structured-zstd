@@ -2643,9 +2643,8 @@ impl RowMatchGenerator {
         // binary tree. Otherwise upstream `ZSTD_resolveRowMatchFinderMode`:
         // rows only above a 2^14 window; the window is source-size-adjusted,
         // so inputs of 16 KiB or less search the hash chain. A dictionary
-        // frame inherits the CDict's decision (`ZSTD_resetCCtx_usingCDict`:
-        // "cdict overrides"), and a copied dictionary brings the CDict's
-        // salt (0) with its tables.
+        // frame inherits the CDict's decision (`ZSTD_resetCCtx_usingCDict`),
+        // and a copied dictionary brings the CDict's salt (0) with its tables.
         self.finder = if config.bt {
             LazyFinder::Tree
         } else {

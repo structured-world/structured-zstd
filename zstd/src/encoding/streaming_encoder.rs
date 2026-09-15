@@ -293,7 +293,8 @@ impl<W: Write, M: Matcher, C: BorrowMut<CompressionContext<M>>> StreamingEncoder
     ///
     /// If no payload was written yet, this still emits a valid empty frame.
     /// Calling this method consumes the encoder; a borrowed context is then
-    /// ready for the next frame.
+    /// ready for the next frame, also when this fails: the frame goes with the
+    /// drain (see [`CompressionContext::abandon_frame`]).
     pub fn finish(mut self) -> Result<W, Error> {
         let mut drain = self
             .drain
@@ -308,6 +309,16 @@ impl<W: Write, M: Matcher, C: BorrowMut<CompressionContext<M>>> StreamingEncoder
             Some(drain) => Ok((drain, self.context.borrow_mut())),
             None => Err(other_error("streaming encoder has no active drain")),
         }
+    }
+}
+
+/// The frame belongs to the drain this encoder writes into: an encoder that
+/// goes without finishing it (dropped mid-frame, or a `finish` that failed)
+/// takes it along, so a borrowed context starts the next encoder's frame
+/// afresh instead of continuing this one into another drain.
+impl<W: Write, M: Matcher, C: BorrowMut<CompressionContext<M>>> Drop for StreamingEncoder<W, M, C> {
+    fn drop(&mut self) {
+        self.context.borrow_mut().abandon_frame();
     }
 }
 
@@ -502,10 +513,10 @@ impl<M: Matcher> CompressionContext<M> {
     /// error. The pledge ends with the frame.
     pub fn set_pledged_content_size(&mut self, size: u64) -> Result<(), Error> {
         self.ensure_settable("pledged content size must be set before the first write")?;
+        // The matcher is handed it as its size hint when the frame starts
+        // (`ensure_frame_started`), not here: a pledge that goes unused must
+        // not stay behind in the matcher for a later frame.
         self.pledged_content_size = Some(size);
-        // Also use pledged size as source-size hint so the matcher
-        // can select smaller tables for small inputs.
-        self.state.matcher.set_source_size_hint(size);
         Ok(())
     }
 
@@ -531,11 +542,10 @@ impl<M: Matcher> CompressionContext<M> {
     /// frame's first [`write`](Self::write).
     pub fn set_source_size_hint(&mut self, size: u64) -> Result<(), Error> {
         self.ensure_settable("source size hint must be set before the first write")?;
-        self.state.matcher.set_source_size_hint(size);
-        // Feed the same hint to the Fast HUF fast-path gate (resolved in
-        // `set_parameters` / `ensure_frame_started` via
-        // `pledged_content_size.or(source_size_hint)`), so a small advisory size
-        // also lifts Fast streams off the expensive optimal-HUF search.
+        // Read at each frame start as `pledged_content_size.or(source_size_hint)`,
+        // by the matcher's sizing and the Fast HUF fast-path gate alike
+        // (`ensure_frame_started`), so a small advisory size also lifts Fast
+        // streams off the expensive optimal-HUF search.
         self.source_size_hint = Some(size);
         Ok(())
     }
@@ -773,12 +783,42 @@ impl<M: Matcher> CompressionContext<M> {
         }
 
         drain.flush().map_err(|err| self.fail(err))?;
+        self.abandon_frame();
+        Ok(())
+    }
+
+    /// Drop the frame in progress without closing it (upstream
+    /// `ZSTD_CCtx_reset(ZSTD_reset_session_only)`): its buffered input and its
+    /// pledge go, and the next [`write`](Self::write) starts a new frame. The
+    /// settings, the dictionary and every allocation stay. What the frame
+    /// already wrote to its drain stays there, an unfinished frame.
+    ///
+    /// This is the way on from a [`finish_frame`](Self::finish_frame) refused
+    /// for a pledge the frame did not meet, when the rest of the input is not
+    /// coming; writing it and finishing again completes the frame instead.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel};
+    ///
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// let mut unfinished = Vec::new();
+    /// context.set_pledged_content_size(100).unwrap();
+    /// context.write(&mut unfinished, b"only part of it").unwrap();
+    /// assert!(context.finish_frame(&mut unfinished).is_err());
+    /// context.abandon_frame();
+    ///
+    /// let mut frame = Vec::new();
+    /// context.write(&mut frame, b"a frame of its own").unwrap();
+    /// context.finish_frame(&mut frame).unwrap();
+    /// ```
+    pub fn abandon_frame(&mut self) {
         // What belongs to the frame goes with it; the settings, the dictionary
         // and every allocation stay for the next one.
         self.frame_started = false;
         self.bytes_consumed = 0;
         self.pledged_content_size = None;
-        Ok(())
+        self.pending.clear();
     }
 
     fn ensure_open(&self) -> Result<(), Error> {
@@ -856,13 +896,12 @@ impl<M: Matcher> CompressionContext<M> {
         self.state.matcher.reset(self.compression_level);
         // Sync `state.strategy_tag` / `state.pre_split` to the strategy the
         // matcher's reset resolved (size- and dictionary-adaptive; a public
-        // strategy override wins on a plain frame, a dictionary frame runs the
-        // CDict's strategy) so the literal-compression gates, the block
+        // strategy override wins) so the literal-compression gates, the block
         // pre-splitter and the dictionary load below agree with the parse.
         // Mirrors `FrameCompressor::compress` and keeps both entry points
         // byte-equivalent.
         let hint = self.pledged_content_size.or(self.source_size_hint);
-        let (params, dict_frame) = crate::encoding::frame_compressor::resolve_frame_params(
+        let params = crate::encoding::frame_compressor::resolve_frame_params(
             self.compression_level,
             hint,
             self.dictionary.as_ref().filter(|_| use_dictionary_state),
@@ -871,7 +910,7 @@ impl<M: Matcher> CompressionContext<M> {
             &mut self.state,
             self.compression_level,
             &params,
-            self.tuning.strategy.filter(|_| !dict_frame),
+            self.tuning.strategy,
         );
         self.state.huf_optimal_search =
             crate::encoding::frame_compressor::huf_search_enabled(self.state.strategy_tag, hint);
@@ -879,7 +918,7 @@ impl<M: Matcher> CompressionContext<M> {
             crate::encoding::frame_compressor::literal_compression_disabled(
                 self.state.strategy_tag,
                 self.compression_level,
-                self.tuning.target_length.filter(|_| !dict_frame),
+                self.tuning.target_length,
                 self.tuning.literal_compression,
             );
         // Seed the repeat-offset history from the dictionary (upstream zstd

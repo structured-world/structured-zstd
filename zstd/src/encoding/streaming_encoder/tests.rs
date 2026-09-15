@@ -102,6 +102,45 @@ fn a_reused_context_writes_the_frames_fresh_encoders_write() {
     assert!(diverged.is_empty(), "{diverged:#?}");
 }
 
+/// A frame an encoder did not finish on a borrowed context (its pledge was not
+/// met, so `finish` failed; it was dropped mid-frame; its pledge was never
+/// written to) goes with that encoder. The next encoder's drain holds a whole
+/// frame of its own, the one a fresh encoder writes, not the tail of the
+/// frame before under that frame's pledge.
+#[test]
+fn a_frame_that_did_not_finish_is_not_continued_by_the_next_encoder() {
+    let level = CompressionLevel::Default;
+    let payload = b"the next frame, whole and on its own".repeat(64);
+    let fresh = {
+        let mut encoder = StreamingEncoder::new(Vec::new(), level);
+        encoder.write_all(&payload).unwrap();
+        encoder.finish().unwrap()
+    };
+    let mut context = CompressionContext::new(level);
+    let next_frame = |context: &mut CompressionContext, case: &str| {
+        let mut encoder = StreamingEncoder::with_context(Vec::new(), context);
+        encoder.write_all(&payload).unwrap();
+        let frame = encoder.finish().unwrap();
+        assert!(frame == fresh, "{case}: the next frame is not a fresh one");
+    };
+
+    let mut encoder = StreamingEncoder::with_context(Vec::new(), &mut context);
+    encoder.set_pledged_content_size(1000).unwrap();
+    encoder.write_all(&[7u8; 600]).unwrap();
+    assert!(encoder.finish().is_err());
+    next_frame(&mut context, "short of the pledge");
+
+    let mut encoder = StreamingEncoder::with_context(Vec::new(), &mut context);
+    encoder.write_all(&[9u8; 300 * 1024]).unwrap();
+    drop(encoder);
+    next_frame(&mut context, "dropped mid-frame");
+
+    let mut encoder = StreamingEncoder::with_context(Vec::new(), &mut context);
+    encoder.set_pledged_content_size(5).unwrap();
+    assert!(encoder.finish().is_err());
+    next_frame(&mut context, "pledged and never written");
+}
+
 /// Unsized frames in a row keep one table geometry, so a reused context keeps
 /// the previous frame's table entries and only moves the floor past them,
 /// where the pledged frames above change geometry and start from cleared
@@ -605,8 +644,8 @@ fn streaming_periodic_btlazy2_roundtrips() {
 
 /// The streaming raw-literals gate follows the effective parameters like the
 /// frame compressor's: a positive `target_length` override on a fast level
-/// disables literal compression on a plain frame, while a dictionary frame
-/// keeps the CDict's targetLength (0 at level 1) and ignores the override.
+/// disables literal compression on a plain frame and on a dictionary frame,
+/// whose dictionary is prepared with the override.
 #[test]
 fn streaming_encoder_literal_gate_follows_the_effective_target_length() {
     use crate::encoding::CompressionParameters;
@@ -629,7 +668,7 @@ fn streaming_encoder_literal_gate_follows_the_effective_target_length() {
         ))
         .unwrap();
     with_dict.write_all(b"dictionary frame payload").unwrap();
-    assert!(!with_dict.context.state.literal_compression_disabled);
+    assert!(with_dict.context.state.literal_compression_disabled);
 }
 
 /// Pre-write `set_magicless(true)` → emitted frame omits the

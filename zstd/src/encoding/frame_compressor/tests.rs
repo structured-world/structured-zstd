@@ -3310,19 +3310,21 @@ fn pre_split_tier_follows_the_effective_strategy() {
     );
 }
 
-/// Regression: on a dictionary frame the matcher runs the CDict's strategy
-/// and ignores a public strategy override ("cdict overrides"), so the frame
-/// state the literal gates and the block splitter read must record the
-/// CDict's strategy too, not the override.
+/// A dictionary prepared under explicit parameters runs them (upstream
+/// `ZSTD_createCDict_advanced2` builds the CDict from the context's
+/// parameters), so the frame state the literal gates and the block splitter
+/// read records the strategy asked for, and the frame decodes. The 20 KiB
+/// CDict alone would resolve L6 to lazy.
 #[test]
-fn dictionary_frame_state_records_the_cdict_strategy_not_the_override() {
-    use crate::encoding::strategy::StrategyTag;
+fn dictionary_frame_runs_a_strategy_override() {
+    use crate::encoding::strategy::{BackendTag, StrategyTag};
     use crate::encoding::{CompressionParameters, Strategy};
     let dict_raw = noise_bytes(20 * 1024, 5);
-    let payload = noise_bytes(16 * 1024, 9);
+    let mut payload = dict_raw[4096..12 * 1024].to_vec();
+    payload.extend_from_slice(&noise_bytes(8 * 1024, 9));
     let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(6));
     enc.set_dictionary(
-        crate::decoding::Dictionary::from_raw_content(0xD1C7_0013, dict_raw).unwrap(),
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_0013, dict_raw.clone()).unwrap(),
     )
     .unwrap();
     let params = CompressionParameters::builder(super::CompressionLevel::Level(6))
@@ -3331,78 +3333,69 @@ fn dictionary_frame_state_records_the_cdict_strategy_not_the_override() {
         .expect("valid override");
     enc.set_parameters(&params);
     enc.set_source_size_hint(payload.len() as u64);
-    // The 20 KiB CDict resolves L6 to lazy; the override must not leak into
-    // the frame state the block loop reads.
-    let _ = enc.compress_independent_frame(&payload);
-    assert_eq!(enc.state.strategy_tag, StrategyTag::Lazy);
-    assert_eq!(enc.state.pre_split, Some(2));
+    let frame = enc.compress_independent_frame(&payload);
+    assert_eq!(enc.state.strategy_tag, StrategyTag::BtUltra2);
+    assert_eq!(enc.state.matcher.active_backend(), BackendTag::HashChain);
+    assert_eq!(
+        enc.state.pre_split,
+        Some(crate::encoding::levels::config::pre_split_for(
+            StrategyTag::BtUltra2,
+            2
+        ))
+    );
+    assert!(
+        frame.len() < payload.len() / 2 + 64,
+        "the dictionary half of the payload is found through the optimal search ({} bytes)",
+        frame.len()
+    );
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .add_dict(crate::decoding::Dictionary::from_raw_content(0xD1C7_0013, dict_raw).unwrap())
+        .unwrap();
+    let mut decoded = Vec::with_capacity(payload.len());
+    decoder.decode_all_to_vec(&frame, &mut decoded).unwrap();
+    assert_eq!(decoded, payload);
 }
 
-/// Regression: the same holds for a CDict outside the lazy band. A 4 KiB
-/// CDict resolves L2 to the fast strategy, and a `Btultra2` override must
-/// not replace it (only `window_log` is the caller's on a dictionary frame).
-#[test]
-fn dictionary_frame_keeps_a_fast_cdict_strategy_under_a_strategy_override() {
-    use crate::encoding::strategy::StrategyTag;
-    use crate::encoding::{CompressionParameters, Strategy};
-    let dict_raw = noise_bytes(4 * 1024, 5);
-    let payload = noise_bytes(100 * 1024, 9);
-    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(2));
-    enc.set_dictionary(
-        crate::decoding::Dictionary::from_raw_content(0xD1C7_0014, dict_raw).unwrap(),
-    )
-    .unwrap();
-    let params = CompressionParameters::builder(super::CompressionLevel::Level(2))
-        .strategy(Strategy::Btultra2)
-        .build()
-        .expect("valid override");
-    enc.set_parameters(&params);
-    enc.set_source_size_hint(payload.len() as u64);
-    let _ = enc.compress_independent_frame(&payload);
-    assert_eq!(enc.state.strategy_tag, StrategyTag::Fast);
-    assert_eq!(enc.state.pre_split, Some(0));
-}
-
-/// Regression: the raw-literals gate is recomputed when the dictionary
-/// state changes AFTER `set_parameters`. A positive `target_length` on a
-/// fast level disables literal compression on a plain frame, but a
-/// dictionary frame runs the CDict's targetLength (0 at level 1) and must
-/// compress literals; the inverse (parameters set while a dictionary was
-/// attached, then `clear_dictionary`) must re-enable the override.
+/// The raw-literals gate is recomputed when the dictionary state changes
+/// AFTER `set_parameters`. With a positive `target_length`, the gate turns
+/// on exactly where the frame runs the fast strategy: L2 over a 200 KiB
+/// source resolves to dfast, while a 4 KiB dictionary's CDict resolves it to
+/// fast, so attaching the dictionary disables literal compression and
+/// clearing it enables it again.
 #[test]
 fn literal_gate_follows_dictionary_attach_and_clear() {
     use crate::encoding::CompressionParameters;
     let dict_raw = noise_bytes(4 * 1024, 5);
-    let payload = noise_bytes(2048, 9);
-    let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+    let payload = noise_bytes(200 * 1024, 9);
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(2))
         .target_length(8)
         .build()
         .expect("valid override");
-    // set_parameters THEN attach: the dictionary frame ignores the override.
-    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(2));
     enc.set_parameters(&params);
-    assert!(enc.state.literal_compression_disabled);
-    enc.set_dictionary(
-        crate::decoding::Dictionary::from_raw_content(0xD1C7_0019, dict_raw.clone()).unwrap(),
-    )
-    .unwrap();
+    enc.set_source_size_hint(payload.len() as u64);
     let _ = enc.compress_independent_frame(&payload);
     assert!(
         !enc.state.literal_compression_disabled,
-        "a dictionary frame keeps the CDict targetLength: literals stay compressed"
+        "a dfast frame compresses literals whatever its targetLength"
     );
-    // Attach THEN set_parameters THEN clear: the plain frame honours it again.
-    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
     enc.set_dictionary(
-        crate::decoding::Dictionary::from_raw_content(0xD1C7_001A, dict_raw).unwrap(),
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_0019, dict_raw).unwrap(),
     )
     .unwrap();
-    enc.set_parameters(&params);
-    enc.clear_dictionary();
+    enc.set_source_size_hint(payload.len() as u64);
     let _ = enc.compress_independent_frame(&payload);
     assert!(
         enc.state.literal_compression_disabled,
-        "without the dictionary the target_length override applies again"
+        "the fast CDict with a positive targetLength leaves literals raw"
+    );
+    enc.clear_dictionary();
+    enc.set_source_size_hint(payload.len() as u64);
+    let _ = enc.compress_independent_frame(&payload);
+    assert!(
+        !enc.state.literal_compression_disabled,
+        "without the dictionary the frame is dfast again"
     );
 }
 
@@ -3434,13 +3427,12 @@ fn set_parameters_uncompressed_with_a_dictionary_attached_does_not_resolve_a_cdi
     assert_eq!(decoded, payload);
 }
 
-/// Regression: on a dictionary frame the matcher ignores every public
-/// override but `window_log`, so the raw-literals gate
-/// (`ZSTD_literalsCompressionIsDisabled`: fast strategy with a positive
-/// targetLength) must read the CDict's targetLength (0 at level 1), not a
-/// `target_length` override the matcher does not run.
+/// The raw-literals gate (`ZSTD_literalsCompressionIsDisabled`: fast
+/// strategy with a positive targetLength) reads a `target_length` override on
+/// a dictionary frame as on any other: the dictionary is prepared with it, so
+/// the fast CDict at level 1 runs targetLength 8, not its row's 0.
 #[test]
-fn dictionary_frame_literal_gate_ignores_a_target_length_override() {
+fn dictionary_frame_literal_gate_reads_a_target_length_override() {
     use crate::encoding::CompressionParameters;
     let dict_raw = noise_bytes(4 * 1024, 5);
     let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
@@ -3454,8 +3446,8 @@ fn dictionary_frame_literal_gate_ignores_a_target_length_override() {
         .expect("valid override");
     enc.set_parameters(&params);
     assert!(
-        !enc.state.literal_compression_disabled,
-        "a dictionary frame keeps the CDict's targetLength 0: literals stay compressed"
+        enc.state.literal_compression_disabled,
+        "the dictionary runs targetLength 8 on the fast strategy: literals stay raw"
     );
 }
 

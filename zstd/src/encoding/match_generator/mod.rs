@@ -1071,11 +1071,13 @@ impl Matcher for MatchGeneratorDriver {
         // A dictionary frame takes its cParams and match-finder from the
         // CDict's cParams (upstream `ZSTD_resetCCtx_usingCDict`), whose tier
         // is keyed by the serialized dictionary size; a lazy-band CDict also
-        // carries `dict_plan` to the Row backend.
+        // carries `dict_plan` to the Row backend. The dictionary is prepared
+        // under the caller's parameters, so they are part of those cParams.
+        let overrides = self.param_overrides.unwrap_or_default();
         let (params, dict_plan) = match dict_hint {
-            Some(sizes) => {
-                crate::encoding::levels::config::resolve_level_params_with_dict(level, hint, sizes)
-            }
+            Some(sizes) => crate::encoding::levels::config::resolve_level_params_with_dict(
+                level, hint, sizes, &overrides,
+            ),
             None => (Self::level_params(level, hint), None),
         };
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -1326,6 +1328,7 @@ impl Matcher for MatchGeneratorDriver {
                     crate::encoding::cparams::get_cdict_cparams(
                         crate::encoding::levels::config::numeric_level(level),
                         sizes.serialized,
+                        &overrides,
                     )
                     .hash_log
                 }));
@@ -1365,6 +1368,7 @@ impl Matcher for MatchGeneratorDriver {
                     let cd = crate::encoding::cparams::get_cdict_cparams(
                         crate::encoding::levels::config::numeric_level(level),
                         sizes.serialized,
+                        &overrides,
                     );
                     (cd.hash_log as usize, cd.chain_log as usize)
                 }));

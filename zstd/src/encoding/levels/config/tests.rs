@@ -164,8 +164,9 @@ fn oversized_attach_dictionary_resolves_the_copy_geometry() {
             CompressionLevel::Level(level),
             Some(4096),
             sizes,
+            &Default::default(),
         );
-        let cdict = get_cdict_cparams(level, sizes.serialized);
+        let cdict = get_cdict_cparams(level, sizes.serialized, &Default::default());
         let copy = copy_cparams(
             cdict,
             u32::from(
