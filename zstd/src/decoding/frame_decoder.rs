@@ -2771,15 +2771,17 @@ impl FrameDecoder {
             output.resize(frame_end, 0);
             // On error, drop the just-grown (zeroed) tail before propagating so
             // callers never observe bytes that were never decoded.
-            let written =
-                match self.run_direct_decode(&mut *input, &mut output[frame_start..], content_size)
-                {
-                    Ok(n) => n,
-                    Err(e) => {
-                        output.truncate(frame_start);
-                        return Err(e);
-                    }
-                };
+            let written = match self.run_direct_decode(
+                &mut *input,
+                &mut output[frame_start..],
+                Some(content_size),
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    output.truncate(frame_start);
+                    return Err(e);
+                }
+            };
             output.truncate(frame_start + written);
             #[cfg(feature = "hash")]
             self.verify_content_checksum()?;
@@ -2896,9 +2898,18 @@ impl FrameDecoder {
             // that the spec relies on for `offset <= window_size`
             // validation. Path choice no longer alters checksum
             // semantics.
-            let direct_eligible = content_size > 0 && (output.len() as u64) >= content_size;
+            // A frame that declares no size decodes straight into the
+            // caller's slice too, the slice being its limit, as upstream
+            // `ZSTD_decompressDCtx` decodes into `dst`. The drain path
+            // reserved the frame's whole declared window for it, which for a
+            // streamed producer's small frame is megabytes for kilobytes.
+            let declared_size = fcs_declared.then_some(content_size);
+            let direct_eligible = match declared_size {
+                Some(declared) => declared > 0 && (output.len() as u64) >= declared,
+                None => true,
+            };
             if direct_eligible {
-                let written = self.run_direct_decode(&mut input, output, content_size)?;
+                let written = self.run_direct_decode(&mut input, output, declared_size)?;
                 output = &mut output[written..];
                 total_bytes_written += written;
                 // Per-frame content-checksum verification (no-op unless the
@@ -3034,9 +3045,18 @@ impl FrameDecoder {
             // `UserSliceBackend::exec_sequence_bounded`, so no
             // `WILDCOPY_OVERLENGTH` trailing slack is required (see the
             // no-lsm path above).
-            let direct_eligible = content_size > 0 && (output.len() as u64) >= content_size;
+            // A frame that declares no size decodes straight into the
+            // caller's slice too, the slice being its limit, as upstream
+            // `ZSTD_decompressDCtx` decodes into `dst`. The drain path
+            // reserved the frame's whole declared window for it, which for a
+            // streamed producer's small frame is megabytes for kilobytes.
+            let declared_size = fcs_declared.then_some(content_size);
+            let direct_eligible = match declared_size {
+                Some(declared) => declared > 0 && (output.len() as u64) >= declared,
+                None => true,
+            };
             if direct_eligible {
-                let written = self.run_direct_decode(&mut input, output, content_size)?;
+                let written = self.run_direct_decode(&mut input, output, declared_size)?;
                 output = &mut output[written..];
                 total_bytes_written += written;
                 // Per-frame content-checksum verification (no-op unless the
@@ -3160,12 +3180,13 @@ impl FrameDecoder {
     ///
     /// - `self.init` (or `init_with_dict_handle`) was called for
     ///   this frame so `self.state` is populated.
-    /// - `content_size` matches `self.state.frame_header
-    ///   .frame_content_size()` and is `> 0` (caller already passed
-    ///   the eligibility gate).
-    /// - `output.len() >= content_size`. No `WILDCOPY_OVERLENGTH`
-    ///   trailing slack is required: the trailing sequence(s) take the
-    ///   bounded (non-overshooting) copy in
+    /// - `declared_size` is the frame's declared content size, `> 0`, with
+    ///   `output.len() >= declared_size` (the eligibility gate), or `None`
+    ///   for a frame that declares none. Then `output` itself is the limit,
+    ///   as upstream `ZSTD_decompressDCtx` decodes into `dst`, and a frame
+    ///   that does not fit is `TargetTooSmall` rather than a size mismatch.
+    ///   No `WILDCOPY_OVERLENGTH` trailing slack is required: the trailing
+    ///   sequence(s) take the bounded (non-overshooting) copy in
     ///   [`UserSliceBackend::exec_sequence_bounded`].
     ///
     /// Dictionary frames are supported: the scratch buffer's shared
@@ -3181,7 +3202,7 @@ impl FrameDecoder {
         &mut self,
         input: &mut &[u8],
         output: &mut [u8],
-        content_size: u64,
+        declared_size: Option<u64>,
     ) -> Result<usize, FrameDecoderError> {
         #[cfg(test)]
         {
@@ -3193,6 +3214,16 @@ impl FrameDecoder {
         use super::user_slice_buf::UserSliceBackend;
         use crate::io::Read;
         use FrameDecoderError as err;
+
+        // The most the frame may write: its declared size, or the caller's
+        // slice for a frame that declares none.
+        let limit = declared_size.unwrap_or(output.len() as u64);
+        // Output past `limit`: the frame lied about its size, or it does not
+        // fit the caller's slice.
+        let overflow = |produced: u64| match declared_size {
+            Some(declared) => err::FrameContentSizeMismatch { declared, produced },
+            None => err::TargetTooSmall,
+        };
 
         let state = self
             .state
@@ -3215,7 +3246,7 @@ impl FrameDecoder {
                 let n = bh.decompressed_size as usize;
                 if bh.last_block
                     && matches!(bh.block_type, crate::blocks::block::BlockType::Raw)
-                    && n as u64 == content_size
+                    && declared_size == Some(n as u64)
                     && probe.len() >= n
                     && output.len() >= n
                 {
@@ -3381,13 +3412,10 @@ impl FrameDecoder {
             // post-decode check below catches overflow via the
             // backend's actual write counter delta.
             let block_upper = u64::from(block_header.decompressed_size);
-            if block_upper > 0 && produced + block_upper > content_size {
-                // Frame is corrupt — Raw/RLE block headers claim
-                // more output than the FCS allows.
-                return Err(err::FrameContentSizeMismatch {
-                    declared: content_size,
-                    produced: produced + block_upper,
-                });
+            if block_upper > 0 && produced + block_upper > limit {
+                // Raw/RLE block headers claim more output than the FCS
+                // allows (a corrupt frame) or the caller's slice holds.
+                return Err(overflow(produced + block_upper));
             }
             // Slice-source fast path: consume the block body
             // straight from `input` without copying into the
@@ -3412,11 +3440,9 @@ impl FrameDecoder {
                     // accumulated `produced` can grow toward
                     // u64::MAX across adversarial frames. Saturating
                     // avoids a panic on the error path itself.
-                    return Err(err::FrameContentSizeMismatch {
-                        declared: content_size,
-                        produced: produced
-                            .saturating_add(u64::from(block_header.decompressed_size)),
-                    });
+                    return Err(overflow(
+                        produced.saturating_add(u64::from(block_header.decompressed_size)),
+                    ));
                 }
                 // Compressed-block in-block overshoot: the sequence
                 // executor (upstream zstd-inline path) or the match-repeat
@@ -3426,12 +3452,11 @@ impl FrameDecoder {
                 // from the partial fill: `tail` bytes were written before
                 // the failing op, and `requested` is what overflowed —
                 // their sum is a strict lower bound on the frame's true
-                // expanded size and is always > `content_size` (the
-                // direct path is only entered when the slice is sized to
-                // `content_size + WILDCOPY_OVERLENGTH`, so any overflow
-                // means the frame exceeded the declared FCS, never a
-                // caller-undersized buffer). Folds into the same
-                // `FrameContentSizeMismatch` contract as Raw/RLE.
+                // expanded size and is always > `limit`. With a declared
+                // size the slice holds at least that much, so any overflow
+                // means the frame exceeded its FCS, never a caller-undersized
+                // buffer, and folds into the same `FrameContentSizeMismatch`
+                // contract as Raw/RLE; without one the slice is the limit.
                 Err(crate::decoding::errors::DecodeBlockContentError::DecompressBlockError(
                     crate::decoding::errors::DecompressBlockError::ExecuteSequencesError(ref e),
                 )) if e.output_overflow_requested().is_some() => {
@@ -3439,10 +3464,7 @@ impl FrameDecoder {
                         .output_overflow_requested()
                         .expect("guard guarantees Some") as u64;
                     let tail = direct.buffer.buffer_ref().tail() as u64;
-                    return Err(err::FrameContentSizeMismatch {
-                        declared: content_size,
-                        produced: tail.saturating_add(requested),
-                    });
+                    return Err(overflow(tail.saturating_add(requested)));
                 }
                 Err(e) => {
                     return Err(block_body_decode_error(
@@ -3465,11 +3487,8 @@ impl FrameDecoder {
             }
             produced = direct.buffer.buffer_ref().tail() as u64;
             // Post-decode FCS overflow check.
-            if produced > content_size {
-                return Err(err::FrameContentSizeMismatch {
-                    declared: content_size,
-                    produced,
-                });
+            if produced > limit {
+                return Err(overflow(produced));
             }
             state.bytes_read_counter += body_consumed;
             state.block_counter += 1;
@@ -3493,15 +3512,14 @@ impl FrameDecoder {
                 break;
             }
         }
-        // Final sanity: blocks summed to exactly `content_size`.
-        if produced != content_size {
-            return Err(err::FrameContentSizeMismatch {
-                declared: content_size,
-                produced,
-            });
+        // Final sanity: blocks summed to exactly the declared size.
+        if let Some(declared) = declared_size
+            && produced != declared
+        {
+            return Err(err::FrameContentSizeMismatch { declared, produced });
         }
 
-        let written = content_size as usize;
+        let written = produced as usize;
         state.frame_finished = true;
         // `direct`'s last use is in the decode loop above; NLL therefore
         // releases its `&mut output` borrow before here, freeing `output` for

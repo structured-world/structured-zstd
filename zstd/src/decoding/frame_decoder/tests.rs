@@ -958,6 +958,70 @@ fn a_streamed_frame_drains_through_a_target_smaller_than_a_block() {
     assert_eq!(decoded, payload);
 }
 
+/// A streamed level-19 frame of 4 KiB that declares no content size, and so an
+/// 8 MiB window, the shape a `ZSTD_compressStream2` / `zstd -` producer emits.
+#[cfg(feature = "std")]
+fn small_frame_of_unknown_size() -> (Vec<u8>, Vec<u8>) {
+    use crate::encoding::StreamingEncoder;
+    use std::io::Write as _;
+    let payload: Vec<u8> = (0..4096u32)
+        .map(|i| b"GET /index.html 200\n"[(i % 20) as usize] ^ (i / 97) as u8)
+        .collect();
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(19));
+    encoder.write_all(&payload).unwrap();
+    let frame = encoder.finish().unwrap();
+    let header = crate::decoding::read_frame_header_info(&frame, false).expect("header");
+    assert!(
+        matches!(
+            header.content_size,
+            crate::decoding::FrameContentSize::Unknown
+        ),
+        "the fixture must declare no content size"
+    );
+    assert!(
+        header.window_size >= 1 << 20,
+        "the fixture must declare a window far past its content"
+    );
+    (payload, frame)
+}
+
+/// Decoding a frame of unknown size into the caller's slice writes straight
+/// into it, as upstream `ZSTD_decompressDCtx` decodes into `dst`: the frame's
+/// declared window is never reserved. The drain path used to allocate (and
+/// zero) the whole window for every such frame, a few kilobytes of content.
+#[cfg(feature = "std")]
+#[test]
+fn a_frame_of_unknown_size_decodes_into_the_slice_without_its_window() {
+    let (payload, frame) = small_frame_of_unknown_size();
+    let mut decoder = FrameDecoder::new();
+    let mut out = alloc::vec![0u8; payload.len()];
+    let written = decoder.decode_all(&frame, &mut out).expect("frame decodes");
+    assert_eq!(written, payload.len());
+    assert_eq!(out, payload);
+    let workspace = decoder.workspace_size();
+    assert!(
+        workspace < 1 << 20,
+        "decoding into the caller's slice reserved {workspace} bytes of window"
+    );
+}
+
+/// A slice too small for a frame of unknown size is the caller's error, as
+/// before, not a content-size mismatch.
+#[cfg(feature = "std")]
+#[test]
+fn a_frame_of_unknown_size_into_a_short_slice_is_target_too_small() {
+    let (payload, frame) = small_frame_of_unknown_size();
+    let mut decoder = FrameDecoder::new();
+    let mut out = alloc::vec![0u8; payload.len() - 1];
+    let err = decoder
+        .decode_all(&frame, &mut out)
+        .expect_err("one byte short must fail");
+    assert!(
+        matches!(err, super::FrameDecoderError::TargetTooSmall),
+        "expected TargetTooSmall, got {err:?}"
+    );
+}
+
 #[test]
 fn dict_frame_decodes_through_direct_path() {
     // A dictionary frame decoded via `decode_all_with_dict_handle`
