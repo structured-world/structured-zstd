@@ -4530,8 +4530,11 @@ fn decompress_stream<R: Read, W: Write>(
         if read == 0 {
             // End of the last frame is success; end before the first one means
             // the input never held a frame at all, which is not an archive that
-            // decodes to nothing.
-            if frames == 0 {
+            // decodes to nothing. Under pass-through it is plain input like any
+            // other, and passes through as the empty output (the reference
+            // command refuses it there too; `cat`, `zcat -f` and `xzcat -f`
+            // pass it).
+            if frames == 0 && !settings.pass_through {
                 bail!("unexpected end of file");
             }
             return Ok(written);

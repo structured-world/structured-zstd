@@ -450,13 +450,18 @@ const COMPRESSED_EXTENSIONS: &[&str] = &[
 ///
 /// The extension is the file name's last dot onward, compared exactly: a
 /// dotfile has none, and `.GZ` is not `.gz`, as in the reference command.
+/// Compared as the name's own bytes, since the extensions are ASCII and the
+/// rest of the name need not be valid UTF-8.
 pub fn has_compressed_extension(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+    let Some(name) = path.file_name() else {
         return false;
     };
-    match name.rfind('.') {
+    let name = name.as_encoded_bytes();
+    match name.iter().rposition(|&byte| byte == b'.') {
         Some(0) | None => false,
-        Some(at) => COMPRESSED_EXTENSIONS.contains(&&name[at..]),
+        Some(at) => COMPRESSED_EXTENSIONS
+            .iter()
+            .any(|extension| extension.as_bytes() == &name[at..]),
     }
 }
 

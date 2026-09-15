@@ -427,3 +427,15 @@ fn compressed_extensions_are_matched_on_the_last_dot() {
     assert!(!has_compressed_extension(Path::new("noext")));
     assert!(!has_compressed_extension(Path::new("dir.gz/plain")));
 }
+
+/// A Unix file name is bytes, and the part before the extension need not be
+/// UTF-8: `\xff.zst` still ends in `.zst` and is still compressed.
+#[cfg(unix)]
+#[test]
+fn a_compressed_extension_counts_after_a_name_that_is_not_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::OsStr::from_bytes(b"\xff.zst");
+    assert!(has_compressed_extension(Path::new(name)));
+    let plain = std::ffi::OsStr::from_bytes(b"\xff.txt");
+    assert!(!has_compressed_extension(Path::new(plain)));
+}

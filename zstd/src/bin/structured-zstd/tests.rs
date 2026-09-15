@@ -1322,7 +1322,9 @@ fn zero_means_unset_where_the_api_says_it_does() {
 
 /// An empty file holds no frame, so there is nothing to test and nothing to
 /// decode. Answering `OK` for it says the archive checked out when it was never
-/// an archive; upstream calls it an unexpected end of file.
+/// an archive; upstream calls it an unexpected end of file. (`-t` never passes
+/// anything through, so this holds for it whatever is set; pass-through itself
+/// is covered by `an_empty_input_passes_through_and_is_refused_otherwise`.)
 #[test]
 fn an_empty_stream_is_not_a_valid_archive() {
     decompress_stream(
@@ -1332,17 +1334,6 @@ fn an_empty_stream_is_not_a_valid_archive() {
         &DecodeSettings::default(),
     )
     .expect_err("an empty input carries no frame to decode");
-    // Even under pass-through: an empty file is not an archive either.
-    decompress_stream(
-        &b""[..],
-        io::sink(),
-        &mut no_dict(),
-        &DecodeSettings {
-            verify_checksum: true,
-            pass_through: true,
-        },
-    )
-    .expect_err("nothing to pass through is still nothing");
 }
 
 /// Skippable frames sit inside ordinary archives — seekable-zstd puts its index
@@ -3362,6 +3353,33 @@ fn progress_over_stdin_follows_the_flag_and_the_pledge() {
     assert_eq!(stdin_monitor(&unpledged, io::empty()).total, None);
     let quiet = parse(&["--no-progress"]).unwrap();
     assert!(!stdin_monitor(&quiet, io::empty()).is_shown());
+}
+
+/// An empty input holds no frame. Decoding it is an error, as the reference
+/// command reports it, but under pass-through it is plain input like any other
+/// and passes through as the empty output, as `cat`, `zcat -f` and `xzcat -f`
+/// pass it; the reference command refuses it there too.
+#[test]
+fn an_empty_input_passes_through_and_is_refused_otherwise() {
+    let pass = DecodeSettings {
+        verify_checksum: true,
+        pass_through: true,
+    };
+    let mut out = Vec::new();
+    let written = decompress_stream(&b""[..], &mut out, &mut no_dict(), &pass)
+        .expect("an empty input passes through");
+    assert_eq!(written, 0);
+    assert!(out.is_empty());
+
+    let err = decompress_stream(
+        &b""[..],
+        io::sink(),
+        &mut no_dict(),
+        &DecodeSettings::default(),
+    )
+    .expect_err("an empty archive is refused without pass-through")
+    .to_string();
+    assert!(err.contains("unexpected end of file"), "{err}");
 }
 
 /// Input that is not a zstd stream is copied through under `--pass-through`,
