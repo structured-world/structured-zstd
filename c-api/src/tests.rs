@@ -3356,3 +3356,82 @@ fn a_dictionary_the_context_moved_on_from_is_not_kept() {
     unsafe { ZSTD_freeCCtx(cctx) };
     unsafe { ZSTD_freeCDict(cdict) };
 }
+
+/// Output that piled up on the context (a whole incompressible input
+/// consumed into a 64-byte output buffer) is let go once it has been copied
+/// out: the context keeps the output room of one block for the frames after
+/// it, not the largest frame it ever held.
+#[test]
+fn drained_stream_output_does_not_pin_its_peak() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let input: Vec<u8> = (0..4 << 20)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect();
+    let cctx = ZSTD_createCCtx();
+    let mut inb = ZSTD_inBuffer {
+        src: input.as_ptr().cast(),
+        size: input.len(),
+        pos: 0,
+    };
+    let mut small = [0u8; 64];
+    let mut outb = ZSTD_outBuffer {
+        dst: small.as_mut_ptr().cast(),
+        size: small.len(),
+        pos: 0,
+    };
+    let rc = unsafe { ZSTD_compressStream2(cctx, &mut outb, &mut inb, 2) };
+    assert_eq!(ZSTD_isError(rc), 0);
+    assert_eq!(inb.pos, inb.size, "the input is consumed in full");
+    let pending_capacity = |cctx: *mut crate::context::ZSTD_CCtx| {
+        unsafe { cctx.as_ref() }
+            .and_then(|context| context.stream.as_ref())
+            .expect("the context streams")
+            .pending_capacity()
+    };
+    assert!(
+        pending_capacity(cctx) >= input.len(),
+        "fixture precondition: the whole frame waits on the context"
+    );
+    let mut frame = small[..outb.pos].to_vec();
+    let mut room = vec![0u8; ZSTD_CStreamOutSize()];
+    let mut empty = ZSTD_inBuffer {
+        src: core::ptr::null(),
+        size: 0,
+        pos: 0,
+    };
+    loop {
+        let mut outb = ZSTD_outBuffer {
+            dst: room.as_mut_ptr().cast(),
+            size: room.len(),
+            pos: 0,
+        };
+        let rc = unsafe { ZSTD_compressStream2(cctx, &mut outb, &mut empty, 2) };
+        assert_eq!(ZSTD_isError(rc), 0);
+        frame.extend_from_slice(&room[..outb.pos]);
+        if rc == 0 {
+            break;
+        }
+    }
+    assert!(
+        pending_capacity(cctx) <= ZSTD_CStreamOutSize(),
+        "{} bytes of output room kept after the frame was copied out",
+        pending_capacity(cctx)
+    );
+    let mut decoded = vec![0u8; input.len()];
+    let n = unsafe {
+        ZSTD_decompress(
+            decoded.as_mut_ptr(),
+            decoded.len(),
+            frame.as_ptr(),
+            frame.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(n), 0);
+    assert_eq!(decoded, input);
+    unsafe { ZSTD_freeCCtx(cctx) };
+}

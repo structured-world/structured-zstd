@@ -107,6 +107,12 @@ impl CStreamState {
         self.pending.len() - self.pending_pos
     }
 
+    /// Bytes reserved for output not yet copied out. Test-only.
+    #[cfg(test)]
+    pub(crate) fn pending_capacity(&self) -> usize {
+        self.pending.capacity()
+    }
+
     /// Copy as much produced output as fits into `out`.
     fn copy_out(&mut self, out: &mut ZSTD_outBuffer, dst: &mut [u8]) {
         let n = self.pending_remaining().min(dst.len() - out.pos);
@@ -117,6 +123,15 @@ impl CStreamState {
         if self.pending_pos == self.pending.len() {
             self.pending.clear();
             self.pending_pos = 0;
+            // A large input written into a small output buffer piles its
+            // whole output up here. Once the frame is closed and copied out,
+            // the context keeps the room of one block (upstream's
+            // `outBuffSize`) for the frames after it, not the peak. Within a
+            // frame the room stays: the caller's next call is likely to fill
+            // it the same way, and shrinking would re-grow it every time.
+            if !self.open {
+                self.pending.shrink_to(ZSTD_CStreamOutSize());
+            }
         }
     }
 }
