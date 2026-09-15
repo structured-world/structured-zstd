@@ -313,8 +313,21 @@ impl BlockDecoder {
         raw: &[u8],
         dict: Option<&'d crate::decoding::dictionary::Dictionary>,
     ) -> Result<(), DecompressBlockError> {
+        // A block produces at most `MAX_BLOCK_SIZE` bytes, its literals and
+        // its matches together (RFC 8878 3.1.1.2.4). Upstream bounds both by
+        // the same `oend`: the literals up front (`litSize > blockSizeMax` is
+        // corruption in `ZSTD_decodeLiteralsBlock`) and every write after.
+        // Sequence writes stop at the per-block ceiling; the literals are
+        // checked here and the whole block after it decodes, which catches
+        // literals left over after the last sequence.
+        let len_before = buffer.len();
         let mut section = LiteralsSection::new();
         let bytes_in_literals_header = section.parse_from_header(raw)?;
+        if section.regenerated_size > MAX_BLOCK_SIZE {
+            return Err(DecompressBlockError::ExpandsPastBlockMaximum {
+                size: section.regenerated_size as usize,
+            });
+        }
         let raw = &raw[bytes_in_literals_header as usize..];
         vprintln!(
             "Found {} literalssection with regenerated size: {}, and compressed size: {:?}",
@@ -421,6 +434,12 @@ impl BlockDecoder {
             buffer.push(literals_view);
         }
 
+        // Nothing drains the buffer inside a block, so the growth of its live
+        // length is this block's output.
+        let produced = buffer.len() - len_before;
+        if produced > MAX_BLOCK_SIZE as usize {
+            return Err(DecompressBlockError::ExpandsPastBlockMaximum { size: produced });
+        }
         Ok(())
     }
 

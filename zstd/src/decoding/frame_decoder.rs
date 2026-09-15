@@ -513,16 +513,18 @@ impl DecoderScratchKind {
     /// frame writes only through `UserSliceBackend` and leaves this
     /// buffer empty.
     ///
-    /// `window_size` is the TARGET visible-window capacity: callers pass
-    /// the full window, and the method itself computes the shortfall past
-    /// the bytes already buffered before calling the backend's
+    /// `target` is the TARGET buffer capacity (`decoding_buffer_size`) and
+    /// `growth_limit` the most later growth may reach
+    /// (`decoding_buffer_limit`); the method itself computes the shortfall
+    /// past the bytes already buffered before calling the backend's
     /// ADDITIONAL-semantics `reserve_exact`. That keeps re-entries (the
     /// decode_all fallback loop runs `decode_blocks` once per strategy
     /// chunk, and streaming callers invoke it per call) from growing a
     /// window-full buffer toward 2x window, while per-block growth keeps
     /// the amortized `reserve`.
     #[inline]
-    fn reserve_buffer(&mut self, window_size: usize) {
+    fn reserve_buffer(&mut self, target: usize, growth_limit: usize) {
+        let window_size = target;
         // Exact growth: this is the one-shot pre-reservation, and a request
         // landing one slack past the retained capacity (e.g. a dictionary
         // prefix already loaded into the buffer) must not DOUBLE a
@@ -536,8 +538,15 @@ impl DecoderScratchKind {
         // window-sized buffer toward 2x window.
         match self {
             Self::Ring(s) => {
+                // The ring's growth rounds to the next power of two, capped at
+                // its limit; with the limit at the target for this one-shot
+                // reservation it lands exactly there, and later growth (a
+                // compressed block's own reservation) may then reach the
+                // frame's real limit, never double past it.
+                s.buffer.set_growth_limit(window_size);
                 let additional = window_size.saturating_sub(s.buffer.len());
                 s.buffer.reserve_exact(additional);
+                s.buffer.set_growth_limit(growth_limit);
             }
             Self::Flat(s) => {
                 let additional = window_size.saturating_sub(s.buffer.len());
@@ -602,6 +611,18 @@ impl DecoderScratchKind {
         match self {
             Self::Ring(s) => s.buffer.read(target),
             Self::Flat(s) => s.buffer.read(target),
+        }
+    }
+
+    /// [`Self::buffer_read`], also reporting the drainable bytes `target` had
+    /// no room for.
+    fn buffer_read_reporting_pending(
+        &mut self,
+        target: &mut [u8],
+    ) -> Result<(usize, usize), Error> {
+        match self {
+            Self::Ring(s) => s.buffer.read_reporting_pending(target),
+            Self::Flat(s) => s.buffer.read_reporting_pending(target),
         }
     }
 
@@ -842,6 +863,51 @@ impl FrameDecoderState {
         } else {
             window_size as usize
         }
+    }
+
+    /// The most a frame decoding through the buffer holds, which its growth
+    /// stops at. A single-segment frame's buffer holds its whole content,
+    /// which is its window. A multi-segment frame's ring holds the
+    /// content-capped window plus room for the next block, since each
+    /// compressed block reserves a whole block before it decodes: without it
+    /// the first block past a full window grew the ring and copied the window
+    /// across, and a limit at the content left no block of room once the
+    /// window filled. Upstream sizes its stream buffer as window + block too
+    /// (`ZSTD_decodingBufferSize_min`); it can cap at the content because its
+    /// buffer is not a ring.
+    fn decoding_buffer_limit(&self) -> usize {
+        let useful_window = self.useful_window_size();
+        if self.frame_header.descriptor.single_segment_flag() {
+            return useful_window;
+        }
+        let window_size = self.frame_header.window_size().unwrap_or(0) as usize;
+        // No overflow: the window was checked against
+        // `MAXIMUM_ALLOWED_WINDOW_SIZE` when the header was taken.
+        useful_window + window_size.min(crate::common::MAX_BLOCK_SIZE as usize)
+    }
+
+    /// What to reserve up front: the limit, except for a multi-segment frame
+    /// whose declared content fits its window, which reserves just its
+    /// content. Only compressed blocks need the block of room past it, and
+    /// they reserve it themselves; the limit then caps that growth at one
+    /// block. Such frames are rare (encoders mark a frame that fits its window
+    /// single-segment), and a small Raw or RLE one should not pay a block.
+    fn decoding_buffer_size(&self) -> usize {
+        let window_size = self.frame_header.window_size().unwrap_or(0);
+        if self.frame_header.fcs_declared() && self.frame_header.frame_content_size() <= window_size
+        {
+            self.useful_window_size()
+        } else {
+            self.decoding_buffer_limit()
+        }
+    }
+
+    /// Reserve this frame's decode buffer ([`Self::decoding_buffer_size`])
+    /// and cap its later growth ([`Self::decoding_buffer_limit`]).
+    fn reserve_decoding_buffer(&mut self) {
+        let target = self.decoding_buffer_size();
+        let growth_limit = self.decoding_buffer_limit();
+        self.decoder_scratch.reserve_buffer(target, growth_limit);
     }
 
     /// Construct a new frame decoder state, reading the frame header
@@ -1751,15 +1817,14 @@ impl FrameDecoder {
         }
 
         // Streaming entry point: pre-reserve the backing buffer to
-        // the FCS-capped window so multi-block frames don't pay repeated
-        // `reserve_amortized` grow steps (128 KiB → 256 KiB → ... →
-        // window) as blocks accumulate. `decode_all` does the same up
-        // front in `decode_all_impl`; this mirrors it for callers
-        // driving `decode_blocks` directly. Idempotent — the
-        // backend's `reserve` early-returns when capacity is already
-        // sufficient.
-        let useful_window = state.useful_window_size();
-        state.decoder_scratch.reserve_buffer(useful_window);
+        // the FCS-capped window plus a block so multi-block frames don't pay
+        // repeated `reserve_amortized` grow steps (128 KiB → 256 KiB → ... →
+        // window) as blocks accumulate, nor a copy of the window when it
+        // fills. `decode_all` does the same up front in `decode_all_impl`;
+        // this mirrors it for callers driving `decode_blocks` directly.
+        // Idempotent — the backend's `reserve` early-returns when capacity
+        // is already sufficient.
+        state.reserve_decoding_buffer();
 
         let mut block_dec = decoding::block_decoder::new();
 
@@ -1993,13 +2058,12 @@ impl FrameDecoder {
         }
 
         // Mirror `decode_blocks`: pre-reserve the backing buffer to the
-        // FCS-capped window so multi-block frames don't pay repeated grow
-        // steps. The RAW frame window stays separately bound — the resume
-        // logic below bounds match reach by the frame's window semantics,
-        // not by the (possibly smaller) reservation cap.
+        // FCS-capped window plus a block so multi-block frames don't pay
+        // repeated grow steps. The RAW frame window stays separately bound —
+        // the resume logic below bounds match reach by the frame's window
+        // semantics, not by the (possibly smaller) reservation cap.
         let window_size = state.frame_header.window_size().unwrap_or(0) as usize;
-        let useful_window = state.useful_window_size();
-        state.decoder_scratch.reserve_buffer(useful_window);
+        state.reserve_decoding_buffer();
 
         // Cold resume: prime the match window + restore entropy/repcode state +
         // advance the block cursor BEFORE the loop, so the first in-range block
@@ -2307,7 +2371,10 @@ impl FrameDecoder {
         }
     }
 
-    /// Decodes as many blocks as possible from the source slice and reads from the decodebuffer into the target slice
+    /// Decodes blocks from the source slice and reads from the decodebuffer into the target slice, one block at a
+    /// time: output is handed to `target` as each block completes, and no further block is decoded while `target`
+    /// cannot take what is already decoded. The decode buffer so holds one window plus one block however much input
+    /// is supplied; call again with the unread input to continue.
     /// The source slice may contain only parts of a frame but must contain at least one full block to make progress
     ///
     /// By all means use decode_blocks if you have a io.Reader available. This is just for compatibility with other decompressors
@@ -2330,6 +2397,8 @@ impl FrameDecoder {
             Some(s) => s.bytes_read_counter,
             None => 0,
         };
+        // Bytes already handed to `target` by the per-block drain below.
+        let mut written = 0usize;
 
         if !self.is_finished() || self.state.is_none() {
             let mut mt_source = source;
@@ -2383,6 +2452,19 @@ impl FrameDecoder {
                     if state.frame_finished {
                         break;
                     }
+                    // Hand what the window no longer needs to `target` before
+                    // decoding more, and decode no further while `target` cannot
+                    // take it: the buffer then holds one window plus the block
+                    // being decoded, whatever the caller supplies, as upstream
+                    // `ZSTD_decompressStream` flushes each block before the next.
+                    let (read, pending) = state
+                        .decoder_scratch
+                        .buffer_read_reporting_pending(&mut target[written..])
+                        .map_err(err::FailedToDrainDecodebuffer)?;
+                    written += read;
+                    if pending > 0 {
+                        break;
+                    }
                     //check if there are enough bytes for the next header
                     if mt_source.len() < 3 {
                         break;
@@ -2401,6 +2483,18 @@ impl FrameDecoder {
                         break;
                     }
                     state.bytes_read_counter += u64::from(block_header_size);
+                    // A frame that declares its size gets its buffer in one
+                    // allocation once its first block is in hand, as upstream
+                    // allocates its stream buffer per frame: growing it block by
+                    // block cost a fresh decoder several reallocations, copies
+                    // and page-fault passes per frame. Not on the header alone,
+                    // which would let a header followed by nothing reserve its
+                    // whole declared window. The size is content-capped, so a
+                    // small frame gets a small buffer; a frame of unknown size
+                    // keeps growing lazily rather than paying for its window.
+                    if state.block_counter == 0 && state.frame_header.fcs_declared() {
+                        state.reserve_decoding_buffer();
+                    }
 
                     // Only expose the held dictionary while THIS frame is dict-backed
                     // (`using_dict` is set per dict-apply, cleared on reset). A reused
@@ -2450,7 +2544,10 @@ impl FrameDecoder {
             }
         }
 
-        let result_len = self.read(target).map_err(err::FailedToDrainDecodebuffer)?;
+        let result_len = written
+            + self
+                .read(&mut target[written..])
+                .map_err(err::FailedToDrainDecodebuffer)?;
         // Once the frame is fully decoded and drained, the running digest is
         // final: validate it in `Verify` mode (no-op otherwise). Same finish
         // point as the streaming reader.
@@ -2717,15 +2814,17 @@ impl FrameDecoder {
             output.resize(frame_end, 0);
             // On error, drop the just-grown (zeroed) tail before propagating so
             // callers never observe bytes that were never decoded.
-            let written =
-                match self.run_direct_decode(&mut *input, &mut output[frame_start..], content_size)
-                {
-                    Ok(n) => n,
-                    Err(e) => {
-                        output.truncate(frame_start);
-                        return Err(e);
-                    }
-                };
+            let written = match self.run_direct_decode(
+                &mut *input,
+                &mut output[frame_start..],
+                Some(content_size),
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    output.truncate(frame_start);
+                    return Err(e);
+                }
+            };
             output.truncate(frame_start + written);
             #[cfg(feature = "hash")]
             self.verify_content_checksum()?;
@@ -2842,9 +2941,18 @@ impl FrameDecoder {
             // that the spec relies on for `offset <= window_size`
             // validation. Path choice no longer alters checksum
             // semantics.
-            let direct_eligible = content_size > 0 && (output.len() as u64) >= content_size;
+            // A frame that declares no size decodes straight into the
+            // caller's slice too, the slice being its limit, as upstream
+            // `ZSTD_decompressDCtx` decodes into `dst`. The drain path
+            // reserved the frame's whole declared window for it, which for a
+            // streamed producer's small frame is megabytes for kilobytes.
+            let declared_size = fcs_declared.then_some(content_size);
+            let direct_eligible = match declared_size {
+                Some(declared) => declared > 0 && (output.len() as u64) >= declared,
+                None => true,
+            };
             if direct_eligible {
-                let written = self.run_direct_decode(&mut input, output, content_size)?;
+                let written = self.run_direct_decode(&mut input, output, declared_size)?;
                 output = &mut output[written..];
                 total_bytes_written += written;
                 // Per-frame content-checksum verification (no-op unless the
@@ -2861,12 +2969,11 @@ impl FrameDecoder {
             // > 128 KiB otherwise grows through several intermediate
             // sizes with `alloc_zeroed + memcpy` each time).
             if let Some(state) = self.state.as_mut() {
-                // FCS-capped via `useful_window_size` — the same cap
+                // FCS-capped via `decoding_buffer_size` — the same cap
                 // `decode_blocks` applies, so its per-iteration reserve in
                 // the loop below cannot grow the buffer back to the raw
                 // frame window.
-                let useful_window = state.useful_window_size();
-                state.decoder_scratch.reserve_buffer(useful_window);
+                state.reserve_decoding_buffer();
             }
             let frame_start_total = total_bytes_written;
             loop {
@@ -2980,9 +3087,18 @@ impl FrameDecoder {
             // `UserSliceBackend::exec_sequence_bounded`, so no
             // `WILDCOPY_OVERLENGTH` trailing slack is required (see the
             // no-lsm path above).
-            let direct_eligible = content_size > 0 && (output.len() as u64) >= content_size;
+            // A frame that declares no size decodes straight into the
+            // caller's slice too, the slice being its limit, as upstream
+            // `ZSTD_decompressDCtx` decodes into `dst`. The drain path
+            // reserved the frame's whole declared window for it, which for a
+            // streamed producer's small frame is megabytes for kilobytes.
+            let declared_size = fcs_declared.then_some(content_size);
+            let direct_eligible = match declared_size {
+                Some(declared) => declared > 0 && (output.len() as u64) >= declared,
+                None => true,
+            };
             if direct_eligible {
-                let written = self.run_direct_decode(&mut input, output, content_size)?;
+                let written = self.run_direct_decode(&mut input, output, declared_size)?;
                 output = &mut output[written..];
                 total_bytes_written += written;
                 // Per-frame content-checksum verification (no-op unless the
@@ -2995,12 +3111,11 @@ impl FrameDecoder {
             // `window_size` once so the per-block growth cycle is
             // skipped (see same comment on the no-lsm path above).
             if let Some(state) = self.state.as_mut() {
-                // FCS-capped via `useful_window_size` — the same cap
+                // FCS-capped via `decoding_buffer_size` — the same cap
                 // `decode_blocks` applies, so its per-iteration reserve in
                 // the loop below cannot grow the buffer back to the raw
                 // frame window.
-                let useful_window = state.useful_window_size();
-                state.decoder_scratch.reserve_buffer(useful_window);
+                state.reserve_decoding_buffer();
             }
             let frame_start_total = total_bytes_written;
             loop {
@@ -3106,12 +3221,13 @@ impl FrameDecoder {
     ///
     /// - `self.init` (or `init_with_dict_handle`) was called for
     ///   this frame so `self.state` is populated.
-    /// - `content_size` matches `self.state.frame_header
-    ///   .frame_content_size()` and is `> 0` (caller already passed
-    ///   the eligibility gate).
-    /// - `output.len() >= content_size`. No `WILDCOPY_OVERLENGTH`
-    ///   trailing slack is required: the trailing sequence(s) take the
-    ///   bounded (non-overshooting) copy in
+    /// - `declared_size` is the frame's declared content size, `> 0`, with
+    ///   `output.len() >= declared_size` (the eligibility gate), or `None`
+    ///   for a frame that declares none. Then `output` itself is the limit,
+    ///   as upstream `ZSTD_decompressDCtx` decodes into `dst`, and a frame
+    ///   that does not fit is `TargetTooSmall` rather than a size mismatch.
+    ///   No `WILDCOPY_OVERLENGTH` trailing slack is required: the trailing
+    ///   sequence(s) take the bounded (non-overshooting) copy in
     ///   [`UserSliceBackend::exec_sequence_bounded`].
     ///
     /// Dictionary frames are supported: the scratch buffer's shared
@@ -3127,7 +3243,7 @@ impl FrameDecoder {
         &mut self,
         input: &mut &[u8],
         output: &mut [u8],
-        content_size: u64,
+        declared_size: Option<u64>,
     ) -> Result<usize, FrameDecoderError> {
         #[cfg(test)]
         {
@@ -3139,6 +3255,16 @@ impl FrameDecoder {
         use super::user_slice_buf::UserSliceBackend;
         use crate::io::Read;
         use FrameDecoderError as err;
+
+        // The most the frame may write: its declared size, or the caller's
+        // slice for a frame that declares none.
+        let limit = declared_size.unwrap_or(output.len() as u64);
+        // Output past `limit`: the frame lied about its size, or it does not
+        // fit the caller's slice.
+        let overflow = |produced: u64| match declared_size {
+            Some(declared) => err::FrameContentSizeMismatch { declared, produced },
+            None => err::TargetTooSmall,
+        };
 
         let state = self
             .state
@@ -3161,7 +3287,7 @@ impl FrameDecoder {
                 let n = bh.decompressed_size as usize;
                 if bh.last_block
                     && matches!(bh.block_type, crate::blocks::block::BlockType::Raw)
-                    && n as u64 == content_size
+                    && declared_size == Some(n as u64)
                     && probe.len() >= n
                     && output.len() >= n
                 {
@@ -3327,13 +3453,10 @@ impl FrameDecoder {
             // post-decode check below catches overflow via the
             // backend's actual write counter delta.
             let block_upper = u64::from(block_header.decompressed_size);
-            if block_upper > 0 && produced + block_upper > content_size {
-                // Frame is corrupt — Raw/RLE block headers claim
-                // more output than the FCS allows.
-                return Err(err::FrameContentSizeMismatch {
-                    declared: content_size,
-                    produced: produced + block_upper,
-                });
+            if block_upper > 0 && produced + block_upper > limit {
+                // Raw/RLE block headers claim more output than the FCS
+                // allows (a corrupt frame) or the caller's slice holds.
+                return Err(overflow(produced + block_upper));
             }
             // Slice-source fast path: consume the block body
             // straight from `input` without copying into the
@@ -3358,11 +3481,9 @@ impl FrameDecoder {
                     // accumulated `produced` can grow toward
                     // u64::MAX across adversarial frames. Saturating
                     // avoids a panic on the error path itself.
-                    return Err(err::FrameContentSizeMismatch {
-                        declared: content_size,
-                        produced: produced
-                            .saturating_add(u64::from(block_header.decompressed_size)),
-                    });
+                    return Err(overflow(
+                        produced.saturating_add(u64::from(block_header.decompressed_size)),
+                    ));
                 }
                 // Compressed-block in-block overshoot: the sequence
                 // executor (upstream zstd-inline path) or the match-repeat
@@ -3372,23 +3493,26 @@ impl FrameDecoder {
                 // from the partial fill: `tail` bytes were written before
                 // the failing op, and `requested` is what overflowed —
                 // their sum is a strict lower bound on the frame's true
-                // expanded size and is always > `content_size` (the
-                // direct path is only entered when the slice is sized to
-                // `content_size + WILDCOPY_OVERLENGTH`, so any overflow
-                // means the frame exceeded the declared FCS, never a
-                // caller-undersized buffer). Folds into the same
-                // `FrameContentSizeMismatch` contract as Raw/RLE.
+                // expanded size and is always > `limit`. With a declared
+                // size the slice holds at least that much, so any overflow
+                // means the frame exceeded its FCS, never a caller-undersized
+                // buffer, and folds into the same `FrameContentSizeMismatch`
+                // contract as Raw/RLE; without one the slice is the limit.
+                // An overflow that stays within `limit` was refused by the
+                // per-block output ceiling instead: a malformed block, which
+                // takes the generic arm below.
                 Err(crate::decoding::errors::DecodeBlockContentError::DecompressBlockError(
                     crate::decoding::errors::DecompressBlockError::ExecuteSequencesError(ref e),
-                )) if e.output_overflow_requested().is_some() => {
+                )) if e.output_overflow_requested().is_some_and(|requested| {
+                    (direct.buffer.buffer_ref().tail() as u64).saturating_add(requested as u64)
+                        > limit
+                }) =>
+                {
                     let requested = e
                         .output_overflow_requested()
                         .expect("guard guarantees Some") as u64;
                     let tail = direct.buffer.buffer_ref().tail() as u64;
-                    return Err(err::FrameContentSizeMismatch {
-                        declared: content_size,
-                        produced: tail.saturating_add(requested),
-                    });
+                    return Err(overflow(tail.saturating_add(requested)));
                 }
                 Err(e) => {
                     return Err(block_body_decode_error(
@@ -3411,11 +3535,8 @@ impl FrameDecoder {
             }
             produced = direct.buffer.buffer_ref().tail() as u64;
             // Post-decode FCS overflow check.
-            if produced > content_size {
-                return Err(err::FrameContentSizeMismatch {
-                    declared: content_size,
-                    produced,
-                });
+            if produced > limit {
+                return Err(overflow(produced));
             }
             state.bytes_read_counter += body_consumed;
             state.block_counter += 1;
@@ -3439,15 +3560,14 @@ impl FrameDecoder {
                 break;
             }
         }
-        // Final sanity: blocks summed to exactly `content_size`.
-        if produced != content_size {
-            return Err(err::FrameContentSizeMismatch {
-                declared: content_size,
-                produced,
-            });
+        // Final sanity: blocks summed to exactly the declared size.
+        if let Some(declared) = declared_size
+            && produced != declared
+        {
+            return Err(err::FrameContentSizeMismatch { declared, produced });
         }
 
-        let written = content_size as usize;
+        let written = produced as usize;
         state.frame_finished = true;
         // `direct`'s last use is in the decode loop above; NLL therefore
         // releases its `&mut output` borrow before here, freeing `output` for

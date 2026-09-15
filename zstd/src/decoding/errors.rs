@@ -265,6 +265,12 @@ pub enum DecompressBlockError {
     SequencesHeaderParseError(SequencesHeaderParseError),
     DecodeSequenceError(DecodeSequenceError),
     ExecuteSequencesError(ExecuteSequencesError),
+    /// The block's literals, or its whole output, run past the block maximum
+    /// (RFC 8878 3.1.1.2.4, `Block_Maximum_Size`): `size` bytes where
+    /// `MAX_BLOCK_SIZE` is the most a block may produce.
+    ExpandsPastBlockMaximum {
+        size: usize,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -302,6 +308,11 @@ impl core::fmt::Display for DecompressBlockError {
             DecompressBlockError::SequencesHeaderParseError(e) => write!(f, "{e:?}"),
             DecompressBlockError::DecodeSequenceError(e) => write!(f, "{e:?}"),
             DecompressBlockError::ExecuteSequencesError(e) => write!(f, "{e:?}"),
+            DecompressBlockError::ExpandsPastBlockMaximum { size } => write!(
+                f,
+                "Block expands to {size} bytes, past the maximum of {}",
+                crate::common::MAX_BLOCK_SIZE,
+            ),
         }
     }
 }

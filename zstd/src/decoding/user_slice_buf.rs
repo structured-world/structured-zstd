@@ -3,21 +3,20 @@
 //!
 //! Selected automatically by
 //! [`crate::decoding::FrameDecoder::decode_all`] (and
-//! [`crate::decoding::FrameDecoder::decode_all_to_vec`]) when ALL of
-//! the following hold:
-//! - `frame_content_size > 0` — the header-derived content size
-//!   is non-zero. This is the actual eligibility condition (NOT
-//!   "FCS present"): an empty frame with an explicit FCS=0
-//!   declaration on the wire stays on the fallback path because
-//!   there is no payload to write into the user slice. To
-//!   distinguish "FCS absent" from "FCS=0 explicit" elsewhere in
-//!   the decoder, use `FrameHeader::fcs_declared()` (e.g. the
-//!   fallback path's post-decode size check does).
-//! - `output.len() >= frame_content_size` — the slice holds the
-//!   declared content. No `WILDCOPY_OVERLENGTH` slack is required:
-//!   when a sequence's literal+match bytes fit but the SIMD wildcopy
-//!   overshoot would not, the trailing sequence(s) take the bounded
-//!   (non-overshooting) copy in [`UserSliceBackend::exec_sequence_bounded`].
+//! [`crate::decoding::FrameDecoder::decode_all_to_vec`]) for a frame
+//! that either:
+//! - declares a non-zero content size the slice holds
+//!   (`output.len() >= frame_content_size`; an explicit FCS=0 stays on
+//!   the fallback path, there being no payload to write), or
+//! - declares none, in which case the slice itself is the limit, as
+//!   upstream `ZSTD_decompressDCtx` decodes into `dst`.
+//!
+//! No `WILDCOPY_OVERLENGTH` slack is required: when a sequence's
+//! literal+match bytes fit but the SIMD wildcopy overshoot would not, the
+//! trailing sequence(s) take the bounded (non-overshooting) copy in
+//! [`UserSliceBackend::exec_sequence_bounded`]. Each block is still held
+//! to `MAX_BLOCK_SIZE` of output by the per-block ceiling
+//! (`set_max_capacity`), whatever room the slice has.
 //! - No active dictionary (the persistent dict_content is not
 //!   carried into the stack-local DecodeBuffer this backend
 //!   builds; dict frames stay on the regular path).
@@ -139,6 +138,17 @@ pub(crate) struct UserSliceBackend<'a> {
     /// for API parity with `FlatBuf` and `RingBuffer`.
     head: usize,
     tail: usize,
+    /// Where sequence writes must stop: the slice's end, or sooner under the
+    /// per-block output ceiling armed by `set_block_output_ceiling` before
+    /// each sequence section. A block may write at most `MAX_BLOCK_SIZE`
+    /// (RFC 8878 3.1.1.2.4) whatever room the caller's slice has, which for a
+    /// frame of unknown size is its only other bound. Folded into the one
+    /// bound every sequence write already checks ([`BufferBackend::cap`]), as
+    /// upstream folds `blockSizeMax` into `oend`, so the ceiling costs no
+    /// check of its own. Raw and RLE blocks write through `try_extend*`,
+    /// which keep the slice's end: the ceiling bounds sequences, as on
+    /// `RingBuffer`.
+    sequence_cap: usize,
 }
 
 impl<'a> UserSliceBackend<'a> {
@@ -150,10 +160,12 @@ impl<'a> UserSliceBackend<'a> {
     /// back to [`Self::exec_sequence_bounded`] (exact, non-overshooting
     /// copies) for that trailing sequence.
     pub(crate) fn from_slice(slice: &'a mut [u8]) -> Self {
+        let sequence_cap = slice.len();
         Self {
             slice,
             head: 0,
             tail: 0,
+            sequence_cap,
         }
     }
 
@@ -266,7 +278,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // wrapping past the slice length and letting the subsequent
         // unsafe pointer math go out of bounds.
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
-        let cap = self.slice.len();
+        let cap = self.sequence_cap;
         // `self.tail <= cap` holds on entry (`from_slice` starts at 0 and
         // every prior sequence advanced `tail` only after this same check),
         // satisfying the `tail <= cap` precondition; see `sequence_output_fits`.
@@ -377,7 +389,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
-        let cap = self.slice.len();
+        let cap = self.sequence_cap;
         // `self.tail <= cap` precondition holds as in the SSE2 arm; see
         // `sequence_output_fits`. Hard guard with `overshoot = 0`; the
         // <=15-byte wildcopy slack is handled by the tight-tail branch
@@ -484,7 +496,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // this overshoot is handled by the tight-tail bounded branch below
         // rather than absorbed by slice capacity.
         const MAX_WILDCOPY_OVERSHOOT: usize = 31;
-        let cap = self.slice.len();
+        let cap = self.sequence_cap;
         // `self.tail <= cap` holds on entry (`from_slice` starts at 0 and every
         // prior sequence advanced `tail` only after this same check), satisfying
         // the `tail <= cap` precondition; see `sequence_output_fits`. Hard guard
@@ -609,7 +621,20 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             slice: &mut [],
             head: 0,
             tail: 0,
+            sequence_cap: 0,
         }
+    }
+
+    /// `max_capacity` bounds the live byte count, so the bound on the write
+    /// cursor is `head + max_capacity`, never past the slice. Saturating on
+    /// purpose: `usize::MAX` is "no ceiling", which lands on the slice's end.
+    #[inline]
+    fn set_max_capacity(&mut self, max_capacity: usize) {
+        self.sequence_cap = self.slice.len().min(self.head.saturating_add(max_capacity));
+        // The ceiling is armed as the live length plus a block, so it never
+        // lands behind the cursor; `sequence_output_fits` relies on
+        // `tail <= cap`.
+        debug_assert!(self.sequence_cap >= self.tail);
     }
 
     #[inline]
@@ -624,12 +649,15 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // check. Lets safe public decode APIs catch a malformed-frame
         // overshoot here instead of via the `assert!` inside
         // `extend_from_within_unchecked` further down the call chain.
+        // Bounded by `sequence_cap`: the per-block ceiling bounds the match
+        // writes this reservation precedes, as `RingBuffer::try_reserve`
+        // bounds them.
         match self.tail.checked_add(n) {
-            Some(new_tail) if new_tail <= self.slice.len() => Ok(()),
+            Some(new_tail) if new_tail <= self.sequence_cap => Ok(()),
             _ => Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
                 requested: n,
-                capacity: self.slice.len(),
+                capacity: self.sequence_cap,
             }),
         }
     }
@@ -654,9 +682,11 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         self.tail - self.head
     }
 
+    /// The bound sequence writes check ([`Self::sequence_cap`]): the slice's
+    /// end, or the per-block ceiling when it is nearer.
     #[inline]
     fn cap(&self) -> usize {
-        self.slice.len()
+        self.sequence_cap
     }
 
     #[inline]
