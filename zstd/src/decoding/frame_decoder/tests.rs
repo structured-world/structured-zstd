@@ -862,6 +862,102 @@ fn reserve_buffer_reserves_the_shortfall_not_the_full_window_again() {
     );
 }
 
+/// A frame longer than its window, streamed through `decode_from_to` with the
+/// whole frame as input, keeps one window plus one block of ring, as upstream
+/// sizes its stream buffer (`ZSTD_decodingBufferSize_min`). The decode used to
+/// run every buffered block before draining any, so the ring grew to the
+/// frame's content size, doubling (and copying) its way there.
+#[test]
+fn a_streamed_frame_longer_than_its_window_keeps_one_window_of_ring() {
+    use crate::encoding::CompressionParameters;
+    let window_log = 20u32;
+    let window = 1usize << window_log;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let payload: Vec<u8> = (0..4 * window)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            b"abcdefgh"[(state >> 61) as usize]
+        })
+        .collect();
+    let params = CompressionParameters::builder(CompressionLevel::Level(1))
+        .window_log(window_log)
+        .build()
+        .expect("window_log within bounds");
+    let mut compressor = FrameCompressor::new(CompressionLevel::Level(1));
+    compressor.set_parameters(&params);
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+    // The frame must declare the 1 MiB window rather than be single-segment,
+    // or the decode takes the flat buffer and the ring is never exercised.
+    let header = crate::decoding::read_frame_header_info(&compressed, false).expect("header");
+    assert_eq!(header.window_size, window as u64);
+
+    let mut decoder = FrameDecoder::new();
+    let mut source = compressed.as_slice();
+    decoder.reset(&mut source).expect("header parses");
+    let mut decoded = Vec::with_capacity(payload.len());
+    let mut chunk = alloc::vec![0u8; 128 * 1024];
+    while !(decoder.is_finished() && decoder.can_collect() == 0) {
+        let (read, written) = decoder
+            .decode_from_to(source, &mut chunk)
+            .expect("frame decodes");
+        source = &source[read..];
+        decoded.extend_from_slice(&chunk[..written]);
+        assert!(read > 0 || written > 0, "decode made no progress");
+    }
+    assert_eq!(decoded, payload);
+    let workspace = decoder.workspace_size();
+    assert!(
+        workspace < window + window / 2,
+        "ring grew past one window plus a block: workspace {workspace} bytes \
+         for a {window}-byte window"
+    );
+}
+
+/// The per-block drain must not change what a caller with a buffer too small
+/// for one block receives: a 1 KiB target still gets every byte, in order.
+#[test]
+fn a_streamed_frame_drains_through_a_target_smaller_than_a_block() {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let payload: Vec<u8> = (0..600 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            b"0123456789abcdef"[(state & 15) as usize]
+        })
+        .collect();
+    let params = crate::encoding::CompressionParameters::builder(CompressionLevel::Level(3))
+        .window_log(17)
+        .build()
+        .expect("window_log within bounds");
+    let mut compressor = FrameCompressor::new(CompressionLevel::Level(3));
+    compressor.set_parameters(&params);
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+
+    let mut decoder = FrameDecoder::new();
+    let mut source = compressed.as_slice();
+    decoder.reset(&mut source).expect("header parses");
+    let mut decoded = Vec::with_capacity(payload.len());
+    let mut chunk = [0u8; 1024];
+    while !(decoder.is_finished() && decoder.can_collect() == 0) {
+        let (read, written) = decoder
+            .decode_from_to(source, &mut chunk)
+            .expect("frame decodes");
+        source = &source[read..];
+        decoded.extend_from_slice(&chunk[..written]);
+        assert!(read > 0 || written > 0, "decode made no progress");
+    }
+    assert_eq!(decoded, payload);
+}
+
 #[test]
 fn dict_frame_decodes_through_direct_path() {
     // A dictionary frame decoded via `decode_all_with_dict_handle`

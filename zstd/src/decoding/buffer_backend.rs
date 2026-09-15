@@ -357,6 +357,12 @@ pub(crate) trait BufferBackend: Sized {
     /// fixed-capacity backends (`UserSliceBackend`), which are already bounded.
     fn set_max_capacity(&mut self, _max_capacity: usize) {}
 
+    /// Live byte count the frame's decode tops out at (window plus one
+    /// block), which amortized growth stops at instead of doubling past it.
+    /// Only `RingBuffer` grows by doubling across a whole window; the flat
+    /// backends are sized once per frame and take this no-op.
+    fn set_growth_limit(&mut self, _growth_limit: usize) {}
+
     /// Live byte count: bytes between the logical head and tail.
     fn len(&self) -> usize;
 

@@ -87,10 +87,23 @@ impl<B: BufferBackend> Read for DecodeBuffer<B> {
     }
 }
 
+/// Live bytes a frame with `window_size` holds at most while its output is
+/// drained as it is produced: the window plus the block being decoded into it.
+/// Upstream sizes its stream buffer the same way (`ZSTD_decodingBufferSize_min`).
+/// A window so large the sum does not fit sets no limit at all.
+fn peak_buffered_len(window_size: usize) -> usize {
+    let block = window_size.min(crate::common::MAX_BLOCK_SIZE as usize);
+    // Saturating on purpose: `usize::MAX` is the "no limit" value of the
+    // growth limit, which is exactly what a sum past it should mean.
+    window_size.saturating_add(block)
+}
+
 impl<B: BufferBackend> DecodeBuffer<B> {
     pub fn new(window_size: usize) -> DecodeBuffer<B> {
+        let mut buffer = B::new();
+        buffer.set_growth_limit(peak_buffered_len(window_size));
         DecodeBuffer {
-            buffer: B::new(),
+            buffer,
             window_size,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
@@ -116,6 +129,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// it issues vanish in the per-frame reset noise.
     pub fn from_backend(mut buffer: B, window_size: usize) -> DecodeBuffer<B> {
         buffer.clear();
+        buffer.set_growth_limit(peak_buffered_len(window_size));
         DecodeBuffer {
             buffer,
             window_size,
@@ -174,6 +188,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     pub fn reset(&mut self, window_size: usize) {
         self.window_size = window_size;
         self.buffer.clear();
+        self.buffer.set_growth_limit(peak_buffered_len(window_size));
         // No reserve here: capacity decisions are pushed up to the frame
         // layer. Direct-decode frames (`run_direct_decode`) write through
         // `UserSliceBackend` and never touch this buffer, so a long-lived

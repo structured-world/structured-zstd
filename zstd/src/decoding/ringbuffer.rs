@@ -40,6 +40,12 @@ pub struct RingBuffer {
     /// grow, so well-formed blocks (covered by the upfront
     /// `reserve(MAX_BLOCK_SIZE)`) never pay for the check.
     max_capacity: usize,
+    /// Live byte count the frame's decode is expected to top out at (its
+    /// window plus one block). Amortized growth doubles, and the step that
+    /// would carry the ring past this is cut to it, so a window-sized ring is
+    /// not doubled for one block. A need beyond it still grows as before.
+    /// `usize::MAX` (the default) leaves the doubling alone.
+    growth_limit: usize,
 }
 
 // SAFETY: RingBuffer does not hold any thread specific values -> it can be sent to another thread -> RingBuffer is Send
@@ -58,6 +64,7 @@ impl RingBuffer {
             head: 0,
             tail: 0,
             max_capacity: usize::MAX,
+            growth_limit: usize::MAX,
         }
     }
 
@@ -192,6 +199,13 @@ impl RingBuffer {
         self.max_capacity = max_capacity;
     }
 
+    /// Set the live byte count growth should stop short at (see
+    /// [`Self::growth_limit`]). `usize::MAX` restores plain doubling.
+    #[inline]
+    pub fn set_growth_limit(&mut self, growth_limit: usize) {
+        self.growth_limit = growth_limit;
+    }
+
     /// Fallible [`Self::reserve`]: identical fast path, but when the
     /// reserve would have to *grow* the ring it first rejects any target
     /// `len() + amount` past [`Self::max_capacity`]. This is where the
@@ -250,9 +264,20 @@ impl RingBuffer {
             .cap
             .checked_add(amount)
             .expect("ringbuffer capacity overflow");
-        let new_cap = usize::max(self.cap.next_power_of_two(), needed.next_power_of_two())
-            .checked_add(1)
-            .expect("ringbuffer capacity overflow");
+        let doubled = usize::max(self.cap.next_power_of_two(), needed.next_power_of_two());
+        // Stop at the frame's expected peak rather than doubling past it: a
+        // full power-of-two window asking room for one more block would
+        // otherwise become two windows. Only when the need itself fits under
+        // the limit; a caller that holds more than the limit grows on.
+        // `needed` counts the sentinel slot (`cap + shortfall = len + amount +
+        // 1`) and the limit counts live bytes, hence the `- 1`; `needed >= 1`
+        // since growth only runs for a positive shortfall.
+        let target = if needed - 1 <= self.growth_limit {
+            doubled.min(self.growth_limit)
+        } else {
+            doubled
+        };
+        let new_cap = target.checked_add(1).expect("ringbuffer capacity overflow");
 
         // Check that the capacity isn't bigger than isize::MAX, which is the max allowed by LLVM, or that
         // we are on a >= 64 bit system which will never allow that much memory to be allocated
@@ -1178,6 +1203,10 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
     #[inline]
     fn set_max_capacity(&mut self, max_capacity: usize) {
         Self::set_max_capacity(self, max_capacity);
+    }
+    #[inline]
+    fn set_growth_limit(&mut self, growth_limit: usize) {
+        Self::set_growth_limit(self, growth_limit);
     }
     #[inline]
     fn len(&self) -> usize {

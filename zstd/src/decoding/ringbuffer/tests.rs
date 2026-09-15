@@ -28,6 +28,51 @@ fn assert_branchless_matches_checked(
     assert_buffers_equal(&checked, &branchless);
 }
 
+/// A full power-of-two window asking room for one more block grows to the
+/// frame's limit (window plus block), not to twice the window.
+#[test]
+fn growth_stops_at_the_limit_instead_of_doubling_past_it() {
+    let window = 1usize << 16;
+    let block = 1usize << 12;
+    let mut rb = RingBuffer::new();
+    rb.set_growth_limit(window + block);
+    rb.reserve(window);
+    assert_eq!(rb.cap, window + 1, "the window itself is a power of two");
+    rb.extend(&alloc::vec![7u8; window]);
+    rb.reserve(block);
+    assert_eq!(rb.cap, window + block + 1);
+    assert!(rb.free() >= block);
+    assert_eq!(rb.len(), window);
+}
+
+/// Growth below the limit keeps doubling, so small frames grow as before.
+#[test]
+fn growth_below_the_limit_keeps_doubling() {
+    let mut rb = RingBuffer::new();
+    rb.set_growth_limit(1 << 20);
+    rb.reserve(1000);
+    assert_eq!(rb.cap, 1024 + 1);
+}
+
+/// A caller holding more than the limit (one that does not drain) still gets
+/// the room it asks for.
+#[test]
+fn a_need_past_the_limit_still_grows() {
+    let mut rb = RingBuffer::new();
+    rb.set_growth_limit(4096);
+    rb.extend(&alloc::vec![1u8; 4000]);
+    rb.reserve(10_000);
+    assert!(rb.free() >= 10_000);
+    assert_eq!(rb.len(), 4000);
+    assert!(
+        rb.as_slices()
+            .0
+            .iter()
+            .chain(rb.as_slices().1)
+            .all(|&b| b == 1)
+    );
+}
+
 #[test]
 fn inline_exec_ok_respects_block_output_ceiling() {
     // The inline sequence-exec path bypasses `try_reserve`, so it must

@@ -513,8 +513,9 @@ impl DecoderScratchKind {
     /// frame writes only through `UserSliceBackend` and leaves this
     /// buffer empty.
     ///
-    /// `window_size` is the TARGET visible-window capacity: callers pass
-    /// the full window, and the method itself computes the shortfall past
+    /// `window_size` is the TARGET buffer capacity: callers pass the
+    /// frame's window plus a block (`decoding_buffer_size`), and the
+    /// method itself computes the shortfall past
     /// the bytes already buffered before calling the backend's
     /// ADDITIONAL-semantics `reserve_exact`. That keeps re-entries (the
     /// decode_all fallback loop runs `decode_blocks` once per strategy
@@ -841,6 +842,24 @@ impl FrameDecoderState {
             window_size.min(self.frame_header.frame_content_size()) as usize
         } else {
             window_size as usize
+        }
+    }
+
+    /// The up-front reservation for a frame that decodes through the buffer:
+    /// the window plus the block decoded into it, or the whole content when
+    /// that is smaller (upstream `ZSTD_decodingBufferSize_min`). Reserving the
+    /// window alone left the first block past a full window to grow the buffer
+    /// and copy the window across.
+    fn decoding_buffer_size(&self) -> usize {
+        let window_size = self.frame_header.window_size().unwrap_or(0);
+        let block = window_size.min(u64::from(crate::common::MAX_BLOCK_SIZE));
+        // No overflow: the window was checked against
+        // `MAXIMUM_ALLOWED_WINDOW_SIZE` when the header was taken.
+        let needed = window_size + block;
+        if self.frame_header.fcs_declared() {
+            needed.min(self.frame_header.frame_content_size()) as usize
+        } else {
+            needed as usize
         }
     }
 
@@ -1751,15 +1770,15 @@ impl FrameDecoder {
         }
 
         // Streaming entry point: pre-reserve the backing buffer to
-        // the FCS-capped window so multi-block frames don't pay repeated
-        // `reserve_amortized` grow steps (128 KiB → 256 KiB → ... →
-        // window) as blocks accumulate. `decode_all` does the same up
-        // front in `decode_all_impl`; this mirrors it for callers
-        // driving `decode_blocks` directly. Idempotent — the
-        // backend's `reserve` early-returns when capacity is already
-        // sufficient.
-        let useful_window = state.useful_window_size();
-        state.decoder_scratch.reserve_buffer(useful_window);
+        // the FCS-capped window plus a block so multi-block frames don't pay
+        // repeated `reserve_amortized` grow steps (128 KiB → 256 KiB → ... →
+        // window) as blocks accumulate, nor a copy of the window when it
+        // fills. `decode_all` does the same up front in `decode_all_impl`;
+        // this mirrors it for callers driving `decode_blocks` directly.
+        // Idempotent — the backend's `reserve` early-returns when capacity
+        // is already sufficient.
+        let buffer_size = state.decoding_buffer_size();
+        state.decoder_scratch.reserve_buffer(buffer_size);
 
         let mut block_dec = decoding::block_decoder::new();
 
@@ -1993,13 +2012,13 @@ impl FrameDecoder {
         }
 
         // Mirror `decode_blocks`: pre-reserve the backing buffer to the
-        // FCS-capped window so multi-block frames don't pay repeated grow
-        // steps. The RAW frame window stays separately bound — the resume
-        // logic below bounds match reach by the frame's window semantics,
-        // not by the (possibly smaller) reservation cap.
+        // FCS-capped window plus a block so multi-block frames don't pay
+        // repeated grow steps. The RAW frame window stays separately bound —
+        // the resume logic below bounds match reach by the frame's window
+        // semantics, not by the (possibly smaller) reservation cap.
         let window_size = state.frame_header.window_size().unwrap_or(0) as usize;
-        let useful_window = state.useful_window_size();
-        state.decoder_scratch.reserve_buffer(useful_window);
+        let buffer_size = state.decoding_buffer_size();
+        state.decoder_scratch.reserve_buffer(buffer_size);
 
         // Cold resume: prime the match window + restore entropy/repcode state +
         // advance the block cursor BEFORE the loop, so the first in-range block
@@ -2307,7 +2326,10 @@ impl FrameDecoder {
         }
     }
 
-    /// Decodes as many blocks as possible from the source slice and reads from the decodebuffer into the target slice
+    /// Decodes blocks from the source slice and reads from the decodebuffer into the target slice, one block at a
+    /// time: output is handed to `target` as each block completes, and no further block is decoded while `target`
+    /// cannot take what is already decoded. The decode buffer so holds one window plus one block however much input
+    /// is supplied; call again with the unread input to continue.
     /// The source slice may contain only parts of a frame but must contain at least one full block to make progress
     ///
     /// By all means use decode_blocks if you have a io.Reader available. This is just for compatibility with other decompressors
@@ -2330,6 +2352,8 @@ impl FrameDecoder {
             Some(s) => s.bytes_read_counter,
             None => 0,
         };
+        // Bytes already handed to `target` by the per-block drain below.
+        let mut written = 0usize;
 
         if !self.is_finished() || self.state.is_none() {
             let mut mt_source = source;
@@ -2381,6 +2405,22 @@ impl FrameDecoder {
                     // consumed above); no more blocks to read. Any leftover
                     // bytes are not a block header — stop before misreading them.
                     if state.frame_finished {
+                        break;
+                    }
+                    // Hand what the window no longer needs to `target` before
+                    // decoding more, and decode no further while `target` cannot
+                    // take it: the buffer then holds one window plus the block
+                    // being decoded, whatever the caller supplies, as upstream
+                    // `ZSTD_decompressStream` flushes each block before the next.
+                    written += state
+                        .decoder_scratch
+                        .buffer_read(&mut target[written..])
+                        .map_err(err::FailedToDrainDecodebuffer)?;
+                    if state
+                        .decoder_scratch
+                        .buffer_can_drain_to_window_size()
+                        .is_some_and(|pending| pending > 0)
+                    {
                         break;
                     }
                     //check if there are enough bytes for the next header
@@ -2450,7 +2490,10 @@ impl FrameDecoder {
             }
         }
 
-        let result_len = self.read(target).map_err(err::FailedToDrainDecodebuffer)?;
+        let result_len = written
+            + self
+                .read(&mut target[written..])
+                .map_err(err::FailedToDrainDecodebuffer)?;
         // Once the frame is fully decoded and drained, the running digest is
         // final: validate it in `Verify` mode (no-op otherwise). Same finish
         // point as the streaming reader.
@@ -2861,12 +2904,12 @@ impl FrameDecoder {
             // > 128 KiB otherwise grows through several intermediate
             // sizes with `alloc_zeroed + memcpy` each time).
             if let Some(state) = self.state.as_mut() {
-                // FCS-capped via `useful_window_size` — the same cap
+                // FCS-capped via `decoding_buffer_size` — the same cap
                 // `decode_blocks` applies, so its per-iteration reserve in
                 // the loop below cannot grow the buffer back to the raw
                 // frame window.
-                let useful_window = state.useful_window_size();
-                state.decoder_scratch.reserve_buffer(useful_window);
+                let buffer_size = state.decoding_buffer_size();
+                state.decoder_scratch.reserve_buffer(buffer_size);
             }
             let frame_start_total = total_bytes_written;
             loop {
@@ -2995,12 +3038,12 @@ impl FrameDecoder {
             // `window_size` once so the per-block growth cycle is
             // skipped (see same comment on the no-lsm path above).
             if let Some(state) = self.state.as_mut() {
-                // FCS-capped via `useful_window_size` — the same cap
+                // FCS-capped via `decoding_buffer_size` — the same cap
                 // `decode_blocks` applies, so its per-iteration reserve in
                 // the loop below cannot grow the buffer back to the raw
                 // frame window.
-                let useful_window = state.useful_window_size();
-                state.decoder_scratch.reserve_buffer(useful_window);
+                let buffer_size = state.decoding_buffer_size();
+                state.decoder_scratch.reserve_buffer(buffer_size);
             }
             let frame_start_total = total_bytes_written;
             loop {
