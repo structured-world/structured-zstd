@@ -386,6 +386,13 @@ mod imp {
         units
     }
 
+    /// The units the guard stores for `path`: the form the handler removes
+    /// (verbatim and absolute on Windows) (for tests).
+    #[cfg(test)]
+    pub fn units_of(path: &Path) -> Vec<PathUnit> {
+        sys::units(path)
+    }
+
     /// Forget what an earlier guard found, as a fresh process would not know
     /// it (for tests).
     #[cfg(test)]

@@ -46,8 +46,8 @@ fn a_long_path_is_guarded_and_an_empty_one_is_not() {
     guard(Path::new(&long));
     assert!(is_guarded(), "a path past 4096 units is guarded");
     assert_eq!(
-        super::imp::stored_path().len(),
-        long.len(),
+        super::imp::stored_path(),
+        super::imp::units_of(Path::new(&long)),
         "in a buffer grown past the short one's"
     );
     clear();
