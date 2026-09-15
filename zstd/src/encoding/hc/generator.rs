@@ -202,14 +202,17 @@ macro_rules! bt_insert_step_no_rebase_body {
             // while `abs_pos` is far from the integer ceiling; on a
             // long-running rebased stream (reachable on 32-bit) `abs_pos` can
             // approach the ceiling and the wrapped value can land back inside
-            // `[window_low, abs_pos)`. `checked_sub` ends the walk on the
-            // underflow instead. `match_stored != HC_EMPTY` here, so the `- 1`
-            // cannot underflow.
-            let Some(candidate_abs) = ($table.position_base + (match_stored as usize - 1))
-                .checked_sub($table.index_shift)
-            else {
+            // `[window_low, abs_pos)`. Ending the walk on the underflow avoids
+            // that. `match_stored != HC_EMPTY` here, so the `- 1` cannot
+            // underflow. The shift is taken off the stored index before the
+            // floor is added, because on a 32-bit word the floor plus a stored
+            // index need not fit; a slot under the shift decodes below
+            // `position_base`, which the window floor rejects anyway.
+            let match_relative = match_stored as usize - 1;
+            if match_relative < $table.index_shift {
                 break;
-            };
+            }
+            let candidate_abs = $table.position_base + (match_relative - $table.index_shift);
             if candidate_abs < window_low || candidate_abs >= $abs_pos {
                 break;
             }

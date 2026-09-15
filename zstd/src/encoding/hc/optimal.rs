@@ -1588,9 +1588,12 @@ impl HcMatchGenerator {
         // started with: a reused compressor carries the previous frame's, and
         // from any other start some first-pass entries would decode back into
         // the window. From a fresh start this is `index_shift = current_len`.
+        // Formed relative to the floor: it is the stored index of the block's
+        // end, which the first pass kept representable, while the block's
+        // absolute end plus the old offset need not fit a 32-bit word.
         debug_assert!(self.table.position_base <= current_abs_start);
         let index_shift =
-            current_abs_start + current_len + self.table.index_shift - self.table.position_base;
+            current_abs_start - self.table.position_base + current_len + self.table.index_shift;
         self.table.position_base = self.table.history_abs_start;
         self.table.index_shift = index_shift;
         self.table.next_to_update3 = current_abs_start;

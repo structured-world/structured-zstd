@@ -60,18 +60,6 @@ pub(crate) const REBASE_RESET_FLOOR_CEILING: usize = usize::MAX >> 1;
 pub(crate) const MAX_PRIMED_WINDOW_SIZE: usize =
     (u32::MAX as usize - crate::common::MAX_BLOCK_SIZE as usize) / 2;
 
-/// Frame-level overflow gate shared by `MatchTable`,
-/// `DfastMatchGenerator`, and `RowMatchGenerator`.
-///
-/// Each backend owns its own rolling window and `history_abs_start`
-/// cursor but they all hand absolute positions to inner loops that add
-/// small constants without per-iteration overflow checks. This helper
-/// enforces a single contract: the next `data.len()` bytes — together
-/// with the still-resident `window_size` — must leave at least
-/// `STREAM_ABS_HEADROOM` slack below `usize::MAX`. Failing fast here
-/// lets every downstream `abs_pos + N` site stay raw and keeps i686
-/// streams correct. New match-finder backends with their own
-/// `add_data` path must route through this helper.
 /// Whether a table buffer of `capacity` slots is too big to keep for a layout
 /// of `wanted` slots, and should be handed back rather than re-used.
 ///
@@ -90,6 +78,18 @@ pub(crate) fn capacity_is_oversized(capacity: usize, wanted: usize) -> bool {
     capacity / 2 > wanted
 }
 
+/// Frame-level overflow gate shared by `MatchTable`,
+/// `DfastMatchGenerator`, and `RowMatchGenerator`.
+///
+/// Each backend owns its own rolling window and `history_abs_start`
+/// cursor but they all hand absolute positions to inner loops that add
+/// small constants without per-iteration overflow checks. This helper
+/// enforces a single contract: the next `data.len()` bytes, together
+/// with the still-resident `window_size`, must leave at least
+/// `STREAM_ABS_HEADROOM` slack below `usize::MAX`. Failing fast here
+/// lets every downstream `abs_pos + N` site stay raw and keeps i686
+/// streams correct. New match-finder backends with their own
+/// `add_data` path must route through this helper.
 #[inline]
 pub(crate) fn check_stream_abs_headroom(
     history_abs_start: usize,
@@ -1304,8 +1304,12 @@ impl MatchTable {
     /// outside the current window's representable range. Upstream zstd parity:
     /// matches the `relIdx` arithmetic in `ZSTD_HcFindBestMatch`.
     pub(crate) fn relative_position(&self, abs_pos: usize) -> Option<u32> {
-        let shifted_abs = abs_pos.checked_add(self.index_shift)?;
-        let rel = shifted_abs.checked_sub(self.position_base)?;
+        // The distance from the floor first: the absolute position plus the
+        // shift need not fit a 32-bit word even when the stored index does,
+        // and an overflow here would read as "rebase now".
+        let rel = abs_pos
+            .checked_sub(self.position_base)?
+            .checked_add(self.index_shift)?;
         let rel_u32 = u32::try_from(rel).ok()?;
         // A frame's first position is a candidate like any other, from a fresh
         // compressor as from a reused one: upstream zstd starts its indices
@@ -1367,9 +1371,9 @@ impl MatchTable {
     pub(crate) fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
         // Hot per-iteration BT walker entry. `abs_pos` is a
         // frame-lifetime absolute stream cursor (capped by
-        // `check_stream_abs_headroom`); `index_shift` is block-local
-        // (`current_len` during the btultra2 seed pass, `0` otherwise).
-        // The result is immediately masked down to the BT ring width
+        // `check_stream_abs_headroom`); `index_shift` is the offset the
+        // btultra2 seed pass leaves behind, which a reused compressor carries
+        // into later frames until a rebase clears it. The result is immediately masked down to the BT ring width
         // by `& bt_mask()`, so what matters here is only the modulo-
         // ring identity `(a + b) mod m == ((a mod 2^bits) + (b mod
         // 2^bits)) mod m` for `m | 2^bits`: `wrapping_add` preserves
@@ -1396,11 +1400,16 @@ impl MatchTable {
         if stored == HC_EMPTY {
             return None;
         }
-        let shifted = position_base + (stored as usize - 1);
-        if shifted < index_shift {
+        // Subtract before adding: on a 32-bit build the floor reaches half the
+        // address space while a stored index reaches `u32::MAX`, so their sum
+        // does not fit the word. An entry below the shift decodes below
+        // `position_base`, which is at or under the window floor, so it is
+        // rejected here rather than by the window check.
+        let relative = stored as usize - 1;
+        if relative < index_shift {
             return None;
         }
-        Some(shifted - index_shift)
+        Some(position_base + (relative - index_shift))
     }
 
     /// Reset the per-frame portion of the storage for the next
@@ -2679,9 +2688,10 @@ impl MatchTable {
         // `ip++ / idx++` fill rather than recomputing them from `pos`.
         let mut src = unsafe { concat_ptr.add(start - history_abs_start) };
         // `rel` cannot reach `u32::MAX` because the caller proved
-        // `!needs_rebase(end - 1)`; `wrapping_add` keeps the overflow branch
-        // off this per-byte hot loop.
-        let mut rel = (start + index_shift - position_base) as u32;
+        // `!needs_rebase(end - 1)`, and the `wrapping_add` below keeps the
+        // overflow branch off this per-byte hot loop. The distance from the
+        // floor comes first so the sum stays in range on a 32-bit word.
+        let mut rel = (start - position_base + index_shift) as u32;
         for _ in start..hashable_end {
             // SAFETY: every `src` in `[start, hashable_end)` is at least 4
             // bytes from the end of `history`, so the unaligned 4-byte read is

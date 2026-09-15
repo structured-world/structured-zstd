@@ -2991,6 +2991,66 @@ fn a_btultra2_second_pass_sees_no_entry_from_before_it() {
     }
 }
 
+/// On a 32-bit build a long reused stream reaches a floor near half the
+/// address space while the offset the btultra2 seed pass leaves behind
+/// approaches `u32::MAX`, so neither the floor plus a stored index nor an
+/// absolute position plus the offset fits the word. Every conversion between
+/// the two, and the seed pass that forms the next offset, has to go through
+/// the distance from the floor. The table is put into that state directly and
+/// the frame must parse exactly as it does from the origin: an overflow panics
+/// in debug, and a wrapped sum reads as a spurious rebase or a lost candidate.
+#[test]
+fn a_btultra2_seed_pass_near_the_top_of_the_address_space_parses_like_a_fresh_one() {
+    let mut state = 0x6C07_8965u32;
+    let half: Vec<u8> = (0..20_000)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            b'a' + ((state >> 24) % 16) as u8
+        })
+        .collect();
+    let payload = [half.as_slice(), half.as_slice()].concat();
+
+    let parse = |floor: Option<(usize, usize)>| {
+        let mut driver = MatchGeneratorDriver::new(128 * 1024, 1);
+        driver.reset(CompressionLevel::Level(22));
+        if let Some((abs_start, index_shift)) = floor {
+            let table = &mut driver.hc_matcher_mut().table;
+            table.history_abs_start = abs_start;
+            table.position_base = abs_start;
+            table.index_shift = index_shift;
+            table.next_to_update3 = abs_start;
+            table.skip_insert_until_abs = abs_start;
+        }
+        let mut space = driver.get_next_space();
+        space.clear();
+        space.extend_from_slice(&payload);
+        driver.commit_space(space);
+        let mut sequences = Vec::new();
+        driver.start_matching(|seq| match seq {
+            Sequence::Literals { literals } => sequences.push((literals.len(), 0, 0)),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => sequences.push((literals.len(), offset, match_len)),
+        });
+        sequences
+    };
+
+    // Past `usize::MAX - u32::MAX` on any word size, with room left for the
+    // window and the block, so the block's end plus the offset does not fit
+    // while every relative position still does.
+    let abs_start = usize::MAX - (1 << 28);
+    let fresh = parse(None);
+    for (floor, index_shift) in [(1 << 20, 1 << 31), (abs_start, 0), (abs_start, 1 << 31)] {
+        assert_eq!(
+            parse(Some((floor, index_shift))),
+            fresh,
+            "floor {floor:#x}, shift {index_shift:#x}"
+        );
+    }
+}
+
 #[test]
 fn hc_prime_with_dictionary_disables_btultra2_seed_pass() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
