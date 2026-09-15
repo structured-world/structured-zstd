@@ -136,9 +136,54 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
         epoch_count = (nb_dmers / epoch_size).max(1);
     }
 
-    // Per-window dmer occurrence counts (upstream zstd `segmentFreqs`, u16: a window
-    // holds at most `dmers_in_k` <= k occurrences of one index).
-    let mut segment_freqs = vec![0u16; 1usize << f];
+    let layout = EpochLayout {
+        dmers_in_k,
+        epoch_size,
+        epoch_count,
+    };
+    // A window holds at most `dmers_in_k + 1` occurrences of one index (one
+    // past the segment before the oldest leaves). Upstream zstd keeps them in
+    // `u16` for any `k`; a longer segment than that counts in `u32`.
+    if dmers_in_k < usize::from(u16::MAX) {
+        select_segments::<u16>(sample, dict_size, f, d, &mut freqs, layout)
+    } else {
+        select_segments::<u32>(sample, dict_size, f, d, &mut freqs, layout)
+    }
+}
+
+/// How the corpus is walked: the dmers a segment spans, and the epochs it is
+/// split into.
+#[derive(Clone, Copy)]
+struct EpochLayout {
+    dmers_in_k: usize,
+    epoch_size: usize,
+    epoch_count: usize,
+}
+
+/// A dmer's occurrence count in the candidate window.
+trait WindowCount: Copy + PartialEq + core::ops::AddAssign + core::ops::SubAssign + From<u8> {}
+impl WindowCount for u16 {}
+impl WindowCount for u32 {}
+
+/// Pick a segment per epoch visit until `dict_size` bytes are filled, and
+/// return them as the dictionary.
+fn select_segments<C: WindowCount>(
+    sample: &[u8],
+    dict_size: usize,
+    f: u32,
+    d: usize,
+    freqs: &mut [u32],
+    layout: EpochLayout,
+) -> Vec<u8> {
+    let EpochLayout {
+        dmers_in_k,
+        epoch_size,
+        epoch_count,
+    } = layout;
+    let zero = C::from(0);
+    let one = C::from(1);
+    // Per-window dmer occurrence counts (upstream zstd `segmentFreqs`).
+    let mut segment_freqs = vec![zero; 1usize << f];
     // Fill from the back (upstream zstd layout) so the best segments sit at the end
     // of the dictionary and get referenced with the smallest offsets.
     let mut out = vec![0u8; dict_size];
@@ -162,15 +207,15 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
         let mut active_score = 0u64;
         while active_end < epoch_end {
             let idx = hash_dmer_index(sample, active_end, f, d);
-            if segment_freqs[idx] == 0 {
+            if segment_freqs[idx] == zero {
                 active_score += u64::from(freqs[idx]);
             }
             active_end += 1;
-            segment_freqs[idx] += 1;
+            segment_freqs[idx] += one;
             if active_end - active_begin == dmers_in_k + 1 {
                 let del = hash_dmer_index(sample, active_begin, f, d);
-                segment_freqs[del] -= 1;
-                if segment_freqs[del] == 0 {
+                segment_freqs[del] -= one;
+                if segment_freqs[del] == zero {
                     active_score -= u64::from(freqs[del]);
                 }
                 active_begin += 1;
@@ -184,7 +229,7 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
         // Reset the window counts for the next epoch.
         while active_begin < epoch_end {
             let del = hash_dmer_index(sample, active_begin, f, d);
-            segment_freqs[del] -= 1;
+            segment_freqs[del] -= one;
             active_begin += 1;
         }
         // Zero the chosen segment's frequencies: its dmers are covered.

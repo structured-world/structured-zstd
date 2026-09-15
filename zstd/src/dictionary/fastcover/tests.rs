@@ -142,6 +142,28 @@ fn fastcover_optimizer_handles_extreme_split_points() {
     assert_eq!(tuned_high.k, 128);
 }
 
+/// A segment longer than 65,535 dmers can hold that many copies of one dmer,
+/// which is more than a 16-bit window count holds: on a run of one repeated
+/// byte every dmer is the same. Such a `k` trains like any other. A segment
+/// scores its distinct dmers, and this corpus has one, so the dictionary is
+/// that dmer's bytes; a count that wrapped would score it again at each wrap.
+#[test]
+fn fastcover_trains_a_segment_longer_than_a_16_bit_count() {
+    let k = 66_000;
+    let sample = vec![0u8; 10 * k + 1000];
+    let dict = train_fastcover_raw(
+        sample.as_slice(),
+        k,
+        FastCoverParams {
+            k,
+            d: 8,
+            f: 20,
+            accel: 1,
+        },
+    );
+    assert_eq!(dict, [0u8; 8]);
+}
+
 #[test]
 fn fastcover_optimizer_reports_normalized_params() {
     let sample = corpus();
