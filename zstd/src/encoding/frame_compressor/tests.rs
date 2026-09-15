@@ -3512,6 +3512,36 @@ fn set_parameters_uncompressed_with_a_dictionary_attached_does_not_resolve_a_cdi
     assert_eq!(decoded, payload);
 }
 
+/// A dictionary frame that a strategy knob moves onto the fast strategy keeps
+/// its CDict row's targetLength (999 at level 22; upstream
+/// `ZSTD_overrideCParams` replaces only the strategy), which is the fast
+/// matcher's step, so the raw-literals gate reads that value too, as upstream
+/// `ZSTD_literalsCompressionIsDisabled` reads the effective cParams.
+#[test]
+fn dictionary_frame_moved_onto_fast_keeps_the_cdict_target_length_in_the_literal_gate() {
+    use crate::encoding::{CompressionParameters, Strategy};
+    let dict_raw = noise_bytes(4 * 1024, 5);
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(22))
+        .strategy(Strategy::Fast)
+        .build()
+        .expect("valid override");
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(22));
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_001C, dict_raw).unwrap(),
+    )
+    .unwrap();
+    enc.set_parameters(&params);
+    assert!(
+        enc.state.literal_compression_disabled,
+        "after set_parameters"
+    );
+    let _ = enc.compress_independent_frame(&noise_bytes(2048, 9));
+    assert!(
+        enc.state.literal_compression_disabled,
+        "at the frame's start"
+    );
+}
+
 /// The raw-literals gate (`ZSTD_literalsCompressionIsDisabled`: fast
 /// strategy with a positive targetLength) reads a `target_length` override on
 /// a dictionary frame as on any other: the dictionary is prepared with it, so

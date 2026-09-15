@@ -1232,7 +1232,8 @@ pub(crate) fn sync_effective_strategy<M: Matcher>(
 /// The effective strategy tag gates this (a strategy override can move a
 /// negative level off fast). For the fast strategy the level table sets
 /// `targetLength > 0` exactly on the negative (acceleration) rows (a CDict's
-/// too), so absent a `target_length` override `level < 0` is that test.
+/// too), so where [`gate_target_length`] has no value `level < 0` is that
+/// test.
 pub(crate) fn literal_compression_disabled(
     strategy_tag: crate::encoding::strategy::StrategyTag,
     level: CompressionLevel,
@@ -1249,6 +1250,36 @@ pub(crate) fn literal_compression_disabled(
                     |tl| tl > 0,
                 )
         }
+    }
+}
+
+/// The `target_length` the raw-literals gate reads for a frame: the caller's,
+/// else, for a dictionary frame a strategy knob moves onto the fast strategy,
+/// the CDict row's, which the fast matcher runs as its step (upstream
+/// `ZSTD_overrideCParams` replaces only the strategy, and
+/// `ZSTD_literalsCompressionIsDisabled` reads the resulting cParams). Every
+/// other frame's fast targetLength is what the level says, which
+/// [`literal_compression_disabled`] derives itself.
+pub(crate) fn gate_target_length(
+    level: CompressionLevel,
+    tuning: &FrameTuning,
+    dictionary: Option<&EncoderDictionary>,
+) -> Option<u32> {
+    match (tuning.target_length, tuning.strategy, dictionary) {
+        (Some(target_length), _, _) => Some(target_length),
+        (None, Some((crate::encoding::strategy::StrategyTag::Fast, _)), Some(dict))
+            if !dict.inner.dict_content.is_empty() =>
+        {
+            Some(
+                crate::encoding::cparams::get_cdict_cparams(
+                    crate::encoding::levels::config::numeric_level(level),
+                    dict.sizes().serialized,
+                    &crate::encoding::parameters::ParamOverrides::default(),
+                )
+                .target_length,
+            )
+        }
+        _ => None,
     }
 }
 
@@ -1723,7 +1754,11 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         self.state.literal_compression_disabled = literal_compression_disabled(
             self.state.strategy_tag,
             self.compression_level,
-            self.tuning.target_length,
+            gate_target_length(
+                self.compression_level,
+                &self.tuning,
+                self.dictionary.as_ref().filter(|_| with_dictionary),
+            ),
             self.tuning.literal_compression,
         );
         self.state.matcher.set_param_overrides(Some(overrides));
@@ -2421,7 +2456,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.state.literal_compression_disabled = literal_compression_disabled(
             self.state.strategy_tag,
             self.compression_level,
-            self.tuning.target_length,
+            gate_target_length(
+                self.compression_level,
+                &self.tuning,
+                self.dictionary.as_ref().filter(|_| use_dictionary_state),
+            ),
             self.tuning.literal_compression,
         );
         let cached_entropy = if use_dictionary_state {

@@ -908,7 +908,11 @@ impl<M: Matcher> CompressionContext<M> {
             crate::encoding::frame_compressor::literal_compression_disabled(
                 self.state.strategy_tag,
                 self.compression_level,
-                self.tuning.target_length,
+                crate::encoding::frame_compressor::gate_target_length(
+                    self.compression_level,
+                    &self.tuning,
+                    self.dictionary.as_ref().filter(|_| use_dictionary_state),
+                ),
                 self.tuning.literal_compression,
             );
         // Seed the repeat-offset history from the dictionary (upstream zstd

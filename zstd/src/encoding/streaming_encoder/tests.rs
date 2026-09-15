@@ -731,6 +731,26 @@ fn streaming_encoder_literal_gate_follows_the_effective_target_length() {
         .unwrap();
     with_dict.write_all(b"dictionary frame payload").unwrap();
     assert!(with_dict.context.state.literal_compression_disabled);
+
+    // A strategy knob alone moves a level-22 dictionary frame onto the fast
+    // strategy with its CDict row's targetLength (999), the fast step, which
+    // the gate reads as well.
+    let fast = CompressionParameters::builder(CompressionLevel::Level(22))
+        .strategy(crate::encoding::Strategy::Fast)
+        .build()
+        .expect("valid override");
+    let dict: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut moved = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(22));
+    moved.set_parameters(&fast).unwrap();
+    moved
+        .set_encoder_dictionary(crate::encoding::EncoderDictionary::from_dictionary(
+            crate::decoding::Dictionary::from_raw_content(0xD1C7_001D, dict).unwrap(),
+        ))
+        .unwrap();
+    moved.write_all(b"dictionary frame payload").unwrap();
+    assert!(moved.context.state.literal_compression_disabled);
 }
 
 /// Pre-write `set_magicless(true)` → emitted frame omits the
