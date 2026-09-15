@@ -1739,12 +1739,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // the owned path. Every borrowed scan applies the per-position
         // `window_low = abs_ip - advertised_window` offset cap so over-window
         // inputs are matched in place (no input->history copy), matching C's
-        // continuous-index + windowLow one-shot behaviour. A reused Dfast
-        // matcher whose tables hold earlier frames takes the owned path, which
-        // retires them by moving the floor, so it writes what a fresh one does
-        // (upstream: first and later uses of a context compress the same).
+        // continuous-index + windowLow one-shot behaviour.
         self.state.matcher.borrowed_supported()
-            && self.state.matcher.borrowed_frame_is_independent()
     }
 
     /// Compress `input` as one frame's worth of blocks into `out` (appended
@@ -1755,6 +1751,15 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// known) or the drain tail.
     fn run_one_frame(&mut self, input: &[u8], prep: &FramePrep, out: &mut Vec<u8>) -> u64 {
         if self.borrowed_eligible(input.len(), prep) {
+            // A reused Dfast matcher's tables hold earlier frames, which its
+            // borrowed kernel (numbering this input from zero) would read as
+            // its own: emptied, the frame is the one a fresh matcher writes
+            // (upstream: first and later uses of a context compress the
+            // same). Measured cheaper than the owned path, which retires them
+            // by moving the floor but copies the input and runs slower.
+            if !self.state.matcher.borrowed_frame_is_independent() {
+                self.state.matcher.forget_earlier_frames();
+            }
             self.run_borrowed_block_loop(input, out)
         } else {
             let mut cursor: &[u8] = input;

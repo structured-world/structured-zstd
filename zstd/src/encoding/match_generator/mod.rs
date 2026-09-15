@@ -585,6 +585,14 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// Make [`Self::borrowed_frame_is_independent`] hold by emptying the
+    /// tables of earlier frames.
+    pub(crate) fn forget_earlier_frames(&mut self) {
+        if let MatcherStorage::Dfast(d) = &mut self.storage {
+            d.forget_earlier_frames();
+        }
+    }
+
     /// Whether a DICTIONARY frame can take the borrowed (no input copy) path.
     /// Only the Simple (Fast) backend with the dictionary ATTACHED (not the
     /// copy/merge regime) has a borrowed dict scan — `start_matching_borrowed_dict`

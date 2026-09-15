@@ -1724,6 +1724,14 @@ impl DfastMatchGenerator {
         }
     }
 
+    /// Empty the tables of every slot an earlier frame wrote, so a borrowed
+    /// scan that numbers its input from zero sees only its own frame.
+    pub(crate) fn forget_earlier_frames(&mut self) {
+        self.tables.fill(DFAST_EMPTY_SLOT);
+        self.position_base = 0;
+        self.tables_hold_earlier_frames = false;
+    }
+
     pub(crate) fn ensure_hash_tables(&mut self) {
         // Independent sizing per upstream zstd `clevels.h`: long-hash =
         // `hashLog`, short-hash = `chainLog`. Lazy allocation so
