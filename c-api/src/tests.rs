@@ -3253,7 +3253,7 @@ fn sizeof_cctx_counts_a_shared_dictionary_once_and_a_referenced_one_never() {
         unsafe { one_shot_frame(cctx, &payload) };
         unsafe { streamed_frame(cctx, &payload) };
 
-        let context = unsafe { &*cctx };
+        let context = unsafe { cctx.as_ref() }.expect("the context was allocated");
         let [compressor_dictionary, stream_dictionary] = held_dictionaries(context);
         let dictionary = compressor_dictionary.expect("the one-shot compressor holds it");
         assert!(
@@ -3317,7 +3317,8 @@ fn a_dictionary_the_context_moved_on_from_is_not_kept() {
         assert_eq!(ZSTD_isError(loaded), 0);
         unsafe { one_shot_frame(cctx, &payload) };
         unsafe { streamed_frame(cctx, &payload) };
-        let old = unsafe { &*cctx }
+        let old = unsafe { cctx.as_ref() }
+            .expect("the context was allocated")
             .attached_dict
             .prepared()
             .expect("loaded")
@@ -3346,7 +3347,7 @@ fn a_dictionary_the_context_moved_on_from_is_not_kept() {
             }
         }
         assert!(
-            held_dictionaries(unsafe { &*cctx })
+            held_dictionaries(unsafe { cctx.as_ref() }.expect("the context was allocated"))
                 .iter()
                 .all(Option::is_none),
             "streamed: {streamed}: the spent prefix is still held"
