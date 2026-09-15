@@ -222,8 +222,28 @@ fn a_count_table_that_does_not_fit_is_an_error() {
         zeroed_counts::<u32>(entries).unwrap_err(),
         TableTooLarge { entries }
     );
+    // One the target can lay out and no allocator can back (a 32-bit
+    // address space may still hold that one).
+    #[cfg(target_pointer_width = "64")]
+    {
+        let entries = isize::MAX as usize / 4;
+        assert_eq!(
+            zeroed_counts::<u32>(entries).unwrap_err(),
+            TableTooLarge { entries }
+        );
+    }
     let table = zeroed_counts::<u16>(1 << 12).unwrap();
     assert_eq!(table.len(), 1 << 12);
+    assert!(table.iter().all(|&count| count == 0));
+    assert!(zeroed_counts::<u16>(0).unwrap().is_empty());
+}
+
+/// A sample shorter than one dmer counts nothing: the table comes back at
+/// its width, every count zero.
+#[test]
+fn a_sample_shorter_than_a_dmer_counts_nothing() {
+    let table = build_frequency_table(b"abc", 8, 10, 1).unwrap();
+    assert_eq!(table.len(), 1 << 10);
     assert!(table.iter().all(|&count| count == 0));
 }
 

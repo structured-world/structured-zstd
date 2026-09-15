@@ -603,7 +603,11 @@ fn train_fastcover_internal(
             )
         })
     };
-    trained.map_err(|table| {
+    trained.map_err(io::Error::from)
+}
+
+impl From<fastcover::TableTooLarge> for io::Error {
+    fn from(table: fastcover::TableTooLarge) -> Self {
         io::Error::new(
             io::ErrorKind::OutOfMemory,
             format!(
@@ -611,7 +615,7 @@ fn train_fastcover_internal(
                 table.entries
             ),
         )
-    })
+    }
 }
 
 /// Train a raw FastCOVER dictionary directly from an in-memory sample.

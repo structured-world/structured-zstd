@@ -78,7 +78,8 @@ fn named_symlinks_are_skipped_unless_links_are_followed() {
     let link = scratch.path().join("link.txt");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    let kept = select_inputs(vec![target.clone(), link.clone()], &[], false, false, 0).unwrap();
+    // At the verbosity that reports the skipped link.
+    let kept = select_inputs(vec![target.clone(), link.clone()], &[], false, false, 2).unwrap();
     assert_eq!(kept.files, vec![target.clone()], "the link is dropped");
 
     let followed = select_inputs(vec![target.clone(), link.clone()], &[], false, true, 0).unwrap();
@@ -123,7 +124,8 @@ fn a_link_back_into_the_tree_is_not_walked_twice_under_f() {
     )
     .unwrap();
 
-    let selection = select_inputs(vec![scratch.path().join("tree")], &[], true, true, 0).unwrap();
+    // At the verbosity that reports the loop.
+    let selection = select_inputs(vec![scratch.path().join("tree")], &[], true, true, 2).unwrap();
     assert_eq!(selection.files, vec![leaf]);
 }
 
@@ -139,7 +141,8 @@ fn symlinks_inside_a_walked_tree_are_skipped_unless_followed() {
     std::os::unix::fs::symlink(&other, scratch.path().join("dir/link.txt")).unwrap();
 
     let dir = scratch.path().join("dir");
-    let skipped = select_inputs(vec![dir.clone()], &[], true, false, 0).unwrap();
+    // At the verbosity that reports the skipped link.
+    let skipped = select_inputs(vec![dir.clone()], &[], true, false, 2).unwrap();
     assert_eq!(skipped.files, vec![real.clone()]);
 
     let followed = select_inputs(vec![dir.clone()], &[], true, true, 0).unwrap();
@@ -163,7 +166,8 @@ fn an_unreadable_directory_is_skipped_and_the_walk_goes_on() {
     // there is no unreadable directory to test.
     let binding = fs::read_dir(&locked).is_err();
 
-    let selection = select_inputs(vec![scratch.path().join("tree")], &[], true, false, 0);
+    // At the verbosity that reports the directory.
+    let selection = select_inputs(vec![scratch.path().join("tree")], &[], true, false, 1);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     if binding {
         assert_eq!(selection.expect("the walk goes on").files, vec![readable]);
@@ -257,6 +261,22 @@ fn a_filelist_past_the_limit_is_refused_while_reading() {
     );
 }
 
+/// A list whose size is already past the limit is refused before it is
+/// opened, and says so. Sparse, so the test writes nothing of it.
+#[test]
+fn a_filelist_reported_past_the_limit_is_refused_up_front() {
+    let scratch = Scratch::new("hugelist");
+    let list = scratch.path().join("list.txt");
+    fs::File::create(&list)
+        .unwrap()
+        .set_len(super::FILELIST_MAX_BYTES + 1)
+        .unwrap();
+    let err = select_inputs(Vec::new(), &[list], false, false, 0)
+        .expect_err("a list past the limit is refused")
+        .to_string();
+    assert!(err.contains("larger than"), "{err}");
+}
+
 /// Names from a list are expanded by `-r` like names from the command line:
 /// the list is just another way of typing them.
 #[test]
@@ -346,6 +366,38 @@ fn mirrored_output_replays_the_source_directory_under_the_root() {
     );
     assert_eq!(mirrored_output_dir(Path::new("../x.txt"), root), None);
     assert_eq!(mirrored_output_dir(Path::new("a/../b/x.txt"), root), None);
+    // A path with nothing left once the root is dropped lands in the root.
+    assert_eq!(
+        mirrored_output_dir(Path::new("/"), root),
+        Some(PathBuf::from("out"))
+    );
+}
+
+/// A source with no directory to mirror needs only the root, and a root that
+/// cannot be a directory (a file is there, or under it) is an error rather
+/// than a mirror written somewhere else.
+#[test]
+fn a_mirror_root_is_created_alone_or_refused() {
+    let scratch = Scratch::new("mirrorroot");
+    let root = scratch.path().join("root");
+    create_mirrored_dirs(Path::new("/"), &root).expect("the root alone is created");
+    assert!(root.is_dir());
+    assert_eq!(
+        fs::read_dir(&root).unwrap().count(),
+        0,
+        "and nothing under it"
+    );
+
+    let file = scratch.file("occupied");
+    let src = Path::new("dir/leaf.txt");
+    assert!(
+        create_mirrored_dirs(src, &file).is_err(),
+        "a file where the root goes"
+    );
+    assert!(
+        create_mirrored_dirs(src, &file.join("below")).is_err(),
+        "a root under a file"
+    );
 }
 
 /// The mirrored directories are created before the output is written, each
@@ -426,6 +478,11 @@ fn compressed_extensions_are_matched_on_the_last_dot() {
     assert!(!has_compressed_extension(Path::new("A.GZ")));
     assert!(!has_compressed_extension(Path::new("noext")));
     assert!(!has_compressed_extension(Path::new("dir.gz/plain")));
+    assert!(
+        !has_compressed_extension(Path::new("/")),
+        "no file name, no extension"
+    );
+    assert!(!has_compressed_extension(Path::new("a.gz/..")));
 }
 
 /// A Unix file name is bytes, and the part before the extension need not be

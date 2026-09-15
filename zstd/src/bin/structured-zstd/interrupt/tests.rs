@@ -36,9 +36,20 @@ fn a_long_path_is_guarded_and_an_empty_one_is_not() {
     super::imp::forget_inherited();
     super::imp::take_default_action();
     clear();
+    assert!(
+        super::imp::stored_path().is_empty(),
+        "nothing is held before the first guard"
+    );
+    guard(Path::new("short"));
+    assert!(is_guarded(), "a short path is guarded");
     let long = "x".repeat(5000);
     guard(Path::new(&long));
     assert!(is_guarded(), "a path past 4096 units is guarded");
+    assert_eq!(
+        super::imp::stored_path().len(),
+        long.len(),
+        "in a buffer grown past the short one's"
+    );
     clear();
     guard(Path::new("short"));
     assert!(is_guarded(), "and a short one after it, in the same buffer");
@@ -46,6 +57,47 @@ fn a_long_path_is_guarded_and_an_empty_one_is_not() {
     guard(Path::new(""));
     assert!(!is_guarded(), "an empty name is not");
     clear();
+}
+
+/// A name with a NUL inside is not one `unlink` can be handed: the handler
+/// would remove whatever its prefix names. It is not guarded.
+#[cfg(unix)]
+#[test]
+fn a_name_with_a_nul_inside_is_not_guarded() {
+    use std::os::unix::ffi::OsStrExt;
+    super::imp::forget_inherited();
+    super::imp::take_default_action();
+    clear();
+    guard(Path::new(std::ffi::OsStr::from_bytes(b"/tmp/szstd\0tail")));
+    assert!(!is_guarded());
+    clear();
+}
+
+/// What an interruption does before the process exits: the published
+/// temporary is removed, and from then on a guard publishes nothing more,
+/// since the process is ending.
+#[cfg(any(unix, windows))]
+#[test]
+fn an_interruption_removes_the_published_temporary() {
+    super::imp::forget_inherited();
+    super::imp::take_default_action();
+    clear();
+    let dir = std::env::temp_dir().join(format!("szstd-remove-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let temporary = dir.join("output.zst.tmp");
+    std::fs::write(&temporary, b"partial").unwrap();
+    guard(&temporary);
+    super::imp::remove_published();
+    let left_behind = temporary.exists();
+    guard(&dir.join("next.zst.tmp"));
+    let guarded_after = is_guarded();
+    clear();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(!left_behind, "the published temporary was left behind");
+    assert!(
+        !guarded_after,
+        "a guard after the interruption published a name"
+    );
 }
 
 /// On Windows the handler runs on a thread of its own, so it can read the
@@ -104,6 +156,11 @@ fn an_inherited_ignore_of_sigint_is_kept() {
     assert!(
         !is_guarded(),
         "with interruptions ignored there is nothing to guard against"
+    );
+    guard(Path::new("/tmp/szstd-guard-test-next"));
+    assert!(
+        !is_guarded(),
+        "nor for the next file, which reads the inherited ignore it remembered"
     );
     assert!(
         super::imp::interrupts_ignored(),

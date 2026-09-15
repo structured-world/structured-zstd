@@ -69,6 +69,15 @@ impl<R: Read> ProgressMonitor<R> {
             return;
         }
         self.last_draw = now;
+        let line = self.line();
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(line.as_bytes());
+        let _ = err.flush();
+    }
+
+    /// The bar as drawn, from the start of the line: how much of the total
+    /// has been read, or how much has been read where there is no total.
+    fn line(&self) -> String {
         let mut line = String::with_capacity(LINE_WIDTH);
         line.push('\r');
         match self.total {
@@ -96,9 +105,7 @@ impl<R: Read> ProgressMonitor<R> {
                 let _ = write!(&mut line, "Read : {}", HumanSize::new(self.read, false));
             }
         }
-        let mut err = std::io::stderr().lock();
-        let _ = err.write_all(line.as_bytes());
-        let _ = err.flush();
+        line
     }
 
     /// Whether the counter is drawn (for tests).

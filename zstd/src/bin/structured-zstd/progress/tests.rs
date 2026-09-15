@@ -56,6 +56,57 @@ fn a_file_length_is_not_narrowed_to_the_pointer_width() {
     );
 }
 
+/// The bar fills in proportion to what has been read of the total: half of
+/// it is half the bar, a read past a total that turned out short fills it and
+/// no more, and a total of zero (a FIFO's directory entry) fills none. With
+/// no total at all there is no bar, only the count.
+#[test]
+fn the_bar_fills_with_the_share_read() {
+    let filled = |read: u64, total: Option<u64>| {
+        let mut monitor = ProgressMonitor::new(&b""[..], total, true);
+        monitor.read = read;
+        let line = monitor.line();
+        assert!(
+            line.starts_with('\r'),
+            "{line:?}: drawn from the line start"
+        );
+        line.matches('#').count()
+    };
+    assert_eq!(filled(1000, Some(2000)), super::BAR_WIDTH / 2);
+    assert_eq!(filled(5000, Some(2000)), super::BAR_WIDTH);
+    assert_eq!(filled(1000, Some(0)), 0);
+    let mut counting = ProgressMonitor::new(&b""[..], None, true);
+    counting.read = 1000;
+    let line = counting.line();
+    assert!(line.starts_with("\rRead : "), "{line:?}");
+    assert!(!line.contains('['), "{line:?}: no bar without a total");
+}
+
+/// A shown monitor redraws no more often than the interval, draws once the
+/// interval has passed, and clears its line when the reader ends.
+#[test]
+fn a_shown_monitor_redraws_on_the_interval_and_clears_at_the_end() {
+    let data = [7u8; 64];
+    let mut monitor = ProgressMonitor::new(&data[..], Some(data.len() as u64), true);
+    assert!(monitor.is_shown());
+    let mut buf = [0u8; 16];
+    let drawn_at = monitor.last_draw;
+    assert_eq!(monitor.read(&mut buf).unwrap(), buf.len());
+    assert_eq!(
+        monitor.last_draw, drawn_at,
+        "within the interval: no redraw"
+    );
+    let overdue = std::time::Instant::now()
+        .checked_sub(super::REDRAW_INTERVAL * 2)
+        .expect("the clock reaches back one interval");
+    monitor.last_draw = overdue;
+    assert_eq!(monitor.read(&mut buf).unwrap(), buf.len());
+    assert!(monitor.last_draw > overdue, "past the interval: redrawn");
+    let mut sink = Vec::new();
+    io::copy(&mut monitor, &mut sink).unwrap();
+    assert!(monitor.finished, "and the end clears it");
+}
+
 /// A read error is the reader's to report; the monitor passes it through
 /// without counting bytes that never arrived or declaring the stream done.
 #[test]

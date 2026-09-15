@@ -204,6 +204,16 @@ mod imp {
 
     /// Remove the published temporary, if any, and exit with status 2.
     fn end_interrupted() -> ! {
+        remove_published();
+        // SAFETY: a plain exit with a constant status.
+        unsafe {
+            sys::_exit(2);
+        }
+    }
+
+    /// What an interruption does before the process exits: remove the
+    /// published temporary, if any, and end the line on stderr.
+    pub fn remove_published() {
         HANDLING.store(true, Ordering::SeqCst);
         let path = ARTEFACT.load(Ordering::SeqCst);
         // SAFETY: a non-null `path` points at a buffer that holds a
@@ -215,10 +225,6 @@ mod imp {
             }
         }
         sys::newline();
-        // SAFETY: a plain exit with a constant status.
-        unsafe {
-            sys::_exit(2);
-        }
     }
 
     /// Put `on_interrupt` in place, and say whether it is. A `SIGINT` the

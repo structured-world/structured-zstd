@@ -304,11 +304,12 @@ impl<W: Write, M: Matcher, C: BorrowMut<CompressionContext<M>>> StreamingEncoder
         Ok(drain)
     }
 
-    fn drain_mut(&mut self) -> Result<(&mut W, &mut CompressionContext<M>), Error> {
-        match self.drain.as_mut() {
-            Some(drain) => Ok((drain, self.context.borrow_mut())),
-            None => Err(other_error("streaming encoder has no active drain")),
-        }
+    fn drain_mut(&mut self) -> (&mut W, &mut CompressionContext<M>) {
+        let drain = self
+            .drain
+            .as_mut()
+            .expect("streaming encoder drain is present until finish consumes self");
+        (drain, self.context.borrow_mut())
     }
 }
 
@@ -326,12 +327,12 @@ impl<W: Write, M: Matcher, C: BorrowMut<CompressionContext<M>>> Write
     for StreamingEncoder<W, M, C>
 {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        let (drain, context) = self.drain_mut()?;
+        let (drain, context) = self.drain_mut();
         context.write(drain, buf)
     }
 
     fn flush(&mut self) -> Result<(), Error> {
-        let (drain, context) = self.drain_mut()?;
+        let (drain, context) = self.drain_mut();
         context.flush(drain)
     }
 }
@@ -686,15 +687,10 @@ impl<M: Matcher> CompressionContext<M> {
         // Enforce pledged upper bound: truncate the accepted slice to the
         // remaining allowance so that partial-write semantics are honored
         // (return Ok(n) with n < buf.len()) instead of failing the full call.
+        // The check above leaves at least one byte of it.
         let buf = if let Some(pledged) = self.pledged_content_size {
-            let remaining_allowed = pledged
-                .checked_sub(self.bytes_consumed)
-                .ok_or_else(|| invalid_input_error("bytes consumed exceed pledged content size"))?;
-            if remaining_allowed == 0 {
-                return Err(invalid_input_error(
-                    "write would exceed pledged content size",
-                ));
-            }
+            debug_assert!(self.bytes_consumed < pledged);
+            let remaining_allowed = pledged - self.bytes_consumed;
             let accepted = core::cmp::min(
                 buf.len(),
                 usize::try_from(remaining_allowed).unwrap_or(usize::MAX),
@@ -712,24 +708,18 @@ impl<M: Matcher> CompressionContext<M> {
         let mut consumed = 0usize;
 
         while !remaining.is_empty() {
-            if let Some(result) = self.emit_full_pending_block(drain, block_capacity, consumed) {
-                return result;
-            }
-
-            let available = block_capacity - self.pending.len();
-            let to_take = core::cmp::min(remaining.len(), available);
-            if to_take == 0 {
-                break;
-            }
+            // A block is emitted the moment it fills, below, and the
+            // capacity is fixed for the frame, so there is always room here.
+            debug_assert!(self.pending.len() < block_capacity);
+            let to_take = core::cmp::min(remaining.len(), block_capacity - self.pending.len());
             self.pending.extend_from_slice(&remaining[..to_take]);
             remaining = &remaining[to_take..];
             consumed += to_take;
 
-            if let Some(result) = self.emit_full_pending_block(drain, block_capacity, consumed) {
-                if let Ok(n) = &result {
-                    self.bytes_consumed += *n as u64;
-                }
-                return result;
+            if self.emit_full_pending_block(drain, block_capacity).is_err() {
+                // The bytes this call took are reported; the failure, sticky
+                // on the context now, is what the next call returns.
+                break;
             }
         }
         self.bytes_consumed += consumed as u64;
@@ -1111,24 +1101,19 @@ impl<M: Matcher> CompressionContext<M> {
         Ok(())
     }
 
+    /// Emit the pending block once it is full, cut where the pre-splitter
+    /// says; a failure leaves the context failed.
     fn emit_full_pending_block<D: Write + ?Sized>(
         &mut self,
         drain: &mut D,
         block_capacity: usize,
-        consumed: usize,
-    ) -> Option<Result<usize, Error>> {
+    ) -> Result<(), Error> {
         if self.pending.len() != block_capacity {
-            return None;
+            return Ok(());
         }
         let block_len = self.pre_split_len(block_capacity, block_capacity);
-        if let Err(err) = self.emit_pending_prefix(drain, block_len, block_capacity) {
-            let err = self.fail(err);
-            if consumed > 0 {
-                return Some(Ok(consumed));
-            }
-            return Some(Err(err));
-        }
-        None
+        self.emit_pending_prefix(drain, block_len, block_capacity)
+            .map_err(|err| self.fail(err))
     }
 
     fn emit_pending_block<D: Write + ?Sized>(

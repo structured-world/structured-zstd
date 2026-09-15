@@ -3357,6 +3357,43 @@ fn dictionary_frame_runs_a_strategy_override() {
     assert_eq!(decoded, payload);
 }
 
+/// The bytes a set of dictionary handles alone keeps alive: one dictionary
+/// held twice in the set counts once, one also held outside the set counts
+/// nothing, and distinct dictionaries each count. A compressor reports the
+/// dictionary it holds.
+#[test]
+fn exclusive_heap_size_counts_what_only_the_set_holds() {
+    use crate::encoding::EncoderDictionary;
+    let first = EncoderDictionary::from_serialized_or_raw_content(&noise_bytes(4096, 3)).unwrap();
+    let second = EncoderDictionary::from_serialized_or_raw_content(&noise_bytes(2048, 4)).unwrap();
+    let first_again = first.clone();
+    assert_eq!(
+        EncoderDictionary::exclusive_heap_size([&first, &first_again, &second]),
+        first.heap_size() + second.heap_size()
+    );
+    assert_eq!(
+        EncoderDictionary::exclusive_heap_size([&first, &second]),
+        second.heap_size(),
+        "the clone outside the set keeps the first alive on its own"
+    );
+    assert_eq!(
+        EncoderDictionary::exclusive_heap_size(core::iter::empty::<&EncoderDictionary>()),
+        0
+    );
+
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(3));
+    assert!(enc.dictionary().is_none());
+    enc.set_encoder_dictionary(second.clone())
+        .expect("the dictionary attaches");
+    let held = enc
+        .dictionary()
+        .expect("the compressor holds the dictionary");
+    assert_eq!(
+        EncoderDictionary::exclusive_heap_size([held, &second]),
+        second.heap_size()
+    );
+}
+
 /// The fast strategy hashes a key of at least 4 bytes: upstream's fast block
 /// compressor takes a minMatch of 3 as 4 (zstd_fast.c,
 /// `ZSTD_compressBlock_fast`: `default: /* includes case 3 */`). A min_match

@@ -280,6 +280,17 @@ fn a_frequency_table_too_wide_for_the_target_is_an_error() {
     assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
 }
 
+/// A table that does not fit reaches the caller as an out-of-memory error
+/// that names the table and the knob that sizes it.
+#[test]
+fn a_table_that_does_not_fit_is_an_out_of_memory_error() {
+    let err = io::Error::from(super::fastcover::TableTooLarge { entries: 1 << 31 });
+    assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+    let message = err.to_string();
+    assert!(message.contains("2147483648 entries"), "{message}");
+    assert!(message.contains("smaller f"), "{message}");
+}
+
 #[test]
 fn train_fastcover_raw_from_slice_normalizes_non_optimized_params() {
     let sample = training_data();

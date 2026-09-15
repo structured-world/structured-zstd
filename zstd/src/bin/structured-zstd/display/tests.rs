@@ -23,10 +23,10 @@ fn sizes_scale_and_round_the_way_the_reference_prints_them() {
     assert_eq!(HumanSize::new(1 << 40, false).to_string(), "1 TiB");
 }
 
-/// Below one unit the value keeps three decimals: a file just under a
-/// kibibyte scaled to KiB would otherwise print as `1 KiB`, which it is not.
+/// A value just over a whole unit keeps two decimals: a file a byte over a
+/// kibibyte would otherwise print as `1 KiB`, which it is not.
 #[test]
-fn a_fraction_of_a_unit_keeps_three_decimals() {
+fn a_value_just_over_a_unit_keeps_two_decimals() {
     let size = HumanSize::new((1 << 20) + 1, false);
     assert_eq!(size.precision(), 2);
     let just_over_a_unit = HumanSize::new(1024 + 1, false);

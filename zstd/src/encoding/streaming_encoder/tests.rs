@@ -141,6 +141,68 @@ fn a_frame_that_did_not_finish_is_not_continued_by_the_next_encoder() {
     next_frame(&mut context, "pledged and never written");
 }
 
+/// The encoder's frame settings reach the context it writes through: a
+/// block-size target, the content-size flag and the dictionary-ID flag each
+/// give the frame the context gives with the same setting, and a frame other
+/// than the one without it. The context reports the dictionary it holds.
+#[test]
+fn encoder_settings_reach_its_context() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let payload: Vec<u8> = (0..400u32)
+        .flat_map(|i| alloc::format!("tenant=demo table=orders key={i} region=eu\n").into_bytes())
+        .collect();
+    type Setting = fn(&mut CompressionContext) -> Result<(), crate::io::Error>;
+    type EncoderSetting = fn(&mut StreamingEncoder<Vec<u8>>) -> Result<(), crate::io::Error>;
+    let settings: [(&str, Setting, EncoderSetting); 3] = [
+        (
+            "target block size",
+            |context| context.set_target_block_size(Some(2048)),
+            |encoder| encoder.set_target_block_size(Some(2048)),
+        ),
+        (
+            "content size flag",
+            |context| context.set_content_size_flag(false),
+            |encoder| encoder.set_content_size_flag(false),
+        ),
+        (
+            "dictionary ID flag",
+            |context| context.set_dictionary_id_flag(false),
+            |encoder| encoder.set_dictionary_id_flag(false),
+        ),
+    ];
+    let through_context = |setting: Setting| {
+        let mut context = CompressionContext::new(CompressionLevel::Default);
+        context.set_dictionary_from_bytes(dict_raw).unwrap();
+        assert!(context.dictionary().is_some());
+        setting(&mut context).unwrap();
+        let mut frame = Vec::new();
+        context
+            .set_pledged_content_size(payload.len() as u64)
+            .unwrap();
+        context.write(&mut frame, &payload).unwrap();
+        context.finish_frame(&mut frame).unwrap();
+        frame
+    };
+    for (name, setting, encoder_setting) in settings {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Default);
+        encoder.set_dictionary_from_bytes(dict_raw).unwrap();
+        encoder_setting(&mut encoder).unwrap();
+        encoder
+            .set_pledged_content_size(payload.len() as u64)
+            .unwrap();
+        encoder.write_all(&payload).unwrap();
+        let frame = encoder.finish().unwrap();
+        assert!(
+            frame == through_context(setting),
+            "{name}: not the context's frame"
+        );
+        assert!(
+            frame != through_context(|_| Ok(())),
+            "{name}: the setting changed nothing"
+        );
+    }
+}
+
 /// Unsized frames in a row keep one table geometry, so a reused context keeps
 /// the previous frame's table entries and only moves the floor past them,
 /// where the pledged frames above change geometry and start from cleared
