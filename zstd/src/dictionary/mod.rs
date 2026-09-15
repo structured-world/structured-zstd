@@ -78,6 +78,8 @@ pub struct FastCoverOptions {
     pub accel: usize,
     pub k: usize,
     pub d: usize,
+    /// Width of the dmer frequency table in bits, `1..=31`; its memory grows
+    /// as `2^f`. A value outside the range is brought to the nearest end.
     pub f: u32,
     pub k_candidates: Vec<usize>,
     pub d_candidates: Vec<usize>,

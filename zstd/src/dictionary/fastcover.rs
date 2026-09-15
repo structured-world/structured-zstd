@@ -59,8 +59,12 @@ fn hash_dmer_index(sample: &[u8], pos: usize, f: u32, d: usize) -> usize {
     (h >> (64 - f)) as usize
 }
 
+/// The frequency-table width, in the range upstream zstd's FastCOVER takes
+/// (`FASTCOVER_MAX_F`, fastcover.c). A width outside it is brought to its
+/// nearest end rather than refused; inside it, the width is used as given, so
+/// memory grows as `2^f` exactly as the caller chose.
 fn clamp_table_bits(f: u32) -> u32 {
-    f.clamp(8, 20)
+    f.clamp(1, 31)
 }
 
 pub(crate) fn normalize_fastcover_params(mut params: FastCoverParams) -> FastCoverParams {
@@ -128,11 +132,15 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     // Upstream zstd `COVER_computeEpochs` (passes = 1): target one selection per
     // epoch, with a floor so epochs stay large enough to contain useful
     // segments.
-    let min_epoch_size = k * 10;
+    // The floor only matters up to the corpus it is capped at, so a product
+    // past `usize` (a `k` near the top of it) is that cap, not an overflow.
+    let min_epoch_size = k
+        .checked_mul(10)
+        .map_or(nb_dmers, |floor| floor.min(nb_dmers));
     let mut epoch_count = (dict_size / k).max(1);
     let mut epoch_size = nb_dmers / epoch_count;
     if epoch_size < min_epoch_size {
-        epoch_size = min_epoch_size.min(nb_dmers);
+        epoch_size = min_epoch_size;
         epoch_count = (nb_dmers / epoch_size).max(1);
     }
 

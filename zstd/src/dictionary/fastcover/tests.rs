@@ -164,13 +164,76 @@ fn fastcover_trains_a_segment_longer_than_a_16_bit_count() {
     assert_eq!(dict, [0u8; 8]);
 }
 
+/// `f` is the width of the frequency table, and every width the trainer's
+/// interface takes (1..=31) is used as given rather than moved into a
+/// narrower band the caller never asked for. Training runs at a width on
+/// either side of the band the defaults search.
+#[test]
+fn fastcover_uses_every_table_width_it_is_given() {
+    for f in [1, 4, 8, 20, 24, 31] {
+        let params = normalize_fastcover_params(FastCoverParams {
+            k: 256,
+            d: 8,
+            f,
+            accel: 1,
+        });
+        assert_eq!(params.f, f);
+    }
+    let sample = corpus();
+    for f in [4, 24] {
+        let dict = train_fastcover_raw(
+            sample.as_slice(),
+            4096,
+            FastCoverParams {
+                k: 256,
+                d: 8,
+                f,
+                accel: 1,
+            },
+        );
+        assert!(!dict.is_empty(), "f={f}");
+    }
+}
+
+/// A segment far longer than the corpus (a `k` near the top of `usize`, which
+/// a 32-bit build reaches from any large command-line value) is capped by the
+/// corpus: the epoch floor sized from it must not overflow on the way.
+#[test]
+fn fastcover_trains_with_a_segment_longer_than_the_corpus() {
+    let sample = corpus();
+    let dict = train_fastcover_raw(
+        sample.as_slice(),
+        4096,
+        FastCoverParams {
+            k: usize::MAX / 4,
+            d: 8,
+            f: 20,
+            accel: 1,
+        },
+    );
+    assert!(!dict.is_empty());
+    assert!(dict.len() <= 4096);
+}
+
 #[test]
 fn fastcover_optimizer_reports_normalized_params() {
     let sample = corpus();
-    let (dict, tuned) =
-        optimize_fastcover_raw(sample.as_slice(), 1024, 0.75, 1, &[64], &[42], &[8]);
+    // A width below the trainer's range comes back at its lower end; the
+    // upper end is checked without training, a table that wide being
+    // gigabytes.
+    let (dict, tuned) = optimize_fastcover_raw(sample.as_slice(), 1024, 0.75, 1, &[64], &[0], &[8]);
     assert!(!dict.is_empty());
     assert_eq!(tuned.d, 32);
-    assert_eq!(tuned.f, 20);
+    assert_eq!(tuned.f, 1);
     assert_eq!(tuned.k, 32);
+    assert_eq!(
+        normalize_fastcover_params(FastCoverParams {
+            k: 64,
+            d: 8,
+            f: 42,
+            accel: 1
+        })
+        .f,
+        31
+    );
 }

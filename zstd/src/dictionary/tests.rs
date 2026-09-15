@@ -267,14 +267,16 @@ fn train_fastcover_raw_from_slice_normalizes_non_optimized_params() {
         optimize: false,
         k: 8,
         d: 64,
-        f: 42,
+        // Below the table widths the trainer takes; the top end (31) is
+        // checked without training, since a table that wide is gigabytes.
+        f: 0,
         ..FastCoverOptions::default()
     };
     let (_, tuned) =
         train_fastcover_raw_from_slice(sample.as_slice(), 2048, &options).expect("must train");
     assert_eq!(tuned.k, 32);
     assert_eq!(tuned.d, 32);
-    assert_eq!(tuned.f, 20);
+    assert_eq!(tuned.f, 1);
 }
 
 #[test]
