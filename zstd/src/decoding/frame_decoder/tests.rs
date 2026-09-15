@@ -1022,6 +1022,59 @@ fn a_frame_of_unknown_size_into_a_short_slice_is_target_too_small() {
     );
 }
 
+/// A frame a little longer than its window, with compressed blocks: each block
+/// reserves a whole block of room before it decodes, so the ring needs the
+/// window plus a block even though the content ends a few bytes past the
+/// window. Capping the ring at the content made the block after a full window
+/// double it.
+#[test]
+fn a_streamed_frame_just_past_its_window_keeps_room_for_a_block() {
+    use crate::encoding::CompressionParameters;
+    let window_log = 20u32;
+    let window = 1usize << window_log;
+    let mut state = 0x6A09_E667_F3BC_C908u64;
+    let payload: Vec<u8> = (0..window + 1000)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            b"abcdefgh"[(state >> 61) as usize]
+        })
+        .collect();
+    let params = CompressionParameters::builder(CompressionLevel::Level(1))
+        .window_log(window_log)
+        .build()
+        .expect("window_log within bounds");
+    let mut compressor = FrameCompressor::new(CompressionLevel::Level(1));
+    compressor.set_parameters(&params);
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+    let header = crate::decoding::read_frame_header_info(&compressed, false).expect("header");
+    assert_eq!(header.window_size, window as u64);
+
+    let mut decoder = FrameDecoder::new();
+    let mut source = compressed.as_slice();
+    decoder.reset(&mut source).expect("header parses");
+    let mut decoded = Vec::with_capacity(payload.len());
+    let mut chunk = alloc::vec![0u8; 128 * 1024];
+    while !(decoder.is_finished() && decoder.can_collect() == 0) {
+        let (read, written) = decoder
+            .decode_from_to(source, &mut chunk)
+            .expect("frame decodes");
+        source = &source[read..];
+        decoded.extend_from_slice(&chunk[..written]);
+        assert!(read > 0 || written > 0, "decode made no progress");
+    }
+    assert_eq!(decoded, payload);
+    let workspace = decoder.workspace_size();
+    assert!(
+        workspace < window + window / 2,
+        "ring grew past one window plus a block: workspace {workspace} bytes"
+    );
+}
+
 /// A multi-segment frame whose declared content is smaller than its window
 /// gets a ring of its content, not of the window rounded up: the header
 /// carries both, and the ring's amortized growth would otherwise round the

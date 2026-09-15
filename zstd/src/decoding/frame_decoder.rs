@@ -849,22 +849,25 @@ impl FrameDecoderState {
         }
     }
 
-    /// The up-front reservation for a frame that decodes through the buffer:
-    /// the window plus the block decoded into it, or the whole content when
-    /// that is smaller (upstream `ZSTD_decodingBufferSize_min`). Reserving the
-    /// window alone left the first block past a full window to grow the buffer
-    /// and copy the window across.
+    /// The up-front reservation for a frame that decodes through the buffer.
+    /// A single-segment frame's buffer holds its whole content, which is its
+    /// window. A multi-segment frame's ring holds the content-capped window
+    /// plus room for the next block, since each block reserves a whole block
+    /// before it decodes: reserving the window alone left the first block
+    /// past a full window to grow the ring and copy the window across, and
+    /// capping at the content left no block of room once the window filled.
+    /// Upstream sizes its stream buffer as window + block too
+    /// (`ZSTD_decodingBufferSize_min`); it can cap at the content because its
+    /// buffer is not a ring.
     fn decoding_buffer_size(&self) -> usize {
-        let window_size = self.frame_header.window_size().unwrap_or(0);
-        let block = window_size.min(u64::from(crate::common::MAX_BLOCK_SIZE));
+        let useful_window = self.useful_window_size();
+        if self.frame_header.descriptor.single_segment_flag() {
+            return useful_window;
+        }
+        let window_size = self.frame_header.window_size().unwrap_or(0) as usize;
         // No overflow: the window was checked against
         // `MAXIMUM_ALLOWED_WINDOW_SIZE` when the header was taken.
-        let needed = window_size + block;
-        if self.frame_header.fcs_declared() {
-            needed.min(self.frame_header.frame_content_size()) as usize
-        } else {
-            needed as usize
-        }
+        useful_window + window_size.min(crate::common::MAX_BLOCK_SIZE as usize)
     }
 
     /// Construct a new frame decoder state, reading the frame header
