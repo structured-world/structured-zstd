@@ -1177,6 +1177,7 @@ fn an_explicit_stream_size_survives_an_unstattable_input() {
         &mut no_dict(),
         ProgressMonitor::new(&payload[..], None, false),
         None,
+        &DecodeSettings::from_options(&opts),
         &mut frame,
     )
     .expect("compressing must succeed");
@@ -3355,6 +3356,33 @@ fn progress_over_stdin_follows_the_flag_and_the_pledge() {
     assert!(!stdin_monitor(&quiet, io::empty()).is_shown());
 }
 
+/// The forced pass-through default follows each input's own destination, as
+/// the reference command decides it per file: in `-df archive.zst -` the stdin
+/// member goes to stdout and passes plain input through, while the named
+/// archive is written to a file of its own and does not.
+#[test]
+fn forced_pass_through_follows_each_inputs_destination() {
+    let mixed = parse(&["-df", "archive.zst", "-"]).unwrap();
+    assert!(
+        DecodeSettings::for_stdin(&mixed).pass_through,
+        "stdin in a mixed run goes to stdout"
+    );
+    assert!(
+        !DecodeSettings::for_file(&mixed).pass_through,
+        "the named archive goes to its own file"
+    );
+    let into_file = parse(&["-df", "-o", "out", "-"]).unwrap();
+    assert!(
+        !DecodeSettings::for_stdin(&into_file).pass_through,
+        "stdin into -o is not stdout"
+    );
+    let cat = parse(&["-dcf", "archive.zst"]).unwrap();
+    assert!(
+        DecodeSettings::for_file(&cat).pass_through,
+        "-c sends a file to stdout"
+    );
+}
+
 /// An empty input holds no frame. Decoding it is an error, as the reference
 /// command reports it, but under pass-through it is plain input like any other
 /// and passes through as the empty output, as `cat`, `zcat -f` and `xzcat -f`
@@ -3924,6 +3952,31 @@ fn advanced_parameters_parse_the_reference_spellings() {
     assert!(parse_advanced_params("wlog=abc").is_err(), "not a number");
     assert!(parse_advanced_params("wlog=23x").is_err(), "trailing junk");
     assert!(parse_advanced_params("wlog=23,").is_err(), "trailing comma");
+}
+
+/// Each `--zstd=` sets the keys it names and leaves the others, as the
+/// reference command writes every list into one set of parameters: knobs split
+/// across occurrences all reach the encoder, a key named again takes its later
+/// value, and a later zero puts it back to the level's.
+#[test]
+fn repeated_advanced_parameter_lists_accumulate() {
+    let opts = parse(&["--zstd=wlog=20", "--zstd=hlog=18", "f"]).unwrap();
+    assert_eq!(
+        opts.advanced.window_log,
+        Some(20),
+        "kept from the first list"
+    );
+    assert_eq!(opts.advanced.hash_log, Some(18));
+
+    let opts = parse(&["--zstd=wlog=20,hlog=18", "--zstd=wlog=21", "f"]).unwrap();
+    assert_eq!(opts.advanced.window_log, Some(21), "the later value wins");
+    assert_eq!(opts.advanced.hash_log, Some(18));
+
+    let opts = parse(&["--zstd=wlog=20", "--zstd=wlog=0", "f"]).unwrap();
+    assert_eq!(
+        opts.advanced.window_log, None,
+        "zero is the level's value again"
+    );
 }
 
 /// The knobs reach the encoder: a `--zstd=wlog=` window is what the frame

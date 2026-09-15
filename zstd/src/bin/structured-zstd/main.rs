@@ -112,9 +112,8 @@ enum Mode {
 /// Parsed command line.
 struct Options {
     mode: Mode,
-    /// Numeric compression level (zstd scale). `store` overrides it.
+    /// Numeric compression level (zstd scale).
     level: i32,
-    store: bool,
     /// Raw dictionary blob path (`-D`), applied to both compress and decompress.
     dict: Option<PathBuf>,
     /// Force output to stdout (`-c` / `zstdcat` / a `-` input).
@@ -493,10 +492,13 @@ fn parse_adapt_params(params: &str) -> Result<()> {
 /// with an optional `K` / `M`, commas between. `overlapLog` / `ovlog` is a
 /// multi-threading knob, accepted and without effect. Zero leaves the knob at
 /// the level's value, as it does there.
-fn parse_advanced_params(text: &str) -> Result<AdvancedParams> {
-    let mut params = AdvancedParams::default();
+///
+/// Written into `params`, which earlier `--zstd=` lists already filled: as the
+/// reference command writes every list into one set of parameters, keys a list
+/// does not name keep their values and keys it names again take the new one.
+fn apply_advanced_params(text: &str, params: &mut AdvancedParams) -> Result<()> {
     if text.is_empty() {
-        return Ok(params);
+        return Ok(());
     }
     for field in text.split(',') {
         let (key, value) = field
@@ -533,6 +535,14 @@ fn parse_advanced_params(text: &str) -> Result<AdvancedParams> {
             _ => bail!("--zstd has no `{key}` parameter"),
         }
     }
+    Ok(())
+}
+
+/// One `--zstd=` list on its own (for tests).
+#[cfg(test)]
+fn parse_advanced_params(text: &str) -> Result<AdvancedParams> {
+    let mut params = AdvancedParams::default();
+    apply_advanced_params(text, &mut params)?;
     Ok(params)
 }
 
@@ -870,7 +880,6 @@ fn parse_args_into(
     let mut opts = Options {
         mode: preset.mode,
         level: default_level,
-        store: false,
         dict: None,
         to_stdout: preset.to_stdout,
         output: None,
@@ -1132,7 +1141,7 @@ fn parse_args_into(
                             bail!("--format={v} is not supported; this build only writes zstd");
                         }
                     } else if let Some(v) = long.strip_prefix("zstd=") {
-                        opts.advanced = parse_advanced_params(v)?;
+                        apply_advanced_params(v, &mut opts.advanced)?;
                     } else if let Some(v) = long.strip_prefix("train-cover=") {
                         select_mode(&mut opts, Mode::Train);
                         opts.trainer = Trainer::Cover;
@@ -2579,18 +2588,8 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
                 level,
                 ..FrameSettings::from_options(opts)
             };
-            let compression_level = if opts.store {
-                CompressionLevel::Uncompressed
-            } else {
-                CompressionLevel::from_level(level)
-            };
-            // `--store` sets no parameters, as `compress_stream` does not.
-            let parameters = if opts.store {
-                None
-            } else {
-                frame_parameters(compression_level, &settings)?
-            };
-            let bytes = match parameters {
+            let compression_level = CompressionLevel::from_level(level);
+            let bytes = match frame_parameters(compression_level, &settings)? {
                 Some(parameters) => {
                     structured_zstd::encoding::estimated_compression_workspace_bytes_for_parameters(
                         &parameters,
@@ -3862,7 +3861,8 @@ fn stream_opened<W: Write>(
     let pledged_size = metadata.is_file().then_some(source_size);
     // The same length is the counter's total, and a FIFO's has none to show.
     let reader = progress_monitor(opts, BufReader::new(source), pledged_size);
-    stream(opts, codecs, reader, pledged_size, sink)
+    let decode = DecodeSettings::for_file(opts);
+    stream(opts, codecs, reader, pledged_size, &decode, sink)
 }
 
 /// Stream stdin through the codec into `sink`. stdin has no length to stat,
@@ -3870,7 +3870,15 @@ fn stream_opened<W: Write>(
 /// caller pledged travels in `opts`.
 fn stream_stdin<W: Write>(opts: &Options, codecs: &mut Codecs, sink: W) -> Result<Processed> {
     let stdin = io::stdin();
-    stream(opts, codecs, stdin_monitor(opts, stdin.lock()), None, sink)
+    let decode = DecodeSettings::for_stdin(opts);
+    stream(
+        opts,
+        codecs,
+        stdin_monitor(opts, stdin.lock()),
+        None,
+        &decode,
+        sink,
+    )
 }
 
 /// The counter over `reader` expecting `total` bytes, drawn under the
@@ -3890,13 +3898,15 @@ fn stdin_monitor<R: Read>(opts: &Options, reader: R) -> ProgressMonitor<R> {
 
 /// Run the mode's codec from `reader` into `sink` and count both sides.
 /// `pledged_size` is the exact length of THIS input when it has one to stat;
-/// `--stream-size` stands in when it does not. `-t` decodes into nothing,
-/// whatever sink it was handed.
+/// `--stream-size` stands in when it does not. `decode` is how THIS input is
+/// decoded, its destination included. `-t` decodes into nothing, whatever sink
+/// it was handed.
 fn stream<R: Read, W: Write>(
     opts: &Options,
     codecs: &mut Codecs,
     mut reader: ProgressMonitor<R>,
     pledged_size: Option<u64>,
+    decode: &DecodeSettings,
     mut sink: W,
 ) -> Result<Processed> {
     let written = match opts.mode {
@@ -3916,18 +3926,8 @@ fn stream<R: Read, W: Write>(
             )?;
             counting.written
         }
-        Mode::Decompress => decompress_stream(
-            &mut reader,
-            &mut sink,
-            codecs,
-            &DecodeSettings::from_options(opts),
-        )?,
-        Mode::Test => decompress_stream(
-            &mut reader,
-            io::sink(),
-            codecs,
-            &DecodeSettings::from_options(opts),
-        )?,
+        Mode::Decompress => decompress_stream(&mut reader, &mut sink, codecs, decode)?,
+        Mode::Test => decompress_stream(&mut reader, io::sink(), codecs, decode)?,
         Mode::List | Mode::Train => unreachable!("list / train never stream"),
     };
     sink.flush().wrap_err("failed to flush output")?;
@@ -4200,10 +4200,8 @@ fn process_file(
 /// to line the arguments up wrong.
 #[derive(Clone, Copy, PartialEq)]
 struct FrameSettings {
-    /// Numeric compression level, ignored when `store` is set.
+    /// Numeric compression level.
     level: i32,
-    /// `--format=zstd` with no compression: emit raw blocks.
-    store: bool,
     /// Exact input length, recorded in the frame header.
     pledged_size: Option<u64>,
     /// Estimated input length; steers geometry, never reaches the header.
@@ -4232,7 +4230,6 @@ impl Default for FrameSettings {
     fn default() -> Self {
         Self {
             level: CompressionLevel::DEFAULT_LEVEL,
-            store: false,
             pledged_size: None,
             size_hint: None,
             long: false,
@@ -4253,7 +4250,6 @@ impl FrameSettings {
     fn from_options(opts: &Options) -> Self {
         Self {
             level: opts.level,
-            store: opts.store,
             pledged_size: opts.pledged_size,
             size_hint: opts.size_hint,
             long: opts.long,
@@ -4350,19 +4346,35 @@ impl Default for DecodeSettings {
 }
 
 impl DecodeSettings {
-    /// What the command line asked for. Pass-through defaults to the
-    /// reference command's rule: on when forced and writing to stdout, which
-    /// is how `zstdcat` and `zstd -dcf` behave. Never under `-t`, which asks
-    /// whether the input is a sound archive: passed through, plain input would
-    /// be reported as one, whichever flag or preset turned it on.
-    fn from_options(opts: &Options) -> Self {
+    /// What the command line asked for, for an input whose output goes to
+    /// stdout or not. Pass-through defaults to the reference command's rule,
+    /// taken per input as it takes it (`fileio.c`, `FIO_decompressFrames`): on
+    /// when forced and this input's output is stdout, which is how `zstdcat`
+    /// and `zstd -dcf` behave. Never under `-t`, which asks whether the input
+    /// is a sound archive: passed through, plain input would be reported as
+    /// one, whichever flag or preset turned it on.
+    fn with_destination(opts: &Options, to_stdout: bool) -> Self {
         Self {
             verify_checksum: opts.checksum,
             pass_through: opts.mode != Mode::Test
-                && opts
-                    .pass_through
-                    .unwrap_or(opts.force && writes_stdout(opts)),
+                && opts.pass_through.unwrap_or(opts.force && to_stdout),
         }
+    }
+
+    /// For the whole run, as a run with one destination has.
+    fn from_options(opts: &Options) -> Self {
+        Self::with_destination(opts, writes_stdout(opts))
+    }
+
+    /// For stdin, whose output is stdout unless `-o` names a file, even in a
+    /// run whose named inputs are written to files of their own.
+    fn for_stdin(opts: &Options) -> Self {
+        Self::with_destination(opts, opts.to_stdout || opts.output.is_none())
+    }
+
+    /// For a named file, whose output is stdout only under `-c`.
+    fn for_file(opts: &Options) -> Self {
+        Self::with_destination(opts, opts.to_stdout)
     }
 }
 
@@ -4374,7 +4386,6 @@ fn new_compressor(
 ) -> Result<CompressionContext> {
     let &FrameSettings {
         level,
-        store,
         size_hint,
         target_block_size,
         checksum,
@@ -4382,11 +4393,7 @@ fn new_compressor(
         dict_id_flag,
         ..
     } = settings;
-    let compression_level = if store {
-        CompressionLevel::Uncompressed
-    } else {
-        CompressionLevel::from_level(level)
-    };
+    let compression_level = CompressionLevel::from_level(level);
     let mut context = CompressionContext::new(compression_level);
     // The reference `zstd` COMMAND defaults the content checksum ON (unlike
     // the library API, whose default is off and which our encoder mirrors), so
@@ -4410,9 +4417,8 @@ fn new_compressor(
             .wrap_err("failed to set the block-size target")?;
     }
     // `--long`, `--zstd=` and the literal mode are per-knob overrides applied
-    // via the compression-parameters API; skipped for `--store`, whose raw
-    // frames match nothing.
-    if !store && let Some(params) = frame_parameters(compression_level, settings)? {
+    // via the compression-parameters API.
+    if let Some(params) = frame_parameters(compression_level, settings)? {
         context
             .set_parameters(&params)
             .wrap_err("failed to apply the compression parameters")?;
