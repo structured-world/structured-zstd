@@ -16,7 +16,7 @@ mod imp {
     use core::ffi::c_int;
     use std::path::Path;
     use std::ptr;
-    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
     use sys::PathUnit;
 
@@ -153,16 +153,25 @@ mod imp {
     }
 
     /// Where the guarded path is kept, NUL-terminated, for the handler: a
-    /// buffer that only grows, of `CAPACITY` units. Written only while
-    /// `ARTEFACT` is null, so the handler never reads a half-written name. An
-    /// outgrown buffer is leaked rather than freed, because on Windows the
-    /// handler runs on a thread of its own and may still hold it; capacity
-    /// doubles, so what is leaked stays below the longest path guarded.
+    /// buffer of `CAPACITY` units that grows to the longest path guarded.
+    /// Only `guard`, on the main thread, writes or replaces it, and only once
+    /// no handler can be reading it (see `HANDLING`).
     static BUFFER: AtomicPtr<PathUnit> = AtomicPtr::new(ptr::null_mut());
     static CAPACITY: AtomicUsize = AtomicUsize::new(0);
 
     /// Points at `BUFFER` while a file is guarded, null otherwise.
     static ARTEFACT: AtomicPtr<PathUnit> = AtomicPtr::new(ptr::null_mut());
+
+    /// Raised by the handler before it reads `ARTEFACT`, and never lowered:
+    /// the handler ends the process.
+    ///
+    /// On Windows the handler runs on a thread of its own, so it can hold the
+    /// published name while the main thread moves on to the next file. `guard`
+    /// clears `ARTEFACT` first and reads this second, the handler raises this
+    /// first and reads `ARTEFACT` second, all sequentially consistent: either
+    /// the handler finds no name, or `guard` finds it handling and leaves the
+    /// buffer as it is. So no name is rewritten, or freed, under the handler.
+    static HANDLING: AtomicBool = AtomicBool::new(false);
 
     /// What `SIGINT` was before the handler first went in, `SIG_ERR` until
     /// then: the disposition `clear` puts back.
@@ -171,11 +180,11 @@ mod imp {
     /// Async-signal-safe by construction: `unlink`, `write` and `_exit`
     /// only, no allocation, no locks, no formatting.
     extern "C" fn on_interrupt(_signum: c_int) {
+        HANDLING.store(true, Ordering::SeqCst);
         let path = ARTEFACT.load(Ordering::SeqCst);
         // SAFETY: a non-null `path` points at a buffer that holds a
         // NUL-terminated string from the moment the pointer was published,
-        // is not rewritten until the pointer has been cleared, and is never
-        // freed.
+        // and `guard` neither rewrites nor frees it once `HANDLING` is up.
         if !path.is_null() {
             unsafe {
                 sys::remove(path);
@@ -219,6 +228,11 @@ mod imp {
     /// Remove `path` if the process is interrupted before [`clear`] is called.
     pub fn guard(path: &Path) {
         ARTEFACT.store(ptr::null_mut(), Ordering::SeqCst);
+        // An interruption already being handled is ending the process, and its
+        // handler may still be reading the last name; that name is left alone.
+        if HANDLING.load(Ordering::SeqCst) {
+            return;
+        }
         // An empty name names nothing. Asked of the name as given, before
         // `units` turns it into the form the handler needs: on Windows that
         // form carries a prefix even when there is nothing after it.
@@ -232,13 +246,25 @@ mod imp {
         }
         let needed = units.len() + 1;
         let mut buffer = BUFFER.load(Ordering::SeqCst);
-        if needed > CAPACITY.load(Ordering::SeqCst) {
+        let capacity = CAPACITY.load(Ordering::SeqCst);
+        if needed > capacity {
             // Paths are bounded by the platform far below where doubling
             // could overflow.
-            let capacity = needed.next_power_of_two();
-            buffer = Box::into_raw(vec![0; capacity].into_boxed_slice()).cast::<PathUnit>();
+            let grown = needed.next_power_of_two();
+            let outgrown = buffer;
+            buffer = Box::into_raw(vec![0; grown].into_boxed_slice()).cast::<PathUnit>();
             BUFFER.store(buffer, Ordering::SeqCst);
-            CAPACITY.store(capacity, Ordering::SeqCst);
+            CAPACITY.store(grown, Ordering::SeqCst);
+            if !outgrown.is_null() {
+                // SAFETY: `outgrown` came from `Box::into_raw` on a slice of
+                // `capacity` units, is no longer published, and no handler
+                // holds it (`HANDLING` was down after `ARTEFACT` was cleared).
+                unsafe {
+                    drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
+                        outgrown, capacity,
+                    )));
+                }
+            }
         }
         // SAFETY: `buffer` holds `CAPACITY >= needed` units, and the handler
         // reads it only through `ARTEFACT`, which is null for this write.
@@ -271,6 +297,34 @@ mod imp {
     #[cfg(test)]
     pub fn is_guarded() -> bool {
         !ARTEFACT.load(Ordering::SeqCst).is_null()
+    }
+
+    /// Mark an interruption as being handled, as the handler does on entry
+    /// (for tests).
+    #[cfg(test)]
+    pub fn begin_handling() {
+        HANDLING.store(true, Ordering::SeqCst);
+    }
+
+    /// The name held in the guard's buffer, whether or not it is published
+    /// (for tests).
+    #[cfg(test)]
+    pub fn stored_path() -> Vec<PathUnit> {
+        let buffer = BUFFER.load(Ordering::SeqCst);
+        let mut units = Vec::new();
+        if buffer.is_null() {
+            return units;
+        }
+        // SAFETY: a non-null buffer holds a NUL-terminated name within its
+        // capacity, and only `guard` on this thread writes it.
+        unsafe {
+            let mut at = 0;
+            while *buffer.add(at) != 0 {
+                units.push(*buffer.add(at));
+                at += 1;
+            }
+        }
+        units
     }
 
     /// Forget what an earlier guard found, as a fresh process would not know

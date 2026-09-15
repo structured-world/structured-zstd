@@ -1858,11 +1858,18 @@ fn run(mut opts: Options) -> Result<usize> {
         opts.follow_links,
         opts.verbosity,
     )?;
-    if files.is_empty() && explicit {
+    // Listing, training and benchmarking take named files only and refuse
+    // stdin with their own reasons; the streaming modes read it.
+    let streams =
+        matches!(opts.mode, Mode::Compress | Mode::Decompress | Mode::Test) && !opts.bench;
+    if files.is_empty() && explicit && streams {
         // Pointed at empty directories or an empty list: nothing to do, and not
         // a request to read stdin. The reference command says so for empty
         // directories and exits 0; for an empty list it reads stdin, which
-        // would compress data the caller never pointed it at.
+        // would compress data the caller never pointed it at. The file-only
+        // modes go on to their own refusal of an empty input list instead, as
+        // the reference command's training and listing do, rather than report
+        // a dictionary or a measurement that was never made.
         display!(
             opts.verbosity,
             1,
@@ -1872,11 +1879,8 @@ fn run(mut opts: Options) -> Result<usize> {
     }
     opts.inputs = files;
 
-    // Listing, training and benchmarking take named files only and refuse
-    // stdin with their own reasons; the streaming modes read it, and refuse to
-    // read it from a terminal unless forced, as the reference command does.
-    let streams =
-        matches!(opts.mode, Mode::Compress | Mode::Decompress | Mode::Test) && !opts.bench;
+    // The streaming modes refuse to read stdin from a terminal unless forced,
+    // as the reference command does.
     if streams && reads_stdin(&opts.inputs) && !opts.force_stdin && io::stdin().is_terminal() {
         bail!("stdin is a console, aborting");
     }

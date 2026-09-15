@@ -48,6 +48,30 @@ fn a_long_path_is_guarded_and_an_empty_one_is_not() {
     clear();
 }
 
+/// On Windows the handler runs on a thread of its own, so it can read the
+/// guarded name while the main thread moves on to the next file. Once an
+/// interruption is being handled the process is ending, and a guard taken
+/// meanwhile must leave the name the handler may be reading exactly as it
+/// was, rather than write the next file's over it and have a mix of the two
+/// removed.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_guard_taken_while_an_interruption_is_handled_leaves_the_name_alone() {
+    super::imp::forget_inherited();
+    super::imp::take_default_action();
+    clear();
+    guard(Path::new("/tmp/szstd-first"));
+    let first = super::imp::stored_path();
+    super::imp::begin_handling();
+    guard(Path::new("/tmp/szstd-second-file"));
+    assert_eq!(
+        super::imp::stored_path(),
+        first,
+        "the name the handler may hold is not rewritten"
+    );
+    assert!(!is_guarded(), "and nothing new is published");
+}
+
 /// `_wunlink` reaches a path past `MAX_PATH` only in the verbatim `\\?\` form,
 /// which is how the standard library created the temporary: a drive path and
 /// a UNC share each gain their prefix, and a path already verbatim or naming

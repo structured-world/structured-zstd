@@ -4017,6 +4017,29 @@ fn trainer_parameters_parse_and_build_options() {
     assert!(parse(&["--train-legacy", "s1"]).is_err());
 }
 
+/// An empty `--filelist` is nothing to do for the modes that stream, but the
+/// modes that take named files need some and say so, as the reference
+/// command's training and listing do: `--train` must not report success with
+/// no dictionary written, nor `-b` or `-l` with nothing measured or listed.
+#[test]
+fn file_only_modes_refuse_an_empty_selection() {
+    let scratch = Scratch::new("emptysel");
+    let list = scratch.file("empty.list", b"");
+    let list = list.to_str().unwrap();
+    for args in [
+        &["--train", "-q", "--filelist", list][..],
+        &["-b", "-q", "--filelist", list],
+        &["-l", "-q", "--filelist", list],
+    ] {
+        assert!(run(parse(args).unwrap()).is_err(), "{args:?}");
+    }
+    assert_eq!(
+        run(parse(&["-q", "--filelist", list]).unwrap()).unwrap(),
+        0,
+        "compressing nothing is not an error"
+    );
+}
+
 /// `--train` selects the mode and the trainer flags select the trainer, in
 /// either order, as upstream reads them: a bare `--train` after
 /// `--train-cover` does not switch back to FastCOVER, nor drop a tuning.
