@@ -847,13 +847,13 @@ fn reserve_buffer_reserves_the_shortfall_not_the_full_window_again() {
     use super::DecoderScratchKind;
     let window = 1usize << 20;
     let mut scratch = DecoderScratchKind::new_flat(window);
-    scratch.reserve_buffer(window);
+    scratch.reserve_buffer(window, window);
     let data = alloc::vec![0u8; window];
     match &mut scratch {
         super::DecoderScratchKind::Flat(s) => s.buffer.push(&data),
         super::DecoderScratchKind::Ring(_) => unreachable!("new_flat builds Flat"),
     }
-    scratch.reserve_buffer(window);
+    scratch.reserve_buffer(window, window);
     let workspace = scratch.workspace_bytes();
     assert!(
         workspace < window * 3 / 2,
@@ -1124,6 +1124,46 @@ fn a_streamed_frame_smaller_than_its_window_gets_a_ring_of_its_content() {
     );
 }
 
+/// Capacity of the ring a multi-segment frame decoded into.
+fn ring_capacity(decoder: &FrameDecoder) -> usize {
+    match &decoder
+        .state
+        .as_ref()
+        .expect("a frame was reset")
+        .decoder_scratch
+    {
+        super::DecoderScratchKind::Ring(s) => s.buffer.capacity(),
+        super::DecoderScratchKind::Flat(_) => panic!("a multi-segment frame decodes into the ring"),
+    }
+}
+
+/// A multi-segment frame whose declared content fits its window reserves its
+/// content, not a block past it: a one-byte Raw frame with a 1 MiB window
+/// needs a byte of ring.
+#[test]
+fn a_streamed_frame_that_fits_its_window_reserves_just_its_content() {
+    let mut frame = alloc::vec![
+        0x28, 0xB5, 0x2F, 0xFD, // magic
+        0x80, // FHD: multi-segment, 4-byte content size
+        0x50, // window descriptor: 1 MiB
+    ];
+    frame.extend_from_slice(&1u32.to_le_bytes());
+    frame.extend_from_slice(&[0x09, 0x00, 0x00, b'q']); // last Raw block, 1 byte
+    let mut decoder = FrameDecoder::new();
+    let mut source = frame.as_slice();
+    decoder.reset(&mut source).expect("header parses");
+    let mut chunk = [0u8; 16];
+    let (_, written) = decoder
+        .decode_from_to(source, &mut chunk)
+        .expect("frame decodes");
+    assert_eq!(&chunk[..written], b"q");
+    let capacity = ring_capacity(&decoder);
+    assert!(
+        capacity < 1024,
+        "a one-byte frame reserved {capacity} bytes of ring"
+    );
+}
+
 /// A streamed frame's one-shot buffer is reserved when its first block is in
 /// hand, not on the header alone: a header declaring 64 MiB, followed by
 /// nothing (a chunk boundary, or a truncated stream), costs no allocation.
@@ -1166,6 +1206,12 @@ fn frame_with_a_block_past_the_block_maximum(content_size: Option<u32>) -> Vec<u
         0x00, 0x00, 0x00, 0x00, // 16 zero extra bits per match length
         0x01, // stream start bit
     ];
+    frame_around_block(&block, content_size)
+}
+
+/// One frame holding `block` as its only (last, compressed) block, with a
+/// 1 MiB window and optionally a declared content size.
+fn frame_around_block(block: &[u8], content_size: Option<u32>) -> Vec<u8> {
     let mut frame = alloc::vec![0x28, 0xB5, 0x2F, 0xFD]; // magic
     match content_size {
         // FHD: multi-segment, no checksum, no content size.
@@ -1176,11 +1222,84 @@ fn frame_with_a_block_past_the_block_maximum(content_size: Option<u32>) -> Vec<u
             frame.extend_from_slice(&size.to_le_bytes());
         }
     }
-    // (0x50 is the window descriptor: 1 MiB.) Last block, compressed, 13 bytes.
+    // (0x50 is the window descriptor: 1 MiB.) Last block, compressed.
     let header = (block.len() as u32) << 3 | 2 << 1 | 1;
     frame.extend_from_slice(&header.to_le_bytes()[..3]);
-    frame.extend_from_slice(&block);
+    frame.extend_from_slice(block);
     frame
+}
+
+/// A 3-byte literals section header (size format 3, 20-bit regenerated size)
+/// of the given type: 0 raw, 1 RLE.
+fn literals_header_20_bit(literals_type: u8, regenerated: u32) -> [u8; 3] {
+    [
+        ((regenerated & 0xF) << 4) as u8 | 0b11 << 2 | literals_type,
+        (regenerated >> 4) as u8,
+        (regenerated >> 12) as u8,
+    ]
+}
+
+/// A block with no sequences whose RLE literals regenerate 200,000 bytes: past
+/// the block maximum on literals alone.
+fn block_of_literals_past_the_block_maximum() -> Vec<u8> {
+    let mut block = literals_header_20_bit(1, 200_000).to_vec();
+    block.push(b'z'); // the repeated byte
+    block.push(0x00); // no sequences
+    block
+}
+
+/// One sequence (literal length 1, repeat offset 1, match length 65,539) and
+/// 65,539 literals left over after it: 131,079 bytes, where the sequence alone
+/// stays within the block maximum and the trailing literals take it past.
+fn block_with_trailing_literals_past_the_block_maximum() -> Vec<u8> {
+    let literals = 1 + 65_539;
+    let mut block = literals_header_20_bit(0, literals).to_vec();
+    block.extend((0..literals).map(|i| i as u8));
+    block.extend_from_slice(&[
+        0x01, // one sequence
+        0x54, // LL, OF and ML all RLE
+        0x01, 0x00, 0x34, // LL code 1, OF code 0, ML code 52
+        0x00, 0x00, // 16 zero extra bits for the match length
+        0x01, // stream start bit
+    ]);
+    block
+}
+
+/// `frame` fails to decode as malformed through the caller's slice (with
+/// room to spare) and through the streaming ring alike.
+fn assert_rejected_as_malformed(frame: &[u8], what: &str) {
+    let mut out = alloc::vec![0u8; 512 * 1024];
+    match FrameDecoder::new().decode_all(frame, &mut out) {
+        Ok(_) | Err(super::FrameDecoderError::TargetTooSmall) => {
+            panic!("{what}: the direct path must reject the block as malformed")
+        }
+        Err(_) => {}
+    }
+    let mut decoder = FrameDecoder::new();
+    let mut source = frame;
+    decoder.reset(&mut source).expect("header parses");
+    let mut chunk = alloc::vec![0u8; 512 * 1024];
+    assert!(
+        decoder.decode_from_to(source, &mut chunk).is_err(),
+        "{what}: the ring must reject the block"
+    );
+}
+
+#[test]
+fn literals_past_the_block_maximum_are_rejected() {
+    let block = block_of_literals_past_the_block_maximum();
+    assert_rejected_as_malformed(&frame_around_block(&block, None), "unsized");
+    assert_rejected_as_malformed(&frame_around_block(&block, Some(200_000)), "declared size");
+}
+
+#[test]
+fn trailing_literals_past_the_block_maximum_are_rejected() {
+    let block = block_with_trailing_literals_past_the_block_maximum();
+    assert_rejected_as_malformed(&frame_around_block(&block, None), "unsized");
+    assert_rejected_as_malformed(
+        &frame_around_block(&block, Some(1 + 65_539 + 65_539)),
+        "declared size",
+    );
 }
 
 #[test]

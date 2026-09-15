@@ -513,17 +513,18 @@ impl DecoderScratchKind {
     /// frame writes only through `UserSliceBackend` and leaves this
     /// buffer empty.
     ///
-    /// `window_size` is the TARGET buffer capacity: callers pass the
-    /// frame's window plus a block (`decoding_buffer_size`), and the
-    /// method itself computes the shortfall past
-    /// the bytes already buffered before calling the backend's
+    /// `target` is the TARGET buffer capacity (`decoding_buffer_size`) and
+    /// `growth_limit` the most later growth may reach
+    /// (`decoding_buffer_limit`); the method itself computes the shortfall
+    /// past the bytes already buffered before calling the backend's
     /// ADDITIONAL-semantics `reserve_exact`. That keeps re-entries (the
     /// decode_all fallback loop runs `decode_blocks` once per strategy
     /// chunk, and streaming callers invoke it per call) from growing a
     /// window-full buffer toward 2x window, while per-block growth keeps
     /// the amortized `reserve`.
     #[inline]
-    fn reserve_buffer(&mut self, window_size: usize) {
+    fn reserve_buffer(&mut self, target: usize, growth_limit: usize) {
+        let window_size = target;
         // Exact growth: this is the one-shot pre-reservation, and a request
         // landing one slack past the retained capacity (e.g. a dictionary
         // prefix already loaded into the buffer) must not DOUBLE a
@@ -537,12 +538,15 @@ impl DecoderScratchKind {
         // window-sized buffer toward 2x window.
         match self {
             Self::Ring(s) => {
-                // The target is the most the frame holds, so growth stops
-                // there: a content-capped size below the window would
-                // otherwise round up to the next power of two.
+                // The ring's growth rounds to the next power of two, capped at
+                // its limit; with the limit at the target for this one-shot
+                // reservation it lands exactly there, and later growth (a
+                // compressed block's own reservation) may then reach the
+                // frame's real limit, never double past it.
                 s.buffer.set_growth_limit(window_size);
                 let additional = window_size.saturating_sub(s.buffer.len());
                 s.buffer.reserve_exact(additional);
+                s.buffer.set_growth_limit(growth_limit);
             }
             Self::Flat(s) => {
                 let additional = window_size.saturating_sub(s.buffer.len());
@@ -607,6 +611,18 @@ impl DecoderScratchKind {
         match self {
             Self::Ring(s) => s.buffer.read(target),
             Self::Flat(s) => s.buffer.read(target),
+        }
+    }
+
+    /// [`Self::buffer_read`], also reporting the drainable bytes `target` had
+    /// no room for.
+    fn buffer_read_reporting_pending(
+        &mut self,
+        target: &mut [u8],
+    ) -> Result<(usize, usize), Error> {
+        match self {
+            Self::Ring(s) => s.buffer.read_reporting_pending(target),
+            Self::Flat(s) => s.buffer.read_reporting_pending(target),
         }
     }
 
@@ -849,17 +865,17 @@ impl FrameDecoderState {
         }
     }
 
-    /// The up-front reservation for a frame that decodes through the buffer.
-    /// A single-segment frame's buffer holds its whole content, which is its
-    /// window. A multi-segment frame's ring holds the content-capped window
-    /// plus room for the next block, since each block reserves a whole block
-    /// before it decodes: reserving the window alone left the first block
-    /// past a full window to grow the ring and copy the window across, and
-    /// capping at the content left no block of room once the window filled.
-    /// Upstream sizes its stream buffer as window + block too
+    /// The most a frame decoding through the buffer holds, which its growth
+    /// stops at. A single-segment frame's buffer holds its whole content,
+    /// which is its window. A multi-segment frame's ring holds the
+    /// content-capped window plus room for the next block, since each
+    /// compressed block reserves a whole block before it decodes: without it
+    /// the first block past a full window grew the ring and copied the window
+    /// across, and a limit at the content left no block of room once the
+    /// window filled. Upstream sizes its stream buffer as window + block too
     /// (`ZSTD_decodingBufferSize_min`); it can cap at the content because its
     /// buffer is not a ring.
-    fn decoding_buffer_size(&self) -> usize {
+    fn decoding_buffer_limit(&self) -> usize {
         let useful_window = self.useful_window_size();
         if self.frame_header.descriptor.single_segment_flag() {
             return useful_window;
@@ -868,6 +884,30 @@ impl FrameDecoderState {
         // No overflow: the window was checked against
         // `MAXIMUM_ALLOWED_WINDOW_SIZE` when the header was taken.
         useful_window + window_size.min(crate::common::MAX_BLOCK_SIZE as usize)
+    }
+
+    /// What to reserve up front: the limit, except for a multi-segment frame
+    /// whose declared content fits its window, which reserves just its
+    /// content. Only compressed blocks need the block of room past it, and
+    /// they reserve it themselves; the limit then caps that growth at one
+    /// block. Such frames are rare (encoders mark a frame that fits its window
+    /// single-segment), and a small Raw or RLE one should not pay a block.
+    fn decoding_buffer_size(&self) -> usize {
+        let window_size = self.frame_header.window_size().unwrap_or(0);
+        if self.frame_header.fcs_declared() && self.frame_header.frame_content_size() <= window_size
+        {
+            self.useful_window_size()
+        } else {
+            self.decoding_buffer_limit()
+        }
+    }
+
+    /// Reserve this frame's decode buffer ([`Self::decoding_buffer_size`])
+    /// and cap its later growth ([`Self::decoding_buffer_limit`]).
+    fn reserve_decoding_buffer(&mut self) {
+        let target = self.decoding_buffer_size();
+        let growth_limit = self.decoding_buffer_limit();
+        self.decoder_scratch.reserve_buffer(target, growth_limit);
     }
 
     /// Construct a new frame decoder state, reading the frame header
@@ -1784,8 +1824,7 @@ impl FrameDecoder {
         // this mirrors it for callers driving `decode_blocks` directly.
         // Idempotent — the backend's `reserve` early-returns when capacity
         // is already sufficient.
-        let buffer_size = state.decoding_buffer_size();
-        state.decoder_scratch.reserve_buffer(buffer_size);
+        state.reserve_decoding_buffer();
 
         let mut block_dec = decoding::block_decoder::new();
 
@@ -2024,8 +2063,7 @@ impl FrameDecoder {
         // the resume logic below bounds match reach by the frame's window
         // semantics, not by the (possibly smaller) reservation cap.
         let window_size = state.frame_header.window_size().unwrap_or(0) as usize;
-        let buffer_size = state.decoding_buffer_size();
-        state.decoder_scratch.reserve_buffer(buffer_size);
+        state.reserve_decoding_buffer();
 
         // Cold resume: prime the match window + restore entropy/repcode state +
         // advance the block cursor BEFORE the loop, so the first in-range block
@@ -2419,15 +2457,12 @@ impl FrameDecoder {
                     // take it: the buffer then holds one window plus the block
                     // being decoded, whatever the caller supplies, as upstream
                     // `ZSTD_decompressStream` flushes each block before the next.
-                    written += state
+                    let (read, pending) = state
                         .decoder_scratch
-                        .buffer_read(&mut target[written..])
+                        .buffer_read_reporting_pending(&mut target[written..])
                         .map_err(err::FailedToDrainDecodebuffer)?;
-                    if state
-                        .decoder_scratch
-                        .buffer_can_drain_to_window_size()
-                        .is_some_and(|pending| pending > 0)
-                    {
+                    written += read;
+                    if pending > 0 {
                         break;
                     }
                     //check if there are enough bytes for the next header
@@ -2458,8 +2493,7 @@ impl FrameDecoder {
                     // small frame gets a small buffer; a frame of unknown size
                     // keeps growing lazily rather than paying for its window.
                     if state.block_counter == 0 && state.frame_header.fcs_declared() {
-                        let buffer_size = state.decoding_buffer_size();
-                        state.decoder_scratch.reserve_buffer(buffer_size);
+                        state.reserve_decoding_buffer();
                     }
 
                     // Only expose the held dictionary while THIS frame is dict-backed
@@ -2939,8 +2973,7 @@ impl FrameDecoder {
                 // `decode_blocks` applies, so its per-iteration reserve in
                 // the loop below cannot grow the buffer back to the raw
                 // frame window.
-                let buffer_size = state.decoding_buffer_size();
-                state.decoder_scratch.reserve_buffer(buffer_size);
+                state.reserve_decoding_buffer();
             }
             let frame_start_total = total_bytes_written;
             loop {
@@ -3082,8 +3115,7 @@ impl FrameDecoder {
                 // `decode_blocks` applies, so its per-iteration reserve in
                 // the loop below cannot grow the buffer back to the raw
                 // frame window.
-                let buffer_size = state.decoding_buffer_size();
-                state.decoder_scratch.reserve_buffer(buffer_size);
+                state.reserve_decoding_buffer();
             }
             let frame_start_total = total_bytes_written;
             loop {
