@@ -1022,6 +1022,156 @@ fn a_frame_of_unknown_size_into_a_short_slice_is_target_too_small() {
     );
 }
 
+/// A multi-segment frame whose declared content is smaller than its window
+/// gets a ring of its content, not of the window rounded up: the header
+/// carries both, and the ring's amortized growth would otherwise round the
+/// content-capped reservation up to the next power of two.
+#[test]
+fn a_streamed_frame_smaller_than_its_window_gets_a_ring_of_its_content() {
+    let content = 600 * 1024u32;
+    let mut frame = alloc::vec![
+        0x28, 0xB5, 0x2F, 0xFD, // magic
+        0x80, // FHD: multi-segment, 4-byte content size
+        0x50, // window descriptor: 1 MiB
+    ];
+    frame.extend_from_slice(&content.to_le_bytes());
+    let mut payload = Vec::with_capacity(content as usize);
+    let mut left = content;
+    while left > 0 {
+        let size = left.min(128 * 1024);
+        left -= size;
+        // Raw block header: last flag, type 0, size.
+        let header = size << 3 | u32::from(left == 0);
+        frame.extend_from_slice(&header.to_le_bytes()[..3]);
+        let body: Vec<u8> = (0..size).map(|i| (i * 7 + left) as u8).collect();
+        payload.extend_from_slice(&body);
+        frame.extend_from_slice(&body);
+    }
+
+    let mut decoder = FrameDecoder::new();
+    let mut source = frame.as_slice();
+    decoder.reset(&mut source).expect("header parses");
+    let mut decoded = Vec::with_capacity(payload.len());
+    let mut chunk = alloc::vec![0u8; 128 * 1024];
+    while !(decoder.is_finished() && decoder.can_collect() == 0) {
+        let (read, written) = decoder
+            .decode_from_to(source, &mut chunk)
+            .expect("frame decodes");
+        source = &source[read..];
+        decoded.extend_from_slice(&chunk[..written]);
+        assert!(read > 0 || written > 0, "decode made no progress");
+    }
+    assert_eq!(decoded, payload);
+    // The ring holds the 600 KiB content; the literal and block staging
+    // buffers take up to a block each on top.
+    let workspace = decoder.workspace_size();
+    assert!(
+        workspace < 900 * 1024,
+        "ring rounded past the frame's content: workspace {workspace} bytes"
+    );
+}
+
+/// A streamed frame's one-shot buffer is reserved when its first block is in
+/// hand, not on the header alone: a header declaring 64 MiB, followed by
+/// nothing (a chunk boundary, or a truncated stream), costs no allocation.
+#[test]
+fn a_streamed_header_without_a_block_reserves_nothing() {
+    let mut frame = alloc::vec![
+        0x28, 0xB5, 0x2F, 0xFD, // magic
+        0x80, // FHD: multi-segment, 4-byte content size
+        0x80, // window descriptor: 64 MiB
+    ];
+    frame.extend_from_slice(&(64u32 << 20).to_le_bytes());
+    let mut decoder = FrameDecoder::new();
+    let mut source = frame.as_slice();
+    decoder.reset(&mut source).expect("header parses");
+    let mut chunk = alloc::vec![0u8; 1024];
+    let (read, written) = decoder
+        .decode_from_to(source, &mut chunk)
+        .expect("no block yet is not an error");
+    assert_eq!((read, written), (0, 0));
+    let workspace = decoder.workspace_size();
+    assert!(
+        workspace < 1 << 20,
+        "a header with no block reserved {workspace} bytes"
+    );
+}
+
+/// A compressed block that expands past `MAX_BLOCK_SIZE` is malformed (RFC 8878
+/// 3.1.1.2.4, Block_Maximum_Size) however large the caller's slice. Hand-built:
+/// a 1 MiB window, optionally a content size, and one block of 2 raw literals
+/// plus two RLE-coded sequences (literal length 1, repeat offset 1,
+/// match-length code 52 = 65,539) that together write 131,080 bytes.
+const PAST_BLOCK_MAXIMUM_OUTPUT: u32 = 2 + 2 * 65_539;
+
+fn frame_with_a_block_past_the_block_maximum(content_size: Option<u32>) -> Vec<u8> {
+    let block: [u8; 13] = [
+        0x10, b'a', b'b', // raw literals section, 2 bytes
+        0x02, // two sequences
+        0x54, // LL, OF and ML all RLE
+        0x01, 0x00, 0x34, // LL code 1, OF code 0, ML code 52
+        0x00, 0x00, 0x00, 0x00, // 16 zero extra bits per match length
+        0x01, // stream start bit
+    ];
+    let mut frame = alloc::vec![0x28, 0xB5, 0x2F, 0xFD]; // magic
+    match content_size {
+        // FHD: multi-segment, no checksum, no content size.
+        None => frame.extend_from_slice(&[0x00, 0x50]),
+        // FHD: multi-segment, 4-byte content size.
+        Some(size) => {
+            frame.extend_from_slice(&[0x80, 0x50]);
+            frame.extend_from_slice(&size.to_le_bytes());
+        }
+    }
+    // (0x50 is the window descriptor: 1 MiB.) Last block, compressed, 13 bytes.
+    let header = (block.len() as u32) << 3 | 2 << 1 | 1;
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    frame.extend_from_slice(&block);
+    frame
+}
+
+#[test]
+fn a_block_past_the_block_maximum_is_rejected_on_the_direct_path() {
+    let frame = frame_with_a_block_past_the_block_maximum(None);
+    let mut out = alloc::vec![0u8; 256 * 1024];
+    let result = FrameDecoder::new().decode_all(&frame, &mut out);
+    // The slice had room: the block is malformed, not the target too small.
+    // (The block-body error variant carries its coordinates under `lsm`.)
+    match result {
+        Ok(_) | Err(super::FrameDecoderError::TargetTooSmall) => {
+            panic!("a block writing 131,080 bytes must be rejected as malformed, got {result:?}")
+        }
+        Err(_) => {}
+    }
+}
+
+/// The same block in a frame whose declared size covers it: the content-size
+/// bound does not stand in for the per-block one.
+#[test]
+fn a_block_past_the_block_maximum_is_rejected_under_a_declared_size() {
+    let frame = frame_with_a_block_past_the_block_maximum(Some(PAST_BLOCK_MAXIMUM_OUTPUT));
+    let mut out = alloc::vec![0u8; PAST_BLOCK_MAXIMUM_OUTPUT as usize];
+    let result = FrameDecoder::new().decode_all(&frame, &mut out);
+    assert!(
+        result.is_err(),
+        "a block writing 131,080 bytes must be rejected, got {result:?}"
+    );
+}
+
+#[test]
+fn a_block_past_the_block_maximum_is_rejected_on_the_ring() {
+    let frame = frame_with_a_block_past_the_block_maximum(None);
+    let mut decoder = FrameDecoder::new();
+    let mut source = frame.as_slice();
+    decoder.reset(&mut source).expect("header parses");
+    let mut chunk = alloc::vec![0u8; 256 * 1024];
+    let result = decoder.decode_from_to(source, &mut chunk);
+    assert!(
+        result.is_err(),
+        "a block writing 131,080 bytes must be rejected, got {result:?}"
+    );
+}
+
 #[test]
 fn dict_frame_decodes_through_direct_path() {
     // A dictionary frame decoded via `decode_all_with_dict_handle`

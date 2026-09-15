@@ -323,6 +323,14 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.reserve_exact(amount);
     }
 
+    /// Lower the live byte count growth stops at, for a frame that knows it
+    /// holds less than a window plus a block (its declared content is
+    /// smaller). `reset` sets the window-derived limit for every frame.
+    #[inline]
+    pub(crate) fn set_growth_limit(&mut self, growth_limit: usize) {
+        self.buffer.set_growth_limit(growth_limit);
+    }
+
     /// Mutable backend handle. Lets the inline sequence executor
     /// write straight into the backend's physical storage; the
     /// `tail()` cursor on the backend is the authoritative output

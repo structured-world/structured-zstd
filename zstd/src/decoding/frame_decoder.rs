@@ -537,6 +537,10 @@ impl DecoderScratchKind {
         // window-sized buffer toward 2x window.
         match self {
             Self::Ring(s) => {
+                // The target is the most the frame holds, so growth stops
+                // there: a content-capped size below the window would
+                // otherwise round up to the next power of two.
+                s.buffer.set_growth_limit(window_size);
                 let additional = window_size.saturating_sub(s.buffer.len());
                 s.buffer.reserve_exact(additional);
             }
@@ -2368,17 +2372,6 @@ impl FrameDecoder {
                     Some(s) => s,
                     None => panic!("Bug in library"),
                 };
-                // A frame that declares its size gets its buffer in one
-                // allocation on its first call, as upstream allocates its
-                // stream buffer at the frame header: growing it block by block
-                // cost a fresh decoder several reallocations, copies and
-                // page-fault passes per frame. The size is content-capped, so a
-                // small frame gets a small buffer; a frame of unknown size keeps
-                // growing lazily rather than paying for its whole window.
-                if state.block_counter == 0 && state.frame_header.fcs_declared() {
-                    let buffer_size = state.decoding_buffer_size();
-                    state.decoder_scratch.reserve_buffer(buffer_size);
-                }
                 let mut block_dec = decoding::block_decoder::new();
 
                 // Honour the content-checksum mode on this hand-rolled decode
@@ -2452,6 +2445,19 @@ impl FrameDecoder {
                         break;
                     }
                     state.bytes_read_counter += u64::from(block_header_size);
+                    // A frame that declares its size gets its buffer in one
+                    // allocation once its first block is in hand, as upstream
+                    // allocates its stream buffer per frame: growing it block by
+                    // block cost a fresh decoder several reallocations, copies
+                    // and page-fault passes per frame. Not on the header alone,
+                    // which would let a header followed by nothing reserve its
+                    // whole declared window. The size is content-capped, so a
+                    // small frame gets a small buffer; a frame of unknown size
+                    // keeps growing lazily rather than paying for its window.
+                    if state.block_counter == 0 && state.frame_header.fcs_declared() {
+                        let buffer_size = state.decoding_buffer_size();
+                        state.decoder_scratch.reserve_buffer(buffer_size);
+                    }
 
                     // Only expose the held dictionary while THIS frame is dict-backed
                     // (`using_dict` is set per dict-apply, cleared on reset). A reused
@@ -3457,9 +3463,16 @@ impl FrameDecoder {
                 // means the frame exceeded its FCS, never a caller-undersized
                 // buffer, and folds into the same `FrameContentSizeMismatch`
                 // contract as Raw/RLE; without one the slice is the limit.
+                // An overflow that stays within `limit` was refused by the
+                // per-block output ceiling instead: a malformed block, which
+                // takes the generic arm below.
                 Err(crate::decoding::errors::DecodeBlockContentError::DecompressBlockError(
                     crate::decoding::errors::DecompressBlockError::ExecuteSequencesError(ref e),
-                )) if e.output_overflow_requested().is_some() => {
+                )) if e.output_overflow_requested().is_some_and(|requested| {
+                    (direct.buffer.buffer_ref().tail() as u64).saturating_add(requested as u64)
+                        > limit
+                }) =>
+                {
                     let requested = e
                         .output_overflow_requested()
                         .expect("guard guarantees Some") as u64;

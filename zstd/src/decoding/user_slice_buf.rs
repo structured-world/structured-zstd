@@ -3,21 +3,20 @@
 //!
 //! Selected automatically by
 //! [`crate::decoding::FrameDecoder::decode_all`] (and
-//! [`crate::decoding::FrameDecoder::decode_all_to_vec`]) when ALL of
-//! the following hold:
-//! - `frame_content_size > 0` — the header-derived content size
-//!   is non-zero. This is the actual eligibility condition (NOT
-//!   "FCS present"): an empty frame with an explicit FCS=0
-//!   declaration on the wire stays on the fallback path because
-//!   there is no payload to write into the user slice. To
-//!   distinguish "FCS absent" from "FCS=0 explicit" elsewhere in
-//!   the decoder, use `FrameHeader::fcs_declared()` (e.g. the
-//!   fallback path's post-decode size check does).
-//! - `output.len() >= frame_content_size` — the slice holds the
-//!   declared content. No `WILDCOPY_OVERLENGTH` slack is required:
-//!   when a sequence's literal+match bytes fit but the SIMD wildcopy
-//!   overshoot would not, the trailing sequence(s) take the bounded
-//!   (non-overshooting) copy in [`UserSliceBackend::exec_sequence_bounded`].
+//! [`crate::decoding::FrameDecoder::decode_all_to_vec`]) for a frame
+//! that either:
+//! - declares a non-zero content size the slice holds
+//!   (`output.len() >= frame_content_size`; an explicit FCS=0 stays on
+//!   the fallback path, there being no payload to write), or
+//! - declares none, in which case the slice itself is the limit, as
+//!   upstream `ZSTD_decompressDCtx` decodes into `dst`.
+//!
+//! No `WILDCOPY_OVERLENGTH` slack is required: when a sequence's
+//! literal+match bytes fit but the SIMD wildcopy overshoot would not, the
+//! trailing sequence(s) take the bounded (non-overshooting) copy in
+//! [`UserSliceBackend::exec_sequence_bounded`]. Each block is still held
+//! to `MAX_BLOCK_SIZE` of output by the per-block ceiling
+//! (`set_max_capacity`), whatever room the slice has.
 //! - No active dictionary (the persistent dict_content is not
 //!   carried into the stack-local DecodeBuffer this backend
 //!   builds; dict frames stay on the regular path).
@@ -139,6 +138,13 @@ pub(crate) struct UserSliceBackend<'a> {
     /// for API parity with `FlatBuf` and `RingBuffer`.
     head: usize,
     tail: usize,
+    /// Per-block output ceiling on the live byte count, armed by
+    /// `set_block_output_ceiling` before each sequence section. A block may
+    /// write at most `MAX_BLOCK_SIZE` (RFC 8878 3.1.1.2.4) whatever room the
+    /// caller's slice has, which for a frame of unknown size is its only
+    /// other bound. Checked where `RingBuffer` checks it: the inline gate
+    /// and the match reservation. `usize::MAX` leaves the slice as the bound.
+    max_capacity: usize,
 }
 
 impl<'a> UserSliceBackend<'a> {
@@ -154,7 +160,17 @@ impl<'a> UserSliceBackend<'a> {
             slice,
             head: 0,
             tail: 0,
+            max_capacity: usize::MAX,
         }
+    }
+
+    /// Whether `n` more bytes keep the live byte count within the per-block
+    /// ceiling ([`Self::max_capacity`]).
+    #[inline(always)]
+    fn within_block_ceiling(&self, n: usize) -> bool {
+        (self.tail - self.head)
+            .checked_add(n)
+            .is_some_and(|live| live <= self.max_capacity)
     }
 
     /// Physical bytes `slice[from..tail]` — the output written since a
@@ -609,7 +625,24 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             slice: &mut [],
             head: 0,
             tail: 0,
+            max_capacity: usize::MAX,
         }
+    }
+
+    /// The linear slice is always contiguous, so only the per-block output
+    /// ceiling can refuse the inline body; `sequence_output_fits` and the
+    /// tight-tail branch cover the slice's own bound. A refused sequence
+    /// takes the `push` / `repeat` path, whose `try_reserve` reports it.
+    #[inline(always)]
+    fn inline_exec_ok(&self, lit_length: usize, match_length: usize, _offset: usize) -> bool {
+        lit_length
+            .checked_add(match_length)
+            .is_some_and(|written| self.within_block_ceiling(written))
+    }
+
+    #[inline]
+    fn set_max_capacity(&mut self, max_capacity: usize) {
+        self.max_capacity = max_capacity;
     }
 
     #[inline]
@@ -624,12 +657,16 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // check. Lets safe public decode APIs catch a malformed-frame
         // overshoot here instead of via the `assert!` inside
         // `extend_from_within_unchecked` further down the call chain.
+        // The per-block ceiling bounds the match writes this reservation
+        // precedes, as `RingBuffer::try_reserve` bounds them.
         match self.tail.checked_add(n) {
-            Some(new_tail) if new_tail <= self.slice.len() => Ok(()),
+            Some(new_tail) if new_tail <= self.slice.len() && self.within_block_ceiling(n) => {
+                Ok(())
+            }
             _ => Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
                 requested: n,
-                capacity: self.slice.len(),
+                capacity: self.slice.len().min(self.max_capacity),
             }),
         }
     }
