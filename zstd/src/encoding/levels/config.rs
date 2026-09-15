@@ -320,7 +320,7 @@ pub(crate) fn apply_param_overrides(
                     fast.hash_log = hash_log;
                 }
                 if let Some(min_match) = ov.min_match {
-                    fast.mls = min_match;
+                    fast.mls = fast_key_len(min_match);
                 }
                 // targetLength is the Fast strategy's step, as it is on the
                 // level's own row: upstream zstd_fast.c `stepSize =
@@ -396,6 +396,14 @@ pub(crate) fn apply_param_overrides(
             }
         }
     }
+}
+
+/// The key width the fast strategy hashes for a `minMatch`: upstream's fast
+/// block compressor takes 3 as 4 (zstd_fast.c, `ZSTD_compressBlock_fast`:
+/// `default: /* includes case 3 */`). A 3 reaches the fast strategy from the
+/// knob, or from an optimal level's CDict row a strategy knob moved onto it.
+fn fast_key_len(min_match: u32) -> u32 {
+    min_match.max(4)
 }
 
 /// Map the resolved runtime strategy to the upstream zstd LDM strategy ordinal
@@ -635,7 +643,7 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
             // Upstream fast `stepSize`: `targetLength + 1` (0 -> 1, so step 2).
             fast: Some(FastConfig {
                 hash_log: cp.hash_log,
-                mls: cp.min_match,
+                mls: fast_key_len(cp.min_match),
                 step_size: target_len.max(1) + 1,
             }),
             dfast: None,

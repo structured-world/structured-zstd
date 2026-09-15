@@ -3357,6 +3357,54 @@ fn dictionary_frame_runs_a_strategy_override() {
     assert_eq!(decoded, payload);
 }
 
+/// The fast strategy hashes a key of at least 4 bytes: upstream's fast block
+/// compressor takes a minMatch of 3 as 4 (zstd_fast.c,
+/// `ZSTD_compressBlock_fast`: `default: /* includes case 3 */`). A min_match
+/// of 3 reaches it from the knob, and from an optimal level's CDict row when
+/// a dictionary frame is moved onto the fast strategy; both frames compress
+/// and decode.
+#[test]
+fn fast_strategy_takes_a_three_byte_min_match_as_four() {
+    use crate::encoding::{CompressionParameters, Strategy};
+    let dict_raw = noise_bytes(16 * 1024, 5);
+    let mut payload = dict_raw[2048..10 * 1024].to_vec();
+    payload.extend_from_slice(&b"key=value; ".repeat(2000));
+    let knob = CompressionParameters::builder(super::CompressionLevel::Level(3))
+        .strategy(Strategy::Fast)
+        .min_match(3)
+        .build()
+        .expect("valid knobs");
+    let optimal_row = CompressionParameters::builder(super::CompressionLevel::Level(19))
+        .strategy(Strategy::Fast)
+        .build()
+        .expect("valid knobs");
+    for (case, params, with_dictionary) in [("knob", knob, false), ("CDict row", optimal_row, true)]
+    {
+        let mut enc: FrameCompressor = FrameCompressor::new(params.level());
+        if with_dictionary {
+            enc.set_dictionary(
+                crate::decoding::Dictionary::from_raw_content(0xD1C7_001B, dict_raw.clone())
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        enc.set_parameters(&params);
+        let frame = enc.compress_independent_frame(&payload);
+        let mut decoder = FrameDecoder::new();
+        if with_dictionary {
+            decoder
+                .add_dict(
+                    crate::decoding::Dictionary::from_raw_content(0xD1C7_001B, dict_raw.clone())
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&frame, &mut decoded).unwrap();
+        assert!(decoded == payload, "{case}: round trip");
+    }
+}
+
 /// The raw-literals gate is recomputed when the dictionary state changes
 /// AFTER `set_parameters`. With a positive `target_length`, the gate turns
 /// on exactly where the frame runs the fast strategy: L2 over a 200 KiB
