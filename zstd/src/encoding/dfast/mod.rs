@@ -176,6 +176,12 @@ pub(crate) struct DfastMatchGenerator {
     /// tables in place instead of clearing + re-committing them). Signals the
     /// frame compressor to SKIP `prime_with_dictionary` this frame.
     pub(crate) dict_resident: bool,
+    /// Whether the tables may hold slots an earlier frame wrote, set by
+    /// [`Self::reset`]. The owned path retires them by moving the floor; the
+    /// borrowed kernel numbers every frame's input from zero, so it would
+    /// read them as positions of its own frame and a reused matcher would
+    /// compress differently from a fresh one.
+    pub(crate) tables_hold_earlier_frames: bool,
 }
 
 /// The dfast backend's immutable dictionary tables — a long+short pair mirroring
@@ -242,6 +248,7 @@ impl DfastMatchGenerator {
             borrowed_input: None,
             borrowed_block: None,
             dict_resident: false,
+            tables_hold_earlier_frames: false,
         }
     }
 
@@ -483,6 +490,11 @@ impl DfastMatchGenerator {
                 }
             }
         }
+        // Tables still allocated carry whatever the previous frames wrote,
+        // owned or borrowed (a width change drops them before this runs),
+        // unless the fallback above has just cleared them.
+        let cleared = reborrow_region.is_none() && next_floor > REBASE_RESET_FLOOR_CEILING;
+        self.tables_hold_earlier_frames = !self.tables.is_empty() && !cleared;
         // No Vec<u8> blocks to recycle: `add_data` returns each input
         // Vec to the caller eagerly via its own `reuse_space`, and the
         // history Vec is owned solely by the matcher. There is nothing

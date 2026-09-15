@@ -2762,6 +2762,54 @@ fn compress_independent_frame_reuse_matches_fresh_on_the_optimal_band() {
     assert!(diverged.is_empty(), "{diverged:#?}");
 }
 
+/// A compressor kept for one-shot frame after frame, with its parameters set
+/// again before each (what a C context compressing through
+/// `ZSTD_compress2` does), writes each 4 KiB piece of a stream exactly as a
+/// fresh compressor with the same parameters writes it, at every level.
+#[test]
+fn a_kept_compressor_writes_each_small_piece_as_a_fresh_one() {
+    use crate::encoding::{CompressionLevel, CompressionParameters};
+    let text: Vec<u8> = (0..12_000u32)
+        .flat_map(|i| {
+            alloc::format!(
+                "ts={} host=h{} level={} msg=event {} took {}ms\n",
+                1_700_000_000 + i * 7,
+                i % 13,
+                ["info", "warn", "debug"][(i % 3) as usize],
+                i % 211,
+                (i * 37) % 997
+            )
+            .into_bytes()
+        })
+        .collect();
+    let mut diverged = Vec::new();
+    for level in [-3, 1, 2, 3, 4, 5, 6, 7, 9, 12, 13, 16, 19, 22] {
+        let level = CompressionLevel::from_level(level);
+        let params = CompressionParameters::builder(level).build().unwrap();
+        let mut kept: FrameCompressor = FrameCompressor::new(level);
+        for (index, piece) in text.chunks(4096).take(40).enumerate() {
+            kept.set_parameters(&params);
+            let reused = kept.compress_independent_frame(piece);
+            let mut fresh: FrameCompressor = FrameCompressor::new(level);
+            fresh.set_parameters(&params);
+            let expected = fresh.compress_independent_frame(piece);
+            if reused != expected {
+                let mut decoded = Vec::with_capacity(piece.len());
+                let decodes = FrameDecoder::new()
+                    .decode_all_to_vec(&reused, &mut decoded)
+                    .is_ok()
+                    && decoded == piece;
+                diverged.push(alloc::format!(
+                    "{level:?} piece {index}: {} bytes reused against {} fresh, decodes: {decodes}",
+                    reused.len(),
+                    expected.len()
+                ));
+            }
+        }
+    }
+    assert!(diverged.is_empty(), "{diverged:#?}");
+}
+
 /// `compress_independent_frame_into` must replace (not append to) the
 /// caller's buffer each call, so a smaller frame after a larger one
 /// yields exactly the smaller frame, and the reused buffer's content

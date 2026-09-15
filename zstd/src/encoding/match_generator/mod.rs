@@ -572,6 +572,19 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// Whether a borrowed scan starting now sees nothing of an earlier frame,
+    /// so the frame is the one a fresh matcher writes. Asked once per frame,
+    /// after `reset`; [`Self::borrowed_supported`] stays the per-block
+    /// invariant. Only the Dfast kernel numbers a borrowed frame's input from
+    /// zero regardless of what its tables hold; the others advance their
+    /// floor past the previous frame, borrowed or not.
+    pub(crate) fn borrowed_frame_is_independent(&self) -> bool {
+        match &self.storage {
+            MatcherStorage::Dfast(d) => !d.tables_hold_earlier_frames,
+            _ => true,
+        }
+    }
+
     /// Whether a DICTIONARY frame can take the borrowed (no input copy) path.
     /// Only the Simple (Fast) backend with the dictionary ATTACHED (not the
     /// copy/merge regime) has a borrowed dict scan — `start_matching_borrowed_dict`

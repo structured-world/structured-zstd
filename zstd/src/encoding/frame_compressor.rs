@@ -1739,8 +1739,12 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // the owned path. Every borrowed scan applies the per-position
         // `window_low = abs_ip - advertised_window` offset cap so over-window
         // inputs are matched in place (no input->history copy), matching C's
-        // continuous-index + windowLow one-shot behaviour.
+        // continuous-index + windowLow one-shot behaviour. A reused Dfast
+        // matcher whose tables hold earlier frames takes the owned path, which
+        // retires them by moving the floor, so it writes what a fresh one does
+        // (upstream: first and later uses of a context compress the same).
         self.state.matcher.borrowed_supported()
+            && self.state.matcher.borrowed_frame_is_independent()
     }
 
     /// Compress `input` as one frame's worth of blocks into `out` (appended
