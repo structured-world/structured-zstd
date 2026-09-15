@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.53](https://github.com/structured-world/structured-zstd/compare/v0.0.52...v0.0.53) - 2026-09-15
+
+### Added
+
+- *(cli)* upstream v1.5.7 file selection, display levels and encoder switches ([#502](https://github.com/structured-world/structured-zstd/pull/502))
+
+### Performance
+
+- *(encode)* close a third of the level-1 gap to libzstd ([#501](https://github.com/structured-world/structured-zstd/pull/501))
+- *(opt)* close a third of the optimal finder's gap to libzstd on the dictionary band ([#498](https://github.com/structured-world/structured-zstd/pull/498))
+
 ## [0.0.52](https://github.com/structured-world/structured-zstd/compare/v0.0.51...v0.0.52) - 2026-09-08
 
 ### Fixed
