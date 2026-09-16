@@ -612,6 +612,15 @@ impl AlignedFSETable {
     }
 }
 
+impl From<SeqFSETable> for AlignedFSETable {
+    /// Wrap an already-built table so it gets the same placement as the
+    /// per-frame ones. The predefined caches are read by the same sequence
+    /// loop, so they want the same alignment.
+    fn from(table: SeqFSETable) -> Self {
+        Self(table)
+    }
+}
+
 impl Deref for AlignedFSETable {
     type Target = SeqFSETable;
 

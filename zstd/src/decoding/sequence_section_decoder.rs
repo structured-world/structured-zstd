@@ -136,9 +136,17 @@ where
     // resolve to the shared dictionary's table (zero-copy) on axes still
     // in `Dict` mode, else the locally-built table. `maybe_update_fse_tables`
     // above has already flipped any rebuilt axis to `Local`.
-    let mut ll_dec = SeqFSEDecoder::new(fse.ll_table(dict));
-    let mut ml_dec = SeqFSEDecoder::new(fse.ml_table(dict));
-    let mut of_dec = SeqFSEDecoder::new(fse.of_table(dict));
+    //
+    // Resolve each axis ONCE: a `Predefined` axis answers out of a `OnceLock`,
+    // so a second call for `accuracy_log` below would repeat that synchronised
+    // load per block.
+    let ll_src = fse.ll_table(dict);
+    let ml_src = fse.ml_table(dict);
+    let of_src = fse.of_table(dict);
+
+    let mut ll_dec = SeqFSEDecoder::new(ll_src);
+    let mut ml_dec = SeqFSEDecoder::new(ml_src);
+    let mut of_dec = SeqFSEDecoder::new(of_src);
 
     ll_dec
         .init_state(&mut br)
@@ -150,9 +158,7 @@ where
         .init_state(&mut br)
         .map_err(DecodeSequenceError::from)?;
 
-    let max_update_bits = fse.ll_table(dict).accuracy_log
-        + fse.ml_table(dict).accuracy_log
-        + fse.of_table(dict).accuracy_log;
+    let max_update_bits = ll_src.accuracy_log + ml_src.accuracy_log + of_src.accuracy_log;
     debug_assert!(
         max_update_bits <= 56,
         "sequence section update bits exceed 56-bit budget"
@@ -1697,41 +1703,44 @@ const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
 // shim.
 #[cfg(feature = "std")]
 pub(crate) fn predefined_ll_table() -> &'static crate::fse::SeqFSETable {
+    use super::scratch::AlignedFSETable;
     use std::sync::OnceLock;
-    static CACHED: OnceLock<crate::fse::SeqFSETable> = OnceLock::new();
+    static CACHED: OnceLock<AlignedFSETable> = OnceLock::new();
     CACHED.get_or_init(|| {
         let mut t = crate::fse::SeqFSETable::new(MAX_LITERAL_LENGTH_CODE);
         t.build_from_probabilities(LL_DEFAULT_ACC_LOG, &LITERALS_LENGTH_DEFAULT_DISTRIBUTION)
             .expect("LITERALS_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_with_packed_seq_meta(&LL_META);
-        t
+        t.into()
     })
 }
 
 #[cfg(feature = "std")]
 pub(crate) fn predefined_ml_table() -> &'static crate::fse::SeqFSETable {
+    use super::scratch::AlignedFSETable;
     use std::sync::OnceLock;
-    static CACHED: OnceLock<crate::fse::SeqFSETable> = OnceLock::new();
+    static CACHED: OnceLock<AlignedFSETable> = OnceLock::new();
     CACHED.get_or_init(|| {
         let mut t = crate::fse::SeqFSETable::new(MAX_MATCH_LENGTH_CODE);
         t.build_from_probabilities(ML_DEFAULT_ACC_LOG, &MATCH_LENGTH_DEFAULT_DISTRIBUTION)
             .expect("MATCH_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_with_packed_seq_meta(&ML_META);
-        t
+        t.into()
     })
 }
 
 #[cfg(feature = "std")]
 pub(crate) fn predefined_of_table() -> (&'static crate::fse::SeqFSETable, u32) {
+    use super::scratch::AlignedFSETable;
     use std::sync::OnceLock;
-    static CACHED: OnceLock<(crate::fse::SeqFSETable, u32)> = OnceLock::new();
+    static CACHED: OnceLock<(AlignedFSETable, u32)> = OnceLock::new();
     let cache = CACHED.get_or_init(|| {
         let mut t = crate::fse::SeqFSETable::new(MAX_OFFSET_CODE);
         t.build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)
             .expect("OFFSET_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_for_offsets();
         let share = compute_offsets_long_share(&t);
-        (t, share)
+        (t.into(), share)
     });
     (&cache.0, cache.1)
 }
