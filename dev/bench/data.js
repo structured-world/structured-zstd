@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789496470073,
+  "lastUpdate": 1789557168965,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -6323,6 +6323,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.188,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d8415897180384d384586539c86f5da9225de404",
+          "message": "perf(decoding): hold streamed frames to a window plus a block, decode unsized frames into the caller's slice (#509)\n\n* perf(decoding): hold a streamed frame to one window plus a block\n\ndecode_from_to decoded every block its input held before draining any of it, so a caller handing over a whole frame grew the ring to the frame's content size, doubling and copying its way there. It now drains into the target before each block and decodes no further while the target is full, as upstream ZSTD_decompressStream flushes each block before the next.\n\nThe ring's amortized growth stops at the frame's window plus one block instead of doubling past it, so a full power-of-two window asking room for a block no longer becomes two windows; a caller that holds more than that still grows. Frames that reserve up front reserve the window plus a block, content-capped, so filling the window costs no copy; frames of unknown size still grow lazily.\n\nTests: a 4 MiB frame with a 1 MiB window streamed in 128 KiB steps keeps the workspace under 1.5 windows (it held the whole content), a 1 KiB target still receives every byte, and the ring's limit cuts the doubling step, leaves small growth alone and still grows for a need past it.\n\nPart of #508\n\n* perf(decoding): allocate a declared-size stream frame's buffer once\n\nA fresh decoder streaming a frame grew its ring from nothing through every doubling, reallocating, copying and faulting its pages in per frame; bounding the growth at a window plus a block changed the sizes glibc sees and made the per-frame cost worse (an 8 MiB level-19 frame through a new ZSTD_DStream: 9.37 -> 16.56 ms, page faults 16.5K -> 122.8K over 20 frames). A frame that declares its size now gets min(window + block, content) in one allocation on its first decode_from_to call, as upstream allocates its stream buffer at the frame header. A frame of unknown size keeps growing lazily under the limit, so a small one is not charged its whole declared window.\n\nPart of #508\n\n* perf(decoding): decode a frame of unknown size straight into the caller's slice\n\ndecode_all took the direct path only for a frame declaring its size; one that declares none went through the drain path, which reserves the frame's declared window. A streamed producer's frame declares no size and, at level 19, an 8 MiB window, so a one-shot decode of 4 KiB allocated and zeroed megabytes per call (ZSTD_decompress: 186 us against libzstd's 4.3 us). Such a frame now decodes into the caller's slice as well, the slice being its limit, as upstream ZSTD_decompressDCtx decodes into dst; output past the slice is TargetTooSmall, as it was on the drain path. Frames declaring a size keep every content-size check.\n\nTests: a 4 KiB level-19 frame of unknown size decodes into its slice without reserving its window (it reserved 8.5 MB), and one byte short is still TargetTooSmall.\n\nPart of #508\n\n* fix(decoding): hold direct-path blocks to the block maximum, reserve a stream buffer per block in hand\n\n- Direct decoding into the caller's slice never enforced MAX_BLOCK_SIZE per block: UserSliceBackend took the per-block ceiling as a no-op, so a malformed compressed block expanding past 128 KiB was accepted whenever the slice (or the declared content size) had room. It now keeps the ceiling on the live byte count and checks it where RingBuffer does, in the inline gate and the match reservation; an overflow within the slice is reported as a malformed block rather than TargetTooSmall.\n- decode_from_to reserved a declared-size frame's buffer on its first call, before knowing a block was there, so a header followed by nothing reserved the whole declared window. The reservation now waits for the first complete block.\n- A content-capped reservation below the window rounded up to the next power of two in the ring (600 KiB content, 1 MiB window: 1 MiB of ring). reserve_buffer now lowers the ring's growth limit to its target, so the doubling lands on the content size.\n\nTests: a hand-built block of two RLE sequences writing 131,080 bytes is rejected on the direct path with and without a declared size (both were accepted) and on the ring; a 64 MiB header with no block reserves nothing (it reserved 67 MB); a 600 KiB frame with a 1 MiB window keeps a ring of its content (it held 1 MiB).\n\nPart of #508\n\n* perf(decoding): fold the block ceiling into the slice bound, keep a block of ring past the window\n\n- The direct path's per-block ceiling cost a check of its own on every sequence (inline gate plus reservation: +1.2..4.5% on the C ABI one-shot rows). It now narrows the one bound sequence writes already check, UserSliceBackend::cap, to the nearer of the slice's end and the ceiling, as upstream folds blockSizeMax into oend.\n- Capping a multi-segment frame's ring at its declared content left no block of room once the window filled whenever the content ran a few bytes past the window, and the block after doubled the ring (an 8 MiB level-19 frame through a new ZSTD_DStream: 6.95 -> 8.15 ms, page faults 6.5K -> 12.6K). The ring now reserves the content-capped window plus a block; a single-segment frame keeps exactly its content.\n\nTest: a frame 1000 bytes past its 1 MiB window, compressed blocks, streamed in 128 KiB steps, stays under 1.5 windows (it fails on the content-capped size).\n\nPart of #508\n\n* fix(decoding): bound block literals, size small rings\n\n- Reject a block whose literals section regenerates more than the\n  block maximum, and a block whose total output (sequences plus the\n  literals left after the last one) runs past it, as upstream's\n  ZSTD_decodeLiteralsBlock and the shared oend bound do. The ring path\n  had no such check, so an oversized block decoded instead of failing.\n  New error DecompressBlockError::ExpandsPastBlockMaximum. Regression\n  tests: literals_past_the_block_maximum_are_rejected,\n  trailing_literals_past_the_block_maximum_are_rejected.\n- A declared-size stream frame no larger than its window reserves just\n  its content, not window plus a block: nothing ever drains out of the\n  window, so the extra block was never written. The growth limit stays\n  at window plus a block for frames that run past it. Test:\n  a_streamed_frame_that_fits_its_window_reserves_just_its_content.\n- decode_from_to takes the pending drainable length from the read it\n  already makes instead of querying the buffer a second time per block.\n\n* fix(decoding): hold a block to its frame's block maximum\n\nA frame's block maximum is the smaller of its window and 128 KiB (RFC 8878\n3.1.1.2.4), which upstream derives once per frame as\n`blockSizeMax = MIN(windowSize, ZSTD_BLOCKSIZE_MAX)` and checks every block\nagainst. Ours bounded blocks at 128 KiB alone, so a frame with a 1 KiB window\ndecoded blocks of 2 KiB: past what the format allows, and past what the\nwindow-sized buffer is meant to hold.\n\nThe limit now comes from the window and bounds a compressed block's literals,\nits whole output and its sequence writes, plus a Raw or RLE block's size from\nits header before it writes, as upstream checks `rSize`. Regression test\na_block_past_a_small_window_is_rejected covers all three block types and failed\non each before this.\n\nAlso pins that the per-block sequence ceiling does not narrow a following Raw\nblock: a compressed block of 13 bytes followed by a Raw block of a whole block\nmaximum fills the caller's slice\n(a_raw_block_after_a_compressed_one_fills_the_slice).\n\n* fix(decoding): report short targets on literal-only blocks\n\n- A compressed block with no sequences wrote its literals through the\n  infallible path, which asserts on a fixed-capacity backend. Literals within\n  the block maximum can still be longer than the caller's slice, so a valid\n  frame decoded into a short target aborted where it must return\n  TargetTooSmall. The write is now fallible (new\n  DecompressBlockError::LiteralsOutputOverflow), and the direct path maps it\n  the way it maps a sequence overshoot: every entry to that path holds\n  output.len() >= limit, so a write past the slice is a write past the limit.\n  Regression test literals_longer_than_the_slice_are_target_too_small.\n  DecodeBuffer::push is now test-only: nothing in the decoder writes output\n  through a path that cannot report a short target.\n- The pre-block reservation asks for the frame's block maximum rather than a\n  flat 128 KiB. A frame with a 1 KiB window got a 131,073-byte ring where its\n  peak is 2 KiB, since the ring's growth limit only clamps a need that fits\n  under it. Test a_compressed_block_in_a_small_window_reserves_one_block_of_it\n  measured that ring before the change.\n- decode_from_to's return contract said read == 0 means the same input cannot\n  advance. Since output is drained before each block, read == 0 with\n  written > 0 means the target filled and the same input decodes further once\n  there is room. The contract now says so; both counters zero is the\n  no-progress signal.\n\n* perf(decoding): keep the literal-only write off the per-block body\n\n* perf(decoding): keep the infallible literal write for growable backends\n\n* perf(decoding): hand the literal-only write over as a tail call\n\n* perf(decoding): arm the block ceiling where the block maximum is known\n\n* fix(decoding): stop a full target from pulling in another block\n\n- A drain that fills the caller's target exactly leaves nothing pending, which\n  the block loop read as room to decode another block: its output had nowhere\n  to go and its input was consumed for a caller that asked for no more. The\n  loop now stops on a full target too. Regression test\n  a_filled_target_stops_before_the_next_block read 3081 bytes of a three-block\n  frame before the change and reads 2054 after.\n- The block-maximum error carried the global 128 KiB constant while the check\n  compares against the frame's own maximum, so a 2 KiB block in a 1 KiB-window\n  frame was reported as expanding past 131072. The variant carries the frame's\n  maximum now and prints that.\n- A frame that declares no size takes the single-raw-block shortcut as well.\n  The probe parsed the first block header and then failed a condition that\n  could never hold for such a frame, leaving the general loop to parse the same\n  header again. The shortcut checks the block maximum, which the general path\n  checks and the shortcut previously did not.\n- CPU kernel detection moved to the decoder's entry: the block decoder takes a\n  resolved kernel, so a chunked decode no longer reads the detection cache once\n  per call. The detecting constructor is now test-only.\n\n* refactor(decoding): resolve the kernel once, drop the side detects\n\n* refactor(decoding): drop the pext side-branch from the sequence readers\n\n* test(decoding): compare the kernels instead of the removed pext policy\n\n* fix(decoding): give 32-bit x86 its BMI2 tier back\n\n- The kernel tiers were all declared for x86_64, so a 32-bit x86 build resolved\n  to the scalar bodies whatever the CPU offered, losing the bit-extract the\n  Huffman state advance had before the dispatch was unified. The BMI2 tier now\n  covers both widths (32-bit `bzhi` applies to the halves), the detection picks\n  it there, and the literals dispatch has its arm. The sequence monolith stays\n  portable on 32-bit: its bodies are x86_64-only.\n- The Huffman state advance takes the table's precomputed mask again through a\n  kernel operation: a tier with a bit-extract instruction ignores the mask and\n  takes the width, the others take the mask instead of rebuilding it per\n  symbol.\n- The kernel-parity tests sweep every tier the dispatcher can select on the\n  running build rather than stopping at the first, and the Huffman one starts\n  from a nonzero state whose masked result is nonzero, so a tier that masked\n  wrongly would fail it.\n\nTwo review findings are answered in comments rather than code, both about the\nper-block ceiling over literal writes. The ceiling bounds SEQUENCE writes,\nwhich is why it is armed beside the sequence reserve; literal writes go through\n`try_extend`, bounded by the caller's slice, and the literals section was held\nto the block maximum where it was parsed. Arming the ceiling over those writes\nwould reject valid frames: a small block leaves the ceiling near its own\noutput, and a following literal-only block of a whole block maximum would\nexceed it while the slice still had room. Test\na_literal_only_block_after_a_compressed_one_fills_the_slice decodes exactly\nthat pair.\n\n* fix(decoding): let the aarch64 tiers reach the literals monomorph\n\n* fix(decoding): reserve no more than the frame has left to give\n\nThe per-block reservation asked for a whole block maximum on every compressed\nblock, so a frame that declared less than a block still grew its ring to one.\nThe initial reservation already capped the ring at the declared content; this\ngrew it straight back. The reservation now asks for the smaller of a block and\nwhat the frame has left to produce, which is what a declared size means.\n\nThe ceiling stays the block maximum: it decides whether a block is malformed,\nand a frame that outruns its declared size is caught by the size check, which\nsays so rather than blaming the block.\n\nRegression test a_compressed_block_reserves_no_more_than_the_frame_declares\ndecodes a 13-byte frame with a 1 MiB window: the ring held 131,086 bytes before\nthis and holds under 4 KiB after.\n\n* perf(decoding): keep the block-reservation arithmetic off the block body\n\n* perf(decoding): keep the declared-size field off the hot field layout\n\n* perf(decoding): take the low-bit mask from a table, not a guarded shift\n\n* perf(decoding): take pext back as a kernel operation\n\n* perf(decoding): keep the mask form of the three-field extract\n\nMeasured `pext` against it on the i9, same frame, arms interleaved: the mask\nform issues FEWER instructions (6.7277e9 against 6.7320e9 on a 1 MiB level-19\nstream decode) and the cycles overlap across repeats (2.640..2.643e9 against\n2.628..2.639e9). `pext` needs three mask loads and two shifts to set up, which\nis what the three shifts and three `bzhi` of the mask form cost outright, and\nits latency is three cycles against one.\n\nSo the instruction it saves is not saved, and paying for it means a second BMI2\ntier plus a `__cpuid` vendor probe, because AMD Zen 1 and Zen 2 microcode `pext`\nat around 18 cycles. Reverted: the extract keeps the form every kernel shares,\nand the vendor question disappears with it.\n\n* fix(decoding): finish an empty frame, and cap the ring at what a frame declares\n\nTwo defects the per-block reservation work left, each with the regression test\nthat fails without it.\n\nA frame that produces nothing could not be decoded into a slice that holds\nnothing. The block loop stops once the target is full, and a target of no bytes\nis full at its own length before any block is read, so the empty last block that\nends such a frame was never reached: every call returned no progress on input\nthat was complete. The stop now excludes an empty target, which reaches that\nblock; a frame that does produce bytes buffers its first block and stops on the\npending arm of the next pass, as before.\n\nA multi-segment frame keeps a block of room past its window because each\ncompressed block reserves a block before it decodes, but a frame cannot produce\npast the size it declared. A 1 MiB window declaring one byte more reserved\n1,179,649 bytes of ring for a byte of it, the per-block reservation having\nalready been capped at the same remainder. The limit takes the declaration too,\nso that frame holds 1,048,578.\n\n* perf(decoding): bzhi for the precomputed HUF mask on Avx2 and Vbmi2\n\n* perf(decoding): advance the HUF state by the table's mask on every kernel\n\nThe precomputed-mask op was overridden by the Bmi2 tier and not by Avx2 or\nVbmi2, so the ladder disagreed with itself: the wider tiers took the default\nwhile the narrower one took `bzhi`. Measured which of the two forms is right,\non the i9, both arms interleaved across five rounds on the level-19 frames that\nspend the most of their time in HUF.\n\n`bzhi` issues MORE instructions (6.7335e9 against 6.7278e9 on a 1 MiB stream\ndecode, 6.7067e9 against 6.7010e9 one-shot): the mask is already in hand, so\ntaking the width instead is a second load. The cycles overlap on every shape\n(2.6262-2.6361 against 2.6320-2.6615 streamed), which is no difference at this\nscale.\n\nSo the mask is not what a tier settles for, it is the better form, and the\nop stops being per-kernel: the advance masks with `state_mask` everywhere and\nthe trait loses the method. The numbers are recorded at the advance so the\nquestion does not come back.\n\n* fix(decoding): cap the ring's reservation at the declared size, not its limit\n\nCapping the growth limit at the declaration aborted the decode on a frame that\ndeclares less than its blocks produce: the ring ran out of buffer under a write\nit cannot refuse, and asserts on that rather than reporting it. The fuzz decode\ntarget finds such a frame in well under a minute.\n\nThe declaration belongs on the up-front reservation instead, which is where the\nwaste was: a 1 MiB window declaring one byte more reserved 1,179,649 bytes for\nthat byte and now reserves 1,048,578. The limit stays at the window plus a\nblock, so a frame that exceeds what it promised still has somewhere to put the\nbytes and is judged once they exist.\n\nCarries the input that aborted, straight from the fuzzer.\n\n* test(decoding): gate the VBMI2 kernel tests on the selector's full predicate\n\nThe tier mixes VBMI2 with AVX2 widths and BMI2 masking, and the sweeps asked\nonly for VBMI2. A CPU that offers it while masking any of the rest would have\nreached the monomorph and decoded through instructions it does not have. Both\nsweeps now ask what the kernel selection asks.",
+          "timestamp": "2026-09-16T13:29:54+03:00",
+          "tree_id": "aaec33d0080ba0fddc7a791b8e8c266632b1d439",
+          "url": "https://github.com/structured-world/structured-zstd/commit/d8415897180384d384586539c86f5da9225de404"
+        },
+        "date": 1789557154105,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.063,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.065,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 168.826,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 172.655,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.81,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.311,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.378,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.611,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.402,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.638,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.124,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.124,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 9.91,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 6.411,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.177,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.585,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.197,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.742,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.288,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.187,
             "unit": "ms"
           }
         ]
