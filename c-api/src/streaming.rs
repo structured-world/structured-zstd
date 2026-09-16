@@ -16,8 +16,9 @@ use crate::context::{ZSTD_CCtx, ZSTD_DCtx};
 use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
 use crate::params::CONTENTSIZE_UNKNOWN;
 
-/// `ZSTD_BLOCKSIZE_MAX`: 128 KiB, the recommended streaming input granule.
-const BLOCK_SIZE_MAX: usize = 128 * 1024;
+/// `ZSTD_BLOCKSIZE_MAX`, the recommended streaming input granule. The codec's
+/// block maximum, named rather than re-declared.
+const BLOCK_SIZE_MAX: usize = codec::MAX_BLOCK_SIZE as usize;
 
 /// `ZSTD_inBuffer` — ABI mirror: `{ const void* src; size_t size; size_t pos }`.
 #[repr(C)]
@@ -152,7 +153,6 @@ impl ZSTD_CCtx {
             .then_some(params.pledged_src_size);
         let frame_params = self.frame_parameters(src_size)?;
         let level = self.attach_level(src_size);
-        let geometry = self.dictionary_geometry(src_size);
         let serial = self.attach_serial();
         let suppress_id = self.attach_suppresses_dict_id();
         let ZSTD_CCtx {
@@ -173,10 +173,6 @@ impl ZSTD_CCtx {
                 }
                 state.dictionary = serial;
             }
-            // Before the parameters: this says where the frame resolves from,
-            // not what it resolves to, and `set_compression_level` drops the
-            // per-frame overrides.
-            context.set_dictionary_geometry(geometry)?;
             match &frame_params {
                 Some(frame_params) => context.set_parameters(frame_params)?,
                 None => context.set_compression_level(CompressionLevel::from_level(level))?,

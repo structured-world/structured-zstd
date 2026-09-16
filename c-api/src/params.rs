@@ -51,7 +51,7 @@ pub(crate) const ZSTD_RESET_SESSION_AND_PARAMETERS: c_int = 3;
 /// `ZSTD_TARGETCBLOCKSIZE_MIN` / `_MAX` (vendored header).
 // Single source of truth with the codec's `set_target_block_size` clamp.
 const TARGET_CBLOCK_SIZE_MIN: c_int = codec::MIN_TARGET_BLOCK_SIZE as c_int;
-const TARGET_CBLOCK_SIZE_MAX: c_int = 131_072;
+const TARGET_CBLOCK_SIZE_MAX: c_int = codec::MAX_BLOCK_SIZE as c_int;
 
 /// Upstream `ZSTD_WINDOWLOG_LIMIT_DEFAULT`: the streaming decoder's default
 /// window-size acceptance ceiling, `1 << 27` bytes.

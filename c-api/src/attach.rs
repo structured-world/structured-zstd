@@ -30,8 +30,10 @@ pub(crate) const ZSTD_DCT_AUTO: c_int = 0;
 pub(crate) const ZSTD_DCT_RAW_CONTENT: c_int = 1;
 pub(crate) const ZSTD_DCT_FULL_DICT: c_int = 2;
 
-/// `ZSTD_dictMagicNumber` little-endian prefix of a serialized dictionary.
-const DICT_MAGIC: u32 = 0xEC30_A437;
+/// `ZSTD_dictMagicNumber` little-endian prefix of a serialized dictionary,
+/// read off the codec's own magic rather than re-declared, so the two cannot
+/// disagree about what a dictionary looks like.
+const DICT_MAGIC: u32 = u32::from_le_bytes(codec::decoding::DICTIONARY_MAGIC);
 
 /// Synthetic non-zero ID for raw-content dictionaries. The encoder attach
 /// path requires a non-zero ID, but raw-content frames never put it on the
@@ -188,46 +190,18 @@ fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<bool, ZSTD_Err
     }
 }
 
-/// `ZSTD_USE_CDICT_PARAMS_SRCSIZE_CUTOFF`: below this a frame is still about
-/// the dictionary, so the dictionary's own tuning is the better guess than
-/// whatever the caller asked for.
-const CDICT_PARAMS_SRC_CUTOFF: u64 = 128 * 1024;
-/// `ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER`: a source only a few times the
-/// dictionary is about the dictionary too, however large both are.
-const CDICT_PARAMS_DICT_MULTIPLIER: u64 = 6;
-
 /// Whether `cdict`'s own compression parameters still describe a frame over
 /// `src_size` bytes (`None` = not yet known), and so drive it.
 ///
-/// See [`ZSTD_CCtx::cdict_params_drive_frame`] for the upstream branch this
-/// ports; `ZSTD_compress_usingCDict` reads the same one
-/// (zstd_compress.c:5834).
+/// The size question is the codec's
+/// ([`codec::encoding::dictionary_describes_frame`]); this only adds what the
+/// codec cannot see, that a `CDict` built through the advanced constructor
+/// carries explicit parameters rather than a level of its own and so always
+/// drives the frame (upstream marks it `ZSTD_NO_CLEVEL`, zstd_compress.c:5636,
+/// and reads it back at :5254 and :5837).
 pub(crate) fn cdict_params_describe_frame(cdict: &ZSTD_CDict, src_size: Option<u64>) -> bool {
-    let content = cdict.dict.content_size() as u64;
-    if content == 0 {
-        return false;
-    }
-    if cdict.params.is_some() {
-        return true;
-    }
-    let Some(src) = src_size else {
-        return true;
-    };
-    src < CDICT_PARAMS_SRC_CUTOFF || src < content * CDICT_PARAMS_DICT_MULTIPLIER
-}
-
-/// Where a frame referencing `cdict` over `src_size` bytes takes its
-/// match-finder geometry: the dictionary's own preparation while its
-/// parameters still describe the frame, the frame's own resolution past that.
-pub(crate) fn cdict_geometry(
-    cdict: &ZSTD_CDict,
-    src_size: Option<u64>,
-) -> codec::encoding::DictionaryGeometry {
-    if cdict_params_describe_frame(cdict, src_size) {
-        codec::encoding::DictionaryGeometry::Prepared
-    } else {
-        codec::encoding::DictionaryGeometry::LoadedIntoFrame
-    }
+    cdict.params.is_some()
+        || codec::encoding::dictionary_describes_frame(cdict.dict.content_size(), src_size)
 }
 
 impl ZSTD_CCtx {
@@ -251,22 +225,6 @@ impl ZSTD_CCtx {
         };
         // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
         cdict_params_describe_frame(unsafe { &**cdict }, src_size)
-    }
-
-    /// Where the next frame over `src_size` bytes takes its match-finder
-    /// geometry. Only a referenced CDict can send it anywhere but the
-    /// dictionary's own preparation: a loaded dictionary or a prefix is
-    /// prepared from the context's own parameters to begin with, which is what
-    /// upstream's always-`usingCDict` path for them amounts to.
-    pub(crate) fn dictionary_geometry(
-        &self,
-        src_size: Option<u64>,
-    ) -> codec::encoding::DictionaryGeometry {
-        match &self.attached_dict {
-            // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
-            CCtxDictAttach::RefCDict { cdict, .. } => cdict_geometry(unsafe { &**cdict }, src_size),
-            _ => codec::encoding::DictionaryGeometry::Prepared,
-        }
     }
 
     /// The explicit parameters the next frame over `src_size` bytes runs under,

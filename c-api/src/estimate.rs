@@ -12,8 +12,9 @@ use codec::encoding::{CompressionLevel, estimated_compression_workspace_bytes};
 use crate::cdict::ZSTD_compressionParameters;
 use crate::context::{ZSTD_CCtx, ZSTD_DCtx};
 
-/// 128 KiB — the format's maximum block size; bounds per-block staging.
-const BLOCK_SIZE_MAX: usize = 128 * 1024;
+/// The format's maximum block size, which bounds per-block staging. The
+/// codec's, named rather than re-declared.
+const BLOCK_SIZE_MAX: usize = codec::MAX_BLOCK_SIZE as usize;
 
 /// `ZSTD_WINDOWLOG_MAX` for the target's pointer width (upstream: 30 on
 /// 32-bit, 31 on 64-bit). Inputs past it are rejected with an encoded error.

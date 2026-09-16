@@ -236,16 +236,6 @@ impl<W: Write, M: Matcher, C: BorrowMut<CompressionContext<M>>> StreamingEncoder
         self.context.borrow_mut().set_source_size_hint(size)
     }
 
-    /// Choose where dictionary frames take their match-finder geometry from;
-    /// see [`CompressionContext::set_dictionary_geometry`]. Must be called
-    /// before the first write.
-    pub fn set_dictionary_geometry(
-        &mut self,
-        geometry: crate::encoding::DictionaryGeometry,
-    ) -> Result<(), Error> {
-        self.context.borrow_mut().set_dictionary_geometry(geometry)
-    }
-
     /// Attach a dictionary blob to the frame; see
     /// [`CompressionContext::set_dictionary_from_bytes`]. Must be called before
     /// the first write.
@@ -558,22 +548,6 @@ impl<M: Matcher> CompressionContext<M> {
         // (`ensure_frame_started`), so a small advisory size also lifts Fast
         // streams off the expensive optimal-HUF search.
         self.source_size_hint = Some(size);
-        Ok(())
-    }
-
-    /// Choose where frames compressing with the attached dictionary take their
-    /// match-finder geometry from; see
-    /// [`FrameCompressor::set_dictionary_geometry`]. A parameter, not a
-    /// one-shot: it applies to every frame until replaced. Must be called
-    /// before the frame's first [`write`](Self::write).
-    ///
-    /// [`FrameCompressor::set_dictionary_geometry`]: crate::encoding::FrameCompressor::set_dictionary_geometry
-    pub fn set_dictionary_geometry(
-        &mut self,
-        geometry: crate::encoding::DictionaryGeometry,
-    ) -> Result<(), Error> {
-        self.ensure_settable("dictionary geometry must be set before the first write")?;
-        self.state.matcher.set_dictionary_geometry(geometry);
         Ok(())
     }
 

@@ -392,32 +392,52 @@ impl DictionarySizes {
     }
 }
 
-/// Where a frame compressing with a dictionary takes its match-finder geometry.
+/// Bytes below which a frame is still about its dictionary rather than about
+/// its own content (upstream `ZSTD_USE_CDICT_PARAMS_SRCSIZE_CUTOFF`).
+const DICTIONARY_DESCRIBES_FRAME_BELOW: u64 = 128 * 1024;
+/// Multiple of the dictionary's content below which the same holds however
+/// large both are (upstream `ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER`).
+const DICTIONARY_DESCRIBES_FRAME_MULTIPLE: u64 = 6;
+
+/// Whether a dictionary of `dict_content` bytes still describes a frame over
+/// `src_size` bytes (`None` = not yet known), so that the shape it was prepared
+/// with is the frame's too.
 ///
-/// A dictionary is prepared once with a shape of its own: a strategy, table
-/// widths and a search depth chosen for the dictionary rather than for any one
-/// frame. A frame either runs that shape, or resolves its own for the source in
-/// hand and takes the dictionary's bytes into those tables.
+/// A source under 128 KiB, or under six times the dictionary, is about the
+/// dictionary: the tables it was prepared with are the right ones and can be
+/// searched in place. Past that the frame is about its own content, and a shape
+/// chosen for a dictionary undersizes it. A frame of unknown size keeps the
+/// dictionary's shape, having nothing better to go on. Upstream weighs the same
+/// three things at `ZSTD_compressBegin_internal` (zstd_compress.c:5254).
+///
+/// A size of `u64::MAX` is the encoder's "unknown" sentinel, not a source of
+/// that many bytes, and counts as unknown here too.
+///
+/// This is the codec's rule, exported so that every surface in front of it
+/// (the C ABI included) asks rather than re-deciding.
 ///
 /// # Examples
 /// ```
-/// use structured_zstd::encoding::DictionaryGeometry;
-/// assert_eq!(DictionaryGeometry::default(), DictionaryGeometry::Prepared);
+/// use structured_zstd::encoding::dictionary_describes_frame;
+///
+/// // A few kilobytes against a 4 KiB dictionary: about the dictionary.
+/// assert!(dictionary_describes_frame(4096, Some(8192)));
+/// // A megabyte against the same: about itself.
+/// assert!(!dictionary_describes_frame(4096, Some(1 << 20)));
+/// // Unknown, so there is nothing better than the dictionary's own shape.
+/// assert!(dictionary_describes_frame(4096, None));
+/// assert!(dictionary_describes_frame(4096, Some(u64::MAX)));
 /// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DictionaryGeometry {
-    /// The frame runs the shape the dictionary was prepared with, and may
-    /// search the dictionary's own tables in place. This is what a frame about
-    /// the dictionary wants, and what upstream `ZSTD_resetCCtx_usingCDict`
-    /// does.
-    #[default]
-    Prepared,
-    /// The frame resolves its own shape for its source and the dictionary is
-    /// loaded into those tables, as upstream resets from the requested
-    /// parameters and calls `ZSTD_compress_insertDictionary`
-    /// (zstd_compress.c:5264). A source far larger than the dictionary is about
-    /// its own content, and a shape chosen for the dictionary undersizes it.
-    LoadedIntoFrame,
+pub fn dictionary_describes_frame(dict_content: usize, src_size: Option<u64>) -> bool {
+    if dict_content == 0 {
+        return false;
+    }
+    let Some(src) = src_size.filter(|size| *size != crate::encoding::cparams::CONTENTSIZE_UNKNOWN)
+    else {
+        return true;
+    };
+    src < DICTIONARY_DESCRIBES_FRAME_BELOW
+        || src < dict_content as u64 * DICTIONARY_DESCRIBES_FRAME_MULTIPLE
 }
 
 /// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm
@@ -510,11 +530,6 @@ pub trait Matcher {
     /// Default no-op for custom matchers and test stubs; consumed at the next
     /// [`reset`](Self::reset).
     fn set_dictionary_size_hint(&mut self, _sizes: DictionarySizes) {}
-    /// Choose where the next frame takes its match-finder geometry from when a
-    /// dictionary is primed into it. Sticky until changed; default no-op for
-    /// custom matchers and test stubs, which resolve as
-    /// [`DictionaryGeometry::Prepared`].
-    fn set_dictionary_geometry(&mut self, _geometry: DictionaryGeometry) {}
     /// Drop any per-frame fine-grained parameter overrides installed via
     /// the public parameter API, reverting to plain level-based geometry
     /// at the next [`reset`](Self::reset). Called by

@@ -305,11 +305,6 @@ pub struct MatchGeneratorDriver {
     // frame runs (upstream `ZSTD_getCParamRowSize` on `dictSize`), the content
     // size the dictionary tables and attach cutoffs.
     dictionary_size_hint: Option<super::DictionarySizes>,
-    // Where a dictionary frame takes its match-finder geometry (set via
-    // set_dictionary_geometry). Unlike the size hints this is sticky: it is
-    // frame configuration, not a one-shot, and every frame under the same
-    // attach resolves the same way.
-    dictionary_geometry: super::DictionaryGeometry,
     // Normalized `ceil_log2` bucket of the frame's source-size hint, captured at
     // `reset` (where `source_size_hint` is consumed) via [`source_size_ceil_log`].
     // `None` means the frame was unhinted. Drives `prime_with_dictionary`'s upstream zstd
@@ -510,7 +505,6 @@ impl MatchGeneratorDriver {
             #[cfg(test)]
             config_override: None,
             param_overrides: None,
-            dictionary_geometry: super::DictionaryGeometry::Prepared,
             slice_size,
             base_slice_size: slice_size,
             // Report the ROUNDED-UP window size that the matcher
@@ -1015,10 +1009,6 @@ impl Matcher for MatchGeneratorDriver {
         self.dictionary_size_hint = Some(sizes);
     }
 
-    fn set_dictionary_geometry(&mut self, geometry: super::DictionaryGeometry) {
-        self.dictionary_geometry = geometry;
-    }
-
     /// Dict-relevance gate for the raw-fast-path. Reached only when a dictionary
     /// is active (the caller short-circuits on `dict_active`), so this answers
     /// "could the dict compress this otherwise-incompressible-looking block?".
@@ -1077,8 +1067,10 @@ impl Matcher for MatchGeneratorDriver {
         // length) so the prime decision and the snapshot-key / epoch bits agree.
         // A dictionary loaded into the frame's tables is never searched in
         // place: there is no separate set of tables to search.
-        self.reset_dict_attach_ok = self.dictionary_geometry == super::DictionaryGeometry::Prepared
-            && dict_hint.is_none_or(|sizes| sizes.content <= MAX_FAST_ATTACH_DICT_REGION);
+        self.reset_dict_attach_ok = dict_hint.is_none_or(|sizes| {
+            super::dictionary_describes_frame(sizes.content, hint)
+                && sizes.content <= MAX_FAST_ATTACH_DICT_REGION
+        });
         let hinted = hint.is_some();
         // A dictionary frame takes its cParams and match-finder from the
         // CDict's cParams (upstream `ZSTD_resetCCtx_usingCDict`), whose tier
@@ -1086,12 +1078,12 @@ impl Matcher for MatchGeneratorDriver {
         // carries `dict_plan` to the Row backend. The dictionary is prepared
         // under the caller's parameters, so they are part of those cParams.
         let overrides = self.param_overrides.unwrap_or_default();
-        // A dictionary loaded into the frame's own tables does not lend the
-        // frame its shape: the frame resolves for its source and the caller's
-        // knobs land through the ordinary override path below, exactly as they
-        // do without a dictionary.
-        let loaded_into_frame = dict_hint.is_some()
-            && self.dictionary_geometry == super::DictionaryGeometry::LoadedIntoFrame;
+        // Once the source outgrows the dictionary, the shape the dictionary was
+        // prepared with stops describing the frame: it resolves its own and the
+        // dictionary goes into those tables. The sizes decide it
+        // (`dictionary_describes_frame`), here, for every caller alike.
+        let loaded_into_frame =
+            dict_hint.is_some_and(|sizes| !super::dictionary_describes_frame(sizes.content, hint));
         let (params, dict_plan) = match dict_hint {
             Some(sizes) if loaded_into_frame => {
                 crate::encoding::levels::config::resolve_level_params_for_loaded_dict(

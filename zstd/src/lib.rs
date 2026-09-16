@@ -77,6 +77,10 @@ macro_rules! vprintln {
 
 mod bit_io;
 mod common;
+/// Largest block the format allows (RFC 8878 3.1.1.2.3, 128 KiB): the single
+/// source of truth for every surface that has to name it, the C ABI included.
+/// A frame's own maximum is the smaller of this and its window.
+pub use common::MAX_BLOCK_SIZE;
 /// Smallest accepted block-size target (the `ZSTD_TARGETCBLOCKSIZE_MIN`
 /// bound): the single source of truth shared by the Rust setters
 /// (`set_target_block_size`) and the C ABI parameter surface.

@@ -134,7 +134,7 @@ fn dict_frames_decode_with_c_across_levels_and_reuse() {
 /// bytes a dictionary is prepared against, and the ratio goes with them.
 #[test]
 fn a_source_far_larger_than_its_dictionary_is_no_larger_than_the_reference() {
-    use structured_zstd::encoding::{CompressionLevel, DictionaryGeometry, FrameCompressor};
+    use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
 
     let dict_bytes = repeated_log_lines(8 * 1024);
     let samples: Vec<&[u8]> = dict_bytes.chunks(256).collect();
@@ -152,7 +152,6 @@ fn a_source_far_larger_than_its_dictionary_is_no_larger_than_the_reference() {
                 .expect("dictionary parses"),
         )
         .expect("attach dict");
-        cctx.set_dictionary_geometry(DictionaryGeometry::LoadedIntoFrame);
         cctx.set_source_size_hint(payload.len() as u64);
         let ours = cctx.compress_independent_frame(&payload);
 

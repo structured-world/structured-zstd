@@ -20,8 +20,9 @@ const CONTENTSIZE_ERROR: c_ulonglong = u64::MAX - 1;
 /// `ZSTD_FRAMEHEADERSIZE_MAX` — the "need at most this many bytes" hint
 /// `ZSTD_getFrameHeader` returns when `src` is too short.
 const FRAMEHEADERSIZE_MAX: usize = 18;
-/// `ZSTD_BLOCKSIZE_MAX` = `1 << 17` (128 KiB).
-const BLOCKSIZE_MAX: u64 = 1 << 17;
+/// `ZSTD_BLOCKSIZE_MAX`: the codec's block maximum, named rather than
+/// re-declared.
+const BLOCKSIZE_MAX: u64 = codec::MAX_BLOCK_SIZE as u64;
 /// Base magic of the skippable-frame range; the low nibble is the variant.
 const SKIPPABLE_MAGIC_BASE: u32 = 0x184D_2A50;
 /// `ZSTD_SKIPPABLEHEADERSIZE` = 4-byte magic + 4-byte `Frame_Size`.

@@ -39,10 +39,11 @@ pub(crate) fn next_dict_serial() -> u64 {
     DICT_SERIAL.fetch_add(1, Ordering::Relaxed)
 }
 
-/// `ZSTD_dictMagicNumber` (`zstd.h`). A serialized zstd dictionary begins with
-/// this little-endian magic; bytes `[4..8]` hold the dictionary ID. Raw-content
-/// dictionaries carry no magic and report ID 0.
-const DICT_MAGIC: u32 = 0xEC30_A437;
+/// `ZSTD_dictMagicNumber` (`zstd.h`): a serialized zstd dictionary begins with
+/// this little-endian magic and bytes `[4..8]` hold the dictionary ID, while
+/// raw-content dictionaries carry no magic and report ID 0. Read off the
+/// codec's own magic rather than re-declared, so the two cannot disagree.
+const DICT_MAGIC: u32 = u32::from_le_bytes(codec::decoding::DICTIONARY_MAGIC);
 
 /// Parse the dictionary ID from a serialized dictionary header, or `0` for a
 /// raw-content dictionary (no magic) / too-short buffer. Matches
@@ -424,16 +425,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
         // The kept compressor attaches the CDict once; the next call with it
         // reuses the primed snapshot that first frame captured.
         let enc = kept_compressor(compressor, key, Some(&cdict_ref.dict), cdict_ref.level)?;
-        // Same cutoff as a referenced CDict (zstd_compress.c:5834): past it the
-        // dictionary's own shape no longer describes the frame, so the frame
-        // resolves its own for this source at the CDict's level and takes the
-        // dictionary into those tables.
-        set_frame_parameters(
-            enc,
-            cdict_ref.params.as_ref(),
-            cdict_ref.level,
-            crate::attach::cdict_geometry(cdict_ref, Some(src.len() as u64)),
-        );
+        set_frame_parameters(enc, cdict_ref.params.as_ref(), cdict_ref.level);
         // Per-call frame flags: the compressor is shared with every other
         // one-shot entry point, whose flags must not leak into this one.
         // Upstream ZSTD_compress_usingCDict leaves the checksum off unless the
@@ -497,13 +489,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict_advanced(
             ..
         } = cctx;
         let enc = kept_compressor(compressor, key, Some(&cdict_ref.dict), cdict_ref.level)?;
-        // The same cutoff as the plain entry point above.
-        set_frame_parameters(
-            enc,
-            cdict_ref.params.as_ref(),
-            cdict_ref.level,
-            crate::attach::cdict_geometry(cdict_ref, Some(src.len() as u64)),
-        );
+        set_frame_parameters(enc, cdict_ref.params.as_ref(), cdict_ref.level);
         enc.set_content_checksum(fparams.checksumFlag != 0);
         enc.set_content_size_flag(fparams.contentSizeFlag != 0);
         // Raw-content dictionaries never emit their synthetic ID regardless

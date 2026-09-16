@@ -15,9 +15,10 @@ use codec::dictionary::{
 use crate::error::{ZSTD_ErrorCode, encode};
 use crate::ffi::in_slice;
 
-/// Little-endian `ZSTD_MAGIC_DICTIONARY` (0xEC30A437) that prefixes a valid
-/// zstd dictionary; the 4 bytes after it are the dictionary ID.
-const DICT_MAGIC: u32 = 0xEC30_A437;
+/// Little-endian `ZSTD_MAGIC_DICTIONARY` that prefixes a valid zstd dictionary
+/// (the 4 bytes after it are the dictionary ID). Read off the codec's own magic
+/// rather than re-declared, so the two cannot disagree.
+const DICT_MAGIC: u32 = u32::from_le_bytes(codec::decoding::DICTIONARY_MAGIC);
 
 /// `ZDICT_params_t` — finalize parameters, ABI-identical to `zdict.h`.
 #[repr(C)]

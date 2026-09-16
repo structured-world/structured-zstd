@@ -2306,40 +2306,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.source_size_hint = Some(size);
     }
 
-    /// Choose where frames compressing with the attached dictionary take their
-    /// match-finder geometry from. Sticky; the default is
-    /// [`DictionaryGeometry::Prepared`], which is what a frame about the
-    /// dictionary wants.
-    ///
-    /// [`DictionaryGeometry::LoadedIntoFrame`] is for a source far larger than
-    /// the dictionary, where a shape chosen for the dictionary undersizes the
-    /// frame: the frame resolves its own and the dictionary's bytes go into
-    /// those tables.
-    ///
-    /// [`DictionaryGeometry::Prepared`]: crate::encoding::DictionaryGeometry::Prepared
-    /// [`DictionaryGeometry::LoadedIntoFrame`]: crate::encoding::DictionaryGeometry::LoadedIntoFrame
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use structured_zstd::encoding::{
-    ///     CompressionLevel, DictionaryGeometry, FrameCompressor,
-    /// };
-    ///
-    /// let source = vec![b'a'; 1 << 20];
-    /// let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(1));
-    /// compressor.set_dictionary_from_bytes(&[7u8; 4096]).unwrap();
-    /// // A megabyte of content is not about a four-kilobyte dictionary.
-    /// compressor.set_dictionary_geometry(DictionaryGeometry::LoadedIntoFrame);
-    ///
-    /// let mut frame = Vec::new();
-    /// compressor.compress_independent_frame_into(&source, &mut frame);
-    /// assert!(!frame.is_empty());
-    /// ```
-    pub fn set_dictionary_geometry(&mut self, geometry: crate::encoding::DictionaryGeometry) {
-        self.state.matcher.set_dictionary_geometry(geometry);
-    }
-
     /// Total heap bytes this compressor's allocations hold, excluding the
     /// inline struct: the match-finder tables / history / recycled buffers and
     /// the primed-dictionary snapshot (via the matcher), the retained
