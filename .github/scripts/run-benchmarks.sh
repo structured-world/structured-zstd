@@ -152,9 +152,16 @@ def load_criterion_samples(root):
     Per-sample time is `times[i] / iters[i]`. The minimum over the samples is
     the figure to report: a sample can only be made SLOWER by interference, so
     the lower edge is the cost of the code and everything above it is the
-    machine. Measured on an idle host, the minimum reproduces within 0.3% run
-    to run where the mean moves 1.5% and the median 2%, and it is the value
-    that agrees with a standalone timing loop over the same code.
+    machine. Measured on an idle host over six runs of one binary, the minimum
+    of the Rust arm reproduces within 0.20% where its mean moves 1.54%, and it
+    is the value that agrees with a standalone timing loop over the same code.
+
+    It does not make every ratio that stable, and is not meant to. A ratio also
+    carries whole-distribution shifts of either arm (one run in six moved the
+    libzstd arm up 5% at every quantile, minimum included), which no choice of
+    statistic can remove. Dropping the interference tail is what this buys;
+    the `sample_ns` spread emitted per cell is what makes the rest visible
+    instead of silently folded into a single number.
     """
     index = {}
     if not root:
