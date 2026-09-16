@@ -43,13 +43,15 @@ if [ -n "${STRUCTURED_ZSTD_BENCH_BIN:-}" ]; then
     exit 2
   fi
   echo "Running pre-built bench binary: $STRUCTURED_ZSTD_BENCH_BIN" >&2
-  "$STRUCTURED_ZSTD_BENCH_BIN" --bench --output-format bencher | tee "$BENCH_RAW_FILE"
+  # `--noplot`: the run needs criterion's sample DATA, and nothing downstream
+  # reads its rendered reports, so rendering them is work no one consumes.
+  "$STRUCTURED_ZSTD_BENCH_BIN" --bench --output-format bencher --noplot | tee "$BENCH_RAW_FILE"
 else
   BENCH_CMD=(cargo bench --bench compare_ffi -p ffi-bench)
   if [ -n "$BENCH_TARGET_TRIPLE" ]; then
     BENCH_CMD+=(--target "$BENCH_TARGET_TRIPLE")
   fi
-  "${BENCH_CMD[@]}" -- --output-format bencher | tee "$BENCH_RAW_FILE"
+  "${BENCH_CMD[@]}" -- --output-format bencher --noplot | tee "$BENCH_RAW_FILE"
 fi
 
 # Memory bench (compare_ffi_memory) runs separately when its binary is
