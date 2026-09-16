@@ -890,6 +890,12 @@ impl FrameDecoderState {
     /// window filled. Upstream sizes its stream buffer as window + block too
     /// (`ZSTD_decodingBufferSize_min`); it can cap at the content because its
     /// buffer is not a ring.
+    ///
+    /// A frame that declares its size caps the whole of that at the declaration:
+    /// the block of room past the window is there for what a block still has to
+    /// produce, and a frame cannot produce past what it promised. Without the
+    /// cap a 1 MiB window declaring one byte more reserved a whole block of
+    /// room for that byte.
     fn decoding_buffer_limit(&self) -> usize {
         let useful_window = self.useful_window_size();
         if self.frame_header.descriptor.single_segment_flag() {
@@ -898,7 +904,12 @@ impl FrameDecoderState {
         let window_size = self.frame_header.window_size().unwrap_or(0) as usize;
         // No overflow: the window was checked against
         // `MAXIMUM_ALLOWED_WINDOW_SIZE` when the header was taken.
-        useful_window + window_size.min(crate::common::MAX_BLOCK_SIZE as usize)
+        let limit = useful_window + window_size.min(crate::common::MAX_BLOCK_SIZE as usize);
+        if self.frame_header.fcs_declared() {
+            let declared = self.frame_header.frame_content_size();
+            return limit.min(usize::try_from(declared).unwrap_or(usize::MAX));
+        }
+        limit
     }
 
     /// What to reserve up front: the limit, except for a multi-segment frame
@@ -2493,7 +2504,13 @@ impl FrameDecoder {
                     // a drain that empties the buffer into the last of `target`
                     // leaves nothing pending, and decoding another block then
                     // consumes input the caller cannot be handed the output of.
-                    if pending > 0 || written == target.len() {
+                    // A target of no bytes is not full in that sense: it starts
+                    // at its own length, so the test would fire before any block
+                    // was read and a frame that produces nothing could never
+                    // reach the empty block that ends it. Such a frame decodes
+                    // here; one that does produce bytes buffers its first block
+                    // and stops on the `pending` arm of the next pass.
+                    if pending > 0 || (!target.is_empty() && written == target.len()) {
                         break;
                     }
                     //check if there are enough bytes for the next header

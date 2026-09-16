@@ -1124,6 +1124,57 @@ fn a_streamed_frame_smaller_than_its_window_gets_a_ring_of_its_content() {
     );
 }
 
+/// A multi-segment frame whose declared content is just past its window still
+/// cannot produce more than it declared, so the block of room the ring keeps
+/// past the window is capped by what is left to produce. A frame of a 1 MiB
+/// window declaring one byte more reserved a whole block of that room up front,
+/// where one byte is all any of it can ever hold.
+#[test]
+fn a_streamed_frame_just_past_its_window_reserves_only_what_it_declares() {
+    let window = 1024 * 1024u32;
+    let content = window + 1;
+    let mut frame = alloc::vec![
+        0x28, 0xB5, 0x2F, 0xFD, // magic
+        0x80, // FHD: multi-segment, 4-byte content size
+        0x50, // window descriptor: 1 MiB
+    ];
+    frame.extend_from_slice(&content.to_le_bytes());
+    let mut payload = Vec::with_capacity(content as usize);
+    let mut left = content;
+    while left > 0 {
+        let size = left.min(128 * 1024);
+        left -= size;
+        // Raw block header: last flag, type 0, size.
+        let header = size << 3 | u32::from(left == 0);
+        frame.extend_from_slice(&header.to_le_bytes()[..3]);
+        let body: Vec<u8> = (0..size).map(|i| (i * 11 + left) as u8).collect();
+        payload.extend_from_slice(&body);
+        frame.extend_from_slice(&body);
+    }
+
+    let mut decoder = FrameDecoder::new();
+    let mut source = frame.as_slice();
+    decoder.reset(&mut source).expect("header parses");
+    let mut decoded = Vec::with_capacity(payload.len());
+    let mut chunk = alloc::vec![0u8; 128 * 1024];
+    while !(decoder.is_finished() && decoder.can_collect() == 0) {
+        let (read, written) = decoder
+            .decode_from_to(source, &mut chunk)
+            .expect("frame decodes");
+        source = &source[read..];
+        decoded.extend_from_slice(&chunk[..written]);
+        assert!(read > 0 || written > 0, "decode made no progress");
+    }
+    assert_eq!(decoded, payload);
+    // The frame's own content, plus the byte the ring keeps to tell a full
+    // buffer from an empty one. No block of room on top of that.
+    let capacity = ring_capacity(&decoder);
+    assert!(
+        capacity <= content as usize + 1,
+        "a frame declaring {content} bytes reserved {capacity} bytes of ring"
+    );
+}
+
 /// Capacity of the ring a multi-segment frame decoded into.
 fn ring_capacity(decoder: &FrameDecoder) -> usize {
     match &decoder
@@ -1393,6 +1444,33 @@ fn a_filled_target_stops_before_the_next_block() {
     // Two blocks fill the window and hand one block over; the third is left
     // for the next call, with its header and body unread.
     assert_eq!(read, 2 * (3 + BLOCK as usize));
+}
+
+/// A frame that produces nothing is decoded with a slice that holds nothing,
+/// and it has to finish: its last block is empty, so there is no output the
+/// caller is short of. Stopping on a full target at the top of the loop made an
+/// empty target full before any block was read, so the block that ends the
+/// frame was never reached and every further call reported no progress on input
+/// that was complete.
+#[test]
+fn an_empty_frame_finishes_through_an_empty_slice() {
+    let mut frame = alloc::vec![
+        0x28, 0xB5, 0x2F, 0xFD, // magic
+        0x00, // FHD: multi-segment, no content size
+        0x00, // window descriptor: 1 KiB
+    ];
+    // One last Raw block of no bytes.
+    frame.extend_from_slice(&1u32.to_le_bytes()[..3]);
+
+    let mut decoder = FrameDecoder::new();
+    let mut source = frame.as_slice();
+    decoder.reset(&mut source).expect("header parses");
+    let (read, written) = decoder
+        .decode_from_to(source, &mut [])
+        .expect("frame decodes");
+    assert_eq!(written, 0);
+    assert_eq!(read, 3, "the block that ends the frame must be read");
+    assert!(decoder.is_finished(), "the frame must finish");
 }
 
 /// A block can produce at most its frame's block maximum, so that is what the
