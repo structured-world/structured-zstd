@@ -761,8 +761,10 @@ fn detect_x86_caps() -> X86Caps {
                     avx2: true,
                     sse2: true,
                 },
+                // Both BMI2 tiers copy the same way: they differ only in how
+                // the sequence decoder splits three bit fields.
                 #[cfg(feature = "kernel-bmi2")]
-                CpuKernelTag::Bmi2 => X86Caps {
+                CpuKernelTag::Bmi2 | CpuKernelTag::Bmi2SlowPext => X86Caps {
                     avx512f: false,
                     avx2: false,
                     sse2: true,

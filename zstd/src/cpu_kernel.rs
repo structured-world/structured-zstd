@@ -121,6 +121,28 @@ impl CpuKernel for ScalarKernel {
     }
 }
 
+/// One `pext` per field, the widths turned into masks from [`BIT_MASK`].
+///
+/// # Safety
+/// The caller's kernel was selected after BMI2 was detected, and on hardware
+/// where `pext` is not microcoded: see [`Bmi2SlowPextKernel`].
+#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+#[target_feature(enable = "bmi2")]
+#[inline]
+unsafe fn extract_triple_pext_impl(packed: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+    use core::arch::x86_64::_pext_u64;
+
+    let mask3 = BIT_MASK[n3 as usize];
+    let mask2 = BIT_MASK[n2 as usize].wrapping_shl(u32::from(n3));
+    let mask1 = BIT_MASK[n1 as usize].wrapping_shl(u32::from(n2) + u32::from(n3));
+
+    (
+        _pext_u64(packed, mask1),
+        _pext_u64(packed, mask2),
+        _pext_u64(packed, mask3),
+    )
+}
+
 // The SSE2 tier exists in `CpuKernelTag` (it carries the 128-bit copy-chunk
 // choice for the unified copy dispatch) but needs no `CpuKernel` ZST yet: the
 // only trait method, `mask_lower_bits`, has no SSE2-specific form (SSE2 has no
@@ -163,6 +185,38 @@ impl CpuKernel for Bmi2Kernel {
         // SAFETY: as for `mask_lower_bits`.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn extract_triple(packed: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+        // SAFETY: as for `mask_lower_bits`, and the tier is only selected on
+        // hardware whose `pext` is not microcoded.
+        unsafe { extract_triple_pext_impl(packed, n1, n2, n3) }
+    }
+}
+
+/// x86_64 BMI2 kernel for hardware whose `pext` runs through microcode (AMD
+/// Zen 1 and Zen 2, where it takes around 18 cycles against one for `bzhi`).
+/// Identical to [`Bmi2Kernel`] except that the three-field extract keeps the
+/// trait's mask form. The vendor question is answered once, where the CPU is
+/// detected; below that there is a kernel, not a flag to branch on.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct Bmi2SlowPextKernel;
+
+#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+impl CpuKernel for Bmi2SlowPextKernel {
+    #[inline(always)]
+    fn mask_lower_bits(value: u64, n: u8) -> u64 {
+        // SAFETY: as for `Bmi2Kernel::mask_lower_bits`.
+        unsafe { mask_lower_bits_bmi2_impl(value, n) }
+    }
+
+    #[inline(always)]
+    fn mask_lower_bits_precomputed(value: u64, _mask: u64, n: u8) -> u64 {
+        // SAFETY: as for `mask_lower_bits`.
+        unsafe { mask_lower_bits_bmi2_impl(value, n) }
+    }
 }
 
 /// x86_64 AVX2 + BMI2 kernel (x86-64-v3 baseline). The common modern
@@ -181,6 +235,14 @@ impl CpuKernel for Avx2Kernel {
         // confirmed both AVX2 and BMI2 — `_bzhi_u64` is callable.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
+
+    #[cfg(feature = "kernel-bmi2")]
+    #[inline(always)]
+    fn extract_triple(packed: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+        // SAFETY: as for `mask_lower_bits`; the tier is not selected on
+        // hardware whose `pext` is microcoded.
+        unsafe { extract_triple_pext_impl(packed, n1, n2, n3) }
+    }
 }
 
 /// x86_64 AVX-512 VBMI2 + AVX2 + BMI2 kernel. Selected when the CPU
@@ -198,6 +260,14 @@ impl CpuKernel for Vbmi2Kernel {
         // SAFETY: same precondition as Avx2Kernel — BMI2 confirmed
         // at runtime before this kernel is instantiated.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
+    }
+
+    #[cfg(feature = "kernel-bmi2")]
+    #[inline(always)]
+    fn extract_triple(packed: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+        // SAFETY: as for `mask_lower_bits`; the tier is not selected on
+        // hardware whose `pext` is microcoded.
+        unsafe { extract_triple_pext_impl(packed, n1, n2, n3) }
     }
 }
 
@@ -348,6 +418,10 @@ pub(crate) enum CpuKernelTag {
         feature = "kernel-bmi2"
     ))]
     Bmi2,
+    /// BMI2 hardware whose `pext` is microcoded (AMD Zen 1 and Zen 2). Takes
+    /// the mask form of the three-field extract; see [`Bmi2SlowPextKernel`].
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+    Bmi2SlowPext,
     #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
     Avx2,
     #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
@@ -377,6 +451,29 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
     *CACHED.get_or_init(detect_cpu_kernel_uncached)
 }
 
+/// Whether this CPU runs `pext` in hardware. AMD Zen 1 and Zen 2 (family 0x17)
+/// microcode it at around 18 cycles, where three masked shifts are faster;
+/// every other vendor and family executes it in one.
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
+fn fast_pext() -> bool {
+    use core::arch::x86_64::__cpuid;
+
+    // Leaves 0 and 1 are architectural on every x86_64, so these are safe.
+    let leaf0 = __cpuid(0);
+    let mut vendor = [0u8; 12];
+    vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
+    vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
+    vendor[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
+    let eax = __cpuid(1).eax;
+    let base_family = (eax >> 8) & 0xF;
+    let family = if base_family == 0xF {
+        base_family + ((eax >> 20) & 0xFF)
+    } else {
+        base_family
+    };
+    vendor != *b"AuthenticAMD" || family != 0x17
+}
+
 #[cfg(feature = "std")]
 fn detect_cpu_kernel_uncached() -> CpuKernelTag {
     #[cfg(target_arch = "x86_64")]
@@ -386,7 +483,7 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
         // `&&` short-circuits away the runtime `is_x86_feature_detected!` call
         // (and its CPUID/cache traffic) for tiers the build disabled — the
         // matching `select_x86_kernel` rung is `#[cfg]`-ed out anyway.
-        return select_x86_kernel(
+        let tier = select_x86_kernel(
             cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512vbmi2"),
             cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512f"),
             cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512vl"),
@@ -395,6 +492,25 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
             cfg!(feature = "kernel-avx2") && is_x86_feature_detected!("avx2"),
             cfg!(feature = "kernel-sse") && is_x86_feature_detected!("sse2"),
         );
+        // The one place a CPU quirk is allowed to be asked about: AMD Zen 1 and
+        // Zen 2 run `pext` through microcode, where the mask form of the
+        // three-field extract wins. Answering it here turns the quirk into a
+        // tier, so the decode paths below carry a kernel rather than a flag.
+        #[cfg(feature = "kernel-bmi2")]
+        if !fast_pext() {
+            let takes_pext = match tier {
+                CpuKernelTag::Bmi2 => true,
+                #[cfg(feature = "kernel-avx2")]
+                CpuKernelTag::Avx2 => true,
+                #[cfg(feature = "kernel-vbmi2")]
+                CpuKernelTag::Vbmi2 => true,
+                _ => false,
+            };
+            if takes_pext {
+                return CpuKernelTag::Bmi2SlowPext;
+            }
+        }
+        return tier;
     }
     // 32-bit x86 carries only the BMI2 tier: the wider tiers' kernels and
     // their `target_feature` bodies are x86_64-only, so there is nothing
@@ -487,6 +603,8 @@ impl CpuKernelTag {
                 feature = "kernel-bmi2"
             ))]
             CpuKernelTag::Bmi2 => "bmi2",
+            #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+            CpuKernelTag::Bmi2SlowPext => "bmi2-slow-pext",
             #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
             CpuKernelTag::Avx2 => "avx2",
             #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]

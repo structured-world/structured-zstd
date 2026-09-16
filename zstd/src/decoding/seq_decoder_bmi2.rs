@@ -15,7 +15,6 @@ use super::sequence_section_decoder::{
     ADVANCE, ADVANCE_MASK, ExecSeq, SeqStreamSetup, init_sequence_stream,
 };
 use crate::blocks::sequence_section::{MAX_OFFSET_CODE, Sequence, SequencesHeader};
-use crate::cpu_kernel::Bmi2Kernel;
 use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
 use crate::decoding::sequence_execution::do_offset_history;
 
@@ -166,7 +165,11 @@ macro_rules! execute_one_body {
 /// Caller must have verified BMI2 availability.
 #[target_feature(enable = "bmi2")]
 #[allow(clippy::too_many_lines)]
-pub(crate) unsafe fn decode_and_execute_sequences_bmi2<'fse, B: BufferBackend>(
+pub(crate) unsafe fn decode_and_execute_sequences_bmi2<
+    'fse,
+    B: BufferBackend,
+    K: crate::cpu_kernel::CpuKernel,
+>(
     section: &SequencesHeader,
     source: &[u8],
     fse: &'fse mut FSEScratch,
@@ -184,7 +187,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_bmi2<'fse, B: BufferBackend>(
         old_buffer_size,
         num_sequences,
         use_long_pipeline,
-    } = init_sequence_stream::<B, Bmi2Kernel>(section, source, fse, buffer, dict)?;
+    } = init_sequence_stream::<B, K>(section, source, fse, buffer, dict)?;
     let literals_buffer_len = literals_buffer.len();
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;

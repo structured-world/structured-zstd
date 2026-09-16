@@ -425,7 +425,10 @@ mod init_sequence_stream_tests {
         let mut offset_hist = [1u32, 4, 8];
         // SAFETY: BMI2 confirmed available by the runtime check above.
         let _ = unsafe {
-            crate::decoding::seq_decoder_bmi2::decode_and_execute_sequences_bmi2::<RingBuffer>(
+            crate::decoding::seq_decoder_bmi2::decode_and_execute_sequences_bmi2::<
+                RingBuffer,
+                crate::cpu_kernel::Bmi2Kernel,
+            >(
                 &header,
                 &source,
                 &mut fse,
