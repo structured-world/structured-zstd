@@ -60,6 +60,27 @@ fn block_fits_the_maximum(
     Ok(())
 }
 
+/// A block with no sequences: its literals ARE its output, written fallibly so
+/// a fixed-capacity backend reports a short target instead of asserting.
+///
+/// Out of line on purpose. Inlined into the per-block body, the error shape cost
+/// 9.9% of cycles on a 1 MiB level-19 stream decode while issuing 0.6% FEWER
+/// instructions: the grown body displaced the sequence path's layout. Behind a
+/// call, the same bound is free.
+#[inline(never)]
+fn write_literals_only<B: super::buffer_backend::BufferBackend>(
+    buffer: &mut crate::decoding::decode_buffer::DecodeBuffer<B>,
+    literals: &[u8],
+) -> Result<(), DecompressBlockError> {
+    buffer
+        .try_push(literals)
+        .map_err(|overflow| DecompressBlockError::LiteralsOutputOverflow {
+            tail: overflow.tail,
+            requested: overflow.requested,
+            capacity: overflow.capacity,
+        })
+}
+
 /// Create a new [BlockDecoder].
 pub fn new() -> BlockDecoder {
     BlockDecoder {
@@ -466,17 +487,7 @@ impl BlockDecoder {
                     },
                 ));
             }
-            // Fallible: on a fixed-capacity backend literals within the block
-            // maximum can still be longer than the caller's slice, which is a
-            // short target rather than a corrupt frame. The infallible `push`
-            // asserts there instead of reporting it.
-            buffer.try_push(literals_view).map_err(|overflow| {
-                DecompressBlockError::LiteralsOutputOverflow {
-                    tail: overflow.tail,
-                    requested: overflow.requested,
-                    capacity: overflow.capacity,
-                }
-            })?;
+            write_literals_only(buffer, literals_view)?;
         }
 
         // Nothing drains the buffer inside a block, so the growth of its live
