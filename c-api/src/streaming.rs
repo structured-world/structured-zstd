@@ -152,6 +152,7 @@ impl ZSTD_CCtx {
             .then_some(params.pledged_src_size);
         let frame_params = self.frame_parameters(src_size)?;
         let level = self.attach_level(src_size);
+        let geometry = self.dictionary_geometry(src_size);
         let serial = self.attach_serial();
         let suppress_id = self.attach_suppresses_dict_id();
         let ZSTD_CCtx {
@@ -172,6 +173,10 @@ impl ZSTD_CCtx {
                 }
                 state.dictionary = serial;
             }
+            // Before the parameters: this says where the frame resolves from,
+            // not what it resolves to, and `set_compression_level` drops the
+            // per-frame overrides.
+            context.set_dictionary_geometry(geometry)?;
             match &frame_params {
                 Some(frame_params) => context.set_parameters(frame_params)?,
                 None => context.set_compression_level(CompressionLevel::from_level(level))?,

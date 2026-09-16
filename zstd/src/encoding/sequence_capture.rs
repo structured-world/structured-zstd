@@ -200,6 +200,12 @@ impl Matcher for CapturingMatcher {
         self.inner.set_dictionary_size_hint(sizes);
     }
 
+    fn set_dictionary_geometry(&mut self, geometry: crate::encoding::DictionaryGeometry) {
+        // Forwarded for the same reason as the sizes: the captured frame must
+        // resolve exactly as the production one does.
+        self.inner.set_dictionary_geometry(geometry);
+    }
+
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
         self.inner.prime_with_dictionary(dict_content, offset_hist);
     }

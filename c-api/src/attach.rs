@@ -196,6 +196,40 @@ const CDICT_PARAMS_SRC_CUTOFF: u64 = 128 * 1024;
 /// dictionary is about the dictionary too, however large both are.
 const CDICT_PARAMS_DICT_MULTIPLIER: u64 = 6;
 
+/// Whether `cdict`'s own compression parameters still describe a frame over
+/// `src_size` bytes (`None` = not yet known), and so drive it.
+///
+/// See [`ZSTD_CCtx::cdict_params_drive_frame`] for the upstream branch this
+/// ports; `ZSTD_compress_usingCDict` reads the same one
+/// (zstd_compress.c:5834).
+pub(crate) fn cdict_params_describe_frame(cdict: &ZSTD_CDict, src_size: Option<u64>) -> bool {
+    let content = cdict.dict.content_size() as u64;
+    if content == 0 {
+        return false;
+    }
+    if cdict.params.is_some() {
+        return true;
+    }
+    let Some(src) = src_size else {
+        return true;
+    };
+    src < CDICT_PARAMS_SRC_CUTOFF || src < content * CDICT_PARAMS_DICT_MULTIPLIER
+}
+
+/// Where a frame referencing `cdict` over `src_size` bytes takes its
+/// match-finder geometry: the dictionary's own preparation while its
+/// parameters still describe the frame, the frame's own resolution past that.
+pub(crate) fn cdict_geometry(
+    cdict: &ZSTD_CDict,
+    src_size: Option<u64>,
+) -> codec::encoding::DictionaryGeometry {
+    if cdict_params_describe_frame(cdict, src_size) {
+        codec::encoding::DictionaryGeometry::Prepared
+    } else {
+        codec::encoding::DictionaryGeometry::LoadedIntoFrame
+    }
+}
+
 impl ZSTD_CCtx {
     /// Whether a referenced CDict's own compression parameters drive the next
     /// frame over `src_size` bytes (`None` = not yet known).
@@ -216,18 +250,23 @@ impl ZSTD_CCtx {
             return false;
         };
         // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
-        let cdict = unsafe { &**cdict };
-        let content = cdict.dict.content_size() as u64;
-        if content == 0 {
-            return false;
+        cdict_params_describe_frame(unsafe { &**cdict }, src_size)
+    }
+
+    /// Where the next frame over `src_size` bytes takes its match-finder
+    /// geometry. Only a referenced CDict can send it anywhere but the
+    /// dictionary's own preparation: a loaded dictionary or a prefix is
+    /// prepared from the context's own parameters to begin with, which is what
+    /// upstream's always-`usingCDict` path for them amounts to.
+    pub(crate) fn dictionary_geometry(
+        &self,
+        src_size: Option<u64>,
+    ) -> codec::encoding::DictionaryGeometry {
+        match &self.attached_dict {
+            // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
+            CCtxDictAttach::RefCDict { cdict, .. } => cdict_geometry(unsafe { &**cdict }, src_size),
+            _ => codec::encoding::DictionaryGeometry::Prepared,
         }
-        if cdict.params.is_some() {
-            return true;
-        }
-        let Some(src) = src_size else {
-            return true;
-        };
-        src < CDICT_PARAMS_SRC_CUTOFF || src < content * CDICT_PARAMS_DICT_MULTIPLIER
     }
 
     /// The explicit parameters the next frame over `src_size` bytes runs under,

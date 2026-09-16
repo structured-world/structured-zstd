@@ -114,7 +114,12 @@ pub(crate) fn set_frame_parameters(
     compressor: &mut FrameCompressor,
     params: Option<&CompressionParameters>,
     level: c_int,
+    geometry: codec::encoding::DictionaryGeometry,
 ) {
+    // Before the parameters, since `set_compression_level` drops the per-frame
+    // overrides and this is not one of them: it says where the frame resolves
+    // from, not what it resolves to.
+    compressor.set_dictionary_geometry(geometry);
     match params {
         Some(params) => compressor.set_parameters(params),
         None => {
@@ -369,6 +374,7 @@ pub unsafe extern "C" fn ZSTD_compress2(
     };
     let params = cctx.params;
     let level = cctx.attach_level(src_size);
+    let geometry = cctx.dictionary_geometry(src_size);
     let serial = cctx.attach_serial();
     let suppress_id = cctx.attach_suppresses_dict_id();
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
@@ -381,7 +387,7 @@ pub unsafe extern "C" fn ZSTD_compress2(
         // The kept compressor, holding the attached dictionary: the same one
         // on the next call is neither parsed nor attached again.
         let enc = kept_compressor(compressor, serial, attached_dict.prepared(), level)?;
-        set_frame_parameters(enc, frame_params.as_ref(), level);
+        set_frame_parameters(enc, frame_params.as_ref(), level, geometry);
         enc.set_content_checksum(params.checksum_flag);
         enc.set_content_size_flag(params.content_size_flag);
         enc.set_dictionary_id_flag(params.dict_id_flag && !suppress_id);

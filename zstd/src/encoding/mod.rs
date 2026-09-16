@@ -392,6 +392,34 @@ impl DictionarySizes {
     }
 }
 
+/// Where a frame compressing with a dictionary takes its match-finder geometry.
+///
+/// A dictionary is prepared once with a shape of its own: a strategy, table
+/// widths and a search depth chosen for the dictionary rather than for any one
+/// frame. A frame either runs that shape, or resolves its own for the source in
+/// hand and takes the dictionary's bytes into those tables.
+///
+/// # Examples
+/// ```
+/// use structured_zstd::encoding::DictionaryGeometry;
+/// assert_eq!(DictionaryGeometry::default(), DictionaryGeometry::Prepared);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DictionaryGeometry {
+    /// The frame runs the shape the dictionary was prepared with, and may
+    /// search the dictionary's own tables in place. This is what a frame about
+    /// the dictionary wants, and what upstream `ZSTD_resetCCtx_usingCDict`
+    /// does.
+    #[default]
+    Prepared,
+    /// The frame resolves its own shape for its source and the dictionary is
+    /// loaded into those tables, as upstream resets from the requested
+    /// parameters and calls `ZSTD_compress_insertDictionary`
+    /// (zstd_compress.c:5264). A source far larger than the dictionary is about
+    /// its own content, and a shape chosen for the dictionary undersizes it.
+    LoadedIntoFrame,
+}
+
 /// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm
 /// making their own tradeoffs between runtime, memory usage and compression ratio
 ///
@@ -482,6 +510,11 @@ pub trait Matcher {
     /// Default no-op for custom matchers and test stubs; consumed at the next
     /// [`reset`](Self::reset).
     fn set_dictionary_size_hint(&mut self, _sizes: DictionarySizes) {}
+    /// Choose where the next frame takes its match-finder geometry from when a
+    /// dictionary is primed into it. Sticky until changed; default no-op for
+    /// custom matchers and test stubs, which resolve as
+    /// [`DictionaryGeometry::Prepared`].
+    fn set_dictionary_geometry(&mut self, _geometry: DictionaryGeometry) {}
     /// Drop any per-frame fine-grained parameter overrides installed via
     /// the public parameter API, reverting to plain level-based geometry
     /// at the next [`reset`](Self::reset). Called by

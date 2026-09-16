@@ -6,6 +6,54 @@ use crate::encoding::CompressionLevel;
 use crate::encoding::cparams::get_cparams;
 use crate::encoding::strategy::{SearchMethod, StrategyTag};
 
+/// A dictionary prepared for itself and a dictionary loaded into the frame
+/// resolve different shapes, and the loaded one is the frame's own.
+///
+/// A dictionary's preparation assumes a source of a few hundred bytes, since it
+/// cannot know which frames will use it. That is the right guess while the
+/// frame is about the dictionary and badly wrong once the frame is megabytes of
+/// its own content: the tables come out sized for the dictionary and the window
+/// for almost nothing. Loaded into the frame, the shape is the one the source
+/// asks for, the dictionary counting only as content the window must cover.
+#[test]
+fn a_loaded_dictionary_resolves_the_frames_own_shape() {
+    let level = CompressionLevel::Level(1);
+    let sizes = crate::encoding::DictionarySizes::raw_content(64 * 1024);
+    let source = 4 * 1024 * 1024u64;
+
+    let (prepared, prepared_plan) = super::resolve_level_params_with_dict(
+        level,
+        Some(source),
+        sizes,
+        &crate::encoding::parameters::ParamOverrides::default(),
+    );
+    let (loaded, loaded_plan) =
+        super::resolve_level_params_for_loaded_dict(level, Some(source), sizes);
+
+    // The frame's own shape is what this level resolves for a source of this
+    // size with that much dictionary content in front of it.
+    let own = get_cparams(super::numeric_level(level), source, sizes.content);
+    assert_eq!(loaded.window_log, own.window_log as u8);
+    assert_eq!(
+        loaded.fast.expect("level 1 is a Fast row").hash_log,
+        own.hash_log
+    );
+
+    // And it is not the dictionary's, whose tables were sized for a source the
+    // frame dwarfs. The window is the frame's under either shape; the table
+    // widths are what a dictionary lends.
+    let prepared_hash = prepared.fast.expect("level 1 is a Fast row").hash_log;
+    assert!(
+        loaded.fast.expect("level 1 is a Fast row").hash_log > prepared_hash,
+        "a {source} byte source resolved hash log {} where its dictionary's shape gives {prepared_hash}",
+        loaded.fast.expect("level 1 is a Fast row").hash_log,
+    );
+
+    // Nothing is searched in place: the dictionary is in the frame's tables.
+    assert!(prepared_plan.is_none_or(|plan| !plan.attach) || loaded_plan.is_none());
+    assert!(loaded_plan.is_none_or(|plan| !plan.attach));
+}
+
 /// The estimate is a budget figure, so it answers for whatever it is asked —
 /// including a window log no encoder would accept. Shifting by one is undefined
 /// past the width of the type, so an unbounded value turns a question about

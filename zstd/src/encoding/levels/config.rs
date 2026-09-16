@@ -1307,6 +1307,50 @@ pub(crate) fn resolve_level_params_with_dict(
     )
 }
 
+/// [`resolve_level_params`] for a frame whose dictionary is loaded into tables
+/// the frame resolved for its own source
+/// ([`DictionaryGeometry::LoadedIntoFrame`]).
+///
+/// The dictionary's own preparation does not enter this: upstream resets the
+/// context from the requested parameters for the real source, counting the
+/// dictionary only as extra content the window has to cover
+/// (`ZSTD_getCParams(level, srcSize, dictContentSize)`, zstd_compress.c:5839),
+/// and then loads the dictionary into the tables that came out. So the tier is
+/// the source's, not the dictionary's, and the caller's own knobs land on top
+/// through the ordinary [`apply_frame_overrides`] path rather than through the
+/// dictionary's preparation.
+///
+/// [`DictionaryGeometry::LoadedIntoFrame`]: crate::encoding::DictionaryGeometry::LoadedIntoFrame
+pub(crate) fn resolve_level_params_for_loaded_dict(
+    level: CompressionLevel,
+    source_size: Option<u64>,
+    sizes: crate::encoding::DictionarySizes,
+) -> (LevelParams, Option<RowDictPlan>) {
+    use crate::encoding::cparams::{CONTENTSIZE_UNKNOWN, uses_row_match_finder};
+    if sizes.content == 0 || matches!(level, CompressionLevel::Uncompressed) {
+        return (resolve_level_params(level, source_size), None);
+    }
+    let frame = crate::encoding::cparams::get_cparams(
+        numeric_level(level),
+        source_size.unwrap_or(CONTENTSIZE_UNKNOWN),
+        sizes.content,
+    );
+    let params = level_params_from_cparams(frame);
+    if !(3..=6).contains(&frame.strategy) {
+        return (params, None);
+    }
+    (
+        params,
+        Some(RowDictPlan {
+            // The dictionary lives in the frame's own tables, so there is no
+            // separate set to search in place.
+            attach: false,
+            use_row: uses_row_match_finder(&frame),
+            cdict: frame,
+        }),
+    )
+}
+
 /// The cheap fingerprint pre-splitter level for a compression level (the
 /// C-like `blockSplitterLevel`), resolved through the same per-level
 /// `LevelParams` table as every other tuning knob. `None` keeps the whole

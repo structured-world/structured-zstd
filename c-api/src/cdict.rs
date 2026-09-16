@@ -424,7 +424,16 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
         // The kept compressor attaches the CDict once; the next call with it
         // reuses the primed snapshot that first frame captured.
         let enc = kept_compressor(compressor, key, Some(&cdict_ref.dict), cdict_ref.level)?;
-        set_frame_parameters(enc, cdict_ref.params.as_ref(), cdict_ref.level);
+        // Same cutoff as a referenced CDict (zstd_compress.c:5834): past it the
+        // dictionary's own shape no longer describes the frame, so the frame
+        // resolves its own for this source at the CDict's level and takes the
+        // dictionary into those tables.
+        set_frame_parameters(
+            enc,
+            cdict_ref.params.as_ref(),
+            cdict_ref.level,
+            crate::attach::cdict_geometry(cdict_ref, Some(src.len() as u64)),
+        );
         // Per-call frame flags: the compressor is shared with every other
         // one-shot entry point, whose flags must not leak into this one.
         // Upstream ZSTD_compress_usingCDict leaves the checksum off unless the
@@ -488,7 +497,13 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict_advanced(
             ..
         } = cctx;
         let enc = kept_compressor(compressor, key, Some(&cdict_ref.dict), cdict_ref.level)?;
-        set_frame_parameters(enc, cdict_ref.params.as_ref(), cdict_ref.level);
+        // The same cutoff as the plain entry point above.
+        set_frame_parameters(
+            enc,
+            cdict_ref.params.as_ref(),
+            cdict_ref.level,
+            crate::attach::cdict_geometry(cdict_ref, Some(src.len() as u64)),
+        );
         enc.set_content_checksum(fparams.checksumFlag != 0);
         enc.set_content_size_flag(fparams.contentSizeFlag != 0);
         // Raw-content dictionaries never emit their synthetic ID regardless
