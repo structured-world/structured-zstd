@@ -267,9 +267,11 @@ pub enum DecompressBlockError {
     ExecuteSequencesError(ExecuteSequencesError),
     /// The block's literals, or its whole output, run past the block maximum
     /// (RFC 8878 3.1.1.2.4, `Block_Maximum_Size`): `size` bytes where
-    /// `MAX_BLOCK_SIZE` is the most a block may produce.
+    /// `maximum` is the most a block of this frame may produce, the smaller of
+    /// its window and 128 KiB.
     ExpandsPastBlockMaximum {
         size: usize,
+        maximum: usize,
     },
     /// A block with no sequences whose literals do not fit a fixed-capacity
     /// backend: `requested` bytes at `tail` against `capacity`. The block is
@@ -319,10 +321,9 @@ impl core::fmt::Display for DecompressBlockError {
             DecompressBlockError::SequencesHeaderParseError(e) => write!(f, "{e:?}"),
             DecompressBlockError::DecodeSequenceError(e) => write!(f, "{e:?}"),
             DecompressBlockError::ExecuteSequencesError(e) => write!(f, "{e:?}"),
-            DecompressBlockError::ExpandsPastBlockMaximum { size } => write!(
+            DecompressBlockError::ExpandsPastBlockMaximum { size, maximum } => write!(
                 f,
-                "Block expands to {size} bytes, past the maximum of {}",
-                crate::common::MAX_BLOCK_SIZE,
+                "Block expands to {size} bytes, past this frame's maximum of {maximum}"
             ),
             DecompressBlockError::LiteralsOutputOverflow {
                 tail,

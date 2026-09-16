@@ -6,7 +6,9 @@ use super::super::blocks::sequence_section::SequencesHeader;
 use super::literals_section_decoder::{LiteralsView, decode_literals_zerocopy};
 use super::sequence_section_decoder::decode_and_execute_sequences;
 use crate::common::MAX_BLOCK_SIZE;
-use crate::cpu_kernel::{CpuKernelTag, detect_cpu_kernel};
+use crate::cpu_kernel::CpuKernelTag;
+#[cfg(any(test, feature = "bench-internals"))]
+use crate::cpu_kernel::detect_cpu_kernel;
 use crate::decoding::errors::DecodeSequenceError;
 use crate::decoding::errors::{
     BlockHeaderReadError, BlockSizeError, BlockTypeError, DecodeBlockContentError,
@@ -52,9 +54,10 @@ fn block_fits_the_maximum(
     window_size: usize,
 ) -> Result<(), DecodeBlockContentError> {
     let size = header.decompressed_size as usize;
-    if size > block_maximum(window_size) {
+    let maximum = block_maximum(window_size);
+    if size > maximum {
         return Err(DecodeBlockContentError::DecompressBlockError(
-            DecompressBlockError::ExpandsPastBlockMaximum { size },
+            DecompressBlockError::ExpandsPastBlockMaximum { size, maximum },
         ));
     }
     Ok(())
@@ -85,12 +88,22 @@ fn write_literals_only<B: super::buffer_backend::BufferBackend>(
         })
 }
 
-/// Create a new [BlockDecoder].
+/// Create a new [BlockDecoder], detecting the CPU kernel. Detection belongs at
+/// the decoder's entry, so the decode paths take [`with_kernel`] instead; this
+/// is for callers that decode a block in isolation.
+#[cfg(any(test, feature = "bench-internals"))]
 pub fn new() -> BlockDecoder {
+    with_kernel(detect_cpu_kernel())
+}
+
+/// Create a new [BlockDecoder] over a kernel the caller already resolved. A
+/// decoder that builds one per call (a chunked decode does) detects once and
+/// passes the tag here, rather than reading the detection cache every time.
+pub(crate) fn with_kernel(kernel: CpuKernelTag) -> BlockDecoder {
     BlockDecoder {
         internal_state: DecoderState::ReadyToDecodeNextHeader,
         header_buffer: [0u8; 3],
-        kernel: detect_cpu_kernel(),
+        kernel,
     }
 }
 
@@ -386,6 +399,7 @@ impl BlockDecoder {
         if section.regenerated_size as usize > block_maximum {
             return Err(DecompressBlockError::ExpandsPastBlockMaximum {
                 size: section.regenerated_size as usize,
+                maximum: block_maximum,
             });
         }
         let raw = &raw[bytes_in_literals_header as usize..];
@@ -517,7 +531,10 @@ impl BlockDecoder {
         // length is this block's output.
         let produced = buffer.len() - len_before;
         if produced > block_maximum {
-            return Err(DecompressBlockError::ExpandsPastBlockMaximum { size: produced });
+            return Err(DecompressBlockError::ExpandsPastBlockMaximum {
+                size: produced,
+                maximum: block_maximum,
+            });
         }
         Ok(())
     }

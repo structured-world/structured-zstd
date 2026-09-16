@@ -1364,6 +1364,37 @@ fn a_raw_block_after_a_compressed_one_fills_the_slice() {
     );
 }
 
+/// A drain that fills `target` exactly leaves nothing pending, which is not a
+/// reason to decode another block: its output would have nowhere to go, and its
+/// input would be consumed for a caller that asked for no more.
+#[test]
+fn a_filled_target_stops_before_the_next_block() {
+    const BLOCK: u32 = 1024;
+    let mut frame = alloc::vec![
+        0x28, 0xB5, 0x2F, 0xFD, // magic
+        0x00, // FHD: multi-segment, no content size
+        0x00, // window descriptor: 1 KiB
+    ];
+    for i in 0..3u32 {
+        // Raw block header: last flag on the third, type 0, size.
+        let header = BLOCK << 3 | u32::from(i == 2);
+        frame.extend_from_slice(&header.to_le_bytes()[..3]);
+        frame.extend((0..BLOCK).map(|b| (b + i) as u8));
+    }
+
+    let mut decoder = FrameDecoder::new();
+    let mut source = frame.as_slice();
+    decoder.reset(&mut source).expect("header parses");
+    let mut chunk = alloc::vec![0u8; BLOCK as usize];
+    let (read, written) = decoder
+        .decode_from_to(source, &mut chunk)
+        .expect("frame decodes");
+    assert_eq!(written, BLOCK as usize);
+    // Two blocks fill the window and hand one block over; the third is left
+    // for the next call, with its header and body unread.
+    assert_eq!(read, 2 * (3 + BLOCK as usize));
+}
+
 /// A block can produce at most its frame's block maximum, so that is what the
 /// pre-block reservation asks for. A 1 KiB window asking for a full 128 KiB
 /// grew the ring to 256 KiB: the growth limit clamps a need that fits under it,

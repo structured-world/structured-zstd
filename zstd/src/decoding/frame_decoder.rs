@@ -203,6 +203,11 @@ pub struct FrameDecoder {
     /// `all(lsm, hash)` (see `per_block_checksums_enabled`).
     #[cfg(all(feature = "lsm", feature = "hash"))]
     computed_block_checksums: alloc::vec::Vec<u32>,
+    /// Best kernel this CPU offers, resolved once per decoder rather than per
+    /// block decoder built. A chunked decode enters `decode_from_to` once per
+    /// caller-sized target, so detecting there put an atomic read and a branch
+    /// on every call; feature detection belongs before the work, not inside it.
+    kernel: crate::cpu_kernel::CpuKernelTag,
 }
 
 /// How the decoder treats a frame's optional XXH64 content checksum
@@ -1066,6 +1071,7 @@ impl FrameDecoder {
             per_block_checksums_enabled: false,
             #[cfg(all(feature = "lsm", feature = "hash"))]
             computed_block_checksums: alloc::vec::Vec::new(),
+            kernel: crate::cpu_kernel::detect_cpu_kernel(),
         }
     }
 
@@ -1826,7 +1832,7 @@ impl FrameDecoder {
         // is already sufficient.
         state.reserve_decoding_buffer();
 
-        let mut block_dec = decoding::block_decoder::new();
+        let mut block_dec = decoding::block_decoder::with_kernel(self.kernel);
 
         let buffer_size_before = state.decoder_scratch.buffer_len();
         let block_counter_before = state.block_counter;
@@ -2138,7 +2144,7 @@ impl FrameDecoder {
             start_block
         };
 
-        let mut block_dec = decoding::block_decoder::new();
+        let mut block_dec = decoding::block_decoder::with_kernel(self.kernel);
 
         // Bytes of prefix-window output that physically precede the first
         // in-range block in the buffer. Captured at the prefix → in-range
@@ -2412,11 +2418,12 @@ impl FrameDecoder {
 
             //pseudo block to scope "state" so we can borrow self again after the block
             {
+                let kernel = self.kernel;
                 let state = match &mut self.state {
                     Some(s) => s,
                     None => panic!("Bug in library"),
                 };
-                let mut block_dec = decoding::block_decoder::new();
+                let mut block_dec = decoding::block_decoder::with_kernel(kernel);
 
                 // Honour the content-checksum mode on this hand-rolled decode
                 // loop (it does not go through `decode_blocks`): hash only when
@@ -2465,7 +2472,11 @@ impl FrameDecoder {
                         .buffer_read_reporting_pending(&mut target[written..])
                         .map_err(err::FailedToDrainDecodebuffer)?;
                     written += read;
-                    if pending > 0 {
+                    // Stop on a full target as well as on output left behind:
+                    // a drain that empties the buffer into the last of `target`
+                    // leaves nothing pending, and decoding another block then
+                    // consumes input the caller cannot be handed the output of.
+                    if pending > 0 || written == target.len() {
                         break;
                     }
                     //check if there are enough bytes for the next header
@@ -3269,6 +3280,7 @@ impl FrameDecoder {
             None => err::TargetTooSmall,
         };
 
+        let kernel = self.kernel;
         let state = self
             .state
             .as_mut()
@@ -3285,12 +3297,22 @@ impl FrameDecoder {
         // the 1-block copy, dominates.
         {
             let mut probe = *input;
-            let mut header_dec = block_decoder::new();
+            let mut header_dec = block_decoder::with_kernel(kernel);
             if let Ok((bh, hsize)) = header_dec.read_block_header(&mut probe) {
                 let n = bh.decompressed_size as usize;
+                // A frame that declares no size takes the shortcut too: the
+                // slice is its limit, and holding the block means holding the
+                // frame. Without this the probe parsed the header that the
+                // general loop below parses again, on the very path (a small
+                // frame from a streamed producer) this decode is for. The
+                // block maximum is checked here as the general path checks it:
+                // a block past it is malformed, and the shortcut must not be
+                // the way around that.
+                let window = state.frame_header.window_size().unwrap_or(0) as usize;
                 if bh.last_block
                     && matches!(bh.block_type, crate::blocks::block::BlockType::Raw)
-                    && declared_size == Some(n as u64)
+                    && declared_size.is_none_or(|declared| declared == n as u64)
+                    && n <= block_decoder::block_maximum(window)
                     && probe.len() >= n
                     && output.len() >= n
                 {
@@ -3397,7 +3419,7 @@ impl FrameDecoder {
         // sync with `decode_blocks` so post-call accessors
         // (`bytes_read_from_source`, `blocks_decoded`) return
         // accurate values.
-        let mut block_dec = block_decoder::new();
+        let mut block_dec = block_decoder::with_kernel(kernel);
         // Track total output bytes against the declared
         // `frame_content_size` via the buffer's actual write
         // counter — `BlockHeader.decompressed_size` is 0 for
