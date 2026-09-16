@@ -60,18 +60,22 @@ fn block_fits_the_maximum(
     Ok(())
 }
 
-/// A block with no sequences: its literals ARE its output, written fallibly so
-/// a fixed-capacity backend reports a short target instead of asserting.
+/// A block with no sequences: its literals ARE its output. Out of line, so the
+/// per-block body keeps the shape the sequence executor is laid out around.
 ///
-/// Out of line on purpose. Inlined into the per-block body, the error shape cost
-/// 9.9% of cycles on a 1 MiB level-19 stream decode while issuing 0.6% FEWER
-/// instructions: the grown body displaced the sequence path's layout. Behind a
-/// call, the same bound is free.
+/// A growable backend allocates rather than refusing, so its write cannot fail
+/// and takes the infallible path; the compile-time const folds the other arm
+/// away. A fixed-capacity backend reports a short target, where the infallible
+/// write would assert.
 #[inline(never)]
 fn write_literals_only<B: super::buffer_backend::BufferBackend>(
     buffer: &mut crate::decoding::decode_buffer::DecodeBuffer<B>,
     literals: &[u8],
 ) -> Result<(), DecompressBlockError> {
+    if !B::FIXED_CAPACITY {
+        buffer.push(literals);
+        return Ok(());
+    }
     buffer
         .try_push(literals)
         .map_err(|overflow| DecompressBlockError::LiteralsOutputOverflow {
@@ -487,16 +491,14 @@ impl BlockDecoder {
                     },
                 ));
             }
-            // A growable backend allocates rather than refusing, so its write
-            // cannot fail and takes the infallible path; the compile-time const
-            // folds the other arm away, leaving the block body as the optimiser
-            // saw it before (the fallible form here cost 9.9% of cycles on a
-            // 1 MiB level-19 stream while issuing 0.6% fewer instructions).
-            if B::FIXED_CAPACITY {
-                write_literals_only(buffer, literals_view)?;
-            } else {
-                buffer.push(literals_view);
-            }
+            // The literals ARE this block's output, and their length was held
+            // to the block maximum above, so the post-block check below has
+            // nothing left to say: hand the write over and return its result.
+            // A tail call rather than `?` on purpose. Carrying the fallible
+            // write's error path through this body cost 9.9% of cycles on a
+            // 1 MiB level-19 stream while issuing 0.6% FEWER instructions: the
+            // sequence executor it calls is laid out around this body.
+            return write_literals_only(buffer, literals_view);
         }
 
         // Nothing drains the buffer inside a block, so the growth of its live
