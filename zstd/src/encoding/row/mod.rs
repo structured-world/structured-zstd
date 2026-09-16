@@ -2480,6 +2480,11 @@ pub(crate) struct RowMatchGenerator {
     /// the positions this frame indexed can never resurface as another
     /// frame's (the owned path gets the same from its history length).
     borrowed_extent: usize,
+    /// The dictionary's bytes survived the last [`Self::reset`] at the head of
+    /// `history`, with its index still cached, so the frame ahead re-borrows
+    /// them instead of being handed the dictionary again. The frame compressor
+    /// reads this to skip the re-commit entirely.
+    dict_resident: bool,
 }
 
 impl RowMatchGenerator {
@@ -2501,6 +2506,7 @@ impl RowMatchGenerator {
             loaded_dict_end: 0,
             low_limit: 0,
             prefix_low: 0,
+            dict_resident: false,
             hash_salt: ROW_HASH_SALT,
             dict_plan: None,
             search_window: 0,
@@ -2709,10 +2715,38 @@ impl RowMatchGenerator {
         let next_floor = self.history_abs_start
             + (self.history.len() - self.history_start).max(self.borrowed_extent);
         self.borrowed_extent = 0;
-        self.window_size = 0;
-        self.history.clear();
-        self.history_start = 0;
         self.offset_hist = [1, 4, 8];
+        // Re-borrow, the shape the dfast and Fast backends already have: a
+        // dictionary frame keeps its bytes resident at the front of history
+        // (`[0, region)`) together with the cached dict index, so the next
+        // frame is not handed the dictionary again. Without this the frame
+        // compressor re-commits and re-indexes the whole dictionary per frame,
+        // which on a 110 KB dictionary under 1 KB frames was 26% of the encode
+        // and the reason level 5 sat at 3.5x the reference.
+        //
+        // The floor advance below still rejects the previous frame's INPUT, and
+        // the dictionary's own matches come from `self.dict`, whose positions
+        // are dictionary-relative and so bypass the floor.
+        let reborrow_region = if self.dict.is_primed()
+            && self.history_start == 0
+            && next_floor <= REBASE_RESET_FLOOR_CEILING
+            && !self.tables.is_empty()
+        {
+            let r = self.dict.region_len();
+            (r > 0 && self.history.len() >= r).then_some(r)
+        } else {
+            None
+        };
+        if let Some(region) = reborrow_region {
+            // Keep `[0, region)`, drop what the previous frame put after it.
+            self.history.truncate(region);
+            self.window_size = region;
+        } else {
+            self.window_size = 0;
+            self.history.clear();
+        }
+        self.history_start = 0;
+        self.dict_resident = reborrow_region.is_some();
         // Clear borrowed-window state so a following OWNED frame's
         // `current_block_range()` / `live_history()` read the owned mirror,
         // not a stale borrowed range. A borrowed frame re-arms via
@@ -2749,14 +2783,43 @@ impl RowMatchGenerator {
         // lazy reps restart from the frame's initial history. The window
         // starts at the frame start with no dictionary (a dictionary frame
         // primes these right after).
-        self.lazy_next_to_update = self.history_abs_start;
         self.lazy_reps = None;
-        self.loaded_dict_end = 0;
-        self.low_limit = self.history_abs_start;
-        self.prefix_low = self.history_abs_start;
         // Block buffers are returned to the caller's pool per block in
         // `add_data`, so there is nothing window-side to recycle here.
         self.chunk_lens.clear();
+        let Some(region) = reborrow_region else {
+            self.lazy_next_to_update = self.history_abs_start;
+            self.loaded_dict_end = 0;
+            self.low_limit = self.history_abs_start;
+            self.prefix_low = self.history_abs_start;
+            return;
+        };
+        // The resident dictionary is the frame's prefix, so the window lands
+        // exactly where `prime_dictionary_current_block` would have put it: the
+        // prefix starts after the dictionary, and the dictionary itself is the
+        // `extDict` segment below it when it was copied, or outside the window
+        // and reached through its own tables when it was attached.
+        self.chunk_lens.push_back(region);
+        let dict_end = self.history_abs_start + region;
+        self.loaded_dict_end = dict_end;
+        self.prefix_low = dict_end;
+        self.low_limit = match self.dict_plan {
+            Some(plan) if plan.attach => dict_end,
+            _ => self.history_abs_start,
+        };
+        // The dictionary is already indexed; the live index resumes past it.
+        self.lazy_next_to_update = dict_end;
+        // The eviction band has to hold the resident dictionary as well as the
+        // frame ahead, which is what priming would have granted it.
+        let headroom =
+            crate::encoding::match_table::storage::MAX_PRIMED_WINDOW_SIZE - self.max_window_size;
+        self.max_window_size += region.min(headroom);
+    }
+
+    /// Whether the dictionary survived the last [`Self::reset`] in place, so
+    /// the frame ahead re-borrows it instead of being primed again.
+    pub(crate) fn dict_resident(&self) -> bool {
+        self.dict_resident
     }
 
     pub(crate) fn get_last_space(&self) -> &[u8] {

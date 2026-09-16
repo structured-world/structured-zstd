@@ -16,7 +16,7 @@ impl MatchGeneratorDriver {
             MatcherStorage::HashChain(hc) => hc.table.dict_resident,
             MatcherStorage::Simple(s) => s.dict_resident(),
             MatcherStorage::Dfast(d) => d.dict_resident(),
-            _ => false,
+            MatcherStorage::Row(r) => r.dict_resident(),
         }
     }
 
