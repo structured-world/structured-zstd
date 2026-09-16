@@ -1175,6 +1175,32 @@ fn a_streamed_frame_just_past_its_window_reserves_only_what_it_declares() {
     );
 }
 
+/// A frame is free to declare less than its blocks go on to produce. The ring
+/// has to be able to hold what arrives: a growth limit cut to the declaration
+/// left the write short of buffer, and the ring aborts on that rather than
+/// reporting it. Only the up-front reservation takes the declaration; the limit
+/// stays at the window plus a block, so the bytes land and the decode carries
+/// on to the checks that judge them.
+#[test]
+fn a_frame_that_produces_past_its_declared_size_does_not_abort_the_ring() {
+    // A frame declaring no content whose compressed block regenerates 512
+    // bytes, which the sequence executor writes into the ring through the
+    // infallible path.
+    let frame: &[u8] = &[
+        0x28, 0xB5, 0x2F, 0xFD, 0x80, 0x14, 0x00, 0x00, 0x00, 0x00, 0x14, 0x02, 0x00, 0xA1, 0xA1,
+        0xA1, 0xA1, 0xA1, 0xA1, 0xA1, 0xA1, 0xA1, 0x9A, 0xA1, 0x81, 0xA1, 0xA1, 0xA1, 0xA1, 0x81,
+        0x7A, 0x00, 0x30, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA,
+        0xCA, 0xCA, 0xCA, 0xCE, 0xA1, 0xA1, 0xA1, 0xA1, 0x81, 0xCA, 0x00, 0x7A, 0xA1, 0xA1, 0x5B,
+        0xA1, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA, 0xAA, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA, 0xCA,
+        0xCA, 0xCA, 0xCA, 0x2F, 0xCE, 0x0E, 0x39,
+    ];
+
+    // Whatever the verdict on the frame, reaching one is the point: the ring
+    // must not run out of buffer under the write.
+    let mut out = Vec::new();
+    let _ = FrameDecoder::new().decode_all_to_vec(frame, &mut out);
+}
+
 /// Capacity of the ring a multi-segment frame decoded into.
 fn ring_capacity(decoder: &FrameDecoder) -> usize {
     match &decoder

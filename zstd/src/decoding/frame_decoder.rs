@@ -891,11 +891,12 @@ impl FrameDecoderState {
     /// (`ZSTD_decodingBufferSize_min`); it can cap at the content because its
     /// buffer is not a ring.
     ///
-    /// A frame that declares its size caps the whole of that at the declaration:
-    /// the block of room past the window is there for what a block still has to
-    /// produce, and a frame cannot produce past what it promised. Without the
-    /// cap a 1 MiB window declaring one byte more reserved a whole block of
-    /// room for that byte.
+    /// A declared content size does NOT cap this. A frame can declare less than
+    /// its blocks go on to produce, and that is caught by the check against the
+    /// declaration once the bytes exist; a limit that stopped the ring short of
+    /// them would instead have the write run out of buffer, which the ring
+    /// asserts on rather than reports. Only the up-front reservation takes the
+    /// declaration ([`Self::decoding_buffer_size`]).
     fn decoding_buffer_limit(&self) -> usize {
         let useful_window = self.useful_window_size();
         if self.frame_header.descriptor.single_segment_flag() {
@@ -904,12 +905,7 @@ impl FrameDecoderState {
         let window_size = self.frame_header.window_size().unwrap_or(0) as usize;
         // No overflow: the window was checked against
         // `MAXIMUM_ALLOWED_WINDOW_SIZE` when the header was taken.
-        let limit = useful_window + window_size.min(crate::common::MAX_BLOCK_SIZE as usize);
-        if self.frame_header.fcs_declared() {
-            let declared = self.frame_header.frame_content_size();
-            return limit.min(usize::try_from(declared).unwrap_or(usize::MAX));
-        }
-        limit
+        useful_window + window_size.min(crate::common::MAX_BLOCK_SIZE as usize)
     }
 
     /// What to reserve up front: the limit, except for a multi-segment frame
@@ -918,14 +914,24 @@ impl FrameDecoderState {
     /// they reserve it themselves; the limit then caps that growth at one
     /// block. Such frames are rare (encoders mark a frame that fits its window
     /// single-segment), and a small Raw or RLE one should not pay a block.
+    ///
+    /// A frame that declares its size never reserves past the declaration: the
+    /// block of room is there for what a block still has to produce, and an
+    /// honest frame produces exactly what it promised. A 1 MiB window declaring
+    /// one byte more reserved a whole block of room for that byte. A frame that
+    /// goes on to exceed its declaration grows into the limit and is then caught
+    /// by the check against it.
     fn decoding_buffer_size(&self) -> usize {
         let window_size = self.frame_header.window_size().unwrap_or(0);
-        if self.frame_header.fcs_declared() && self.frame_header.frame_content_size() <= window_size
-        {
-            self.useful_window_size()
-        } else {
-            self.decoding_buffer_limit()
+        if !self.frame_header.fcs_declared() {
+            return self.decoding_buffer_limit();
         }
+        let declared = self.frame_header.frame_content_size();
+        if declared <= window_size {
+            return self.useful_window_size();
+        }
+        self.decoding_buffer_limit()
+            .min(usize::try_from(declared).unwrap_or(usize::MAX))
     }
 
     /// Reserve this frame's decode buffer ([`Self::decoding_buffer_size`])
