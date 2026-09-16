@@ -1561,13 +1561,15 @@ pub(crate) fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
-            // Default OF distribution → cached table read in place, plus the
-            // long-share the cache computed once alongside it.
+            // Default OF distribution → cached table read in place. The share
+            // is taken from the constant rather than from the cache: reading it
+            // there would probe the `OnceLock` on a path that otherwise never
+            // touches the table, and the pipeline gate would then pay two
+            // probes per block for this one axis.
             #[cfg(feature = "std")]
             {
-                let (_, long_share) = predefined_of_table();
                 scratch.mark_of_predefined();
-                scratch.offsets_long_share = long_share;
+                scratch.offsets_long_share = PREDEFINED_OF_LONG_SHARE;
             }
             #[cfg(not(feature = "std"))]
             {
@@ -1744,6 +1746,13 @@ pub(crate) fn predefined_of_table() -> (&'static crate::fse::SeqFSETable, u32) {
     });
     (&cache.0, cache.1)
 }
+
+/// Long-offset share of the predefined offsets table. That table is built from
+/// a distribution fixed by the format, so the share it yields is fixed too, and
+/// naming it here keeps the Predefined arm from resolving the cached table just
+/// to read one number. A test pins it against the builder.
+#[cfg(feature = "std")]
+const PREDEFINED_OF_LONG_SHARE: u32 = 48;
 
 // The default Match Length decoding table uses an accuracy logarithm of 6 bits.
 const ML_DEFAULT_ACC_LOG: u8 = 6;

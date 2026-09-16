@@ -509,9 +509,19 @@ mod init_sequence_stream_tests {
 mod predefined_table_source_tests {
     use super::super::super::scratch::FSEScratch;
     use super::super::{
-        maybe_update_fse_tables, predefined_ll_table, predefined_ml_table, predefined_of_table,
+        PREDEFINED_OF_LONG_SHARE, maybe_update_fse_tables, predefined_ll_table,
+        predefined_ml_table, predefined_of_table,
     };
     use crate::blocks::sequence_section::SequencesHeader;
+
+    /// The Predefined arm reads the long-offset share from a constant so it
+    /// does not have to resolve the cached table for one number. That constant
+    /// is only safe while it equals what the builder produces from the
+    /// format's own distribution, which is what this pins.
+    #[test]
+    fn the_named_long_share_matches_the_table_the_builder_produces() {
+        assert_eq!(PREDEFINED_OF_LONG_SHARE, predefined_of_table().1);
+    }
 
     /// A Predefined-mode axis must READ the process-wide cached default table,
     /// not copy it into the per-frame scratch: the table is immutable and the
