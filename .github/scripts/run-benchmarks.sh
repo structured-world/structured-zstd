@@ -186,9 +186,12 @@ def load_criterion_samples(root):
         per_iter = sorted(t / i for t, i in zip(times, iters) if i > 0)
         if not per_iter:
             continue
+        # Sample counts are even (10 or 30), so the median averages the two
+        # middle values rather than taking the upper one.
+        mid = len(per_iter) // 2
         index[full_id] = {
             "min_ns": per_iter[0],
-            "median_ns": per_iter[len(per_iter) // 2],
+            "median_ns": (per_iter[(len(per_iter) - 1) // 2] + per_iter[mid]) / 2,
             "max_ns": per_iter[-1],
             "samples": len(per_iter),
         }
@@ -459,10 +462,14 @@ with open(raw_path) as f:
             # central estimate; the reported figure comes from the raw samples.
             sample = criterion_samples.get(name)
             if sample is None:
+                # No substitute is used, not even for this one row. A ratio
+                # pairs two implementations, so falling back on one side would
+                # divide a central estimate by the other side's minimum, and
+                # those differ by several percent: it would manufacture a delta
+                # out of nothing. The run fails below instead.
                 benchmarks_without_samples.append(name)
-                ns = int(bench_match.group(2).replace(",", ""))
-            else:
-                ns = sample["min_ns"]
+                continue
+            ns = sample["min_ns"]
             ms = ns / 1_000_000
             timings.append((name, ms))
             parsed = parse_benchmark_name(name)
@@ -606,31 +613,22 @@ with open(raw_path) as f:
             })
             scenario_training_bytes[scenario] = int(training_bytes)
 
-if timing_point_count == 0:
-    print("ERROR: No benchmark timings parsed from compare_ffi output.", file=sys.stderr)
-    sys.exit(1)
-
-if len(benchmarks_without_samples) == timing_point_count:
-    # Not one benchmark could be joined to its samples: CRITERION_HOME did not
-    # reach the bench binary, or criterion wrote nowhere. Falling back to the
-    # printed estimates for the whole run would silently restore the noisy
-    # numbers this join exists to replace, so fail instead of masking it.
-    print(
-        "ERROR: no criterion sample data found for any of the "
-        f"{timing_point_count} benchmarks under "
-        f"BENCH_CRITERION_HOME={os.environ.get('BENCH_CRITERION_HOME')!r}.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
 if benchmarks_without_samples:
+    # Either CRITERION_HOME did not reach the bench binary, or criterion wrote
+    # nothing for these. Reporting the run anyway would mean publishing figures
+    # on two different estimators, so stop and say which ones are missing.
     print(
-        f"WARN: {len(benchmarks_without_samples)} of {timing_point_count} "
-        "benchmarks had no criterion sample data; those rows fall back to the "
-        "printed point estimate and carry the run-to-run noise it absorbs: "
+        f"ERROR: {len(benchmarks_without_samples)} benchmark(s) have no "
+        "criterion sample data under "
+        f"BENCH_CRITERION_HOME={os.environ.get('BENCH_CRITERION_HOME')!r}: "
         f"{', '.join(sorted(benchmarks_without_samples)[:10])}",
         file=sys.stderr,
     )
+    sys.exit(1)
+
+if timing_point_count == 0:
+    print("ERROR: No benchmark timings parsed from compare_ffi output.", file=sys.stderr)
+    sys.exit(1)
 
 # Restrict the alert set to the canonical pair regardless of how
 # many levels this shard processed. Combined with `REGRESSION_STAGES`
