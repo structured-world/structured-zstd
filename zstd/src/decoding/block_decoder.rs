@@ -473,6 +473,18 @@ impl BlockDecoder {
             // (immutable view into block_content_buffer) can coexist
             // with the mutable borrows on the FSE / decode-buffer /
             // offset-hist fields.
+            // Room for this block's output, and the ceiling that bounds it.
+            // Exact growth: the reservation is a no-op while the frame-entry
+            // window reservation covers it, and on the frame's last block (a
+            // tail worth a fraction of a block) the amortized policy would
+            // DOUBLE a window-sized buffer. The ceiling is what stops a
+            // malformed block's sequences from growing the buffer past
+            // `len + block_maximum` (a decompression-bomb OOM on the growable
+            // RingBuffer); `DecodeBuffer::repeat` rejects the crossing match.
+            // Both belong here, where the block maximum is already in hand: the
+            // arithmetic then stays out of the per-kernel sequence monomorphs.
+            buffer.reserve_exact(block_maximum);
+            buffer.set_block_output_ceiling(block_maximum);
             decode_and_execute_sequences(
                 &seq_section,
                 raw,

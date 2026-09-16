@@ -158,25 +158,10 @@ where
         "sequence section update bits exceed 56-bit budget"
     );
 
-    // Exact growth: this worst-case pre-block reservation is a no-op while
-    // the frame-entry window reservation covers it, and on the frame's LAST
-    // block (where the remaining content is smaller than a full block) the
-    // amortized policy would DOUBLE the window-sized buffer for a tail
-    // worth a fraction of a block. The ring backend keeps its own
-    // amortized growth via the trait default.
-    // Both the reservation and the ceiling are the frame's block maximum,
-    // which a narrow window lowers below 128 KiB: reserving a full 128 KiB for
-    // a frame whose window is 1 KiB gave it a 131,073-byte ring where its peak
-    // is 2 KiB, the growth limit only clamping a need that fits under it.
-    // Derived here rather than carried on frame state: one `min` against a
-    // block decode, and a cached copy would have to be reset with the window.
-    let block_maximum = crate::decoding::block_decoder::block_maximum(buffer.window_size);
-    buffer.reserve_exact(block_maximum);
-    // Arm the per-block output ceiling so a malformed / adversarial block
-    // whose sequences over-produce cannot grow the buffer past
-    // `len + block_maximum` (a decompression-bomb OOM on the growable
-    // RingBuffer); `DecodeBuffer::repeat` rejects the crossing match.
-    buffer.set_block_output_ceiling(block_maximum);
+    // The block's output room is reserved and its ceiling armed by the block
+    // decoder before it calls in: that is where the frame's block maximum is
+    // known, and keeping the arithmetic out of this body keeps it out of the
+    // per-kernel monomorphs this function is inlined into.
     let old_buffer_size = buffer.len();
     let num_sequences = section.num_sequences as usize;
 
