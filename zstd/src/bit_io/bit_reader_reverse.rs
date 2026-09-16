@@ -24,72 +24,6 @@ const BIT_MASK: [u64; 65] = {
     table
 };
 
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
-#[derive(Copy, Clone)]
-struct TripleExtractDispatch {
-    use_pext: bool,
-}
-
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
-static TRIPLE_EXTRACT_DISPATCH: OnceLock<TripleExtractDispatch> = OnceLock::new();
-
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
-#[inline(always)]
-fn should_use_pext(vendor: [u8; 12], family: u32) -> bool {
-    vendor != *b"AuthenticAMD" || family != 0x17
-}
-
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
-#[inline(always)]
-fn triple_extract_dispatch() -> &'static TripleExtractDispatch {
-    TRIPLE_EXTRACT_DISPATCH.get_or_init(detect_triple_extract_dispatch)
-}
-
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
-fn detect_triple_extract_dispatch() -> TripleExtractDispatch {
-    use core::arch::x86_64::__cpuid;
-    use std::arch::is_x86_feature_detected;
-
-    if !is_x86_feature_detected!("bmi2") {
-        return TripleExtractDispatch { use_pext: false };
-    }
-
-    // AMD Zen1/Zen2 execute PEXT/PDEP through a slow microcode path.
-    // Keep scalar extraction there and enable PEXT on Intel and newer AMD.
-    let leaf0 = __cpuid(0);
-    let mut vendor = [0u8; 12];
-    vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
-    vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
-    vendor[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
-    let eax = __cpuid(1).eax;
-    let base_family = (eax >> 8) & 0xF;
-    let ext_family = (eax >> 20) & 0xFF;
-    let family = if base_family == 0xF {
-        base_family + ext_family
-    } else {
-        base_family
-    };
-
-    TripleExtractDispatch {
-        use_pext: should_use_pext(vendor, family),
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
-#[target_feature(enable = "bmi2")]
-unsafe fn extract_triple_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
-    use core::arch::x86_64::_pext_u64;
-
-    let mask3 = BIT_MASK[n3 as usize];
-    let mask2 = BIT_MASK[n2 as usize].wrapping_shl(u32::from(n3));
-    let mask1 = BIT_MASK[n1 as usize].wrapping_shl(u32::from(n2) + u32::from(n3));
-
-    let val1 = _pext_u64(all_three, mask1);
-    let val2 = _pext_u64(all_three, mask2);
-    let val3 = _pext_u64(all_three, mask3);
-    (val1, val2, val3)
-}
-
 /// Zstandard encodes some types of data in a way that the data must be read
 /// back to front to decode it properly. `BitReaderReversed` provides a
 /// convenient interface to do that.
@@ -144,16 +78,6 @@ pub struct BitReaderReversed<'s, K: CpuKernel = ScalarKernel> {
     /// drives monomorphisation of methods that route through `K::mask_lower_bits`
     /// without forcing the struct itself to carry runtime kernel state.
     _kernel: PhantomData<K>,
-
-    /// Cached `triple_extract_dispatch().use_pext` snapshot, populated
-    /// once in `new()`. `peek_bits_triple` reads this field instead of
-    /// re-checking the global `OnceLock` on every sequence — the
-    /// per-call atomic load + dispatch-branch was paying ~3 cycles on
-    /// every sequence decode (thousands per block × many blocks per
-    /// frame). One bool per `BitReaderReversed` lifetime, amortised
-    /// across every `peek_bits_triple` in the same decode pass.
-    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
-    pub(crate) use_pext_triple: bool,
 }
 
 impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
@@ -196,8 +120,6 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
             bit_container: 0,
             extra_bits: 0,
             _kernel: PhantomData,
-            #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
-            use_pext_triple: triple_extract_dispatch().use_pext,
         }
     }
 
@@ -366,21 +288,10 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
         let shift_by = (64u8 - self.bits_consumed).wrapping_sub(sum);
         let all_three = self.bit_container.wrapping_shr(shift_by as u32);
 
-        #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
-        if self.use_pext_triple {
-            // SAFETY: `use_pext_triple` was set in `new()` from
-            // `triple_extract_dispatch().use_pext`, which only returns
-            // `true` when BMI2 is runtime-detected; the unsafe call is
-            // gated on the same runtime check that the inline-form
-            // `try_extract_triple_with_pext` used to perform per-call.
-            return unsafe { extract_triple_pext(all_three, n1, n2, n3) };
-        }
-
-        let val1 = K::mask_lower_bits(all_three.wrapping_shr(u32::from(n3) + u32::from(n2)), n1);
-        let val2 = K::mask_lower_bits(all_three.wrapping_shr(u32::from(n3)), n2);
-        let val3 = K::mask_lower_bits(all_three, n3);
-
-        (val1, val2, val3)
+        // The kernel was chosen where this decode was dispatched, so the split
+        // is the monomorph's own instruction sequence. The reader used to carry
+        // the choice as a flag and branch on it here, once per sequence.
+        K::extract_triple(all_three, n1, n2, n3)
     }
 
     /// BMI2-scoped variant of [`peek_bits`]. The whole body executes

@@ -4,144 +4,22 @@ use crate::bit_io::BitReaderReversed;
 use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
-#[cfg(target_arch = "x86")]
-use core::arch::x86::_bzhi_u32;
-#[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::_bzhi_u64;
-#[cfg(all(feature = "std", target_arch = "aarch64"))]
-use std::arch::is_aarch64_feature_detected;
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-use std::arch::is_x86_feature_detected;
-#[cfg(feature = "std")]
-use std::sync::OnceLock;
 
 /// The Zstandard specification limits the maximum length of a code to 11 bits.
 pub(crate) const MAX_MAX_NUM_BITS: u8 = 11;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum HuffmanDecodeKernel {
-    Scalar,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    X86Bmi2,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    X86Avx2,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    X86Vbmi2,
-    #[cfg(target_arch = "aarch64")]
-    Aarch64Neon,
-    #[cfg(target_arch = "aarch64")]
-    Aarch64Sve,
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[inline(always)]
-const fn select_x86_huffman_decode_kernel(
-    has_avx512vbmi2: bool,
-    has_avx512f: bool,
-    has_avx512vl: bool,
-    has_avx512bw: bool,
-    has_bmi2: bool,
-    has_avx2: bool,
-) -> HuffmanDecodeKernel {
-    if has_avx512vbmi2 && has_avx512f && has_avx512vl && has_avx512bw && has_bmi2 {
-        return HuffmanDecodeKernel::X86Vbmi2;
-    }
-    if has_avx2 && has_bmi2 {
-        return HuffmanDecodeKernel::X86Avx2;
-    }
-    if has_bmi2 {
-        return HuffmanDecodeKernel::X86Bmi2;
-    }
-    HuffmanDecodeKernel::Scalar
-}
-
-#[cfg(feature = "std")]
-#[inline(always)]
-pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
-    static KERNEL: OnceLock<HuffmanDecodeKernel> = OnceLock::new();
-    *KERNEL.get_or_init(|| {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            let kernel = select_x86_huffman_decode_kernel(
-                is_x86_feature_detected!("avx512vbmi2"),
-                is_x86_feature_detected!("avx512f"),
-                is_x86_feature_detected!("avx512vl"),
-                is_x86_feature_detected!("avx512bw"),
-                is_x86_feature_detected!("bmi2"),
-                is_x86_feature_detected!("avx2"),
-            );
-            if kernel != HuffmanDecodeKernel::Scalar {
-                return kernel;
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if is_aarch64_feature_detected!("sve") {
-                return HuffmanDecodeKernel::Aarch64Sve;
-            }
-            if is_aarch64_feature_detected!("neon") {
-                return HuffmanDecodeKernel::Aarch64Neon;
-            }
-        }
-        HuffmanDecodeKernel::Scalar
-    })
-}
-
-#[cfg(not(feature = "std"))]
-#[inline(always)]
-pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        let kernel = select_x86_huffman_decode_kernel(
-            cfg!(target_feature = "avx512vbmi2"),
-            cfg!(target_feature = "avx512f"),
-            cfg!(target_feature = "avx512vl"),
-            cfg!(target_feature = "avx512bw"),
-            cfg!(target_feature = "bmi2"),
-            cfg!(target_feature = "avx2"),
-        );
-        if kernel != HuffmanDecodeKernel::Scalar {
-            return kernel;
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        if cfg!(target_feature = "sve") {
-            return HuffmanDecodeKernel::Aarch64Sve;
-        }
-        if cfg!(target_feature = "neon") {
-            return HuffmanDecodeKernel::Aarch64Neon;
-        }
-    }
-    HuffmanDecodeKernel::Scalar
-}
-
 pub struct HuffmanDecoder<'table> {
     table: &'table HuffmanTable,
-    /// Read by `decode_symbol_and_advance` on x86 to pick between the
-    /// scalar and BMI2 single-symbol decode bodies (single-stream tail
-    /// loop after the 4-stream burst). On aarch64 and portable targets
-    /// the BMI2 arm doesn't exist and the field is unread — the
-    /// 4-stream SIMD-fallback path that previously consumed this
-    /// field now dispatches via the [`HufKernel`] trait at
-    /// `decompress_literals` entry instead.
-    #[cfg_attr(
-        not(any(target_arch = "x86", target_arch = "x86_64")),
-        allow(dead_code)
-    )]
-    kernel: HuffmanDecodeKernel,
     /// State is used to index into the table.
     pub state: u64,
 }
 
 impl<'t> HuffmanDecoder<'t> {
-    /// Create a new decoder with the provided table
+    /// Create a new decoder with the provided table. It holds no kernel of its
+    /// own: the decode methods take the `K` their caller was monomorphised for,
+    /// which is resolved once where the decode is dispatched.
     pub fn new(table: &'t HuffmanTable) -> HuffmanDecoder<'t> {
-        HuffmanDecoder {
-            table,
-            kernel: detect_huffman_decode_kernel(),
-            state: 0,
-        }
+        HuffmanDecoder { table, state: 0 }
     }
 
     /// Decode the symbol the internal state (cursor) is pointed at and return the
@@ -205,57 +83,20 @@ impl<'t> HuffmanDecoder<'t> {
     }
 
     /// Decode symbol and advance state in one table lookup.
+    ///
+    /// The kernel is `K`, chosen once where the decode was dispatched, so the
+    /// state advance is the monomorph's own instruction: `bzhi` on the BMI2
+    /// tiers, a mask elsewhere. `state_mask` is `(1 << max_num_bits) - 1`, the
+    /// same value `bzhi` produces, so the two agree bit for bit.
     #[inline(always)]
     pub fn decode_symbol_and_advance<K: crate::cpu_kernel::CpuKernel>(
-        &mut self,
-        br: &mut BitReaderReversed<'_, K>,
-    ) -> u8 {
-        // On x86 the BMI2 kernel uses `_bzhi_u64` and is a real
-        // perf win over the scalar `((state << n) & mask) | new_bits`
-        // sequence, so the runtime match is load-bearing. On aarch64
-        // both NEON and SVE arms previously aliased the scalar body
-        // verbatim — the match was paying a 3-arm dispatch cost for
-        // zero benefit. Collapsed to a direct scalar call there.
-        // The enum's Aarch64Neon / Aarch64Sve variants are themselves
-        // cfg-gated to target_arch = "aarch64", so under the outer
-        // x86 cfg below they don't exist — the match here is
-        // exhaustive on Scalar + X86Bmi2/Avx2/Vbmi2 alone, and an
-        // inner `cfg(target_arch = "aarch64")` arm would be dead
-        // (outer x86 cfg already false on aarch64).
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            match self.kernel {
-                HuffmanDecodeKernel::Scalar => self.decode_symbol_and_advance_scalar(br),
-                HuffmanDecodeKernel::X86Bmi2
-                | HuffmanDecodeKernel::X86Avx2
-                | HuffmanDecodeKernel::X86Vbmi2 => {
-                    // SAFETY: This path is selected only after runtime/static feature checks.
-                    unsafe { self.decode_symbol_and_advance_x86_bmi2(br) }
-                }
-            }
-        }
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        {
-            // aarch64 and portable targets: the X86* arms compile out
-            // entirely, so the match would collapse to a single arm.
-            // Bypass the match and call scalar directly — both
-            // Aarch64Neon and Aarch64Sve specialisations were
-            // verbatim clones of the scalar body (they were dropped
-            // in an earlier commit), and no NEON/SVE intrinsics
-            // exist for the single-symbol decode shape.
-            self.decode_symbol_and_advance_scalar(br)
-        }
-    }
-
-    #[inline(always)]
-    fn decode_symbol_and_advance_scalar<K: crate::cpu_kernel::CpuKernel>(
         &mut self,
         br: &mut BitReaderReversed<'_, K>,
     ) -> u8 {
         let packed = self.table.packed_decode[self.state as usize];
         let num_bits = (packed >> 8) as u8;
         let new_bits = br.get_bits(num_bits);
-        self.state = ((self.state << num_bits) & self.table.state_mask) | new_bits;
+        self.state = K::mask_lower_bits(self.state << num_bits, self.table.max_num_bits) | new_bits;
         packed as u8
     }
 
@@ -277,33 +118,6 @@ impl<'t> HuffmanDecoder<'t> {
         let new_bits = br.get_bits_unchecked(num_bits);
         self.state = ((self.state << num_bits) & self.table.state_mask) | new_bits;
         packed as u8
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "bmi2")]
-    unsafe fn decode_symbol_and_advance_x86_bmi2<K: crate::cpu_kernel::CpuKernel>(
-        &mut self,
-        br: &mut BitReaderReversed<'_, K>,
-    ) -> u8 {
-        let packed = self.table.packed_decode[self.state as usize];
-        let num_bits = (packed >> 8) as u8;
-        let new_bits = br.get_bits(num_bits);
-        self.state = unsafe { self.advance_state_x86_bmi2(num_bits, new_bits) };
-        packed as u8
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "bmi2")]
-    unsafe fn advance_state_x86_bmi2(&self, num_bits: u8, new_bits: u64) -> u64 {
-        #[cfg(target_arch = "x86_64")]
-        {
-            _bzhi_u64(self.state << num_bits, u32::from(self.table.max_num_bits)) | new_bits
-        }
-        #[cfg(target_arch = "x86")]
-        {
-            let shifted = ((self.state << num_bits) & u64::from(u32::MAX)) as u32;
-            u64::from(_bzhi_u32(shifted, u32::from(self.table.max_num_bits))) | new_bits
-        }
     }
 
     // aarch64 NEON / SVE kernels for `decode_symbol_and_advance` were

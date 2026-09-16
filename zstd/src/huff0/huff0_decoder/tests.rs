@@ -84,7 +84,6 @@ fn decode_symbol_and_advance_scalar_matches_manual_transition() {
 
     let mut decoder = HuffmanDecoder {
         table: &table,
-        kernel: HuffmanDecodeKernel::Scalar,
         state: initial_state,
     };
     let mut br =
@@ -95,23 +94,31 @@ fn decode_symbol_and_advance_scalar_matches_manual_transition() {
     assert_eq!(decoder.state, expected_state);
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// The state advance is the kernel's own instruction (`bzhi` where the tier
+/// has it, a mask elsewhere) and the two must agree bit for bit, since the
+/// stream they decode does not know which one ran.
 #[test]
-fn select_x86_kernel_ordering_is_stable() {
-    assert_eq!(
-        select_x86_huffman_decode_kernel(true, true, true, true, true, true),
-        HuffmanDecodeKernel::X86Vbmi2
-    );
-    assert_eq!(
-        select_x86_huffman_decode_kernel(false, false, false, false, true, true),
-        HuffmanDecodeKernel::X86Avx2
-    );
-    assert_eq!(
-        select_x86_huffman_decode_kernel(false, false, false, false, true, false),
-        HuffmanDecodeKernel::X86Bmi2
-    );
-    assert_eq!(
-        select_x86_huffman_decode_kernel(false, false, false, false, false, true),
-        HuffmanDecodeKernel::Scalar
-    );
+fn every_kernel_advances_the_state_alike() {
+    let table = test_table();
+    let source = [0b10101010, 0b01010101];
+
+    let mut scalar = HuffmanDecoder::new(&table);
+    let mut scalar_br = BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&source);
+    let scalar_symbol = scalar.decode_symbol_and_advance(&mut scalar_br);
+
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+    if std::arch::is_x86_feature_detected!("bmi2") {
+        let mut bmi2 = HuffmanDecoder::new(&table);
+        let mut bmi2_br = BitReaderReversed::<crate::cpu_kernel::Bmi2Kernel>::new(&source);
+        assert_eq!(bmi2.decode_symbol_and_advance(&mut bmi2_br), scalar_symbol);
+        assert_eq!(bmi2.state, scalar.state);
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
+    {
+        let mut neon = HuffmanDecoder::new(&table);
+        let mut neon_br = BitReaderReversed::<crate::cpu_kernel::NeonKernel>::new(&source);
+        assert_eq!(neon.decode_symbol_and_advance(&mut neon_br), scalar_symbol);
+        assert_eq!(neon.state, scalar.state);
+    }
 }

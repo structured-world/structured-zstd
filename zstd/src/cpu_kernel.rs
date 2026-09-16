@@ -61,6 +61,25 @@ pub trait CpuKernel: Copy + 'static {
     /// per-stream table builders pin to `n <= MAX_*_BITS` at
     /// construction time; no per-call wrapper assert runs.
     fn mask_lower_bits(value: u64, n: u8) -> u64;
+
+    /// Split the low `n1 + n2 + n3` bits of `packed` into three fields, the
+    /// highest first. The FSE sequence decoder reads its three state updates
+    /// this way, once per sequence.
+    ///
+    /// The default is three [`Self::mask_lower_bits`]; a kernel whose hardware
+    /// extracts them in one instruction overrides it. Every implementation
+    /// returns the same three values, so which one ran is invisible to the
+    /// stream being decoded.
+    ///
+    /// Precondition: `n1 + n2 + n3 <= 64`, as for `mask_lower_bits`.
+    #[inline(always)]
+    fn extract_triple(packed: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+        (
+            Self::mask_lower_bits(packed.wrapping_shr(u32::from(n3) + u32::from(n2)), n1),
+            Self::mask_lower_bits(packed.wrapping_shr(u32::from(n3)), n2),
+            Self::mask_lower_bits(packed, n3),
+        )
+    }
 }
 
 /// Scalar fallback — portable, no SIMD or BMI2 intrinsics. Selected
