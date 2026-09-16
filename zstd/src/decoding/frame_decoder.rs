@@ -527,6 +527,16 @@ impl DecoderScratchKind {
     /// chunk, and streaming callers invoke it per call) from growing a
     /// window-full buffer toward 2x window, while per-block growth keeps
     /// the amortized `reserve`.
+    /// Hand the buffer what the frame declared it would produce, so the
+    /// per-block reservation can stop at the frame's remainder.
+    #[inline]
+    fn set_declared_content(&mut self, content_size: Option<u64>) {
+        match self {
+            Self::Ring(s) => s.buffer.set_declared_content(content_size),
+            Self::Flat(s) => s.buffer.set_declared_content(content_size),
+        }
+    }
+
     #[inline]
     fn reserve_buffer(&mut self, target: usize, growth_limit: usize) {
         let window_size = target;
@@ -912,6 +922,13 @@ impl FrameDecoderState {
     fn reserve_decoding_buffer(&mut self) {
         let target = self.decoding_buffer_size();
         let growth_limit = self.decoding_buffer_limit();
+        // What the frame promised to produce, so the per-block reservation can
+        // ask for the smaller of a block and what is left of that promise.
+        let declared = self
+            .frame_header
+            .fcs_declared()
+            .then(|| self.frame_header.frame_content_size());
+        self.decoder_scratch.set_declared_content(declared);
         self.decoder_scratch.reserve_buffer(target, growth_limit);
     }
 

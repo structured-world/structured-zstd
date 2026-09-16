@@ -32,6 +32,8 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     // refcount bump). The borrow checker guarantees the dictionary outlives
     // every read; `DecodeBuffer` itself stays `Send`/`Sync` by auto-derive.
     pub window_size: usize,
+    /// See [`DecodeBuffer::set_declared_content`].
+    declared_content: Option<u64>,
     total_output_counter: u64,
     #[cfg(feature = "hash")]
     pub(crate) hash: twox_hash::XxHash64,
@@ -117,6 +119,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         DecodeBuffer {
             buffer,
             window_size,
+            declared_content: None,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -145,6 +148,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         DecodeBuffer {
             buffer,
             window_size,
+            declared_content: None,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -207,8 +211,32 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.set_max_capacity(ceiling);
     }
 
+    /// What the frame says it will produce in total, when it says so. The
+    /// per-block reservation asks for no more than what is left of it: a frame
+    /// declaring less than a block cannot produce one, and reserving a whole
+    /// block for it leaves the ring mostly unused for the frame's lifetime.
+    /// `None` for a frame of unknown size, where a block is all we know.
+    #[inline]
+    pub(crate) fn set_declared_content(&mut self, content_size: Option<u64>) {
+        self.declared_content = content_size;
+    }
+
+    /// Bytes the frame may still produce, for a frame that declared a size.
+    #[inline]
+    pub(crate) fn remaining_declared(&self) -> Option<usize> {
+        self.declared_content.map(|declared| {
+            // Saturating on purpose: a frame that has produced more than it
+            // declared is malformed, and the size check that rejects it runs
+            // where the block finishes. The answer here is just "nothing left
+            // worth reserving for".
+            let left = declared.saturating_sub(self.total_output_counter);
+            usize::try_from(left).unwrap_or(usize::MAX)
+        })
+    }
+
     pub fn reset(&mut self, window_size: usize) {
         self.window_size = window_size;
+        self.declared_content = None;
         self.buffer.clear();
         self.buffer.set_growth_limit(peak_buffered_len(window_size));
         // No reserve here: capacity decisions are pushed up to the frame

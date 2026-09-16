@@ -507,7 +507,18 @@ impl BlockDecoder {
             // RingBuffer); `DecodeBuffer::repeat` rejects the crossing match.
             // Both belong here, where the block maximum is already in hand: the
             // arithmetic then stays out of the per-kernel sequence monomorphs.
-            buffer.reserve_exact(block_maximum);
+            // Reserve what the block can actually produce: its maximum, or
+            // what the frame has left to give when it declared a size. A frame
+            // declaring 13 bytes cannot produce 128 KiB, and reserving that
+            // for it left the ring mostly unused for the frame's lifetime. The
+            // ceiling stays the block maximum: it decides whether a block is
+            // malformed, and a frame that outruns its declared size is caught
+            // by the size check instead, which says so.
+            let room = match buffer.remaining_declared() {
+                Some(left) => block_maximum.min(left),
+                None => block_maximum,
+            };
+            buffer.reserve_exact(room);
             buffer.set_block_output_ceiling(block_maximum);
             decode_and_execute_sequences(
                 &seq_section,

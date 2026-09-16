@@ -1429,6 +1429,47 @@ fn a_compressed_block_in_a_small_window_reserves_one_block_of_it() {
     );
 }
 
+/// A frame that declares 13 bytes cannot produce a block of 128 KiB, so the
+/// per-block reservation asks for what is left of the frame instead. The ring
+/// is otherwise grown to a block maximum by the first compressed block, whatever
+/// the frame said it would produce.
+#[test]
+fn a_compressed_block_reserves_no_more_than_the_frame_declares() {
+    // Literals, then one sequence: literal length 1, repeat offset 1, match
+    // length 3, leaving 9 literals after it. 13 bytes out.
+    let mut block = literals_header_20_bit(0, 10).to_vec();
+    block.extend((0..10u32).map(|i| b'a' + i as u8));
+    block.extend_from_slice(&[
+        0x01, // one sequence
+        0x54, // LL, OF and ML all RLE
+        0x01, 0x00, 0x00, // LL code 1, OF code 0, ML code 0
+        0x01, // stream start bit
+    ]);
+    let mut frame = alloc::vec![
+        0x28, 0xB5, 0x2F, 0xFD, // magic
+        0x80, // FHD: multi-segment, 4-byte content size
+        0x50, // window descriptor: 1 MiB
+    ];
+    frame.extend_from_slice(&13u32.to_le_bytes());
+    let header = (block.len() as u32) << 3 | 2 << 1 | 1; // compressed, last
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    frame.extend_from_slice(&block);
+
+    let mut decoder = FrameDecoder::new();
+    let mut source = frame.as_slice();
+    decoder.reset(&mut source).expect("header parses");
+    let mut chunk = [0u8; 64];
+    let (_, written) = decoder
+        .decode_from_to(source, &mut chunk)
+        .expect("frame decodes");
+    assert_eq!(&chunk[..written], b"aaaabcdefghij");
+    let capacity = ring_capacity(&decoder);
+    assert!(
+        capacity < 4 * 1024,
+        "a 13-byte frame reserved {capacity} bytes of ring"
+    );
+}
+
 /// A compressed block with sequences, then one with none whose literals fill a
 /// whole block maximum. The ceiling the first block armed bounds sequence
 /// writes only, so the literal write that follows is bounded by the caller's
