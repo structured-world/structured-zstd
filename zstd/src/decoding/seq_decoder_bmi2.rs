@@ -40,12 +40,7 @@ macro_rules! decode_one_body {
         let (obits, ml_add, ll_add) = if sum_wide <= 56 {
             let sum = sum_wide as u8;
             $br.ensure_bits(sum);
-            // SAFETY: enclosing fn is target_feature(bmi2).
-            let triple = if $br.use_pext_triple_fast() {
-                unsafe { $br.peek_bits_triple_bmi2(sum, of_num_bits, ml_num_bits, ll_num_bits) }
-            } else {
-                $br.peek_bits_triple(sum, of_num_bits, ml_num_bits, ll_num_bits)
-            };
+            let triple = $br.peek_bits_triple(sum, of_num_bits, ml_num_bits, ll_num_bits);
             $br.consume(sum);
             triple
         } else {

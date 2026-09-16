@@ -1,18 +1,12 @@
 use crate::cpu_kernel::{CpuKernel, ScalarKernel};
 use core::convert::TryInto;
 use core::marker::PhantomData;
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
-use std::sync::OnceLock;
 
 /// Pre-computed mask table: `BIT_MASK[n]` equals the lower `n` bits set,
-/// i.e. `(1u64 << n) - 1` for `n` in `0..=64`.
-///
-/// `mask_lower_bits` no longer reads this table — it computes the mask
-/// via `u64::MAX >> (64 - n)` to save a load. The table is still used
-/// by the BMI2 PEXT triple-extract path on x86-64 (where the mask is
-/// constructed once per call and then fed to `_pext_u64`), and by the
-/// tests that verify mask values directly.
-#[cfg(any(test, all(target_arch = "x86_64", feature = "kernel-bmi2")))]
+/// i.e. `(1u64 << n) - 1` for `n` in `0..=64`. Kept for the tests that verify
+/// mask values directly; `mask_lower_bits` computes the mask instead of
+/// loading it.
+#[cfg(test)]
 const BIT_MASK: [u64; 65] = {
     let mut table = [0u64; 65];
     let mut i: u32 = 1;
@@ -84,32 +78,6 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
     /// How many bits are left to read by the reader.
     pub fn bits_remaining(&self) -> isize {
         self.index as isize * 8 + (64 - self.bits_consumed as isize) - self.extra_bits as isize
-    }
-
-    /// Returns `true` when the cached vendor policy says PEXT is fast
-    /// on the running CPU (Intel + AMD Zen3+) and the bmi2-direct
-    /// triple-extract path should be used. AMD Zen1/Zen2 microcode
-    /// PEXT is slower than the scalar 3× shift+mask path, so
-    /// [`should_use_pext`] caches `false` for those vendors.
-    ///
-    /// `no_std` x86_64 builds lack the runtime detection (`use_pext_triple`
-    /// is std-gated), so this falls back to `true`: callers on
-    /// `no_std` rely on compile-time `target_feature = "bmi2"` and
-    /// implicitly trust that the chosen target CPU advertises fast
-    /// PEXT. Vendor-specific microcode regression remains a
-    /// build-time concern there — pin a known-good target with
-    /// `RUSTFLAGS="-C target-cpu=..."`.
-    #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
-    #[inline(always)]
-    pub(crate) fn use_pext_triple_fast(&self) -> bool {
-        #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
-        {
-            self.use_pext_triple
-        }
-        #[cfg(not(all(feature = "std", target_arch = "x86_64")))]
-        {
-            true
-        }
     }
 
     pub fn new(source: &'s [u8]) -> BitReaderReversed<'s, K> {
@@ -320,52 +288,6 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
         );
         let shift_by = (64u8 - self.bits_consumed).wrapping_sub(n);
         core::arch::x86_64::_bzhi_u64(self.bit_container.wrapping_shr(shift_by as u32), n as u32)
-    }
-
-    /// BMI2-scoped variant of [`peek_bits_triple`]. Mirrors the
-    /// scalar/K-trait variant but inlines `_pext_u64` directly instead
-    /// of crossing the `extract_triple_pext` CALL boundary.
-    ///
-    /// On AMD Zen1/Zen2 (vendor=AuthenticAMD family=0x17) `_pext_u64`
-    /// goes through slow microcode; callers should still consult
-    /// `self.use_pext_triple` (populated at construction from the
-    /// global dispatch cache) and route to the scalar variant on
-    /// those CPUs. This method assumes the caller already gated on
-    /// `use_pext_triple == true`.
-    ///
-    /// # Safety
-    /// Caller MUST ensure BMI2 is available AND the running CPU
-    /// benefits from `_pext_u64` (i.e. not Zen1/Zen2).
-    #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
-    #[target_feature(enable = "bmi2")]
-    #[inline]
-    pub(crate) unsafe fn peek_bits_triple_bmi2(
-        &mut self,
-        sum: u8,
-        n1: u8,
-        n2: u8,
-        n3: u8,
-    ) -> (u64, u64, u64) {
-        debug_assert_eq!(
-            u16::from(sum),
-            u16::from(n1) + u16::from(n2) + u16::from(n3),
-            "peek_bits_triple_bmi2: sum ({}) must equal n1+n2+n3 ({}+{}+{})",
-            sum,
-            n1,
-            n2,
-            n3
-        );
-        debug_assert!(
-            sum == 0 || self.bits_consumed + sum <= 64,
-            "peek_bits_triple_bmi2: not enough bits (consumed={}, requested={})",
-            self.bits_consumed,
-            sum
-        );
-        let shift_by = (64u8 - self.bits_consumed).wrapping_sub(sum);
-        let all_three = self.bit_container.wrapping_shr(shift_by as u32);
-        // SAFETY: caller's target_feature includes BMI2 per `# Safety`
-        // contract; same scope as the enclosing fn.
-        unsafe { extract_triple_pext(all_three, n1, n2, n3) }
     }
 
     /// Consume `n` bits from the source.
