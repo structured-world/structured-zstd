@@ -1364,6 +1364,57 @@ fn a_raw_block_after_a_compressed_one_fills_the_slice() {
     );
 }
 
+/// A block can produce at most its frame's block maximum, so that is what the
+/// pre-block reservation asks for. A 1 KiB window asking for a full 128 KiB
+/// grew the ring to 256 KiB: the growth limit clamps a need that fits under it,
+/// and this one did not.
+#[test]
+fn a_compressed_block_in_a_small_window_reserves_one_block_of_it() {
+    // Literals, then one sequence: literal length 1, repeat offset 1, match
+    // length 3, leaving 9 literals after it.
+    let mut block = literals_header_20_bit(0, 10).to_vec();
+    block.extend((0..10u32).map(|i| b'a' + i as u8));
+    block.extend_from_slice(&[
+        0x01, // one sequence
+        0x54, // LL, OF and ML all RLE
+        0x01, 0x00, 0x00, // LL code 1, OF code 0, ML code 0
+        0x01, // stream start bit
+    ]);
+    let size_field = block.len() as u32;
+    let frame = frame_with_a_tiny_window(&block, 2, size_field);
+
+    let mut decoder = FrameDecoder::new();
+    let mut source = frame.as_slice();
+    decoder.reset(&mut source).expect("header parses");
+    let mut chunk = [0u8; 64];
+    let (_, written) = decoder
+        .decode_from_to(source, &mut chunk)
+        .expect("frame decodes");
+    assert_eq!(&chunk[..written], b"aaaabcdefghij");
+    let capacity = ring_capacity(&decoder);
+    assert!(
+        capacity <= 4 * 1024,
+        "a 1 KiB-window frame reserved {capacity} bytes of ring"
+    );
+}
+
+/// A compressed block with no sequences writes its literals straight to the
+/// buffer. Into a slice shorter than they are, that must be `TargetTooSmall`
+/// like any other overshoot, not the infallible write's capacity assert.
+#[test]
+fn literals_longer_than_the_slice_are_target_too_small() {
+    let mut block = literals_header_20_bit(1, 2000).to_vec();
+    block.push(b'z'); // the repeated byte
+    block.push(0x00); // no sequences
+    let frame = frame_around_block(&block, None);
+    let mut out = alloc::vec![0u8; 100];
+    let result = FrameDecoder::new().decode_all(&frame, &mut out);
+    assert!(
+        matches!(result, Err(super::FrameDecoderError::TargetTooSmall)),
+        "2000 literals into 100 bytes must be TargetTooSmall, got {result:?}"
+    );
+}
+
 /// A frame's block maximum is the smaller of its window and 128 KiB (RFC 8878
 /// 3.1.1.2.4), so a 1 KiB window bounds every block at 1 KiB: literals, a
 /// block's whole output, and a Raw or RLE block's size alike.

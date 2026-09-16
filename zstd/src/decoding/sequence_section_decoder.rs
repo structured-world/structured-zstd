@@ -6,7 +6,6 @@ use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
-use crate::common::MAX_BLOCK_SIZE;
 use crate::cpu_kernel::CpuKernelTag;
 use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
 use crate::decoding::sequence_execution::do_offset_history;
@@ -85,7 +84,7 @@ pub(crate) struct SeqStreamSetup<'src, 'fse, K: crate::cpu_kernel::CpuKernel> {
 /// if the block's mode bytes call for it, skips the start-of-stream
 /// padding, initialises the LL/OF/ML decoder states, reserves the
 /// block's output capacity AND arms the per-block output ceiling (the
-/// decompression-bomb guard that bounds growth at `len + MAX_BLOCK_SIZE`),
+/// decompression-bomb guard that bounds growth at `len + block_maximum`),
 /// and computes the long-pipeline gate.
 ///
 /// Centralising this is what keeps the ceiling (and every other
@@ -165,16 +164,19 @@ where
     // amortized policy would DOUBLE the window-sized buffer for a tail
     // worth a fraction of a block. The ring backend keeps its own
     // amortized growth via the trait default.
-    buffer.reserve_exact(MAX_BLOCK_SIZE as usize);
+    // Both the reservation and the ceiling are the frame's block maximum,
+    // which a narrow window lowers below 128 KiB: reserving a full 128 KiB for
+    // a frame whose window is 1 KiB gave it a 131,073-byte ring where its peak
+    // is 2 KiB, the growth limit only clamping a need that fits under it.
+    // Derived here rather than carried on frame state: one `min` against a
+    // block decode, and a cached copy would have to be reset with the window.
+    let block_maximum = crate::decoding::block_decoder::block_maximum(buffer.window_size);
+    buffer.reserve_exact(block_maximum);
     // Arm the per-block output ceiling so a malformed / adversarial block
     // whose sequences over-produce cannot grow the buffer past
     // `len + block_maximum` (a decompression-bomb OOM on the growable
-    // RingBuffer); `DecodeBuffer::repeat` rejects the crossing match. The
-    // ceiling is the frame's block maximum, which a narrow window lowers
-    // below 128 KiB.
-    buffer.set_block_output_ceiling(crate::decoding::block_decoder::block_maximum(
-        buffer.window_size,
-    ));
+    // RingBuffer); `DecodeBuffer::repeat` rejects the crossing match.
+    buffer.set_block_output_ceiling(block_maximum);
     let old_buffer_size = buffer.len();
     let num_sequences = section.num_sequences as usize;
 
@@ -611,7 +613,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
     if remaining != 0 {
         // try_restore_checkpoint succeeds when no reallocation happened
         // between the checkpoint and now (the common case: upfront
-        // reserve(MAX_BLOCK_SIZE) covers a well-formed block). When a
+        // reserve of the block maximum covers a well-formed block). When a
         // malformed block decodes past that bound, reserve_amortized
         // fires and compacts the ring buffer — the captured tail is no
         // longer meaningful and the rollback is skipped. Either way the
@@ -1007,8 +1009,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_avx2<
 /// pipeline already issued a PREFETCH_L1 ADVANCE iterations earlier).
 /// The per-call `buffer.reserve(match_length)` is preserved by that
 /// variant — required for memory safety against malformed inputs whose
-/// `match_length` exceeds the upfront `reserve(MAX_BLOCK_SIZE)`
-/// headroom.
+/// `match_length` exceeds the upfront block-maximum headroom.
 #[inline(always)]
 #[allow(dead_code)] // live on aarch64 + tests only; see decode_and_execute_sequences_impl
 pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
@@ -1132,7 +1133,7 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
         //   decode produces baseline values starting at 3 for ml
         //   codes 0..3, so `seq.ml >= 3` for any valid sequence).
         //   The wildcopy helpers assert this in debug builds.
-        // - Caller's upfront `reserve(MAX_BLOCK_SIZE)` plus the
+        // - Caller's upfront block-maximum reserve plus the
         //   `WILDCOPY_OVERLENGTH = 32` slack on the user slice
         //   guarantees the writable tail has room for
         //   `lit_length + match_length + 15` (max wildcopy

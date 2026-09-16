@@ -2380,8 +2380,11 @@ impl FrameDecoder {
     /// By all means use decode_blocks if you have a io.Reader available. This is just for compatibility with other decompressors
     /// which try to serve an old-style c api
     ///
-    /// Returns (read, written), if read == 0 then the source did not contain a full block and further calls with the same
-    /// input will not make any progress!
+    /// Returns (read, written). Both zero means the call made no progress: the
+    /// source holds no full block and the buffer no drainable output, so the
+    /// same input cannot advance. `read == 0` with `written > 0` is progress of
+    /// the other kind: `target` filled from output already buffered, and the
+    /// same input decodes further once the caller offers more room.
     ///
     /// Note that no kind of block can be bigger than 128kb.
     /// So to be safe use at least 128*1024 (max block content size) + 3 (block_header size) + 18 (max frame_header size) bytes as your source buffer
@@ -3513,6 +3516,25 @@ impl FrameDecoder {
                         .expect("guard guarantees Some") as u64;
                     let tail = direct.buffer.buffer_ref().tail() as u64;
                     return Err(overflow(tail.saturating_add(requested)));
+                }
+                // A no-sequence block's literals did not fit the slice. Every
+                // direct-path entry holds `output.len() >= limit` (a declared
+                // size is checked against the slice before the path is chosen,
+                // and an undeclared frame's limit IS the slice), so a write
+                // past the slice is a write past `limit`: the frame outgrew its
+                // declared size, or the caller's target is short.
+                Err(crate::decoding::errors::DecodeBlockContentError::DecompressBlockError(
+                    crate::decoding::errors::DecompressBlockError::LiteralsOutputOverflow {
+                        tail,
+                        requested,
+                        capacity,
+                    },
+                )) => {
+                    debug_assert!(
+                        capacity as u64 >= limit,
+                        "direct path entered with a short slice"
+                    );
+                    return Err(overflow((tail as u64).saturating_add(requested as u64)));
                 }
                 Err(e) => {
                     return Err(block_body_decode_error(

@@ -155,6 +155,16 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
+    /// Infallible append, for tests over a growable backend. The decoder
+    /// writes through [`Self::try_push`]: on a fixed-capacity backend the
+    /// infallible path asserts where a short target must be reported.
+    #[cfg(test)]
+    #[inline]
+    pub fn push(&mut self, data: &[u8]) {
+        self.buffer.extend(data);
+        self.total_output_counter += data.len() as u64;
+    }
+
     /// Enable or disable the drain-time XXH64 pass. Set by the frame layer
     /// from the decoder's [`ContentChecksum`](crate::decoding::ContentChecksum)
     /// mode before each decode (`false` for `None`).
@@ -395,12 +405,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.extend_from_reader(read, fill_length)?;
         self.total_output_counter += fill_length as u64;
         Ok(())
-    }
-
-    #[inline]
-    pub fn push(&mut self, data: &[u8]) {
-        self.buffer.extend(data);
-        self.total_output_counter += data.len() as u64;
     }
 
     /// Add `n` to the cumulative produced-byte counter for output produced

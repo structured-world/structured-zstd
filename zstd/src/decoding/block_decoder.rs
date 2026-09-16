@@ -466,7 +466,17 @@ impl BlockDecoder {
                     },
                 ));
             }
-            buffer.push(literals_view);
+            // Fallible: on a fixed-capacity backend literals within the block
+            // maximum can still be longer than the caller's slice, which is a
+            // short target rather than a corrupt frame. The infallible `push`
+            // asserts there instead of reporting it.
+            buffer.try_push(literals_view).map_err(|overflow| {
+                DecompressBlockError::LiteralsOutputOverflow {
+                    tail: overflow.tail,
+                    requested: overflow.requested,
+                    capacity: overflow.capacity,
+                }
+            })?;
         }
 
         // Nothing drains the buffer inside a block, so the growth of its live

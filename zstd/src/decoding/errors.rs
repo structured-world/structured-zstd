@@ -271,6 +271,17 @@ pub enum DecompressBlockError {
     ExpandsPastBlockMaximum {
         size: usize,
     },
+    /// A block with no sequences whose literals do not fit a fixed-capacity
+    /// backend: `requested` bytes at `tail` against `capacity`. The block is
+    /// within the block maximum, so this says the caller's slice is short, and
+    /// the frame decoder turns it into `TargetTooSmall` (or a content-size
+    /// mismatch for a frame that declared one). Growable backends grow instead
+    /// and never produce it.
+    LiteralsOutputOverflow {
+        tail: usize,
+        requested: usize,
+        capacity: usize,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -312,6 +323,14 @@ impl core::fmt::Display for DecompressBlockError {
                 f,
                 "Block expands to {size} bytes, past the maximum of {}",
                 crate::common::MAX_BLOCK_SIZE,
+            ),
+            DecompressBlockError::LiteralsOutputOverflow {
+                tail,
+                requested,
+                capacity,
+            } => write!(
+                f,
+                "Literals would write past the output buffer: tail={tail}, requested={requested}, capacity={capacity}"
             ),
         }
     }
