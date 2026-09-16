@@ -338,8 +338,15 @@ fn peek_bits_triple_agrees_across_kernels() {
                 n3
             );
         }
+        // The full predicate the kernel selection uses: the tier mixes VBMI2
+        // with AVX2 widths, so a CPU offering VBMI2 alone must not reach it.
         #[cfg(feature = "kernel-vbmi2")]
-        if is_x86_feature_detected!("avx512vbmi2") {
+        if is_x86_feature_detected!("avx512vbmi2")
+            && is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx2")
+        {
             assert_eq!(
                 triple_under!(crate::cpu_kernel::Vbmi2Kernel, sum, n1, n2, n3),
                 expected,

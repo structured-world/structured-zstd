@@ -149,8 +149,18 @@ fn every_kernel_advances_the_state_alike() {
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("bmi2") {
         same_as_scalar!(crate::cpu_kernel::Avx2Kernel);
     }
+    // The same predicate the kernel selection uses, in full: the tier mixes
+    // VBMI2 with AVX2 widths and BMI2 masking, so a CPU that offers VBMI2 while
+    // masking any of the rest must not reach this monomorph. It would decode
+    // through instructions it does not have.
     #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
-    if std::arch::is_x86_feature_detected!("avx512vbmi2") {
+    if std::arch::is_x86_feature_detected!("avx512vbmi2")
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("bmi2")
+        && std::arch::is_x86_feature_detected!("avx2")
+    {
         same_as_scalar!(crate::cpu_kernel::Vbmi2Kernel);
     }
     #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
