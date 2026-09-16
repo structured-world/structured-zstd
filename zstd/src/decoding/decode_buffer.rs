@@ -221,6 +221,19 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.declared_content = content_size;
     }
 
+    /// Room for one block's output: its maximum, or what the frame has left to
+    /// produce when it declared a size. A frame declaring less than a block
+    /// cannot produce one, and reserving a whole block for it leaves the buffer
+    /// mostly unused for the frame's lifetime.
+    #[inline]
+    pub(crate) fn reserve_for_block(&mut self, block_maximum: usize) {
+        let room = match self.remaining_declared() {
+            Some(left) => block_maximum.min(left),
+            None => block_maximum,
+        };
+        self.reserve_exact(room);
+    }
+
     /// Bytes the frame may still produce, for a frame that declared a size.
     #[inline]
     pub(crate) fn remaining_declared(&self) -> Option<usize> {
