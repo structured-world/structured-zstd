@@ -70,6 +70,16 @@ fn block_fits_the_maximum(
 /// and takes the infallible path; the compile-time const folds the other arm
 /// away. A fixed-capacity backend reports a short target, where the infallible
 /// write would assert.
+///
+/// No per-block ceiling is armed for this write, and none is needed. The
+/// ceiling bounds SEQUENCE writes, which is why it is armed beside the
+/// sequence reserve; the write here goes through `try_extend`, whose bound is
+/// the caller's slice. Arming the previous block's ceiling over it would
+/// REJECT valid frames: a small block leaves the ceiling near its own output,
+/// and a following literal-only block of a whole block maximum would exceed it
+/// while the slice still had room. The literals were already held to the block
+/// maximum where their section was parsed, so this write cannot exceed it
+/// either.
 #[inline(never)]
 fn write_literals_only<B: super::buffer_backend::BufferBackend>(
     buffer: &mut crate::decoding::decode_buffer::DecodeBuffer<B>,

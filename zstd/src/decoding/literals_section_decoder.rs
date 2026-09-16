@@ -6,7 +6,10 @@ use super::scratch::HuffmanScratch;
 use crate::bit_io::BitReaderReversed;
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 use crate::cpu_kernel::Avx2Kernel;
-#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-bmi2"
+))]
 use crate::cpu_kernel::Bmi2Kernel;
 #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
 use crate::cpu_kernel::Vbmi2Kernel;
@@ -163,7 +166,10 @@ fn decompress_literals(
         CpuKernelTag::Avx2 => unsafe {
             decompress_literals_avx2(section, scratch, dict, source, target)
         },
-        #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel-bmi2"
+        ))]
         CpuKernelTag::Bmi2 => unsafe {
             decompress_literals_bmi2(section, scratch, dict, source, target)
         },
@@ -183,7 +189,10 @@ unsafe fn decompress_literals_avx2(
     decompress_literals_impl::<Avx2Kernel>(section, scratch, dict, source, target)
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-bmi2"
+))]
 #[target_feature(enable = "bmi2")]
 unsafe fn decompress_literals_bmi2(
     section: &LiteralsSection,

@@ -307,15 +307,91 @@ fn peek_bits_triple_agrees_across_kernels() {
         (15, 16, 17),
         (5, 0, 4),
     ];
+    /// Read the same widths from the same bits under one kernel.
+    macro_rules! triple_under {
+        ($kernel:ty, $sum:expr, $n1:expr, $n2:expr, $n3:expr) => {{
+            let mut reader = super::BitReaderReversed::<$kernel>::new(&data);
+            reader.ensure_bits($sum);
+            reader.peek_bits_triple($sum, $n1, $n2, $n3)
+        }};
+    }
+
     for &(n1, n2, n3) in &widths {
         let sum = n1 + n2 + n3;
-        let mut scalar = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
-        let mut bmi2 = super::BitReaderReversed::<crate::cpu_kernel::Bmi2Kernel>::new(&data);
-        scalar.ensure_bits(sum);
-        bmi2.ensure_bits(sum);
-        let s = scalar.peek_bits_triple(sum, n1, n2, n3);
-        let b = bmi2.peek_bits_triple(sum, n1, n2, n3);
-        assert_eq!(s, b, "mismatch at widths=({},{},{})", n1, n2, n3);
+        let expected = triple_under!(crate::cpu_kernel::ScalarKernel, sum, n1, n2, n3);
+        assert_eq!(
+            triple_under!(crate::cpu_kernel::Bmi2Kernel, sum, n1, n2, n3),
+            expected,
+            "Bmi2Kernel differs at widths=({},{},{})",
+            n1,
+            n2,
+            n3
+        );
+        #[cfg(feature = "kernel-avx2")]
+        if is_x86_feature_detected!("avx2") {
+            assert_eq!(
+                triple_under!(crate::cpu_kernel::Avx2Kernel, sum, n1, n2, n3),
+                expected,
+                "Avx2Kernel differs at widths=({},{},{})",
+                n1,
+                n2,
+                n3
+            );
+        }
+        #[cfg(feature = "kernel-vbmi2")]
+        if is_x86_feature_detected!("avx512vbmi2") {
+            assert_eq!(
+                triple_under!(crate::cpu_kernel::Vbmi2Kernel, sum, n1, n2, n3),
+                expected,
+                "Vbmi2Kernel differs at widths=({},{},{})",
+                n1,
+                n2,
+                n3
+            );
+        }
+    }
+}
+
+/// The aarch64 tiers read the same triple as the scalar bodies they share.
+#[cfg(all(feature = "std", target_arch = "aarch64", feature = "kernel-neon"))]
+#[test]
+fn peek_bits_triple_agrees_across_kernels() {
+    let data: [u8; 16] = [
+        0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x13, 0x37, 0xCA, 0xFE, 0x01, 0x99, 0x88, 0x77, 0x66, 0x55,
+        0x44,
+    ];
+    let widths = [(0, 0, 0), (1, 1, 1), (3, 5, 7), (8, 8, 8), (15, 16, 17)];
+
+    macro_rules! triple_under {
+        ($kernel:ty, $sum:expr, $n1:expr, $n2:expr, $n3:expr) => {{
+            let mut reader = super::BitReaderReversed::<$kernel>::new(&data);
+            reader.ensure_bits($sum);
+            reader.peek_bits_triple($sum, $n1, $n2, $n3)
+        }};
+    }
+
+    for &(n1, n2, n3) in &widths {
+        let sum = n1 + n2 + n3;
+        let expected = triple_under!(crate::cpu_kernel::ScalarKernel, sum, n1, n2, n3);
+        assert_eq!(
+            triple_under!(crate::cpu_kernel::NeonKernel, sum, n1, n2, n3),
+            expected,
+            "NeonKernel differs at widths=({},{},{})",
+            n1,
+            n2,
+            n3
+        );
+        #[cfg(feature = "kernel-sve")]
+        if std::arch::is_aarch64_feature_detected!("sve") {
+            assert_eq!(
+                triple_under!(crate::cpu_kernel::SveKernel, sum, n1, n2, n3),
+                expected,
+                "SveKernel differs at widths=({},{},{})",
+                n1,
+                n2,
+                n3
+            );
+        }
     }
 }
 

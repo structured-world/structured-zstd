@@ -288,6 +288,20 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 dict,
             )
         }
+        // 32-bit x86 reaches the BMI2 tier for the entropy tables (the HUF
+        // state advance takes `bzhi` through `K`), but the sequence monolith
+        // has no 32-bit body: its `target_feature` modules are x86_64-only.
+        // The portable walk is what runs here until one exists.
+        #[cfg(all(target_arch = "x86", feature = "kernel-bmi2"))]
+        CpuKernelTag::Bmi2 => super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
+            section,
+            source,
+            fse,
+            buffer,
+            offset_hist,
+            literals_buffer,
+            dict,
+        ),
         #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
         CpuKernelTag::Bmi2 => {
             // SAFETY: `detect_cpu_kernel()` only returns Bmi2 when
@@ -630,6 +644,15 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // as `OutputBufferOverflow` instead of panicking via the per-call
     // `assert!` inside `BufferBackend::extend`. Growable backends
     // (FlatBuf, RingBuffer) accept the write infallibly.
+    //
+    // The per-block ceiling is NOT re-checked here on purpose. It bounds the
+    // match writes, whose length a malformed block controls; these bytes are
+    // literals, and the whole literals section was held to the block maximum
+    // where it was parsed, so the ceiling would find nothing the parse did not
+    // already reject. Reserving against it would be worse than redundant: on
+    // the direct path the ceiling is relative to the block that armed it, so a
+    // valid frame whose blocks differ in size would start failing. The block's
+    // total output is checked once it has decoded.
     if lit_cur < literals_buffer_len {
         let rest = &literals_buffer[lit_cur..];
         buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;

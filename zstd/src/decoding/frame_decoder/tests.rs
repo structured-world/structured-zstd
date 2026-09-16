@@ -1429,6 +1429,51 @@ fn a_compressed_block_in_a_small_window_reserves_one_block_of_it() {
     );
 }
 
+/// A compressed block with sequences, then one with none whose literals fill a
+/// whole block maximum. The ceiling the first block armed bounds sequence
+/// writes only, so the literal write that follows is bounded by the caller's
+/// slice and both blocks decode.
+#[test]
+fn a_literal_only_block_after_a_compressed_one_fills_the_slice() {
+    const RLE_LITERALS: u32 = 128 * 1024;
+    // Literals, then one sequence: literal length 1, repeat offset 1, match
+    // length 3, leaving 9 literals after it. 13 bytes out.
+    let mut first = literals_header_20_bit(0, 10).to_vec();
+    first.extend((0..10u32).map(|i| b'a' + i as u8));
+    first.extend_from_slice(&[
+        0x01, // one sequence
+        0x54, // LL, OF and ML all RLE
+        0x01, 0x00, 0x00, // LL code 1, OF code 0, ML code 0
+        0x01, // stream start bit
+    ]);
+    // A block of RLE literals and no sequences: a whole block maximum of them.
+    let mut second = literals_header_20_bit(1, RLE_LITERALS).to_vec();
+    second.push(b'z'); // the repeated byte
+    second.push(0x00); // no sequences
+
+    let mut frame = alloc::vec![
+        0x28, 0xB5, 0x2F, 0xFD, // magic
+        0x80, // FHD: multi-segment, 4-byte content size
+        0x50, // window descriptor: 1 MiB
+    ];
+    let content = 13 + RLE_LITERALS;
+    frame.extend_from_slice(&content.to_le_bytes());
+    let header = (first.len() as u32) << 3 | 2 << 1; // compressed, not last
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    frame.extend_from_slice(&first);
+    let header = (second.len() as u32) << 3 | 2 << 1 | 1; // compressed, last
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    frame.extend_from_slice(&second);
+
+    let mut out = alloc::vec![0u8; content as usize];
+    let written = FrameDecoder::new()
+        .decode_all(&frame, &mut out)
+        .expect("a literal-only block after a compressed one decodes");
+    assert_eq!(written, content as usize);
+    assert_eq!(&out[..4], b"aaaa"); // one literal, then the match of three
+    assert!(out[13..].iter().all(|&b| b == b'z'));
+}
+
 /// A compressed block with no sequences writes its literals straight to the
 /// buffer. Into a slice shorter than they are, that must be `TargetTooSmall`
 /// like any other overshoot, not the infallible write's capacity assert.
