@@ -436,8 +436,12 @@ pub fn dictionary_describes_frame(dict_content: usize, src_size: Option<u64>) ->
     else {
         return true;
     };
+    // Asked as a division rather than `src < dict * 6`: this is public, so the
+    // dictionary is whatever the caller names, and six times a large one does
+    // not fit the type. For integers the two are the same question, and a
+    // division of a `u64` by a constant cannot overflow.
     src < DICTIONARY_DESCRIBES_FRAME_BELOW
-        || src < dict_content as u64 * DICTIONARY_DESCRIBES_FRAME_MULTIPLE
+        || src / DICTIONARY_DESCRIBES_FRAME_MULTIPLE < dict_content as u64
 }
 
 /// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm
@@ -626,3 +630,5 @@ pub enum Sequence<'data> {
 
 #[cfg(test)]
 mod compress_bound_tests;
+#[cfg(test)]
+mod tests;

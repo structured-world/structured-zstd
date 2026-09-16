@@ -123,15 +123,16 @@ fn dict_frames_decode_with_c_across_levels_and_reuse() {
     }
 }
 
-/// A source far larger than its dictionary is compressed for its own content,
-/// and must be no larger than the reference's frame.
+/// A source far larger than its dictionary must be no larger than the
+/// reference's frame, on the shape this codec keeps for it.
 ///
 /// The reference stops lending a dictionary its shape once the source outgrows
-/// it (`ZSTD_compressBegin_internal`, zstd_compress.c:5254): past 128 KiB and
-/// past six times the dictionary, the frame resolves for its own size and the
-/// dictionary goes into those tables. Run on a dictionary's own shape instead,
-/// a megabyte of content is matched through tables sized for the few hundred
-/// bytes a dictionary is prepared against, and the ratio goes with them.
+/// it (`ZSTD_compressBegin_internal`, zstd_compress.c:5254) and resolves the
+/// frame's own instead. This codec keeps the dictionary's, deliberately: doing
+/// it the reference's way was measured at five to ten times the time for the
+/// same bytes. So the two sides reach a megabyte of content through differently
+/// shaped tables, and what this pins is that ours does not pay for that in
+/// ratio.
 #[test]
 fn a_source_far_larger_than_its_dictionary_is_no_larger_than_the_reference() {
     use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
@@ -179,14 +180,6 @@ fn a_source_far_larger_than_its_dictionary_is_no_larger_than_the_reference() {
     }
 }
 
-/// A source far larger than its dictionary is compressed for its own content,
-/// and must be no larger than the reference's frame.
-///
-/// The reference stops lending a dictionary its shape once the source outgrows
-/// it (`ZSTD_compressBegin_internal`, zstd_compress.c:5254): past 128 KiB and
-/// past six times the dictionary, the frame resolves for its own size and the
-/// dictionary goes into those tables. Run on a dictionary's own shape instead,
-/// a megabyte of content is matched through tables sized for the few hundred
 /// A dictionary frame on the optimal band must not come out LARGER than the
 /// reference's, on input the dictionary describes well.
 ///
