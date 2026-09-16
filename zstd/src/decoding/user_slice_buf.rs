@@ -140,14 +140,16 @@ pub(crate) struct UserSliceBackend<'a> {
     tail: usize,
     /// Where sequence writes must stop: the slice's end, or sooner under the
     /// per-block output ceiling armed by `set_block_output_ceiling` before
-    /// each sequence section. A block may write at most `MAX_BLOCK_SIZE`
-    /// (RFC 8878 3.1.1.2.4) whatever room the caller's slice has, which for a
-    /// frame of unknown size is its only other bound. Folded into the one
+    /// each sequence section. A block may write at most its frame's block
+    /// maximum (RFC 8878 3.1.1.2.4) whatever room the caller's slice has, which
+    /// for a frame of unknown size is its only other bound. Folded into the one
     /// bound every sequence write already checks ([`BufferBackend::cap`]), as
     /// upstream folds `blockSizeMax` into `oend`, so the ceiling costs no
-    /// check of its own. Raw and RLE blocks write through `try_extend*`,
-    /// which keep the slice's end: the ceiling bounds sequences, as on
-    /// `RingBuffer`.
+    /// check of its own. Raw and RLE blocks never read it: they write through
+    /// `try_extend*`, which bound at the slice's end, and their own size is
+    /// held to the block maximum from their header before they write. So the
+    /// ceiling of the block that armed it cannot narrow a later Raw or RLE
+    /// block, and there is nothing to re-arm at their boundaries.
     sequence_cap: usize,
 }
 

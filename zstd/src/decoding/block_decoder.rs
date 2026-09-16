@@ -33,6 +33,33 @@ enum DecoderState {
     Failed, //TODO put "self.internal_state = DecoderState::Failed;" everywhere an unresolvable error occurs
 }
 
+/// The most a block of a frame with `window_size` may produce: the smaller of
+/// the window and 128 KiB (RFC 8878 3.1.1.2.4), which upstream keeps per frame
+/// as `blockSizeMax`. A single-segment frame's window is its content size, so
+/// such a frame's blocks are bounded by the content as well.
+#[inline]
+pub(crate) fn block_maximum(window_size: usize) -> usize {
+    window_size.min(MAX_BLOCK_SIZE as usize)
+}
+
+/// A Raw or RLE block states its output in its header, so it is held to the
+/// frame's block maximum before anything is written, as upstream checks `rSize`
+/// against `blockSizeMax` in `ZSTD_decompressContinue`. A compressed block's
+/// output is only known as it decodes, and is checked there.
+#[inline]
+fn block_fits_the_maximum(
+    header: &BlockHeader,
+    window_size: usize,
+) -> Result<(), DecodeBlockContentError> {
+    let size = header.decompressed_size as usize;
+    if size > block_maximum(window_size) {
+        return Err(DecodeBlockContentError::DecompressBlockError(
+            DecompressBlockError::ExpandsPastBlockMaximum { size },
+        ));
+    }
+    Ok(())
+}
+
 /// Create a new [BlockDecoder].
 pub fn new() -> BlockDecoder {
     BlockDecoder {
@@ -94,8 +121,9 @@ impl BlockDecoder {
                 // path. Advance ONLY after the write succeeds, matching
                 // the Raw arm's split_at-then-try_push-then-advance shape.
                 let fill = source[0];
-                workspace
-                    .split()
+                let parts = workspace.split();
+                block_fits_the_maximum(header, parts.buffer.window_size)?;
+                parts
                     .buffer
                     .try_extend_and_fill(fill, header.decompressed_size as usize)
                     .map_err(|_| DecodeBlockContentError::BackendOverflow { step: block_type })?;
@@ -120,8 +148,9 @@ impl BlockDecoder {
                 // `UserSliceBackend` when the Raw payload would push
                 // past the caller's output slice. Growable backends
                 // grow on demand and always succeed.
-                workspace
-                    .split()
+                let parts = workspace.split();
+                block_fits_the_maximum(header, parts.buffer.window_size)?;
+                parts
                     .buffer
                     .try_push(payload)
                     .map_err(|_| DecodeBlockContentError::BackendOverflow { step: block_type })?;
@@ -174,8 +203,9 @@ impl BlockDecoder {
                         source: err,
                     }
                 })?;
-                workspace
-                    .split()
+                let parts = workspace.split();
+                block_fits_the_maximum(header, parts.buffer.window_size)?;
+                parts
                     .buffer
                     .extend_and_fill(buf[0], header.decompressed_size as usize);
 
@@ -189,8 +219,9 @@ impl BlockDecoder {
                 // borrow-by-reference indirection. (Both io shims provide a
                 // blanket `Read for &mut T`, so `&mut source` would also
                 // compile; the by-value form is just cleaner here.)
-                workspace
-                    .split()
+                let parts = workspace.split();
+                block_fits_the_maximum(header, parts.buffer.window_size)?;
+                parts
                     .buffer
                     .extend_from_reader(source, header.decompressed_size as usize)
                     .map_err(|err| DecodeBlockContentError::ReadError {
@@ -313,17 +344,21 @@ impl BlockDecoder {
         raw: &[u8],
         dict: Option<&'d crate::decoding::dictionary::Dictionary>,
     ) -> Result<(), DecompressBlockError> {
-        // A block produces at most `MAX_BLOCK_SIZE` bytes, its literals and
-        // its matches together (RFC 8878 3.1.1.2.4). Upstream bounds both by
-        // the same `oend`: the literals up front (`litSize > blockSizeMax` is
-        // corruption in `ZSTD_decodeLiteralsBlock`) and every write after.
-        // Sequence writes stop at the per-block ceiling; the literals are
-        // checked here and the whole block after it decodes, which catches
-        // literals left over after the last sequence.
+        // A block produces at most its frame's block maximum, its literals and
+        // its matches together: the smaller of the window and 128 KiB (RFC 8878
+        // 3.1.1.2.4), as upstream derives it once per frame
+        // (`zstd_decompress.c`: `blockSizeMax = MIN(windowSize,
+        // ZSTD_BLOCKSIZE_MAX)`). Upstream bounds both halves by the same
+        // `oend`: the literals up front (`litSize > blockSizeMax` is corruption
+        // in `ZSTD_decodeLiteralsBlock`) and every write after. Sequence writes
+        // stop at the per-block ceiling; the literals are checked here and the
+        // whole block after it decodes, which catches literals left over after
+        // the last sequence.
+        let block_maximum = block_maximum(buffer.window_size);
         let len_before = buffer.len();
         let mut section = LiteralsSection::new();
         let bytes_in_literals_header = section.parse_from_header(raw)?;
-        if section.regenerated_size > MAX_BLOCK_SIZE {
+        if section.regenerated_size as usize > block_maximum {
             return Err(DecompressBlockError::ExpandsPastBlockMaximum {
                 size: section.regenerated_size as usize,
             });
@@ -437,7 +472,7 @@ impl BlockDecoder {
         // Nothing drains the buffer inside a block, so the growth of its live
         // length is this block's output.
         let produced = buffer.len() - len_before;
-        if produced > MAX_BLOCK_SIZE as usize {
+        if produced > block_maximum {
             return Err(DecompressBlockError::ExpandsPastBlockMaximum { size: produced });
         }
         Ok(())

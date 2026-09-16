@@ -1239,6 +1239,21 @@ fn literals_header_20_bit(literals_type: u8, regenerated: u32) -> [u8; 3] {
     ]
 }
 
+/// A frame with a 1 KiB window (the smallest a frame may declare, so its block
+/// maximum is 1 KiB rather than 128 KiB) around one last block of `block_type`
+/// whose header carries `size_field`. No content size.
+fn frame_with_a_tiny_window(payload: &[u8], block_type: u32, size_field: u32) -> Vec<u8> {
+    let mut frame = alloc::vec![
+        0x28, 0xB5, 0x2F, 0xFD, // magic
+        0x00, // FHD: multi-segment, no content size
+        0x00, // window descriptor: 1 KiB
+    ];
+    let header = size_field << 3 | block_type << 1 | 1;
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    frame.extend_from_slice(payload);
+    frame
+}
+
 /// A block with no sequences whose RLE literals regenerate 200,000 bytes: past
 /// the block maximum on literals alone.
 fn block_of_literals_past_the_block_maximum() -> Vec<u8> {
@@ -1299,6 +1314,79 @@ fn trailing_literals_past_the_block_maximum_are_rejected() {
     assert_rejected_as_malformed(
         &frame_around_block(&block, Some(1 + 65_539 + 65_539)),
         "declared size",
+    );
+}
+
+/// A compressed block (one sequence, literals left over) followed by a Raw
+/// block of a whole block maximum, in a frame declaring both: the per-block
+/// ceiling the compressed block armed bounds sequence writes only, so the Raw
+/// block that follows is bounded by the caller's slice and decodes.
+#[test]
+fn a_raw_block_after_a_compressed_one_fills_the_slice() {
+    const LITERALS: usize = 10;
+    const RAW: usize = 128 * 1024;
+    // Literals, then one sequence: literal length 1, repeat offset 1, match
+    // length 3, leaving 9 literals after it. 13 bytes out.
+    let mut block = literals_header_20_bit(0, LITERALS as u32).to_vec();
+    block.extend((0..LITERALS).map(|i| b'a' + i as u8));
+    block.extend_from_slice(&[
+        0x01, // one sequence
+        0x54, // LL, OF and ML all RLE
+        0x01, 0x00, 0x00, // LL code 1, OF code 0, ML code 0
+        0x01, // stream start bit
+    ]);
+    let compressed_output = 1 + 3 + (LITERALS - 1);
+
+    let mut frame = alloc::vec![
+        0x28, 0xB5, 0x2F, 0xFD, // magic
+        0x80, // FHD: multi-segment, 4-byte content size
+        0x50, // window descriptor: 1 MiB
+    ];
+    frame.extend_from_slice(&((compressed_output + RAW) as u32).to_le_bytes());
+    // Compressed block, not last.
+    let header = (block.len() as u32) << 3 | 2 << 1;
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    frame.extend_from_slice(&block);
+    // Last block, Raw, a whole block maximum of it.
+    let header = (RAW as u32) << 3 | 1;
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    frame.extend((0..RAW).map(|i| (i * 31) as u8));
+
+    let mut out = alloc::vec![0u8; compressed_output + RAW];
+    let written = FrameDecoder::new()
+        .decode_all(&frame, &mut out)
+        .expect("a Raw block after a compressed one decodes");
+    assert_eq!(written, compressed_output + RAW);
+    assert_eq!(&out[..4], b"aaaa"); // one literal, then the match of three
+    assert_eq!(
+        &out[compressed_output..compressed_output + 4],
+        &[0u8, 31, 62, 93]
+    );
+}
+
+/// A frame's block maximum is the smaller of its window and 128 KiB (RFC 8878
+/// 3.1.1.2.4), so a 1 KiB window bounds every block at 1 KiB: literals, a
+/// block's whole output, and a Raw or RLE block's size alike.
+#[test]
+fn a_block_past_a_small_window_is_rejected() {
+    let mut literals = literals_header_20_bit(1, 2048).to_vec();
+    literals.push(b'z'); // the repeated byte
+    literals.push(0x00); // no sequences
+    let size_field = literals.len() as u32;
+    assert_rejected_as_malformed(
+        &frame_with_a_tiny_window(&literals, 2, size_field),
+        "literals of 2 KiB in a 1 KiB window",
+    );
+
+    let raw: Vec<u8> = (0..2048u32).map(|i| i as u8).collect();
+    assert_rejected_as_malformed(
+        &frame_with_a_tiny_window(&raw, 0, 2048),
+        "a Raw block of 2 KiB in a 1 KiB window",
+    );
+
+    assert_rejected_as_malformed(
+        &frame_with_a_tiny_window(b"z", 1, 2048),
+        "an RLE block of 2 KiB in a 1 KiB window",
     );
 }
 

@@ -168,9 +168,13 @@ where
     buffer.reserve_exact(MAX_BLOCK_SIZE as usize);
     // Arm the per-block output ceiling so a malformed / adversarial block
     // whose sequences over-produce cannot grow the buffer past
-    // `len + MAX_BLOCK_SIZE` (a decompression-bomb OOM on the growable
-    // RingBuffer); `DecodeBuffer::repeat` rejects the crossing match.
-    buffer.set_block_output_ceiling(MAX_BLOCK_SIZE as usize);
+    // `len + block_maximum` (a decompression-bomb OOM on the growable
+    // RingBuffer); `DecodeBuffer::repeat` rejects the crossing match. The
+    // ceiling is the frame's block maximum, which a narrow window lowers
+    // below 128 KiB.
+    buffer.set_block_output_ceiling(crate::decoding::block_decoder::block_maximum(
+        buffer.window_size,
+    ));
     let old_buffer_size = buffer.len();
     let num_sequences = section.num_sequences as usize;
 
