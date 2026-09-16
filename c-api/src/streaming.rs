@@ -144,8 +144,14 @@ impl ZSTD_CCtx {
             return Ok(());
         }
         let params = self.params;
-        let frame_params = self.frame_parameters()?;
-        let level = self.attach_level();
+        // A stream knows its size only if the caller pledged one; without a
+        // pledge the frame is of unknown size, which is where a referenced
+        // CDict's own parameters are the better guess (upstream reads
+        // `pledgedSrcSize` at the same branch).
+        let src_size = (params.pledged_src_size != crate::params::CONTENTSIZE_UNKNOWN)
+            .then_some(params.pledged_src_size);
+        let frame_params = self.frame_parameters(src_size)?;
+        let level = self.attach_level(src_size);
         let serial = self.attach_serial();
         let suppress_id = self.attach_suppresses_dict_id();
         let ZSTD_CCtx {

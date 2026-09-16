@@ -1692,6 +1692,117 @@ fn dict_payload() -> Vec<u8> {
     payload
 }
 
+/// Compress `input` through `cctx` with `ZSTD_compress2`, returning the frame.
+fn compressed_frame(cctx: *mut crate::ZSTD_CCtx, input: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0u8; ZSTD_compressBound(input.len())];
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            input.as_ptr(),
+            input.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    frame.truncate(written);
+    frame
+}
+
+/// A referenced `CDict` lends its own compression level to the frame only while
+/// the source is small enough to be about the dictionary. Upstream
+/// `ZSTD_compressBegin_internal` (zstd_compress.c:5254) takes the CDict's
+/// parameters when the source is under 128 KiB, under six times the dictionary
+/// content, or of unknown size; past that the context is reset from the
+/// parameters the CALLER asked for and the dictionary is loaded into those
+/// tables. A caller who sets level 1 and references a level-19 CDict is asking
+/// for level 1 on a large source, and used to get level 19.
+#[test]
+fn a_referenced_cdict_lends_its_level_only_to_a_small_source() {
+    let dict = trained_dictionary();
+    let cdict = unsafe { ZSTD_createCDict(dict.as_ptr(), dict.len(), 19) };
+    assert!(!cdict.is_null());
+
+    // Well past both cutoffs: 1 MiB is over 128 KiB and over six times a
+    // dictionary of this size. Log lines with a rotating field and a drifting
+    // tail, so the deep levels have long-range matches to find that level 1
+    // does not: a corpus both levels compress alike cannot tell them apart.
+    let mut large = Vec::with_capacity(1 << 20);
+    let mut key = 0u32;
+    while large.len() < (1 << 20) {
+        large.extend_from_slice(
+            format!(
+                "ts=2026-03-26T21:39:{:02}Z tenant=demo table=orders key={key} \
+                 region=eu-west payload={}\n",
+                key % 60,
+                "abcdefghij".repeat((key % 7) as usize + 1),
+            )
+            .as_bytes(),
+        );
+        key += 1;
+    }
+    large.truncate(1 << 20);
+    assert!(large.len() >= 6 * dict.len());
+
+    let reference = ZSTD_createCCtx();
+    let referenced = ZSTD_createCCtx();
+    unsafe {
+        // The same level on both, and on one of them the CDict that disagrees
+        // with it. Level 19 against level 1 is far enough apart that no tuning
+        // detail can blur the two apart.
+        assert_eq!(ZSTD_CCtx_setParameter(reference, 100, 1), 0);
+        assert_eq!(ZSTD_CCtx_setParameter(referenced, 100, 1), 0);
+        assert_eq!(
+            ZSTD_CCtx_loadDictionary(reference, dict.as_ptr(), dict.len()),
+            0
+        );
+        assert_eq!(ZSTD_isError(ZSTD_CCtx_refCDict(referenced, cdict)), 0);
+    }
+    let asked_for = compressed_frame(reference, &large);
+    let got = compressed_frame(referenced, &large);
+
+    // Both ran a level-1 match finder over the same bytes with the same
+    // dictionary, so their frames land in the same size class. A level-19 frame
+    // is far smaller than that, which is what the CDict's level produced.
+    let low = asked_for.len() - asked_for.len() / 10;
+    assert!(
+        got.len() >= low,
+        "a level-1 request over a {} byte source produced {} bytes where level 1 produces {}",
+        large.len(),
+        got.len(),
+        asked_for.len()
+    );
+
+    // The other side of the cutoff is unchanged: a small source is what a
+    // referenced CDict's own level is for.
+    let small = ZSTD_createCCtx();
+    let small_reference = ZSTD_createCCtx();
+    unsafe {
+        assert_eq!(ZSTD_CCtx_setParameter(small, 100, 1), 0);
+        assert_eq!(ZSTD_isError(ZSTD_CCtx_refCDict(small, cdict)), 0);
+        assert_eq!(ZSTD_CCtx_setParameter(small_reference, 100, 19), 0);
+        assert_eq!(
+            ZSTD_CCtx_loadDictionary(small_reference, dict.as_ptr(), dict.len()),
+            0
+        );
+    }
+    let payload = dict_payload();
+    assert!(payload.len() < 128 * 1024);
+    assert_eq!(
+        compressed_frame(small, &payload),
+        compressed_frame(small_reference, &payload),
+        "a small source must still run the CDict's own level"
+    );
+
+    unsafe {
+        ZSTD_freeCCtx(reference);
+        ZSTD_freeCCtx(referenced);
+        ZSTD_freeCCtx(small);
+        ZSTD_freeCCtx(small_reference);
+        ZSTD_freeCDict(cdict);
+    }
+}
+
 #[test]
 fn cctx_load_dictionary_roundtrips_via_compress2() {
     let dict = trained_dictionary();

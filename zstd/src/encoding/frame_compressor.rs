@@ -214,6 +214,24 @@ impl EncoderDictionary {
         }
     }
 
+    /// Bytes of dictionary content, the part a frame can reference.
+    ///
+    /// This is the extent a caller weighs a source against when deciding
+    /// whether a frame is still about the dictionary or about its own content.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_zstd::encoding::EncoderDictionary;
+    ///
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(&[7u8; 4096])
+    ///     .expect("raw content is always usable");
+    /// assert_eq!(dictionary.content_size(), 4096);
+    /// ```
+    pub fn content_size(&self) -> usize {
+        self.inner.dict_content.len()
+    }
+
     /// The dictionary id.
     ///
     /// Zero is a raw-content dictionary, which has no header to carry an id.

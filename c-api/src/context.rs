@@ -360,12 +360,15 @@ pub unsafe extern "C" fn ZSTD_compress2(
     // (upstream rule), so the sticky knobs are resolved — and can reject —
     // only when they will actually drive the frame; an unsupported sticky
     // combination must not break a valid RefCDict path.
-    let frame_params = match cctx.frame_parameters() {
+    // All the input is here, so the frame's size is known and decides whether a
+    // referenced CDict's parameters still describe it.
+    let src_size = Some(src.len() as u64);
+    let frame_params = match cctx.frame_parameters(src_size) {
         Ok(frame_params) => frame_params,
         Err(code) => return encode(code),
     };
     let params = cctx.params;
-    let level = cctx.attach_level();
+    let level = cctx.attach_level(src_size);
     let serial = cctx.attach_serial();
     let suppress_id = cctx.attach_suppresses_dict_id();
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {

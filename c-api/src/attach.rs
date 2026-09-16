@@ -188,22 +188,69 @@ fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<bool, ZSTD_Err
     }
 }
 
+/// `ZSTD_USE_CDICT_PARAMS_SRCSIZE_CUTOFF`: below this a frame is still about
+/// the dictionary, so the dictionary's own tuning is the better guess than
+/// whatever the caller asked for.
+const CDICT_PARAMS_SRC_CUTOFF: u64 = 128 * 1024;
+/// `ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER`: a source only a few times the
+/// dictionary is about the dictionary too, however large both are.
+const CDICT_PARAMS_DICT_MULTIPLIER: u64 = 6;
+
 impl ZSTD_CCtx {
-    /// The explicit parameters the next frame runs under, `None` for its
-    /// level's own tuning: a referenced CDict's win over the sticky knobs
-    /// (upstream rule), which are resolved (and can reject) only when they
-    /// drive the frame, so an unsupported sticky combination cannot break a
-    /// valid `RefCDict` path.
-    pub(crate) fn frame_parameters(&self) -> Result<Option<CompressionParameters>, ZSTD_ErrorCode> {
-        match &self.attached_dict {
-            // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
-            CCtxDictAttach::RefCDict { cdict, .. } => Ok(unsafe { &**cdict }.params),
-            _ => self
-                .params
-                .resolve()
-                .map(Some)
-                .ok_or(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported),
+    /// Whether a referenced CDict's own compression parameters drive the next
+    /// frame over `src_size` bytes (`None` = not yet known).
+    ///
+    /// Upstream `ZSTD_compressBegin_internal` (zstd_compress.c:5254) takes them
+    /// while the frame is still about the dictionary: a source under 128 KiB,
+    /// under six times the dictionary content, or of unknown size. Past that
+    /// the context is reset from the parameters the caller asked for and the
+    /// dictionary is loaded into those tables, so a caller who sets a level
+    /// next to a CDict of another one gets the level they set.
+    ///
+    /// A CDict built through the advanced constructor is the exception and
+    /// always wins: it carries explicit parameters rather than a level of its
+    /// own, which upstream marks with `ZSTD_NO_CLEVEL` (zstd_compress.c:5636)
+    /// and reads back at the same branch.
+    fn cdict_params_drive_frame(&self, src_size: Option<u64>) -> bool {
+        let CCtxDictAttach::RefCDict { cdict, .. } = &self.attached_dict else {
+            return false;
+        };
+        // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
+        let cdict = unsafe { &**cdict };
+        let content = cdict.dict.content_size() as u64;
+        if content == 0 {
+            return false;
         }
+        if cdict.params.is_some() {
+            return true;
+        }
+        let Some(src) = src_size else {
+            return true;
+        };
+        src < CDICT_PARAMS_SRC_CUTOFF || src < content * CDICT_PARAMS_DICT_MULTIPLIER
+    }
+
+    /// The explicit parameters the next frame over `src_size` bytes runs under,
+    /// `None` for its level's own tuning: a referenced CDict's win over the
+    /// sticky knobs while [`Self::cdict_params_drive_frame`] holds, and the
+    /// sticky ones are resolved (and can reject) only when they drive the
+    /// frame, so an unsupported sticky combination cannot break a valid
+    /// `RefCDict` path that never reads them.
+    pub(crate) fn frame_parameters(
+        &self,
+        src_size: Option<u64>,
+    ) -> Result<Option<CompressionParameters>, ZSTD_ErrorCode> {
+        if self.cdict_params_drive_frame(src_size) {
+            // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
+            let CCtxDictAttach::RefCDict { cdict, .. } = &self.attached_dict else {
+                unreachable!("only a referenced CDict drives a frame's parameters")
+            };
+            return Ok(unsafe { &**cdict }.params);
+        }
+        self.params
+            .resolve()
+            .map(Some)
+            .ok_or(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported)
     }
 
     /// Identity of the attached dictionary for the compressors that hold it
@@ -217,15 +264,19 @@ impl ZSTD_CCtx {
         }
     }
 
-    /// The compression level frames must use under the current attach:
-    /// a referenced CDict's parameters win over the context's sticky level
-    /// (upstream rule); every other attach keeps the context level.
-    pub(crate) fn attach_level(&self) -> c_int {
-        match &self.attached_dict {
+    /// The compression level the next frame over `src_size` bytes must use
+    /// under the current attach: a referenced CDict's level wins over the
+    /// context's sticky one while [`Self::cdict_params_drive_frame`] holds;
+    /// every other attach, and a source past that, keeps the context level.
+    pub(crate) fn attach_level(&self, src_size: Option<u64>) -> c_int {
+        if self.cdict_params_drive_frame(src_size) {
             // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
-            CCtxDictAttach::RefCDict { cdict, .. } => unsafe { &**cdict }.level,
-            _ => self.params.level,
+            let CCtxDictAttach::RefCDict { cdict, .. } = &self.attached_dict else {
+                unreachable!("only a referenced CDict drives a frame's level")
+            };
+            return unsafe { &**cdict }.level;
         }
+        self.params.level
     }
 
     /// Drop a single-use prefix after the frame that consumed it started.
