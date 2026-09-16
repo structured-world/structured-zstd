@@ -1316,24 +1316,32 @@ pub(crate) fn resolve_level_params_with_dict(
 /// dictionary only as extra content the window has to cover
 /// (`ZSTD_getCParams(level, srcSize, dictContentSize)`, zstd_compress.c:5839),
 /// and then loads the dictionary into the tables that came out. So the tier is
-/// the source's, not the dictionary's, and the caller's own knobs land on top
-/// through the ordinary [`apply_frame_overrides`] path rather than through the
-/// dictionary's preparation.
+/// the source's, not the dictionary's.
+///
+/// The caller's knobs are applied HERE rather than afterwards, because the
+/// adjustment that bounds them has to run last: a `hashLog` the caller asks for
+/// is capped at `dictAndWindowLog + 1`, and a cap applied before the knob it
+/// bounds does nothing. Measured on the i9 with the cap out of order, a 1 KiB
+/// window under an 18 KiB dictionary built a table of 807 KB and paid 832M
+/// cycles over a 4 MiB source where the same frame without the dictionary pays
+/// 178M: the window slides every kilobyte and each slide walks the whole table.
 ///
 /// [`DictionaryGeometry::LoadedIntoFrame`]: crate::encoding::DictionaryGeometry::LoadedIntoFrame
 pub(crate) fn resolve_level_params_for_loaded_dict(
     level: CompressionLevel,
     source_size: Option<u64>,
     sizes: crate::encoding::DictionarySizes,
+    overrides: &crate::encoding::parameters::ParamOverrides,
 ) -> (LevelParams, Option<RowDictPlan>) {
     use crate::encoding::cparams::{CONTENTSIZE_UNKNOWN, uses_row_match_finder};
     if sizes.content == 0 || matches!(level, CompressionLevel::Uncompressed) {
         return (resolve_level_params(level, source_size), None);
     }
-    let frame = crate::encoding::cparams::get_cparams(
+    let frame = crate::encoding::cparams::get_frame_cparams(
         numeric_level(level),
         source_size.unwrap_or(CONTENTSIZE_UNKNOWN),
         sizes.content,
+        overrides,
     );
     let params = level_params_from_cparams(frame);
     if !(3..=6).contains(&frame.strategy) {

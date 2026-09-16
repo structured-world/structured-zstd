@@ -27,8 +27,12 @@ fn a_loaded_dictionary_resolves_the_frames_own_shape() {
         sizes,
         &crate::encoding::parameters::ParamOverrides::default(),
     );
-    let (loaded, loaded_plan) =
-        super::resolve_level_params_for_loaded_dict(level, Some(source), sizes);
+    let (loaded, loaded_plan) = super::resolve_level_params_for_loaded_dict(
+        level,
+        Some(source),
+        sizes,
+        &crate::encoding::parameters::ParamOverrides::default(),
+    );
 
     // The frame's own shape is what this level resolves for a source of this
     // size with that much dictionary content in front of it.
@@ -52,6 +56,45 @@ fn a_loaded_dictionary_resolves_the_frames_own_shape() {
     // Nothing is searched in place: the dictionary is in the frame's tables.
     assert!(prepared_plan.is_none_or(|plan| !plan.attach) || loaded_plan.is_none());
     assert!(loaded_plan.is_none_or(|plan| !plan.attach));
+}
+
+/// A width the caller asks for is still bounded by what it will index.
+///
+/// The bound is `dictAndWindowLog + 1`, and it only bites if it runs AFTER the
+/// knob it bounds (upstream `ZSTD_getCParamsFromCCtxParams`: override, then
+/// adjust). Run the other way round, a 1 KiB window under an 18 KiB dictionary
+/// takes a requested `hashLog` of 20 whole: on the i9 that table cost 832M
+/// cycles over a 4 MiB source against 178M for the same frame without the
+/// dictionary, because the window slides every kilobyte and each slide walks
+/// the table.
+#[test]
+fn a_requested_hash_log_is_bounded_by_what_it_indexes() {
+    let level = CompressionLevel::Level(1);
+    let sizes = crate::encoding::DictionarySizes::raw_content(18 * 1024);
+    let source = 4 * 1024 * 1024u64;
+    let overrides = crate::encoding::parameters::ParamOverrides {
+        window_log: Some(10),
+        hash_log: Some(20),
+        ..Default::default()
+    };
+
+    let (params, _) =
+        super::resolve_level_params_for_loaded_dict(level, Some(source), sizes, &overrides);
+
+    // The window is the caller's, and the table is bounded by the window plus
+    // the dictionary it indexes, not by the 20 that was asked for.
+    assert_eq!(params.window_log, 10);
+    let hash_log = params.fast.expect("level 1 is a Fast row").hash_log;
+    let bound = crate::encoding::cparams::dict_and_window_log(10, source, 18 * 1024) + 1;
+    assert!(
+        hash_log <= bound,
+        "a requested hash log of 20 resolved to {hash_log}, past the {bound} its window and \
+         dictionary can index"
+    );
+    assert!(
+        hash_log < 20,
+        "the request must be bounded, not taken whole"
+    );
 }
 
 /// The estimate is a budget figure, so it answers for whatever it is asked —

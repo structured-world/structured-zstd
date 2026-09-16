@@ -1095,7 +1095,7 @@ impl Matcher for MatchGeneratorDriver {
         let (params, dict_plan) = match dict_hint {
             Some(sizes) if loaded_into_frame => {
                 crate::encoding::levels::config::resolve_level_params_for_loaded_dict(
-                    level, hint, sizes,
+                    level, hint, sizes, &overrides,
                 )
             }
             Some(sizes) => crate::encoding::levels::config::resolve_level_params_with_dict(
@@ -1143,11 +1143,16 @@ impl Matcher for MatchGeneratorDriver {
         // all-`None` case is skipped so default level geometry stays
         // byte-identical to plain level-based compression. Shared with the
         // workspace estimate, which has to build what this builds.
-        if let Some(ov) = self.param_overrides {
+        // Not for a dictionary loaded into the frame: that resolution applied
+        // them itself, in the order that lets the adjustment bound them. Re-
+        // applying the raw values here would put each knob back past its cap.
+        if let Some(ov) = self.param_overrides
+            && !loaded_into_frame
+        {
             crate::encoding::levels::config::apply_frame_overrides(
                 &mut params,
                 &ov,
-                dict_hint.is_some() && !loaded_into_frame,
+                dict_hint.is_some(),
                 hint,
             );
         }

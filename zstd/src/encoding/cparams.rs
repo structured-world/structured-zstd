@@ -132,7 +132,7 @@ fn cycle_log(hash_log: u32, strategy: u32) -> u32 {
 
 /// `ZSTD_dictAndWindowLog` (zstd_compress.c). `src_size` must not be
 /// `CONTENTSIZE_UNKNOWN` (the caller gates this).
-fn dict_and_window_log(window_log: u32, src_size: u64, dict_size: u64) -> u32 {
+pub(crate) fn dict_and_window_log(window_log: u32, src_size: u64, dict_size: u64) -> u32 {
     let max_window_size: u64 = 1u64 << WINDOWLOG_MAX;
     if dict_size == 0 {
         return window_log;
@@ -255,6 +255,20 @@ pub(crate) fn get_cdict_cparams(
     overrides: &crate::encoding::parameters::ParamOverrides,
 ) -> CParams {
     let mut cp = get_cparams_mode(compression_level, CONTENTSIZE_UNKNOWN, dict_size, true);
+    if apply_cparam_overrides(&mut cp, overrides) {
+        cp = adjust_cparams(cp, CONTENTSIZE_UNKNOWN, dict_size, true);
+    }
+    cp
+}
+
+/// Put each knob the caller set in place of the row's, reporting whether any
+/// landed. Upstream `ZSTD_overrideCParams`, whose every caller re-adjusts
+/// afterwards: a width the caller asked for is still bounded by the source and
+/// dictionary it will index.
+fn apply_cparam_overrides(
+    cp: &mut CParams,
+    overrides: &crate::encoding::parameters::ParamOverrides,
+) -> bool {
     let mut overridden = false;
     let mut set = |field: &mut u32, value: Option<u32>| {
         if let Some(value) = value {
@@ -269,8 +283,28 @@ pub(crate) fn get_cdict_cparams(
     set(&mut cp.min_match, overrides.min_match);
     set(&mut cp.target_length, overrides.target_length);
     set(&mut cp.strategy, overrides.strategy.map(|s| s.ordinal()));
-    if overridden {
-        cp = adjust_cparams(cp, CONTENTSIZE_UNKNOWN, dict_size, true);
+    overridden
+}
+
+/// The cParams a frame resolves under the caller's own knobs for a source of
+/// `src_size` with `dict_size` bytes of dictionary in front of it: the level's
+/// row, the knobs on top, then the adjustment that bounds them
+/// (`ZSTD_getCParamsFromCCtxParams` with `ZSTD_cpm_unknown`).
+///
+/// The order is upstream's and it is what makes the bound bite: a `hashLog` the
+/// caller asks for is capped at `dictAndWindowLog + 1`, so a wide table cannot
+/// be built over a narrow window. Applied the other way round, the cap runs
+/// before the knob it is meant to bound and a small-window frame with a large
+/// dictionary builds a table many times its window.
+pub(crate) fn get_frame_cparams(
+    compression_level: i32,
+    src_size: u64,
+    dict_size: usize,
+    overrides: &crate::encoding::parameters::ParamOverrides,
+) -> CParams {
+    let mut cp = get_cparams_mode(compression_level, src_size, dict_size, false);
+    if apply_cparam_overrides(&mut cp, overrides) {
+        cp = adjust_cparams(cp, src_size, dict_size, false);
     }
     cp
 }

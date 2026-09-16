@@ -7,16 +7,18 @@
 //! million entries over a window of a kilobyte, sliding once per kilobyte of
 //! input, and reports what the parameter resolution actually built.
 //!
-//! Neither mode builds that table; each is a benchmark of the table the
-//! resolution does build, and the output line names which one ran:
+//! Each mode is a benchmark of the table its resolution builds, and the output
+//! line names which one ran:
 //!
 //! - `mode=capped` (no `dict_path`, the default): `hashLog` is capped at
-//!   `windowLog + 1`, two entries per window byte.
-//! - `mode=dictionary` (with `dict_path`): the frame runs the dictionary's own
-//!   table geometry, and the requested `hashLog` is not read at all.
+//!   `windowLog + 1`, two entries per window byte, so the requested width is
+//!   not what gets built.
+//! - `mode=dictionary` (with `dict_path`): the dictionary is prepared under the
+//!   requested parameters, so the width IS read, capped by
+//!   `dictAndWindowLog + 1`. A 1 KiB window with an 18 KiB dictionary reaches
+//!   `heap=296000` at `hashLog` 11 and `heap=807488` at 20.
 //!
-//! The `heap=` figure shows the table that was built; the same arguments with
-//! a smaller `hash_log` print the same figure in both modes.
+//! The `heap=` figure shows the table that was built.
 //!
 //! Build: cargo build --profile bench -p ffi-bench --example slide_oversized_table
 //! Run:   ./target/release/examples/slide_oversized_table

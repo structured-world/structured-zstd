@@ -981,17 +981,22 @@ impl FastKernelMatcher {
     ///
     /// The two costs scale differently — the slide with the table's entries,
     /// the rehash with the window's bytes — so the choice between them would
-    /// matter if a table could be much larger than the window it indexes. It
-    /// cannot: a frame without a dictionary caps `hash_log` at
-    /// `window_log + 1` (upstream `ZSTD_adjustCParams_internal`), which bounds
-    /// the table at two entries per window byte, and a dictionary frame takes
-    /// its table width from the dictionary's own cParams rather than from a
-    /// caller's `hashLog`. Measured over `windowLog` 10 to 16 with `hashLog`
-    /// pinned at 20 (`examples/slide_oversized_table.rs`): identical time
-    /// without a dictionary, and up to twice as fast with one. So there is no
-    /// size-dependent choice here to make, and adding one would buy a branch
-    /// and two code paths for a configuration the parameter resolution does
-    /// not produce.
+    /// matter if a table could be much larger than the window it indexes. The
+    /// parameter resolution does not produce that: a requested `hash_log` is
+    /// bounded by `dictAndWindowLog + 1` (upstream
+    /// `ZSTD_adjustCParams_internal`), which is `window_log + 1` without a
+    /// dictionary and counts the dictionary's content with it when there is
+    /// one, so the table stays within a couple of entries per byte the window
+    /// can reach. Measured over `windowLog` 10 to 16 with `hashLog` pinned at
+    /// 20 (`examples/slide_oversized_table.rs`).
+    ///
+    /// That bound has to be applied AFTER the requested width, or it bounds
+    /// nothing. With the two the wrong way round, a 1 KiB window under an
+    /// 18 KiB dictionary built a table of 807 KB, and a 4 MiB source cost 832M
+    /// cycles against 178M for the same frame without the dictionary: the
+    /// window slides every kilobyte and each slide walks the whole table. That
+    /// is the shape this reasoning depends on not existing, so the ordering is
+    /// pinned by `a_requested_hash_log_is_bounded_by_what_it_indexes`.
     fn drain_real_prefix(&mut self, drop_n: usize) {
         let drain_end = HISTORY_DRAIN_BASE + drop_n;
         self.history.drain(HISTORY_DRAIN_BASE..drain_end);
