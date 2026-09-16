@@ -59,21 +59,6 @@ fn mask_lower_bits(value: u64, n: u8) -> u64 {
         value & mask
     }
 }
-// Used only by the in-file extract_triple correctness tests after
-// `peek_bits_triple` switched to the per-reader `use_pext_triple`
-// cached flag (commit 8805122f) — production now calls
-// `extract_triple_pext` directly via that path. Gating with
-// `#[cfg(test)]` keeps the helper available for the tests while
-// avoiding a `dead_code` warning under `-D warnings`.
-#[cfg(all(test, feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
-#[inline(always)]
-fn try_extract_triple_with_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> Option<(u64, u64, u64)> {
-    if !triple_extract_dispatch().use_pext {
-        return None;
-    }
-
-    Some(unsafe { extract_triple_pext(all_three, n1, n2, n3) })
-}
 #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
 use std::arch::is_x86_feature_detected;
 
@@ -301,12 +286,11 @@ fn peek_bits_bmi2_matches_scalar() {
     }
 }
 
-/// `peek_bits_triple_bmi2` MUST produce the same triple as the
-/// scalar variant for every width combination the FSE/HUF decoders
-/// can reach.
+/// Every kernel reads the same triple out of the same bits: the stream being
+/// decoded cannot tell which monomorph ran.
 #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
 #[test]
-fn peek_bits_triple_bmi2_matches_scalar() {
+fn peek_bits_triple_agrees_across_kernels() {
     if !is_x86_feature_detected!("bmi2") {
         return;
     }
@@ -326,33 +310,22 @@ fn peek_bits_triple_bmi2_matches_scalar() {
     for &(n1, n2, n3) in &widths {
         let sum = n1 + n2 + n3;
         let mut scalar = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
-        let mut bmi2 = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
+        let mut bmi2 = super::BitReaderReversed::<crate::cpu_kernel::Bmi2Kernel>::new(&data);
         scalar.ensure_bits(sum);
         bmi2.ensure_bits(sum);
         let s = scalar.peek_bits_triple(sum, n1, n2, n3);
-        // SAFETY: gated on `is_x86_feature_detected!("bmi2")` above.
-        let b = unsafe { bmi2.peek_bits_triple_bmi2(sum, n1, n2, n3) };
+        let b = bmi2.peek_bits_triple(sum, n1, n2, n3);
         assert_eq!(s, b, "mismatch at widths=({},{},{})", n1, n2, n3);
     }
 }
 
+/// The kernel's own `extract_triple` against a plain masking reference, over
+/// the widths the FSE and HUF decoders can reach.
 #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
 #[test]
-fn should_use_pext_policy_table() {
-    let cases = [
-        (*b"AuthenticAMD", 0x17, false),
-        (*b"AuthenticAMD", 0x19, true),
-        (*b"GenuineIntel", 0x06, true),
-    ];
+fn extract_triple_matches_the_reference_under_every_kernel() {
+    use crate::cpu_kernel::CpuKernel;
 
-    for (vendor, family, expected) in cases {
-        assert_eq!(super::should_use_pext(vendor, family), expected);
-    }
-}
-
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
-#[test]
-fn bmi2_triple_extract_matches_scalar_reference() {
     if !is_x86_feature_detected!("bmi2") {
         return;
     }
@@ -384,12 +357,14 @@ fn bmi2_triple_extract_matches_scalar_reference() {
     for &(n1, n2, n3) in &widths {
         for &all_three in &fixed_values {
             let expected = scalar_extract_triple(all_three, n1, n2, n3);
-            let pext = unsafe { super::extract_triple_pext(all_three, n1, n2, n3) };
-            assert_eq!(pext, expected);
-
-            if let Some(dispatched) = try_extract_triple_with_pext(all_three, n1, n2, n3) {
-                assert_eq!(dispatched, expected);
-            }
+            assert_eq!(
+                crate::cpu_kernel::ScalarKernel::extract_triple(all_three, n1, n2, n3),
+                expected
+            );
+            assert_eq!(
+                crate::cpu_kernel::Bmi2Kernel::extract_triple(all_three, n1, n2, n3),
+                expected
+            );
         }
     }
 
@@ -398,12 +373,14 @@ fn bmi2_triple_extract_matches_scalar_reference() {
         for _ in 0..64 {
             let all_three = next_test_value(&mut state);
             let expected = scalar_extract_triple(all_three, n1, n2, n3);
-            let pext = unsafe { super::extract_triple_pext(all_three, n1, n2, n3) };
-            assert_eq!(pext, expected);
-
-            if let Some(dispatched) = try_extract_triple_with_pext(all_three, n1, n2, n3) {
-                assert_eq!(dispatched, expected);
-            }
+            assert_eq!(
+                crate::cpu_kernel::ScalarKernel::extract_triple(all_three, n1, n2, n3),
+                expected
+            );
+            assert_eq!(
+                crate::cpu_kernel::Bmi2Kernel::extract_triple(all_three, n1, n2, n3),
+                expected
+            );
         }
     }
 }
