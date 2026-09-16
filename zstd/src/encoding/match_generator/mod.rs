@@ -1077,13 +1077,33 @@ impl Matcher for MatchGeneratorDriver {
         // A dictionary frame runs the shape the dictionary was prepared with,
         // whatever the source size. Upstream stops doing that once the source
         // outgrows the dictionary and resolves the frame's own instead
-        // (zstd_compress.c:5264), and that was measured here and rejected: on a
-        // 1 MiB source with a 3 KB dictionary it cost 5.3 ms at level 9 against
-        // 0.50 ms for the prepared shape, for the same 246 bytes out. The
-        // prepared shape also beats the reference on both axes there (1.37 ms
-        // and 1243 bytes), so following upstream's structure on this axis is
-        // what would make us slow. See `dictionary_describes_frame`, which the
-        // C ABI still reads for a question the codec cannot answer.
+        // (zstd_compress.c:5264). That alternative was implemented and measured
+        // against this one and against the reference, in one session with the
+        // arms interleaved, over five levels and two dictionary shapes, and it
+        // loses on every row where the two differ. Time per frame over a 1 MiB
+        // source, ours / the alternative / the reference:
+        //
+        //   3 KB dictionary        110 KB dictionary
+        //   L1  1.13 / 1.13 / 0.73  1.14 / 1.15 / 0.79 ms
+        //   L3  0.24 / 0.30 / 0.27  0.26 / 0.32 / 0.42 ms
+        //   L5  0.52 / 2.69 / 0.38  0.43 / 2.77 / 1.16 ms
+        //   L9  0.50 / 5.36 / 1.37  0.71 / 5.58 / 2.28 ms
+        //   L12 0.87 / 5.56 / 1.87  1.60 / 5.58 / 3.08 ms
+        //
+        // Three to eight times the time for bytes that match to within a
+        // percent, and under the larger dictionary this shape also beats the
+        // reference on BOTH axes from L3 up (at L9, 0.71 ms and 243 bytes
+        // against 2.28 ms and 1241), which the alternative would have given
+        // away. A control arm at 64 KiB, under the size where the alternative
+        // can run at all, stayed within 2.4% with identical output.
+        //
+        // The bench host is a VMware guest with no PMU passthrough, so cycles
+        // and instructions are unavailable there (`perf stat -e cycles` reports
+        // the event as unsupported); the figures above are `task-clock`, and at
+        // this margin an instruction count would not be what decides it.
+        //
+        // See `dictionary_describes_frame`, which the C ABI still reads for a
+        // question the codec cannot answer.
         let (params, dict_plan) = match dict_hint {
             Some(sizes) => crate::encoding::levels::config::resolve_level_params_with_dict(
                 level, hint, sizes, &overrides,
