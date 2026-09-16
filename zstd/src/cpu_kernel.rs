@@ -181,6 +181,13 @@ impl CpuKernel for Avx2Kernel {
         // confirmed both AVX2 and BMI2 — `_bzhi_u64` is callable.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
+
+    /// `bzhi` takes the width, so the caller's mask is not needed.
+    #[inline(always)]
+    fn mask_lower_bits_precomputed(value: u64, _mask: u64, n: u8) -> u64 {
+        // SAFETY: as for `mask_lower_bits`.
+        unsafe { mask_lower_bits_bmi2_impl(value, n) }
+    }
 }
 
 /// x86_64 AVX-512 VBMI2 + AVX2 + BMI2 kernel. Selected when the CPU
@@ -197,6 +204,13 @@ impl CpuKernel for Vbmi2Kernel {
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
         // SAFETY: same precondition as Avx2Kernel — BMI2 confirmed
         // at runtime before this kernel is instantiated.
+        unsafe { mask_lower_bits_bmi2_impl(value, n) }
+    }
+
+    /// `bzhi` takes the width, so the caller's mask is not needed.
+    #[inline(always)]
+    fn mask_lower_bits_precomputed(value: u64, _mask: u64, n: u8) -> u64 {
+        // SAFETY: as for `mask_lower_bits`.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
 }
