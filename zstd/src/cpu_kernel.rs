@@ -96,18 +96,28 @@ pub trait CpuKernel: Copy + 'static {
 #[derive(Copy, Clone, Default)]
 pub struct ScalarKernel;
 
+/// `BIT_MASK[n]` is the low `n` bits set for `n` in `0..=64`, and all bits for
+/// anything past that (a width the formats cannot ask for).
+///
+/// A table rather than `u64::MAX >> (64 - n)`: the shift form needs a guard for
+/// `n == 0`, since a 64-bit shift is undefined, and that guard is a branch or a
+/// `cmov` on every field of every sequence. Indexed by a `u8`, and sized for
+/// every `u8`, so the load carries no bounds check either. The widths in use
+/// are small, so the hot part is the first few cache lines of it.
+pub(crate) const BIT_MASK: [u64; 256] = {
+    let mut table = [u64::MAX; 256];
+    let mut i: usize = 0;
+    while i < 64 {
+        table[i] = (1u64 << i) - 1;
+        i += 1;
+    }
+    table
+};
+
 impl CpuKernel for ScalarKernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
-        // `checked_shr` returns `None` for shift counts >= 64, which
-        // happens exactly when `n == 0` (`64 - 0 = 64`). Mapping
-        // both that case and the invalid `n > 64` underflow to 0
-        // gives the mathematically-correct empty mask for n=0 and
-        // a safe-ish fallback for the invalid range.
-        let mask = u64::MAX
-            .checked_shr(64u32.wrapping_sub(n as u32))
-            .unwrap_or(0);
-        value & mask
+        value & BIT_MASK[n as usize]
     }
 }
 
