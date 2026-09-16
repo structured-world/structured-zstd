@@ -980,23 +980,25 @@ impl FastKernelMatcher {
     /// a slide holding more than it held going in.
     ///
     /// The two costs scale differently — the slide with the table's entries,
-    /// the rehash with the window's bytes — so the choice between them would
-    /// matter if a table could be much larger than the window it indexes. The
-    /// parameter resolution does not produce that: a requested `hash_log` is
-    /// bounded by `dictAndWindowLog + 1` (upstream
-    /// `ZSTD_adjustCParams_internal`), which is `window_log + 1` without a
-    /// dictionary and counts the dictionary's content with it when there is
-    /// one, so the table stays within a couple of entries per byte the window
-    /// can reach. Measured over `windowLog` 10 to 16 with `hashLog` pinned at
-    /// 20 (`examples/slide_oversized_table.rs`).
+    /// the rehash with the window's bytes — so the choice between them matters
+    /// exactly when the table is much larger than the window it indexes.
     ///
-    /// That bound has to be applied AFTER the requested width, or it bounds
-    /// nothing. With the two the wrong way round, a 1 KiB window under an
-    /// 18 KiB dictionary built a table of 807 KB, and a 4 MiB source cost 832M
-    /// cycles against 178M for the same frame without the dictionary: the
-    /// window slides every kilobyte and each slide walks the whole table. That
-    /// is the shape this reasoning depends on not existing, so the ordering is
-    /// pinned by `a_requested_hash_log_is_bounded_by_what_it_indexes`.
+    /// Without a dictionary that cannot happen: `hash_log` is bounded by
+    /// `window_log + 1` (upstream `ZSTD_adjustCParams_internal`), two entries
+    /// per window byte, and the slide measured identical to a rehash over
+    /// `windowLog` 10 to 16 with `hashLog` pinned at 20
+    /// (`examples/slide_oversized_table.rs`).
+    ///
+    /// WITH a dictionary it can, and does. The same bound is
+    /// `dictAndWindowLog + 1`, which counts the dictionary's content, so a
+    /// small window under a large dictionary is sized for the dictionary: an
+    /// 18 KiB dictionary under a 1 KiB window resolves `hash_log` 16, a table
+    /// of 64 entries per byte the window holds. Measured over a 4 MiB source,
+    /// that frame costs 832M cycles against 178M for the same frame without the
+    /// dictionary — the window slides every kilobyte and each slide walks the
+    /// whole table. Whether a rehash would be cheaper on that shape is NOT
+    /// settled here: only the slide arm has been measured, and the rehash arm
+    /// is what the comparison still needs.
     fn drain_real_prefix(&mut self, drop_n: usize) {
         let drain_end = HISTORY_DRAIN_BASE + drop_n;
         self.history.drain(HISTORY_DRAIN_BASE..drain_end);
