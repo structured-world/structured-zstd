@@ -84,11 +84,16 @@ impl<'t> HuffmanDecoder<'t> {
 
     /// Decode symbol and advance state in one table lookup.
     ///
-    /// The kernel is `K`, chosen once where the decode was dispatched, so the
-    /// state advance is the monomorph's own instruction: `bzhi` on the BMI2
-    /// tiers, the table's `state_mask` elsewhere, which is built once per table
-    /// rather than per symbol. `state_mask == (1 << max_num_bits) - 1` is the
-    /// value `bzhi` produces, so the two agree bit for bit.
+    /// The advance masks with the table's `state_mask`, built once per table
+    /// rather than per symbol, on every kernel alike.
+    ///
+    /// `state_mask == (1 << max_num_bits) - 1`, so a BMI2 `bzhi` on the width
+    /// produces the same value and was measured against this on the i9: it
+    /// issues MORE instructions (6.7335e9 against 6.7278e9 on a 1 MiB level-19
+    /// stream decode) because the width is a second load where the mask is
+    /// already in hand, and the cycles overlap across repeats on every decode
+    /// shape. So the mask is not a fallback that the accelerated tiers give up
+    /// something by taking: it is the better form, and no tier overrides it.
     #[inline(always)]
     pub fn decode_symbol_and_advance<K: crate::cpu_kernel::CpuKernel>(
         &mut self,
@@ -97,11 +102,7 @@ impl<'t> HuffmanDecoder<'t> {
         let packed = self.table.packed_decode[self.state as usize];
         let num_bits = (packed >> 8) as u8;
         let new_bits = br.get_bits(num_bits);
-        self.state = K::mask_lower_bits_precomputed(
-            self.state << num_bits,
-            self.table.state_mask,
-            self.table.max_num_bits,
-        ) | new_bits;
+        self.state = ((self.state << num_bits) & self.table.state_mask) | new_bits;
         packed as u8
     }
 

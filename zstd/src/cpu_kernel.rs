@@ -62,15 +62,6 @@ pub trait CpuKernel: Copy + 'static {
     /// construction time; no per-call wrapper assert runs.
     fn mask_lower_bits(value: u64, n: u8) -> u64;
 
-    /// [`Self::mask_lower_bits`] for a caller that already holds the mask,
-    /// `mask == (1 << n) - 1`: the HUF table keeps one per decoder. A kernel
-    /// with a bit-extract instruction ignores the mask and takes `n`; the
-    /// others take the mask and skip building it per call.
-    #[inline(always)]
-    fn mask_lower_bits_precomputed(value: u64, mask: u64, _n: u8) -> u64 {
-        value & mask
-    }
-
     /// Split the low `n1 + n2 + n3` bits of `packed` into three fields, the
     /// highest first. The FSE sequence decoder reads its three state updates
     /// this way, once per sequence.
@@ -156,13 +147,6 @@ impl CpuKernel for Bmi2Kernel {
         // running CPU.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
-
-    /// `bzhi` takes the width, so the caller's mask is not needed.
-    #[inline(always)]
-    fn mask_lower_bits_precomputed(value: u64, _mask: u64, n: u8) -> u64 {
-        // SAFETY: as for `mask_lower_bits`.
-        unsafe { mask_lower_bits_bmi2_impl(value, n) }
-    }
 }
 
 /// x86_64 AVX2 + BMI2 kernel (x86-64-v3 baseline). The common modern
@@ -181,13 +165,6 @@ impl CpuKernel for Avx2Kernel {
         // confirmed both AVX2 and BMI2 — `_bzhi_u64` is callable.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
-
-    /// `bzhi` takes the width, so the caller's mask is not needed.
-    #[inline(always)]
-    fn mask_lower_bits_precomputed(value: u64, _mask: u64, n: u8) -> u64 {
-        // SAFETY: as for `mask_lower_bits`.
-        unsafe { mask_lower_bits_bmi2_impl(value, n) }
-    }
 }
 
 /// x86_64 AVX-512 VBMI2 + AVX2 + BMI2 kernel. Selected when the CPU
@@ -204,13 +181,6 @@ impl CpuKernel for Vbmi2Kernel {
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
         // SAFETY: same precondition as Avx2Kernel — BMI2 confirmed
         // at runtime before this kernel is instantiated.
-        unsafe { mask_lower_bits_bmi2_impl(value, n) }
-    }
-
-    /// `bzhi` takes the width, so the caller's mask is not needed.
-    #[inline(always)]
-    fn mask_lower_bits_precomputed(value: u64, _mask: u64, n: u8) -> u64 {
-        // SAFETY: as for `mask_lower_bits`.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
 }
