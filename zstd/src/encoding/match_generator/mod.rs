@@ -1065,12 +1065,8 @@ impl Matcher for MatchGeneratorDriver {
         // A dictionary too large for the tagged attach position field falls back
         // to copy mode. Captured here (from the load-set size hint = actual dict
         // length) so the prime decision and the snapshot-key / epoch bits agree.
-        // A dictionary loaded into the frame's tables is never searched in
-        // place: there is no separate set of tables to search.
-        self.reset_dict_attach_ok = dict_hint.is_none_or(|sizes| {
-            super::dictionary_describes_frame(sizes.content, hint)
-                && sizes.content <= MAX_FAST_ATTACH_DICT_REGION
-        });
+        self.reset_dict_attach_ok =
+            dict_hint.is_none_or(|sizes| sizes.content <= MAX_FAST_ATTACH_DICT_REGION);
         let hinted = hint.is_some();
         // A dictionary frame takes its cParams and match-finder from the
         // CDict's cParams (upstream `ZSTD_resetCCtx_usingCDict`), whose tier
@@ -1078,18 +1074,17 @@ impl Matcher for MatchGeneratorDriver {
         // carries `dict_plan` to the Row backend. The dictionary is prepared
         // under the caller's parameters, so they are part of those cParams.
         let overrides = self.param_overrides.unwrap_or_default();
-        // Once the source outgrows the dictionary, the shape the dictionary was
-        // prepared with stops describing the frame: it resolves its own and the
-        // dictionary goes into those tables. The sizes decide it
-        // (`dictionary_describes_frame`), here, for every caller alike.
-        let loaded_into_frame =
-            dict_hint.is_some_and(|sizes| !super::dictionary_describes_frame(sizes.content, hint));
+        // A dictionary frame runs the shape the dictionary was prepared with,
+        // whatever the source size. Upstream stops doing that once the source
+        // outgrows the dictionary and resolves the frame's own instead
+        // (zstd_compress.c:5264), and that was measured here and rejected: on a
+        // 1 MiB source with a 3 KB dictionary it cost 5.3 ms at level 9 against
+        // 0.50 ms for the prepared shape, for the same 246 bytes out. The
+        // prepared shape also beats the reference on both axes there (1.37 ms
+        // and 1243 bytes), so following upstream's structure on this axis is
+        // what would make us slow. See `dictionary_describes_frame`, which the
+        // C ABI still reads for a question the codec cannot answer.
         let (params, dict_plan) = match dict_hint {
-            Some(sizes) if loaded_into_frame => {
-                crate::encoding::levels::config::resolve_level_params_for_loaded_dict(
-                    level, hint, sizes, &overrides,
-                )
-            }
             Some(sizes) => crate::encoding::levels::config::resolve_level_params_with_dict(
                 level, hint, sizes, &overrides,
             ),
@@ -1135,12 +1130,7 @@ impl Matcher for MatchGeneratorDriver {
         // all-`None` case is skipped so default level geometry stays
         // byte-identical to plain level-based compression. Shared with the
         // workspace estimate, which has to build what this builds.
-        // Not for a dictionary loaded into the frame: that resolution applied
-        // them itself, in the order that lets the adjustment bound them. Re-
-        // applying the raw values here would put each knob back past its cap.
-        if let Some(ov) = self.param_overrides
-            && !loaded_into_frame
-        {
+        if let Some(ov) = self.param_overrides {
             crate::encoding::levels::config::apply_frame_overrides(
                 &mut params,
                 &ov,
@@ -1344,19 +1334,13 @@ impl Matcher for MatchGeneratorDriver {
                 // UNKNOWN, dictSize)` adjusted for a `minSrcSize` source), not
                 // the source-capped main width: a small source must not
                 // shrink the table a large dictionary was sized for.
-                // A dictionary loaded into the frame's tables is indexed at the
-                // frame's own width: there is no separately-sized set.
                 m.set_dict_table_hash_log(dict_hint.map(|sizes| {
-                    if loaded_into_frame {
-                        hash_log
-                    } else {
-                        crate::encoding::cparams::get_cdict_cparams(
-                            crate::encoding::levels::config::numeric_level(level),
-                            sizes.serialized,
-                            &overrides,
-                        )
-                        .hash_log
-                    }
+                    crate::encoding::cparams::get_cdict_cparams(
+                        crate::encoding::levels::config::numeric_level(level),
+                        sizes.serialized,
+                        &overrides,
+                    )
+                    .hash_log
                 }));
                 m.reset(
                     params.window_log,
@@ -1391,10 +1375,6 @@ impl Matcher for MatchGeneratorDriver {
                 // (upstream hashes the dictMatchState tables with
                 // `dictCParams`), not the source-capped live widths.
                 dfast.set_dict_table_bits(dict_hint.map(|sizes| {
-                    // Loaded into the frame's tables: the frame's own widths.
-                    if loaded_into_frame {
-                        return (long_bits, short_bits);
-                    }
                     let cd = crate::encoding::cparams::get_cdict_cparams(
                         crate::encoding::levels::config::numeric_level(level),
                         sizes.serialized,
@@ -1409,13 +1389,11 @@ impl Matcher for MatchGeneratorDriver {
                 // The width-change invalidation in `set_hash_bits` does not
                 // cover an unhinted attach frame followed by a large hinted
                 // one whose live widths coincide at the level's full widths.
-                let dfast_attach_next = !loaded_into_frame
-                    && dict_hint.is_some_and(|sizes| {
-                        sizes.content <= crate::encoding::dfast::DFAST_ATTACH_DICT_MAX_LEN
-                    })
-                    && self
-                        .reset_size_log
-                        .is_none_or(|log| log <= DFAST_ATTACH_DICT_CUTOFF_LOG);
+                let dfast_attach_next = dict_hint.is_some_and(|sizes| {
+                    sizes.content <= crate::encoding::dfast::DFAST_ATTACH_DICT_MAX_LEN
+                }) && self
+                    .reset_size_log
+                    .is_none_or(|log| log <= DFAST_ATTACH_DICT_CUTOFF_LOG);
                 if dict_hint.is_some() && !dfast_attach_next {
                     dfast.invalidate_dict_cache();
                 }

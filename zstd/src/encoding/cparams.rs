@@ -286,29 +286,6 @@ fn apply_cparam_overrides(
     overridden
 }
 
-/// The cParams a frame resolves under the caller's own knobs for a source of
-/// `src_size` with `dict_size` bytes of dictionary in front of it: the level's
-/// row, the knobs on top, then the adjustment that bounds them
-/// (`ZSTD_getCParamsFromCCtxParams` with `ZSTD_cpm_unknown`).
-///
-/// The order is upstream's and it is what makes the bound bite: a `hashLog` the
-/// caller asks for is capped at `dictAndWindowLog + 1`, so a wide table cannot
-/// be built over a narrow window. Applied the other way round, the cap runs
-/// before the knob it is meant to bound and a small-window frame with a large
-/// dictionary builds a table many times its window.
-pub(crate) fn get_frame_cparams(
-    compression_level: i32,
-    src_size: u64,
-    dict_size: usize,
-    overrides: &crate::encoding::parameters::ParamOverrides,
-) -> CParams {
-    let mut cp = get_cparams_mode(compression_level, src_size, dict_size, false);
-    if apply_cparam_overrides(&mut cp, overrides) {
-        cp = adjust_cparams(cp, src_size, dict_size, false);
-    }
-    cp
-}
-
 /// `ZSTD_resetCCtx_byAttachingCDict` cParams: the CDict's cParams re-adjusted
 /// for the frame's source alone (`ZSTD_cpm_attachDict` ignores the dictionary
 /// size, the dictionary keeps its own tables) with the frame's own
