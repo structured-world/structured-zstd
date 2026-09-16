@@ -311,32 +311,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
             // divergence can be applied without touching the other
             // kernels — see #279 round 3.
             unsafe {
-                super::seq_decoder_bmi2::decode_and_execute_sequences_bmi2::<
-                    B,
-                    crate::cpu_kernel::Bmi2Kernel,
-                >(
-                    section,
-                    source,
-                    fse,
-                    buffer,
-                    offset_hist,
-                    literals_buffer,
-                    dict,
-                )
-            }
-        }
-        // Same monolith, a kernel whose three-field extract takes the mask
-        // form: this hardware microcodes `pext`. The wider monoliths are given
-        // up along with it, which costs little on the parts in question (Zen 1
-        // splits a 256-bit operation in two anyway).
-        #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
-        CpuKernelTag::Bmi2SlowPext => {
-            // SAFETY: detect confirmed BMI2, as for the arm above.
-            unsafe {
-                super::seq_decoder_bmi2::decode_and_execute_sequences_bmi2::<
-                    B,
-                    crate::cpu_kernel::Bmi2SlowPextKernel,
-                >(
+                super::seq_decoder_bmi2::decode_and_execute_sequences_bmi2::<B>(
                     section,
                     source,
                     fse,

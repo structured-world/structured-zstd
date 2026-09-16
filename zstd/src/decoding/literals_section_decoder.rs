@@ -179,14 +179,7 @@ fn decompress_literals(
             feature = "kernel-bmi2"
         ))]
         CpuKernelTag::Bmi2 => unsafe {
-            decompress_literals_bmi2::<Bmi2Kernel>(section, scratch, dict, source, target)
-        },
-        // Same body, the kernel whose three-field extract takes the mask form.
-        #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
-        CpuKernelTag::Bmi2SlowPext => unsafe {
-            decompress_literals_bmi2::<crate::cpu_kernel::Bmi2SlowPextKernel>(
-                section, scratch, dict, source, target,
-            )
+            decompress_literals_bmi2(section, scratch, dict, source, target)
         },
         // The aarch64 tiers need no `target_feature` wrapper: NEON is part of
         // the baseline ABI there, and SVE reaches nothing in this pipeline yet.
@@ -226,14 +219,14 @@ unsafe fn decompress_literals_avx2(
     feature = "kernel-bmi2"
 ))]
 #[target_feature(enable = "bmi2")]
-unsafe fn decompress_literals_bmi2<K: CpuKernel>(
+unsafe fn decompress_literals_bmi2(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
     dict: Option<&Dictionary>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
-    decompress_literals_impl::<K>(section, scratch, dict, source, target)
+    decompress_literals_impl::<Bmi2Kernel>(section, scratch, dict, source, target)
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
