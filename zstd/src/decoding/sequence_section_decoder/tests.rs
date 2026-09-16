@@ -504,3 +504,56 @@ mod init_sequence_stream_tests {
         };
     }
 }
+
+#[cfg(all(test, feature = "std"))]
+mod predefined_table_source_tests {
+    use super::super::super::scratch::FSEScratch;
+    use super::super::{
+        maybe_update_fse_tables, predefined_ll_table, predefined_ml_table, predefined_of_table,
+    };
+    use crate::blocks::sequence_section::SequencesHeader;
+
+    /// A Predefined-mode axis must READ the process-wide cached default table,
+    /// not copy it into the per-frame scratch: the table is immutable and the
+    /// copy is per block, so it dominates small frames. Pointer identity is the
+    /// only assertion that distinguishes reading in place from copying, since a
+    /// copy compares equal by value.
+    #[test]
+    fn predefined_axes_read_the_cached_tables_in_place() {
+        let mut header = SequencesHeader::new();
+        // One sequence, modes byte `0x00`: LL, OF and ML all Predefined.
+        header.parse_from_header(&[0x01, 0x00]).unwrap();
+
+        let mut fse = FSEScratch::new();
+        let bytes_read = maybe_update_fse_tables(&header, &[], &mut fse).unwrap();
+        // Predefined axes carry no table description in the block.
+        assert_eq!(bytes_read, 0);
+
+        assert!(core::ptr::eq(fse.ll_table(None), predefined_ll_table()));
+        assert!(core::ptr::eq(fse.of_table(None), predefined_of_table().0));
+        assert!(core::ptr::eq(fse.ml_table(None), predefined_ml_table()));
+        // The cache also supplies the long-offset share, so the gate does not
+        // re-walk the table.
+        assert_eq!(fse.offsets_long_share, predefined_of_table().1);
+    }
+
+    /// Repeat mode means "keep the previous block's table", which for an axis
+    /// left on the predefined cache is that same cached table: a Repeat block
+    /// must not fall back to the untouched local buffer.
+    #[test]
+    fn repeat_after_predefined_keeps_reading_the_cache() {
+        let mut predefined = SequencesHeader::new();
+        predefined.parse_from_header(&[0x01, 0x00]).unwrap();
+        let mut fse = FSEScratch::new();
+        maybe_update_fse_tables(&predefined, &[], &mut fse).unwrap();
+
+        let mut repeat = SequencesHeader::new();
+        // Modes byte `0xFF`: LL, OF and ML all Repeat.
+        repeat.parse_from_header(&[0x01, 0xFF]).unwrap();
+        maybe_update_fse_tables(&repeat, &[], &mut fse).unwrap();
+
+        assert!(core::ptr::eq(fse.ll_table(None), predefined_ll_table()));
+        assert!(core::ptr::eq(fse.of_table(None), predefined_of_table().0));
+        assert!(core::ptr::eq(fse.ml_table(None), predefined_ml_table()));
+    }
+}

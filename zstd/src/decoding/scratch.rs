@@ -146,9 +146,9 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
                 offsets_long_share: 0,
                 ddict_is_cold: false,
-                ll_source: TableSource::Local,
-                of_source: TableSource::Local,
-                ml_source: TableSource::Local,
+                ll_source: SeqTableSource::Local,
+                of_source: SeqTableSource::Local,
+                ml_source: SeqTableSource::Local,
             },
             buffer: DecodeBuffer::new(window_size),
             offset_hist: [1, 4, 8],
@@ -370,14 +370,26 @@ impl Default for HuffmanScratch {
     }
 }
 
-/// Whether an entropy table (a sequence FSE axis, or the Huffman
-/// literals table) reads its own freshly-built table (`Local`) or the
-/// shared dictionary's table by reference (`Dict`). The decode
-/// copy-on-write source: see [`FSEScratch`] / [`HuffmanScratch`].
+/// Whether the Huffman literals table reads its own freshly-built table
+/// (`Local`) or the shared dictionary's by reference (`Dict`). The decode
+/// copy-on-write source: see [`HuffmanScratch`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TableSource {
     Local,
     Dict,
+}
+
+/// Source of one sequence FSE axis: its own freshly-built table (`Local`),
+/// the shared dictionary's by reference (`Dict`), or the process-wide cache
+/// of the RFC 8878 default distribution (`Predefined`). The literals Huffman
+/// table has no predefined form in the format, which is why it carries the
+/// two-state [`TableSource`] instead. See [`FSEScratch`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SeqTableSource {
+    Local,
+    Dict,
+    #[cfg(feature = "std")]
+    Predefined,
 }
 
 /// Unwrap the call-scoped dictionary borrow at a `Dict`-sourced read. A `Dict`
@@ -421,8 +433,10 @@ pub struct FSEScratch {
     /// [`DecoderScratch::init_from_dict`] all three point at the shared
     /// dictionary (`Dict`) with **no table bytes copied** (the upstream zstd's
     /// eager `ZSTD_copyDDictParameters` memcpy is elided); a block that
-    /// rebuilds an axis (FSE_Compressed / RLE / Predefined mode) writes
-    /// the local `AlignedFSETable` and flips that axis to `Local`.
+    /// rebuilds an axis (FSE_Compressed / RLE mode) writes the local
+    /// `AlignedFSETable` and flips that axis to `Local`, while a
+    /// Predefined-mode axis flips to `Predefined` and reads the cached
+    /// default table in place.
     /// Repeat-mode blocks leave the source untouched, so they read
     /// straight out of the shared dictionary handle until the first
     /// rebuild. On the no-dict path every axis stays `Local`.
@@ -432,9 +446,9 @@ pub struct FSEScratch {
     /// owner — the `FrameDecoder` registry or `FrameDecoderState::active_dict`).
     /// No dictionary reference is STORED here: the borrow checker guarantees the
     /// dictionary outlives every read, with no refcount and no per-frame clone.
-    ll_source: TableSource,
-    of_source: TableSource,
-    ml_source: TableSource,
+    ll_source: SeqTableSource,
+    of_source: SeqTableSource,
+    ml_source: SeqTableSource,
 }
 
 impl FSEScratch {
@@ -455,9 +469,9 @@ impl FSEScratch {
             match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
             offsets_long_share: 0,
             ddict_is_cold: false,
-            ll_source: TableSource::Local,
-            of_source: TableSource::Local,
-            ml_source: TableSource::Local,
+            ll_source: SeqTableSource::Local,
+            of_source: SeqTableSource::Local,
+            ml_source: SeqTableSource::Local,
         }
     }
 
@@ -479,9 +493,9 @@ impl FSEScratch {
         // dictionary attached, so carrying a stale `true` here would mis-arm
         // the prefetch pipeline on the restored frame.
         self.ddict_is_cold = false;
-        self.ll_source = TableSource::Local;
-        self.of_source = TableSource::Local;
-        self.ml_source = TableSource::Local;
+        self.ll_source = SeqTableSource::Local;
+        self.of_source = SeqTableSource::Local;
+        self.ml_source = SeqTableSource::Local;
     }
 
     /// Live LL decode table: the dictionary's (zero-copy) when the axis is
@@ -491,24 +505,30 @@ impl FSEScratch {
     /// the active dictionary before reading).
     pub(crate) fn ll_table<'a>(&'a self, dict: Option<&'a Dictionary>) -> &'a SeqFSETable {
         match self.ll_source {
-            TableSource::Local => &self.literal_lengths,
-            TableSource::Dict => &expect_dict(dict).fse.literal_lengths,
+            SeqTableSource::Local => &self.literal_lengths,
+            SeqTableSource::Dict => &expect_dict(dict).fse.literal_lengths,
+            #[cfg(feature = "std")]
+            SeqTableSource::Predefined => super::sequence_section_decoder::predefined_ll_table(),
         }
     }
 
     /// Live OF decode table (see [`Self::ll_table`]).
     pub(crate) fn of_table<'a>(&'a self, dict: Option<&'a Dictionary>) -> &'a SeqFSETable {
         match self.of_source {
-            TableSource::Local => &self.offsets,
-            TableSource::Dict => &expect_dict(dict).fse.offsets,
+            SeqTableSource::Local => &self.offsets,
+            SeqTableSource::Dict => &expect_dict(dict).fse.offsets,
+            #[cfg(feature = "std")]
+            SeqTableSource::Predefined => super::sequence_section_decoder::predefined_of_table().0,
         }
     }
 
     /// Live ML decode table (see [`Self::ll_table`]).
     pub(crate) fn ml_table<'a>(&'a self, dict: Option<&'a Dictionary>) -> &'a SeqFSETable {
         match self.ml_source {
-            TableSource::Local => &self.match_lengths,
-            TableSource::Dict => &expect_dict(dict).fse.match_lengths,
+            SeqTableSource::Local => &self.match_lengths,
+            SeqTableSource::Dict => &expect_dict(dict).fse.match_lengths,
+            #[cfg(feature = "std")]
+            SeqTableSource::Predefined => super::sequence_section_decoder::predefined_ml_table(),
         }
     }
 
@@ -521,33 +541,54 @@ impl FSEScratch {
         self.offsets_long_share = dict.as_dict().fse.offsets_long_share;
         // Re-arm all three COW axes every frame (a prior frame may have rebuilt
         // any of them to `Local`).
-        self.ll_source = TableSource::Dict;
-        self.of_source = TableSource::Dict;
-        self.ml_source = TableSource::Dict;
+        self.ll_source = SeqTableSource::Dict;
+        self.of_source = SeqTableSource::Dict;
+        self.ml_source = SeqTableSource::Dict;
     }
 
     /// Revert all axes to `Local` (called on scratch `reset` so a reused
     /// workspace does not read a previous frame's dictionary tables).
     pub(crate) fn detach_dict(&mut self) {
-        self.ll_source = TableSource::Local;
-        self.of_source = TableSource::Local;
-        self.ml_source = TableSource::Local;
+        self.ll_source = SeqTableSource::Local;
+        self.of_source = SeqTableSource::Local;
+        self.ml_source = SeqTableSource::Local;
     }
 
     /// Flip an axis to read its locally-built table (called by
-    /// `maybe_update_fse_tables` after FSE_Compressed / RLE / Predefined
-    /// rebuilds — the copy-on-write "write" step).
+    /// `maybe_update_fse_tables` after an FSE_Compressed / RLE rebuild —
+    /// the copy-on-write "write" step).
     #[inline]
     pub(crate) fn mark_ll_local(&mut self) {
-        self.ll_source = TableSource::Local;
+        self.ll_source = SeqTableSource::Local;
     }
     #[inline]
     pub(crate) fn mark_of_local(&mut self) {
-        self.of_source = TableSource::Local;
+        self.of_source = SeqTableSource::Local;
     }
     #[inline]
     pub(crate) fn mark_ml_local(&mut self) {
-        self.ml_source = TableSource::Local;
+        self.ml_source = SeqTableSource::Local;
+    }
+
+    /// Point an axis at the cached RFC 8878 default table. A `Predefined`-mode
+    /// block costs this flag write instead of copying the table into the local
+    /// buffer, mirroring upstream pointing its axis at the static default
+    /// table. A later Repeat-mode block leaves the source untouched and so
+    /// keeps reading the same cached table, which is what Repeat means.
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn mark_ll_predefined(&mut self) {
+        self.ll_source = SeqTableSource::Predefined;
+    }
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn mark_of_predefined(&mut self) {
+        self.of_source = SeqTableSource::Predefined;
+    }
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn mark_ml_predefined(&mut self) {
+        self.ml_source = SeqTableSource::Predefined;
     }
 }
 
