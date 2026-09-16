@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789557168965,
+  "lastUpdate": 1789576052198,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -6527,6 +6527,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.187,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "37b93d75ca774c41f79f015f6a2c055720c549b9",
+          "message": "fix(encode): honour explicit compression parameters on dictionary frames (#511)\n\n* fix(c-api): a referenced CDict lends its level only while the frame is small\n\nA CDict referenced with `ZSTD_CCtx_refCDict` drove every frame on the context,\nwhatever the caller had asked for. Upstream lends its parameters only while the\nframe is still about the dictionary: `ZSTD_compressBegin_internal`\n(zstd_compress.c:5254) takes them for a source under 128 KiB, under six times\nthe dictionary content, or of unknown size, and otherwise resets the context\nfrom the parameters the caller asked for and loads the dictionary into those\ntables. A CDict built through the advanced constructor is the exception and\nalways wins, carrying explicit parameters instead of a level of its own\n(`ZSTD_NO_CLEVEL`, :5636).\n\nSo a caller who set level 1 and referenced a level-19 CDict got level 19 on a\n1 MiB source: 20,181 bytes where the level they asked for writes 42,564. The\none-shot path weighs the input it was handed, the streaming path the pledge,\nand an unpledged stream stays with the CDict as a frame of unknown size does.\n\n`EncoderDictionary::content_size` is what the six-times comparison reads.\n\nPart of #505.\n\n* fix(encode): resolve a frame's own shape when its dictionary is loaded into it\n\nTaking the caller's level back was half the fix: the tables were still built\nfrom the dictionary's preparation, which assumes a source of a few hundred\nbytes because a dictionary cannot know which frames will use it. A megabyte of\ncontent was matched through widths chosen for that guess.\n\nUpstream does not run those tables past the cutoff. It resolves the frame from\nthe requested parameters for the real source, counting the dictionary only as\ncontent the window has to cover, and calls `ZSTD_compress_insertDictionary` to\nload the dictionary into what came out (zstd_compress.c:5264). The same holds\nfor `ZSTD_compress_usingCDict`, which re-resolves the CDict's own level for the\nsource instead (:5839).\n\nSo the geometry is now a choice the caller makes, `DictionaryGeometry`:\n`Prepared` is the dictionary's own shape, searched in place where it can be,\nand is the default and what every Rust-API caller keeps; `LoadedIntoFrame`\nresolves the frame's own and puts the dictionary in those tables, never\nattaching. The C ABI picks it at the same cutoff, on both the referenced-CDict\nand the `usingCDict` paths.\n\nAt levels 1, 3 and 5 a 1 MiB source with an 8 KiB dictionary now compresses no\nlarger than libzstd's frame for it, and libzstd decodes ours.\n\nCloses #505.\n\n* fix(encode): bound a requested table width by what it will index\n\nA width the caller asks for is capped at `dictAndWindowLog + 1`, and the cap\nonly bites if it runs after the knob it bounds: upstream overrides first and\nadjusts second (`ZSTD_getCParamsFromCCtxParams`). A frame resolving its own\nshape around a loaded dictionary applied them the other way round, so the cap\nran against the level's width and the caller's survived whole.\n\nMeasured on the i9 over a 4 MiB source, `windowLog` 10 with `hashLog` 20 and an\n18 KiB dictionary: a table of 807 KB over a 1 KiB window, 832M cycles against\n178M for the same frame without the dictionary. The window slides every\nkilobyte and each slide walks the whole table, so the cost is the table's size,\nnot the window's.\n\nThat shape is what `FastKernelMatcher::drain_real_prefix` argues cannot exist\nwhen it chooses an index slide over a rehash. Its comment said a dictionary\nframe never reads the caller's `hashLog`, which stopped being true when\nexplicit parameters started reaching a dictionary's preparation; it now states\nthe bound that does hold, with the numbers, and the ordering it rests on is\npinned by a test.\n\n`examples/slide_oversized_table.rs` said the same stale thing in its header and\nnow carries the measured widths instead.\n\nPart of #505.\n\n* refactor: the C ABI asks the codec, it does not decide for itself\n\nThe cutoff that says whether a dictionary still describes a frame was written\ninto `c-api/`, so it only applied to callers who went through the C ABI. A\nRust-API caller with a megabyte of content and a four-kilobyte dictionary kept\nmatching it through tables sized for the dictionary, and the two surfaces would\nhave drifted from there. A compatibility surface must not own behaviour.\n\nThe rule is the codec's now, one function\n(`encoding::dictionary_describes_frame`), applied where the frame resolves and\ntherefore to every caller alike. The C ABI calls it and adds only what the\ncodec cannot see: a `CDict` built through the advanced constructor carries\nexplicit parameters rather than a level, so it drives the frame whatever the\nsizes say. `DictionaryGeometry` and its setters are gone with the choice they\noffered; the sizes decide.\n\nThe same rule caught the rest of `c-api/` re-declaring what the codec already\nknows: the dictionary magic three times over, the block maximum three times in\nthree spellings (`128 * 1024`, `1 << 17`, `131_072`). Each is now read off the\ncodec, which grew a public `MAX_BLOCK_SIZE` for the purpose.\n\nWritten down as a project rule so it is not re-litigated: the C ABI translates,\nit never decides.\n\nPart of #505.\n\n* perf(encode): keep the dictionary's own shape whatever the source size\n\nResolving the frame's own shape once the source outgrows its dictionary is what\nupstream does (zstd_compress.c:5264), and measuring it against what we already\nhad rejects it outright. A 1 MiB source with a 3 KB dictionary, both arms in one\nsession on the same host, three rounds:\n\n  level    prepared shape      frame's own shape      reference\n  1         1.13 ms / 13774     1.13 ms / 13774        0.73 ms / 13780\n  3         0.24 ms /   278     0.30 ms /   277        0.27 ms /   270\n  5         0.52 ms /   248     2.69 ms /   271        0.38 ms /   280\n  9         0.50 ms /   246     5.36 ms /   248        1.37 ms /  1243\n  12        0.87 ms /   250     5.56 ms /   247        1.87 ms /  1242\n\nFive to ten times the time for the same bytes, and worse bytes at level 5. The\ncontrol arm, a 64 KiB source under the cutoff where the change provably cannot\nrun, stayed within 2.4% with identical output.\n\nThe deciding row is the reference column: the prepared shape already beats it on\nboth axes at levels 9 and 12 (0.50 ms and 246 bytes against 1.37 ms and 1243),\nso adopting upstream's structure here is what would have made us slow. Where\nupstream's shape is worse than ours, ours stays.\n\nSo the geometry switch and everything that served it are gone; a dictionary\nlends the frame its shape at every size, as before. What stays from this round\nis the level cutoff a referenced CDict answers to, which is a correctness\nmatter and not a shape one, and the numbers, recorded at the resolution and in\nthe test that pins it.\n\nPart of #505.\n\n* docs(encode): state the table-over-window shape a dictionary really produces\n\nThe slide-versus-rehash reasoning claimed the parameter resolution never builds\na table much larger than the window it indexes. It does, with a dictionary: the\nbound is `dictAndWindowLog + 1` and counts the dictionary's content, so an\n18 KiB dictionary under a 1 KiB window resolves `hash_log` 16, a table of 64\nentries per byte the window holds. Over a 4 MiB source that frame costs 832M\ncycles against 178M for the same frame without the dictionary, because the\nwindow slides every kilobyte and each slide walks the whole table.\n\nOnly the slide arm has been measured, so the comment now says the comparison is\nopen rather than settled, and names the arm it still needs.\n\nPart of #505.\n\n* perf(encode): re-borrow the dictionary on Row instead of re-priming it\n\nRow was the one backend without a residency path: `dictionary_is_resident`\nanswered for HashChain, Simple and Dfast and fell through to `false` for it, so\n`Row::reset` cleared history and the frame compressor handed it the whole\ndictionary again. Every frame re-committed and re-indexed the dictionary, while\nits index was already cached across frames and returned early.\n\nMeasured before: a 110 KB dictionary under 1 KB frames spent 26.4% of the\nencode in `load_frame_dictionary`, 19.1% of it memmove, and level 5 sat at 3.52x\nthe reference where dfast, which has residency, sat at 1.97x.\n\nThe re-borrow is the shape dfast already uses: keep `[0, region)` of history,\nlet the floor advance reject the previous frame's input, and take the\ndictionary's matches from its own index, whose positions are dictionary-relative\nand so bypass the floor. The window lands where priming would have put it: the\nprefix starts past the dictionary, and the dictionary is the `extDict` segment\nbelow it when copied, outside the window when attached.\n\n* fix(encode): answer the dictionary-size cutoff by division, not by multiplying\n\n`dictionary_describes_frame` compared `src < dict * 6`, and it is public, so the\ndictionary is whatever the caller names: six times a large `usize` does not fit\nthe type, and the multiplication panicked in a debug build and wrapped in a\nrelease one. A wrapped product reads as a smaller bound than the real one, so a\nsource plainly about its dictionary was answered as if it were not. For integers\n`src / 6 < dict` is the same question and cannot overflow. Carries the test that\npanicked on the old form.\n\nAlso corrects two comments this branch left stale in\n`ffi-bench/tests/dictionary_ffi.rs`: the rationale above the large-source ratio\ntest still described resolving the frame's own shape, which the measurement\nrejected and the code no longer does, and a truncated copy of that same comment\nhad been spliced onto the head of the optimal-band test's.\n\n* docs(encode): carry the whole measurement behind the dictionary-shape choice\n\nThe comment defending the unconditional choice cited one level-9 row, which\nunder-reported what decided it and left the obvious question — does this hold\nacross levels and dictionary sizes — unanswered in the place someone reads it.\n\nIt now carries the table: five levels, two dictionary shapes, ours against the\nimplemented alternative against the reference, plus the control arm under the\nsize where the alternative can run at all. The second dictionary shape is new\nhere; the first run used a 3 KB dictionary only, and a 110 KB one was the gap\nworth closing. It closes the same way, wider: three to eight times the time for\nbytes that match to within a percent, and from level 3 up the shipped shape also\nbeats the reference on both axes, which the alternative would have given away.\n\nAlso records why there is no instruction count: the bench host is a VMware guest\nwith no PMU passthrough, so `perf stat -e cycles` reports the event as\nunsupported and `task-clock` is what there is.",
+          "timestamp": "2026-09-16T18:38:28+03:00",
+          "tree_id": "402abfa3a4639ef97e9ec446ba9e13b7a993fdc4",
+          "url": "https://github.com/structured-world/structured-zstd/commit/37b93d75ca774c41f79f015f6a2c055720c549b9"
+        },
+        "date": 1789576037827,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.076,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 191.006,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 256.103,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.551,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.388,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.838,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.982,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.874,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.007,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 9.905,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 6.414,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.089,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.175,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.596,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.211,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.754,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.305,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.156,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.188,
             "unit": "ms"
           }
         ]
