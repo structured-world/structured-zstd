@@ -32,8 +32,6 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     // refcount bump). The borrow checker guarantees the dictionary outlives
     // every read; `DecodeBuffer` itself stays `Send`/`Sync` by auto-derive.
     pub window_size: usize,
-    /// See [`DecodeBuffer::set_declared_content`].
-    declared_content: Option<u64>,
     total_output_counter: u64,
     #[cfg(feature = "hash")]
     pub(crate) hash: twox_hash::XxHash64,
@@ -50,6 +48,10 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     /// without that flag ever being set.
     #[cfg(feature = "hash")]
     hash_dirty: bool,
+    /// See [`DecodeBuffer::set_declared_content`]. Last on purpose: the fields
+    /// above are read per sequence, and moving them would shift the layout the
+    /// decode monolith is built around.
+    declared_content: Option<u64>,
 }
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
