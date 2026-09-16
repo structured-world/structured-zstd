@@ -487,7 +487,16 @@ impl BlockDecoder {
                     },
                 ));
             }
-            write_literals_only(buffer, literals_view)?;
+            // A growable backend allocates rather than refusing, so its write
+            // cannot fail and takes the infallible path; the compile-time const
+            // folds the other arm away, leaving the block body as the optimiser
+            // saw it before (the fallible form here cost 9.9% of cycles on a
+            // 1 MiB level-19 stream while issuing 0.6% fewer instructions).
+            if B::FIXED_CAPACITY {
+                write_literals_only(buffer, literals_view)?;
+            } else {
+                buffer.push(literals_view);
+            }
         }
 
         // Nothing drains the buffer inside a block, so the growth of its live

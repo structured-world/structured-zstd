@@ -250,6 +250,10 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// path). See the trait const's doc.
     const INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER: bool = false;
 
+    /// The caller's slice cannot grow: a write past it is reported, never
+    /// asserted. See the trait const's doc.
+    const FIXED_CAPACITY: bool = true;
+
     /// Upstream zstd `ZSTD_execSequence` body — see trait doc for
     /// preconditions / contract.
     #[cfg(target_arch = "x86_64")]

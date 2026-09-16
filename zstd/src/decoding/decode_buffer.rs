@@ -155,10 +155,10 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
-    /// Infallible append, for tests over a growable backend. The decoder
-    /// writes through [`Self::try_push`]: on a fixed-capacity backend the
-    /// infallible path asserts where a short target must be reported.
-    #[cfg(test)]
+    /// Infallible append, for a backend that grows rather than refusing
+    /// ([`BufferBackend::FIXED_CAPACITY`] `== false`). On a fixed-capacity
+    /// backend the write asserts where a short target must be reported, so
+    /// those paths take [`Self::try_push`].
     #[inline]
     pub fn push(&mut self, data: &[u8]) {
         self.buffer.extend(data);
