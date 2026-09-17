@@ -202,7 +202,7 @@
   <body>
     <main>
       <h1>Rust vs C FFI Relative Dashboard</h1>
-      <p id="intro-copy">Default view tracks Rust/FFI relative deltas by target and scenario. Parity band is loading from payload.</p>
+      <p id="intro-copy">Default view tracks Rust/FFI relative deltas by target and scenario, each measured against libzstd within the same run. Timings are the fastest of that run's samples; hover a point for the spread behind it. Parity band is loading from payload.</p>
 
       <section class="stats">
         <div class="card">
@@ -868,6 +868,10 @@
         status.replaceChildren();
         const regressions = perSeries.filter((item) => item.regression);
         const wins = perSeries.filter((item) => !item.regression && !item.inBand);
+        // Biggest lag behind libzstd first: this list exists to pick the level
+        // and fixture worth attacking next, so nothing is withheld from it. Each
+        // line carries its own sample spread instead, which is what says whether
+        // a number is solid enough to spend a day on.
         const focus = (regressions.length ? regressions : perSeries)
           .sort((a, b) => b.deviation - a.deviation)
           .slice(0, 8);
@@ -2128,7 +2132,10 @@
           BAND_LOW = band.delta_low;
           BAND_HIGH = band.delta_high;
         }
-        el("intro-copy").textContent = `Default view tracks Rust/FFI relative deltas by target and scenario. Parity band is ${BAND_LOW.toFixed(2)}..${BAND_HIGH.toFixed(2)}.`;
+        el("intro-copy").textContent =
+          "Default view tracks Rust/FFI relative deltas by target and scenario, each measured against libzstd within the same run. " +
+          "Timings are the fastest of that run's samples; hover a point for the spread behind it. " +
+          `Parity band is ${BAND_LOW.toFixed(2)}..${BAND_HIGH.toFixed(2)}.`;
 
         state.records = payload.records || [];
         if (!state.records.length) throw new Error("benchmark-relative.json has no records");

@@ -88,8 +88,14 @@ async function buildFixtures() {
 }
 
 // --- Timing -----------------------------------------------------------------
-function medianNsPerOp(fn, totalBudgetMs) {
-  // Warm up, then collect samples until the budget elapses; return the median.
+function fastestNsPerOp(fn, totalBudgetMs) {
+  // Warm up, then time single operations until the budget elapses and report
+  // the fastest. Scheduling, GC and JIT deoptimisation can only ADD time to an
+  // operation, so the lower edge of the samples is the cost of the code and
+  // everything above it is the machine; a central statistic instead carries
+  // however much of that tail it happened to collect, which is what makes a
+  // cell drift between runs of identical code. The native matrix reports the
+  // same statistic, so the two dashboard sections stay comparable.
   for (let i = 0; i < 3; i++) fn();
   const samples = [];
   const deadline = process.hrtime.bigint() + BigInt(totalBudgetMs) * 1_000_000n;
@@ -99,7 +105,7 @@ function medianNsPerOp(fn, totalBudgetMs) {
     samples.push(Number(process.hrtime.bigint() - t0));
   } while (process.hrtime.bigint() < deadline && samples.length < 200);
   samples.sort((a, b) => a - b);
-  return samples[samples.length >> 1];
+  return samples[0];
 }
 
 const LEVELS = [1, 3, 19, 22];
@@ -126,8 +132,8 @@ for (const [scenario, data] of fixtures) {
       // Round-trip correctness check before timing.
       const back = eng.decompress(framed);
       const ok = eq(back, data);
-      const cNs = medianNsPerOp(() => eng.compress(data, level), BUDGET_MS);
-      const dNs = medianNsPerOp(() => eng.decompress(framed), BUDGET_MS);
+      const cNs = fastestNsPerOp(() => eng.compress(data, level), BUDGET_MS);
+      const dNs = fastestNsPerOp(() => eng.decompress(framed), BUDGET_MS);
       const ratio = framed.length / Math.max(1, data.length);
       console.log(
         `REPORT scenario=${scenario} engine=${name} level=${level} ` +
@@ -170,8 +176,8 @@ for (const [scenario, data] of dictSamples) {
     for (const [name, eng] of Object.entries(engines)) {
       const framed = eng.compressUsingDict(data, dict, level);
       const ok = eq(eng.decompressUsingDict(framed, dict), data);
-      const cNs = medianNsPerOp(() => eng.compressUsingDict(data, dict, level), BUDGET_MS);
-      const dNs = medianNsPerOp(() => eng.decompressUsingDict(framed, dict), BUDGET_MS);
+      const cNs = fastestNsPerOp(() => eng.compressUsingDict(data, dict, level), BUDGET_MS);
+      const dNs = fastestNsPerOp(() => eng.decompressUsingDict(framed, dict), BUDGET_MS);
       const ratio = framed.length / Math.max(1, data.length);
       console.log(
         `REPORT_DICT scenario=${scenario} engine=${name} level=${level} ` +
@@ -227,8 +233,8 @@ for (const [scenario, data] of fixtures) {
       const streamed = streamCompressOnce(eng.CompressStreamCtor, data, level);
       const ok = eq(eng.decompress(streamed), data);
       if (!ok) { rows.push({ scenario, level, name: `${tier}-stream`, ok: false }); }
-      const sNs = medianNsPerOp(() => streamCompressOnce(eng.CompressStreamCtor, data, level), BUDGET_MS);
-      const oNs = medianNsPerOp(() => eng.compress(data, level), BUDGET_MS);
+      const sNs = fastestNsPerOp(() => streamCompressOnce(eng.CompressStreamCtor, data, level), BUDGET_MS);
+      const oNs = fastestNsPerOp(() => eng.compress(data, level), BUDGET_MS);
       const ratio = streamed.length / Math.max(1, data.length);
       console.log(
         `REPORT_STREAM scenario=${scenario} engine=${tier} level=${level} ` +
