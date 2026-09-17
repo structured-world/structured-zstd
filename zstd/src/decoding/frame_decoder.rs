@@ -1109,6 +1109,24 @@ impl FrameDecoder {
         }
     }
 
+    /// Decode with a named CPU tier instead of the one this machine selected.
+    ///
+    /// Which tier runs is otherwise a property of the host, so a test on any
+    /// one machine covers exactly one of them. The tiers are separate
+    /// monomorphs with their own gates and their own argument plumbing, and
+    /// a divergence between them is precisely what no single-host run can see.
+    ///
+    /// The caller is responsible for naming a tier the CPU can actually
+    /// execute: the monoliths carry `target_feature`, and asking for one the
+    /// machine lacks is undefined behaviour rather than an error.
+    #[cfg(test)]
+    // Its consumer is the per-tier agreement test, and the tiers worth
+    // disagreeing are the x86 ones, so on other architectures nothing calls it.
+    #[allow(dead_code)]
+    pub(crate) fn decode_with_kernel_for_tests(&mut self, kernel: crate::cpu_kernel::CpuKernelTag) {
+        self.kernel = kernel;
+    }
+
     /// Heap bytes currently held by the decoder's lazily-grown workspace:
     /// the decode-window buffer plus the per-block literal/content buffers
     /// and the entropy tables. Returns 0 before the first frame is initialised

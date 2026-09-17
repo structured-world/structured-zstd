@@ -1153,8 +1153,12 @@ fn max_measurement_secs() -> Option<Duration> {
 /// pair, and the per-arm minimum across rounds is then free of any disturbance
 /// that did not cover every round.
 ///
-/// The budget is DIVIDED, not multiplied: N rounds of `budget / N` cost the
-/// same wall-clock as one round of `budget`.
+/// The MEASUREMENT budget is divided, not multiplied, so most of the cost is
+/// carried over rather than added. Two things do not divide: each round repeats
+/// its group setup, and the per-round warm-up has a floor, so the warm-up total
+/// grows once `budget / rounds` falls under it. Three rounds measured about a
+/// fifth longer than one full-budget round on a decompress group; a round count
+/// high enough to sit on the warm-up floor costs proportionally more than that.
 fn bench_rounds() -> u32 {
     std::env::var("STRUCTURED_ZSTD_BENCH_ROUNDS")
         .ok()

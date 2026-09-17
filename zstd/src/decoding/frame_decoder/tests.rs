@@ -1772,6 +1772,102 @@ fn dict_frame_decodes_through_direct_path() {
     );
 }
 
+/// Decode one dictionary frame on every CPU tier this host can execute and
+/// require them to produce the same bytes.
+///
+/// Which tier runs is a property of the machine, so ordinary tests cover
+/// exactly one of them. Each tier is its own monomorph with its own gate and
+/// its own argument plumbing around the dictionary copy, and a mistake in one
+/// of them (asking the output-resident gate of a dictionary match, or losing
+/// the resolved dictionary slice on the way in) has nowhere else to show up.
+/// The fixture is the one from `dict_frame_decodes_through_direct_path`: a
+/// payload that is dictionary material with no second copy in the frame, so
+/// every dictionary-region match has to resolve against the dictionary.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[test]
+fn every_cpu_tier_decodes_a_dictionary_frame_the_same_way() {
+    use crate::cpu_kernel::CpuKernelTag;
+
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let handle = DictionaryHandle::decode_dict(dict_raw).expect("dictionary should parse");
+    let dict_tail: alloc::vec::Vec<u8> = handle
+        .as_dict()
+        .dict_content
+        .iter()
+        .rev()
+        .take(2048)
+        .rev()
+        .copied()
+        .collect();
+    let mut payload = dict_tail;
+    payload.extend_from_slice(b"unique suffix after dictionary material 0123456789");
+
+    let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor
+        .set_dictionary_from_bytes(dict_raw)
+        .expect("dict load");
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+
+    // Fixture sanity, as in the direct-path test: unless the frame actually
+    // depends on the dictionary, none of the decodes below reach the path
+    // whose per-tier agreement is the point here.
+    let mut plain = Vec::new();
+    let mut no_dict = FrameCompressor::new(CompressionLevel::Default);
+    no_dict.set_source(payload.as_slice());
+    no_dict.set_drain(&mut plain);
+    no_dict.compress();
+    assert!(
+        compressed.len() < plain.len(),
+        "fixture must depend on the dictionary: dict {} bytes vs plain {} bytes",
+        compressed.len(),
+        plain.len()
+    );
+
+    let decode_on = |kernel: CpuKernelTag| {
+        let mut decoder = FrameDecoder::new();
+        decoder.decode_with_kernel_for_tests(kernel);
+        let mut out = alloc::vec![0u8; payload.len()];
+        let n = decoder
+            .decode_all_with_dict_handle(compressed.as_slice(), &mut out, &handle)
+            .expect("dictionary frame must decode on every tier");
+        out.truncate(n);
+        out
+    };
+
+    // Scalar is always executable and is the reference the others answer to.
+    assert_eq!(
+        decode_on(CpuKernelTag::Scalar),
+        payload,
+        "the scalar tier must decode the dictionary frame exactly"
+    );
+
+    #[cfg(feature = "kernel-sse")]
+    if std::is_x86_feature_detected!("sse2") {
+        assert_eq!(decode_on(CpuKernelTag::Sse2), payload, "SSE2 tier diverged");
+    }
+    #[cfg(feature = "kernel-bmi2")]
+    if std::is_x86_feature_detected!("bmi2") {
+        assert_eq!(decode_on(CpuKernelTag::Bmi2), payload, "BMI2 tier diverged");
+    }
+    #[cfg(feature = "kernel-avx2")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
+        assert_eq!(decode_on(CpuKernelTag::Avx2), payload, "AVX2 tier diverged");
+    }
+    // VBMI2 carries a wider feature set than one probe covers, so it is asked
+    // for only when the detector itself named it.
+    #[cfg(feature = "kernel-vbmi2")]
+    if matches!(crate::cpu_kernel::detect_cpu_kernel(), CpuKernelTag::Vbmi2) {
+        assert_eq!(
+            decode_on(CpuKernelTag::Vbmi2),
+            payload,
+            "VBMI2 tier diverged"
+        );
+    }
+}
+
 #[test]
 fn implausible_content_size_skips_eager_alloc_direct_path() {
     // Adversarial frame: a 1 KiB window (small ring) but a declared

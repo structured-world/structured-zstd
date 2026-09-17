@@ -35,9 +35,25 @@ trap 'rm -rf "$BENCH_RAW_FILE" "$BENCH_CRITERION_HOME"' EXIT
 # difference between the implementations. Running the matrix several times puts
 # the arms in `A B A B ...` with the rest of the matrix between each pair, and
 # the per-arm minimum across rounds drops any disturbance that missed a round.
-# The bench divides its own measurement budget by this count, so the rounds cost
-# the wall-clock one full-budget round used to.
+# The bench divides its own MEASUREMENT budget by this count, so most of the
+# cost is carried over rather than added. What does not divide is the per-round
+# group setup and the warm-up floor, which is why three rounds measured about a
+# fifth longer than one full-budget round rather than the same.
 BENCH_ROUNDS="${STRUCTURED_ZSTD_BENCH_ROUNDS:-3}"
+# Refuse a value that would silently change what the run means: a non-number or
+# zero leaves `seq` with nothing to iterate, so the matrix would produce no
+# timings at all, and the bench binary would read the same variable differently
+# from this script.
+case "$BENCH_ROUNDS" in
+  '' | *[!0-9]*)
+    echo "STRUCTURED_ZSTD_BENCH_ROUNDS must be a positive integer, got '$BENCH_ROUNDS'" >&2
+    exit 2
+    ;;
+esac
+if [ "$BENCH_ROUNDS" -lt 1 ]; then
+  echo "STRUCTURED_ZSTD_BENCH_ROUNDS must be at least 1, got '$BENCH_ROUNDS'" >&2
+  exit 2
+fi
 export STRUCTURED_ZSTD_BENCH_ROUNDS="$BENCH_ROUNDS"
 export STRUCTURED_ZSTD_EMIT_REPORT=1
 # CI matrix splits build (per target) from execution (per target × level):
@@ -210,7 +226,21 @@ def load_criterion_samples(root):
     # covered only some of them.
     pooled = defaultdict(list)
     per_round = defaultdict(list)
-    for meta_path in sorted(base.glob("**/new/benchmark.json")):
+
+    def round_order(path):
+        """Round directories are `round-N`; sort them by N, not by name.
+
+        Lexical order puts `round-10` before `round-2`, which would only show
+        up once the round count reaches double figures, and then silently: the
+        minima would still be correct, while the order `round_min_ns` claims
+        would not be.
+        """
+        for part in path.parts:
+            if part.startswith("round-") and part[6:].isdigit():
+                return (int(part[6:]), str(path))
+        return (0, str(path))
+
+    for meta_path in sorted(base.glob("**/new/benchmark.json"), key=round_order):
         sample_path = meta_path.with_name("sample.json")
         if not sample_path.is_file():
             continue
