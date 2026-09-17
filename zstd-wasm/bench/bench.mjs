@@ -88,14 +88,10 @@ async function buildFixtures() {
 }
 
 // --- Timing -----------------------------------------------------------------
-function fastestNsPerOp(fn, totalBudgetMs) {
-  // Warm up, then time single operations until the budget elapses and report
-  // the fastest. Scheduling, GC and JIT deoptimisation can only ADD time to an
-  // operation, so the lower edge of the samples is the cost of the code and
-  // everything above it is the machine; a central statistic instead carries
-  // however much of that tail it happened to collect, which is what makes a
-  // cell drift between runs of identical code. The native matrix reports the
-  // same statistic, so the two dashboard sections stay comparable.
+// Warm up, then time single operations until the budget elapses, in collection
+// order. The caller reduces these to one figure per arm; see
+// `fastestOverCommonCount` for why the reduction cannot happen here.
+function sampleNsPerOp(fn, totalBudgetMs) {
   for (let i = 0; i < 3; i++) fn();
   const samples = [];
   const deadline = process.hrtime.bigint() + BigInt(totalBudgetMs) * 1_000_000n;
@@ -104,8 +100,28 @@ function fastestNsPerOp(fn, totalBudgetMs) {
     fn();
     samples.push(Number(process.hrtime.bigint() - t0));
   } while (process.hrtime.bigint() < deadline && samples.length < 200);
-  samples.sort((a, b) => a - b);
-  return samples[0];
+  return samples;
+}
+
+// Report each arm's fastest operation, over as many samples as the SLOWEST arm
+// managed to collect.
+//
+// The fastest is the figure worth reporting: scheduling, GC and JIT
+// deoptimisation can only ADD time to an operation, so the lower edge of the
+// samples is the cost of the code and everything above it is the machine, and
+// the native matrix reports the same statistic.
+//
+// But it is an extreme order statistic, and its expected value falls as the
+// sample count rises. Under a fixed time budget a quick arm fits hundreds of
+// operations and a slow one a handful, so comparing their minima directly would
+// hand the quick arm an advantage that has nothing to do with its code — badly
+// so on the 8 MiB fixtures at high levels, where an arm can manage only a few.
+// Truncating every arm to the common count removes that: the arms are then
+// compared over the same number of chances. The comparison is as coarse as its
+// slowest member, which is the honest price of a bounded budget.
+function fastestOverCommonCount(...sampleSets) {
+  const common = Math.min(...sampleSets.map((s) => s.length));
+  return sampleSets.map((s) => Math.min(...s.slice(0, common)));
 }
 
 const LEVELS = [1, 3, 19, 22];
@@ -127,13 +143,26 @@ const fixtures = await buildFixtures();
 const rows = [];
 for (const [scenario, data] of fixtures) {
   for (const level of LEVELS) {
+    // Every engine is sampled before any of them is reduced to a number: the
+    // engines are the arms being compared, so they have to share a count.
+    const measured = [];
     for (const [name, eng] of Object.entries(engines)) {
       const framed = eng.compress(data, level);
       // Round-trip correctness check before timing.
       const back = eng.decompress(framed);
-      const ok = eq(back, data);
-      const cNs = fastestNsPerOp(() => eng.compress(data, level), BUDGET_MS);
-      const dNs = fastestNsPerOp(() => eng.decompress(framed), BUDGET_MS);
+      measured.push({
+        name,
+        framed,
+        ok: eq(back, data),
+        compress: sampleNsPerOp(() => eng.compress(data, level), BUDGET_MS),
+        decompress: sampleNsPerOp(() => eng.decompress(framed), BUDGET_MS),
+      });
+    }
+    const compressNs = fastestOverCommonCount(...measured.map((m) => m.compress));
+    const decompressNs = fastestOverCommonCount(...measured.map((m) => m.decompress));
+    measured.forEach(({ name, framed, ok }, i) => {
+      const cNs = compressNs[i];
+      const dNs = decompressNs[i];
       const ratio = framed.length / Math.max(1, data.length);
       console.log(
         `REPORT scenario=${scenario} engine=${name} level=${level} ` +
@@ -141,7 +170,7 @@ for (const [scenario, data] of fixtures) {
           `compress_ns=${cNs} decompress_ns=${dNs} roundtrip=${ok ? "ok" : "FAIL"}`,
       );
       rows.push({ scenario, level, name, ratio, cNs, dNs, ok });
-    }
+    });
   }
 }
 
@@ -173,11 +202,22 @@ console.log("\n=== dictionary compress/decompress vs @bokuweb/zstd-wasm ===");
 const dictRows = [];
 for (const [scenario, data] of dictSamples) {
   for (const level of LEVELS) {
+    const measured = [];
     for (const [name, eng] of Object.entries(engines)) {
       const framed = eng.compressUsingDict(data, dict, level);
-      const ok = eq(eng.decompressUsingDict(framed, dict), data);
-      const cNs = fastestNsPerOp(() => eng.compressUsingDict(data, dict, level), BUDGET_MS);
-      const dNs = fastestNsPerOp(() => eng.decompressUsingDict(framed, dict), BUDGET_MS);
+      measured.push({
+        name,
+        framed,
+        ok: eq(eng.decompressUsingDict(framed, dict), data),
+        compress: sampleNsPerOp(() => eng.compressUsingDict(data, dict, level), BUDGET_MS),
+        decompress: sampleNsPerOp(() => eng.decompressUsingDict(framed, dict), BUDGET_MS),
+      });
+    }
+    const compressNs = fastestOverCommonCount(...measured.map((m) => m.compress));
+    const decompressNs = fastestOverCommonCount(...measured.map((m) => m.decompress));
+    measured.forEach(({ name, framed, ok }, i) => {
+      const cNs = compressNs[i];
+      const dNs = decompressNs[i];
       const ratio = framed.length / Math.max(1, data.length);
       console.log(
         `REPORT_DICT scenario=${scenario} engine=${name} level=${level} ` +
@@ -185,7 +225,7 @@ for (const [scenario, data] of dictSamples) {
           `compress_ns=${cNs} decompress_ns=${dNs} roundtrip=${ok ? "ok" : "FAIL"}`,
       );
       dictRows.push({ scenario, level, name, ratio, cNs, dNs, ok });
-    }
+    });
   }
 }
 for (const [scenario, data] of dictSamples) {
@@ -233,8 +273,12 @@ for (const [scenario, data] of fixtures) {
       const streamed = streamCompressOnce(eng.CompressStreamCtor, data, level);
       const ok = eq(eng.decompress(streamed), data);
       if (!ok) { rows.push({ scenario, level, name: `${tier}-stream`, ok: false }); }
-      const sNs = fastestNsPerOp(() => streamCompressOnce(eng.CompressStreamCtor, data, level), BUDGET_MS);
-      const oNs = fastestNsPerOp(() => eng.compress(data, level), BUDGET_MS);
+      // Streaming against one-shot is a two-arm comparison like any other, so
+      // the two share a sample count before either is reduced.
+      const [sNs, oNs] = fastestOverCommonCount(
+        sampleNsPerOp(() => streamCompressOnce(eng.CompressStreamCtor, data, level), BUDGET_MS),
+        sampleNsPerOp(() => eng.compress(data, level), BUDGET_MS),
+      );
       const ratio = streamed.length / Math.max(1, data.length);
       console.log(
         `REPORT_STREAM scenario=${scenario} engine=${tier} level=${level} ` +
