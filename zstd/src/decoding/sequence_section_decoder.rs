@@ -1122,9 +1122,36 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
         let prefix_end = buf_len.checked_add(lits.len()).filter(|end| offset <= *end);
         if prefix_end.is_none() {
             // Match source reaches outside what's been written in this
-            // frame — upstream zstd's `extDict` arm. Punt back to the slow
-            // `repeat()` path; that path already routes through
-            // `repeat_from_dict` for these offsets.
+            // frame — upstream zstd's `extDict` arm. When the whole match
+            // sits inside reachable dictionary content it is one more inline
+            // copy, the way upstream keeps that branch inside
+            // `ZSTD_execSequence`; every other shape (spanning dictionary and
+            // output, out of window, out of range) stays on the slow
+            // `repeat()` path, which reports the errors.
+            if let Some(dict_src) =
+                buffer.dict_match_source(dict, lits.len(), offset, seq.ml as usize)
+            {
+                // SAFETY: as for the prefix-resident call below — parent-slice
+                // provenance for the literals, dispatch-site gate for their
+                // 16-byte read — and the match source is the dictionary slice,
+                // whose length covers `seq.ml` by the selector's contract.
+                let lit_src = unsafe { literals.as_ptr().add(lit_cur_before) };
+                unsafe {
+                    buffer
+                        .buffer_mut()
+                        .exec_sequence_inline_dict(
+                            lit_src,
+                            seq.ll as usize,
+                            dict_src,
+                            seq.ml as usize,
+                        )
+                        .map_err(DecompressBlockError::ExecuteSequencesError)?;
+                }
+                if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                    buffer.advance_output_counter((seq.ll + seq.ml) as u64);
+                }
+                return Ok(());
+            }
             buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
             buffer
                 .repeat_lookahead_prefetched(dict, offset, seq.ml as usize)

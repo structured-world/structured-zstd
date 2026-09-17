@@ -200,6 +200,87 @@ pub(crate) trait BufferBackend: Sized {
         );
     }
 
+    /// Dictionary-source variant of [`Self::exec_sequence_inline`], for a
+    /// match lying wholly inside dictionary content as selected by
+    /// `DecodeBuffer::dict_match_source`. Upstream keeps this case inline
+    /// too (`zstd_decompress_block.c` 1052-1058): rebase onto the dictionary
+    /// and, when the match ends before `dictEnd`, one copy and done.
+    ///
+    /// `dict_src` runs from the match's first byte to the end of the
+    /// dictionary. The match is its first `match_length` bytes; the rest is
+    /// the room a wildcopy may overshoot the SOURCE into, and when there is
+    /// not enough of it the copy is the exact one — which is why upstream
+    /// uses `memmove` here rather than its wildcopy.
+    ///
+    /// The dictionary is a separate allocation from the output, so no overlap
+    /// is possible and the offset plays no part in choosing the copy. That is
+    /// what lets this be written once here, in terms of the same
+    /// `inline_exec_base_ptr` / `inline_exec_commit` hooks every opted-in
+    /// backend already provides, rather than once per backend: the only thing
+    /// that differs between them is where the output lives, and those hooks
+    /// already answer it.
+    ///
+    /// # Safety
+    /// Literal-source preconditions as for [`Self::exec_sequence_inline`].
+    /// `dict_src` must be valid for reads of its whole length, and
+    /// `dict_src.len() >= match_length`.
+    #[inline(always)]
+    unsafe fn exec_sequence_inline_dict(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        dict_src: &[u8],
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        // Same 16-byte helpers either way; x86 keeps its SSE2 definitions and
+        // gates the portable module out of non-test builds.
+        #[cfg(not(target_arch = "x86_64"))]
+        use super::exec_sequence_inline::portable::{copy16, wildcopy_no_overlap};
+        #[cfg(target_arch = "x86_64")]
+        use super::exec_sequence_inline::x86::{copy16, wildcopy_no_overlap};
+        const MAX_WILDCOPY_OVERSHOOT: usize = 15;
+        debug_assert!(match_length >= 1);
+        debug_assert!(dict_src.len() >= match_length);
+        let cap = self.cap();
+        let tail = self.tail();
+        let total = sequence_output_fits(lit_length, match_length, tail, cap, 0)?;
+
+        // SAFETY: `sequence_output_fits` bounds every destination write (plus
+        // the <= 15-byte wildcopy overshoot, which the tight-tail branch takes
+        // over when it would not fit) inside the backend's writable region,
+        // which `inline_exec_base_ptr` addresses. `lit_src` carries the parent
+        // literals buffer's provenance and the dispatch-site gate covers its
+        // 16-byte unconditional read. The match source is the dictionary
+        // slice, read within its own length.
+        unsafe {
+            let base = self.inline_exec_base_ptr();
+            let op_lit = base.add(tail);
+            let dict_ptr = dict_src.as_ptr();
+            if total + MAX_WILDCOPY_OVERSHOOT > cap - tail {
+                // Tight tail: an overshoot would run past the writable region.
+                core::ptr::copy_nonoverlapping(lit_src, op_lit, lit_length);
+                core::ptr::copy_nonoverlapping(dict_ptr, op_lit.add(lit_length), match_length);
+            } else {
+                copy16(op_lit, lit_src);
+                if lit_length > 16 {
+                    wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+                }
+                let op_match = base.add(tail + lit_length);
+                // A wildcopy reads the match length rounded up to its stride;
+                // where the dictionary ends sooner there is nothing to read,
+                // so that case copies exactly. Upstream reaches the same
+                // conclusion by using `memmove` on this branch.
+                if dict_src.len() >= match_length.next_multiple_of(16) {
+                    wildcopy_no_overlap(op_match, dict_ptr, match_length);
+                } else {
+                    core::ptr::copy_nonoverlapping(dict_ptr, op_match, match_length);
+                }
+            }
+            self.inline_exec_commit(tail + total);
+        }
+        Ok(())
+    }
+
     /// AVX2-tier variant of [`Self::exec_sequence_inline`]. Same
     /// contract but the **no-overlap match-copy** path (`offset >= 32`)
     /// emits 32-byte ymm stores via `wildcopy_no_overlap_avx2`. Issue

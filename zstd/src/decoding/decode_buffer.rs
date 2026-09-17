@@ -307,6 +307,61 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
+    /// Dictionary content from a match's first byte to the end of the
+    /// dictionary, for the inline sequence executor. The match is the first
+    /// `match_length` bytes; what follows is the room a wildcopy may overshoot
+    /// into, which is why the tail comes back rather than just the match — a
+    /// copy that would read past the dictionary has to be the exact one.
+    ///
+    /// `None` sends the sequence to the cold path, which is where every other
+    /// shape is handled and where the errors are reported: no dictionary, the
+    /// dictionary already out of the window, a match reaching back past the
+    /// dictionary's start, and a match that continues out of the dictionary
+    /// into the output.
+    ///
+    /// `lit_length` is the literal run this sequence writes BEFORE its match,
+    /// so the source is measured from the post-literal position — upstream
+    /// measures the same distance from `oLitEnd` (`zstd_decompress_block.c`
+    /// 1052-1058, the extDict branch), and its
+    /// `match + matchLength <= dictEnd` is the `match_length <=
+    /// bytes_from_dict` test here.
+    ///
+    /// The window gate counts those literals too, which is exactly what the
+    /// cold path sees after pushing them: the two agree on which sequences
+    /// are dictionary-resident, so routing one here never accepts what the
+    /// cold path would have refused.
+    #[inline(always)]
+    pub(crate) fn dict_match_source<'d>(
+        &self,
+        dict: Option<&'d crate::decoding::dictionary::Dictionary>,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Option<&'d [u8]> {
+        let after_literals = self.buffer.len().checked_add(lit_length)?;
+        // Reaches back no further than the output holds: not a dictionary
+        // match at all, and the inline executor's own source covers it.
+        let bytes_from_dict = offset.checked_sub(after_literals)?;
+        if bytes_from_dict == 0 {
+            return None;
+        }
+
+        let total_output = self.total_output_counter.max(self.buffer.len() as u64);
+        if total_output + lit_length as u64 > self.window_size as u64 {
+            return None;
+        }
+
+        let dict_content = self.dict_content(dict);
+        // Starts before the dictionary does, or runs out of it into the
+        // output. Both are the cold path's to resolve.
+        if bytes_from_dict > dict_content.len() || match_length > bytes_from_dict {
+            return None;
+        }
+
+        let low = dict_content.len() - bytes_from_dict;
+        Some(&dict_content[low..])
+    }
+
     /// Return the last `n` bytes of the visible buffer as two
     /// contiguous slices (`(s1, s2)` matching the wrap semantics of
     /// the underlying backend). `n` must be `<= self.len()`. Used by

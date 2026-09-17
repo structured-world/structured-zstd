@@ -610,3 +610,162 @@ fn a_reset_clears_a_digest_written_around_the_hashing_flag() {
         "the next frame would append to the previous frame's digest"
     );
 }
+
+/// `dict_match_source` decides which sequences the inline executor may copy
+/// itself. It hands back a source ONLY for a match lying wholly inside
+/// reachable dictionary content; every other shape belongs to the cold path,
+/// which is where the errors are reported. Getting that division wrong is
+/// either a silent wrong-bytes decode or a refusal to decode valid input, so
+/// each arm of the decision is pinned here.
+mod dict_match_source {
+    use super::*;
+    use crate::decoding::dictionary::Dictionary;
+
+    const DICT_LEN: usize = 64;
+    const PRODUCED: usize = 10;
+
+    /// Dictionary whose byte at index `i` is `i`, so an asserted slice names
+    /// the exact window of dictionary content that was selected.
+    fn counted_dict() -> crate::decoding::dictionary::DictionaryHandle {
+        let content: Vec<u8> = (0..DICT_LEN).map(|i| i as u8).collect();
+        Dictionary::from_raw_content(7, content)
+            .expect("raw-content dictionary")
+            .into_handle()
+    }
+
+    fn buffer_with(window: usize) -> DecodeBuffer<RingBuffer> {
+        let mut buf = DecodeBuffer::<RingBuffer>::new(window);
+        buf.push(&[0xEEu8; PRODUCED]);
+        buf
+    }
+
+    #[test]
+    fn a_match_inside_the_dictionary_yields_its_exact_bytes() {
+        let handle = counted_dict();
+        let buf = buffer_with(1024);
+
+        // 10 produced + 5 literals puts the match at position 15; an offset
+        // of 20 reaches 5 bytes back past the output, so the source is the
+        // dictionary's last 5 bytes.
+        let src = buf
+            .dict_match_source(Some(handle.as_dict()), 5, 20, 5)
+            .expect("a match wholly inside the dictionary is the inline case");
+        assert_eq!(&src[..5], &[59, 60, 61, 62, 63]);
+        // The match ends exactly at the dictionary's end, so a wildcopy has
+        // no room to overshoot into and the caller must copy exactly.
+        assert_eq!(src.len(), 5, "no room past the match");
+    }
+
+    #[test]
+    fn the_source_carries_the_room_left_past_the_match() {
+        // Same reach into the dictionary, a shorter match: 4 bytes of match
+        // and 1 byte of room, which is what tells the caller whether a
+        // wildcopy may overshoot the source.
+        let handle = counted_dict();
+        let buf = buffer_with(1024);
+
+        let src = buf
+            .dict_match_source(Some(handle.as_dict()), 5, 20, 4)
+            .expect("dictionary-resident");
+        assert_eq!(&src[..4], &[59, 60, 61, 62]);
+        assert_eq!(src.len() - 4, 1, "one byte of room past the match");
+    }
+
+    #[test]
+    fn the_literal_run_moves_the_source_window() {
+        // Same offset, different literal run: the match is measured from
+        // AFTER the literals, so the selected dictionary window shifts by
+        // exactly the literal length. Ignoring the literals here would copy
+        // the wrong bytes while still looking in range.
+        let handle = counted_dict();
+        let buf = buffer_with(1024);
+
+        let with_literals = buf
+            .dict_match_source(Some(handle.as_dict()), 5, 20, 4)
+            .expect("dictionary-resident with the literals counted");
+        let without_literals = buf
+            .dict_match_source(Some(handle.as_dict()), 0, 20, 4)
+            .expect("dictionary-resident with no literals");
+        assert_eq!(&with_literals[..4], &[59, 60, 61, 62]);
+        assert_eq!(&without_literals[..4], &[54, 55, 56, 57]);
+    }
+
+    #[test]
+    fn a_match_running_out_of_the_dictionary_is_left_to_the_cold_path() {
+        // Reaches 5 bytes into the dictionary but is 6 long, so it continues
+        // into the output. Upstream splits that case in two copies; we hand
+        // the whole sequence back.
+        let handle = counted_dict();
+        let buf = buffer_with(1024);
+        assert!(
+            buf.dict_match_source(Some(handle.as_dict()), 5, 20, 6)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_match_reaching_past_the_dictionary_start_is_left_to_the_cold_path() {
+        // 100 back from position 15 is 85 bytes before the output, further
+        // than the 64-byte dictionary reaches. The cold path reports it.
+        let handle = counted_dict();
+        let buf = buffer_with(1024);
+        assert!(
+            buf.dict_match_source(Some(handle.as_dict()), 5, 100, 4)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_match_inside_the_output_is_not_a_dictionary_match() {
+        // Offset 12 from position 15 stays within what the output already
+        // holds; the inline executor's own source covers it.
+        let handle = counted_dict();
+        let buf = buffer_with(1024);
+        assert!(
+            buf.dict_match_source(Some(handle.as_dict()), 5, 12, 4)
+                .is_none()
+        );
+        // The exact boundary: an offset equal to the post-literal position
+        // reaches back to the first produced byte, still inside the output.
+        assert!(
+            buf.dict_match_source(Some(handle.as_dict()), 5, PRODUCED + 5, 4)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_dictionary_yields_nothing() {
+        let buf = buffer_with(1024);
+        assert!(buf.dict_match_source(None, 5, 20, 4).is_none());
+    }
+
+    #[test]
+    fn a_dictionary_out_of_the_window_yields_nothing() {
+        // Window 8, but 10 bytes are already produced: the dictionary has
+        // fallen out of reach and the cold path must say so rather than the
+        // inline executor quietly copying from it.
+        let handle = counted_dict();
+        let buf = buffer_with(8);
+        assert!(
+            buf.dict_match_source(Some(handle.as_dict()), 5, 20, 4)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_window_gate_counts_the_literals_about_to_be_written() {
+        // 10 produced, window 12. With no literals the dictionary is still
+        // reachable; with 5 literals the sequence crosses the window, which
+        // is what the cold path would see once it had pushed them.
+        let handle = counted_dict();
+        let buf = buffer_with(12);
+        assert!(
+            buf.dict_match_source(Some(handle.as_dict()), 0, 20, 4)
+                .is_some()
+        );
+        assert!(
+            buf.dict_match_source(Some(handle.as_dict()), 5, 20, 4)
+                .is_none()
+        );
+    }
+}

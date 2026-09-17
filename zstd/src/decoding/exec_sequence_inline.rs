@@ -164,6 +164,89 @@ macro_rules! exec_sequence_avx2_inline {
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 pub(crate) use exec_sequence_avx2_inline;
 
+/// AVX2-tier body for a sequence whose match lies wholly inside dictionary
+/// content, as selected by
+/// [`crate::decoding::decode_buffer::DecodeBuffer::dict_match_source`].
+/// Upstream copies this case inside `ZSTD_execSequence` too
+/// (`zstd_decompress_block.c` 1052-1058): rebase onto the dictionary and, when
+/// the match ends before `dictEnd`, one copy and done.
+///
+/// `$dict_src` is the dictionary from the match's first byte to the end of the
+/// dictionary. The match is its first `$match_length` bytes; the rest is the
+/// room a wildcopy may overshoot the SOURCE into. There is no overlap to
+/// handle — the dictionary is a separate allocation from the output — so the
+/// offset plays no part in choosing the copy, only that room does.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+macro_rules! exec_sequence_avx2_dict_inline {
+    ($buffer:expr, $lit_src:expr, $lit_length:expr, $dict_src:expr, $match_length:expr) => {{
+        use crate::decoding::buffer_backend::sequence_output_fits;
+        use crate::decoding::exec_sequence_inline::x86::{
+            copy16, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
+        };
+        const MAX_WILDCOPY_OVERSHOOT: usize = 31;
+        let lit_length_v: usize = $lit_length;
+        let match_length_v: usize = $match_length;
+        let lit_src_v: *const u8 = $lit_src;
+        let dict_src_v: &[u8] = $dict_src;
+        debug_assert!(dict_src_v.len() >= match_length_v);
+        let backend = $buffer.buffer_mut();
+        let cap = backend.cap();
+        let tail = backend.tail();
+        match sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0) {
+            Err(e) => Err(e),
+            Ok(total) => {
+                // SAFETY: as for `exec_sequence_avx2_inline` on the destination
+                // side — linear backend, `sequence_output_fits` validated
+                // `tail + total <= cap`. The source side is the dictionary
+                // slice, valid for reads of its whole length, and every read
+                // below is bounded by that length.
+                unsafe {
+                    let base = backend.inline_exec_base_ptr();
+                    let dict_ptr = dict_src_v.as_ptr();
+                    let room = dict_src_v.len();
+                    if total + MAX_WILDCOPY_OVERSHOOT > cap - tail {
+                        // Tight tail: an overshoot would run past the output.
+                        // Copy both halves exactly; the dictionary source
+                        // cannot overlap the destination.
+                        let op = base.add(tail);
+                        core::ptr::copy_nonoverlapping(lit_src_v, op, lit_length_v);
+                        core::ptr::copy_nonoverlapping(
+                            dict_ptr,
+                            op.add(lit_length_v),
+                            match_length_v,
+                        );
+                    } else {
+                        let op_lit = base.add(tail);
+                        let op_match = base.add(tail + lit_length_v);
+                        copy16(op_lit, lit_src_v);
+                        if lit_length_v > 16 {
+                            wildcopy_no_overlap(
+                                op_lit.add(16),
+                                lit_src_v.add(16),
+                                lit_length_v - 16,
+                            );
+                        }
+                        // A wildcopy reads up to the match length rounded up to
+                        // its stride; past the dictionary's end there is nothing
+                        // to read, so that case copies exactly.
+                        if room >= match_length_v.next_multiple_of(32) {
+                            wildcopy_no_overlap_avx2(op_match, dict_ptr, match_length_v);
+                        } else if room >= match_length_v.next_multiple_of(16) {
+                            wildcopy_no_overlap(op_match, dict_ptr, match_length_v);
+                        } else {
+                            core::ptr::copy_nonoverlapping(dict_ptr, op_match, match_length_v);
+                        }
+                    }
+                    backend.inline_exec_commit(tail + total);
+                }
+                Ok(())
+            }
+        }
+    }};
+}
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+pub(crate) use exec_sequence_avx2_dict_inline;
+
 /// SSE2 twin of [`exec_sequence_avx2_inline`] for the BMI2 tier (which has
 /// no AVX2): 16-byte xmm match-copy only (`offset >= 16`), so the WILDCOPY
 /// destination overshoot stays 15 bytes (vs 31 for the ymm path). Mirrors

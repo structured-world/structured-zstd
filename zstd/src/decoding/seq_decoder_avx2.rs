@@ -18,7 +18,7 @@
 
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
-use super::exec_sequence_inline::exec_sequence_avx2_inline;
+use super::exec_sequence_inline::{exec_sequence_avx2_dict_inline, exec_sequence_avx2_inline};
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
     ADVANCE, ADVANCE_MASK, ExecSeq, SeqStreamSetup, init_sequence_stream,
@@ -295,6 +295,28 @@ macro_rules! execute_one_body {
                     // Inline path bypasses the wrapper's output counter; keep it
                     // current for backends that read it (Ring/Flat resume +
                     // dict gate). Const-folded away for UserSliceBackend.
+                    if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                        $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                    }
+                    break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
+                }
+
+                // Reaches past the output into the dictionary. When the whole
+                // match sits inside reachable dictionary content the copy is
+                // one more inline copy, the way upstream handles its extDict
+                // branch; anything else is the cold path's.
+                if let Some(dict_src) =
+                    $buffer.dict_match_source($dict, seq_ll_v as usize, offset, seq_ml_v as usize)
+                {
+                    // SAFETY: parent-slice provenance, as above.
+                    let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
+                    let r = exec_sequence_avx2_dict_inline!(
+                        $buffer,
+                        lit_src,
+                        seq_ll_v as usize,
+                        dict_src,
+                        seq_ml_v as usize
+                    );
                     if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
                         $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
                     }

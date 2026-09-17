@@ -988,13 +988,13 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         new_len <= self.max_capacity
     }
 
-    #[cfg(target_arch = "x86_64")]
+    // Not gated on x86: the bodies carry nothing architecture-specific, and
+    // the dictionary-source inline copy is a portable consumer of them.
     #[inline(always)]
     unsafe fn inline_exec_base_ptr(&mut self) -> *mut u8 {
         self.buf.as_ptr()
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn inline_exec_commit(&mut self, new_tail: usize) {
         // `inline_exec_ok` guaranteed `new_tail < cap`, so the wrap

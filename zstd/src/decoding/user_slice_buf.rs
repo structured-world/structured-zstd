@@ -594,13 +594,13 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         Ok(())
     }
 
-    #[cfg(target_arch = "x86_64")]
+    // Not gated on x86: the bodies carry nothing architecture-specific, and
+    // the dictionary-source inline copy is a portable consumer of them.
     #[inline(always)]
     unsafe fn inline_exec_base_ptr(&mut self) -> *mut u8 {
         self.slice.as_mut_ptr()
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn inline_exec_commit(&mut self, new_tail: usize) {
         self.tail = new_tail;
