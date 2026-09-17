@@ -202,7 +202,7 @@
   <body>
     <main>
       <h1>Rust vs C FFI Relative Dashboard</h1>
-      <p id="intro-copy">Default view tracks Rust/FFI relative deltas by target and scenario. Parity band is loading from payload.</p>
+      <p id="intro-copy">Default view tracks Rust/FFI relative deltas by target and scenario, each measured against libzstd within the same run. Timings are the fastest of that run's samples; hover a point for the spread behind it. Parity band is loading from payload.</p>
 
       <section class="stats">
         <div class="card">
@@ -691,7 +691,11 @@
           const seriesKey = row.key || `${row.metric || "metric"}|${row.stage || "stage"}|${row.scenario || "scenario"}|${row.level || "level"}|${row.source || "none"}`;
           const id = `${target}:${seriesKey}`;
           if (!grouped.has(id)) grouped.set(id, new Map());
-          grouped.get(id).set(runKey, row.delta_ratio);
+          // The point's own measurement noise travels beside its value so the
+          // tooltip can show it on hover. Keeping it off the plot itself is
+          // deliberate: it answers a question asked about one point, not a
+          // dimension worth spending chart space on.
+          grouped.get(id).set(runKey, { value: row.delta_ratio, noise: sampleNoiseNote(row) });
         }
 
         const labels = uniq(records.map((r) => r.generated_at || "local-run"));
@@ -699,7 +703,8 @@
           const hue = 35 + idx * 55;
           return {
             label: seriesId,
-            data: labels.map((label) => timeline.get(label) ?? null),
+            data: labels.map((label) => timeline.get(label)?.value ?? null),
+            sampleNoise: labels.map((label) => timeline.get(label)?.noise ?? ""),
             spanGaps: true,
             borderWidth: 2,
             pointRadius: 3,
@@ -782,6 +787,31 @@
         return row.delta_ratio < BAND_LOW || row.delta_ratio > BAND_HIGH;
       }
 
+      // How much of a listed move could be the measurement rather than the
+      // code. Each timing cell publishes the spread of the raw samples behind
+      // it, and interference only ever makes a sample SLOWER, so the distance
+      // from a side's minimum (the figure that is reported) up to its median is
+      // that side's own noise on this run. A delta no larger than the two sides
+      // combined is not evidence of a change.
+      function sampleTailPercent(spread) {
+        if (!spread) return null;
+        const min = spread.min_ns;
+        const median = spread.median_ns;
+        if (typeof min !== "number" || typeof median !== "number") return null;
+        if (!(min > 0)) return null;
+        return ((median - min) / min) * 100;
+      }
+
+      function sampleNoiseNote(row) {
+        const ours = sampleTailPercent(row.rust_sample_ns);
+        const reference = sampleTailPercent(row.ffi_sample_ns);
+        if (ours === null && reference === null) return "";
+        const parts = [];
+        if (ours !== null) parts.push(`ours +${ours.toFixed(1)}%`);
+        if (reference !== null) parts.push(`libzstd +${reference.toFixed(1)}%`);
+        return ` [sample tail: ${parts.join(", ")}]`;
+      }
+
       function updateStatus(filtered) {
         const numericRows = filtered.filter((row) => typeof row.delta_ratio === "number");
         if (!numericRows.length) {
@@ -812,7 +842,9 @@
               ? "within parity band"
               : "outside band (win — Rust beat FFI)";
           setStatusText(
-            `Latest delta: ${latest.delta_ratio.toFixed(4)} (${pct}%) ${label}`,
+            `Latest delta against libzstd in the same run: ` +
+              `${latest.delta_ratio.toFixed(4)} (${pct}%) ${label}` +
+              sampleNoiseNote(latest),
             regression ? "outside-band" : "near-parity",
           );
           return;
@@ -828,21 +860,30 @@
             regression,
             inBand,
             deviation,
-            text: `${compactSeriesLabel(seriesId)}: ${row.delta_ratio.toFixed(4)} (${pct}%) ${verdict}`,
+            text:
+              `${compactSeriesLabel(seriesId)}: ${row.delta_ratio.toFixed(4)} (${pct}%) ${verdict}` +
+              sampleNoiseNote(row),
           };
         });
         const status = el("status");
         status.replaceChildren();
         const regressions = perSeries.filter((item) => item.regression);
         const wins = perSeries.filter((item) => !item.regression && !item.inBand);
+        // Biggest lag behind libzstd first: this list exists to pick the level
+        // and fixture worth attacking next, so nothing is withheld from it. Each
+        // line carries its own sample spread instead, which is what says whether
+        // a number is solid enough to spend a day on.
         const focus = (regressions.length ? regressions : perSeries)
           .sort((a, b) => b.deviation - a.deviation)
           .slice(0, 8);
         const summary = document.createElement("div");
         summary.textContent =
-          `Latest series: ${perSeries.length}. Outside parity band: ${regressions.length}` +
+          `Latest snapshot, ours against libzstd measured in the same run. ` +
+          `Series: ${perSeries.length}. Outside parity band: ${regressions.length}` +
           (wins.length ? ` (notable wins not counted: ${wins.length}).` : ".") +
-          ` Showing top ${focus.length} by deviation.`;
+          (regressions.length
+            ? ` Showing the ${focus.length} furthest behind.`
+            : ` Showing top ${focus.length} by deviation.`);
         status.appendChild(summary);
         if (focus.length > 0) {
           const list = document.createElement("ul");
@@ -994,6 +1035,14 @@
             },
             plugins: {
               legend: { display: false },
+              tooltip: {
+                callbacks: {
+                  // Hovering a point is where "is this move bigger than the
+                  // measurement?" gets asked, so the point's sample spread is
+                  // answered there rather than drawn on the chart.
+                  afterLabel: (ctx) => ctx.dataset.sampleNoise?.[ctx.dataIndex] || undefined,
+                },
+              },
             },
             maintainAspectRatio: false,
           },
@@ -2087,7 +2136,10 @@
           BAND_LOW = band.delta_low;
           BAND_HIGH = band.delta_high;
         }
-        el("intro-copy").textContent = `Default view tracks Rust/FFI relative deltas by target and scenario. Parity band is ${BAND_LOW.toFixed(2)}..${BAND_HIGH.toFixed(2)}.`;
+        el("intro-copy").textContent =
+          "Default view tracks Rust/FFI relative deltas by target and scenario, each measured against libzstd within the same run. " +
+          "Timings are the fastest of that run's samples; hover a point for the spread behind it. " +
+          `Parity band is ${BAND_LOW.toFixed(2)}..${BAND_HIGH.toFixed(2)}.`;
 
         state.records = payload.records || [];
         if (!state.records.length) throw new Error("benchmark-relative.json has no records");
