@@ -81,19 +81,22 @@ macro_rules! execute_one_body {
             let resolved_offset_v: u32 = $resolved_offset;
             let literals_buffer_len_v: usize = $literals_buffer_len;
             let lit_cur_before = *$lit_cur;
-            let high = match lit_cur_before
-                .checked_add(seq_ll_v as usize)
-                .filter(|&h| h <= literals_buffer_len_v)
-            {
-                Some(h) => h,
-                None => {
-                    break 'exec_inner Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                        wanted: lit_cur_before.saturating_add(seq_ll_v as usize),
-                        have: literals_buffer_len_v,
-                    }
-                    .into());
+            // The cursor never passes the end (it only advances to a `high`
+            // this check already accepted), so the remaining literals are a
+            // subtraction that cannot underflow, and asking whether this
+            // sequence fits is one comparison against it. Taking the sum
+            // instead would need an overflow check on every sequence to say
+            // the same thing.
+            debug_assert!(lit_cur_before <= literals_buffer_len_v);
+            let lit_remaining = literals_buffer_len_v - lit_cur_before;
+            if seq_ll_v as usize > lit_remaining {
+                break 'exec_inner Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                    wanted: lit_cur_before.saturating_add(seq_ll_v as usize),
+                    have: literals_buffer_len_v,
                 }
-            };
+                .into());
+            }
+            let high = lit_cur_before + seq_ll_v as usize;
             // SAFETY: high <= literals_buffer_len_v, lit_cur_before <= high.
             let lits = unsafe { $literals_buffer.get_unchecked(lit_cur_before..high) };
             *$lit_cur = high;
@@ -104,20 +107,25 @@ macro_rules! execute_one_body {
 
             // Literal-source slack, which both inline paths need: their `copy16`
             // reads 16 bytes whatever the literal length, and the wildcopy
-            // regime reads the length rounded up to its stride.
+            // regime reads the length rounded up to its stride. Asked of the
+            // remaining literals, so it is one comparison per sequence against
+            // a subtraction already in hand. Above 16 the rounded read covers
+            // the unconditional one, so only the larger of the two is tested.
             let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-                && lit_cur_before
-                    .checked_add(16)
-                    .is_some_and(|b| b <= literals_buffer_len_v)
-                && (seq_ll_v as usize <= 16
-                    || lit_cur_before
-                        .checked_add((seq_ll_v as usize).next_multiple_of(16))
-                        .is_some_and(|b| b <= literals_buffer_len_v));
+                && if seq_ll_v as usize <= 16 {
+                    lit_remaining >= 16
+                } else {
+                    // `next_multiple_of(16)` by hand: the length is bounded by
+                    // a block, so rounding it up cannot overflow, and the
+                    // library form pays an overflow check per sequence to
+                    // establish what that bound already gives.
+                    lit_remaining >= (seq_ll_v as usize + 15) & !15
+                };
             let offset = resolved_offset_v as usize;
-            let prefix_resident = $buffer
-                .len()
-                .checked_add(lits.len())
-                .is_some_and(|end| offset <= end);
+            // Both terms are bounded (the live output by the window cap, the
+            // literal run by a block), so the sum is nowhere near `usize::MAX`
+            // on any target this builds for.
+            let prefix_resident = offset <= $buffer.len() + lits.len();
 
             if prefix_resident {
                 if inline_literals_ok
