@@ -860,9 +860,7 @@
             regression,
             inBand,
             deviation,
-            text:
-              `${compactSeriesLabel(seriesId)}: ${row.delta_ratio.toFixed(4)} (${pct}%) ${verdict}` +
-              sampleNoiseNote(row),
+            text: `${compactSeriesLabel(seriesId)}: ${row.delta_ratio.toFixed(4)} (${pct}%) ${verdict}`,
           };
         });
         const status = el("status");
@@ -870,9 +868,10 @@
         const regressions = perSeries.filter((item) => item.regression);
         const wins = perSeries.filter((item) => !item.regression && !item.inBand);
         // Biggest lag behind libzstd first: this list exists to pick the level
-        // and fixture worth attacking next, so nothing is withheld from it. Each
-        // line carries its own sample spread instead, which is what says whether
-        // a number is solid enough to spend a day on.
+        // and fixture worth attacking next, so nothing is withheld from it and
+        // each line stays down to what identifies the cell. Whether a number is
+        // solid is answered by the per-round timings in the published JSON, not
+        // by a figure crowded into this line.
         const focus = (regressions.length ? regressions : perSeries)
           .sort((a, b) => b.deviation - a.deviation)
           .slice(0, 8);
