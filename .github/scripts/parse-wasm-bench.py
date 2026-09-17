@@ -36,12 +36,6 @@ from pathlib import Path
 # belong in the vs-bokuweb section.
 REPORT_KINDS = {"REPORT": "plain", "REPORT_DICT": "dict"}
 
-# Identifies the statistic behind every timing this script publishes: the
-# fastest operation, taken over as many samples as the slowest arm of the
-# comparison managed. Change it whenever the harness changes how it reduces its
-# samples, so points from before and after cannot be plotted as one series.
-TIMING_ESTIMATOR = "sample-min-common-count"
-
 
 def parse_kv(tokens):
     """Turn `key=value` tokens into a dict; tokens without `=` are skipped."""
@@ -143,11 +137,6 @@ def main():
             "decompress_ns": decompress_ns,
             "compress_bytes_per_sec": throughput_bps(input_bytes, compress_ns),
             "decompress_bytes_per_sec": throughput_bps(input_bytes, decompress_ns),
-            # Which statistic produced the timings above. Points from different
-            # estimators are not on the same scale, so the merge keeps them
-            # apart rather than drawing a step where only the measurement
-            # changed. `ratio` needs no stamp: it is an exact byte count.
-            "estimator": TIMING_ESTIMATOR,
             "roundtrip_ok": roundtrip_ok,
             "commit_sha": commit_sha,
             "commit_message": commit_message,

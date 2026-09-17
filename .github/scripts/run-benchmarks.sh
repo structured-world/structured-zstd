@@ -324,11 +324,6 @@ commit_message = commit_message.splitlines()[0].strip() if commit_message else N
 generated_at = os.environ.get("STRUCTURED_ZSTD_BENCH_GENERATED_AT") or datetime.now(timezone.utc).isoformat()
 timing_point_count = 0
 
-# Identifies the statistic behind every timing value published here. Change it
-# whenever the estimator changes, so points from before and after cannot be
-# plotted as one series and read as a performance step.
-TIMING_ESTIMATOR = "sample-min"
-
 DELTA_LOW = 0.99
 DELTA_HIGH = 1.05
 REGRESSION_STAGES = {"compress", "decompress"}
@@ -922,12 +917,6 @@ for row in delta_rows:
             {
                 **common,
                 "metric": "throughput_bytes_per_sec",
-                # Which statistic produced the two values. Timing points made
-                # by different estimators are not on the same scale, so the
-                # merge keeps them apart rather than drawing a step where only
-                # the measurement changed. Sizes and allocation counts carry no
-                # such stamp: they are exact and unaffected.
-                "estimator": TIMING_ESTIMATOR,
                 "rust_value": row["speed"]["rust_bytes_per_sec"],
                 "ffi_value": row["speed"]["ffi_bytes_per_sec"],
                 "delta_ratio": speed_delta,
