@@ -691,7 +691,11 @@
           const seriesKey = row.key || `${row.metric || "metric"}|${row.stage || "stage"}|${row.scenario || "scenario"}|${row.level || "level"}|${row.source || "none"}`;
           const id = `${target}:${seriesKey}`;
           if (!grouped.has(id)) grouped.set(id, new Map());
-          grouped.get(id).set(runKey, row.delta_ratio);
+          // The point's own measurement noise travels beside its value so the
+          // tooltip can show it on hover. Keeping it off the plot itself is
+          // deliberate: it answers a question asked about one point, not a
+          // dimension worth spending chart space on.
+          grouped.get(id).set(runKey, { value: row.delta_ratio, noise: sampleNoiseNote(row) });
         }
 
         const labels = uniq(records.map((r) => r.generated_at || "local-run"));
@@ -699,7 +703,8 @@
           const hue = 35 + idx * 55;
           return {
             label: seriesId,
-            data: labels.map((label) => timeline.get(label) ?? null),
+            data: labels.map((label) => timeline.get(label)?.value ?? null),
+            sampleNoise: labels.map((label) => timeline.get(label)?.noise ?? ""),
             spanGaps: true,
             borderWidth: 2,
             pointRadius: 3,
@@ -782,6 +787,31 @@
         return row.delta_ratio < BAND_LOW || row.delta_ratio > BAND_HIGH;
       }
 
+      // How much of a listed move could be the measurement rather than the
+      // code. Each timing cell publishes the spread of the raw samples behind
+      // it, and interference only ever makes a sample SLOWER, so the distance
+      // from a side's minimum (the figure that is reported) up to its median is
+      // that side's own noise on this run. A delta no larger than the two sides
+      // combined is not evidence of a change.
+      function sampleTailPercent(spread) {
+        if (!spread) return null;
+        const min = spread.min_ns;
+        const median = spread.median_ns;
+        if (typeof min !== "number" || typeof median !== "number") return null;
+        if (!(min > 0)) return null;
+        return ((median - min) / min) * 100;
+      }
+
+      function sampleNoiseNote(row) {
+        const ours = sampleTailPercent(row.rust_sample_ns);
+        const reference = sampleTailPercent(row.ffi_sample_ns);
+        if (ours === null && reference === null) return "";
+        const parts = [];
+        if (ours !== null) parts.push(`ours +${ours.toFixed(1)}%`);
+        if (reference !== null) parts.push(`libzstd +${reference.toFixed(1)}%`);
+        return ` [sample tail: ${parts.join(", ")}]`;
+      }
+
       function updateStatus(filtered) {
         const numericRows = filtered.filter((row) => typeof row.delta_ratio === "number");
         if (!numericRows.length) {
@@ -812,7 +842,8 @@
               ? "within parity band"
               : "outside band (win — Rust beat FFI)";
           setStatusText(
-            `Latest delta: ${latest.delta_ratio.toFixed(4)} (${pct}%) ${label}`,
+            `Latest delta: ${latest.delta_ratio.toFixed(4)} (${pct}%) ${label}` +
+              sampleNoiseNote(latest),
             regression ? "outside-band" : "near-parity",
           );
           return;
@@ -828,7 +859,9 @@
             regression,
             inBand,
             deviation,
-            text: `${compactSeriesLabel(seriesId)}: ${row.delta_ratio.toFixed(4)} (${pct}%) ${verdict}`,
+            text:
+              `${compactSeriesLabel(seriesId)}: ${row.delta_ratio.toFixed(4)} (${pct}%) ${verdict}` +
+              sampleNoiseNote(row),
           };
         });
         const status = el("status");
@@ -994,6 +1027,14 @@
             },
             plugins: {
               legend: { display: false },
+              tooltip: {
+                callbacks: {
+                  // Hovering a point is where "is this move bigger than the
+                  // measurement?" gets asked, so the point's sample spread is
+                  // answered there rather than drawn on the chart.
+                  afterLabel: (ctx) => ctx.dataset.sampleNoise?.[ctx.dataIndex] || undefined,
+                },
+              },
             },
             maintainAspectRatio: false,
           },

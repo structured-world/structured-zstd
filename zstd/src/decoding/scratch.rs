@@ -384,12 +384,16 @@ enum TableSource {
 /// of the RFC 8878 default distribution (`Predefined`). The literals Huffman
 /// table has no predefined form in the format, which is why it carries the
 /// two-state [`TableSource`] instead. See [`FSEScratch`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy)]
 enum SeqTableSource {
     Local,
     Dict,
+    /// Carries the resolved table rather than re-deriving it. The cache answers
+    /// out of a `OnceLock`, and an axis stays `Predefined` across the Repeat
+    /// blocks that follow, so re-entering the lock every block would pay a
+    /// synchronised load for a table that cannot change.
     #[cfg(feature = "std")]
-    Predefined,
+    Predefined(&'static SeqFSETable),
 }
 
 /// Unwrap the call-scoped dictionary borrow at a `Dict`-sourced read. A `Dict`
@@ -508,7 +512,7 @@ impl FSEScratch {
             SeqTableSource::Local => &self.literal_lengths,
             SeqTableSource::Dict => &expect_dict(dict).fse.literal_lengths,
             #[cfg(feature = "std")]
-            SeqTableSource::Predefined => super::sequence_section_decoder::predefined_ll_table(),
+            SeqTableSource::Predefined(table) => table,
         }
     }
 
@@ -518,7 +522,7 @@ impl FSEScratch {
             SeqTableSource::Local => &self.offsets,
             SeqTableSource::Dict => &expect_dict(dict).fse.offsets,
             #[cfg(feature = "std")]
-            SeqTableSource::Predefined => super::sequence_section_decoder::predefined_of_table().0,
+            SeqTableSource::Predefined(table) => table,
         }
     }
 
@@ -528,7 +532,7 @@ impl FSEScratch {
             SeqTableSource::Local => &self.match_lengths,
             SeqTableSource::Dict => &expect_dict(dict).fse.match_lengths,
             #[cfg(feature = "std")]
-            SeqTableSource::Predefined => super::sequence_section_decoder::predefined_ml_table(),
+            SeqTableSource::Predefined(table) => table,
         }
     }
 
@@ -571,24 +575,25 @@ impl FSEScratch {
     }
 
     /// Point an axis at the cached RFC 8878 default table. A `Predefined`-mode
-    /// block costs this flag write instead of copying the table into the local
-    /// buffer, mirroring upstream pointing its axis at the static default
-    /// table. A later Repeat-mode block leaves the source untouched and so
-    /// keeps reading the same cached table, which is what Repeat means.
+    /// block costs this reference write instead of copying the table into the
+    /// local buffer, mirroring upstream pointing its axis at the static default
+    /// table. The reference is kept rather than re-derived, so the Repeat-mode
+    /// blocks that follow read it straight out: they leave the source untouched
+    /// and go on seeing the same table, which is what Repeat means.
     #[cfg(feature = "std")]
     #[inline]
-    pub(crate) fn mark_ll_predefined(&mut self) {
-        self.ll_source = SeqTableSource::Predefined;
+    pub(crate) fn mark_ll_predefined(&mut self, table: &'static SeqFSETable) {
+        self.ll_source = SeqTableSource::Predefined(table);
     }
     #[cfg(feature = "std")]
     #[inline]
-    pub(crate) fn mark_of_predefined(&mut self) {
-        self.of_source = SeqTableSource::Predefined;
+    pub(crate) fn mark_of_predefined(&mut self, table: &'static SeqFSETable) {
+        self.of_source = SeqTableSource::Predefined(table);
     }
     #[cfg(feature = "std")]
     #[inline]
-    pub(crate) fn mark_ml_predefined(&mut self) {
-        self.ml_source = SeqTableSource::Predefined;
+    pub(crate) fn mark_ml_predefined(&mut self, table: &'static SeqFSETable) {
+        self.ml_source = SeqTableSource::Predefined(table);
     }
 }
 

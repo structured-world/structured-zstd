@@ -1500,7 +1500,7 @@ pub(crate) fn maybe_update_fse_tables(
             // Default LL distribution → read the cached table in place.
             #[cfg(feature = "std")]
             {
-                scratch.mark_ll_predefined();
+                scratch.mark_ll_predefined(predefined_ll_table());
             }
             #[cfg(not(feature = "std"))]
             {
@@ -1568,7 +1568,7 @@ pub(crate) fn maybe_update_fse_tables(
             // probes per block for this one axis.
             #[cfg(feature = "std")]
             {
-                scratch.mark_of_predefined();
+                scratch.mark_of_predefined(predefined_of_table().0);
                 scratch.offsets_long_share = PREDEFINED_OF_LONG_SHARE;
             }
             #[cfg(not(feature = "std"))]
@@ -1624,7 +1624,7 @@ pub(crate) fn maybe_update_fse_tables(
             // Default ML distribution → read the cached table in place.
             #[cfg(feature = "std")]
             {
-                scratch.mark_ml_predefined();
+                scratch.mark_ml_predefined(predefined_ml_table());
             }
             #[cfg(not(feature = "std"))]
             {

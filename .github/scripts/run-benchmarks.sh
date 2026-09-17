@@ -1161,12 +1161,21 @@ lines.extend([
     "",
     "## Timing Metrics",
     "",
-    "| Benchmark | ms/iter |",
-    "| --- | ---: |",
+    "The reported time is the minimum over criterion's samples: interference "
+    "can only make a sample slower, so the lower edge is the cost of the code. "
+    "The median and maximum say how much tail the machine added on this run, "
+    "which is the scale below which a difference between runs means nothing.",
+    "",
+    "| Benchmark | ms/iter (min) | median ns | max ns |",
+    "| --- | ---: | ---: | ---: |",
 ])
 
 for name, ms in sorted(timings):
-    lines.append(f"| `{name}` | {ms:.3f} |")
+    # Guaranteed present: a benchmark without samples fails the run above.
+    spread = criterion_samples[name]
+    lines.append(
+        f"| `{name}` | {ms:.3f} | {spread['median_ns']:.1f} | {spread['max_ns']:.1f} |"
+    )
 
 with open("benchmark-report.md", "w") as f:
     f.write("\n".join(lines) + "\n")
