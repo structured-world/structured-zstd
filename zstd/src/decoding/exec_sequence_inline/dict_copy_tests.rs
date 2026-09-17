@@ -2,9 +2,15 @@
 //! read out of the dictionary. It picks between two copy shapes by how much
 //! dictionary is left past the match: enough for the wildcopy stride to
 //! over-read, or not, in which case the copy is exact. Dispatch alone never
-//! reaches both, and on a given host it reaches only the tier that host
-//! selects, so these drive each shape and each available tier directly and
-//! check the bytes against what the sequence defines.
+//! reaches both, so these drive each shape directly and check the bytes
+//! against what the sequence defines.
+//!
+//! Scope, since it is easy to read more into these than they cover: they
+//! exercise the copy BODIES, the tier-neutral one and the ymm one against it.
+//! The four decoder monomorphs that reach those bodies, each with its own gate
+//! and its own argument plumbing, are a separate question, and the answer to it
+//! is `frame_decoder::tests::every_cpu_tier_decodes_a_dictionary_frame_the_same_way`,
+//! which decodes one dictionary frame on every tier the host can execute.
 
 use crate::decoding::buffer_backend::BufferBackend;
 use crate::decoding::decode_buffer::DecodeBuffer;
