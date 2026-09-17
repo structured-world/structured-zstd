@@ -842,7 +842,8 @@
               ? "within parity band"
               : "outside band (win — Rust beat FFI)";
           setStatusText(
-            `Latest delta: ${latest.delta_ratio.toFixed(4)} (${pct}%) ${label}` +
+            `Latest delta against libzstd in the same run: ` +
+              `${latest.delta_ratio.toFixed(4)} (${pct}%) ${label}` +
               sampleNoiseNote(latest),
             regression ? "outside-band" : "near-parity",
           );
@@ -877,9 +878,12 @@
           .slice(0, 8);
         const summary = document.createElement("div");
         summary.textContent =
-          `Latest series: ${perSeries.length}. Outside parity band: ${regressions.length}` +
+          `Latest snapshot, ours against libzstd measured in the same run. ` +
+          `Series: ${perSeries.length}. Outside parity band: ${regressions.length}` +
           (wins.length ? ` (notable wins not counted: ${wins.length}).` : ".") +
-          ` Showing top ${focus.length} by deviation.`;
+          (regressions.length
+            ? ` Showing the ${focus.length} furthest behind: the levels and fixtures to attack next.`
+            : ` Showing top ${focus.length} by deviation.`);
         status.appendChild(summary);
         if (focus.length > 0) {
           const list = document.createElement("ul");
