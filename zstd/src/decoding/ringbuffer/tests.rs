@@ -133,6 +133,45 @@ fn inline_exec_ok_admits_contiguous_wrapped_sequence() {
 }
 
 #[test]
+fn a_wrapped_ring_admits_a_dictionary_match_the_output_gate_refuses() {
+    // A dictionary match reads from a separate allocation, so the source bound
+    // the output-resident gate applies has nothing to say about it. Asking that
+    // gate would refuse every dictionary match on a wrapped ring: the source
+    // bound is `offset <= tail + lit`, while reaching the dictionary at all
+    // means reaching back further than the output holds, and once wrapped the
+    // output holds more than `tail`. The dictionary gate asks only for a
+    // contiguous destination and the block ceiling.
+    use super::super::buffer_backend::BufferBackend;
+    let mut rb = RingBuffer::new();
+    rb.reserve(4096);
+    let cap = rb.cap;
+    rb.head = cap - 64;
+    rb.tail = 32;
+    // Same write as the wrapped case above, with an offset that reaches past
+    // the output into dictionary territory.
+    assert!(
+        !rb.inline_exec_ok(16, 16, 4000),
+        "the output-resident gate refuses a source it cannot place in the ring"
+    );
+    assert!(
+        rb.inline_exec_dict_ok(16, 16),
+        "the dictionary gate must admit the same write, whose source is not in \
+         the ring at all"
+    );
+    // What the dictionary gate does still answer: the destination must be
+    // contiguous, and the block ceiling still applies.
+    assert!(
+        !rb.inline_exec_dict_ok(16, cap),
+        "a write reaching the upper live segment must be refused"
+    );
+    rb.set_max_capacity(rb.len() + 8);
+    assert!(
+        !rb.inline_exec_dict_ok(16, 16),
+        "a write past the per-block output ceiling must be refused"
+    );
+}
+
+#[test]
 fn smoke() {
     let mut rb = RingBuffer::new();
 
