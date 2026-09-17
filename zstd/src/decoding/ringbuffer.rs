@@ -956,6 +956,18 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         //   subset upstream zstd handles with its fast `ZSTD_execSequence` body;
         //   only its `execSequenceEnd` near the buffer boundary is the
         //   equivalent of our fallback.
+        // Everything except the source bound is what a dictionary match asks
+        // for too, so it lives in `inline_exec_dict_ok` and this adds the one
+        // condition that separates the two: where the match source comes from.
+        // Unwrapped, the caller's `offset <= live + lit` invariant already puts
+        // it at `>= head`; wrapped, `offset <= tail + lit` keeps
+        // `tail + lit - offset >= 0`, in the contiguous lower live segment.
+        self.inline_exec_dict_ok(lit_length, match_length)
+            && (self.head <= self.tail || offset <= self.tail + lit_length)
+    }
+
+    #[inline(always)]
+    fn inline_exec_dict_ok(&self, lit_length: usize, match_length: usize) -> bool {
         const INLINE_EXEC_MAX_OVERSHOOT: usize = 31;
         let Some(end) = self
             .tail
@@ -969,8 +981,8 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
             end < self.cap
         } else {
             // Wrapped: write + overshoot stays in the free gap before `head`,
-            // and the match source stays in the contiguous lower segment.
-            end < self.head && offset <= self.tail + lit_length
+            // so it neither wraps nor clobbers the upper live segment.
+            end < self.head
         };
         if !physical_fit {
             return false;

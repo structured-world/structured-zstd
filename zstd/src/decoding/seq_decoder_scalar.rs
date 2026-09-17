@@ -59,6 +59,7 @@ macro_rules! execute_one_body {
     (
         $buffer:expr,
         $dict:expr,
+        $dict_content:expr,
         $literals_buffer:expr,
         $lit_cur:expr,
         $literals_buffer_len:expr,
@@ -78,6 +79,7 @@ macro_rules! execute_one_body {
         super::sequence_section_decoder::execute_one_sequence_pipelined(
             $buffer,
             $dict,
+            $dict_content,
             $literals_buffer,
             $lit_cur,
             $literals_buffer_len,
@@ -111,6 +113,12 @@ pub(crate) fn decode_and_execute_sequences_scalar<'fse, B: BufferBackend>(
     let literals_buffer_len = literals_buffer.len();
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
+    // Invariant for the whole block, so it is resolved here rather than per
+    // sequence inside the dictionary-source selector.
+    let dict_content: &[u8] = match dict {
+        Some(d) => &d.dict_content,
+        None => &[],
+    };
 
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
@@ -162,6 +170,7 @@ pub(crate) fn decode_and_execute_sequences_scalar<'fse, B: BufferBackend>(
             let r = execute_one_body!(
                 buffer,
                 dict,
+                dict_content,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
@@ -190,6 +199,7 @@ pub(crate) fn decode_and_execute_sequences_scalar<'fse, B: BufferBackend>(
                 let r = execute_one_body!(
                     buffer,
                     dict,
+                    dict_content,
                     literals_buffer,
                     &mut lit_cur,
                     literals_buffer_len,
@@ -221,6 +231,7 @@ pub(crate) fn decode_and_execute_sequences_scalar<'fse, B: BufferBackend>(
             let r = execute_one_body!(
                 buffer,
                 dict,
+                dict_content,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,

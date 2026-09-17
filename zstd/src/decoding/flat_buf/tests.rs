@@ -253,6 +253,32 @@ fn try_reserve_rejects_growth_past_block_ceiling() {
     );
 }
 
+/// The inline executor writes without going through `try_reserve`, so the
+/// ceiling has to be enforced where the inline path is admitted instead. A
+/// sequence whose output would pass the ceiling must be refused there and left
+/// to the cold `push` / `repeat` route, which reports the overflow. `RingBuffer`
+/// already checks this in its own `inline_exec_ok`; a linear backend inheriting
+/// the permissive default would let a malformed block write into whatever spare
+/// capacity a pre-reserved allocation happens to carry.
+#[test]
+fn inline_exec_rejects_output_past_block_ceiling() {
+    let mut f = FlatBuf::with_capacity(4096);
+    f.extend(&[0u8; 32]);
+    let ceiling = f.len() + 100; // 132, far below the 4 KiB allocation
+    f.set_max_capacity(ceiling);
+    // 32 + 20 + 40 = 92 <= 132: within the ceiling, inline is admissible.
+    assert!(
+        f.inline_exec_ok(20, 40, 8),
+        "a sequence inside the ceiling must stay on the inline path"
+    );
+    // 32 + 20 + 400 = 452 fits the 4 KiB allocation but passes the 132 ceiling.
+    assert!(
+        !f.inline_exec_ok(20, 400, 8),
+        "a sequence whose output passes the per-block ceiling must leave the \
+             inline path, even when it fits the current allocation"
+    );
+}
+
 /// The ceiling bounds this block's OUTPUT, so a reserve past it must be
 /// rejected even when it FITS the existing allocation (no growth needed).
 /// A large pre-reserved buffer (e.g. a known-FCS single-segment frame) has

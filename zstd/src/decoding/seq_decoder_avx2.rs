@@ -219,6 +219,7 @@ macro_rules! execute_one_body {
     (
         $buffer:expr,
         $dict:expr,
+        $dict_content:expr,
         $literals_buffer:expr,
         $lit_cur:expr,
         $literals_buffer_len:expr,
@@ -257,15 +258,10 @@ macro_rules! execute_one_body {
                 break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
             }
 
-            // Upstream zstd inline-eligibility gates. `inline_exec_ok` lets a wrapping
-            // backend (RingBuffer) veto the inline path when the live region is
-            // not contiguous at `tail`; linear backends fold it to `true`.
-            let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-                && $buffer.buffer_mut().inline_exec_ok(
-                    seq_ll_v as usize,
-                    seq_ml_v as usize,
-                    resolved_offset_v as usize,
-                )
+            // Literal-source slack, which both inline paths need: their `copy16`
+            // reads 16 bytes whatever the literal length, and the wildcopy
+            // regime reads the length rounded up to its stride.
+            let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC
                 && lit_cur_before
                     .checked_add(16)
                     .is_some_and(|b| b <= literals_buffer_len_v)
@@ -273,14 +269,23 @@ macro_rules! execute_one_body {
                     || lit_cur_before
                         .checked_add((seq_ll_v as usize).next_multiple_of(16))
                         .is_some_and(|b| b <= literals_buffer_len_v));
+            let offset = resolved_offset_v as usize;
+            let prefix_resident = $buffer
+                .len()
+                .checked_add(lits.len())
+                .is_some_and(|end| offset <= end);
 
-            if inline_path_safe {
-                let buf_len = $buffer.len();
-                let offset = resolved_offset_v as usize;
-                let prefix_end_ok = buf_len
-                    .checked_add(lits.len())
-                    .is_some_and(|end| offset <= end);
-                if prefix_end_ok {
+            // `inline_exec_ok` lets a wrapping backend (RingBuffer) veto the
+            // inline path when the live region is not contiguous at `tail`;
+            // linear backends fold it to a capacity question.
+            if prefix_resident {
+                if inline_literals_ok
+                    && $buffer.buffer_mut().inline_exec_ok(
+                        seq_ll_v as usize,
+                        seq_ml_v as usize,
+                        offset,
+                    )
+                {
                     // SAFETY: parent-slice provenance; offset prefix-resident.
                     let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
                     // Inline the AVX2 exec body at the call site (no trait-method
@@ -300,28 +305,37 @@ macro_rules! execute_one_body {
                     }
                     break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
                 }
-
-                // Reaches past the output into the dictionary. When the whole
-                // match sits inside reachable dictionary content the copy is
-                // one more inline copy, the way upstream handles its extDict
-                // branch; anything else is the cold path's.
-                if let Some(dict_src) =
-                    $buffer.dict_match_source($dict, seq_ll_v as usize, offset, seq_ml_v as usize)
-                {
-                    // SAFETY: parent-slice provenance, as above.
-                    let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
-                    let r = exec_sequence_avx2_dict_inline!(
-                        $buffer,
-                        lit_src,
-                        seq_ll_v as usize,
-                        dict_src,
-                        seq_ml_v as usize
-                    );
-                    if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
-                        $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
-                    }
-                    break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
+            // Reaches past the output into the dictionary. When the whole match
+            // sits inside reachable dictionary content the copy is one more
+            // inline copy, the way upstream handles its extDict branch;
+            // anything else is the cold path's. The gate is the DICTIONARY one:
+            // the source is a separate allocation, so the output-resident bound
+            // does not apply and asking for it would refuse every such match on
+            // a wrapped ring.
+            } else if inline_literals_ok
+                && $buffer
+                    .buffer_mut()
+                    .inline_exec_dict_ok(seq_ll_v as usize, seq_ml_v as usize)
+                && let Some(dict_src) = $buffer.dict_match_source(
+                    $dict_content,
+                    seq_ll_v as usize,
+                    offset,
+                    seq_ml_v as usize,
+                )
+            {
+                // SAFETY: parent-slice provenance, as above.
+                let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
+                let r = exec_sequence_avx2_dict_inline!(
+                    $buffer,
+                    lit_src,
+                    seq_ll_v as usize,
+                    dict_src,
+                    seq_ml_v as usize
+                );
+                if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                    $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
                 }
+                break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
             }
 
             // Cold fallback.
@@ -375,6 +389,12 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
     let literals_buffer_len = literals_buffer.len();
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
+    // Invariant for the whole block, so it is resolved here rather than per
+    // sequence inside the dictionary-source selector.
+    let dict_content: &[u8] = match dict {
+        Some(d) => &d.dict_content,
+        None => &[],
+    };
 
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
@@ -440,6 +460,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             let r = execute_one_body!(
                 buffer,
                 dict,
+                dict_content,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
@@ -469,6 +490,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 let r = execute_one_body!(
                     buffer,
                     dict,
+                    dict_content,
                     literals_buffer,
                     &mut lit_cur,
                     literals_buffer_len,
@@ -520,6 +542,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             let r = execute_one_body!(
                 buffer,
                 dict,
+                dict_content,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,

@@ -9,7 +9,7 @@
 
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
-use super::exec_sequence_inline::exec_sequence_avx2_inline;
+use super::exec_sequence_inline::{exec_sequence_avx2_dict_inline, exec_sequence_avx2_inline};
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
     ADVANCE, ADVANCE_MASK, ExecSeq, SeqStreamSetup, init_sequence_stream,
@@ -63,6 +63,7 @@ macro_rules! execute_one_body {
     (
         $buffer:expr,
         $dict:expr,
+        $dict_content:expr,
         $literals_buffer:expr,
         $lit_cur:expr,
         $literals_buffer_len:expr,
@@ -97,12 +98,10 @@ macro_rules! execute_one_body {
                 break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
             }
 
-            let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-                && $buffer.buffer_mut().inline_exec_ok(
-                    seq_ll_v as usize,
-                    seq_ml_v as usize,
-                    resolved_offset_v as usize,
-                )
+            // Literal-source slack, which both inline paths need: their `copy16`
+            // reads 16 bytes whatever the literal length, and the wildcopy
+            // regime reads the length rounded up to its stride.
+            let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC
                 && lit_cur_before
                     .checked_add(16)
                     .is_some_and(|b| b <= literals_buffer_len_v)
@@ -110,14 +109,20 @@ macro_rules! execute_one_body {
                     || lit_cur_before
                         .checked_add((seq_ll_v as usize).next_multiple_of(16))
                         .is_some_and(|b| b <= literals_buffer_len_v));
+            let offset = resolved_offset_v as usize;
+            let prefix_resident = $buffer
+                .len()
+                .checked_add(lits.len())
+                .is_some_and(|end| offset <= end);
 
-            if inline_path_safe {
-                let buf_len = $buffer.len();
-                let offset = resolved_offset_v as usize;
-                let prefix_end_ok = buf_len
-                    .checked_add(lits.len())
-                    .is_some_and(|end| offset <= end);
-                if prefix_end_ok {
+            if prefix_resident {
+                if inline_literals_ok
+                    && $buffer.buffer_mut().inline_exec_ok(
+                        seq_ll_v as usize,
+                        seq_ml_v as usize,
+                        offset,
+                    )
+                {
                     // SAFETY: parent-slice provenance; offset prefix-resident.
                     let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
                     // Inline the AVX2 exec body at the call site (no trait-method
@@ -138,6 +143,34 @@ macro_rules! execute_one_body {
                     }
                     break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
                 }
+            // A match reaching past the output into reachable dictionary content
+            // is one more inline copy, on the same ymm body this tier uses for
+            // the output-resident case.
+            } else if inline_literals_ok
+                && $buffer
+                    .buffer_mut()
+                    .inline_exec_dict_ok(seq_ll_v as usize, seq_ml_v as usize)
+                && let Some(dict_src) = $buffer.dict_match_source(
+                    $dict_content,
+                    seq_ll_v as usize,
+                    offset,
+                    seq_ml_v as usize,
+                )
+            {
+                // SAFETY: parent-slice provenance, as above; the match source is
+                // the dictionary slice, whose length covers `seq_ml_v`.
+                let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
+                let r = exec_sequence_avx2_dict_inline!(
+                    $buffer,
+                    lit_src,
+                    seq_ll_v as usize,
+                    dict_src,
+                    seq_ml_v as usize
+                );
+                if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                    $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                }
+                break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
             }
 
             if let Err(e) = $buffer.try_push(lits) {
@@ -184,6 +217,12 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
     let literals_buffer_len = literals_buffer.len();
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
+    // Invariant for the whole block, so it is resolved here rather than per
+    // sequence inside the dictionary-source selector.
+    let dict_content: &[u8] = match dict {
+        Some(d) => &d.dict_content,
+        None => &[],
+    };
 
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
@@ -247,6 +286,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
             let r = execute_one_body!(
                 buffer,
                 dict,
+                dict_content,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
@@ -275,6 +315,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
                 let r = execute_one_body!(
                     buffer,
                     dict,
+                    dict_content,
                     literals_buffer,
                     &mut lit_cur,
                     literals_buffer_len,
@@ -306,6 +347,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
             let r = execute_one_body!(
                 buffer,
                 dict,
+                dict_content,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,

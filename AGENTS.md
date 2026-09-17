@@ -200,13 +200,13 @@ A reviewer should not accept, and an author should not offer, any of these:
 - **"Fewer instructions, therefore faster."** Instruction count is a
   diagnostic, not a verdict. Instructions are not equally priced: addressing
   mode, dependency chain, port pressure and sign-extension all change what one
-  costs, and changes that cut instructions while raising cycles are common here.
-  Cycles decide.
+  costs, and changes that cut instructions while taking longer are common here.
+  Time decides.
 - **An instruction count compared across a boundary that moved.** Counts are
   comparable whole-program against whole-program on the same input and output,
   or one function against itself. Inlining moves work between symbols without
   changing its cost.
-- **A cycle figure from separately built binaries, below roughly one and a half
+- **A timing from separately built binaries, below roughly one and a half
   percent.** Two builds of the same source differ by about that much from code
   layout alone. Such a delta needs a second measurement on a path the change
   cannot execute, with the difference of the two being the attributable figure.
@@ -223,9 +223,15 @@ A reviewer should not accept, and an author should not offer, any of these:
   the revision, and when the two disagree the upstream comparison is the one
   that decides whether the change is good.
 
-Require instead: what changed, on which fixture, against upstream, with cycles
-and instructions both, and for anything under a couple of percent, what the
-control arm said.
+Require instead: what changed, on which fixture, against upstream, **in time**,
+and for anything under a couple of percent, what the control arm said.
+
+Time is the whole of it. A counter is worth reading only where it explains a
+time difference already measured, and it is not something to ask an author for:
+a bench host need not expose a performance monitoring unit at all, so demanding
+a cycle figure can be demanding something the machine cannot produce. Wall-clock
+against upstream in the same run, with the control arm under the band, is a
+complete answer.
 
 ## 8. Correctness constraints a performance change must not break
 

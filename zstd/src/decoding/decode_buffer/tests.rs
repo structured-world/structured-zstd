@@ -648,7 +648,7 @@ mod dict_match_source {
         // of 20 reaches 5 bytes back past the output, so the source is the
         // dictionary's last 5 bytes.
         let src = buf
-            .dict_match_source(Some(handle.as_dict()), 5, 20, 5)
+            .dict_match_source(&handle.as_dict().dict_content, 5, 20, 5)
             .expect("a match wholly inside the dictionary is the inline case");
         assert_eq!(&src[..5], &[59, 60, 61, 62, 63]);
         // The match ends exactly at the dictionary's end, so a wildcopy has
@@ -665,7 +665,7 @@ mod dict_match_source {
         let buf = buffer_with(1024);
 
         let src = buf
-            .dict_match_source(Some(handle.as_dict()), 5, 20, 4)
+            .dict_match_source(&handle.as_dict().dict_content, 5, 20, 4)
             .expect("dictionary-resident");
         assert_eq!(&src[..4], &[59, 60, 61, 62]);
         assert_eq!(src.len() - 4, 1, "one byte of room past the match");
@@ -681,10 +681,10 @@ mod dict_match_source {
         let buf = buffer_with(1024);
 
         let with_literals = buf
-            .dict_match_source(Some(handle.as_dict()), 5, 20, 4)
+            .dict_match_source(&handle.as_dict().dict_content, 5, 20, 4)
             .expect("dictionary-resident with the literals counted");
         let without_literals = buf
-            .dict_match_source(Some(handle.as_dict()), 0, 20, 4)
+            .dict_match_source(&handle.as_dict().dict_content, 0, 20, 4)
             .expect("dictionary-resident with no literals");
         assert_eq!(&with_literals[..4], &[59, 60, 61, 62]);
         assert_eq!(&without_literals[..4], &[54, 55, 56, 57]);
@@ -698,7 +698,7 @@ mod dict_match_source {
         let handle = counted_dict();
         let buf = buffer_with(1024);
         assert!(
-            buf.dict_match_source(Some(handle.as_dict()), 5, 20, 6)
+            buf.dict_match_source(&handle.as_dict().dict_content, 5, 20, 6)
                 .is_none()
         );
     }
@@ -710,7 +710,7 @@ mod dict_match_source {
         let handle = counted_dict();
         let buf = buffer_with(1024);
         assert!(
-            buf.dict_match_source(Some(handle.as_dict()), 5, 100, 4)
+            buf.dict_match_source(&handle.as_dict().dict_content, 5, 100, 4)
                 .is_none()
         );
     }
@@ -722,13 +722,13 @@ mod dict_match_source {
         let handle = counted_dict();
         let buf = buffer_with(1024);
         assert!(
-            buf.dict_match_source(Some(handle.as_dict()), 5, 12, 4)
+            buf.dict_match_source(&handle.as_dict().dict_content, 5, 12, 4)
                 .is_none()
         );
         // The exact boundary: an offset equal to the post-literal position
         // reaches back to the first produced byte, still inside the output.
         assert!(
-            buf.dict_match_source(Some(handle.as_dict()), 5, PRODUCED + 5, 4)
+            buf.dict_match_source(&handle.as_dict().dict_content, 5, PRODUCED + 5, 4)
                 .is_none()
         );
     }
@@ -736,7 +736,9 @@ mod dict_match_source {
     #[test]
     fn no_dictionary_yields_nothing() {
         let buf = buffer_with(1024);
-        assert!(buf.dict_match_source(None, 5, 20, 4).is_none());
+        // A frame without a dictionary resolves to empty content, which the
+        // selector must treat as nothing to read rather than as a match.
+        assert!(buf.dict_match_source(&[], 5, 20, 4).is_none());
     }
 
     #[test]
@@ -747,7 +749,7 @@ mod dict_match_source {
         let handle = counted_dict();
         let buf = buffer_with(8);
         assert!(
-            buf.dict_match_source(Some(handle.as_dict()), 5, 20, 4)
+            buf.dict_match_source(&handle.as_dict().dict_content, 5, 20, 4)
                 .is_none()
         );
     }
@@ -760,11 +762,11 @@ mod dict_match_source {
         let handle = counted_dict();
         let buf = buffer_with(12);
         assert!(
-            buf.dict_match_source(Some(handle.as_dict()), 0, 20, 4)
+            buf.dict_match_source(&handle.as_dict().dict_content, 0, 20, 4)
                 .is_some()
         );
         assert!(
-            buf.dict_match_source(Some(handle.as_dict()), 5, 20, 4)
+            buf.dict_match_source(&handle.as_dict().dict_content, 5, 20, 4)
                 .is_none()
         );
     }

@@ -400,6 +400,21 @@ pub(crate) trait BufferBackend: Sized {
         true
     }
 
+    /// Whether [`Self::exec_sequence_inline_dict`] may run for this
+    /// `(lit_length, match_length)` at the current cursor.
+    ///
+    /// The dictionary is a separate allocation, so the match source is not in
+    /// the output and the source bound [`Self::inline_exec_ok`] applies to it
+    /// is not a question here: what remains is a contiguous destination and the
+    /// per-block output ceiling. Asking the output-resident gate instead would
+    /// refuse every dictionary match on a wrapped ring, since a match reaching
+    /// into the dictionary is by definition further back than the output holds.
+    #[allow(unused_variables)]
+    #[inline(always)]
+    fn inline_exec_dict_ok(&self, lit_length: usize, match_length: usize) -> bool {
+        true
+    }
+
     /// Construct an empty backend. Backend-specific sizing is done
     /// via `with_capacity` constructors on the concrete types (see
     /// [`super::flat_buf::FlatBuf::with_capacity`]).

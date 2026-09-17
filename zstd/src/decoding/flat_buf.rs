@@ -89,6 +89,27 @@ impl BufferBackend for FlatBuf {
     /// every target.
     const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = true;
 
+    /// A linear buffer is always contiguous, so what is left to answer here is
+    /// the per-block output ceiling: the inline path writes without going
+    /// through `try_reserve`, which is where that ceiling is otherwise enforced.
+    /// Without this a block could write into whatever spare a pre-reserved
+    /// allocation carries beyond `MAX_BLOCK_SIZE` and never meet the guard.
+    /// `RingBuffer` closes the same gap at the end of its own override;
+    /// `max_capacity == usize::MAX` between blocks makes this a no-op.
+    #[inline(always)]
+    fn inline_exec_ok(&self, lit_length: usize, match_length: usize, _offset: usize) -> bool {
+        // `len()` is the live output and both lengths are one sequence's, each
+        // bounded by a block, so the sum is nowhere near `usize::MAX`.
+        self.len() + lit_length + match_length <= self.max_capacity
+    }
+
+    /// The offset never mattered here, so a dictionary match asks exactly what
+    /// an output-resident one does.
+    #[inline(always)]
+    fn inline_exec_dict_ok(&self, lit_length: usize, match_length: usize) -> bool {
+        self.inline_exec_ok(lit_length, match_length, 0)
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn exec_sequence_inline(

@@ -432,6 +432,12 @@ pub(crate) fn decode_and_execute_sequences_impl<
     let literals_buffer_len = literals_buffer.len();
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
+    // Invariant for the whole block, so it is resolved here rather than per
+    // sequence inside the dictionary-source selector.
+    let dict_content: &[u8] = match dict {
+        Some(d) => &d.dict_content,
+        None => &[],
+    };
 
     // Transactional rollback state. The fused decode+execute commits
     // each sequence's side-effects (literal push, match repeat, offset
@@ -567,6 +573,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
             if let Err(e) = execute_one_sequence_pipelined(
                 buffer,
                 dict,
+                dict_content,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
@@ -724,6 +731,12 @@ fn run_pipelined_sequence_loop<
         ml: 0,
         actual_offset: 0,
     }; ADVANCE];
+    // Invariant for the whole block, so it is resolved here rather than per
+    // sequence inside the dictionary-source selector.
+    let dict_content: &[u8] = match dict {
+        Some(d) => &d.dict_content,
+        None => &[],
+    };
 
     for slot in ring.iter_mut() {
         let seq = decode_one_sequence_inline(ll_dec, ml_dec, of_dec, br);
@@ -774,6 +787,7 @@ fn run_pipelined_sequence_loop<
         execute_one_sequence_pipelined_resolved(
             buffer,
             dict,
+            dict_content,
             literals_buffer,
             lit_cur,
             literals_buffer_len,
@@ -795,6 +809,7 @@ fn run_pipelined_sequence_loop<
         execute_one_sequence_pipelined_resolved(
             buffer,
             dict,
+            dict_content,
             literals_buffer,
             lit_cur,
             literals_buffer_len,
@@ -832,6 +847,7 @@ pub(crate) struct ExecSeq {
 pub(crate) fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     dict: Option<&crate::decoding::dictionary::Dictionary>,
+    dict_content: &[u8],
     literals: &[u8],
     lit_cur: &mut usize,
     lit_len: usize,
@@ -840,6 +856,7 @@ pub(crate) fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::
     execute_one_sequence_pipelined(
         buffer,
         dict,
+        dict_content,
         literals,
         lit_cur,
         lit_len,
@@ -877,9 +894,16 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_bmi2<
     seq: Sequence,
     resolved_offset: u32,
 ) -> Result<(), DecompressBlockError> {
+    // Not a loop body (this wrapper is vestigial), so the slice is resolved
+    // here rather than threaded in.
+    let dict_content: &[u8] = match dict {
+        Some(d) => &d.dict_content,
+        None => &[],
+    };
     execute_one_sequence_pipelined(
         buffer,
         dict,
+        dict_content,
         literals,
         lit_cur,
         lit_len,
@@ -908,7 +932,20 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_bmi2<
     lit_len: usize,
     exec_seq: ExecSeq,
 ) -> Result<(), DecompressBlockError> {
-    execute_one_sequence_pipelined_resolved(buffer, dict, literals, lit_cur, lit_len, exec_seq)
+    // Vestigial wrapper, as above.
+    let dict_content: &[u8] = match dict {
+        Some(d) => &d.dict_content,
+        None => &[],
+    };
+    execute_one_sequence_pipelined_resolved(
+        buffer,
+        dict,
+        dict_content,
+        literals,
+        lit_cur,
+        lit_len,
+        exec_seq,
+    )
 }
 
 /// VBMI2-tier exec wrapper. Currently delegates via the AVX2 variant
@@ -1025,10 +1062,16 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_avx2<
 /// variant — required for memory safety against malformed inputs whose
 /// `match_length` exceeds the upfront block-maximum headroom.
 #[inline(always)]
-#[allow(dead_code)] // live on aarch64 + tests only; see decode_and_execute_sequences_impl
+#[allow(dead_code)]
+// live on aarch64 + tests only; see decode_and_execute_sequences_impl
+// Grouping the arguments into a struct would push them off the argument
+// registers and onto memory loads, which is the cost this per-sequence
+// boundary exists to avoid (same reasoning as `run_pipelined_sequence_loop`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     dict: Option<&crate::decoding::dictionary::Dictionary>,
+    dict_content: &[u8],
     literals: &[u8],
     lit_cur: &mut usize,
     lit_len: usize,
@@ -1094,70 +1137,71 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
     // over-counts by `15 - ((seq.ll - 1) % 16)` whenever `seq.ll %
     // 16 != 1` — keeping the upstream zstd inline path active on more
     // sequences near the end of the literals buffer.
-    let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-        && buffer.buffer_mut().inline_exec_ok(
-            seq.ll as usize,
-            seq.ml as usize,
-            resolved_offset as usize,
-        )
+    // Literal-source slack, which both inline paths need: their `copy16` reads
+    // 16 bytes whatever the literal length, and the wildcopy regime reads the
+    // length rounded up to its stride.
+    let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC
         && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
         && (seq.ll as usize <= 16
             || lit_cur_before
                 .checked_add((seq.ll as usize).next_multiple_of(16))
                 .is_some_and(|b| b <= lit_len));
-    if inline_path_safe {
-        // Validate match-copy offset against the live region
-        // (matches `repeat()`'s `offset > buffer.len()` → dict path
-        // gate). Upstream zstd inline path stays on the prefix-resident
-        // case; offsets that step into dict / extDict territory fall
-        // back to the layered path below.
-        let buf_len = buffer.len();
-        let offset = resolved_offset as usize;
-        // `checked_add` against adversarial input: if `buf_len +
-        // lits.len()` would wrap `usize`, treat the offset as
-        // out-of-range and fall back to the layered path. Without
-        // the check, wrapping addition could classify a wildly
-        // out-of-range `offset` as in-range and feed the upstream zstd
-        // inline path an OOB match-source pointer.
-        let prefix_end = buf_len.checked_add(lits.len()).filter(|end| offset <= *end);
-        if prefix_end.is_none() {
-            // Match source reaches outside what's been written in this
-            // frame — upstream zstd's `extDict` arm. When the whole match
-            // sits inside reachable dictionary content it is one more inline
-            // copy, the way upstream keeps that branch inside
-            // `ZSTD_execSequence`; every other shape (spanning dictionary and
-            // output, out of window, out of range) stays on the slow
-            // `repeat()` path, which reports the errors.
-            if let Some(dict_src) =
-                buffer.dict_match_source(dict, lits.len(), offset, seq.ml as usize)
-            {
-                // SAFETY: as for the prefix-resident call below — parent-slice
-                // provenance for the literals, dispatch-site gate for their
-                // 16-byte read — and the match source is the dictionary slice,
-                // whose length covers `seq.ml` by the selector's contract.
-                let lit_src = unsafe { literals.as_ptr().add(lit_cur_before) };
-                unsafe {
-                    buffer
-                        .buffer_mut()
-                        .exec_sequence_inline_dict(
-                            lit_src,
-                            seq.ll as usize,
-                            dict_src,
-                            seq.ml as usize,
-                        )
-                        .map_err(DecompressBlockError::ExecuteSequencesError)?;
-                }
-                if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
-                    buffer.advance_output_counter((seq.ll + seq.ml) as u64);
-                }
-                return Ok(());
+    let offset = resolved_offset as usize;
+    // Where the match source lives (matches `repeat()`'s `offset >
+    // buffer.len()` → dict path gate). `checked_add` against adversarial
+    // input: if `buffer.len() + lits.len()` would wrap `usize`, treat the
+    // offset as out-of-range rather than letting wrapping addition classify a
+    // wildly out-of-range one as resident and hand the inline path an OOB
+    // match-source pointer.
+    let prefix_resident = buffer
+        .len()
+        .checked_add(lits.len())
+        .is_some_and(|end| offset <= end);
+    if !prefix_resident {
+        // Match source reaches outside what's been written in this frame:
+        // upstream zstd's `extDict` arm. When the whole match sits inside
+        // reachable dictionary content it is one more inline copy, the way
+        // upstream keeps that branch inside `ZSTD_execSequence`; every other
+        // shape (spanning dictionary and output, out of window, out of range)
+        // stays on the slow `repeat()` path, which reports the errors.
+        //
+        // The gate is the DICTIONARY one: the source is the dictionary, a
+        // separate allocation, so the output-resident bound does not apply and
+        // asking for it would refuse every such match on a wrapped ring.
+        if inline_literals_ok
+            && buffer
+                .buffer_mut()
+                .inline_exec_dict_ok(seq.ll as usize, seq.ml as usize)
+            && let Some(dict_src) =
+                buffer.dict_match_source(dict_content, lits.len(), offset, seq.ml as usize)
+        {
+            // SAFETY: as for the prefix-resident call below (parent-slice
+            // provenance for the literals, dispatch-site gate for their
+            // 16-byte read), and the match source is the dictionary slice,
+            // whose length covers `seq.ml` by the selector's contract.
+            let lit_src = unsafe { literals.as_ptr().add(lit_cur_before) };
+            unsafe {
+                buffer
+                    .buffer_mut()
+                    .exec_sequence_inline_dict(lit_src, seq.ll as usize, dict_src, seq.ml as usize)
+                    .map_err(DecompressBlockError::ExecuteSequencesError)?;
             }
-            buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
-            buffer
-                .repeat_lookahead_prefetched(dict, offset, seq.ml as usize)
-                .map_err(ExecuteSequencesError::from)?;
+            if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                buffer.advance_output_counter((seq.ll + seq.ml) as u64);
+            }
             return Ok(());
         }
+        buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
+        buffer
+            .repeat_lookahead_prefetched(dict, offset, seq.ml as usize)
+            .map_err(ExecuteSequencesError::from)?;
+        return Ok(());
+    }
+    let inline_path_safe = inline_literals_ok
+        && buffer
+            .buffer_mut()
+            .inline_exec_ok(seq.ll as usize, seq.ml as usize, offset);
+    if inline_path_safe {
         // SAFETY:
         // - Backend opted in (compile-time const).
         // - `lits` is a non-aliased slice of the literals block.

@@ -643,3 +643,9 @@ mod inline_helper_tests;
 // covered on the main x86 CI lane as well as the i686 job.
 #[cfg(test)]
 mod portable_helper_tests;
+
+// The dictionary copier, on both of the copy shapes it chooses between and on
+// every tier the host can run, each checked against the bytes the sequence
+// defines rather than against another tier alone.
+#[cfg(test)]
+mod dict_copy_tests;

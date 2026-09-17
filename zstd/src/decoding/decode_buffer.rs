@@ -330,28 +330,36 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// cold path sees after pushing them: the two agree on which sequences
     /// are dictionary-resident, so routing one here never accepts what the
     /// cold path would have refused.
+    /// `dict_content` is the active dictionary's content, or empty when the
+    /// frame has none. It is invariant for the whole block, so it is resolved
+    /// once above the sequence loop and handed in rather than re-derived from
+    /// the dictionary handle on every sequence.
     #[inline(always)]
     pub(crate) fn dict_match_source<'d>(
         &self,
-        dict: Option<&'d crate::decoding::dictionary::Dictionary>,
+        dict_content: &'d [u8],
         lit_length: usize,
         offset: usize,
         match_length: usize,
     ) -> Option<&'d [u8]> {
-        let after_literals = self.buffer.len().checked_add(lit_length)?;
+        // The live output is bounded by the window and the literal run by one
+        // block, so the sum is nowhere near `usize::MAX` on any target; the
+        // assertion is what would catch that invariant being broken, rather
+        // than a `checked_add` quietly costing a value on every sequence.
+        debug_assert!(self.buffer.len().checked_add(lit_length).is_some());
+        let after_literals = self.buffer.len() + lit_length;
         // Reaches back no further than the output holds: not a dictionary
         // match at all, and the inline executor's own source covers it.
-        let bytes_from_dict = offset.checked_sub(after_literals)?;
-        if bytes_from_dict == 0 {
+        if offset <= after_literals {
             return None;
         }
+        let bytes_from_dict = offset - after_literals;
 
         let total_output = self.total_output_counter.max(self.buffer.len() as u64);
         if total_output + lit_length as u64 > self.window_size as u64 {
             return None;
         }
 
-        let dict_content = self.dict_content(dict);
         // Starts before the dictionary does, or runs out of it into the
         // output. Both are the cold path's to resolve.
         if bytes_from_dict > dict_content.len() || match_length > bytes_from_dict {
