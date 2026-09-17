@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789638450415,
+  "lastUpdate": 1789681258786,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -6935,6 +6935,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.187,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cbb1d986a96b12e498e405bf564fbdbfadc5697b",
+          "message": "perf(decoding): copy a dictionary-resident match in the inline executor (#515)\n\n* perf(decoding): copy a dictionary-resident match in the inline executor\n\nA sequence whose match reaches back into the dictionary left the inline\nexecutor entirely: the literals went through `try_push` and the match\nthrough the out-of-line `#[cold] repeat_from_dict`, which re-validated,\nreserved a second time and copied through the backend's dispatch. On a\ndictionary-primed small frame that is every match in the block.\n\nUpstream keeps the case inline (`zstd_decompress_block.c` 1052-1058):\nrebase onto the dictionary, and when the match ends before `dictEnd`,\none copy and done.\n\n`DecodeBuffer` now answers where such a match reads from, and nothing\nwhen any part of it belongs to the cold path: no dictionary, the\ndictionary out of the window, a match reaching past its start, or one\ncontinuing into the output. The copy itself is written once against the\n`inline_exec_base_ptr` / `inline_exec_commit` hooks every opted-in\nbackend already provides, so all three share it. Those hooks lose their\nx86 gate, which only held because the x86 macro was their one consumer;\nthe bodies were never architecture-specific.\n\nNo overlap is possible between a separate dictionary allocation and the\noutput, so the offset plays no part in choosing the copy. The room left\npast the match does: a wildcopy reads the match length rounded up to its\nstride, and where the dictionary ends sooner the copy is the exact one,\nwhich is why upstream reaches for `memmove` on this branch.\n\nCloses #507\n\n* bench: interleave the two arms across rounds\n\nThe arms of a group run one after the other, so a disturbance that lasts\nlonger than one arm lands entirely on that arm and the ratio reports it as a\ndifference between the implementations. It is not reachable by sampling\nharder: when the whole arm ran in the disturbed state, the minimum over its\nsamples is disturbed too.\n\nRun the matrix several times with the budget divided by the round count, so\nthe arms of every group alternate with the rest of the matrix between each\npair, and take each arm's minimum across rounds. Samples from all rounds are\npooled; the per-round minima ride along in the published JSON, which is what\nseparates a disturbance that moved between rounds from one that stayed with\nan arm throughout.\n\nAlso:\n- give the reference arm the same buffer shape as ours, so the two are not\n  allocated at different sizes and therefore different addresses.\n- keep the memory bench's criterion data out of the pooled tree: its timings\n  are deliberately biased by the tracking allocator.\n- drop the sample-spread note from the dashboard's lagging-cell list. It\n  reports how much a single arm jittered within its own window, which on a\n  frame decoded at two settled speeds read as a fraction of a percent while\n  the two arms stood a factor apart. The list names the fixture, level and\n  target to look at; the timings behind it belong in the JSON.\n\nMeasured on one decompress group: 4.31 s for a single full-budget round\nagainst 5.26 s for three divided rounds, so the rounds cost ~22% more\nwall-clock, the per-round group setup being what does not divide.\n\n* fix(decoding): admit dictionary matches on their own terms, on every tier\n\nThe dictionary fast path was admitted by the gate that answers for an\noutput-resident match. That gate asks the backend two different questions at\nonce, and one of them has no meaning for a dictionary match: where its source\nlies. On a wrapped ring it demands the source be within `tail + lit`, while a\nmatch reaching into the dictionary is by definition further back than the\noutput holds, so the two conditions cannot both be met and every such match on\na wrapped ring fell to the cold path.\n\nSplit the question. `inline_exec_dict_ok` asks only what the dictionary case\nneeds, a contiguous destination and the per-block output ceiling, and the\noutput-resident gate is now that plus the source bound, so the shared part has\none definition. Each decoder then routes on where the match source lives before\nasking the backend, rather than asking one gate and nesting the other case\ninside it.\n\nAlso in this round:\n\n- `FlatBuf` was not enforcing the per-block output ceiling on the inline path\n  at all. The inline executor writes without going through `try_reserve`, which\n  is where that ceiling is otherwise applied, and `RingBuffer` closes the gap in\n  its own gate while a linear backend inherited a permissive default. A block\n  could therefore write into whatever spare a pre-reserved allocation carries\n  past `MAX_BLOCK_SIZE`. Carries the regression test.\n- The BMI2 and VBMI2 monomorphs had no dictionary branch, so on the CPU tiers\n  that select them the copy fell to the cold path and the gain did not apply.\n  BMI2 takes the shared 16-byte body, VBMI2 the ymm one it already uses for\n  output-resident matches.\n- The dictionary source selector took its gates as `Option` values only to\n  decide whether to leave the fast path, and re-derived the dictionary content\n  from the handle on every sequence. The gates are bare comparisons now (and two\n  of them collapse into one), and the content is resolved once above each\n  sequence loop and handed in.\n- The copier gets its own tests: the bytes it writes on each of the two copy\n  shapes it chooses between, and the ymm body against the tier-neutral one on\n  identical input, since dispatch alone runs only the tier the host selects.\n\n`AGENTS.md` asked a performance claim for cycles and instructions. Instruction\ncounts it already rejects as a verdict two paragraphs earlier, and a bench host\nneed not expose a performance monitoring unit at all, so the requirement could\nask for something the machine cannot produce. It asks for time now.\n\n* test(decoding): pin the wrapped-ring dictionary gate\n\nThe gate split is what makes a dictionary match reachable on a wrapped ring;\nthis holds that open. It asserts both halves at once: the output-resident gate\nrefuses a source it cannot place in the ring, the dictionary gate admits the\nsame write, and the dictionary gate still answers for destination contiguity\nand the per-block output ceiling.\n\n* fix(bench): order rounds numerically and validate the round count\n\nRound directories are `round-N`, and the parser sorted them by name, so from\nten rounds on `round-10` came before `round-2`. The minima stayed correct; the\norder `round_min_ns` documents did not, which is that field's whole purpose.\nSorted by the number now.\n\nThe round count came straight from the environment into `seq`. Zero or a\nnon-number leaves it with nothing to iterate, so the matrix would produce no\ntimings at all, and the bench binary reads the same variable with its own\nfallback, so the two sides could disagree about what ran. It is validated at\nthe top and refused loudly.\n\nThe wall-clock claim was wrong: the measurement budget divides, but the\nper-round group setup and the warm-up floor do not. Three rounds measured about\na fifth longer than one full-budget round, and that is what it says now.\n\nAdds the per-tier agreement test the dictionary path was missing: one\ndictionary frame decoded on every CPU tier the host can execute, each compared\nagainst the payload. Each tier is its own monomorph with its own gate and\nargument plumbing, and ordinary dispatch only ever runs the one the host\nselects, so a routing mistake in another had nowhere to show up. The decoder\ngains a test-only kernel selector for it.\n\n* docs(decoding): state what the dictionary copier tests cover\n\nThe module doc read as if the copier tests covered every CPU tier. They cover\nthe copy bodies; the decoder monomorphs that reach them are covered by the\nper-tier frame decode, which it now points at.",
+          "timestamp": "2026-09-18T00:19:04+03:00",
+          "tree_id": "a660832988d471a1c8aa57da33183d91627a8f2b",
+          "url": "https://github.com/structured-world/structured-zstd/commit/cbb1d986a96b12e498e405bf564fbdbfadc5697b"
+        },
+        "date": 1789681239966,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.077,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 195.362,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 263.156,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.543,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.288,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.859,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.967,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.883,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.996,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.006,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 9.374,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.191,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.214,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.53,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.137,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.692,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.219,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.021,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.125,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.021,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.123,
             "unit": "ms"
           }
         ]
