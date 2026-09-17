@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.54](https://github.com/structured-world/structured-zstd/compare/v0.0.53...v0.0.54) - 2026-09-17
+
+### Fixed
+
+- *(encode)* honour explicit compression parameters on dictionary frames ([#511](https://github.com/structured-world/structured-zstd/pull/511))
+
+### Performance
+
+- *(decoding)* copy a dictionary-resident match in the inline executor ([#515](https://github.com/structured-world/structured-zstd/pull/515))
+- *(decoding)* read predefined sequence tables in place; report benchmarks from the fastest sample ([#513](https://github.com/structured-world/structured-zstd/pull/513))
+- *(decoding)* hold streamed frames to a window plus a block, decode unsized frames into the caller's slice ([#509](https://github.com/structured-world/structured-zstd/pull/509))
+
 ## [0.0.53](https://github.com/structured-world/structured-zstd/compare/v0.0.52...v0.0.53) - 2026-09-15
 
 ### Added
