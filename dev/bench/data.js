@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789576052198,
+  "lastUpdate": 1789638450415,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -6731,6 +6731,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.188,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2b178cfe086a8be7e6446eb68335b9aca0d5090c",
+          "message": "perf(decoding): read predefined sequence tables in place; report benchmarks from the fastest sample (#513)\n\n* perf(decoding): read predefined sequence tables in place\n\nA block whose LL/ML/OF mode byte says Predefined copied the cached\ndefault table into the per-frame scratch, moving the whole fixed-size\ndecode array (512 entries, 4 KiB per axis) although only the live span\nmatters and although the source is an immutable process-wide cache.\nUpstream points its axis at the static default table instead.\n\nThe copy is per block and independent of frame size, so it dominates\nsmall frames: on the dict-decode shape with a 47-byte frame it was\nabout 11% of the decode.\n\nThe per-axis copy-on-write source already distinguished the local table\nfrom the dictionary's; give it a third state for the predefined cache so\nthe axis costs a flag write. The entropy snapshot path still materialises\nevery axis into owned local storage, so exported state stays\nself-contained, and a Repeat-mode block keeps reading whatever the axis\nhad, which for a predefined axis is that same cache.\n\nThe Huffman literals table has no predefined form in the format, so it\nkeeps the two-state source and the two domains no longer share an enum.\n\nCloses #512\n\n* perf(decoding): resolve each sequence table once, align the cache\n\nTwo follow-ups on the predefined-table path.\n\n`init_sequence_stream` called each axis accessor twice, once to build the\ndecoder and once to read `accuracy_log`. For a predefined axis that is a\n`OnceLock` probe, so the second call repeated a synchronised load per\nblock, six per block across the three axes. Bind each axis once and read\nthe local for both.\n\nThe predefined caches also sat in a plain `OnceLock`, so their decode\narrays got only natural alignment while the per-frame tables are wrapped\nin an aligned container precisely to control placement in the sequence\nloop. Wrap the cached tables the same way, so borrowing one in place\nkeeps the placement the copy used to give it.\n\n* fix(ci): report benchmark timings from the raw samples, not the estimate\n\nA dashboard cell moved several percent between runs of identical code, and\noccasionally by a factor. The cause is which statistic the pipeline reads.\n\nCriterion takes flat samples of a few milliseconds each. Scheduler\ninterference can only ADD time to a sample, so the distribution is skewed\nto the right: on an idle host one cell spans 728 to 947 ns, with both the\nRust and the libzstd arm skewed alike. The printed point estimate is a\ncentral statistic over that tail, so it sits above the true cost by\nhowever much of the tail it absorbed, and where exactly depends on how\nmany samples got hit.\n\nRead criterion's own per-sample data instead and report the minimum.\nAcross four runs of one binary the minimum reproduces within 0.32% where\nthe mean moves 1.48% and the median 1.96%, and it agrees to about one\npercent with a standalone timing loop over the same code, which the\ncentral estimate misses by four to five.\n\nEach cell now also carries its sample spread, so a reader can tell a real\nmove from the cell's own noise instead of comparing bare point estimates.\n\nSample count, measurement budget, fixtures, the bench harness and the\nemitted fields are all unchanged.\n\nCloses #514\n\n* docs(ci): state what the sample minimum does and does not stabilise\n\n* perf(decoding): name the predefined offsets long-share\n\nThe Predefined arm read the long-offset share out of the cached table,\nwhich meant resolving that cache on a path that has no other reason to\ntouch the table: the pipeline gate then paid two `OnceLock` probes per\nblock for this one axis, since the decoder resolves the same table again.\n\nThe table is built from a distribution the format fixes, so the share it\nyields is fixed too. Name it, and pin it against the builder with a test\nso it cannot drift.\n\n* perf(ci): stop rendering criterion reports nothing reads\n\n* fix(ci): never publish a ratio built from two different estimators\n\nA benchmark whose samples could not be read fell back to the printed\npoint estimate for that row alone. A ratio pairs two implementations, so\none side falling back divides a central estimate by the other side's\nminimum, and the two differ by four to five percent: that manufactures a\ndelta out of nothing, which is the exact failure this join was added to\nremove. Missing samples now stop the run and name what is missing.\n\nThe published median also averaged nothing: sample counts are even, and\nindexing the midpoint returned the upper middle value rather than the\nmedian.\n\n* perf(decoding): keep the resolved predefined table on the axis\n\nAn axis that enters Predefined mode stays there through the Repeat blocks\nthat follow, and each of those blocks re-entered the `OnceLock` to get a\ntable that cannot change. Carry the resolved reference in the axis source\ninstead, so only the block that sets the mode resolves it.\n\nThe benchmark pipeline also publishes each cell's sample spread but\nnothing rendered it, so the figure it is meant to qualify still looked\nlike a bare number. The timing table in the generated report gains the\nmedian and maximum, and the dashboard answers with the spread where the\nquestion is actually asked: in the tooltip of the hovered point, and on\nthe lines of the outside-band list.\n\n* fix(bench): report the fastest wasm sample, show each cell's spread\n\nThe wasm harness returned the median of its samples while the native\nmatrix now reports the minimum, so the two dashboard sections were\nreading different statistics. Interference can only add time to an\noperation, so the lower edge is the cost of the code either way.\n\nOn the dashboard, the deviation list exists to pick the level and\nfixture worth attacking next, so it withholds nothing: every line now\ncarries the sample spread behind it, and a hovered point answers with\nthe same, which is what says whether a number is solid enough to spend\na day on. The intro says what the figure is and against what.\n\n* fix(bench): compare wasm arms over an equal number of samples\n\nReporting the fastest operation made the wasm harness's fixed time budget\na bias. The fastest is an extreme order statistic, so its expected value\nfalls as the sample count rises, and under a fixed budget a quick arm\nfits hundreds of operations where a slow one fits a handful. Comparing\ntheir minima directly hands the quick arm an advantage that has nothing\nto do with its code, worst on the 8 MiB fixtures at high levels where an\narm can manage only a few operations.\n\nSample every arm of a comparison first, then reduce them all over the\ncount the slowest one reached: the engines against each other, and\nstreaming against one-shot. The result is as coarse as its slowest\nmember, which is the honest price of a bounded budget, and it no longer\ndepends on how many chances an arm was given.\n\n* fix(ci): keep timings from different estimators out of one series\n\nThe published history was measured by criterion's central estimate; the\npoints this pipeline emits now are sample minima, and the two sit several\npercent apart. Appending them under the same key would draw a step across\nevery cell at the boundary and read as a performance jump, on the one\npanel whose job is to say which level and fixture to attack next.\n\nStamp every published timing with the statistic that produced it, in both\nthe native and the wasm payload, and drop retained timing rows carrying a\ndifferent stamp when merging. Sizes and allocation counts are exact\nregardless of the estimator and keep their full history: on the current\npayload that retains 10760 rows and drops 9240.\n\n* fix(ci): a wasm record keeps its byte counts when its timings go\n\nA wasm record carries its ratio and its timings together, unlike the\nnative payload where each row holds one metric. Dropping a record whose\nestimator no longer matches therefore took an exact byte count with it,\nlosing the ratio history the estimator change has no bearing on: 3264\npoints on the current payload.\n\nBlank the timings on such a record and keep the rest. The dashboard\nalready reads a non-numeric throughput as \"no point here\" rather than\nplotting a zero, so the series simply starts at the boundary while every\nratio survives.\n\n* Revert \"fix(ci): keep timings from different estimators out of one series\"\n\nThis traded away the thing the series is for. The dashboard is read to\nsee that a cell was 0.168 and is now 0.60, which needs the points joined,\nnot separated at the commit where the measurement improved. Severing them\nthere, and dropping 9240 retained rows to do it, destroyed real history to\navoid a one-time step we already know the cause of.\n\nAlso reverts \"fix(ci): a wasm record keeps its byte counts when its\ntimings go\", which only existed to soften the same severance.\n\nThe estimator change still shows up as a step at one commit. That is\naccepted: it is our own benchmark, the step is explained by this PR, and\ncontinuity across it is worth more than a smooth line.\n\n* docs(bench): say what the deviation list compares, and when\n\nThe heading above the list named neither side of the comparison nor the\nrun it belongs to, so a reader had no way to tell \"slower than libzstd in\nthis run\" from \"slower than the previous run\" — and one of those is not\nwhat the list means. It now says both, and says what the list is for:\nthe levels and fixtures to attack next.\n\n* docs(bench): drop the instruction from the deviation heading",
+          "timestamp": "2026-09-17T12:26:42+03:00",
+          "tree_id": "9e6544281e015bcf913d9e49948a482b57ba5bed",
+          "url": "https://github.com/structured-world/structured-zstd/commit/2b178cfe086a8be7e6446eb68335b9aca0d5090c"
+        },
+        "date": 1789638433248,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.074,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.11,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 179.751,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 224.609,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.57,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.298,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.872,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.973,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.906,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 9.913,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 6.339,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.178,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.589,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.195,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.75,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.284,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.187,
             "unit": "ms"
           }
         ]
