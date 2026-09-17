@@ -21,6 +21,24 @@ from pathlib import Path
 # Must match the stamp `parse-wasm-bench.py` writes onto each record.
 TIMING_ESTIMATOR = "sample-min-common-count"
 
+# A wasm record carries its byte counts and its timings together, unlike the
+# native payload where each row is one metric. So a record measured by another
+# estimator cannot simply be dropped: that would take an exact `ratio` with it.
+# Blank the timings instead and keep the rest. The dashboard already treats a
+# non-numeric throughput as "no point here" rather than plotting a zero.
+TIMING_FIELDS = (
+    "compress_ns",
+    "decompress_ns",
+    "compress_bytes_per_sec",
+    "decompress_bytes_per_sec",
+)
+
+
+def without_incomparable_timings(row):
+    if row.get("estimator") == TIMING_ESTIMATOR:
+        return row
+    return {**row, **{field: None for field in TIMING_FIELDS if field in row}}
+
 RETENTION_DAYS = 180
 MAX_RECORDS = 20000
 
@@ -84,18 +102,21 @@ def main():
     # Timings are comparable only within one estimator. Retained points from
     # before the stamp existed were medians of the samples, which sit away from
     # the minimum published now; plotting both as one series would draw a step
-    # where only the measurement changed.
+    # where only the measurement changed. Their byte counts are exact whatever
+    # the estimator, so only the timings go.
     existing = load_records(existing_file)
-    comparable = [row for row in existing if row.get("estimator") == TIMING_ESTIMATOR]
-    if len(comparable) != len(existing):
+    kept = [without_incomparable_timings(row) for row in existing]
+    blanked = sum(1 for row in existing if row.get("estimator") != TIMING_ESTIMATOR)
+    if blanked:
         print(
-            f"INFO: dropping {len(existing) - len(comparable)} retained wasm rows "
-            f"measured by a different estimator than {TIMING_ESTIMATOR!r}",
+            f"INFO: blanking the timings on {blanked} retained wasm rows measured "
+            f"by a different estimator than {TIMING_ESTIMATOR!r}; their ratios are "
+            "kept.",
             file=sys.stderr,
         )
 
     merged = {}
-    for row in comparable + run_records:
+    for row in kept + run_records:
         merged[record_key(row)] = row
 
     values = sorted(
