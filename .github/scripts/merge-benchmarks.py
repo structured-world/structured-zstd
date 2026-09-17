@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -206,8 +207,36 @@ def record_key(row):
     )
 
 
+# Timing values are only comparable when they come from the same statistic.
+# Published points carry the estimator that produced them; retained points from
+# before that stamp existed were central estimates over the sample distribution,
+# which sit several percent away from the minimum reported now. Plotting the two
+# as one series would draw a step where only the measurement changed, so the
+# older timing points are dropped at this boundary. Sizes and allocation counts
+# are exact and keep their full history.
+TIMING_METRIC = "throughput_bytes_per_sec"
+TIMING_ESTIMATOR = "sample-min"
+
+
+def timing_is_comparable(row):
+    if row.get("metric") != TIMING_METRIC:
+        return True
+    return row.get("estimator") == TIMING_ESTIMATOR
+
+
+dropped_timing = sum(1 for row in existing_records if not timing_is_comparable(row))
+if dropped_timing:
+    print(
+        f"INFO: dropping {dropped_timing} retained timing rows measured by a "
+        f"different estimator than {TIMING_ESTIMATOR!r}; sizes and memory rows "
+        "keep their history.",
+        file=sys.stderr,
+    )
+
 merged = {}
 for row in existing_records + relative_records:
+    if not timing_is_comparable(row):
+        continue
     merged[record_key(row)] = row
 merged_values = sorted(
     merged.values(),

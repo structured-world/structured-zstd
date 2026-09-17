@@ -18,6 +18,9 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# Must match the stamp `parse-wasm-bench.py` writes onto each record.
+TIMING_ESTIMATOR = "sample-min-common-count"
+
 RETENTION_DAYS = 180
 MAX_RECORDS = 20000
 
@@ -78,8 +81,21 @@ def main():
         print("ERROR: this run produced no wasm records to merge", file=sys.stderr)
         return 1
 
+    # Timings are comparable only within one estimator. Retained points from
+    # before the stamp existed were medians of the samples, which sit away from
+    # the minimum published now; plotting both as one series would draw a step
+    # where only the measurement changed.
+    existing = load_records(existing_file)
+    comparable = [row for row in existing if row.get("estimator") == TIMING_ESTIMATOR]
+    if len(comparable) != len(existing):
+        print(
+            f"INFO: dropping {len(existing) - len(comparable)} retained wasm rows "
+            f"measured by a different estimator than {TIMING_ESTIMATOR!r}",
+            file=sys.stderr,
+        )
+
     merged = {}
-    for row in load_records(existing_file) + run_records:
+    for row in comparable + run_records:
         merged[record_key(row)] = row
 
     values = sorted(
