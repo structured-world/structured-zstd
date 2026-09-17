@@ -490,7 +490,14 @@ fn bench_decompress_source(
         // one `target`. Creating a fresh DCtx per iteration would
         // dominate sub-millisecond samples.
         let mut dctx = FfiDCtxHandle::new();
-        let mut target = vec![0u8; expected_len];
+        // Same allocation as the arm above, down to the trailing slack it needs
+        // to stay on its direct path. The extra bytes are spare capacity here
+        // and change nothing about what libzstd does, but they keep the two
+        // arms' buffers identically shaped: a difference in size lands the two
+        // at different addresses and in different allocator states, which is a
+        // property of the harness that a ratio would report as a property of
+        // the implementations.
+        let mut target = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
         pretouch_pages(&mut target);
         b.iter(|| {
             let written = dctx.decompress_into(black_box(compressed), &mut target);
@@ -1074,6 +1081,13 @@ fn configure_group<M: criterion::measurement::Measurement>(
         ScenarioClass::Small => (30, Duration::from_millis(200)),
         _ => (10, Duration::from_millis(500)),
     };
+    // Split both budgets across the rounds so R rounds cost what one round of
+    // the full budget costs. Warm-up keeps a floor: each round re-enters the
+    // code cold, and a warm-up too short to reach steady state would put the
+    // ramp inside the measurement it precedes.
+    let rounds = bench_rounds();
+    let measurement = measurement / rounds;
+    let warm_up = (warm_up / rounds).max(Duration::from_millis(50));
     group.sample_size(samples);
     group.measurement_time(measurement);
     group.warm_up_time(warm_up);
@@ -1127,6 +1141,26 @@ fn max_measurement_secs() -> Option<Duration> {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
+}
+
+/// How many times the whole matrix will be run, from
+/// `STRUCTURED_ZSTD_BENCH_ROUNDS` (default 1).
+///
+/// The two arms of a group run one after the other, so a disturbance lasting
+/// longer than one arm lands entirely on that arm and the ratio records it as
+/// a difference between the implementations. Splitting the budget into rounds
+/// puts the arms in `A B A B ...` with the rest of the matrix between each
+/// pair, and the per-arm minimum across rounds is then free of any disturbance
+/// that did not cover every round.
+///
+/// The budget is DIVIDED, not multiplied: N rounds of `budget / N` cost the
+/// same wall-clock as one round of `budget`.
+fn bench_rounds() -> u32 {
+    std::env::var("STRUCTURED_ZSTD_BENCH_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|rounds| *rounds > 0)
+        .unwrap_or(1)
 }
 
 fn emit_frame_header_report(

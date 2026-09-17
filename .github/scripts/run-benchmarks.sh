@@ -30,7 +30,15 @@ BENCH_RAW_FILE="$(mktemp -t structured-zstd-bench-raw.XXXXXX)"
 BENCH_CRITERION_HOME="$(mktemp -d -t structured-zstd-bench-crit.XXXXXX)"
 trap 'rm -rf "$BENCH_RAW_FILE" "$BENCH_CRITERION_HOME"' EXIT
 
-export CRITERION_HOME="$BENCH_CRITERION_HOME"
+# The two arms of a group run one after the other, so a disturbance lasting
+# longer than one arm lands entirely on that arm and the ratio reports it as a
+# difference between the implementations. Running the matrix several times puts
+# the arms in `A B A B ...` with the rest of the matrix between each pair, and
+# the per-arm minimum across rounds drops any disturbance that missed a round.
+# The bench divides its own measurement budget by this count, so the rounds cost
+# the wall-clock one full-budget round used to.
+BENCH_ROUNDS="${STRUCTURED_ZSTD_BENCH_ROUNDS:-3}"
+export STRUCTURED_ZSTD_BENCH_ROUNDS="$BENCH_ROUNDS"
 export STRUCTURED_ZSTD_EMIT_REPORT=1
 # CI matrix splits build (per target) from execution (per target × level):
 # the `bench-build` job hands the compiled criterion binary to every
@@ -43,16 +51,31 @@ if [ -n "${STRUCTURED_ZSTD_BENCH_BIN:-}" ]; then
     exit 2
   fi
   echo "Running pre-built bench binary: $STRUCTURED_ZSTD_BENCH_BIN" >&2
-  # `--noplot`: the run needs criterion's sample DATA, and nothing downstream
-  # reads its rendered reports, so rendering them is work no one consumes.
-  "$STRUCTURED_ZSTD_BENCH_BIN" --bench --output-format bencher --noplot | tee "$BENCH_RAW_FILE"
 else
   BENCH_CMD=(cargo bench --bench compare_ffi -p ffi-bench)
   if [ -n "$BENCH_TARGET_TRIPLE" ]; then
     BENCH_CMD+=(--target "$BENCH_TARGET_TRIPLE")
   fi
-  "${BENCH_CMD[@]}" -- --output-format bencher --noplot | tee "$BENCH_RAW_FILE"
 fi
+
+# Each round writes into its own criterion directory; the parser walks them all
+# and pools the samples. The raw log is overwritten rather than appended: its
+# bencher lines only enumerate which benchmarks ran (the reported figure comes
+# from the samples) and its `REPORT_*` lines are identical every round, so one
+# round's copy is the whole of what the parser needs from it.
+for round in $(seq 1 "$BENCH_ROUNDS"); do
+  CRITERION_HOME="$BENCH_CRITERION_HOME/round-$round"
+  export CRITERION_HOME
+  mkdir -p "$CRITERION_HOME"
+  echo "Benchmark round $round of $BENCH_ROUNDS" >&2
+  if [ -n "${STRUCTURED_ZSTD_BENCH_BIN:-}" ]; then
+    # `--noplot`: the run needs criterion's sample DATA, and nothing downstream
+    # reads its rendered reports, so rendering them is work no one consumes.
+    "$STRUCTURED_ZSTD_BENCH_BIN" --bench --output-format bencher --noplot | tee "$BENCH_RAW_FILE"
+  else
+    "${BENCH_CMD[@]}" -- --output-format bencher --noplot | tee "$BENCH_RAW_FILE"
+  fi
+done
 
 # Memory bench (compare_ffi_memory) runs separately when its binary is
 # available — keeps the timing run on a pristine system allocator and
@@ -61,6 +84,15 @@ fi
 # about review-cycle latency, not memory regression), main pushes do.
 # Both runs append `REPORT_*` lines to the same raw file so downstream
 # parsing is uniform.
+#
+# Its criterion data goes OUTSIDE the rounds tree the parser pools: the
+# tracking allocator deliberately biases this binary's timings, and a
+# benchmark id it shares with the timing run would otherwise pool biased
+# samples into that benchmark's figure. Only `REPORT_MEM` lines are wanted
+# from here, and those travel through the raw file.
+CRITERION_HOME="$(mktemp -d -t structured-zstd-bench-mem.XXXXXX)"
+export CRITERION_HOME
+trap 'rm -rf "$BENCH_RAW_FILE" "$BENCH_CRITERION_HOME" "$CRITERION_HOME"' EXIT
 if [ -n "${STRUCTURED_ZSTD_BENCH_MEMORY_BIN:-}" ]; then
   if [ ! -x "$STRUCTURED_ZSTD_BENCH_MEMORY_BIN" ]; then
     echo "STRUCTURED_ZSTD_BENCH_MEMORY_BIN=$STRUCTURED_ZSTD_BENCH_MEMORY_BIN is not executable" >&2
@@ -171,7 +203,14 @@ def load_criterion_samples(root):
     base = Path(root)
     if not base.is_dir():
         return index
-    for meta_path in base.glob("**/new/benchmark.json"):
+    # Rounds land in sibling directories under `root`, so one recursive walk
+    # collects every round's samples for a benchmark. They are POOLED rather
+    # than letting the last round win: the minimum over the pool is the
+    # minimum over all rounds, which is what survives a disturbance that
+    # covered only some of them.
+    pooled = defaultdict(list)
+    per_round = defaultdict(list)
+    for meta_path in sorted(base.glob("**/new/benchmark.json")):
         sample_path = meta_path.with_name("sample.json")
         if not sample_path.is_file():
             continue
@@ -183,9 +222,13 @@ def load_criterion_samples(root):
             times = sample["times"]
         except (OSError, ValueError, KeyError):
             continue
-        per_iter = sorted(t / i for t, i in zip(times, iters) if i > 0)
-        if not per_iter:
+        round_samples = [t / i for t, i in zip(times, iters) if i > 0]
+        if not round_samples:
             continue
+        pooled[full_id].extend(round_samples)
+        per_round[full_id].append(min(round_samples))
+    for full_id, values in pooled.items():
+        per_iter = sorted(values)
         # Sample counts are even (10 or 30), so the median averages the two
         # middle values rather than taking the upper one.
         mid = len(per_iter) // 2
@@ -194,6 +237,10 @@ def load_criterion_samples(root):
             "median_ns": (per_iter[(len(per_iter) - 1) // 2] + per_iter[mid]) / 2,
             "max_ns": per_iter[-1],
             "samples": len(per_iter),
+            # Per-round minima, oldest first. Two arms of one group alternate
+            # across rounds, so comparing these tells a disturbance that moved
+            # between rounds from one that stayed with an arm throughout.
+            "round_min_ns": per_round[full_id],
         }
     return index
 
