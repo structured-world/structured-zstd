@@ -330,18 +330,21 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
         }
         #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
         CpuKernelTag::Avx2 => {
-            // SAFETY: detect confirmed BMI2 + AVX2.
-            unsafe {
-                super::seq_decoder_avx2::decode_and_execute_sequences_avx2::<B>(
-                    section,
-                    source,
-                    fse,
-                    buffer,
-                    offset_hist,
-                    literals_buffer,
-                    dict,
-                )
-            }
+            // PROBE, not a proposal: routes this tier to the SHARED generic
+            // body instead of its hand-written monolith, to find out what the
+            // monolith is actually worth. Four such monoliths exist, each
+            // expanding the executor three times, and keeping them in step by
+            // hand is what let the dictionary branch go missing from two of
+            // them. If the generic body measures level, they are deletable.
+            decode_and_execute_sequences_impl::<B, crate::cpu_kernel::Avx2Kernel>(
+                section,
+                source,
+                fse,
+                buffer,
+                offset_hist,
+                literals_buffer,
+                dict,
+            )
         }
         #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
         CpuKernelTag::Vbmi2 => {
