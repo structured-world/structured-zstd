@@ -58,12 +58,23 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
             // No overlap: source range ends before destination starts.
             core::ptr::copy_nonoverlapping(match_src, op_match, match_length);
         } else {
-            // Overlapping LZ copy: forward byte-by-byte replicates the
-            // `offset`-periodic pattern (upstream zstd `ZSTD_overlapCopy`, scalar form).
-            let mut i = 0usize;
-            while i < match_length {
-                *op_match.add(i) = *match_src.add(i);
-                i += 1;
+            // Overlapping LZ copy. The match repeats a period of `offset`
+            // bytes, so copy that period once and then double what is already
+            // written: every step is a non-overlapping block copy, and the
+            // block doubles each time, so even a period of one byte fills the
+            // match in block moves rather than one byte at a time. Upstream
+            // reaches the same place differently (`ZSTD_overlapCopy8` spreads
+            // the period to eight and its wildcopy takes it from there,
+            // zstd_decompress_block.c:804-824); what matters is that neither
+            // walks the match byte by byte, which on a long match with a short
+            // offset costs a factor.
+            let period = offset.min(match_length);
+            core::ptr::copy_nonoverlapping(match_src, op_match, period);
+            let mut filled = period;
+            while filled < match_length {
+                let chunk = filled.min(match_length - filled);
+                core::ptr::copy_nonoverlapping(op_match.cast_const(), op_match.add(filled), chunk);
+                filled += chunk;
             }
         }
     }
