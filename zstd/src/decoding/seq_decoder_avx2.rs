@@ -202,7 +202,8 @@ fn resolve_sequence_wide<K: crate::cpu_kernel::CpuKernel>(
 }
 
 macro_rules! decode_seq_fused_cshape {
-    ($ll_dec:expr, $ml_dec:expr, $of_dec:expr, $br:expr, $hist:expr) => {{
+    ($ll_dec:expr, $ml_dec:expr, $of_dec:expr, $br:expr, $hist:expr,
+     $update_bits:expr, $advance_states:expr) => {{
         let ll_state = $ll_dec.state;
         let ml_state = $ml_dec.state;
         let of_state = $of_dec.state;
@@ -219,9 +220,15 @@ macro_rules! decode_seq_fused_cshape {
         // total = exact bits consumed by this sequence in every arm (rep-0
         // reads 0 offset bits so total = ml+ll; rep-1 reads 1; real reads ofBits).
         let total = u16::from(of_bits) + u16::from(ml_bits) + u16::from(ll_bits);
-        if total <= 56 {
-            $br.ensure_bits(total as u8);
-            cshape_resolve!(
+        // The state advance belongs to the decode, as it does upstream
+        // (`ZSTD_decodeSequence` ends by advancing all three unless this is the
+        // last sequence), and it is here so that ONE refill check covers this
+        // sequence's values AND the transition bits that follow them. Asking
+        // separately, as two `ensure_bits` calls, was the loop's hottest line.
+        let update_bits = u16::from($update_bits);
+        if total + update_bits <= 56 {
+            $br.ensure_bits((total + update_bits) as u8);
+            let resolved = cshape_resolve!(
                 get_bits_unchecked,
                 ll_base,
                 ml_base,
@@ -231,11 +238,39 @@ macro_rules! decode_seq_fused_cshape {
                 of_bits,
                 $br,
                 $hist
-            )
+            );
+            if $advance_states {
+                $ll_dec.update_state_fast($br);
+                $ml_dec.update_state_fast($br);
+                $of_dec.update_state_fast($br);
+            }
+            resolved
         } else {
-            resolve_sequence_wide(
-                $br, ll_base, ml_base, of_base, ll_bits, ml_bits, of_bits, $hist,
-            )
+            let resolved = if total <= 56 {
+                $br.ensure_bits(total as u8);
+                cshape_resolve!(
+                    get_bits_unchecked,
+                    ll_base,
+                    ml_base,
+                    of_base,
+                    ll_bits,
+                    ml_bits,
+                    of_bits,
+                    $br,
+                    $hist
+                )
+            } else {
+                resolve_sequence_wide(
+                    $br, ll_base, ml_base, of_base, ll_bits, ml_bits, of_bits, $hist,
+                )
+            };
+            if $advance_states {
+                $br.ensure_bits($update_bits);
+                $ll_dec.update_state_fast($br);
+                $ml_dec.update_state_fast($br);
+                $of_dec.update_state_fast($br);
+            }
+            resolved
         }
     }};
 }
@@ -655,27 +690,21 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
         let mut shadow_hist = *offset_hist;
         let mut fallback_err: Option<DecompressBlockError> = None;
         for i in 0..num_sequences {
+            // The states advance for the NEXT sequence inside the decode, ahead
+            // of executing this one, as upstream advances them at the end of
+            // `ZSTD_decodeSequence` and only then calls `ZSTD_execSequence`. The
+            // execute reads no bits, so the bitstream order is unchanged, and
+            // the three FSE states plus the bit reader stop being live across
+            // the heavy match copy.
             let (seq_ll, seq_ml, resolved_offset) = decode_seq_fused_cshape!(
                 &mut ll_dec,
                 &mut ml_dec,
                 &mut of_dec,
                 &mut br,
-                &mut shadow_hist
+                &mut shadow_hist,
+                max_update_bits,
+                i + 1 < num_sequences
             );
-            // Advance the FSE states for the NEXT sequence before executing the
-            // current one, mirroring upstream `ZSTD_decodeSequence` (which
-            // updates the states inside decode, then calls `ZSTD_execSequence`).
-            // The execute reads no bits, so moving it after the state update is
-            // byte-identical (value bits then state-transition bits are consumed
-            // in the same order); it stops the three FSE states and the bit
-            // reader from staying live across the heavy match copy, cutting
-            // register pressure in the hot loop.
-            if i + 1 < num_sequences {
-                br.ensure_bits(max_update_bits);
-                ll_dec.update_state_fast(&mut br);
-                ml_dec.update_state_fast(&mut br);
-                of_dec.update_state_fast(&mut br);
-            }
             let r = execute_one_body!(
                 &mut cur,
                 buffer,
