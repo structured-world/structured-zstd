@@ -443,7 +443,15 @@ macro_rules! execute_one_body {
             }
             // Both terms are bounded (the live output by the window cap, the
             // literal run by a block), so this cannot wrap on any target this
-            // builds for, and it reads locals rather than the buffer.
+            // builds for, and it reads locals rather than the buffer. The
+            // assertion keeps the bound the plain addition replaced: if a
+            // backend or window change ever breaks it, the whole debug suite
+            // says so rather than a release build wrapping into a wrong
+            // prefix-resident answer.
+            debug_assert!(
+                $cur.live().checked_add(lits.len()).is_some(),
+                "live output plus the literal run must not wrap",
+            );
             let prefix_resident = offset <= $cur.live() + lits.len();
 
             // `inline_exec_ok` lets a wrapping backend (RingBuffer) veto the

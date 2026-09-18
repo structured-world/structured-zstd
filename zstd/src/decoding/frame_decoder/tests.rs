@@ -1,6 +1,9 @@
 extern crate std;
 
 use super::{DictionaryHandle, FrameDecoder};
+use crate::decoding::errors::{
+    DecodeBlockContentError, DecompressBlockError, ExecuteSequencesError, FrameDecoderError,
+};
 use crate::encoding::{CompressionLevel, FrameCompressor};
 use alloc::vec::Vec;
 
@@ -3535,14 +3538,38 @@ fn a_zero_offset_sequence_is_refused_rather_than_executed() {
         0x00, 0x00, 0x26, 0x9d, 0x00,
     ];
 
+    // Both surfaces must REFUSE it, and for this reason: an `Ok` here is the
+    // silent garbage the guard exists to prevent, so a test that tolerated one
+    // would pass with the guard deleted and protect nothing.
+    let expect_zero_offset = |err: &FrameDecoderError| {
+        assert!(
+            matches!(
+                err,
+                FrameDecoderError::FailedToReadBlockBody(
+                    DecodeBlockContentError::DecompressBlockError(
+                        DecompressBlockError::ExecuteSequencesError(
+                            ExecuteSequencesError::ZeroOffset
+                        )
+                    )
+                ),
+            ),
+            "expected the zero-offset refusal, got {err:?}",
+        );
+    };
+
     let mut decoder = FrameDecoder::new();
     let mut out = alloc::vec![0u8; 1 << 16];
-    // Either outcome is acceptable as long as it is an outcome: the decoder may
-    // reject the frame, and it may not panic or wander off reading its own
-    // output as a match source.
-    let _ = decoder.decode_all(frame.as_slice(), &mut out);
+    let err = decoder
+        .decode_all(frame.as_slice(), &mut out)
+        .expect_err("decode_all must refuse a zero-offset sequence");
+    expect_zero_offset(&err);
 
+    // The growing-sink surface refuses the same frame, but it can reach its own
+    // limit before the sequence executes, so only the refusal is pinned here;
+    // the cause is pinned above, on the surface that reaches the guard.
     let mut collected = Vec::new();
     let mut streamed = FrameDecoder::new();
-    let _ = streamed.decode_all_to_vec(frame.as_slice(), &mut collected);
+    streamed
+        .decode_all_to_vec(frame.as_slice(), &mut collected)
+        .expect_err("decode_all_to_vec must refuse the frame");
 }
