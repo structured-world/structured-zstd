@@ -129,47 +129,18 @@ macro_rules! execute_one_body {
                     // SAFETY: gated on `SUPPORTS_INLINE_SEQUENCE_EXEC`, so the
                     // backend is linear and overrides this.
                     let base = unsafe { backend.inline_exec_base_ptr() };
-                    let total_v = seq_ll_v as usize + seq_ml_v as usize;
-                    let cap_w = cap.saturating_sub(
-                        crate::decoding::exec_sequence_inline::MAX_WILDCOPY_OVERSHOOT,
+                    let r = exec_sequence_avx2_inline_at!(
+                        base,
+                        tail,
+                        cap,
+                        cap.saturating_sub(
+                            crate::decoding::exec_sequence_inline::MAX_WILDCOPY_OVERSHOOT
+                        ),
+                        lit_src,
+                        seq_ll_v as usize,
+                        offset,
+                        seq_ml_v as usize
                     );
-                    let r: Result<usize, crate::decoding::errors::ExecuteSequencesError> = if tail
-                        + total_v
-                        <= cap_w
-                    {
-                        exec_sequence_avx2_inline_at!(
-                            base,
-                            tail,
-                            lit_src,
-                            seq_ll_v as usize,
-                            offset,
-                            seq_ml_v as usize
-                        );
-                        Ok(total_v)
-                    } else {
-                        crate::decoding::buffer_backend::sequence_output_fits(
-                            seq_ll_v as usize,
-                            seq_ml_v as usize,
-                            tail,
-                            cap,
-                            0,
-                        )
-                        .map(|total| {
-                            // SAFETY: the fit check above, and the same
-                            // source preconditions as the wide body.
-                            unsafe {
-                                crate::decoding::exec_sequence_inline::exec_sequence_bounded_copy(
-                                    base,
-                                    tail,
-                                    lit_src,
-                                    seq_ll_v as usize,
-                                    offset,
-                                    seq_ml_v as usize,
-                                );
-                            }
-                            total
-                        })
-                    };
                     if let Ok(total) = r {
                         // SAFETY: the copy wrote exactly `total` bytes at `tail`.
                         unsafe { $buffer.buffer_mut().inline_exec_commit(tail + total) };
