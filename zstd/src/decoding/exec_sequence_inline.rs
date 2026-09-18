@@ -69,31 +69,27 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
     }
 }
 
-/// Textual expansion of the AVX2 `ZSTD_execSequence` body at the call
-/// site, fusing the match-copy into a per-tier sequence monolith. A
-/// `#[target_feature(avx2)]` function cannot be `#[inline(always)]`
-/// (rust#145574), so the [`BufferBackend::exec_sequence_inline_avx2`]
-/// trait method stays a real CALL on the hot path; expanding the body via
-/// a macro removes that boundary (the reference `decompressSequences_bmi2`
-/// is one inlined monolith). Backend access goes through the inlinable
-/// accessors `cap` / `tail` / `inline_exec_base_ptr` / `inline_exec_commit`,
-/// so the macro stays generic over `B` while only the linear inline
-/// backends (`UserSliceBackend`, `FlatBuf`) ever reach it (gated on
-/// `SUPPORTS_INLINE_SEQUENCE_EXEC`). 32-byte ymm match-copy for
-/// `offset >= 32`; usable from any tier whose enclosing fn carries
-/// `target_feature(avx2,bmi2)` (AVX2 and VBMI2). The trait method
-/// `exec_sequence_inline_avx2` remains the unit-tested reference spec for
-/// this body. Returns `Result<(), ExecuteSequencesError>`.
+/// Textual expansion of the AVX2 `ZSTD_execSequence` body at the call site,
+/// fusing the match-copy into a per-tier sequence monolith, addressed by an
+/// explicit cursor rather than by asking the backend where it is.
+///
+/// A `#[target_feature(avx2)]` function cannot be `#[inline(always)]`
+/// (rust#145574), so the [`BufferBackend::exec_sequence_inline_avx2`] trait
+/// method stays a real CALL on the hot path; expanding the body via a macro
+/// removes that boundary (the reference `decompressSequences_bmi2` is one
+/// inlined monolith). The trait method remains the unit-tested reference spec
+/// for this body. 32-byte ymm match-copy for `offset >= 32`; usable from any
+/// tier whose enclosing fn carries `target_feature(avx2,bmi2)` (AVX2 and VBMI2).
+///
+/// Taking the cursor as arguments is what lets the AVX2 tier keep its write
+/// position in locals for a whole block; the VBMI2 tier reads one per sequence
+/// and passes it here, so both share this body. Returns the bytes written, so
+/// the caller can advance whichever of the two it holds.
 //
 // Gated on `kernel-avx2` (implied by `kernel-vbmi2`) so the macro is absent
 // when its only consumers (`seq_decoder_avx2` / `seq_decoder_vbmi2`) are
 // compiled out — otherwise the `--no-default-features` build sees an unused
 // macro and trips `-D warnings`.
-/// The AVX2 copy body addressed by an explicit cursor rather than by asking the
-/// backend where it is. A loop that keeps its write position in a local hands it
-/// here directly; [`exec_sequence_avx2_inline`] is the same body for a caller
-/// that does not, reading the cursor and committing it around this. Returns the
-/// bytes written, so the caller can advance whichever of the two it holds.
 ///
 /// # Safety
 /// The enclosing function must carry `target_feature(bmi2,avx2)`, `base` must be
