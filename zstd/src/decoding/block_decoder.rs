@@ -436,8 +436,12 @@ impl BlockDecoder {
             });
         }
 
-        let raw_literals = &raw[..upper_limit_for_literals];
-        vprintln!("Slice for literals: {}", raw_literals.len());
+        // The literals payload plus whatever the block holds after it. The
+        // decoder reads literals only within `upper_limit_for_literals`; the
+        // tail decides whether a Raw section can be borrowed instead of copied,
+        // which is what buys the executor its read slack for free.
+        let raw_literals = raw;
+        vprintln!("Slice for literals: {}", upper_limit_for_literals);
 
         literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
         // Zero-copy literals view — for Raw sections this borrows
@@ -449,19 +453,20 @@ impl BlockDecoder {
         // flamegraph.
         let LiteralsView {
             data: literals_view,
+            len: literals_len,
             bytes_used: bytes_used_in_literals_section,
         } = decode_literals_zerocopy(
             &section,
             huf,
             dict,
             raw_literals,
+            upper_limit_for_literals,
             literals_buffer,
             self.kernel,
         )?;
         assert!(
-            section.regenerated_size as usize == literals_view.len(),
-            "Wrong number of literals: {}, Should have been: {}",
-            literals_view.len(),
+            section.regenerated_size as usize == literals_len,
+            "Wrong number of literals: {literals_len}, Should have been: {}",
             section.regenerated_size
         );
         assert!(bytes_used_in_literals_section == upper_limit_for_literals as u32);
@@ -520,6 +525,7 @@ impl BlockDecoder {
                 buffer,
                 offset_hist,
                 literals_view,
+                literals_len,
                 dict,
                 self.kernel,
             )?;
@@ -538,7 +544,7 @@ impl BlockDecoder {
             // write's error path through this body cost 9.9% of cycles on a
             // 1 MiB level-19 stream while issuing 0.6% FEWER instructions: the
             // sequence executor it calls is laid out around this body.
-            return write_literals_only(buffer, literals_view);
+            return write_literals_only(buffer, &literals_view[..literals_len]);
         }
 
         // Nothing drains the buffer inside a block, so the growth of its live

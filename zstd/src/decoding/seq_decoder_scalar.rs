@@ -91,6 +91,8 @@ macro_rules! execute_one_body {
 
 /// Scalar-tier monolithic decode + execute.
 #[allow(clippy::too_many_lines)]
+// The block's inputs; see the AVX2 tier for why they stay separate.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_and_execute_sequences_scalar<'fse, B: BufferBackend>(
     section: &SequencesHeader,
     source: &[u8],
@@ -98,6 +100,7 @@ pub(crate) fn decode_and_execute_sequences_scalar<'fse, B: BufferBackend>(
     buffer: &mut DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
+    literals_len: usize,
     dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
 ) -> Result<(), DecompressBlockError> {
     let SeqStreamSetup {
@@ -110,7 +113,10 @@ pub(crate) fn decode_and_execute_sequences_scalar<'fse, B: BufferBackend>(
         num_sequences,
         use_long_pipeline,
     } = init_sequence_stream::<B, ScalarKernel>(section, source, fse, buffer, dict)?;
-    let literals_buffer_len = literals_buffer.len();
+    // `literals_buffer` runs past the literals by the copiers' read slack, so
+    // the literal count is the parameter, never the slice's length.
+    let literals_buffer_len = literals_len;
+    debug_assert!(literals_buffer.len() >= literals_len);
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
     // Invariant for the whole block, so it is resolved here rather than per
@@ -274,7 +280,7 @@ pub(crate) fn decode_and_execute_sequences_scalar<'fse, B: BufferBackend>(
     }
 
     if lit_cur < literals_buffer_len {
-        let rest = &literals_buffer[lit_cur..];
+        let rest = &literals_buffer[lit_cur..literals_buffer_len];
         buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;
         seq_sum = seq_sum.wrapping_add(rest.len() as u32);
     }

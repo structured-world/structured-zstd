@@ -98,17 +98,10 @@ macro_rules! execute_one_body {
                 break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
             }
 
-            // Literal-source slack, which both inline paths need: their `copy16`
-            // reads 16 bytes whatever the literal length, and the wildcopy
-            // regime reads the length rounded up to its stride.
-            let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-                && lit_cur_before
-                    .checked_add(16)
-                    .is_some_and(|b| b <= literals_buffer_len_v)
-                && (seq_ll_v as usize <= 16
-                    || lit_cur_before
-                        .checked_add((seq_ll_v as usize).next_multiple_of(16))
-                        .is_some_and(|b| b <= literals_buffer_len_v));
+            // The literal-source slack both inline paths need is guaranteed for
+            // the whole block by the literals decoder; see the AVX2 tier for
+            // where upstream settles the same question.
+            let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC;
             let offset = resolved_offset_v as usize;
             let prefix_resident = $buffer
                 .len()
@@ -202,6 +195,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
     buffer: &mut DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
+    literals_len: usize,
     dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
 ) -> Result<(), DecompressBlockError> {
     let SeqStreamSetup {
@@ -214,7 +208,10 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
         num_sequences,
         use_long_pipeline,
     } = init_sequence_stream::<B, Vbmi2Kernel>(section, source, fse, buffer, dict)?;
-    let literals_buffer_len = literals_buffer.len();
+    // `literals_buffer` runs past the literals by the copiers' read slack, so
+    // the literal count is the parameter, never the slice's length.
+    let literals_buffer_len = literals_len;
+    debug_assert!(literals_buffer.len() >= literals_len);
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
     // Invariant for the whole block, so it is resolved here rather than per
@@ -390,7 +387,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
     }
 
     if lit_cur < literals_buffer_len {
-        let rest = &literals_buffer[lit_cur..];
+        let rest = &literals_buffer[lit_cur..literals_buffer_len];
         buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;
         seq_sum = seq_sum.wrapping_add(rest.len() as u32);
     }

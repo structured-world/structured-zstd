@@ -250,6 +250,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
+    literals_len: usize,
     dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
     kernel: CpuKernelTag,
 ) -> Result<(), DecompressBlockError> {
@@ -274,6 +275,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 buffer,
                 offset_hist,
                 literals_buffer,
+                literals_len,
                 dict,
             )
         }
@@ -291,6 +293,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 buffer,
                 offset_hist,
                 literals_buffer,
+                literals_len,
                 dict,
             )
         }
@@ -306,6 +309,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
             buffer,
             offset_hist,
             literals_buffer,
+            literals_len,
             dict,
         ),
         #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
@@ -324,6 +328,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                     buffer,
                     offset_hist,
                     literals_buffer,
+                    literals_len,
                     dict,
                 )
             }
@@ -339,6 +344,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                     buffer,
                     offset_hist,
                     literals_buffer,
+                    literals_len,
                     dict,
                 )
             }
@@ -355,6 +361,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                     buffer,
                     offset_hist,
                     literals_buffer,
+                    literals_len,
                     dict,
                 )
             }
@@ -367,6 +374,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
             buffer,
             offset_hist,
             literals_buffer,
+            literals_len,
             dict,
         ),
         #[cfg(all(
@@ -381,6 +389,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
             buffer,
             offset_hist,
             literals_buffer,
+            literals_len,
             dict,
         ),
     }
@@ -397,6 +406,8 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
 // every test build. Allowed because the function is conditionally
 // reachable per build configuration.
 #[allow(dead_code)]
+// The block's inputs; see the AVX2 tier for why they stay separate.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_and_execute_sequences_impl<
     'fse,
     B: super::buffer_backend::BufferBackend,
@@ -408,6 +419,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
+    literals_len: usize,
     dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
 ) -> Result<(), DecompressBlockError> {
     // Consume the one-shot `ddict_is_cold` flag at function entry,
@@ -429,7 +441,10 @@ pub(crate) fn decode_and_execute_sequences_impl<
         num_sequences,
         use_long_pipeline,
     } = init_sequence_stream::<B, K>(section, source, fse, buffer, dict)?;
-    let literals_buffer_len = literals_buffer.len();
+    // `literals_buffer` runs past the literals by the copiers' read slack, so
+    // the literal count is the parameter, never the slice's length.
+    let literals_buffer_len = literals_len;
+    debug_assert!(literals_buffer.len() >= literals_len);
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
     // Invariant for the whole block, so it is resolved here rather than per
@@ -667,7 +682,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // valid frame whose blocks differ in size would start failing. The block's
     // total output is checked once it has decoded.
     if lit_cur < literals_buffer_len {
-        let rest = &literals_buffer[lit_cur..];
+        let rest = &literals_buffer[lit_cur..literals_buffer_len];
         buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;
         seq_sum = seq_sum.wrapping_add(rest.len() as u32);
     }
@@ -1108,44 +1123,17 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
     // compile-time per backend monomorphisation, so the dead arm
     // carries no runtime cost on either side.
     //
-    // **Literal-source slack guard** (the read-side upstream zstd-port
-    // safety contract): upstream zstd's `ZSTD_copy16` reads 16 bytes
-    // unconditionally regardless of `litLength`; on truncated
-    // literals (the closing sequences of a block) that would read
-    // past the end of the literals buffer slice — UB even when the
-    // bytes happen to be valid memory inside the backing `Vec`.
-    // Upstream zstd guards with `iLitEnd > litLimit` → slow path. We mirror
-    // the same gate. The upstream zstd inline path issues two distinct reads
-    // past the declared literal end:
-    //   (1) Unconditional first `ZSTD_copy16` from `lit_cur_before`
-    //       — needs `lit_cur_before + 16 <= lit_len`. THIS GATE
-    //       MATTERS EVEN WHEN `seq.ll == 0`: the copy still happens,
-    //       overwriting the dst region the match copy will rewrite.
-    //   (2) Tail wildcopy's final 16-byte chunk — ONLY when
-    //       `lit_length > 16` (the upstream zstd inline path gates the
-    //       wildcopy call on that same threshold). Reads up to
-    //       `lit_cur_before + lit_length + 15`, i.e. `high + 15`.
-    // For `lit_length ∈ 0..=16` only (1) fires; gate (2) would
-    // unnecessarily reject short-literal-tail sequences near
-    // `lit_len` whose `copy16` over-read fits inside the buffer
-    // (`lit_cur_before + 16 <= lit_len`) but whose `high + 15`
-    // exceeds it. Apply (2) only in the wildcopy regime.
-    // `checked_add` covers adversarial overflow.
-    // For seq.ll > 16 the wildcopy tail's final 16-byte iteration
-    // reads through `lit_cur_before + seq.ll.next_multiple_of(16)
-    // - 1`. Use that exact bound rather than `high + 15`, which
-    // over-counts by `15 - ((seq.ll - 1) % 16)` whenever `seq.ll %
-    // 16 != 1` — keeping the upstream zstd inline path active on more
-    // sequences near the end of the literals buffer.
-    // Literal-source slack, which both inline paths need: their `copy16` reads
-    // 16 bytes whatever the literal length, and the wildcopy regime reads the
-    // length rounded up to its stride.
-    let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-        && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
-        && (seq.ll as usize <= 16
-            || lit_cur_before
-                .checked_add((seq.ll as usize).next_multiple_of(16))
-                .is_some_and(|b| b <= lit_len));
+    // **Literal-source slack** (the read-side port contract): the inline
+    // copiers read past the declared literal end twice, an unconditional
+    // `copy16` whatever the literal length, and the wildcopy tail's last chunk
+    // when the length exceeds 16. Both reads are covered for the whole block by
+    // the literals decoder, which hands this loop a buffer carrying
+    // `WILDCOPY_OVERLENGTH` readable bytes after the literals: a Raw section is
+    // borrowed only when the block has that room after it, and every other
+    // section is materialised with it. Upstream decides the same thing in the
+    // same place (`zstd_decompress_block.c:275`), which is why its executor
+    // tests only `iLitEnd > litLimit` and never the slack.
+    let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC;
     let offset = resolved_offset as usize;
     // Where the match source lives (matches `repeat()`'s `offset >
     // buffer.len()` → dict path gate). `checked_add` against adversarial

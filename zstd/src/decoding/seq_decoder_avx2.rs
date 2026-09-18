@@ -288,17 +288,15 @@ macro_rules! execute_one_body {
                 break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
             }
 
-            // Literal-source slack, which both inline paths need: their `copy16`
-            // reads 16 bytes whatever the literal length, and the wildcopy
-            // regime reads the length rounded up to its stride.
-            let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-                && lit_cur_before
-                    .checked_add(16)
-                    .is_some_and(|b| b <= literals_buffer_len_v)
-                && (seq_ll_v as usize <= 16
-                    || lit_cur_before
-                        .checked_add((seq_ll_v as usize).next_multiple_of(16))
-                        .is_some_and(|b| b <= literals_buffer_len_v));
+            // The literal-source slack both inline paths need (their `copy16`
+            // reads 16 bytes whatever the length, and the wildcopy regime reads
+            // the length rounded up to its stride) is guaranteed for the whole
+            // block by the literals decoder, which either borrows a Raw section
+            // that has the room after it or copies into a buffer that does.
+            // Upstream settles it the same way and at the same place
+            // (zstd_decompress_block.c:275), which is why its executor has no
+            // such test either.
+            let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC;
             let offset = resolved_offset_v as usize;
             let prefix_resident = $buffer
                 .len()
@@ -397,6 +395,11 @@ macro_rules! execute_one_body {
 /// `detect_cpu_kernel() == Avx2`.
 #[target_feature(enable = "bmi2,avx2")]
 #[allow(clippy::too_many_lines)]
+// The block's inputs, each already a scalar or a borrow the caller holds.
+// Grouping them into a struct to satisfy the lint would marshal a record per
+// block for a function whose whole point is to keep the loop's operands in
+// registers; upstream passes the same set the same way.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
     section: &SequencesHeader,
     source: &[u8],
@@ -404,6 +407,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
     buffer: &mut DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
+    literals_len: usize,
     dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
 ) -> Result<(), DecompressBlockError> {
     let SeqStreamSetup {
@@ -416,7 +420,10 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
         num_sequences,
         use_long_pipeline,
     } = init_sequence_stream::<B, Avx2Kernel>(section, source, fse, buffer, dict)?;
-    let literals_buffer_len = literals_buffer.len();
+    // `literals_buffer` runs past the literals by the copiers' read slack, so
+    // the literal count is the parameter, never the slice's length.
+    let literals_buffer_len = literals_len;
+    debug_assert!(literals_buffer.len() >= literals_len);
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
     // Invariant for the whole block, so it is resolved here rather than per
@@ -608,7 +615,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
     }
 
     if lit_cur < literals_buffer_len {
-        let rest = &literals_buffer[lit_cur..];
+        let rest = &literals_buffer[lit_cur..literals_buffer_len];
         buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;
         seq_sum = seq_sum.wrapping_add(rest.len() as u32);
     }

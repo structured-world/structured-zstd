@@ -50,6 +50,7 @@ fn raw_truncated_source_returns_error_no_panic() {
         &mut scratch,
         None,
         &source,
+        source.len(),
         &mut target,
         detect_cpu_kernel(),
     );
@@ -73,6 +74,7 @@ fn rle_empty_source_returns_error_no_panic() {
         &mut scratch,
         None,
         &source,
+        source.len(),
         &mut target,
         detect_cpu_kernel(),
     );
@@ -103,6 +105,7 @@ fn compressed_truncated_source_returns_error_no_panic() {
         &mut scratch,
         None,
         &source,
+        10,
         &mut target,
         detect_cpu_kernel(),
     );
@@ -140,20 +143,30 @@ fn rle_view_excludes_pre_existing_target_bytes() {
         &mut scratch,
         None,
         &source,
+        source.len(),
         &mut target,
         detect_cpu_kernel(),
     )
     .expect("RLE with valid source must succeed");
-    assert_eq!(view.data.len(), 4, "view length must match regen_size");
+    assert_eq!(view.len, 4, "literal count must match regen_size");
     assert!(
-        view.data.iter().all(|&b| b == 0x42),
+        view.data[..view.len].iter().all(|&b| b == 0x42),
         "view must contain only the newly-RLE-expanded bytes, got {:?}",
-        view.data
+        &view.data[..view.len]
+    );
+    // The copiers read past the literals, so the view carries that much more
+    // readable room; the literals themselves end at `len`.
+    assert!(
+        view.data.len() >= view.len + crate::WILDCOPY_OVERLENGTH,
+        "view must carry the copiers' read slack, got {} for {} literals",
+        view.data.len(),
+        view.len
     );
     // Silence unused-warning if the compiler ever strips
     // LiteralsView fields — read bytes_used too.
     let _ = LiteralsView {
         data: view.data,
+        len: view.len,
         bytes_used: view.bytes_used,
     };
 }
