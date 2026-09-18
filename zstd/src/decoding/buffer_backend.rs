@@ -129,6 +129,9 @@ pub(crate) trait BufferBackend: Sized {
     /// wrap read the backend's own `tail`. A cursor carried past a wrap would
     /// address the ring linearly and ask that gate a stale question, so the
     /// ring is given its position back at every sequence instead.
+    // Read by the x86_64 AVX2 sequence loop, the only one that carries a
+    // cursor; dead on every other target, like the inline-exec hooks above.
+    #[allow(dead_code)]
     const CURSOR_IS_BLOCK_STABLE: bool = false;
 
     /// Upstream zstd's `ZSTD_execSequence` body
