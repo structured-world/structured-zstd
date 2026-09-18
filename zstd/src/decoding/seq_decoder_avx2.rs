@@ -171,6 +171,32 @@ macro_rules! cshape_resolve {
 /// converts to the real-offset domain that the executor consumes and that
 /// `offset_hist` records (verified equal to `do_offset_history` across its full
 /// test matrix). Expands to `(ll, ml, actual_offset)`; rotates `$hist` in place.
+/// The `total > 56` arm of [`decode_seq_fused_cshape`], out of line.
+///
+/// One `ensure_bits` cannot cover a sequence whose three fields ask for more
+/// bits than the reader holds, so that case re-checks per read. Reaching it
+/// needs a wide offset: with `ll` and `ml` capped at 16 bits each, `of` must
+/// ask for more than 24, which takes a window above 16 MB. Inline it was a
+/// second full copy of the resolve logic sitting beside the hot one, in a
+/// function already carrying seven times the reference's code, for a branch
+/// most frames never take.
+#[cold]
+#[inline(never)]
+fn resolve_sequence_wide<K: crate::cpu_kernel::CpuKernel>(
+    br: &mut crate::bit_io::BitReaderReversed<'_, K>,
+    ll_base: u32,
+    ml_base: u32,
+    of_base: u32,
+    ll_bits: u8,
+    ml_bits: u8,
+    of_bits: u8,
+    hist: &mut [u32; 3],
+) -> (u32, u32, u32) {
+    cshape_resolve!(
+        get_bits, ll_base, ml_base, of_base, ll_bits, ml_bits, of_bits, br, hist
+    )
+}
+
 macro_rules! decode_seq_fused_cshape {
     ($ll_dec:expr, $ml_dec:expr, $of_dec:expr, $br:expr, $hist:expr) => {{
         let ll_state = $ll_dec.state;
@@ -203,8 +229,8 @@ macro_rules! decode_seq_fused_cshape {
                 $hist
             )
         } else {
-            cshape_resolve!(
-                get_bits, ll_base, ml_base, of_base, ll_bits, ml_bits, of_bits, $br, $hist
+            resolve_sequence_wide(
+                $br, ll_base, ml_base, of_base, ll_bits, ml_bits, of_bits, $hist,
             )
         }
     }};
