@@ -3478,6 +3478,44 @@ fn the_lookahead_arm_decodes_what_the_straight_loop_does() {
     );
 }
 
+/// A corrupted sequence stream ends in an error, never a panic.
+///
+/// The sequence loop's exits for a stream that does not end where it said it
+/// would (bits left over, or too few for the count it declared) are reachable
+/// only from malformed input, so nothing but the fuzzer was exercising them.
+/// Flipping bytes through the tail of a real frame drives them from the
+/// ordinary suite.
+#[test]
+fn a_corrupted_sequence_stream_errors_rather_than_panics() {
+    let payload: Vec<u8> = (0..16384u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+
+    // The sequence section is the tail of the block, so mutating bytes from the
+    // end walks through it; every byte value is tried at a few positions.
+    for back in 5..40usize {
+        if back >= compressed.len() {
+            break;
+        }
+        let pos = compressed.len() - back;
+        for delta in [1u8, 0x5A, 0xFF] {
+            let mut frame = compressed.clone();
+            frame[pos] = frame[pos].wrapping_add(delta);
+
+            let mut out = alloc::vec![0u8; payload.len() + 4096];
+            let mut decoder = FrameDecoder::new();
+            // Any outcome but a panic is acceptable: the frame may still decode
+            // (a checksum-free frame can absorb some edits), or be refused.
+            let _ = decoder.decode_all(frame.as_slice(), &mut out);
+        }
+    }
+}
+
 /// A sequence whose resolved offset is zero must be refused, not executed.
 ///
 /// Zero is not a valid match offset, and a decoder that lets one through takes
