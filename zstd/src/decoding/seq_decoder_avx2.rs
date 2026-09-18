@@ -339,14 +339,13 @@ impl OutCursor {
             base,
             op,
             cap,
-            // An output shorter than the overshoot has no room for an
-            // overshooting write at all: that is a branch to the exact copier,
-            // spelled out here rather than clamped, so the case is visible.
-            cap_w: if cap >= MAX_WILDCOPY_OVERSHOOT {
-                cap - MAX_WILDCOPY_OVERSHOOT
-            } else {
-                0
-            },
+            // Saturating is the meaning here, not a masked bound: an output
+            // shorter than the overshoot leaves no room for an overshooting
+            // write at all, and an end of zero says exactly that, sending every
+            // sequence to the exact copier. This is a value computed once per
+            // block, not the per-sequence gate; the gate is the comparison
+            // against it.
+            cap_w: cap.saturating_sub(MAX_WILDCOPY_OVERSHOOT),
             live_base: core::num::Wrapping(op) - core::num::Wrapping(live),
         }
     }

@@ -138,12 +138,13 @@ macro_rules! execute_one_body {
                     // SAFETY: gated on `SUPPORTS_INLINE_SEQUENCE_EXEC`, so the
                     // backend is linear and overrides this.
                     let base = unsafe { backend.inline_exec_base_ptr() };
-                    // An output shorter than the copiers' overshoot has no room
-                    // for an overshooting write at all, which is a branch to the
-                    // exact copier rather than a bound to clamp into: saturating
-                    // here would answer "end at zero" and hide the case.
-                    let overshoot = crate::decoding::exec_sequence_inline::MAX_WILDCOPY_OVERSHOOT;
-                    let cap_w = if cap >= overshoot { cap - overshoot } else { 0 };
+                    // Saturating is the meaning: an output shorter than the
+                    // overshoot leaves no room for an overshooting write, and an
+                    // end of zero says so, sending the sequence to the exact
+                    // copier. The gate is the comparison against this, not this.
+                    let cap_w = cap.saturating_sub(
+                        crate::decoding::exec_sequence_inline::MAX_WILDCOPY_OVERSHOOT,
+                    );
                     let r = exec_sequence_avx2_inline_at!(
                         base,
                         tail,
@@ -220,6 +221,8 @@ macro_rules! execute_one_body {
 /// Caller must have verified the full VBMI2 + AVX-512 + AVX2 + BMI2 set.
 #[target_feature(enable = "bmi2,avx2,avx512vbmi2,avx512f,avx512vl,avx512bw")]
 #[allow(clippy::too_many_lines)]
+// The block's inputs; see the AVX2 tier for why they stay separate.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
     section: &SequencesHeader,
     source: &[u8],
