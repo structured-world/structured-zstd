@@ -97,10 +97,13 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
 /// for this body. 32-byte ymm match-copy for `offset >= 32`; usable from any
 /// tier whose enclosing fn carries `target_feature(avx2,bmi2)` (AVX2 and VBMI2).
 ///
-/// Taking the cursor as arguments is what lets the AVX2 tier keep its write
-/// position in locals for a whole block; the VBMI2 tier reads one per sequence
-/// and passes it here, so both share this body. Returns the bytes written, so
-/// the caller can advance whichever of the two it holds.
+/// Taking the write position as an argument is what lets the AVX2 tier keep it
+/// in locals for a whole block; the VBMI2 tier reads one per sequence and passes
+/// it here, so both share this body.
+///
+/// The caller owns the room question. It knows the end with the overshoot taken
+/// off, so it decides between this body and the exact one without this body
+/// needing the capacity at all, which keeps one fewer value live in the loop.
 //
 // Gated on `kernel-avx2` (implied by `kernel-vbmi2`) so the macro is absent
 // when its only consumers (`seq_decoder_avx2` / `seq_decoder_vbmi2`) are
@@ -108,13 +111,13 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
 // macro and trips `-D warnings`.
 ///
 /// # Safety
-/// The enclosing function must carry `target_feature(bmi2,avx2)`, `base` must be
-/// the start of a linear output valid for writes through `cap`, and `lit_src`
-/// must be readable for the literal length rounded up to 16.
+/// The enclosing function must carry `target_feature(bmi2,avx2)`; `base` must be
+/// valid for writes over `[tail, tail + lit_length + match_length + 31)`;
+/// `lit_src` must be readable for the literal length rounded up to 16; and the
+/// match source `tail + lit_length - offset` must be inside what is written.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 macro_rules! exec_sequence_avx2_inline_at {
-    ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
-        use crate::decoding::buffer_backend::sequence_output_fits;
+    ($base:expr, $tail:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
         use crate::decoding::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
             wildcopy_overlap_8byte_stride,
@@ -124,58 +127,29 @@ macro_rules! exec_sequence_avx2_inline_at {
         let match_length_v: usize = $match_length;
         let lit_src_v: *const u8 = $lit_src;
         let base: *mut u8 = $base;
-        let cap: usize = $cap;
-        let cap_w: usize = $cap_w;
         let tail: usize = $tail;
-        // One comparison decides the hot path, exactly as upstream's
-        // `oMatchEnd > oend_w`: `cap_w` is the end with the overshoot already
-        // taken off, computed once per block. Both lengths are bounded by a
-        // block's FSE expansion, so the sum cannot overflow. Everything else,
-        // including whether the write fits at all, belongs to the branch that
-        // is almost never taken.
-        let total = lit_length_v + match_length_v;
-        if tail + total > cap_w {
-            sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0).map(|total| {
-                // Tight tail: the write fits but the overshoot would not.
-                // SAFETY: as below, with the exact copy in place of the
-                // overshooting one.
-                unsafe {
-                    $crate::decoding::exec_sequence_inline::exec_sequence_bounded_copy(
-                        base,
-                        tail,
-                        lit_src_v,
-                        lit_length_v,
-                        offset_v,
-                        match_length_v,
-                    );
-                }
-                total
-            })
-        } else {
-            // SAFETY: the enclosing fn carries
-            // `#[target_feature(enable = "...,bmi2,avx2")]`, the caller vouches
-            // for `base`, and the comparison above established room for the
-            // write and for every byte the wildcopy may overshoot.
-            unsafe {
-                let op_lit = base.add(tail);
-                let op_match = base.add(tail + lit_length_v);
-                let match_src = base.cast_const().add(tail + lit_length_v - offset_v);
-                copy16(op_lit, lit_src_v);
-                if lit_length_v > 16 {
-                    wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
-                }
-                if offset_v >= 32 {
-                    wildcopy_no_overlap_avx2(op_match, match_src, match_length_v);
-                } else if offset_v >= 16 {
-                    wildcopy_no_overlap(op_match, match_src, match_length_v);
-                } else {
-                    let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
-                    if match_length_v > 8 {
-                        wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 8);
-                    }
+        // SAFETY: the enclosing fn carries
+        // `#[target_feature(enable = "...,bmi2,avx2")]`, and the caller has
+        // established room for the write and for every byte the copies below
+        // may overshoot.
+        unsafe {
+            let op_lit = base.add(tail);
+            let op_match = base.add(tail + lit_length_v);
+            let match_src = base.cast_const().add(tail + lit_length_v - offset_v);
+            copy16(op_lit, lit_src_v);
+            if lit_length_v > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
+            }
+            if offset_v >= 32 {
+                wildcopy_no_overlap_avx2(op_match, match_src, match_length_v);
+            } else if offset_v >= 16 {
+                wildcopy_no_overlap(op_match, match_src, match_length_v);
+            } else {
+                let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
+                if match_length_v > 8 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 8);
                 }
             }
-            Ok(total)
         }
     }};
 }

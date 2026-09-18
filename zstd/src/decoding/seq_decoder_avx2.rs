@@ -298,8 +298,6 @@ struct OutCursor {
     base: *mut u8,
     /// Write position, the backend's `tail`.
     op: usize,
-    /// Where writes must stop: the backend's `cap`.
-    cap: usize,
     /// `cap` less the wildcopy overshoot, so the per-sequence question "does
     /// this fit, overshoot included" is one comparison against a value the
     /// block computed once. Upstream carries the same thing as a pointer
@@ -328,7 +326,6 @@ impl OutCursor {
         Self {
             base,
             op,
-            cap,
             // An output with less room than the overshoot leaves `cap_w` at 0,
             // which sends every sequence to the exact copier. That is the right
             // answer for such an output, not a masked underflow.
@@ -427,26 +424,61 @@ macro_rules! execute_one_body {
                 {
                     // SAFETY: parent-slice provenance; offset prefix-resident.
                     let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
-                    // Inline the AVX2 exec body at the call site (no trait-method
-                    // call boundary; see `exec_sequence_avx2_inline`), addressed
-                    // by the cursor this loop carries.
-                    let r = exec_sequence_avx2_inline_at!(
-                        $cur.base,
-                        $cur.op,
-                        $cur.cap,
-                        $cur.cap_w,
-                        lit_src,
+                    let total = seq_ll_v as usize + seq_ml_v as usize;
+                    // One comparison decides it, exactly as upstream's
+                    // `oMatchEnd > oend_w`: `cap_w` is the output end with the
+                    // copiers' overshoot already taken off, computed once per
+                    // block. Both lengths are bounded by a block's FSE
+                    // expansion, so the sum cannot overflow. Whether the write
+                    // fits at all is the tight branch's question, and only that
+                    // branch needs the capacity itself.
+                    if $cur.op + total <= $cur.cap_w {
+                        // Inline the AVX2 exec body at the call site (no
+                        // trait-method call boundary), addressed by the cursor
+                        // this loop carries.
+                        exec_sequence_avx2_inline_at!(
+                            $cur.base,
+                            $cur.op,
+                            lit_src,
+                            seq_ll_v as usize,
+                            offset,
+                            seq_ml_v as usize
+                        );
+                        $cur.op += total;
+                        // Inline path bypasses the wrapper's output counter;
+                        // keep it current for backends that read it
+                        // (Ring/Flat resume + dict gate). Const-folded away
+                        // for UserSliceBackend.
+                        if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                            $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                        }
+                        break 'exec_inner Ok(());
+                    }
+                    // Tight tail: the write may still fit, but not the
+                    // overshoot. The capacity comes from the backend, which this
+                    // branch is about to touch anyway.
+                    let cap = $buffer.buffer_mut().cap();
+                    match crate::decoding::buffer_backend::sequence_output_fits(
                         seq_ll_v as usize,
-                        offset,
-                        seq_ml_v as usize
-                    );
-                    match r {
+                        seq_ml_v as usize,
+                        $cur.op,
+                        cap,
+                        0,
+                    ) {
                         Ok(total) => {
+                            // SAFETY: the fit check above, and the same source
+                            // preconditions as the overshooting body.
+                            unsafe {
+                                crate::decoding::exec_sequence_inline::exec_sequence_bounded_copy(
+                                    $cur.base,
+                                    $cur.op,
+                                    lit_src,
+                                    seq_ll_v as usize,
+                                    offset,
+                                    seq_ml_v as usize,
+                                );
+                            }
                             $cur.op += total;
-                            // Inline path bypasses the wrapper's output counter;
-                            // keep it current for backends that read it
-                            // (Ring/Flat resume + dict gate). Const-folded away
-                            // for UserSliceBackend.
                             if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
                                 $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
                             }
