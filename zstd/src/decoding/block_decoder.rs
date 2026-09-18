@@ -443,6 +443,16 @@ impl BlockDecoder {
         let raw_literals = raw;
         vprintln!("Slice for literals: {}", upper_limit_for_literals);
 
+        // The sequence header sits immediately after the literals payload, so
+        // its count is readable before the literals are decoded. Read it here:
+        // whether the copiers will run at all decides whether the literals need
+        // the read slack, and a literals-only block should not be copied into
+        // scratch to provide slack nothing will use.
+        let mut seq_section = SequencesHeader::new();
+        let bytes_in_sequence_header =
+            seq_section.parse_from_header(&raw[upper_limit_for_literals..])?;
+        let sequences_will_run = seq_section.num_sequences != 0;
+
         literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
         // Zero-copy literals view — for Raw sections this borrows
         // straight into `raw_literals` (no memcpy into the Vec).
@@ -461,6 +471,7 @@ impl BlockDecoder {
             dict,
             raw_literals,
             upper_limit_for_literals,
+            sequences_will_run,
             literals_buffer,
             self.kernel,
         )?;
@@ -474,8 +485,6 @@ impl BlockDecoder {
         let raw = &raw[upper_limit_for_literals..];
         vprintln!("Slice for sequences with headers: {}", raw.len());
 
-        let mut seq_section = SequencesHeader::new();
-        let bytes_in_sequence_header = seq_section.parse_from_header(raw)?;
         let raw = &raw[bytes_in_sequence_header as usize..];
         vprintln!(
             "Found sequencessection with sequences: {} and size: {}",

@@ -51,6 +51,7 @@ fn raw_truncated_source_returns_error_no_panic() {
         None,
         &source,
         source.len(),
+        true,
         &mut target,
         detect_cpu_kernel(),
     );
@@ -75,6 +76,7 @@ fn rle_empty_source_returns_error_no_panic() {
         None,
         &source,
         source.len(),
+        true,
         &mut target,
         detect_cpu_kernel(),
     );
@@ -106,6 +108,7 @@ fn compressed_truncated_source_returns_error_no_panic() {
         None,
         &source,
         10,
+        true,
         &mut target,
         detect_cpu_kernel(),
     );
@@ -144,6 +147,7 @@ fn rle_view_excludes_pre_existing_target_bytes() {
         None,
         &source,
         source.len(),
+        true,
         &mut target,
         detect_cpu_kernel(),
     )

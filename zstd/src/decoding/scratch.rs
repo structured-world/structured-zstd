@@ -205,8 +205,14 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // This matches upstream zstd's `dctx->litExtraBuffer` /
         // `dctx->workspace` lifecycle — touched once at decoder
         // construction, warm across all subsequent frames.
-        if self.literals_buffer.capacity() < block_cap {
-            self.literals_buffer.resize(block_cap, 0);
+        // The literals buffer is reserved with the copiers' read slack on top of
+        // the block bound: a materialised section is padded to
+        // `literals + WILDCOPY_OVERLENGTH`, so a block whose literals reach the
+        // bound would otherwise grow the Vec in the decode hot path, and its
+        // amortised growth would double a 128 KiB scratch to get 32 bytes.
+        let literals_cap = block_cap + crate::WILDCOPY_OVERLENGTH;
+        if self.literals_buffer.capacity() < literals_cap {
+            self.literals_buffer.resize(literals_cap, 0);
             self.literals_buffer.clear();
         }
         if self.block_content_buffer.capacity() < block_cap {

@@ -97,12 +97,19 @@ pub struct LiteralsView<'a> {
 /// whether a Raw section can be borrowed rather than copied: borrowing is only
 /// safe when the block carries the copiers' read slack after the literals. The
 /// entropy paths never see past `payload_len`.
+/// `needs_slack` says whether a sequence executor will read these literals. A
+/// block with no sequences writes them out as they are, so it gets no padding
+/// and a Raw section stays borrowed however little follows it in the block.
+// The block's literals inputs, each a borrow or a scalar the caller already
+// holds; a struct here would marshal a record per block to satisfy the lint.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_literals_zerocopy<'a>(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
     dict: Option<&Dictionary>,
     source: &'a [u8],
     payload_len: usize,
+    needs_slack: bool,
     target: &'a mut Vec<u8>,
     kernel: CpuKernelTag,
 ) -> Result<LiteralsView<'a>, DecompressLiteralsError> {
@@ -131,16 +138,23 @@ pub fn decode_literals_zerocopy<'a>(
             // bytes after it for the copiers' slack, exactly as upstream
             // decides between `dctx->litPtr = istart + lhSize` and a copy into
             // `dctx->litBuffer` (zstd_decompress_block.c:275-295). Asked once
-            // per block here, the executor never asks again.
-            if source.len() >= n + WILDCOPY_OVERLENGTH {
+            // per block here, the executor never asks again. With no sequences
+            // to run there is nothing to give slack to, so the borrow stands
+            // whatever follows the payload.
+            if !needs_slack || source.len() >= n + WILDCOPY_OVERLENGTH {
+                let end = if needs_slack {
+                    n + WILDCOPY_OVERLENGTH
+                } else {
+                    n
+                };
                 return Ok(LiteralsView {
-                    data: &source[..n + WILDCOPY_OVERLENGTH],
+                    data: &source[..end],
                     len: n,
                     bytes_used: section.regenerated_size,
                 });
             }
             target.extend_from_slice(&source[..n]);
-            pad_with_slack(target, base, n, bytes_used_raw(section))
+            pad_with_slack(target, base, n, bytes_used_raw(section), needs_slack)
         }
         LiteralsSectionType::RLE => {
             // RLE expands one byte to N — has to write into target.
@@ -150,13 +164,13 @@ pub fn decode_literals_zerocopy<'a>(
             }
             let n = section.regenerated_size as usize;
             target.resize(base + n, source[0]);
-            pad_with_slack(target, base, n, 1)
+            pad_with_slack(target, base, n, 1, needs_slack)
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
             let payload = &source[..payload_len.min(source.len())];
             let bytes_used = decompress_literals(section, scratch, dict, payload, target, kernel)?;
             let n = target.len() - base;
-            pad_with_slack(target, base, n, bytes_used)
+            pad_with_slack(target, base, n, bytes_used, needs_slack)
         }
     }
 }
@@ -175,8 +189,11 @@ fn pad_with_slack(
     base: usize,
     n: usize,
     bytes_used: u32,
+    needs_slack: bool,
 ) -> Result<LiteralsView<'_>, DecompressLiteralsError> {
-    target.resize(base + n + WILDCOPY_OVERLENGTH, 0);
+    if needs_slack {
+        target.resize(base + n + WILDCOPY_OVERLENGTH, 0);
+    }
     Ok(LiteralsView {
         data: &target[base..],
         len: n,
