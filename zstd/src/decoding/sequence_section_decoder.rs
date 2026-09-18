@@ -1079,25 +1079,19 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
     resolved_offset: u32,
 ) -> Result<(), DecompressBlockError> {
     let lit_cur_before = *lit_cur;
-    // The cursor never passes the end (it only advances to a `high` this check
-    // already accepted), so the remaining literals are a subtraction that
-    // cannot underflow, and asking whether this sequence fits is one
-    // comparison against it. Taking the sum instead would need an overflow
-    // check on every sequence to say the same thing, and the wrap it guards
-    // against is what would make the `get_unchecked` below slice out of
-    // bounds.
-    debug_assert!(lit_cur_before <= lit_len);
-    let lit_remaining = lit_len - lit_cur_before;
-    if seq.ll as usize > lit_remaining {
-        return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+    // `checked_add` guards against `usize` wrap on 32-bit targets
+    // when a malformed stream pushes `lit_cur_before + seq.ll` past
+    // `usize::MAX`; without it the wrap produces `high < lit_cur_before`
+    // and the subsequent `get_unchecked` would slice OOB (UB).
+    let high = lit_cur_before
+        .checked_add(seq.ll as usize)
+        .filter(|&h| h <= lit_len)
+        .ok_or(ExecuteSequencesError::NotEnoughBytesForSequence {
             wanted: lit_cur_before.saturating_add(seq.ll as usize),
             have: lit_len,
-        }
-        .into());
-    }
-    let high = lit_cur_before + seq.ll as usize;
-    // SAFETY: high <= lit_len (the remaining-literals check above) and
-    // lit_cur_before <= high.
+        })?;
+    // SAFETY: high <= lit_len (verified above) and lit_cur_before <= high
+    // (the `checked_add` succeeded, so no wrap).
     let lits = unsafe { literals.get_unchecked(lit_cur_before..high) };
     *lit_cur = high;
 
@@ -1147,15 +1141,11 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
     // 16 bytes whatever the literal length, and the wildcopy regime reads the
     // length rounded up to its stride.
     let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-        && if seq.ll as usize <= 16 {
-            lit_remaining >= 16
-        } else {
-            // `next_multiple_of(16)` by hand: the length is bounded by a
-            // block, so rounding it up cannot overflow, and the library form
-            // pays an overflow check per sequence to establish what that bound
-            // already gives.
-            lit_remaining >= (seq.ll as usize + 15) & !15
-        };
+        && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
+        && (seq.ll as usize <= 16
+            || lit_cur_before
+                .checked_add((seq.ll as usize).next_multiple_of(16))
+                .is_some_and(|b| b <= lit_len));
     let offset = resolved_offset as usize;
     // Where the match source lives (matches `repeat()`'s `offset >
     // buffer.len()` → dict path gate). `checked_add` against adversarial
@@ -1163,10 +1153,10 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
     // offset as out-of-range rather than letting wrapping addition classify a
     // wildly out-of-range one as resident and hand the inline path an OOB
     // match-source pointer.
-    // Both terms are bounded (the live output by the window cap, the literal
-    // run by a block), so the sum is nowhere near `usize::MAX` on any target
-    // this builds for.
-    let prefix_resident = offset <= buffer.len() + lits.len();
+    let prefix_resident = buffer
+        .len()
+        .checked_add(lits.len())
+        .is_some_and(|end| offset <= end);
     if !prefix_resident {
         // Match source reaches outside what's been written in this frame:
         // upstream zstd's `extDict` arm. When the whole match sits inside
