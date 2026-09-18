@@ -29,6 +29,11 @@
 /// Most bytes a wildcopy body may write past the sequence it was asked for: its
 /// widest stride less one. A destination with at least this much room after the
 /// write can take the overshooting copiers; anything tighter takes the exact one.
+///
+/// Gated to the tier that reads it (the AVX2 sequence loop, which keeps the
+/// output end less this value in its cursor), so the builds without that tier
+/// do not carry an unused constant.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 pub(crate) const MAX_WILDCOPY_OVERSHOOT: usize = 31;
 
 /// Exact, non-overshooting literal+match copy of one sequence at
