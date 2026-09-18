@@ -433,7 +433,12 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
 
-    if use_long_pipeline {
+    // PROBE, not a proposal: bounds what outlining the pipelined arm could be
+    // worth by removing it from the function altogether. The simple arm is
+    // correct for every block, so this decodes the same bytes; what it gives
+    // up is the prefetch lookahead on cold-dictionary and large-history
+    // frames, which this fixture has neither of.
+    if false && use_long_pipeline {
         // === Long-pipeline arm (8-deep lookahead ring) ===
         let mut prefetch_pos: usize = old_buffer_size;
         let mut shadow_hist: [u32; 3] = *offset_hist;
