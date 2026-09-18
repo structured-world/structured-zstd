@@ -647,6 +647,18 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             actual_offset: 0,
         }; ADVANCE];
 
+        // The probe below is bounded by the BACKEND's length, which a carried
+        // cursor leaves behind for the whole block, so every source the block
+        // itself produced is refused. That is deliberate, and it was measured:
+        // addressing the probe through the cursor instead (128 KiB block, one
+        // cold dictionary, so 281 of its 391 probes are the refused ones) cost
+        // 3.0% — 9.07 s against 9.34 s over 20k decodes, ranges disjoint across
+        // three interleaved pairs. A source this block wrote is at most a block
+        // back and microseconds old, so warming it buys nothing while the two
+        // hints and the bound cost per sequence. The probe exists for the long
+        // offsets the arm is gated on, and those sit below the backend's length
+        // already.
+        //
         // Prefill ring with ADVANCE decoded+prefetched sequences.
         for slot in ring.iter_mut() {
             let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
