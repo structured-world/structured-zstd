@@ -115,55 +115,55 @@ macro_rules! exec_sequence_avx2_inline_at {
         let base: *mut u8 = $base;
         let cap: usize = $cap;
         let tail: usize = $tail;
-        // Hard guard with `overshoot = 0`; the <=31-byte wildcopy slack is
-        // handled by the tight-tail branch below so an exact-fit output
-        // slice (no `WILDCOPY_OVERLENGTH` trailing room) stays correct.
-        match sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0) {
-            Err(e) => Err(e),
-            Ok(total) => {
-                // SAFETY: the enclosing fn carries
-                // `#[target_feature(enable = "...,bmi2,avx2")]` and the caller
-                // vouches for `base`; `sequence_output_fits` validated
-                // `tail + total <= cap`.
+        // One comparison decides the hot path, as upstream's `oMatchEnd >
+        // oend_w` does: room for the write AND for the wildcopy overshoot. Both
+        // lengths are bounded by a block's FSE expansion, so the sum cannot
+        // overflow. Everything else, including whether the write fits at all,
+        // belongs to the branch that is almost never taken.
+        let room = cap - tail;
+        let total = lit_length_v + match_length_v;
+        if total + MAX_WILDCOPY_OVERSHOOT > room {
+            sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0).map(|total| {
+                // Tight tail: the write fits but the overshoot would not.
+                // SAFETY: as below, with the exact copy in place of the
+                // overshooting one.
                 unsafe {
-                    if total + MAX_WILDCOPY_OVERSHOOT > cap - tail {
-                        // Tight tail: literal+match fit exactly but the
-                        // wildcopy overshoot would write past `cap`. Shared
-                        // exact, non-overshooting copy.
-                        $crate::decoding::exec_sequence_inline::exec_sequence_bounded_copy(
-                            base,
-                            tail,
-                            lit_src_v,
-                            lit_length_v,
-                            offset_v,
-                            match_length_v,
-                        );
-                    } else {
-                        let op_lit = base.add(tail);
-                        let op_match = base.add(tail + lit_length_v);
-                        let match_src = base.cast_const().add(tail + lit_length_v - offset_v);
-                        copy16(op_lit, lit_src_v);
-                        if lit_length_v > 16 {
-                            wildcopy_no_overlap(
-                                op_lit.add(16),
-                                lit_src_v.add(16),
-                                lit_length_v - 16,
-                            );
-                        }
-                        if offset_v >= 32 {
-                            wildcopy_no_overlap_avx2(op_match, match_src, match_length_v);
-                        } else if offset_v >= 16 {
-                            wildcopy_no_overlap(op_match, match_src, match_length_v);
-                        } else {
-                            let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
-                            if match_length_v > 8 {
-                                wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 8);
-                            }
-                        }
+                    $crate::decoding::exec_sequence_inline::exec_sequence_bounded_copy(
+                        base,
+                        tail,
+                        lit_src_v,
+                        lit_length_v,
+                        offset_v,
+                        match_length_v,
+                    );
+                }
+                total
+            })
+        } else {
+            // SAFETY: the enclosing fn carries
+            // `#[target_feature(enable = "...,bmi2,avx2")]`, the caller vouches
+            // for `base`, and the comparison above established room for the
+            // write and for every byte the wildcopy may overshoot.
+            unsafe {
+                let op_lit = base.add(tail);
+                let op_match = base.add(tail + lit_length_v);
+                let match_src = base.cast_const().add(tail + lit_length_v - offset_v);
+                copy16(op_lit, lit_src_v);
+                if lit_length_v > 16 {
+                    wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
+                }
+                if offset_v >= 32 {
+                    wildcopy_no_overlap_avx2(op_match, match_src, match_length_v);
+                } else if offset_v >= 16 {
+                    wildcopy_no_overlap(op_match, match_src, match_length_v);
+                } else {
+                    let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
+                    if match_length_v > 8 {
+                        wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 8);
                     }
                 }
-                Ok(total)
             }
+            Ok(total)
         }
     }};
 }
