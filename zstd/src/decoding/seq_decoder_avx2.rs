@@ -409,15 +409,19 @@ macro_rules! execute_one_body {
             let lits = unsafe { $literals_buffer.get_unchecked(lit_cur_before..high) };
             *$lit_cur = high;
 
-            // Offset zero cannot reach here, so this is asserted rather than
-            // tested, as upstream asserts it. An offset entry's base value is
-            // `1 << ofCode` and no path can build one with a larger code: the
-            // FSE table rejects a symbol past `MAX_OFFSET_CODE`
-            // (`TooManySymbols`), the RLE mode checks its symbol against the
-            // same bound, and the predefined table is fixed. So a fresh offset
-            // resolves to at least 1, while the repcode arms turn a zero into
-            // `0xFFFFFFFF` on purpose for the residency gate below to reject.
-            debug_assert_ne!(resolved_offset_v, 0);
+            // A zero offset IS reachable on malformed input and is rejected
+            // here, not asserted. The argument for asserting it was that an
+            // offset entry's base value is `1 << ofCode` and the table build
+            // bounds the code, so a resolved offset is at least 1; fuzzing
+            // disproved it, on the lookahead arm, whose offsets come through
+            // `do_offset_history` rather than the fused resolve. Without the
+            // test a release build would take a zero as a match source of
+            // itself and decode corrupt input to garbage instead of an error,
+            // so the ~1.2 instructions per sequence it costs are the price of
+            // rejecting it.
+            if resolved_offset_v == 0 {
+                break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
+            }
 
             // The literal-source slack both inline paths need (their `copy16`
             // reads 16 bytes whatever the length, and the wildcopy regime reads

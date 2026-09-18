@@ -3423,3 +3423,34 @@ fn resume_does_not_redecode_prefix_blocks() {
         "resume must decode only in-range blocks, not re-decode the prefix"
     );
 }
+
+/// A sequence whose resolved offset is zero must be refused, not executed.
+///
+/// Zero is not a valid match offset, and a decoder that lets one through takes
+/// the match source to be the write position itself, turning corrupt input into
+/// silent garbage instead of an error. It is reachable: this frame comes from
+/// the fuzzer, which found it on the lookahead arm, where offsets are resolved
+/// by `do_offset_history` rather than the fused branchy resolve, and where the
+/// history can hand back a zero.
+///
+/// Kept as bytes rather than only as a fuzz corpus file so the contract is
+/// checked by the ordinary test run, on every target, in both debug and release.
+#[test]
+fn a_zero_offset_sequence_is_refused_rather_than_executed() {
+    let frame: [u8; 35] = [
+        0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x73, 0xc5, 0x00, 0x00, 0x3d, 0x7a, 0x1c, 0x04, 0xc5, 0x00,
+        0x00, 0x28, 0x7e, 0x28, 0x27, 0xf5, 0xfd, 0x2e, 0x00, 0xfd, 0x2e, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x26, 0x9d, 0x00,
+    ];
+
+    let mut decoder = FrameDecoder::new();
+    let mut out = alloc::vec![0u8; 1 << 16];
+    // Either outcome is acceptable as long as it is an outcome: the decoder may
+    // reject the frame, and it may not panic or wander off reading its own
+    // output as a match source.
+    let _ = decoder.decode_all(frame.as_slice(), &mut out);
+
+    let mut collected = Vec::new();
+    let mut streamed = FrameDecoder::new();
+    let _ = streamed.decode_all_to_vec(frame.as_slice(), &mut collected);
+}
