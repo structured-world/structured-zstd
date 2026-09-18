@@ -18,7 +18,9 @@
 
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
-use super::exec_sequence_inline::{exec_sequence_avx2_dict_inline, exec_sequence_avx2_inline_at};
+use super::exec_sequence_inline::{
+    MAX_WILDCOPY_OVERSHOOT, exec_sequence_avx2_dict_inline, exec_sequence_avx2_inline_at,
+};
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
     ADVANCE, ADVANCE_MASK, ExecSeq, SeqStreamSetup, init_sequence_stream,
@@ -298,9 +300,15 @@ struct OutCursor {
     op: usize,
     /// Where writes must stop: the backend's `cap`.
     cap: usize,
-    /// Length of the live region, which is what a match offset is measured
-    /// against.
-    live: usize,
+    /// `cap` less the wildcopy overshoot, so the per-sequence question "does
+    /// this fit, overshoot included" is one comparison against a value the
+    /// block computed once. Upstream carries the same thing as a pointer
+    /// (`oend_w = oend - WILDCOPY_OVERLENGTH`).
+    cap_w: usize,
+    /// Start of the live region. The length a match offset is measured against
+    /// is `op - head`, and `head` does not move while a block decodes, so the
+    /// loop advances one cursor rather than two.
+    head: usize,
 }
 
 impl OutCursor {
@@ -315,11 +323,17 @@ impl OutCursor {
         } else {
             core::ptr::null_mut()
         };
+        let op = backend.tail();
+        let cap = backend.cap();
         Self {
             base,
-            op: backend.tail(),
-            cap: backend.cap(),
-            live,
+            op,
+            cap,
+            // An output with less room than the overshoot leaves `cap_w` at 0,
+            // which sends every sequence to the exact copier. That is the right
+            // answer for such an output, not a masked underflow.
+            cap_w: cap.saturating_sub(MAX_WILDCOPY_OVERSHOOT),
+            head: op - live,
         }
     }
 
@@ -398,7 +412,7 @@ macro_rules! execute_one_body {
             // Both terms are bounded (the live output by the window cap, the
             // literal run by a block), so this cannot wrap on any target this
             // builds for, and it reads locals rather than the buffer.
-            let prefix_resident = offset <= $cur.live + lits.len();
+            let prefix_resident = offset <= ($cur.op - $cur.head) + lits.len();
 
             // `inline_exec_ok` lets a wrapping backend (RingBuffer) veto the
             // inline path when the live region is not contiguous at `tail`;
@@ -420,6 +434,7 @@ macro_rules! execute_one_body {
                         $cur.base,
                         $cur.op,
                         $cur.cap,
+                        $cur.cap_w,
                         lit_src,
                         seq_ll_v as usize,
                         offset,
@@ -428,7 +443,6 @@ macro_rules! execute_one_body {
                     match r {
                         Ok(total) => {
                             $cur.op += total;
-                            $cur.live += total;
                             // Inline path bypasses the wrapper's output counter;
                             // keep it current for backends that read it
                             // (Ring/Flat resume + dict gate). Const-folded away

@@ -133,6 +133,9 @@ macro_rules! execute_one_body {
                         base,
                         tail,
                         cap,
+                        cap.saturating_sub(
+                            crate::decoding::exec_sequence_inline::MAX_WILDCOPY_OVERSHOOT
+                        ),
                         lit_src,
                         seq_ll_v as usize,
                         offset,

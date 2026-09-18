@@ -26,6 +26,11 @@
 //! See the [`portable`] module doc for how the inline path is reached
 //! per target.
 
+/// Most bytes a wildcopy body may write past the sequence it was asked for: its
+/// widest stride less one. A destination with at least this much room after the
+/// write can take the overshooting copiers; anything tighter takes the exact one.
+pub(crate) const MAX_WILDCOPY_OVERSHOOT: usize = 31;
+
 /// Exact, non-overshooting literal+match copy of one sequence at
 /// `base[tail..]` — the cold-path twin of the SIMD wildcopy bodies. Every
 /// inline-exec site (the per-kernel macros below and
@@ -108,28 +113,28 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
 /// must be readable for the literal length rounded up to 16.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 macro_rules! exec_sequence_avx2_inline_at {
-    ($base:expr, $tail:expr, $cap:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
+    ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
         use crate::decoding::buffer_backend::sequence_output_fits;
         use crate::decoding::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
             wildcopy_overlap_8byte_stride,
         };
-        const MAX_WILDCOPY_OVERSHOOT: usize = 31;
         let lit_length_v: usize = $lit_length;
         let offset_v: usize = $offset;
         let match_length_v: usize = $match_length;
         let lit_src_v: *const u8 = $lit_src;
         let base: *mut u8 = $base;
         let cap: usize = $cap;
+        let cap_w: usize = $cap_w;
         let tail: usize = $tail;
-        // One comparison decides the hot path, as upstream's `oMatchEnd >
-        // oend_w` does: room for the write AND for the wildcopy overshoot. Both
-        // lengths are bounded by a block's FSE expansion, so the sum cannot
-        // overflow. Everything else, including whether the write fits at all,
-        // belongs to the branch that is almost never taken.
-        let room = cap - tail;
+        // One comparison decides the hot path, exactly as upstream's
+        // `oMatchEnd > oend_w`: `cap_w` is the end with the overshoot already
+        // taken off, computed once per block. Both lengths are bounded by a
+        // block's FSE expansion, so the sum cannot overflow. Everything else,
+        // including whether the write fits at all, belongs to the branch that
+        // is almost never taken.
         let total = lit_length_v + match_length_v;
-        if total + MAX_WILDCOPY_OVERSHOOT > room {
+        if tail + total > cap_w {
             sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0).map(|total| {
                 // Tight tail: the write fits but the overshoot would not.
                 // SAFETY: as below, with the exact copy in place of the
