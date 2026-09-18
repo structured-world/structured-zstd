@@ -249,6 +249,7 @@ macro_rules! execute_one_body {
         $literals_buffer:expr,
         $lit_cur:expr,
         $literals_buffer_len:expr,
+        $live_len:expr,
         $seq_ll:expr,
         $seq_ml:expr,
         $resolved_offset:expr
@@ -304,10 +305,18 @@ macro_rules! execute_one_body {
                     lit_remaining >= (seq_ll_v as usize + 15) & !15
                 };
             let offset = resolved_offset_v as usize;
+            // The live output is carried in a local and advanced by what each
+            // sequence writes, the way the reference carries its output pointer
+            // in a register. Read from the backend instead it is two loads
+            // through a structure the executor just wrote to, on every
+            // sequence, for a number the loop already knows. The assertion is
+            // what holds the two in step: it runs on every sequence of every
+            // fixture in the debug suite and costs nothing in release.
+            debug_assert_eq!($live_len, $buffer.len());
             // Both terms are bounded (the live output by the window cap, the
             // literal run by a block), so the sum is nowhere near `usize::MAX`
             // on any target this builds for.
-            let prefix_resident = offset <= $buffer.len() + lits.len();
+            let prefix_resident = offset <= $live_len + lits.len();
 
             // `inline_exec_ok` lets a wrapping backend (RingBuffer) veto the
             // inline path when the live region is not contiguous at `tail`;
@@ -430,6 +439,11 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
         None => &[],
     };
 
+    // Live output carried alongside the loop rather than re-read from the
+    // backend per sequence; see the assertion in `execute_one_body`. Every
+    // path that writes advances it by exactly what it wrote.
+    let mut live_len = buffer.len();
+
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
 
@@ -498,6 +512,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
+                live_len,
                 exec_seq.ll,
                 exec_seq.ml,
                 exec_seq.actual_offset
@@ -506,6 +521,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 pipeline_err = Some(e);
                 break;
             }
+            live_len += (exec_seq.ll + exec_seq.ml) as usize;
             seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
 
             if i + 1 < num_sequences {
@@ -528,6 +544,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                     literals_buffer,
                     &mut lit_cur,
                     literals_buffer_len,
+                    live_len,
                     exec_seq.ll,
                     exec_seq.ml,
                     exec_seq.actual_offset
@@ -536,6 +553,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                     pipeline_err = Some(e);
                     break;
                 }
+                live_len += (exec_seq.ll + exec_seq.ml) as usize;
                 seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
             }
         }
@@ -580,6 +598,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
+                live_len,
                 seq_ll,
                 seq_ml,
                 resolved_offset
@@ -588,6 +607,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 fallback_err = Some(e);
                 break;
             }
+            live_len += (seq_ll + seq_ml) as usize;
             seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
         }
         if let Some(e) = fallback_err {
