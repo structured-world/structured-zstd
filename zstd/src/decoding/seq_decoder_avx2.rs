@@ -423,6 +423,14 @@ macro_rules! execute_one_body {
             // such test either.
             let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC;
             let offset = resolved_offset_v as usize;
+            // A wrapping backend keeps its own position: the gate below and the
+            // commit that normalises the wrap both read the backend's `tail`,
+            // so it gets the cursor back before each sequence rather than at
+            // the end of the block. Const-folded away for the linear backends,
+            // which is where the carried cursor was measured.
+            if !B::CURSOR_IS_BLOCK_STABLE {
+                *$cur = OutCursor::capture($buffer);
+            }
             // Both terms are bounded (the live output by the window cap, the
             // literal run by a block), so this cannot wrap on any target this
             // builds for, and it reads locals rather than the buffer.
@@ -457,6 +465,12 @@ macro_rules! execute_one_body {
                     match r {
                         Ok(total) => {
                             $cur.op += total;
+                            // A wrapping backend has to see the write now, so
+                            // its commit can normalise the wrap before the next
+                            // sequence asks the gate above.
+                            if !B::CURSOR_IS_BLOCK_STABLE {
+                                $cur.publish($buffer);
+                            }
                             // Inline path bypasses the wrapper's output counter;
                             // keep it current for backends that read it
                             // (Ring/Flat resume + dict gate). Const-folded away

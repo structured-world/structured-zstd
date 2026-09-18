@@ -121,6 +121,16 @@ pub(crate) trait BufferBackend: Sized {
     /// is an error to report rather than an assert to trip.
     const FIXED_CAPACITY: bool = false;
 
+    /// `true` when the write cursor only ever moves forward, so a caller may
+    /// carry it in locals across a whole block and hand it back once.
+    ///
+    /// `false` for `RingBuffer`: its cursor wraps, and both the gate that
+    /// admits a sequence to the inline path and the commit that normalises the
+    /// wrap read the backend's own `tail`. A cursor carried past a wrap would
+    /// address the ring linearly and ask that gate a stale question, so the
+    /// ring is given its position back at every sequence instead.
+    const CURSOR_IS_BLOCK_STABLE: bool = false;
+
     /// Upstream zstd's `ZSTD_execSequence` body
     /// (zstd_decompress_block.c:1008-1105). Writes `lit_length` bytes
     /// from `lit_src` at the current tail, then writes `match_length`

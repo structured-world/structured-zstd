@@ -244,6 +244,10 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// the slow `extend` + `repeat` chain.
     const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = true;
 
+    /// The write cursor only moves forward across the caller's slice, so a
+    /// sequence loop may carry it for a whole block.
+    const CURSOR_IS_BLOCK_STABLE: bool = true;
+
     /// Direct path reads `tail` for its output count and never consults
     /// `total_output_counter`, so the inline path skips the per-sequence
     /// counter RMW here (preserves the ~9% it costs on the all-inline hot

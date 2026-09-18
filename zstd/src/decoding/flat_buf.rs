@@ -89,6 +89,10 @@ impl BufferBackend for FlatBuf {
     /// every target.
     const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = true;
 
+    /// A flat buffer's cursor only moves forward, so a sequence loop may carry
+    /// it for a whole block.
+    const CURSOR_IS_BLOCK_STABLE: bool = true;
+
     /// A linear buffer is always contiguous, so what is left to answer here is
     /// the per-block output ceiling: the inline path writes without going
     /// through `try_reserve`, which is where that ceiling is otherwise enforced.
