@@ -89,9 +89,19 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
 // when its only consumers (`seq_decoder_avx2` / `seq_decoder_vbmi2`) are
 // compiled out — otherwise the `--no-default-features` build sees an unused
 // macro and trips `-D warnings`.
+/// The AVX2 copy body addressed by an explicit cursor rather than by asking the
+/// backend where it is. A loop that keeps its write position in a local hands it
+/// here directly; [`exec_sequence_avx2_inline`] is the same body for a caller
+/// that does not, reading the cursor and committing it around this. Returns the
+/// bytes written, so the caller can advance whichever of the two it holds.
+///
+/// # Safety
+/// The enclosing function must carry `target_feature(bmi2,avx2)`, `base` must be
+/// the start of a linear output valid for writes through `cap`, and `lit_src`
+/// must be readable for the literal length rounded up to 16.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-macro_rules! exec_sequence_avx2_inline {
-    ($buffer:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
+macro_rules! exec_sequence_avx2_inline_at {
+    ($base:expr, $tail:expr, $cap:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
         use crate::decoding::buffer_backend::sequence_output_fits;
         use crate::decoding::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
@@ -102,9 +112,9 @@ macro_rules! exec_sequence_avx2_inline {
         let offset_v: usize = $offset;
         let match_length_v: usize = $match_length;
         let lit_src_v: *const u8 = $lit_src;
-        let backend = $buffer.buffer_mut();
-        let cap = backend.cap();
-        let tail = backend.tail();
+        let base: *mut u8 = $base;
+        let cap: usize = $cap;
+        let tail: usize = $tail;
         // Hard guard with `overshoot = 0`; the <=31-byte wildcopy slack is
         // handled by the tight-tail branch below so an exact-fit output
         // slice (no `WILDCOPY_OVERLENGTH` trailing room) stays correct.
@@ -112,13 +122,10 @@ macro_rules! exec_sequence_avx2_inline {
             Err(e) => Err(e),
             Ok(total) => {
                 // SAFETY: the enclosing fn carries
-                // `#[target_feature(enable = "...,bmi2,avx2")]`; the inline
-                // path is gated on `B::SUPPORTS_INLINE_SEQUENCE_EXEC`, so the
-                // backend is linear and overrides `inline_exec_base_ptr` /
-                // `inline_exec_commit`. `sequence_output_fits` validated
+                // `#[target_feature(enable = "...,bmi2,avx2")]` and the caller
+                // vouches for `base`; `sequence_output_fits` validated
                 // `tail + total <= cap`.
                 unsafe {
-                    let base = backend.inline_exec_base_ptr();
                     if total + MAX_WILDCOPY_OVERSHOOT > cap - tail {
                         // Tight tail: literal+match fit exactly but the
                         // wildcopy overshoot would write past `cap`. Shared
@@ -154,15 +161,14 @@ macro_rules! exec_sequence_avx2_inline {
                             }
                         }
                     }
-                    backend.inline_exec_commit(tail + total);
                 }
-                Ok(())
+                Ok(total)
             }
         }
     }};
 }
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-pub(crate) use exec_sequence_avx2_inline;
+pub(crate) use exec_sequence_avx2_inline_at;
 
 /// AVX2-tier body for a sequence whose match lies wholly inside dictionary
 /// content, as selected by

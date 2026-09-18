@@ -18,7 +18,7 @@
 
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
-use super::exec_sequence_inline::{exec_sequence_avx2_dict_inline, exec_sequence_avx2_inline};
+use super::exec_sequence_inline::{exec_sequence_avx2_dict_inline, exec_sequence_avx2_inline_at};
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
     ADVANCE, ADVANCE_MASK, ExecSeq, SeqStreamSetup, init_sequence_stream,
@@ -245,8 +245,64 @@ macro_rules! decode_seq_fused_cshape {
 /// try_push + repeat_lookahead_prefetched. Expands as a statement-block
 /// returning `Result<(), DecompressBlockError>` so the caller can `?`
 /// or branch on it as needed.
+/// Where the block's output stands, carried in locals for the length of the
+/// sequence loop.
+///
+/// Upstream hoists `op`, `oend`, `litPtr`, `prefixStart` and the rest out of its
+/// context before the loop and touches none of them through it
+/// (`zstd_decompress_block.c:1620-1670`); its per-sequence gates are then
+/// comparisons between registers. Ours asked the buffer instead, and a question
+/// asked through `&mut` after a write is a reload the optimiser cannot hoist.
+/// The cold paths still own the buffer, so they publish this cursor before
+/// running and take it back afterwards.
+struct OutCursor {
+    /// Start of the linear output. Null when the backend has no inline path,
+    /// where it is never read.
+    base: *mut u8,
+    /// Write position, the backend's `tail`.
+    op: usize,
+    /// Where writes must stop: the backend's `cap`.
+    cap: usize,
+    /// Length of the live region, which is what a match offset is measured
+    /// against.
+    live: usize,
+}
+
+impl OutCursor {
+    /// Take the buffer's position into locals.
+    #[inline(always)]
+    fn capture<B: BufferBackend>(buffer: &mut DecodeBuffer<B>) -> Self {
+        let live = buffer.len();
+        let backend = buffer.buffer_mut();
+        let base = if B::SUPPORTS_INLINE_SEQUENCE_EXEC {
+            // SAFETY: the const says this backend is linear and overrides it.
+            unsafe { backend.inline_exec_base_ptr() }
+        } else {
+            core::ptr::null_mut()
+        };
+        Self {
+            base,
+            op: backend.tail(),
+            cap: backend.cap(),
+            live,
+        }
+    }
+
+    /// Hand the position back to the buffer, before anything that reads or
+    /// writes through it.
+    #[inline(always)]
+    fn publish<B: BufferBackend>(&self, buffer: &mut DecodeBuffer<B>) {
+        if B::SUPPORTS_INLINE_SEQUENCE_EXEC {
+            // SAFETY: every byte below `op` was written by the copies this
+            // cursor tracked, and `op <= cap` held at each of them.
+            unsafe { buffer.buffer_mut().inline_exec_commit(self.op) };
+        }
+    }
+}
+
 macro_rules! execute_one_body {
     (
+        $cur:expr,
         $buffer:expr,
         $dict:expr,
         $dict_content:expr,
@@ -304,10 +360,10 @@ macro_rules! execute_one_body {
             // such test either.
             let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC;
             let offset = resolved_offset_v as usize;
-            let prefix_resident = $buffer
-                .len()
-                .checked_add(lits.len())
-                .is_some_and(|end| offset <= end);
+            // Both terms are bounded (the live output by the window cap, the
+            // literal run by a block), so this cannot wrap on any target this
+            // builds for, and it reads locals rather than the buffer.
+            let prefix_resident = offset <= $cur.live + lits.len();
 
             // `inline_exec_ok` lets a wrapping backend (RingBuffer) veto the
             // inline path when the live region is not contiguous at `tail`;
@@ -323,22 +379,48 @@ macro_rules! execute_one_body {
                     // SAFETY: parent-slice provenance; offset prefix-resident.
                     let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
                     // Inline the AVX2 exec body at the call site (no trait-method
-                    // call boundary; see `exec_sequence_avx2_inline`).
-                    let r = exec_sequence_avx2_inline!(
-                        $buffer,
+                    // call boundary; see `exec_sequence_avx2_inline`), addressed
+                    // by the cursor this loop carries.
+                    let r = exec_sequence_avx2_inline_at!(
+                        $cur.base,
+                        $cur.op,
+                        $cur.cap,
                         lit_src,
                         seq_ll_v as usize,
                         offset,
                         seq_ml_v as usize
                     );
-                    // Inline path bypasses the wrapper's output counter; keep it
-                    // current for backends that read it (Ring/Flat resume +
-                    // dict gate). Const-folded away for UserSliceBackend.
-                    if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
-                        $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                    match r {
+                        Ok(total) => {
+                            $cur.op += total;
+                            $cur.live += total;
+                            // Inline path bypasses the wrapper's output counter;
+                            // keep it current for backends that read it
+                            // (Ring/Flat resume + dict gate). Const-folded away
+                            // for UserSliceBackend.
+                            if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                                $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                            }
+                            break 'exec_inner Ok(());
+                        }
+                        Err(e) => {
+                            break 'exec_inner Err(DecompressBlockError::ExecuteSequencesError(e));
+                        }
                     }
-                    break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
                 }
+                // Reaches past the output into the dictionary. When the whole match
+                // sits inside reachable dictionary content the copy is one more
+                // inline copy, the way upstream handles its extDict branch;
+                // anything else is the cold path's. The gate is the DICTIONARY one:
+                // the source is a separate allocation, so the output-resident bound
+                // does not apply and asking for it would refuse every such match on
+                // a wrapped ring.
+            }
+
+            // Everything below reads or writes through the buffer, so it gets
+            // the cursor back first and this loop re-reads it afterwards.
+            $cur.publish($buffer);
+
             // Reaches past the output into the dictionary. When the whole match
             // sits inside reachable dictionary content the copy is one more
             // inline copy, the way upstream handles its extDict branch;
@@ -346,7 +428,8 @@ macro_rules! execute_one_body {
             // the source is a separate allocation, so the output-resident bound
             // does not apply and asking for it would refuse every such match on
             // a wrapped ring.
-            } else if inline_literals_ok
+            if !prefix_resident
+                && inline_literals_ok
                 && $buffer
                     .buffer_mut()
                     .inline_exec_dict_ok(seq_ll_v as usize, seq_ml_v as usize)
@@ -369,21 +452,26 @@ macro_rules! execute_one_body {
                 if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
                     $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
                 }
+                *$cur = OutCursor::capture($buffer);
                 break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
             }
 
             // Cold fallback.
-            if let Err(e) = $buffer.try_push(lits) {
-                break 'exec_inner Err(ExecuteSequencesError::from(e).into());
-            }
-            match $buffer.repeat_lookahead_prefetched(
-                $dict,
-                resolved_offset_v as usize,
-                seq_ml_v as usize,
-            ) {
-                Ok(()) => Ok(()),
-                Err(e) => Err(ExecuteSequencesError::from(e).into()),
-            }
+            let cold = 'cold: {
+                if let Err(e) = $buffer.try_push(lits) {
+                    break 'cold Err(ExecuteSequencesError::from(e).into());
+                }
+                match $buffer.repeat_lookahead_prefetched(
+                    $dict,
+                    resolved_offset_v as usize,
+                    seq_ml_v as usize,
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(ExecuteSequencesError::from(e).into()),
+                }
+            };
+            *$cur = OutCursor::capture($buffer);
+            cold
         };
         _result
     }};
@@ -441,6 +529,9 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
 
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
+    // Where the output stands, in locals for the length of the loop. Published
+    // back to the buffer on every path that leaves it.
+    let mut cur = OutCursor::capture(buffer);
 
     if use_long_pipeline {
         // === Long-pipeline arm (8-deep lookahead ring) ===
@@ -501,6 +592,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             };
 
             let r = execute_one_body!(
+                &mut cur,
                 buffer,
                 dict,
                 dict_content,
@@ -531,6 +623,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 let slot = (num_sequences + k) & ADVANCE_MASK;
                 let exec_seq = ring[slot];
                 let r = execute_one_body!(
+                    &mut cur,
                     buffer,
                     dict,
                     dict_content,
@@ -549,6 +642,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             }
         }
 
+        cur.publish(buffer);
         if let Some(e) = pipeline_err {
             if buffer.try_restore_checkpoint(buffer_checkpoint) {
                 *offset_hist = saved_offset_hist;
@@ -583,6 +677,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 of_dec.update_state_fast(&mut br);
             }
             let r = execute_one_body!(
+                &mut cur,
                 buffer,
                 dict,
                 dict_content,
@@ -599,6 +694,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             }
             seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
         }
+        cur.publish(buffer);
         if let Some(e) = fallback_err {
             let _ = buffer.try_restore_checkpoint(buffer_checkpoint);
             return Err(e);

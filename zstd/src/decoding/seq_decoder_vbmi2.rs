@@ -9,7 +9,7 @@
 
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
-use super::exec_sequence_inline::{exec_sequence_avx2_dict_inline, exec_sequence_avx2_inline};
+use super::exec_sequence_inline::{exec_sequence_avx2_dict_inline, exec_sequence_avx2_inline_at};
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
     ADVANCE, ADVANCE_MASK, ExecSeq, SeqStreamSetup, init_sequence_stream,
@@ -120,21 +120,37 @@ macro_rules! execute_one_body {
                     let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
                     // Inline the AVX2 exec body at the call site (no trait-method
                     // call boundary; VBMI2 always implies AVX2+BMI2 so the ymm
-                    // wildcopy is in scope — see `exec_sequence_avx2_inline`).
-                    let r = exec_sequence_avx2_inline!(
-                        $buffer,
+                    // wildcopy is in scope — see `exec_sequence_avx2_inline_at`).
+                    // This tier still reads the cursor per sequence; the AVX2
+                    // tier carries it in locals across the whole block.
+                    let backend = $buffer.buffer_mut();
+                    let tail = backend.tail();
+                    let cap = backend.cap();
+                    // SAFETY: gated on `SUPPORTS_INLINE_SEQUENCE_EXEC`, so the
+                    // backend is linear and overrides this.
+                    let base = unsafe { backend.inline_exec_base_ptr() };
+                    let r = exec_sequence_avx2_inline_at!(
+                        base,
+                        tail,
+                        cap,
                         lit_src,
                         seq_ll_v as usize,
                         offset,
                         seq_ml_v as usize
                     );
-                    // Inline path bypasses the wrapper's output counter; keep it
-                    // current for backends that read it (Ring/Flat). Const-folded
-                    // away for UserSliceBackend.
-                    if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
-                        $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                    if let Ok(total) = r {
+                        // SAFETY: the copy wrote exactly `total` bytes at `tail`.
+                        unsafe { $buffer.buffer_mut().inline_exec_commit(tail + total) };
+                        // Inline path bypasses the wrapper's output counter; keep
+                        // it current for backends that read it (Ring/Flat).
+                        // Const-folded away for UserSliceBackend.
+                        if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                            $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                        }
                     }
-                    break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
+                    break 'exec_inner r
+                        .map(|_| ())
+                        .map_err(DecompressBlockError::ExecuteSequencesError);
                 }
             // A match reaching past the output into reachable dictionary content
             // is one more inline copy, on the same ymm body this tier uses for
