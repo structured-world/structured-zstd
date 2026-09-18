@@ -349,83 +349,6 @@ impl OutCursor {
     }
 }
 
-/// Everything a sequence needs when the inline path cannot take it: a match
-/// reaching into the dictionary, or a backend that has to go through
-/// `push` + `repeat`.
-///
-/// Out of line and cold on purpose. It is the only place in the loop that needs
-/// the dictionary, its content and the buffer itself, so keeping it here stops
-/// those from being values the hot path carries; the loop's measured cost is
-/// stack traffic, at 52 memory-touching instructions per sequence against the
-/// reference's 34. The cursor is published before this runs and re-read after,
-/// because the buffer owns the position while it does.
-///
-/// # Safety
-/// Caller must have verified BMI2 + AVX2, and `lit_src` must be readable for
-/// the literal length rounded up to the copiers' stride.
-#[cold]
-#[inline(never)]
-#[target_feature(enable = "bmi2,avx2")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn execute_sequence_cold<B: BufferBackend>(
-    cur: &mut OutCursor,
-    buffer: &mut DecodeBuffer<B>,
-    dict: Option<&crate::decoding::dictionary::Dictionary>,
-    dict_content: &[u8],
-    lits: &[u8],
-    lit_src: *const u8,
-    prefix_resident: bool,
-    seq_ll: u32,
-    seq_ml: u32,
-    resolved_offset: u32,
-) -> Result<(), DecompressBlockError> {
-    cur.publish(buffer);
-
-    // Reaches past the output into the dictionary. When the whole match sits
-    // inside reachable dictionary content the copy is one more inline copy, the
-    // way upstream handles its extDict branch; anything else is the fallback's.
-    // The gate is the DICTIONARY one: the source is a separate allocation, so
-    // the output-resident bound does not apply and asking for it would refuse
-    // every such match on a wrapped ring.
-    if !prefix_resident
-        && B::SUPPORTS_INLINE_SEQUENCE_EXEC
-        && buffer
-            .buffer_mut()
-            .inline_exec_dict_ok(seq_ll as usize, seq_ml as usize)
-        && let Some(dict_src) = buffer.dict_match_source(
-            dict_content,
-            seq_ll as usize,
-            resolved_offset as usize,
-            seq_ml as usize,
-        )
-    {
-        let r = exec_sequence_avx2_dict_inline!(
-            buffer,
-            lit_src,
-            seq_ll as usize,
-            dict_src,
-            seq_ml as usize
-        );
-        if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
-            buffer.advance_output_counter((seq_ll + seq_ml) as u64);
-        }
-        *cur = OutCursor::capture(buffer);
-        return r.map_err(DecompressBlockError::ExecuteSequencesError);
-    }
-
-    let fallback = 'fallback: {
-        if let Err(e) = buffer.try_push(lits) {
-            break 'fallback Err(ExecuteSequencesError::from(e).into());
-        }
-        match buffer.repeat_lookahead_prefetched(dict, resolved_offset as usize, seq_ml as usize) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(ExecuteSequencesError::from(e).into()),
-        }
-    };
-    *cur = OutCursor::capture(buffer);
-    fallback
-}
-
 macro_rules! execute_one_body {
     (
         $cur:expr,
@@ -543,25 +466,61 @@ macro_rules! execute_one_body {
                 // a wrapped ring.
             }
 
-            // Everything left reads or writes through the buffer, and none of it
-            // runs on a frame the inline path handles, so it lives in its own
-            // cold function: the dictionary source and the buffer it needs stop
-            // being live values in this loop.
-            // SAFETY: the enclosing fn carries the same target features.
-            unsafe {
-                execute_sequence_cold(
-                    $cur,
-                    $buffer,
-                    $dict,
+            // Everything below reads or writes through the buffer, so it gets
+            // the cursor back first and this loop re-reads it afterwards.
+            $cur.publish($buffer);
+
+            // Reaches past the output into the dictionary. When the whole match
+            // sits inside reachable dictionary content the copy is one more
+            // inline copy, the way upstream handles its extDict branch;
+            // anything else is the cold path's. The gate is the DICTIONARY one:
+            // the source is a separate allocation, so the output-resident bound
+            // does not apply and asking for it would refuse every such match on
+            // a wrapped ring.
+            if !prefix_resident
+                && inline_literals_ok
+                && $buffer
+                    .buffer_mut()
+                    .inline_exec_dict_ok(seq_ll_v as usize, seq_ml_v as usize)
+                && let Some(dict_src) = $buffer.dict_match_source(
                     $dict_content,
-                    lits,
-                    $literals_buffer.as_ptr().add(lit_cur_before),
-                    prefix_resident,
-                    seq_ll_v,
-                    seq_ml_v,
-                    resolved_offset_v,
+                    seq_ll_v as usize,
+                    offset,
+                    seq_ml_v as usize,
                 )
+            {
+                // SAFETY: parent-slice provenance, as above.
+                let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
+                let r = exec_sequence_avx2_dict_inline!(
+                    $buffer,
+                    lit_src,
+                    seq_ll_v as usize,
+                    dict_src,
+                    seq_ml_v as usize
+                );
+                if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                    $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                }
+                *$cur = OutCursor::capture($buffer);
+                break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
             }
+
+            // Cold fallback.
+            let cold = 'cold: {
+                if let Err(e) = $buffer.try_push(lits) {
+                    break 'cold Err(ExecuteSequencesError::from(e).into());
+                }
+                match $buffer.repeat_lookahead_prefetched(
+                    $dict,
+                    resolved_offset_v as usize,
+                    seq_ml_v as usize,
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(ExecuteSequencesError::from(e).into()),
+                }
+            };
+            *$cur = OutCursor::capture($buffer);
+            cold
         };
         _result
     }};
