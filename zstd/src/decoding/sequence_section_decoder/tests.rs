@@ -503,6 +503,7 @@ mod init_sequence_stream_tests {
                 &mut buf,
                 &mut offset_hist,
                 &lits,
+                lits.len() - crate::WILDCOPY_OVERLENGTH,
                 None,
             )
         };
