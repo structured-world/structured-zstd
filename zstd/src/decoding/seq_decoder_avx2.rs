@@ -385,160 +385,6 @@ macro_rules! execute_one_body {
     }};
 }
 
-/// The lookahead-ring implementation of a block, for this tier.
-///
-/// Its own function because it is its own ALGORITHM: decode eight sequences
-/// ahead, prefetch each match source, and execute the oldest, so the prefetch
-/// issued at `i` has resolved by the time `i + 8` consumes it. The macros
-/// inside stay what they are, instruments expanded in place, so nothing about
-/// the tier's instruction guarantee changes.
-///
-/// Splitting it out costs one call per BLOCK, not per sequence, which is the
-/// difference that matters: the executor itself must stay a macro, since a
-/// function there measured +21%. What it buys is that the straight loop no
-/// longer shares a body with this one, so the compiler schedules and allocates
-/// registers for the common case alone. `compute_use_long_pipeline` keeps this
-/// arm for cold dictionaries and histories past 16 MB, so most blocks never
-/// enter it.
-///
-/// # Safety
-/// Caller must have verified BMI2 + AVX2, as for the entry point below.
-#[target_feature(enable = "bmi2,avx2")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn run_lookahead_ring_block_avx2<B: BufferBackend>(
-    br: &mut crate::bit_io::BitReaderReversed<'_, Avx2Kernel>,
-    ll_dec: &mut crate::fse::SeqFSEDecoder<'_>,
-    ml_dec: &mut crate::fse::SeqFSEDecoder<'_>,
-    of_dec: &mut crate::fse::SeqFSEDecoder<'_>,
-    buffer: &mut DecodeBuffer<B>,
-    dict: Option<&crate::decoding::dictionary::Dictionary>,
-    dict_content: &[u8],
-    offset_hist: &mut [u32; 3],
-    literals_buffer: &[u8],
-    lit_cur: &mut usize,
-    literals_buffer_len: usize,
-    num_sequences: usize,
-    old_buffer_size: usize,
-    max_update_bits: u8,
-    seq_sum: &mut u32,
-    buffer_checkpoint: super::decode_buffer::DecodeBufferCheckpoint,
-    saved_offset_hist: [u32; 3],
-) -> Result<(), DecompressBlockError> {
-    let mut prefetch_pos: usize = old_buffer_size;
-    let mut shadow_hist: [u32; 3] = *offset_hist;
-    let mut ring: [ExecSeq; ADVANCE] = [ExecSeq {
-        ll: 0,
-        ml: 0,
-        actual_offset: 0,
-    }; ADVANCE];
-
-    // Prefill ring with ADVANCE decoded+prefetched sequences.
-    for slot in ring.iter_mut() {
-        let seq = decode_one_body!(ll_dec, ml_dec, of_dec, br);
-        let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
-        let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
-        let source_idx = match_start.wrapping_sub(actual_offset as usize);
-        buffer.prefetch_lookahead_match_source(source_idx);
-        prefetch_pos = match_start.wrapping_add(seq.ml as usize);
-        *slot = ExecSeq {
-            ll: seq.ll,
-            ml: seq.ml,
-            actual_offset,
-        };
-        br.ensure_bits(max_update_bits);
-        ll_dec.update_state_fast(br);
-        ml_dec.update_state_fast(br);
-        of_dec.update_state_fast(br);
-    }
-
-    // SAFETY: alignment-only asm, no memory or register clobbers.
-    unsafe {
-        core::arch::asm!(
-            ".p2align 6",
-            "nop",
-            ".p2align 5",
-            "nop",
-            ".p2align 3",
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-
-    let mut pipeline_err: Option<DecompressBlockError> = None;
-    for i in ADVANCE..num_sequences {
-        let seq = decode_one_body!(ll_dec, ml_dec, of_dec, br);
-        let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
-        let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
-        let source_idx = match_start.wrapping_sub(actual_offset as usize);
-        buffer.prefetch_lookahead_match_source(source_idx);
-        prefetch_pos = match_start.wrapping_add(seq.ml as usize);
-
-        let slot = i & ADVANCE_MASK;
-        let exec_seq = ring[slot];
-        ring[slot] = ExecSeq {
-            ll: seq.ll,
-            ml: seq.ml,
-            actual_offset,
-        };
-
-        let r = execute_one_body!(
-            buffer,
-            dict,
-            dict_content,
-            literals_buffer,
-            lit_cur,
-            literals_buffer_len,
-            exec_seq.ll,
-            exec_seq.ml,
-            exec_seq.actual_offset
-        );
-        if let Err(e) = r {
-            pipeline_err = Some(e);
-            break;
-        }
-        *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
-
-        if i + 1 < num_sequences {
-            br.ensure_bits(max_update_bits);
-            ll_dec.update_state_fast(br);
-            ml_dec.update_state_fast(br);
-            of_dec.update_state_fast(br);
-        }
-    }
-
-    // Drain the remaining ADVANCE ring slots.
-    if pipeline_err.is_none() {
-        for k in 0..ADVANCE {
-            let slot = (num_sequences + k) & ADVANCE_MASK;
-            let exec_seq = ring[slot];
-            let r = execute_one_body!(
-                buffer,
-                dict,
-                dict_content,
-                literals_buffer,
-                lit_cur,
-                literals_buffer_len,
-                exec_seq.ll,
-                exec_seq.ml,
-                exec_seq.actual_offset
-            );
-            if let Err(e) = r {
-                pipeline_err = Some(e);
-                break;
-            }
-            *seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
-        }
-    }
-
-    if let Some(e) = pipeline_err {
-        if buffer.try_restore_checkpoint(buffer_checkpoint) {
-            *offset_hist = saved_offset_hist;
-        }
-        return Err(e);
-    }
-    *offset_hist = shadow_hist;
-    Ok(())
-}
-
 /// AVX2-tier monolithic decode + execute. Outer init, RLE dispatch, FSE
 /// state init, both pipeline arms, sequence-decode (via
 /// `decode_one_body!`) and sequence-execute (via `execute_one_body!`)
@@ -584,28 +430,119 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
     let saved_offset_hist = *offset_hist;
 
     if use_long_pipeline {
-        // SAFETY: same BMI2 + AVX2 precondition as this function's own.
+        // === Long-pipeline arm (8-deep lookahead ring) ===
+        let mut prefetch_pos: usize = old_buffer_size;
+        let mut shadow_hist: [u32; 3] = *offset_hist;
+        let mut ring: [ExecSeq; ADVANCE] = [ExecSeq {
+            ll: 0,
+            ml: 0,
+            actual_offset: 0,
+        }; ADVANCE];
+
+        // Prefill ring with ADVANCE decoded+prefetched sequences.
+        for slot in ring.iter_mut() {
+            let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
+            let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
+            let source_idx = match_start.wrapping_sub(actual_offset as usize);
+            buffer.prefetch_lookahead_match_source(source_idx);
+            prefetch_pos = match_start.wrapping_add(seq.ml as usize);
+            *slot = ExecSeq {
+                ll: seq.ll,
+                ml: seq.ml,
+                actual_offset,
+            };
+            br.ensure_bits(max_update_bits);
+            ll_dec.update_state_fast(&mut br);
+            ml_dec.update_state_fast(&mut br);
+            of_dec.update_state_fast(&mut br);
+        }
+
+        // SAFETY: alignment-only asm, no memory or register clobbers.
         unsafe {
-            run_lookahead_ring_block_avx2(
-                &mut br,
-                &mut ll_dec,
-                &mut ml_dec,
-                &mut of_dec,
+            core::arch::asm!(
+                ".p2align 6",
+                "nop",
+                ".p2align 5",
+                "nop",
+                ".p2align 3",
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+
+        let mut pipeline_err: Option<DecompressBlockError> = None;
+        for i in ADVANCE..num_sequences {
+            let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            let actual_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
+            let match_start = prefetch_pos.wrapping_add(seq.ll as usize);
+            let source_idx = match_start.wrapping_sub(actual_offset as usize);
+            buffer.prefetch_lookahead_match_source(source_idx);
+            prefetch_pos = match_start.wrapping_add(seq.ml as usize);
+
+            let slot = i & ADVANCE_MASK;
+            let exec_seq = ring[slot];
+            ring[slot] = ExecSeq {
+                ll: seq.ll,
+                ml: seq.ml,
+                actual_offset,
+            };
+
+            let r = execute_one_body!(
                 buffer,
                 dict,
                 dict_content,
-                offset_hist,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
-                num_sequences,
-                old_buffer_size,
-                max_update_bits,
-                &mut seq_sum,
-                buffer_checkpoint,
-                saved_offset_hist,
-            )?;
+                exec_seq.ll,
+                exec_seq.ml,
+                exec_seq.actual_offset
+            );
+            if let Err(e) = r {
+                pipeline_err = Some(e);
+                break;
+            }
+            seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+
+            if i + 1 < num_sequences {
+                br.ensure_bits(max_update_bits);
+                ll_dec.update_state_fast(&mut br);
+                ml_dec.update_state_fast(&mut br);
+                of_dec.update_state_fast(&mut br);
+            }
         }
+
+        // Drain the remaining ADVANCE ring slots.
+        if pipeline_err.is_none() {
+            for k in 0..ADVANCE {
+                let slot = (num_sequences + k) & ADVANCE_MASK;
+                let exec_seq = ring[slot];
+                let r = execute_one_body!(
+                    buffer,
+                    dict,
+                    dict_content,
+                    literals_buffer,
+                    &mut lit_cur,
+                    literals_buffer_len,
+                    exec_seq.ll,
+                    exec_seq.ml,
+                    exec_seq.actual_offset
+                );
+                if let Err(e) = r {
+                    pipeline_err = Some(e);
+                    break;
+                }
+                seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+            }
+        }
+
+        if let Some(e) = pipeline_err {
+            if buffer.try_restore_checkpoint(buffer_checkpoint) {
+                *offset_hist = saved_offset_hist;
+            }
+            return Err(e);
+        }
+        *offset_hist = shadow_hist;
     } else {
         // === Short-block arm (straight single-pass fused loop) ===
         let mut shadow_hist = *offset_hist;
