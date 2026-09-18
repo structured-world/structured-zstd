@@ -284,9 +284,15 @@ macro_rules! execute_one_body {
             let lits = unsafe { $literals_buffer.get_unchecked(lit_cur_before..high) };
             *$lit_cur = high;
 
-            if resolved_offset_v == 0 {
-                break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
-            }
+            // Offset zero cannot reach here, so this is asserted rather than
+            // tested, as upstream asserts it. An offset entry's base value is
+            // `1 << ofCode` and no path can build one with a larger code: the
+            // FSE table rejects a symbol past `MAX_OFFSET_CODE`
+            // (`TooManySymbols`), the RLE mode checks its symbol against the
+            // same bound, and the predefined table is fixed. So a fresh offset
+            // resolves to at least 1, while the repcode arms turn a zero into
+            // `0xFFFFFFFF` on purpose for the residency gate below to reject.
+            debug_assert_ne!(resolved_offset_v, 0);
 
             // The literal-source slack both inline paths need (their `copy16`
             // reads 16 bytes whatever the length, and the wildcopy regime reads
