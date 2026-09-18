@@ -123,19 +123,32 @@ macro_rules! execute_one_body {
                     // wildcopy is in scope — see `exec_sequence_avx2_inline_at`).
                     // This tier still reads the cursor per sequence; the AVX2
                     // tier carries it in locals across the whole block.
+                    // The write end is derived per sequence here, unlike the
+                    // AVX2 tier which carries it for a block: hoisting it needs
+                    // a carried cursor, which is only sound for a backend whose
+                    // cursor moves forward (`CURSOR_IS_BLOCK_STABLE`) and needs
+                    // the per-block ceiling folded in. This tier is behind an
+                    // off-by-default feature and cannot be measured on the
+                    // hardware this is developed against, so it keeps the shape
+                    // that asks the backend every time rather than an unmeasured
+                    // copy of the other tier's.
                     let backend = $buffer.buffer_mut();
                     let tail = backend.tail();
                     let cap = backend.cap();
                     // SAFETY: gated on `SUPPORTS_INLINE_SEQUENCE_EXEC`, so the
                     // backend is linear and overrides this.
                     let base = unsafe { backend.inline_exec_base_ptr() };
+                    // An output shorter than the copiers' overshoot has no room
+                    // for an overshooting write at all, which is a branch to the
+                    // exact copier rather than a bound to clamp into: saturating
+                    // here would answer "end at zero" and hide the case.
+                    let overshoot = crate::decoding::exec_sequence_inline::MAX_WILDCOPY_OVERSHOOT;
+                    let cap_w = if cap >= overshoot { cap - overshoot } else { 0 };
                     let r = exec_sequence_avx2_inline_at!(
                         base,
                         tail,
                         cap,
-                        cap.saturating_sub(
-                            crate::decoding::exec_sequence_inline::MAX_WILDCOPY_OVERSHOOT
-                        ),
+                        cap_w,
                         lit_src,
                         seq_ll_v as usize,
                         offset,

@@ -339,10 +339,14 @@ impl OutCursor {
             base,
             op,
             cap,
-            // An output with less room than the overshoot leaves `cap_w` at 0,
-            // which sends every sequence to the exact copier. That is the right
-            // answer for such an output, not a masked underflow.
-            cap_w: cap.saturating_sub(MAX_WILDCOPY_OVERSHOOT),
+            // An output shorter than the overshoot has no room for an
+            // overshooting write at all: that is a branch to the exact copier,
+            // spelled out here rather than clamped, so the case is visible.
+            cap_w: if cap >= MAX_WILDCOPY_OVERSHOOT {
+                cap - MAX_WILDCOPY_OVERSHOOT
+            } else {
+                0
+            },
             live_base: core::num::Wrapping(op) - core::num::Wrapping(live),
         }
     }
