@@ -2,19 +2,27 @@
 resolver = "3"
 members = ["zstd", "zstd-wasm", "c-api", "ffi-bench"]
 
-# Bench profile inherits from release but overrides LTO/codegen-units so
-# the perf measurement reflects full cross-crate inlining. We deliberately
-# scope this to `[profile.bench]` instead of `[profile.release]`: the
-# release profile is shared by the `cli` binary and every downstream
-# consumer of this workspace, and fat LTO + codegen-units = 1 multiplies
-# release build times ~5× and significantly increases peak compile RAM.
-# Bench builds run on CI with the wall clock budget for it; everyday
-# `cargo build --release` (and downstream consumers) should not pay that
-# cost without explicitly opting in.
-[profile.bench]
+# Fat LTO over one codegen unit, for the binaries this workspace ships and
+# for everything that measures them.
+#
+# Cargo reads profiles from the workspace root only, so this does not reach a
+# crate that depends on `structured-zstd`: that build uses its own profile.
+# What it does reach is our `cli`, our examples and our benchmarks, and those
+# should all be the same build. The optimiser's window is not a detail to
+# leave differing between them: measured here, one edit reads -1.90%
+# instructions over sixteen codegen units and +3.61% over one, and a chain of
+# changes worth -6.5% under the first is +0.5% under the second. A benchmark
+# that disagrees in SIGN with the shipped binary measures the wrong program.
+#
+# The cost is ours: release builds of this workspace take longer and peak
+# higher. That is the right place for it to land.
+[profile.release]
 lto = "fat"
 codegen-units = 1
-debug = "line-tables-only"
+
+# Benchmarks inherit the release profile above, with no debug info: a
+# benchmark measures the shipped build and has no use for line tables.
+[profile.bench]
 
 # `cargo flamegraph` profile — like bench, but with FULL debug info
 # so Rust symbol-mangling resolves in the .svg. The flamegraph tool
