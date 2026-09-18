@@ -202,10 +202,10 @@ fn resolve_sequence_wide<K: crate::cpu_kernel::CpuKernel>(
 }
 
 macro_rules! decode_seq_fused_cshape {
-    ($ll_state:expr, $ml_state:expr, $of_state:expr, $br:expr, $hist:expr) => {{
-        let ll_state = $ll_state;
-        let ml_state = $ml_state;
-        let of_state = $of_state;
+    ($ll_dec:expr, $ml_dec:expr, $of_dec:expr, $br:expr, $hist:expr) => {{
+        let ll_state = $ll_dec.state;
+        let ml_state = $ml_dec.state;
+        let of_state = $of_dec.state;
 
         let ll_base = ll_state.base_value;
         let ml_base = ml_state.base_value;
@@ -655,14 +655,13 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
         let mut shadow_hist = *offset_hist;
         let mut fallback_err: Option<DecompressBlockError> = None;
         for i in 0..num_sequences {
-            // The three entries, read once and kept across both the value reads
-            // and the state advance below, the way upstream keeps `llDInfo` and
-            // its `llNext` / `llnbBits` across the same span.
-            let ll_state = ll_dec.state;
-            let ml_state = ml_dec.state;
-            let of_state = of_dec.state;
-            let (seq_ll, seq_ml, resolved_offset) =
-                decode_seq_fused_cshape!(ll_state, ml_state, of_state, &mut br, &mut shadow_hist);
+            let (seq_ll, seq_ml, resolved_offset) = decode_seq_fused_cshape!(
+                &mut ll_dec,
+                &mut ml_dec,
+                &mut of_dec,
+                &mut br,
+                &mut shadow_hist
+            );
             // Advance the FSE states for the NEXT sequence before executing the
             // current one, mirroring upstream `ZSTD_decodeSequence` (which
             // updates the states inside decode, then calls `ZSTD_execSequence`).
@@ -673,9 +672,9 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             // register pressure in the hot loop.
             if i + 1 < num_sequences {
                 br.ensure_bits(max_update_bits);
-                ll_dec.update_state_from(&mut br, ll_state);
-                ml_dec.update_state_from(&mut br, ml_state);
-                of_dec.update_state_from(&mut br, of_state);
+                ll_dec.update_state_fast(&mut br);
+                ml_dec.update_state_fast(&mut br);
+                of_dec.update_state_fast(&mut br);
             }
             let r = execute_one_body!(
                 &mut cur,

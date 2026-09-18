@@ -217,33 +217,9 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     /// [`update_state`]: Self::update_state
     #[inline(always)]
     pub(crate) fn update_state_fast<K: CpuKernel>(&mut self, bits: &mut BitReaderReversed<'_, K>) {
-        let entry = self.state;
-        self.update_state_from(bits, entry);
-    }
-
-    /// Advance the state using a COPY of the current entry the caller already
-    /// holds, instead of reading the decoder's own again.
-    ///
-    /// The sequence loop loads all three entries up front to get their base
-    /// values and bit counts, exactly as upstream loads `llDInfo` / `mlDInfo` /
-    /// `ofDInfo` once and keeps `llNext` / `llnbBits` in locals across the
-    /// value reads (`zstd_decompress_block.c:1261-1266`, used at 1337-1340).
-    /// Passing that copy back here spares the reload of a field the caller has
-    /// in a register.
-    ///
-    /// Same preconditions as [`Self::update_state_fast`], plus: `entry` must be
-    /// this decoder's current state.
-    #[inline(always)]
-    pub(crate) fn update_state_from<K: CpuKernel>(
-        &mut self,
-        bits: &mut BitReaderReversed<'_, K>,
-        entry: E,
-    ) {
-        debug_assert_eq!(entry.num_bits(), self.state.num_bits());
-        debug_assert_eq!(entry.new_state(), self.state.new_state());
-        let num_bits = entry.num_bits();
+        let num_bits = self.state.num_bits();
         let add = bits.get_bits_unchecked(num_bits);
-        let next_state = usize::from(entry.new_state()) + add as usize;
+        let next_state = usize::from(self.state.new_state()) + add as usize;
         // SAFETY: `new_state` and `num_bits` were paired by
         // `calc_baseline_and_numbits` during table construction such that
         // `new_state + (2.pow(num_bits) - 1) < table_size = self.table.decode.len()`.
