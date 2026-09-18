@@ -446,12 +446,21 @@ macro_rules! execute_one_body {
             // inline path when the live region is not contiguous at `tail`;
             // linear backends fold it to a capacity question.
             if prefix_resident {
+                // The backend gate answers two things: a wrapping backend's
+                // "does this write stay contiguous", and a linear one's
+                // per-block ceiling. The ceiling is already folded into the
+                // limit this cursor carries, and the cursor is ahead of the
+                // backend's own length, so for a carried cursor that gate is
+                // strictly weaker than the comparison below and only costs the
+                // loads it takes to ask. The ring, which cannot carry a cursor,
+                // still needs it.
                 if inline_literals_ok
-                    && $buffer.buffer_mut().inline_exec_ok(
-                        seq_ll_v as usize,
-                        seq_ml_v as usize,
-                        offset,
-                    )
+                    && (B::CURSOR_IS_BLOCK_STABLE
+                        || $buffer.buffer_mut().inline_exec_ok(
+                            seq_ll_v as usize,
+                            seq_ml_v as usize,
+                            offset,
+                        ))
                 {
                     // SAFETY: parent-slice provenance; offset prefix-resident.
                     let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };

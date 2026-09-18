@@ -68,11 +68,15 @@ pub fn decode_literals(
 /// data was materialised.
 pub struct LiteralsView<'a> {
     /// The literal bytes, followed by at least [`WILDCOPY_OVERLENGTH`] more
-    /// readable bytes. The executor's copiers read the literal length rounded
-    /// up to their stride (and 16 bytes whatever the length), so this slack is
-    /// what lets them do it without asking per sequence whether it is there.
-    /// Its contents are not literal data and must not be decoded: `len` is
-    /// where the literals end.
+    /// readable bytes WHEN THE CALLER ASKED FOR SLACK. The executor's copiers
+    /// read the literal length rounded up to their stride (and 16 bytes
+    /// whatever the length), so that slack is what lets them do it without
+    /// asking per sequence whether it is there.
+    ///
+    /// A block with no sequences runs no copiers, asks for no slack, and gets a
+    /// view that ends at the literals: an unsafe consumer must not assume the
+    /// overread room unless it passed `needs_slack`. Either way the literal
+    /// data ends at `len`, and anything past it is not literal content.
     pub data: &'a [u8],
     /// How many of `data`'s bytes are literals. Always `<= data.len()`.
     pub len: usize,

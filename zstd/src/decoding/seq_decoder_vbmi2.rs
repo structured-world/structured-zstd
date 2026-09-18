@@ -134,7 +134,12 @@ macro_rules! execute_one_body {
                     // copy of the other tier's.
                     let backend = $buffer.buffer_mut();
                     let tail = backend.tail();
-                    let cap = backend.cap();
+                    // The write limit, which carries the per-block ceiling, not
+                    // the raw allocation. This tier reads the backend every
+                    // sequence, so `inline_exec_ok` above already sees a current
+                    // live length and enforces the ceiling; taking the limit
+                    // here means the copy does not depend on that being so.
+                    let cap = backend.inline_write_limit();
                     // SAFETY: gated on `SUPPORTS_INLINE_SEQUENCE_EXEC`, so the
                     // backend is linear and overrides this.
                     let base = unsafe { backend.inline_exec_base_ptr() };
