@@ -219,7 +219,11 @@ pub(crate) unsafe fn decode_and_execute_sequences_bmi2<'fse, B: BufferBackend>(
     // `literals_buffer` runs past the literals by the copiers' read slack, so
     // the literal count is the parameter, never the slice's length.
     let literals_buffer_len = literals_len;
-    debug_assert!(literals_buffer.len() >= literals_len);
+    debug_assert!(
+        literals_buffer.len() >= literals_len + crate::WILDCOPY_OVERLENGTH,
+        "literals view lacks the copiers' read slack: {} bytes for {literals_len} literals",
+        literals_buffer.len(),
+    );
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
     // Invariant for the whole block, so it is resolved here rather than per

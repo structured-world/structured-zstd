@@ -595,9 +595,17 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
         use_long_pipeline,
     } = init_sequence_stream::<B, Avx2Kernel>(section, source, fse, buffer, dict)?;
     // `literals_buffer` runs past the literals by the copiers' read slack, so
-    // the literal count is the parameter, never the slice's length.
+    // the literal count is the parameter, never the slice's length. The slack
+    // is the source-read contract of the inline copiers, which read sixteen
+    // bytes whatever the literal length and round the wildcopy up to its
+    // stride, so assert it rather than the count alone: a sequence section
+    // exists here, and the literals decoder pads whenever one does.
     let literals_buffer_len = literals_len;
-    debug_assert!(literals_buffer.len() >= literals_len);
+    debug_assert!(
+        literals_buffer.len() >= literals_len + crate::WILDCOPY_OVERLENGTH,
+        "literals view lacks the copiers' read slack: {} bytes for {literals_len} literals",
+        literals_buffer.len(),
+    );
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
     // Invariant for the whole block, so it is resolved here rather than per
