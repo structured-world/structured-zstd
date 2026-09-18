@@ -14,6 +14,15 @@ members = ["zstd", "zstd-wasm", "c-api", "ffi-bench"]
 # changes worth -6.5% under the first is +0.5% under the second. A benchmark
 # that disagrees in SIGN with the shipped binary measures the wrong program.
 #
+# This is NOT claimed as a speed win, and it was measured rather than assumed:
+# against cargo's release defaults, same source, prebuilt binaries interleaved
+# three times, the decode loop reads 9.49-9.54 s without it and 9.38-9.46 s
+# with it (about 1%, below the threshold this repository requires of a
+# build-to-build claim), and the reused-compressor encode loop reads
+# 1.34-1.38 s without it and 1.37-1.40 s with it, overlapping. The reason to
+# set it is the paragraph above: the benchmark and the shipped binary must be
+# one build.
+#
 # The cost is ours: release builds of this workspace take longer and peak
 # higher. That is the right place for it to land.
 [profile.release]
