@@ -331,7 +331,10 @@ impl OutCursor {
             core::ptr::null_mut()
         };
         let op = backend.tail();
-        let cap = backend.cap();
+        // The write limit, not the raw capacity: it carries the per-block
+        // output ceiling, which a carried cursor cannot ask the backend about
+        // once it is ahead of it.
+        let cap = backend.inline_write_limit();
         Self {
             base,
             op,

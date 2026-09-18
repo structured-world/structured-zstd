@@ -134,6 +134,21 @@ pub(crate) trait BufferBackend: Sized {
     #[allow(dead_code)]
     const CURSOR_IS_BLOCK_STABLE: bool = false;
 
+    /// The highest write cursor this block may reach, with the per-block output
+    /// ceiling folded in.
+    ///
+    /// A carried cursor cannot ask [`Self::inline_exec_ok`] about the ceiling,
+    /// because that reads the backend's own live length and the backend has not
+    /// seen the writes yet. Folding the ceiling into one limit keeps the
+    /// per-sequence question a single comparison and keeps it correct: a
+    /// backend whose `cap` already accounts for the ceiling (`UserSliceBackend`)
+    /// needs no override.
+    #[allow(dead_code)]
+    #[inline(always)]
+    fn inline_write_limit(&self) -> usize {
+        self.cap()
+    }
+
     /// Upstream zstd's `ZSTD_execSequence` body
     /// (zstd_decompress_block.c:1008-1105). Writes `lit_length` bytes
     /// from `lit_src` at the current tail, then writes `match_length`
