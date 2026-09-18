@@ -182,10 +182,6 @@ macro_rules! cshape_resolve {
 /// most frames never take.
 #[cold]
 #[inline(never)]
-// The arguments are the sequence's own scalars. Grouping them into a struct
-// would push them off the argument registers and onto memory loads, which is
-// what this boundary exists to avoid paying.
-#[allow(clippy::too_many_arguments)]
 fn resolve_sequence_wide<K: crate::cpu_kernel::CpuKernel>(
     br: &mut crate::bit_io::BitReaderReversed<'_, K>,
     ll_base: u32,
@@ -245,40 +241,28 @@ macro_rules! decode_seq_fused_cshape {
 /// try_push + repeat_lookahead_prefetched. Expands as a statement-block
 /// returning `Result<(), DecompressBlockError>` so the caller can `?`
 /// or branch on it as needed.
-/// One sequence executed, as ONE body for this tier.
-///
-/// What guarantees the tier's instructions is `#[target_feature]` on this
-/// function, not the number of copies of its body: inside this scope the ymm
-/// helpers emit ymm. The body used to be a macro expanded at each of the
-/// three call sites (pipelined main, pipelined drain, simple loop), because
-/// `#[inline(always)]` cannot be combined with `#[target_feature]`
-/// (rust-lang/rust#145574) and textual expansion was the only way to inline
-/// it. That bought inlining at the price of three copies of one body in a
-/// function already carrying seven times the reference's code.
-///
-/// A call per sequence is the trade. In a loop that runs register-saturated
-/// that is not obviously a loss: an out-of-line body contains its own register
-/// pressure instead of spilling the caller's live values, which is the shape
-/// the reference has and the one AGENTS.md records as having won before.
-#[target_feature(enable = "bmi2,avx2")]
-// The arguments are one sequence plus the buffers it reads and writes. Grouping
-// them into a struct would push them off the argument registers and onto memory
-// loads, on the per-sequence boundary this function IS.
-#[allow(clippy::too_many_arguments)]
-unsafe fn execute_one_sequence_avx2<B: BufferBackend>(
-    buffer: &mut DecodeBuffer<B>,
-    dict: Option<&crate::decoding::dictionary::Dictionary>,
-    dict_content: &[u8],
-    literals_buffer: &[u8],
-    lit_cur: &mut usize,
-    literals_buffer_len_v: usize,
-    seq_ll_v: u32,
-    seq_ml_v: u32,
-    resolved_offset_v: u32,
-) -> Result<(), DecompressBlockError> {
-    let _result: Result<(), DecompressBlockError> = 'exec_inner: {
-        {
-            let lit_cur_before = *lit_cur;
+macro_rules! execute_one_body {
+    (
+        $buffer:expr,
+        $dict:expr,
+        $dict_content:expr,
+        $literals_buffer:expr,
+        $lit_cur:expr,
+        $literals_buffer_len:expr,
+        $seq_ll:expr,
+        $seq_ml:expr,
+        $resolved_offset:expr
+    ) => {{
+        // Labeled-block expansion — every early exit is
+        // `break 'exec_inner Err(...)`, no closure, no `?` operator,
+        // so the macro body inlines into the caller with zero CALL
+        // boundary even at -Copt-level=0.
+        let _result: Result<(), DecompressBlockError> = 'exec_inner: {
+            let seq_ll_v: u32 = $seq_ll;
+            let seq_ml_v: u32 = $seq_ml;
+            let resolved_offset_v: u32 = $resolved_offset;
+            let literals_buffer_len_v: usize = $literals_buffer_len;
+            let lit_cur_before = *$lit_cur;
             // The cursor never passes the end (it only advances to a `high`
             // this check already accepted), so the remaining literals are a
             // subtraction that cannot underflow, and asking whether this
@@ -296,8 +280,8 @@ unsafe fn execute_one_sequence_avx2<B: BufferBackend>(
             }
             let high = lit_cur_before + seq_ll_v as usize;
             // SAFETY: high <= literals_buffer_len_v, lit_cur_before <= high.
-            let lits = unsafe { literals_buffer.get_unchecked(lit_cur_before..high) };
-            *lit_cur = high;
+            let lits = unsafe { $literals_buffer.get_unchecked(lit_cur_before..high) };
+            *$lit_cur = high;
 
             if resolved_offset_v == 0 {
                 break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
@@ -323,25 +307,25 @@ unsafe fn execute_one_sequence_avx2<B: BufferBackend>(
             // Both terms are bounded (the live output by the window cap, the
             // literal run by a block), so the sum is nowhere near `usize::MAX`
             // on any target this builds for.
-            let prefix_resident = offset <= buffer.len() + lits.len();
+            let prefix_resident = offset <= $buffer.len() + lits.len();
 
             // `inline_exec_ok` lets a wrapping backend (RingBuffer) veto the
             // inline path when the live region is not contiguous at `tail`;
             // linear backends fold it to a capacity question.
             if prefix_resident {
                 if inline_literals_ok
-                    && buffer.buffer_mut().inline_exec_ok(
+                    && $buffer.buffer_mut().inline_exec_ok(
                         seq_ll_v as usize,
                         seq_ml_v as usize,
                         offset,
                     )
                 {
                     // SAFETY: parent-slice provenance; offset prefix-resident.
-                    let lit_src = unsafe { literals_buffer.as_ptr().add(lit_cur_before) };
+                    let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
                     // Inline the AVX2 exec body at the call site (no trait-method
                     // call boundary; see `exec_sequence_avx2_inline`).
                     let r = exec_sequence_avx2_inline!(
-                        buffer,
+                        $buffer,
                         lit_src,
                         seq_ll_v as usize,
                         offset,
@@ -351,7 +335,7 @@ unsafe fn execute_one_sequence_avx2<B: BufferBackend>(
                     // current for backends that read it (Ring/Flat resume +
                     // dict gate). Const-folded away for UserSliceBackend.
                     if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
-                        buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                        $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
                     }
                     break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
                 }
@@ -363,54 +347,53 @@ unsafe fn execute_one_sequence_avx2<B: BufferBackend>(
             // does not apply and asking for it would refuse every such match on
             // a wrapped ring.
             } else if inline_literals_ok
-                && buffer
+                && $buffer
                     .buffer_mut()
                     .inline_exec_dict_ok(seq_ll_v as usize, seq_ml_v as usize)
-                && let Some(dict_src) = buffer.dict_match_source(
-                    dict_content,
+                && let Some(dict_src) = $buffer.dict_match_source(
+                    $dict_content,
                     seq_ll_v as usize,
                     offset,
                     seq_ml_v as usize,
                 )
             {
                 // SAFETY: parent-slice provenance, as above.
-                let lit_src = unsafe { literals_buffer.as_ptr().add(lit_cur_before) };
+                let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
                 let r = exec_sequence_avx2_dict_inline!(
-                    buffer,
+                    $buffer,
                     lit_src,
                     seq_ll_v as usize,
                     dict_src,
                     seq_ml_v as usize
                 );
                 if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
-                    buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                    $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
                 }
                 break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
             }
 
             // Cold fallback.
-            if let Err(e) = buffer.try_push(lits) {
+            if let Err(e) = $buffer.try_push(lits) {
                 break 'exec_inner Err(ExecuteSequencesError::from(e).into());
             }
-            match buffer.repeat_lookahead_prefetched(
-                dict,
+            match $buffer.repeat_lookahead_prefetched(
+                $dict,
                 resolved_offset_v as usize,
                 seq_ml_v as usize,
             ) {
                 Ok(()) => Ok(()),
                 Err(e) => Err(ExecuteSequencesError::from(e).into()),
             }
-        }
-    };
-    _result
+        };
+        _result
+    }};
 }
 
 /// AVX2-tier monolithic decode + execute. Outer init, RLE dispatch, FSE
 /// state init, both pipeline arms, sequence-decode (via
-/// `decode_one_body!`) live in one function body, expanded textually so
-/// no inner boundary survives. Sequence-execute is one body for the tier
-/// ([`execute_one_sequence_avx2`]), called from each of the three sites
-/// rather than copied into them.
+/// `decode_one_body!`) and sequence-execute (via `execute_one_body!`)
+/// all live in one function body. Macros guarantee textual expansion
+/// at every callsite — no inner function boundaries.
 ///
 /// # Safety
 /// Caller must have verified that the runtime CPU advertises BMI2 + AVX2.
@@ -508,22 +491,17 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 actual_offset,
             };
 
-            // SAFETY: this function is itself `target_feature(bmi2,avx2)` and
-            // the dispatcher reached it only after the detector named that
-            // tier, so the callee's features hold.
-            let r = unsafe {
-                execute_one_sequence_avx2(
-                    buffer,
-                    dict,
-                    dict_content,
-                    literals_buffer,
-                    &mut lit_cur,
-                    literals_buffer_len,
-                    exec_seq.ll,
-                    exec_seq.ml,
-                    exec_seq.actual_offset,
-                )
-            };
+            let r = execute_one_body!(
+                buffer,
+                dict,
+                dict_content,
+                literals_buffer,
+                &mut lit_cur,
+                literals_buffer_len,
+                exec_seq.ll,
+                exec_seq.ml,
+                exec_seq.actual_offset
+            );
             if let Err(e) = r {
                 pipeline_err = Some(e);
                 break;
@@ -543,20 +521,17 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             for k in 0..ADVANCE {
                 let slot = (num_sequences + k) & ADVANCE_MASK;
                 let exec_seq = ring[slot];
-                // SAFETY: as at the call above.
-                let r = unsafe {
-                    execute_one_sequence_avx2(
-                        buffer,
-                        dict,
-                        dict_content,
-                        literals_buffer,
-                        &mut lit_cur,
-                        literals_buffer_len,
-                        exec_seq.ll,
-                        exec_seq.ml,
-                        exec_seq.actual_offset,
-                    )
-                };
+                let r = execute_one_body!(
+                    buffer,
+                    dict,
+                    dict_content,
+                    literals_buffer,
+                    &mut lit_cur,
+                    literals_buffer_len,
+                    exec_seq.ll,
+                    exec_seq.ml,
+                    exec_seq.actual_offset
+                );
                 if let Err(e) = r {
                     pipeline_err = Some(e);
                     break;
@@ -598,20 +573,17 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 ml_dec.update_state_fast(&mut br);
                 of_dec.update_state_fast(&mut br);
             }
-            // SAFETY: as at the calls above.
-            let r = unsafe {
-                execute_one_sequence_avx2(
-                    buffer,
-                    dict,
-                    dict_content,
-                    literals_buffer,
-                    &mut lit_cur,
-                    literals_buffer_len,
-                    seq_ll,
-                    seq_ml,
-                    resolved_offset,
-                )
-            };
+            let r = execute_one_body!(
+                buffer,
+                dict,
+                dict_content,
+                literals_buffer,
+                &mut lit_cur,
+                literals_buffer_len,
+                seq_ll,
+                seq_ml,
+                resolved_offset
+            );
             if let Err(e) = r {
                 fallback_err = Some(e);
                 break;
