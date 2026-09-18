@@ -3450,14 +3450,16 @@ fn the_lookahead_arm_decodes_what_the_straight_loop_does() {
         Dictionary::from_raw_content(dict_id, dict_content.clone()).expect("decoder dict builds"),
     );
 
-    // Embeds the dictionary content, so blocks carry plenty of matches and
-    // clear the arm's sequence threshold.
+    // Short fragments of the dictionary, separated by bytes that cannot match:
+    // many small matches rather than a few long ones, which is what clears the
+    // arm's sequence threshold.
     let mut payload = Vec::with_capacity(64 * 1024);
-    let mut salt = 0u8;
     while payload.len() < 64 * 1024 {
-        payload.extend_from_slice(&dict_content);
-        payload.push(salt);
-        salt = salt.wrapping_add(7);
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let at = (s >> 8) as usize % (dict_content.len() - 64);
+        let len = 8 + (s >> 28) as usize % 24;
+        payload.extend_from_slice(&dict_content[at..at + len]);
+        payload.push((s >> 16) as u8);
     }
 
     let mut cctx: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(12));
