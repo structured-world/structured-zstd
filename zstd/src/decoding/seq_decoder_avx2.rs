@@ -568,6 +568,10 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
     let literals_buffer_len = literals_len;
     debug_assert!(literals_buffer.len() >= literals_len);
     let mut lit_cur: usize = 0;
+    // Only the debug assertion at the end reads this, so it does not exist in a
+    // release build: an accumulator carried across the loop is a live value
+    // competing for a register with the ones the decode actually needs.
+    #[cfg(debug_assertions)]
     let mut seq_sum: u32 = 0;
     // Invariant for the whole block, so it is resolved here rather than per
     // sequence inside the dictionary-source selector.
@@ -656,7 +660,10 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 pipeline_err = Some(e);
                 break;
             }
-            seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+            #[cfg(debug_assertions)]
+            {
+                seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+            }
 
             if i + 1 < num_sequences {
                 br.ensure_bits(max_update_bits);
@@ -687,7 +694,10 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                     pipeline_err = Some(e);
                     break;
                 }
-                seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+                #[cfg(debug_assertions)]
+                {
+                    seq_sum = seq_sum.wrapping_add(exec_seq.ll).wrapping_add(exec_seq.ml);
+                }
             }
         }
 
@@ -735,7 +745,10 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 fallback_err = Some(e);
                 break;
             }
-            seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
+            #[cfg(debug_assertions)]
+            {
+                seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
+            }
         }
         cur.publish(buffer);
         if let Some(e) = fallback_err {
@@ -762,13 +775,19 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
     if lit_cur < literals_buffer_len {
         let rest = &literals_buffer[lit_cur..literals_buffer_len];
         buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;
-        seq_sum = seq_sum.wrapping_add(rest.len() as u32);
+        #[cfg(debug_assertions)]
+        {
+            seq_sum = seq_sum.wrapping_add(rest.len() as u32);
+        }
     }
 
-    let diff = buffer.len() - old_buffer_size;
-    debug_assert_eq!(
-        seq_sum as usize, diff,
-        "seq_sum {seq_sum} != buffer growth {diff}"
-    );
+    #[cfg(debug_assertions)]
+    {
+        let diff = buffer.len() - old_buffer_size;
+        debug_assert_eq!(
+            seq_sum as usize, diff,
+            "seq_sum {seq_sum} != buffer growth {diff}"
+        );
+    }
     Ok(())
 }
