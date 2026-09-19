@@ -1,12 +1,18 @@
-# Throwaway diagnostic. Which of the two speed deltas is steadier on a shared
-# runner: the one formed from the two criterion arms, or the one formed from a
-# measurement that alternates the implementations inside one window?
+# Throwaway diagnostic. Does a small fixture's measured ratio depend on where
+# its destination buffer sits?
 #
-# Run the real benchmark script twice on one machine and compare the two
-# payloads cell by cell. Both numbers are produced by both runs, so the same
-# comparison decides it: whichever moves less between two independent runs of
-# identical code is the better number to publish. Nothing here is a claim about
-# the implementations; it is a claim about the measurement.
+# `small-10k-random` decompress is the one cell where the paired figure is
+# noticeably less steady than the one it replaces, and its two SOURCES split by
+# 20% in a run that read them 0.695 and 0.857 on work that should be identical:
+# a 10 KiB random input compresses to raw blocks of the same length under both
+# encoders. Source and destination are both L1-resident at that size, so the
+# cache-set colouring between them can cost more than the decode, and the heap
+# moves between runs.
+#
+# Sweep the destination's offset inside the arena and read the ratio at each.
+# A flat sweep clears colouring and sends the search elsewhere; a swinging one
+# names it, and the fix is then to place the source deliberately too rather
+# than let a per-group allocation decide it.
 #
 # Push-triggered on `probe/**` only. Delete the branch when the answer is in.
 name: bench-probe
@@ -20,16 +26,15 @@ permissions:
 
 jobs:
   probe:
-    name: paired delta versus arm-pair delta, twice on one runner
+    name: destination offset sweep on small-10k-random
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
-      STRUCTURED_ZSTD_BENCH_TARGET: x86_64-gnu
-      STRUCTURED_ZSTD_BENCH_TRIPLE: x86_64-unknown-linux-gnu
-      STRUCTURED_ZSTD_BENCH_GENERATED_AT: '2026-01-01T00:00:00+00:00'
-      STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: 'level_3_dfast,level_6_lazy'
+      STRUCTURED_ZSTD_EMIT_REPORT: '1'
+      STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: 'level_3_dfast'
+      STRUCTURED_ZSTD_BENCH_LARGE_BYTES: '16777216'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -48,75 +53,32 @@ jobs:
         run: |
           cargo bench --bench compare_ffi -p ffi-bench \
             --target x86_64-unknown-linux-gnu --no-run --message-format=json > build.log
-          mkdir -p bench-binary
+          mkdir -p bench-binary target/criterion
           cp "$(jq -r 'select(.executable != null and (.target.name == "compare_ffi")) | .executable' build.log | tail -1)" \
             bench-binary/compare_ffi
           chmod +x bench-binary/compare_ffi
 
-      - name: First run
-        env:
-          STRUCTURED_ZSTD_BENCH_BIN: ${{ github.workspace }}/bench-binary/compare_ffi
+      # Offsets chosen to walk cache-line, page and multi-page distances, plus
+      # two that are deliberately not powers of two.
+      - name: Sweep the destination offset
         run: |
-          ./.github/scripts/run-benchmarks.sh > /dev/null
-          cp benchmark-relative.json first.json
+          for off in 0 64 320 4096 8192 12288 32768 65536 262144; do
+            echo "--- offset $off"
+            STRUCTURED_ZSTD_BENCH_PROBE_OFFSET=$off \
+              ./bench-binary/compare_ffi --bench --output-format bencher --noplot \
+              --measurement-time 1 "decompress/level_3_dfast/small-10k-random/" 2>&1 \
+              | grep -E '^REPORT_PAIR|^PROBE_GEOM ' || true
+          done
 
-      - name: Second run
-        env:
-          STRUCTURED_ZSTD_BENCH_BIN: ${{ github.workspace }}/bench-binary/compare_ffi
+      # The same sweep on a fixture whose buffers are far too large to sit in
+      # L1, as a control: if colouring is the mechanism, this one stays flat
+      # while the small one swings.
+      - name: The same sweep on a megabyte fixture
         run: |
-          ./.github/scripts/run-benchmarks.sh > /dev/null
-          cp benchmark-relative.json second.json
-
-      # Identical code, one machine, two runs. Whatever a number moves between
-      # them is measurement, so the smaller mover is the better number.
-      - name: How much each number moved between the two runs
-        run: |
-          python3 - <<'PY'
-          import json, statistics
-
-          def rows(path):
-              payload = json.load(open(path))
-              out = {}
-              for record in payload["records"]:
-                  if record.get("metric") != "throughput_bytes_per_sec":
-                      continue
-                  key = (record["stage"], record["scenario"],
-                         record["level"], str(record.get("source")))
-                  out[key] = record
-              return out
-
-          first, second = rows("first.json"), rows("second.json")
-          shared = sorted(set(first) & set(second))
-          print(f"cells compared: {len(shared)}")
-
-          def drift(getter):
-              moves = []
-              for key in shared:
-                  a, b = getter(first[key]), getter(second[key])
-                  if a and b and a > 0 and b > 0:
-                      moves.append(abs(b / a - 1.0) * 100.0)
-              return moves
-
-          paired = drift(lambda r: r["delta_ratio"] if r.get("delta_source") == "paired" else None)
-          arms = drift(lambda r: r.get("delta_from_criterion_arms"))
-
-          for name, moves in (("paired", paired), ("criterion arms", arms)):
-              if not moves:
-                  print(f"{name:<16} no data")
-                  continue
-              moves.sort()
-              print(f"{name:<16} n={len(moves):<4} median={statistics.median(moves):6.2f}%  "
-                    f"p90={moves[int(len(moves) * 0.9)]:6.2f}%  max={max(moves):6.2f}%")
-
-          print()
-          print(f"{'cell':<52}{'paired run1':>12}{'run2':>10}{'move':>8}   "
-                f"{'arms run1':>10}{'run2':>10}{'move':>8}")
-          for key in shared:
-              a, b = first[key], second[key]
-              pa, pb = a["delta_ratio"], b["delta_ratio"]
-              aa, ab = a.get("delta_from_criterion_arms"), b.get("delta_from_criterion_arms")
-              label = "/".join(part for part in key if part != "None")
-              pm = abs(pb / pa - 1) * 100 if pa else float("nan")
-              am = abs(ab / aa - 1) * 100 if aa else float("nan")
-              print(f"{label:<52}{pa:12.3f}{pb:10.3f}{pm:7.1f}%   {aa:10.3f}{ab:10.3f}{am:7.1f}%")
-          PY
+          for off in 0 64 4096 65536; do
+            echo "--- offset $off"
+            STRUCTURED_ZSTD_BENCH_PROBE_OFFSET=$off \
+              ./bench-binary/compare_ffi --bench --output-format bencher --noplot \
+              --measurement-time 1 "decompress/level_3_dfast/high-entropy-1m/" 2>&1 \
+              | grep -E '^REPORT_PAIR|^PROBE_GEOM ' || true
+          done

@@ -654,6 +654,18 @@ fn emit_pair_report(
     );
 }
 
+/// PROBE: how far into the arena a destination slice starts.
+fn probe_offset() -> usize {
+    use std::sync::OnceLock;
+    static OFFSET: OnceLock<usize> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        std::env::var("STRUCTURED_ZSTD_BENCH_PROBE_OFFSET")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Which side of a comparison a buffer belongs to.
 #[derive(Clone, Copy)]
 enum Arm {
@@ -662,10 +674,24 @@ enum Arm {
 }
 
 impl Arm {
-    fn index(self) -> usize {
-        match self {
+    /// Which of the arena's two slots this arm draws from THIS round.
+    ///
+    /// The mapping rotates with the same round parity that swaps the
+    /// registration order. Holding it fixed would leave one implementation on
+    /// one address for the life of the dashboard: whatever a particular
+    /// address is worth, in cache sets, page colouring or alignment, would be
+    /// credited to the same side every round, and a per-arm minimum across
+    /// rounds cannot cancel an advantage that never moves. Rotating it lets
+    /// both implementations meet both addresses.
+    fn slot(self) -> usize {
+        let declared = match self {
             Arm::Rust => 0,
             Arm::Ffi => 1,
+        };
+        if reverse_arm_order() {
+            1 - declared
+        } else {
+            declared
         }
     }
 }
@@ -718,29 +744,45 @@ impl BenchArena {
     }
 
     fn appended(&mut self, arm: Arm) -> &mut Vec<u8> {
-        &mut self.appended[arm.index()]
+        &mut self.appended[arm.slot()]
     }
 
     /// Both arms' append buffers at once, for a measurement that needs to hold
-    /// them simultaneously.
+    /// them simultaneously, returned as (rust, ffi) for whichever slots those
+    /// arms hold this round.
     fn appended_pair(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>) {
-        let [rust, ffi] = &mut self.appended;
-        (rust, ffi)
+        let [first, second] = &mut self.appended;
+        if Arm::Rust.slot() == 0 {
+            (first, second)
+        } else {
+            (second, first)
+        }
     }
 
-    /// Both arms' destination buffers at once, sliced to `len`.
+    /// Both arms' destination buffers at once, sliced to `len`, in the same
+    /// (rust, ffi) order.
     fn written_pair(&mut self, len: usize) -> (&mut [u8], &mut [u8]) {
-        let [rust, ffi] = &mut self.written;
+        // PROBE: start the slices this far into the arena, to sweep how much a
+        // cell's timing depends on where its destination sits relative to its
+        // source. A 10 KiB fixture is L1-resident on both sides, so cache-set
+        // colouring between the two buffers can cost far more than the decode
+        // itself, and the heap moves between runs.
+        let off = probe_offset();
+        let [first, second] = &mut self.written;
         assert!(
-            len <= rust.len(),
-            "arena holds {} bytes per arm, a group asked for {len}",
-            rust.len(),
+            off + len <= first.len(),
+            "arena holds {} bytes per arm, a group asked for {len} at {off}",
+            first.len(),
         );
-        (&mut rust[..len], &mut ffi[..len])
+        if Arm::Rust.slot() == 0 {
+            (&mut first[off..off + len], &mut second[off..off + len])
+        } else {
+            (&mut second[off..off + len], &mut first[off..off + len])
+        }
     }
 
     fn written(&mut self, arm: Arm, len: usize) -> &mut [u8] {
-        let buffer = &mut self.written[arm.index()];
+        let buffer = &mut self.written[arm.slot()];
         assert!(
             len <= buffer.len(),
             "arena holds {} bytes per arm, a group asked for {len}",
@@ -820,6 +862,18 @@ fn bench_decompress_source(
         let mut dctx = FfiDCtxHandle::new();
         let paired = ARENA.with_borrow_mut(|arena| {
             let (rust_target, ffi_target) = arena.written_pair(destination_len);
+            // PROBE: the three addresses whose relative colouring the sweep is
+            // testing.
+            eprintln!(
+                "PROBE_GEOM {}/{}/{} off={} src={:p} rust_dst={:p} ffi_dst={:p}",
+                level.name,
+                scenario.id,
+                source,
+                probe_offset(),
+                compressed.as_ptr(),
+                rust_target.as_ptr(),
+                ffi_target.as_ptr(),
+            );
             measure_pair(
                 || {
                     let written = decoder
