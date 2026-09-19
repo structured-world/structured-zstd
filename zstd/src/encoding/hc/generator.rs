@@ -112,6 +112,14 @@ macro_rules! bt_insert_step_no_rebase_body {
             $table.hash_log,
             $table.search_mls,
         );
+        // Upstream holds `U32* const hashTable = ms->hashTable` for the whole
+        // body (zstd_opt.c:449). Ours re-derived it from the shared table
+        // buffer at every use, and each re-derivation is a bounds-checked
+        // reslice that reloads the buffer's header and the seam offset through
+        // `&mut self`.
+        let hash_ptr = $table.hash_table_mut().as_mut_ptr();
+        debug_assert_eq!($table.hash_table().len(), 1usize << $table.hash_log);
+        debug_assert!(hash < 1usize << $table.hash_log);
         // Prefetch the hash bucket now. For the large L16+ hash table over
         // high-entropy input the bucket is L3/DRAM-cold, and unlike upstream's
         // monolithic ZSTD_btGetAllMatches (which overlaps this miss with its
@@ -131,7 +139,7 @@ macro_rules! bt_insert_step_no_rebase_body {
             // SAFETY: prefetch is a hint that never faults; `hash` indexes
             // `hash_table` directly below, so it is in bounds.
             unsafe {
-                _mm_prefetch($table.hash_table().as_ptr().add(hash).cast(), _MM_HINT_T0);
+                _mm_prefetch(hash_ptr.add(hash).cast(), _MM_HINT_T0);
             }
             // Prefetch the NEXT position's bucket too. The optimal-parser DP
             // advances one position per iteration, so this miss is issued a
@@ -149,10 +157,7 @@ macro_rules! bt_insert_step_no_rebase_body {
                 // SAFETY: prefetch never faults; an out-of-range index is a
                 // harmless no-op hint.
                 unsafe {
-                    _mm_prefetch(
-                        $table.hash_table().as_ptr().add(hash_next).cast(),
-                        _MM_HINT_T0,
-                    );
+                    _mm_prefetch(hash_ptr.add(hash_next).cast(), _MM_HINT_T0);
                 }
             }
         }
@@ -189,8 +194,12 @@ macro_rules! bt_insert_step_no_rebase_body {
         let pair_idx = $table.bt_pair_index_for_abs($abs_pos);
         let mut smaller_slot = pair_idx;
         let mut larger_slot = pair_idx + 1;
-        let mut match_stored = $table.hash_table()[hash];
-        $table.hash_table_mut()[hash] = stored;
+        // SAFETY: `hash` is masked to `hash_log` bits and the table is
+        // `1 << hash_log` slots wide (both asserted at `hash_ptr`), so the slot
+        // is in range by construction. Upstream reads and writes the same slot
+        // through its own raw `hashTable`.
+        let mut match_stored = unsafe { *hash_ptr.add(hash) };
+        unsafe { *hash_ptr.add(hash) = stored };
 
         while compares_left > 0 {
             if match_stored == $crate::encoding::match_table::storage::HC_EMPTY {
@@ -725,6 +734,14 @@ macro_rules! bt_insert_and_collect_matches_body {
             $table.hash_log,
             $table.search_mls,
         );
+        // Upstream holds `U32* const hashTable = ms->hashTable` for the whole
+        // body (zstd_opt.c:607). Ours re-derived it from the shared table
+        // buffer at every use, and each re-derivation is a bounds-checked
+        // reslice that reloads the buffer's header and the seam offset through
+        // `&mut self`. One raw base, the way `chain_ptr` below already does it.
+        let hash_ptr = $table.hash_table_mut().as_mut_ptr();
+        debug_assert_eq!($table.hash_table().len(), 1usize << $table.hash_log);
+        debug_assert!(hash < 1usize << $table.hash_log);
         // Prefetch the hash bucket now. For the large L16+ hash table over
         // high-entropy input the bucket is L3/DRAM-cold, and unlike upstream's
         // monolithic ZSTD_btGetAllMatches (which overlaps this miss with its
@@ -744,7 +761,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             // SAFETY: prefetch is a hint that never faults; `hash` indexes
             // `hash_table` directly below, so it is in bounds.
             unsafe {
-                _mm_prefetch($table.hash_table().as_ptr().add(hash).cast(), _MM_HINT_T0);
+                _mm_prefetch(hash_ptr.add(hash).cast(), _MM_HINT_T0);
             }
             // Prefetch the NEXT position's bucket too. The optimal-parser DP
             // advances one position per iteration, so this miss is issued a
@@ -762,10 +779,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                 // SAFETY: prefetch never faults; an out-of-range index is a
                 // harmless no-op hint.
                 unsafe {
-                    _mm_prefetch(
-                        $table.hash_table().as_ptr().add(hash_next).cast(),
-                        _MM_HINT_T0,
-                    );
+                    _mm_prefetch(hash_ptr.add(hash_next).cast(), _MM_HINT_T0);
                 }
             }
         }
@@ -843,8 +857,12 @@ macro_rules! bt_insert_and_collect_matches_body {
         let pair_idx = $table.bt_pair_index_for_abs($abs_pos);
         let mut smaller_slot = pair_idx;
         let mut larger_slot = pair_idx + 1;
-        let mut match_stored = $table.hash_table()[hash];
-        $table.hash_table_mut()[hash] = stored;
+        // SAFETY: `hash` is masked to `hash_log` bits and the table is
+        // `1 << hash_log` slots wide (both asserted at `hash_ptr`), so the slot
+        // is in range by construction. Upstream reads and writes the same slot
+        // through its own raw `hashTable`.
+        let mut match_stored = unsafe { *hash_ptr.add(hash) };
+        unsafe { *hash_ptr.add(hash) = stored };
         // Upstream zstd semantics: `bestLength` starts at `lengthToBeat - 1`; rep/hash3
         // probing may raise it; BT then only reports strictly longer matches.
         // `min_match_len >= HC_FORMAT_MINMATCH (3)` by configure invariant,
