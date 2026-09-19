@@ -465,6 +465,33 @@ fn pretouch_pages(buf: &mut [u8]) {
     }
 }
 
+/// PROBE: the CPU the process last ran on, plus its context-switch counts,
+/// straight out of procfs so no extra dependency is needed.
+fn cpu_and_switches() -> String {
+    let cpu = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| {
+            // Fields are counted from 1 and the command name in fields 2 and 3
+            // can itself contain spaces, so count from after its closing paren.
+            // `processor` is field 39, the 36th after the name.
+            let after_comm = stat.rsplit_once(") ")?.1;
+            after_comm.split_whitespace().nth(36).map(str::to_owned)
+        })
+        .unwrap_or_default();
+    let mut voluntary = String::new();
+    let mut involuntary = String::new();
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("voluntary_ctxt_switches:") {
+                voluntary = rest.trim().to_owned();
+            } else if let Some(rest) = line.strip_prefix("nonvoluntary_ctxt_switches:") {
+                involuntary = rest.trim().to_owned();
+            }
+        }
+    }
+    format!("cpu={cpu} vol_switches={voluntary} invol_switches={involuntary}")
+}
+
 /// Which side of a comparison a buffer belongs to.
 #[derive(Clone, Copy)]
 enum Arm {
@@ -610,6 +637,19 @@ fn bench_decompress_source(
     // the direct-write path; the slack is the dispatcher's eligibility gate.
     // The C arm asks for the same, so a size difference cannot separate them.
     let destination_len = expected_len + structured_zstd::WILDCOPY_OVERLENGTH;
+
+    // PROBE: which CPU this cell is about to run on, and how often the
+    // scheduler has taken the process off a CPU against its will. A cell that
+    // reads two different speeds in one process is either migrating between
+    // cores or sharing one with something else, and these two numbers say
+    // which.
+    eprintln!(
+        "PROBE_CPU {}/{}/{} {}",
+        level.name,
+        scenario.id,
+        source,
+        cpu_and_switches()
+    );
 
     bench_arm_pair(
         &mut group,

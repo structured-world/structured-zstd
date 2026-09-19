@@ -1,17 +1,16 @@
-# Throwaway diagnostic. One question: does the process-wide arena change what
-# the bench measures, or not?
+# Throwaway diagnostic. Does pinning the bench to one CPU make a cell read the
+# same speed every time it runs?
 #
-# Two binaries differing ONLY in `compare_ffi.rs` (the buffer-pair version that
-# is already on the PR, and the arena version on top of it), built in one job
-# and run interleaved, so the comparison cannot be a machine-to-machine
-# difference. That distinction matters here: the same cell has read 14, 28-39
-# and 62-69 ns/iter in three separate jobs of the same binary, so nothing that
-# compares numbers ACROSS jobs can decide anything.
+# On the shared runners a cell has read two speeds ~1.4x apart inside one
+# process, and the absolute level of the same binary and command has varied 4.5x
+# between jobs. The first of those is what pinning could fix: a single-threaded
+# bench that migrates between vCPUs loses the caches its samples were warming,
+# and can land beside a busy sibling.
 #
-# The arena run also showed the cell snapping between two states ~1.4x apart
-# inside one process, sometimes landing the two arms of one cell in different
-# states. Whether that is the arena or the machine is exactly what interleaving
-# answers.
+# Same binary throughout, run unpinned and pinned to one CPU, interleaved three
+# times so a state belonging to the machine shows up in both. Each cell prints
+# the CPU it is about to run on and the process's context-switch counts, so the
+# mechanism is visible and not inferred from the timings.
 #
 # Push-triggered on `probe/**` only. Delete the branch when the answer is in.
 name: bench-probe
@@ -25,19 +24,18 @@ permissions:
 
 jobs:
   probe:
-    name: arena versus buffer-pair, interleaved on one machine
+    name: pinned versus unpinned on one shared runner
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
-      # The filter the dashboard's own runner script uses, so both binaries see
-      # the same matrix.
       STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: 'level_3_dfast,level_6_lazy'
+      # What the runner script sets on CI, so the fixture sizes match the ones
+      # the dashboard measures rather than the much larger local defaults.
+      STRUCTURED_ZSTD_BENCH_LARGE_BYTES: '16777216'
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-gnu
@@ -46,9 +44,10 @@ jobs:
       - name: Runner identity
         run: |
           grep -m1 'model name' /proc/cpuinfo || true
-          nproc; cat /proc/loadavg; free -m | head -2
+          echo "cpus=$(nproc)"; cat /proc/loadavg; free -m | head -2
+          taskset --version || echo "no taskset"
 
-      - name: Build the arena binary
+      - name: Build the bench binary as bench-build does
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v3"
         run: |
@@ -56,33 +55,25 @@ jobs:
             --target x86_64-unknown-linux-gnu --no-run --message-format=json > build.log
           mkdir -p bench-binary target/criterion
           cp "$(jq -r 'select(.executable != null and (.target.name == "compare_ffi")) | .executable' build.log | tail -1)" \
-            bench-binary/arena
-          chmod +x bench-binary/arena
+            bench-binary/compare_ffi
+          chmod +x bench-binary/compare_ffi
 
-      # Same branch, same everything, with only the bench source rolled back to
-      # the version already on the PR.
-      - name: Build the buffer-pair binary
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v3"
+      # The last CPU rather than the first: CPU 0 takes the interrupts.
+      - name: Interleave unpinned and pinned
         run: |
-          git checkout 97ed02d4 -- zstd/benches/compare_ffi.rs
-          cargo bench --bench compare_ffi -p ffi-bench \
-            --target x86_64-unknown-linux-gnu --no-run --message-format=json > build2.log
-          cp "$(jq -r 'select(.executable != null and (.target.name == "compare_ffi")) | .executable' build2.log | tail -1)" \
-            bench-binary/pair
-          chmod +x bench-binary/pair
-          git checkout HEAD -- zstd/benches/compare_ffi.rs
-
-      # Three interleaved passes. A state that belongs to the machine moves
-      # between passes and shows up in both binaries; one that belongs to the
-      # arena stays with the arena binary in every pass.
-      - name: Interleave the two binaries
-        run: |
+          last_cpu=$(( $(nproc) - 1 ))
+          echo "pinning to cpu $last_cpu"
           for pass in 1 2 3; do
-            for arm in pair arena; do
-              echo "--- pass $pass, $arm"
-              ./bench-binary/$arm --bench --output-format bencher --noplot \
-                --measurement-time 2 "decompress/.*/(high-entropy-1m|decodecorpus-synthetic-1m)/" 2>&1 \
-                | grep -E '^test decompress|^PROBE_STATE arena' || true
+            for mode in bare pinned; do
+              echo "--- pass $pass, $mode"
+              if [ "$mode" = pinned ]; then
+                pin=(taskset -c "$last_cpu")
+              else
+                pin=()
+              fi
+              "${pin[@]}" ./bench-binary/compare_ffi --bench --output-format bencher \
+                --noplot --measurement-time 2 \
+                "decompress/.*/(high-entropy-1m|decodecorpus-synthetic-1m)/" 2>&1 \
+                | grep -E '^test decompress|^PROBE_CPU ' || true
             done
           done
