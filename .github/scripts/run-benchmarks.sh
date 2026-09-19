@@ -576,8 +576,26 @@ def summarize_paired_rounds(rounds):
         if len(ordered) % 2 == 0
         else ordered[mid]
     )
+    # The other estimator the same rounds support: each round's median of
+    # per-sample ratios, then the median of those. It keeps the pairing sample
+    # by sample where the minima may come from two different samples of one
+    # visit, at the price of dividing one disturbed reading by another. Carried
+    # beside the published figure so the two can be compared on the same runs
+    # rather than argued about.
+    sample_medians = sorted(
+        entry["speedup_median"] for entry in rounds if entry["speedup_median"] > 0.0
+    )
+    sample_median = None
+    if sample_medians:
+        half = len(sample_medians) // 2
+        sample_median = (
+            (sample_medians[half - 1] + sample_medians[half]) / 2.0
+            if len(sample_medians) % 2 == 0
+            else sample_medians[half]
+        )
     return {
         "delta_rust_over_ffi": median,
+        "delta_from_sample_medians": sample_median,
         "per_round_delta": deltas,
         "rounds": len(deltas),
         "samples": min(entry["samples"] for entry in rounds),

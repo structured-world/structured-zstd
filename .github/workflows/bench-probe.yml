@@ -88,13 +88,22 @@ jobs:
                       result[key] = abs(b / a - 1.0) * 100.0
               return result
 
-          paired = lambda r: r["delta_ratio"] if r.get("delta_source") == "paired" else None
+          def paired(record):
+              return record["delta_ratio"] if record.get("delta_source") == "paired" else None
+
+          def sample_medians(record):
+              return (record.get("paired") or {}).get("delta_from_sample_medians")
+
           arms = lambda r: r.get("delta_from_criterion_arms")
 
           table = {}
           for rounds in (3, 9):
               first, second = rows(f"r{rounds}-p1.json"), rows(f"r{rounds}-p2.json")
-              for name, getter in (("paired", paired), ("arms", arms)):
+              for name, getter in (
+                  ("min/min", paired),
+                  ("samp-med", sample_medians),
+                  ("arms", arms),
+              ):
                   table[(rounds, name)] = moves(first, second, getter)
 
           for (rounds, name), data in table.items():
@@ -106,10 +115,14 @@ jobs:
                     f"p90={values[int(len(values) * 0.9)]:6.2f}%  max={max(values):6.2f}%")
 
           print()
-          print(f"{'cell':<48}{'paired@3':>10}{'paired@9':>10}{'arms@3':>9}{'arms@9':>9}")
-          keys = sorted(set(table[(3, 'paired')]) & set(table[(9, 'paired')]))
+          print(f"{'cell':<44}{'mm@3':>8}{'mm@9':>8}{'sm@3':>8}{'sm@9':>8}{'arm@3':>8}{'arm@9':>8}")
+          keys = sorted(set(table[(3, 'min/min')]) & set(table[(9, 'min/min')]))
           for key in keys:
               label = "/".join(part for part in key if part != "None")
-              print(f"{label:<48}{table[(3,'paired')][key]:9.1f}%{table[(9,'paired')][key]:9.1f}%"
-                    f"{table[(3,'arms')].get(key, float('nan')):8.1f}%{table[(9,'arms')].get(key, float('nan')):8.1f}%")
+              cells = "".join(
+                  f"{table[(rounds, name)].get(key, float('nan')):7.1f}%"
+                  for name in ("min/min", "samp-med", "arms")
+                  for rounds in (3, 9)
+              )
+              print(f"{label:<44}{cells}")
           PY
