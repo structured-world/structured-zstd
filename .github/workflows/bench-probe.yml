@@ -34,6 +34,7 @@ jobs:
       CARGO_INCREMENTAL: 0
       STRUCTURED_ZSTD_EMIT_REPORT: '1'
       STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: 'level_3_dfast'
+      STRUCTURED_ZSTD_BENCH_SCENARIO_NOTE: 'decoders are now held for the process'
       STRUCTURED_ZSTD_BENCH_LARGE_BYTES: '16777216'
     steps:
       - uses: actions/checkout@v7
