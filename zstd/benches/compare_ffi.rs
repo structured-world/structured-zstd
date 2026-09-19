@@ -546,15 +546,18 @@ fn measure_pair(mut rust_op: impl FnMut(), mut ffi_op: impl FnMut()) -> PairedMe
     // fixture. A batch averages at least this many iterations whatever the
     // clock says.
     const MIN_ITERS: u64 = 16;
-    // Enough batches that the minimum is settled. Deep batches carry little
-    // noise of their own, so this does not need criterion's thirty.
+    // Batches per side across the WHOLE run, shared out over its rounds. What
+    // defeats this measurement is not a few slow batches, which the minimum
+    // discards, but a disturbance long enough to cover every batch of a visit:
+    // one cell's minimum read 328 ns against a floor of 206 with all twelve
+    // batches slow. No statistic inside a visit can see past that, so the
+    // defence is more visits, each shorter, with the rest of the matrix between
+    // them, at the same total cost. Undisturbed deep batches barely differ
+    // (one side held within 0.9% across a whole sweep), so a visit of four
+    // estimates its minimum nearly as well as a visit of twelve.
+    const TOTAL_SAMPLES: usize = 36;
     const MAX_SAMPLES: usize = 12;
-    const MIN_SAMPLES: usize = 8;
-    // Roughly what one side of one cell may spend. An operation slower than
-    // `budget / MIN_SAMPLES` overruns it, which is the intended trade: the
-    // measurement is only worth having if each side is estimated as well as
-    // the arms it replaces.
-    const BUDGET_NS: f64 = 1_200_000_000.0;
+    const MIN_SAMPLES: usize = 4;
     // A ceiling, so an operation that is somehow free cannot ask for an
     // unbounded batch.
     const MAX_ITERS: u64 = 1 << 26;
@@ -575,12 +578,9 @@ fn measure_pair(mut rust_op: impl FnMut(), mut ffi_op: impl FnMut()) -> PairedMe
     let rust_iters = batch_size(time_batch(&mut rust_op, MIN_ITERS));
     let ffi_iters = batch_size(time_batch(&mut ffi_op, MIN_ITERS));
 
-    // Spend a fixed budget rather than a fixed sample count, so one slow
-    // fixture cannot dominate the run. A batch already past the budget still
-    // gets `MIN_SAMPLES`: fewer than that and the minimum is a lucky draw.
-    // Both batches are sized to the same target, so either stands for the
-    // pair's cost.
-    let samples = ((BUDGET_NS / TARGET_BATCH_NS) as usize).clamp(MIN_SAMPLES, MAX_SAMPLES);
+    // This visit's share of the run's batches. More rounds mean shorter visits,
+    // not more work.
+    let samples = (TOTAL_SAMPLES / bench_rounds() as usize).clamp(MIN_SAMPLES, MAX_SAMPLES);
 
     let mut rust_samples = Vec::with_capacity(samples);
     let mut ffi_samples = Vec::with_capacity(samples);
