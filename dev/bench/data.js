@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789686025938,
+  "lastUpdate": 1789781938238,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -7343,6 +7343,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.129,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "82f7ecb02a5d150bf5a7481c0e2cc956527fb2a8",
+          "message": "perf(decoding): settle per-sequence questions once per block; fix the overlapping-match copier (#517)\n\n* perf(decoding): gate the avx2 sequence loop on remaining literals\n\nThe per-sequence gates asked their questions as values: a `checked_add` plus\n`is_some_and` for the literal bounds, `next_multiple_of` for the wildcopy\nstride, another `checked_add` for prefix residency. Each materialises an\n`Option` only to decide whether to leave the fast path, and each pays an\noverflow check to establish what the block bounds already give.\n\nAsked of the REMAINING literals instead. The cursor never passes the end, so\nthe subtraction cannot underflow and every question becomes one comparison\nagainst it. Above 16 the rounded read covers the unconditional one, so only\nthe larger of the two is tested.\n\n* perf(decoding): gate every sequence loop on remaining literals\n\nCarries the avx2 change to the other three monomorphs and to the portable\nexecutor, so the four do not drift: the bmi2 and vbmi2 monoliths and\n`execute_one_sequence_pipelined` asked the same questions as values, with the\nsame per-sequence overflow checks behind them.\n\nMeasured on the avx2 tier, decodecorpus z000033 at level -1, paired harnesses\non the bench host: -1.90% instructions (callgrind, two-point fit, deterministic)\nand -1.86% time over three interleaved readings whose ranges do not overlap.\nA control arm on a fixture of raw blocks, where the sequence loop never runs,\nshows no gain.\n\n* perf(decoding): move the wide-offset resolve out of the avx2 hot function\n\nOne `ensure_bits` cannot cover a sequence asking for more bits than the reader\nholds, so that case re-checks per read. Reaching it needs a wide offset: with\nthe two lengths capped at 16 bits each, the offset must ask for more than 24,\nwhich takes a window above 16 MB.\n\nInline it was a second full copy of the resolve logic beside the hot one, in a\nfunction that carries seven times the reference's code (5,523 instructions\nagainst 721, at matching stack-traffic proportion, so the size is the problem\nand not the register allocator).\n\n* perf(decoding): probe the pipelined arm's cost by removing it\n\nNot a proposal, a measurement. Bounds what outlining the avx2 pipelined arm\ncould be worth: with the branch gone the simple arm handles every block, so the\ndecode is the same, and the only loss is the prefetch lookahead on\ncold-dictionary and large-history frames. If the instruction count does not\nmove, outlining the arm is not worth its fifteen parameters.\n\n* Revert \"perf(decoding): probe the pipelined arm's cost by removing it\"\n\nThis reverts commit ee1d150562adb7ca47f2024b842dee2a0f661189.\n\n* perf(decoding): carry the live output length alongside the avx2 loop\n\nResidency of a match source was asked of the backend on every sequence, which\nis two loads through a structure the executor had just written to, for a number\nthe loop already knows: each sequence advances the output by exactly its\nliteral and match lengths. The reference carries its output pointer in a\nregister for the same reason.\n\nCarried in a local now and advanced by what each sequence writes, with a\n`debug_assert_eq` against the backend holding the two in step. That assertion\nruns on every sequence of every fixture in the debug suite and costs nothing in\nrelease, which is a stronger guarantee than the reasoning that removed the\nload.\n\n* Revert \"perf(decoding): carry the live output length alongside the avx2 loop\"\n\nThis reverts commit b7f905e46161094cba990df3fb380e5faa72423c.\n\n* perf(decoding): probe what the avx2 monolith is worth\n\nNot a proposal. Routes the avx2 tier to the shared generic body to measure what\nthe hand-written monolith buys. The tiers exist to GUARANTEE the extended\ninstructions through target_feature and textual expansion, which a generic body\ncompiled for the baseline cannot promise, so this is a measurement of that\nguarantee's value, not a candidate design.\n\n* Revert \"perf(decoding): probe what the avx2 monolith is worth\"\n\nThis reverts commit 8626c936e2293feea310000d706864740d4b7185.\n\n* refactor(decoding): one executor body per tier, not one per call site\n\nThe avx2 tier expanded the executor macro at each of its three call sites\n(pipelined main, pipelined drain, simple loop), so one body existed three times\ninside a function already carrying seven times the reference's code. The tier's\ninstruction guarantee does not come from that: it comes from\n`#[target_feature]` on the enclosing function. Textual expansion was there only\nbecause `#[inline(always)]` cannot be combined with `#[target_feature]`\n(rust-lang/rust#145574), so a macro was the only way to inline.\n\nIt is one `#[target_feature(enable = \"bmi2,avx2\")]` function now, called from\nthe three sites. Inside that scope the ymm helpers still emit ymm, so nothing\nabout the guarantee changes; what changes is a call per sequence in place of two\nextra copies of the body. In a register-saturated loop that is not obviously a\nloss, and the measurement decides it.\n\n* Revert \"refactor(decoding): one executor body per tier, not one per call site\"\n\nThis reverts commit ebdb0cbb905072887aa8caedd48d091a7e0a82e4.\n\n* perf(decoding): give the lookahead ring its own avx2 implementation\n\nThe tier had one function holding both block algorithms, so the straight\nloop shared a body, a frame and a register allocation with the\neight-deep lookahead ring that most blocks never enter. Split the ring\nout into its own #[target_feature] function: each implementation is now\none expansion of the tier macros, and the call is paid once per block\nrather than per sequence, which is where making the executor a function\ncost 21%.\n\nPart of #178\n\n* perf(decoding): restore the checked literal gates in the sequence loops\n\nRewriting the per-sequence gates from checked_add/next_multiple_of into\nbare comparisons on the remaining literals read as -1.90% instructions,\nbut that was measured in the release profile. Rebuilt with the profile\nthe benches ship (fat LTO, one codegen unit) it is a regression: 8,211,668\nto 8,508,382 instructions per iteration (+3.61%) on decodecorpus z000033\nat level -1, and about +4% in time (1182-1198 ns against 1121-1141 for\nthe same tree without it), five interleaved rounds. Whole-crate\nvisibility evidently folded the checked forms already, so the hand\nwritten remainder and rounding are now computed where they used to\nvanish.\n\nThe outlined wide-offset resolve stays: on its own, without these gates,\nit measures 8,211,668 to 8,159,406 (-0.64%) with time unchanged.\n\nPart of #178\n\n* perf(decoding): keep the lookahead ring in the tier's own body\n\nGiving the ring arm its own #[target_feature] function reads as free in\none arrangement and expensive in another, which is the signature of a\ncodegen accident rather than a structural gain: measured against the\nsame tree without it, 8,159,406 to 8,461,718 instructions per iteration\n(+3.70%) and 1148-1183 ns against 1106-1128, five interleaved rounds\nwith disjoint ranges, on decodecorpus z000033 at level -1.\n\nThe boundary is never paid at runtime either way: LLVM inlines the\nextracted function straight back, so no symbol for it survives. What\nchanges is only which gates fold with which, and on this arrangement it\nfolds worse.\n\nPart of #178\n\n* perf(decoding): settle the literals read slack once per block\n\nThe inline copiers read past the literals they are given: sixteen bytes\nwhatever the literal length, and the length rounded up to the wildcopy\nstride above that. Every sequence therefore asked whether that room was\nthere, two checked adds and two comparisons, and the per-sequence\ninstruction map put that one gate at 3.25 of our 58.2 instructions per\nsequence against the reference's 35.8.\n\nUpstream asks the same question once per block instead, where the\nliterals section is parsed (zstd_decompress_block.c:275): a Raw section\nis referenced in place only when the block carries WILDCOPY_OVERLENGTH\nbytes after it, and otherwise it is copied into a buffer that has them.\nIts executor then has no such test at all.\n\nDo the same. The literals decoder now hands the sequence loop a view\nwhose slice runs past the literals by that slack, with the literal count\nalongside it, and every tier's gate collapses to the backend's\ncompile-time SUPPORTS_INLINE_SEQUENCE_EXEC.\n\nPart of #178\n\n* perf(decoding): assert the nonzero offset in the avx2 loop\n\nA zero offset cannot reach the executor, so the loop asserted it in\ndebug and tested it in release, once per sequence. Nothing can build an\noffset entry whose base value is zero: the base is 1 << ofCode, the FSE\ntable rejects a symbol past MAX_OFFSET_CODE, the RLE mode checks its\nsymbol against the same bound, and the predefined table is fixed. The\nrepcode arms already turn a zero into 0xFFFFFFFF deliberately, for the\nresidency gate to reject as out of range.\n\nUpstream asserts the same thing in the same place rather than testing\nit (zstd_decompress_block.c:1013-1037).\n\nPart of #178\n\n* perf(decoding): carry the output cursor in the avx2 sequence loop\n\nUpstream hoists op, oend, litPtr, prefixStart and the rest into locals\nbefore its sequence loop and touches the context through none of it, so\nits per-sequence gates are comparisons between registers. Ours asked the\nbuffer: the residency gate read len() and the copier read cap() and\ntail(), each through &mut after a write, which the optimiser cannot\nhoist out of the loop.\n\nCarry them instead. The loop takes the position once per block into an\nOutCursor, every gate and the copy address read that, and the cold paths\n(dictionary source, push + repeat) get it published before they run and\ntaken back after, since they own the buffer.\n\nThe copy body is now addressed by an explicit cursor, so the two callers\nthat had to read one first (the vbmi2 tier) and the one that carries it\n(this tier) share a single body rather than a wrapper and a copy.\n\nPart of #178\n\n* perf(decoding): one output-room comparison per sequence\n\nThe inline copier asked twice: whether the write fits at all, then\nwhether it fits with the wildcopy overshoot. Upstream asks once, against\nan end pointer that already has the overshoot subtracted (oMatchEnd >\noend_w), and lets the branch that fails sort out which of the two cases\nit is.\n\nDo the same: the hot path is one comparison, and the tight tail keeps\nthe exact-fit test and the non-overshooting copy it always had.\n\nPart of #178\n\n* Revert \"perf(decoding): one output-room comparison per sequence\"\n\nThis reverts commit b46a839f90e3be3522fe319db9e0ac8c2c028a4c.\n\n* perf(decoding): advance the fse states from the entries already read\n\nThe loop reads all three table entries at the top of a sequence for\ntheir base values and bit counts, then advanced each state through\nupdate_state_fast, which read the decoder's copy of the same entry\nagain for its nextState and nbBits.\n\nUpstream reads each entry once and keeps llNext / llnbBits in locals\nacross the value reads, handing them to ZSTD_updateFseStateWithDInfo\nafterwards (zstd_decompress_block.c:1261-1266 and 1337-1340). Do the\nsame: update_state_from takes the entry the caller holds, with a debug\nassertion that it is indeed the decoder's current one.\n\nPart of #178\n\n* Revert \"perf(decoding): advance the fse states from the entries already read\"\n\nThis reverts commit 5d57c0d264c15070bc6c3e220b2af70567ab748b.\n\n* perf(decoding): one refill check covers a sequence and its transition\n\nThe loop asked the bit reader twice per sequence: once for the value\nbits, once for the three state-transition reads that follow them. That\nsingle line, if self.bits_consumed + n > 64, was the hottest in the\nper-sequence map at 2.25 instructions.\n\nUpstream advances the states at the end of ZSTD_decodeSequence, inside\nthe same span its refills cover. Move ours there too: when the values\nand the transition fit one 56-bit budget, one ensure_bits covers both\nand the three advances read unchecked. The wide case keeps the two-step\nshape it needs.\n\nPart of #178\n\n* docs(decoding): describe the copy body by the cursor it takes\n\nThe wrapper that read the cursor from the backend is gone, so the\nsurviving body's doc names what it actually is and who passes what.\n\n* Reapply \"perf(decoding): one output-room comparison per sequence\"\n\nThis reverts commit 702bc007be62529556cb668ffea3087b23c96199.\n\n* fix(decoding): copy an overlapping match in blocks, not byte by byte\n\nThe exact copier used for a sequence near the end of the output walked\nan overlapping match one byte at a time. On a long match with a short\nperiod that is a factor: on a 1 MiB low-entropy fixture at level 3 it\nwas 57.7M of the run's 61.3M instructions, and the decode took 444 us\nagainst 65 us for the same input before the literal-slack change routed\nthese sequences here.\n\nCopy the period once and then double what is already written, so every\nstep is a block move. Upstream gets to the same place by spreading the\nperiod to eight bytes and wildcopying from there\n(zstd_decompress_block.c:804-872); neither walks the match byte by byte.\n\nFound by measuring a fixture shape the earlier rounds had not: the\nregression is invisible on decodecorpus, where matches are short.\n\nPart of #178\n\n* perf(decoding): carry the write end and the live base, not the live length\n\nTwo per-sequence arithmetic steps the block can do once. The copier\nrecomputed the room left (cap - tail) to compare against the write plus\nits overshoot; the cursor now carries cap less the overshoot, which is\nupstream's oend_w, and the gate is one add and one compare against it.\nAnd the loop advanced both the write position and the live length,\nthough the two differ by a base that does not move while a block\ndecodes; carrying the base instead drops an add per sequence.\n\nAn output with less room than the overshoot leaves the end at zero, so\nevery sequence takes the exact copier, which is the right answer for\nsuch an output rather than a masked underflow.\n\nPart of #178\n\n* perf(decoding): keep the growth accumulator out of release builds\n\nOnly the assertion at the end of the block reads it, yet it was summed\nper sequence in every build, carrying a live value across the loop that\ncompetes for a register with the ones the decode needs. The hot path\nhere runs 52 stack-touching instructions per sequence against the\nreference's 34, so a carried value that release has no reader for is\nworth removing.\n\nPart of #178\n\n* Revert \"perf(decoding): keep the growth accumulator out of release builds\"\n\nThis reverts commit 3f3e0c6e86245b8043224078bcaf4880abce11df.\n\n* perf(decoding): move the avx2 sequence cold path out of the loop\n\nThe dictionary, its content and the buffer itself were live values in\nthe hot loop although only the two cold branches use them: a match\nreaching into the dictionary, and the push + repeat fallback. The loop's\nmeasured cost is stack traffic, 52 memory-touching instructions per\nsequence against the reference's 34, so a value carried for a branch\nthat almost never runs is paid on every sequence.\n\nPut both branches in one cold, out-of-line function. The cursor is\npublished before it runs and re-read after, since the buffer owns the\nposition while it does.\n\nPart of #178\n\n* Revert \"perf(decoding): move the avx2 sequence cold path out of the loop\"\n\nThis reverts commit f07c2823b389c9e60d9584edd7c1e098a6a8f9ff.\n\n* perf(decoding): the copier stops needing the output capacity\n\nThe room question and the copy were in one macro, so the capacity had to\ntravel with the write position and was a value the loop carried. The\ncaller already knows the end with the overshoot taken off, so it now\ndecides between the overshooting body and the exact one itself, and the\ncapacity is read from the backend only on the branch that needs it.\n\nOne fewer live value in a loop whose measured cost is stack traffic, and\nthe copy body is a copy body again.\n\nPart of #178\n\n* Revert \"perf(decoding): the copier stops needing the output capacity\"\n\nThis reverts commit bf165c0ae41ab278fb207b1e6127220c446fcd69.\n\n* build: ship the build the benchmarks measure\n\nThe workspace shipped thin LTO over sixteen codegen units while the\nbenchmarks forced fat LTO over one, so every published number described\na build nobody got. On the same source, main measures 8,211,668\ninstructions per decode iteration over one codegen unit and 8,595,959\nover sixteen: the shipped configuration was 4.7% worse for no reason\nother than the profile.\n\nGive the release profile the same fat LTO and single codegen unit, and\nlet the bench profile inherit it with no debug info. Cargo reads profiles\nfrom the workspace root only, so a crate depending on structured-zstd\nstill builds with its own; what this changes is our cli, our examples and\nour benchmarks, which should all be one build.\n\nThe cost is longer release builds of this workspace, which is the right\nplace for it.\n\nWhy it matters beyond the defaults: with the two differing, the same edit\nread -1.90% instructions in one and +3.61% in the other, and a chain of\nchanges worth -6.5% under the first was +0.5% under the second.\n\n* fix(decoding): gate the overshoot constant to the tier that reads it\n\nOnly the AVX2 sequence loop keeps the output end less this value in its\ncursor, so on every other target the constant is dead and the warning\ndenied by CI.\n\n* fix(decoding): the live-length base is modular, and vbmi2 tests build\n\nTwo defects the x86 suite catches and the local aarch64 one cannot, since\nthe AVX2 tier does not compile there at all.\n\nThe cursor derived its live-length base as tail - len. For a wrapped\nRingBuffer the live length spans the segment above head and the one below\ntail, so it exceeds the physical tail and the subtraction underflowed:\na_streamed_frame_longer_than_its_window_keeps_one_window_of_ring and\na_streamed_frame_drains_through_a_target_smaller_than_a_block both panic\non a valid stream. The base is a virtual coordinate, not a position, so\nit is modular now, and reading the live length back is modular too. The\nbackend's own head would not fix it: once the ring wraps, tail - head is\nnot the live length either.\n\nThe vbmi2 tier's test call still passed the old argument list, so the\nkernel-vbmi2 configuration failed to compile.\n\n* fix(decoding): only a forward-only backend may carry the cursor\n\nRingBuffer does take the inline path, on its contiguous sub-window, and\nits commit is what normalises the wrap. Carrying the write position in\nlocals across a block therefore addressed the ring linearly past a wrap\nand asked its admission gate a stale question, so a streamed frame\nlonger than its window decoded to the wrong bytes.\n\nSay which backends may be carried: the slice and flat buffers, whose\ncursor only moves forward. The ring is handed its position back before\neach sequence and given the write immediately after, which is what it\ndid before this branch. Both tests that caught it now pass.\n\n* style(decoding): mark the cursor const dead outside the tier that reads it\n\n* fix(decoding): fold the block ceiling into the carried write limit\n\nFlatBuf enforces the per-block output ceiling in inline_exec_ok, which\nreads its own live length. A carried cursor is ahead of that length, so\nthe gate approved writes the ceiling should have stopped: the bound that\nguards a malformed block from growing the buffer past len + block\nmaximum was not being met on the inline path.\n\nFold the ceiling into the write limit the cursor already carries, so the\none comparison per sequence meets both bounds. UserSliceBackend needs no\noverride: its cap is already the nearer of the slice end and the ceiling.\n\n* perf(decoding): pad literals only when a copier will read them\n\nTwo costs the slack guarantee introduced where nothing needed it.\n\nA block with no sequences writes its literals out as they are, but a Raw\nsection whose payload is followed by little else (the short sequence\nheader is all a literals-only block has) was copied into scratch just to\ncarry slack no copier would read, turning a zero-copy path into a full\nblock copy. The sequence header sits right after the literals, so the\ncount is readable before decoding them: with no sequences the borrow\nstands, and the materialised sections skip the padding too.\n\nAnd the scratch reservation pre-touches exactly the block bound, so a\nblock whose literals reach it grew the Vec in the decode hot path, where\namortised growth doubles a 128 KiB buffer to obtain 32 bytes. Reserve the\nbound plus the slack.\n\n* test(decoding): assert the slack the copiers read, in every tier\n\nThe precondition at a tier's entry point checked only that the slice\nheld the literals, while the unsafe reads below it go past them: sixteen\nbytes whatever the literal length, and the wildcopy rounded up to its\nstride. Assert what the copiers actually require. A sequence section\nexists wherever these run, and the literals decoder pads whenever one\ndoes, so the stronger form holds by construction.\n\n* refactor(decoding): spell out the short-output branch instead of saturating\n\nThe write end was derived with saturating_sub, which turns the one case\nit exists for, an output shorter than the copiers' overshoot, into a\nsilent clamp to zero. That case is a branch to the exact copier and reads\nas one now, in both tiers that compute the end.\n\nThe remaining saturating add in the flat buffer's write limit is the\nopposite: between blocks the ceiling is usize::MAX, meaning no ceiling,\nand saturating is what expresses that. Said so at the site.\n\n* style(decoding): keep the saturating write end, and lint the vbmi2 entry\n\nThe explicit short-output branch is what clippy's implicit_saturating_sub\nrejects, and it is right that this one is a value rather than a gate: the\ngate is the comparison against the end, and an end of zero is the honest\nanswer for an output shorter than the overshoot. Said so at both sites.\n\nThe vbmi2 entry point never got the argument-count allow its siblings\ncarry; the kernel-vbmi2 configuration is off by default, so only a clippy\nrun with that feature and --all-targets on x86 sees it.\n\n* perf(decoding): skip the backend gate a carried cursor already answers\n\nThree points from the second review pass.\n\nFor a backend whose cursor is carried, the per-sequence backend gate is\nstrictly weaker than the comparison the cursor makes: it asks the block\nceiling of a live length the backend has not seen updated, while the\ncursor asks the same ceiling of a position that is ahead of it. Skip it\nthere and keep it for the ring, which cannot carry a cursor and needs it\nfor the wrap question.\n\nThe vbmi2 tier takes its write limit the same way the avx2 one does, so\nthe copy no longer depends on that tier's gate being the thing that\nenforces the ceiling.\n\nAnd the literals view's doc now says what its slack actually promises:\nonly when the caller asked for it, which a block with no sequences does\nnot.\n\n* fix(decoding): reject a zero offset instead of asserting it cannot happen\n\nThe branch had replaced the per-sequence zero-offset test with a debug\nassertion, on the argument that an offset entry's base value is 1 <<\nofCode and the table build bounds the code, so a resolved offset is at\nleast one. Fuzzing disproved it in 90 seconds: the lookahead arm resolves\noffsets through do_offset_history, not the fused branchy resolve, and\nthat path hands back a zero for a zero offset code.\n\nWithout the test a release build takes the zero as a match source of the\nwrite position itself, so corrupt input decodes to garbage rather than\nan error. The ~1.2 instructions per sequence it costs are the price of\nsaying no.\n\nThe fuzzer's input is kept as a test rather than only as a corpus file:\nzstd/fuzz/artifacts is gitignored, so nothing there is replayed by CI,\nand as a test it runs on every target in both debug and release. Verified\nto fail without this fix and pass with it, on x86.\n\n* test(decoding): cover the lookahead arm and the zero-offset refusal\n\nThe lookahead arm needs a block with enough sequences AND a cold\ndictionary; nothing arranged both, so the arm that the fuzzer found the\nzero offset on had no test at all. This decodes a dictionary frame that\nmeets both conditions and checks it byte for byte.\n\n* test(decoding): give the lookahead arm many short matches\n\n* test(decoding): drive the sequence loop's malformed-stream exits\n\nThe exits for a stream that does not end where it declared (bits left\nover, or too few for the sequence count) are reachable only from corrupt\ninput, so only the fuzzer was reaching them. Walking byte flips through\nthe tail of a real frame reaches them from the ordinary suite, and pins\nthat the outcome is an error rather than a panic.\n\n* docs(decoding): record why the lookahead probe keeps the backend bound\n\nThe lookahead prefetch is bounded by the backend's length, which a carried\ncursor leaves behind for a whole block, so it refuses every match source the\nblock itself produced. Addressing it through the cursor instead was measured\nand costs 3.0% on the case that loses the most probes (128 KiB block, one cold\ndictionary: 281 of 391). The note keeps the next reader from re-deriving it.\n\n* test(decoding): pin the zero-offset refusal and assert the cursor sum\n\nThe zero-offset regression test discarded both decode results, so it passed\nwith the guard deleted and protected nothing; it now requires decode_all to\nfail with ExecuteSequencesError::ZeroOffset (verified red with the guard\nremoved) and the growing-sink surface to refuse the frame.\n\nThe prefix-resident sum records its non-overflow invariant as a debug_assert\nrather than only in prose, so the whole debug suite pins the bound the plain\naddition replaced.\n\n* docs(build): record the measured cost of fat LTO on release\n\nThe profile is set for bench/release parity, not for speed, and the numbers\nnow sit beside it: against cargo's release defaults the decode loop gains\nabout 1% (below this repository's build-to-build threshold) and the encode\nloop overlaps. Recording them stops the justification being re-derived.",
+          "timestamp": "2026-09-19T04:16:04+03:00",
+          "tree_id": "f292ea8e3347f09dd6732b0bd1669841a26d7164",
+          "url": "https://github.com/structured-world/structured-zstd/commit/82f7ecb02a5d150bf5a7481c0e2cc956527fb2a8"
+        },
+        "date": 1789781923833,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.076,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 178.515,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 216.508,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.485,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.186,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.469,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.887,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.465,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.837,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.151,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.149,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 9.997,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.374,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.09,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.199,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.494,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.146,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.677,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.246,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.172,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.166,
             "unit": "ms"
           }
         ]
