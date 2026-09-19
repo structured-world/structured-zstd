@@ -477,6 +477,25 @@ fn pretouch_pages(buf: &mut [u8]) {
     }
 }
 
+/// PROBE: minor faults taken so far and current resident size, straight out of
+/// procfs so no extra dependency is needed. Empty on anything without procfs.
+fn process_state() -> String {
+    let minflt = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| {
+            // Field 10 is `minflt`, counted from 1, and fields 2 and 3 are the
+            // command name in parentheses, which can itself contain spaces.
+            let after_comm = stat.rsplit_once(") ")?.1;
+            after_comm.split_whitespace().nth(7).map(str::to_owned)
+        })
+        .unwrap_or_default();
+    let resident_pages = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|statm| statm.split_whitespace().nth(1).map(str::to_owned))
+        .unwrap_or_default();
+    format!("minflt={minflt} resident_pages={resident_pages}")
+}
+
 /// The working buffer each arm of a comparison writes into, for both arms.
 ///
 /// Criterion runs one arm to completion before the next is registered, so a
@@ -579,6 +598,22 @@ fn bench_decompress_source(
             *slot = Some(ArmBuffers::zeroed(
                 expected_len + structured_zstd::WILDCOPY_OVERLENGTH,
             ));
+            // PROBE: what the process looked like at the moment this cell took
+            // its buffers. The same cell reads 14 us run narrowly and 28-39 us
+            // inside the matrix, so the question is what the matrix left behind:
+            // resident size and the minor-fault count say whether the extra time
+            // is pages arriving during the loop or placement of pages already
+            // there, and the addresses say which allocator region they came off.
+            let buffers = slot.as_ref().expect("just stored");
+            eprintln!(
+                "PROBE_STATE {}/{}/{} rust_dst={:p} ffi_dst={:p} {}",
+                level.name,
+                scenario.id,
+                source,
+                buffers.rust.as_ptr(),
+                buffers.ffi.as_ptr(),
+                process_state(),
+            );
         }
     };
 
