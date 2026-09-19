@@ -1,18 +1,17 @@
-# Throwaway diagnostic. One question, four runs of one prebuilt binary.
+# Throwaway diagnostic. One question: does the process-wide arena change what
+# the bench measures, or not?
 #
-# The `high-entropy-1m` decompress cell reads ~14 us however narrowly it is
-# run, including with every fixture of a level and every group of that level in
-# the same process, and ~28-39 us when the runner script drives the same binary
-# over two levels. Two things change between those: the second level doubles
-# the work done before the cell is reached, and the script sets
-# STRUCTURED_ZSTD_EMIT_REPORT, which adds two full compressions of every
-# fixture per level on top.
+# Two binaries differing ONLY in `compare_ffi.rs` (the buffer-pair version that
+# is already on the PR, and the arena version on top of it), built in one job
+# and run interleaved, so the comparison cannot be a machine-to-machine
+# difference. That distinction matters here: the same cell has read 14, 28-39
+# and 62-69 ns/iter in three separate jobs of the same binary, so nothing that
+# compares numbers ACROSS jobs can decide anything.
 #
-# Separate them: same binary, same two levels, reports off and then on, without
-# the script. Then the script itself as the control. Each run also prints, at
-# the moment the cell takes its buffers, where they landed plus the process's
-# minor-fault count and resident size, which says whether any extra time is
-# pages arriving during the loop or the placement of pages already there.
+# The arena run also showed the cell snapping between two states ~1.4x apart
+# inside one process, sometimes landing the two arms of one cell in different
+# states. Whether that is the arena or the machine is exactly what interleaving
+# answers.
 #
 # Push-triggered on `probe/**` only. Delete the branch when the answer is in.
 name: bench-probe
@@ -26,14 +25,19 @@ permissions:
 
 jobs:
   probe:
-    name: matrix width versus report emission
+    name: arena versus buffer-pair, interleaved on one machine
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
+      # The filter the dashboard's own runner script uses, so both binaries see
+      # the same matrix.
+      STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: 'level_3_dfast,level_6_lazy'
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-gnu
@@ -42,52 +46,43 @@ jobs:
       - name: Runner identity
         run: |
           grep -m1 'model name' /proc/cpuinfo || true
-          echo "nproc=$(nproc) loadavg=$(cat /proc/loadavg)"
+          nproc; cat /proc/loadavg; free -m | head -2
 
-      # Exactly the `bench-build` job's command and flags, so the binary under
-      # test is the one the dashboard publishes from.
-      - name: Build the bench binary as bench-build does
+      - name: Build the arena binary
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v3"
         run: |
           cargo bench --bench compare_ffi -p ffi-bench \
-            --target x86_64-unknown-linux-gnu --no-run \
-            --message-format=json > build.log
-          mkdir -p bench-binary
-          bin_path=$(jq -r 'select(.executable != null and (.target.name == "compare_ffi")) | .executable' build.log | tail -1)
-          test -x "$bin_path"
-          cp "$bin_path" bench-binary/compare_ffi
-          chmod +x bench-binary/compare_ffi
-          # criterion writes its own state here and prints an error instead of a
-          # timing when it cannot.
-          mkdir -p target/criterion
+            --target x86_64-unknown-linux-gnu --no-run --message-format=json > build.log
+          mkdir -p bench-binary target/criterion
+          cp "$(jq -r 'select(.executable != null and (.target.name == "compare_ffi")) | .executable' build.log | tail -1)" \
+            bench-binary/arena
+          chmod +x bench-binary/arena
 
-      - name: One level, reports off
-        run: |
-          ./bench-binary/compare_ffi --bench --output-format bencher --noplot \
-            --measurement-time 2 "/level_3_dfast/" 2>&1 \
-            | grep -E '^test decompress|^PROBE_STATE ' || true
-
-      - name: Two levels, reports off
-        run: |
-          ./bench-binary/compare_ffi --bench --output-format bencher --noplot \
-            --measurement-time 2 "/level_(3_dfast|6_lazy)/" 2>&1 \
-            | grep -E '^test decompress|^PROBE_STATE ' || true
-
-      - name: Two levels, reports on
+      # Same branch, same everything, with only the bench source rolled back to
+      # the version already on the PR.
+      - name: Build the buffer-pair binary
         env:
-          STRUCTURED_ZSTD_EMIT_REPORT: '1'
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v3"
         run: |
-          ./bench-binary/compare_ffi --bench --output-format bencher --noplot \
-            --measurement-time 2 "/level_(3_dfast|6_lazy)/" 2>&1 \
-            | grep -E '^test decompress|^PROBE_STATE ' || true
+          git checkout 97ed02d4 -- zstd/benches/compare_ffi.rs
+          cargo bench --bench compare_ffi -p ffi-bench \
+            --target x86_64-unknown-linux-gnu --no-run --message-format=json > build2.log
+          cp "$(jq -r 'select(.executable != null and (.target.name == "compare_ffi")) | .executable' build2.log | tail -1)" \
+            bench-binary/pair
+          chmod +x bench-binary/pair
+          git checkout HEAD -- zstd/benches/compare_ffi.rs
 
-      # The control: the command that produced 28-39 us.
-      - name: The runner script, as the benchmark job invokes it
-        env:
-          STRUCTURED_ZSTD_BENCH_TARGET: x86_64-gnu
-          STRUCTURED_ZSTD_BENCH_TRIPLE: x86_64-unknown-linux-gnu
-          STRUCTURED_ZSTD_BENCH_GENERATED_AT: '2026-01-01T00:00:00+00:00'
-          STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: 'level_3_dfast,level_6_lazy'
-          STRUCTURED_ZSTD_BENCH_BIN: ${{ github.workspace }}/bench-binary/compare_ffi
-        run: ./.github/scripts/run-benchmarks.sh 2>&1 | grep -E '^test decompress|^PROBE_STATE ' || true
+      # Three interleaved passes. A state that belongs to the machine moves
+      # between passes and shows up in both binaries; one that belongs to the
+      # arena stays with the arena binary in every pass.
+      - name: Interleave the two binaries
+        run: |
+          for pass in 1 2 3; do
+            for arm in pair arena; do
+              echo "--- pass $pass, $arm"
+              ./bench-binary/$arm --bench --output-format bencher --noplot \
+                --measurement-time 2 "decompress/.*/(high-entropy-1m|decodecorpus-synthetic-1m)/" 2>&1 \
+                | grep -E '^test decompress|^PROBE_STATE arena' || true
+            done
+          done

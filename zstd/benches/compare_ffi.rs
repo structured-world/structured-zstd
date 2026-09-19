@@ -465,25 +465,6 @@ fn pretouch_pages(buf: &mut [u8]) {
     }
 }
 
-/// PROBE: minor faults taken so far and current resident size, straight out of
-/// procfs so no extra dependency is needed. Empty on anything without procfs.
-fn process_state() -> String {
-    let minflt = std::fs::read_to_string("/proc/self/stat")
-        .ok()
-        .and_then(|stat| {
-            // Field 10 is `minflt`, counted from 1, and fields 2 and 3 are the
-            // command name in parentheses, which can itself contain spaces.
-            let after_comm = stat.rsplit_once(") ")?.1;
-            after_comm.split_whitespace().nth(7).map(str::to_owned)
-        })
-        .unwrap_or_default();
-    let resident_pages = std::fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|statm| statm.split_whitespace().nth(1).map(str::to_owned))
-        .unwrap_or_default();
-    format!("minflt={minflt} resident_pages={resident_pages}")
-}
-
 /// Which side of a comparison a buffer belongs to.
 #[derive(Clone, Copy)]
 enum Arm {
@@ -544,14 +525,13 @@ impl BenchArena {
         for buffer in &mut appended {
             buffer.clear();
         }
-        // PROBE: where the arena landed and what the process looked like when
-        // it was built, so a cell's timing can be read against them.
+        // PROBE: how large the arena is and where it landed, so its cost can be
+        // read rather than assumed.
         eprintln!(
             "PROBE_STATE arena append_capacity={append_capacity} write_len={write_len} \
-             rust_dst={:p} ffi_dst={:p} {}",
+             rust_dst={:p} ffi_dst={:p}",
             written[0].as_ptr(),
             written[1].as_ptr(),
-            process_state(),
         );
         Self { appended, written }
     }
@@ -969,11 +949,6 @@ fn bench_dictionary(c: &mut Criterion) {
             // input in place and takes the output buffer per call, so it needs
             // no `set_drain`/`set_source` — sidestepping the lifetime issue
             // (PR #277) that forced the old per-iter shape.
-            // The only pair whose arms are not both registered unconditionally:
-            // the Rust arm below is gated on the dictionary parsing. An order
-            // that alternates between rounds needs both arms to exist in both
-            // orders, so this group keeps its declaration order and the
-            // `bench_arm_pair` treatment waits for the gate to be lifted.
             // One output buffer per arm across iterations, from the arena:
             // `compress` would hand back a fresh `Vec` every time and measure
             // that side's allocator rather than its encoder. Sizing them per
@@ -982,67 +957,83 @@ fn bench_dictionary(c: &mut Criterion) {
             // their pages came from and in how much spare capacity they
             // carried. The arena holds the bound, which is what
             // `compress_to_buffer` requires.
-            group.bench_function("c_ffi_with_dict", |b| {
-                let mut compressor =
-                    zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
-                        .unwrap();
-                configure_ffi_bulk_compressor(&mut compressor, &level);
-                ARENA.with_borrow_mut(|arena| {
-                    let compressed = arena.appended(Arm::Ffi);
-                    b.iter(|| {
-                        compressed.clear();
-                        compressor
-                            .compress_to_buffer(&scenario.bytes, compressed)
-                            .expect("dictionary compression should succeed");
-                        black_box(&compressed);
-                    })
-                })
-            });
-
-            // Gate pure_rust_with_dict registration on the same
-            // `rust_dict_handle.is_some()` signal that decompress-dict uses
-            // below — if the per-scenario dictionary parse failed earlier,
-            // `EncoderDictionary::from_bytes` routes through the same parse and
-            // would fail identically; an `.expect()` panic before `b.iter`
-            // would abort the whole bench suite.
-            if rust_with_dict_len.is_some()
-                && EncoderDictionary::from_bytes(&ffi_dictionary).is_ok()
-            {
-                group.bench_function("pure_rust_with_dict", |b| {
-                    // `compress_independent_frame_into` reads input in
-                    // place + takes the output buffer per call, so neither
-                    // the source `R` nor drain `W` generic is ever bound by
-                    // a `set_source`/`set_drain` call — pin them to the
-                    // defaults so inference has a concrete type.
-                    let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
-                    // Enable LDM before attaching the dictionary (see the
-                    // warmup compressor above for why the order is safe).
-                    if let Some(params) = ldm_parameters(&level) {
-                        compressor.set_parameters(&params);
-                    }
-                    // Full feature gate: checksum on, matching the FFI arms.
-                    compressor.set_content_checksum(cfg!(feature = "hash"));
-                    compressor
-                        .set_encoder_dictionary(
-                            EncoderDictionary::from_bytes(&ffi_dictionary)
-                                .expect("dictionary parse checked above"),
-                        )
-                        .expect("prepared dictionary should attach");
-                    // Reuse one output buffer across iterations (the
-                    // CCtx-equivalent caller-owned `dst`), from the same arena
-                    // the C arm draws from, so neither reallocates and neither
-                    // depends on what ran before it.
+            //
+            // Whether the Rust arm can run at all is settled BEFORE either arm
+            // is registered, so that when both exist they alternate like every
+            // other pair. Registering the C arm unconditionally and the Rust
+            // arm behind the gate put the C arm first in every round, and the
+            // per-arm minimum across rounds cannot cancel a position bias when
+            // neither arm ever occupies the other position. The gate matches
+            // the one `decompress-dict` uses below: if the per-scenario
+            // dictionary parse failed, `EncoderDictionary::from_bytes` routes
+            // through the same parse and would fail identically, and an
+            // `.expect()` panic before `b.iter` would abort the whole suite.
+            let ffi_dict_arm =
+                |b: &mut criterion::Bencher<'_, criterion::measurement::WallTime>| {
+                    let mut compressor =
+                        zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
+                            .unwrap();
+                    configure_ffi_bulk_compressor(&mut compressor, &level);
                     ARENA.with_borrow_mut(|arena| {
-                        let compressed = arena.appended(Arm::Rust);
+                        let compressed = arena.appended(Arm::Ffi);
                         b.iter(|| {
-                            compressor.compress_independent_frame_into(
-                                scenario.bytes.as_slice(),
-                                compressed,
-                            );
+                            compressed.clear();
+                            compressor
+                                .compress_to_buffer(&scenario.bytes, compressed)
+                                .expect("dictionary compression should succeed");
                             black_box(&compressed);
                         })
                     })
-                });
+                };
+            let rust_dict_arm = |b: &mut criterion::Bencher<
+                '_,
+                criterion::measurement::WallTime,
+            >| {
+                // `compress_independent_frame_into` reads input in place +
+                // takes the output buffer per call, so neither the source `R`
+                // nor drain `W` generic is ever bound by a
+                // `set_source`/`set_drain` call — pin them to the defaults so
+                // inference has a concrete type.
+                let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
+                // Enable LDM before attaching the dictionary (see the warmup
+                // compressor above for why the order is safe).
+                if let Some(params) = ldm_parameters(&level) {
+                    compressor.set_parameters(&params);
+                }
+                // Full feature gate: checksum on, matching the FFI arms.
+                compressor.set_content_checksum(cfg!(feature = "hash"));
+                compressor
+                    .set_encoder_dictionary(
+                        EncoderDictionary::from_bytes(&ffi_dictionary)
+                            .expect("dictionary parse checked before registration"),
+                    )
+                    .expect("prepared dictionary should attach");
+                // Reuse one output buffer across iterations (the
+                // CCtx-equivalent caller-owned `dst`), from the same arena the
+                // C arm draws from, so neither reallocates and neither depends
+                // on what ran before it.
+                ARENA.with_borrow_mut(|arena| {
+                    let compressed = arena.appended(Arm::Rust);
+                    b.iter(|| {
+                        compressor
+                            .compress_independent_frame_into(scenario.bytes.as_slice(), compressed);
+                        black_box(&compressed);
+                    })
+                })
+            };
+
+            if rust_with_dict_len.is_some()
+                && EncoderDictionary::from_bytes(&ffi_dictionary).is_ok()
+            {
+                bench_arm_pair(
+                    &mut group,
+                    "pure_rust_with_dict",
+                    rust_dict_arm,
+                    "c_ffi_with_dict",
+                    ffi_dict_arm,
+                );
+            } else {
+                group.bench_function("c_ffi_with_dict", ffi_dict_arm);
             }
 
             group.finish();
