@@ -451,28 +451,43 @@ fn bench_decompress_source(
             .as_slice()
     };
 
-    // Both destinations are taken HERE, before either arm runs, and the fixture
-    // with them. Allocating inside each arm gave the two buffers different
-    // points in the process's allocation history — the first arm's came off a
-    // heap the matrix had just churned, the second's off the free list the
-    // first one left — and on the bench runner that difference read as a
+    // BOTH destinations are taken together, by whichever arm runs first, and
+    // never before one of them runs. Allocating one inside each arm gave the
+    // two buffers different points in the process's allocation history — the
+    // first arm's came off a heap the matrix had just churned, the second's off
+    // the free list the first one left — and on the bench runner that read as a
     // FOURFOLD difference between the implementations on input that is
-    // byte-identical between the two sources. It is a property of the harness,
-    // so it is removed here rather than reported as a property of the decoders.
+    // byte-identical between the two sources. That is a property of the
+    // harness, so it is removed rather than reported as a property of the
+    // decoders. Taking them lazily keeps the deferral the comment above
+    // describes: a tight filter must not pay for a group it excludes.
     //
     // Sized with WILDCOPY_OVERLENGTH slack so `decode_all` routes through the
     // direct-write path; the slack is the dispatcher's eligibility gate. The
     // C arm gets the same shape so a size difference cannot land the two at
     // different addresses.
-    let compressed = materialize();
-    release_freed_memory();
-    let mut rust_target = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
-    let mut ffi_target = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
-    pretouch_pages(&mut rust_target);
-    pretouch_pages(&mut ffi_target);
+    struct Destinations {
+        rust: Vec<u8>,
+        ffi: Vec<u8>,
+    }
+    let destinations = core::cell::RefCell::new(Option::<Destinations>::None);
+    let prepare_destinations = || {
+        let mut slot = destinations.borrow_mut();
+        if slot.is_none() {
+            release_freed_memory();
+            let mut rust = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
+            let mut ffi = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
+            pretouch_pages(&mut rust);
+            pretouch_pages(&mut ffi);
+            *slot = Some(Destinations { rust, ffi });
+        }
+    };
 
     group.bench_function("pure_rust", |b| {
-        let target = &mut rust_target;
+        let compressed = materialize();
+        prepare_destinations();
+        let mut slot = destinations.borrow_mut();
+        let target = &mut slot.as_mut().expect("prepared above").rust;
         let mut decoder = FrameDecoder::new();
         b.iter(|| {
             let written = decoder.decode_all(black_box(compressed), target).unwrap();
@@ -482,11 +497,14 @@ fn bench_decompress_source(
     });
 
     group.bench_function("c_ffi", |b| {
+        let compressed = materialize();
+        prepare_destinations();
         // Reuse one DCtx across iterations so the timing sample reflects decode
         // steady-state, as the arm above reuses one `FrameDecoder`. Creating a
         // fresh DCtx per iteration would dominate sub-millisecond samples.
         let mut dctx = FfiDCtxHandle::new();
-        let target = &mut ffi_target;
+        let mut slot = destinations.borrow_mut();
+        let target = &mut slot.as_mut().expect("prepared above").ffi;
         b.iter(|| {
             let written = dctx.decompress_into(black_box(compressed), target);
             assert_eq!(written, expected_len);
