@@ -536,6 +536,57 @@ impl MatchTable {
         distance <= max_rel_no_rebase && self.index_shift <= max_rel_no_rebase - distance
     }
 
+    /// Settle, for the whole coming block, that every position in it converts
+    /// to a stored index — so the conversion itself needs no test.
+    ///
+    /// This is where upstream puts the same decision: it asks
+    /// `ZSTD_window_needOverflowCorrection` once before compressing a block and
+    /// runs `ZSTD_window_correctOverflow` + `ZSTD_reduceIndex` there
+    /// (`zstd_compress.c`), after which `curr = (U32)(ip - base)` is a plain
+    /// pointer subtraction on every position it searches. Ours asked per
+    /// position instead, and a question asked per position is answered per
+    /// position.
+    ///
+    /// `can_skip_rebase_check` is monotone in its argument (the distance only
+    /// grows), so clearing the block's LAST position clears every position in
+    /// it.
+    pub(crate) fn arm_block_positions(&mut self, current_abs_end: usize) {
+        // An empty block has no last position to clear.
+        if current_abs_end <= self.position_base {
+            return;
+        }
+        let last = current_abs_end - 1;
+        if !self.can_skip_rebase_check(last) {
+            // The BOUND is the block's last position, but the rebase replays
+            // the inserted prefix, so it is given the insertion frontier: a
+            // replay up to the block end would insert positions the parser has
+            // not reached and put future bytes in the tree. After
+            // `begin_rebase` the base is the history floor and the shift is
+            // zero, so the block's last position is representable by the window
+            // cap alone, which the assertion below holds it to.
+            let frontier = self.skip_insert_until_abs.max(self.history_abs_start);
+            self.rebase_positions_cold(frontier);
+        }
+        debug_assert!(
+            self.can_skip_rebase_check(last),
+            "block arming must leave every position in the block representable",
+        );
+    }
+
+    /// Convert an absolute position to its stored index, with no test.
+    ///
+    /// Valid only for positions inside a block that [`Self::arm_block_positions`]
+    /// has cleared; the assertion pins that. Upstream's per-position conversion
+    /// is the same shape and for the same reason.
+    #[inline(always)]
+    pub(crate) fn relative_position_armed(&self, abs_pos: usize) -> u32 {
+        debug_assert!(
+            self.can_skip_rebase_check(abs_pos),
+            "position not cleared by arm_block_positions",
+        );
+        (abs_pos - self.position_base + self.index_shift) as u32
+    }
+
     /// Decide whether the table needs a cold rebase before `abs_pos`
     /// can be inserted. Pure predicate — does **not** perform the
     /// rebase. The caller (whichever backend owns the BT walk path)
@@ -1307,18 +1358,30 @@ impl MatchTable {
         // The distance from the floor first: the absolute position plus the
         // shift need not fit a 32-bit word even when the stored index does,
         // and an overflow here would read as "rebase now".
-        let rel = abs_pos
-            .checked_sub(self.position_base)?
-            .checked_add(self.index_shift)?;
-        let rel_u32 = u32::try_from(rel).ok()?;
+        //
+        // Written as bare comparisons rather than `checked_*` + `?`: the caller
+        // wants only the early exit, and a checked operation computes the
+        // rejected value before testing it, turning a branch the predictor gets
+        // right into a materialised `Option`. Ordered most-rejecting first.
+        if abs_pos < self.position_base {
+            return None;
+        }
+        let distance = abs_pos - self.position_base;
+        if self.index_shift > usize::MAX - distance {
+            return None;
+        }
+        let rel = distance + self.index_shift;
         // A frame's first position is a candidate like any other, from a fresh
         // compressor as from a reused one: upstream zstd starts its indices
         // above its empty sentinel for exactly that (`ZSTD_WINDOW_START_INDEX`,
-        // `zstd_compress_internal.h`), and the `+ 1` below does it here.
+        // `zstd_compress_internal.h`), and the caller's `+ 1` does it here.
         // Positions are stored as (relative_pos + 1), with 0 reserved
-        // as the empty sentinel. So the raw relative position itself
-        // must stay strictly below u32::MAX.
-        (rel_u32 < u32::MAX).then_some(rel_u32)
+        // as the empty sentinel, so the raw relative position itself must stay
+        // strictly below `u32::MAX`.
+        if rel >= u32::MAX as usize {
+            return None;
+        }
+        Some(rel as u32)
     }
 
     /// Lower bound (in absolute positions) of the window that's still
@@ -2458,6 +2521,11 @@ impl MatchTable {
     /// so it is settled here once and the stored index is the cursor plus a
     /// hoisted offset, with no `Option`.
     fn fill_hash3_hoisted(&mut self, abs_pos: usize) -> bool {
+        // This is the unarmed entry, so the representability question is
+        // answered here rather than inside the fill.
+        if !self.can_skip_rebase_check(abs_pos) {
+            return false;
+        }
         // The slice holds no borrow, so the table write can take `&mut self`
         // (the same reborrow the collect body uses).
         let (concat_ptr, concat_len) = {
@@ -2495,7 +2563,16 @@ impl MatchTable {
         concat_len: usize,
         abs_pos: usize,
     ) -> bool {
-        if self.hash3_log == 0 || !self.can_skip_rebase_check(abs_pos) {
+        // Representability is the CALLER's to settle: the match finder reaches
+        // here inside a block that `arm_block_positions` cleared, and asking
+        // again is the per-position question this refactor removed. The general
+        // catch-up, whose caller has not armed anything, asks it in
+        // `fill_hash3_hoisted` before delegating.
+        debug_assert!(
+            self.can_skip_rebase_check(abs_pos),
+            "hash3 fill needs a position the caller has cleared",
+        );
+        if self.hash3_log == 0 {
             return false;
         }
         let history_abs_start = self.history_abs_start;

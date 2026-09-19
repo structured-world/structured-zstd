@@ -112,6 +112,14 @@ macro_rules! bt_insert_step_no_rebase_body {
             $table.hash_log,
             $table.search_mls,
         );
+        // Upstream holds `U32* const hashTable = ms->hashTable` for the whole
+        // body (zstd_opt.c:449). Ours re-derived it from the shared table
+        // buffer at every use, and each re-derivation is a bounds-checked
+        // reslice that reloads the buffer's header and the seam offset through
+        // `&mut self`.
+        let hash_ptr = $table.hash_table_mut().as_mut_ptr();
+        debug_assert_eq!($table.hash_table().len(), 1usize << $table.hash_log);
+        debug_assert!(hash < 1usize << $table.hash_log);
         // Prefetch the hash bucket now. For the large L16+ hash table over
         // high-entropy input the bucket is L3/DRAM-cold, and unlike upstream's
         // monolithic ZSTD_btGetAllMatches (which overlaps this miss with its
@@ -131,7 +139,7 @@ macro_rules! bt_insert_step_no_rebase_body {
             // SAFETY: prefetch is a hint that never faults; `hash` indexes
             // `hash_table` directly below, so it is in bounds.
             unsafe {
-                _mm_prefetch($table.hash_table().as_ptr().add(hash).cast(), _MM_HINT_T0);
+                _mm_prefetch(hash_ptr.add(hash).cast(), _MM_HINT_T0);
             }
             // Prefetch the NEXT position's bucket too. The optimal-parser DP
             // advances one position per iteration, so this miss is issued a
@@ -149,17 +157,12 @@ macro_rules! bt_insert_step_no_rebase_body {
                 // SAFETY: prefetch never faults; an out-of-range index is a
                 // harmless no-op hint.
                 unsafe {
-                    _mm_prefetch(
-                        $table.hash_table().as_ptr().add(hash_next).cast(),
-                        _MM_HINT_T0,
-                    );
+                    _mm_prefetch(hash_ptr.add(hash_next).cast(), _MM_HINT_T0);
                 }
             }
         }
-        let Some(relative_pos) = $table.relative_position($abs_pos) else {
-            return 1;
-        };
-        let stored = relative_pos + 1;
+        // Total, not tested: the block was armed before the parse began.
+        let stored = $table.relative_position_armed($abs_pos) + 1;
         let bt_mask = $table.bt_mask();
         // `abs_pos < bt_mask` legitimately happens for the first BT walk of
         // a fresh frame (bt_low effectively "no floor"). Saturating keeps
@@ -189,8 +192,12 @@ macro_rules! bt_insert_step_no_rebase_body {
         let pair_idx = $table.bt_pair_index_for_abs($abs_pos);
         let mut smaller_slot = pair_idx;
         let mut larger_slot = pair_idx + 1;
-        let mut match_stored = $table.hash_table()[hash];
-        $table.hash_table_mut()[hash] = stored;
+        // SAFETY: `hash` is masked to `hash_log` bits and the table is
+        // `1 << hash_log` slots wide (both asserted at `hash_ptr`), so the slot
+        // is in range by construction. Upstream reads and writes the same slot
+        // through its own raw `hashTable`.
+        let mut match_stored = unsafe { *hash_ptr.add(hash) };
+        unsafe { *hash_ptr.add(hash) = stored };
 
         while compares_left > 0 {
             if match_stored == $crate::encoding::match_table::storage::HC_EMPTY {
@@ -472,6 +479,89 @@ pub(crate) use for_each_repcode_candidate_body;
 /// `$cmf` so the per-iteration vector probe inlines under the wrapper's
 /// `target_feature` umbrella. Returns nothing (matches the original method).
 /// Crate-private (see `bt_insert_step_no_rebase_body!`).
+/// One repeat-offset probe, expanded per slot.
+///
+/// The repeat loop runs three or four times with the slot known at each
+/// expansion, so it is unrolled rather than counted: the counter, its bound and
+/// the `is this the synthetic slot` test are all resolved at compile time, and
+/// the registers they occupied stay free for the invariants the probe reloaded
+/// from the stack on every iteration (`cur_gate` among them, visible as
+/// `xor 0x20(%rsp),%ecx` in the disassembly of the counted form).
+macro_rules! rep_probe_slot {
+    (
+        $rep:expr,
+        $abs_pos:ident,
+        $hist_start:ident,
+        $rbase:ident,
+        $idx:ident,
+        $cur_gate:ident,
+        $rep_scan_limit:ident,
+        $min_match_len:ident,
+        $sufficient_len:expr,
+        $tail_limit:ident,
+        $best_len_for_skip:ident,
+        $out:ident,
+        $found:ident,
+        $skip:ident,
+        $cpl:path $(,)?
+    ) => {
+        'slot: {
+            let rep: usize = $rep;
+            if rep == 0 || rep > $abs_pos {
+                break 'slot;
+            }
+            let candidate_pos = $abs_pos - rep;
+            if candidate_pos < $hist_start {
+                break 'slot;
+            }
+            let candidate_idx = candidate_pos - $hist_start;
+            // SAFETY: `candidate_idx < idx` (rep >= 1) and `idx + 4 <= rlen`,
+            // so the 4-byte read stays inside `concat`.
+            let cand_word = unsafe {
+                $rbase
+                    .add(candidate_idx)
+                    .cast::<u32>()
+                    .read_unaligned()
+                    .to_le()
+            };
+            let cand_gate = if $min_match_len == 3 {
+                cand_word & 0x00FF_FFFF
+            } else {
+                cand_word
+            };
+            if cand_gate != $cur_gate {
+                break 'slot;
+            }
+            // SAFETY: same umbrella; both pointers + the limit stay in `concat`.
+            let match_len =
+                unsafe { $cpl($rbase.add(candidate_idx), $rbase.add($idx), $rep_scan_limit) };
+            if match_len < $min_match_len {
+                break 'slot;
+            }
+            $found = true;
+            let _ = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
+                $out,
+                $best_len_for_skip,
+                $crate::encoding::opt::types::MatchCandidate {
+                    start: $abs_pos,
+                    offset: rep,
+                    match_len,
+                },
+                $min_match_len,
+            );
+            // `abs_pos + match_len >= current_abs_end` is `match_len >=
+            // tail_limit` with the block end folded into the length space the
+            // probe already works in, so the block end stops being a live
+            // value here. Upstream tests the same thing as `ip+mlen == iLimit`,
+            // one comparison in its own single coordinate.
+            if match_len > $sufficient_len || match_len >= $tail_limit {
+                $skip = true;
+            }
+        }
+    };
+}
+pub(crate) use rep_probe_slot;
+
 macro_rules! bt_insert_and_collect_matches_body {
     (
         $table:expr,
@@ -547,71 +637,56 @@ macro_rules! bt_insert_and_collect_matches_body {
             } else {
                 cur_word
             };
-            let ll0 = usize::from($lit_len == 0);
-            for rep_code in ll0..3 + ll0 {
-                // The synthetic slot's wrap is deliberate and measured. Guarding
-                // `reps[0] <= 1` before a plain subtraction, so the slot is
-                // rejected at its origin rather than through a value the bound
-                // below discards, is the shape this codebase asks for on a
-                // per-position path — and here it costs: +7.4% cycles at level
-                // 13 and +5.9% at level 19 on 10 KiB random with a dictionary,
-                // +2.5% on the corpus at level 17, with retired instructions up
-                // 2% alongside them and the control arm flat, so it is added
-                // work rather than layout. One extra branch in one of three
-                // slots stops the three from folding together.
-                //
-                // Upstream writes the same rejection the same way, as an
-                // intentional unsigned overflow that "discards 0 and -1"
-                // (zstd_opt.c:653). The outcome is identical either way: a
-                // `reps[0]` of 0 wraps past `abs_pos` and one of 1 becomes the
-                // zero the next line rejects.
-                let rep = if rep_code == 3 {
-                    ($reps[0] as usize).wrapping_sub(1)
-                } else {
-                    $reps[rep_code] as usize
+            // Fixed for the whole probe: neither term depends on which repeat
+            // is being tried, and both were being re-derived inside the loop.
+            let rep_scan_limit = cur_tail.min(tail_limit);
+            // Upstream's `repCode` runs from `ll0` to `ZSTD_REP_NUM + ll0`,
+            // taking `rep[repCode]` except for the last slot, which is
+            // `rep[0] - 1` (zstd_opt.c:646-649). The slots are known here, so
+            // the two arms below are that sequence written out: same order,
+            // same candidates.
+            //
+            // The synthetic slot's wrap is deliberate and measured. Guarding
+            // `reps[0] <= 1` before a plain subtraction, so the slot is
+            // rejected at its origin rather than through a value the bound
+            // inside discards, is the shape this codebase asks for on a
+            // per-position path — and here it costs: +7.4% cycles at level
+            // 13 and +5.9% at level 19 on 10 KiB random with a dictionary,
+            // +2.5% on the corpus at level 17, with retired instructions up
+            // 2% alongside them and the control arm flat, so it is added
+            // work rather than layout. Upstream writes the same rejection the
+            // same way, as an intentional unsigned overflow that "discards 0
+            // and -1": a `reps[0]` of 0 wraps past `abs_pos` and one of 1
+            // becomes the zero the slot's first test rejects.
+            macro_rules! probe {
+                ($slot_rep:expr) => {
+                    $crate::encoding::hc::generator::rep_probe_slot!(
+                        $slot_rep,
+                        $abs_pos,
+                        hist_start,
+                        rbase,
+                        idx,
+                        cur_gate,
+                        rep_scan_limit,
+                        $min_match_len,
+                        $sufficient_len,
+                        tail_limit,
+                        $best_len_for_skip,
+                        $out,
+                        rep_len_candidate_found,
+                        skip_further_match_search,
+                        $cpl,
+                    )
                 };
-                if rep == 0 || rep > $abs_pos {
-                    continue;
-                }
-                let candidate_pos = $abs_pos - rep;
-                if candidate_pos < hist_start {
-                    continue;
-                }
-                let candidate_idx = candidate_pos - hist_start;
-                // SAFETY: `candidate_idx < idx` (rep >= 1) and `idx + 4 <= rlen`,
-                // so the 4-byte read stays inside `concat`.
-                let cand_word =
-                    unsafe { rbase.add(candidate_idx).cast::<u32>().read_unaligned().to_le() };
-                let cand_gate = if $min_match_len == 3 {
-                    cand_word & 0x00FF_FFFF
-                } else {
-                    cand_word
-                };
-                if cand_gate != cur_gate {
-                    continue;
-                }
-                let rmax = (rlen - candidate_idx).min(cur_tail).min(tail_limit);
-                // SAFETY: same umbrella; both pointers + `rmax` stay in `concat`.
-                let match_len = unsafe { $cpl(rbase.add(candidate_idx), rbase.add(idx), rmax) };
-                if match_len < $min_match_len {
-                    continue;
-                }
-                rep_len_candidate_found = true;
-                let _ = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                    $out,
-                    $best_len_for_skip,
-                    $crate::encoding::opt::types::MatchCandidate {
-                        start: $abs_pos,
-                        offset: rep,
-                        match_len,
-                    },
-                    $min_match_len,
-                );
-                if match_len > $sufficient_len
-                    || $abs_pos + match_len >= $current_abs_end
-                {
-                    skip_further_match_search = true;
-                }
+            }
+            if $lit_len == 0 {
+                probe!($reps[1] as usize);
+                probe!($reps[2] as usize);
+                probe!(($reps[0] as usize).wrapping_sub(1));
+            } else {
+                probe!($reps[0] as usize);
+                probe!($reps[1] as usize);
+                probe!($reps[2] as usize);
             }
         }
         if $use_hash3 && !skip_further_match_search && *$best_len_for_skip < $min_match_len {
@@ -704,9 +779,10 @@ macro_rules! bt_insert_and_collect_matches_body {
                     h3,
                     $min_match_len,
                 );
+                // Same fold as the repeat probe: the block end lives in the
+                // length space the probe already carries.
                 if !rep_len_candidate_found
-                    && (h3.match_len > $sufficient_len
-                        || $abs_pos + h3.match_len >= $current_abs_end)
+                    && (h3.match_len > $sufficient_len || h3.match_len >= tail_limit)
                 {
                     $table.skip_insert_until_abs = $abs_pos + 1;
                     skip_further_match_search = true;
@@ -725,6 +801,14 @@ macro_rules! bt_insert_and_collect_matches_body {
             $table.hash_log,
             $table.search_mls,
         );
+        // Upstream holds `U32* const hashTable = ms->hashTable` for the whole
+        // body (zstd_opt.c:607). Ours re-derived it from the shared table
+        // buffer at every use, and each re-derivation is a bounds-checked
+        // reslice that reloads the buffer's header and the seam offset through
+        // `&mut self`. One raw base, the way `chain_ptr` below already does it.
+        let hash_ptr = $table.hash_table_mut().as_mut_ptr();
+        debug_assert_eq!($table.hash_table().len(), 1usize << $table.hash_log);
+        debug_assert!(hash < 1usize << $table.hash_log);
         // Prefetch the hash bucket now. For the large L16+ hash table over
         // high-entropy input the bucket is L3/DRAM-cold, and unlike upstream's
         // monolithic ZSTD_btGetAllMatches (which overlaps this miss with its
@@ -744,7 +828,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             // SAFETY: prefetch is a hint that never faults; `hash` indexes
             // `hash_table` directly below, so it is in bounds.
             unsafe {
-                _mm_prefetch($table.hash_table().as_ptr().add(hash).cast(), _MM_HINT_T0);
+                _mm_prefetch(hash_ptr.add(hash).cast(), _MM_HINT_T0);
             }
             // Prefetch the NEXT position's bucket too. The optimal-parser DP
             // advances one position per iteration, so this miss is issued a
@@ -762,17 +846,12 @@ macro_rules! bt_insert_and_collect_matches_body {
                 // SAFETY: prefetch never faults; an out-of-range index is a
                 // harmless no-op hint.
                 unsafe {
-                    _mm_prefetch(
-                        $table.hash_table().as_ptr().add(hash_next).cast(),
-                        _MM_HINT_T0,
-                    );
+                    _mm_prefetch(hash_ptr.add(hash_next).cast(), _MM_HINT_T0);
                 }
             }
         }
-        let Some(relative_pos) = $table.relative_position($abs_pos) else {
-            return;
-        };
-        let stored = relative_pos + 1;
+        // Total, not tested: the block was armed before the parse began.
+        let stored = $table.relative_position_armed($abs_pos) + 1;
         let bt_mask = $table.bt_mask();
         // Hoist the BT pointer-pair table's base out of `self` once: every
         // access below is `chain_table[computed_index]` through `&mut self`,
@@ -843,8 +922,12 @@ macro_rules! bt_insert_and_collect_matches_body {
         let pair_idx = $table.bt_pair_index_for_abs($abs_pos);
         let mut smaller_slot = pair_idx;
         let mut larger_slot = pair_idx + 1;
-        let mut match_stored = $table.hash_table()[hash];
-        $table.hash_table_mut()[hash] = stored;
+        // SAFETY: `hash` is masked to `hash_log` bits and the table is
+        // `1 << hash_log` slots wide (both asserted at `hash_ptr`), so the slot
+        // is in range by construction. Upstream reads and writes the same slot
+        // through its own raw `hashTable`.
+        let mut match_stored = unsafe { *hash_ptr.add(hash) };
+        unsafe { *hash_ptr.add(hash) = stored };
         // Upstream zstd semantics: `bestLength` starts at `lengthToBeat - 1`; rep/hash3
         // probing may raise it; BT then only reports strictly longer matches.
         // `min_match_len >= HC_FORMAT_MINMATCH (3)` by configure invariant,

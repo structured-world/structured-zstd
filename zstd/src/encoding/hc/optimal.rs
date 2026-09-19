@@ -1028,10 +1028,11 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 $self.table.skip_insert_until_abs = $self.table.history_abs_start;
             }
             let mut update_abs = $self.table.skip_insert_until_abs;
+            // No rebase guard: `arm_block_positions` cleared every position in
+            // this block before the parse began, and the catch-up only inserts
+            // positions below `$abs_pos`, which is in it.
+            debug_assert!($self.table.can_skip_rebase_check($abs_pos));
             while update_abs < $abs_pos {
-                if !$self.table.can_skip_rebase_check($abs_pos) {
-                    $self.table.maybe_rebase_positions(update_abs);
-                }
                 let forward = unsafe {
                     $self
                         .table
@@ -1116,6 +1117,10 @@ impl HcMatchGenerator {
         let current = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
 
         let current_abs_end = current_abs_start + current_len;
+        // Settle index representability for the whole block here, as upstream
+        // settles it before compressing one, so nothing below has to ask again
+        // per position.
+        self.table.arm_block_positions(current_abs_end);
         self.table
             .apply_limited_update_after_long_match(current_abs_start);
         let hash3_start_cursor = self
@@ -1155,6 +1160,10 @@ impl HcMatchGenerator {
         let mut plan_buffers = self.take_optimal_plan_buffers();
         if self.should_run_btultra2_seed_pass::<S>(current_len) {
             self.run_btultra2_seed_pass(current, current_abs_start, current_len, &mut plan_buffers);
+            // The seed pass pushes the stored-index offset past everything it
+            // inserted, so the block has to be cleared again for the main pass
+            // against the offset it leaves behind.
+            self.table.arm_block_positions(current_abs_end);
         }
 
         // Const-generic profile selection: every field is folded from
@@ -2088,6 +2097,7 @@ impl HcMatchGenerator {
         feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
+    #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_neon<
         S: crate::encoding::strategy::Strategy,
     >(
@@ -2117,6 +2127,7 @@ impl HcMatchGenerator {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse4.2")]
+    #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_sse42<
         S: crate::encoding::strategy::Strategy,
     >(
@@ -2152,6 +2163,7 @@ impl HcMatchGenerator {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
+    #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_sse2<
         S: crate::encoding::strategy::Strategy,
     >(
@@ -2181,6 +2193,7 @@ impl HcMatchGenerator {
         feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
+    #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_avx2_bmi2<
         S: crate::encoding::strategy::Strategy,
     >(
@@ -2217,6 +2230,7 @@ impl HcMatchGenerator {
         feature = "kernel-simd128"
     ))]
     #[target_feature(enable = "simd128")]
+    #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_simd128<
         S: crate::encoding::strategy::Strategy,
     >(
@@ -2249,6 +2263,7 @@ impl HcMatchGenerator {
     // Macro emits `unsafe { }` wrappers for NEON/AVX/SSE variants; scalar
     // callees are safe so the blocks are redundant here only.
     #[allow(unused_unsafe)]
+    #[inline(never)]
     pub(crate) fn collect_optimal_candidates_initialized_scalar<
         S: crate::encoding::strategy::Strategy,
     >(

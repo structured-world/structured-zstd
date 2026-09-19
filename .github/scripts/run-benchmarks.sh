@@ -28,7 +28,12 @@ BENCH_RAW_FILE="$(mktemp -t structured-zstd-bench-raw.XXXXXX)"
 # much of the tail it absorbed and moves several percent between runs of
 # identical code. The per-sample minimum is the interference-free figure.
 BENCH_CRITERION_HOME="$(mktemp -d -t structured-zstd-bench-crit.XXXXXX)"
-trap 'rm -rf "$BENCH_RAW_FILE" "$BENCH_CRITERION_HOME"' EXIT
+# Every round's output, appended. The raw file above is overwritten per round
+# because its other `REPORT_*` lines are identical every time; `REPORT_PAIR`
+# lines are not, they are measurements, and one per round is three independent
+# paired estimates to pool.
+BENCH_PAIRS_FILE="$(mktemp -t structured-zstd-bench-pairs.XXXXXX)"
+trap 'rm -rf "$BENCH_RAW_FILE" "$BENCH_CRITERION_HOME" "$BENCH_PAIRS_FILE"' EXIT
 
 # The two arms of a group run one after the other, so a disturbance lasting
 # longer than one arm lands entirely on that arm and the ratio reports it as a
@@ -83,6 +88,12 @@ for round in $(seq 1 "$BENCH_ROUNDS"); do
   CRITERION_HOME="$BENCH_CRITERION_HOME/round-$round"
   export CRITERION_HOME
   mkdir -p "$CRITERION_HOME"
+  # The bench registers the two arms of a comparison in an order that depends on
+  # this number. Criterion does not interleave samples across registrations, so
+  # a fixed order leaves the first arm meeting whatever the rest of the matrix
+  # left behind, in every round — and rounds do not cancel an effect that sits
+  # on a position rather than on a moment.
+  export STRUCTURED_ZSTD_BENCH_ROUND="$round"
   echo "Benchmark round $round of $BENCH_ROUNDS" >&2
   if [ -n "${STRUCTURED_ZSTD_BENCH_BIN:-}" ]; then
     # `--noplot`: the run needs criterion's sample DATA, and nothing downstream
@@ -91,6 +102,7 @@ for round in $(seq 1 "$BENCH_ROUNDS"); do
   else
     "${BENCH_CMD[@]}" -- --output-format bencher --noplot | tee "$BENCH_RAW_FILE"
   fi
+  cat "$BENCH_RAW_FILE" >> "$BENCH_PAIRS_FILE"
 done
 
 # Memory bench (compare_ffi_memory) runs separately when its binary is
@@ -130,6 +142,7 @@ fi
 echo "Parsing results..." >&2
 
 BENCH_RAW_FILE="$BENCH_RAW_FILE" \
+BENCH_PAIRS_FILE="$BENCH_PAIRS_FILE" \
 BENCH_CRITERION_HOME="$BENCH_CRITERION_HOME" \
 BENCH_TARGET_LABEL="$BENCH_TARGET_LABEL" \
 BENCH_TARGET_TRIPLE="$BENCH_TARGET_TRIPLE" \
@@ -162,6 +175,20 @@ DICT_TRAIN_RE = re.compile(
 # measurement to the kernel + arch + libc that produced it.
 KERNEL_RE = re.compile(
     r'^REPORT_KERNEL kernel=(\S+) arch=(\S+) target_env=(\S+)$'
+)
+# The two implementations measured alternately inside one window, which is
+# where the published speed delta comes from. Criterion runs an arm to
+# completion before the next starts, so its two arms answer about moments
+# seconds apart, and on a shared runner the machine's speed moves on that
+# scale: one cell has been seen at 27.2 and 35.5 us in a single process, with
+# the two arms landing in different states and reporting a 1.28x difference
+# between implementations that was not there. A ratio formed per sample from
+# alternating batches scales with the machine and cancels it.
+PAIR_RE = re.compile(
+    r'^REPORT_PAIR stage=(\S+) scenario=(\S+) level=(\S+) source=(\S+) '
+    r'speedup_median=([0-9.eE+-]+) speedup_min=([0-9.eE+-]+) speedup_max=([0-9.eE+-]+) '
+    r'rust_min_ns=([0-9.eE+-]+) ffi_min_ns=([0-9.eE+-]+) samples=(\d+) '
+    r'rust_iters=(\d+) ffi_iters=(\d+)$'
 )
 
 def unescape_report_label(value):
@@ -367,6 +394,10 @@ dictionary_training_rows = []
 kernel_info = None
 machine_info = collect_machine_info()
 timing_rows = []
+# Paired comparisons by canonical key, one entry per round. These carry the
+# published speed delta; see PAIR_RE for why a ratio formed from two separate
+# criterion arms does not.
+paired_rounds = defaultdict(list)
 scenario_input_bytes = {}
 scenario_training_bytes = {}
 raw_path = os.environ["BENCH_RAW_FILE"]
@@ -519,6 +550,59 @@ def classify_ratio_delta(delta):
         return "near_parity"
     return "rust_worse_larger"
 
+def summarize_paired_rounds(rounds):
+    """Collapse one cell's per-round paired measurements into one delta.
+
+    Each round contributes a ratio formed INSIDE that round, from the two
+    sides' minima over an alternating window. The rounds are then combined by
+    taking the median of those ratios. Pooling the minima across rounds
+    instead would pair one round's best Rust batch with another round's best C
+    batch, which is the cross-window comparison this measurement exists to
+    avoid — the machine's speed moves between rounds.
+    """
+    if not rounds:
+        return None
+    deltas = [
+        entry["ffi_min_ns"] / entry["rust_min_ns"]
+        for entry in rounds
+        if entry["rust_min_ns"] > 0.0 and entry["ffi_min_ns"] > 0.0
+    ]
+    if not deltas:
+        return None
+    ordered = sorted(deltas)
+    mid = len(ordered) // 2
+    median = (
+        (ordered[mid - 1] + ordered[mid]) / 2.0
+        if len(ordered) % 2 == 0
+        else ordered[mid]
+    )
+    # The other estimator the same rounds support: each round's median of
+    # per-sample ratios, then the median of those. It keeps the pairing sample
+    # by sample where the minima may come from two different samples of one
+    # visit, at the price of dividing one disturbed reading by another. Carried
+    # beside the published figure so the two can be compared on the same runs
+    # rather than argued about.
+    sample_medians = sorted(
+        entry["speedup_median"] for entry in rounds if entry["speedup_median"] > 0.0
+    )
+    sample_median = None
+    if sample_medians:
+        half = len(sample_medians) // 2
+        sample_median = (
+            (sample_medians[half - 1] + sample_medians[half]) / 2.0
+            if len(sample_medians) % 2 == 0
+            else sample_medians[half]
+        )
+    return {
+        "delta_rust_over_ffi": median,
+        "delta_from_sample_medians": sample_median,
+        "per_round_delta": deltas,
+        "rounds": len(deltas),
+        "samples": min(entry["samples"] for entry in rounds),
+        "rust_iters": min(entry["rust_iters"] for entry in rounds),
+        "ffi_iters": min(entry["ffi_iters"] for entry in rounds),
+    }
+
 def classify_speed_delta(delta):
     if delta is None:
         return "insufficient-data"
@@ -527,6 +611,50 @@ def classify_speed_delta(delta):
     if delta <= DELTA_HIGH:
         return "near_parity"
     return "rust_faster"
+
+# Paired comparisons come from the accumulated file rather than the raw one:
+# the raw file holds only the last round, and each round's paired measurement
+# is an independent estimate worth keeping.
+pairs_path = os.environ.get("BENCH_PAIRS_FILE")
+if pairs_path and Path(pairs_path).is_file():
+    with open(pairs_path) as f:
+        for raw_line in f:
+            pair_match = PAIR_RE.match(raw_line.strip())
+            if not pair_match:
+                continue
+            (
+                stage,
+                scenario,
+                level,
+                source,
+                speedup_median,
+                speedup_min,
+                speedup_max,
+                rust_min_ns,
+                ffi_min_ns,
+                pair_samples,
+                pair_rust_iters,
+                pair_ffi_iters,
+            ) = pair_match.groups()
+            # `na` is how the bench spells "this stage has no such axis"; the
+            # key builder wants the absence itself.
+            source_key = None if source == "na" else source
+            # The same normalisation every timing row gets. The bench names a
+            # dictionary level `..._dict` and `parse_benchmark_name` strips that
+            # suffix, so a key built from the raw level here matches nothing:
+            # every `*_ldm_dict` cell silently published the unpaired figure
+            # while its paired samples were taken and thrown away.
+            level_key = strip_dict_level_suffix(level)
+            paired_rounds[canonical_key(stage, scenario, level_key, source_key)].append({
+                "speedup_median": float(speedup_median),
+                "speedup_min": float(speedup_min),
+                "speedup_max": float(speedup_max),
+                "rust_min_ns": float(rust_min_ns),
+                "ffi_min_ns": float(ffi_min_ns),
+                "samples": int(pair_samples),
+                "rust_iters": int(pair_rust_iters),
+                "ffi_iters": int(pair_ffi_iters),
+            })
 
 with open(raw_path) as f:
     for raw_line in f:
@@ -884,7 +1012,14 @@ for key in all_keys:
     ffi_ms = ffi_timing["ms_per_iter"] if ffi_timing else None
     rust_bps = rust_timing["bytes_per_sec"] if rust_timing else None
     ffi_bps = ffi_timing["bytes_per_sec"] if ffi_timing else None
-    speed_delta = (
+    # The paired measurement is the published delta wherever it exists: it
+    # compares the two implementations inside one window, so the machine's own
+    # drift scales both sides and cancels. The criterion arms stay as the
+    # absolute per-implementation series, but a delta formed by dividing one
+    # arm's minimum by the other's pairs two moments that can be seconds apart,
+    # and on a shared runner that has manufactured differences of 1.3x and more.
+    paired = summarize_paired_rounds(paired_rounds.get(key))
+    unpaired_speed_delta = (
         rust_bps / ffi_bps
         if (rust_bps is not None and ffi_bps is not None and ffi_bps > 0.0)
         else (
@@ -893,6 +1028,20 @@ for key in all_keys:
             else None
         )
     )
+    # Within the paired measurement the statistic stays what it has always
+    # been, each side's MINIMUM: interference can only add time, so the lower
+    # edge is the cost of the code. What pairing changes is that the two minima
+    # now come from one alternating window instead of two arms seconds apart.
+    # The median of per-sample ratios is carried alongside as a diagnostic but
+    # is not published: it divides one disturbed sample by another, which reads
+    # systematically below the minima here (0.879 against 0.904 on the row
+    # where the two differ most).
+    if paired is not None:
+        speed_delta = paired["delta_rust_over_ffi"]
+        speed_delta_source = "paired"
+    else:
+        speed_delta = unpaired_speed_delta
+        speed_delta_source = "criterion_arms"
 
     has_comparable_ratio = (
         ratio_pack["rust_ratio"] is not None and ratio_pack["ffi_ratio"] is not None
@@ -930,12 +1079,18 @@ for key in all_keys:
                 "rust_bytes_per_sec": rust_bps,
                 "ffi_bytes_per_sec": ffi_bps,
                 "delta_rust_over_ffi": speed_delta,
+                "delta_source": speed_delta_source,
+                # What the delta would have been if formed from the two
+                # criterion arms, kept so the two can be compared and a cell
+                # where they disagree can be spotted.
+                "delta_from_criterion_arms": unpaired_speed_delta,
+                "paired": paired,
                 "status": classify_speed_delta(speed_delta),
                 "reference_band": {
                     "delta_low": DELTA_LOW,
                     "delta_high": DELTA_HIGH,
                 },
-                "interpretation": "delta>1 means Rust faster than FFI; throughput ratio uses rust_bytes_per_sec/ffi_bytes_per_sec when available, otherwise fallback is ffi_ms_per_iter/rust_ms_per_iter",
+                "interpretation": "delta>1 means Rust faster than FFI; it is ffi_min_ns/rust_min_ns from a measurement that alternates the two implementations inside one window, and falls back to rust_bytes_per_sec/ffi_bytes_per_sec from the separate criterion arms when no paired measurement exists",
             },
             "meta": {
                 "target_label": bench_target_label,
@@ -1005,6 +1160,12 @@ for row in delta_rows:
                 # above was computed from.
                 "rust_sample_ns": row["speed"]["series"].get("rust", {}).get("sample_ns"),
                 "ffi_sample_ns": row["speed"]["series"].get("ffi", {}).get("sample_ns"),
+                # Where `delta_ratio` came from, and what the two arms said on
+                # their own. When the two disagree it is the arms that drifted,
+                # not the paired figure.
+                "delta_source": row["speed"]["delta_source"],
+                "delta_from_criterion_arms": row["speed"]["delta_from_criterion_arms"],
+                "paired": row["speed"]["paired"],
                 "interpretation": "delta>1 means Rust faster than FFI",
             }
         )
