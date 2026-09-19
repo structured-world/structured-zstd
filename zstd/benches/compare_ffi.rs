@@ -312,45 +312,33 @@ fn bench_compress(c: &mut Criterion) {
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
             // One output buffer per arm for the whole sample (the C caller's
-            // `dst`; see `ffi_encode_into`), and both taken TOGETHER before
-            // either arm runs. Criterion runs the first arm to completion
-            // before the second is registered, so a buffer allocated inside
-            // each arm gets its pages from a different heap: the first arm's
-            // from whatever the matrix left, the second's from what the first
-            // arm's entire run left behind. Sized from the compression bound
-            // and pre-faulted so neither arm pays a realloc or a page fault
-            // inside the timing loop. Taken lazily, so a tight filter does not
-            // pay for a group it excludes.
-            let outputs = core::cell::RefCell::new(Option::<ArmBuffers>::None);
-            let prepare_outputs = || {
-                let mut slot = outputs.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(ArmBuffers::with_capacity(zstd::zstd_safe::compress_bound(
-                        scenario.bytes.len(),
-                    )));
-                }
-            };
-
+            // `dst`; see `ffi_encode_into`), from the process-wide arena so
+            // neither arm's pages depend on what ran before this group.
             bench_arm_pair(
                 &mut group,
                 "pure_rust",
                 |b| {
-                    prepare_outputs();
-                    let mut slot = outputs.borrow_mut();
-                    let output = &mut slot.as_mut().expect("prepared above").rust;
-                    b.iter(|| {
-                        rust_encode_into(&scenario.bytes[..], &level, output);
-                        black_box(&output);
+                    ARENA.with_borrow_mut(|arena| {
+                        let output = arena.appended(Arm::Rust);
+                        b.iter(|| {
+                            rust_encode_into(&scenario.bytes[..], &level, output);
+                            black_box(&output);
+                        })
                     })
                 },
                 "c_ffi",
                 |b| {
-                    prepare_outputs();
-                    let mut slot = outputs.borrow_mut();
-                    let output = &mut slot.as_mut().expect("prepared above").ffi;
-                    b.iter(|| {
-                        ffi_encode_into(&scenario.bytes[..], level.ffi_level, level.ldm, output);
-                        black_box(&output);
+                    ARENA.with_borrow_mut(|arena| {
+                        let output = arena.appended(Arm::Ffi);
+                        b.iter(|| {
+                            ffi_encode_into(
+                                &scenario.bytes[..],
+                                level.ffi_level,
+                                level.ldm,
+                                output,
+                            );
+                            black_box(&output);
+                        })
                     })
                 },
             );
@@ -496,44 +484,99 @@ fn process_state() -> String {
     format!("minflt={minflt} resident_pages={resident_pages}")
 }
 
-/// The working buffer each arm of a comparison writes into, for both arms.
-///
-/// Criterion runs one arm to completion before the next is registered, so a
-/// buffer allocated inside an arm's own closure gets its pages from a heap the
-/// other arm never saw: the first arm's from whatever the matrix left behind,
-/// the second's from what the first arm's entire run left. That difference is
-/// large enough to read as a several-fold gap between the two implementations
-/// on input they handle identically, which is a property of the harness and
-/// not of either codec. Taking both here, in one shape and one size, removes
-/// the position an effect like that sits on.
-struct ArmBuffers {
-    rust: Vec<u8>,
-    ffi: Vec<u8>,
+/// Which side of a comparison a buffer belongs to.
+#[derive(Clone, Copy)]
+enum Arm {
+    Rust,
+    Ffi,
 }
 
-impl ArmBuffers {
-    /// Two zero-filled buffers of `len` bytes, for arms that write through a
-    /// `&mut [u8]` of a known length.
-    fn zeroed(len: usize) -> Self {
+impl Arm {
+    fn index(self) -> usize {
+        match self {
+            Arm::Rust => 0,
+            Arm::Ffi => 1,
+        }
+    }
+}
+
+/// Every working buffer the matrix uses, allocated once for the process.
+///
+/// A buffer taken inside a group gets its pages from wherever the heap happens
+/// to be when that group runs, which makes a cell's timing depend on its
+/// position in the matrix rather than on the work it does. Two shapes of that
+/// were measured here: criterion runs one arm to completion before the next is
+/// registered, so per-arm buffers came off different heaps; and the decompress
+/// groups compressed their fixture before taking their buffers, with a
+/// different encoder per source, so the pair landed differently per source. The
+/// second read as a threefold difference between the implementations on frames
+/// that are byte-identical.
+///
+/// Allocating once, sized from the whole scenario set before any group runs,
+/// leaves no position for an effect like that to sit on: every cell gets the
+/// same addresses and the same resident pages whatever ran before it. The cost
+/// is that small fixtures hold buffers sized for the largest, which is a
+/// constant the measurement no longer has to control for.
+struct BenchArena {
+    /// For arms that append into a `Vec` (the compression side), held at the
+    /// compression bound of the largest scenario so no arm reallocates.
+    appended: [Vec<u8>; 2],
+    /// For arms that write through a `&mut [u8]` (the decompression side),
+    /// held at the largest scenario's output length plus the slack the
+    /// direct-write path is gated on, and sliced to what a group asks for.
+    written: [Vec<u8>; 2],
+}
+
+impl BenchArena {
+    fn for_scenarios(scenarios: &[Scenario]) -> Self {
+        let longest = scenarios.iter().map(|s| s.bytes.len()).max().unwrap_or(0);
+        let append_capacity = zstd::zstd_safe::compress_bound(longest);
+        let write_len = longest + structured_zstd::WILDCOPY_OVERLENGTH;
+
         release_freed_memory();
-        let mut rust = vec![0u8; len];
-        let mut ffi = vec![0u8; len];
-        pretouch_pages(&mut rust);
-        pretouch_pages(&mut ffi);
-        Self { rust, ffi }
+        let mut appended = [vec![0u8; append_capacity], vec![0u8; append_capacity]];
+        let mut written = [vec![0u8; write_len], vec![0u8; write_len]];
+        for buffer in appended.iter_mut().chain(written.iter_mut()) {
+            pretouch_pages(buffer);
+        }
+        // The pages stay faulted in; only the length goes, so an appending arm
+        // starts from an empty vector that can never outgrow its capacity.
+        for buffer in &mut appended {
+            buffer.clear();
+        }
+        // PROBE: where the arena landed and what the process looked like when
+        // it was built, so a cell's timing can be read against them.
+        eprintln!(
+            "PROBE_STATE arena append_capacity={append_capacity} write_len={write_len} \
+             rust_dst={:p} ffi_dst={:p} {}",
+            written[0].as_ptr(),
+            written[1].as_ptr(),
+            process_state(),
+        );
+        Self { appended, written }
     }
 
-    /// Two empty buffers holding `capacity` bytes of pre-faulted spare
-    /// capacity, for arms that append into a `&mut Vec<u8>`. The length is
-    /// dropped after the pages are faulted in, so the capacity (and the
-    /// residency) survives into the timing loop while the vector still starts
-    /// empty.
-    fn with_capacity(capacity: usize) -> Self {
-        let mut buffers = Self::zeroed(capacity);
-        buffers.rust.clear();
-        buffers.ffi.clear();
-        buffers
+    fn appended(&mut self, arm: Arm) -> &mut Vec<u8> {
+        &mut self.appended[arm.index()]
     }
+
+    fn written(&mut self, arm: Arm, len: usize) -> &mut [u8] {
+        let buffer = &mut self.written[arm.index()];
+        assert!(
+            len <= buffer.len(),
+            "arena holds {} bytes per arm, a group asked for {len}",
+            buffer.len(),
+        );
+        &mut buffer[..len]
+    }
+}
+
+thread_local! {
+    /// Built on first use from the whole scenario set, so its addresses do not
+    /// depend on which group happened to ask first. Criterion drives the
+    /// benches from one thread, so one arena per thread is one arena.
+    static ARENA: core::cell::RefCell<BenchArena> =
+        core::cell::RefCell::new(BenchArena::for_scenarios(benchmark_scenarios_cached()));
 }
 
 fn bench_decompress_source(
@@ -576,76 +619,47 @@ fn bench_decompress_source(
             .as_slice()
     };
 
-    // Both destinations are taken together, and BEFORE the fixture is
-    // compressed. Compressing it is the one thing the two sources do
-    // differently — one runs our encoder, the other libzstd's, each leaving its
-    // own holes in the heap — so buffers taken afterwards landed differently
-    // per source even though the two sources produce byte-identical frames.
-    // Both arms of a group share these buffers, which is how the published
-    // numbers came to show BOTH arms slow in the `c_stream` cell and both fast
-    // in `rust_stream`. Placing them first takes the encoder out of the
-    // question. Taking them lazily keeps the deferral `materialize` describes:
-    // a tight filter must not pay for a group it excludes.
+    // Destinations come from the process-wide arena, so neither the source
+    // that compressed this fixture nor the position of this group in the
+    // matrix can decide where they land. Both arms of a group share a pair,
+    // and taking that pair after compressing the fixture (a different encoder
+    // per source) once read as a threefold difference between the
+    // implementations on frames that are byte-identical between the sources.
     //
-    // Sized with WILDCOPY_OVERLENGTH slack so `decode_all` routes through the
-    // direct-write path; the slack is the dispatcher's eligibility gate. The
-    // C arm gets the same shape so a size difference cannot land the two at
-    // different addresses.
-    let destinations = core::cell::RefCell::new(Option::<ArmBuffers>::None);
-    let prepare_destinations = || {
-        let mut slot = destinations.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(ArmBuffers::zeroed(
-                expected_len + structured_zstd::WILDCOPY_OVERLENGTH,
-            ));
-            // PROBE: what the process looked like at the moment this cell took
-            // its buffers. The same cell reads 14 us run narrowly and 28-39 us
-            // inside the matrix, so the question is what the matrix left behind:
-            // resident size and the minor-fault count say whether the extra time
-            // is pages arriving during the loop or placement of pages already
-            // there, and the addresses say which allocator region they came off.
-            let buffers = slot.as_ref().expect("just stored");
-            eprintln!(
-                "PROBE_STATE {}/{}/{} rust_dst={:p} ffi_dst={:p} {}",
-                level.name,
-                scenario.id,
-                source,
-                buffers.rust.as_ptr(),
-                buffers.ffi.as_ptr(),
-                process_state(),
-            );
-        }
-    };
+    // Asked for with WILDCOPY_OVERLENGTH slack so `decode_all` routes through
+    // the direct-write path; the slack is the dispatcher's eligibility gate.
+    // The C arm asks for the same, so a size difference cannot separate them.
+    let destination_len = expected_len + structured_zstd::WILDCOPY_OVERLENGTH;
 
     bench_arm_pair(
         &mut group,
         "pure_rust",
         |b| {
-            prepare_destinations();
             let compressed = materialize();
-            let mut slot = destinations.borrow_mut();
-            let target = &mut slot.as_mut().expect("prepared above").rust;
             let mut decoder = FrameDecoder::new();
-            b.iter(|| {
-                let written = decoder.decode_all(black_box(compressed), target).unwrap();
-                black_box(&target[..written]);
-                assert_eq!(written, expected_len);
+            ARENA.with_borrow_mut(|arena| {
+                let target = arena.written(Arm::Rust, destination_len);
+                b.iter(|| {
+                    let written = decoder.decode_all(black_box(compressed), target).unwrap();
+                    black_box(&target[..written]);
+                    assert_eq!(written, expected_len);
+                })
             })
         },
         "c_ffi",
         |b| {
-            prepare_destinations();
             let compressed = materialize();
             // Reuse one DCtx across iterations so the timing sample reflects
             // decode steady-state, as the other arm reuses one `FrameDecoder`.
             // A fresh DCtx per iteration would dominate sub-millisecond samples.
             let mut dctx = FfiDCtxHandle::new();
-            let mut slot = destinations.borrow_mut();
-            let target = &mut slot.as_mut().expect("prepared above").ffi;
-            b.iter(|| {
-                let written = dctx.decompress_into(black_box(compressed), target);
-                assert_eq!(written, expected_len);
-                black_box(&target[..written]);
+            ARENA.with_borrow_mut(|arena| {
+                let target = arena.written(Arm::Ffi, destination_len);
+                b.iter(|| {
+                    let written = dctx.decompress_into(black_box(compressed), target);
+                    assert_eq!(written, expected_len);
+                    black_box(&target[..written]);
+                })
             })
         },
     );
@@ -960,39 +974,28 @@ fn bench_dictionary(c: &mut Criterion) {
             // that alternates between rounds needs both arms to exist in both
             // orders, so this group keeps its declaration order and the
             // `bench_arm_pair` treatment waits for the gate to be lifted.
-            // One output buffer per arm across iterations: `compress` would
-            // hand back a fresh `Vec` every time and measure that side's
-            // allocator rather than its encoder. Both are taken together,
-            // before either arm runs, and at the SAME capacity. Sizing them
-            // separately gave the C arm the compression bound and ours only
-            // what our side happened to produce, so the two arms differed in
-            // where their pages came from AND in how much spare capacity they
-            // carried. `compress_to_buffer` fails outright below the bound, so
-            // the bound is the size both take.
-            let dict_outputs = core::cell::RefCell::new(Option::<ArmBuffers>::None);
-            let prepare_dict_outputs = || {
-                let mut slot = dict_outputs.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(ArmBuffers::with_capacity(zstd::zstd_safe::compress_bound(
-                        scenario.bytes.len(),
-                    )));
-                }
-            };
-
+            // One output buffer per arm across iterations, from the arena:
+            // `compress` would hand back a fresh `Vec` every time and measure
+            // that side's allocator rather than its encoder. Sizing them per
+            // arm gave the C arm the compression bound and ours only what our
+            // side happened to produce, so the arms differed both in where
+            // their pages came from and in how much spare capacity they
+            // carried. The arena holds the bound, which is what
+            // `compress_to_buffer` requires.
             group.bench_function("c_ffi_with_dict", |b| {
-                prepare_dict_outputs();
                 let mut compressor =
                     zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
                         .unwrap();
                 configure_ffi_bulk_compressor(&mut compressor, &level);
-                let mut slot = dict_outputs.borrow_mut();
-                let compressed = &mut slot.as_mut().expect("prepared above").ffi;
-                b.iter(|| {
-                    compressed.clear();
-                    compressor
-                        .compress_to_buffer(&scenario.bytes, compressed)
-                        .expect("dictionary compression should succeed");
-                    black_box(&compressed);
+                ARENA.with_borrow_mut(|arena| {
+                    let compressed = arena.appended(Arm::Ffi);
+                    b.iter(|| {
+                        compressed.clear();
+                        compressor
+                            .compress_to_buffer(&scenario.bytes, compressed)
+                            .expect("dictionary compression should succeed");
+                        black_box(&compressed);
+                    })
                 })
             });
 
@@ -1006,7 +1009,6 @@ fn bench_dictionary(c: &mut Criterion) {
                 && EncoderDictionary::from_bytes(&ffi_dictionary).is_ok()
             {
                 group.bench_function("pure_rust_with_dict", |b| {
-                    prepare_dict_outputs();
                     // `compress_independent_frame_into` reads input in
                     // place + takes the output buffer per call, so neither
                     // the source `R` nor drain `W` generic is ever bound by
@@ -1027,17 +1029,19 @@ fn bench_dictionary(c: &mut Criterion) {
                         )
                         .expect("prepared dictionary should attach");
                     // Reuse one output buffer across iterations (the
-                    // CCtx-equivalent caller-owned `dst`), taken with the C
-                    // arm's above so neither realloc nor page-fault inside the
-                    // loop and neither depends on what the other arm's run left
-                    // on the heap.
-                    let mut slot = dict_outputs.borrow_mut();
-                    let compressed = &mut slot.as_mut().expect("prepared above").rust;
-                    b.iter(|| {
-                        compressor
-                            .compress_independent_frame_into(scenario.bytes.as_slice(), compressed);
-                        black_box(&compressed);
-                    });
+                    // CCtx-equivalent caller-owned `dst`), from the same arena
+                    // the C arm draws from, so neither reallocates and neither
+                    // depends on what ran before it.
+                    ARENA.with_borrow_mut(|arena| {
+                        let compressed = arena.appended(Arm::Rust);
+                        b.iter(|| {
+                            compressor.compress_independent_frame_into(
+                                scenario.bytes.as_slice(),
+                                compressed,
+                            );
+                            black_box(&compressed);
+                        })
+                    })
                 });
             }
 
@@ -1127,53 +1131,41 @@ fn bench_dictionary(c: &mut Criterion) {
                 );
             }
 
-            // Both outputs together, before either arm, for the reason
-            // `ArmBuffers` carries: an arm that takes its own gets pages from a
-            // heap the other arm never saw.
-            let dict_targets = core::cell::RefCell::new(Option::<ArmBuffers>::None);
-            let prepare_dict_targets = || {
-                let mut slot = dict_targets.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(ArmBuffers::zeroed(expected_len));
-                }
-            };
-
+            // Outputs from the arena, like every other group: an arm that takes
+            // its own gets pages from a heap the other arm never saw.
             bench_arm_pair(
                 &mut group,
                 "pure_rust_with_dict",
                 |b| {
-                    prepare_dict_targets();
                     let mut decoder = FrameDecoder::new();
-                    let mut slot = dict_targets.borrow_mut();
-                    let output = &mut slot.as_mut().expect("prepared above").rust;
-                    b.iter(|| {
-                        let n = decoder
-                            .decode_all_with_dict_handle(
-                                black_box(with_dict_bytes.as_slice()),
-                                output.as_mut_slice(),
-                                rust_dict_handle,
-                            )
-                            .expect("rust decode-with-dict must succeed");
-                        assert_eq!(n, expected_len, "rust decode wrote a partial output");
-                        black_box(&output[..n]);
+                    ARENA.with_borrow_mut(|arena| {
+                        let output = arena.written(Arm::Rust, expected_len);
+                        b.iter(|| {
+                            let n = decoder
+                                .decode_all_with_dict_handle(
+                                    black_box(with_dict_bytes.as_slice()),
+                                    output,
+                                    rust_dict_handle,
+                                )
+                                .expect("rust decode-with-dict must succeed");
+                            assert_eq!(n, expected_len, "rust decode wrote a partial output");
+                            black_box(&output[..n]);
+                        })
                     })
                 },
                 "c_ffi_with_dict",
                 |b| {
-                    prepare_dict_targets();
                     let mut decompressor =
                         zstd::bulk::Decompressor::with_dictionary(&ffi_dictionary).unwrap();
-                    let mut slot = dict_targets.borrow_mut();
-                    let output = &mut slot.as_mut().expect("prepared above").ffi;
-                    b.iter(|| {
-                        let n = decompressor
-                            .decompress_to_buffer(
-                                black_box(with_dict_bytes.as_slice()),
-                                output.as_mut_slice(),
-                            )
-                            .expect("ffi decode-with-dict must succeed");
-                        assert_eq!(n, expected_len, "ffi decode wrote a partial output");
-                        black_box(&output[..n]);
+                    ARENA.with_borrow_mut(|arena| {
+                        let output = arena.written(Arm::Ffi, expected_len);
+                        b.iter(|| {
+                            let n = decompressor
+                                .decompress_to_buffer(black_box(with_dict_bytes.as_slice()), output)
+                                .expect("ffi decode-with-dict must succeed");
+                            assert_eq!(n, expected_len, "ffi decode wrote a partial output");
+                            black_box(&output[..n]);
+                        })
                     })
                 },
             );
