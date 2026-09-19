@@ -591,14 +591,20 @@ fn measure_pair(mut run: impl FnMut(Arm, usize)) -> Option<PairedMeasurement> {
     const MAX_ITERS: u64 = 1 << 26;
 
     // Warm both sides, on both slots, before the clock is consulted at all.
-    // The first warm-up call doubles as the gate for an operation so slow that
-    // nothing below could fit: it is one call the cell would have made anyway.
-    let first_call = std::time::Instant::now();
-    run(Arm::Rust, 0);
-    if first_call.elapsed().as_nanos() as f64 * MIN_SAMPLES as f64 > VISIT_CAP_NS {
+    // The first call of EACH side doubles as the gate for an operation so slow
+    // that nothing below could fit: one call per side is what the cell would
+    // have made anyway. Gating only the first side left the other free to spend
+    // two warm-ups and a probe before the batch arithmetic could reject the
+    // visit, so a pair with one slow side could cost several times the cap and
+    // still emit nothing.
+    let mut gate = |arm: Arm, slot: usize| {
+        let started = std::time::Instant::now();
+        run(arm, slot);
+        started.elapsed().as_nanos() as f64 * MIN_SAMPLES as f64 <= VISIT_CAP_NS
+    };
+    if !gate(Arm::Rust, 0) || !gate(Arm::Ffi, 1) {
         return None;
     }
-    run(Arm::Ffi, 1);
     run(Arm::Rust, 1);
     run(Arm::Ffi, 0);
 
