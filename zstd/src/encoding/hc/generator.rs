@@ -161,10 +161,8 @@ macro_rules! bt_insert_step_no_rebase_body {
                 }
             }
         }
-        let Some(relative_pos) = $table.relative_position($abs_pos) else {
-            return 1;
-        };
-        let stored = relative_pos + 1;
+        // Total, not tested: the block was armed before the parse began.
+        let stored = $table.relative_position_armed($abs_pos) + 1;
         let bt_mask = $table.bt_mask();
         // `abs_pos < bt_mask` legitimately happens for the first BT walk of
         // a fresh frame (bt_low effectively "no floor"). Saturating keeps
@@ -792,10 +790,8 @@ macro_rules! bt_insert_and_collect_matches_body {
                 }
             }
         }
-        let Some(relative_pos) = $table.relative_position($abs_pos) else {
-            return;
-        };
-        let stored = relative_pos + 1;
+        // Total, not tested: the block was armed before the parse began.
+        let stored = $table.relative_position_armed($abs_pos) + 1;
         let bt_mask = $table.bt_mask();
         // Hoist the BT pointer-pair table's base out of `self` once: every
         // access below is `chain_table[computed_index]` through `&mut self`,

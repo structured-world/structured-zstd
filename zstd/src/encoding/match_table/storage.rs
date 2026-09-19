@@ -536,6 +536,57 @@ impl MatchTable {
         distance <= max_rel_no_rebase && self.index_shift <= max_rel_no_rebase - distance
     }
 
+    /// Settle, for the whole coming block, that every position in it converts
+    /// to a stored index — so the conversion itself needs no test.
+    ///
+    /// This is where upstream puts the same decision: it asks
+    /// `ZSTD_window_needOverflowCorrection` once before compressing a block and
+    /// runs `ZSTD_window_correctOverflow` + `ZSTD_reduceIndex` there
+    /// (`zstd_compress.c`), after which `curr = (U32)(ip - base)` is a plain
+    /// pointer subtraction on every position it searches. Ours asked per
+    /// position instead, and a question asked per position is answered per
+    /// position.
+    ///
+    /// `can_skip_rebase_check` is monotone in its argument (the distance only
+    /// grows), so clearing the block's LAST position clears every position in
+    /// it.
+    pub(crate) fn arm_block_positions(&mut self, current_abs_end: usize) {
+        // An empty block has no last position to clear.
+        if current_abs_end <= self.position_base {
+            return;
+        }
+        let last = current_abs_end - 1;
+        if !self.can_skip_rebase_check(last) {
+            // The BOUND is the block's last position, but the rebase replays
+            // the inserted prefix, so it is given the insertion frontier: a
+            // replay up to the block end would insert positions the parser has
+            // not reached and put future bytes in the tree. After
+            // `begin_rebase` the base is the history floor and the shift is
+            // zero, so the block's last position is representable by the window
+            // cap alone, which the assertion below holds it to.
+            let frontier = self.skip_insert_until_abs.max(self.history_abs_start);
+            self.rebase_positions_cold(frontier);
+        }
+        debug_assert!(
+            self.can_skip_rebase_check(last),
+            "block arming must leave every position in the block representable",
+        );
+    }
+
+    /// Convert an absolute position to its stored index, with no test.
+    ///
+    /// Valid only for positions inside a block that [`Self::arm_block_positions`]
+    /// has cleared; the assertion pins that. Upstream's per-position conversion
+    /// is the same shape and for the same reason.
+    #[inline(always)]
+    pub(crate) fn relative_position_armed(&self, abs_pos: usize) -> u32 {
+        debug_assert!(
+            self.can_skip_rebase_check(abs_pos),
+            "position not cleared by arm_block_positions",
+        );
+        (abs_pos - self.position_base + self.index_shift) as u32
+    }
+
     /// Decide whether the table needs a cold rebase before `abs_pos`
     /// can be inserted. Pure predicate — does **not** perform the
     /// rebase. The caller (whichever backend owns the BT walk path)

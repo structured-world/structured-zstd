@@ -219,6 +219,56 @@ fn the_hoisted_hash3_fill_matches_the_per_position_loop() {
 /// takes the per-position loop, which rebases before inserting: the positions
 /// are re-encoded from the floor and the side table is filled up to the
 /// target all the same.
+/// Arming a block settles the index encoding for every position in it, so a
+/// shift that leaves the block's LAST position unrepresentable is re-encoded
+/// once here rather than re-tested at each position during the parse.
+#[test]
+fn arming_a_block_re_encodes_when_its_last_position_would_not_fit() {
+    let mut t = new_table(64);
+    t.history = b"abcdef_abcdef_abcdef_abcdef".to_vec();
+    t.history_start = 0;
+    t.history_abs_start = 0;
+    t.window_size = t.history.len();
+    t.chunk_lens.push_back(t.history.len());
+    t.search_depth = 4;
+    t.ensure_tables();
+    t.index_shift = u32::MAX as usize - 10;
+    assert!(
+        !t.can_skip_rebase_check(20),
+        "fixture precondition: the block's last position must not fit",
+    );
+
+    t.arm_block_positions(21);
+
+    assert_eq!(t.index_shift, 0, "the positions were re-encoded");
+    assert!(
+        t.can_skip_rebase_check(20),
+        "arming must leave every position in the block representable",
+    );
+}
+
+/// The converse: a block whose last position already fits is left alone, so
+/// arming costs one comparison on the path every ordinary block takes.
+#[test]
+fn arming_a_block_that_already_fits_changes_nothing() {
+    let mut t = new_table(64);
+    t.history = b"abcdef_abcdef_abcdef_abcdef".to_vec();
+    t.history_start = 0;
+    t.history_abs_start = 0;
+    t.window_size = t.history.len();
+    t.chunk_lens.push_back(t.history.len());
+    t.search_depth = 4;
+    t.ensure_tables();
+    t.index_shift = 7;
+    t.position_base = 0;
+    t.skip_insert_until_abs = 5;
+
+    t.arm_block_positions(21);
+
+    assert_eq!(t.index_shift, 7, "an encoding that fits is not disturbed");
+    assert_eq!(t.skip_insert_until_abs, 5, "the insertion frontier stands");
+}
+
 #[test]
 fn a_hash3_catch_up_past_the_index_range_rebases_first() {
     let mut t = new_table(64);
