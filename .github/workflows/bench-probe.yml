@@ -1,18 +1,16 @@
-# Throwaway diagnostic. Does a small fixture's measured ratio depend on where
-# its destination buffer sits?
+# Throwaway diagnostic. Does spreading the paired batches over more, shorter
+# visits make the published delta steadier at the same total cost?
 #
-# `small-10k-random` decompress is the one cell where the paired figure is
-# noticeably less steady than the one it replaces, and its two SOURCES split by
-# 20% in a run that read them 0.695 and 0.857 on work that should be identical:
-# a 10 KiB random input compresses to raw blocks of the same length under both
-# encoders. Source and destination are both L1-resident at that size, so the
-# cache-set colouring between them can cost more than the decode, and the heap
-# moves between runs.
+# A disturbance long enough to cover a whole visit defeats any statistic inside
+# it, and with three visits the median across them survives only one such
+# visit. The bench now shares a fixed batch total over however many times the
+# matrix runs, so nine rounds give nine visits of four batches where three
+# rounds give three of twelve.
 #
-# Sweep the destination's offset inside the arena and read the ratio at each.
-# A flat sweep clears colouring and sends the search elsewhere; a swinging one
-# names it, and the fix is then to place the source deliberately too rather
-# than let a per-group allocation decide it.
+# Same binary, one machine, the real script: twice at three rounds, twice at
+# nine, interleaved so a change in the machine lands on both settings. The
+# number that matters is how far the paired delta moves between the two runs
+# of each setting.
 #
 # Push-triggered on `probe/**` only. Delete the branch when the answer is in.
 name: bench-probe
@@ -26,16 +24,16 @@ permissions:
 
 jobs:
   probe:
-    name: destination offset sweep on small-10k-random
+    name: three visits of twelve versus nine visits of four
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
-      STRUCTURED_ZSTD_EMIT_REPORT: '1'
+      STRUCTURED_ZSTD_BENCH_TARGET: x86_64-gnu
+      STRUCTURED_ZSTD_BENCH_TRIPLE: x86_64-unknown-linux-gnu
+      STRUCTURED_ZSTD_BENCH_GENERATED_AT: '2026-01-01T00:00:00+00:00'
       STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: 'level_3_dfast'
-      STRUCTURED_ZSTD_BENCH_SCENARIO_NOTE: 'decoders are now held for the process'
-      STRUCTURED_ZSTD_BENCH_LARGE_BYTES: '16777216'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -43,43 +41,75 @@ jobs:
           targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
 
-      - name: Runner identity
-        run: |
-          grep -m1 'model name' /proc/cpuinfo || true
-          echo "cpus=$(nproc)"; cat /proc/loadavg
-
       - name: Build the bench binary as bench-build does
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v3"
         run: |
           cargo bench --bench compare_ffi -p ffi-bench \
             --target x86_64-unknown-linux-gnu --no-run --message-format=json > build.log
-          mkdir -p bench-binary target/criterion
+          mkdir -p bench-binary
           cp "$(jq -r 'select(.executable != null and (.target.name == "compare_ffi")) | .executable' build.log | tail -1)" \
             bench-binary/compare_ffi
           chmod +x bench-binary/compare_ffi
 
-      # Offsets chosen to walk cache-line, page and multi-page distances, plus
-      # two that are deliberately not powers of two.
-      - name: Sweep the destination offset
+      - name: Four runs, the two settings interleaved
+        env:
+          STRUCTURED_ZSTD_BENCH_BIN: ${{ github.workspace }}/bench-binary/compare_ffi
         run: |
-          for off in 0 64 320 4096 8192 12288 32768 65536 262144; do
-            echo "--- offset $off"
-            STRUCTURED_ZSTD_BENCH_PROBE_OFFSET=$off \
-              ./bench-binary/compare_ffi --bench --output-format bencher --noplot \
-              --measurement-time 1 "decompress/level_3_dfast/small-10k-random/" 2>&1 \
-              | grep -E '^REPORT_PAIR|^PROBE_GEOM ' || true
+          for pass in 1 2; do
+            for rounds in 3 9; do
+              echo "--- pass $pass, $rounds rounds"
+              start=$(date +%s)
+              STRUCTURED_ZSTD_BENCH_ROUNDS=$rounds ./.github/scripts/run-benchmarks.sh > /dev/null
+              echo "took $(( $(date +%s) - start )) s"
+              cp benchmark-relative.json "r${rounds}-p${pass}.json"
+            done
           done
 
-      # The same sweep on a fixture whose buffers are far too large to sit in
-      # L1, as a control: if colouring is the mechanism, this one stays flat
-      # while the small one swings.
-      - name: The same sweep on a megabyte fixture
+      - name: How far each setting's delta moved between its two runs
         run: |
-          for off in 0 64 4096 65536; do
-            echo "--- offset $off"
-            STRUCTURED_ZSTD_BENCH_PROBE_OFFSET=$off \
-              ./bench-binary/compare_ffi --bench --output-format bencher --noplot \
-              --measurement-time 1 "decompress/level_3_dfast/high-entropy-1m/" 2>&1 \
-              | grep -E '^REPORT_PAIR|^PROBE_GEOM ' || true
-          done
+          python3 - <<'PY'
+          import json, statistics
+
+          def rows(path):
+              out = {}
+              for record in json.load(open(path))["records"]:
+                  if record.get("metric") != "throughput_bytes_per_sec":
+                      continue
+                  key = (record["stage"], record["scenario"], str(record.get("source")))
+                  out[key] = record
+              return out
+
+          def moves(first, second, getter):
+              result = {}
+              for key in sorted(set(first) & set(second)):
+                  a, b = getter(first[key]), getter(second[key])
+                  if a and b and a > 0 and b > 0:
+                      result[key] = abs(b / a - 1.0) * 100.0
+              return result
+
+          paired = lambda r: r["delta_ratio"] if r.get("delta_source") == "paired" else None
+          arms = lambda r: r.get("delta_from_criterion_arms")
+
+          table = {}
+          for rounds in (3, 9):
+              first, second = rows(f"r{rounds}-p1.json"), rows(f"r{rounds}-p2.json")
+              for name, getter in (("paired", paired), ("arms", arms)):
+                  table[(rounds, name)] = moves(first, second, getter)
+
+          for (rounds, name), data in table.items():
+              values = sorted(data.values())
+              if not values:
+                  continue
+              print(f"rounds={rounds} {name:<7} n={len(values):<3} "
+                    f"median={statistics.median(values):6.2f}%  "
+                    f"p90={values[int(len(values) * 0.9)]:6.2f}%  max={max(values):6.2f}%")
+
+          print()
+          print(f"{'cell':<48}{'paired@3':>10}{'paired@9':>10}{'arms@3':>9}{'arms@9':>9}")
+          keys = sorted(set(table[(3, 'paired')]) & set(table[(9, 'paired')]))
+          for key in keys:
+              label = "/".join(part for part in key if part != "None")
+              print(f"{label:<48}{table[(3,'paired')][key]:9.1f}%{table[(9,'paired')][key]:9.1f}%"
+                    f"{table[(3,'arms')].get(key, float('nan')):8.1f}%{table[(9,'arms')].get(key, float('nan')):8.1f}%")
+          PY
