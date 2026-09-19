@@ -662,10 +662,24 @@ enum Arm {
 }
 
 impl Arm {
-    fn index(self) -> usize {
-        match self {
+    /// Which of the arena's two slots this arm draws from THIS round.
+    ///
+    /// The mapping rotates with the same round parity that swaps the
+    /// registration order. Holding it fixed would leave one implementation on
+    /// one address for the life of the dashboard: whatever a particular
+    /// address is worth, in cache sets, page colouring or alignment, would be
+    /// credited to the same side every round, and a per-arm minimum across
+    /// rounds cannot cancel an advantage that never moves. Rotating it lets
+    /// both implementations meet both addresses.
+    fn slot(self) -> usize {
+        let declared = match self {
             Arm::Rust => 0,
             Arm::Ffi => 1,
+        };
+        if reverse_arm_order() {
+            1 - declared
+        } else {
+            declared
         }
     }
 }
@@ -718,29 +732,39 @@ impl BenchArena {
     }
 
     fn appended(&mut self, arm: Arm) -> &mut Vec<u8> {
-        &mut self.appended[arm.index()]
+        &mut self.appended[arm.slot()]
     }
 
     /// Both arms' append buffers at once, for a measurement that needs to hold
-    /// them simultaneously.
+    /// them simultaneously, returned as (rust, ffi) for whichever slots those
+    /// arms hold this round.
     fn appended_pair(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>) {
-        let [rust, ffi] = &mut self.appended;
-        (rust, ffi)
+        let [first, second] = &mut self.appended;
+        if Arm::Rust.slot() == 0 {
+            (first, second)
+        } else {
+            (second, first)
+        }
     }
 
-    /// Both arms' destination buffers at once, sliced to `len`.
+    /// Both arms' destination buffers at once, sliced to `len`, in the same
+    /// (rust, ffi) order.
     fn written_pair(&mut self, len: usize) -> (&mut [u8], &mut [u8]) {
-        let [rust, ffi] = &mut self.written;
+        let [first, second] = &mut self.written;
         assert!(
-            len <= rust.len(),
+            len <= first.len(),
             "arena holds {} bytes per arm, a group asked for {len}",
-            rust.len(),
+            first.len(),
         );
-        (&mut rust[..len], &mut ffi[..len])
+        if Arm::Rust.slot() == 0 {
+            (&mut first[..len], &mut second[..len])
+        } else {
+            (&mut second[..len], &mut first[..len])
+        }
     }
 
     fn written(&mut self, arm: Arm, len: usize) -> &mut [u8] {
-        let buffer = &mut self.written[arm.index()];
+        let buffer = &mut self.written[arm.slot()];
         assert!(
             len <= buffer.len(),
             "arena holds {} bytes per arm, a group asked for {len}",
