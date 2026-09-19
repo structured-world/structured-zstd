@@ -1307,18 +1307,30 @@ impl MatchTable {
         // The distance from the floor first: the absolute position plus the
         // shift need not fit a 32-bit word even when the stored index does,
         // and an overflow here would read as "rebase now".
-        let rel = abs_pos
-            .checked_sub(self.position_base)?
-            .checked_add(self.index_shift)?;
-        let rel_u32 = u32::try_from(rel).ok()?;
+        //
+        // Written as bare comparisons rather than `checked_*` + `?`: the caller
+        // wants only the early exit, and a checked operation computes the
+        // rejected value before testing it, turning a branch the predictor gets
+        // right into a materialised `Option`. Ordered most-rejecting first.
+        if abs_pos < self.position_base {
+            return None;
+        }
+        let distance = abs_pos - self.position_base;
+        if self.index_shift > usize::MAX - distance {
+            return None;
+        }
+        let rel = distance + self.index_shift;
         // A frame's first position is a candidate like any other, from a fresh
         // compressor as from a reused one: upstream zstd starts its indices
         // above its empty sentinel for exactly that (`ZSTD_WINDOW_START_INDEX`,
-        // `zstd_compress_internal.h`), and the `+ 1` below does it here.
+        // `zstd_compress_internal.h`), and the caller's `+ 1` does it here.
         // Positions are stored as (relative_pos + 1), with 0 reserved
-        // as the empty sentinel. So the raw relative position itself
-        // must stay strictly below u32::MAX.
-        (rel_u32 < u32::MAX).then_some(rel_u32)
+        // as the empty sentinel, so the raw relative position itself must stay
+        // strictly below `u32::MAX`.
+        if rel >= u32::MAX as usize {
+            return None;
+        }
+        Some(rel as u32)
     }
 
     /// Lower bound (in absolute positions) of the window that's still

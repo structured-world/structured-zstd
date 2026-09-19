@@ -556,6 +556,9 @@ macro_rules! bt_insert_and_collect_matches_body {
             } else {
                 cur_word
             };
+            // Fixed for the whole probe: neither term depends on which repeat
+            // is being tried, and both were being re-derived inside the loop.
+            let rep_scan_limit = cur_tail.min(tail_limit);
             let ll0 = usize::from($lit_len == 0);
             for rep_code in ll0..3 + ll0 {
                 // The synthetic slot's wrap is deliberate and measured. Guarding
@@ -599,9 +602,15 @@ macro_rules! bt_insert_and_collect_matches_body {
                 if cand_gate != cur_gate {
                     continue;
                 }
-                let rmax = (rlen - candidate_idx).min(cur_tail).min(tail_limit);
-                // SAFETY: same umbrella; both pointers + `rmax` stay in `concat`.
-                let match_len = unsafe { $cpl(rbase.add(candidate_idx), rbase.add(idx), rmax) };
+                // The scan limit does not depend on which repeat is being
+                // tried: a repeat offset is at least one, so `candidate_idx <
+                // idx` and the candidate's own tail is always the longer of the
+                // two. Upstream compares against one `iLimit` pointer for the
+                // same reason. Asserted rather than recomputed per repeat.
+                debug_assert!(rlen - candidate_idx > cur_tail);
+                // SAFETY: same umbrella; both pointers + the limit stay in `concat`.
+                let match_len =
+                    unsafe { $cpl(rbase.add(candidate_idx), rbase.add(idx), rep_scan_limit) };
                 if match_len < $min_match_len {
                     continue;
                 }
