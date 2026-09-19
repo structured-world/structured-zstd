@@ -530,15 +530,22 @@ fn measure_pair(mut rust_op: impl FnMut(), mut ffi_op: impl FnMut()) -> PairedMe
     // enough for the machine to change speed inside it; a millisecond clears
     // both by a wide margin on every host this runs on.
     const TARGET_BATCH_NS: f64 = 1_000_000.0;
-    // Enough samples for a median to be stable, few enough that the whole
-    // measurement costs a few tens of milliseconds per cell.
-    const MAX_SAMPLES: usize = 32;
-    // Below this a median stops meaning much, so a slow operation costs more
-    // wall-clock rather than fewer samples.
-    const MIN_SAMPLES: usize = 6;
+    // A duration target alone leaves an operation slower than the target
+    // measured ONE iteration at a time, so every sample is a single unaveraged
+    // reading. That is what made the first version of this measurement move
+    // 41.8% between two runs of identical code on the slowest fixture while
+    // the criterion arms moved 0.3%. A batch averages at least this many
+    // iterations whatever the clock says.
+    const MIN_ITERS: u64 = 16;
+    // Enough samples that a minimum is a settled estimate rather than a lucky
+    // draw, which is the other half of the same failure.
+    const MAX_SAMPLES: usize = 64;
+    const MIN_SAMPLES: usize = 12;
     // Roughly what one side of one cell may spend. An operation slower than
-    // `budget / MIN_SAMPLES` overruns it, which is the intended trade.
-    const BUDGET_NS: f64 = 100_000_000.0;
+    // `budget / MIN_SAMPLES` overruns it, which is the intended trade: the
+    // measurement is only worth having if each side is estimated as well as
+    // the arms it replaces.
+    const BUDGET_NS: f64 = 500_000_000.0;
     // A ceiling for the calibration, so an operation that is somehow free
     // cannot spin the doubling loop forever.
     const MAX_ITERS: u64 = 1 << 22;
@@ -548,8 +555,9 @@ fn measure_pair(mut rust_op: impl FnMut(), mut ffi_op: impl FnMut()) -> PairedMe
     ffi_op();
 
     // Size the batch so that BOTH sides clear the clock's resolution, which
-    // means gating on the faster of the two.
-    let mut iters: u64 = 1;
+    // means gating on the faster of the two, and so that every batch averages
+    // several iterations however slow the operation is.
+    let mut iters: u64 = MIN_ITERS;
     let mut batch_ns = 0.0;
     while iters < MAX_ITERS {
         let rust_ns = time_batch(&mut rust_op, iters);
