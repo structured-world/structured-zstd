@@ -639,7 +639,13 @@ if pairs_path and Path(pairs_path).is_file():
             # `na` is how the bench spells "this stage has no such axis"; the
             # key builder wants the absence itself.
             source_key = None if source == "na" else source
-            paired_rounds[canonical_key(stage, scenario, level, source_key)].append({
+            # The same normalisation every timing row gets. The bench names a
+            # dictionary level `..._dict` and `parse_benchmark_name` strips that
+            # suffix, so a key built from the raw level here matches nothing:
+            # every `*_ldm_dict` cell silently published the unpaired figure
+            # while its paired samples were taken and thrown away.
+            level_key = strip_dict_level_suffix(level)
+            paired_rounds[canonical_key(stage, scenario, level_key, source_key)].append({
                 "speedup_median": float(speedup_median),
                 "speedup_min": float(speedup_min),
                 "speedup_max": float(speedup_max),

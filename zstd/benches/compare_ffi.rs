@@ -582,6 +582,10 @@ fn measure_pair(mut run: impl FnMut(Arm, usize)) -> Option<PairedMeasurement> {
     const TOTAL_SAMPLES: usize = 36;
     const MAX_SAMPLES: usize = 12;
     const MIN_SAMPLES: usize = 4;
+    // Batches needed to give both sides both slots and both lead positions:
+    // the lead turns every batch and the slots every second one. A visit is
+    // rounded down to a whole number of these.
+    const ROTATION_PERIOD: usize = 4;
     // A ceiling, so an operation that is somehow free cannot ask for an
     // unbounded batch.
     const MAX_ITERS: u64 = 1 << 26;
@@ -614,7 +618,13 @@ fn measure_pair(mut run: impl FnMut(Arm, usize)) -> Option<PairedMeasurement> {
     // allows. More rounds mean shorter visits, not more work; and below the
     // floor a minimum is a lucky draw, so the visit is not made at all.
     let share = (TOTAL_SAMPLES / bench_rounds() as usize).clamp(MIN_SAMPLES, MAX_SAMPLES);
-    let samples = share.min((VISIT_CAP_NS / batch_ns.max(1.0)) as usize);
+    let affordable = share.min((VISIT_CAP_NS / batch_ns.max(1.0)) as usize);
+    // Down to a whole number of rotation periods. The slots turn every second
+    // batch and the lead turns every batch, so four batches is what it takes to
+    // give both sides both slots and both positions; a count like six would
+    // leave one side on one slot twice as often, and the repetitions would
+    // repeat that rather than cancel it.
+    let samples = affordable - affordable % ROTATION_PERIOD;
     if samples < MIN_SAMPLES {
         return None;
     }
@@ -761,50 +771,82 @@ impl Arm {
 /// same addresses and the same resident pages whatever ran before it. The cost
 /// is that small fixtures hold buffers sized for the largest, which is a
 /// constant the measurement no longer has to control for.
+///
+/// Each PAIR is taken on its first use, so a run filtered to one side of the
+/// matrix never allocates the other's: profiling a single kilobyte-sized
+/// decompress cell would otherwise pre-touch two compression buffers sized for
+/// the largest scenario, which is most of the memory and all of it wasted. What
+/// stays eager is the SIZE, taken from every scenario rather than the selected
+/// ones — a size that depended on the filter would put the addresses back under
+/// the run's control, which is the thing this exists to prevent.
 struct BenchArena {
+    /// Length every `written` buffer is held at, and the capacity every
+    /// `appended` one carries. Fixed before any group runs.
+    append_capacity: usize,
+    write_len: usize,
     /// For arms that append into a `Vec` (the compression side), held at the
     /// compression bound of the largest scenario so no arm reallocates.
-    appended: [Vec<u8>; 2],
+    appended: Option<[Vec<u8>; 2]>,
     /// For arms that write through a `&mut [u8]` (the decompression side),
     /// held at the largest scenario's output length plus the slack the
     /// direct-write path is gated on, and sliced to what a group asks for.
-    written: [Vec<u8>; 2],
+    written: Option<[Vec<u8>; 2]>,
 }
 
 impl BenchArena {
     fn for_scenarios(scenarios: &[Scenario]) -> Self {
         let longest = scenarios.iter().map(|s| s.bytes.len()).max().unwrap_or(0);
-        let append_capacity = zstd::zstd_safe::compress_bound(longest);
-        let write_len = longest + structured_zstd::WILDCOPY_OVERLENGTH;
+        Self {
+            append_capacity: zstd::zstd_safe::compress_bound(longest),
+            write_len: longest + structured_zstd::WILDCOPY_OVERLENGTH,
+            appended: None,
+            written: None,
+        }
+    }
 
+    /// Two buffers of `len` bytes with their pages faulted in.
+    fn take_pair(len: usize) -> [Vec<u8>; 2] {
         release_freed_memory();
-        let mut appended = [vec![0u8; append_capacity], vec![0u8; append_capacity]];
-        let mut written = [vec![0u8; write_len], vec![0u8; write_len]];
-        for buffer in appended.iter_mut().chain(written.iter_mut()) {
+        let mut pair = [vec![0u8; len], vec![0u8; len]];
+        for buffer in &mut pair {
             pretouch_pages(buffer);
         }
-        // The pages stay faulted in; only the length goes, so an appending arm
-        // starts from an empty vector that can never outgrow its capacity.
-        for buffer in &mut appended {
-            buffer.clear();
-        }
-        Self { appended, written }
+        pair
+    }
+
+    fn append_pair(&mut self) -> &mut [Vec<u8>; 2] {
+        let capacity = self.append_capacity;
+        self.appended.get_or_insert_with(|| {
+            let mut pair = Self::take_pair(capacity);
+            // The pages stay faulted in; only the length goes, so an appending
+            // arm starts from an empty vector that cannot outgrow its capacity.
+            for buffer in &mut pair {
+                buffer.clear();
+            }
+            pair
+        })
+    }
+
+    fn write_pair(&mut self) -> &mut [Vec<u8>; 2] {
+        let len = self.write_len;
+        self.written.get_or_insert_with(|| Self::take_pair(len))
     }
 
     fn appended(&mut self, arm: Arm) -> &mut Vec<u8> {
-        &mut self.appended[arm.slot()]
+        let slot = arm.slot();
+        &mut self.append_pair()[slot]
     }
 
     /// Both append slots at once, by slot index, for the paired measurement,
     /// which turns the two sides over both slots itself.
     fn appended_slots(&mut self) -> [&mut Vec<u8>; 2] {
-        let [first, second] = &mut self.appended;
+        let [first, second] = self.append_pair();
         [first, second]
     }
 
     /// Both destination slots at once, by slot index, sliced to `len`.
     fn written_slots(&mut self, len: usize) -> [&mut [u8]; 2] {
-        let [first, second] = &mut self.written;
+        let [first, second] = self.write_pair();
         assert!(
             len <= first.len(),
             "arena holds {} bytes per arm, a group asked for {len}",
@@ -814,7 +856,8 @@ impl BenchArena {
     }
 
     fn written(&mut self, arm: Arm, len: usize) -> &mut [u8] {
-        let buffer = &mut self.written[arm.slot()];
+        let slot = arm.slot();
+        let buffer = &mut self.write_pair()[slot];
         assert!(
             len <= buffer.len(),
             "arena holds {} bytes per arm, a group asked for {len}",
