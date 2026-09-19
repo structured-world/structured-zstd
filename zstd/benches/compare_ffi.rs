@@ -311,6 +311,31 @@ fn bench_compress(c: &mut Criterion) {
             configure_group(&mut group, scenario, BenchOp::Compress);
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
+            // The paired comparison, which is what the dashboard reports. It
+            // runs before the criterion arms so neither arm's own measurement
+            // colours it, over the same buffers and the same per-frame shape.
+            if emit_reports {
+                let paired = ARENA.with_borrow_mut(|arena| {
+                    let (rust_output, ffi_output) = arena.appended_pair();
+                    measure_pair(
+                        || {
+                            rust_encode_into(&scenario.bytes[..], &level, rust_output);
+                            black_box(&rust_output);
+                        },
+                        || {
+                            ffi_encode_into(
+                                &scenario.bytes[..],
+                                level.ffi_level,
+                                level.ldm,
+                                ffi_output,
+                            );
+                            black_box(&ffi_output);
+                        },
+                    )
+                });
+                emit_pair_report("compress", scenario, level.name, "na", &paired);
+            }
+
             // One output buffer per arm for the whole sample (the C caller's
             // `dst`; see `ffi_encode_into`), from the process-wide arena so
             // neither arm's pages depend on what ran before this group.
@@ -465,31 +490,154 @@ fn pretouch_pages(buf: &mut [u8]) {
     }
 }
 
-/// PROBE: the CPU the process last ran on, plus its context-switch counts,
-/// straight out of procfs so no extra dependency is needed.
-fn cpu_and_switches() -> String {
-    let cpu = std::fs::read_to_string("/proc/self/stat")
-        .ok()
-        .and_then(|stat| {
-            // Fields are counted from 1 and the command name in fields 2 and 3
-            // can itself contain spaces, so count from after its closing paren.
-            // `processor` is field 39, the 36th after the name.
-            let after_comm = stat.rsplit_once(") ")?.1;
-            after_comm.split_whitespace().nth(36).map(str::to_owned)
-        })
-        .unwrap_or_default();
-    let mut voluntary = String::new();
-    let mut involuntary = String::new();
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("voluntary_ctxt_switches:") {
-                voluntary = rest.trim().to_owned();
-            } else if let Some(rest) = line.strip_prefix("nonvoluntary_ctxt_switches:") {
-                involuntary = rest.trim().to_owned();
-            }
+/// A comparison measured with the two implementations alternating inside one
+/// window, rather than one whole measurement after the other.
+///
+/// Criterion runs an arm to completion before the next one starts, which on a
+/// shared runner leaves seconds between them, and the machine's speed moves on
+/// that scale: the same cell has been seen at 27.2 and 35.5 us in one process,
+/// and the two arms of a cell landing in different states produced a 1.28x
+/// difference between the implementations out of nothing. Pinning the process
+/// to one CPU narrows it but does not remove it, so the answer is not to make
+/// the machine hold still, it is to stop asking the two arms about different
+/// moments. Alternating per sample scales both sides by whatever the machine
+/// is doing, and that cancels in the ratio.
+struct PairedMeasurement {
+    /// `ffi_ns / rust_ns` per sample, then the median: above 1 means ours is
+    /// faster, matching the sign the dashboard already uses for speed.
+    speedup_median: f64,
+    speedup_min: f64,
+    speedup_max: f64,
+    /// The best batch either side reached, for the absolute series.
+    rust_min_ns: f64,
+    ffi_min_ns: f64,
+    samples: usize,
+    iters: u64,
+}
+
+/// Time `iters` calls and return the nanoseconds one call took.
+fn time_batch(op: &mut impl FnMut(), iters: u64) -> f64 {
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        op();
+    }
+    start.elapsed().as_nanos() as f64 / iters as f64
+}
+
+/// Measure both implementations alternately and report the ratio.
+fn measure_pair(mut rust_op: impl FnMut(), mut ffi_op: impl FnMut()) -> PairedMeasurement {
+    // One batch should outlast the clock's resolution without running long
+    // enough for the machine to change speed inside it; a millisecond clears
+    // both by a wide margin on every host this runs on.
+    const TARGET_BATCH_NS: f64 = 1_000_000.0;
+    // Enough samples for a median to be stable, few enough that the whole
+    // measurement costs a few tens of milliseconds per cell.
+    const MAX_SAMPLES: usize = 32;
+    // Below this a median stops meaning much, so a slow operation costs more
+    // wall-clock rather than fewer samples.
+    const MIN_SAMPLES: usize = 6;
+    // Roughly what one side of one cell may spend. An operation slower than
+    // `budget / MIN_SAMPLES` overruns it, which is the intended trade.
+    const BUDGET_NS: f64 = 100_000_000.0;
+    // A ceiling for the calibration, so an operation that is somehow free
+    // cannot spin the doubling loop forever.
+    const MAX_ITERS: u64 = 1 << 22;
+
+    // Warm both sides before the clock is consulted at all.
+    rust_op();
+    ffi_op();
+
+    // Size the batch so that BOTH sides clear the clock's resolution, which
+    // means gating on the faster of the two.
+    let mut iters: u64 = 1;
+    let mut batch_ns = 0.0;
+    while iters < MAX_ITERS {
+        let rust_ns = time_batch(&mut rust_op, iters);
+        let ffi_ns = time_batch(&mut ffi_op, iters);
+        batch_ns = rust_ns.max(ffi_ns) * iters as f64;
+        if rust_ns.min(ffi_ns) * iters as f64 >= TARGET_BATCH_NS {
+            break;
+        }
+        iters *= 2;
+    }
+
+    // Spend a fixed budget rather than a fixed sample count, so one slow
+    // fixture cannot dominate the run. A batch already past the budget still
+    // gets `MIN_SAMPLES`: fewer than that and the median stops meaning much.
+    let samples = if batch_ns > 0.0 {
+        ((BUDGET_NS / batch_ns) as usize).clamp(MIN_SAMPLES, MAX_SAMPLES)
+    } else {
+        MAX_SAMPLES
+    };
+
+    let mut rust_samples = Vec::with_capacity(samples);
+    let mut ffi_samples = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        // Alternate which side leads, so a drift that happens inside one
+        // sample does not always land on the same arm.
+        if sample % 2 == 0 {
+            rust_samples.push(time_batch(&mut rust_op, iters));
+            ffi_samples.push(time_batch(&mut ffi_op, iters));
+        } else {
+            ffi_samples.push(time_batch(&mut ffi_op, iters));
+            rust_samples.push(time_batch(&mut rust_op, iters));
         }
     }
-    format!("cpu={cpu} vol_switches={voluntary} invol_switches={involuntary}")
+
+    // The ratio is formed PER SAMPLE and only then summarised. Dividing one
+    // side's best by the other's best would pair two moments again, which is
+    // the thing this measurement exists to avoid.
+    let mut speedups: Vec<f64> = rust_samples
+        .iter()
+        .zip(&ffi_samples)
+        .map(|(rust, ffi)| if *rust > 0.0 { ffi / rust } else { f64::NAN })
+        .filter(|value| value.is_finite())
+        .collect();
+    speedups.sort_by(|a, b| a.partial_cmp(b).expect("filtered to finite"));
+    let median = if speedups.is_empty() {
+        f64::NAN
+    } else {
+        let mid = speedups.len() / 2;
+        if speedups.len().is_multiple_of(2) {
+            (speedups[mid - 1] + speedups[mid]) / 2.0
+        } else {
+            speedups[mid]
+        }
+    };
+    let fold = |values: &[f64]| values.iter().copied().fold(f64::INFINITY, f64::min);
+
+    PairedMeasurement {
+        speedup_median: median,
+        speedup_min: speedups.first().copied().unwrap_or(f64::NAN),
+        speedup_max: speedups.last().copied().unwrap_or(f64::NAN),
+        rust_min_ns: fold(&rust_samples),
+        ffi_min_ns: fold(&ffi_samples),
+        samples: speedups.len(),
+        iters,
+    }
+}
+
+/// Emit one paired comparison in the shape the benchmark parser reads.
+fn emit_pair_report(
+    stage: &str,
+    scenario: &Scenario,
+    level_name: &str,
+    source: &str,
+    paired: &PairedMeasurement,
+) {
+    println!(
+        "REPORT_PAIR stage={stage} scenario={} level={level_name} source={source} \
+         speedup_median={:.6} speedup_min={:.6} speedup_max={:.6} \
+         rust_min_ns={:.3} ffi_min_ns={:.3} samples={} iters={}",
+        scenario.id,
+        paired.speedup_median,
+        paired.speedup_min,
+        paired.speedup_max,
+        paired.rust_min_ns,
+        paired.ffi_min_ns,
+        paired.samples,
+        paired.iters,
+    );
 }
 
 /// Which side of a comparison a buffer belongs to.
@@ -552,19 +700,29 @@ impl BenchArena {
         for buffer in &mut appended {
             buffer.clear();
         }
-        // PROBE: how large the arena is and where it landed, so its cost can be
-        // read rather than assumed.
-        eprintln!(
-            "PROBE_STATE arena append_capacity={append_capacity} write_len={write_len} \
-             rust_dst={:p} ffi_dst={:p}",
-            written[0].as_ptr(),
-            written[1].as_ptr(),
-        );
         Self { appended, written }
     }
 
     fn appended(&mut self, arm: Arm) -> &mut Vec<u8> {
         &mut self.appended[arm.index()]
+    }
+
+    /// Both arms' append buffers at once, for a measurement that needs to hold
+    /// them simultaneously.
+    fn appended_pair(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>) {
+        let [rust, ffi] = &mut self.appended;
+        (rust, ffi)
+    }
+
+    /// Both arms' destination buffers at once, sliced to `len`.
+    fn written_pair(&mut self, len: usize) -> (&mut [u8], &mut [u8]) {
+        let [rust, ffi] = &mut self.written;
+        assert!(
+            len <= rust.len(),
+            "arena holds {} bytes per arm, a group asked for {len}",
+            rust.len(),
+        );
+        (&mut rust[..len], &mut ffi[..len])
     }
 
     fn written(&mut self, arm: Arm, len: usize) -> &mut [u8] {
@@ -592,7 +750,7 @@ fn bench_decompress_source(
     level: LevelConfig,
     source: &'static str,
     expected_len: usize,
-    _emit_reports: bool,
+    emit_reports: bool,
 ) {
     let benchmark_name = format!(
         "decompress/{}/{}/{}/matrix",
@@ -638,18 +796,31 @@ fn bench_decompress_source(
     // The C arm asks for the same, so a size difference cannot separate them.
     let destination_len = expected_len + structured_zstd::WILDCOPY_OVERLENGTH;
 
-    // PROBE: which CPU this cell is about to run on, and how often the
-    // scheduler has taken the process off a CPU against its will. A cell that
-    // reads two different speeds in one process is either migrating between
-    // cores or sharing one with something else, and these two numbers say
-    // which.
-    eprintln!(
-        "PROBE_CPU {}/{}/{} {}",
-        level.name,
-        scenario.id,
-        source,
-        cpu_and_switches()
-    );
+    // The paired comparison, which is what the dashboard reports. It runs
+    // before the criterion arms so that neither arm's own measurement can
+    // colour it, and it uses the same buffers and the same steady-state shape
+    // (one decoder, one DCtx, reused across iterations) as the arms below.
+    if emit_reports {
+        let compressed = materialize();
+        let mut decoder = FrameDecoder::new();
+        let mut dctx = FfiDCtxHandle::new();
+        let paired = ARENA.with_borrow_mut(|arena| {
+            let (rust_target, ffi_target) = arena.written_pair(destination_len);
+            measure_pair(
+                || {
+                    let written = decoder
+                        .decode_all(black_box(compressed), rust_target)
+                        .unwrap();
+                    black_box(&rust_target[..written]);
+                },
+                || {
+                    let written = dctx.decompress_into(black_box(compressed), ffi_target);
+                    black_box(&ffi_target[..written]);
+                },
+            )
+        });
+        emit_pair_report("decompress", scenario, level.name, source, &paired);
+    }
 
     bench_arm_pair(
         &mut group,
@@ -834,6 +1005,39 @@ fn bench_dictionary(c: &mut Criterion) {
         let mut group = c.benchmark_group(benchmark_name);
         configure_group(&mut group, scenario, BenchOp::Compress);
         group.throughput(Throughput::Bytes(total_training_bytes as u64));
+
+        // The paired comparison, which is what the dashboard reports. Dictionary
+        // training allocates inside the measured work on both sides, so unlike
+        // the other groups there is no shared buffer to take from the arena;
+        // what the pairing buys here is the same window for both sides.
+        if emit_reports {
+            let paired = measure_pair(
+                || {
+                    let (raw_dict, tuned) = train_fastcover_raw_from_slice(
+                        scenario.bytes.as_slice(),
+                        rust_content_budget,
+                        &fastcover_options,
+                    )
+                    .expect("fastcover training should succeed");
+                    let dict = finalize_raw_dict(
+                        raw_dict.as_slice(),
+                        scenario.bytes.as_slice(),
+                        dict_size,
+                        FinalizeOptions::default(),
+                    )
+                    .expect("fastcover dictionary finalization should succeed");
+                    black_box((dict.len(), tuned.score));
+                },
+                || {
+                    black_box(
+                        zstd::dict::from_samples(&ffi_samples, dict_size)
+                            .expect("ffi dictionary training should succeed")
+                            .len(),
+                    );
+                },
+            );
+            emit_pair_report("dict-train", scenario, "na", "na", &paired);
+        }
 
         bench_arm_pair(
             &mut group,
@@ -1062,9 +1266,50 @@ fn bench_dictionary(c: &mut Criterion) {
                 })
             };
 
-            if rust_with_dict_len.is_some()
-                && EncoderDictionary::from_bytes(&ffi_dictionary).is_ok()
-            {
+            let rust_dict_available = rust_with_dict_len.is_some()
+                && EncoderDictionary::from_bytes(&ffi_dictionary).is_ok();
+
+            // The paired comparison, which is what the dashboard reports. Only
+            // possible when both sides have a dictionary to compress with.
+            if emit_reports && rust_dict_available {
+                let mut ffi_compressor =
+                    zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
+                        .unwrap();
+                configure_ffi_bulk_compressor(&mut ffi_compressor, &level);
+                let mut rust_compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
+                if let Some(params) = ldm_parameters(&level) {
+                    rust_compressor.set_parameters(&params);
+                }
+                rust_compressor.set_content_checksum(cfg!(feature = "hash"));
+                rust_compressor
+                    .set_encoder_dictionary(
+                        EncoderDictionary::from_bytes(&ffi_dictionary)
+                            .expect("dictionary parse checked above"),
+                    )
+                    .expect("prepared dictionary should attach");
+                let paired = ARENA.with_borrow_mut(|arena| {
+                    let (rust_output, ffi_output) = arena.appended_pair();
+                    measure_pair(
+                        || {
+                            rust_compressor.compress_independent_frame_into(
+                                scenario.bytes.as_slice(),
+                                rust_output,
+                            );
+                            black_box(&rust_output);
+                        },
+                        || {
+                            ffi_output.clear();
+                            ffi_compressor
+                                .compress_to_buffer(&scenario.bytes, ffi_output)
+                                .expect("dictionary compression should succeed");
+                            black_box(&ffi_output);
+                        },
+                    )
+                });
+                emit_pair_report("compress-dict", scenario, level.name, "na", &paired);
+            }
+
+            if rust_dict_available {
                 bench_arm_pair(
                     &mut group,
                     "pure_rust_with_dict",
@@ -1160,6 +1405,38 @@ fn bench_dictionary(c: &mut Criterion) {
                     scenario.bytes.as_slice(),
                     "ffi dict decode bytes diverge from scenario reference",
                 );
+            }
+
+            // The paired comparison, which is what the dashboard reports.
+            if emit_reports {
+                let mut decoder = FrameDecoder::new();
+                let mut decompressor =
+                    zstd::bulk::Decompressor::with_dictionary(&ffi_dictionary).unwrap();
+                let paired = ARENA.with_borrow_mut(|arena| {
+                    let (rust_output, ffi_output) = arena.written_pair(expected_len);
+                    measure_pair(
+                        || {
+                            let n = decoder
+                                .decode_all_with_dict_handle(
+                                    black_box(with_dict_bytes.as_slice()),
+                                    rust_output,
+                                    rust_dict_handle,
+                                )
+                                .expect("rust decode-with-dict must succeed");
+                            black_box(&rust_output[..n]);
+                        },
+                        || {
+                            let n = decompressor
+                                .decompress_to_buffer(
+                                    black_box(with_dict_bytes.as_slice()),
+                                    ffi_output,
+                                )
+                                .expect("ffi decode-with-dict must succeed");
+                            black_box(&ffi_output[..n]);
+                        },
+                    )
+                });
+                emit_pair_report("decompress-dict", scenario, level.name, "na", &paired);
             }
 
             // Outputs from the arena, like every other group: an arm that takes

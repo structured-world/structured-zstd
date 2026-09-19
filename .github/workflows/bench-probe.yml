@@ -1,16 +1,12 @@
-# Throwaway diagnostic. Does pinning the bench to one CPU make a cell read the
-# same speed every time it runs?
+# Throwaway diagnostic. Which of the two speed deltas is steadier on a shared
+# runner: the one formed from the two criterion arms, or the one formed from a
+# measurement that alternates the implementations inside one window?
 #
-# On the shared runners a cell has read two speeds ~1.4x apart inside one
-# process, and the absolute level of the same binary and command has varied 4.5x
-# between jobs. The first of those is what pinning could fix: a single-threaded
-# bench that migrates between vCPUs loses the caches its samples were warming,
-# and can land beside a busy sibling.
-#
-# Same binary throughout, run unpinned and pinned to one CPU, interleaved three
-# times so a state belonging to the machine shows up in both. Each cell prints
-# the CPU it is about to run on and the process's context-switch counts, so the
-# mechanism is visible and not inferred from the timings.
+# Run the real benchmark script twice on one machine and compare the two
+# payloads cell by cell. Both numbers are produced by both runs, so the same
+# comparison decides it: whichever moves less between two independent runs of
+# identical code is the better number to publish. Nothing here is a claim about
+# the implementations; it is a claim about the measurement.
 #
 # Push-triggered on `probe/**` only. Delete the branch when the answer is in.
 name: bench-probe
@@ -24,16 +20,16 @@ permissions:
 
 jobs:
   probe:
-    name: pinned versus unpinned on one shared runner
+    name: paired delta versus arm-pair delta, twice on one runner
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
+      STRUCTURED_ZSTD_BENCH_TARGET: x86_64-gnu
+      STRUCTURED_ZSTD_BENCH_TRIPLE: x86_64-unknown-linux-gnu
+      STRUCTURED_ZSTD_BENCH_GENERATED_AT: '2026-01-01T00:00:00+00:00'
       STRUCTURED_ZSTD_BENCH_LEVEL_FILTER: 'level_3_dfast,level_6_lazy'
-      # What the runner script sets on CI, so the fixture sizes match the ones
-      # the dashboard measures rather than the much larger local defaults.
-      STRUCTURED_ZSTD_BENCH_LARGE_BYTES: '16777216'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -44,8 +40,7 @@ jobs:
       - name: Runner identity
         run: |
           grep -m1 'model name' /proc/cpuinfo || true
-          echo "cpus=$(nproc)"; cat /proc/loadavg; free -m | head -2
-          taskset --version || echo "no taskset"
+          echo "cpus=$(nproc)"; cat /proc/loadavg
 
       - name: Build the bench binary as bench-build does
         env:
@@ -53,27 +48,75 @@ jobs:
         run: |
           cargo bench --bench compare_ffi -p ffi-bench \
             --target x86_64-unknown-linux-gnu --no-run --message-format=json > build.log
-          mkdir -p bench-binary target/criterion
+          mkdir -p bench-binary
           cp "$(jq -r 'select(.executable != null and (.target.name == "compare_ffi")) | .executable' build.log | tail -1)" \
             bench-binary/compare_ffi
           chmod +x bench-binary/compare_ffi
 
-      # The last CPU rather than the first: CPU 0 takes the interrupts.
-      - name: Interleave unpinned and pinned
+      - name: First run
+        env:
+          STRUCTURED_ZSTD_BENCH_BIN: ${{ github.workspace }}/bench-binary/compare_ffi
         run: |
-          last_cpu=$(( $(nproc) - 1 ))
-          echo "pinning to cpu $last_cpu"
-          for pass in 1 2 3; do
-            for mode in bare pinned; do
-              echo "--- pass $pass, $mode"
-              if [ "$mode" = pinned ]; then
-                pin=(taskset -c "$last_cpu")
-              else
-                pin=()
-              fi
-              "${pin[@]}" ./bench-binary/compare_ffi --bench --output-format bencher \
-                --noplot --measurement-time 2 \
-                "decompress/.*/(high-entropy-1m|decodecorpus-synthetic-1m)/" 2>&1 \
-                | grep -E '^test decompress|^PROBE_CPU ' || true
-            done
-          done
+          ./.github/scripts/run-benchmarks.sh > /dev/null
+          cp benchmark-relative.json first.json
+
+      - name: Second run
+        env:
+          STRUCTURED_ZSTD_BENCH_BIN: ${{ github.workspace }}/bench-binary/compare_ffi
+        run: |
+          ./.github/scripts/run-benchmarks.sh > /dev/null
+          cp benchmark-relative.json second.json
+
+      # Identical code, one machine, two runs. Whatever a number moves between
+      # them is measurement, so the smaller mover is the better number.
+      - name: How much each number moved between the two runs
+        run: |
+          python3 - <<'PY'
+          import json, statistics
+
+          def rows(path):
+              payload = json.load(open(path))
+              out = {}
+              for record in payload["records"]:
+                  if record.get("metric") != "throughput_bytes_per_sec":
+                      continue
+                  key = (record["stage"], record["scenario"],
+                         record["level"], str(record.get("source")))
+                  out[key] = record
+              return out
+
+          first, second = rows("first.json"), rows("second.json")
+          shared = sorted(set(first) & set(second))
+          print(f"cells compared: {len(shared)}")
+
+          def drift(getter):
+              moves = []
+              for key in shared:
+                  a, b = getter(first[key]), getter(second[key])
+                  if a and b and a > 0 and b > 0:
+                      moves.append(abs(b / a - 1.0) * 100.0)
+              return moves
+
+          paired = drift(lambda r: r["delta_ratio"] if r.get("delta_source") == "paired" else None)
+          arms = drift(lambda r: r.get("delta_from_criterion_arms"))
+
+          for name, moves in (("paired", paired), ("criterion arms", arms)):
+              if not moves:
+                  print(f"{name:<16} no data")
+                  continue
+              moves.sort()
+              print(f"{name:<16} n={len(moves):<4} median={statistics.median(moves):6.2f}%  "
+                    f"p90={moves[int(len(moves) * 0.9)]:6.2f}%  max={max(moves):6.2f}%")
+
+          print()
+          print(f"{'cell':<52}{'paired run1':>12}{'run2':>10}{'move':>8}   "
+                f"{'arms run1':>10}{'run2':>10}{'move':>8}")
+          for key in shared:
+              a, b = first[key], second[key]
+              pa, pb = a["delta_ratio"], b["delta_ratio"]
+              aa, ab = a.get("delta_from_criterion_arms"), b.get("delta_from_criterion_arms")
+              label = "/".join(part for part in key if part != "None")
+              pm = abs(pb / pa - 1) * 100 if pa else float("nan")
+              am = abs(ab / aa - 1) * 100 if aa else float("nan")
+              print(f"{label:<52}{pa:12.3f}{pb:10.3f}{pm:7.1f}%   {aa:10.3f}{ab:10.3f}{am:7.1f}%")
+          PY
