@@ -782,6 +782,36 @@ thread_local! {
         core::cell::RefCell::new(BenchArena::for_scenarios(benchmark_scenarios_cached()));
 }
 
+/// The decoders every plain decompress cell uses, built once for the process.
+///
+/// A decoder allocates its own working memory when it is built, out of
+/// whatever the heap looks like at that moment. Built inside a cell, that
+/// placement is decided by everything the matrix did beforehand and then does
+/// not move for the life of the cell, so the minimum over the cell's batches is
+/// a minimum over one placement rather than over the decode. Measured across
+/// nine destination offsets and two sweeps on one runner, libzstd's side held
+/// 185.4-187.1 ns on `small-10k-random` while ours ranged 205.8-328.8, and the
+/// slow readings covered every batch of a cell rather than a few of them:
+/// sweeping the DESTINATION left that untouched, which is what points at the
+/// decoder's own memory. Building both once gives every cell the same decoder
+/// at the same address.
+///
+/// The dictionary groups keep building theirs per group: libzstd's side there
+/// is bound to a dictionary and cannot be hoisted the same way, and hoisting
+/// only ours would put back the asymmetry this is removing.
+struct BenchDecoders {
+    rust: FrameDecoder,
+    ffi: FfiDCtxHandle,
+}
+
+thread_local! {
+    static DECODERS: core::cell::RefCell<BenchDecoders> =
+        core::cell::RefCell::new(BenchDecoders {
+            rust: FrameDecoder::new(),
+            ffi: FfiDCtxHandle::new(),
+        });
+}
+
 fn bench_decompress_source(
     c: &mut Criterion,
     scenario: &Scenario,
@@ -840,22 +870,21 @@ fn bench_decompress_source(
     // (one decoder, one DCtx, reused across iterations) as the arms below.
     if emit_reports {
         let compressed = materialize();
-        let mut decoder = FrameDecoder::new();
-        let mut dctx = FfiDCtxHandle::new();
-        let paired = ARENA.with_borrow_mut(|arena| {
-            let (rust_target, ffi_target) = arena.written_pair(destination_len);
-            measure_pair(
-                || {
-                    let written = decoder
-                        .decode_all(black_box(compressed), rust_target)
-                        .unwrap();
-                    black_box(&rust_target[..written]);
-                },
-                || {
-                    let written = dctx.decompress_into(black_box(compressed), ffi_target);
-                    black_box(&ffi_target[..written]);
-                },
-            )
+        let paired = DECODERS.with_borrow_mut(|decoders| {
+            let BenchDecoders { rust, ffi } = decoders;
+            ARENA.with_borrow_mut(|arena| {
+                let (rust_target, ffi_target) = arena.written_pair(destination_len);
+                measure_pair(
+                    || {
+                        let written = rust.decode_all(black_box(compressed), rust_target).unwrap();
+                        black_box(&rust_target[..written]);
+                    },
+                    || {
+                        let written = ffi.decompress_into(black_box(compressed), ffi_target);
+                        black_box(&ffi_target[..written]);
+                    },
+                )
+            })
         });
         emit_pair_report("decompress", scenario, level.name, source, &paired);
     }
@@ -865,29 +894,35 @@ fn bench_decompress_source(
         "pure_rust",
         |b| {
             let compressed = materialize();
-            let mut decoder = FrameDecoder::new();
-            ARENA.with_borrow_mut(|arena| {
-                let target = arena.written(Arm::Rust, destination_len);
-                b.iter(|| {
-                    let written = decoder.decode_all(black_box(compressed), target).unwrap();
-                    black_box(&target[..written]);
-                    assert_eq!(written, expected_len);
+            DECODERS.with_borrow_mut(|decoders| {
+                ARENA.with_borrow_mut(|arena| {
+                    let target = arena.written(Arm::Rust, destination_len);
+                    b.iter(|| {
+                        let written = decoders
+                            .rust
+                            .decode_all(black_box(compressed), target)
+                            .unwrap();
+                        black_box(&target[..written]);
+                        assert_eq!(written, expected_len);
+                    })
                 })
             })
         },
         "c_ffi",
         |b| {
             let compressed = materialize();
-            // Reuse one DCtx across iterations so the timing sample reflects
-            // decode steady-state, as the other arm reuses one `FrameDecoder`.
-            // A fresh DCtx per iteration would dominate sub-millisecond samples.
-            let mut dctx = FfiDCtxHandle::new();
-            ARENA.with_borrow_mut(|arena| {
-                let target = arena.written(Arm::Ffi, destination_len);
-                b.iter(|| {
-                    let written = dctx.decompress_into(black_box(compressed), target);
-                    assert_eq!(written, expected_len);
-                    black_box(&target[..written]);
+            // The DCtx is reused across iterations, as the other arm reuses its
+            // decoder: a fresh one per iteration would dominate sub-millisecond
+            // samples. Both are held for the process, so neither arm's working
+            // memory is placed by what the matrix did before this cell.
+            DECODERS.with_borrow_mut(|decoders| {
+                ARENA.with_borrow_mut(|arena| {
+                    let target = arena.written(Arm::Ffi, destination_len);
+                    b.iter(|| {
+                        let written = decoders.ffi.decompress_into(black_box(compressed), target);
+                        assert_eq!(written, expected_len);
+                        black_box(&target[..written]);
+                    })
                 })
             })
         },
