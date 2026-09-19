@@ -451,56 +451,44 @@ fn bench_decompress_source(
             .as_slice()
     };
 
+    // Both destinations are taken HERE, before either arm runs, and the fixture
+    // with them. Allocating inside each arm gave the two buffers different
+    // points in the process's allocation history — the first arm's came off a
+    // heap the matrix had just churned, the second's off the free list the
+    // first one left — and on the bench runner that difference read as a
+    // FOURFOLD difference between the implementations on input that is
+    // byte-identical between the two sources. It is a property of the harness,
+    // so it is removed here rather than reported as a property of the decoders.
+    //
+    // Sized with WILDCOPY_OVERLENGTH slack so `decode_all` routes through the
+    // direct-write path; the slack is the dispatcher's eligibility gate. The
+    // C arm gets the same shape so a size difference cannot land the two at
+    // different addresses.
+    let compressed = materialize();
+    release_freed_memory();
+    let mut rust_target = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
+    let mut ffi_target = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
+    pretouch_pages(&mut rust_target);
+    pretouch_pages(&mut ffi_target);
+
     group.bench_function("pure_rust", |b| {
-        // Materialize BEFORE the trim, in both arms. Compressing the fixture is
-        // what fills the input cell, and it allocates and frees the encoder's
-        // contexts on the way — so an arm that trims first and materializes
-        // second starts on the free lists that work left behind, while the arm
-        // that finds the cell already full starts clean. Which arm gets which
-        // then depends on the order they run in, and that is the run-order
-        // effect the trim exists to remove.
-        let compressed = materialize();
-        release_freed_memory();
-        // Target sized with WILDCOPY_OVERLENGTH slack so `decode_all`
-        // routes through the direct-write path (decode straight into
-        // `target`, no FlatBuf drain copy). The slack is the
-        // dispatcher's eligibility gate; without it the call falls
-        // back to the legacy per-block drain loop. The auto-reserve
-        // inside `decode_all_to_vec` provides the equivalent slack
-        // transparently for Vec-based callers.
-        let mut target = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
-        pretouch_pages(&mut target);
+        let target = &mut rust_target;
         let mut decoder = FrameDecoder::new();
         b.iter(|| {
-            let written = decoder
-                .decode_all(black_box(compressed), &mut target)
-                .unwrap();
+            let written = decoder.decode_all(black_box(compressed), target).unwrap();
             black_box(&target[..written]);
             assert_eq!(written, expected_len);
         })
     });
 
     group.bench_function("c_ffi", |b| {
-        // Materialize then trim, as the arm above; see the note there.
-        let compressed = materialize();
-        release_freed_memory();
-        // Reuse one DCtx + target buffer across iterations so the
-        // timing sample reflects decode steady-state — matches the
-        // pure-Rust loop above which reuses one `FrameDecoder` and
-        // one `target`. Creating a fresh DCtx per iteration would
-        // dominate sub-millisecond samples.
+        // Reuse one DCtx across iterations so the timing sample reflects decode
+        // steady-state, as the arm above reuses one `FrameDecoder`. Creating a
+        // fresh DCtx per iteration would dominate sub-millisecond samples.
         let mut dctx = FfiDCtxHandle::new();
-        // Same allocation as the arm above, down to the trailing slack it needs
-        // to stay on its direct path. The extra bytes are spare capacity here
-        // and change nothing about what libzstd does, but they keep the two
-        // arms' buffers identically shaped: a difference in size lands the two
-        // at different addresses and in different allocator states, which is a
-        // property of the harness that a ratio would report as a property of
-        // the implementations.
-        let mut target = vec![0u8; expected_len + structured_zstd::WILDCOPY_OVERLENGTH];
-        pretouch_pages(&mut target);
+        let target = &mut ffi_target;
         b.iter(|| {
-            let written = dctx.decompress_into(black_box(compressed), &mut target);
+            let written = dctx.decompress_into(black_box(compressed), target);
             assert_eq!(written, expected_len);
             black_box(&target[..written]);
         })
