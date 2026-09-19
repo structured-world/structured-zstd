@@ -2521,6 +2521,11 @@ impl MatchTable {
     /// so it is settled here once and the stored index is the cursor plus a
     /// hoisted offset, with no `Option`.
     fn fill_hash3_hoisted(&mut self, abs_pos: usize) -> bool {
+        // This is the unarmed entry, so the representability question is
+        // answered here rather than inside the fill.
+        if !self.can_skip_rebase_check(abs_pos) {
+            return false;
+        }
         // The slice holds no borrow, so the table write can take `&mut self`
         // (the same reborrow the collect body uses).
         let (concat_ptr, concat_len) = {
@@ -2558,7 +2563,16 @@ impl MatchTable {
         concat_len: usize,
         abs_pos: usize,
     ) -> bool {
-        if self.hash3_log == 0 || !self.can_skip_rebase_check(abs_pos) {
+        // Representability is the CALLER's to settle: the match finder reaches
+        // here inside a block that `arm_block_positions` cleared, and asking
+        // again is the per-position question this refactor removed. The general
+        // catch-up, whose caller has not armed anything, asks it in
+        // `fill_hash3_hoisted` before delegating.
+        debug_assert!(
+            self.can_skip_rebase_check(abs_pos),
+            "hash3 fill needs a position the caller has cleared",
+        );
+        if self.hash3_log == 0 {
             return false;
         }
         let history_abs_start = self.history_abs_start;
