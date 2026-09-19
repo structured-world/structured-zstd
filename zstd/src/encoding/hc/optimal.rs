@@ -2097,6 +2097,7 @@ impl HcMatchGenerator {
         feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
+    #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_neon<
         S: crate::encoding::strategy::Strategy,
     >(
@@ -2126,6 +2127,7 @@ impl HcMatchGenerator {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse4.2")]
+    #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_sse42<
         S: crate::encoding::strategy::Strategy,
     >(
@@ -2161,6 +2163,7 @@ impl HcMatchGenerator {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
+    #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_sse2<
         S: crate::encoding::strategy::Strategy,
     >(
@@ -2190,6 +2193,7 @@ impl HcMatchGenerator {
         feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
+    #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_avx2_bmi2<
         S: crate::encoding::strategy::Strategy,
     >(
@@ -2226,6 +2230,7 @@ impl HcMatchGenerator {
         feature = "kernel-simd128"
     ))]
     #[target_feature(enable = "simd128")]
+    #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_simd128<
         S: crate::encoding::strategy::Strategy,
     >(
@@ -2258,6 +2263,7 @@ impl HcMatchGenerator {
     // Macro emits `unsafe { }` wrappers for NEON/AVX/SSE variants; scalar
     // callees are safe so the blocks are redundant here only.
     #[allow(unused_unsafe)]
+    #[inline(never)]
     pub(crate) fn collect_optimal_candidates_initialized_scalar<
         S: crate::encoding::strategy::Strategy,
     >(
