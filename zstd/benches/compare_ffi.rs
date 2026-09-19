@@ -311,28 +311,37 @@ fn bench_compress(c: &mut Criterion) {
             configure_group(&mut group, scenario, BenchOp::Compress);
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
-            group.bench_function("pure_rust", |b| {
-                release_freed_memory();
-                // One output buffer for the whole sample, exactly as the c_ffi
-                // arm below keeps one `dst`. The compressor is still fresh per
-                // iteration on both sides.
-                let mut output = Vec::new();
-                b.iter(|| {
-                    rust_encode_into(&scenario.bytes[..], &level, &mut output);
-                    black_box(&output);
-                })
-            });
-
-            group.bench_function("c_ffi", |b| {
-                release_freed_memory();
-                // One output buffer for the whole sample (the C caller's
-                // `dst`); see `ffi_encode_into`.
-                let mut output = Vec::new();
-                b.iter(|| {
-                    ffi_encode_into(&scenario.bytes[..], level.ffi_level, level.ldm, &mut output);
-                    black_box(&output);
-                })
-            });
+            bench_arm_pair(
+                &mut group,
+                "pure_rust",
+                |b| {
+                    release_freed_memory();
+                    // One output buffer for the whole sample, exactly as the
+                    // c_ffi arm keeps one `dst`. The compressor is still fresh
+                    // per iteration on both sides.
+                    let mut output = Vec::new();
+                    b.iter(|| {
+                        rust_encode_into(&scenario.bytes[..], &level, &mut output);
+                        black_box(&output);
+                    })
+                },
+                "c_ffi",
+                |b| {
+                    release_freed_memory();
+                    // One output buffer for the whole sample (the C caller's
+                    // `dst`); see `ffi_encode_into`.
+                    let mut output = Vec::new();
+                    b.iter(|| {
+                        ffi_encode_into(
+                            &scenario.bytes[..],
+                            level.ffi_level,
+                            level.ldm,
+                            &mut output,
+                        );
+                        black_box(&output);
+                    })
+                },
+            );
 
             group.finish();
         }
@@ -383,6 +392,51 @@ fn bench_decompress(c: &mut Criterion) {
 /// side effect — LLVM may not remove it. One write per 4 KiB stride
 /// (the most common page size; larger huge pages still get touched at
 /// the smaller stride) is enough to fault each anon page in.
+/// Whether this round registers the C arm of a comparison first.
+///
+/// Criterion does not interleave samples from separate `bench_function`
+/// registrations: whichever arm is registered first meets whatever state the
+/// rest of the matrix left behind, and does so in every round for as long as
+/// the order is fixed. Repeating the matrix does not remove an effect that sits
+/// on a POSITION rather than on a moment — this repository has published a
+/// fourfold difference between the two arms that came from exactly that, on
+/// input the two sources encode identically.
+///
+/// So the runner varies the order between rounds and the parser takes each
+/// arm's minimum across them, which leaves no position for such an effect to
+/// sit on. Rounds are numbered from one, so odd rounds keep the declaration
+/// order and even rounds reverse it; a single-round run (a local `cargo bench`)
+/// keeps the declaration order.
+fn reverse_arm_order() -> bool {
+    use std::sync::OnceLock;
+    static REVERSED: OnceLock<bool> = OnceLock::new();
+    *REVERSED.get_or_init(|| {
+        std::env::var("STRUCTURED_ZSTD_BENCH_ROUND")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .is_some_and(|round| round % 2 == 0)
+    })
+}
+
+/// Register the two arms of a comparison in this round's order.
+///
+/// Both are registered either way; only which one Criterion runs first moves.
+fn bench_arm_pair<M: criterion::measurement::Measurement>(
+    group: &mut criterion::BenchmarkGroup<'_, M>,
+    rust_name: &str,
+    rust_arm: impl FnMut(&mut criterion::Bencher<'_, M>),
+    ffi_name: &str,
+    ffi_arm: impl FnMut(&mut criterion::Bencher<'_, M>),
+) {
+    if reverse_arm_order() {
+        group.bench_function(ffi_name, ffi_arm);
+        group.bench_function(rust_name, rust_arm);
+    } else {
+        group.bench_function(rust_name, rust_arm);
+        group.bench_function(ffi_name, ffi_arm);
+    }
+}
+
 #[inline(never)]
 fn pretouch_pages(buf: &mut [u8]) {
     if buf.is_empty() {
@@ -483,34 +537,38 @@ fn bench_decompress_source(
         }
     };
 
-    group.bench_function("pure_rust", |b| {
-        let compressed = materialize();
-        prepare_destinations();
-        let mut slot = destinations.borrow_mut();
-        let target = &mut slot.as_mut().expect("prepared above").rust;
-        let mut decoder = FrameDecoder::new();
-        b.iter(|| {
-            let written = decoder.decode_all(black_box(compressed), target).unwrap();
-            black_box(&target[..written]);
-            assert_eq!(written, expected_len);
-        })
-    });
-
-    group.bench_function("c_ffi", |b| {
-        let compressed = materialize();
-        prepare_destinations();
-        // Reuse one DCtx across iterations so the timing sample reflects decode
-        // steady-state, as the arm above reuses one `FrameDecoder`. Creating a
-        // fresh DCtx per iteration would dominate sub-millisecond samples.
-        let mut dctx = FfiDCtxHandle::new();
-        let mut slot = destinations.borrow_mut();
-        let target = &mut slot.as_mut().expect("prepared above").ffi;
-        b.iter(|| {
-            let written = dctx.decompress_into(black_box(compressed), target);
-            assert_eq!(written, expected_len);
-            black_box(&target[..written]);
-        })
-    });
+    bench_arm_pair(
+        &mut group,
+        "pure_rust",
+        |b| {
+            let compressed = materialize();
+            prepare_destinations();
+            let mut slot = destinations.borrow_mut();
+            let target = &mut slot.as_mut().expect("prepared above").rust;
+            let mut decoder = FrameDecoder::new();
+            b.iter(|| {
+                let written = decoder.decode_all(black_box(compressed), target).unwrap();
+                black_box(&target[..written]);
+                assert_eq!(written, expected_len);
+            })
+        },
+        "c_ffi",
+        |b| {
+            let compressed = materialize();
+            prepare_destinations();
+            // Reuse one DCtx across iterations so the timing sample reflects
+            // decode steady-state, as the other arm reuses one `FrameDecoder`.
+            // A fresh DCtx per iteration would dominate sub-millisecond samples.
+            let mut dctx = FfiDCtxHandle::new();
+            let mut slot = destinations.borrow_mut();
+            let target = &mut slot.as_mut().expect("prepared above").ffi;
+            b.iter(|| {
+                let written = dctx.decompress_into(black_box(compressed), target);
+                assert_eq!(written, expected_len);
+                black_box(&target[..written]);
+            })
+        },
+    );
 
     group.finish();
 }
@@ -663,36 +721,40 @@ fn bench_dictionary(c: &mut Criterion) {
         configure_group(&mut group, scenario, BenchOp::Compress);
         group.throughput(Throughput::Bytes(total_training_bytes as u64));
 
-        group.bench_function("pure_rust", |b| {
-            release_freed_memory();
-            b.iter(|| {
-                let (raw_dict, tuned) = train_fastcover_raw_from_slice(
-                    scenario.bytes.as_slice(),
-                    rust_content_budget,
-                    &fastcover_options,
-                )
-                .expect("fastcover training should succeed");
-                let dict = finalize_raw_dict(
-                    raw_dict.as_slice(),
-                    scenario.bytes.as_slice(),
-                    dict_size,
-                    FinalizeOptions::default(),
-                )
-                .expect("fastcover dictionary finalization should succeed");
-                black_box((dict.len(), tuned.score));
-            })
-        });
-
-        group.bench_function("c_ffi", |b| {
-            release_freed_memory();
-            b.iter(|| {
-                black_box(
-                    zstd::dict::from_samples(&ffi_samples, dict_size)
-                        .expect("ffi dictionary training should succeed")
-                        .len(),
-                )
-            })
-        });
+        bench_arm_pair(
+            &mut group,
+            "pure_rust",
+            |b| {
+                release_freed_memory();
+                b.iter(|| {
+                    let (raw_dict, tuned) = train_fastcover_raw_from_slice(
+                        scenario.bytes.as_slice(),
+                        rust_content_budget,
+                        &fastcover_options,
+                    )
+                    .expect("fastcover training should succeed");
+                    let dict = finalize_raw_dict(
+                        raw_dict.as_slice(),
+                        scenario.bytes.as_slice(),
+                        dict_size,
+                        FinalizeOptions::default(),
+                    )
+                    .expect("fastcover dictionary finalization should succeed");
+                    black_box((dict.len(), tuned.score));
+                })
+            },
+            "c_ffi",
+            |b| {
+                release_freed_memory();
+                b.iter(|| {
+                    black_box(
+                        zstd::dict::from_samples(&ffi_samples, dict_size)
+                            .expect("ffi dictionary training should succeed")
+                            .len(),
+                    )
+                })
+            },
+        );
 
         group.finish();
 
@@ -813,6 +875,11 @@ fn bench_dictionary(c: &mut Criterion) {
             // input in place and takes the output buffer per call, so it needs
             // no `set_drain`/`set_source` — sidestepping the lifetime issue
             // (PR #277) that forced the old per-iter shape.
+            // The only pair whose arms are not both registered unconditionally:
+            // the Rust arm below is gated on the dictionary parsing. An order
+            // that alternates between rounds needs both arms to exist in both
+            // orders, so this group keeps its declaration order and the
+            // `bench_arm_pair` treatment waits for the gate to be lifted.
             group.bench_function("c_ffi_with_dict", |b| {
                 release_freed_memory();
                 let mut compressor =
@@ -967,39 +1034,43 @@ fn bench_dictionary(c: &mut Criterion) {
                 );
             }
 
-            group.bench_function("pure_rust_with_dict", |b| {
-                release_freed_memory();
-                let mut decoder = FrameDecoder::new();
-                let mut output = vec![0u8; expected_len];
-                b.iter(|| {
-                    let n = decoder
-                        .decode_all_with_dict_handle(
-                            black_box(with_dict_bytes.as_slice()),
-                            output.as_mut_slice(),
-                            rust_dict_handle,
-                        )
-                        .expect("rust decode-with-dict must succeed");
-                    assert_eq!(n, expected_len, "rust decode wrote a partial output");
-                    black_box(&output[..n]);
-                })
-            });
-
-            group.bench_function("c_ffi_with_dict", |b| {
-                release_freed_memory();
-                let mut decompressor =
-                    zstd::bulk::Decompressor::with_dictionary(&ffi_dictionary).unwrap();
-                let mut output = vec![0u8; expected_len];
-                b.iter(|| {
-                    let n = decompressor
-                        .decompress_to_buffer(
-                            black_box(with_dict_bytes.as_slice()),
-                            output.as_mut_slice(),
-                        )
-                        .expect("ffi decode-with-dict must succeed");
-                    assert_eq!(n, expected_len, "ffi decode wrote a partial output");
-                    black_box(&output[..n]);
-                })
-            });
+            bench_arm_pair(
+                &mut group,
+                "pure_rust_with_dict",
+                |b| {
+                    release_freed_memory();
+                    let mut decoder = FrameDecoder::new();
+                    let mut output = vec![0u8; expected_len];
+                    b.iter(|| {
+                        let n = decoder
+                            .decode_all_with_dict_handle(
+                                black_box(with_dict_bytes.as_slice()),
+                                output.as_mut_slice(),
+                                rust_dict_handle,
+                            )
+                            .expect("rust decode-with-dict must succeed");
+                        assert_eq!(n, expected_len, "rust decode wrote a partial output");
+                        black_box(&output[..n]);
+                    })
+                },
+                "c_ffi_with_dict",
+                |b| {
+                    release_freed_memory();
+                    let mut decompressor =
+                        zstd::bulk::Decompressor::with_dictionary(&ffi_dictionary).unwrap();
+                    let mut output = vec![0u8; expected_len];
+                    b.iter(|| {
+                        let n = decompressor
+                            .decompress_to_buffer(
+                                black_box(with_dict_bytes.as_slice()),
+                                output.as_mut_slice(),
+                            )
+                            .expect("ffi decode-with-dict must succeed");
+                        assert_eq!(n, expected_len, "ffi decode wrote a partial output");
+                        black_box(&output[..n]);
+                    })
+                },
+            );
 
             group.finish();
         }

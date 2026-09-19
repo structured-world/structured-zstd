@@ -83,6 +83,12 @@ for round in $(seq 1 "$BENCH_ROUNDS"); do
   CRITERION_HOME="$BENCH_CRITERION_HOME/round-$round"
   export CRITERION_HOME
   mkdir -p "$CRITERION_HOME"
+  # The bench registers the two arms of a comparison in an order that depends on
+  # this number. Criterion does not interleave samples across registrations, so
+  # a fixed order leaves the first arm meeting whatever the rest of the matrix
+  # left behind, in every round — and rounds do not cancel an effect that sits
+  # on a position rather than on a moment.
+  export STRUCTURED_ZSTD_BENCH_ROUND="$round"
   echo "Benchmark round $round of $BENCH_ROUNDS" >&2
   if [ -n "${STRUCTURED_ZSTD_BENCH_BIN:-}" ]; then
     # `--noplot`: the run needs criterion's sample DATA, and nothing downstream
