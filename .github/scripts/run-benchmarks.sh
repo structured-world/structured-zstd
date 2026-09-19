@@ -28,7 +28,12 @@ BENCH_RAW_FILE="$(mktemp -t structured-zstd-bench-raw.XXXXXX)"
 # much of the tail it absorbed and moves several percent between runs of
 # identical code. The per-sample minimum is the interference-free figure.
 BENCH_CRITERION_HOME="$(mktemp -d -t structured-zstd-bench-crit.XXXXXX)"
-trap 'rm -rf "$BENCH_RAW_FILE" "$BENCH_CRITERION_HOME"' EXIT
+# Every round's output, appended. The raw file above is overwritten per round
+# because its other `REPORT_*` lines are identical every time; `REPORT_PAIR`
+# lines are not, they are measurements, and one per round is three independent
+# paired estimates to pool.
+BENCH_PAIRS_FILE="$(mktemp -t structured-zstd-bench-pairs.XXXXXX)"
+trap 'rm -rf "$BENCH_RAW_FILE" "$BENCH_CRITERION_HOME" "$BENCH_PAIRS_FILE"' EXIT
 
 # The two arms of a group run one after the other, so a disturbance lasting
 # longer than one arm lands entirely on that arm and the ratio reports it as a
@@ -97,6 +102,7 @@ for round in $(seq 1 "$BENCH_ROUNDS"); do
   else
     "${BENCH_CMD[@]}" -- --output-format bencher --noplot | tee "$BENCH_RAW_FILE"
   fi
+  cat "$BENCH_RAW_FILE" >> "$BENCH_PAIRS_FILE"
 done
 
 # Memory bench (compare_ffi_memory) runs separately when its binary is
@@ -136,6 +142,7 @@ fi
 echo "Parsing results..." >&2
 
 BENCH_RAW_FILE="$BENCH_RAW_FILE" \
+BENCH_PAIRS_FILE="$BENCH_PAIRS_FILE" \
 BENCH_CRITERION_HOME="$BENCH_CRITERION_HOME" \
 BENCH_TARGET_LABEL="$BENCH_TARGET_LABEL" \
 BENCH_TARGET_TRIPLE="$BENCH_TARGET_TRIPLE" \
@@ -386,9 +393,10 @@ dictionary_training_rows = []
 kernel_info = None
 machine_info = collect_machine_info()
 timing_rows = []
-# Paired comparisons by canonical key. These carry the published speed delta;
-# see PAIR_RE for why a ratio formed from two separate criterion arms does not.
-paired_index = {}
+# Paired comparisons by canonical key, one entry per round. These carry the
+# published speed delta; see PAIR_RE for why a ratio formed from two separate
+# criterion arms does not.
+paired_rounds = defaultdict(list)
 scenario_input_bytes = {}
 scenario_training_bytes = {}
 raw_path = os.environ["BENCH_RAW_FILE"]
@@ -541,6 +549,40 @@ def classify_ratio_delta(delta):
         return "near_parity"
     return "rust_worse_larger"
 
+def summarize_paired_rounds(rounds):
+    """Collapse one cell's per-round paired measurements into one delta.
+
+    Each round contributes a ratio formed INSIDE that round, from the two
+    sides' minima over an alternating window. The rounds are then combined by
+    taking the median of those ratios. Pooling the minima across rounds
+    instead would pair one round's best Rust batch with another round's best C
+    batch, which is the cross-window comparison this measurement exists to
+    avoid — the machine's speed moves between rounds.
+    """
+    if not rounds:
+        return None
+    deltas = [
+        entry["ffi_min_ns"] / entry["rust_min_ns"]
+        for entry in rounds
+        if entry["rust_min_ns"] > 0.0 and entry["ffi_min_ns"] > 0.0
+    ]
+    if not deltas:
+        return None
+    ordered = sorted(deltas)
+    mid = len(ordered) // 2
+    median = (
+        (ordered[mid - 1] + ordered[mid]) / 2.0
+        if len(ordered) % 2 == 0
+        else ordered[mid]
+    )
+    return {
+        "delta_rust_over_ffi": median,
+        "per_round_delta": deltas,
+        "rounds": len(deltas),
+        "samples": min(entry["samples"] for entry in rounds),
+        "iters": min(entry["iters"] for entry in rounds),
+    }
+
 def classify_speed_delta(delta):
     if delta is None:
         return "insufficient-data"
@@ -549,6 +591,42 @@ def classify_speed_delta(delta):
     if delta <= DELTA_HIGH:
         return "near_parity"
     return "rust_faster"
+
+# Paired comparisons come from the accumulated file rather than the raw one:
+# the raw file holds only the last round, and each round's paired measurement
+# is an independent estimate worth keeping.
+pairs_path = os.environ.get("BENCH_PAIRS_FILE")
+if pairs_path and Path(pairs_path).is_file():
+    with open(pairs_path) as f:
+        for raw_line in f:
+            pair_match = PAIR_RE.match(raw_line.strip())
+            if not pair_match:
+                continue
+            (
+                stage,
+                scenario,
+                level,
+                source,
+                speedup_median,
+                speedup_min,
+                speedup_max,
+                rust_min_ns,
+                ffi_min_ns,
+                pair_samples,
+                pair_iters,
+            ) = pair_match.groups()
+            # `na` is how the bench spells "this stage has no such axis"; the
+            # key builder wants the absence itself.
+            source_key = None if source == "na" else source
+            paired_rounds[canonical_key(stage, scenario, level, source_key)].append({
+                "speedup_median": float(speedup_median),
+                "speedup_min": float(speedup_min),
+                "speedup_max": float(speedup_max),
+                "rust_min_ns": float(rust_min_ns),
+                "ffi_min_ns": float(ffi_min_ns),
+                "samples": int(pair_samples),
+                "iters": int(pair_iters),
+            })
 
 with open(raw_path) as f:
     for raw_line in f:
@@ -590,36 +668,6 @@ with open(raw_path) as f:
         if kernel_match:
             k_name, k_arch, k_env = kernel_match.groups()
             kernel_info = {"kernel": k_name, "arch": k_arch, "target_env": k_env}
-            continue
-
-        pair_match = PAIR_RE.match(line)
-        if pair_match:
-            (
-                stage,
-                scenario,
-                level,
-                source,
-                speedup_median,
-                speedup_min,
-                speedup_max,
-                rust_min_ns,
-                ffi_min_ns,
-                pair_samples,
-                pair_iters,
-            ) = pair_match.groups()
-            # `na` is how the bench spells "this stage has no such axis"; the
-            # key builder wants the absence itself.
-            source_key = None if source == "na" else source
-            level_key = level if level != "na" else "na"
-            paired_index[canonical_key(stage, scenario, level_key, source_key)] = {
-                "speedup_median": float(speedup_median),
-                "speedup_min": float(speedup_min),
-                "speedup_max": float(speedup_max),
-                "rust_min_ns": float(rust_min_ns),
-                "ffi_min_ns": float(ffi_min_ns),
-                "samples": int(pair_samples),
-                "iters": int(pair_iters),
-            }
             continue
 
         report_match = REPORT_RE.match(line)
@@ -942,7 +990,7 @@ for key in all_keys:
     # absolute per-implementation series, but a delta formed by dividing one
     # arm's minimum by the other's pairs two moments that can be seconds apart,
     # and on a shared runner that has manufactured differences of 1.3x and more.
-    paired = paired_index.get(key)
+    paired = summarize_paired_rounds(paired_rounds.get(key))
     unpaired_speed_delta = (
         rust_bps / ffi_bps
         if (rust_bps is not None and ffi_bps is not None and ffi_bps > 0.0)
@@ -960,12 +1008,8 @@ for key in all_keys:
     # is not published: it divides one disturbed sample by another, which reads
     # systematically below the minima here (0.879 against 0.904 on the row
     # where the two differ most).
-    if (
-        paired is not None
-        and paired["rust_min_ns"] > 0.0
-        and paired["ffi_min_ns"] > 0.0
-    ):
-        speed_delta = paired["ffi_min_ns"] / paired["rust_min_ns"]
+    if paired is not None:
+        speed_delta = paired["delta_rust_over_ffi"]
         speed_delta_source = "paired"
     else:
         speed_delta = unpaired_speed_delta
