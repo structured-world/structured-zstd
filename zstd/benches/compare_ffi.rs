@@ -512,7 +512,12 @@ struct PairedMeasurement {
     rust_min_ns: f64,
     ffi_min_ns: f64,
     samples: usize,
-    iters: u64,
+    /// Each side gets its own batch size, sized so both batches last about as
+    /// long. A shared count would make the slower side's batch as many times
+    /// longer as it is slower, which on a pair where one side is five times
+    /// the other turns a two-second cell into ten.
+    rust_iters: u64,
+    ffi_iters: u64,
 }
 
 /// Time `iters` calls and return the nanoseconds one call took.
@@ -526,69 +531,68 @@ fn time_batch(op: &mut impl FnMut(), iters: u64) -> f64 {
 
 /// Measure both implementations alternately and report the ratio.
 fn measure_pair(mut rust_op: impl FnMut(), mut ffi_op: impl FnMut()) -> PairedMeasurement {
-    // One batch should outlast the clock's resolution without running long
-    // enough for the machine to change speed inside it; a millisecond clears
-    // both by a wide margin on every host this runs on.
-    const TARGET_BATCH_NS: f64 = 1_000_000.0;
+    // A batch has to average as deeply as a criterion sample does, or the
+    // minimum over batches is a worse estimate of a side than the minimum over
+    // criterion's samples and the pairing loses more than it gains. Criterion
+    // spreads ten samples over its measurement budget, so one of its samples is
+    // on the order of a tenth of a second; a batch matches that. Measured with
+    // a batch a hundred times shorter, this figure moved 0.73% between two runs
+    // of identical code against the arms' 0.49%, and up to 18.8% on a cell
+    // where the arms moved 0.3%.
+    const TARGET_BATCH_NS: f64 = 100_000_000.0;
     // A duration target alone leaves an operation slower than the target
-    // measured ONE iteration at a time, so every sample is a single unaveraged
-    // reading. That is what made the first version of this measurement move
-    // 41.8% between two runs of identical code on the slowest fixture while
-    // the criterion arms moved 0.3%. A batch averages at least this many
-    // iterations whatever the clock says.
+    // measured ONE iteration at a time, so every batch would be a single
+    // unaveraged reading. That shape moved this figure 41.8% on the slowest
+    // fixture. A batch averages at least this many iterations whatever the
+    // clock says.
     const MIN_ITERS: u64 = 16;
-    // Enough samples that a minimum is a settled estimate rather than a lucky
-    // draw, which is the other half of the same failure.
-    const MAX_SAMPLES: usize = 64;
-    const MIN_SAMPLES: usize = 12;
+    // Enough batches that the minimum is settled. Deep batches carry little
+    // noise of their own, so this does not need criterion's thirty.
+    const MAX_SAMPLES: usize = 12;
+    const MIN_SAMPLES: usize = 8;
     // Roughly what one side of one cell may spend. An operation slower than
     // `budget / MIN_SAMPLES` overruns it, which is the intended trade: the
     // measurement is only worth having if each side is estimated as well as
     // the arms it replaces.
-    const BUDGET_NS: f64 = 500_000_000.0;
-    // A ceiling for the calibration, so an operation that is somehow free
-    // cannot spin the doubling loop forever.
-    const MAX_ITERS: u64 = 1 << 22;
+    const BUDGET_NS: f64 = 1_200_000_000.0;
+    // A ceiling, so an operation that is somehow free cannot ask for an
+    // unbounded batch.
+    const MAX_ITERS: u64 = 1 << 26;
 
     // Warm both sides before the clock is consulted at all.
     rust_op();
     ffi_op();
 
-    // Size the batch so that BOTH sides clear the clock's resolution, which
-    // means gating on the faster of the two, and so that every batch averages
-    // several iterations however slow the operation is.
-    let mut iters: u64 = MIN_ITERS;
-    let mut batch_ns = 0.0;
-    while iters < MAX_ITERS {
-        let rust_ns = time_batch(&mut rust_op, iters);
-        let ffi_ns = time_batch(&mut ffi_op, iters);
-        batch_ns = rust_ns.max(ffi_ns) * iters as f64;
-        if rust_ns.min(ffi_ns) * iters as f64 >= TARGET_BATCH_NS {
-            break;
+    // One short probe per side, then each batch size follows by arithmetic. A
+    // doubling ladder up to a tenth of a second would cost about as much as
+    // the measurement it is sizing.
+    let batch_size = |per_call_ns: f64| -> u64 {
+        if per_call_ns <= 0.0 {
+            return MAX_ITERS;
         }
-        iters *= 2;
-    }
+        ((TARGET_BATCH_NS / per_call_ns).ceil() as u64).clamp(MIN_ITERS, MAX_ITERS)
+    };
+    let rust_iters = batch_size(time_batch(&mut rust_op, MIN_ITERS));
+    let ffi_iters = batch_size(time_batch(&mut ffi_op, MIN_ITERS));
 
     // Spend a fixed budget rather than a fixed sample count, so one slow
     // fixture cannot dominate the run. A batch already past the budget still
-    // gets `MIN_SAMPLES`: fewer than that and the median stops meaning much.
-    let samples = if batch_ns > 0.0 {
-        ((BUDGET_NS / batch_ns) as usize).clamp(MIN_SAMPLES, MAX_SAMPLES)
-    } else {
-        MAX_SAMPLES
-    };
+    // gets `MIN_SAMPLES`: fewer than that and the minimum is a lucky draw.
+    // Both batches are sized to the same target, so either stands for the
+    // pair's cost.
+    let samples = ((BUDGET_NS / TARGET_BATCH_NS) as usize).clamp(MIN_SAMPLES, MAX_SAMPLES);
 
     let mut rust_samples = Vec::with_capacity(samples);
     let mut ffi_samples = Vec::with_capacity(samples);
     for sample in 0..samples {
         // Alternate which side leads, so a drift that happens inside one
         // sample does not always land on the same arm.
-        if sample % 2 == 0 {
-            rust_samples.push(time_batch(&mut rust_op, iters));
-            ffi_samples.push(time_batch(&mut ffi_op, iters));
+        if sample.is_multiple_of(2) {
+            rust_samples.push(time_batch(&mut rust_op, rust_iters));
+            ffi_samples.push(time_batch(&mut ffi_op, ffi_iters));
         } else {
-            ffi_samples.push(time_batch(&mut ffi_op, iters));
-            rust_samples.push(time_batch(&mut rust_op, iters));
+            ffi_samples.push(time_batch(&mut ffi_op, ffi_iters));
+            rust_samples.push(time_batch(&mut rust_op, rust_iters));
         }
     }
 
@@ -621,7 +625,8 @@ fn measure_pair(mut rust_op: impl FnMut(), mut ffi_op: impl FnMut()) -> PairedMe
         rust_min_ns: fold(&rust_samples),
         ffi_min_ns: fold(&ffi_samples),
         samples: speedups.len(),
-        iters,
+        rust_iters,
+        ffi_iters,
     }
 }
 
@@ -636,7 +641,7 @@ fn emit_pair_report(
     println!(
         "REPORT_PAIR stage={stage} scenario={} level={level_name} source={source} \
          speedup_median={:.6} speedup_min={:.6} speedup_max={:.6} \
-         rust_min_ns={:.3} ffi_min_ns={:.3} samples={} iters={}",
+         rust_min_ns={:.3} ffi_min_ns={:.3} samples={} rust_iters={} ffi_iters={}",
         scenario.id,
         paired.speedup_median,
         paired.speedup_min,
@@ -644,7 +649,8 @@ fn emit_pair_report(
         paired.rust_min_ns,
         paired.ffi_min_ns,
         paired.samples,
-        paired.iters,
+        paired.rust_iters,
+        paired.ffi_iters,
     );
 }
 

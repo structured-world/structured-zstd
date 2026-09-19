@@ -187,7 +187,8 @@ KERNEL_RE = re.compile(
 PAIR_RE = re.compile(
     r'^REPORT_PAIR stage=(\S+) scenario=(\S+) level=(\S+) source=(\S+) '
     r'speedup_median=([0-9.eE+-]+) speedup_min=([0-9.eE+-]+) speedup_max=([0-9.eE+-]+) '
-    r'rust_min_ns=([0-9.eE+-]+) ffi_min_ns=([0-9.eE+-]+) samples=(\d+) iters=(\d+)$'
+    r'rust_min_ns=([0-9.eE+-]+) ffi_min_ns=([0-9.eE+-]+) samples=(\d+) '
+    r'rust_iters=(\d+) ffi_iters=(\d+)$'
 )
 
 def unescape_report_label(value):
@@ -580,7 +581,8 @@ def summarize_paired_rounds(rounds):
         "per_round_delta": deltas,
         "rounds": len(deltas),
         "samples": min(entry["samples"] for entry in rounds),
-        "iters": min(entry["iters"] for entry in rounds),
+        "rust_iters": min(entry["rust_iters"] for entry in rounds),
+        "ffi_iters": min(entry["ffi_iters"] for entry in rounds),
     }
 
 def classify_speed_delta(delta):
@@ -613,7 +615,8 @@ if pairs_path and Path(pairs_path).is_file():
                 rust_min_ns,
                 ffi_min_ns,
                 pair_samples,
-                pair_iters,
+                pair_rust_iters,
+                pair_ffi_iters,
             ) = pair_match.groups()
             # `na` is how the bench spells "this stage has no such axis"; the
             # key builder wants the absence itself.
@@ -625,7 +628,8 @@ if pairs_path and Path(pairs_path).is_file():
                 "rust_min_ns": float(rust_min_ns),
                 "ffi_min_ns": float(ffi_min_ns),
                 "samples": int(pair_samples),
-                "iters": int(pair_iters),
+                "rust_iters": int(pair_rust_iters),
+                "ffi_iters": int(pair_ffi_iters),
             })
 
 with open(raw_path) as f:
