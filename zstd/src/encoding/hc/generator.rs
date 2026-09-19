@@ -498,7 +498,7 @@ macro_rules! rep_probe_slot {
         $rep_scan_limit:ident,
         $min_match_len:ident,
         $sufficient_len:expr,
-        $current_abs_end:ident,
+        $tail_limit:ident,
         $best_len_for_skip:ident,
         $out:ident,
         $found:ident,
@@ -549,7 +549,12 @@ macro_rules! rep_probe_slot {
                 },
                 $min_match_len,
             );
-            if match_len > $sufficient_len || $abs_pos + match_len >= $current_abs_end {
+            // `abs_pos + match_len >= current_abs_end` is `match_len >=
+            // tail_limit` with the block end folded into the length space the
+            // probe already works in, so the block end stops being a live
+            // value here. Upstream tests the same thing as `ip+mlen == iLimit`,
+            // one comparison in its own single coordinate.
+            if match_len > $sufficient_len || match_len >= $tail_limit {
                 $skip = true;
             }
         }
@@ -665,7 +670,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                         rep_scan_limit,
                         $min_match_len,
                         $sufficient_len,
-                        $current_abs_end,
+                        tail_limit,
                         $best_len_for_skip,
                         $out,
                         rep_len_candidate_found,
@@ -774,9 +779,10 @@ macro_rules! bt_insert_and_collect_matches_body {
                     h3,
                     $min_match_len,
                 );
+                // Same fold as the repeat probe: the block end lives in the
+                // length space the probe already carries.
                 if !rep_len_candidate_found
-                    && (h3.match_len > $sufficient_len
-                        || $abs_pos + h3.match_len >= $current_abs_end)
+                    && (h3.match_len > $sufficient_len || h3.match_len >= tail_limit)
                 {
                     $table.skip_insert_until_abs = $abs_pos + 1;
                     skip_further_match_search = true;
