@@ -528,17 +528,20 @@ fn time_batch(run: &mut impl FnMut(Arm, usize), arm: Arm, slot: usize, iters: u6
     start.elapsed().as_nanos() as f64 / iters as f64
 }
 
-/// One call's cost, cheaply: a single timed call, refined over about a
-/// millisecond of calls when that one call was too short for the clock.
-fn probe_per_call_ns(run: &mut impl FnMut(Arm, usize), arm: Arm) -> f64 {
+/// One call's cost, cheaply, and what finding it out cost: a single timed
+/// call, refined over about a millisecond of calls when that one call was too
+/// short for the clock. The second figure is what the visit has already spent
+/// on this side, which its remaining budget has to account for.
+fn probe_per_call_ns(run: &mut impl FnMut(Arm, usize), arm: Arm) -> (f64, f64) {
     const REFINE_BELOW_NS: f64 = 100_000.0;
     const REFINE_FOR_NS: f64 = 1_000_000.0;
     let single = time_batch(run, arm, 0, 1);
     if single >= REFINE_BELOW_NS {
-        return single;
+        return (single, single);
     }
     let calls = ((REFINE_FOR_NS / single.max(1.0)).ceil() as u64).clamp(1, 1 << 20);
-    time_batch(run, arm, 0, calls)
+    let refined = time_batch(run, arm, 0, calls);
+    (refined, single + refined * calls as f64)
 }
 
 /// Measure both implementations alternately and report the ratio, or `None`
@@ -590,41 +593,56 @@ fn measure_pair(mut run: impl FnMut(Arm, usize)) -> Option<PairedMeasurement> {
     // unbounded batch.
     const MAX_ITERS: u64 = 1 << 26;
 
-    // Warm both sides, on both slots, before the clock is consulted at all.
-    // The first call of EACH side doubles as the gate for an operation so slow
-    // that nothing below could fit: one call per side is what the cell would
-    // have made anyway. Gating only the first side left the other free to spend
-    // two warm-ups and a probe before the batch arithmetic could reject the
-    // visit, so a pair with one slow side could cost several times the cap and
-    // still emit nothing.
-    let mut gate = |arm: Arm, slot: usize| {
+    // The cap is a budget per side, and setting the visit up spends from it:
+    // warming both slots and probing for a batch size are calls like any other.
+    // Counting only the timed batches let a side with 400 ms calls spend 1.2 s
+    // on setup and then four 400 ms batches on top, overrunning a 2 s cap by
+    // forty percent. Each side's spend is tracked from its first call, and only
+    // what is left of the budget pays for batches.
+    let mut spent = [0.0f64; 2];
+    let mut warm = |arm: Arm, slot: usize, spent: &mut [f64; 2]| {
         let started = std::time::Instant::now();
         run(arm, slot);
-        started.elapsed().as_nanos() as f64 * MIN_SAMPLES as f64 <= VISIT_CAP_NS
+        let elapsed = started.elapsed().as_nanos() as f64;
+        spent[arm.side()] += elapsed;
+        // One call so slow that the smallest visit could not fit ends it here,
+        // before the other side spends anything more. One call per side is what
+        // the cell would have made anyway.
+        elapsed * MIN_SAMPLES as f64 <= VISIT_CAP_NS
     };
-    if !gate(Arm::Rust, 0) || !gate(Arm::Ffi, 1) {
+    if !warm(Arm::Rust, 0, &mut spent) || !warm(Arm::Ffi, 1, &mut spent) {
         return None;
     }
-    run(Arm::Rust, 1);
-    run(Arm::Ffi, 0);
+    warm(Arm::Rust, 1, &mut spent);
+    warm(Arm::Ffi, 0, &mut spent);
 
     // One short probe per side, then each batch size follows by arithmetic. A
     // doubling ladder up to a tenth of a second would cost about as much as
     // the measurement it is sizing.
-    let rust_per_call = probe_per_call_ns(&mut run, Arm::Rust);
-    let ffi_per_call = probe_per_call_ns(&mut run, Arm::Ffi);
+    let (rust_per_call, rust_probe_ns) = probe_per_call_ns(&mut run, Arm::Rust);
+    let (ffi_per_call, ffi_probe_ns) = probe_per_call_ns(&mut run, Arm::Ffi);
+    spent[Arm::Rust.side()] += rust_probe_ns;
+    spent[Arm::Ffi.side()] += ffi_probe_ns;
     let batch_size = |per_call_ns: f64| -> u64 {
         ((TARGET_BATCH_NS / per_call_ns.max(1.0)).ceil() as u64).clamp(1, MAX_ITERS)
     };
     let rust_iters = batch_size(rust_per_call);
     let ffi_iters = batch_size(ffi_per_call);
-    let batch_ns = (rust_per_call * rust_iters as f64).max(ffi_per_call * ffi_iters as f64);
 
-    // This visit's share of the run's batches, cut down to what the time cap
-    // allows. More rounds mean shorter visits, not more work; and below the
-    // floor a minimum is a lucky draw, so the visit is not made at all.
+    // This visit's share of the run's batches, cut down to what each side has
+    // left of its budget. More rounds mean shorter visits, not more work; and
+    // below the floor a minimum is a lucky draw, so the visit is not made.
     let share = (TOTAL_SAMPLES / bench_rounds() as usize).clamp(MIN_SAMPLES, MAX_SAMPLES);
-    let affordable = share.min((VISIT_CAP_NS / batch_ns.max(1.0)) as usize);
+    let batches_left = |arm: Arm, batch_ns: f64| -> usize {
+        let left = VISIT_CAP_NS - spent[arm.side()];
+        if left <= 0.0 {
+            return 0;
+        }
+        (left / batch_ns.max(1.0)) as usize
+    };
+    let affordable = share
+        .min(batches_left(Arm::Rust, rust_per_call * rust_iters as f64))
+        .min(batches_left(Arm::Ffi, ffi_per_call * ffi_iters as f64));
     // Down to a whole number of rotation periods. The slots turn every second
     // batch and the lead turns every batch, so four batches is what it takes to
     // give both sides both slots and both positions; a count like six would
@@ -729,6 +747,16 @@ enum Arm {
 }
 
 impl Arm {
+    /// Which side this is, fixed for the life of the process. Distinct from
+    /// `slot`, which says which BUFFER the side draws from and deliberately
+    /// moves: anything accumulated per implementation has to key off this one.
+    fn side(self) -> usize {
+        match self {
+            Arm::Rust => 0,
+            Arm::Ffi => 1,
+        }
+    }
+
     /// Which of the arena's two slots this arm draws from THIS round, for the
     /// criterion arms. The paired measurement turns the slots itself, every two
     /// batches, so it does not go through here.
