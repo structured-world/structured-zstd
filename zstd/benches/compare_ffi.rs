@@ -713,7 +713,9 @@ enum Arm {
 }
 
 impl Arm {
-    /// Which of the arena's two slots this arm draws from THIS round.
+    /// Which of the arena's two slots this arm draws from THIS round, for the
+    /// criterion arms. The paired measurement turns the slots itself, every two
+    /// batches, so it does not go through here.
     ///
     /// The mapping rotates with the same round parity that swaps the
     /// registration order. Holding it fixed would leave one implementation on
@@ -722,6 +724,13 @@ impl Arm {
     /// credited to the same side every round, and a per-arm minimum across
     /// rounds cannot cancel an advantage that never moves. Rotating it lets
     /// both implementations meet both addresses.
+    ///
+    /// An odd round count still weights one assignment more than the other
+    /// here. It matters far less than it would for the published figure: the
+    /// arms' minimum is taken over every round's samples pooled, not over a
+    /// median of per-round values, so the extra round widens the draw rather
+    /// than tilting a middle value. Making it exact needs an even round count,
+    /// which is the runner's choice rather than this function's.
     fn slot(self) -> usize {
         let declared = match self {
             Arm::Rust => 0,
