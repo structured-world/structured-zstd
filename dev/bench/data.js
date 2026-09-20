@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789781938238,
+  "lastUpdate": 1789867683698,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -7547,6 +7547,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.166,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3fe77ddf72f6634a0d85107ccc23d11f1e12dd64",
+          "message": "perf(encoder): settle the optimal finder's per-position questions once per block (#519)\n\n* perf(encoder): hold the hash table by one raw base in the BT bodies\n\nBoth binary-tree bodies re-derived the hash table from the shared table\nbuffer at every use, and each re-derivation is a bounds-checked reslice that\nreloads the buffer header and the seam offset through &mut self. Upstream\nholds it as one raw pointer for the whole body.\n\n* perf(encoder): drop a dead bound and hoist the repeat scan limit\n\nThe repeat probe capped its scan with three terms where one suffices: a repeat\noffset is at least one, so the candidate's own tail is always longer than the\ncurrent position's and that min can never select it. What remains does not\ndepend on which repeat is tried, so it is taken once for the probe instead of\nper repeat.\n\nrelative_position() rejected out-of-range positions by materialising three\nOptions where the caller wants only the early exit; it is now a chain of bare\ncomparisons ordered most-rejecting first.\n\n* perf(encoder): settle index representability once per block\n\nThe optimal parser asked, at every searched position and at every catch-up\ninsertion, whether that position still converts to a stored index. Upstream\nasks once before compressing a block (ZSTD_window_needOverflowCorrection then\nZSTD_window_correctOverflow) and its per-position conversion is a plain\npointer subtraction.\n\narm_block_positions() takes the same decision at the block edge, bounded by\nthe block's last position because the predicate is monotone, and re-takes it\nafter the btultra2 seed pass, which moves the offset past everything it\ninserted. The per-position Option gate and the catch-up rebase guard become\nassertions.\n\nThe rebase itself is given the insertion frontier, not the block end: it\nreplays the inserted prefix, and replaying to the block end would put bytes\nthe parser has not reached into the tree. Two tests cover both arms.\n\n* perf(encoder): move the hash3 rebase question to the unarmed caller\n\nThe hash3 catch-up re-asked whether the position still converts to a stored\nindex on every position the finder searched, inside a block that was already\ncleared. The fill now asserts it and the general catch-up, whose caller has\narmed nothing, asks it before delegating.\n\n* perf(encoder): unroll the repeat-offset probe\n\nThe probe ran a counted loop over three or four slots whose identity is known\nat compile time, so it carried a counter, its bound and a test for the\nsynthetic slot in registers the body needed elsewhere: the disassembly shows\nthe loop reloading its own invariants from the stack every iteration, the\ncurrent position's gate word among them. The slots are written out instead,\nin upstream's order, with the body expanded per slot.\n\n* perf(encoder): fold the block end into the length the probes carry\n\nThe repeat and hash3 probes tested `abs_pos + match_len >= current_abs_end`,\nholding the block end live across the body and adding per candidate, when the\nsame question is `match_len >= tail_limit` in the length space they already\nwork in. Upstream asks it as `ip+mlen == iLimit`, one comparison in its own\ncoordinate.\n\n* perf(encoder): keep one finder per strategy, not one per call site\n\nThe seed pass and the main pass hand the finder a different sufficient-match\nlength, so the compiler specialised it per call site: six instantiations of the\navx2 body in the binary and TWO of them hot at once (13.45M and 12.92M\ninstructions at level 22), the same logic alternating two 5 KB copies through\nthe instruction cache every block.\n\nDenying the inline leaves one instantiation per strategy, three instead of six\nand one hot instead of two, and costs nothing: output byte-identical, program\ninstructions 134,365,494 -> 133,820,689, clock overlapping. Applied to every\nkernel wrapper so the tiers do not disagree.\n\n* fix(bench): take both decompress destinations before either arm runs\n\nEach arm allocated its own destination inside itself, so the two buffers came\noff the heap at different points in the matrix's allocation history: the first\narm's after the churn of everything before it, the second arm's off the free\nlist the first had just left. On the bench runner that difference reads as a\nFOURFOLD difference between the implementations — 111 us against 27 us — on\ninput that is byte-identical between the two sources, which was verified by\nencoding the fixture with each encoder and comparing.\n\nIt is not the decoder: isolated, every cell of that group is equal and fast on\nthe same runner, both arms, both sources, huge pages on or off. The asymmetry\nbelonged to the harness, so both destinations and the fixture are taken before\neither arm starts.\n\n* fix(bench): take the destination pair lazily, not at group construction\n\nTaking both destinations and the fixture at group construction restored the\ncost the OnceCell above exists to defer: a tight Criterion filter compressed\nand validated every fixture and allocated two megabyte buffers for groups it\nexcludes, which is what swamped a filtered profile with encode samples.\n\nThe pair is now taken by whichever arm runs first, so the two buffers still\ncome from ONE point in the allocation history — which is what removes the\nfourfold the harness was reporting — while a group nobody runs pays nothing.\nA filter matching no benchmark now returns in 0.17 s.\n\n* fix(bench): alternate which arm of a comparison runs first between rounds\n\nCriterion does not interleave samples from separate bench_function\nregistrations, so whichever arm is registered first meets whatever state the\nrest of the matrix left behind — and it does so in every round for as long as\nthe order is fixed. Repeating the matrix cancels a disturbance that moved; it\ncannot cancel one that sits on a position. This repository published a\nfourfold difference between the two arms that came from exactly that, on input\nthe two sources encode identically.\n\nThe runner now names the round and the bench registers the pair in an order\nthat depends on it: odd rounds keep the declaration order, even rounds reverse\nit, and the parser's per-arm minimum across rounds leaves no position for such\nan effect to sit on. Four of the five pairs are converted; the compress-dict\npair registers its Rust arm conditionally, which the alternation needs lifted\nfirst, and says so at the code.\n\n* fix(bench): give both arms of every comparison one buffer pair\n\nCriterion runs one arm of a comparison to completion before the next is\nregistered, so a working buffer allocated inside an arm's own closure\ngets its pages from a heap the other arm never saw: the first arm's from\nwhatever the matrix left behind, the second's from what the first arm's\nentire run left. Every group did that, and the plain decompress group\nadditionally took its destinations AFTER compressing the fixture, which\nis the one step the two sources perform differently (our encoder for\nrust_stream, libzstd's for c_stream). The published numbers show the\nconsequence: both arms slow in the c_stream cell and both fast in\nrust_stream, on frames that are byte-identical between the two sources.\n\nCollect the shape in one place and use it everywhere: both buffers are\ntaken together, at one size, pre-faulted, before either arm runs, and in\nthe decompress group before the fixture is compressed. The dictionary\ncompress group also gave its two arms different capacities (the\ncompression bound for one, the observed output length for the other);\nboth now take the bound.\n\nBuffers are still taken lazily, so a tight filter does not pay for a\ngroup it excludes.\n\n* fix(bench): allocate every working buffer once per process\n\nA buffer taken inside a group gets its pages from wherever the heap\nhappens to be when that group runs, so a cell's timing depends on its\nposition in the matrix rather than on the work it does: the\nhigh-entropy-1m decompress cell reads ~14 us run narrowly and 28-39 us\ninside the matrix, on identical work over identical bytes.\n\nPairing the two arms' buffers removed the worst of that (the pair landed\nper-source, because the fixture's compression ran between the group\nstarting and the buffers being taken). This removes the rest of the\nclass: one arena, sized from the whole scenario set, allocated and\npre-faulted before any group runs, sliced by every group. No cell's\nmemory can now depend on what ran before it.\n\nSmall fixtures hold buffers sized for the largest scenario. That is a\nconstant the measurement no longer has to control for, which is the\npoint.\n\n* fix(bench): alternate the dictionary compression arms too\n\nThe dictionary compress group registered its C arm unconditionally and\nits Rust arm behind the dictionary-parse gate, so the C arm ran first in\nevery round and the per-arm minimum across rounds could not cancel a\nposition bias: neither arm ever occupied the other position.\n\nSettle whether the Rust arm can run before either is registered, then\nalternate the pair when both exist and register the C arm alone when the\ndictionary does not parse. Verified by running the group with the round\ncounter odd and even: our arm leads one, libzstd's the other.\n\n* feat(bench): publish the delta from a paired measurement\n\nCriterion runs one arm of a comparison to completion before the next\nstarts, so its two arms answer about moments seconds apart. On the\nshared runners the machine's speed moves on that scale: one cell has\nbeen observed at 27.2 and 35.5 us inside a single process, with the two\narms landing in different states and reporting a 1.28x difference\nbetween implementations that was not there. Pinning the process to one\nCPU narrows the spread (max/min over a pass went from 1.31 to 1.02 and\n1.05 in two passes of three) but does not remove it, because the state\nbelongs to the host rather than to the core.\n\nSo stop asking the two arms about different moments. Each cell now also\nruns both implementations alternately, sample by sample, with the\nleading side swapped between samples, over the same buffers and the same\nsteady-state shape as the criterion arms. The statistic stays each side's\nminimum, which is what the harness has always published and what\ninterference can only move upward; what changes is that the two minima\nnow come from one window of about a tenth of a second instead of two\nmeasurements seconds apart.\n\nThe criterion arms stay as the absolute per-implementation series. The\npayload records which source the delta came from and what the arms alone\nwould have said, so a cell where they disagree is visible: across one\nlocal matrix the two differ by 2.7% at the median and 24.8% at the most.\n\nSample count comes from a time budget rather than a fixed number, so a\nslow fixture cannot dominate the run.\n\n* fix(bench): sample the paired measurement enough to be worth publishing\n\nTwo runs of identical code on one runner moved the paired delta 1.17% at\nthe median and 41.8% at the worst, against 0.46% and 6.5% for the delta\nformed from the criterion arms. The paired figure was the noisier of the\ntwo, so as it stood it was the wrong number to publish.\n\nThe reason was in the data: the worst cells were all the slowest fixture.\nA batch sized only by duration leaves an operation slower than the target\nmeasured one iteration at a time, so every sample was a single unaveraged\nreading, and the time budget then floored the sample count at six. The\npairing was sound; the estimate of each side was not.\n\nBatches now average at least sixteen iterations however slow the\noperation, the budget allows up to sixty-four samples, and the floor is\ntwelve. Every repetition's measurement is kept rather than only the last,\nand they combine by the median of their ratios: pooling the minima across\nrepetitions would pair the best batch of one with the best batch of\na different one, which is the cross-window comparison the measurement\nexists to avoid. Per-repetition deltas now agree within about a percent\nwhere they disagreed by tens.\n\n* perf(bench): average a paired batch as deeply as a criterion sample\n\nWith a batch of one millisecond the paired delta moved 0.73% between two\nruns of identical code against the criterion arms' 0.49%, and up to\n18.8% on a cell where the arms moved 0.3%. The pairing was not the\nproblem: a criterion sample spreads over a tenth of a second and\naverages tens of thousands of iterations, so its minimum is a far better\nestimate of a side than a minimum over batches a hundred times shorter.\n\nBatches now target a tenth of a second, matching that depth, and each\nside gets its own batch size so both last about as long. A shared count\nmade the slower side's batch as many times longer as it was slower,\nwhich on a pair with a fivefold gap turned a two-second cell into ten.\nBatch sizes follow from one short probe per side rather than a doubling\nladder, which at this target would have cost as much as the measurement\nit sizes.\n\nPer-repetition deltas now agree within 0.1 to 1% where they disagreed by\ntens of percent.\n\n* fix(bench): rotate which arena slot each arm draws from\n\nSwapping the registration order between repetitions left every Rust\nbenchmark on arena slot 0 and every C one on slot 1. Whatever a\nparticular address is worth, in cache sets, page colouring or alignment,\nwas therefore credited to the same implementation every time, and a\nper-arm minimum across repetitions cannot cancel an advantage that never\nmoves.\n\nThe slot mapping now turns with the same parity that swaps the order, so\nboth implementations meet both addresses. Verified by running the\ndecompress group with the counter odd and even: our arm takes the lower\naddress in one and the higher in the other.\n\n* fix(bench): hold the plain decompress decoders for the process\n\nA decoder allocates its working memory when it is built, out of whatever\nthe heap looks like at that moment. Built inside a cell, that placement\nis decided by everything the matrix did beforehand and then does not move\nfor the life of the cell, so the cell's minimum is a minimum over one\nplacement rather than over the decode.\n\nThe evidence is a sweep of the destination offset across nine positions\nand two passes on one runner: libzstd's side held 185.4-187.1 ns on\nsmall-10k-random while ours ranged 205.8-328.8, the slow readings covered\nevery batch of a cell rather than a few, and moving the destination left\nall of it untouched. What the sweep did not move is what the decoders\nallocate for themselves.\n\nBoth are now built once and shared by the paired measurement and by both\ncriterion arms. The dictionary groups keep building theirs per group:\nlibzstd's side there is bound to a dictionary and cannot be hoisted the\nsame way, and hoisting only ours would put back the asymmetry this\nremoves.\n\n* perf(bench): share the paired batches out over the run's visits\n\nWhat defeats the paired measurement is not a few slow batches, which the\nminimum discards, but a disturbance long enough to cover every batch of\na visit: one cell's minimum read 328 ns against a floor of 206 with all\ntwelve batches slow. No statistic inside a visit can see past that.\n\nThe batches a cell gets are now a total for the whole run, divided by the\nnumber of times the matrix is repeated, so more repetitions buy shorter\nvisits with the rest of the matrix between them instead of more work.\nUndisturbed deep batches barely differ (one side held within 0.9% across\na whole sweep), so a visit of four estimates its minimum nearly as well\nas a visit of twelve, while a disturbance now has to cover most of the\nvisits to move the median across them.\n\n* fix(bench): cap a paired visit and turn its slots every two batches\n\nTwo defects in the paired measurement, both reported against the same\nversion.\n\nIt had no time bound. It runs outside criterion, so neither the group's\nmeasurement time nor the matrix-wide ceiling reached it, and a floor of\nsixteen iterations per batch meant an operation taking about a second per\ncall would have spent hundreds of seconds on one cell. The floor is gone:\ndepth is a matter of time, and an operation slower than the batch target\nis already deep at one call. A visit now has a cap, the batch count is\ncut to fit it, and a cell whose smallest useful visit does not fit emits\nno paired line at all, leaving the published delta to the criterion arms\nfor that cell. The probe that sizes a batch is one call rather than\nsixteen, refined only when that call is too short for the clock.\n\nTurning the arena slots by round parity weighted one assignment two to\none under an odd round count, and the median across rounds kept that. The\nslots now turn every two batches inside a visit, so the round count\ncannot tilt them.\n\nThe parser also carries the other paired estimator, each round's median\nof per-sample ratios, beside the published minima, so the two can be\ncompared on the same runs.\n\n* docs(bench): say which rotation the criterion arms still use\n\nThe paired measurement turns the arena slots itself now, so the\nround-parity mapping serves only the criterion arms. Record that, and\nthat an odd round count still weights one assignment there, with why it\nmatters less on that side: those minima are pooled across rounds rather\nthan reduced to a median, so the extra round widens the draw instead of\ntilting a middle value.\n\n* fix(bench): key paired results by the normalised level\n\nA dictionary level is named `..._dict` by the bench and stripped of that\nsuffix by the timing-row parser, but the paired-results key kept it, so\nthe lookup never matched for the `*_ldm_dict` variants: both dictionary\nstages published the unpaired criterion-arm ratio while their paired\nsamples were taken and discarded. Reproduced before the fix on a run\ncarrying one ordinary level beside the ldm-dict one — all six dictionary\ncells read `criterion_arms` where `level_3_dfast` in the same groups read\n`paired` — and all six read `paired` after it.\n\nTwo more, both from the same round:\n\nA visit is now rounded down to a whole number of rotation periods. The\nslots turn every second batch and the lead every batch, so four is what\nit takes to give both sides both slots and both positions; a visit cut to\nfive or six by the time cap left one side on one slot twice as often, and\nthe repetitions repeated that rather than cancelled it.\n\nEach arena pair is taken on first use rather than all four buffers up\nfront, so a run filtered to one side of the matrix no longer pre-touches\nthe other's buffers at the largest scenario's size. The SIZE stays eager\nand taken from every scenario: a size that depended on the filter would\nput the addresses back under the run's control, which is what the arena\nexists to prevent.\n\n* fix(bench): gate the visit cap on the first call of both sides\n\nThe cap was checked against the first call of one side only, so a pair\nwith a fast side and a slow one ran two more warm-ups and a probe on the\nslow side before the batch arithmetic could reject the visit. Such a cell\ncould spend several times the cap and still emit nothing, which is the\nopposite of what the cap is for.\n\nEach side's first call is now timed and checked, before the remaining\nwarm-ups. One call per side is what the cell would have made anyway.\n\n* fix(bench): charge a visit's setup against its own time cap\n\nThe cap reserved its whole budget for timed batches, though warming both\nslots and probing for a batch size are calls like any other. A side with\n400 ms calls spent 1.2 s on setup and then took four 400 ms batches on\ntop, overrunning a 2 s cap by forty percent.\n\nEach side's spend is now tracked from its first call and only the\nremainder pays for batches, with the count cut per side rather than from\nwhichever batch happened to be longer. `Arm` gains `side()` for this:\n`slot()` says which BUFFER a side draws from and deliberately moves\nbetween batches, so anything accumulated per implementation cannot key\noff it.\n\n* fix(bench): charge timed batches against the visit cap\n\nThe batch count was sized from the probe, which predicts what a batch\nwill cost; a batch that runs longer carried the visit past its own cap.\nEach batch is now added to its side's spend as it happens and the visit\nends at a whole rotation period once another period would not fit, so\nthe cap holds on what was spent rather than on what was predicted, and\nboth sides still get both slots and both lead positions equally often.\n\nThe probe stays on one slot: the slots come from one process-wide arena,\nallocated together and pre-faulted, and a second probe per side would\npay two more calls of setup to sharpen a prediction that no longer\nenforces anything.\n\nAlso delete the paired log in the trap the memory bench installs, which\nlisted every other temporary but not that one, so a run on a persistent\nhost left one behind each time.",
+          "timestamp": "2026-09-20T03:47:54+03:00",
+          "tree_id": "482539d8076cffcd32aeda537e3d7e580f7cdf92",
+          "url": "https://github.com/structured-world/structured-zstd/commit/3fe77ddf72f6634a0d85107ccc23d11f1e12dd64"
+        },
+        "date": 1789867669843,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.074,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.083,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 193.774,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 196.497,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.516,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.26,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.753,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.792,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.033,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.173,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.173,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 7.638,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.127,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.07,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.171,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.151,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.885,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.296,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.961,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.018,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.133,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.018,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.129,
             "unit": "ms"
           }
         ]
