@@ -528,10 +528,32 @@ fn time_batch(run: &mut impl FnMut(Arm, usize), arm: Arm, slot: usize, iters: u6
     start.elapsed().as_nanos() as f64 / iters as f64
 }
 
+/// One timed batch, with what it took added to the running cost of its side so
+/// the visit's time cap is enforced on what actually happened rather than on
+/// what the probe predicted.
+fn charged_batch(
+    run: &mut impl FnMut(Arm, usize),
+    arm: Arm,
+    slot: usize,
+    iters: u64,
+    cost: &mut [f64; 2],
+) -> f64 {
+    let per_call = time_batch(run, arm, slot, iters);
+    cost[arm.side()] += per_call * iters as f64;
+    per_call
+}
+
 /// One call's cost, cheaply, and what finding it out cost: a single timed
 /// call, refined over about a millisecond of calls when that one call was too
 /// short for the clock. The second figure is what the visit has already spent
 /// on this side, which its remaining budget has to account for.
+///
+/// One slot is probed, not both. The slots are equal by construction: they come
+/// from one process-wide arena, allocated together at one size and pre-faulted
+/// before any group runs. A second probe per side would buy a slightly better
+/// prediction of the batch cost and pay two more calls of setup for it, and the
+/// prediction is not what enforces the time cap anyway: the sampling loop
+/// charges each batch as it happens and stops when the budget is gone.
 fn probe_per_call_ns(run: &mut impl FnMut(Arm, usize), arm: Arm) -> (f64, f64) {
     const REFINE_BELOW_NS: f64 = 100_000.0;
     const REFINE_FOR_NS: f64 = 1_000_000.0;
@@ -655,6 +677,14 @@ fn measure_pair(mut run: impl FnMut(Arm, usize)) -> Option<PairedMeasurement> {
 
     let mut rust_samples = Vec::with_capacity(samples);
     let mut ffi_samples = Vec::with_capacity(samples);
+    // The count above was sized from the probe, which is a PREDICTION of what a
+    // batch will cost; batches that run longer than predicted would carry the
+    // visit past its cap. So each batch is charged to its own side as it
+    // happens, and the visit ends once another rotation period would not fit in
+    // what either side has left. It ends only on a period boundary: cutting
+    // mid-period would leave one side a slot or a lead position more often than
+    // the other, which is the bias the rotation exists to remove.
+    let mut period_cost = [0.0f64; 2];
     for sample in 0..samples {
         // Which slot each side writes to turns every two samples, and which
         // side leads turns every sample, so neither an address nor a position
@@ -664,11 +694,47 @@ fn measure_pair(mut run: impl FnMut(Arm, usize)) -> Option<PairedMeasurement> {
         let rust_slot = (sample / 2) % 2;
         let ffi_slot = 1 - rust_slot;
         if sample.is_multiple_of(2) {
-            rust_samples.push(time_batch(&mut run, Arm::Rust, rust_slot, rust_iters));
-            ffi_samples.push(time_batch(&mut run, Arm::Ffi, ffi_slot, ffi_iters));
+            rust_samples.push(charged_batch(
+                &mut run,
+                Arm::Rust,
+                rust_slot,
+                rust_iters,
+                &mut period_cost,
+            ));
+            ffi_samples.push(charged_batch(
+                &mut run,
+                Arm::Ffi,
+                ffi_slot,
+                ffi_iters,
+                &mut period_cost,
+            ));
         } else {
-            ffi_samples.push(time_batch(&mut run, Arm::Ffi, ffi_slot, ffi_iters));
-            rust_samples.push(time_batch(&mut run, Arm::Rust, rust_slot, rust_iters));
+            ffi_samples.push(charged_batch(
+                &mut run,
+                Arm::Ffi,
+                ffi_slot,
+                ffi_iters,
+                &mut period_cost,
+            ));
+            rust_samples.push(charged_batch(
+                &mut run,
+                Arm::Rust,
+                rust_slot,
+                rust_iters,
+                &mut period_cost,
+            ));
+        }
+        if !(sample + 1).is_multiple_of(ROTATION_PERIOD) {
+            continue;
+        }
+        let mut fits = true;
+        for side in 0..2 {
+            spent[side] += period_cost[side];
+            fits &= spent[side] + period_cost[side] <= VISIT_CAP_NS;
+            period_cost[side] = 0.0;
+        }
+        if !fits {
+            break;
         }
     }
 

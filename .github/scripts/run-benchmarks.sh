@@ -120,7 +120,7 @@ done
 # from here, and those travel through the raw file.
 CRITERION_HOME="$(mktemp -d -t structured-zstd-bench-mem.XXXXXX)"
 export CRITERION_HOME
-trap 'rm -rf "$BENCH_RAW_FILE" "$BENCH_CRITERION_HOME" "$CRITERION_HOME"' EXIT
+trap 'rm -rf "$BENCH_RAW_FILE" "$BENCH_CRITERION_HOME" "$BENCH_PAIRS_FILE" "$CRITERION_HOME"' EXIT
 if [ -n "${STRUCTURED_ZSTD_BENCH_MEMORY_BIN:-}" ]; then
   if [ ! -x "$STRUCTURED_ZSTD_BENCH_MEMORY_BIN" ]; then
     echo "STRUCTURED_ZSTD_BENCH_MEMORY_BIN=$STRUCTURED_ZSTD_BENCH_MEMORY_BIN is not executable" >&2
