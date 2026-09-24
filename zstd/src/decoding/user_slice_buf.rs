@@ -321,9 +321,9 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             return Ok(());
         }
 
-        // SAFETY: capacity asserted above; pointer arithmetic stays
-        // within `self.slice` for the writes (tail + total + overshoot
-        // <= slice.len()) and reads (match src = tail + lit_length -
+        // SAFETY: the tight-tail branch was not taken, so pointer arithmetic
+        // stays within `self.slice` for the writes (tail + total + overshoot
+        // <= cap) and reads (match src = tail + lit_length -
         // offset, bounded by `offset <= tail + lit_length`). Literal
         // reads use the caller-provided `lit_src` whose provenance
         // covers the parent literals buffer (NOT a sub-slice), so
@@ -386,8 +386,9 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
         let cap = self.sequence_cap;
         // Check capacity once on the hot path; the tight-tail branch checks
-        // whether an exact copy fits. Sequence lengths are bounded by the FSE tables, and the caller's
-        // slice is at most isize::MAX bytes, so these additions cannot wrap.
+        // whether an exact copy fits. Sequence lengths are bounded by the FSE
+        // tables and the caller's slice is at most isize::MAX bytes, so these
+        // additions cannot wrap.
         debug_assert!(self.tail <= cap);
         debug_assert!(
             self.tail
@@ -422,8 +423,8 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             return Ok(());
         }
 
-        // SAFETY: identical invariants to the x86 arm — the capacity
-        // check bounds every write (plus the ≤ 15-byte wildcopy
+        // SAFETY: identical invariants to the x86 arm: the untaken
+        // tight-tail branch bounds every write (plus the ≤ 15-byte wildcopy
         // overshoot) inside `self.slice`; `offset <= tail + lit_length`
         // keeps the match source in-bounds; `lit_src` carries the parent
         // literals buffer's provenance (dispatch-site `inline_path_safe`

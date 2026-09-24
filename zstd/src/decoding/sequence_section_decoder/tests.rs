@@ -411,7 +411,7 @@ mod init_sequence_stream_tests {
         );
     }
 
-    /// Drive the BMI2 monolith preamble directly. The runtime kernel
+    /// Drive the BMI2 entry's preamble directly. The runtime kernel
     /// selector prefers the avx2 tier on any CPU that has BMI2, so this
     /// tier never runs through the normal dispatch on CI hardware; call it
     /// directly (guarded on the same feature it requires).

@@ -289,9 +289,8 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
             )
         }
         // 32-bit x86 reaches the BMI2 tier for the entropy tables (the HUF
-        // state advance takes `bzhi` through `K`), but the sequence monolith
-        // has no 32-bit body: its `target_feature` modules are x86_64-only.
-        // The portable walk is what runs here until one exists.
+        // state advance takes `bzhi` through `K`), but the BMI2 sequence entry
+        // is x86_64-only, so the portable walk runs here.
         #[cfg(all(target_arch = "x86", feature = "kernel-bmi2"))]
         CpuKernelTag::Bmi2 => super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
             section,
@@ -307,10 +306,8 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
         CpuKernelTag::Bmi2 => {
             // SAFETY: `detect_cpu_kernel()` only returns Bmi2 when
             // `is_x86_feature_detected!("bmi2")` confirmed BMI2 is
-            // available. The per-tier trampoline lives in its own
-            // module (`seq_decoder_bmi2`) so future BMI2-specific
-            // divergence can be applied without touching the other
-            // kernels — see #279 round 3.
+            // available. The entry runs the shared portable body under
+            // `target_feature(bmi2)`, so the kernel's masks compile to `bzhi`.
             unsafe {
                 super::seq_decoder_bmi2::decode_and_execute_sequences_bmi2::<B>(
                     section,
