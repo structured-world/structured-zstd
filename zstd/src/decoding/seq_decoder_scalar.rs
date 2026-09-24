@@ -363,6 +363,10 @@ pub(super) fn decode_and_execute_sequences_impl<'fse, B: BufferBackend, K: CpuKe
         None => &[],
     };
 
+    // Each sequence commits its output at once, but the bitstream is only
+    // checked for exhaustion after the loop. Repcodes resolve against a shadow
+    // history committed on success, and a failure restores this checkpoint, so
+    // an `Err` leaves neither partial output nor a mutated history behind.
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
 
@@ -440,6 +444,8 @@ pub(super) fn decode_and_execute_sequences_impl<'fse, B: BufferBackend, K: CpuKe
 
     let remaining = br.bits_remaining();
     if remaining != 0 {
+        // Rewind the history only when the buffer rollback happened, or the
+        // workspace would pair kept output with an older history.
         if buffer.try_restore_checkpoint(buffer_checkpoint) {
             *offset_hist = saved_offset_hist;
         }
@@ -452,6 +458,10 @@ pub(super) fn decode_and_execute_sequences_impl<'fse, B: BufferBackend, K: CpuKe
         .into());
     }
 
+    // Tail literals go through `try_push`, so an overshoot on the fixed-size
+    // backend is an `OutputBufferOverflow`, not a panic. The per-block ceiling
+    // is not re-checked: it bounds match writes, and the literals section was
+    // already held to the block maximum when it was parsed.
     if lit_cur < literals_buffer_len {
         let rest = &literals_buffer[lit_cur..literals_buffer_len];
         buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;

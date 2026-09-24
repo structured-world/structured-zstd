@@ -361,23 +361,22 @@ mod init_sequence_stream_tests {
 
     /// One-sequence, all-Predefined header. Pairs with an ample non-zero
     /// bitstream so `init_sequence_stream` returns `Ok` (the sequence loop
-    /// may still error afterwards). Used to drive the per-tier monolith
-    /// preambles directly: on x86_64 CI only the avx2 tier is selected at
-    /// runtime, so scalar / bmi2 / vbmi2 and the K-generic impl would
-    /// otherwise never execute their (shared) preamble.
+    /// may still error afterwards). Used to drive each tier's entry
+    /// directly: on x86_64 CI only the avx2 tier is selected at runtime,
+    /// so the scalar, bmi2 and vbmi2 entries would otherwise never execute
+    /// their (shared) preamble.
     fn predefined_one_sequence_header() -> SequencesHeader {
         let mut header = SequencesHeader::new();
         header.parse_from_header(&[0x01, 0x00]).unwrap();
         header
     }
 
-    /// Drives the always-available decoders (the portable scalar tier and
-    /// the K-generic impl that backs the aarch64 NEON/SVE path) through a
-    /// well-formed preamble. The result is intentionally ignored: a
-    /// crafted bitstream need not yield a valid sequence, only reach and
-    /// pass the preamble.
+    /// Drives the portable body (the Scalar entry; NEON, SVE and BMI2 run
+    /// the same body) through a well-formed preamble. The result is
+    /// intentionally ignored: a crafted bitstream need not yield a valid
+    /// sequence, only reach and pass the preamble.
     #[test]
-    fn scalar_tier_and_generic_impl_run_preamble() {
+    fn scalar_tier_runs_preamble() {
         let header = predefined_one_sequence_header();
         let source = [0xFFu8; 8];
         let lits = [0u8; 32];
@@ -386,20 +385,6 @@ mod init_sequence_stream_tests {
         let mut buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
         let mut offset_hist = [1u32, 4, 8];
         let _ = crate::decoding::seq_decoder_scalar::decode_and_execute_sequences_scalar(
-            &header,
-            &source,
-            &mut fse,
-            &mut buf,
-            &mut offset_hist,
-            &lits,
-            lits.len() - crate::WILDCOPY_OVERLENGTH,
-            None,
-        );
-
-        let mut fse = FSEScratch::new();
-        let mut buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
-        let mut offset_hist = [1u32, 4, 8];
-        let _ = super::super::decode_and_execute_sequences_impl::<RingBuffer, ScalarKernel>(
             &header,
             &source,
             &mut fse,
