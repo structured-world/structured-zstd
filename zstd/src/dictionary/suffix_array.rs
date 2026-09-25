@@ -202,68 +202,73 @@ fn sa_is<T: Symbol>(s: &[T], upper: usize) -> Vec<u32> {
         }
     };
 
-    // The leftmost S-type positions, and each one's rank among them.
-    let mut lms_map = vec![EMPTY; n + 1];
-    let mut lms = Vec::new();
-    for i in 1..n {
-        if !ls[i - 1] && ls[i] {
-            lms_map[i] = lms.len() as u32;
-            lms.push(i as u32);
-        }
-    }
+    // The leftmost S-type positions, in text order.
+    let is_lms = |p: usize| p > 0 && p < n && ls[p] && !ls[p - 1];
+    let lms: Vec<u32> = (1..n).filter(|&i| is_lms(i)).map(|i| i as u32).collect();
     let m = lms.len();
 
     induce(&mut sa, &mut buf, &lms);
 
     if m > 0 {
-        let mut sorted_lms: Vec<u32> = sa
-            .iter()
-            .copied()
-            .filter(|&v| v != EMPTY && lms_map[v as usize] != EMPTY)
-            .collect();
-        // Name each LMS substring by rank, equal substrings sharing a name, and
-        // sort the string of names recursively.
-        let mut rec_s = vec![0u32; m];
-        let mut rec_upper = 0u32;
-        rec_s[lms_map[sorted_lms[0] as usize] as usize] = 0;
+        // Name each LMS substring by rank, equal substrings sharing a name,
+        // and sort the string of names recursively. Laid out in `sa` itself as
+        // `sais.c` lays it out: the sorted LMS positions compacted to the
+        // front, each one's name at `m + p / 2` (LMS positions are at least two
+        // apart, so the slots are distinct and lie past the first `m`), then
+        // the names gathered in text order at the back. A substring runs from
+        // its LMS position to the next one, or to the end of the text.
+        let mut k = 0;
+        for i in 0..n {
+            let v = sa[i] as usize;
+            if is_lms(v) {
+                sa[k] = v as u32;
+                k += 1;
+            }
+        }
+        debug_assert_eq!(k, m);
+        sa[m..].fill(EMPTY);
+        let substring_end = |p: usize| {
+            let mut end = p + 1;
+            while end < n && !is_lms(end) {
+                end += 1;
+            }
+            end
+        };
+        let mut name = 0u32;
+        let mut prev = sa[0] as usize;
+        let mut prev_end = substring_end(prev);
+        debug_assert!(m + prev / 2 < n);
+        sa[m + prev / 2] = 0;
         for i in 1..m {
-            let mut l = sorted_lms[i - 1] as usize;
-            let mut r = sorted_lms[i] as usize;
-            let next = |p: usize| {
-                let rank = lms_map[p] as usize;
-                if rank + 1 < m {
-                    lms[rank + 1] as usize
-                } else {
-                    n
-                }
-            };
-            let end_l = next(l);
-            let end_r = next(r);
-            let mut same = true;
-            if end_l - l != end_r - r {
-                same = false;
-            } else {
-                while l < end_l {
-                    if s[l] != s[r] {
-                        break;
-                    }
-                    l += 1;
-                    r += 1;
-                }
-                if l == n || s[l] != s[r] {
-                    same = false;
-                }
-            }
+            let cur = sa[i] as usize;
+            let cur_end = substring_end(cur);
+            // Equal when as long and equal symbol for symbol, the symbol after
+            // included. One that runs into the end of the text ends at the
+            // virtual sentinel, which nothing else reaches, so it is unique.
+            let same = cur_end - cur == prev_end - prev
+                && cur_end < n
+                && prev_end < n
+                && s[cur..=cur_end] == s[prev..=prev_end];
             if !same {
-                rec_upper += 1;
+                name += 1;
             }
-            rec_s[lms_map[sorted_lms[i] as usize] as usize] = rec_upper;
+            debug_assert!(m + cur / 2 < n);
+            sa[m + cur / 2] = name;
+            prev = cur;
+            prev_end = cur_end;
         }
+        let mut j = n;
+        for i in (m..n).rev() {
+            if sa[i] != EMPTY {
+                j -= 1;
+                sa[j] = sa[i];
+            }
+        }
+        debug_assert_eq!(j, n - m);
+        let rec_s = sa[n - m..].to_vec();
 
-        let rec_sa = sa_is(&rec_s, rec_upper as usize);
-        for (slot, &rank) in sorted_lms.iter_mut().zip(&rec_sa) {
-            *slot = lms[rank as usize];
-        }
+        let rec_sa = sa_is(&rec_s, name as usize);
+        let sorted_lms: Vec<u32> = rec_sa.iter().map(|&rank| lms[rank as usize]).collect();
         induce(&mut sa, &mut buf, &sorted_lms);
     }
     sa

@@ -55,3 +55,17 @@ fn induced_sorting_matches_the_definition() {
     }
     assert_eq!(suffix_array(&periodic), naive(&periodic));
 }
+
+/// Short texts over two or three symbols, by the thousand: the shapes where an
+/// LMS substring running into the end of the text has the length of another,
+/// which naming has to tell apart without reading past the end, and where the
+/// recursion goes several levels deep.
+#[test]
+fn many_short_texts_over_tiny_alphabets_sort_correctly() {
+    for seed in 0..2000u64 {
+        let alphabet = 2 + (seed % 2) as u8;
+        let len = 10 + (seed % 40) as usize;
+        let text = lcg_bytes(seed.wrapping_mul(0x9E37_79B9), len, alphabet);
+        assert_eq!(suffix_array(&text), naive(&text), "seed {seed}: {text:?}");
+    }
+}
