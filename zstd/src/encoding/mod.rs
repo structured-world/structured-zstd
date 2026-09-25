@@ -107,7 +107,7 @@ pub use levels::config::{
 };
 pub use match_generator::MatchGeneratorDriver;
 pub use parameters::{
-    Bounds, CParameter, CompressionParameters, CompressionParametersBuilder,
+    Bounds, CParameter, CompressionParameters, CompressionParametersBuilder, LevelParameters,
     LiteralCompressionMode, ParameterError, Strategy,
 };
 pub use streaming_encoder::{CompressionContext, StreamingEncoder};

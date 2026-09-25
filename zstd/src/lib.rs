@@ -154,7 +154,9 @@ pub mod testing {
         src: u64,
         dict: usize,
     ) -> (u32, u32, u32, u32, u32, u32, u32) {
-        let cp = crate::encoding::cparams::get_cparams_public(level, src, dict);
+        // `ZSTD_getCParams` spells an unknown source size as 0.
+        let cp =
+            crate::encoding::LevelParameters::for_level(level, (src != 0).then_some(src), dict);
         (
             cp.window_log,
             cp.chain_log,
@@ -162,7 +164,7 @@ pub mod testing {
             cp.search_log,
             cp.min_match,
             cp.target_length,
-            cp.strategy,
+            cp.strategy.ordinal(),
         )
     }
 

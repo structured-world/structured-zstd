@@ -3352,6 +3352,69 @@ fn an_unreadable_directory_named_alone_fails_the_run() {
     }
 }
 
+/// `--show-default-cparams` prints the reference command's layout: the name and
+/// size, then one line per parameter, the strategy by upstream's name and
+/// ordinal. Level 3 on an unknown-size source is the `clevels.h` row
+/// `{21, 16, 17, 1, 5, 0, ZSTD_dfast}` unadjusted.
+#[test]
+fn show_default_cparams_prints_the_reference_layout() {
+    let mut out = Vec::new();
+    write_default_cparams(&mut out, STDIN_MARK, None, 0, 3).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "/*stdin*\\ (src size unknown)\n \
+         - windowLog     : 21\n \
+         - chainLog      : 16\n \
+         - hashLog       : 17\n \
+         - searchLog     : 1\n \
+         - minMatch      : 5\n \
+         - targetLength  : 0\n \
+         - strategy      : ZSTD_dfast (2)\n"
+    );
+}
+
+/// An empty file is reported with its size, zero, but sized as an unknown
+/// source, since the reference reads a zero size as unknown here; a real size
+/// moves the selection (level 11 on 4 KiB is the optimal parser).
+#[test]
+fn show_default_cparams_sizes_an_empty_file_as_unknown() {
+    let mut empty = Vec::new();
+    write_default_cparams(&mut empty, "empty", Some(0), 0, 11).unwrap();
+    let mut unknown = Vec::new();
+    write_default_cparams(&mut unknown, "empty", None, 0, 11).unwrap();
+    let empty = String::from_utf8(empty).unwrap();
+    let unknown = String::from_utf8(unknown).unwrap();
+    assert!(empty.starts_with("empty (0 bytes)\n"), "{empty}");
+    assert_eq!(
+        empty.lines().skip(1).collect::<Vec<_>>(),
+        unknown.lines().skip(1).collect::<Vec<_>>(),
+        "same parameters as an unknown size"
+    );
+
+    let mut small = Vec::new();
+    write_default_cparams(&mut small, "small", Some(4096), 0, 11).unwrap();
+    let small = String::from_utf8(small).unwrap();
+    assert!(
+        small.contains(" - strategy      : ZSTD_btopt (7)\n"),
+        "{small}"
+    );
+    assert!(small.contains(" - windowLog     : 12\n"), "{small}");
+}
+
+/// Decompression has no parameters to show, so the flag is refused there, as
+/// the reference command refuses it.
+#[test]
+fn show_default_cparams_is_refused_when_decompressing() {
+    let scratch = Scratch::new("cparamsd");
+    let frame = scratch.file("f.zst", &frame_of(b"payload"));
+    let mut opts = parse(&["-d", "-q", "--show-default-cparams", "f"]).unwrap();
+    opts.inputs = vec![frame];
+    let err = run(opts)
+        .expect_err("decompression with --show-default-cparams is refused")
+        .to_string();
+    assert!(err.contains("decompression mode"), "{err}");
+}
+
 /// Decompression reports how many bytes came out, which is what `-t` and the
 /// summaries print; a corrupted checksum is ignored under `--no-check`.
 #[test]

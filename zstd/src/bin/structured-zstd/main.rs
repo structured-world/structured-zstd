@@ -15,8 +15,8 @@ use std::io::{self, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use structured_zstd::encoding::{
-    CompressionContext, CompressionLevel, CompressionParameters, LiteralCompressionMode, Strategy,
-    StreamingEncoder,
+    CompressionContext, CompressionLevel, CompressionParameters, LevelParameters,
+    LiteralCompressionMode, Strategy, StreamingEncoder,
 };
 
 /// Error type for the tool: a boxed message, which is all a command-line
@@ -212,6 +212,9 @@ struct Options {
     /// with the window sized to the input, so the whole reference is
     /// reachable.
     patch_from: Option<PathBuf>,
+    /// Print the parameters the level selects for each input before
+    /// compressing it (`--show-default-cparams`).
+    show_default_cparams: bool,
     /// Which dictionary trainer `--train*` runs.
     trainer: Trainer,
     /// The trainer's tuning from `--train-fastcover=...` / `--train-cover=...`.
@@ -926,6 +929,7 @@ fn parse_args_into(
         advanced: AdvancedParams::default(),
         literals: LiteralCompressionMode::Auto,
         patch_from: None,
+        show_default_cparams: false,
         trainer: Trainer::FastCover,
         trainer_params: TrainerParams::default(),
     };
@@ -1014,6 +1018,7 @@ fn parse_args_into(
                 "no-pass-through" => opts.pass_through = Some(false),
                 "exclude-compressed" => opts.exclude_compressed = true,
                 "ignore-read-errors" => opts.ignore_read_errors = true,
+                "show-default-cparams" => opts.show_default_cparams = true,
                 "progress" => opts.progress = Progress::Always,
                 "no-progress" => opts.progress = Progress::Never,
                 "version" => {
@@ -1665,6 +1670,87 @@ the trainer tuning, and -M/--memory below the enforced ceiling when decoding.
 A new output file keeps its source's permissions.
 ";
 
+/// Upstream's names for the nine strategies, in ordinal order from 1
+/// (`zstdcli.c`, `ZSTD_strategyMap`).
+const STRATEGY_NAMES: [&str; 9] = [
+    "ZSTD_fast",
+    "ZSTD_dfast",
+    "ZSTD_greedy",
+    "ZSTD_lazy",
+    "ZSTD_lazy2",
+    "ZSTD_btlazy2",
+    "ZSTD_btopt",
+    "ZSTD_btultra",
+    "ZSTD_btultra2",
+];
+
+/// Write what `--show-default-cparams` reports for one input: the parameters
+/// `level` selects for it, in the reference command's layout
+/// (`zstdcli.c`, `printDefaultCParams`).
+///
+/// `size` is the input's length when it has one (`None` for stdin or anything
+/// not a regular file). A length of zero is printed as such but sized as an
+/// unknown source, because `ZSTD_getCParams`, which the reference calls here,
+/// reads zero as "unknown".
+fn write_default_cparams(
+    out: &mut impl Write,
+    name: &str,
+    size: Option<u64>,
+    dictionary_size: usize,
+    level: i32,
+) -> io::Result<()> {
+    match size {
+        Some(bytes) => writeln!(out, "{name} ({bytes} bytes)")?,
+        None => writeln!(out, "{name} (src size unknown)")?,
+    }
+    let params =
+        LevelParameters::for_level(level, size.filter(|&bytes| bytes != 0), dictionary_size);
+    let ordinal = params.strategy.ordinal();
+    // `ordinal` is 1..=9 by construction of `Strategy`.
+    let strategy = STRATEGY_NAMES[ordinal as usize - 1];
+    writeln!(out, " - windowLog     : {}", params.window_log)?;
+    writeln!(out, " - chainLog      : {}", params.chain_log)?;
+    writeln!(out, " - hashLog       : {}", params.hash_log)?;
+    writeln!(out, " - searchLog     : {}", params.search_log)?;
+    writeln!(out, " - minMatch      : {}", params.min_match)?;
+    writeln!(out, " - targetLength  : {}", params.target_length)?;
+    writeln!(out, " - strategy      : {strategy} ({ordinal})")
+}
+
+/// Print `--show-default-cparams` for every input of a compressing run, on
+/// stderr and whatever the verbosity, as the reference command does.
+fn show_default_cparams(opts: &Options) -> Result<()> {
+    let dictionary_size = match dictionary_path(opts) {
+        Some(path) => fs::metadata(path)
+            .wrap_err_with(|| format!("failed to inspect dictionary file {}", path.display()))?
+            .len(),
+        None => 0,
+    };
+    let dictionary_size = usize::try_from(dictionary_size)
+        .map_err(|_| eyre!("dictionary of {dictionary_size} bytes does not fit in memory"))?;
+    let mut err = io::stderr().lock();
+    let stdin = [PathBuf::from("-")];
+    let inputs: &[PathBuf] = if opts.inputs.is_empty() {
+        &stdin
+    } else {
+        &opts.inputs
+    };
+    for input in inputs {
+        let (name, size) = if input == Path::new("-") {
+            (STDIN_MARK.to_string(), None)
+        } else {
+            let size = fs::metadata(input)
+                .ok()
+                .filter(fs::Metadata::is_file)
+                .map(|metadata| metadata.len());
+            (input.display().to_string(), size)
+        };
+        write_default_cparams(&mut err, &name, size, dictionary_size, opts.level)
+            .wrap_err("failed to write the default parameters")?;
+    }
+    Ok(())
+}
+
 /// The file the run's dictionary comes from: `-D`, or the `--patch-from`
 /// reference, which is a dictionary by another name. The command line refuses
 /// both at once, so at most one is set.
@@ -2045,6 +2131,20 @@ fn run_selected(mut opts: Options) -> Result<usize> {
     // (not a stream), so it is handled separately from the (de)compress flow.
     if opts.mode == Mode::List {
         return list_files(&opts);
+    }
+
+    // Reached only by the streaming modes, as the reference command's check is
+    // (benchmark, training and listing have left by now and ignore the flag).
+    // Decompression has no parameters to show; testing is not decompression
+    // there, so it is not refused, and prints nothing since it compresses
+    // nothing.
+    if opts.show_default_cparams {
+        if opts.mode == Mode::Decompress {
+            bail!("error : can't use --show-default-cparams in decompression mode");
+        }
+        if opts.mode == Mode::Compress {
+            show_default_cparams(&opts)?;
+        }
     }
 
     // A destination named outright belongs to the whole run, whatever it reads:

@@ -372,24 +372,6 @@ fn get_cparams_mode(
     adjust_cparams(cp, src_size_hint, dict_size, create_cdict)
 }
 
-/// Public `ZSTD_getCParams` entry: maps `src_size_hint == 0` to UNKNOWN,
-/// matching upstream exactly. The C-reference comparison surface (`zz_cparams`
-/// validates it byte-for-byte against C `ZSTD_getCParams`); the encoder sizes
-/// its own tables from [`default_cparams`] + [`create_cdict_table_logs`].
-#[cfg(feature = "bench-internals")]
-pub(crate) fn get_cparams_public(
-    compression_level: i32,
-    src_size_hint: u64,
-    dict_size: usize,
-) -> CParams {
-    let src = if src_size_hint == 0 {
-        CONTENTSIZE_UNKNOWN
-    } else {
-        src_size_hint
-    };
-    get_cparams(compression_level, src, dict_size)
-}
-
 /// The `(hash_log, chain_log)` a dictionary's prepared match-finder tables get
 /// under `ZSTD_cpm_createCDict` — the single source for the CDict table
 /// geometry (mirrors `ZSTD_adjustCParams_internal` with an unknown source, so
