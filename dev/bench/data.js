@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790332893992,
+  "lastUpdate": 1790355602978,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -8567,6 +8567,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.129,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b898ebfa1897050ced08f5e4fe8b294e0983e481",
+          "message": "perf(opt): stop pre-filling the optimal parser's DP buffers (#526)\n\n* perf(opt): grow the DP node buffers with the frontier\n\n- nodes and node_prices are Vecs reserved to full capacity but grown\n  only as far as the DP frontier reaches, instead of being filled\n  completely before the first segment of every frame\n- freshly grown cells already hold the reset state, so the reset loop\n  only covers cells that existed before\n- the forced seed no longer writes nodes[longest_len]: the traceback\n  takes that stretch from forced_end_state, and the cell lies past the\n  frontier\n- the seed sentinel is written only when the seed had candidates; with\n  none (LDM only) nothing was grown and the forward loop does not run\n\nCloses #525\n\n* perf(opt): index the DP node arenas through raw bases\n\nGrowing the node buffers as Vecs handed &mut Vec to the resize path\ninside the DP loop, so every access after a frontier extension reloaded\nboth headers and kept the bounds checks; large inputs at the optimal\nlevels paid for it.\n\n- nodes and node_prices are uninitialised boxed arenas of\n  HC_OPT_NODE_LEN cells, allocated once and never filled, as upstream\n  carves opt[] from its workspace\n- the DP resolves their base pointers once per call; every cell is\n  written before it is read in the same call (seed, reset of the cells\n  the frontier extends over, or a match / literal update)\n- reset writes the whole node rather than litlen alone, since the\n  cell may never have been initialised\n- a with1literal frontier step sets the price sentinel past it at once:\n  the next iteration reads that cell before the closing sentinel runs,\n  and before this change it read whatever an earlier call left there\n- the price-set kernels get slices ending at the furthest reset cell\n\nPart of #525\n\n* docs: repair broken rustdoc links and gate them in CI\n\n`cargo doc -D warnings` failed on about seventy links, public and\nprivate, most of them pointing at code that has since moved, been\nrenamed or become test-only. Each is repointed at its current item, or\nturned into plain code where the target exists only on another\narchitecture or behind cfg(test).\n\n- rewrite docs that described removed code rather than the current\n  shape: the level-resolution stages (now one get_cparams port), the\n  backend each strategy runs on (Greedy / Lazy / Btlazy2 on Row), the\n  Fast kernel module (wired long ago; its dead_code allowance is no\n  longer needed), the HUF decode kernel sentence and a stray block\n  glued onto the public FrameCompressor::compress doc\n- fix the offset-code distribution URL, which pointed at the\n  match-length section\n- README license badge uses an absolute URL, so it resolves on docs.rs\n  and crates.io too\n- scalar-only test builds warned on an unused macro and a needless mut;\n  the HUF kernel test now also runs its comparison on the scalar tier\n- CI lint job runs rustdoc with -D warnings for the library (public and\n  private items) and for the C ABI and wasm crates\n\n* fix(bt): take the hash and chain bases from one borrow\n\nBoth BT walks hoisted the hash-table base out of `hash_table_mut()` and\nthen the chain-table base out of `chain_table_mut()`. The second reslice\nreborrows the whole shared tables buffer, which invalidates the pointer\ntaken from the first, and the walk then read and wrote the hash bucket\nthrough it: undefined behaviour under the aliasing model, reported by\nMiri (Stacked Borrows) on every optimal-parser test.\n\nBoth bases now come from a single `hash_and_chain_mut()` split, whose\ntwo halves are disjoint. Same addresses, same accesses.\n\nRegression check: `cargo miri nextest run` on\n`btultra2_sparse_skip_matching_preserves_tail_cross_block_match`\n(scalar kernel) failed at the hash-bucket read before and passes now.\nAlso repoints two stale doc links in the same file.\n\n* docs: repair the x86-only rustdoc links\n\nFour links live in code compiled only on x86, so the aarch64 doc build\ncould not see them: a BMI2 peek variant, the AVX2 inline exec trait\nmethod and macro, and the ring buffer's inline-exec gate.\n\n* docs(decoding): describe both ring layouts the inline gate admits\n\nThe x86 ring inline exec doc described only the unwrapped layout and\nquoted the copy body's 15-byte overshoot as the gate bound. The gate\nalso admits a wrapped ring whose write stays before `head` and whose\nmatch source is the lower live segment, and its margin is the AVX2\nbody's 31 bytes. The comment on SUPPORTS_INLINE_SEQUENCE_EXEC made the\nsame unwrapped-only claim.\n\n* docs(decoding): place the wrapped match source correctly\n\nOn a wrapped ring the gate's `offset <= tail + lit_length` only keeps\nthe source address nonnegative. When `offset <= lit_length` the source\nis this sequence's own literals, not the lower live segment; the doc\nand the gate comments claimed the lower segment in every case.\n\n* docs(encoding): tie the matcher backend to the resolved search method\n\nMatcherStorage and LevelParams described the backend as a fixed level\nrange derived from the strategy tag. LevelParams::backend() takes it\nfrom the resolved search method, which follows the (level, source size)\ncParams row and any override, so a size tier can move a level to\nanother backend: level 11 is lazy2 on Row for a large source and btopt\non HashChain for 16 KiB or less. Each storage variant now names the\nsearch methods it serves.\n\n* perf(opt): reset only prices when the DP frontier extends\n\nExtending the frontier wrote a whole default node per new cell; only its\nprice has to be written. A node is now read only while its price is\nfinite, and each transition that makes a price finite writes the whole\nnode, so unreached cells keep whatever the arena holds:\n\n- reset_opt_nodes becomes reset_opt_node_prices, and the seed's\n  unreached cells get prices only\n- the literal step reads the predecessor node after its price check, and\n  reads the overwritten cell only when that cell was reached (a default\n  node stands in, failing the end-of-match test as a reset node did)\n- the price-set kernels take the node arena as MaybeUninit and only\n  write it\n- debug assertions check every traceback and repcode read hits a\n  reached cell\n\nOutput byte-identical at levels 11-22 on eight fixtures. Retired\ninstructions (callgrind, runner1): z000033 L19 x2 2,809,053,243 ->\n2,770,283,147 (-1.38%), small-4k-log-lines L11 x200 72,944,447 ->\n72,793,549 (-0.21%), small-10k-random L16 flat, L3 control flat. Time\n(interleaved prebuilt binaries, host load 2.5-4.4) is inside the noise\non every fixture, z000033 L19 10.27-10.36 s against 10.12-10.31 s: kept\nfor the removed work.",
+          "timestamp": "2026-09-25T19:16:22+03:00",
+          "tree_id": "b779e6fb8eed129c499bcaeb467c2b79ae19ced7",
+          "url": "https://github.com/structured-world/structured-zstd/commit/b898ebfa1897050ced08f5e4fe8b294e0983e481"
+        },
+        "date": 1790355588338,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.068,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.082,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 195.128,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 204.766,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.843,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.517,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.359,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.895,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.382,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.919,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.126,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.126,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 9.72,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.251,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.089,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.18,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.347,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.14,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.499,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.236,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.172,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.167,
             "unit": "ms"
           }
         ]
