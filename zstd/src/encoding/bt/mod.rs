@@ -45,8 +45,8 @@ pub(crate) struct BtMatcher {
     pub(crate) opt_state: HcOptState,
     /// Per-frame scratch for the optimal-parse node stream: `HC_OPT_NODE_LEN`
     /// cells allocated once and never filled, like upstream zstd's
-    /// workspace-carved `opt[ZSTD_OPT_NUM]`. The DP writes each cell before
-    /// reading it (see [`HcOptimalPlanBuffers::nodes`]).
+    /// workspace-carved `opt[ZSTD_OPT_NUM]`. The DP never reads a cell it has
+    /// not written in the same call (see [`HcOptimalPlanBuffers::nodes`]).
     pub(crate) opt_nodes_scratch: Box<[MaybeUninit<HcOptimalNode>]>,
     /// SoA companion to `opt_nodes_scratch`: the running DP price for each
     /// node, split out of `HcOptimalNode` into its own contiguous `u32`
@@ -205,8 +205,8 @@ impl BtMatcher {
         self.opt_state.reset();
         // The `opt_nodes_scratch` / `opt_node_prices_scratch` /
         // `opt_price_arena` boxed slices persist across resets (no realloc
-        // churn). Per-block correctness comes from the DP writing every
-        // node cell before it reads it and from the generation stamps marking stale price
+        // churn). Per-block correctness comes from the DP reading only DP
+        // cells it wrote in the same call and from the generation stamps marking stale price
         // cells. The LL/ML stamps stay MONOTONIC across resets (never
         // zeroed): stale generation cells in the persistent arena carry
         // older, smaller stamps and so can never falsely match the next
@@ -615,28 +615,18 @@ impl BtMatcher {
         opt_state.set_base_prices(accurate);
     }
 
-    /// Brings cells `start..=end` into the frontier as unreached: price `MAX`
-    /// and a node that is never end-of-match (`litlen != 0`). Upstream zstd
-    /// writes only those two fields; the whole node is written here because
-    /// this is the first time the call touches these cells, which may never
-    /// have been initialised.
+    /// Brings cells `start..=end` into the frontier as unreached: price `MAX`.
+    /// Their nodes are left untouched, possibly uninitialised: the DP reads a
+    /// node only once its price is finite, and every transition that makes a
+    /// price finite writes the whole node with it.
     ///
     /// # Safety
     ///
-    /// `nodes` and `node_prices` point into arenas longer than `end`.
+    /// `node_prices` points into an arena longer than `end`.
     #[inline(always)]
-    pub(crate) unsafe fn reset_opt_nodes(
-        nodes: *mut HcOptimalNode,
-        node_prices: *mut u32,
-        start: usize,
-        end: usize,
-    ) {
+    pub(crate) unsafe fn reset_opt_node_prices(node_prices: *mut u32, start: usize, end: usize) {
         for i in start..=end {
             // SAFETY: `i <= end`, in bounds by the caller's contract.
-            unsafe { nodes.add(i).write(HcOptimalNode::default()) };
-        }
-        for i in start..=end {
-            // SAFETY: as above.
             unsafe { node_prices.add(i).write(u32::MAX) };
         }
     }

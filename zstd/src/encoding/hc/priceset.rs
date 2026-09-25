@@ -11,6 +11,7 @@
 use super::super::bt::BtMatcher;
 use super::super::cost_model::{HcOptState, HcOptimalCostProfile};
 use super::super::opt::types::HcOptimalNode;
+use core::mem::MaybeUninit;
 
 /// 8-lane `next_cost < node_price` mask for the optimal-parser price-set
 /// loop. AVX2 lacks an unsigned `cmplt`, so derive `nc < np` from
@@ -72,8 +73,9 @@ fn priceset_next_cost(
 /// Scalar price-set over the match-length range `[start, max]` for the
 /// NON-abort optimal modes (btultra / btultra2). Each `match_len` writes a
 /// distinct node `pos + match_len`, so order is irrelevant; the improvement
-/// test reduces to `next_cost < node_prices[next]` (`reset_opt_nodes` set
-/// every beyond-frontier cell to `u32::MAX`, subsuming `next > last_pos`).
+/// test reduces to `next_cost < node_prices[next]` (`reset_opt_node_prices`
+/// set every beyond-frontier price to `u32::MAX`, subsuming
+/// `next > last_pos`). Nodes may be uninitialised and are only written.
 /// `#[inline]` so it folds into each per-tier optimal-parser monomorphisation
 /// (no call overhead). Returns the highest written `next`.
 #[inline]
@@ -94,7 +96,7 @@ fn priceset_next_cost(
 )]
 pub(crate) fn priceset_range_nonabort_scalar(
     node_prices: &mut [u32],
-    nodes: &mut [HcOptimalNode],
+    nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
     ml_stamp: u32,
     profile: HcOptimalCostProfile,
@@ -117,12 +119,12 @@ pub(crate) fn priceset_range_nonabort_scalar(
         let next = pos + ml;
         if next_cost < node_prices[next] {
             node_prices[next] = next_cost;
-            nodes[next] = HcOptimalNode {
+            nodes[next].write(HcOptimalNode {
                 off,
                 mlen: ml as u32,
                 litlen: 0,
                 reps,
-            };
+            });
             if next > new_last {
                 new_last = next;
             }
@@ -162,7 +164,7 @@ pub(crate) fn priceset_range_nonabort_scalar(
 )]
 fn priceset_range_vec<const W: usize>(
     node_prices: &mut [u32],
-    nodes: &mut [HcOptimalNode],
+    nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
     ml_stamp: u32,
     profile: HcOptimalCostProfile,
@@ -232,12 +234,12 @@ fn priceset_range_vec<const W: usize>(
             bits &= bits - 1;
             let next = base_next + k;
             node_prices[next] = buf[k];
-            nodes[next] = HcOptimalNode {
+            nodes[next].write(HcOptimalNode {
                 off,
                 mlen: (ml + k) as u32,
                 litlen: 0,
                 reps,
-            };
+            });
             if next > new_last {
                 new_last = next;
             }
@@ -251,12 +253,12 @@ fn priceset_range_vec<const W: usize>(
         let next = pos + ml;
         if next_cost < node_prices[next] {
             node_prices[next] = next_cost;
-            nodes[next] = HcOptimalNode {
+            nodes[next].write(HcOptimalNode {
                 off,
                 mlen: ml as u32,
                 litlen: 0,
                 reps,
-            };
+            });
             if next > new_last {
                 new_last = next;
             }
@@ -322,7 +324,7 @@ unsafe fn priceset_cached_prices8_avx2(cells: &[[u32; 2]], stamp: u32) -> Option
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn priceset_range_nonabort_avx2(
     node_prices: &mut [u32],
-    nodes: &mut [HcOptimalNode],
+    nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
     ml_stamp: u32,
     profile: HcOptimalCostProfile,
@@ -405,7 +407,7 @@ unsafe fn priceset_improved_mask4_neon(next_cost: &[u32; 4], node_price: &[u32])
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn priceset_range_nonabort_neon(
     node_prices: &mut [u32],
-    nodes: &mut [HcOptimalNode],
+    nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
     ml_stamp: u32,
     profile: HcOptimalCostProfile,
@@ -537,7 +539,7 @@ unsafe fn priceset_improved_mask4_sse41(next_cost: &[u32; 4], node_price: &[u32]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn priceset_range_nonabort_sse41(
     node_prices: &mut [u32],
-    nodes: &mut [HcOptimalNode],
+    nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
     ml_stamp: u32,
     profile: HcOptimalCostProfile,
@@ -584,7 +586,7 @@ pub(crate) unsafe fn priceset_range_nonabort_sse41(
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn priceset_range_nonabort_sse2(
     node_prices: &mut [u32],
-    nodes: &mut [HcOptimalNode],
+    nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
     ml_stamp: u32,
     profile: HcOptimalCostProfile,
@@ -678,7 +680,7 @@ unsafe fn priceset_improved_mask4_simd128(next_cost: &[u32; 4], node_price: &[u3
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn priceset_range_nonabort_simd128(
     node_prices: &mut [u32],
-    nodes: &mut [HcOptimalNode],
+    nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
     ml_stamp: u32,
     profile: HcOptimalCostProfile,

@@ -110,9 +110,12 @@ macro_rules! build_optimal_plan_impl_body {
         } = &mut *$buffers;
         // The node arenas are indexed through base pointers resolved once, the
         // way upstream zstd indexes `opt[]`: nothing in this body resizes them,
-        // and a raw base leaves no slice header to reload per access. Every
-        // cell is written before it is read within this call (seed, reset of
-        // the cells the frontier extends over, or a match / literal update).
+        // and a raw base leaves no slice header to reload per access. Within
+        // this call every price up to `last_pos + 1` is written before it is
+        // read (seed, reset of the cells the frontier extends over, or a match
+        // / literal update). A node is read only once its price is finite, and
+        // each transition that makes a price finite writes the whole node, so
+        // cells the frontier reaches but no transition does stay unwritten.
         debug_assert!(
             nodes.len() >= frontier_buffer_size && node_prices.len() >= frontier_buffer_size
         );
@@ -376,30 +379,13 @@ macro_rules! build_optimal_plan_impl_body {
                 );
                 // `min_match_len >= HC_FORMAT_MINMATCH (3)` by invariant.
                 last_pos = (min_match_len - 1).min(frontier_limit);
-                for p in 1..min_match_len.min(frontier_buffer_size) {
-                    // `initial_litlen` is the litlen carried from prior
-                    // optimal-plan segments — its real bound is the
-                    // current block length (the frame compressor caps
-                    // block scan at `HC_BLOCKSIZE_MAX`), not the segment
-                    // `current_len`. `p < min_match_len` (small constant),
-                    // so the sum stays well within `u32::MAX`. Use
-                    // `checked_add` FIRST so the `usize` addition itself
-                    // cannot overflow on i686 (where `usize` is 32-bit
-                    // and a wrapping `+` would slip past `try_from`).
-                    let seed_litlen = initial_litlen
-                        .checked_add(p)
-                        .and_then(|s| u32::try_from(s).ok())
-                        .expect("optimal parser seed litlen out of u32 range");
-                    // Unreached (price `MAX`; the price has no other home), with
-                    // the literal run the seed would carry to `p`.
-                    // SAFETY: `p < frontier_buffer_size`, inside both arenas.
-                    unsafe {
-                        nodes.add(p).write(HcOptimalNode {
-                            litlen: seed_litlen,
-                            ..HcOptimalNode::default()
-                        });
-                        node_prices.add(p).write(u32::MAX);
-                    }
+                // Cells `1..min_match_len` start unreached; the forward loop
+                // reaches them through the literal transition, which writes the
+                // node it makes reachable.
+                let seed_end = min_match_len.min(frontier_buffer_size);
+                if seed_end > 1 {
+                    // SAFETY: `seed_end - 1 < frontier_buffer_size`.
+                    unsafe { BtMatcher::reset_opt_node_prices(node_prices, 1, seed_end - 1) };
                 }
             }
 
@@ -457,8 +443,7 @@ macro_rules! build_optimal_plan_impl_body {
                     if max_match_len > last_pos {
                         // SAFETY: `max_match_len < frontier_buffer_size`.
                         unsafe {
-                            BtMatcher::reset_opt_nodes(
-                                nodes,
+                            BtMatcher::reset_opt_node_prices(
                                 node_prices,
                                 last_pos + 1,
                                 max_match_len,
@@ -517,14 +502,14 @@ macro_rules! build_optimal_plan_impl_body {
         }
         while !seed_forced_shortest_path && pos <= last_pos && pos <= frontier_limit {
             debug_assert!(pos + 1 < frontier_buffer_size);
-            // SAFETY (every arena access in this loop): cells `0..=last_pos` hold
-            // nodes and prices written in this call, and `last_pos + 1` holds a
-            // written price, so `pos - 1`, `pos` and `pos + 1` are readable; a
-            // match cell past `last_pos` is read only after `reset_opt_nodes`
-            // wrote it.
-            let prev_node = unsafe { *nodes.add(pos - 1) };
+            // SAFETY (every arena access in this loop): prices `0..=last_pos + 1`
+            // were written in this call, and a match cell past `last_pos` is
+            // read only after `reset_opt_node_prices` wrote its price. A node is
+            // read only where its price is finite: the transition that made it
+            // finite wrote the node.
             let prev_node_price = unsafe { *node_prices.add(pos - 1) };
             if prev_node_price != u32::MAX {
+                let prev_node = unsafe { *nodes.add(pos - 1) };
                 let lit_len = prev_node.litlen as usize + 1;
                 let lit_price = {
                     let bt = $self.backend.bt_mut();
@@ -549,7 +534,14 @@ macro_rules! build_optimal_plan_impl_body {
                 // below) — also the price of `prev_match`, the pre-overwrite copy.
                 let node_pos_price = unsafe { *node_prices.add(pos) };
                 if lit_cost <= node_pos_price {
-                    let prev_match = unsafe { *nodes.add(pos) };
+                    // An unreached cell has no node to read; the default node
+                    // (`litlen != 0`) fails the end-of-match test below exactly
+                    // as a reset node would.
+                    let prev_match = if node_pos_price != u32::MAX {
+                        unsafe { *nodes.add(pos) }
+                    } else {
+                        HcOptimalNode::default()
+                    };
                     unsafe {
                         *nodes.add(pos) = HcOptimalNode {
                             litlen: lit_len as u32,
@@ -596,6 +588,7 @@ macro_rules! build_optimal_plan_impl_body {
                                 debug_assert!(pos >= prev_match.mlen as usize);
                                 let prev_pos = pos - prev_match.mlen as usize;
                                 {
+                                    debug_assert!(unsafe { *node_prices.add(prev_pos) } != u32::MAX);
                                     let prev_state = unsafe { *nodes.add(prev_pos) };
                                     let (_, reps_after_match) = BtMatcher::encode_offset_with_reps(
                                         prev_match.off,
@@ -648,6 +641,7 @@ macro_rules! build_optimal_plan_impl_body {
                     // Upstream zstd parity (zstd_opt.c:1255): `cur >= opt[cur].mlen`.
                     debug_assert!(pos >= base_node.mlen as usize);
                     let prev_pos = pos - base_node.mlen as usize;
+                    debug_assert!(unsafe { *node_prices.add(prev_pos) } != u32::MAX);
                     let prev_state = unsafe { *nodes.add(prev_pos) };
                     let (_, reps_after_match) = BtMatcher::encode_offset_with_reps(
                         base_node.off,
@@ -775,7 +769,7 @@ macro_rules! build_optimal_plan_impl_body {
                 debug_assert!(max_next < frontier_buffer_size);
                 if max_next > last_pos {
                     // SAFETY: `max_next < frontier_buffer_size`.
-                    unsafe { BtMatcher::reset_opt_nodes(nodes, node_prices, last_pos + 1, max_next) };
+                    unsafe { BtMatcher::reset_opt_node_prices(node_prices, last_pos + 1, max_next) };
                 }
                 let lit_len = base_litlen;
                 let off_base = BtMatcher::encode_offset_base_with_reps(
@@ -830,14 +824,18 @@ macro_rules! build_optimal_plan_impl_body {
                     // inline scalar otherwise) — it folds into this wrapper's
                     // monomorphisation, so no call ABI / runtime feature check.
                     // The kernel reaches cells `pos + start_len ..= max_next`, so
-                    // the arenas go in as slices ending at `max_next`, which are
-                    // initialised: `0..=last_pos` was written in this call and
-                    // anything past it was just reset.
+                    // the arenas go in as slices ending at `max_next`. The prices
+                    // there are initialised (`0..=last_pos` written in this call,
+                    // the rest just reset); the nodes may not be, so they go in
+                    // as `MaybeUninit` and the kernel only writes them.
                     let written = max_next + 1;
                     let (node_prices_s, nodes_s) = unsafe {
                         (
                             core::slice::from_raw_parts_mut(node_prices, written),
-                            core::slice::from_raw_parts_mut(nodes, written),
+                            core::slice::from_raw_parts_mut(
+                                nodes.cast::<core::mem::MaybeUninit<HcOptimalNode>>(),
+                                written,
+                            ),
                         )
                     };
                     #[allow(unused_unsafe)]
@@ -923,6 +921,7 @@ macro_rules! build_optimal_plan_impl_body {
         let mut cur = target_pos.saturating_sub(last_stretch.mlen as usize);
         let end_reps = if last_stretch.litlen == 0 {
             debug_assert!(cur <= last_pos);
+            debug_assert!(unsafe { *node_prices.add(cur) } != u32::MAX, "unreached node read");
             let prev_state = unsafe { *nodes.add(cur) };
             let (_, reps_after_match) = BtMatcher::encode_offset_with_reps(
                 last_stretch.off,
@@ -964,6 +963,10 @@ macro_rules! build_optimal_plan_impl_body {
 
         loop {
             debug_assert!(stretch_pos <= last_pos);
+            debug_assert!(
+                unsafe { *node_prices.add(stretch_pos) } != u32::MAX,
+                "unreached node read"
+            );
             let next_stretch = unsafe { *nodes.add(stretch_pos) };
             store[store_start].litlen = next_stretch.litlen;
             if next_stretch.mlen == 0 {
@@ -1683,8 +1686,9 @@ impl HcMatchGenerator {
         let mut candidates = core::mem::take(&mut bt.opt_candidates_scratch);
         let store = core::mem::take(&mut bt.opt_store_scratch);
         let mut price_arena = core::mem::take(&mut bt.opt_price_arena);
-        // Allocated, never filled: the DP writes each cell before reading it,
-        // so a frame whose frontier stays short touches only what it reaches.
+        // Allocated, never filled: the DP reads only cells it wrote in the same
+        // call, so a frame whose frontier stays short touches only what it
+        // reaches.
         if nodes.len() < HC_OPT_NODE_LEN {
             nodes = alloc::boxed::Box::new_uninit_slice(HC_OPT_NODE_LEN);
         }

@@ -95,16 +95,19 @@ pub(crate) struct HcOptimalPlanState {
 /// scaffolding.
 pub(crate) struct HcOptimalPlanBuffers {
     /// DP cells, `HC_OPT_NODE_LEN` of them and never filled up front, like
-    /// upstream zstd's workspace-carved `opt` array: each call writes a cell
-    /// (seed, [`BtMatcher::reset_opt_nodes`], or a match/literal update) before
-    /// it reads it, so only the cells the frontier reaches are ever touched.
-    ///
-    /// [`BtMatcher::reset_opt_nodes`]: crate::encoding::bt::BtMatcher::reset_opt_nodes
+    /// upstream zstd's workspace-carved `opt` array. A node is written only by
+    /// the transition that makes its cell reachable, and read only while its
+    /// price in [`Self::node_prices`] is finite, so unreached cells are never
+    /// touched.
     pub(crate) nodes: Box<[MaybeUninit<HcOptimalNode>]>,
     /// SoA price companion to `nodes` (see `BtMatcher::opt_node_prices_scratch`):
     /// `node_prices[i]` mirrors node `i`'s running DP price as a contiguous
     /// `u32` so the inner price-set loop can SIMD-compare a run of node prices.
-    /// Same length and same write-before-read rule as `nodes`.
+    /// Each call writes a price (seed, [`BtMatcher::reset_opt_node_prices`], or
+    /// a match / literal update) before it reads it; `u32::MAX` marks a cell
+    /// the frontier reaches but no transition does.
+    ///
+    /// [`BtMatcher::reset_opt_node_prices`]: crate::encoding::bt::BtMatcher::reset_opt_node_prices
     pub(crate) node_prices: Box<[MaybeUninit<u32>]>,
     pub(crate) candidates: Vec<MatchCandidate>,
     pub(crate) store: Vec<HcOptimalNode>,
