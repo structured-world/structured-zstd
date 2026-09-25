@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790325322944,
+  "lastUpdate": 1790330517829,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -8159,6 +8159,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.187,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5baa95136bd79dcfbfc157b9e9df6d76a846f125",
+          "message": "refactor(decoding): drop the dead sequence body, align comments (#523)\n\n* style(decoding): move scalar tests out, align comments\n\n- Move the scalar-tier bit-read test into seq_decoder_scalar/tests.rs and\n  document what it guards.\n- Module and macro docs name the tiers that run the shared body (Scalar,\n  NEON, SVE, BMI2) instead of describing the removed per-tier monoliths.\n- The BMI2 dispatch comment describes the entry as it is, not a future split.\n- SAFETY notes in the inline executor point at the tight-tail branch that now\n  bounds the writes.\n\n* refactor(decoding): drop the sequence body no tier runs\n\nWith NEON and SVE routed to the portable body, the old K-generic\ndecode_and_execute_sequences_impl in sequence_section_decoder was reached by\none test only, kept alive by allow(dead_code) and a comment claiming aarch64\nused it. Remove it together with its pipelined loop and single-sequence\ndecoder, and the x86 executor wrappers that had no callers at all.\n\n- The preamble test drives the scalar entry, which is the same body.\n- The rollback and tail-literal rationale moves to the live body.\n- execute_one_sequence_pipelined loses its stale dead_code allowance.\n\n* test(decoding): accept the located zero-offset refusal under lsm\n\nWith the lsm feature a block-body failure is reported as\nFailedToReadBlockBodyAt, which wraps the same cause with the block's\ncoordinates. The zero-offset test only matched the plain variant, so it\nfailed in every lsm build; CI never ran it because its feature set omits\nlsm. Unwrap either variant and check the cause.\n\n* docs(decoding): narrow the rollback note to what the loop guarantees\n\n* perf(decoding): keep the direct-path block loop out of line\n\ndecode_all inlined the whole direct-path block loop, so its preheader spilled\nsome 27 precomputed field addresses to the stack on every call, including\nframes that return from the single-raw-block shortcut before the loop runs.\nAny change to the scratch struct layout then reshuffled those spills: #520's\nsmaller FSE Entry added about 38 instructions to each raw frame. Move the\nloop into run_direct_decode_blocks, marked inline(never), the way upstream\nzstd keeps ZSTD_decompressBlock_internal out of ZSTD_decompressFrame.\n\nXeon E5-2697 v4, profile_decode_direct, bench profile, main vs this change,\nthree interleaved rounds of perf stat -r 5 (task-clock):\n\n- 1 KiB raw frame: AVX2 -10.5%, BMI2 -6.4%\n- 4 KiB log frame, L3: AVX2 -2.6%, BMI2 -1.6%\n- z000033 L3, 1 MiB raw: unchanged on AVX2; BMI2 z000033 +1.1%\n- 64 x 128 KiB frames, L19: unchanged on AVX2, BMI2 +3.3%\n\ncallgrind counts the same instructions on the BMI2 L19 case in both builds\n(plus the call), so that slowdown is where the unchanged sequence loop now\nsits, not added work.\n\n* Revert \"perf(decoding): keep the direct-path block loop out of line\"\n\nThis reverts commit e181d583e22b5fd99412918d101d0fe8b674ae48.",
+          "timestamp": "2026-09-25T12:22:15+03:00",
+          "tree_id": "92b5f0ac0420042ba49abd14806bbad1d71e2141",
+          "url": "https://github.com/structured-world/structured-zstd/commit/5baa95136bd79dcfbfc157b9e9df6d76a846f125"
+        },
+        "date": 1790330505055,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.072,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 176.607,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 221.968,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.474,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.18,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.456,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.937,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.485,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.958,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.156,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.156,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.006,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 8.854,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.783,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.103,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.214,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.337,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.258,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.481,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.348,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.147,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.144,
             "unit": "ms"
           }
         ]
