@@ -4194,6 +4194,83 @@ fn advanced_parameters_reach_the_frame() {
     );
 }
 
+/// `--max` sets every knob to its hardest end, as the reference's
+/// `setMaxCompression` does, with the window stopped where this build still
+/// decodes. It unlocks the ultra levels and long-distance matching, replaces a
+/// `--zstd=` list given before it, and is adjusted by one given after it.
+#[test]
+fn max_sets_every_knob_to_its_hardest_end() {
+    let opts = parse(&["--max", "f"]).unwrap();
+    assert!(opts.long, "--max enables long-distance matching");
+    assert_eq!(
+        opts.advanced,
+        AdvancedParams {
+            window_log: Some(27),
+            chain_log: Some(30),
+            hash_log: Some(30),
+            search_log: Some(30),
+            min_match: Some(3),
+            target_length: Some(131_072),
+            strategy: Some(Strategy::Btultra2),
+            ldm_hash_log: Some(30),
+            ldm_min_match: Some(16),
+            ldm_bucket_size_log: Some(8),
+            ldm_hash_rate_log: None,
+        }
+    );
+    assert_eq!(
+        parse(&["--max", "-22", "f"]).unwrap().level,
+        22,
+        "--max unlocks the ultra levels"
+    );
+    assert!(
+        parse(&["-3", "--max", "f"]).is_ok(),
+        "the strategy it sets carries long-distance matching at any level"
+    );
+
+    let before = parse(&["--zstd=wlog=20,hlog=18", "--max", "f"]).unwrap();
+    assert_eq!(
+        before.advanced,
+        max_compression_params(),
+        "an earlier list is replaced"
+    );
+    let after = parse(&["--max", "--zstd=wlog=20", "f"]).unwrap();
+    assert_eq!(
+        after.advanced.window_log,
+        Some(20),
+        "a later list adjusts it"
+    );
+    assert_eq!(
+        after.advanced.chain_log,
+        Some(30),
+        "and leaves the rest at the maximum"
+    );
+}
+
+/// A `--max` frame over a known-size input is down-sized to the input, so it
+/// compresses without the widest tables and decodes back to the input.
+#[test]
+fn a_max_frame_round_trips() {
+    let opts = parse(&["--max", "f"]).unwrap();
+    // Small: at a search depth of 2^30 a debug build walks every candidate.
+    let payload: Vec<u8> = (0..16 * 1024u32)
+        .map(|i| b'a' + (i.wrapping_mul(2_654_435_761) >> 28) as u8)
+        .collect();
+    let mut frame = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut frame,
+        &FrameSettings {
+            pledged_size: Some(payload.len() as u64),
+            ..FrameSettings::from_options(&opts)
+        },
+        &mut no_dict(),
+    )
+    .unwrap();
+    assert!(frame.len() < payload.len(), "the payload is compressible");
+    assert_eq!(decoded(&frame).unwrap(), payload);
+}
+
 /// `--long` below level 16 is refused because the matcher does not run there,
 /// unless `--zstd=strat=` moves the level onto a parser where it does.
 #[test]

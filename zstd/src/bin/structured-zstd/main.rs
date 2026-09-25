@@ -457,7 +457,7 @@ fn check_window_log(log: u32) -> Result<()> {
 
     let bounds = CParameter::WindowLog.bounds();
     let decodable = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE.ilog2();
-    let upper = bounds.upper_bound.min(i64::from(decodable));
+    let upper = i64::from(max_window_log());
     if i64::from(log) < bounds.lower_bound || i64::from(log) > upper {
         bail!(
             "window log {log} is outside the supported range {}..={upper} \
@@ -467,6 +467,50 @@ fn check_window_log(log: u32) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The largest window this build both writes and reads back: the encoder's
+/// ceiling or the decoder's, whichever is lower (see [`check_window_log`]).
+fn max_window_log() -> u32 {
+    use structured_zstd::encoding::CParameter;
+
+    let encodable = u32::try_from(CParameter::WindowLog.bounds().upper_bound)
+        .expect("the window-log bound is a small positive number");
+    let decodable = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE.ilog2();
+    encodable.min(decodable)
+}
+
+/// Every knob at the end of its range that compresses hardest, as the
+/// reference command's `--max` sets them (`zstdcli.c`, `setMaxCompression`).
+/// One departure: the window stops at [`max_window_log`] rather than at 31,
+/// since a larger one would write frames this build refuses to decode. The
+/// long-distance hash rate is left to derive from the rest, which is what the
+/// reference's 0 there asks for.
+fn max_compression_params() -> AdvancedParams {
+    use structured_zstd::encoding::CParameter;
+
+    let upper = |parameter: CParameter| {
+        u32::try_from(parameter.bounds().upper_bound)
+            .expect("every compression-parameter bound is a small positive number")
+    };
+    let lower = |parameter: CParameter| {
+        u32::try_from(parameter.bounds().lower_bound)
+            .expect("every compression-parameter bound is a small positive number")
+    };
+    AdvancedParams {
+        window_log: Some(max_window_log()),
+        chain_log: Some(upper(CParameter::ChainLog)),
+        hash_log: Some(upper(CParameter::HashLog)),
+        search_log: Some(upper(CParameter::SearchLog)),
+        min_match: Some(lower(CParameter::MinMatch)),
+        target_length: Some(upper(CParameter::TargetLength)),
+        strategy: Some(Strategy::Btultra2),
+        ldm_hash_log: Some(upper(CParameter::LdmHashLog)),
+        // The reference's heuristic value, not a bound.
+        ldm_min_match: Some(16),
+        ldm_bucket_size_log: Some(upper(CParameter::LdmBucketSizeLog)),
+        ldm_hash_rate_log: None,
+    }
 }
 
 /// Validate the parameter list of `--adapt=min=N,max=N`.
@@ -1003,6 +1047,18 @@ fn parse_args_into(
                 "keep" => opts.keep = true,
                 "rm" => opts.remove_source = true,
                 "ultra" => ultra = true,
+                // Replaces every knob at once, as the reference command's does,
+                // so a `--zstd=` before it is overwritten and one after it
+                // adjusts the maximum. Its tables at their widest do not fit a
+                // 32-bit address space, which the reference refuses the same way.
+                "max" => {
+                    if usize::BITS < 64 {
+                        bail!("--max is incompatible with 32-bit mode");
+                    }
+                    ultra = true;
+                    opts.long = true;
+                    opts.advanced = max_compression_params();
+                }
                 "quiet" => *verbosity -= 1,
                 "verbose" => *verbosity += 1,
                 // The wire-format switches: the checksum, the
@@ -1614,6 +1670,8 @@ Advanced options:
 
 Advanced compression options:
   --ultra                       Enable levels beyond 19, up to 22; requires more memory.
+  --max                         Compress with every parameter at its maximum; the window stops at 27,
+                                the widest this build reads back. Requires a lot of memory.
   --fast[=#]                    Use to very fast compression levels. [Default: 1]
   --long[=#]                    Enable long distance matching with window log #. [Default: 27]
                                 Available from level 16 up (or with --zstd=strat=7..9), where
