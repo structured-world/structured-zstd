@@ -95,12 +95,27 @@ impl Corpus {
         Some(u64::from_le_bytes(word.try_into().expect("eight bytes")))
     }
 
-    /// Bytes `a` and `b` have in common (`ZDICT_count`).
+    /// Bytes `a` and `b` have in common (`ZDICT_count`), compared a word at
+    /// a time as the reference compares them.
+    #[inline]
     fn common(&self, a: usize, b: usize) -> usize {
-        let (Some(left), Some(right)) = (self.bytes.get(a..), self.bytes.get(b..)) else {
+        let bytes = self.bytes.as_slice();
+        let Some(limit) = bytes.len().checked_sub(a.max(b)) else {
             return 0;
         };
-        left.iter().zip(right).take_while(|(x, y)| x == y).count()
+        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
+        let mut n = 0;
+        while n + 8 <= limit {
+            let diff = word(a + n) ^ word(b + n);
+            if diff != 0 {
+                return n + (diff.trailing_zeros() / 8) as usize;
+            }
+            n += 8;
+        }
+        while n < limit && bytes[a + n] == bytes[b + n] {
+            n += 1;
+        }
+        n
     }
 }
 
@@ -127,9 +142,11 @@ impl Suffixes {
     /// the noise.
     #[inline]
     fn at(&self, at: i64) -> usize {
-        usize::try_from(at + 1)
-            .ok()
-            .and_then(|slot| self.padded.get(slot))
+        // A walk stops at rank -1 at the lowest, where the padding holds the
+        // noise position.
+        debug_assert!(at >= -1);
+        self.padded
+            .get((at + 1) as usize)
             .copied()
             .unwrap_or(self.noise) as usize
     }
@@ -261,6 +278,16 @@ fn mark(done: &mut [bool], at: usize) {
     }
 }
 
+/// Mark `len` positions from `at` covered, as far as the marks reach. Both
+/// are bounded by the corpus length, so the sum cannot overflow.
+#[inline]
+fn mark_run(done: &mut [bool], at: usize, len: usize) {
+    let end = (at + len).min(done.len());
+    if at < end {
+        done[at..end].fill(true);
+    }
+}
+
 /// `ZDICT_analyzePos`: the segment the suffix of rank `start` leads to, or an
 /// empty one. Every position the analysis settles is marked in `done`.
 fn analyze_position(
@@ -289,9 +316,7 @@ fn analyze_position(
         {
             pattern_end += 1;
         }
-        for u in 1..pattern_end {
-            mark(done, pos + u);
-        }
+        mark_run(done, pos + 1, pattern_end - 1);
         return empty;
     }
 
@@ -415,9 +440,7 @@ fn analyze_position(
         } else {
             corpus.common(pos, tested).min(max_length)
         };
-        for p in tested..tested + length {
-            mark(done, p);
-        }
+        mark_run(done, tested, length);
     }
     solution
 }

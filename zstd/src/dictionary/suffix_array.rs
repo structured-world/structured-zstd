@@ -117,21 +117,48 @@ fn sa_is<T: Symbol>(s: &[T], upper: usize) -> Vec<u32> {
         let c = s[n - 1].index();
         sa[buf[c] as usize] = (n - 1) as u32;
         buf[c] += 1;
+        // The two induction sweeps are the whole cost of the construction, one
+        // random write per suffix. A slot holding the empty mark or position 0
+        // has no predecessor to induce, and one unsigned compare of `v - 1`
+        // against `n` rejects both. Every index below is in bounds by the
+        // bucket layout: a position is below `n`, and each bucket's cursor
+        // stays inside the bucket its symbol's suffixes fill.
         for i in 0..n {
-            let v = sa[i];
-            if v != EMPTY && v >= 1 && !ls[v as usize - 1] {
-                let c = s[v as usize - 1].index();
-                sa[buf[c] as usize] = v - 1;
-                buf[c] += 1;
+            // SAFETY: `i < n == sa.len()`.
+            let p = unsafe { *sa.get_unchecked(i) }.wrapping_sub(1) as usize;
+            if p < n {
+                // SAFETY: `p < n == ls.len() == s.len()`.
+                if !unsafe { *ls.get_unchecked(p) } {
+                    let c = unsafe { s.get_unchecked(p) }.index();
+                    debug_assert!(c < buf.len() && (buf[c] as usize) < n);
+                    // SAFETY: `c <= upper` (symbols lie in `0..=upper` and
+                    // `buf.len() == upper + 1`); `buf[c] < n` by the layout.
+                    unsafe {
+                        let slot = buf.get_unchecked_mut(c);
+                        *sa.get_unchecked_mut(*slot as usize) = p as u32;
+                        *slot += 1;
+                    }
+                }
             }
         }
         buf.copy_from_slice(&sum_l);
         for i in (0..n).rev() {
-            let v = sa[i];
-            if v != EMPTY && v >= 1 && ls[v as usize - 1] {
-                let c = s[v as usize - 1].index() + 1;
-                buf[c] -= 1;
-                sa[buf[c] as usize] = v - 1;
+            // SAFETY: `i < n == sa.len()`.
+            let p = unsafe { *sa.get_unchecked(i) }.wrapping_sub(1) as usize;
+            if p < n {
+                // SAFETY: `p < n == ls.len() == s.len()`.
+                if unsafe { *ls.get_unchecked(p) } {
+                    let c = unsafe { s.get_unchecked(p) }.index() + 1;
+                    debug_assert!(c < buf.len());
+                    // SAFETY: an S-type symbol is below `upper`, so
+                    // `c <= upper`; the bucket's end cursor is above its start.
+                    unsafe {
+                        let slot = buf.get_unchecked_mut(c);
+                        *slot -= 1;
+                        debug_assert!((*slot as usize) < n);
+                        *sa.get_unchecked_mut(*slot as usize) = p as u32;
+                    }
+                }
             }
         }
     };
