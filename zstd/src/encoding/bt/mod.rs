@@ -17,7 +17,9 @@
 
 #![allow(dead_code)]
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 
 use super::cost_model::{HC_MAX_LIT, HcOptState, HcOptimalCostProfile};
 #[cfg(feature = "ldm")]
@@ -41,18 +43,18 @@ pub(crate) struct BtMatcher {
     /// Upstream zstd `optStatePtr_t` — Huffman / FSE-derived literal and
     /// sequence-symbol cost tables that drive the optimal parser.
     pub(crate) opt_state: HcOptState,
-    /// Per-frame scratch for the optimal-parse node stream. Reserved to
-    /// `HC_OPT_NODE_LEN` once, like upstream zstd's fixed `opt[ZSTD_OPT_NUM]`,
-    /// but only as long as the furthest frontier reached, so no cell the DP
-    /// does not reach is ever written (and no in-parse realloc).
-    pub(crate) opt_nodes_scratch: Vec<HcOptimalNode>,
+    /// Per-frame scratch for the optimal-parse node stream: `HC_OPT_NODE_LEN`
+    /// cells allocated once and never filled, like upstream zstd's
+    /// workspace-carved `opt[ZSTD_OPT_NUM]`. The DP writes each cell before
+    /// reading it (see [`HcOptimalPlanBuffers::nodes`]).
+    pub(crate) opt_nodes_scratch: Box<[MaybeUninit<HcOptimalNode>]>,
     /// SoA companion to `opt_nodes_scratch`: the running DP price for each
     /// node, split out of `HcOptimalNode` into its own contiguous `u32`
     /// array so the optimal-parser inner price-set loop can SIMD-compare a
     /// run of consecutive node prices with a single vector load (the 28-byte
     /// AoS node stride would otherwise force a strided gather). Same length
     /// as `opt_nodes_scratch`; index `i` is the price of node `i`.
-    pub(crate) opt_node_prices_scratch: Vec<u32>,
+    pub(crate) opt_node_prices_scratch: Box<[MaybeUninit<u32>]>,
     /// Per-frame scratch for collected match candidates.
     pub(crate) opt_candidates_scratch: Vec<MatchCandidate>,
     /// Per-frame scratch for the final emitted node stream.
@@ -159,8 +161,8 @@ impl BtMatcher {
             // Empty boxed slices: no allocation until the optimal parser
             // first runs (non-BT strategies never touch these), matching
             // the prior lazy `Vec::new()` + grow behaviour.
-            opt_nodes_scratch: Vec::new(),
-            opt_node_prices_scratch: Vec::new(),
+            opt_nodes_scratch: Box::default(),
+            opt_node_prices_scratch: Box::default(),
             opt_candidates_scratch: Vec::new(),
             opt_store_scratch: Vec::new(),
             opt_segment_plan_scratch: Vec::new(),
@@ -181,8 +183,8 @@ impl BtMatcher {
     /// producer hold. The fixed-size price arrays and `opt_state` are inline
     /// (counted by the owner's `size_of`), so only the `Vec` fields contribute.
     pub(crate) fn heap_size(&self) -> usize {
-        let scratch = self.opt_nodes_scratch.capacity() * core::mem::size_of::<HcOptimalNode>()
-            + self.opt_node_prices_scratch.capacity() * core::mem::size_of::<u32>()
+        let scratch = self.opt_nodes_scratch.len() * core::mem::size_of::<HcOptimalNode>()
+            + self.opt_node_prices_scratch.len() * core::mem::size_of::<u32>()
             + self.opt_candidates_scratch.capacity() * core::mem::size_of::<MatchCandidate>()
             + self.opt_store_scratch.capacity() * core::mem::size_of::<HcOptimalNode>()
             + (self.opt_segment_plan_scratch.capacity() + self.opt_seed_plan_scratch.capacity())
@@ -201,11 +203,10 @@ impl BtMatcher {
     /// drops cached price stamps.
     pub(crate) fn reset(&mut self) {
         self.opt_state.reset();
-        // `opt_nodes_scratch` / `opt_node_prices_scratch` (grown with the
-        // frontier) and the `opt_price_arena` boxed slice persist across
-        // resets (no realloc churn). Per-block
-        // correctness comes from the DP re-initialising the node frontier
-        // it reads and from the generation stamps marking stale price
+        // The `opt_nodes_scratch` / `opt_node_prices_scratch` /
+        // `opt_price_arena` boxed slices persist across resets (no realloc
+        // churn). Per-block correctness comes from the DP writing every
+        // node cell before it reads it and from the generation stamps marking stale price
         // cells. The LL/ML stamps stay MONOTONIC across resets (never
         // zeroed): stale generation cells in the persistent arena carry
         // older, smaller stamps and so can never falsely match the next
@@ -614,51 +615,30 @@ impl BtMatcher {
         opt_state.set_base_prices(accurate);
     }
 
-    /// Extends the frontier to `end`: cells `start..=end` come out reset, and
-    /// the buffers reach `end + 2` so the sentinel past the frontier fits.
+    /// Brings cells `start..=end` into the frontier as unreached: price `MAX`
+    /// and a node that is never end-of-match (`litlen != 0`). Upstream zstd
+    /// writes only those two fields; the whole node is written here because
+    /// this is the first time the call touches these cells, which may never
+    /// have been initialised.
+    ///
+    /// # Safety
+    ///
+    /// `nodes` and `node_prices` point into arenas longer than `end`.
     #[inline(always)]
-    pub(crate) fn reset_opt_nodes(
-        nodes: &mut Vec<HcOptimalNode>,
-        node_prices: &mut Vec<u32>,
+    pub(crate) unsafe fn reset_opt_nodes(
+        nodes: *mut HcOptimalNode,
+        node_prices: *mut u32,
         start: usize,
         end: usize,
     ) {
-        // Cells grown here already hold the reset state, so only the ones that
-        // existed before need rewriting.
-        if start < nodes.len() {
-            let existing_end = end.min(nodes.len() - 1);
-            for node in &mut nodes[start..=existing_end] {
-                Self::reset_opt_node(node);
-            }
-            for price in &mut node_prices[start..=existing_end] {
-                *price = u32::MAX;
-            }
+        for i in start..=end {
+            // SAFETY: `i <= end`, in bounds by the caller's contract.
+            unsafe { nodes.add(i).write(HcOptimalNode::default()) };
         }
-        Self::ensure_opt_nodes(nodes, node_prices, end + 2);
-    }
-
-    /// Grows both DP buffers to at least `len` cells, new cells in the reset
-    /// state (`litlen = MAX`, price `MAX`). Capacity is reserved up front, so
-    /// this never reallocates within a block.
-    #[inline(always)]
-    pub(crate) fn ensure_opt_nodes(
-        nodes: &mut Vec<HcOptimalNode>,
-        node_prices: &mut Vec<u32>,
-        len: usize,
-    ) {
-        debug_assert_eq!(nodes.len(), node_prices.len());
-        if nodes.len() < len {
-            nodes.resize(len, HcOptimalNode::default());
-            node_prices.resize(len, u32::MAX);
+        for i in start..=end {
+            // SAFETY: as above.
+            unsafe { node_prices.add(i).write(u32::MAX) };
         }
-    }
-
-    #[inline(always)]
-    pub(crate) fn reset_opt_node(node: &mut HcOptimalNode) {
-        // Price is reset separately via `node_prices` (see `reset_opt_nodes`);
-        // here we only mark the slot not end-of-match. Upstream zstd parity: stale mlen
-        // is ignored while the (separately-held) price is MAX and litlen != 0.
-        node.litlen = u32::MAX;
     }
 
     #[inline(always)]
