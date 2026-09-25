@@ -252,6 +252,20 @@ pub mod testing {
         crate::dictionary::dict_roundtrip_fixture()
     }
 
+    /// The content the legacy trainer selects, before any header: facade for
+    /// the `ffi-bench` test that compares it with the tail of the reference's
+    /// `ZDICT_trainFromBuffer_legacy` dictionary. `None` when the trainer
+    /// yields nothing.
+    #[cfg(feature = "dict-builder")]
+    pub fn legacy_dict_content(
+        samples: &[u8],
+        sample_sizes: &[usize],
+        dict_size: usize,
+        selectivity: u32,
+    ) -> Option<alloc::vec::Vec<u8>> {
+        crate::dictionary::legacy_dict_content(samples, sample_sizes, dict_size, selectivity)
+    }
+
     pub use crate::blocks::block::BlockType;
 
     /// First block's type (raw / rle / compressed) in a frame. Facade over the

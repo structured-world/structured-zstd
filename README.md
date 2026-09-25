@@ -12,7 +12,7 @@
 
 - **Production-grade decoder** — complete [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878) implementation: dictionary-backed streams, raw / RLE / compressed blocks, the full frame format, optional content checksums, runtime-dispatched SIMD kernels (SSE2 / BMI2 / AVX2 / NEON, opt-in AVX-512).
 - **Full-range encoder** — every C-zstd level (`-131072..=22`) produces valid frames decodable by this crate and by upstream C zstd; named presets, per-knob parameter overrides, long-distance matching, streaming via `std::io::Write`.
-- **Dictionaries end to end** — compress and decompress with the same dictionary format C zstd consumes; reusable parsed handles; pure-Rust COVER / FastCOVER training behind the `dict-builder` feature.
+- **Dictionaries end to end** — compress and decompress with the same dictionary format C zstd consumes; reusable parsed handles; pure-Rust COVER / FastCOVER / legacy training behind the `dict-builder` feature.
 - **Wire-compatible both ways** — frames interoperate with C zstd in either direction; interop is enforced in CI against the reference implementation.
 - **`no_std` ready** — the decoder builds with `--no-default-features` for embedded and sandboxed targets.
 - **WebAssembly / npm** — the same codec as an npm package with automatic SIMD selection; no native addons, no postinstall scripts.
@@ -88,9 +88,15 @@ sound archive.
 `--exclude-compressed` skips inputs whose extension names an
 already-compressed format.
 
-Flags that only steer how the work is done (`-T`, `-B`, `--adapt`, ...) are
-accepted and ignored; their values are still validated, so a typo is an error
-rather than silence.
+Flags that only steer how the work is done (`-T`, `--adapt`, `-B` when
+compressing, ...) are accepted and ignored; their values are still validated,
+so a typo is an error rather than silence. `-b` measures every input as frames
+of its own, cut into `-B#` pieces when a size is given, as upstream's
+benchmark does.
+`--max` sets every compression parameter to its hardest end, as upstream's
+does, with the window stopped at 27 (the widest this build decodes), and
+`--show-default-cparams` prints what the level selects for each input in
+upstream's layout.
 `--target-compressed-block-size` does take effect: it bounds what goes into a
 block, so blocks flush sooner. `--long` means `--long=27`, as upstream
 documents, and is capped there: a larger window would produce frames this
@@ -113,8 +119,10 @@ with FastCOVER, the algorithm upstream also defaults to (a knob set to zero
 keeps its default, as upstream reads it), and a bare `--train-cover` trains
 with the COVER trainer. Its tuning, `--train-cover=...`, is refused rather
 than misread: the reference-side parameters name knobs this trainer does not
-have. `--train-legacy` names an algorithm this build does not have and is
-refused. `-D` takes either a dictionary produced by `--train` or any file at
+have. `--train-legacy[=s=#]` (or `-s#`) runs upstream's original trainer, which
+counts samples: they are loaded as upstream loads them (each file one sample of
+up to 128 KiB, or cut into `-B#` pieces), and for the same file list the
+dictionary carries the same content as upstream's. `-D` takes either a dictionary produced by `--train` or any file at
 all, which is then used as raw content the way upstream does; such a
 dictionary has no ID, so the same bytes must be supplied when decoding.
 
@@ -248,6 +256,9 @@ in pure Rust:
 - COVER (`create_raw_dict_from_source`) and FastCOVER (`create_fastcover_raw_dict_from_source`) raw dictionaries
 - `finalize_raw_dict` to produce the full zstd dictionary format
 - `create_fastcover_dict_from_source` for train + finalize in one call
+- `create_legacy_dict_from_slice`: upstream's original suffix-array trainer
+  (`ZDICT_trainFromBuffer_legacy`), whose content matches upstream's byte for
+  byte on the same samples
 
 ## Feature flags
 
@@ -261,7 +272,7 @@ in pure Rust:
 | `kernel-simd128` | ✅ | WebAssembly SIMD kernel (needs `-C target-feature=+simd128`) |
 | `kernel-vbmi2` | ❌ | AVX-512 decode kernel (see note below) |
 | `kernel-scalar` | ✅ | Marker for the always-compiled scalar fallback |
-| `dict-builder` | ❌ | Pure-Rust COVER / FastCOVER dictionary training |
+| `dict-builder` | ❌ | Pure-Rust COVER / FastCOVER / legacy dictionary training |
 | `lsm` | ❌ | [Storage-format extensions](#storage-format-extensions) |
 
 Each flag gates its tier wherever that tier exists. `kernel-sse`,

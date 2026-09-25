@@ -17,7 +17,7 @@
 //! and its consumer bench only produce the data, not the labels.
 //!
 //! Implementation goes through [`FrameCompressor::new_with_matcher`] +
-//! a [`CapturingMatcher`] wrapper rather than driving the matcher in
+//! a `CapturingMatcher` wrapper rather than driving the matcher in
 //! isolation, so the captured stream reflects block-splitter decisions,
 //! strategy-tag selection and per-level resets exactly as the
 //! production encoder would emit them. Capturing the matcher in
@@ -251,11 +251,11 @@ impl Matcher for CapturingMatcher {
 /// `compressed.len() >= MAX_BLOCK_SIZE`. The capture would then
 /// contain phantom triples whose on-wire form has no sequences. To
 /// prevent silently misaligned output, this function parses the
-/// emitted frame's block headers (RFC 8878 §3.1.1.2.2) via
-/// [`detect_raw_or_rle_blocks_in_frame`] and panics with a clear
-/// diagnostic if any Raw_Block or RLE_Block is present. Callers
-/// see a hard failure instead of a misleading capture
-/// (PR #149 review #25).
+/// emitted frame's block headers (RFC 8878 §3.1.1.2.2) and panics with
+/// a clear diagnostic if any Raw_Block or RLE_Block is present, or if
+/// the frame holds more blocks than the matcher was asked for (a
+/// post-split frame). Callers see a hard failure instead of a
+/// misleading capture.
 pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> SequenceCapture {
     compress_and_collect_sequences_impl(input, level, None, None)
 }

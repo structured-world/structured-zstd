@@ -223,6 +223,9 @@ struct Options {
     trainer: Trainer,
     /// The trainer's tuning from `--train-fastcover=...` / `--train-cover=...`.
     trainer_params: TrainerParams,
+    /// The legacy trainer's selectivity from `-s#` or `--train-legacy=s=#`;
+    /// zero is its default.
+    selectivity: u32,
 }
 
 /// The dictionary trainers `--train` selects between.
@@ -232,6 +235,8 @@ enum Trainer {
     FastCover,
     /// `--train-cover`: the segment-scoring COVER trainer.
     Cover,
+    /// `--train-legacy`: the reference's original suffix-array trainer.
+    Legacy,
 }
 
 /// Tuning from `--train-fastcover=k=#,d=#,f=#,steps=#,split=#,accel=#` and
@@ -986,6 +991,7 @@ fn parse_args_into(
         show_default_cparams: false,
         trainer: Trainer::FastCover,
         trainer_params: TrainerParams::default(),
+        selectivity: 0,
     };
     let mut ultra = false;
     // `-e`, when typed. Without it the benchmark ends where it starts, so no
@@ -1033,11 +1039,9 @@ fn parse_args_into(
                     opts.trainer = Trainer::Cover;
                     opts.trainer_params = TrainerParams::default();
                 }
-                // The legacy trainer produces a different dictionary. Accepting
-                // the flag and running another trainer would hand back one the
-                // caller did not ask for, with nothing to say so.
                 "train-legacy" => {
-                    bail!("--{long} is not implemented; --train-cover and --train-fastcover are")
+                    select_mode(&mut opts, Mode::Train);
+                    opts.trainer = Trainer::Legacy;
                 }
                 // `-c` and `-o` name competing destinations, so each clears the
                 // other and the later one on the command line wins, as upstream
@@ -1227,6 +1231,23 @@ fn parse_args_into(
                         select_mode(&mut opts, Mode::Train);
                         opts.trainer = Trainer::FastCover;
                         opts.trainer_params = parse_trainer_params(v, true)?;
+                    } else if let Some(v) = long.strip_prefix("train-legacy=") {
+                        // `s=#` or `selectivity=#`, as `parseLegacyParameters`
+                        // reads it.
+                        select_mode(&mut opts, Mode::Train);
+                        opts.trainer = Trainer::Legacy;
+                        let value = v
+                            .strip_prefix("selectivity=")
+                            .or_else(|| v.strip_prefix("s="))
+                            .ok_or_else(|| {
+                                eyre!("--train-legacy takes `s=#` or `selectivity=#`, got `{v}`")
+                            })?;
+                        let (selectivity, tail) = read_leading_u32(value)
+                            .wrap_err("invalid --train-legacy selectivity")?;
+                        if !tail.is_empty() {
+                            bail!("invalid --train-legacy selectivity `{value}`");
+                        }
+                        opts.selectivity = selectivity;
                     } else if let Some(reference) =
                         option_value(long, "patch-from", arg_os, &mut iter)?
                     {
@@ -1318,6 +1339,19 @@ fn parse_args_into(
                 'k' => opts.keep = true,
                 // `-S` measures each input on its own.
                 'S' => opts.bench_separately = true,
+                's' => {
+                    // `-s#`: the legacy trainer's selectivity, read like the
+                    // reference reads it (`readU32FromChar`).
+                    let rest: String = chars[ci + 1..].iter().collect();
+                    let (selectivity, tail) =
+                        read_leading_u32(&rest).wrap_err("invalid -s selectivity")?;
+                    if !tail.is_empty() {
+                        bail!("invalid -s selectivity `{rest}`");
+                    }
+                    opts.selectivity = selectivity;
+                    ci = chars.len();
+                    continue;
+                }
                 'q' => *verbosity -= 1,
                 'v' => *verbosity += 1,
                 'C' => opts.checksum = true,
@@ -1722,6 +1756,10 @@ Dictionary builder:
   --train-cover                 Use the cover algorithm (takes no tuning here).
   --train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#]
                                 Use the fast cover algorithm (with optional arguments).
+
+  --train-legacy[=s=#]          Use the legacy algorithm with selectivity #. [Default: 9]
+  -B#                           With --train-legacy, cut each file into samples of size #;
+                                otherwise each file is one sample of up to 128 KiB.
   -o NAME                       Use NAME as dictionary name. [Default: dictionary]
   --maxdict=#                   Limit dictionary to specified size #. [Default: 112640]
   --dictID=#                    Force dictionary ID to #. [Default: Random]
@@ -1743,8 +1781,9 @@ multi-threaded run), --adapt, --zstd=ovlog=#, --[no-]sparse,
 single-threaded).
 
 Rejected rather than ignored, because they would change the result: --format=
-other than zstd, --rsyncable (needs worker threads), --train-legacy, shrink in
-the trainer tuning, and -M/--memory below the enforced ceiling when decoding.
+other than zstd, --rsyncable (needs worker threads), shrink in the trainer
+tuning, and -M/--memory below the enforced ceiling when decoding.
+--train-cover and --train-fastcover read whole files, so -B does not cut them.
 A new output file keeps its source's permissions.
 ";
 
@@ -3158,13 +3197,14 @@ fn bench_display_name(label: &str) -> String {
     }
 }
 
-/// `--train`: build a FastCOVER dictionary from the concatenated sample files
-/// and write it to `-o` (default `dictionary`). Mirrors upstream
-/// `zstd --train FILEs -o dict --maxdict=N [--dictID=N]`.
+/// `--train`: build a dictionary from the sample files with the selected
+/// trainer (FastCOVER, COVER or legacy) and write it to `-o` (default
+/// `dictionary`). Mirrors upstream `zstd --train FILEs -o dict --maxdict=N
+/// [--dictID=N]`.
 fn train_dictionary(opts: &Options) -> Result<()> {
     use structured_zstd::dictionary::{
-        FinalizeOptions, create_fastcover_dict_from_slice, create_raw_dict_from_slice,
-        finalize_raw_dict,
+        FinalizeOptions, create_fastcover_dict_from_slice, create_legacy_dict_from_slice,
+        create_raw_dict_from_slice, finalize_raw_dict,
     };
 
     if opts.inputs.iter().any(|input| input == Path::new("-")) {
@@ -3201,9 +3241,17 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // Whether the trainer takes the tuning it was given is a question about the
     // command line alone, so it is answered before any sample is touched: a run
     // bound to be refused does not first read a corpus that may be large.
-    // `Some` holds the FastCOVER options, `None` stands for COVER.
-    let fastcover = match opts.trainer {
-        Trainer::FastCover => Some(fastcover_options(&opts.trainer_params)?),
+    enum Plan {
+        FastCover(structured_zstd::dictionary::FastCoverOptions),
+        Cover,
+        Legacy,
+    }
+    let plan = match opts.trainer {
+        Trainer::FastCover => Plan::FastCover(fastcover_options(&opts.trainer_params)?),
+        // The legacy trainer is tuned by selectivity alone; a cover tuning list
+        // given before `--train-legacy` names a trainer that no longer runs,
+        // as it does in the reference.
+        Trainer::Legacy => Plan::Legacy,
         Trainer::Cover => {
             // The COVER trainer here scores segments by k-mer frequency, as the
             // reference's does, but is not parameterised the same way: `k`,
@@ -3216,7 +3264,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
                      use --train-fastcover=... for a tunable trainer"
                 );
             }
-            None
+            Plan::Cover
         }
     };
     let output = opts
@@ -3268,37 +3316,29 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         }
     }
 
-    // Each sample is opened once, and what the dictionary may carry is taken
-    // from that same open file rather than from its path afterwards. A path
-    // answers about whatever it names at the moment it is asked, and training
-    // takes long enough for a sample to be replaced while it runs: asking again
-    // at the end could describe a file whose bytes are not the ones now inside
-    // the dictionary, and grant its permissions to theirs.
-    let mut corpus = Vec::new();
-    let mut samples = Vec::with_capacity(opts.inputs.len());
-    for input in &opts.inputs {
-        let mut file = File::open(input)
-            .wrap_err_with(|| format!("failed to open training sample {}", input.display()))?;
-        let metadata = file
-            .metadata()
-            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
-        if !metadata.is_file() {
-            bail!(
-                "--train needs regular files: {} is not one",
-                input.display()
-            );
-        }
-        file.read_to_end(&mut corpus)
-            .wrap_err_with(|| format!("failed to read training sample {}", input.display()))?;
-        samples.push(metadata);
-    }
-
     let finalize = FinalizeOptions {
         dict_id: opts.dict_id,
     };
     let mut dict = Vec::new();
-    match fastcover {
-        Some(options) => {
+    let sources = match plan {
+        Plan::Legacy => {
+            // The legacy trainer counts samples, so they are loaded as the
+            // reference's command loads them: shuffled, capped per file, and
+            // cut by `-B`. The same files then yield the same content.
+            let set = load_training_samples(&opts.inputs, opts.block_size, opts.memory_limit)?;
+            create_legacy_dict_from_slice(
+                &set.corpus,
+                &set.sizes,
+                &mut dict,
+                opts.max_dict,
+                opts.selectivity,
+                finalize,
+            )
+            .map_err(|err| eyre!("dictionary training failed: {err}"))?;
+            set.sources
+        }
+        Plan::FastCover(options) => {
+            let (corpus, sources) = read_whole_samples(&opts.inputs)?;
             // From the slice, not through a reader: the corpus is the largest
             // thing this run holds, and the reader path buffers it a second
             // time inside.
@@ -3310,8 +3350,10 @@ fn train_dictionary(opts: &Options) -> Result<()> {
                 finalize,
             )
             .map_err(|err| eyre!("dictionary training failed: {err}"))?;
+            sources
         }
-        None => {
+        Plan::Cover => {
+            let (corpus, sources) = read_whole_samples(&opts.inputs)?;
             // From the slice, as FastCOVER is: the reader path would buffer
             // the whole corpus a second time, and `corpus` has to stay alive
             // for the finalizing pass below anyway.
@@ -3326,8 +3368,9 @@ fn train_dictionary(opts: &Options) -> Result<()> {
             // was asked for, so the best content survives the cut.
             dict = finalize_raw_dict(raw.as_slice(), corpus.as_slice(), opts.max_dict, finalize)
                 .map_err(|err| eyre!("dictionary training failed: {err}"))?;
+            sources
         }
-    }
+    };
 
     // A trained dictionary is an output file like any other, so it is written
     // through a temporary that is renamed into place: an interrupted run
@@ -3340,7 +3383,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
             .and_then(|()| sink.flush())
             .wrap_err_with(|| format!("failed to write dictionary {}", output.display()))?;
     } else {
-        place_trained_dictionary(&output, &dict, &samples)?;
+        place_trained_dictionary(&output, &dict, &sources)?;
     }
     display!(
         opts.verbosity,
@@ -3351,6 +3394,172 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         opts.inputs.len()
     );
     Ok(())
+}
+
+/// Read every sample file whole into one corpus, for the trainers that do not
+/// tell samples apart; `-B` has nothing to cut for them, and they get every
+/// byte, as the reference's do when `-B` cuts files into samples.
+///
+/// Each sample is opened once, and what the dictionary may carry is taken from
+/// that same open file rather than from its path afterwards. A path answers
+/// about whatever it names at the moment it is asked, and training takes long
+/// enough for a sample to be replaced while it runs: asking again at the end
+/// could describe a file whose bytes are not the ones now inside the
+/// dictionary, and grant its permissions to theirs.
+fn read_whole_samples(inputs: &[PathBuf]) -> Result<(Vec<u8>, Vec<fs::Metadata>)> {
+    let mut corpus = Vec::new();
+    let mut sources = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let mut file = File::open(input)
+            .wrap_err_with(|| format!("failed to open training sample {}", input.display()))?;
+        let metadata = file
+            .metadata()
+            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
+        if !metadata.is_file() {
+            bail!(
+                "--train needs regular files: {} is not one",
+                input.display()
+            );
+        }
+        file.read_to_end(&mut corpus)
+            .wrap_err_with(|| format!("failed to read training sample {}", input.display()))?;
+        sources.push(metadata);
+    }
+    Ok((corpus, sources))
+}
+
+/// Most bytes one file contributes as a sample when `-B` does not cut it
+/// (`dibio.c`, `SAMPLESIZE_MAX`).
+const TRAINING_SAMPLE_MAX: u64 = 128 << 10;
+
+/// Most training data loaded at all (`dibio.c`, `MAX_SAMPLES_SIZE`).
+const TRAINING_DATA_MAX: u64 = 2 << 30;
+
+/// Fewest samples a trainer is given (`dibio.c`: "nb of samples too low").
+const TRAINING_SAMPLES_MIN: usize = 5;
+
+/// The samples a trainer is handed, loaded the way the reference's command
+/// loads them (`dibio.c`, `DiB_trainFromFiles`).
+struct TrainingSet {
+    /// Every sample back to back.
+    corpus: Vec<u8>,
+    /// The length of each sample in `corpus`.
+    sizes: Vec<usize>,
+    /// What each file read was, taken from the open file.
+    sources: Vec<fs::Metadata>,
+}
+
+/// Reorder the sample files the way the reference does before loading
+/// (`DiB_shuffle`), so a sample set too large to load keeps a spread of files
+/// rather than the first ones, and the corpus is laid out as there.
+fn shuffle_training_files<T>(files: &mut [T]) {
+    let mut seed: u32 = 0xFD2F_B528;
+    let mut next = || {
+        seed = (seed.wrapping_mul(2_654_435_761) ^ 2_246_822_519).rotate_left(13);
+        seed >> 5
+    };
+    for i in (1..files.len()).rev() {
+        let j = (next() % (i as u32 + 1)) as usize;
+        files.swap(i, j);
+    }
+}
+
+/// Load the training samples as the reference's command does: files in its
+/// shuffled order, each one sample of at most [`TRAINING_SAMPLE_MAX`] bytes, or
+/// cut whole into `block_size` samples when `-B` gives one; empty files left
+/// out; at most [`TRAINING_DATA_MAX`] bytes, or `memory_limit` when smaller.
+fn load_training_samples(
+    inputs: &[PathBuf],
+    block_size: Option<u64>,
+    memory_limit: Option<u64>,
+) -> Result<TrainingSet> {
+    let mut order: Vec<&PathBuf> = inputs.iter().collect();
+    shuffle_training_files(&mut order);
+
+    // What would be loaded without a limit, and as how many samples.
+    let mut wanted = 0u64;
+    let mut samples = 0u64;
+    for input in &order {
+        let size = fs::metadata(input)
+            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?
+            .len();
+        if size == 0 {
+            continue;
+        }
+        match block_size {
+            Some(block) => {
+                samples += size.div_ceil(block);
+                wanted += size;
+            }
+            None => {
+                samples += 1;
+                wanted += size.min(TRAINING_SAMPLE_MAX);
+            }
+        }
+    }
+    if samples < TRAINING_SAMPLES_MIN as u64 {
+        bail!(
+            "{samples} training sample(s) is too few; provide one file per sample, or \
+             split files into fixed-size samples with -B#"
+        );
+    }
+    let budget = wanted
+        .min(TRAINING_DATA_MAX)
+        .min(memory_limit.unwrap_or(u64::MAX));
+    let budget = usize::try_from(budget)
+        .map_err(|_| eyre!("{budget} bytes of samples is more than this machine can hold"))?;
+
+    let mut set = TrainingSet {
+        corpus: Vec::with_capacity(budget),
+        sizes: Vec::new(),
+        sources: Vec::new(),
+    };
+    'files: for input in order {
+        if set.sizes.len() as u64 >= samples {
+            break;
+        }
+        let file = File::open(input)
+            .wrap_err_with(|| format!("failed to open training sample {}", input.display()))?;
+        let metadata = file
+            .metadata()
+            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
+        let size = metadata.len();
+        if size == 0 {
+            continue;
+        }
+        let mut reader = file;
+        let mut taken = 0u64;
+        loop {
+            let piece = match block_size {
+                Some(block) => (size - taken).min(block),
+                None => size.min(TRAINING_SAMPLE_MAX),
+            };
+            if set.corpus.len() as u64 + piece > budget as u64 {
+                if taken == 0 {
+                    break 'files;
+                }
+                break;
+            }
+            let before = set.corpus.len();
+            (&mut reader)
+                .take(piece)
+                .read_to_end(&mut set.corpus)
+                .wrap_err_with(|| format!("failed to read training sample {}", input.display()))?;
+            if (set.corpus.len() - before) as u64 != piece {
+                bail!(
+                    "{} changed while it was being read; run again",
+                    input.display()
+                );
+            }
+            set.sizes.push(piece as usize);
+            taken += piece;
+            if block_size.is_none() || taken >= size || set.sizes.len() as u64 >= samples {
+                break;
+            }
+        }
+        set.sources.push(metadata);
+    }
+    Ok(set)
 }
 
 /// Write a trained dictionary to the regular file `output` through a

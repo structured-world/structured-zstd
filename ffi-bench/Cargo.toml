@@ -136,6 +136,11 @@ path = "tests/dictionary_ffi.rs"
 required-features = ["bench-internals"]
 
 [[test]]
+name = "legacy_trainer_ffi"
+path = "tests/legacy_trainer_ffi.rs"
+required-features = ["bench-internals"]
+
+[[test]]
 name = "encode_corpus_ffi"
 path = "tests/encode_corpus_ffi.rs"
 

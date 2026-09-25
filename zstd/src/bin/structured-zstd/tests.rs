@@ -1724,19 +1724,119 @@ fn training_refuses_to_overwrite_without_force() {
 }
 
 /// The trainer flags name algorithms, and the algorithm decides what the
-/// dictionary contains. FastCOVER and COVER are here; the legacy trainer is
-/// not, so its flag has to say no rather than run another trainer under its
-/// name.
+/// dictionary contains: `--train-legacy` selects the legacy trainer, and its
+/// selectivity comes from `=s=#`, `=selectivity=#` or `-s#`, read as the
+/// reference reads them.
 #[test]
-fn the_legacy_trainer_is_refused_not_substituted() {
+fn the_legacy_trainer_flags_select_it_and_its_selectivity() {
     assert_eq!(parse(&["--train", "s1"]).unwrap().mode, Mode::Train);
     assert_eq!(
         parse(&["--train-fastcover", "s1"]).unwrap().mode,
         Mode::Train
     );
     assert_eq!(parse(&["--train-cover", "s1"]).unwrap().mode, Mode::Train);
-    assert!(parse(&["--train-legacy", "s1"]).is_err());
-    assert!(parse(&["--train-legacy=s=8", "s1"]).is_err());
+    let legacy = parse(&["--train-legacy", "s1"]).unwrap();
+    assert_eq!(
+        (legacy.mode, legacy.trainer),
+        (Mode::Train, Trainer::Legacy)
+    );
+    assert_eq!(legacy.selectivity, 0, "the trainer's own default");
+    assert_eq!(parse(&["--train-legacy=s=8", "s1"]).unwrap().selectivity, 8);
+    assert_eq!(
+        parse(&["--train-legacy=selectivity=12", "s1"])
+            .unwrap()
+            .selectivity,
+        12
+    );
+    assert_eq!(
+        parse(&["--train-legacy", "-s5", "s1"]).unwrap().selectivity,
+        5
+    );
+    assert!(parse(&["--train-legacy=k=8", "s1"]).is_err(), "no such key");
+    assert!(
+        parse(&["--train-legacy=s=8x", "s1"]).is_err(),
+        "trailing junk"
+    );
+    assert!(parse(&["--train-legacy", "-sx", "s1"]).is_err());
+}
+
+/// `--train-legacy` trains end to end: sample files in, a dictionary out that
+/// the decoder accepts, made of what the samples repeat.
+#[test]
+fn legacy_training_writes_a_dictionary() {
+    let dir = Scratch::new("legacy-train");
+    let mut names = Vec::new();
+    for i in 0..40u32 {
+        let body = format!(
+            "[Unit]\nDescription=worker {i}\nAfter=network-online.target\n\n[Service]\n\
+             ExecStart=/usr/bin/worker --id {i} --config /etc/worker/worker.toml\n\
+             Restart=on-failure\n"
+        );
+        names.push(dir.file(&format!("w{i}.service"), body.as_bytes()));
+    }
+    let output = dir.path().join("legacy.dict");
+    let mut args = vec!["--train-legacy".to_string(), "-o".to_string()];
+    args.push(output.display().to_string());
+    args.extend(names.iter().map(|name| name.display().to_string()));
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(parse(&argv).unwrap()).unwrap();
+
+    let dict = fs::read(&output).unwrap();
+    structured_zstd::decoding::Dictionary::decode_dict(&dict).expect("a valid dictionary");
+    let text = String::from_utf8_lossy(&dict);
+    assert!(text.contains("After=network-online.target"));
+    assert!(text.contains("Restart=on-failure"));
+}
+
+/// The legacy trainer is handed its samples as the reference's command hands
+/// them over: each file one sample of at most 128 KiB, or cut whole into `-B`
+/// pieces; empty files left out; fewer than five samples refused.
+#[test]
+fn training_samples_are_loaded_the_way_the_reference_loads_them() {
+    let dir = Scratch::new("training-load");
+    let big = dir.file("big", &vec![b'x'; 300 << 10]);
+    let small = dir.file("small", b"0123456789");
+    let empty = dir.file("empty", b"");
+    let inputs = vec![big.clone(), small.clone(), empty.clone()];
+
+    assert!(
+        load_training_samples(&inputs, None, None).is_err(),
+        "two samples are too few"
+    );
+
+    let cut = load_training_samples(&inputs, Some(64 << 10), None).unwrap();
+    let mut sizes = cut.sizes.clone();
+    sizes.sort_unstable();
+    assert_eq!(
+        sizes,
+        vec![10, 44 << 10, 64 << 10, 64 << 10, 64 << 10, 64 << 10]
+    );
+    assert_eq!(cut.corpus.len(), (300 << 10) + 10, "whole files once cut");
+
+    let mut many = Vec::new();
+    for i in 0..5 {
+        many.push(dir.file(&format!("big{i}"), &vec![b'y'; 200 << 10]));
+    }
+    let capped = load_training_samples(&many, None, None).unwrap();
+    assert_eq!(
+        capped.sizes,
+        vec![128 << 10; 5],
+        "each file capped at 128 KiB"
+    );
+    let limited = load_training_samples(&many, None, Some(300 << 10)).unwrap();
+    assert_eq!(limited.sizes.len(), 2, "-M bounds what is loaded");
+}
+
+/// The files are taken in the reference's shuffled order (`DiB_shuffle`), so
+/// the same file list lays the corpus out the same way; the legacy dictionary
+/// trained from a fixed list then carries the reference's content byte for
+/// byte. The order is what `dibio.c`'s own `DiB_shuffle`, compiled as is,
+/// makes of eight entries.
+#[test]
+fn training_files_are_shuffled_like_the_reference_shuffles_them() {
+    let mut order: Vec<u32> = (0..8).collect();
+    shuffle_training_files(&mut order);
+    assert_eq!(order, vec![4, 5, 2, 0, 6, 1, 7, 3]);
 }
 
 /// A window is a promise about how much memory decoding will need, so it is
@@ -4464,7 +4564,10 @@ fn trainer_parameters_parse_and_build_options() {
     let opts = parse(&["--train-cover", "s1"]).unwrap();
     assert_eq!(opts.trainer, Trainer::Cover);
     assert!(opts.trainer_params.is_default());
-    assert!(parse(&["--train-legacy", "s1"]).is_err());
+    assert_eq!(
+        parse(&["--train-legacy", "s1"]).unwrap().trainer,
+        Trainer::Legacy
+    );
 }
 
 /// An empty `--filelist` is nothing to do for the modes that stream, but the
