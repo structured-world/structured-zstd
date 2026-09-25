@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.56](https://github.com/structured-world/structured-zstd/compare/v0.0.55...v0.0.56) - 2026-09-25
+
+### Performance
+
+- *(decoding)* share the portable sequence body across tiers ([#520](https://github.com/structured-world/structured-zstd/pull/520))
+
+### Refactored
+
+- *(decoding)* drop the dead sequence body, align comments ([#523](https://github.com/structured-world/structured-zstd/pull/523))
+
 ## [0.0.55](https://github.com/structured-world/structured-zstd/compare/v0.0.54...v0.0.55) - 2026-09-20
 
 ### Performance
