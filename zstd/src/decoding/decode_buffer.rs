@@ -391,7 +391,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     }
 
     /// Capture a rollback point covering the buffer's write cursor and the
-    /// total-output counter. Pair with [`restore_checkpoint`] to undo
+    /// total-output counter. Pair with [`Self::try_restore_checkpoint`] to undo
     /// speculative pushes/repeats made after the capture — used by the fused
     /// sequence executor to roll back when the post-loop bitstream
     /// validation rejects a malformed block, restoring the
@@ -405,7 +405,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
-    /// Attempt to restore a checkpoint captured by [`checkpoint`].
+    /// Attempt to restore a checkpoint captured by [`Self::checkpoint`].
     ///
     /// Returns `true` if the rollback was performed; `false` if an
     /// intervening reallocation invalidated the captured tail index
@@ -562,7 +562,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.repeat_inner::<false>(dict, offset, match_length)
     }
 
-    /// Same as [`repeat`] but the caller asserts a lookahead
+    /// Same as [`Self::repeat`] but the caller asserts a lookahead
     /// prefetch was already issued for this match source ADVANCE
     /// iterations ago, so the in-loop `prefetch_match_source` would
     /// be redundant issue-port pressure on top of the L1 line that's

@@ -19,7 +19,8 @@
 //! position, bit `n` of `hash` after `k` updates depends on the last
 //! `min(n, k)` bytes — a content-defined window without any explicit
 //! ring buffer. A "split point" is signalled whenever
-//! `(hash & stop_mask) == 0`. Upstream zstd [`init`] derives `stop_mask` so
+//! `(hash & stop_mask) == 0`. Upstream zstd `ZSTD_ldm_gear_init` (here
+//! [`GearHashState::new`]) derives `stop_mask` so
 //! that on average one split occurs every `2 ^ hash_rate_log` bytes,
 //! and the active bits sit at the high end of the rolling window
 //! (`min(min_match_length, 64)` bits) — biasing splits toward

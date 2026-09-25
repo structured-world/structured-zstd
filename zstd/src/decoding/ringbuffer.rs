@@ -1078,7 +1078,7 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         Ok(())
     }
 
-    /// Non-x86 port of [`Self::exec_sequence_inline`] — portable u128 / u64
+    /// Non-x86 arm of `exec_sequence_inline` — portable u128 / u64
     /// wildcopy helpers (NEON `ldr q`/`str q` on aarch64). Same contiguity
     /// contract as the x86 arm.
     #[cfg(not(target_arch = "x86_64"))]

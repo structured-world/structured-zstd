@@ -163,7 +163,7 @@ pub struct FrameDecoder {
     shared_dicts: BTreeMap<u32, DictionaryHandle>,
     #[cfg(not(target_has_atomic = "ptr"))]
     shared_dicts: (),
-    /// `ZSTD_f_zstd1_magicless` — when true, [`init`] / [`reset`]
+    /// `ZSTD_f_zstd1_magicless` — when true, [`Self::init`] / [`Self::reset`]
     /// expect frames without the 4-byte magic number prefix.
     /// Default false (standard zstd format).
     magicless: bool,
@@ -231,7 +231,7 @@ pub enum ContentChecksum {
     EmitOnly,
     /// Compute the checksum and compare it against the frame's stored value;
     /// a disagreement fails the decode with
-    /// [`FrameDecoderError::ChecksumMismatch`](crate::decoding::errors::FrameDecoderError::ChecksumMismatch).
+    /// [`FrameDecoderError::ChecksumMismatch`].
     /// Without the `hash` feature there is no way to compute a digest, so
     /// `Verify` cannot detect a mismatch and behaves like `None`.
     Verify,
@@ -674,7 +674,8 @@ impl DecoderScratchKind {
 
     /// Prime the match window with the caller's already-decompressed tail for
     /// a resumed partial decode. Routes through whichever backend the current
-    /// scratch holds. See [`DecodeBuffer::prime_window`].
+    /// scratch holds. See
+    /// [`DecodeBuffer::prime_window`](crate::decoding::decode_buffer::DecodeBuffer::prime_window).
     #[cfg(feature = "lsm")]
     fn prime_window(&mut self, prefix: &[u8], total_output: u64) {
         match self {
@@ -969,7 +970,7 @@ impl FrameDecoderState {
     }
 
     /// Build a fresh state from an already-parsed frame header (the non-parsing
-    /// tail of [`new_with_format`]). Shared by the `Read` path and the
+    /// tail of [`Self::new_with_format`]). Shared by the `Read` path and the
     /// slice-direct path ([`FrameDecoder::reset_from_slice`]).
     pub(crate) fn new_with_parsed_header(
         frame: frame::FrameHeader,
@@ -1025,7 +1026,7 @@ impl FrameDecoderState {
     }
 
     /// Apply an already-parsed frame header to this state (the non-parsing tail
-    /// of [`reset_with_format`]). Shared by the `Read` path and the slice-direct
+    /// of [`Self::reset_with_format`]). Shared by the `Read` path and the slice-direct
     /// path ([`FrameDecoder::reset_from_slice`]).
     #[inline]
     pub(crate) fn reset_with_parsed_header(
@@ -1285,7 +1286,7 @@ impl FrameDecoder {
 
     /// Enable or disable magicless frame format
     /// (`ZSTD_f_zstd1_magicless`). When set to `true`, subsequent
-    /// [`init`] / [`reset`] calls expect the frame header to begin
+    /// [`Self::init`] / [`Self::reset`] calls expect the frame header to begin
     /// directly with the frame-header descriptor — no 4-byte magic
     /// number prefix. Default false. Must match the encoder's
     /// magicless setting; the format is unambiguous only when the
@@ -3300,7 +3301,7 @@ impl FrameDecoder {
     ///   that does not fit is `TargetTooSmall` rather than a size mismatch.
     ///   No `WILDCOPY_OVERLENGTH` trailing slack is required: the trailing
     ///   sequence(s) take the bounded (non-overshooting) copy in
-    ///   [`UserSliceBackend::exec_sequence_bounded`].
+    ///   [`UserSliceBackend::exec_sequence_bounded`](crate::decoding::user_slice_buf::UserSliceBackend::exec_sequence_bounded).
     ///
     /// Dictionary frames are supported: the scratch buffer's shared
     /// dict handle is forwarded to the stack-local `DecodeBuffer`, so

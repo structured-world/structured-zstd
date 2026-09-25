@@ -56,8 +56,7 @@
 //! i9-9900K — see #244 for the flamegraph.
 //!
 //! Selected at compile time via `DecodeBuffer<UserSliceBackend<'a>>`
-//! (generic [`BufferBackend`](super::buffer_backend::BufferBackend)
-//! parameter). The lifetime parameter binds the backend to the
+//! (generic [`BufferBackend`] parameter). The lifetime parameter binds the backend to the
 //! user-provided slice — the backing
 //! `DecodeBuffer<UserSliceBackend<'a>>` is stack-local in
 //! `decode_all` and does not survive across calls. Persistent
@@ -233,10 +232,10 @@ impl<'a> UserSliceBackend<'a> {
 
 impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// Upstream zstd-shape inline `ZSTD_execSequence` on every target: x86_64
-    /// via the SSE2 [`super::exec_sequence_inline::x86`] module
+    /// via the SSE2 `exec_sequence_inline::x86` module
     /// (`_mm_loadu_si128` / `_mm_storeu_si128`, SSE2 is the x86_64
     /// baseline so no `#[target_feature]` gate), all other ISAs via the
-    /// architecture-agnostic [`super::exec_sequence_inline::portable`]
+    /// architecture-agnostic `exec_sequence_inline::portable`
     /// module (unaligned u128/u64 moves lowered to NEON `ldr q`/`str q`
     /// on aarch64 and the widest available store elsewhere). Both arms
     /// are gated on this const, unconditionally `true` because an

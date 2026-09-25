@@ -171,6 +171,10 @@ pub(crate) const FAST_L1: FastConfig = FastConfig {
 /// family and the compile-time strategy consts; the runtime
 /// [`BackendTag`] used by the driver dispatcher is derived via
 /// [`StrategyTag::backend`] so the two cannot drift.
+///
+/// [`StrategyTag`]: crate::encoding::strategy::StrategyTag
+/// [`BackendTag`]: crate::encoding::strategy::BackendTag
+/// [`StrategyTag::backend`]: crate::encoding::strategy::StrategyTag::backend
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(crate) struct LevelParams {
     pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
@@ -262,8 +266,9 @@ pub(crate) fn pre_split_for(tag: crate::encoding::strategy::StrategyTag, lazy_de
     }
 }
 
-/// Apply the public-parameter per-knob overrides (#27) onto the
-/// level-resolved [`LevelParams`], in place. Runs in [`Matcher::reset`]
+/// Apply the public-parameter per-knob overrides onto the
+/// level-resolved [`LevelParams`], in place. Runs in
+/// [`Matcher::reset`](crate::encoding::Matcher::reset)
 /// after the level params are computed and before backend selection, so
 /// a strategy override re-routes the backend uniformly. An all-`None`
 /// override is a no-op the caller skips via
@@ -440,7 +445,7 @@ pub(crate) fn ldm_strategy_ordinal(
 /// and chain widths, the Dfast / Row table widths, the L22 config buckets, and
 /// the Fast attach-vs-copy cutoff. Two hints sharing this value resolve to the
 /// identical matcher shape, which is why it (not the raw byte count) keys the
-/// primed-dictionary snapshot — see [`PrimedKey`]. Operates on the full `u64`
+/// primed-dictionary snapshot — see `match_generator::PrimedKey`. Operates on the full `u64`
 /// so callers comparing a hint against a cutoff get the same bucketed decision
 /// here and at the driver, with no `as usize` truncation on 32-bit targets.
 pub(crate) fn source_size_ceil_log(size: u64) -> u8 {
@@ -1128,19 +1133,15 @@ pub fn estimated_bt_strategy_extra_bytes(strategy_ordinal: u32, window_log: u32)
 ///
 /// The resolved geometry is a function of the SOURCE SIZE, not the level
 /// alone. This is the easy-to-miss part (so read this before assuming a level
-/// maps to one fixed match-finder). It mirrors three upstream zstd stages:
+/// maps to one fixed match-finder). Every level except `Uncompressed` goes
+/// through [`get_cparams`](crate::encoding::cparams::get_cparams), the port of
+/// upstream zstd `ZSTD_getCParams_internal`, which runs its two stages:
 ///
-/// 1. [`LEVEL_TABLE`] holds the tier-0 (source > 256 KiB) base row per level
-///    (upstream `ZSTD_defaultCParameters[0]`). L6-L12 carry
-///    `SearchMethod::RowHash` (the Row match-finder), like upstream's
-///    greedy/lazy default.
-/// 2. [`apply_cparams_tier`] overrides the table-shaping widths for the
-///    smaller source tiers (upstream `ZSTD_getCParams_internal` tier table).
-///    NOTE: upstream ALSO switches STRATEGY in some tiers (L2 → dfast, L4 →
-///    greedy on small sources); those backend switches are NOT yet replicated,
-///    so those levels keep their base strategy on small inputs.
-/// 3. [`adjust_params_for_source_size`] caps `window_log` to
-///    ~`ceil_log2(source_size)` (upstream `ZSTD_adjustCParams_internal`).
+/// 1. the `clevels.h` row for the (level, source-size tier) pair. The tier
+///    changes the STRATEGY as well as the table widths: level 11 is lazy2 on
+///    a large source and btopt on one of 16 KiB or less;
+/// 2. `ZSTD_adjustCParams_internal`, which caps `window_log` to
+///    ~`ceil_log2(source_size)` and shrinks the hash and chain logs to match.
 ///
 /// THEN, inside the Row backend, the greedy/lazy band searches a hash chain
 /// instead of rows when the resolved `window_log <= 14`

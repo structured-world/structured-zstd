@@ -1070,7 +1070,7 @@ unsafe fn copy_exact_inline_sse2(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
-/// NEON inline exact copy — aarch64 analog of [`copy_exact_inline_avx2`],
+/// NEON inline exact copy — aarch64 analog of `copy_exact_inline_avx2`,
 /// **unrolled 2×16B (32 B/iter)**. NEON is the aarch64 baseline
 /// (`cfg(target_feature = "neon")`), so the body inlines with no boundary.
 /// Requires `len >= 33`.

@@ -39,10 +39,6 @@ impl<'t> HuffmanDecoder<'t> {
 
     /// Initialize internal state and prepare to decode data. Then
     /// `decode_symbol_and_advance` can be used for full decode steps.
-    /// The 4-stream batched fallback path used by
-    /// `literals_section_decoder` lives in the [`HufKernel`] trait
-    /// impls (`decode4_unchecked` + `advance_state`) and is selected
-    /// once via `match detect_huffman_decode_kernel() { ... }`.
     #[inline(always)]
     pub fn init_state<K: crate::cpu_kernel::CpuKernel>(
         &mut self,

@@ -5,7 +5,7 @@
 //! once into a `CDict` (encoder side) or `DDict` (decoder side) and then used
 //! across many compress / decompress calls. The encoder-side reuse (parsed
 //! dictionary + primed match-finder snapshot) is realised by caching a
-//! [`FrameCompressor`] on the `ZSTD_CCtx`, keyed by the `CDict`'s never-reused
+//! [`FrameCompressor`](codec::encoding::FrameCompressor) on the `ZSTD_CCtx`, keyed by the `CDict`'s never-reused
 //! serial; the decoder caches the loaded dictionary on the `ZSTD_DCtx` keyed by
 //! the `DDict`'s serial (a raw-address key would be ABA-unsafe across free +
 //! realloc). The match-finder tables a dictionary primes are sized to the

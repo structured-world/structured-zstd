@@ -72,7 +72,7 @@ pub(crate) struct HcCandidateQuery {
 }
 
 /// Per-frame DP state captured at the start of `build_optimal_plan_impl`:
-/// the rep history to use as opt[0], the initial literal-run length, and
+/// the rep history to use as `opt[0]`, the initial literal-run length, and
 /// the cost-model profile picked for the current strategy.
 #[derive(Copy, Clone)]
 pub(crate) struct HcOptimalPlanState {

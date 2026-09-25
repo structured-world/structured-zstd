@@ -85,7 +85,7 @@ pub struct LiteralsView<'a> {
     pub bytes_used: u32,
 }
 
-/// Zero-copy variant of [`decode_literals`]. For Raw literal sections
+/// Decode the provided literals section without copying where it can. For Raw literal sections
 /// returns a slice straight into `source` instead of copying bytes
 /// into a Vec — eliminates one memcpy + one zero-touch wave per RAW
 /// literal byte on the direct-decode path. RLE / HUF paths still go

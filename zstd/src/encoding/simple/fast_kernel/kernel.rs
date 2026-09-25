@@ -1938,7 +1938,8 @@ fast_dict_borrowed_wrapper!(
 );
 
 /// Dispatch the borrowed dual-base dict kernel to the resolved per-tier SIMD
-/// wrapper. `kernel` is the matcher's once-resolved [`FastpathKernel`]; the
+/// wrapper. `kernel` is the matcher's once-resolved
+/// [`FastpathKernel`](crate::encoding::fastpath::FastpathKernel); the
 /// scalar arm carries no `#[target_feature]` (generic word-at-a-time count).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: bool>(

@@ -8,8 +8,7 @@
 //! targeted at — see backlog item #132.
 //!
 //! Selected at compile time via `DecodeBuffer<FlatBuf>` (generic
-//! [`BufferBackend`](super::buffer_backend::BufferBackend)
-//! parameter). The earlier `enum BufferStorage { Ring, Flat }` attempt
+//! [`BufferBackend`] parameter). The earlier `enum BufferStorage { Ring, Flat }` attempt
 //! paid runtime match overhead in every hot-path entry and measured a
 //! +43–58 % regression on small-frame decompress — generic mono-
 //! morphisation strips that match at compile time per call site.

@@ -185,8 +185,8 @@ pub(crate) struct DfastMatchGenerator {
 }
 
 /// The dfast backend's immutable dictionary tables — a long+short pair mirroring
-/// the live [`DfastMatchGenerator::long_hash`] / [`DfastMatchGenerator::short_hash`]
-/// shapes, sized to the same `(long_hash_bits, short_hash_bits)`. Held by the
+/// the live long / short regions of [`DfastMatchGenerator::tables`] in
+/// shape, sized to the same `(long_hash_bits, short_hash_bits)`. Held by the
 /// shared [`DictAttach`] level-1 lifecycle; the per-tier dual-probe LOOKUP is
 /// level-2 in this backend's kernel. Slots hold a +1-biased concat index
 /// shifted by [`DFAST_DICT_TAG_BITS`] with the hash tag in the low bits
@@ -299,7 +299,8 @@ impl DfastMatchGenerator {
         unsafe { self.tables.as_mut_ptr().add(off) }
     }
 
-    /// Set both hash table sizes from the per-level [`DfastConfig`]:
+    /// Set both hash table sizes from the per-level
+    /// [`DfastConfig`](crate::encoding::levels::config::DfastConfig):
     /// `long_bits` = upstream zstd `cParams.hashLog`, `short_bits` = upstream zstd
     /// `cParams.chainLog`. Both clamps stay above `MIN_WINDOW_LOG` so very
     /// small windows don't underflow. The caller already caps `long_bits` by
@@ -1930,9 +1931,9 @@ impl DfastMatchGenerator {
     /// insertion.
     ///
     /// Upstream writes four inline hash-and-store pairs here. Routing each
-    /// through [`Self::insert_masked`] re-derived the scan source, re-ran the
-    /// rebase guard and rebuilt a bounds-checked slice every time, which put
-    /// the two wrappers at 7.6% of a level-3 encode against roughly nothing
+    /// through a single-insertion helper re-derives the scan source, re-runs
+    /// the rebase guard and rebuilds a bounds-checked slice every time, which
+    /// measured at 7.6% of a level-3 encode against roughly nothing
     /// identifiable on the reference profile.
     #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
     fn insert_complementary(&mut self, curr_plus_2: usize, ip_minus_2: usize, ip_minus_1: usize) {

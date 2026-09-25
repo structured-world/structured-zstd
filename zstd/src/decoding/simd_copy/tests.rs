@@ -6,7 +6,8 @@ use alloc::vec;
 /// baseline, so the narrower ones are reachable here and can be held to the
 /// same output as the widest.
 fn runnable_tiers() -> vec::Vec<ExactCopyTier> {
-    let mut tiers = vec![ExactCopyTier::Scalar];
+    let mut tiers = vec::Vec::with_capacity(4);
+    tiers.push(ExactCopyTier::Scalar);
     #[cfg(all(
         feature = "std",
         feature = "kernel-sse",

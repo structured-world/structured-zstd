@@ -61,8 +61,8 @@ impl HcMatch {
     }
 }
 
-/// Hard cap on chain-walk depth. Used to size the fixed-length
-/// candidate buffer returned by [`HcMatcher::chain_candidates`].
+/// Hard cap on chain-walk depth, and the capacity the optimal parser reserves
+/// for its per-position candidate buffer.
 pub(crate) const MAX_HC_SEARCH_DEPTH: usize = 512;
 
 /// Hash-chain matcher state used by the `Lazy2` parse mode (and the
@@ -79,8 +79,7 @@ pub(crate) struct HcMatcher {
     pub(crate) lazy_depth: u8,
     /// Maximum number of chain entries inspected per `find_best_match`
     /// call. Upstream zstd parity: `params->cParams.searchLog` (clamped to
-    /// [`MAX_HC_SEARCH_DEPTH`](super::match_generator::MAX_HC_SEARCH_DEPTH)
-    /// for HC mode; BT modes use the unclamped value as their walk
+    /// [`MAX_HC_SEARCH_DEPTH`] for HC mode; BT modes use the unclamped value as their walk
     /// budget).
     pub(crate) search_depth: usize,
     /// "Sufficient" match length — once a candidate reaches this

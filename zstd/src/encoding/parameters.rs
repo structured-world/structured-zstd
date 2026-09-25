@@ -1,7 +1,7 @@
 //! Fine-grained compression parameters — the drop-in equivalent of C
-//! zstd's advanced `ZSTD_CCtx_setParameter` surface (#27).
+//! zstd's advanced `ZSTD_CCtx_setParameter` surface.
 //!
-//! [`CompressionLevel`](crate::encoding::CompressionLevel) selects a
+//! [`CompressionLevel`] selects a
 //! whole tuning preset in one knob. This module exposes the individual
 //! knobs underneath it — window/hash/chain/search logs, the match
 //! strategy, and the long-distance-matching (LDM) block — so callers
@@ -11,7 +11,7 @@
 //!
 //! [`CompressionParameters`] is built through
 //! [`CompressionParameters::builder`], which takes an explicit base
-//! [`CompressionLevel`](crate::encoding::CompressionLevel) (there is no
+//! [`CompressionLevel`] (there is no
 //! implicit default). Every knob left unset inherits that base level's
 //! resolved value, so a builder that overrides nothing reproduces plain
 //! level-based compression byte-for-byte.
@@ -36,8 +36,7 @@
 //!
 //! # Long-distance matching (LDM)
 //!
-//! LDM is **off at every [`CompressionLevel`](crate::encoding::CompressionLevel)
-//! preset**, matching upstream `libzstd.so.1` where `ZSTD_compress(..., level)`
+//! LDM is **off at every [`CompressionLevel`] preset**, matching upstream `libzstd.so.1` where `ZSTD_compress(..., level)`
 //! never enables LDM — even at level 22. It is activated either by
 //! [`CompressionParametersBuilder::enable_long_distance_matching`] or by any of
 //! the `ldm_*` setters, which each imply `enable_long_distance_matching(true)`.
@@ -331,8 +330,7 @@ impl ParamOverrides {
 /// [`FrameCompressor::set_parameters`](crate::encoding::FrameCompressor::set_parameters)
 /// or [`compress_with_parameters`](crate::encoding::compress_with_parameters).
 ///
-/// Wraps a base [`CompressionLevel`](crate::encoding::CompressionLevel)
-/// plus the set of knobs that override it. A parameter set that
+/// Wraps a base [`CompressionLevel`] plus the set of knobs that override it. A parameter set that
 /// overrides nothing is equivalent to compressing at its base level.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CompressionParameters {

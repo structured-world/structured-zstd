@@ -785,7 +785,7 @@ impl MatchTable {
         unsafe { Self::read_le_u32_ptr(data.as_ptr()) }
     }
 
-    /// Pointer variant of [`read_le_u32`]. Used from macros that
+    /// Pointer variant of [`Self::read_le_u32`]. Used from macros that
     /// already hold a raw pointer.
     ///
     /// # Safety
@@ -3128,7 +3128,7 @@ impl MatchTable {
         self.tables.fill(HC_EMPTY);
     }
 
-    /// HC-side history replay after [`begin_rebase`]. Re-inserts every
+    /// HC-side history replay after [`Self::begin_rebase`]. Re-inserts every
     /// position from `history_start` (inclusive) to `abs_pos`
     /// (exclusive) into the HC chain/hash tables without re-checking
     /// the rebase guard — the caller has just rebased, so positions

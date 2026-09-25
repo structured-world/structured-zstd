@@ -3286,7 +3286,7 @@ impl RowMatchGenerator {
     ///    remaining un-replicated piece is the cross-block entropy
     ///    sharing, not the match-length threshold.) The hybrid form
     ///    still skips the upstream zstd `lazy_depth == 1` lookahead probe
-    ///    that [`start_matching`] above runs unconditionally — the
+    ///    that [`Self::start_matching`] runs unconditionally — the
     ///    speed shape stays upstream zstd-like.
     ///
     /// 3. **Skip-step grows with literal-run length**: on a miss upstream zstd

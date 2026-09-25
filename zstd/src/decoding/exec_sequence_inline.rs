@@ -10,20 +10,21 @@
 //! 2. Match copy fast path: `offset >= 16` → single wildcopy
 //!    (`no_overlap` semantics, 16-byte SIMD loop).
 //! 3. Match copy short-offset: `offset < 16` →
-//!    [`ZSTD_overlapCopy8`] spreading then wildcopy
+//!    `ZSTD_overlapCopy8` spreading then wildcopy
 //!    (`overlap_src_before_dst`, 8-byte loop while diff < 16,
 //!    16-byte once diff catches up).
 //!
-//! Two helper implementations with an identical byte-level contract:
-//! [`x86`] uses SSE2 intrinsics (`_mm_loadu/storeu_si128`, the x86_64
-//! baseline); [`portable`] uses unaligned `u128`/`u64` moves that the
+//! Two helper implementations with an identical byte-level contract, each
+//! compiled only on the targets it serves (so neither is linked from here):
+//! `x86` uses SSE2 intrinsics (`_mm_loadu/storeu_si128`, the x86_64
+//! baseline); `portable` uses unaligned `u128`/`u64` moves that the
 //! backend lowers to its widest store (NEON `ldr q`/`str q` on aarch64,
 //! plain movs on i686/riscv/wasm). The backend's `exec_sequence_inline`
 //! arm picks one by `cfg(target_arch)`. Backends gate the whole path on
 //! `SUPPORTS_INLINE_SEQUENCE_EXEC` (`true` for `UserSliceBackend` /
 //! `FlatBuf` on every target, `false` for `RingBuffer`, which stays on
 //! the `extend` + `repeat` fallback for wrap-aware multi-segment frames).
-//! See the [`portable`] module doc for how the inline path is reached
+//! See the `portable` module doc for how the inline path is reached
 //! per target.
 
 /// Most bytes a wildcopy body may write past the sequence it was asked for: its
@@ -441,7 +442,7 @@ pub(crate) mod x86 {
 }
 
 /// Portable (non-x86) wildcopy helpers: identical byte-level contract
-/// to [`x86`], expressed with `read_unaligned`/`write_unaligned` so any
+/// to the `x86` module, expressed with `read_unaligned`/`write_unaligned` so any
 /// target can use them. On aarch64 LLVM lowers the 16-byte `u128`
 /// load/store to a single NEON `ldr q`/`str q`; elsewhere it picks the
 /// widest available move. The `cfg(not(x86_64))` arms of
@@ -461,7 +462,7 @@ pub(crate) mod x86 {
 /// Both `FlatBuf` and `UserSliceBackend` set
 /// `SUPPORTS_INLINE_SEQUENCE_EXEC = true` on every target; `RingBuffer`
 /// keeps it `false` and stays on the wrap-aware fallback. x86_64 uses
-/// the SSE2 [`x86`] module for production, so this module is gated out
+/// the SSE2 `x86` module for production, so this module is gated out
 /// there in non-test builds to avoid two definitions; it is still
 /// compiled under `cfg(test)` on x86_64 so the architecture-independent
 /// helpers are exercised on the main x86 CI lane, not only the i686
@@ -532,7 +533,7 @@ pub(crate) mod portable {
     /// Upstream zstd `ZSTD_overlapCopy8`: copies 8 bytes and, for `offset < 8`,
     /// spreads the src/dst distance so the following wildcopy can use the
     /// safe ≥ 8 stride. Returns the updated `(dst, src)` pair. Byte-exact
-    /// port of [`super::x86::overlap_copy8`] (same dec32/dec64 tables and
+    /// port of `x86::overlap_copy8` (same dec32/dec64 tables and
     /// the same net-offset computation that avoids intermediate pointer
     /// underflow).
     ///

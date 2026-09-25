@@ -308,7 +308,7 @@ impl BtMatcher {
 
     /// Upstream zstd parity: `ZSTD_optLdm_maybeAddMatch`. Convert the active LDM
     /// window (open/close cursors set by
-    /// [`ldm_get_next_match_and_update_seq_store`]) into a usable
+    /// [`Self::ldm_get_next_match_and_update_seq_store`]) into a usable
     /// `MatchCandidate` when the current position falls inside it.
     pub(crate) fn ldm_maybe_add_match(
         &self,
@@ -336,7 +336,7 @@ impl BtMatcher {
     }
 
     /// Upstream zstd parity: `ZSTD_optLdm_processMatchCandidate`. Wraps
-    /// [`ldm_maybe_add_match`] with a re-seed step when the parser has
+    /// [`Self::ldm_maybe_add_match`] with a re-seed step when the parser has
     /// stepped past the current LDM window.
     pub(crate) fn ldm_process_match_candidate(
         &self,

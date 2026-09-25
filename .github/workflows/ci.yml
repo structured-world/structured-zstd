@@ -73,7 +73,7 @@ jobs:
               - 'rust-toolchain.toml'
 
   lint:
-    timeout-minutes: 10
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -92,6 +92,17 @@ jobs:
         # Lint them with the features their `required-features` gate on so the
         # whole surface compiles clean.
         run: cargo clippy -p ffi-bench --all-targets --features bench-internals,hash,copy-shape-stats -- -D warnings
+      - name: Rustdoc
+        # Public docs with the docs.rs feature set, then the private items too:
+        # a broken intra-doc link is a stale reference to code that moved.
+        # The C ABI crate shares the library's crate name, so it is documented
+        # in its own invocation.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc -p structured-zstd --no-deps --features std,hash,ldm,dict-builder,lsm
+          cargo doc -p structured-zstd --no-deps --document-private-items --features std,hash,ldm,dict-builder,lsm
+          cargo doc -p structured-zstd-c -p structured-zstd-wasm --no-deps --document-private-items
       - name: Gate — compare_ffi/memory must not pull bench-internals
         # Rationale: both `compare_ffi` (timing) and `compare_ffi_memory`
         # (peak alloc) benchmark structured-zstd against libzstd. If

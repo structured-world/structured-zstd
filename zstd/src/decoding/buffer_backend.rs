@@ -443,9 +443,8 @@ pub(crate) trait BufferBackend: Sized {
         true
     }
 
-    /// Construct an empty backend. Backend-specific sizing is done
-    /// via `with_capacity` constructors on the concrete types (see
-    /// [`super::flat_buf::FlatBuf::with_capacity`]).
+    /// Construct an empty backend. It allocates nothing here; capacity is
+    /// reserved on demand once the frame's window size is known.
     fn new() -> Self;
 
     /// Empty the buffer; reset internal cursors to 0.

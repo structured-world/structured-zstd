@@ -207,8 +207,8 @@ where
 /// Upstream zstd parity: zstd's `ZSTD_decompressSequences_body` interleaves
 /// `ZSTD_decodeSequence` and `ZSTD_execSequence` in one loop, keeping
 /// the `seq_t` in registers. We were paying ~24 B/seq × 2 (write + read)
-/// of L1↔L2 traffic on the dropped Vec<Sequence> roundtrip plus the
-/// per-iter Vec::push overhead.
+/// of L1↔L2 traffic on the dropped `Vec<Sequence>` roundtrip plus the
+/// per-iter `Vec::push` overhead.
 ///
 /// Falls back to the legacy two-pass pipeline (`decode_sequences` +
 /// `execute_sequences`) when any of LL/ML/OF is in RLE mode — that path
@@ -983,7 +983,7 @@ const LL_DEFAULT_ACC_LOG: u8 = 6;
 /// If [ModeType::Predefined] is selected for a symbol type, its FSE decoding
 /// table is generated using a predefined distribution table.
 ///
-/// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#literals-length
+/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#literals-length>
 const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
     4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
     -1, -1, -1, -1,
@@ -1089,7 +1089,7 @@ const ML_DEFAULT_ACC_LOG: u8 = 6;
 /// If [ModeType::Predefined] is selected for a symbol type, its FSE decoding
 /// table is generated using a predefined distribution table.
 ///
-/// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#match-length
+/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#match-length>
 const MATCH_LENGTH_DEFAULT_DISTRIBUTION: [i32; 53] = [
     1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
@@ -1100,7 +1100,7 @@ const OF_DEFAULT_ACC_LOG: u8 = 5;
 /// If [ModeType::Predefined] is selected for a symbol type, its FSE decoding
 /// table is generated using a predefined distribution table.
 ///
-/// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#match-length
+/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#offset-codes>
 const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
 ];

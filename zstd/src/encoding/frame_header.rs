@@ -73,7 +73,7 @@ impl FrameHeader {
 
     /// Generate a serialized frame header descriptor for the frame header.
     ///
-    /// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_header_descriptor
+    /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_header_descriptor>
     fn descriptor(&self) -> u8 {
         // A frame header starts with a frame header descriptor.
         // It describes what other fields are present

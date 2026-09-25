@@ -138,6 +138,10 @@ fn every_kernel_advances_the_state_alike() {
         }};
     }
 
+    // A fresh scalar decoder over the same bits must repeat itself: the
+    // baseline every tier below is held to, and the one comparison a build
+    // with no SIMD tier still runs.
+    same_as_scalar!(crate::cpu_kernel::ScalarKernel);
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
         feature = "kernel-bmi2"

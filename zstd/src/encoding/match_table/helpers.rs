@@ -28,7 +28,8 @@ pub(crate) const MIN_MATCH_LEN: usize = 5;
 pub(crate) const FAST_HASH_FILL_STEP: usize = 3;
 /// Stride the lazy / row matchers index a block they wrote off unsearched at.
 ///
-/// Same question, same answer as the fast path's [`RAW_SKIP_INDEX_STEP`], which
+/// Same question, same answer as the fast path's
+/// [`RAW_SKIP_INDEX_STEP`](crate::encoding::incompressible::RAW_SKIP_INDEX_STEP), which
 /// this defers to: the block is not searched, so the only reason to index it is
 /// a LATER block duplicating it, that duplicate is recognised on the seen-content
 /// grid and then searched, and the search sweeps positions — so an entry every

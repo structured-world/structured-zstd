@@ -409,8 +409,9 @@ impl StrategyTag {
         }
     }
 
-    /// Map a [`CompressionLevel`] to its [`StrategyTag`]. Mirrors the
-    /// per-level dispatch in `match_generator::resolve_level_params`.
+    /// Map a [`CompressionLevel`](crate::encoding::CompressionLevel) to its
+    /// [`StrategyTag`]. Mirrors the per-level dispatch in
+    /// `match_generator::resolve_level_params`.
     pub(crate) fn for_compression_level(level: crate::encoding::CompressionLevel) -> Self {
         use crate::encoding::CompressionLevel;
         match level {

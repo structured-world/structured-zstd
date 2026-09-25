@@ -43,7 +43,8 @@ pub struct EncoderDictionary {
     /// Size of the serialized dictionary this was built from (header, entropy
     /// tables, repeat offsets and content); the CDict cParams tier key
     /// (upstream `ZSTD_createCDict(dictBuffer, dictSize, level)`). Falls back
-    /// to the content length when the wrapped [`Dictionary`] was handed over
+    /// to the content length when the wrapped
+    /// [`Dictionary`](crate::decoding::Dictionary) was handed over
     /// already parsed ([`Self::from_dictionary`]) — exact for raw-content
     /// dictionaries, a close lower bound otherwise.
     serialized_len: usize,
@@ -289,7 +290,8 @@ pub struct FrameCompressor<
     /// Diagnostic: skip the block pre-splitter and cut full blocks only
     /// (upstream's block structure under `ZSTD_generateSequences`, whose
     /// sequence-collecting mode never accrues the savings the splitter
-    /// requires). Set via [`Self::set_pre_split_disabled`]; default `false`.
+    /// requires). Set via `set_pre_split_disabled` (a `bench-internals`
+    /// diagnostic); default `false`.
     pre_split_disabled: bool,
     /// Whether to record `Frame_Content_Size` in the frame header when the
     /// total size is known (semantics of upstream `ZSTD_c_contentSizeFlag`).
@@ -473,7 +475,7 @@ impl PreviousFseTable {
 pub(crate) struct FseTables {
     /// The three predefined LL/ML/OF tables are functions of
     /// compile-time-constant distributions. The
-    /// [`fse_encoder::FseDefaultTable`] type alias resolves to
+    /// [`FseDefaultTable`](crate::fse::fse_encoder::FseDefaultTable) type alias resolves to
     /// `&'static FSETable` when a process-wide cache is available
     /// (atomic-pointer targets, or no-atomic targets with the
     /// `critical-section` feature) and to `Box<FSETable>` on the
@@ -1091,8 +1093,8 @@ pub(crate) fn optimal_block_size(
     )
 }
 
-/// [`optimal_block_size`] with the pre-split level already resolved
-/// (`None` = never split, only full blocks).
+/// Size of the next block to cut from `block`, given the pre-split level
+/// already resolved for the frame (`None` = never split, only full blocks).
 ///
 /// Out of line on purpose: inlined into the per-block frame loop it grew the
 /// loop body and shifted the code layout around `run_fast_kernel_block`,
@@ -1728,10 +1730,9 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         }
     }
 
-    /// Configure fine-grained compression parameters (#27).
+    /// Configure fine-grained compression parameters.
     ///
-    /// Resets the base [`CompressionLevel`](crate::encoding::CompressionLevel)
-    /// to the parameters' level and installs the per-knob overrides
+    /// Resets the base [`CompressionLevel`] to the parameters' level and installs the per-knob overrides
     /// (window/hash/chain/search logs, strategy, LDM) applied at the next
     /// frame. Pass `None`-equivalent (a builder that overrides nothing)
     /// to fall back to plain level-based compression.
@@ -1882,8 +1883,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// construct ONE `FrameCompressor` and call this in a loop to emit N
     /// independent, self-describing frames (each carrying its own header,
     /// blocks, and checksum, decodable in isolation, with no cross-frame
-    /// match history). Every call resets the per-frame state via
-    /// [`Self::prepare_frame`]: only the allocations are kept, so the
+    /// match history). Every call resets the per-frame state: only the
+    /// allocations are kept, so the
     /// dominant per-frame setup cost (table allocation + dictionary prime)
     /// is paid once instead of N times. Passing the same `out` buffer each
     /// call additionally reuses the output allocation, matching C's
@@ -2357,12 +2358,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// at the end. This means peak memory usage is O(compressed_size).
     ///
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
-    /// [Read::take] function
-    /// Per-frame setup values resolved by [`Self::prepare_frame`] and
-    /// consumed by the block loop + [`Self::finish_frame`]. Lets the
-    /// owned `compress()` and the borrowed one-shot path share the exact
-    /// same reset / dict-prime / entropy-seed setup and frame tail.
+    /// [Read::take] function.
     pub fn compress(&mut self) {
+        // `prepare_frame` / `finish_frame` are shared with the borrowed
+        // one-shot path, so both run the same reset / dict-prime /
+        // entropy-seed setup and frame tail.
         let prep = self.prepare_frame();
         // Take the reader out so `run_owned_block_loop` can borrow it
         // mutably alongside `&mut self` (the rest of the loop touches

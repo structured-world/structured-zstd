@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 ///
 /// The owned block loop used to always stage a block in a scratch `Vec` that
 /// the matcher then copied into its history. Backends implementing
-/// [`Matcher::fill_in_place`](crate::encoding::Matcher::fill_in_place) instead
+/// [`Matcher::fill_in_place`] instead
 /// read straight into that history, so the bytes are already in place and only
 /// need claiming — [`BlockInput::InPlace`] carries just the length.
 pub(crate) enum BlockInput {

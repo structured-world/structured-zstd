@@ -204,7 +204,8 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     ///    output (which holds a zero-default `state` and may reference
     ///    an empty `decode` vec) would resolve to
     ///    `read_entry(0).get_unchecked(0)` on an empty slice — UB.
-    ///    The empty-table guard in [`update_state`] is intentionally
+    ///    The empty-table guard in the checked `update_state` (a test / fuzz
+    ///    helper) is intentionally
     ///    omitted here to keep the per-sequence fast path branch-free;
     ///    the only call site (`decode_and_execute_sequences`) always
     ///    succeeds `init_state` before entering the per-sequence loop,
@@ -214,7 +215,6 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     /// where a single refill check covers all three FSE state updates.
     ///
     /// [`init_state`]: Self::init_state
-    /// [`update_state`]: Self::update_state
     #[inline(always)]
     pub(crate) fn update_state_fast<K: CpuKernel>(&mut self, bits: &mut BitReaderReversed<'_, K>) {
         let num_bits = self.state.num_bits();
