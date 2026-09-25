@@ -339,7 +339,8 @@ fn compress_and_collect_sequences_impl(
     //   maps to exactly ONE physical on-wire block, so
     //   `CapturingMatcher::current_block` tracks correctly.
     //
-    // * Post-split (`Level(16..=22)` + window >= 1<<17, dispatched
+    // * Post-split (a btopt / btultra / btultra2 frame with a window of at
+    //   least 1<<17, dispatched
     //   from `levels/fastest.rs::compress_block_encoded` via
     //   `compress_block_with_post_split`): a SINGLE matcher call's
     //   output is split into multiple physical blocks by
@@ -347,11 +348,10 @@ fn compress_and_collect_sequences_impl(
     //   → N blocks → `current_block` only increments once,
     //   `block_tail_lengths.len()` is short by `N - 1`.
     //
-    // Reject `Level(n >= 16)` only. Covers `Level(16..=22)` and
-    // clamped `Level(>22)` (match_generator.rs:412-415 lands on
-    // Level 22 params for n > 22). `Level(11..=15)` is allowed
-    // because pre-split produces a separate matcher call per
-    // physical block (PR #149 review #24 + #27 + #30).
+    // Reject `Level(n >= 16)` up front: every such level runs the optimal
+    // band on a large source, and levels above 22 clamp to 22. A lower level
+    // the source size or a dictionary moves onto that band is caught after
+    // compression, by counting the frame's blocks.
     let post_split = matches!(level, CompressionLevel::Level(n) if n >= 16);
     assert!(
         !post_split,
@@ -460,9 +460,21 @@ fn compress_and_collect_sequences_impl(
     // or RLE block is present so the broken precondition surfaces
     // immediately instead of being misread as a real divergence
     // (PR #149 review #25).
-    let raw_or_rle = detect_raw_or_rle_blocks_in_frame(&output).expect(
+    let (physical_blocks, raw_or_rle) = detect_raw_or_rle_blocks_in_frame(&output).expect(
         "sequence_capture: failed to parse emitted frame header — refusing to \
          return a possibly-misaligned capture without raw-block detection",
+    );
+    // The level guard above is a prediction; this is the fact. The post-split
+    // pass follows the strategy the frame runs, which the source size or a
+    // dictionary can raise onto the optimal band below level 16, so the frame
+    // itself is checked for more blocks than the matcher was asked for.
+    assert_eq!(
+        physical_blocks,
+        block_tail_lengths.len(),
+        "compress_and_collect_sequences does not support post-split levels: the \
+         frame holds {physical_blocks} blocks for {} matcher calls, so the per-call \
+         block counter cannot line up with it.",
+        block_tail_lengths.len(),
     );
     assert!(
         raw_or_rle.is_empty(),
@@ -480,14 +492,14 @@ fn compress_and_collect_sequences_impl(
     }
 }
 
-/// Walk the emitted Zstandard frame and return the on-wire indices
-/// of any Raw_Block or RLE_Block entries (RFC 8878 §3.1.1.2.2). The
+/// Walk the emitted Zstandard frame and return its block count and the
+/// on-wire indices of any Raw_Block or RLE_Block entries (RFC 8878 §3.1.1.2.2). The
 /// capture's matcher hook cannot observe the encoder's late
 /// raw-fallback decision; this parser gives us a way to fail-fast
 /// when that decision happens. Returns `Err` on malformed frames so
 /// the caller can panic with a clearer diagnostic than a silent
 /// short read.
-fn detect_raw_or_rle_blocks_in_frame(frame: &[u8]) -> Result<Vec<usize>, &'static str> {
+fn detect_raw_or_rle_blocks_in_frame(frame: &[u8]) -> Result<(usize, Vec<usize>), &'static str> {
     const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
     if frame.len() < 6 || frame[..4] != ZSTD_MAGIC {
         return Err("frame missing zstd magic");
@@ -575,7 +587,7 @@ fn detect_raw_or_rle_blocks_in_frame(frame: &[u8]) -> Result<Vec<usize>, &'stati
     if content_checksum_flag == 1 && cursor.checked_add(4).is_none_or(|end| end > frame.len()) {
         return Err("truncated content checksum");
     }
-    Ok(raw_or_rle)
+    Ok((block_idx, raw_or_rle))
 }
 
 #[cfg(test)]

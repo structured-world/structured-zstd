@@ -11,6 +11,7 @@ use crate::{
             compression_level_allows_raw_fast_path,
         },
         match_generator::MatchGeneratorDriver,
+        strategy::StrategyTag,
     },
 };
 use alloc::vec::Vec;
@@ -168,11 +169,9 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // consume it: when no sink collects checksums (the common case), and when
     // the block is headed for the post-split helper, which emits several
     // physical blocks and records a checksum per partition of its own.
+    let post_split = post_split_enabled(state.strategy_tag, window_size);
     #[cfg(all(feature = "lsm", feature = "hash"))]
-    let post_split_path = rle_byte_opt.is_none()
-        && !raw_fast_path
-        && matches!(compression_level, CompressionLevel::Level(16..=22))
-        && state.matcher.window_size() >= (1 << 17);
+    let post_split_path = rle_byte_opt.is_none() && !raw_fast_path && post_split;
     #[cfg(all(feature = "lsm", feature = "hash"))]
     let precomputed_checksum = block_checksums
         .as_ref()
@@ -222,9 +221,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     } else {
         // Compress as a standard compressed block
         uncompressed_data.commit(&mut state.matcher);
-        if matches!(compression_level, CompressionLevel::Level(16..=22))
-            && state.matcher.window_size() >= (1 << 17)
-        {
+        if post_split {
             // This helper may emit multiple physical blocks (compressed or raw)
             // into `output`; the decompressed-size and (if requested) checksum
             // sidecars are pushed per physical block from inside the partition
@@ -363,8 +360,9 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
 /// branch selection and shares the heavy `compress_block` machinery; the
 /// only differences are how the block is acquired (borrowed slice, no
 /// copy) and that raw/RLE bodies are emitted straight from `block`. The
-/// `Level(16..=22)` post-split branch is unreachable here (the borrowed
-/// path is gated to Fast levels), so it is omitted.
+/// post-split branch is unreachable here (it needs an optimal-band
+/// strategy, and the borrowed path is gated to the fast one), so it is
+/// omitted.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_block_encoded_borrowed(
     state: &mut CompressState<MatchGeneratorDriver>,
@@ -566,6 +564,20 @@ pub(crate) fn compress_block_encoded_borrowed(
             BlockType::Compressed
         }
     }
+}
+
+/// Whether a compressed block goes through the post-split pass, which may cut
+/// it into several blocks along its sequences. Decided by the strategy the
+/// frame runs, not by its level, as upstream zstd decides it
+/// (`zstd_compress.c`, `ZSTD_resolveBlockSplitterMode`: `strategy >= btopt &&
+/// windowLog >= 17`), so a parameter set that moves the strategy moves the
+/// pass with it.
+#[inline]
+fn post_split_enabled(strategy_tag: StrategyTag, window_size: u64) -> bool {
+    matches!(
+        strategy_tag,
+        StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
+    ) && window_size >= 1 << 17
 }
 
 /// Whether this block may go out raw without being searched.
