@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.57](https://github.com/structured-world/structured-zstd/compare/v0.0.56...v0.0.57) - 2026-09-25
+
+### Added
+
+- *(cli)* fail -r on unreadable directories ([#528](https://github.com/structured-world/structured-zstd/pull/528))
+
+### Performance
+
+- *(opt)* stop pre-filling the optimal parser's DP buffers ([#526](https://github.com/structured-world/structured-zstd/pull/526))
+
 ## [0.0.56](https://github.com/structured-world/structured-zstd/compare/v0.0.55...v0.0.56) - 2026-09-25
 
 ### Performance
