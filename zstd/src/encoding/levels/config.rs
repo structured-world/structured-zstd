@@ -166,15 +166,14 @@ pub(crate) const FAST_L1: FastConfig = FastConfig {
     step_size: 2,
 };
 
-/// Resolved tuning parameters for a compression level. The
-/// [`StrategyTag`] is the single source of truth for the backend
-/// family and the compile-time strategy consts; the runtime
-/// [`BackendTag`] used by the driver dispatcher is derived via
-/// [`StrategyTag::backend`] so the two cannot drift.
+/// Resolved tuning parameters for a compression level and source size. The
+/// [`StrategyTag`] selects the compile-time strategy consts; the runtime
+/// [`BackendTag`] used by the driver dispatcher comes from the resolved
+/// search method ([`Self::backend`]), so an override or a size tier that
+/// changes the search changes the backend with it.
 ///
 /// [`StrategyTag`]: crate::encoding::strategy::StrategyTag
 /// [`BackendTag`]: crate::encoding::strategy::BackendTag
-/// [`StrategyTag::backend`]: crate::encoding::strategy::StrategyTag::backend
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(crate) struct LevelParams {
     pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
