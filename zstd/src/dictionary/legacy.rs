@@ -124,31 +124,25 @@ impl Corpus {
 /// `suffix[bufferSize]`): a walk off either end compares against noise and
 /// stops there.
 struct Suffixes {
-    padded: Vec<u32>,
-    noise: u32,
+    sa: Vec<u32>,
+    noise: usize,
 }
 
 impl Suffixes {
-    fn new(sa: Vec<u32>, len: u32) -> Self {
-        let mut padded = Vec::with_capacity(sa.len() + 2);
-        padded.push(len);
-        padded.extend_from_slice(&sa);
-        padded.push(len);
-        Self { padded, noise: len }
+    fn new(sa: Vec<u32>, len: usize) -> Self {
+        Self { sa, noise: len }
     }
 
-    /// `suffix[at]`, for `at` in `-1..=len`; any rank further out is the noise
-    /// band as well, which a walk can only reach on a corpus whose tail matches
-    /// the noise.
+    /// `suffix[at]`, where ranks `-1` and `len` (and any further out, which a
+    /// walk only reaches on a corpus whose tail matches the noise) are the
+    /// noise band. A negative rank wraps past every real one, so a single
+    /// compare tells the two apart.
     #[inline]
     fn at(&self, at: i64) -> usize {
-        // A walk stops at rank -1 at the lowest, where the padding holds the
-        // noise position.
-        debug_assert!(at >= -1);
-        self.padded
-            .get((at + 1) as usize)
-            .copied()
-            .unwrap_or(self.noise) as usize
+        match self.sa.get(at as u64 as usize) {
+            Some(&pos) => pos as usize,
+            None => self.noise,
+        }
     }
 }
 
@@ -242,7 +236,7 @@ fn find_segments(list: &mut [DictItem], corpus: &Corpus, len: usize, min_rep: u3
     for (at, &pos) in sa.iter().enumerate() {
         rank[pos as usize] = at as u32;
     }
-    let suffixes = Suffixes::new(sa, len as u32);
+    let suffixes = Suffixes::new(sa, len);
     // Slack past the corpus, as the reference allocates it: a covered run may
     // be marked into the noise band.
     let mut done = vec![false; len + 16];
@@ -473,57 +467,66 @@ fn try_merge(list: &mut [DictItem], elt: DictItem, skip: usize, corpus: &Corpus)
     let size = list[0].pos as usize;
     let elt_end = elt.pos + elt.length;
 
-    // An existing entry starts inside `elt`: extend it backwards.
-    for u in 1..size {
-        if u == skip {
-            continue;
-        }
-        if list[u].pos > elt.pos && list[u].pos <= elt_end {
-            let added = list[u].pos - elt.pos;
-            list[u].length += added;
-            list[u].pos = elt.pos;
-            list[u].savings = list[u]
-                .savings
-                .wrapping_add(elt.savings.wrapping_mul(added) / elt.length);
-            list[u].savings = list[u].savings.wrapping_add(elt.length / 8);
-            return promote(list, u);
+    // An existing entry starts inside `elt`: extend it backwards. The scans
+    // walk the table as a slice, and the rare skipped entry is tested last.
+    let mut hit = 0;
+    for (u, item) in list[..size].iter().enumerate().skip(1) {
+        if item.pos > elt.pos && item.pos <= elt_end && u != skip {
+            hit = u;
+            break;
         }
     }
+    if hit != 0 {
+        let item = &mut list[hit];
+        let added = item.pos - elt.pos;
+        item.length += added;
+        item.pos = elt.pos;
+        item.savings = item
+            .savings
+            .wrapping_add(elt.savings.wrapping_mul(added) / elt.length);
+        item.savings = item.savings.wrapping_add(elt.length / 8);
+        return promote(list, hit);
+    }
 
-    // `elt` starts inside an existing entry, or right after a copy of it.
+    // `elt` starts inside an existing entry, or right after a copy of it. The
+    // eight bytes after `elt`'s start are the same for every entry, so they
+    // are read once rather than per entry as the reference reads them.
+    let elt_head = corpus.read64(elt.pos as usize + 1);
     for u in 1..size {
+        let item = list[u];
         if u == skip {
             continue;
         }
-        if list[u].pos + list[u].length >= elt.pos && list[u].pos < elt.pos {
-            let added = elt_end as i64 - i64::from(list[u].pos + list[u].length);
-            list[u].savings = list[u].savings.wrapping_add(elt.length / 8);
+        if item.pos + item.length >= elt.pos && item.pos < elt.pos {
+            let added = elt_end as i64 - i64::from(item.pos + item.length);
+            let item = &mut list[u];
+            item.savings = item.savings.wrapping_add(elt.length / 8);
             if added > 0 {
-                list[u].length += added as u32;
-                list[u].savings = list[u]
+                item.length += added as u32;
+                item.savings = item
                     .savings
                     .wrapping_add(elt.savings.wrapping_mul(added as u32) / elt.length);
             }
             return promote(list, u);
         }
-        let head = corpus.read64(list[u].pos as usize);
-        if head.is_some()
-            && head == corpus.read64(elt.pos as usize + 1)
+        if elt_head.is_some()
+            && corpus.read64(item.pos as usize) == elt_head
             && is_included(
                 corpus,
-                list[u].pos as usize,
+                item.pos as usize,
                 elt.pos as usize + 1,
-                list[u].length as usize,
+                item.length as usize,
             )
         {
             // The reference takes this product at pointer width, where it does
             // not wrap, unlike the two above.
-            let added = (i64::from(elt.length) - i64::from(list[u].length)).max(1) as u64;
-            list[u].pos = elt.pos;
-            list[u].savings = list[u]
+            let added = (i64::from(elt.length) - i64::from(item.length)).max(1) as u64;
+            let item = &mut list[u];
+            item.pos = elt.pos;
+            item.savings = item
                 .savings
                 .wrapping_add((u64::from(elt.savings) * added / u64::from(elt.length)) as u32);
-            list[u].length = elt.length.min(list[u].length + 1);
+            item.length = elt.length.min(item.length + 1);
             return u;
         }
     }
