@@ -304,7 +304,7 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
         K::extract_triple(all_three, n1, n2, n3)
     }
 
-    /// BMI2-scoped variant of [`peek_bits`]. The whole body executes
+    /// BMI2-scoped variant of [`Self::peek_bits`]. The whole body executes
     /// in `#[target_feature(enable = "bmi2")]` scope, so `_bzhi_u64`
     /// inlines as a single `bzhi` instruction at the caller site
     /// instead of crossing the `mask_lower_bits_bmi2_impl` CALL

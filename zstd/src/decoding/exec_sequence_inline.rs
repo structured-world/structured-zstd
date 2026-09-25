@@ -96,7 +96,8 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
 /// explicit cursor rather than by asking the backend where it is.
 ///
 /// A `#[target_feature(avx2)]` function cannot be `#[inline(always)]`
-/// (rust#145574), so the [`BufferBackend::exec_sequence_inline_avx2`] trait
+/// (rust#145574), so the
+/// [`BufferBackend::exec_sequence_inline_avx2`](super::buffer_backend::BufferBackend::exec_sequence_inline_avx2) trait
 /// method stays a real CALL on the hot path; expanding the body via a macro
 /// removes that boundary (the reference `decompressSequences_bmi2` is one
 /// inlined monolith). The trait method remains the unit-tested reference spec

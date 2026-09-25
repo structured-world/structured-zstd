@@ -1018,7 +1018,8 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
     }
 
     /// Inline `ZSTD_execSequence` fast path on the contiguous sub-window. Gated by
-    /// [`Self::inline_exec_ok`]: `head <= tail` and the write + 15-byte
+    /// [`BufferBackend::inline_exec_ok`](super::buffer_backend::BufferBackend::inline_exec_ok):
+    /// `head <= tail` and the write + 15-byte
     /// overshoot stay below `cap`, so the linear addressing the FlatBuf body
     /// uses is valid for the ring too. Mirrors `FlatBuf::exec_sequence_inline`
     /// with `tail`/`cap`/the ring base in place of the Vec.

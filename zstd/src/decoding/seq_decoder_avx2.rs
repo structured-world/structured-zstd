@@ -82,8 +82,8 @@ macro_rules! decode_one_body {
 }
 
 /// Textual expansion of per-sequence execute. Fast path: the inlined AVX2
-/// match-copy macro [`exec_sequence_avx2_inline`]. Cold path: legacy
-/// try_push + repeat_lookahead_prefetched. Expands as a statement-block
+/// match-copy macro `exec_sequence_avx2_inline_at!`. Cold path: legacy
+/// `try_push` + `repeat_lookahead_prefetched`. Expands as a statement-block
 /// returning `Result<(), DecompressBlockError>` so the caller can `?`
 /// or branch on it as needed.
 /// Where the block's output stands, carried in locals for the length of the
