@@ -59,7 +59,8 @@ pub(crate) struct HcMatchGenerator {
     /// `BtMatcher` when an optimal mode is configured.
     pub(crate) backend: HcBackend,
     /// Compile-time strategy tag mirrored from
-    /// [`MatchGeneratorDriver::strategy_tag`] during `configure()`.
+    /// [`MatchGeneratorDriver::strategy_tag`](crate::encoding::match_generator::MatchGeneratorDriver::strategy_tag)
+    /// during `configure()`.
     /// The driver hot path never reads this — it dispatches to
     /// `compress_block::<S>` from its own tag — but the
     /// `#[cfg(test)] start_matching` helper consumes it so artificial
@@ -117,9 +118,20 @@ macro_rules! bt_insert_step_no_rebase_body {
         // buffer at every use, and each re-derivation is a bounds-checked
         // reslice that reloads the buffer's header and the seam offset through
         // `&mut self`.
-        let hash_ptr = $table.hash_table_mut().as_mut_ptr();
+        //
+        // The BT pointer-pair base is hoisted the same way — see the
+        // collect-matches body for the full rationale (per-step Vec reload +
+        // bounds check through `&mut self` vs the upstream zstd's raw `U32*`
+        // walk). Both bases come out of ONE split borrow: taking the second
+        // through its own `&mut` reslice reborrows the whole buffer, which
+        // invalidates a pointer already taken from the first.
         debug_assert_eq!($table.hash_table().len(), 1usize << $table.hash_log);
+        debug_assert_eq!($table.chain_table().len(), 2 << $table.bt_log());
         debug_assert!(hash < 1usize << $table.hash_log);
+        let (hash_ptr, chain_ptr) = {
+            let (hash_table, chain_table) = $table.hash_and_chain_mut();
+            (hash_table.as_mut_ptr(), chain_table.as_mut_ptr())
+        };
         // Prefetch the hash bucket now. For the large L16+ hash table over
         // high-entropy input the bucket is L3/DRAM-cold, and unlike upstream's
         // monolithic ZSTD_btGetAllMatches (which overlaps this miss with its
@@ -170,11 +182,6 @@ macro_rules! bt_insert_step_no_rebase_body {
         // triggers early; raw subtraction would underflow into a huge
         // sentinel that ALWAYS triggers.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
-        // Hoist the BT pointer-pair base out of `self` once — see the
-        // collect-matches body for the full rationale (per-step Vec reload +
-        // bounds check through `&mut self` vs the upstream zstd's raw `U32*` walk).
-        let chain_ptr = $table.chain_table_mut().as_mut_ptr();
-        debug_assert_eq!($table.chain_table().len(), 2 << $table.bt_log());
         let window_low = $table.window_low_abs_for_target($target_abs);
         // `abs_pos + 9` is safe in raw form: `MatchTable::add_data` caps
         // total input at `usize::MAX - STREAM_ABS_HEADROOM` (where
@@ -805,10 +812,29 @@ macro_rules! bt_insert_and_collect_matches_body {
         // body (zstd_opt.c:607). Ours re-derived it from the shared table
         // buffer at every use, and each re-derivation is a bounds-checked
         // reslice that reloads the buffer's header and the seam offset through
-        // `&mut self`. One raw base, the way `chain_ptr` below already does it.
-        let hash_ptr = $table.hash_table_mut().as_mut_ptr();
+        // `&mut self`. One raw base, the way `chain_ptr` below does it.
+        //
+        // The BT pointer-pair table's base is hoisted out of `self` once too:
+        // every access below is `chain_table[computed_index]` through `&mut
+        // self`, which the optimizer cannot prove loop-invariant, so it reloads
+        // the Vec's (ptr,len) from the struct AND bounds-checks on every tree
+        // step (the upstream zstd walks a raw `U32* btable`, zstd_opt.c). The raw
+        // base carries no borrow, so the `&self` helper calls in the loop
+        // (`bt_pair_index_for_abs`, `window_low_abs_for_target`,
+        // `relative_position`) coexist — they read other fields, never
+        // `chain_table`. Indices are in bounds by the BT invariants:
+        // `bt_pair_index_for_abs` returns `2*(abs & bt_mask) (+1)` ≤
+        // `chain_table.len()-1`, and the slots only ever hold those values.
+        // Both bases come out of ONE split borrow: taking the second through
+        // its own `&mut` reslice reborrows the whole buffer, which invalidates
+        // a pointer already taken from the first.
         debug_assert_eq!($table.hash_table().len(), 1usize << $table.hash_log);
+        debug_assert_eq!($table.chain_table().len(), 2 << $table.bt_log());
         debug_assert!(hash < 1usize << $table.hash_log);
+        let (hash_ptr, chain_ptr) = {
+            let (hash_table, chain_table) = $table.hash_and_chain_mut();
+            (hash_table.as_mut_ptr(), chain_table.as_mut_ptr())
+        };
         // Prefetch the hash bucket now. For the large L16+ hash table over
         // high-entropy input the bucket is L3/DRAM-cold, and unlike upstream's
         // monolithic ZSTD_btGetAllMatches (which overlaps this miss with its
@@ -853,19 +879,6 @@ macro_rules! bt_insert_and_collect_matches_body {
         // Total, not tested: the block was armed before the parse began.
         let stored = $table.relative_position_armed($abs_pos) + 1;
         let bt_mask = $table.bt_mask();
-        // Hoist the BT pointer-pair table's base out of `self` once: every
-        // access below is `chain_table[computed_index]` through `&mut self`,
-        // which the optimizer cannot prove loop-invariant, so it reloads the
-        // Vec's (ptr,len) from the struct AND bounds-checks on every tree
-        // step (the upstream zstd walks a raw `U32* btable`, zstd_opt.c). The raw
-        // base carries no borrow, so the `&self` helper calls in the loop
-        // (`bt_pair_index_for_abs`, `window_low_abs_for_target`,
-        // `relative_position`) coexist — they read other fields, never
-        // `chain_table`. Indices are in bounds by the BT invariants:
-        // `bt_pair_index_for_abs` returns `2*(abs & bt_mask) (+1)` ≤
-        // `chain_table.len()-1`, and the slots only ever hold those values.
-        let chain_ptr = $table.chain_table_mut().as_mut_ptr();
-        debug_assert_eq!($table.chain_table().len(), 2 << $table.bt_log());
         // See `bt_insert_step_no_rebase_body!`: saturating is needed for the
         // first BT walk of a fresh frame where `abs_pos < bt_mask`.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
@@ -1400,13 +1413,13 @@ impl HcMatchGenerator {
     }
 
     /// Strategy-aware entry point used by
-    /// [`MatchGeneratorDriver::compress_block`]. Branches on
-    /// `S::USE_BT` — a compile-time `const` — so each
+    /// [`MatchGeneratorDriver::compress_block`](crate::encoding::match_generator::MatchGeneratorDriver::compress_block).
+    /// Branches on `S::USE_BT` — a compile-time `const` — so each
     /// monomorphisation keeps exactly one arm: `Lazy` /
     /// `Fast` / `Dfast` / `Greedy` see only `start_matching_lazy`,
     /// `BtOpt` / `BtUltra` / `BtUltra2` see only
     /// `start_matching_optimal`. The inherent test-only
-    /// [`HcMatchGenerator::start_matching`] reaches the same arms by
+    /// `HcMatchGenerator::start_matching` reaches the same arms by
     /// runtime-matching on `self.strategy_tag` (the parse-mode field
     /// has been removed); production never invokes that path.
     pub(crate) fn start_matching_strategy<S: crate::encoding::strategy::Strategy>(
