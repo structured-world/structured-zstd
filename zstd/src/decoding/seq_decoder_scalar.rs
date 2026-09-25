@@ -365,8 +365,10 @@ pub(super) fn decode_and_execute_sequences_impl<'fse, B: BufferBackend, K: CpuKe
 
     // Each sequence commits its output at once, but the bitstream is only
     // checked for exhaustion after the loop. Repcodes resolve against a shadow
-    // history committed on success, and a failure restores this checkpoint, so
-    // an `Err` leaves neither partial output nor a mutated history behind.
+    // history committed on success. A sequence or bitstream failure restores
+    // this checkpoint when the backend can roll back, and the history is
+    // rewound only together with the output. A tail-literal overflow below
+    // returns after both are committed.
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
 
