@@ -3541,16 +3541,20 @@ fn a_zero_offset_sequence_is_refused_rather_than_executed() {
     // Both surfaces must REFUSE it, and for this reason: an `Ok` here is the
     // silent garbage the guard exists to prevent, so a test that tolerated one
     // would pass with the guard deleted and protect nothing.
+    // With `lsm` the same refusal arrives in the block-located variant, which
+    // carries the failing block's coordinates around the identical cause.
     let expect_zero_offset = |err: &FrameDecoderError| {
+        let source = match err {
+            FrameDecoderError::FailedToReadBlockBody(source) => source,
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::FailedToReadBlockBodyAt { source, .. } => source,
+            other => panic!("expected a block-body refusal, got {other:?}"),
+        };
         assert!(
             matches!(
-                err,
-                FrameDecoderError::FailedToReadBlockBody(
-                    DecodeBlockContentError::DecompressBlockError(
-                        DecompressBlockError::ExecuteSequencesError(
-                            ExecuteSequencesError::ZeroOffset
-                        )
-                    )
+                source,
+                DecodeBlockContentError::DecompressBlockError(
+                    DecompressBlockError::ExecuteSequencesError(ExecuteSequencesError::ZeroOffset)
                 ),
             ),
             "expected the zero-offset refusal, got {err:?}",
