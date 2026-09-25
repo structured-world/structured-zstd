@@ -41,12 +41,12 @@ impl Symbol for u32 {
 ///
 /// # Panics
 ///
-/// If `text` is `u32::MAX` bytes or longer, since positions are held as `u32`
-/// with one value kept free as the empty mark.
+/// If `text` is 2 GiB or longer: positions are held as `u32` whose top bit
+/// marks an entry during construction.
 pub(crate) fn suffix_array(text: &[u8]) -> Vec<u32> {
     assert!(
-        text.len() < EMPTY as usize,
-        "a suffix array of {} bytes does not fit u32 positions",
+        text.len() < 1 << 31,
+        "a suffix array of {} bytes does not fit 31-bit positions",
         text.len()
     );
     sa_is(text, usize::from(u8::MAX))
@@ -99,66 +99,105 @@ fn sa_is<T: Symbol>(s: &[T], upper: usize) -> Vec<u32> {
         }
     }
 
-    let mut sa = vec![EMPTY; n];
+    // Bucket ends: one past the last slot of each symbol's bucket.
+    let ends: Vec<u32> = (0..=upper)
+        .map(|c| if c < upper { sum_l[c + 1] } else { n as u32 })
+        .collect();
+    let mut sa = vec![0u32; n];
     let mut buf = vec![0u32; upper + 1];
+    // The induction sweeps are the whole cost of the construction: one random
+    // write per suffix. They follow Yuta Mori's `sais.c` (`induceSA`): whether
+    // a suffix's predecessor is to be induced in the sweep that reads it is
+    // decided when the suffix is written, from the symbol before it, which is
+    // next to the one just read, and kept as the complement of the position
+    // (`!j`, the top bit set). The L sweep complements every entry it reads,
+    // which turns exactly the entries whose predecessor is S-type into the
+    // live ones for the S sweep; the S sweep restores the rest. The bucket
+    // cursor stays in a register while the symbol does not change.
+    //
+    // Every index below is in bounds by the bucket layout: a position is below
+    // `n`, a symbol lies in `0..=upper`, and each cursor stays inside the
+    // bucket its symbol's suffixes fill.
+    let live = |v: u32| (v as i32) > 0;
     let induce = |sa: &mut [u32], buf: &mut [u32], lms: &[u32]| {
-        sa.fill(EMPTY);
+        sa.fill(0);
         buf.copy_from_slice(&sum_s);
         for &d in lms {
             let d = d as usize;
             if d == n {
                 continue;
             }
+            // An LMS suffix's predecessor is L-type: live for the L sweep.
             let c = s[d].index();
             sa[buf[c] as usize] = d as u32;
             buf[c] += 1;
         }
+
         buf.copy_from_slice(&sum_l);
-        let c = s[n - 1].index();
-        sa[buf[c] as usize] = (n - 1) as u32;
-        buf[c] += 1;
-        // The two induction sweeps are the whole cost of the construction, one
-        // random write per suffix. A slot holding the empty mark or position 0
-        // has no predecessor to induce, and one unsigned compare of `v - 1`
-        // against `n` rejects both. Every index below is in bounds by the
-        // bucket layout: a position is below `n`, and each bucket's cursor
-        // stays inside the bucket its symbol's suffixes fill.
+        let last = n - 1;
+        let mut c1 = s[last].index();
+        let mut b = buf[c1] as usize;
+        sa[b] = if s[last - 1] < s[last] {
+            !(last as u32)
+        } else {
+            last as u32
+        };
+        b += 1;
         for i in 0..n {
             // SAFETY: `i < n == sa.len()`.
-            let p = unsafe { *sa.get_unchecked(i) }.wrapping_sub(1) as usize;
-            if p < n {
-                // SAFETY: `p < n == ls.len() == s.len()`.
-                if !unsafe { *ls.get_unchecked(p) } {
-                    let c = unsafe { s.get_unchecked(p) }.index();
-                    debug_assert!(c < buf.len() && (buf[c] as usize) < n);
-                    // SAFETY: `c <= upper` (symbols lie in `0..=upper` and
-                    // `buf.len() == upper + 1`); `buf[c] < n` by the layout.
+            let v = unsafe { *sa.get_unchecked(i) };
+            unsafe { *sa.get_unchecked_mut(i) = !v };
+            if live(v) {
+                let j = v as usize - 1;
+                // SAFETY: `j < n == s.len()`.
+                let c0 = unsafe { s.get_unchecked(j) }.index();
+                if c0 != c1 {
+                    debug_assert!(c0 < buf.len() && c1 < buf.len());
+                    // SAFETY: both symbols lie in `0..=upper`.
                     unsafe {
-                        let slot = buf.get_unchecked_mut(c);
-                        *sa.get_unchecked_mut(*slot as usize) = p as u32;
-                        *slot += 1;
+                        *buf.get_unchecked_mut(c1) = b as u32;
+                        b = *buf.get_unchecked(c0) as usize;
                     }
+                    c1 = c0;
                 }
+                // `j` is L-type; its predecessor is live for this sweep when it
+                // is L-type as well, which here means not smaller.
+                let dead = j > 0 && unsafe { s.get_unchecked(j - 1) }.index() < c1;
+                debug_assert!(b < n);
+                // SAFETY: `b` stays inside bucket `c1`.
+                unsafe { *sa.get_unchecked_mut(b) = if dead { !(j as u32) } else { j as u32 } };
+                b += 1;
             }
         }
-        buf.copy_from_slice(&sum_l);
+
+        buf.copy_from_slice(&ends);
+        let mut c1 = 0usize;
+        let mut b = buf[0] as usize;
         for i in (0..n).rev() {
             // SAFETY: `i < n == sa.len()`.
-            let p = unsafe { *sa.get_unchecked(i) }.wrapping_sub(1) as usize;
-            if p < n {
-                // SAFETY: `p < n == ls.len() == s.len()`.
-                if unsafe { *ls.get_unchecked(p) } {
-                    let c = unsafe { s.get_unchecked(p) }.index() + 1;
-                    debug_assert!(c < buf.len());
-                    // SAFETY: an S-type symbol is below `upper`, so
-                    // `c <= upper`; the bucket's end cursor is above its start.
+            let v = unsafe { *sa.get_unchecked(i) };
+            if live(v) {
+                let j = v as usize - 1;
+                // SAFETY: `j < n == s.len()`.
+                let c0 = unsafe { s.get_unchecked(j) }.index();
+                if c0 != c1 {
+                    debug_assert!(c0 < buf.len() && c1 < buf.len());
+                    // SAFETY: both symbols lie in `0..=upper`.
                     unsafe {
-                        let slot = buf.get_unchecked_mut(c);
-                        *slot -= 1;
-                        debug_assert!((*slot as usize) < n);
-                        *sa.get_unchecked_mut(*slot as usize) = p as u32;
+                        *buf.get_unchecked_mut(c1) = b as u32;
+                        b = *buf.get_unchecked(c0) as usize;
                     }
+                    c1 = c0;
                 }
+                // `j` is S-type; its predecessor is live when it is S-type as
+                // well, which here means not larger.
+                let dead = j == 0 || unsafe { s.get_unchecked(j - 1) }.index() > c1;
+                debug_assert!(b > 0);
+                b -= 1;
+                // SAFETY: `b` stays inside bucket `c1`.
+                unsafe { *sa.get_unchecked_mut(b) = if dead { !(j as u32) } else { j as u32 } };
+            } else {
+                unsafe { *sa.get_unchecked_mut(i) = !v };
             }
         }
     };
