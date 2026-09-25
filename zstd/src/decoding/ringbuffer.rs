@@ -950,8 +950,9 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         //   + overshoot ends strictly before `head` (so it neither wraps nor
         //   clobbers the upper live segment) and (b) the match source does not
         //   underflow into that upper segment: `offset <= tail + lit` keeps
-        //   `tail + lit - offset >= 0`, placing the source in the contiguous
-        //   lower live segment `[0, tail)`. Sequences violating either bound
+        //   `tail + lit - offset >= 0`, so the source is either this
+        //   sequence's own literals (`offset <= lit`) or the contiguous lower
+        //   live segment `[0, tail)`. Sequences violating either bound
         //   (a far-back match across the wrap, or a write that reaches `head`)
         //   fall back to the wrap-correct `push` / `repeat` path. This is the
         //   subset upstream zstd handles with its fast `ZSTD_execSequence` body;
@@ -962,7 +963,7 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         // condition that separates the two: where the match source comes from.
         // Unwrapped, the caller's `offset <= live + lit` invariant already puts
         // it at `>= head`; wrapped, `offset <= tail + lit` keeps
-        // `tail + lit - offset >= 0`, in the contiguous lower live segment.
+        // `tail + lit - offset >= 0`, in this sequence's literals or below them.
         self.inline_exec_dict_ok(lit_length, match_length)
             && (self.head <= self.tail || offset <= self.tail + lit_length)
     }
@@ -1026,7 +1027,9 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
     ///
     /// - unwrapped (`head <= tail`): the write plus margin stays below `cap`;
     /// - wrapped (`head > tail`): the write plus margin stays below `head`, and
-    ///   `offset <= tail + lit_length` keeps the match source in the lower live
+    ///   `offset <= tail + lit_length` keeps the source address
+    ///   `tail + lit_length - offset` nonnegative: it lies in this sequence's
+    ///   own literals when `offset <= lit_length`, otherwise in the lower live
     ///   segment `[0, tail)`.
     ///
     /// The body itself overshoots by at most 15 bytes, which
@@ -1056,7 +1059,8 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         debug_assert!(match_length >= 1);
         // `inline_exec_ok` admits both the unwrapped run (`head <= tail`) and a
         // wrapped ring whose write stays in the gap before `head` and whose
-        // match source is the contiguous lower segment (`offset <= tail+lit`).
+        // match source stays at or above 0 (`offset <= tail+lit`: this
+        // sequence's literals or the contiguous lower segment below them).
         // The match-source contiguity bound differs per case; assert the one
         // that applies so a future caller bypassing the gate is caught.
         debug_assert!(
