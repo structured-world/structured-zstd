@@ -923,9 +923,10 @@ impl RingBuffer {
 }
 
 impl super::buffer_backend::BufferBackend for RingBuffer {
-    // The ring supports the inline `ZSTD_execSequence` body, but only on the
-    // contiguous (non-wrapped) sub-window — `inline_exec_ok` gates it and the
-    // caller falls back to the wrap-correct `push` / `repeat` path otherwise.
+    // The ring supports the inline `ZSTD_execSequence` body wherever the
+    // sequence is one contiguous in-bounds run, unwrapped or wrapped —
+    // `inline_exec_ok` gates it and the caller falls back to the wrap-correct
+    // `push` / `repeat` path otherwise.
     const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = true;
 
     #[inline(always)]
@@ -1017,12 +1018,22 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         }
     }
 
-    /// Inline `ZSTD_execSequence` fast path on the contiguous sub-window. Gated by
-    /// [`BufferBackend::inline_exec_ok`](super::buffer_backend::BufferBackend::inline_exec_ok):
-    /// `head <= tail` and the write + 15-byte
-    /// overshoot stay below `cap`, so the linear addressing the FlatBuf body
-    /// uses is valid for the ring too. Mirrors `FlatBuf::exec_sequence_inline`
-    /// with `tail`/`cap`/the ring base in place of the Vec.
+    /// Inline `ZSTD_execSequence` fast path on a contiguous run of the ring,
+    /// addressed linearly from `tail` the way the FlatBuf body addresses its
+    /// Vec. Gated by
+    /// [`BufferBackend::inline_exec_ok`](super::buffer_backend::BufferBackend::inline_exec_ok),
+    /// which admits two layouts, each with a 31-byte margin past the write:
+    ///
+    /// - unwrapped (`head <= tail`): the write plus margin stays below `cap`;
+    /// - wrapped (`head > tail`): the write plus margin stays below `head`, and
+    ///   `offset <= tail + lit_length` keeps the match source in the lower live
+    ///   segment `[0, tail)`.
+    ///
+    /// The body itself overshoots by at most 15 bytes, which
+    /// `sequence_output_fits` re-checks against `cap`; the gate's wider margin
+    /// is the AVX2 body's 31-byte overshoot, so one gate serves both bodies. Mirrors
+    /// `FlatBuf::exec_sequence_inline` with `tail`/`cap`/the ring base in place
+    /// of the Vec.
     #[cfg(target_arch = "x86_64")]
     #[inline]
     unsafe fn exec_sequence_inline(
