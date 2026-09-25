@@ -1879,6 +1879,55 @@ fn benchmark_flags_parse_level_range() {
     assert_eq!(opts.bench_end, opts.bench_start);
 }
 
+/// `-B#` is read the way the reference reads it (a count with `K` / `M`), and
+/// zero is no block size at all.
+#[test]
+fn block_size_is_read_like_the_reference_reads_it() {
+    assert_eq!(
+        parse(&["-b", "-B64K", "f"]).unwrap().block_size,
+        Some(64 << 10)
+    );
+    assert_eq!(
+        parse(&["-b", "-B1MiB", "f"]).unwrap().block_size,
+        Some(1 << 20)
+    );
+    assert_eq!(
+        parse(&["-b", "-B4096", "f"]).unwrap().block_size,
+        Some(4096)
+    );
+    assert_eq!(parse(&["-b", "-B0", "f"]).unwrap().block_size, None);
+    assert_eq!(parse(&["-b", "-B", "f"]).unwrap().block_size, None);
+    assert!(parse(&["-b", "-B1G", "f"]).is_err(), "no G multiplier");
+    assert!(parse(&["-b", "-Bx", "f"]).is_err());
+}
+
+/// The benchmark compresses every input as frames of its own, cut into `-B`
+/// pieces from 32 bytes up, as the reference's block table does; an empty
+/// input yields no frame, and a smaller `-B` cuts nothing.
+#[test]
+fn benchmark_frames_follow_the_inputs_and_the_block_size() {
+    assert_eq!(bench_chunk_lengths(&[100, 50], None), vec![100, 50]);
+    assert_eq!(
+        bench_chunk_lengths(&[100, 50], Some(40)),
+        vec![40, 40, 20, 40, 10]
+    );
+    assert_eq!(
+        bench_chunk_lengths(&[100, 0, 50], Some(64)),
+        vec![64, 36, 50]
+    );
+    assert_eq!(
+        bench_chunk_lengths(&[100], Some(31)),
+        vec![100],
+        "below 32 is ignored"
+    );
+    assert_eq!(bench_chunk_lengths(&[100], Some(32)), vec![32, 32, 32, 4]);
+    assert_eq!(
+        bench_frames_bound(&[40, 40]),
+        Some(2 * structured_zstd::encoding::compress_bound(40) as u64),
+        "each frame pays its own framing"
+    );
+}
+
 #[test]
 fn dash_is_a_stdin_input() {
     let opts = parse(&["-d", "-"]).unwrap();

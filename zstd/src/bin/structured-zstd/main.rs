@@ -142,6 +142,10 @@ struct Options {
     /// Measure each input on its own (`-S`) instead of as one stream, so the
     /// reported ratio and throughput describe a file rather than a mixture.
     bench_separately: bool,
+    /// `-B#`: the benchmark cuts every input into independent frames of this
+    /// many bytes (below [`MIN_BENCH_BLOCK_SIZE`] it cuts nothing, as the
+    /// reference's benchmark ignores such a size).
+    block_size: Option<u64>,
     /// Long-distance matching (`--long`), enabled on the encoder via the
     /// compression-parameters API.
     long: bool,
@@ -284,6 +288,11 @@ const DEFAULT_MAX_DICT: usize = 112_640;
 
 /// Least time `-b` measures each level for (upstream `BMK_TIMETEST_DEFAULT_S`).
 const DEFAULT_BENCH_SECONDS: f64 = 3.0;
+
+/// Smallest `-B` block the benchmark cuts its inputs into; a smaller one leaves
+/// each input whole (`benchzstd.c`, `BMK_benchMemAdvancedNoAlloc`:
+/// `adv->blockSize >= 32`).
+const MIN_BENCH_BLOCK_SIZE: u64 = 32;
 
 /// Window log a bare `--long` selects, as upstream documents (128 MiB).
 const DEFAULT_LONG_WINDOW_LOG: u32 = 27;
@@ -945,6 +954,7 @@ fn parse_args_into(
         bench_end: default_level,
         bench_secs: DEFAULT_BENCH_SECONDS,
         bench_separately: false,
+        block_size: None,
         long: false,
         long_window_log: None,
         memory_limit: None,
@@ -1312,23 +1322,30 @@ fn parse_args_into(
                 'v' => *verbosity += 1,
                 'C' => opts.checksum = true,
                 'r' => opts.recursive = true,
-                'B' | 'T' => {
-                    // `-B[N]` job / block size, `-T[N]` thread count. Both
-                    // steer how the work is done, not what comes out: we use a
-                    // fixed block size and run single-threaded. Upstream
-                    // accepts them, so a script that passes them must not fail
-                    // here — but the VALUE is still parsed: ignoring what a
-                    // flag does is not a reason to ignore what it says, and a
-                    // typo is a broken command line either way. A size takes a
-                    // size suffix; a thread count is a plain count, the way
-                    // `--threads=` reads it.
+                'B' => {
+                    // `-B[N]` cuts the benchmark's inputs into independent
+                    // frames and a training sample into several samples. When
+                    // compressing it is the job size of a multi-threaded run,
+                    // which this build does not have, so it is kept and has no
+                    // effect there. Read as the reference reads it
+                    // (`readU32FromChar`): a count with an optional `K` / `M`.
+                    let rest: String = chars[ci + 1..].iter().collect();
+                    let (size, tail) = read_leading_u32(&rest).wrap_err("invalid -B value")?;
+                    if !tail.is_empty() {
+                        bail!("invalid -B value `{rest}`");
+                    }
+                    opts.block_size = (size != 0).then_some(u64::from(size));
+                    ci = chars.len();
+                    continue;
+                }
+                'T' => {
+                    // `-T[N]` thread count: single-threaded here, so it steers
+                    // nothing, but the value is still parsed the way
+                    // `--threads=` reads it, since a typo is a broken command
+                    // line either way.
                     let rest: String = chars[ci + 1..].iter().collect();
                     if !rest.is_empty() {
-                        if c == 'B' {
-                            parse_size(&rest).wrap_err("invalid -B value")?;
-                        } else {
-                            rest.parse::<u32>().wrap_err("invalid -T thread count")?;
-                        }
+                        rest.parse::<u32>().wrap_err("invalid -T thread count")?;
                     }
                     ci = chars.len();
                     continue;
@@ -1681,6 +1698,7 @@ Advanced compression options:
   --zstd=wlog=#,clog=#,hlog=#,slog=#,mml=#,tlen=#,strat=#[,lhlog=#,lmml=#,lblog=#,lhrlog=#]
                                 Override the level's compression parameters knob by knob.
   --exclude-compressed          Only compress files that are not already compressed.
+  --show-default-cparams        Print the parameters the level selects for each input.
 
   --stream-size=#               Specify size of streaming input from STDIN.
   --size-hint=#                 Optimize compression parameters for streaming input of approximately size #.
@@ -1712,13 +1730,15 @@ Benchmark options:
   -b#                           Perform benchmarking with compression level #. [Default: 3]
   -e#                           Test all compression levels up to #; starting level is `-b#`. [Default: 1]
   -i#                           Set the minimum evaluation to time # seconds. [Default: 3]
+  -B#                           Cut file into independent chunks of size #. [Default: No chunking]
   -S                            Output one benchmark result per input file. [Default: Consolidated result]
   -D dictionary                 Benchmark using dictionary
 
 Environment: ZSTD_CLEVEL sets the default compression level; ZSTD_NBTHREADS is read and validated.
 
 Accepted for compatibility, with no effect here: -T#/--threads=#, --single-thread,
---auto-threads, -B#, --block-size=#, --adapt, --zstd=ovlog=#, --[no-]sparse,
+--auto-threads, -B# and --block-size=# when compressing (the job size of a
+multi-threaded run), --adapt, --zstd=ovlog=#, --[no-]sparse,
 --[no-]asyncio, --[no-]mmap-dict, --[no-]row-match-finder (compression runs
 single-threaded).
 
@@ -2733,17 +2753,27 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     if let Some(limit) = opts.memory_limit {
         // With `-S` only one input is in memory at a time, so the largest file
         // is what has to fit rather than their sum.
+        let subject: &[u64] = if opts.bench_separately {
+            let at = sizes
+                .iter()
+                .position(|&size| size == largest)
+                .expect("the largest size is one of the sizes");
+            &sizes[at..=at]
+        } else {
+            &sizes
+        };
         let inputs = if opts.bench_separately { largest } else { sum };
-        // Three buffers exist at once: the input, the frame it compresses to,
+        let chunks = bench_chunk_lengths(subject, opts.block_size);
+        // Three buffers exist at once: the input, the frames it compresses to,
         // and the decoded copy. Each is allocated at the size named here and
         // never grows past it, so this is what the run actually holds rather
-        // than a lower bound on it. The frame's is `compress_bound`, which is
-        // the input plus the framing an incompressible input still pays — the
-        // case a ceiling has to survive.
-        let frame = usize::try_from(inputs)
-            .map(structured_zstd::encoding::compress_bound)
-            .map(|bound| bound as u64)
-            .ok();
+        // than a lower bound on it. The frames' is `compress_bound` of each,
+        // which is the input plus the framing an incompressible input still
+        // pays — the case a ceiling has to survive.
+        let frame = bench_frames_bound(&chunks);
+        // The encoder is sized by the frame it builds, and the frames are the
+        // chunks, so the widest chunk is the source it is weighed against.
+        let widest_chunk = chunks.iter().copied().max().unwrap_or(0);
         // Beside them stands the match finder every compression pass builds,
         // whose tables are the largest thing at the higher levels — hundreds of
         // MiB where the buffers are tens. It is sized by the level, by the
@@ -2779,13 +2809,13 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
                 Some(parameters) => {
                     structured_zstd::encoding::estimated_compression_workspace_bytes_for_parameters(
                         &parameters,
-                        Some(inputs),
+                        Some(widest_chunk),
                         dictionary,
                     )
                 }
                 None => structured_zstd::encoding::estimated_compression_workspace_bytes_for_run(
                     compression_level,
-                    Some(inputs),
+                    Some(widest_chunk),
                     None,
                     false,
                     dictionary,
@@ -2828,7 +2858,13 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         for (input, size) in opts.inputs.iter().zip(&sizes) {
             let data =
                 read_inputs_bounded(std::slice::from_ref(input), std::slice::from_ref(size))?;
-            benchmark_one(opts, codecs, &input.display().to_string(), &data)?;
+            benchmark_one(
+                opts,
+                codecs,
+                &input.display().to_string(),
+                &data,
+                std::slice::from_ref(size),
+            )?;
         }
         return Ok(());
     }
@@ -2840,7 +2876,7 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         [only] => only.display().to_string(),
         many => format!(" {} files", many.len()),
     };
-    benchmark_one(opts, codecs, &label, &data)
+    benchmark_one(opts, codecs, &label, &data, &sizes)
 }
 
 /// Read every input into one buffer, taking no more room — and no more bytes —
@@ -2887,10 +2923,46 @@ fn read_inputs_bounded(inputs: &[PathBuf], sizes: &[u64]) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Measure one benchmark subject: the whole input as one stream, or a single
-/// file under `-S`. Split out so the two modes differ only in what they hand
-/// over, not in how the measurement is taken.
-fn benchmark_one(opts: &Options, codecs: &mut Codecs, label: &str, data: &[u8]) -> Result<()> {
+/// The lengths of the independent frames a benchmark compresses its inputs as,
+/// in order: every input a frame of its own, cut into `block_size` pieces when
+/// one of at least [`MIN_BENCH_BLOCK_SIZE`] is given. An empty input yields no
+/// frame. This is the reference's block table (`benchzstd.c`,
+/// `BMK_benchMemAdvancedNoAlloc`), so ratio and speed describe the same frames.
+fn bench_chunk_lengths(file_sizes: &[u64], block_size: Option<u64>) -> Vec<u64> {
+    let block = block_size.filter(|&size| size >= MIN_BENCH_BLOCK_SIZE);
+    let mut chunks = Vec::new();
+    for &size in file_sizes {
+        let piece = block.unwrap_or(size.max(1));
+        let mut left = size;
+        while left > 0 {
+            let take = left.min(piece);
+            chunks.push(take);
+            left -= take;
+        }
+    }
+    chunks
+}
+
+/// The room the frames of `chunks` can take at most: `compress_bound` of each.
+/// `None` when that is more than this machine can address.
+fn bench_frames_bound(chunks: &[u64]) -> Option<u64> {
+    chunks.iter().try_fold(0u64, |total, &chunk| {
+        let bound = structured_zstd::encoding::compress_bound(usize::try_from(chunk).ok()?);
+        total.checked_add(u64::try_from(bound).ok()?)
+    })
+}
+
+/// Measure one benchmark subject: every input together, or a single file under
+/// `-S`. Split out so the two modes differ only in what they hand over, not in
+/// how the measurement is taken. `file_sizes` are the lengths of the inputs
+/// `data` holds, in order; each is compressed as frames of its own.
+fn benchmark_one(
+    opts: &Options,
+    codecs: &mut Codecs,
+    label: &str,
+    data: &[u8],
+    file_sizes: &[u64],
+) -> Result<()> {
     use std::time::Instant;
 
     if data.is_empty() {
@@ -2908,42 +2980,66 @@ fn benchmark_one(opts: &Options, codecs: &mut Codecs, label: &str, data: &[u8]) 
     );
     if opts.verbosity == 1 {
         // The reference command's machine-readable header, for scripts that
-        // drive `-b -q`.
+        // drive `-b -q`; the block size is the one asked for, as it prints it.
         println!(
-            "bench {UPSTREAM_VERSION} : input {} bytes, {} seconds, 0 KB blocks",
+            "bench {UPSTREAM_VERSION} : input {} bytes, {} seconds, {} KB blocks",
             data.len(),
-            opts.bench_secs as u64
+            opts.bench_secs as u64,
+            opts.block_size.unwrap_or(0) >> 10
         );
     }
 
+    let chunks = bench_chunk_lengths(file_sizes, opts.block_size);
+    debug_assert_eq!(
+        chunks.iter().sum::<u64>(),
+        data.len() as u64,
+        "the frames cover the input exactly"
+    );
     // The two buffers the measurement fills, sized once from what they will
-    // hold: the frame can be no larger than `compress_bound` says, and the
-    // decoded copy is exactly the input again. That keeps them the size the `-M`
-    // ceiling counted them at instead of the doubled capacity a growing `Vec`
-    // ends up with — and it keeps the growth out of the timed sections, which
-    // would otherwise be reported as compression and decompression speed.
-    let mut compressed = Vec::with_capacity(structured_zstd::encoding::compress_bound(data.len()));
+    // hold: the frames can be no larger than `compress_bound` of each says,
+    // and the decoded copy is exactly the input again. That keeps them the size
+    // the `-M` ceiling counted them at instead of the doubled capacity a
+    // growing `Vec` ends up with — and it keeps the growth out of the timed
+    // sections, which would otherwise be reported as compression and
+    // decompression speed.
+    let frames_bound = bench_frames_bound(&chunks)
+        .and_then(|bound| usize::try_from(bound).ok())
+        .ok_or_else(|| eyre!("-b: {label} is more than this machine can hold compressed"))?;
+    let mut compressed = Vec::with_capacity(frames_bound);
     let mut decoded = Vec::with_capacity(data.len());
     for level in opts.bench_start..=opts.bench_end {
         validate_level(level)?;
+        let settings = FrameSettings {
+            level,
+            size_hint: None,
+            // The reference's benchmark compresses with the library's frame
+            // defaults (`BMK_initCCtx` sets no checksum), not the command's, so
+            // its sizes and decoding speeds carry no content checksum.
+            checksum: false,
+            ..FrameSettings::from_options(opts)
+        };
         let mut best_compress = f64::MAX;
         let start = Instant::now();
         loop {
             compressed.clear();
             let t = Instant::now();
-            compress_stream(
-                data,
-                &mut compressed,
-                &FrameSettings {
-                    level,
-                    // The benchmark holds the whole input, so the length is
-                    // exact and there is no estimate to fall back on.
-                    pledged_size: Some(data.len() as u64),
-                    size_hint: None,
-                    ..FrameSettings::from_options(opts)
-                },
-                codecs,
-            )?;
+            let mut rest = data;
+            for &chunk in &chunks {
+                // Each piece is a frame of its own, as the reference's
+                // benchmark compresses every block independently. The length is
+                // exact, so it is pledged rather than estimated.
+                let (piece, tail) = rest.split_at(chunk as usize);
+                rest = tail;
+                compress_stream(
+                    piece,
+                    &mut compressed,
+                    &FrameSettings {
+                        pledged_size: Some(chunk),
+                        ..settings
+                    },
+                    codecs,
+                )?;
+            }
             best_compress = best_compress.min(t.elapsed().as_secs_f64());
             if start.elapsed().as_secs_f64() >= opts.bench_secs {
                 break;
@@ -2965,6 +3061,11 @@ fn benchmark_one(opts: &Options, codecs: &mut Codecs, label: &str, data: &[u8]) 
             if start.elapsed().as_secs_f64() >= opts.bench_secs {
                 break;
             }
+        }
+        // A speed measured on output that is not the input measures nothing;
+        // the reference's benchmark checks the round trip the same way.
+        if decoded != data {
+            bail!("-b: level {level} did not decode {label} back to its input");
         }
 
         let c_speed = if best_compress > 0.0 {
