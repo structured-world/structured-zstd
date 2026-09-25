@@ -3267,6 +3267,91 @@ fn empty_directories_are_nothing_to_do_not_a_request_for_stdin() {
     assert_eq!(run(opts).unwrap(), 1);
 }
 
+/// A directory `-r` cannot open is a failed input: the rest of the tree is
+/// still compressed, but the exit status says part of it was left out, so a
+/// script like `structured-zstd -r dir && rm -r dir` cannot remove data that
+/// was never compressed. `--ignore-read-errors` keeps the reference command's
+/// status, which is 0.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_fails_the_run_unless_read_errors_are_ignored() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("lockedrun");
+    let readable = scratch.file("tree/ok/a.txt", b"readable bytes");
+    scratch.file("tree/locked/b.txt", b"locked bytes");
+    let locked = scratch.path().join("tree/locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    // A process that permissions do not bind (root) opens it anyway, and then
+    // there is no unreadable directory to test.
+    let binding = fs::read_dir(&locked).is_err();
+    let tree = scratch.path().join("tree");
+    let compressed = scratch.path().join("tree/ok/a.txt.zst");
+
+    let mut strict = parse(&["-r", "-qq", "d"]).unwrap();
+    strict.inputs = vec![tree.clone()];
+    let strict_failed = run(strict);
+    let strict_compressed = compressed.exists();
+    let _ = fs::remove_file(&compressed);
+
+    let lenient = parse(&["-r", "-qq", "--ignore-read-errors", "d"]).map(|mut opts| {
+        opts.inputs = vec![tree];
+        run(opts)
+    });
+    let lenient_compressed = compressed.exists();
+    // Restored before any assertion, so a failure still leaves a tree the
+    // scratch directory can remove.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    if binding {
+        assert_eq!(
+            strict_failed.expect("a skipped directory is counted, not an error"),
+            1,
+            "the unreadable directory is a failed input"
+        );
+        assert!(
+            strict_compressed,
+            "the readable part of the tree is still compressed"
+        );
+        assert_eq!(
+            lenient
+                .expect("--ignore-read-errors is an option")
+                .expect("the run completes"),
+            0,
+            "--ignore-read-errors keeps the status at 0"
+        );
+        assert!(lenient_compressed, "and still compresses what it can read");
+    }
+    assert!(readable.exists(), "the source is kept without --rm");
+}
+
+/// `-r` pointed straight at a directory it cannot open selects nothing. That
+/// is not the empty-directory case, which has nothing to do and succeeds: the
+/// run was asked for files it could not read, so it fails, unless read errors
+/// are ignored.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_named_alone_fails_the_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("lockedroot");
+    scratch.file("locked/b.txt", b"locked bytes");
+    let locked = scratch.path().join("locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let binding = fs::read_dir(&locked).is_err();
+
+    let mut strict = parse(&["-r", "-qq", "d"]).unwrap();
+    strict.inputs = vec![locked.clone()];
+    let strict_failed = run(strict);
+    let mut lenient = parse(&["-r", "-qq", "--ignore-read-errors", "d"]).unwrap();
+    lenient.inputs = vec![locked.clone()];
+    let lenient_failed = run(lenient);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    if binding {
+        assert_eq!(strict_failed.expect("counted, not an error"), 1);
+        assert_eq!(lenient_failed.expect("counted, not an error"), 0);
+    }
+}
+
 /// Decompression reports how many bytes came out, which is what `-t` and the
 /// summaries print; a corrupted checksum is ignored under `--no-check`.
 #[test]

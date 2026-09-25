@@ -63,6 +63,11 @@ warning, an existing output is asked about unless `-f` is given (and refused
 under `-q`, where nothing can be asked), one failing input does not stop the
 others, and the exit status is 1 when any input failed and 2 on an interrupt
 while an output file is being written, which also removes the partial file.
+A directory `-r` cannot open counts as a failed input: it is reported, the
+rest of the tree is still processed, and the run exits 1. Upstream reports it
+and exits 0, so `zstd -r dir && rm -r dir` deletes files that were never
+compressed; `--ignore-read-errors` restores upstream's status for callers who
+rely on it.
 `--rm` keeps a source whose output went to stdout, a device or a pipe
 (`-o /dev/null`, a FIFO), since nothing there holds a copy; upstream removes
 it in the last two cases.

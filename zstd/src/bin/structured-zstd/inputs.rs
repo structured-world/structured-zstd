@@ -30,6 +30,9 @@ pub struct Selection {
     /// ended up with no files was pointed at empty directories or an empty
     /// list, which is not a request to read stdin.
     pub explicit: bool,
+    /// Directories `-r` could not open: each was reported and contributed
+    /// nothing, so the files under it were never selected.
+    pub unreadable_dirs: usize,
 }
 
 /// Resolve the command line's inputs to the files a run processes.
@@ -70,27 +73,37 @@ pub fn select_inputs(
         bail!("every named input is a symbolic link; pass -f to follow them");
     }
     let explicit = named_count > 0 || !filelists.is_empty();
+    let mut walk = Walk {
+        follow_links,
+        verbosity,
+        unreadable_dirs: 0,
+    };
     if recursive {
         let mut expanded = Vec::with_capacity(files.len());
         for input in files {
             match fs::metadata(&input) {
                 Ok(metadata) if metadata.is_dir() => {
                     let mut ancestors = Vec::new();
-                    descend(
-                        &input,
-                        &metadata,
-                        follow_links,
-                        verbosity,
-                        &mut expanded,
-                        &mut ancestors,
-                    )?;
+                    walk.descend(&input, &metadata, &mut expanded, &mut ancestors)?;
                 }
                 _ => expanded.push(input),
             }
         }
         files = expanded;
     }
-    Ok(Selection { files, explicit })
+    Ok(Selection {
+        files,
+        explicit,
+        unreadable_dirs: walk.unreadable_dirs,
+    })
+}
+
+/// A `-r` walk: its settings, and what it could not read.
+struct Walk {
+    follow_links: bool,
+    verbosity: i32,
+    /// Directories the walk reported and skipped because they would not open.
+    unreadable_dirs: usize,
 }
 
 /// What identifies a directory whatever name reaches it, so a walk notices
@@ -116,35 +129,103 @@ fn dir_id(path: &Path, metadata: &fs::Metadata) -> Option<DirId> {
     fs::canonicalize(path).ok()
 }
 
-/// Walk `dir` unless the walk is already inside it. A link followed under
-/// `-f`, or a bind mount, can lead back to an ancestor; entering it again
-/// would list the tree once more per nesting level until the path ran out of
-/// room, so the loop is reported and not descended. `ancestors` holds the
-/// directories on the way down to `dir`.
-fn descend(
-    dir: &Path,
-    metadata: &fs::Metadata,
-    follow_links: bool,
-    verbosity: i32,
-    out: &mut Vec<PathBuf>,
-    ancestors: &mut Vec<DirId>,
-) -> Result<()> {
-    let Some(id) = dir_id(dir, metadata) else {
-        return walk_directory(dir, follow_links, verbosity, out, ancestors);
-    };
-    if ancestors.contains(&id) {
-        display!(
-            verbosity,
-            2,
-            "Warning : {} leads back into a directory being walked, ignoring",
-            dir.display()
-        );
-        return Ok(());
+impl Walk {
+    /// Walk `dir` unless the walk is already inside it. A link followed under
+    /// `-f`, or a bind mount, can lead back to an ancestor; entering it again
+    /// would list the tree once more per nesting level until the path ran out
+    /// of room, so the loop is reported and not descended. `ancestors` holds
+    /// the directories on the way down to `dir`.
+    fn descend(
+        &mut self,
+        dir: &Path,
+        metadata: &fs::Metadata,
+        out: &mut Vec<PathBuf>,
+        ancestors: &mut Vec<DirId>,
+    ) -> Result<()> {
+        let Some(id) = dir_id(dir, metadata) else {
+            return self.walk_directory(dir, out, ancestors);
+        };
+        if ancestors.contains(&id) {
+            display!(
+                self.verbosity,
+                2,
+                "Warning : {} leads back into a directory being walked, ignoring",
+                dir.display()
+            );
+            return Ok(());
+        }
+        ancestors.push(id);
+        let walked = self.walk_directory(dir, out, ancestors);
+        ancestors.pop();
+        walked
     }
-    ancestors.push(id);
-    let walked = walk_directory(dir, follow_links, verbosity, out, ancestors);
-    ancestors.pop();
-    walked
+
+    /// Append every file under `dir` to `out`, depth first.
+    ///
+    /// Entries are taken in name order so two runs over one tree process it
+    /// the same way; the reference command takes them in directory order,
+    /// which the filesystem does not promise to keep. Subdirectories go
+    /// through [`Self::descend`], which keeps a link from leading the walk
+    /// round in a circle.
+    ///
+    /// The two read failures end differently. A directory that cannot be
+    /// opened is reported, contributes nothing, and is counted, so the run can
+    /// fail on it once the readable rest is done. A listing that fails
+    /// part-way is an error that ends the run, as in the reference command
+    /// (`util.c`, `UTIL_prepareFileList`), since the tree it would leave
+    /// behind is incomplete in a way nothing reports.
+    fn walk_directory(
+        &mut self,
+        dir: &Path,
+        out: &mut Vec<PathBuf>,
+        ancestors: &mut Vec<DirId>,
+    ) -> Result<()> {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                display!(
+                    self.verbosity,
+                    1,
+                    "Cannot open directory '{}': {err}",
+                    dir.display()
+                );
+                self.unreadable_dirs += 1;
+                return Ok(());
+            }
+        };
+        let mut names: Vec<OsString> = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) => names.push(entry.file_name()),
+                Err(err) => bail!("readdir({}) error: {err}", dir.display()),
+            }
+        }
+        names.sort();
+        for name in names {
+            let path = dir.join(name);
+            // Every link is skipped here without `-f`, a link to a named pipe
+            // included: the FIFO exemption applies to names given on the
+            // command line, where a link is how a pipe is handed over, and the
+            // reference command's walk drops links without looking at what
+            // they point at.
+            if !self.follow_links && is_symlink(&path) {
+                display!(
+                    self.verbosity,
+                    2,
+                    "Warning : {} is a symbolic link, ignoring",
+                    path.display()
+                );
+                continue;
+            }
+            match fs::metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => {
+                    self.descend(&path, &metadata, out, ancestors)?;
+                }
+                _ => out.push(path),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Whether `path` itself is a symbolic link, whatever it points at.
@@ -244,70 +325,6 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 #[cfg(not(unix))]
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
-}
-
-/// Append every file under `dir` to `out`, depth first.
-///
-/// Entries are taken in name order so two runs over one tree process it the
-/// same way; the reference command takes them in directory order, which the
-/// filesystem does not promise to keep. Subdirectories go through
-/// [`descend`], which keeps a link from leading the walk round in a circle.
-///
-/// The two read failures end differently, as they do in the reference command
-/// (`util.c`, `UTIL_prepareFileList`): a directory that cannot be opened is
-/// reported and contributes nothing while the run goes on with exit status 0,
-/// but a listing that fails part-way is an error that ends the run, since the
-/// tree it would leave behind is incomplete in a way nothing reports.
-fn walk_directory(
-    dir: &Path,
-    follow_links: bool,
-    verbosity: i32,
-    out: &mut Vec<PathBuf>,
-    ancestors: &mut Vec<DirId>,
-) -> Result<()> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(err) => {
-            display!(
-                verbosity,
-                1,
-                "Cannot open directory '{}': {err}",
-                dir.display()
-            );
-            return Ok(());
-        }
-    };
-    let mut names: Vec<OsString> = Vec::new();
-    for entry in entries {
-        match entry {
-            Ok(entry) => names.push(entry.file_name()),
-            Err(err) => bail!("readdir({}) error: {err}", dir.display()),
-        }
-    }
-    names.sort();
-    for name in names {
-        let path = dir.join(name);
-        // Every link is skipped here without `-f`, a link to a named pipe
-        // included: the FIFO exemption applies to names given on the command
-        // line, where a link is how a pipe is handed over, and the reference
-        // command's walk drops links without looking at what they point at.
-        if !follow_links && is_symlink(&path) {
-            display!(
-                verbosity,
-                2,
-                "Warning : {} is a symbolic link, ignoring",
-                path.display()
-            );
-            continue;
-        }
-        match fs::metadata(&path) {
-            Ok(metadata) if metadata.is_dir() => {
-                descend(&path, &metadata, follow_links, verbosity, out, ancestors)?;
-            }
-            _ => out.push(path),
-        }
-    }
-    Ok(())
 }
 
 /// Where `--output-dir-flat DIR` puts the output of `src`: under `DIR`, by

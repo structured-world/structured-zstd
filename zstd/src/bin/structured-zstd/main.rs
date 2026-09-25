@@ -186,6 +186,10 @@ struct Options {
     exclude_compressed: bool,
     /// Replace directories among the inputs by the files beneath them (`-r`).
     recursive: bool,
+    /// Report a directory `-r` cannot open and go on without counting it as a
+    /// failed input (`--ignore-read-errors`), which is the reference command's
+    /// exit status. Off by default: a run that left part of a tree out fails.
+    ignore_read_errors: bool,
     /// Process symbolic links rather than skipping them; part of `-f`.
     follow_links: bool,
     /// Read stdin even when it is a terminal; part of `-f`.
@@ -907,6 +911,7 @@ fn parse_args_into(
         pass_through: preset.pass_through,
         exclude_compressed: false,
         recursive: false,
+        ignore_read_errors: false,
         follow_links: preset.force,
         // `zstdcat` / `zcat` read a terminal on stdin the way `cat` does. The
         // reference command's preset forces only the output side
@@ -1008,6 +1013,7 @@ fn parse_args_into(
                 "pass-through" => opts.pass_through = Some(true),
                 "no-pass-through" => opts.pass_through = Some(false),
                 "exclude-compressed" => opts.exclude_compressed = true,
+                "ignore-read-errors" => opts.ignore_read_errors = true,
                 "progress" => opts.progress = Progress::Always,
                 "no-progress" => opts.progress = Progress::Never,
                 "version" => {
@@ -1590,6 +1596,8 @@ Advanced options:
                                 output to terminal will mix with progress counter text.
 
   -r                            Operate recursively on directories.
+  --ignore-read-errors          With -r, report a directory that cannot be opened and go on
+                                without failing the run (exit 0, as upstream zstd).
   --filelist LIST               Read a list of files to operate on from LIST.
   --output-dir-flat DIR         Store processed files in DIR.
   --output-dir-mirror DIR       Store processed files in DIR, respecting original directory structure.
@@ -1890,9 +1898,16 @@ fn writes_stdout(opts: &Options) -> bool {
 /// Run the command line. The count of inputs that failed comes back; the
 /// exit status is 1 when it is not zero, as the reference command's is,
 /// while an error that ends the run early is returned outright.
+///
+/// A directory `-r` could not open counts as a failed input unless
+/// `--ignore-read-errors` is given. The reference command reports it and exits
+/// 0, which lets `zstd -r dir && rm -r dir` delete files that were never
+/// compressed; the readable rest of the tree is still processed either way.
 fn run(mut opts: Options) -> Result<usize> {
     let Selection {
-        files, explicit, ..
+        files,
+        explicit,
+        unreadable_dirs,
     } = inputs::select_inputs(
         std::mem::take(&mut opts.inputs),
         &opts.filelists,
@@ -1900,6 +1915,11 @@ fn run(mut opts: Options) -> Result<usize> {
         opts.follow_links,
         opts.verbosity,
     )?;
+    let skipped = if opts.ignore_read_errors {
+        0
+    } else {
+        unreadable_dirs
+    };
     // Listing, training and benchmarking take named files only and refuse
     // stdin with their own reasons; the streaming modes read it.
     let streams =
@@ -1917,10 +1937,18 @@ fn run(mut opts: Options) -> Result<usize> {
             1,
             "please provide correct input file(s) or non-empty directories -- ignored"
         );
-        return Ok(0);
+        return Ok(skipped);
     }
     opts.inputs = files;
+    // The count is exact: at most one per directory walked, each its own input.
+    Ok(run_selected(opts)? + skipped)
+}
 
+/// The run over the inputs [`run`] selected. The count of inputs that failed
+/// comes back, as from [`run`].
+fn run_selected(mut opts: Options) -> Result<usize> {
+    let streams =
+        matches!(opts.mode, Mode::Compress | Mode::Decompress | Mode::Test) && !opts.bench;
     // The streaming modes refuse to read stdin from a terminal unless forced,
     // as the reference command does.
     if streams && reads_stdin(&opts.inputs) && !opts.force_stdin && io::stdin().is_terminal() {

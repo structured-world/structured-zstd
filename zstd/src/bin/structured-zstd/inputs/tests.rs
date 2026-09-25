@@ -150,9 +150,8 @@ fn symlinks_inside_a_walked_tree_are_skipped_unless_followed() {
 }
 
 /// A directory `-r` cannot open is reported and skipped, and the rest of the
-/// tree is still selected: the reference command does the same and exits 0,
-/// so a run over a tree with one private directory keeps working the way a
-/// script written against it expects.
+/// tree is still selected; the skip is counted, which is what lets the run
+/// fail on it once the readable files are done.
 #[cfg(unix)]
 #[test]
 fn an_unreadable_directory_is_skipped_and_the_walk_goes_on() {
@@ -170,8 +169,22 @@ fn an_unreadable_directory_is_skipped_and_the_walk_goes_on() {
     let selection = select_inputs(vec![scratch.path().join("tree")], &[], true, false, 1);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     if binding {
-        assert_eq!(selection.expect("the walk goes on").files, vec![readable]);
+        let selection = selection.expect("the walk goes on");
+        assert_eq!(selection.files, vec![readable]);
+        assert_eq!(selection.unreadable_dirs, 1, "the skip is counted");
     }
+}
+
+/// A tree that opens everywhere reports no unreadable directory, so a clean
+/// run's status is not touched by the count.
+#[test]
+fn a_readable_tree_counts_no_unreadable_directory() {
+    let scratch = Scratch::new("clean");
+    scratch.file("tree/a.txt");
+    scratch.file("tree/sub/b.txt");
+    let selection = select_inputs(vec![scratch.path().join("tree")], &[], true, false, 0).unwrap();
+    assert_eq!(selection.files.len(), 2);
+    assert_eq!(selection.unreadable_dirs, 0);
 }
 
 /// `--filelist` names inputs one per line, in the shape `ls` prints them.
