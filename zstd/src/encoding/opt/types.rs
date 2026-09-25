@@ -27,7 +27,7 @@ pub(crate) struct MatchCandidate {
 /// committing this cell.
 ///
 /// The running PRICE is NOT stored here: it lives solely in the parallel
-/// `node_prices: Box<[u32]>` (one `u32` per position), so the SIMD price-set
+/// `node_prices: Vec<u32>` (one `u32` per position), so the SIMD price-set
 /// can vector-load consecutive prices and there is a SINGLE source of truth for
 /// each price (no AoS/SoA duplication to keep in lockstep).
 #[derive(Copy, Clone, Debug)]
@@ -92,11 +92,16 @@ pub(crate) struct HcOptimalPlanState {
 /// checker can split the matcher's fields without macro-level
 /// scaffolding.
 pub(crate) struct HcOptimalPlanBuffers {
-    pub(crate) nodes: alloc::boxed::Box<[HcOptimalNode]>,
+    /// DP cells, grown with the frontier by [`BtMatcher::reset_opt_nodes`]
+    /// rather than filled up front: the length always covers `last_pos + 1`.
+    ///
+    /// [`BtMatcher::reset_opt_nodes`]: crate::encoding::bt::BtMatcher::reset_opt_nodes
+    pub(crate) nodes: Vec<HcOptimalNode>,
     /// SoA price companion to `nodes` (see `BtMatcher::opt_node_prices_scratch`):
     /// `node_prices[i]` mirrors node `i`'s running DP price as a contiguous
     /// `u32` so the inner price-set loop can SIMD-compare a run of node prices.
-    pub(crate) node_prices: alloc::boxed::Box<[u32]>,
+    /// Always the same length as `nodes`.
+    pub(crate) node_prices: Vec<u32>,
     pub(crate) candidates: Vec<MatchCandidate>,
     pub(crate) store: Vec<HcOptimalNode>,
     /// Single backing allocation for the LL/ML price caches as `[price,

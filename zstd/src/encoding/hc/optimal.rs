@@ -331,6 +331,13 @@ macro_rules! build_optimal_plan_impl_body {
                 $self.backend.bt_mut().opt_ml_price_stamp =
                     $self.backend.bt_mut().opt_ml_price_stamp.wrapping_add(1).max(1);
                 ml_price_stamp = $self.backend.bt_mut().opt_ml_price_stamp;
+                // The seed writes cells `0..min_match_len` and the sentinel past
+                // them; grow the buffers that far before touching any.
+                BtMatcher::ensure_opt_nodes(
+                    &mut *nodes,
+                    &mut *node_prices,
+                    (min_match_len + 1).min(frontier_buffer_size),
+                );
                 // Deferred base/seed prices: only reached on a matched seed (see
                 // the declarations above). Assign before the forward DP / seed
                 // paths below read them.
@@ -411,10 +418,9 @@ macro_rules! build_optimal_plan_impl_body {
                         litlen: 0,
                         reps: initial_reps,
                     };
-                    if longest_len < frontier_buffer_size && forced_price < node_prices[longest_len] {
-                        nodes[longest_len] = forced_state;
-                        node_prices[longest_len] = forced_price;
-                    }
+                    // Not stored in `nodes[longest_len]`: that cell lies past the
+                    // frontier, and the traceback takes this stretch from
+                    // `forced_end_state`, never from the cell.
                     forced_end = Some(longest_len);
                     forced_end_state = Some(forced_state);
                     forced_end_price = Some(forced_price);
@@ -482,13 +488,24 @@ macro_rules! build_optimal_plan_impl_body {
                     }
                     prev_max_len = prev_max_len.max(max_match_len);
                 }
-                if last_pos + 1 < frontier_buffer_size {
+                // With no candidates (reachable only with LDM, which skips the
+                // no-match walk above) the seed wrote nothing and the buffers
+                // were never grown; the forward loop does not run either.
+                if !candidates.is_empty() && last_pos + 1 < frontier_buffer_size {
                     node_prices[last_pos + 1] = u32::MAX;
                 }
             }
         }
         while !seed_forced_shortest_path && pos <= last_pos && pos <= frontier_limit {
             debug_assert!(pos + 1 < frontier_buffer_size);
+            // The unchecked accesses below reach at most `last_pos + 1`; the
+            // buffers grow with the frontier, so that cell must already exist.
+            debug_assert!(
+                nodes.len() >= (last_pos + 2).min(frontier_buffer_size)
+                    && node_prices.len() == nodes.len(),
+                "DP buffers ({}) behind the frontier ({last_pos})",
+                nodes.len(),
+            );
             let prev_node = unsafe { *nodes.get_unchecked(pos - 1) };
             let prev_node_price = unsafe { *node_prices.get_unchecked(pos - 1) };
             if prev_node_price != u32::MAX {
@@ -573,6 +590,13 @@ macro_rules! build_optimal_plan_impl_body {
                                     node_prices[next] = with1literal;
                                     if next > last_pos {
                                         last_pos = next;
+                                        // The frontier moved without a reset;
+                                        // keep room for the sentinel past it.
+                                        BtMatcher::ensure_opt_nodes(
+                                            &mut *nodes,
+                                            &mut *node_prices,
+                                            (last_pos + 2).min(frontier_buffer_size),
+                                        );
                                     }
                                 }
                             }
@@ -1622,11 +1646,13 @@ impl HcMatchGenerator {
         let mut candidates = core::mem::take(&mut bt.opt_candidates_scratch);
         let store = core::mem::take(&mut bt.opt_store_scratch);
         let mut price_arena = core::mem::take(&mut bt.opt_price_arena);
-        if nodes.len() < HC_OPT_NODE_LEN {
-            nodes = alloc::vec![HcOptimalNode::default(); HC_OPT_NODE_LEN].into_boxed_slice();
+        // Reserve only: the DP grows the length as its frontier advances, so a
+        // frame whose frontier stays short never writes the rest.
+        if nodes.capacity() < HC_OPT_NODE_LEN {
+            nodes.reserve_exact(HC_OPT_NODE_LEN - nodes.len());
         }
-        if node_prices.len() < HC_OPT_NODE_LEN {
-            node_prices = alloc::vec![u32::MAX; HC_OPT_NODE_LEN].into_boxed_slice();
+        if node_prices.capacity() < HC_OPT_NODE_LEN {
+            node_prices.reserve_exact(HC_OPT_NODE_LEN - node_prices.len());
         }
         if candidates.capacity() < MAX_HC_SEARCH_DEPTH {
             candidates.reserve_exact(MAX_HC_SEARCH_DEPTH - candidates.capacity());
