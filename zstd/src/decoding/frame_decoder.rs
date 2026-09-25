@@ -3322,21 +3322,8 @@ impl FrameDecoder {
             self.direct_frames += 1;
         }
         use super::block_decoder;
-        use super::decode_buffer::DecodeBuffer;
-        use super::scratch::DirectScratch;
-        use super::user_slice_buf::UserSliceBackend;
         use crate::io::Read;
         use FrameDecoderError as err;
-
-        // The most the frame may write: its declared size, or the caller's
-        // slice for a frame that declares none.
-        let limit = declared_size.unwrap_or(output.len() as u64);
-        // Output past `limit`: the frame lied about its size, or it does not
-        // fit the caller's slice.
-        let overflow = |produced: u64| match declared_size {
-            Some(declared) => err::FrameContentSizeMismatch { declared, produced },
-            None => err::TargetTooSmall,
-        };
 
         let kernel = self.kernel;
         let state = self
@@ -3416,6 +3403,46 @@ impl FrameDecoder {
                 }
             }
         }
+
+        self.run_direct_decode_blocks(input, output, declared_size)
+    }
+
+    /// General block loop of [`Self::run_direct_decode`], for every frame the
+    /// single-raw-block shortcut does not take.
+    ///
+    /// Kept out of line, as upstream zstd keeps `ZSTD_decompressBlock_internal`
+    /// out of `ZSTD_decompressFrame`: inlined, its setup for the entropy and
+    /// sequence state ran on every call, including the frames that return from
+    /// the shortcut above.
+    #[inline(never)]
+    fn run_direct_decode_blocks(
+        &mut self,
+        input: &mut &[u8],
+        output: &mut [u8],
+        declared_size: Option<u64>,
+    ) -> Result<usize, FrameDecoderError> {
+        use super::block_decoder;
+        use super::decode_buffer::DecodeBuffer;
+        use super::scratch::DirectScratch;
+        use super::user_slice_buf::UserSliceBackend;
+        use crate::io::Read;
+        use FrameDecoderError as err;
+
+        // The most the frame may write: its declared size, or the caller's
+        // slice for a frame that declares none.
+        let limit = declared_size.unwrap_or(output.len() as u64);
+        // Output past `limit`: the frame lied about its size, or it does not
+        // fit the caller's slice.
+        let overflow = |produced: u64| match declared_size {
+            Some(declared) => err::FrameContentSizeMismatch { declared, produced },
+            None => err::TargetTooSmall,
+        };
+
+        let kernel = self.kernel;
+        let state = self
+            .state
+            .as_mut()
+            .expect("caller ensures init populated state");
 
         // Borrow persistent fields out of whichever scratch variant
         // `init` produced (Flat for single_segment, Ring for
