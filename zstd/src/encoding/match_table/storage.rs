@@ -160,6 +160,20 @@ pub(crate) const HC_CHAIN_LOG: usize = 19;
 /// modes leave it sized to zero.
 pub(crate) const HC3_HASH_LOG: usize = 17;
 
+/// The binary tree's coordinates: the biases that map a stored index to its
+/// absolute position (`abs_bias`), its history index (`idx_bias`) and its pair
+/// slot (`bt_bias`, then `& bt_mask`, doubled). They follow from the position
+/// base, the index shift, the history start and the chain log, none of which
+/// moves while an armed block is parsed, so the parser takes them once per
+/// block, as upstream resolves `base` and `btMask` once per call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BtCoords {
+    pub(crate) abs_bias: usize,
+    pub(crate) idx_bias: usize,
+    pub(crate) bt_bias: usize,
+    pub(crate) bt_mask: usize,
+}
+
 /// Shared storage backing every match finder. Holds the contiguous
 /// Immutable dictionary match structure (upstream zstd `ZSTD_dictMatchState`) for
 /// the binary-tree / optimal path. A hash + single-link chain over the
@@ -283,6 +297,9 @@ pub(crate) struct MatchTable {
     /// guarantee 8 readable bytes); the HC `hash_position` stays 4-byte.
     /// Defaults to `4`.
     pub(crate) search_mls: usize,
+    /// Tree coordinates of the block being parsed, taken by
+    /// [`Self::capture_block_coords`] before the parse.
+    pub(crate) block_coords: BtCoords,
     /// Immutable dictionary match chain (upstream zstd `ZSTD_dictMatchState`),
     /// searched by the BT/optimal collect alongside the live tree. `Some`
     /// once primed from a non-empty dictionary on a BT level.
@@ -340,6 +357,7 @@ impl Clone for MatchTable {
             is_btultra2: self.is_btultra2,
             uses_bt: self.uses_bt,
             search_mls: self.search_mls,
+            block_coords: self.block_coords,
             dms: self.dms.clone(),
             borrowed_input: self.borrowed_input,
             borrowed_block: self.borrowed_block,
@@ -382,6 +400,7 @@ impl Clone for MatchTable {
         self.is_btultra2 = source.is_btultra2;
         self.uses_bt = source.uses_bt;
         self.search_mls = source.search_mls;
+        self.block_coords = source.block_coords;
         self.borrowed_input = source.borrowed_input;
         self.borrowed_block = source.borrowed_block;
         self.kernel = source.kernel;
@@ -512,6 +531,7 @@ impl MatchTable {
             is_btultra2: false,
             uses_bt: false,
             search_mls: 4,
+            block_coords: BtCoords::default(),
             dms: DictAttach::new(),
             borrowed_input: None,
             borrowed_block: None,
@@ -1424,6 +1444,26 @@ impl MatchTable {
     #[inline(always)]
     pub(crate) fn bt_mask(&self) -> usize {
         (1usize << self.bt_log()) - 1
+    }
+
+    /// The binary tree's coordinates as the table stands now.
+    pub(crate) fn bt_coords(&self) -> BtCoords {
+        let abs_bias = self
+            .position_base
+            .wrapping_sub(1)
+            .wrapping_sub(self.index_shift);
+        BtCoords {
+            abs_bias,
+            idx_bias: abs_bias.wrapping_sub(self.history_abs_start),
+            bt_bias: self.position_base.wrapping_sub(1),
+            bt_mask: self.bt_mask(),
+        }
+    }
+
+    /// Take the tree's coordinates for the block about to be parsed; the
+    /// search reads them from [`Self::block_coords`] on every position.
+    pub(crate) fn capture_block_coords(&mut self) {
+        self.block_coords = self.bt_coords();
     }
 
     /// Convert an absolute position into a BT pair index in

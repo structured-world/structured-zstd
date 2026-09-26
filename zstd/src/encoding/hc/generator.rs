@@ -903,9 +903,15 @@ macro_rules! bt_insert_and_collect_matches_body {
                 }
             }
         }
+        // The tree's coordinates are fixed for the block and were taken before
+        // its parse, so none is derived again per position.
+        let coords = $table.block_coords;
+        debug_assert_eq!(coords, $table.bt_coords(), "block coordinates are stale");
         // Total, not tested: the block was armed before the parse began.
-        let stored = $table.relative_position_armed($abs_pos) + 1;
-        let bt_mask = $table.bt_mask();
+        // `abs_pos - abs_bias` is `relative_position_armed(abs_pos) + 1`.
+        debug_assert!($table.can_skip_rebase_check($abs_pos));
+        let stored = $abs_pos.wrapping_sub(coords.abs_bias) as u32;
+        let bt_mask = coords.bt_mask;
         // See `bt_insert_range_body!`: saturating is needed for the
         // first BT walk of a fresh frame where `abs_pos < bt_mask`.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
@@ -920,11 +926,7 @@ macro_rules! bt_insert_and_collect_matches_body {
         // abs_pos - window_low ⟺ s.wrapping_add(win_off) < win_range.
         // HC_EMPTY (s = 0) maps to base = (lowest representable abs) - 1 <
         // window_low, so it falls out of range and ends the walk.
-        let win_off = $table
-            .position_base
-            .wrapping_sub(1)
-            .wrapping_sub($table.index_shift)
-            .wrapping_sub(window_low);
+        let win_off = coords.abs_bias.wrapping_sub(window_low);
         let win_range = $abs_pos - window_low;
         // Decode biases: fold the per-node coordinate conversions into
         // loop-invariant additions. The gate-validated chain entry
@@ -938,12 +940,9 @@ macro_rules! bt_insert_and_collect_matches_body {
         // single-coordinate equivalent. Wrapping throughout: the window gate
         // already proved `match_stored ∈ [window_low, abs_pos)` before decode,
         // mirroring the `win_off` form above.
-        let abs_bias = $table
-            .position_base
-            .wrapping_sub(1)
-            .wrapping_sub($table.index_shift);
-        let idx_bias = abs_bias.wrapping_sub($table.history_abs_start);
-        let bt_bias = $table.position_base.wrapping_sub(1);
+        let abs_bias = coords.abs_bias;
+        let idx_bias = coords.idx_bias;
+        let bt_bias = coords.bt_bias;
         // Raw `+ 9` is safe here — see `bt_insert_range_body!`
         // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
         // cap in `MatchTable::add_data`.
@@ -959,7 +958,10 @@ macro_rules! bt_insert_and_collect_matches_body {
         let mut compares_left = ($max_chain_depth).min($search_depth);
         let mut common_length_smaller = 0usize;
         let mut common_length_larger = 0usize;
-        let pair_idx = $table.bt_pair_index_for_abs($abs_pos);
+        // `bt_pair_index_for_abs(abs_pos)`: `stored + bt_bias` is
+        // `abs_pos + index_shift`.
+        let pair_idx = 2 * ((stored as usize).wrapping_add(bt_bias) & bt_mask);
+        debug_assert_eq!(pair_idx, $table.bt_pair_index_for_abs($abs_pos));
         let mut smaller_slot = pair_idx;
         let mut larger_slot = pair_idx + 1;
         // SAFETY: `hash` is masked to `hash_log` bits and the table is

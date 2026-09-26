@@ -1095,6 +1095,8 @@ macro_rules! optimal_block_body {
         $collect:ident,
         $priceset:path $(,)?
     ) => {{
+        // The block is armed, so the tree's coordinates hold for the whole pass.
+        $self.table.capture_block_coords();
         // Everything the pass carries between segments lives in `$buffers.pass`,
         // read at the top of a segment and written at its end, so none of it is
         // live across the segment body (see `HcOptimalPlanBuffers::pass`).
@@ -2063,6 +2065,7 @@ impl HcMatchGenerator {
     ) {
         use crate::encoding::strategy::{self, StrategyTag};
         self.table.ensure_tables();
+        self.table.capture_block_coords();
         let reps = &query.reps;
         let ll0 = query.lit_len == 0;
         // Dispatch purely from `self.strategy_tag` (set by
