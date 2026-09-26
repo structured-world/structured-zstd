@@ -25,7 +25,9 @@
 mod cover;
 mod fastcover;
 mod frequency;
+mod legacy;
 mod reservoir;
+mod suffix_array;
 
 use crate::bit_io::BitWriter;
 use crate::blocks::sequence_section::{
@@ -43,6 +45,7 @@ pub use fastcover::{
     DEFAULT_D_CANDIDATES, DEFAULT_F_CANDIDATES, DEFAULT_K_CANDIDATES, FastCoverParams,
     FastCoverTuned,
 };
+pub use legacy::DEFAULT_SELECTIVITY;
 use std::{
     boxed::Box,
     collections::{BinaryHeap, HashMap},
@@ -361,7 +364,10 @@ fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result
     }
 
     let mut table = HuffmanEncoderTable::build_from_data(stats.as_slice());
-    if table.writeable_table_description_size().is_none() {
+    if table
+        .writeable_table_description_size(&mut crate::fse::fse_encoder::FSETable::blank())
+        .is_none()
+    {
         // Sampled real data can land on the same shape: a flat alphabet wider
         // than 128 symbols. Fall back to the synthetic narrow one, which always
         // has a description.
@@ -698,6 +704,90 @@ pub fn create_fastcover_dict_from_slice<W: io::Write>(
     let finalized = finalize_raw_dict(raw_dict.as_slice(), sample, dict_size, finalize)?;
     output.write_all(finalized.as_slice())?;
     Ok(tuned)
+}
+
+/// Train and finalize a dictionary with the reference's original trainer, the
+/// one `zstd --train-legacy` runs (`ZDICT_trainFromBuffer_legacy`).
+///
+/// `samples` is every sample back to back and `sample_sizes` their lengths:
+/// the trainer searches the corpus as a whole, and the number of samples sets
+/// how often a segment has to repeat to be kept, `samples >> selectivity`
+/// times and at least 4. A higher `selectivity` keeps more, rarer segments;
+/// zero is [`DEFAULT_SELECTIVITY`]. Corpus past 2000 MiB is dropped a whole
+/// sample at a time from the end.
+///
+/// # Errors
+///
+/// `InvalidInput` when `dict_size` is below 256 bytes, when the corpus is under
+/// 512 bytes, when it repeats too little to yield 128 bytes of content, or when
+/// `sample_sizes` does not add up to `samples.len()`.
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{create_legacy_dict_from_slice, FinalizeOptions};
+///
+/// let mut samples = Vec::new();
+/// let mut sizes = Vec::new();
+/// for i in 0..200u32 {
+///     let line = format!("tenant=demo table=orders key={i} region=eu status=shipped\n");
+///     sizes.push(line.len());
+///     samples.extend_from_slice(line.as_bytes());
+/// }
+/// let mut dict = Vec::new();
+/// create_legacy_dict_from_slice(&samples, &sizes, &mut dict, 4096, 0, FinalizeOptions::default())
+///     .unwrap();
+/// assert!(dict.starts_with(&[0x37, 0xA4, 0x30, 0xEC]));
+/// ```
+pub fn create_legacy_dict_from_slice<W: io::Write>(
+    samples: &[u8],
+    sample_sizes: &[usize],
+    output: &mut W,
+    dict_size: usize,
+    selectivity: u32,
+    finalize: FinalizeOptions,
+) -> io::Result<()> {
+    let described = sample_sizes
+        .iter()
+        .try_fold(0usize, |total, &size| total.checked_add(size));
+    if described != Some(samples.len()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the sample sizes do not add up to the corpus",
+        ));
+    }
+    let content =
+        legacy::train_legacy_raw(samples, sample_sizes, dict_size, selectivity).map_err(|err| {
+            let reason = match err {
+                legacy::TooSmall::Dictionary => format!(
+                    "a legacy dictionary must be at least {} bytes",
+                    legacy::DICT_SIZE_MIN
+                ),
+                legacy::TooSmall::Corpus => format!(
+                    "the samples total {} bytes; the legacy trainer needs at least {}",
+                    samples.len(),
+                    legacy::MIN_SAMPLES_SIZE
+                ),
+                legacy::TooSmall::Content => {
+                    "the samples repeat too little to yield dictionary content".into()
+                }
+            };
+            io::Error::new(io::ErrorKind::InvalidInput, reason)
+        })?;
+    let finalized = finalize_raw_dict(content.as_slice(), samples, dict_size, finalize)?;
+    output.write_all(finalized.as_slice())
+}
+
+/// The legacy trainer's content alone, for the reference comparison in
+/// `ffi-bench`.
+#[cfg(feature = "bench-internals")]
+pub(crate) fn legacy_dict_content(
+    samples: &[u8],
+    sample_sizes: &[usize],
+    dict_size: usize,
+    selectivity: u32,
+) -> Option<Vec<u8>> {
+    legacy::train_legacy_raw(samples, sample_sizes, dict_size, selectivity).ok()
 }
 
 /// Build a finalized FastCOVER dictionary, attach it to a fastest-level

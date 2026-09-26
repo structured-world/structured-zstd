@@ -17,9 +17,10 @@
 //!          └─ S::USE_BT == true  → start_matching_optimal::<S>
 //!              ├─ HcOptimalCostProfile::const_for_strategy::<S>()
 //!              ├─ should_run_btultra2_seed_pass::<S>          // const false unless S = BtUltra2
-//!              └─ select_kernel() once, then per-segment loop:
-//!                  └─ build_optimal_plan_impl_<kernel>::<S, ACC, FAV, LDM>
-//!                      └─ build_optimal_plan_impl_body!(S)
+//!              └─ select_kernel() once, then one pass over the block:
+//!                  └─ run_optimal_block_<kernel>::<S, ACC, FAV, LDM, KEEP_PLAN>
+//!                      └─ optimal_block_body!: per segment
+//!                          build_optimal_plan_impl_body!(S)
 //!                              ├─ S::OPT_LEVEL == 0  → abort_on_worse_match
 //!                              ├─ S::OPT_LEVEL >= 2  → opt_level (refined)
 //!                              └─ $collect::<S, true>

@@ -943,6 +943,55 @@ fn the_benchmark_input_is_the_size_it_was_counted_at() {
     assert_eq!(combined[8000], 2, "the second file's follow");
 }
 
+/// The `-M` check measures the benchmark's frames without listing them; what it
+/// works out has to be what the list itself adds up to, for whole blocks,
+/// tails, empty inputs and block sizes below the minimum alike.
+#[test]
+fn the_frame_extent_matches_the_frames_it_describes() {
+    let files: [&[u64]; 4] = [&[], &[0, 1, 5000], &[1 << 20, 3], &[70_000, 0, 131_071]];
+    for sizes in files {
+        for block in [None, Some(1024), Some(MIN_BENCH_BLOCK_SIZE), Some(40_000)] {
+            let chunks = bench_chunk_lengths(sizes, block);
+            let room: u64 = chunks
+                .iter()
+                .map(|&len| structured_zstd::encoding::compress_bound(len as usize) as u64)
+                .sum();
+            let widest = chunks.iter().copied().max().unwrap_or(0);
+            assert_eq!(
+                bench_frames_extent(sizes, block),
+                Some((room, widest)),
+                "{sizes:?} in blocks of {block:?}"
+            );
+        }
+    }
+}
+
+/// File sizes that add up past `u64::MAX` (sparse files report any length) do
+/// not wrap: the total stays at the most there is, which the loader's cap then
+/// cuts to what it trains on, and the sample count is exact.
+#[test]
+fn training_sizes_past_the_integer_range_do_not_wrap() {
+    let huge = u64::MAX / 2 + 1;
+    let (samples, wanted) = training_extent(&[huge, huge, 0], Some(4096));
+    assert_eq!(wanted, u64::MAX);
+    assert_eq!(samples, 2 * huge.div_ceil(4096));
+}
+
+/// A benchmark input that shrank between being sized and being read is
+/// refused. The frames are cut at the sizes recorded first, so a short read
+/// would cut past the end of the buffer instead of measuring anything.
+#[test]
+fn a_benchmark_input_that_shrank_is_refused() {
+    let input = std::env::temp_dir().join(format!("szstd-benchshrink-{}", std::process::id()));
+    fs::write(&input, vec![7u8; 1000]).unwrap();
+
+    let read = read_inputs_bounded(std::slice::from_ref(&input), &[4000]);
+
+    let _ = fs::remove_file(&input);
+    let err = read.expect_err("a file shorter than its recorded size is an error");
+    assert!(err.to_string().contains("changed"), "{err}");
+}
+
 /// Permission bits alone do not say who they let in. Two samples at `0640` may
 /// belong to different groups, and the dictionary belongs to whichever group the
 /// directory it was created in gave it — so keeping the group bits would open
@@ -1724,19 +1773,119 @@ fn training_refuses_to_overwrite_without_force() {
 }
 
 /// The trainer flags name algorithms, and the algorithm decides what the
-/// dictionary contains. FastCOVER and COVER are here; the legacy trainer is
-/// not, so its flag has to say no rather than run another trainer under its
-/// name.
+/// dictionary contains: `--train-legacy` selects the legacy trainer, and its
+/// selectivity comes from `=s=#`, `=selectivity=#` or `-s#`, read as the
+/// reference reads them.
 #[test]
-fn the_legacy_trainer_is_refused_not_substituted() {
+fn the_legacy_trainer_flags_select_it_and_its_selectivity() {
     assert_eq!(parse(&["--train", "s1"]).unwrap().mode, Mode::Train);
     assert_eq!(
         parse(&["--train-fastcover", "s1"]).unwrap().mode,
         Mode::Train
     );
     assert_eq!(parse(&["--train-cover", "s1"]).unwrap().mode, Mode::Train);
-    assert!(parse(&["--train-legacy", "s1"]).is_err());
-    assert!(parse(&["--train-legacy=s=8", "s1"]).is_err());
+    let legacy = parse(&["--train-legacy", "s1"]).unwrap();
+    assert_eq!(
+        (legacy.mode, legacy.trainer),
+        (Mode::Train, Trainer::Legacy)
+    );
+    assert_eq!(legacy.selectivity, 0, "the trainer's own default");
+    assert_eq!(parse(&["--train-legacy=s=8", "s1"]).unwrap().selectivity, 8);
+    assert_eq!(
+        parse(&["--train-legacy=selectivity=12", "s1"])
+            .unwrap()
+            .selectivity,
+        12
+    );
+    assert_eq!(
+        parse(&["--train-legacy", "-s5", "s1"]).unwrap().selectivity,
+        5
+    );
+    assert!(parse(&["--train-legacy=k=8", "s1"]).is_err(), "no such key");
+    assert!(
+        parse(&["--train-legacy=s=8x", "s1"]).is_err(),
+        "trailing junk"
+    );
+    assert!(parse(&["--train-legacy", "-sx", "s1"]).is_err());
+}
+
+/// `--train-legacy` trains end to end: sample files in, a dictionary out that
+/// the decoder accepts, made of what the samples repeat.
+#[test]
+fn legacy_training_writes_a_dictionary() {
+    let dir = Scratch::new("legacy-train");
+    let mut names = Vec::new();
+    for i in 0..40u32 {
+        let body = format!(
+            "[Unit]\nDescription=worker {i}\nAfter=network-online.target\n\n[Service]\n\
+             ExecStart=/usr/bin/worker --id {i} --config /etc/worker/worker.toml\n\
+             Restart=on-failure\n"
+        );
+        names.push(dir.file(&format!("w{i}.service"), body.as_bytes()));
+    }
+    let output = dir.path().join("legacy.dict");
+    let mut args = vec!["--train-legacy".to_string(), "-o".to_string()];
+    args.push(output.display().to_string());
+    args.extend(names.iter().map(|name| name.display().to_string()));
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(parse(&argv).unwrap()).unwrap();
+
+    let dict = fs::read(&output).unwrap();
+    structured_zstd::decoding::Dictionary::decode_dict(&dict).expect("a valid dictionary");
+    let text = String::from_utf8_lossy(&dict);
+    assert!(text.contains("After=network-online.target"));
+    assert!(text.contains("Restart=on-failure"));
+}
+
+/// The legacy trainer is handed its samples as the reference's command hands
+/// them over: each file one sample of at most 128 KiB, or cut whole into `-B`
+/// pieces; empty files left out; fewer than five samples refused.
+#[test]
+fn training_samples_are_loaded_the_way_the_reference_loads_them() {
+    let dir = Scratch::new("training-load");
+    let big = dir.file("big", &vec![b'x'; 300 << 10]);
+    let small = dir.file("small", b"0123456789");
+    let empty = dir.file("empty", b"");
+    let inputs = vec![big.clone(), small.clone(), empty.clone()];
+
+    assert!(
+        load_training_samples(&inputs, None, None).is_err(),
+        "two samples are too few"
+    );
+
+    let cut = load_training_samples(&inputs, Some(64 << 10), None).unwrap();
+    let mut sizes = cut.sizes.clone();
+    sizes.sort_unstable();
+    assert_eq!(
+        sizes,
+        vec![10, 44 << 10, 64 << 10, 64 << 10, 64 << 10, 64 << 10]
+    );
+    assert_eq!(cut.corpus.len(), (300 << 10) + 10, "whole files once cut");
+
+    let mut many = Vec::new();
+    for i in 0..5 {
+        many.push(dir.file(&format!("big{i}"), &vec![b'y'; 200 << 10]));
+    }
+    let capped = load_training_samples(&many, None, None).unwrap();
+    assert_eq!(
+        capped.sizes,
+        vec![128 << 10; 5],
+        "each file capped at 128 KiB"
+    );
+    let limited = load_training_samples(&many, None, Some(300 << 10)).unwrap();
+    assert_eq!(limited.sizes.len(), 2, "-M bounds what is loaded");
+}
+
+/// The files are taken in the reference's shuffled order (`DiB_shuffle`), so
+/// the same file list lays the corpus out the same way; the legacy dictionary
+/// trained from a fixed list then carries the reference's content byte for
+/// byte. The order is what `dibio.c`'s own `DiB_shuffle`, compiled as is,
+/// makes of eight entries.
+#[test]
+fn training_files_are_shuffled_like_the_reference_shuffles_them() {
+    let mut order: Vec<u32> = (0..8).collect();
+    shuffle_training_files(&mut order);
+    assert_eq!(order, vec![4, 5, 2, 0, 6, 1, 7, 3]);
 }
 
 /// A window is a promise about how much memory decoding will need, so it is
@@ -1877,6 +2026,55 @@ fn benchmark_flags_parse_level_range() {
     let opts = parse(&["-b", "in.txt"]).unwrap();
     assert!(opts.bench);
     assert_eq!(opts.bench_end, opts.bench_start);
+}
+
+/// `-B#` is read the way the reference reads it (a count with `K` / `M`), and
+/// zero is no block size at all.
+#[test]
+fn block_size_is_read_like_the_reference_reads_it() {
+    assert_eq!(
+        parse(&["-b", "-B64K", "f"]).unwrap().block_size,
+        Some(64 << 10)
+    );
+    assert_eq!(
+        parse(&["-b", "-B1MiB", "f"]).unwrap().block_size,
+        Some(1 << 20)
+    );
+    assert_eq!(
+        parse(&["-b", "-B4096", "f"]).unwrap().block_size,
+        Some(4096)
+    );
+    assert_eq!(parse(&["-b", "-B0", "f"]).unwrap().block_size, None);
+    assert_eq!(parse(&["-b", "-B", "f"]).unwrap().block_size, None);
+    assert!(parse(&["-b", "-B1G", "f"]).is_err(), "no G multiplier");
+    assert!(parse(&["-b", "-Bx", "f"]).is_err());
+}
+
+/// The benchmark compresses every input as frames of its own, cut into `-B`
+/// pieces from 32 bytes up, as the reference's block table does; an empty
+/// input yields no frame, and a smaller `-B` cuts nothing.
+#[test]
+fn benchmark_frames_follow_the_inputs_and_the_block_size() {
+    assert_eq!(bench_chunk_lengths(&[100, 50], None), vec![100, 50]);
+    assert_eq!(
+        bench_chunk_lengths(&[100, 50], Some(40)),
+        vec![40, 40, 20, 40, 10]
+    );
+    assert_eq!(
+        bench_chunk_lengths(&[100, 0, 50], Some(64)),
+        vec![64, 36, 50]
+    );
+    assert_eq!(
+        bench_chunk_lengths(&[100], Some(31)),
+        vec![100],
+        "below 32 is ignored"
+    );
+    assert_eq!(bench_chunk_lengths(&[100], Some(32)), vec![32, 32, 32, 4]);
+    assert_eq!(
+        bench_frames_extent(&[80], Some(40)),
+        Some((2 * structured_zstd::encoding::compress_bound(40) as u64, 40)),
+        "each frame pays its own framing"
+    );
 }
 
 #[test]
@@ -3352,6 +3550,69 @@ fn an_unreadable_directory_named_alone_fails_the_run() {
     }
 }
 
+/// `--show-default-cparams` prints the reference command's layout: the name and
+/// size, then one line per parameter, the strategy by upstream's name and
+/// ordinal. Level 3 on an unknown-size source is the `clevels.h` row
+/// `{21, 16, 17, 1, 5, 0, ZSTD_dfast}` unadjusted.
+#[test]
+fn show_default_cparams_prints_the_reference_layout() {
+    let mut out = Vec::new();
+    write_default_cparams(&mut out, STDIN_MARK, None, 0, 3).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "/*stdin*\\ (src size unknown)\n \
+         - windowLog     : 21\n \
+         - chainLog      : 16\n \
+         - hashLog       : 17\n \
+         - searchLog     : 1\n \
+         - minMatch      : 5\n \
+         - targetLength  : 0\n \
+         - strategy      : ZSTD_dfast (2)\n"
+    );
+}
+
+/// An empty file is reported with its size, zero, but sized as an unknown
+/// source, since the reference reads a zero size as unknown here; a real size
+/// moves the selection (level 11 on 4 KiB is the optimal parser).
+#[test]
+fn show_default_cparams_sizes_an_empty_file_as_unknown() {
+    let mut empty = Vec::new();
+    write_default_cparams(&mut empty, "empty", Some(0), 0, 11).unwrap();
+    let mut unknown = Vec::new();
+    write_default_cparams(&mut unknown, "empty", None, 0, 11).unwrap();
+    let empty = String::from_utf8(empty).unwrap();
+    let unknown = String::from_utf8(unknown).unwrap();
+    assert!(empty.starts_with("empty (0 bytes)\n"), "{empty}");
+    assert_eq!(
+        empty.lines().skip(1).collect::<Vec<_>>(),
+        unknown.lines().skip(1).collect::<Vec<_>>(),
+        "same parameters as an unknown size"
+    );
+
+    let mut small = Vec::new();
+    write_default_cparams(&mut small, "small", Some(4096), 0, 11).unwrap();
+    let small = String::from_utf8(small).unwrap();
+    assert!(
+        small.contains(" - strategy      : ZSTD_btopt (7)\n"),
+        "{small}"
+    );
+    assert!(small.contains(" - windowLog     : 12\n"), "{small}");
+}
+
+/// Decompression has no parameters to show, so the flag is refused there, as
+/// the reference command refuses it.
+#[test]
+fn show_default_cparams_is_refused_when_decompressing() {
+    let scratch = Scratch::new("cparamsd");
+    let frame = scratch.file("f.zst", &frame_of(b"payload"));
+    let mut opts = parse(&["-d", "-q", "--show-default-cparams", "f"]).unwrap();
+    opts.inputs = vec![frame];
+    let err = run(opts)
+        .expect_err("decompression with --show-default-cparams is refused")
+        .to_string();
+    assert!(err.contains("decompression mode"), "{err}");
+}
+
 /// Decompression reports how many bytes came out, which is what `-t` and the
 /// summaries print; a corrupted checksum is ignored under `--no-check`.
 #[test]
@@ -4131,6 +4392,94 @@ fn advanced_parameters_reach_the_frame() {
     );
 }
 
+/// `--max` sets every knob to its hardest end, as the reference's
+/// `setMaxCompression` does, with the window stopped where this build still
+/// decodes. It unlocks the ultra levels and long-distance matching, replaces a
+/// `--zstd=` list given before it, and is adjusted by one given after it.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn max_sets_every_knob_to_its_hardest_end() {
+    let opts = parse(&["--max", "f"]).unwrap();
+    assert!(opts.long, "--max enables long-distance matching");
+    assert_eq!(
+        opts.advanced,
+        AdvancedParams {
+            window_log: Some(27),
+            chain_log: Some(30),
+            hash_log: Some(30),
+            search_log: Some(30),
+            min_match: Some(3),
+            target_length: Some(131_072),
+            strategy: Some(Strategy::Btultra2),
+            ldm_hash_log: Some(30),
+            ldm_min_match: Some(16),
+            ldm_bucket_size_log: Some(8),
+            ldm_hash_rate_log: None,
+        }
+    );
+    assert_eq!(
+        parse(&["--max", "-22", "f"]).unwrap().level,
+        22,
+        "--max unlocks the ultra levels"
+    );
+    assert!(
+        parse(&["-3", "--max", "f"]).is_ok(),
+        "the strategy it sets carries long-distance matching at any level"
+    );
+
+    let before = parse(&["--zstd=wlog=20,hlog=18", "--max", "f"]).unwrap();
+    assert_eq!(
+        before.advanced,
+        max_compression_params(),
+        "an earlier list is replaced"
+    );
+    let after = parse(&["--max", "--zstd=wlog=20", "f"]).unwrap();
+    assert_eq!(
+        after.advanced.window_log,
+        Some(20),
+        "a later list adjusts it"
+    );
+    assert_eq!(
+        after.advanced.chain_log,
+        Some(30),
+        "and leaves the rest at the maximum"
+    );
+}
+
+/// A `--max` frame over a known-size input is down-sized to the input, so it
+/// compresses without the widest tables and decodes back to the input.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn a_max_frame_round_trips() {
+    let opts = parse(&["--max", "f"]).unwrap();
+    // Small: at a search depth of 2^30 a debug build walks every candidate.
+    let payload: Vec<u8> = (0..16 * 1024u32)
+        .map(|i| b'a' + (i.wrapping_mul(2_654_435_761) >> 28) as u8)
+        .collect();
+    let mut frame = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut frame,
+        &FrameSettings {
+            pledged_size: Some(payload.len() as u64),
+            ..FrameSettings::from_options(&opts)
+        },
+        &mut no_dict(),
+    )
+    .unwrap();
+    assert!(frame.len() < payload.len(), "the payload is compressible");
+    assert_eq!(decoded(&frame).unwrap(), payload);
+}
+
+/// On a 32-bit target `--max` is refused, as the reference refuses it: its
+/// tables at their widest do not fit the address space.
+#[test]
+#[cfg(not(target_pointer_width = "64"))]
+fn max_is_refused_on_a_32_bit_target() {
+    let err = parse(&["--max", "f"]).unwrap_err();
+    assert!(err.to_string().contains("32-bit"), "{err}");
+}
+
 /// `--long` below level 16 is refused because the matcher does not run there,
 /// unless `--zstd=strat=` moves the level onto a parser where it does.
 #[test]
@@ -4275,7 +4624,10 @@ fn trainer_parameters_parse_and_build_options() {
     let opts = parse(&["--train-cover", "s1"]).unwrap();
     assert_eq!(opts.trainer, Trainer::Cover);
     assert!(opts.trainer_params.is_default());
-    assert!(parse(&["--train-legacy", "s1"]).is_err());
+    assert_eq!(
+        parse(&["--train-legacy", "s1"]).unwrap().trainer,
+        Trainer::Legacy
+    );
 }
 
 /// An empty `--filelist` is nothing to do for the modes that stream, but the

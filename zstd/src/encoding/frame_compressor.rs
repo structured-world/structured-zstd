@@ -443,7 +443,7 @@ pub(crate) type SharedFseTable = alloc::rc::Rc<FSETable>;
 /// reference counts, then whatever padding the table's alignment adds. One
 /// allocation holds both, so a caller sizing a context is told about the whole
 /// of it rather than the payload alone.
-const fn shared_table_overhead() -> usize {
+pub(crate) const fn shared_table_overhead() -> usize {
     let counts = 2 * core::mem::size_of::<usize>();
     let align = core::mem::align_of::<FSETable>();
     counts.div_ceil(align) * align

@@ -242,6 +242,76 @@ impl CParameter {
     }
 }
 
+/// The match-finder parameters a numeric level selects for a source of a given
+/// size, the drop-in equivalent of C zstd's `ZSTD_getCParams`.
+///
+/// The size matters: the reference's level table has a row per source-size
+/// tier, and the tier changes the strategy as well as the table widths, so one
+/// level can run a different match-finder on a small input than on a large
+/// one. This is the selection the encoder itself makes for a frame without a
+/// dictionary; knobs set through [`CompressionParameters`] override it.
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::encoding::{LevelParameters, Strategy};
+///
+/// // Level 11 is a lazy2 level on a large or unknown-size source...
+/// let large = LevelParameters::for_level(11, None, 0);
+/// assert_eq!(large.strategy, Strategy::Lazy2);
+///
+/// // ...and the optimal parser on one of 16 KiB or less, whose window is
+/// // also cut down to the source.
+/// let small = LevelParameters::for_level(11, Some(4096), 0);
+/// assert_eq!(small.strategy, Strategy::Btopt);
+/// assert_eq!(small.window_log, 12);
+/// ```
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LevelParameters {
+    /// Back-reference window, `log2`. C `windowLog`.
+    pub window_log: u32,
+    /// Chain / binary-tree table size, `log2`. C `chainLog`.
+    pub chain_log: u32,
+    /// Hash table size, `log2`. C `hashLog`.
+    pub hash_log: u32,
+    /// Search attempts per position, `log2`. C `searchLog`.
+    pub search_log: u32,
+    /// Match-finder hash width, in bytes. C `minMatch`.
+    pub min_match: u32,
+    /// Length that ends a search early; on a negative level, the step size
+    /// minus one. C `targetLength`.
+    pub target_length: u32,
+    /// The match-finder strategy. C `strategy`.
+    pub strategy: Strategy,
+}
+
+impl LevelParameters {
+    /// Parameters for `level` compressing a source of `source_size` bytes with
+    /// a `dictionary_size`-byte dictionary (`0` for none).
+    ///
+    /// `level` is on the reference's scale: `0` is the default level, levels
+    /// above [`CompressionLevel::MAX_LEVEL`] clamp to it, and a negative level
+    /// is an acceleration factor. `None` is a source of unknown size, which is
+    /// sized as a large one; `Some(0)` is a source that is really empty.
+    /// C `ZSTD_getCParams` spells unknown as `0`, so a caller porting from it
+    /// maps `0` to `None`.
+    pub fn for_level(level: i32, source_size: Option<u64>, dictionary_size: usize) -> Self {
+        let size = source_size.unwrap_or(crate::encoding::cparams::CONTENTSIZE_UNKNOWN);
+        let cp = crate::encoding::cparams::get_cparams(level, size, dictionary_size);
+        Self {
+            window_log: cp.window_log,
+            chain_log: cp.chain_log,
+            hash_log: cp.hash_log,
+            search_log: cp.search_log,
+            min_match: cp.min_match,
+            target_length: cp.target_length,
+            // Every row of the level table names one of the nine strategies.
+            strategy: Strategy::from_ordinal(cp.strategy)
+                .expect("the level table only holds strategies 1..=9"),
+        }
+    }
+}
+
 /// Error returned by [`CompressionParametersBuilder::build`] when a knob
 /// is set outside its [`CParameter::bounds`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

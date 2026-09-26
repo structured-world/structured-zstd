@@ -9,13 +9,33 @@
 
 #![cfg(all(target_arch = "aarch64", target_endian = "little"))]
 
-use core::arch::aarch64::{uint8x16_t, vceqq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8};
+use core::arch::aarch64::{
+    uint8x16_t, vandq_u8, vceqq_u8, vget_lane_u64, vld1q_u8, vminvq_u8, vreinterpret_u64_u8,
+    vreinterpretq_u16_u8, vshrn_n_u16,
+};
 
 use super::scalar;
 
-/// 16-byte NEON vector prefix-length probe. Returns the number of leading
-/// equal bytes that fit in whole 16-byte chunks; the caller (or the wrapper
-/// below) handles the scalar tail.
+/// Index of the first unequal byte of a 16-byte `vceqq_u8` result that has
+/// one. NEON has no byte mask move: narrowing each 16-bit lane by four keeps a
+/// nibble per byte, in order, so the first zero nibble is the first mismatch.
+#[target_feature(enable = "neon")]
+#[inline]
+fn first_unequal(eq: uint8x16_t) -> usize {
+    let nibbles = vget_lane_u64(
+        vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)),
+        0,
+    );
+    ((!nibbles).trailing_zeros() / 4) as usize
+}
+
+/// NEON vector prefix-length probe. Returns the number of leading equal bytes
+/// that fit in whole 16-byte chunks; the caller (or the wrapper below) handles
+/// the scalar tail.
+///
+/// Compares 32 bytes a step with one branch: the two equality masks are
+/// joined and their minimum lane tested, and the mismatch is only located on
+/// the step that has one.
 ///
 /// # Safety
 /// `lhs` / `rhs` must point to at least `max` initialized bytes. NEON must be
@@ -25,20 +45,25 @@ use super::scalar;
 #[inline]
 pub(crate) unsafe fn prefix_len_simd(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
     let mut off = 0usize;
-    while off + 16 <= max {
-        let a: uint8x16_t = unsafe { vld1q_u8(lhs.add(off)) };
-        let b: uint8x16_t = unsafe { vld1q_u8(rhs.add(off)) };
-        let eq = vceqq_u8(a, b);
-        let lanes = vreinterpretq_u64_u8(eq);
-        let low = vgetq_lane_u64(lanes, 0);
-        if low != u64::MAX {
-            let diff = low ^ u64::MAX;
-            return off + scalar::mismatch_byte_index(diff as usize);
+    while off + 32 <= max {
+        let (eq0, eq1) = unsafe {
+            (
+                vceqq_u8(vld1q_u8(lhs.add(off)), vld1q_u8(rhs.add(off))),
+                vceqq_u8(vld1q_u8(lhs.add(off + 16)), vld1q_u8(rhs.add(off + 16))),
+            )
+        };
+        if vminvq_u8(vandq_u8(eq0, eq1)) != u8::MAX {
+            if vminvq_u8(eq0) != u8::MAX {
+                return off + first_unequal(eq0);
+            }
+            return off + 16 + first_unequal(eq1);
         }
-        let high = vgetq_lane_u64(lanes, 1);
-        if high != u64::MAX {
-            let diff = high ^ u64::MAX;
-            return off + 8 + scalar::mismatch_byte_index(diff as usize);
+        off += 32;
+    }
+    if off + 16 <= max {
+        let eq = unsafe { vceqq_u8(vld1q_u8(lhs.add(off)), vld1q_u8(rhs.add(off))) };
+        if vminvq_u8(eq) != u8::MAX {
+            return off + first_unequal(eq);
         }
         off += 16;
     }

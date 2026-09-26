@@ -301,7 +301,9 @@ impl HcOptState {
         }
     }
 
-    pub(crate) fn rescale_freqs(&mut self, src: &[u8], profile: HcOptimalCostProfile) {
+    /// `accurate` is the strategy's price mode, which the base prices are
+    /// derived in.
+    pub(crate) fn rescale_freqs(&mut self, src: &[u8], accurate: bool) {
         self.price_type = HcOptPriceType::Dynamic;
         if self.lit_length_sum == 0 {
             if src.len() <= HC_PREDEF_THRESHOLD {
@@ -404,7 +406,7 @@ impl HcOptState {
             self.match_length_sum = Self::scale_stats(&mut self.match_length_freq, 11);
             self.off_code_sum = Self::scale_stats(&mut self.off_code_freq, 11);
         }
-        self.set_base_prices(profile.accurate);
+        self.set_base_prices(accurate);
     }
 
     pub(crate) fn update_stats(
@@ -440,9 +442,7 @@ impl HcOptState {
 
 #[derive(Copy, Clone)]
 pub(crate) struct HcOptimalCostProfile {
-    pub(crate) max_chain_depth: usize,
     pub(crate) sufficient_match_len: usize,
-    pub(crate) accurate: bool,
     pub(crate) favor_small_offsets: bool,
 }
 
@@ -454,10 +454,10 @@ impl HcOptimalCostProfile {
     /// this entry — there is no runtime peer.
     ///
     /// The `debug_assert!(S::USE_BT, …)` enforces that
-    /// `MAX_CHAIN_DEPTH` / `SUFFICIENT_MATCH_LEN` are only consulted
+    /// `SUFFICIENT_MATCH_LEN` is only consulted
     /// for BT-walking strategies, since non-BT strategies
     /// (`Fast` / `Dfast` / `Greedy` / `Lazy`) carry placeholder
-    /// values for those consts — see the `MAX_CHAIN_DEPTH` doc
+    /// values for the BT consts; see the `MAX_CHAIN_DEPTH` doc
     /// comment on each of those strategy types.
     #[inline]
     pub(crate) fn const_for_strategy<S: super::strategy::Strategy>() -> Self {
@@ -468,14 +468,14 @@ impl HcOptimalCostProfile {
              profile is only meaningful when the BT walker is active.",
         );
         Self {
-            max_chain_depth: S::MAX_CHAIN_DEPTH,
             sufficient_match_len: S::SUFFICIENT_MATCH_LEN,
-            accurate: S::ACCURATE_PRICE,
             favor_small_offsets: S::FAVOR_SMALL_OFFSETS,
         }
     }
 
-    pub(crate) fn literal_price(&self, stats: &HcOptState, byte: u8) -> u32 {
+    /// `ACCURATE` is the strategy's price mode (upstream `optLevel >= 1`), a
+    /// const so the parser's per-candidate prices carry no weight-mode branch.
+    pub(crate) fn literal_price<const ACCURATE: bool>(&self, stats: &HcOptState, byte: u8) -> u32 {
         if !stats.literals_compressed() {
             return 8 * HC_BITCOST_MULTIPLIER;
         }
@@ -487,28 +487,32 @@ impl HcOptimalCostProfile {
         // final subtract never underflows.
         debug_assert!(stats.lit_sum_base_price >= HC_BITCOST_MULTIPLIER);
         let lit_max = stats.lit_sum_base_price - HC_BITCOST_MULTIPLIER;
-        let mut lit_weight = HcOptState::weight(stats.lit_freq[byte as usize], self.accurate);
+        let mut lit_weight = HcOptState::weight(stats.lit_freq[byte as usize], ACCURATE);
         if lit_weight > lit_max {
             lit_weight = lit_max;
         }
         stats.lit_sum_base_price - lit_weight
     }
 
-    pub(crate) fn lit_length_price(&self, stats: &HcOptState, lit_len: usize) -> u32 {
+    pub(crate) fn lit_length_price<const ACCURATE: bool>(
+        &self,
+        stats: &HcOptState,
+        lit_len: usize,
+    ) -> u32 {
         if lit_len == HC_BLOCKSIZE_MAX {
             // Upstream zstd parity: ZSTD_litLengthPrice() handles the non-representable
             // BLOCKSIZE_MAX literal-length by charging one extra bit over the
             // largest encodable litLength symbol.
             return HC_BITCOST_MULTIPLIER
-                + self.lit_length_price(stats, HC_BLOCKSIZE_MAX.saturating_sub(1));
+                + self.lit_length_price::<ACCURATE>(stats, HC_BLOCKSIZE_MAX.saturating_sub(1));
         }
         if matches!(stats.price_type, HcOptPriceType::Predefined) {
-            return HcOptState::weight(lit_len as u32, self.accurate);
+            return HcOptState::weight(lit_len as u32, ACCURATE);
         }
         // ll_bits ≤ 16 ⇒ ll_bits * 256 ≤ 4096, sum no overflow.
         let (ll_code, ll_bits) = HcOptState::lit_code_and_bits(lit_len);
         ll_bits * HC_BITCOST_MULTIPLIER + stats.lit_length_sum_base_price
-            - HcOptState::weight(stats.lit_length_freq[ll_code], self.accurate)
+            - HcOptState::weight(stats.lit_length_freq[ll_code], ACCURATE)
     }
 
     #[inline(always)]
@@ -533,18 +537,22 @@ impl HcOptimalCostProfile {
     }
 
     #[inline(always)]
-    pub(crate) fn match_length_price(&self, stats: &HcOptState, match_len: usize) -> u32 {
+    pub(crate) fn match_length_price<const ACCURATE: bool>(
+        &self,
+        stats: &HcOptState,
+        match_len: usize,
+    ) -> u32 {
         // Upstream zstd parity: mlBase = match_len - MINMATCH; callers guarantee
         // match_len ≥ HC_FORMAT_MINMATCH. ml_bits ≤ 16, * 256 ≤ 4096.
         debug_assert!(match_len >= HC_FORMAT_MINMATCH);
         let ml_base = match_len - HC_FORMAT_MINMATCH;
         if matches!(stats.price_type, HcOptPriceType::Predefined) {
-            return HcOptState::weight(ml_base as u32, self.accurate);
+            return HcOptState::weight(ml_base as u32, ACCURATE);
         }
         let (ml_code, ml_bits) = HcOptState::ml_code_and_bits(match_len);
         ml_bits * HC_BITCOST_MULTIPLIER
             + (stats.match_length_sum_base_price
-                - HcOptState::weight(stats.match_length_freq[ml_code], self.accurate))
+                - HcOptState::weight(stats.match_length_freq[ml_code], ACCURATE))
     }
 
     #[inline(always)]

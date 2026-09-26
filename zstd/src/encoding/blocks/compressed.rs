@@ -208,14 +208,58 @@ impl CompressedBlockScratch {
 struct SequencePrefixSums {
     lit: Vec<usize>,
     ml: Vec<usize>,
+    /// Each sequence's literal-length and match-length codes, and a prefix sum
+    /// of the extra bits the two carry. Neither depends on the offset history,
+    /// so they are derived once per block (upstream zstd `ZSTD_seqToCodes`) and
+    /// every split probe reads its range from here.
+    ll_code: Vec<u8>,
+    ml_code: Vec<u8>,
+    length_bits: Vec<usize>,
+}
+
+/// The precomputed length codes of a run of sequences.
+#[derive(Clone, Copy)]
+struct LengthCodes<'a> {
+    ll: &'a [u8],
+    ml: &'a [u8],
+    /// Extra bits of every literal and match length in the run.
+    bits: usize,
 }
 
 impl SequencePrefixSums {
     fn heap_size(&self) -> usize {
-        (self.lit.capacity() + self.ml.capacity()) * core::mem::size_of::<usize>()
+        (self.lit.capacity() + self.ml.capacity() + self.length_bits.capacity())
+            * core::mem::size_of::<usize>()
+            + self.ll_code.capacity()
+            + self.ml_code.capacity()
+    }
+
+    /// The length codes of sequences `start..end`.
+    fn codes(&self, start: usize, end: usize) -> LengthCodes<'_> {
+        LengthCodes {
+            ll: &self.ll_code[start..end],
+            ml: &self.ml_code[start..end],
+            bits: self.length_bits[end] - self.length_bits[start],
+        }
     }
 
     fn rebuild(&mut self, sequences: &[RawSequence]) {
+        self.ll_code.clear();
+        self.ml_code.clear();
+        self.length_bits.clear();
+        self.ll_code.reserve(sequences.len());
+        self.ml_code.reserve(sequences.len());
+        self.length_bits.reserve(sequences.len() + 1);
+        let mut bits = 0usize;
+        self.length_bits.push(0);
+        for seq in sequences {
+            let (ll, _, ll_bits) = encode_literal_length(seq.ll);
+            let (ml, _, ml_bits) = encode_match_len(seq.ml);
+            self.ll_code.push(ll);
+            self.ml_code.push(ml);
+            bits += ll_bits + ml_bits;
+            self.length_bits.push(bits);
+        }
         self.lit.clear();
         self.ml.clear();
         // `Vec::reserve_exact(additional)` adds `additional` elements ABOVE
@@ -252,7 +296,7 @@ impl SequencePrefixSums {
 
 /// One collected sequence.
 ///
-/// `off_base` holds the offset the matcher found until [`fill_wire_offsets`]
+/// `off_base` holds the offset the matcher found until [`fill_and_count`]
 /// runs over the sequence, and the wire code from then on: 1/2/3 for the repeat
 /// offsets, N+3 for an explicit N. It is one field rather than two because the
 /// found offset has no reader once its code exists, and a fourth word would
@@ -372,6 +416,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     scratch.partitions.clear();
     scratch.prefix_sums.rebuild(&scratch.parts.sequences);
     let mut workspace = scratch.estimator_workspace.take().unwrap_or_default();
+    let built_huff = core::mem::take(&mut workspace.built_huff);
     // Reuse the estimator's inner scratch across frames instead of
     // allocating a fresh `CompressedBlockScratch` (count tables + Vecs)
     // every block-split. Lazily created on the first split.
@@ -384,12 +429,18 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         parts: &scratch.parts,
         prefix_sums: &scratch.prefix_sums,
         block_entry: ProbeEntryState {
-            last_huff_table: state.last_huff_table.clone(),
+            huff: if state.last_huff_table.is_some() {
+                HuffRef::BlockEntry
+            } else {
+                HuffRef::None
+            },
             ll_previous: state.fse_tables.ll_previous.clone(),
             ml_previous: state.fse_tables.ml_previous.clone(),
             of_previous: state.fse_tables.of_previous.clone(),
             offset_hist: state.offset_hist,
         },
+        entry_huff: state.last_huff_table.as_ref(),
+        built_huff,
         scratch_state: CompressState {
             matcher: EntropyOnlyMatcher,
             // The splitter's scratch state never reaches the raw-skip, which
@@ -398,7 +449,9 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             // Inherited rather than re-resolved: this scratch state stands in
             // for the same compressor on the same CPU.
             copy_tier: state.copy_tier,
-            last_huff_table: state.last_huff_table.clone(),
+            // Probes read the table they repeat from `entry_huff` /
+            // `built_huff`; this slot stays empty.
+            last_huff_table: None,
             huff_table_spare: None,
             huff_rollback: None,
             // Lent, not created: the estimator builds a table per split
@@ -406,7 +459,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             // on every post-split block and drop them at the end of it. Handed
             // back below, so the emitter that follows keeps using the same one.
             huff_weights: core::mem::take(&mut state.huff_weights),
-            fse_tables: clone_fse_tables(&state.fse_tables),
+            fse_tables: probe_fse_tables(&state.fse_tables),
             block_scratch: inner_scratch,
             offset_hist: state.offset_hist,
             strategy_tag: state.strategy_tag,
@@ -419,15 +472,37 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     estimator.derive_block_splits(0, scratch.parts.sequences.len(), &mut scratch.partitions);
     scratch.partitions.push(scratch.parts.sequences.len());
     workspace = estimator.workspace;
-    scratch.estimator_workspace = Some(workspace);
     // Stash the inner scratch back for the next frame (its buffers stay
     // allocated; the estimator clears them per use), and take the weight
     // builder's buffers back so the emitter and the next block reuse them.
     let CompressState {
         block_scratch: inner_block_scratch,
-        huff_weights,
+        mut huff_weights,
+        fse_tables: probe_tables,
         ..
     } = estimator.scratch_state;
+    // The last probe's tables join the pool for the next block's probes.
+    workspace.recycle_previous(probe_tables.ll_previous);
+    workspace.recycle_previous(probe_tables.ml_previous);
+    workspace.recycle_previous(probe_tables.of_previous);
+    for handle in [
+        probe_tables.ll_next,
+        probe_tables.ml_next,
+        probe_tables.of_next,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        workspace.recycle_fse(handle);
+    }
+    // The tables the probes built go back to the builder for its next tables,
+    // and their emptied arena to the workspace for the next block.
+    let mut built_huff = estimator.built_huff;
+    for table in built_huff.drain(..) {
+        huff_weights.recycle(table);
+    }
+    workspace.built_huff = built_huff;
+    scratch.estimator_workspace = Some(workspace);
     state.huff_weights = huff_weights;
     scratch.estimator_inner = Some(Box::new(inner_block_scratch));
 
@@ -830,15 +905,41 @@ struct EstimatorWorkspace {
     ll_counts: Box<[usize; 256]>,
     ml_counts: Box<[usize; 256]>,
     of_counts: Box<[usize; 256]>,
-    sequences: Vec<RawSequence>,
+    /// FSE table handles no probe state holds any more, for the next probe to
+    /// build into. Every one is unique, so a build writes it in place.
+    spare_fse: Vec<SharedFseTable>,
+    /// The arena a block's probes keep the Huffman tables they build in
+    /// ([`SplitEstimator::built_huff`]), empty between blocks: the tables go back
+    /// to the weight builder, the room stays for the next block's probes.
+    built_huff: Vec<huff0_encoder::HuffmanTable>,
 }
 
 impl EstimatorWorkspace {
-    /// The four boxed count tables plus whatever the sequence buffer has grown
-    /// to. All four boxes are always present once the workspace exists.
+    /// The four boxed count tables, always present once the workspace exists,
+    /// the pooled tables with their reference counts, and the room kept for
+    /// the probes' Huffman tables.
     fn heap_size(&self) -> usize {
         4 * core::mem::size_of::<[usize; 256]>()
-            + self.sequences.capacity() * core::mem::size_of::<RawSequence>()
+            + self.built_huff.capacity() * core::mem::size_of::<huff0_encoder::HuffmanTable>()
+            + self.spare_fse.capacity() * core::mem::size_of::<SharedFseTable>()
+            + self.spare_fse.len()
+                * (core::mem::size_of::<FSETable>()
+                    + crate::encoding::frame_compressor::shared_table_overhead())
+    }
+
+    /// Pool a handle, unless something else still holds it: a shared table
+    /// cannot be built into, so it is only let go.
+    fn recycle_fse(&mut self, mut handle: SharedFseTable) {
+        if SharedFseTable::get_mut(&mut handle).is_some() {
+            self.spare_fse.push(handle);
+        }
+    }
+
+    /// Pool the custom tables of an axis state that is going away.
+    fn recycle_previous(&mut self, previous: Option<PreviousFseTable>) {
+        if let Some(PreviousFseTable::Custom(handle)) = previous {
+            self.recycle_fse(handle);
+        }
     }
 }
 
@@ -849,7 +950,8 @@ impl Default for EstimatorWorkspace {
             ll_counts: Box::new([0; 256]),
             ml_counts: Box::new([0; 256]),
             of_counts: Box::new([0; 256]),
-            sequences: Vec::new(),
+            spare_fse: Vec::new(),
+            built_huff: Vec::new(),
         }
     }
 }
@@ -862,36 +964,86 @@ impl Default for EstimatorWorkspace {
 /// FSE bit-level write. Splitter probes use this path to get the same byte
 /// count `encode_block_parts` would produce while saving the dominant
 /// `encode_sequences` write cost on every probe.
+#[cfg(test)]
 fn estimate_block_parts_size<M: Matcher>(
     state: &mut CompressState<M>,
     literals_vec: &[u8],
     raw_sequences: &[RawSequence],
     workspace: &mut EstimatorWorkspace,
 ) -> usize {
-    // The probe cannot fill in place: it walks sub-ranges of the block's
-    // sequences repeatedly, from a scratch history, while the array itself is
-    // borrowed immutably by the estimator for the whole search. So it keeps a
-    // copy — which costs nothing that matters, since block splitting only runs
-    // from level 11 up and never on the band this array's copy was hurting.
-    workspace.sequences.clear();
-    if workspace.sequences.capacity() < raw_sequences.len() {
-        workspace
-            .sequences
-            .reserve_exact(raw_sequences.len() - workspace.sequences.len());
-    }
-    workspace.sequences.extend_from_slice(raw_sequences);
-    fill_wire_offsets(
-        &mut workspace.sequences,
-        &mut state.offset_hist,
-        matches!(
-            state.strategy_tag,
-            crate::encoding::strategy::StrategyTag::Fast
-        ),
-    );
-
-    let lit_bytes = estimate_literals_section_bytes(
+    let mut sums = SequencePrefixSums::default();
+    sums.rebuild(raw_sequences);
+    let previous = state.last_huff_table.take();
+    let tables = &mut state.fse_tables;
+    let previous_fse = [
+        tables.ll_previous.take(),
+        tables.ml_previous.take(),
+        tables.of_previous.take(),
+    ];
+    let (bytes, outcome, decisions) = estimate_block_parts_size_with(
+        state,
+        previous.as_ref(),
+        [
+            previous_fse[0].as_ref(),
+            previous_fse[1].as_ref(),
+            previous_fse[2].as_ref(),
+        ],
         literals_vec,
-        &mut state.last_huff_table,
+        raw_sequences,
+        sums.codes(0, raw_sequences.len()),
+        workspace,
+    );
+    state.last_huff_table = match outcome {
+        HuffOutcome::Keep => previous,
+        HuffOutcome::Clear => None,
+        HuffOutcome::New(table) => Some(table),
+    };
+    let [ll, ml, of] = previous_fse;
+    let tables = &mut state.fse_tables;
+    tables.ll_previous = ll;
+    tables.ml_previous = ml;
+    tables.of_previous = of;
+    remember_last_used_tables(tables, decisions);
+    for next in [
+        &mut tables.ll_next,
+        &mut tables.ml_next,
+        &mut tables.of_next,
+    ] {
+        if let Some(handle) = next.take() {
+            workspace.recycle_fse(handle);
+        }
+    }
+    bytes
+}
+
+/// What pricing a literals section did to the Huffman table the next section
+/// may repeat: keep the one it was given, drop it, or take a new one. A probe
+/// reads the previous table and reports this, rather than rewriting a copy of
+/// it, so the table it starts from is borrowed.
+enum HuffOutcome {
+    Keep,
+    Clear,
+    New(huff0_encoder::HuffmanTable),
+}
+
+/// `estimate_block_parts_size` for sequences whose length codes are already
+/// derived: the splitter's probes, which price many ranges of one block. The
+/// tables the section may repeat are borrowed, the Huffman table as `previous`
+/// and the FSE tables as `previous_fse`, and what the section does with each is
+/// returned beside the size, a built FSE table in its `*_next` slot of
+/// `state.fse_tables`; the offset history is advanced in `state`.
+fn estimate_block_parts_size_with<M: Matcher>(
+    state: &mut CompressState<M>,
+    previous: Option<&huff0_encoder::HuffmanTable>,
+    previous_fse: [Option<&PreviousFseTable>; 3],
+    literals_vec: &[u8],
+    raw_sequences: &[RawSequence],
+    codes: LengthCodes<'_>,
+    workspace: &mut EstimatorWorkspace,
+) -> (usize, HuffOutcome, [LastUsedTable; 3]) {
+    let (lit_bytes, outcome) = estimate_literals_section_bytes(
+        literals_vec,
+        previous,
         &mut workspace.lit_counts,
         state.strategy_tag,
         state.huf_optimal_search,
@@ -900,20 +1052,22 @@ fn estimate_block_parts_size<M: Matcher>(
         literals_suspected_incompressible(literals_vec.len(), raw_sequences.len()),
     );
 
-    let seq_bytes = if workspace.sequences.is_empty() {
-        1
+    // A section without sequences writes no tables, so every axis keeps its own.
+    let (seq_bytes, decisions) = if raw_sequences.is_empty() {
+        (1, [LastUsedTable::Keep; 3])
     } else {
         estimate_sequences_section_bytes(
-            &workspace.sequences,
+            raw_sequences,
+            codes,
+            &mut state.offset_hist,
+            previous_fse,
             &mut state.fse_tables,
-            &mut workspace.ll_counts,
-            &mut workspace.ml_counts,
-            &mut workspace.of_counts,
+            workspace,
             state.strategy_tag,
         )
     };
 
-    lit_bytes + seq_bytes
+    (lit_bytes + seq_bytes, outcome, decisions)
 }
 
 // One argument over the lint's threshold. Every one of them is a distinct
@@ -923,20 +1077,25 @@ fn estimate_block_parts_size<M: Matcher>(
 #[allow(clippy::too_many_arguments)]
 fn estimate_literals_section_bytes(
     literals: &[u8],
-    last_huff: &mut Option<huff0_encoder::HuffmanTable>,
+    last_huff: Option<&huff0_encoder::HuffmanTable>,
     counts: &mut [usize; 256],
     strategy: crate::encoding::strategy::StrategyTag,
     huf_search: bool,
     lit_disabled: bool,
     weight_scratch: &mut huff0_encoder::WeightScratch,
     suspected_incompressible: bool,
-) -> usize {
+) -> (usize, HuffOutcome) {
+    let raw = || {
+        (
+            uncompressed_literals_header_bytes(literals.len()) + literals.len(),
+            HuffOutcome::Clear,
+        )
+    };
     // Mirror `encode_block_parts` literal-mode branches
     // **in the same order**. The disabled gate (negative levels: raw literals,
     // no Huffman) is checked FIRST exactly as the emitter does.
     if lit_disabled {
-        *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+        return raw();
     }
     // The emitter pre-checks `all_identical`
     // (any non-empty section) BEFORE the `min_lits` gate — RLE and raw
@@ -947,13 +1106,14 @@ fn estimate_literals_section_bytes(
     // regardless of strategy. Estimator must use the same ordering and
     // predicate so probe costs match emit byte-for-byte.
     if !literals.is_empty() && all_bytes_identical(literals) {
-        *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + 1;
+        return (
+            uncompressed_literals_header_bytes(literals.len()) + 1,
+            HuffOutcome::Clear,
+        );
     }
     let min_lits = min_literals_to_compress(strategy, last_huff.is_some());
     if literals.len() < min_lits {
-        *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+        return raw();
     }
 
     // Upstream zstd preferRepeat fast-path: skip the histogram +
@@ -971,18 +1131,16 @@ fn estimate_literals_section_bytes(
     // short-circuit so we still fall through to rebuild when the
     // prior table can't encode the current literals.
     if prefer_repeat_eligible(strategy, literals.len())
-        && let Some(prev) = last_huff.as_ref()
+        && let Some(prev) = last_huff
         && let Some(reuse_payload) = estimate_huff_payload_bytes_checked(prev, literals)
     {
         let compressed_header = compressed_literals_header_bytes(literals.len());
         let total = compressed_header + reuse_payload; // no tree_desc on reuse
-        let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
         let huf_section_size = total - compressed_header;
         if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
-            *last_huff = None;
-            return raw_section_bytes;
+            return raw();
         }
-        return total;
+        return (total, HuffOutcome::Keep);
     }
 
     // Mirror the emitter's end-sample shortcut, in the same position. Without
@@ -990,8 +1148,7 @@ fn estimate_literals_section_bytes(
     // Huffman-compressed here and is emitted raw there, and the splitter picks
     // a partition on a price the emitter cannot produce.
     if suspected_incompressible && end_samples_look_flat(literals, counts) {
-        *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+        return raw();
     }
 
     let (max_sym, largest_count) = crate::histogram::count_bytes(literals, counts);
@@ -999,8 +1156,7 @@ fn estimate_literals_section_bytes(
     // byte-for-byte (flat histogram → raw section, no tree build) so
     // splitter probe costs match what the emitter writes.
     if largest_count <= (literals.len() >> 7) + 4 {
-        *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+        return raw();
     }
     // Mutable because the size query is what encodes the weight description
     // into the table's own buffer, so the emitter that follows reads it.
@@ -1010,12 +1166,13 @@ fn estimate_literals_section_bytes(
         weight_scratch,
     );
 
-    let Some(new_desc) = new_table.writeable_table_description_size() else {
-        *last_huff = None;
+    let Some(new_desc) =
+        new_table.writeable_table_description_size(weight_scratch.weight_fse_table())
+    else {
         // Nothing downstream reads this table; hand its buffers to the next
         // build rather than dropping them.
         weight_scratch.recycle(new_table);
-        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+        return raw();
     };
     // For lit_size ≥ 256, upstream zstd `compress_literals` calls `encoder.encode4x`
     // which splits the data in 4 streams with a 6-byte jumptable and per-stream
@@ -1032,20 +1189,12 @@ fn estimate_literals_section_bytes(
     // Using the 4-stream `estimate_huff_payload_bytes_checked` here would
     // disagree with the encoder and bias the splitter to pick a different
     // table than the encoder ultimately emits.
-    let use_new = decide_huff_reuse_like_encoder(
-        &new_table,
-        last_huff.as_ref(),
-        new_desc,
-        literals,
-        counts,
-        strategy,
-    );
+    let use_new =
+        decide_huff_reuse_like_encoder(&new_table, last_huff, new_desc, literals, counts, strategy);
     let reuse_payload = if !use_new {
         // Safe to recompute with 4-stream model now that the table is chosen:
         // the chosen-table path always returns the actual wire cost.
-        last_huff
-            .as_ref()
-            .and_then(|t| estimate_huff_payload_bytes_checked(t, literals))
+        last_huff.and_then(|t| estimate_huff_payload_bytes_checked(t, literals))
     } else {
         None
     };
@@ -1075,86 +1224,132 @@ fn estimate_literals_section_bytes(
     let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
     let huf_section_size = total - compressed_header; // tree_desc + payload, no lhSize
     if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
-        *last_huff = None;
         weight_scratch.recycle(new_table);
-        return raw_section_bytes;
+        return (raw_section_bytes, HuffOutcome::Clear);
     }
 
     if use_new {
-        // The table this displaces is the one to recycle; the new one is kept.
-        if let Some(displaced) = last_huff.replace(new_table) {
-            weight_scratch.recycle(displaced);
-        }
+        (total, HuffOutcome::New(new_table))
     } else {
         weight_scratch.recycle(new_table);
+        (total, HuffOutcome::Keep)
     }
-    total
 }
 
+/// Price a sequence section. The offset codes are the one part that depends on
+/// the history the section starts from, so they are resolved here, in one pass
+/// that advances `offset_hist` as the emitter would; the length codes and
+/// their extra bits come precomputed in `codes`. Each histogram is built once
+/// and handed to the table selection, which the emitter's path counts again.
+///
+/// The tables the section may repeat are `previous` (LL, ML, OF), borrowed: a
+/// probe reads them and does not take a handle. What the section decided for
+/// each axis is returned beside the size, a built table left in that axis's
+/// `*_next` slot of `fse_tables`, for the caller to commit.
 fn estimate_sequences_section_bytes(
     sequences: &[RawSequence],
+    codes: LengthCodes<'_>,
+    offset_hist: &mut [u32; 3],
+    previous: [Option<&PreviousFseTable>; 3],
     fse_tables: &mut FseTables,
-    ll_counts: &mut [usize; 256],
-    ml_counts: &mut [usize; 256],
-    of_counts: &mut [usize; 256],
+    workspace: &mut EstimatorWorkspace,
     strategy: crate::encoding::strategy::StrategyTag,
-) -> usize {
-    ll_counts.fill(0);
-    ml_counts.fill(0);
+) -> (usize, [LastUsedTable; 3]) {
+    let EstimatorWorkspace {
+        ll_counts,
+        ml_counts,
+        of_counts,
+        ..
+    } = workspace;
+    let (ll_counts, ml_counts, of_counts) = (&mut **ll_counts, &mut **ml_counts, &mut **of_counts);
+    debug_assert_eq!(codes.ll.len(), sequences.len());
+    let histogram = |codes: &[u8], counts: &mut [usize; 256]| {
+        counts.fill(0);
+        let mut max = 0u8;
+        for &code in codes {
+            counts[code as usize] += 1;
+            max = max.max(code);
+        }
+        max as usize
+    };
+    let ll_max = histogram(codes.ll, ll_counts);
+    let ml_max = histogram(codes.ml, ml_counts);
     of_counts.fill(0);
-    let mut extra_bits: usize = 0;
-    for seq in sequences {
-        let (ll, _, ll_bits) = encode_literal_length(seq.ll);
-        let (ml, _, ml_bits) = encode_match_len(seq.ml);
-        let (of, _, _) = encode_offset(seq.off_base);
-        ll_counts[ll as usize] += 1;
-        ml_counts[ml as usize] += 1;
+    let mut of_max = 0usize;
+    let mut of_bits = 0usize;
+    let mut hist = *offset_hist;
+    let mut count_offset = |off_base: u32| {
+        let (of, _, _) = encode_offset(off_base);
         of_counts[of as usize] += 1;
+        of_max = of_max.max(of as usize);
         // Upstream zstd: OF code's value equals its additional-bits width.
-        extra_bits += ll_bits + ml_bits + of as usize;
+        of_bits += of as usize;
+    };
+    if matches!(strategy, crate::encoding::strategy::StrategyTag::Fast) {
+        for seq in sequences {
+            count_offset(encode_offset_with_history_fast(
+                seq.off_base,
+                seq.ll,
+                &mut hist,
+            ));
+        }
+    } else {
+        for seq in sequences {
+            count_offset(encode_offset_with_history(seq.off_base, seq.ll, &mut hist));
+        }
     }
+    *offset_hist = hist;
+    let extra_bits = codes.bits + of_bits;
+    let total = sequences.len();
 
     // Destructured for the same reason as the emitter: the default accessors
     // borrow the whole struct, which would collide with the `*_next` slots.
     let FseTables {
-        ll_previous,
-        ml_previous,
-        of_previous,
         ll_next,
         ml_next,
         of_next,
         ll_default,
         ml_default,
         of_default,
+        ..
     } = fse_tables;
     let ll_default: &FSETable = ll_default;
     let ml_default: &FSETable = ml_default;
     let of_default: &FSETable = of_default;
+    let [ll_previous, ml_previous, of_previous] = previous;
 
-    // Same `choose_table` calls as the real encoder — counts the iterator
-    // internally, identical decision path.
-    let ll_mode = choose_table(
-        ll_previous.as_ref(),
+    // The table selection the real encoder makes, from the same histograms.
+    let ll_mode = choose_table_from_counts(
+        ll_previous,
         ll_default,
-        sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
+        ll_counts,
+        total,
+        ll_max,
         9,
         strategy,
+        None,
         ll_next,
     );
-    let ml_mode = choose_table(
-        ml_previous.as_ref(),
+    let ml_mode = choose_table_from_counts(
+        ml_previous,
         ml_default,
-        sequences.iter().map(|seq| encode_match_len(seq.ml).0),
+        ml_counts,
+        total,
+        ml_max,
         9,
         strategy,
+        None,
         ml_next,
     );
-    let of_mode = choose_table(
-        of_previous.as_ref(),
+    let of_mode = choose_table_from_counts(
+        of_previous,
         of_default,
-        sequences.iter().map(|seq| encode_offset(seq.off_base).0),
+        of_counts,
+        total,
+        of_max,
         8,
         strategy,
+        None,
         of_next,
     );
 
@@ -1184,28 +1379,22 @@ fn estimate_sequences_section_bytes(
     };
     let stream_bytes = (bit_content + padding_bits) / 8;
 
-    // Mirror state mutation done by `encode_block_parts`.
+    // What `encode_block_parts` would commit, left to the caller to commit.
     let decisions = [
         into_last_used_table(ll_mode),
         into_last_used_table(ml_mode),
         into_last_used_table(of_mode),
     ];
-    remember_last_used_tables(fse_tables, decisions);
-    // The emitter keeps the handle a commit displaces, to build the next
-    // block's table into. A probe must not: the splitter holds many of these
-    // states at once, and a spare per axis per probe doubles the tables alive
-    // at any moment. Dropping it leaves a probe with exactly what it needs,
-    // which is what the allocate-per-table form gave it.
-    fse_tables.ll_next = None;
-    fse_tables.ml_next = None;
-    fse_tables.of_next = None;
 
-    nb_seq_header
-        + mode_byte
-        + ll_table_desc_bytes
-        + of_table_desc_bytes
-        + ml_table_desc_bytes
-        + stream_bytes
+    (
+        nb_seq_header
+            + mode_byte
+            + ll_table_desc_bytes
+            + of_table_desc_bytes
+            + ml_table_desc_bytes
+            + stream_bytes,
+        decisions,
+    )
 }
 
 /// Bit cost of a sequence section under `mode`, matching what
@@ -1687,28 +1876,10 @@ fn highest_used_code<const MAX_CODE: usize>(counts: &[usize; 256]) -> usize {
         .unwrap_or(0)
 }
 
-/// [`fill_and_count`] without the histogram, for the block-split estimator: it
-/// prices sub-ranges repeatedly from a scratch history and counts them itself.
-fn fill_wire_offsets(
-    raw_sequences: &mut [RawSequence],
-    offset_hist: &mut [u32; 3],
-    fast_repcode: bool,
-) {
-    // Local copy for the same reason as `fill_and_count`.
-    let mut hist = *offset_hist;
-    if fast_repcode {
-        for seq in raw_sequences.iter_mut() {
-            seq.off_base = encode_offset_with_history_fast(seq.off_base, seq.ll, &mut hist);
-        }
-    } else {
-        for seq in raw_sequences.iter_mut() {
-            seq.off_base = encode_offset_with_history(seq.off_base, seq.ll, &mut hist);
-        }
-    }
-    *offset_hist = hist;
-}
-
-fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
+/// The FSE tables a split probe's scratch state works with: the defaults, and
+/// no previous table, since every probe reads the one it may repeat from the
+/// state it starts from.
+fn probe_fse_tables(fse_tables: &FseTables) -> FseTables {
     // The `*_default` fields are cfg-typed via the
     // [`crate::fse::fse_encoder::FseDefaultTable`] alias —
     // `&'static FSETable` on atomic / `critical-section` targets
@@ -1730,17 +1901,17 @@ fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
         ll_default: fse_tables.ll_default,
         #[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
         ll_default: fse_tables.ll_default.clone(),
-        ll_previous: fse_tables.ll_previous.clone(),
+        ll_previous: None,
         #[cfg(any(target_has_atomic = "ptr", feature = "critical-section"))]
         ml_default: fse_tables.ml_default,
         #[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
         ml_default: fse_tables.ml_default.clone(),
-        ml_previous: fse_tables.ml_previous.clone(),
+        ml_previous: None,
         #[cfg(any(target_has_atomic = "ptr", feature = "critical-section"))]
         of_default: fse_tables.of_default,
         #[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
         of_default: fse_tables.of_default.clone(),
-        of_previous: fse_tables.of_previous.clone(),
+        of_previous: None,
         // Empty, not blank tables: a probe gets its own slots so it cannot
         // overwrite what the emitter is describing, but most probes never
         // build a custom table and must not pay for one.
@@ -1757,17 +1928,31 @@ fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
 /// estimator replaces.
 #[derive(Clone)]
 struct ProbeEntryState {
-    last_huff_table: Option<huff0_encoder::HuffmanTable>,
+    huff: HuffRef,
     ll_previous: Option<PreviousFseTable>,
     ml_previous: Option<PreviousFseTable>,
     of_previous: Option<PreviousFseTable>,
     offset_hist: [u32; 3],
 }
 
+/// Which Huffman table a probe state may repeat. Tables are never copied into
+/// a state: the block's entry table is borrowed from the compressor, and a
+/// table a probe builds is kept once in the estimator's arena.
+#[derive(Clone, Copy)]
+enum HuffRef {
+    None,
+    BlockEntry,
+    Built(usize),
+}
+
 struct SplitEstimator<'a> {
     parts: &'a EncodedBlockParts,
     prefix_sums: &'a SequencePrefixSums,
     block_entry: ProbeEntryState,
+    /// The table the block starts from, borrowed.
+    entry_huff: Option<&'a huff0_encoder::HuffmanTable>,
+    /// Every table a probe built, addressed by [`HuffRef::Built`].
+    built_huff: Vec<huff0_encoder::HuffmanTable>,
     scratch_state: CompressState<EntropyOnlyMatcher>,
     workspace: EstimatorWorkspace,
 }
@@ -1794,15 +1979,37 @@ impl SplitEstimator<'_> {
         } else {
             lit_start + lit_len
         };
-        self.scratch_state.last_huff_table = entry.last_huff_table.clone();
-        self.scratch_state.fse_tables.ll_previous = entry.ll_previous.clone();
-        self.scratch_state.fse_tables.ml_previous = entry.ml_previous.clone();
-        self.scratch_state.fse_tables.of_previous = entry.of_previous.clone();
+        // Every table the probe may repeat is read where the entry state keeps
+        // it; a handle is taken only for what the post state keeps. A build slot
+        // comes from the pool, so a probe that builds a table writes into one it
+        // already has.
+        let tables = &mut self.scratch_state.fse_tables;
+        for next in [
+            &mut tables.ll_next,
+            &mut tables.ml_next,
+            &mut tables.of_next,
+        ] {
+            if next.is_none() {
+                *next = self.workspace.spare_fse.pop();
+            }
+        }
         self.scratch_state.offset_hist = entry.offset_hist;
-        let emitted_payload = estimate_block_parts_size(
+        let previous = match entry.huff {
+            HuffRef::None => None,
+            HuffRef::BlockEntry => self.entry_huff,
+            HuffRef::Built(at) => Some(&self.built_huff[at]),
+        };
+        let (emitted_payload, outcome, decisions) = estimate_block_parts_size_with(
             &mut self.scratch_state,
+            previous,
+            [
+                entry.ll_previous.as_ref(),
+                entry.ml_previous.as_ref(),
+                entry.of_previous.as_ref(),
+            ],
             &self.parts.literals[lit_start..lit_end],
             &self.parts.sequences[start_idx..end_idx],
+            self.prefix_sums.codes(start_idx, end_idx),
             &mut self.workspace,
         );
         let source_len = (lit_end - lit_start) + match_len;
@@ -1814,19 +2021,40 @@ impl SplitEstimator<'_> {
             emitted_payload
         } + 3;
         // Real emit on raw fallback restores the entry state — see
-        // `emit_single_sequence_block`'s saved-state restore branch.
+        // `emit_single_sequence_block`'s saved-state restore branch. A table the
+        // probe built stays in its slot for the next probe to build into.
         let post = if raw_fallback {
+            if let HuffOutcome::New(table) = outcome {
+                self.scratch_state.huff_weights.recycle(table);
+            }
             entry.clone()
         } else {
+            let huff = match outcome {
+                HuffOutcome::Keep => entry.huff,
+                HuffOutcome::Clear => HuffRef::None,
+                HuffOutcome::New(table) => {
+                    self.built_huff.push(table);
+                    HuffRef::Built(self.built_huff.len() - 1)
+                }
+            };
+            let tables = &mut self.scratch_state.fse_tables;
+            let [ll, ml, of] = decisions;
             ProbeEntryState {
-                last_huff_table: self.scratch_state.last_huff_table.clone(),
-                ll_previous: self.scratch_state.fse_tables.ll_previous.clone(),
-                ml_previous: self.scratch_state.fse_tables.ml_previous.clone(),
-                of_previous: self.scratch_state.fse_tables.of_previous.clone(),
+                huff,
+                ll_previous: decided_previous(ll, &entry.ll_previous, &mut tables.ll_next),
+                ml_previous: decided_previous(ml, &entry.ml_previous, &mut tables.ml_next),
+                of_previous: decided_previous(of, &entry.of_previous, &mut tables.of_next),
                 offset_hist: self.scratch_state.offset_hist,
             }
         };
         (cost, raw_fallback, post)
+    }
+
+    /// Pool the tables of a probe state nothing will read again.
+    fn recycle_state(&mut self, state: ProbeEntryState) {
+        self.workspace.recycle_previous(state.ll_previous);
+        self.workspace.recycle_previous(state.ml_previous);
+        self.workspace.recycle_previous(state.of_previous);
     }
 
     fn derive_block_splits(
@@ -1841,7 +2069,9 @@ impl SplitEstimator<'_> {
             return;
         }
         let entry = self.block_entry.clone();
-        let (full, full_raw_fallback, _) = self.estimate_subblock_size(start_idx, end_idx, &entry);
+        let (full, full_raw_fallback, full_post) =
+            self.estimate_subblock_size(start_idx, end_idx, &entry);
+        self.recycle_state(full_post);
         // G3 — whole-block bail-out before partition split. Upstream zstd
         // `ZSTD_compressSubBlock_multi` (`zstd_compress_superblock.c:530-532`)
         // bails when `estBlockSize > srcSize` (strict). Our trigger is
@@ -1887,7 +2117,8 @@ impl SplitEstimator<'_> {
         if full_raw_fallback {
             return;
         }
-        self.derive_block_splits_with_full(start_idx, end_idx, full, entry, partitions);
+        let exit = self.derive_block_splits_with_full(start_idx, end_idx, full, entry, partitions);
+        self.recycle_state(exit);
     }
 
     /// Returns the post-emit state at `end_idx` produced by whichever
@@ -1910,6 +2141,7 @@ impl SplitEstimator<'_> {
             // exit state is the post-state of that single-partition probe.
             let (_cost, _raw_fallback, post) =
                 self.estimate_subblock_size(start_idx, end_idx, &entry);
+            self.recycle_state(entry);
             return post;
         }
         let mid_idx = (start_idx + end_idx) / 2;
@@ -1918,7 +2150,9 @@ impl SplitEstimator<'_> {
         // not from the parent's block-entry state. Without this propagation
         // `second` is evaluated as a fresh-block start, biasing the
         // `first + second < full` decision toward overly optimistic splits.
-        let (second, _, _) = self.estimate_subblock_size(mid_idx, end_idx, &first_post);
+        let (second, _, second_post) = self.estimate_subblock_size(mid_idx, end_idx, &first_post);
+        self.recycle_state(second_post);
+        self.recycle_state(first_post);
         if first + second < full {
             // If the left side gets further split, the true state at
             // `mid_idx` is the left subtree's exit state, not `first_post`.
@@ -1935,6 +2169,7 @@ impl SplitEstimator<'_> {
         }
         // No split here — this range will be emitted as one partition.
         let (_cost, _raw_fallback, post) = self.estimate_subblock_size(start_idx, end_idx, &entry);
+        self.recycle_state(entry);
         post
     }
 }
@@ -2045,47 +2280,8 @@ fn fse_bit_cost(counts: &[usize; 256], max_symbol: usize, table: &FSETable) -> O
     Some(cost >> 8)
 }
 
-fn choose_table<'a>(
-    previous: Option<&'a PreviousFseTable>,
-    default_table: &'a FSETable,
-    data: impl Iterator<Item = u8>,
-    max_log: u8,
-    strategy: crate::encoding::strategy::StrategyTag,
-    next: &'a mut Option<SharedFseTable>,
-) -> FseTableMode<'a> {
-    // Collect symbol distribution, tracking the highest code so the selector
-    // skips the full-256 reverse scan (see `choose_table_from_counts`).
-    let mut counts = [0usize; 256];
-    let mut total = 0usize;
-    let mut max_symbol = 0usize;
-    for symbol in data {
-        let symbol = symbol as usize;
-        counts[symbol] += 1;
-        total += 1;
-        max_symbol = max_symbol.max(symbol);
-    }
-    choose_table_from_counts(
-        previous,
-        default_table,
-        &mut counts,
-        total,
-        max_symbol,
-        max_log,
-        strategy,
-        // Estimator-only path (no emitted table): price the unadjusted histogram,
-        // matching upstream's `ZSTD_NCountCost`.
-        None,
-        next,
-    )
-}
-
-/// Same decision logic as [`choose_table`] but takes pre-computed
-/// symbol counts and total directly. Hot-path callers in
-/// `compress_literals_and_sequences` use this overload to avoid
-/// re-iterating the sequence vec three times (one pass per
-/// ll/ml/of stream); the iterator form is kept for the cost
-/// estimator's call sites where the data is already in iterator
-/// form.
+/// Choose an FSE table mode from a stream's symbol counts, which every caller
+/// has already built while visiting the codes once.
 // The eight inputs are the cohesive FSE-table-selection set, each carrying its
 // own perf / correctness rationale below (the `&mut` histogram for the no-copy
 // emit build, the caller-tracked `max_symbol` / `last_code` that avoid a
@@ -2365,6 +2561,26 @@ enum LastUsedTable {
     Rle(u8),
     /// The table is in the axis's `*_next` slot, waiting to be committed.
     Encoded,
+}
+
+/// The table an axis repeats after a probe decided `decision` from `entry`:
+/// what [`commit_last_used_table`] would leave in the previous slot, taken for
+/// a probe state. Only a repeat takes a handle to the entry's table; a built
+/// table moves out of `next`, which the next probe refills from the pool.
+fn decided_previous(
+    decision: LastUsedTable,
+    entry: &Option<PreviousFseTable>,
+    next: &mut Option<SharedFseTable>,
+) -> Option<PreviousFseTable> {
+    match decision {
+        LastUsedTable::Keep => entry.clone(),
+        LastUsedTable::Default => Some(PreviousFseTable::Default),
+        LastUsedTable::Rle(symbol) => Some(PreviousFseTable::Rle(symbol)),
+        LastUsedTable::Encoded => Some(PreviousFseTable::Custom(
+            next.take()
+                .expect("an encoded axis built its table into the slot"),
+        )),
+    }
 }
 
 fn into_last_used_table(mode: FseTableMode<'_>) -> LastUsedTable {
@@ -3096,7 +3312,8 @@ fn compress_literals(
         weight_scratch,
     );
 
-    let Some(new_table_description_size) = new_encoder_table.writeable_table_description_size()
+    let Some(new_table_description_size) =
+        new_encoder_table.writeable_table_description_size(weight_scratch.weight_fse_table())
     else {
         raw_literals(literals, writer);
         weight_scratch.recycle(new_encoder_table);

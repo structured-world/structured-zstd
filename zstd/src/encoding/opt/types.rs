@@ -40,6 +40,27 @@ pub(crate) struct HcOptimalNode {
     pub(crate) reps: [u32; 3],
 }
 
+impl HcOptimalNode {
+    /// Record a match ending at `cell`: its offset, its length and an empty
+    /// literal run. The repeat history is left as it was, possibly
+    /// uninitialised: the forward pass derives it when it reaches the cell, as
+    /// upstream's does (`ZSTD_compressBlock_opt_generic` stores `mlen`, `off`,
+    /// `litlen` and the price, and applies `ZSTD_newRep` at `cur`).
+    ///
+    /// # Safety
+    /// `cell` must be valid for writes.
+    #[inline(always)]
+    pub(crate) unsafe fn write_match_end(cell: *mut Self, off: u32, mlen: u32) {
+        // SAFETY: field places of a writable cell; no reference to the whole
+        // (possibly uninitialised) node is formed.
+        unsafe {
+            core::ptr::addr_of_mut!((*cell).off).write(off);
+            core::ptr::addr_of_mut!((*cell).mlen).write(mlen);
+            core::ptr::addr_of_mut!((*cell).litlen).write(0);
+        }
+    }
+}
+
 impl Default for HcOptimalNode {
     fn default() -> Self {
         Self {
@@ -61,9 +82,10 @@ pub(crate) struct HcOptimalSequence {
     pub(crate) lit_len: u32,
 }
 
-/// Inputs to the per-position candidate collection step. Bundled so the
-/// `collect_optimal_candidates_initialized_body!` macro can hand-roll the
-/// argument list once.
+/// One position's search as the test entry `collect_optimal_candidates` takes
+/// it: the repeat history, the pending literal run, and an optional
+/// long-distance candidate merged after the search.
+#[cfg(test)]
 #[derive(Copy, Clone)]
 pub(crate) struct HcCandidateQuery {
     pub(crate) reps: [u32; 3],
@@ -131,4 +153,24 @@ pub(crate) struct HcOptimalPlanBuffers {
     /// searched and the re-entry reads the answer instead of asking again.
     /// `None` whenever the buffer's contents do not answer any query.
     pub(crate) candidates_searched_at: Option<(usize, usize)>,
+    /// Where the block pass stands between segments. Held here, in memory,
+    /// rather than in locals of the pass: the pass needs it only at segment
+    /// boundaries, and as locals it stayed live across the whole segment body,
+    /// taking registers from the DP's own loops. Upstream keeps the same state
+    /// behind pointers (`rep`, `ms->opt`) for the same reason.
+    pub(crate) pass: HcBlockPass,
+}
+
+/// The block pass's position between segments: see
+/// [`HcOptimalPlanBuffers::pass`].
+#[derive(Copy, Clone, Default)]
+pub(crate) struct HcBlockPass {
+    /// Block offset of the next segment.
+    pub(crate) cursor: usize,
+    /// Literals pending before `cursor`.
+    pub(crate) litlen: usize,
+    /// Repeat offsets at `cursor`.
+    pub(crate) reps: [u32; 3],
+    /// Block offset the statistics update has consumed literals up to.
+    pub(crate) literals_cursor: usize,
 }

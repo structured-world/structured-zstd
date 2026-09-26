@@ -4,7 +4,7 @@
 //! model (`opt_state`), the optimal-parser scratch buffers
 //! (`opt_*_scratch` / `opt_*_generation` / `opt_*_stamp`), and the
 //! LDM long-distance match buffer (`ldm_sequences`). Method bodies
-//! (BT walk, `bt_insert_step_no_rebase`, `bt_update_tree_until`,
+//! (BT walk, `bt_insert_range`, `bt_update_tree_until`,
 //! `build_optimal_plan*`, `collect_optimal_candidates*`,
 //! `emit_optimal_plan`, …) still live on `HcMatchGenerator` and will
 //! move onto `impl BtMatcher` once Stage 3b threads
@@ -153,6 +153,21 @@ impl BtMatcher {
             return true;
         }
         false
+    }
+
+    /// Append the long-distance candidate after the search when it is at
+    /// least `min_match_len` and longer than every candidate the search found
+    /// (upstream zstd `ZSTD_optLdm_maybeAddMatch`, zstd_opt.c). The search
+    /// ladder keeps `out` sorted by strictly increasing length, so its last
+    /// entry is the bar.
+    #[inline(always)]
+    pub(crate) fn push_ldm_candidate(
+        out: &mut Vec<MatchCandidate>,
+        ldm: MatchCandidate,
+        min_match_len: usize,
+    ) {
+        let mut best_len = out.last().map_or(0, |c| c.match_len);
+        let _ = Self::push_candidate_ladder(out, &mut best_len, ldm, min_match_len);
     }
 
     pub(crate) fn new() -> Self {
@@ -379,6 +394,7 @@ impl BtMatcher {
             store,
             price_arena,
             candidates_searched_at: _,
+            pass: _,
         } = buffers;
         candidates.clear();
         self.opt_nodes_scratch = nodes;
@@ -572,47 +588,41 @@ impl BtMatcher {
         }
     }
 
-    /// Upstream zstd parity: replay an already-emitted plan segment through the
-    /// `optStatePtr_t` stats updater so the next parse pass sees frozen
-    /// counts. Pure static helper — only mutates the caller-owned
-    /// `opt_state` / `reps` / `literals_start`.
-    pub(crate) fn update_plan_stats_segment(
-        current: &[u8],
-        current_len: usize,
-        plan: &[HcOptimalSequence],
+    /// Upstream zstd parity: `ZSTD_updateStats` for one sequence the parser
+    /// has just settled, called from its traceback so the next segment prices
+    /// against counts that include it. `literals_start` is the block offset
+    /// the previous sequence ended at and `reps` the history before this one;
+    /// both advance. The caller refreshes the base prices once the segment's
+    /// sequences are in.
+    #[inline]
+    pub(crate) fn record_sequence_stats(
+        block: &[u8],
+        sequence: HcOptimalSequence,
         literals_start: &mut usize,
         reps: &mut [u32; 3],
         opt_state: &mut HcOptState,
-        accurate: bool,
     ) {
-        if plan.is_empty() {
+        let lit_len = sequence.lit_len as usize;
+        let match_len = sequence.match_len as usize;
+        // `checked_add` on both edges so a malformed sequence can't overflow
+        // `usize` arithmetic before the bounds guard fires. `saturating_add`
+        // would have masked overflow as "clamp to usize::MAX" which then
+        // bypasses the `> block.len()` check.
+        let Some(start) = literals_start.checked_add(lit_len) else {
+            return;
+        };
+        let Some(end) = start.checked_add(match_len) else {
+            return;
+        };
+        if end > block.len() {
             return;
         }
-        for item in plan {
-            let lit_len = item.lit_len as usize;
-            let match_len = item.match_len as usize;
-            // `checked_add` on both edges so a malformed / partially-built
-            // plan can't overflow `usize` arithmetic before the
-            // bounds guard fires. `saturating_add` would have masked
-            // overflow as "clamp to usize::MAX" which then bypasses the
-            // `> current_len` check.
-            let Some(start) = literals_start.checked_add(lit_len) else {
-                continue;
-            };
-            let Some(end) = start.checked_add(match_len) else {
-                continue;
-            };
-            if end > current_len {
-                continue;
-            }
-            let literals = &current[*literals_start..start];
-            let (off_base, next_reps) =
-                Self::encode_offset_with_reps(item.offset, literals.len(), *reps);
-            opt_state.update_stats(literals.len(), literals, off_base, match_len);
-            *reps = next_reps;
-            *literals_start = end;
-        }
-        opt_state.set_base_prices(accurate);
+        let literals = &block[*literals_start..start];
+        let (off_base, next_reps) =
+            Self::encode_offset_with_reps(sequence.offset, literals.len(), *reps);
+        opt_state.update_stats(literals.len(), literals, off_base, match_len);
+        *reps = next_reps;
+        *literals_start = end;
     }
 
     /// Brings cells `start..=end` into the frontier as unreached: price `MAX`.
@@ -649,7 +659,7 @@ impl BtMatcher {
     }
 
     #[inline(always)]
-    pub(crate) fn cached_literal_price(
+    pub(crate) fn cached_literal_price<const ACCURATE: bool>(
         profile: HcOptimalCostProfile,
         stats: &HcOptState,
         byte: u8,
@@ -657,6 +667,12 @@ impl BtMatcher {
         generations: &mut [u32; HC_MAX_LIT + 1],
         stamp: u32,
     ) -> u32 {
+        // The integer weight is one bit scan on a frequency, no dearer than the
+        // probe that would stand in for it, so it is computed in place, as
+        // upstream does at `optLevel` 0. Only the fractional weight is cached.
+        if !ACCURATE {
+            return profile.literal_price::<false>(stats, byte);
+        }
         // SAFETY: `byte as usize` is `0..256` and the fixed-size arrays are
         // `[u32; HC_MAX_LIT + 1 = 257]`, so the index is statically in bounds.
         // Each cached_*_price call sits inside the optimal parser per-byte
@@ -666,7 +682,7 @@ impl BtMatcher {
             if *generations.get_unchecked(idx) == stamp {
                 return *prices.get_unchecked(idx);
             }
-            let price = profile.literal_price(stats, byte);
+            let price = profile.literal_price::<ACCURATE>(stats, byte);
             *prices.get_unchecked_mut(idx) = price;
             *generations.get_unchecked_mut(idx) = stamp;
             price
@@ -674,15 +690,16 @@ impl BtMatcher {
     }
 
     #[inline(always)]
-    pub(crate) fn cached_lit_length_price(
+    pub(crate) fn cached_lit_length_price<const ACCURATE: bool>(
         profile: HcOptimalCostProfile,
         stats: &HcOptState,
         lit_len: usize,
         cache: &mut [[u32; 2]],
         stamp: u32,
     ) -> u32 {
-        if lit_len >= cache.len() {
-            return profile.lit_length_price(stats, lit_len);
+        // Computed in place under the integer weight; see `cached_literal_price`.
+        if !ACCURATE || lit_len >= cache.len() {
+            return profile.lit_length_price::<ACCURATE>(stats, lit_len);
         }
         // SAFETY: the early-return above proves `lit_len < cache.len()`.
         // Each cell pairs `[price, generation]`, so the stamp check and the
@@ -693,7 +710,7 @@ impl BtMatcher {
             if cell[1] == stamp {
                 return cell[0];
             }
-            let price = profile.lit_length_price(stats, lit_len);
+            let price = profile.lit_length_price::<ACCURATE>(stats, lit_len);
             cell[0] = price;
             cell[1] = stamp;
             price
@@ -701,7 +718,7 @@ impl BtMatcher {
     }
 
     #[inline(always)]
-    pub(crate) fn cached_lit_length_delta_price(
+    pub(crate) fn cached_lit_length_delta_price<const ACCURATE: bool>(
         profile: HcOptimalCostProfile,
         stats: &HcOptState,
         lit_len: usize,
@@ -715,21 +732,24 @@ impl BtMatcher {
             // No need to compute `0_usize - 1`.
             return 0;
         }
-        let price = Self::cached_lit_length_price(profile, stats, lit_len, cache, stamp);
-        let previous = Self::cached_lit_length_price(profile, stats, lit_len - 1, cache, stamp);
+        let price =
+            Self::cached_lit_length_price::<ACCURATE>(profile, stats, lit_len, cache, stamp);
+        let previous =
+            Self::cached_lit_length_price::<ACCURATE>(profile, stats, lit_len - 1, cache, stamp);
         price as i32 - previous as i32
     }
 
     #[inline(always)]
-    pub(crate) fn cached_match_length_price(
+    pub(crate) fn cached_match_length_price<const ACCURATE: bool>(
         profile: HcOptimalCostProfile,
         stats: &HcOptState,
         match_len: usize,
         cache: &mut [[u32; 2]],
         stamp: u32,
     ) -> u32 {
-        if match_len >= cache.len() {
-            return profile.match_length_price(stats, match_len);
+        // Computed in place under the integer weight; see `cached_literal_price`.
+        if !ACCURATE || match_len >= cache.len() {
+            return profile.match_length_price::<ACCURATE>(stats, match_len);
         }
         // SAFETY: see `cached_lit_length_price` — paired `[price, generation]`
         // cells, one cache line per probe; early return proves
@@ -739,7 +759,7 @@ impl BtMatcher {
             if cell[1] == stamp {
                 return cell[0];
             }
-            let price = profile.match_length_price(stats, match_len);
+            let price = profile.match_length_price::<ACCURATE>(stats, match_len);
             cell[0] = price;
             cell[1] = stamp;
             price

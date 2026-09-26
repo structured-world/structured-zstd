@@ -1992,7 +1992,7 @@ fn frame_emit_info_decompressed_ranges_match_decoded_output() {
     let data = emit_info_fixture_data();
 
     // Cover both the single-block-per-chunk path (Default) and the
-    // Level(16..=22) post-split path (multiple physical partitions per
+    // optimal-band post-split path (multiple physical partitions per
     // input chunk), since lsm-tree compresses at zstd:22 and post-split
     // is the riskiest capture site (per-partition `src_size`).
     for level in [

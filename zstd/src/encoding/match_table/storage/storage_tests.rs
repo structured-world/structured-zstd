@@ -109,7 +109,7 @@ fn skip_matching_bt_dense_routes_through_bt_update_tree() {
 fn replay_history_for_rebase_bt_walks_inserted_prefix() {
     let mut t = new_table(64);
     // Construct a contiguous mirror long enough for the BT walker
-    // (`bt_insert_step_no_rebase` reads 8-byte prefixes).
+    // (`bt_insert_range` reads 8-byte prefixes).
     t.history = vec![0u8; 64];
     for (i, slot) in t.history.iter_mut().enumerate() {
         *slot = (i % 17) as u8;

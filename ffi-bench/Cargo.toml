@@ -133,7 +133,12 @@ required-features = ["bench-internals"]
 [[test]]
 name = "dictionary_ffi"
 path = "tests/dictionary_ffi.rs"
-required-features = ["bench-internals"]
+required-features = ["bench-internals", "dict-builder"]
+
+[[test]]
+name = "legacy_trainer_ffi"
+path = "tests/legacy_trainer_ffi.rs"
+required-features = ["bench-internals", "dict-builder"]
 
 [[test]]
 name = "encode_corpus_ffi"

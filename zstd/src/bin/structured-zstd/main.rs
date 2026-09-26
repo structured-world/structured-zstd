@@ -15,8 +15,8 @@ use std::io::{self, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use structured_zstd::encoding::{
-    CompressionContext, CompressionLevel, CompressionParameters, LiteralCompressionMode, Strategy,
-    StreamingEncoder,
+    CompressionContext, CompressionLevel, CompressionParameters, LevelParameters,
+    LiteralCompressionMode, Strategy, StreamingEncoder,
 };
 
 /// Error type for the tool: a boxed message, which is all a command-line
@@ -142,6 +142,10 @@ struct Options {
     /// Measure each input on its own (`-S`) instead of as one stream, so the
     /// reported ratio and throughput describe a file rather than a mixture.
     bench_separately: bool,
+    /// `-B#`: the benchmark cuts every input into independent frames of this
+    /// many bytes (below [`MIN_BENCH_BLOCK_SIZE`] it cuts nothing, as the
+    /// reference's benchmark ignores such a size).
+    block_size: Option<u64>,
     /// Long-distance matching (`--long`), enabled on the encoder via the
     /// compression-parameters API.
     long: bool,
@@ -212,10 +216,16 @@ struct Options {
     /// with the window sized to the input, so the whole reference is
     /// reachable.
     patch_from: Option<PathBuf>,
+    /// Print the parameters the level selects for each input before
+    /// compressing it (`--show-default-cparams`).
+    show_default_cparams: bool,
     /// Which dictionary trainer `--train*` runs.
     trainer: Trainer,
     /// The trainer's tuning from `--train-fastcover=...` / `--train-cover=...`.
     trainer_params: TrainerParams,
+    /// The legacy trainer's selectivity from `-s#` or `--train-legacy=s=#`;
+    /// zero is its default.
+    selectivity: u32,
 }
 
 /// The dictionary trainers `--train` selects between.
@@ -225,6 +235,8 @@ enum Trainer {
     FastCover,
     /// `--train-cover`: the segment-scoring COVER trainer.
     Cover,
+    /// `--train-legacy`: the reference's original suffix-array trainer.
+    Legacy,
 }
 
 /// Tuning from `--train-fastcover=k=#,d=#,f=#,steps=#,split=#,accel=#` and
@@ -281,6 +293,11 @@ const DEFAULT_MAX_DICT: usize = 112_640;
 
 /// Least time `-b` measures each level for (upstream `BMK_TIMETEST_DEFAULT_S`).
 const DEFAULT_BENCH_SECONDS: f64 = 3.0;
+
+/// Smallest `-B` block the benchmark cuts its inputs into; a smaller one leaves
+/// each input whole (`benchzstd.c`, `BMK_benchMemAdvancedNoAlloc`:
+/// `adv->blockSize >= 32`).
+const MIN_BENCH_BLOCK_SIZE: u64 = 32;
 
 /// Window log a bare `--long` selects, as upstream documents (128 MiB).
 const DEFAULT_LONG_WINDOW_LOG: u32 = 27;
@@ -454,7 +471,7 @@ fn check_window_log(log: u32) -> Result<()> {
 
     let bounds = CParameter::WindowLog.bounds();
     let decodable = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE.ilog2();
-    let upper = bounds.upper_bound.min(i64::from(decodable));
+    let upper = i64::from(max_window_log());
     if i64::from(log) < bounds.lower_bound || i64::from(log) > upper {
         bail!(
             "window log {log} is outside the supported range {}..={upper} \
@@ -464,6 +481,50 @@ fn check_window_log(log: u32) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The largest window this build both writes and reads back: the encoder's
+/// ceiling or the decoder's, whichever is lower (see [`check_window_log`]).
+fn max_window_log() -> u32 {
+    use structured_zstd::encoding::CParameter;
+
+    let encodable = u32::try_from(CParameter::WindowLog.bounds().upper_bound)
+        .expect("the window-log bound is a small positive number");
+    let decodable = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE.ilog2();
+    encodable.min(decodable)
+}
+
+/// Every knob at the end of its range that compresses hardest, as the
+/// reference command's `--max` sets them (`zstdcli.c`, `setMaxCompression`).
+/// One departure: the window stops at [`max_window_log`] rather than at 31,
+/// since a larger one would write frames this build refuses to decode. The
+/// long-distance hash rate is left to derive from the rest, which is what the
+/// reference's 0 there asks for.
+fn max_compression_params() -> AdvancedParams {
+    use structured_zstd::encoding::CParameter;
+
+    let upper = |parameter: CParameter| {
+        u32::try_from(parameter.bounds().upper_bound)
+            .expect("every compression-parameter bound is a small positive number")
+    };
+    let lower = |parameter: CParameter| {
+        u32::try_from(parameter.bounds().lower_bound)
+            .expect("every compression-parameter bound is a small positive number")
+    };
+    AdvancedParams {
+        window_log: Some(max_window_log()),
+        chain_log: Some(upper(CParameter::ChainLog)),
+        hash_log: Some(upper(CParameter::HashLog)),
+        search_log: Some(upper(CParameter::SearchLog)),
+        min_match: Some(lower(CParameter::MinMatch)),
+        target_length: Some(upper(CParameter::TargetLength)),
+        strategy: Some(Strategy::Btultra2),
+        ldm_hash_log: Some(upper(CParameter::LdmHashLog)),
+        // The reference's heuristic value, not a bound.
+        ldm_min_match: Some(16),
+        ldm_bucket_size_log: Some(upper(CParameter::LdmBucketSizeLog)),
+        ldm_hash_rate_log: None,
+    }
 }
 
 /// Validate the parameter list of `--adapt=min=N,max=N`.
@@ -898,6 +959,7 @@ fn parse_args_into(
         bench_end: default_level,
         bench_secs: DEFAULT_BENCH_SECONDS,
         bench_separately: false,
+        block_size: None,
         long: false,
         long_window_log: None,
         memory_limit: None,
@@ -926,8 +988,10 @@ fn parse_args_into(
         advanced: AdvancedParams::default(),
         literals: LiteralCompressionMode::Auto,
         patch_from: None,
+        show_default_cparams: false,
         trainer: Trainer::FastCover,
         trainer_params: TrainerParams::default(),
+        selectivity: 0,
     };
     let mut ultra = false;
     // `-e`, when typed. Without it the benchmark ends where it starts, so no
@@ -975,11 +1039,9 @@ fn parse_args_into(
                     opts.trainer = Trainer::Cover;
                     opts.trainer_params = TrainerParams::default();
                 }
-                // The legacy trainer produces a different dictionary. Accepting
-                // the flag and running another trainer would hand back one the
-                // caller did not ask for, with nothing to say so.
                 "train-legacy" => {
-                    bail!("--{long} is not implemented; --train-cover and --train-fastcover are")
+                    select_mode(&mut opts, Mode::Train);
+                    opts.trainer = Trainer::Legacy;
                 }
                 // `-c` and `-o` name competing destinations, so each clears the
                 // other and the later one on the command line wins, as upstream
@@ -999,6 +1061,18 @@ fn parse_args_into(
                 "keep" => opts.keep = true,
                 "rm" => opts.remove_source = true,
                 "ultra" => ultra = true,
+                // Replaces every knob at once, as the reference command's does,
+                // so a `--zstd=` before it is overwritten and one after it
+                // adjusts the maximum. Its tables at their widest do not fit a
+                // 32-bit address space, which the reference refuses the same way.
+                "max" => {
+                    if usize::BITS < 64 {
+                        bail!("--max is incompatible with 32-bit mode");
+                    }
+                    ultra = true;
+                    opts.long = true;
+                    opts.advanced = max_compression_params();
+                }
                 "quiet" => *verbosity -= 1,
                 "verbose" => *verbosity += 1,
                 // The wire-format switches: the checksum, the
@@ -1014,6 +1088,7 @@ fn parse_args_into(
                 "no-pass-through" => opts.pass_through = Some(false),
                 "exclude-compressed" => opts.exclude_compressed = true,
                 "ignore-read-errors" => opts.ignore_read_errors = true,
+                "show-default-cparams" => opts.show_default_cparams = true,
                 "progress" => opts.progress = Progress::Always,
                 "no-progress" => opts.progress = Progress::Never,
                 "version" => {
@@ -1156,6 +1231,23 @@ fn parse_args_into(
                         select_mode(&mut opts, Mode::Train);
                         opts.trainer = Trainer::FastCover;
                         opts.trainer_params = parse_trainer_params(v, true)?;
+                    } else if let Some(v) = long.strip_prefix("train-legacy=") {
+                        // `s=#` or `selectivity=#`, as `parseLegacyParameters`
+                        // reads it.
+                        select_mode(&mut opts, Mode::Train);
+                        opts.trainer = Trainer::Legacy;
+                        let value = v
+                            .strip_prefix("selectivity=")
+                            .or_else(|| v.strip_prefix("s="))
+                            .ok_or_else(|| {
+                                eyre!("--train-legacy takes `s=#` or `selectivity=#`, got `{v}`")
+                            })?;
+                        let (selectivity, tail) = read_leading_u32(value)
+                            .wrap_err("invalid --train-legacy selectivity")?;
+                        if !tail.is_empty() {
+                            bail!("invalid --train-legacy selectivity `{value}`");
+                        }
+                        opts.selectivity = selectivity;
                     } else if let Some(reference) =
                         option_value(long, "patch-from", arg_os, &mut iter)?
                     {
@@ -1247,27 +1339,47 @@ fn parse_args_into(
                 'k' => opts.keep = true,
                 // `-S` measures each input on its own.
                 'S' => opts.bench_separately = true,
+                's' => {
+                    // `-s#`: the legacy trainer's selectivity, read like the
+                    // reference reads it (`readU32FromChar`).
+                    let rest: String = chars[ci + 1..].iter().collect();
+                    let (selectivity, tail) =
+                        read_leading_u32(&rest).wrap_err("invalid -s selectivity")?;
+                    if !tail.is_empty() {
+                        bail!("invalid -s selectivity `{rest}`");
+                    }
+                    opts.selectivity = selectivity;
+                    ci = chars.len();
+                    continue;
+                }
                 'q' => *verbosity -= 1,
                 'v' => *verbosity += 1,
                 'C' => opts.checksum = true,
                 'r' => opts.recursive = true,
-                'B' | 'T' => {
-                    // `-B[N]` job / block size, `-T[N]` thread count. Both
-                    // steer how the work is done, not what comes out: we use a
-                    // fixed block size and run single-threaded. Upstream
-                    // accepts them, so a script that passes them must not fail
-                    // here — but the VALUE is still parsed: ignoring what a
-                    // flag does is not a reason to ignore what it says, and a
-                    // typo is a broken command line either way. A size takes a
-                    // size suffix; a thread count is a plain count, the way
-                    // `--threads=` reads it.
+                'B' => {
+                    // `-B[N]` cuts the benchmark's inputs into independent
+                    // frames and a training sample into several samples. When
+                    // compressing it is the job size of a multi-threaded run,
+                    // which this build does not have, so it is kept and has no
+                    // effect there. Read as the reference reads it
+                    // (`readU32FromChar`): a count with an optional `K` / `M`.
+                    let rest: String = chars[ci + 1..].iter().collect();
+                    let (size, tail) = read_leading_u32(&rest).wrap_err("invalid -B value")?;
+                    if !tail.is_empty() {
+                        bail!("invalid -B value `{rest}`");
+                    }
+                    opts.block_size = (size != 0).then_some(u64::from(size));
+                    ci = chars.len();
+                    continue;
+                }
+                'T' => {
+                    // `-T[N]` thread count: single-threaded here, so it steers
+                    // nothing, but the value is still parsed the way
+                    // `--threads=` reads it, since a typo is a broken command
+                    // line either way.
                     let rest: String = chars[ci + 1..].iter().collect();
                     if !rest.is_empty() {
-                        if c == 'B' {
-                            parse_size(&rest).wrap_err("invalid -B value")?;
-                        } else {
-                            rest.parse::<u32>().wrap_err("invalid -T thread count")?;
-                        }
+                        rest.parse::<u32>().wrap_err("invalid -T thread count")?;
                     }
                     ci = chars.len();
                     continue;
@@ -1609,6 +1721,8 @@ Advanced options:
 
 Advanced compression options:
   --ultra                       Enable levels beyond 19, up to 22; requires more memory.
+  --max                         Compress with every parameter at its maximum; the window stops at 27,
+                                the widest this build reads back. Requires a lot of memory.
   --fast[=#]                    Use to very fast compression levels. [Default: 1]
   --long[=#]                    Enable long distance matching with window log #. [Default: 27]
                                 Available from level 16 up (or with --zstd=strat=7..9), where
@@ -1618,6 +1732,7 @@ Advanced compression options:
   --zstd=wlog=#,clog=#,hlog=#,slog=#,mml=#,tlen=#,strat=#[,lhlog=#,lmml=#,lblog=#,lhrlog=#]
                                 Override the level's compression parameters knob by knob.
   --exclude-compressed          Only compress files that are not already compressed.
+  --show-default-cparams        Print the parameters the level selects for each input.
 
   --stream-size=#               Specify size of streaming input from STDIN.
   --size-hint=#                 Optimize compression parameters for streaming input of approximately size #.
@@ -1641,6 +1756,10 @@ Dictionary builder:
   --train-cover                 Use the cover algorithm (takes no tuning here).
   --train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#]
                                 Use the fast cover algorithm (with optional arguments).
+
+  --train-legacy[=s=#]          Use the legacy algorithm with selectivity #. [Default: 9]
+  -B#                           With --train-legacy, cut each file into samples of size #;
+                                otherwise each file is one sample of up to 128 KiB.
   -o NAME                       Use NAME as dictionary name. [Default: dictionary]
   --maxdict=#                   Limit dictionary to specified size #. [Default: 112640]
   --dictID=#                    Force dictionary ID to #. [Default: Random]
@@ -1649,21 +1768,105 @@ Benchmark options:
   -b#                           Perform benchmarking with compression level #. [Default: 3]
   -e#                           Test all compression levels up to #; starting level is `-b#`. [Default: 1]
   -i#                           Set the minimum evaluation to time # seconds. [Default: 3]
+  -B#                           Cut file into independent chunks of size #. [Default: No chunking]
   -S                            Output one benchmark result per input file. [Default: Consolidated result]
   -D dictionary                 Benchmark using dictionary
 
 Environment: ZSTD_CLEVEL sets the default compression level; ZSTD_NBTHREADS is read and validated.
 
 Accepted for compatibility, with no effect here: -T#/--threads=#, --single-thread,
---auto-threads, -B#, --block-size=#, --adapt, --zstd=ovlog=#, --[no-]sparse,
+--auto-threads, -B# and --block-size=# when compressing (the job size of a
+multi-threaded run), --adapt, --zstd=ovlog=#, --[no-]sparse,
 --[no-]asyncio, --[no-]mmap-dict, --[no-]row-match-finder (compression runs
 single-threaded).
 
 Rejected rather than ignored, because they would change the result: --format=
-other than zstd, --rsyncable (needs worker threads), --train-legacy, shrink in
-the trainer tuning, and -M/--memory below the enforced ceiling when decoding.
+other than zstd, --rsyncable (needs worker threads), shrink in the trainer
+tuning, and -M/--memory below the enforced ceiling when decoding.
+--train-cover and --train-fastcover read whole files, so -B does not cut them.
 A new output file keeps its source's permissions.
 ";
+
+/// Upstream's names for the nine strategies, in ordinal order from 1
+/// (`zstdcli.c`, `ZSTD_strategyMap`).
+const STRATEGY_NAMES: [&str; 9] = [
+    "ZSTD_fast",
+    "ZSTD_dfast",
+    "ZSTD_greedy",
+    "ZSTD_lazy",
+    "ZSTD_lazy2",
+    "ZSTD_btlazy2",
+    "ZSTD_btopt",
+    "ZSTD_btultra",
+    "ZSTD_btultra2",
+];
+
+/// Write what `--show-default-cparams` reports for one input: the parameters
+/// `level` selects for it, in the reference command's layout
+/// (`zstdcli.c`, `printDefaultCParams`).
+///
+/// `size` is the input's length when it has one (`None` for stdin or anything
+/// not a regular file). A length of zero is printed as such but sized as an
+/// unknown source, because `ZSTD_getCParams`, which the reference calls here,
+/// reads zero as "unknown".
+fn write_default_cparams(
+    out: &mut impl Write,
+    name: &str,
+    size: Option<u64>,
+    dictionary_size: usize,
+    level: i32,
+) -> io::Result<()> {
+    match size {
+        Some(bytes) => writeln!(out, "{name} ({bytes} bytes)")?,
+        None => writeln!(out, "{name} (src size unknown)")?,
+    }
+    let params =
+        LevelParameters::for_level(level, size.filter(|&bytes| bytes != 0), dictionary_size);
+    let ordinal = params.strategy.ordinal();
+    // `ordinal` is 1..=9 by construction of `Strategy`.
+    let strategy = STRATEGY_NAMES[ordinal as usize - 1];
+    writeln!(out, " - windowLog     : {}", params.window_log)?;
+    writeln!(out, " - chainLog      : {}", params.chain_log)?;
+    writeln!(out, " - hashLog       : {}", params.hash_log)?;
+    writeln!(out, " - searchLog     : {}", params.search_log)?;
+    writeln!(out, " - minMatch      : {}", params.min_match)?;
+    writeln!(out, " - targetLength  : {}", params.target_length)?;
+    writeln!(out, " - strategy      : {strategy} ({ordinal})")
+}
+
+/// Print `--show-default-cparams` for every input of a compressing run, on
+/// stderr and whatever the verbosity, as the reference command does.
+fn show_default_cparams(opts: &Options) -> Result<()> {
+    let dictionary_size = match dictionary_path(opts) {
+        Some(path) => fs::metadata(path)
+            .wrap_err_with(|| format!("failed to inspect dictionary file {}", path.display()))?
+            .len(),
+        None => 0,
+    };
+    let dictionary_size = usize::try_from(dictionary_size)
+        .map_err(|_| eyre!("dictionary of {dictionary_size} bytes does not fit in memory"))?;
+    let mut err = io::stderr().lock();
+    let stdin = [PathBuf::from("-")];
+    let inputs: &[PathBuf] = if opts.inputs.is_empty() {
+        &stdin
+    } else {
+        &opts.inputs
+    };
+    for input in inputs {
+        let (name, size) = if input == Path::new("-") {
+            (STDIN_MARK.to_string(), None)
+        } else {
+            let size = fs::metadata(input)
+                .ok()
+                .filter(fs::Metadata::is_file)
+                .map(|metadata| metadata.len());
+            (input.display().to_string(), size)
+        };
+        write_default_cparams(&mut err, &name, size, dictionary_size, opts.level)
+            .wrap_err("failed to write the default parameters")?;
+    }
+    Ok(())
+}
 
 /// The file the run's dictionary comes from: `-D`, or the `--patch-from`
 /// reference, which is a dictionary by another name. The command line refuses
@@ -2045,6 +2248,20 @@ fn run_selected(mut opts: Options) -> Result<usize> {
     // (not a stream), so it is handled separately from the (de)compress flow.
     if opts.mode == Mode::List {
         return list_files(&opts);
+    }
+
+    // Reached only by the streaming modes, as the reference command's check is
+    // (benchmark, training and listing have left by now and ignore the flag).
+    // Decompression has no parameters to show; testing is not decompression
+    // there, so it is not refused, and prints nothing since it compresses
+    // nothing.
+    if opts.show_default_cparams {
+        if opts.mode == Mode::Decompress {
+            bail!("error : can't use --show-default-cparams in decompression mode");
+        }
+        if opts.mode == Mode::Compress {
+            show_default_cparams(&opts)?;
+        }
     }
 
     // A destination named outright belongs to the whole run, whatever it reads:
@@ -2575,17 +2792,27 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     if let Some(limit) = opts.memory_limit {
         // With `-S` only one input is in memory at a time, so the largest file
         // is what has to fit rather than their sum.
+        let subject: &[u64] = if opts.bench_separately {
+            let at = sizes
+                .iter()
+                .position(|&size| size == largest)
+                .expect("the largest size is one of the sizes");
+            &sizes[at..=at]
+        } else {
+            &sizes
+        };
         let inputs = if opts.bench_separately { largest } else { sum };
-        // Three buffers exist at once: the input, the frame it compresses to,
+        // Three buffers exist at once: the input, the frames it compresses to,
         // and the decoded copy. Each is allocated at the size named here and
         // never grows past it, so this is what the run actually holds rather
-        // than a lower bound on it. The frame's is `compress_bound`, which is
-        // the input plus the framing an incompressible input still pays — the
-        // case a ceiling has to survive.
-        let frame = usize::try_from(inputs)
-            .map(structured_zstd::encoding::compress_bound)
-            .map(|bound| bound as u64)
-            .ok();
+        // than a lower bound on it. The frames' is `compress_bound` of each,
+        // which is the input plus the framing an incompressible input still
+        // pays — the case a ceiling has to survive. The encoder is sized by the
+        // frame it builds, so the widest frame is the source it is weighed
+        // against.
+        let extent = bench_frames_extent(subject, opts.block_size);
+        let frame = extent.map(|(room, _)| room);
+        let widest_chunk = extent.map_or(0, |(_, widest)| widest);
         // Beside them stands the match finder every compression pass builds,
         // whose tables are the largest thing at the higher levels — hundreds of
         // MiB where the buffers are tens. It is sized by the level, by the
@@ -2621,13 +2848,13 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
                 Some(parameters) => {
                     structured_zstd::encoding::estimated_compression_workspace_bytes_for_parameters(
                         &parameters,
-                        Some(inputs),
+                        Some(widest_chunk),
                         dictionary,
                     )
                 }
                 None => structured_zstd::encoding::estimated_compression_workspace_bytes_for_run(
                     compression_level,
-                    Some(inputs),
+                    Some(widest_chunk),
                     None,
                     false,
                     dictionary,
@@ -2670,7 +2897,13 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         for (input, size) in opts.inputs.iter().zip(&sizes) {
             let data =
                 read_inputs_bounded(std::slice::from_ref(input), std::slice::from_ref(size))?;
-            benchmark_one(opts, codecs, &input.display().to_string(), &data)?;
+            benchmark_one(
+                opts,
+                codecs,
+                &input.display().to_string(),
+                &data,
+                std::slice::from_ref(size),
+            )?;
         }
         return Ok(());
     }
@@ -2682,7 +2915,7 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         [only] => only.display().to_string(),
         many => format!(" {} files", many.len()),
     };
-    benchmark_one(opts, codecs, &label, &data)
+    benchmark_one(opts, codecs, &label, &data, &sizes)
 }
 
 /// Read every input into one buffer, taking no more room — and no more bytes —
@@ -2719,9 +2952,12 @@ fn read_inputs_bounded(inputs: &[PathBuf], sizes: &[u64]) -> Result<Vec<u8>> {
         file.take(size + 1)
             .read_to_end(&mut data)
             .wrap_err_with(|| format!("failed to read {}", input.display()))?;
-        if (data.len() - before) as u64 > *size {
+        // Short is refused as well as long: the frames are cut at the sizes
+        // recorded before the read, so a file that shrank would be cut past
+        // the end of what was read.
+        if (data.len() - before) as u64 != *size {
             bail!(
-                "{} grew while it was being read; run again",
+                "{} changed size while it was being read; run again",
                 input.display()
             );
         }
@@ -2729,10 +2965,68 @@ fn read_inputs_bounded(inputs: &[PathBuf], sizes: &[u64]) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Measure one benchmark subject: the whole input as one stream, or a single
-/// file under `-S`. Split out so the two modes differ only in what they hand
-/// over, not in how the measurement is taken.
-fn benchmark_one(opts: &Options, codecs: &mut Codecs, label: &str, data: &[u8]) -> Result<()> {
+/// The lengths of the independent frames a benchmark compresses its inputs as,
+/// in order: every input a frame of its own, cut into `block_size` pieces when
+/// one of at least [`MIN_BENCH_BLOCK_SIZE`] is given. An empty input yields no
+/// frame. This is the reference's block table (`benchzstd.c`,
+/// `BMK_benchMemAdvancedNoAlloc`), so ratio and speed describe the same frames.
+fn bench_chunk_lengths(file_sizes: &[u64], block_size: Option<u64>) -> Vec<u64> {
+    let block = block_size.filter(|&size| size >= MIN_BENCH_BLOCK_SIZE);
+    let mut chunks = Vec::new();
+    for &size in file_sizes {
+        let piece = block.unwrap_or(size.max(1));
+        let mut left = size;
+        while left > 0 {
+            let take = left.min(piece);
+            chunks.push(take);
+            left -= take;
+        }
+    }
+    chunks
+}
+
+/// The frames [`bench_chunk_lengths`] cuts `file_sizes` into, measured without
+/// listing them: the room they take at most (`compress_bound` of each) and the
+/// widest of them. Worked out per file from its whole blocks and its tail, so a
+/// small `-B` over a large input costs nothing before `-M` has weighed it.
+/// `None` when the room is more than this machine can address.
+fn bench_frames_extent(file_sizes: &[u64], block_size: Option<u64>) -> Option<(u64, u64)> {
+    let block = block_size.filter(|&size| size >= MIN_BENCH_BLOCK_SIZE);
+    let bound = |len: u64| -> Option<u64> {
+        u64::try_from(structured_zstd::encoding::compress_bound(
+            usize::try_from(len).ok()?,
+        ))
+        .ok()
+    };
+    let mut room = 0u64;
+    let mut widest = 0u64;
+    for &size in file_sizes {
+        if size == 0 {
+            continue;
+        }
+        let piece = block.unwrap_or(size);
+        let whole = size / piece;
+        let tail = size % piece;
+        room = room.checked_add(whole.checked_mul(bound(piece)?)?)?;
+        if tail > 0 {
+            room = room.checked_add(bound(tail)?)?;
+        }
+        widest = widest.max(size.min(piece));
+    }
+    Some((room, widest))
+}
+
+/// Measure one benchmark subject: every input together, or a single file under
+/// `-S`. Split out so the two modes differ only in what they hand over, not in
+/// how the measurement is taken. `file_sizes` are the lengths of the inputs
+/// `data` holds, in order; each is compressed as frames of its own.
+fn benchmark_one(
+    opts: &Options,
+    codecs: &mut Codecs,
+    label: &str,
+    data: &[u8],
+    file_sizes: &[u64],
+) -> Result<()> {
     use std::time::Instant;
 
     if data.is_empty() {
@@ -2750,42 +3044,66 @@ fn benchmark_one(opts: &Options, codecs: &mut Codecs, label: &str, data: &[u8]) 
     );
     if opts.verbosity == 1 {
         // The reference command's machine-readable header, for scripts that
-        // drive `-b -q`.
+        // drive `-b -q`; the block size is the one asked for, as it prints it.
         println!(
-            "bench {UPSTREAM_VERSION} : input {} bytes, {} seconds, 0 KB blocks",
+            "bench {UPSTREAM_VERSION} : input {} bytes, {} seconds, {} KB blocks",
             data.len(),
-            opts.bench_secs as u64
+            opts.bench_secs as u64,
+            opts.block_size.unwrap_or(0) >> 10
         );
     }
 
+    let chunks = bench_chunk_lengths(file_sizes, opts.block_size);
+    debug_assert_eq!(
+        chunks.iter().sum::<u64>(),
+        data.len() as u64,
+        "the frames cover the input exactly"
+    );
     // The two buffers the measurement fills, sized once from what they will
-    // hold: the frame can be no larger than `compress_bound` says, and the
-    // decoded copy is exactly the input again. That keeps them the size the `-M`
-    // ceiling counted them at instead of the doubled capacity a growing `Vec`
-    // ends up with — and it keeps the growth out of the timed sections, which
-    // would otherwise be reported as compression and decompression speed.
-    let mut compressed = Vec::with_capacity(structured_zstd::encoding::compress_bound(data.len()));
+    // hold: the frames can be no larger than `compress_bound` of each says,
+    // and the decoded copy is exactly the input again. That keeps them the size
+    // the `-M` ceiling counted them at instead of the doubled capacity a
+    // growing `Vec` ends up with — and it keeps the growth out of the timed
+    // sections, which would otherwise be reported as compression and
+    // decompression speed.
+    let frames_bound = bench_frames_extent(file_sizes, opts.block_size)
+        .and_then(|(room, _)| usize::try_from(room).ok())
+        .ok_or_else(|| eyre!("-b: {label} is more than this machine can hold compressed"))?;
+    let mut compressed = Vec::with_capacity(frames_bound);
     let mut decoded = Vec::with_capacity(data.len());
     for level in opts.bench_start..=opts.bench_end {
         validate_level(level)?;
+        let settings = FrameSettings {
+            level,
+            size_hint: None,
+            // The reference's benchmark compresses with the library's frame
+            // defaults (`BMK_initCCtx` sets no checksum), not the command's, so
+            // its sizes and decoding speeds carry no content checksum.
+            checksum: false,
+            ..FrameSettings::from_options(opts)
+        };
         let mut best_compress = f64::MAX;
         let start = Instant::now();
         loop {
             compressed.clear();
             let t = Instant::now();
-            compress_stream(
-                data,
-                &mut compressed,
-                &FrameSettings {
-                    level,
-                    // The benchmark holds the whole input, so the length is
-                    // exact and there is no estimate to fall back on.
-                    pledged_size: Some(data.len() as u64),
-                    size_hint: None,
-                    ..FrameSettings::from_options(opts)
-                },
-                codecs,
-            )?;
+            let mut rest = data;
+            for &chunk in &chunks {
+                // Each piece is a frame of its own, as the reference's
+                // benchmark compresses every block independently. The length is
+                // exact, so it is pledged rather than estimated.
+                let (piece, tail) = rest.split_at(chunk as usize);
+                rest = tail;
+                compress_stream(
+                    piece,
+                    &mut compressed,
+                    &FrameSettings {
+                        pledged_size: Some(chunk),
+                        ..settings
+                    },
+                    codecs,
+                )?;
+            }
             best_compress = best_compress.min(t.elapsed().as_secs_f64());
             if start.elapsed().as_secs_f64() >= opts.bench_secs {
                 break;
@@ -2807,6 +3125,11 @@ fn benchmark_one(opts: &Options, codecs: &mut Codecs, label: &str, data: &[u8]) 
             if start.elapsed().as_secs_f64() >= opts.bench_secs {
                 break;
             }
+        }
+        // A speed measured on output that is not the input measures nothing;
+        // the reference's benchmark checks the round trip the same way.
+        if decoded != data {
+            bail!("-b: level {level} did not decode {label} back to its input");
         }
 
         let c_speed = if best_compress > 0.0 {
@@ -2899,13 +3222,14 @@ fn bench_display_name(label: &str) -> String {
     }
 }
 
-/// `--train`: build a FastCOVER dictionary from the concatenated sample files
-/// and write it to `-o` (default `dictionary`). Mirrors upstream
-/// `zstd --train FILEs -o dict --maxdict=N [--dictID=N]`.
+/// `--train`: build a dictionary from the sample files with the selected
+/// trainer (FastCOVER, COVER or legacy) and write it to `-o` (default
+/// `dictionary`). Mirrors upstream `zstd --train FILEs -o dict --maxdict=N
+/// [--dictID=N]`.
 fn train_dictionary(opts: &Options) -> Result<()> {
     use structured_zstd::dictionary::{
-        FinalizeOptions, create_fastcover_dict_from_slice, create_raw_dict_from_slice,
-        finalize_raw_dict,
+        FinalizeOptions, create_fastcover_dict_from_slice, create_legacy_dict_from_slice,
+        create_raw_dict_from_slice, finalize_raw_dict,
     };
 
     if opts.inputs.iter().any(|input| input == Path::new("-")) {
@@ -2942,9 +3266,17 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // Whether the trainer takes the tuning it was given is a question about the
     // command line alone, so it is answered before any sample is touched: a run
     // bound to be refused does not first read a corpus that may be large.
-    // `Some` holds the FastCOVER options, `None` stands for COVER.
-    let fastcover = match opts.trainer {
-        Trainer::FastCover => Some(fastcover_options(&opts.trainer_params)?),
+    enum Plan {
+        FastCover(structured_zstd::dictionary::FastCoverOptions),
+        Cover,
+        Legacy,
+    }
+    let plan = match opts.trainer {
+        Trainer::FastCover => Plan::FastCover(fastcover_options(&opts.trainer_params)?),
+        // The legacy trainer is tuned by selectivity alone; a cover tuning list
+        // given before `--train-legacy` names a trainer that no longer runs,
+        // as it does in the reference.
+        Trainer::Legacy => Plan::Legacy,
         Trainer::Cover => {
             // The COVER trainer here scores segments by k-mer frequency, as the
             // reference's does, but is not parameterised the same way: `k`,
@@ -2957,7 +3289,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
                      use --train-fastcover=... for a tunable trainer"
                 );
             }
-            None
+            Plan::Cover
         }
     };
     let output = opts
@@ -3009,37 +3341,33 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         }
     }
 
-    // Each sample is opened once, and what the dictionary may carry is taken
-    // from that same open file rather than from its path afterwards. A path
-    // answers about whatever it names at the moment it is asked, and training
-    // takes long enough for a sample to be replaced while it runs: asking again
-    // at the end could describe a file whose bytes are not the ones now inside
-    // the dictionary, and grant its permissions to theirs.
-    let mut corpus = Vec::new();
-    let mut samples = Vec::with_capacity(opts.inputs.len());
-    for input in &opts.inputs {
-        let mut file = File::open(input)
-            .wrap_err_with(|| format!("failed to open training sample {}", input.display()))?;
-        let metadata = file
-            .metadata()
-            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
-        if !metadata.is_file() {
-            bail!(
-                "--train needs regular files: {} is not one",
-                input.display()
-            );
-        }
-        file.read_to_end(&mut corpus)
-            .wrap_err_with(|| format!("failed to read training sample {}", input.display()))?;
-        samples.push(metadata);
-    }
-
     let finalize = FinalizeOptions {
         dict_id: opts.dict_id,
     };
     let mut dict = Vec::new();
-    match fastcover {
-        Some(options) => {
+    let sources = match plan {
+        Plan::Legacy => {
+            // The legacy trainer counts samples, so they are loaded as the
+            // reference's command loads them: shuffled, capped per file, and
+            // cut by `-B`. The same files then yield the same content.
+            // `-M` caps what is loaded, as the reference's command passes its
+            // memory limit to `DiB_trainFromFiles` (zstdcli.c), which keeps
+            // whole samples up to it (dibio.c); dropping it would train on a
+            // different corpus than the reference for the same command line.
+            let set = load_training_samples(&opts.inputs, opts.block_size, opts.memory_limit)?;
+            create_legacy_dict_from_slice(
+                &set.corpus,
+                &set.sizes,
+                &mut dict,
+                opts.max_dict,
+                opts.selectivity,
+                finalize,
+            )
+            .map_err(|err| eyre!("dictionary training failed: {err}"))?;
+            set.sources
+        }
+        Plan::FastCover(options) => {
+            let (corpus, sources) = read_whole_samples(&opts.inputs)?;
             // From the slice, not through a reader: the corpus is the largest
             // thing this run holds, and the reader path buffers it a second
             // time inside.
@@ -3051,8 +3379,10 @@ fn train_dictionary(opts: &Options) -> Result<()> {
                 finalize,
             )
             .map_err(|err| eyre!("dictionary training failed: {err}"))?;
+            sources
         }
-        None => {
+        Plan::Cover => {
+            let (corpus, sources) = read_whole_samples(&opts.inputs)?;
             // From the slice, as FastCOVER is: the reader path would buffer
             // the whole corpus a second time, and `corpus` has to stay alive
             // for the finalizing pass below anyway.
@@ -3067,8 +3397,9 @@ fn train_dictionary(opts: &Options) -> Result<()> {
             // was asked for, so the best content survives the cut.
             dict = finalize_raw_dict(raw.as_slice(), corpus.as_slice(), opts.max_dict, finalize)
                 .map_err(|err| eyre!("dictionary training failed: {err}"))?;
+            sources
         }
-    }
+    };
 
     // A trained dictionary is an output file like any other, so it is written
     // through a temporary that is renamed into place: an interrupted run
@@ -3081,7 +3412,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
             .and_then(|()| sink.flush())
             .wrap_err_with(|| format!("failed to write dictionary {}", output.display()))?;
     } else {
-        place_trained_dictionary(&output, &dict, &samples)?;
+        place_trained_dictionary(&output, &dict, &sources)?;
     }
     display!(
         opts.verbosity,
@@ -3092,6 +3423,186 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         opts.inputs.len()
     );
     Ok(())
+}
+
+/// Read every sample file whole into one corpus, for the trainers that do not
+/// tell samples apart; `-B` has nothing to cut for them, and they get every
+/// byte, as the reference's do when `-B` cuts files into samples.
+///
+/// Each sample is opened once, and what the dictionary may carry is taken from
+/// that same open file rather than from its path afterwards. A path answers
+/// about whatever it names at the moment it is asked, and training takes long
+/// enough for a sample to be replaced while it runs: asking again at the end
+/// could describe a file whose bytes are not the ones now inside the
+/// dictionary, and grant its permissions to theirs.
+fn read_whole_samples(inputs: &[PathBuf]) -> Result<(Vec<u8>, Vec<fs::Metadata>)> {
+    let mut corpus = Vec::new();
+    let mut sources = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let mut file = File::open(input)
+            .wrap_err_with(|| format!("failed to open training sample {}", input.display()))?;
+        let metadata = file
+            .metadata()
+            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
+        if !metadata.is_file() {
+            bail!(
+                "--train needs regular files: {} is not one",
+                input.display()
+            );
+        }
+        file.read_to_end(&mut corpus)
+            .wrap_err_with(|| format!("failed to read training sample {}", input.display()))?;
+        sources.push(metadata);
+    }
+    Ok((corpus, sources))
+}
+
+/// Most bytes one file contributes as a sample when `-B` does not cut it
+/// (`dibio.c`, `SAMPLESIZE_MAX`).
+const TRAINING_SAMPLE_MAX: u64 = 128 << 10;
+
+/// Most training data loaded at all (`dibio.c`, `MAX_SAMPLES_SIZE`).
+const TRAINING_DATA_MAX: u64 = 2 << 30;
+
+/// Fewest samples a trainer is given (`dibio.c`: "nb of samples too low").
+const TRAINING_SAMPLES_MIN: usize = 5;
+
+/// The samples a trainer is handed, loaded the way the reference's command
+/// loads them (`dibio.c`, `DiB_trainFromFiles`).
+struct TrainingSet {
+    /// Every sample back to back.
+    corpus: Vec<u8>,
+    /// The length of each sample in `corpus`.
+    sizes: Vec<usize>,
+    /// What each file read was, taken from the open file.
+    sources: Vec<fs::Metadata>,
+}
+
+/// Reorder the sample files the way the reference does before loading
+/// (`DiB_shuffle`), so a sample set too large to load keeps a spread of files
+/// rather than the first ones, and the corpus is laid out as there.
+fn shuffle_training_files<T>(files: &mut [T]) {
+    let mut seed: u32 = 0xFD2F_B528;
+    let mut next = || {
+        seed = (seed.wrapping_mul(2_654_435_761) ^ 2_246_822_519).rotate_left(13);
+        seed >> 5
+    };
+    for i in (1..files.len()).rev() {
+        let j = (next() % (i as u32 + 1)) as usize;
+        files.swap(i, j);
+    }
+}
+
+/// How many samples `file_sizes` make and how many bytes they hold, as the
+/// loader would take them without a limit: each file one sample of at most
+/// [`TRAINING_SAMPLE_MAX`] bytes, or cut into `block_size` samples; empty files
+/// left out.
+fn training_extent(file_sizes: &[u64], block_size: Option<u64>) -> (u64, u64) {
+    // Both only ever meet a bound: `wanted` is cut to the trainer's cap and
+    // `samples` is compared with the minimum and the count loaded. A sum past
+    // the integer range (sparse files report any length) is therefore "more
+    // than any bound", which is what stopping at the top says; wrapping would
+    // turn it into a small number and a silently smaller training set.
+    let mut wanted = 0u64;
+    let mut samples = 0u64;
+    for &size in file_sizes {
+        if size == 0 {
+            continue;
+        }
+        let (count, bytes) = match block_size {
+            Some(block) => (size.div_ceil(block), size),
+            None => (1, size.min(TRAINING_SAMPLE_MAX)),
+        };
+        samples = samples.saturating_add(count);
+        wanted = wanted.saturating_add(bytes);
+    }
+    (samples, wanted)
+}
+
+/// Load the training samples as the reference's command does: files in its
+/// shuffled order, each one sample of at most [`TRAINING_SAMPLE_MAX`] bytes, or
+/// cut whole into `block_size` samples when `-B` gives one; empty files left
+/// out; at most [`TRAINING_DATA_MAX`] bytes, or `memory_limit` when smaller.
+fn load_training_samples(
+    inputs: &[PathBuf],
+    block_size: Option<u64>,
+    memory_limit: Option<u64>,
+) -> Result<TrainingSet> {
+    let mut order: Vec<&PathBuf> = inputs.iter().collect();
+    shuffle_training_files(&mut order);
+
+    let mut file_sizes = Vec::with_capacity(order.len());
+    for input in &order {
+        file_sizes.push(
+            fs::metadata(input)
+                .wrap_err_with(|| format!("failed to inspect {}", input.display()))?
+                .len(),
+        );
+    }
+    let (samples, wanted) = training_extent(&file_sizes, block_size);
+    if samples < TRAINING_SAMPLES_MIN as u64 {
+        bail!(
+            "{samples} training sample(s) is too few; provide one file per sample, or \
+             split files into fixed-size samples with -B#"
+        );
+    }
+    let budget = wanted
+        .min(TRAINING_DATA_MAX)
+        .min(memory_limit.unwrap_or(u64::MAX));
+    let budget = usize::try_from(budget)
+        .map_err(|_| eyre!("{budget} bytes of samples is more than this machine can hold"))?;
+
+    let mut set = TrainingSet {
+        corpus: Vec::with_capacity(budget),
+        sizes: Vec::new(),
+        sources: Vec::new(),
+    };
+    'files: for input in order {
+        if set.sizes.len() as u64 >= samples {
+            break;
+        }
+        let file = File::open(input)
+            .wrap_err_with(|| format!("failed to open training sample {}", input.display()))?;
+        let metadata = file
+            .metadata()
+            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
+        let size = metadata.len();
+        if size == 0 {
+            continue;
+        }
+        let mut reader = file;
+        let mut taken = 0u64;
+        loop {
+            let piece = match block_size {
+                Some(block) => (size - taken).min(block),
+                None => size.min(TRAINING_SAMPLE_MAX),
+            };
+            if set.corpus.len() as u64 + piece > budget as u64 {
+                if taken == 0 {
+                    break 'files;
+                }
+                break;
+            }
+            let before = set.corpus.len();
+            (&mut reader)
+                .take(piece)
+                .read_to_end(&mut set.corpus)
+                .wrap_err_with(|| format!("failed to read training sample {}", input.display()))?;
+            if (set.corpus.len() - before) as u64 != piece {
+                bail!(
+                    "{} changed while it was being read; run again",
+                    input.display()
+                );
+            }
+            set.sizes.push(piece as usize);
+            taken += piece;
+            if block_size.is_none() || taken >= size || set.sizes.len() as u64 >= samples {
+                break;
+            }
+        }
+        set.sources.push(metadata);
+    }
+    Ok(set)
 }
 
 /// Write a trained dictionary to the regular file `output` through a

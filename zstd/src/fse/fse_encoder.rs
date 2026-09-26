@@ -1,19 +1,16 @@
 use crate::bit_io::BitWriter;
 use alloc::vec::Vec;
 
-pub(crate) struct FSEEncoder<'output, V: AsMut<Vec<u8>>> {
-    pub(super) table: FSETable,
+/// Encodes a stream with a table the caller holds, so a table built into
+/// reusable storage is never moved into the encoder.
+pub(crate) struct FSEEncoder<'table, 'output, V: AsMut<Vec<u8>>> {
+    pub(super) table: &'table FSETable,
     writer: &'output mut BitWriter<V>,
 }
 
-impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
-    pub fn new(table: FSETable, writer: &mut BitWriter<V>) -> FSEEncoder<'_, V> {
+impl<'table, 'output, V: AsMut<Vec<u8>>> FSEEncoder<'table, 'output, V> {
+    pub fn new(table: &'table FSETable, writer: &'output mut BitWriter<V>) -> Self {
         FSEEncoder { table, writer }
-    }
-
-    #[cfg(any(test, feature = "fuzz-exports"))]
-    pub fn into_table(self) -> FSETable {
-        self.table
     }
 
     /// Encodes the data using the provided table
@@ -180,6 +177,10 @@ pub struct FSETable {
     pub(super) state_table_flat: [u16; MAX_FSE_TABLE_SIZE],
     /// Per-symbol upstream zstd-parity coding transform — see [`SymbolTT`].
     pub(super) symbol_tt: [SymbolTT; 256],
+    /// How many leading entries of `states` / `symbol_tt` may hold a non-default
+    /// value; everything past it is default. Lets a rebuild clear only what the
+    /// previous build wrote beyond the new alphabet instead of the whole array.
+    live_symbols: usize,
 }
 
 impl FSETable {
@@ -193,6 +194,7 @@ impl FSETable {
             table_size: 0,
             state_table_flat: [0u16; MAX_FSE_TABLE_SIZE],
             symbol_tt: [SymbolTT::default(); 256],
+            live_symbols: 0,
         }
     }
 
@@ -423,6 +425,7 @@ pub fn build_table_from_data(
     build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
 }
 
+#[cfg(any(test, feature = "fuzz-exports", feature = "dict-builder"))]
 pub(crate) fn build_table_from_symbol_counts(
     counts: &[usize],
     max_log: u8,
@@ -496,6 +499,7 @@ pub(crate) fn build_seq_ctable_into(
     build_table_from_probabilities_into(&probs[..=max_symbol], table_log, out);
 }
 
+#[cfg(any(test, feature = "fuzz-exports", feature = "dict-builder"))]
 fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {
     let mut out = FSETable::blank();
     build_table_from_counts_into(counts, max_log, avoid_0_numbit, &mut out);
@@ -842,15 +846,21 @@ pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, ou
         states: symbol_states,
         state_table_flat,
         symbol_tt,
+        live_symbols,
     } = out;
     *out_table_size = table_size;
     // The destination may be a table from an earlier block: reset what the
     // build below does not overwrite in full. `state_table_flat` needs none of
     // it, the scatter fills every slot under `table_size` and nothing reads
     // past it; `symbol_tt` and `states` are written only for `probs.len()`
-    // symbols, so the tail above that has to be cleared rather than inherited.
-    symbol_states[probs.len()..].fill_with(SymbolStates::default);
-    symbol_tt[probs.len()..].fill(SymbolTT::default());
+    // symbols, so what an earlier build wrote above that has to be cleared
+    // rather than inherited. Past `live_symbols` the arrays are already
+    // default, so the clear stops there.
+    if *live_symbols > probs.len() {
+        symbol_states[probs.len()..*live_symbols].fill_with(SymbolStates::default);
+        symbol_tt[probs.len()..*live_symbols].fill(SymbolTT::default());
+    }
+    *live_symbols = probs.len();
 
     // Upstream zstd `FSE_buildCTable_wksp` (lib/compress/fse_compress.c) — build
     // `nextStateTable` (== `state_table_flat`) once via cumul + spread +
@@ -977,6 +987,10 @@ pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, ou
     for (symbol, &prob) in probs.iter().enumerate() {
         symbol_states[symbol].probability = prob;
         if prob == 0 {
+            // A slot reused from an earlier build may still hold that build's
+            // start state and bit width for this symbol; an absent one has none.
+            symbol_states[symbol].start_state = None;
+            symbol_states[symbol].max_num_bits = None;
             // Upstream zstd fills `symbolTT` for prob==0 too, so `FSE_getMaxNbBits`
             // still works (returns `acc_log + 1` for absent symbols).
             // We don't expose that path, but mirror the value for parity.

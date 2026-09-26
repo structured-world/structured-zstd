@@ -88,6 +88,41 @@ fn empty_override_is_byte_identical_to_level() {
     }
 }
 
+/// Once every match-finder knob is set, the base level has nothing left to
+/// decide: the frame is the same whichever level the parameters start from, as
+/// it is upstream, where the block splitter follows the effective cParams
+/// (`ZSTD_resolveBlockSplitterMode`: `strategy >= btopt && windowLog >= 17`).
+/// A dfast base level carrying btultra2 knobs used to skip the post-split pass
+/// a btultra2 level runs, because that pass was keyed on the level number.
+#[test]
+fn a_fully_specified_parameter_set_ignores_the_base_level() {
+    let data = &include_bytes!("../../decodecorpus_files/z000033")[..512 * 1024];
+    let frame_from = |level: i32| {
+        let params = CompressionParameters::builder(CompressionLevel::Level(level))
+            .window_log(20)
+            .chain_log(21)
+            .hash_log(21)
+            .search_log(9)
+            .min_match(3)
+            .target_length(999)
+            .strategy(Strategy::Btultra2)
+            .build()
+            .unwrap();
+        compress_with_parameters(data, &params)
+    };
+    let native = frame_from(22);
+    for level in [3, 13] {
+        let frame = frame_from(level);
+        assert_eq!(
+            frame.len(),
+            native.len(),
+            "level {level} base with btultra2 knobs diverged from level 22",
+        );
+        assert_eq!(frame, native);
+    }
+    assert_eq!(decode(&native), data);
+}
+
 /// Custom parameters must produce valid (decodable) frames that
 /// reproduce the input.
 #[test]
