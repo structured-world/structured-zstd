@@ -1106,10 +1106,11 @@ macro_rules! optimal_block_body {
             reps: $reps,
             literals_cursor: 0,
         };
-        // Bound once per block. A block shorter than the 8-byte tail the parser
-        // leaves as literals has no segment, which the floor at zero says.
-        let match_loop_limit = $current.len().saturating_sub(8);
-        while $buffers.pass.cursor < match_loop_limit {
+        // The last 8 bytes are left as literals. Written as an addition on the
+        // cursor, which never passes the block's end, so a block shorter than
+        // the tail needs no floor: it simply has no segment.
+        let block_len = $current.len();
+        while $buffers.pass.cursor + 8 < block_len {
             let cursor = $buffers.pass.cursor;
             let segment = &$current[cursor..];
             let segment_abs_start = $current_abs_start + cursor;

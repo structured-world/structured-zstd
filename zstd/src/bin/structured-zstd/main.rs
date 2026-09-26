@@ -3495,14 +3495,11 @@ fn shuffle_training_files<T>(files: &mut [T]) {
 /// loader would take them without a limit: each file one sample of at most
 /// [`TRAINING_SAMPLE_MAX`] bytes, or cut into `block_size` samples; empty files
 /// left out.
-fn training_extent(file_sizes: &[u64], block_size: Option<u64>) -> (u64, u64) {
-    // Both only ever meet a bound: `wanted` is cut to the trainer's cap and
-    // `samples` is compared with the minimum and the count loaded. A sum past
-    // the integer range (sparse files report any length) is therefore "more
-    // than any bound", which is what stopping at the top says; wrapping would
-    // turn it into a small number and a silently smaller training set.
-    let mut wanted = 0u64;
-    let mut samples = 0u64;
+fn training_extent(file_sizes: &[u64], block_size: Option<u64>) -> (u128, u128) {
+    // Summed exactly: sparse files report any length, and the sum of a slice of
+    // `u64`s cannot outgrow `u128` (a slice holds fewer than 2^64 of them).
+    let mut wanted = 0u128;
+    let mut samples = 0u128;
     for &size in file_sizes {
         if size == 0 {
             continue;
@@ -3511,8 +3508,8 @@ fn training_extent(file_sizes: &[u64], block_size: Option<u64>) -> (u64, u64) {
             Some(block) => (size.div_ceil(block), size),
             None => (1, size.min(TRAINING_SAMPLE_MAX)),
         };
-        samples = samples.saturating_add(count);
-        wanted = wanted.saturating_add(bytes);
+        samples += u128::from(count);
+        wanted += u128::from(bytes);
     }
     (samples, wanted)
 }
@@ -3538,7 +3535,7 @@ fn load_training_samples(
         );
     }
     let (samples, wanted) = training_extent(&file_sizes, block_size);
-    if samples < TRAINING_SAMPLES_MIN as u64 {
+    if samples < TRAINING_SAMPLES_MIN as u128 {
         bail!(
             "{samples} training sample(s) is too few; provide one file per sample, or \
              split files into fixed-size samples with -B#"
@@ -3549,18 +3546,29 @@ fn load_training_samples(
     // at `-B1`, and a limit on the bytes alone would be exceeded by the list.
     const SIZE_ENTRY: u64 = core::mem::size_of::<usize>() as u64;
     let budget = TRAINING_DATA_MAX.min(memory_limit.unwrap_or(u64::MAX));
-    let corpus_room = usize::try_from(wanted.min(budget))
+    // The two buffers share the budget, so their room is split from it rather
+    // than each given all of it. A sample holds at most `piece` bytes and costs
+    // an entry, so the bytes are at most `piece / (piece + entry)` of the
+    // budget; the entries are one per whole piece that fits, plus one per file
+    // for the shorter piece at its end.
+    let piece = block_size.unwrap_or(TRAINING_SAMPLE_MAX);
+    let files = file_sizes.iter().filter(|&&size| size > 0).count() as u64;
+    // In `u128`: `piece` is whatever `-B` asked for, up to `u64::MAX`.
+    let per_sample = u128::from(piece) + u128::from(SIZE_ENTRY);
+    let bytes_room = u128::from(budget) * u128::from(piece) / per_sample;
+    let corpus_room = usize::try_from(wanted.min(bytes_room))
         .map_err(|_| eyre!("{budget} bytes of samples is more than this machine can hold"))?;
-    // At most as many entries as the smallest samples fit in the budget.
-    let entries = samples.min(budget / (SIZE_ENTRY + block_size.unwrap_or(1)));
+    let entries = samples.min(u128::from(budget) / per_sample + u128::from(files));
+    let entries = usize::try_from(entries)
+        .map_err(|_| eyre!("{entries} samples is more than this machine can hold"))?;
 
     let mut set = TrainingSet {
         corpus: Vec::with_capacity(corpus_room),
-        sizes: Vec::with_capacity(entries as usize),
+        sizes: Vec::with_capacity(entries),
         sources: Vec::new(),
     };
     'files: for input in order {
-        if set.sizes.len() as u64 >= samples {
+        if set.sizes.len() as u128 >= samples {
             break;
         }
         let file = File::open(input)
@@ -3579,8 +3587,11 @@ fn load_training_samples(
                 Some(block) => (size - taken).min(block),
                 None => size.min(TRAINING_SAMPLE_MAX),
             };
+            // What is held with this sample's entry, never more than a word past
+            // the budget; compared without adding `piece`, which a large `-B`
+            // makes as large as the file.
             let held = set.corpus.len() as u64 + (set.sizes.len() as u64 + 1) * SIZE_ENTRY;
-            if held + piece > budget {
+            if held > budget || piece > budget - held {
                 if taken == 0 {
                     break 'files;
                 }
@@ -3599,7 +3610,7 @@ fn load_training_samples(
             }
             set.sizes.push(piece as usize);
             taken += piece;
-            if block_size.is_none() || taken >= size || set.sizes.len() as u64 >= samples {
+            if block_size.is_none() || taken >= size || set.sizes.len() as u128 >= samples {
                 break;
             }
         }

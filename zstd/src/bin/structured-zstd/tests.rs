@@ -980,6 +980,15 @@ fn training_sample_sizes_count_against_the_budget() {
     let _ = fs::remove_file(&input);
     let set = set.expect("the samples load within the budget");
     assert!(!set.sizes.is_empty(), "some samples fit");
+    // Reserved as well as used: both buffers are sized from the one budget,
+    // which allows a word per file for the partial sample at its end.
+    let entry = core::mem::size_of::<usize>();
+    assert!(
+        set.corpus.capacity() + set.sizes.capacity() * entry <= 200 + entry,
+        "{} bytes of room for samples and {} for sizes exceed the 200-byte budget",
+        set.corpus.capacity(),
+        set.sizes.capacity()
+    );
     assert!(
         set.corpus.len() + set.sizes.len() * core::mem::size_of::<usize>() <= 200,
         "{} bytes of samples and {} sizes exceed the 200-byte budget",
@@ -988,15 +997,40 @@ fn training_sample_sizes_count_against_the_budget() {
     );
 }
 
-/// File sizes that add up past `u64::MAX` (sparse files report any length) do
-/// not wrap: the total stays at the most there is, which the loader's cap then
-/// cuts to what it trains on, and the sample count is exact.
+/// A block size at the top of the range makes each file one sample, and the
+/// budget arithmetic that divides by a sample's cost, or compares a piece with
+/// what is left, must not overflow on it.
+#[test]
+fn a_block_size_at_the_top_of_the_range_loads_whole_files() {
+    let input = std::env::temp_dir().join(format!("szstd-train-bmax-{}", std::process::id()));
+    fs::write(&input, [5u8; 700]).unwrap();
+
+    let set = load_training_samples(
+        &[
+            input.clone(),
+            input.clone(),
+            input.clone(),
+            input.clone(),
+            input.clone(),
+        ],
+        Some(u64::MAX),
+        None,
+    );
+
+    let _ = fs::remove_file(&input);
+    let set = set.expect("five files are five samples");
+    assert_eq!(set.sizes, vec![700; 5]);
+}
+
+/// File sizes that add up past `u64::MAX` (sparse files report any length) are
+/// summed exactly rather than wrapped or stopped at a bound: both the byte
+/// total and the sample count are the true ones.
 #[test]
 fn training_sizes_past_the_integer_range_do_not_wrap() {
     let huge = u64::MAX / 2 + 1;
     let (samples, wanted) = training_extent(&[huge, huge, 0], Some(4096));
-    assert_eq!(wanted, u64::MAX);
-    assert_eq!(samples, 2 * huge.div_ceil(4096));
+    assert_eq!(wanted, 2 * u128::from(huge));
+    assert_eq!(samples, 2 * u128::from(huge.div_ceil(4096)));
 }
 
 /// A benchmark input that shrank between being sized and being read is
