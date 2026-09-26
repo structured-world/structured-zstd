@@ -2802,17 +2802,17 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
             &sizes
         };
         let inputs = if opts.bench_separately { largest } else { sum };
-        let chunks = bench_chunk_lengths(subject, opts.block_size);
         // Three buffers exist at once: the input, the frames it compresses to,
         // and the decoded copy. Each is allocated at the size named here and
         // never grows past it, so this is what the run actually holds rather
         // than a lower bound on it. The frames' is `compress_bound` of each,
         // which is the input plus the framing an incompressible input still
-        // pays — the case a ceiling has to survive.
-        let frame = bench_frames_bound(&chunks);
-        // The encoder is sized by the frame it builds, and the frames are the
-        // chunks, so the widest chunk is the source it is weighed against.
-        let widest_chunk = chunks.iter().copied().max().unwrap_or(0);
+        // pays — the case a ceiling has to survive. The encoder is sized by the
+        // frame it builds, so the widest frame is the source it is weighed
+        // against.
+        let extent = bench_frames_extent(subject, opts.block_size);
+        let frame = extent.map(|(room, _)| room);
+        let widest_chunk = extent.map_or(0, |(_, widest)| widest);
         // Beside them stands the match finder every compression pass builds,
         // whose tables are the largest thing at the higher levels — hundreds of
         // MiB where the buffers are tens. It is sized by the level, by the
@@ -2952,9 +2952,12 @@ fn read_inputs_bounded(inputs: &[PathBuf], sizes: &[u64]) -> Result<Vec<u8>> {
         file.take(size + 1)
             .read_to_end(&mut data)
             .wrap_err_with(|| format!("failed to read {}", input.display()))?;
-        if (data.len() - before) as u64 > *size {
+        // Short is refused as well as long: the frames are cut at the sizes
+        // recorded before the read, so a file that shrank would be cut past
+        // the end of what was read.
+        if (data.len() - before) as u64 != *size {
             bail!(
-                "{} grew while it was being read; run again",
+                "{} changed size while it was being read; run again",
                 input.display()
             );
         }
@@ -2982,13 +2985,35 @@ fn bench_chunk_lengths(file_sizes: &[u64], block_size: Option<u64>) -> Vec<u64> 
     chunks
 }
 
-/// The room the frames of `chunks` can take at most: `compress_bound` of each.
-/// `None` when that is more than this machine can address.
-fn bench_frames_bound(chunks: &[u64]) -> Option<u64> {
-    chunks.iter().try_fold(0u64, |total, &chunk| {
-        let bound = structured_zstd::encoding::compress_bound(usize::try_from(chunk).ok()?);
-        total.checked_add(u64::try_from(bound).ok()?)
-    })
+/// The frames [`bench_chunk_lengths`] cuts `file_sizes` into, measured without
+/// listing them: the room they take at most (`compress_bound` of each) and the
+/// widest of them. Worked out per file from its whole blocks and its tail, so a
+/// small `-B` over a large input costs nothing before `-M` has weighed it.
+/// `None` when the room is more than this machine can address.
+fn bench_frames_extent(file_sizes: &[u64], block_size: Option<u64>) -> Option<(u64, u64)> {
+    let block = block_size.filter(|&size| size >= MIN_BENCH_BLOCK_SIZE);
+    let bound = |len: u64| -> Option<u64> {
+        u64::try_from(structured_zstd::encoding::compress_bound(
+            usize::try_from(len).ok()?,
+        ))
+        .ok()
+    };
+    let mut room = 0u64;
+    let mut widest = 0u64;
+    for &size in file_sizes {
+        if size == 0 {
+            continue;
+        }
+        let piece = block.unwrap_or(size);
+        let whole = size / piece;
+        let tail = size % piece;
+        room = room.checked_add(whole.checked_mul(bound(piece)?)?)?;
+        if tail > 0 {
+            room = room.checked_add(bound(tail)?)?;
+        }
+        widest = widest.max(size.min(piece));
+    }
+    Some((room, widest))
 }
 
 /// Measure one benchmark subject: every input together, or a single file under
@@ -3041,8 +3066,8 @@ fn benchmark_one(
     // growing `Vec` ends up with — and it keeps the growth out of the timed
     // sections, which would otherwise be reported as compression and
     // decompression speed.
-    let frames_bound = bench_frames_bound(&chunks)
-        .and_then(|bound| usize::try_from(bound).ok())
+    let frames_bound = bench_frames_extent(file_sizes, opts.block_size)
+        .and_then(|(room, _)| usize::try_from(room).ok())
         .ok_or_else(|| eyre!("-b: {label} is more than this machine can hold compressed"))?;
     let mut compressed = Vec::with_capacity(frames_bound);
     let mut decoded = Vec::with_capacity(data.len());
@@ -3468,6 +3493,32 @@ fn shuffle_training_files<T>(files: &mut [T]) {
     }
 }
 
+/// How many samples `file_sizes` make and how many bytes they hold, as the
+/// loader would take them without a limit: each file one sample of at most
+/// [`TRAINING_SAMPLE_MAX`] bytes, or cut into `block_size` samples; empty files
+/// left out.
+fn training_extent(file_sizes: &[u64], block_size: Option<u64>) -> (u64, u64) {
+    // Both only ever meet a bound: `wanted` is cut to the trainer's cap and
+    // `samples` is compared with the minimum and the count loaded. A sum past
+    // the integer range (sparse files report any length) is therefore "more
+    // than any bound", which is what stopping at the top says; wrapping would
+    // turn it into a small number and a silently smaller training set.
+    let mut wanted = 0u64;
+    let mut samples = 0u64;
+    for &size in file_sizes {
+        if size == 0 {
+            continue;
+        }
+        let (count, bytes) = match block_size {
+            Some(block) => (size.div_ceil(block), size),
+            None => (1, size.min(TRAINING_SAMPLE_MAX)),
+        };
+        samples = samples.saturating_add(count);
+        wanted = wanted.saturating_add(bytes);
+    }
+    (samples, wanted)
+}
+
 /// Load the training samples as the reference's command does: files in its
 /// shuffled order, each one sample of at most [`TRAINING_SAMPLE_MAX`] bytes, or
 /// cut whole into `block_size` samples when `-B` gives one; empty files left
@@ -3480,27 +3531,15 @@ fn load_training_samples(
     let mut order: Vec<&PathBuf> = inputs.iter().collect();
     shuffle_training_files(&mut order);
 
-    // What would be loaded without a limit, and as how many samples.
-    let mut wanted = 0u64;
-    let mut samples = 0u64;
+    let mut file_sizes = Vec::with_capacity(order.len());
     for input in &order {
-        let size = fs::metadata(input)
-            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?
-            .len();
-        if size == 0 {
-            continue;
-        }
-        match block_size {
-            Some(block) => {
-                samples += size.div_ceil(block);
-                wanted += size;
-            }
-            None => {
-                samples += 1;
-                wanted += size.min(TRAINING_SAMPLE_MAX);
-            }
-        }
+        file_sizes.push(
+            fs::metadata(input)
+                .wrap_err_with(|| format!("failed to inspect {}", input.display()))?
+                .len(),
+        );
     }
+    let (samples, wanted) = training_extent(&file_sizes, block_size);
     if samples < TRAINING_SAMPLES_MIN as u64 {
         bail!(
             "{samples} training sample(s) is too few; provide one file per sample, or \

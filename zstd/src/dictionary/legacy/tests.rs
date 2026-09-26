@@ -20,6 +20,30 @@ fn neighbour_walks_stop_at_the_noise_slots() {
     assert_eq!(solution.length, 0);
 }
 
+/// The same hang in the second walk, the one that measures the kept segment's
+/// neighbourhood: four copies of the band repeat `MIN_RATIO` times, so the
+/// analysis gets past the repetition check and walks the ranks again, reaching
+/// the upper noise slot with the band still matching.
+#[test]
+fn the_measuring_walk_stops_at_the_noise_slot() {
+    let band = noise_band();
+    let corpus_bytes: Vec<u8> = band
+        .iter()
+        .copied()
+        .cycle()
+        .take(4 * NOISE_LENGTH)
+        .collect();
+    let corpus = Corpus::new(&corpus_bytes);
+    // In suffix order: each copy's suffix is a prefix of the one before it.
+    let suffixes = Suffixes::new(vec![96, 64, 32, 0], corpus_bytes.len());
+    let mut done = vec![false; corpus_bytes.len() + 16];
+    let solution = analyze_position(&mut done, &suffixes, 0, &corpus, MIN_RATIO);
+    assert!(
+        solution.length as usize >= MIN_MATCH_LENGTH,
+        "four copies repeat often enough to be kept"
+    );
+}
+
 /// `count` log lines of a few shapes, each line a sample.
 fn log_samples(count: u32) -> (Vec<u8>, Vec<usize>) {
     const SHAPES: [&str; 4] = [

@@ -943,6 +943,55 @@ fn the_benchmark_input_is_the_size_it_was_counted_at() {
     assert_eq!(combined[8000], 2, "the second file's follow");
 }
 
+/// The `-M` check measures the benchmark's frames without listing them; what it
+/// works out has to be what the list itself adds up to, for whole blocks,
+/// tails, empty inputs and block sizes below the minimum alike.
+#[test]
+fn the_frame_extent_matches_the_frames_it_describes() {
+    let files: [&[u64]; 4] = [&[], &[0, 1, 5000], &[1 << 20, 3], &[70_000, 0, 131_071]];
+    for sizes in files {
+        for block in [None, Some(1024), Some(MIN_BENCH_BLOCK_SIZE), Some(40_000)] {
+            let chunks = bench_chunk_lengths(sizes, block);
+            let room: u64 = chunks
+                .iter()
+                .map(|&len| structured_zstd::encoding::compress_bound(len as usize) as u64)
+                .sum();
+            let widest = chunks.iter().copied().max().unwrap_or(0);
+            assert_eq!(
+                bench_frames_extent(sizes, block),
+                Some((room, widest)),
+                "{sizes:?} in blocks of {block:?}"
+            );
+        }
+    }
+}
+
+/// File sizes that add up past `u64::MAX` (sparse files report any length) do
+/// not wrap: the total stays at the most there is, which the loader's cap then
+/// cuts to what it trains on, and the sample count is exact.
+#[test]
+fn training_sizes_past_the_integer_range_do_not_wrap() {
+    let huge = u64::MAX / 2 + 1;
+    let (samples, wanted) = training_extent(&[huge, huge, 0], Some(4096));
+    assert_eq!(wanted, u64::MAX);
+    assert_eq!(samples, 2 * huge.div_ceil(4096));
+}
+
+/// A benchmark input that shrank between being sized and being read is
+/// refused. The frames are cut at the sizes recorded first, so a short read
+/// would cut past the end of the buffer instead of measuring anything.
+#[test]
+fn a_benchmark_input_that_shrank_is_refused() {
+    let input = std::env::temp_dir().join(format!("szstd-benchshrink-{}", std::process::id()));
+    fs::write(&input, vec![7u8; 1000]).unwrap();
+
+    let read = read_inputs_bounded(std::slice::from_ref(&input), &[4000]);
+
+    let _ = fs::remove_file(&input);
+    let err = read.expect_err("a file shorter than its recorded size is an error");
+    assert!(err.to_string().contains("changed"), "{err}");
+}
+
 /// Permission bits alone do not say who they let in. Two samples at `0640` may
 /// belong to different groups, and the dictionary belongs to whichever group the
 /// directory it was created in gave it — so keeping the group bits would open
@@ -2022,8 +2071,8 @@ fn benchmark_frames_follow_the_inputs_and_the_block_size() {
     );
     assert_eq!(bench_chunk_lengths(&[100], Some(32)), vec![32, 32, 32, 4]);
     assert_eq!(
-        bench_frames_bound(&[40, 40]),
-        Some(2 * structured_zstd::encoding::compress_bound(40) as u64),
+        bench_frames_extent(&[80], Some(40)),
+        Some((2 * structured_zstd::encoding::compress_bound(40) as u64, 40)),
         "each frame pays its own framing"
     );
 }
@@ -4348,6 +4397,7 @@ fn advanced_parameters_reach_the_frame() {
 /// decodes. It unlocks the ultra levels and long-distance matching, replaces a
 /// `--zstd=` list given before it, and is adjusted by one given after it.
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn max_sets_every_knob_to_its_hardest_end() {
     let opts = parse(&["--max", "f"]).unwrap();
     assert!(opts.long, "--max enables long-distance matching");
@@ -4399,6 +4449,7 @@ fn max_sets_every_knob_to_its_hardest_end() {
 /// A `--max` frame over a known-size input is down-sized to the input, so it
 /// compresses without the widest tables and decodes back to the input.
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn a_max_frame_round_trips() {
     let opts = parse(&["--max", "f"]).unwrap();
     // Small: at a search depth of 2^30 a debug build walks every candidate.
@@ -4418,6 +4469,15 @@ fn a_max_frame_round_trips() {
     .unwrap();
     assert!(frame.len() < payload.len(), "the payload is compressible");
     assert_eq!(decoded(&frame).unwrap(), payload);
+}
+
+/// On a 32-bit target `--max` is refused, as the reference refuses it: its
+/// tables at their widest do not fit the address space.
+#[test]
+#[cfg(not(target_pointer_width = "64"))]
+fn max_is_refused_on_a_32_bit_target() {
+    let err = parse(&["--max", "f"]).unwrap_err();
+    assert!(err.to_string().contains("32-bit"), "{err}");
 }
 
 /// `--long` below level 16 is refused because the matcher does not run there,
