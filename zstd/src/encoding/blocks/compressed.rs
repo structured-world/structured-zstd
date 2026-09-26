@@ -428,12 +428,18 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         parts: &scratch.parts,
         prefix_sums: &scratch.prefix_sums,
         block_entry: ProbeEntryState {
-            last_huff_table: state.last_huff_table.clone(),
+            huff: if state.last_huff_table.is_some() {
+                HuffRef::BlockEntry
+            } else {
+                HuffRef::None
+            },
             ll_previous: state.fse_tables.ll_previous.clone(),
             ml_previous: state.fse_tables.ml_previous.clone(),
             of_previous: state.fse_tables.of_previous.clone(),
             offset_hist: state.offset_hist,
         },
+        entry_huff: state.last_huff_table.as_ref(),
+        built_huff: Vec::new(),
         scratch_state: CompressState {
             matcher: EntropyOnlyMatcher,
             // The splitter's scratch state never reaches the raw-skip, which
@@ -442,7 +448,9 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             // Inherited rather than re-resolved: this scratch state stands in
             // for the same compressor on the same CPU.
             copy_tier: state.copy_tier,
-            last_huff_table: state.last_huff_table.clone(),
+            // Probes read the table they repeat from `entry_huff` /
+            // `built_huff`; this slot stays empty.
+            last_huff_table: None,
             huff_table_spare: None,
             huff_rollback: None,
             // Lent, not created: the estimator builds a table per split
@@ -469,9 +477,13 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     // builder's buffers back so the emitter and the next block reuse them.
     let CompressState {
         block_scratch: inner_block_scratch,
-        huff_weights,
+        mut huff_weights,
         ..
     } = estimator.scratch_state;
+    // The tables the probes built go back to the builder for its next tables.
+    for table in estimator.built_huff {
+        huff_weights.recycle(table);
+    }
     state.huff_weights = huff_weights;
     scratch.estimator_inner = Some(Box::new(inner_block_scratch));
 
@@ -911,27 +923,49 @@ fn estimate_block_parts_size<M: Matcher>(
 ) -> usize {
     let mut sums = SequencePrefixSums::default();
     sums.rebuild(raw_sequences);
-    estimate_block_parts_size_with(
+    let previous = state.last_huff_table.take();
+    let (bytes, outcome) = estimate_block_parts_size_with(
         state,
+        previous.as_ref(),
         literals_vec,
         raw_sequences,
         sums.codes(0, raw_sequences.len()),
         workspace,
-    )
+    );
+    state.last_huff_table = match outcome {
+        HuffOutcome::Keep => previous,
+        HuffOutcome::Clear => None,
+        HuffOutcome::New(table) => Some(table),
+    };
+    bytes
+}
+
+/// What pricing a literals section did to the Huffman table the next section
+/// may repeat: keep the one it was given, drop it, or take a new one. A probe
+/// reads the previous table and reports this, rather than rewriting a copy of
+/// it, so the table it starts from is borrowed.
+enum HuffOutcome {
+    Keep,
+    Clear,
+    New(huff0_encoder::HuffmanTable),
 }
 
 /// [`estimate_block_parts_size`] for sequences whose length codes are already
-/// derived: the splitter's probes, which price many ranges of one block.
+/// derived: the splitter's probes, which price many ranges of one block. The
+/// Huffman table the section may repeat is `previous`, and what the section
+/// does with it is returned beside the size; the FSE repeat tables and the
+/// offset history are advanced in `state`.
 fn estimate_block_parts_size_with<M: Matcher>(
     state: &mut CompressState<M>,
+    previous: Option<&huff0_encoder::HuffmanTable>,
     literals_vec: &[u8],
     raw_sequences: &[RawSequence],
     codes: LengthCodes<'_>,
     workspace: &mut EstimatorWorkspace,
-) -> usize {
-    let lit_bytes = estimate_literals_section_bytes(
+) -> (usize, HuffOutcome) {
+    let (lit_bytes, outcome) = estimate_literals_section_bytes(
         literals_vec,
-        &mut state.last_huff_table,
+        previous,
         &mut workspace.lit_counts,
         state.strategy_tag,
         state.huf_optimal_search,
@@ -953,7 +987,7 @@ fn estimate_block_parts_size_with<M: Matcher>(
         )
     };
 
-    lit_bytes + seq_bytes
+    (lit_bytes + seq_bytes, outcome)
 }
 
 // One argument over the lint's threshold. Every one of them is a distinct
@@ -963,20 +997,25 @@ fn estimate_block_parts_size_with<M: Matcher>(
 #[allow(clippy::too_many_arguments)]
 fn estimate_literals_section_bytes(
     literals: &[u8],
-    last_huff: &mut Option<huff0_encoder::HuffmanTable>,
+    last_huff: Option<&huff0_encoder::HuffmanTable>,
     counts: &mut [usize; 256],
     strategy: crate::encoding::strategy::StrategyTag,
     huf_search: bool,
     lit_disabled: bool,
     weight_scratch: &mut huff0_encoder::WeightScratch,
     suspected_incompressible: bool,
-) -> usize {
+) -> (usize, HuffOutcome) {
+    let raw = || {
+        (
+            uncompressed_literals_header_bytes(literals.len()) + literals.len(),
+            HuffOutcome::Clear,
+        )
+    };
     // Mirror `encode_block_parts` literal-mode branches
     // **in the same order**. The disabled gate (negative levels: raw literals,
     // no Huffman) is checked FIRST exactly as the emitter does.
     if lit_disabled {
-        *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+        return raw();
     }
     // The emitter pre-checks `all_identical`
     // (any non-empty section) BEFORE the `min_lits` gate — RLE and raw
@@ -987,13 +1026,14 @@ fn estimate_literals_section_bytes(
     // regardless of strategy. Estimator must use the same ordering and
     // predicate so probe costs match emit byte-for-byte.
     if !literals.is_empty() && all_bytes_identical(literals) {
-        *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + 1;
+        return (
+            uncompressed_literals_header_bytes(literals.len()) + 1,
+            HuffOutcome::Clear,
+        );
     }
     let min_lits = min_literals_to_compress(strategy, last_huff.is_some());
     if literals.len() < min_lits {
-        *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+        return raw();
     }
 
     // Upstream zstd preferRepeat fast-path: skip the histogram +
@@ -1011,18 +1051,16 @@ fn estimate_literals_section_bytes(
     // short-circuit so we still fall through to rebuild when the
     // prior table can't encode the current literals.
     if prefer_repeat_eligible(strategy, literals.len())
-        && let Some(prev) = last_huff.as_ref()
+        && let Some(prev) = last_huff
         && let Some(reuse_payload) = estimate_huff_payload_bytes_checked(prev, literals)
     {
         let compressed_header = compressed_literals_header_bytes(literals.len());
         let total = compressed_header + reuse_payload; // no tree_desc on reuse
-        let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
         let huf_section_size = total - compressed_header;
         if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
-            *last_huff = None;
-            return raw_section_bytes;
+            return raw();
         }
-        return total;
+        return (total, HuffOutcome::Keep);
     }
 
     // Mirror the emitter's end-sample shortcut, in the same position. Without
@@ -1030,8 +1068,7 @@ fn estimate_literals_section_bytes(
     // Huffman-compressed here and is emitted raw there, and the splitter picks
     // a partition on a price the emitter cannot produce.
     if suspected_incompressible && end_samples_look_flat(literals, counts) {
-        *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+        return raw();
     }
 
     let (max_sym, largest_count) = crate::histogram::count_bytes(literals, counts);
@@ -1039,8 +1076,7 @@ fn estimate_literals_section_bytes(
     // byte-for-byte (flat histogram → raw section, no tree build) so
     // splitter probe costs match what the emitter writes.
     if largest_count <= (literals.len() >> 7) + 4 {
-        *last_huff = None;
-        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+        return raw();
     }
     // Mutable because the size query is what encodes the weight description
     // into the table's own buffer, so the emitter that follows reads it.
@@ -1051,11 +1087,10 @@ fn estimate_literals_section_bytes(
     );
 
     let Some(new_desc) = new_table.writeable_table_description_size() else {
-        *last_huff = None;
         // Nothing downstream reads this table; hand its buffers to the next
         // build rather than dropping them.
         weight_scratch.recycle(new_table);
-        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+        return raw();
     };
     // For lit_size ≥ 256, upstream zstd `compress_literals` calls `encoder.encode4x`
     // which splits the data in 4 streams with a 6-byte jumptable and per-stream
@@ -1072,20 +1107,12 @@ fn estimate_literals_section_bytes(
     // Using the 4-stream `estimate_huff_payload_bytes_checked` here would
     // disagree with the encoder and bias the splitter to pick a different
     // table than the encoder ultimately emits.
-    let use_new = decide_huff_reuse_like_encoder(
-        &new_table,
-        last_huff.as_ref(),
-        new_desc,
-        literals,
-        counts,
-        strategy,
-    );
+    let use_new =
+        decide_huff_reuse_like_encoder(&new_table, last_huff, new_desc, literals, counts, strategy);
     let reuse_payload = if !use_new {
         // Safe to recompute with 4-stream model now that the table is chosen:
         // the chosen-table path always returns the actual wire cost.
-        last_huff
-            .as_ref()
-            .and_then(|t| estimate_huff_payload_bytes_checked(t, literals))
+        last_huff.and_then(|t| estimate_huff_payload_bytes_checked(t, literals))
     } else {
         None
     };
@@ -1115,20 +1142,16 @@ fn estimate_literals_section_bytes(
     let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
     let huf_section_size = total - compressed_header; // tree_desc + payload, no lhSize
     if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
-        *last_huff = None;
         weight_scratch.recycle(new_table);
-        return raw_section_bytes;
+        return (raw_section_bytes, HuffOutcome::Clear);
     }
 
     if use_new {
-        // The table this displaces is the one to recycle; the new one is kept.
-        if let Some(displaced) = last_huff.replace(new_table) {
-            weight_scratch.recycle(displaced);
-        }
+        (total, HuffOutcome::New(new_table))
     } else {
         weight_scratch.recycle(new_table);
+        (total, HuffOutcome::Keep)
     }
-    total
 }
 
 /// Price a sequence section. The offset codes are the one part that depends on
@@ -1821,17 +1844,31 @@ fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
 /// estimator replaces.
 #[derive(Clone)]
 struct ProbeEntryState {
-    last_huff_table: Option<huff0_encoder::HuffmanTable>,
+    huff: HuffRef,
     ll_previous: Option<PreviousFseTable>,
     ml_previous: Option<PreviousFseTable>,
     of_previous: Option<PreviousFseTable>,
     offset_hist: [u32; 3],
 }
 
+/// Which Huffman table a probe state may repeat. Tables are never copied into
+/// a state: the block's entry table is borrowed from the compressor, and a
+/// table a probe builds is kept once in the estimator's arena.
+#[derive(Clone, Copy)]
+enum HuffRef {
+    None,
+    BlockEntry,
+    Built(usize),
+}
+
 struct SplitEstimator<'a> {
     parts: &'a EncodedBlockParts,
     prefix_sums: &'a SequencePrefixSums,
     block_entry: ProbeEntryState,
+    /// The table the block starts from, borrowed.
+    entry_huff: Option<&'a huff0_encoder::HuffmanTable>,
+    /// Every table a probe built, addressed by [`HuffRef::Built`].
+    built_huff: Vec<huff0_encoder::HuffmanTable>,
     scratch_state: CompressState<EntropyOnlyMatcher>,
     workspace: EstimatorWorkspace,
 }
@@ -1858,13 +1895,20 @@ impl SplitEstimator<'_> {
         } else {
             lit_start + lit_len
         };
-        self.scratch_state.last_huff_table = entry.last_huff_table.clone();
+        // The FSE repeat tables are shared handles, so seeding them is a
+        // reference-count bump; the Huffman table is only borrowed.
         self.scratch_state.fse_tables.ll_previous = entry.ll_previous.clone();
         self.scratch_state.fse_tables.ml_previous = entry.ml_previous.clone();
         self.scratch_state.fse_tables.of_previous = entry.of_previous.clone();
         self.scratch_state.offset_hist = entry.offset_hist;
-        let emitted_payload = estimate_block_parts_size_with(
+        let previous = match entry.huff {
+            HuffRef::None => None,
+            HuffRef::BlockEntry => self.entry_huff,
+            HuffRef::Built(at) => Some(&self.built_huff[at]),
+        };
+        let (emitted_payload, outcome) = estimate_block_parts_size_with(
             &mut self.scratch_state,
+            previous,
             &self.parts.literals[lit_start..lit_end],
             &self.parts.sequences[start_idx..end_idx],
             self.prefix_sums.codes(start_idx, end_idx),
@@ -1881,13 +1925,24 @@ impl SplitEstimator<'_> {
         // Real emit on raw fallback restores the entry state — see
         // `emit_single_sequence_block`'s saved-state restore branch.
         let post = if raw_fallback {
+            if let HuffOutcome::New(table) = outcome {
+                self.scratch_state.huff_weights.recycle(table);
+            }
             entry.clone()
         } else {
+            let huff = match outcome {
+                HuffOutcome::Keep => entry.huff,
+                HuffOutcome::Clear => HuffRef::None,
+                HuffOutcome::New(table) => {
+                    self.built_huff.push(table);
+                    HuffRef::Built(self.built_huff.len() - 1)
+                }
+            };
             ProbeEntryState {
-                last_huff_table: self.scratch_state.last_huff_table.clone(),
-                ll_previous: self.scratch_state.fse_tables.ll_previous.clone(),
-                ml_previous: self.scratch_state.fse_tables.ml_previous.clone(),
-                of_previous: self.scratch_state.fse_tables.of_previous.clone(),
+                huff,
+                ll_previous: self.scratch_state.fse_tables.ll_previous.take(),
+                ml_previous: self.scratch_state.fse_tables.ml_previous.take(),
+                of_previous: self.scratch_state.fse_tables.of_previous.take(),
                 offset_hist: self.scratch_state.offset_hist,
             }
         };
