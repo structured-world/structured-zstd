@@ -147,17 +147,20 @@ fn bucket_ends(counts: &[u32], buf: &mut [u32]) {
     }
 }
 
-/// SA-IS over `s` into `sa` (as long as `s`), whose symbols all lie in
-/// `0..=upper`. The text is taken to end in a virtual sentinel smaller than
-/// every symbol.
+/// SA-IS over `s` into the first `s.len()` slots of `space`, whose symbols all
+/// lie in `0..=upper`. The text is taken to end in a virtual sentinel smaller
+/// than every symbol. Slots of `space` past the array are free for the
+/// construction to use.
 ///
-/// Laid out as Yuta Mori's `sais.c` lays it out, with nothing beside `sa` but
-/// the bucket counters and a bit per position: the reduced string is gathered
-/// at the back of `sa` and sorted recursively into the front, so no level
-/// holds a copy of its input or of the array.
-fn sa_is<T: Symbol>(s: &[T], sa: &mut [u32], upper: usize) {
+/// Laid out as Yuta Mori's `sais.c` lays it out, with nothing beside the array
+/// but the bucket tables and a bit per position: the reduced string is
+/// gathered at the back of the array and sorted recursively into the front, so
+/// no level holds a copy of its input or of the array. The bucket tables go in
+/// the free slots when they fit, which in the recursion they usually do: a
+/// level reduced to `m` symbols leaves `n - 2m` slots between the two.
+fn sa_is<T: Symbol>(s: &[T], space: &mut [u32], upper: usize) {
     let n = s.len();
-    debug_assert_eq!(sa.len(), n);
+    let (sa, free) = space.split_at_mut(n);
     match n {
         0 => return,
         1 => {
@@ -179,16 +182,25 @@ fn sa_is<T: Symbol>(s: &[T], sa: &mut [u32], upper: usize) {
     }
 
     let types = Types::new(s);
-    let mut counts = vec![0u32; upper + 1];
+    let k = upper + 1;
+    let mut owned: Vec<u32>;
+    let (counts, buf) = if free.len() >= 2 * k {
+        let (counts, rest) = free.split_at_mut(k);
+        counts.fill(0);
+        (counts, &mut rest[..k])
+    } else {
+        owned = vec![0u32; 2 * k];
+        owned.split_at_mut(k)
+    };
     for &c in s {
         counts[c.index()] += 1;
     }
-    let mut buf = vec![0u32; upper + 1];
+    let counts = &*counts;
 
     // Stage 1: the LMS positions at their buckets' ends, in any order, induce
     // the order of the LMS substrings.
     sa.fill(0);
-    bucket_ends(&counts, &mut buf);
+    bucket_ends(counts, buf);
     let mut m = 0;
     for p in (1..n).rev() {
         if types.is_lms(p, n) {
@@ -198,7 +210,7 @@ fn sa_is<T: Symbol>(s: &[T], sa: &mut [u32], upper: usize) {
             m += 1;
         }
     }
-    induce(s, sa, &counts, &mut buf);
+    induce(s, sa, counts, buf);
     if m == 0 {
         // No LMS suffix: the induction from the last suffix alone is the
         // whole order.
@@ -264,16 +276,17 @@ fn sa_is<T: Symbol>(s: &[T], sa: &mut [u32], upper: usize) {
     // name distinct its order is the names themselves, and no recursion is
     // needed.
     {
-        // `m <= n / 2`, so the front `m` slots and the back `m` are disjoint.
+        // `m <= n / 2`, so the front `m` slots and the back `m` are disjoint,
+        // and the recursion has the `n - 2m` between them to spare.
         let (front, reduced) = sa.split_at_mut(n - m);
-        let order = &mut front[..m];
         if name as usize + 1 == m {
             for (at, &rank) in reduced.iter().enumerate() {
-                order[rank as usize] = at as u32;
+                front[rank as usize] = at as u32;
             }
         } else {
-            sa_is(&*reduced, order, name as usize);
+            sa_is(&*reduced, front, name as usize);
         }
+        let order = &mut front[..m];
         // The reduced string is done with: its slots take the LMS positions
         // in text order, which turn the sorted indices into positions.
         let mut at = 0;
@@ -294,7 +307,7 @@ fn sa_is<T: Symbol>(s: &[T], sa: &mut [u32], upper: usize) {
     // (`sais.c`, `sais_main` stage 3). A bucket's end is at least the number
     // of LMS positions of its symbol and below, so the write cursor never
     // passes the read one.
-    bucket_ends(&counts, &mut buf);
+    bucket_ends(counts, buf);
     let mut i = m;
     let mut j = n;
     while i > 0 {
@@ -320,7 +333,7 @@ fn sa_is<T: Symbol>(s: &[T], sa: &mut [u32], upper: usize) {
         }
     }
     sa[..j].fill(0);
-    induce(s, sa, &counts, &mut buf);
+    induce(s, sa, counts, buf);
 }
 
 /// The two induction sweeps from the LMS positions already in `sa` (every
