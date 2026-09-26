@@ -119,13 +119,15 @@ fn prefetch_stride_x86<const HINT: i32>(slice: &[u8]) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+// The aarch64 hints are inline assembly, which Miri cannot execute; under Miri
+// they take the no-op fallback below, a hint having no observable effect.
+#[cfg(all(target_arch = "aarch64", not(miri)))]
 #[inline(always)]
 fn prefetch_slice_impl_l1(slice: &[u8]) {
     prefetch_stride_aarch64::<true>(slice);
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(miri)))]
 #[inline(always)]
 fn prefetch_first_line_l1_impl(ptr: *const u8) {
     use core::arch::asm;
@@ -138,13 +140,13 @@ fn prefetch_first_line_l1_impl(ptr: *const u8) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(miri)))]
 #[inline(always)]
 fn prefetch_slice_impl_t1(slice: &[u8]) {
     prefetch_stride_aarch64::<false>(slice);
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(miri)))]
 #[inline(always)]
 fn prefetch_stride_aarch64<const L1: bool>(slice: &[u8]) {
     use core::arch::asm;
@@ -182,7 +184,7 @@ fn prefetch_stride_aarch64<const L1: bool>(slice: &[u8]) {
 #[cfg(not(any(
     target_arch = "x86_64",
     all(target_arch = "x86", target_feature = "sse"),
-    target_arch = "aarch64",
+    all(target_arch = "aarch64", not(miri)),
 )))]
 #[inline(always)]
 fn prefetch_slice_impl_l1(_slice: &[u8]) {}
@@ -190,7 +192,7 @@ fn prefetch_slice_impl_l1(_slice: &[u8]) {}
 #[cfg(not(any(
     target_arch = "x86_64",
     all(target_arch = "x86", target_feature = "sse"),
-    target_arch = "aarch64",
+    all(target_arch = "aarch64", not(miri)),
 )))]
 #[inline(always)]
 fn prefetch_first_line_l1_impl(_ptr: *const u8) {}
@@ -198,7 +200,7 @@ fn prefetch_first_line_l1_impl(_ptr: *const u8) {}
 #[cfg(not(any(
     target_arch = "x86_64",
     all(target_arch = "x86", target_feature = "sse"),
-    target_arch = "aarch64",
+    all(target_arch = "aarch64", not(miri)),
 )))]
 #[inline(always)]
 fn prefetch_slice_impl_t1(_slice: &[u8]) {}
