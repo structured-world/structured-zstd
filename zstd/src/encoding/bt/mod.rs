@@ -657,6 +657,12 @@ impl BtMatcher {
         generations: &mut [u32; HC_MAX_LIT + 1],
         stamp: u32,
     ) -> u32 {
+        // The integer weight is one bit scan on a frequency, no dearer than the
+        // probe that would stand in for it, so it is computed in place, as
+        // upstream does at `optLevel` 0. Only the fractional weight is cached.
+        if !ACCURATE {
+            return profile.literal_price::<false>(stats, byte);
+        }
         // SAFETY: `byte as usize` is `0..256` and the fixed-size arrays are
         // `[u32; HC_MAX_LIT + 1 = 257]`, so the index is statically in bounds.
         // Each cached_*_price call sits inside the optimal parser per-byte
@@ -681,7 +687,8 @@ impl BtMatcher {
         cache: &mut [[u32; 2]],
         stamp: u32,
     ) -> u32 {
-        if lit_len >= cache.len() {
+        // Computed in place under the integer weight; see `cached_literal_price`.
+        if !ACCURATE || lit_len >= cache.len() {
             return profile.lit_length_price::<ACCURATE>(stats, lit_len);
         }
         // SAFETY: the early-return above proves `lit_len < cache.len()`.
@@ -730,7 +737,8 @@ impl BtMatcher {
         cache: &mut [[u32; 2]],
         stamp: u32,
     ) -> u32 {
-        if match_len >= cache.len() {
+        // Computed in place under the integer weight; see `cached_literal_price`.
+        if !ACCURATE || match_len >= cache.len() {
             return profile.match_length_price::<ACCURATE>(stats, match_len);
         }
         // SAFETY: see `cached_lit_length_price` — paired `[price, generation]`
