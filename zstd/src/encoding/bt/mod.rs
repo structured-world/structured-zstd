@@ -379,6 +379,7 @@ impl BtMatcher {
             store,
             price_arena,
             candidates_searched_at: _,
+            pass: _,
         } = buffers;
         candidates.clear();
         self.opt_nodes_scratch = nodes;
@@ -572,47 +573,41 @@ impl BtMatcher {
         }
     }
 
-    /// Upstream zstd parity: replay an already-emitted plan segment through the
-    /// `optStatePtr_t` stats updater so the next parse pass sees frozen
-    /// counts. Pure static helper — only mutates the caller-owned
-    /// `opt_state` / `reps` / `literals_start`.
-    pub(crate) fn update_plan_stats_segment(
-        current: &[u8],
-        current_len: usize,
-        plan: &[HcOptimalSequence],
+    /// Upstream zstd parity: `ZSTD_updateStats` for one sequence the parser
+    /// has just settled, called from its traceback so the next segment prices
+    /// against counts that include it. `literals_start` is the block offset
+    /// the previous sequence ended at and `reps` the history before this one;
+    /// both advance. The caller refreshes the base prices once the segment's
+    /// sequences are in.
+    #[inline]
+    pub(crate) fn record_sequence_stats(
+        block: &[u8],
+        sequence: HcOptimalSequence,
         literals_start: &mut usize,
         reps: &mut [u32; 3],
         opt_state: &mut HcOptState,
-        accurate: bool,
     ) {
-        if plan.is_empty() {
+        let lit_len = sequence.lit_len as usize;
+        let match_len = sequence.match_len as usize;
+        // `checked_add` on both edges so a malformed sequence can't overflow
+        // `usize` arithmetic before the bounds guard fires. `saturating_add`
+        // would have masked overflow as "clamp to usize::MAX" which then
+        // bypasses the `> block.len()` check.
+        let Some(start) = literals_start.checked_add(lit_len) else {
+            return;
+        };
+        let Some(end) = start.checked_add(match_len) else {
+            return;
+        };
+        if end > block.len() {
             return;
         }
-        for item in plan {
-            let lit_len = item.lit_len as usize;
-            let match_len = item.match_len as usize;
-            // `checked_add` on both edges so a malformed / partially-built
-            // plan can't overflow `usize` arithmetic before the
-            // bounds guard fires. `saturating_add` would have masked
-            // overflow as "clamp to usize::MAX" which then bypasses the
-            // `> current_len` check.
-            let Some(start) = literals_start.checked_add(lit_len) else {
-                continue;
-            };
-            let Some(end) = start.checked_add(match_len) else {
-                continue;
-            };
-            if end > current_len {
-                continue;
-            }
-            let literals = &current[*literals_start..start];
-            let (off_base, next_reps) =
-                Self::encode_offset_with_reps(item.offset, literals.len(), *reps);
-            opt_state.update_stats(literals.len(), literals, off_base, match_len);
-            *reps = next_reps;
-            *literals_start = end;
-        }
-        opt_state.set_base_prices(accurate);
+        let literals = &block[*literals_start..start];
+        let (off_base, next_reps) =
+            Self::encode_offset_with_reps(sequence.offset, literals.len(), *reps);
+        opt_state.update_stats(literals.len(), literals, off_base, match_len);
+        *reps = next_reps;
+        *literals_start = end;
     }
 
     /// Brings cells `start..=end` into the frontier as unreached: price `MAX`.

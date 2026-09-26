@@ -131,4 +131,24 @@ pub(crate) struct HcOptimalPlanBuffers {
     /// searched and the re-entry reads the answer instead of asking again.
     /// `None` whenever the buffer's contents do not answer any query.
     pub(crate) candidates_searched_at: Option<(usize, usize)>,
+    /// Where the block pass stands between segments. Held here, in memory,
+    /// rather than in locals of the pass: the pass needs it only at segment
+    /// boundaries, and as locals it stayed live across the whole segment body,
+    /// taking registers from the DP's own loops. Upstream keeps the same state
+    /// behind pointers (`rep`, `ms->opt`) for the same reason.
+    pub(crate) pass: HcBlockPass,
+}
+
+/// The block pass's position between segments: see
+/// [`HcOptimalPlanBuffers::pass`].
+#[derive(Copy, Clone, Default)]
+pub(crate) struct HcBlockPass {
+    /// Block offset of the next segment.
+    pub(crate) cursor: usize,
+    /// Literals pending before `cursor`.
+    pub(crate) litlen: usize,
+    /// Repeat offsets at `cursor`.
+    pub(crate) reps: [u32; 3],
+    /// Block offset the statistics update has consumed literals up to.
+    pub(crate) literals_cursor: usize,
 }
