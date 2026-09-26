@@ -73,60 +73,127 @@ fn noise_band() -> [u8; NOISE_LENGTH] {
 /// The corpus followed by its noise band, read through bounds-checked
 /// accessors that treat anything past the band as a mismatch.
 ///
-/// One contiguous copy, as the reference makes it
-/// (`ZDICT_trainFromBuffer_legacy`). Borrowing the samples and keeping the
-/// band apart saves the copy's memory, but joining the two in the accessors
-/// measured 2.5-5% slower on the whole trainer at identical output.
-struct Corpus {
-    bytes: Vec<u8>,
+/// The samples are borrowed and the band kept apart, and the accessors join
+/// the two. The reference copies the whole corpus into a buffer one band
+/// longer (`ZDICT_trainFromBuffer_legacy`), a second copy of the samples while
+/// the caller still holds them for the finalizer.
+struct Corpus<'a> {
+    samples: &'a [u8],
+    noise: [u8; NOISE_LENGTH],
 }
 
-impl Corpus {
-    fn new(samples: &[u8]) -> Self {
-        let mut bytes = Vec::with_capacity(samples.len() + NOISE_LENGTH);
-        bytes.extend_from_slice(samples);
-        bytes.extend_from_slice(&noise_band());
-        Self { bytes }
+impl<'a> Corpus<'a> {
+    fn new(samples: &'a [u8]) -> Self {
+        Self {
+            samples,
+            noise: noise_band(),
+        }
+    }
+
+    /// Length of the samples and the band together.
+    #[inline]
+    fn len(&self) -> usize {
+        self.samples.len() + NOISE_LENGTH
     }
 
     #[inline]
     fn byte(&self, at: usize) -> Option<u8> {
-        self.bytes.get(at).copied()
+        match self.samples.get(at) {
+            Some(&byte) => Some(byte),
+            None => self.noise.get(at - self.samples.len()).copied(),
+        }
+    }
+
+    /// `N` bytes from `at`, or `None` past the band.
+    #[inline(always)]
+    fn read<const N: usize>(&self, at: usize) -> Option<[u8; N]> {
+        if let Some(bytes) = self.samples.get(at..at + N) {
+            return Some(bytes.try_into().expect("N bytes"));
+        }
+        self.read_across(at)
+    }
+
+    /// [`Self::read`] for a read that reaches the band, which only the last
+    /// few positions of the corpus make.
+    #[cold]
+    #[inline(never)]
+    fn read_across<const N: usize>(&self, at: usize) -> Option<[u8; N]> {
+        let mut out = [0u8; N];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.byte(at + i)?;
+        }
+        Some(out)
     }
 
     #[inline]
     fn read16(&self, at: usize) -> Option<u16> {
-        let pair = self.bytes.get(at..at + 2)?;
-        Some(u16::from_le_bytes([pair[0], pair[1]]))
+        self.read::<2>(at).map(u16::from_le_bytes)
     }
 
     #[inline]
     fn read64(&self, at: usize) -> Option<u64> {
-        let word = self.bytes.get(at..at + 8)?;
-        Some(u64::from_le_bytes(word.try_into().expect("eight bytes")))
+        self.read::<8>(at).map(u64::from_le_bytes)
     }
 
     /// Bytes `a` and `b` have in common (`ZDICT_count`), compared a word at
-    /// a time as the reference compares them.
+    /// a time as the reference compares them while both words lie in the
+    /// samples, then a byte at a time across into the band.
     #[inline]
     fn common(&self, a: usize, b: usize) -> usize {
-        let bytes = self.bytes.as_slice();
-        let Some(limit) = bytes.len().checked_sub(a.max(b)) else {
-            return 0;
+        let samples = self.samples;
+        // A comparison that starts in the band has no word to read in the
+        // samples.
+        let Some(in_samples) = samples.len().checked_sub(a.max(b)) else {
+            return self.common_tail(a, b, 0);
         };
-        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
+        let base = samples.as_ptr();
         let mut n = 0;
-        while n + 8 <= limit {
-            let diff = word(a + n) ^ word(b + n);
+        while n + 8 <= in_samples {
+            // SAFETY: `a, b <= max(a, b)` and `n + 8 <= samples.len() -
+            // max(a, b)`, so both eight-byte reads end inside the samples.
+            // Read unchecked: through a slice index the bound is tested on
+            // every word, since the loop limit does not tell the optimiser
+            // that each index stays inside.
+            let (x, y) = unsafe {
+                (
+                    base.add(a + n).cast::<u64>().read_unaligned(),
+                    base.add(b + n).cast::<u64>().read_unaligned(),
+                )
+            };
+            let diff = u64::from_le(x) ^ u64::from_le(y);
             if diff != 0 {
                 return n + (diff.trailing_zeros() / 8) as usize;
             }
             n += 8;
         }
-        while n < limit && bytes[a + n] == bytes[b + n] {
+        self.common_tail(a, b, n)
+    }
+
+    /// The last bytes of [`Self::common`] from `n` on, fewer than a word of
+    /// them in the samples, then on into the band.
+    #[cold]
+    #[inline(never)]
+    fn common_tail(&self, a: usize, b: usize, mut n: usize) -> usize {
+        let Some(limit) = self.len().checked_sub(a.max(b)) else {
+            return 0;
+        };
+        while n < limit && self.byte(a + n) == self.byte(b + n) {
             n += 1;
         }
         n
+    }
+
+    /// Copy the `out.len()` bytes from `from` into `out`.
+    fn copy_to(&self, from: usize, out: &mut [u8]) {
+        if let Some(bytes) = self.samples.get(from..from + out.len()) {
+            out.copy_from_slice(bytes);
+            return;
+        }
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self
+                .byte(from + i)
+                .expect("a segment lies inside the corpus");
+        }
     }
 }
 
@@ -236,7 +303,7 @@ pub(crate) fn train_legacy_raw(
         let length = item.length as usize;
         let start = end - length;
         let from = item.pos as usize;
-        content[start..end].copy_from_slice(&corpus.bytes[from..from + length]);
+        corpus.copy_to(from, &mut content[start..end]);
         end = start;
     }
     debug_assert_eq!(end, 0, "the kept segments fill the content exactly");
@@ -245,9 +312,10 @@ pub(crate) fn train_legacy_raw(
 
 /// `ZDICT_trainBuffer_legacy`: walk every uncovered position of the corpus in
 /// text order and insert the segment its suffix neighbourhood yields.
-fn find_segments(list: &mut [DictItem], corpus: &Corpus, len: usize, min_rep: u32) {
+fn find_segments(list: &mut [DictItem], corpus: &Corpus<'_>, len: usize, min_rep: u32) {
     let min_ratio = min_rep.max(MIN_RATIO);
-    let sa = suffix_array(&corpus.bytes[..len]);
+    debug_assert_eq!(corpus.samples.len(), len);
+    let sa = suffix_array(corpus.samples);
     let mut rank = vec![0u32; len];
     for (at, &pos) in sa.iter().enumerate() {
         rank[pos as usize] = at as u32;
@@ -304,7 +372,7 @@ fn analyze_position(
     done: &mut [bool],
     suffixes: &Suffixes,
     mut start: i64,
-    corpus: &Corpus,
+    corpus: &Corpus<'_>,
     min_ratio: u32,
 ) -> DictItem {
     let mut pos = suffixes.at(start);
@@ -462,15 +530,16 @@ fn analyze_position(
     solution
 }
 
-/// Whether the `length` bytes at `a` equal those at `b` (`isIncluded`).
-fn is_included(corpus: &Corpus, a: usize, b: usize, length: usize) -> bool {
-    match (
-        corpus.bytes.get(a..a + length),
-        corpus.bytes.get(b..b + length),
-    ) {
-        (Some(x), Some(y)) => x == y,
-        _ => false,
+/// Whether the `length` bytes at `a` equal those at `b` (`isIncluded`); both
+/// runs must lie inside the corpus. Compares `length` bytes and no more, where
+/// `common` would run on to the end of the shared prefix.
+fn is_included(corpus: &Corpus<'_>, a: usize, b: usize, length: usize) -> bool {
+    let samples = corpus.samples;
+    if let (Some(x), Some(y)) = (samples.get(a..a + length), samples.get(b..b + length)) {
+        return x == y;
     }
+    a.max(b) + length <= corpus.len()
+        && (0..length).all(|i| corpus.byte(a + i) == corpus.byte(b + i))
 }
 
 /// Move entry `at` towards the front while its savings beat its predecessor's.
@@ -486,7 +555,7 @@ fn promote(list: &mut [DictItem], mut at: usize) -> usize {
 
 /// `ZDICT_tryMerge`: fold `elt` into an entry it overlaps, skipping entry
 /// `skip`. Returns the merged entry's index, or 0 when nothing merged.
-fn try_merge(list: &mut [DictItem], elt: DictItem, skip: usize, corpus: &Corpus) -> usize {
+fn try_merge(list: &mut [DictItem], elt: DictItem, skip: usize, corpus: &Corpus<'_>) -> usize {
     let size = list[0].pos as usize;
     let elt_end = elt.pos + elt.length;
 
@@ -571,7 +640,7 @@ fn remove_item(list: &mut [DictItem], id: usize) {
 /// `ZDICT_insertDictItem`: merge `elt` into the table if it overlaps an entry,
 /// and keep merging while the merged entry overlaps another; otherwise insert
 /// it in savings order, dropping the last entry when the table is full.
-fn insert_item(list: &mut [DictItem], max_size: u32, elt: DictItem, corpus: &Corpus) {
+fn insert_item(list: &mut [DictItem], max_size: u32, elt: DictItem, corpus: &Corpus<'_>) {
     let mut merge_id = try_merge(list, elt, 0, corpus);
     if merge_id != 0 {
         loop {
