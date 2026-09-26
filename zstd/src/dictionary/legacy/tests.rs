@@ -2,6 +2,24 @@ use super::*;
 use alloc::format;
 use alloc::string::String;
 
+/// Every rank past either end of the suffix array reads the noise band, and
+/// the band is the same bytes on every run. A corpus whose text repeats the
+/// band therefore compared equal at every rank past the end, and the
+/// neighbour walks never stopped: training hung on such a corpus. The walks
+/// stop at the two noise slots the reference allocates.
+#[test]
+fn neighbour_walks_stop_at_the_noise_slots() {
+    // The corpus is the band itself, and its one suffix is the only rank in
+    // the array: every walk leaves the array on its first step.
+    let band = noise_band();
+    let corpus = Corpus::new(&band);
+    let suffixes = Suffixes::new(vec![0], band.len());
+    let mut done = vec![false; band.len() + 16];
+    let solution = analyze_position(&mut done, &suffixes, 0, &corpus, MIN_RATIO);
+    // One suffix cannot repeat `MIN_RATIO` times.
+    assert_eq!(solution.length, 0);
+}
+
 /// `count` log lines of a few shapes, each line a sample.
 fn log_samples(count: u32) -> (Vec<u8>, Vec<usize>) {
     const SHAPES: [&str; 4] = [

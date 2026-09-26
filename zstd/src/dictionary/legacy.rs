@@ -59,8 +59,24 @@ struct DictItem {
     savings: u32,
 }
 
+/// The reference's noise band (`ZDICT_fillNoise`), the same bytes on every run.
+fn noise_band() -> [u8; NOISE_LENGTH] {
+    let mut band = [0u8; NOISE_LENGTH];
+    let mut acc: u32 = 2_654_435_761;
+    for byte in &mut band {
+        acc = acc.wrapping_mul(2_246_822_519);
+        *byte = (acc >> 21) as u8;
+    }
+    band
+}
+
 /// The corpus followed by its noise band, read through bounds-checked
 /// accessors that treat anything past the band as a mismatch.
+///
+/// One contiguous copy, as the reference makes it
+/// (`ZDICT_trainFromBuffer_legacy`). Borrowing the samples and keeping the
+/// band apart saves the copy's memory, but joining the two in the accessors
+/// measured 2.5-5% slower on the whole trainer at identical output.
 struct Corpus {
     bytes: Vec<u8>,
 }
@@ -69,12 +85,7 @@ impl Corpus {
     fn new(samples: &[u8]) -> Self {
         let mut bytes = Vec::with_capacity(samples.len() + NOISE_LENGTH);
         bytes.extend_from_slice(samples);
-        // The reference's noise generator (`ZDICT_fillNoise`).
-        let mut acc: u32 = 2_654_435_761;
-        for _ in 0..NOISE_LENGTH {
-            acc = acc.wrapping_mul(2_246_822_519);
-            bytes.push((acc >> 21) as u8);
-        }
+        bytes.extend_from_slice(&noise_band());
         Self { bytes }
     }
 
@@ -133,10 +144,15 @@ impl Suffixes {
         Self { sa, noise: len }
     }
 
-    /// `suffix[at]`, where ranks `-1` and `len` (and any further out, which a
-    /// walk only reaches on a corpus whose tail matches the noise) are the
-    /// noise band. A negative rank wraps past every real one, so a single
-    /// compare tells the two apart.
+    /// Ranks in the array; rank `ranks()` is the upper noise slot.
+    #[inline]
+    fn ranks(&self) -> i64 {
+        self.sa.len() as i64
+    }
+
+    /// `suffix[at]`, where ranks `-1` and `len` are the noise band (the walks
+    /// stop at those two slots). A negative rank wraps past every real one,
+    /// so a single compare tells the two apart.
     #[inline]
     fn at(&self, at: i64) -> usize {
         match self.sa.get(at as u64 as usize) {
@@ -315,13 +331,18 @@ fn analyze_position(
     }
 
     // The neighbours sharing at least the minimum length, forward then back.
+    // Each walk stops at its noise slot as well as on a short match: every
+    // rank past the array reads the same band, so a corpus that repeats the
+    // band would otherwise walk forever. The reference reads past its two
+    // slots there, so it has no result to keep; on every other corpus the
+    // slot holds noise that ends the walk anyway.
     loop {
         end += 1;
-        if corpus.common(pos, suffixes.at(end)) < MIN_MATCH_LENGTH {
+        if end >= suffixes.ranks() || corpus.common(pos, suffixes.at(end)) < MIN_MATCH_LENGTH {
             break;
         }
     }
-    while corpus.common(pos, suffixes.at(start - 1)) >= MIN_MATCH_LENGTH {
+    while start > 0 && corpus.common(pos, suffixes.at(start - 1)) >= MIN_MATCH_LENGTH {
         start -= 1;
     }
 
@@ -377,7 +398,9 @@ fn analyze_position(
         end += 1;
         let length = corpus.common(pos, suffixes.at(end)).min(LENGTH_LIMIT - 1);
         lengths[length] += 1;
-        if length < MIN_MATCH_LENGTH {
+        // The upper noise slot is counted, as the reference counts it, and
+        // ends the walk (see the first walk above).
+        if length < MIN_MATCH_LENGTH || end >= suffixes.ranks() {
             break;
         }
     }
