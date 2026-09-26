@@ -649,7 +649,7 @@ impl BtMatcher {
     }
 
     #[inline(always)]
-    pub(crate) fn cached_literal_price(
+    pub(crate) fn cached_literal_price<const ACCURATE: bool>(
         profile: HcOptimalCostProfile,
         stats: &HcOptState,
         byte: u8,
@@ -666,7 +666,7 @@ impl BtMatcher {
             if *generations.get_unchecked(idx) == stamp {
                 return *prices.get_unchecked(idx);
             }
-            let price = profile.literal_price(stats, byte);
+            let price = profile.literal_price::<ACCURATE>(stats, byte);
             *prices.get_unchecked_mut(idx) = price;
             *generations.get_unchecked_mut(idx) = stamp;
             price
@@ -674,7 +674,7 @@ impl BtMatcher {
     }
 
     #[inline(always)]
-    pub(crate) fn cached_lit_length_price(
+    pub(crate) fn cached_lit_length_price<const ACCURATE: bool>(
         profile: HcOptimalCostProfile,
         stats: &HcOptState,
         lit_len: usize,
@@ -682,7 +682,7 @@ impl BtMatcher {
         stamp: u32,
     ) -> u32 {
         if lit_len >= cache.len() {
-            return profile.lit_length_price(stats, lit_len);
+            return profile.lit_length_price::<ACCURATE>(stats, lit_len);
         }
         // SAFETY: the early-return above proves `lit_len < cache.len()`.
         // Each cell pairs `[price, generation]`, so the stamp check and the
@@ -693,7 +693,7 @@ impl BtMatcher {
             if cell[1] == stamp {
                 return cell[0];
             }
-            let price = profile.lit_length_price(stats, lit_len);
+            let price = profile.lit_length_price::<ACCURATE>(stats, lit_len);
             cell[0] = price;
             cell[1] = stamp;
             price
@@ -701,7 +701,7 @@ impl BtMatcher {
     }
 
     #[inline(always)]
-    pub(crate) fn cached_lit_length_delta_price(
+    pub(crate) fn cached_lit_length_delta_price<const ACCURATE: bool>(
         profile: HcOptimalCostProfile,
         stats: &HcOptState,
         lit_len: usize,
@@ -715,13 +715,15 @@ impl BtMatcher {
             // No need to compute `0_usize - 1`.
             return 0;
         }
-        let price = Self::cached_lit_length_price(profile, stats, lit_len, cache, stamp);
-        let previous = Self::cached_lit_length_price(profile, stats, lit_len - 1, cache, stamp);
+        let price =
+            Self::cached_lit_length_price::<ACCURATE>(profile, stats, lit_len, cache, stamp);
+        let previous =
+            Self::cached_lit_length_price::<ACCURATE>(profile, stats, lit_len - 1, cache, stamp);
         price as i32 - previous as i32
     }
 
     #[inline(always)]
-    pub(crate) fn cached_match_length_price(
+    pub(crate) fn cached_match_length_price<const ACCURATE: bool>(
         profile: HcOptimalCostProfile,
         stats: &HcOptState,
         match_len: usize,
@@ -729,7 +731,7 @@ impl BtMatcher {
         stamp: u32,
     ) -> u32 {
         if match_len >= cache.len() {
-            return profile.match_length_price(stats, match_len);
+            return profile.match_length_price::<ACCURATE>(stats, match_len);
         }
         // SAFETY: see `cached_lit_length_price` — paired `[price, generation]`
         // cells, one cache line per probe; early return proves
@@ -739,7 +741,7 @@ impl BtMatcher {
             if cell[1] == stamp {
                 return cell[0];
             }
-            let price = profile.match_length_price(stats, match_len);
+            let price = profile.match_length_price::<ACCURATE>(stats, match_len);
             cell[0] = price;
             cell[1] = stamp;
             price

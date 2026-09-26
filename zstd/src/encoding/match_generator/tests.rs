@@ -950,10 +950,12 @@ fn btultra2_profile_disables_small_offset_handicap() {
         !profile.favor_small_offsets,
         "btultra2 should match upstream zstd opt2 offset pricing"
     );
-    assert!(
-        profile.accurate,
-        "btultra2 should use upstream zstd opt2 accurate pricing"
-    );
+    const {
+        assert!(
+            <super::super::strategy::BtUltra2 as super::super::strategy::Strategy>::ACCURATE_PRICE,
+            "btultra2 should use upstream zstd opt2 accurate pricing"
+        );
+    }
 }
 
 #[test]
@@ -1030,7 +1032,7 @@ fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
 
     hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abcd",
-        HcOptimalCostProfile::const_for_strategy::<super::super::strategy::BtUltra2>(),
+        <super::super::strategy::BtUltra2 as super::super::strategy::Strategy>::ACCURATE_PRICE,
     );
 
     let base_ll_freqs: [u32; HC_MAX_LL + 1] = [
@@ -1075,7 +1077,7 @@ fn dictionary_fse_seed_applies_without_huffman_seed() {
     hc.seed_dictionary_entropy(None, Some(&*ll), Some(&*ml), Some(&*of));
     hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abcd",
-        HcOptimalCostProfile::const_for_strategy::<super::super::strategy::BtUltra2>(),
+        <super::super::strategy::BtUltra2 as super::super::strategy::Strategy>::ACCURATE_PRICE,
     );
 
     let base_ll_freqs: [u32; HC_MAX_LL + 1] = [
@@ -1119,7 +1121,7 @@ fn dictionary_seed_overrides_predef_price_mode_on_tiny_input() {
     hc.seed_dictionary_entropy(None, Some(&*ll), Some(&*ml), Some(&*of));
     hc.backend.bt_mut().opt_state.rescale_freqs(
         b"abc",
-        HcOptimalCostProfile::const_for_strategy::<super::super::strategy::BtUltra2>(),
+        <super::super::strategy::BtUltra2 as super::super::strategy::Strategy>::ACCURATE_PRICE,
     );
     assert!(
         matches!(
@@ -1136,9 +1138,9 @@ fn lit_length_price_blocksize_max_costs_one_extra_bit() {
         HcOptimalCostProfile::const_for_strategy::<super::super::strategy::BtUltra2>();
     let mut stats_predef = HcOptState::new();
     stats_predef.price_type = HcOptPriceType::Predefined;
-    let predef_max = profile_predef.lit_length_price(&stats_predef, HC_BLOCKSIZE_MAX);
+    let predef_max = profile_predef.lit_length_price::<true>(&stats_predef, HC_BLOCKSIZE_MAX);
     let predef_prev =
-        profile_predef.lit_length_price(&stats_predef, HC_BLOCKSIZE_MAX.saturating_sub(1));
+        profile_predef.lit_length_price::<true>(&stats_predef, HC_BLOCKSIZE_MAX.saturating_sub(1));
     assert_eq!(
         predef_max,
         predef_prev + HC_BITCOST_MULTIPLIER,
@@ -1158,8 +1160,9 @@ fn lit_length_price_blocksize_max_costs_one_extra_bit() {
     stats_dyn.lit_freq.fill(1);
     stats_dyn.lit_sum = (HC_MAX_LIT + 1) as u32;
     stats_dyn.set_base_prices(true);
-    let dyn_max = profile_dyn.lit_length_price(&stats_dyn, HC_BLOCKSIZE_MAX);
-    let dyn_prev = profile_dyn.lit_length_price(&stats_dyn, HC_BLOCKSIZE_MAX.saturating_sub(1));
+    let dyn_max = profile_dyn.lit_length_price::<true>(&stats_dyn, HC_BLOCKSIZE_MAX);
+    let dyn_prev =
+        profile_dyn.lit_length_price::<true>(&stats_dyn, HC_BLOCKSIZE_MAX.saturating_sub(1));
     assert_eq!(
         dyn_max,
         dyn_prev + HC_BITCOST_MULTIPLIER,
@@ -1289,7 +1292,7 @@ fn literal_price_uses_eight_bits_when_literals_uncompressed() {
     stats.set_literals_compressed_for_tests(false);
     stats.price_type = HcOptPriceType::Predefined;
     assert_eq!(
-        profile.literal_price(&stats, b'a'),
+        profile.literal_price::<true>(&stats, b'a'),
         8 * HC_BITCOST_MULTIPLIER,
         "uncompressed literals should cost 8 bits regardless of price mode"
     );
@@ -1337,7 +1340,7 @@ fn dictionary_huffman_seed_ignored_when_literals_uncompressed() {
     stats.seed_dictionary_entropy(Some(&huff), Some(&*ll), Some(&*ml), Some(&*of));
     stats.rescale_freqs(
         b"abcd",
-        HcOptimalCostProfile::const_for_strategy::<super::super::strategy::BtUltra2>(),
+        <super::super::strategy::BtUltra2 as super::super::strategy::Strategy>::ACCURATE_PRICE,
     );
     assert_eq!(
         stats.lit_sum, 0,

@@ -51,7 +51,7 @@ unsafe fn priceset_improved_mask8_avx2(next_cost: &[u32; 8], node_price: &[u32])
 /// so the SoA vector path stays byte-identical.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn priceset_next_cost(
+fn priceset_next_cost<const ACCURATE: bool>(
     profile: HcOptimalCostProfile,
     stats: &HcOptState,
     ml_cache: &mut [[u32; 2]],
@@ -61,8 +61,9 @@ fn priceset_next_cost(
     off_price: u32,
     base_cost: u32,
 ) -> u32 {
-    let ml_price =
-        BtMatcher::cached_match_length_price(profile, stats, match_len, ml_cache, ml_stamp);
+    let ml_price = BtMatcher::cached_match_length_price::<ACCURATE>(
+        profile, stats, match_len, ml_cache, ml_stamp,
+    );
     let seq_cost = BtMatcher::add_prices(
         ll0_price,
         profile.match_price_from_parts(off_price, ml_price, stats),
@@ -94,7 +95,7 @@ fn priceset_next_cost(
     ),
     allow(dead_code)
 )]
-pub(crate) fn priceset_range_nonabort_scalar(
+pub(crate) fn priceset_range_nonabort_scalar<const ACCURATE: bool>(
     node_prices: &mut [u32],
     nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
@@ -113,7 +114,7 @@ pub(crate) fn priceset_range_nonabort_scalar(
 ) -> usize {
     let mut new_last = last_pos;
     for ml in start..=max {
-        let next_cost = priceset_next_cost(
+        let next_cost = priceset_next_cost::<ACCURATE>(
             profile, stats, ml_cache, ml_stamp, ml, ll0_price, off_price, base_cost,
         );
         let next = pos + ml;
@@ -162,7 +163,7 @@ pub(crate) fn priceset_range_nonabort_scalar(
     )),
     allow(dead_code)
 )]
-fn priceset_range_vec<const W: usize>(
+fn priceset_range_vec<const W: usize, const ACCURATE: bool>(
     node_prices: &mut [u32],
     nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
@@ -215,7 +216,7 @@ fn priceset_range_vec<const W: usize>(
             }
         } else {
             for (k, slot) in buf.iter_mut().enumerate() {
-                *slot = priceset_next_cost(
+                *slot = priceset_next_cost::<ACCURATE>(
                     profile,
                     stats,
                     ml_cache,
@@ -247,7 +248,7 @@ fn priceset_range_vec<const W: usize>(
         ml += W;
     }
     while ml <= max {
-        let next_cost = priceset_next_cost(
+        let next_cost = priceset_next_cost::<ACCURATE>(
             profile, stats, ml_cache, ml_stamp, ml, ll0_price, off_price, base_cost,
         );
         let next = pos + ml;
@@ -322,7 +323,7 @@ unsafe fn priceset_cached_prices8_avx2(cells: &[[u32; 2]], stamp: u32) -> Option
 #[target_feature(enable = "avx2")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn priceset_range_nonabort_avx2(
+pub(crate) unsafe fn priceset_range_nonabort_avx2<const ACCURATE: bool>(
     node_prices: &mut [u32],
     nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
@@ -339,7 +340,7 @@ pub(crate) unsafe fn priceset_range_nonabort_avx2(
     reps: [u32; 3],
     last_pos: usize,
 ) -> usize {
-    priceset_range_vec::<8>(
+    priceset_range_vec::<8, ACCURATE>(
         node_prices,
         nodes,
         ml_cache,
@@ -405,7 +406,7 @@ unsafe fn priceset_improved_mask4_neon(next_cost: &[u32; 4], node_price: &[u32])
 #[target_feature(enable = "neon")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn priceset_range_nonabort_neon(
+pub(crate) unsafe fn priceset_range_nonabort_neon<const ACCURATE: bool>(
     node_prices: &mut [u32],
     nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
@@ -422,7 +423,7 @@ pub(crate) unsafe fn priceset_range_nonabort_neon(
     reps: [u32; 3],
     last_pos: usize,
 ) -> usize {
-    priceset_range_vec::<4>(
+    priceset_range_vec::<4, ACCURATE>(
         node_prices,
         nodes,
         ml_cache,
@@ -537,7 +538,7 @@ unsafe fn priceset_improved_mask4_sse41(next_cost: &[u32; 4], node_price: &[u32]
 #[target_feature(enable = "sse4.2")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn priceset_range_nonabort_sse41(
+pub(crate) unsafe fn priceset_range_nonabort_sse41<const ACCURATE: bool>(
     node_prices: &mut [u32],
     nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
@@ -554,7 +555,7 @@ pub(crate) unsafe fn priceset_range_nonabort_sse41(
     reps: [u32; 3],
     last_pos: usize,
 ) -> usize {
-    priceset_range_vec::<4>(
+    priceset_range_vec::<4, ACCURATE>(
         node_prices,
         nodes,
         ml_cache,
@@ -584,7 +585,7 @@ pub(crate) unsafe fn priceset_range_nonabort_sse41(
 #[target_feature(enable = "sse2")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn priceset_range_nonabort_sse2(
+pub(crate) unsafe fn priceset_range_nonabort_sse2<const ACCURATE: bool>(
     node_prices: &mut [u32],
     nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
@@ -601,7 +602,7 @@ pub(crate) unsafe fn priceset_range_nonabort_sse2(
     reps: [u32; 3],
     last_pos: usize,
 ) -> usize {
-    priceset_range_vec::<4>(
+    priceset_range_vec::<4, ACCURATE>(
         node_prices,
         nodes,
         ml_cache,
@@ -678,7 +679,7 @@ unsafe fn priceset_improved_mask4_simd128(next_cost: &[u32; 4], node_price: &[u3
 #[target_feature(enable = "simd128")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn priceset_range_nonabort_simd128(
+pub(crate) unsafe fn priceset_range_nonabort_simd128<const ACCURATE: bool>(
     node_prices: &mut [u32],
     nodes: &mut [MaybeUninit<HcOptimalNode>],
     ml_cache: &mut [[u32; 2]],
@@ -695,7 +696,7 @@ pub(crate) unsafe fn priceset_range_nonabort_simd128(
     reps: [u32; 3],
     last_pos: usize,
 ) -> usize {
-    priceset_range_vec::<4>(
+    priceset_range_vec::<4, ACCURATE>(
         node_prices,
         nodes,
         ml_cache,
