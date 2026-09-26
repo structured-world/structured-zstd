@@ -19,10 +19,16 @@ const NAIVE_THRESHOLD: usize = 10;
 /// A symbol of the text being sorted: the bytes at the top level, the ranks of
 /// the reduced string in the recursion.
 trait Symbol: Copy + Ord {
+    /// Whether the bucket table can outgrow the cache: the recursion's
+    /// alphabet is its number of names.
+    const WIDE: bool;
+
     fn index(self) -> usize;
 }
 
 impl Symbol for u8 {
+    const WIDE: bool = false;
+
     #[inline]
     fn index(self) -> usize {
         usize::from(self)
@@ -30,9 +36,43 @@ impl Symbol for u8 {
 }
 
 impl Symbol for u32 {
+    const WIDE: bool = true;
+
     #[inline]
     fn index(self) -> usize {
         self as usize
+    }
+}
+
+/// How many entries ahead of the sweep its loads are prefetched. The text a
+/// swept entry points into is prefetched twice as far ahead, so that the
+/// symbol is in cache when the bucket cursor it selects is prefetched.
+const PREFETCH_DISTANCE: usize = 32;
+
+/// Warm the loads the sweep makes when it reaches entries `near` and `far`:
+/// the text before the suffix at `far` and, where the bucket table is large,
+/// the cursor of the bucket the suffix at `near` selects. An index past the
+/// array (a sweep's wrapped subtraction included) warms nothing. A hint only:
+/// entries not yet written, or not live, aim the text prefetch anywhere and
+/// read a clamped symbol.
+#[inline(always)]
+fn prefetch_ahead<T: Symbol>(s: &[T], sa: &[u32], buf: &[u32], near: usize, far: usize) {
+    let n = sa.len();
+    if far < n {
+        // SAFETY: bounded by the test above.
+        let pos = unsafe { *sa.get_unchecked(far) } as usize;
+        crate::decoding::prefetch::prefetch_l1_at(
+            s.as_ptr().wrapping_add(pos.wrapping_sub(1)).cast(),
+        );
+    }
+    if T::WIDE && near < n {
+        // SAFETY: bounded by the test above.
+        let near = unsafe { *sa.get_unchecked(near) } as usize;
+        // A dead entry (top bit set) or an empty one wraps past `n - 1`.
+        let at = near.wrapping_sub(1).min(n - 1);
+        // SAFETY: `at < n == s.len()`.
+        let c = unsafe { s.get_unchecked(at) }.index();
+        crate::decoding::prefetch::prefetch_l1_at(buf.as_ptr().wrapping_add(c).cast());
     }
 }
 
@@ -315,6 +355,7 @@ fn induce<T: Symbol>(s: &[T], sa: &mut [u32], counts: &[u32], buf: &mut [u32]) {
     };
     b += 1;
     for i in 0..n {
+        prefetch_ahead(s, sa, buf, i + PREFETCH_DISTANCE, i + 2 * PREFETCH_DISTANCE);
         // SAFETY: `i < n == sa.len()`.
         let v = unsafe { *sa.get_unchecked(i) };
         unsafe { *sa.get_unchecked_mut(i) = !v };
@@ -345,6 +386,13 @@ fn induce<T: Symbol>(s: &[T], sa: &mut [u32], counts: &[u32], buf: &mut [u32]) {
     let mut c1 = 0usize;
     let mut b = buf[0] as usize;
     for i in (0..n).rev() {
+        prefetch_ahead(
+            s,
+            sa,
+            buf,
+            i.wrapping_sub(PREFETCH_DISTANCE),
+            i.wrapping_sub(2 * PREFETCH_DISTANCE),
+        );
         // SAFETY: `i < n == sa.len()`.
         let v = unsafe { *sa.get_unchecked(i) };
         if live(v) {
