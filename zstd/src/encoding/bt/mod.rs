@@ -4,7 +4,7 @@
 //! model (`opt_state`), the optimal-parser scratch buffers
 //! (`opt_*_scratch` / `opt_*_generation` / `opt_*_stamp`), and the
 //! LDM long-distance match buffer (`ldm_sequences`). Method bodies
-//! (BT walk, `bt_insert_step_no_rebase`, `bt_update_tree_until`,
+//! (BT walk, `bt_insert_range`, `bt_update_tree_until`,
 //! `build_optimal_plan*`, `collect_optimal_candidates*`,
 //! `emit_optimal_plan`, …) still live on `HcMatchGenerator` and will
 //! move onto `impl BtMatcher` once Stage 3b threads

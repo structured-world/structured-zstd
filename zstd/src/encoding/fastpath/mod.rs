@@ -51,8 +51,8 @@
 //!
 //! Week 1 (this commit): module scaffold + dispatcher skeleton.
 //! Week 2a: match-length / common-prefix-len + `count_match_from_indices`.
-//! Week 3a: BT walk (`bt_insert_step_no_rebase`,
-//!   `bt_insert_and_collect_matches`) + HC chain walk.
+//! Week 3a: BT walk (`bt_insert_range`, the collect-matches body) + HC
+//!   chain walk.
 //! Week 3b: optimal parser DP (`build_optimal_plan_impl` + price helpers).
 //! Week 4: entropy encoders (FSE `encode_interleaved`, Huff0 `encode_stream`).
 //! Week 5-6: bench vs `perf/pre-intrinsics-refactor-baseline` tag, profile,

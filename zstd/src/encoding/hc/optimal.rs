@@ -1152,7 +1152,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $reps:ident,
         $ll0:ident,
         $out:ident,
-        $bt_insert_step:ident,
+        $bt_insert_range:ident,
         $cpl:path,
         $cmf:path $(,)?
     ) => {{
@@ -1178,28 +1178,27 @@ macro_rules! collect_optimal_candidates_initialized_body {
             return;
         }
         {
-            // BT tree catch-up folded inline (was a per-position call to
-            // bt_update_tree_until): insert the positions the parser skipped into
-            // the binary tree before this position's search. Upstream zstd
-            // ZSTD_updateTree shape; `$bt_insert_step` overshoots the target with
-            // no clamp (forward skips match-covered positions), exactly as C.
-            // SAFETY: caller is in the same target_feature umbrella as
-            // `$bt_insert_step`; the runtime kernel detector already gated entry.
+            // BT tree catch-up: insert the positions the parser skipped into the
+            // binary tree before this position's search, as one run (upstream
+            // zstd ZSTD_updateTree). `$bt_insert_range` overshoots the target
+            // with no clamp (a long match skips the positions it covers),
+            // exactly as upstream.
             if $self.table.skip_insert_until_abs < $self.table.history_abs_start {
                 $self.table.skip_insert_until_abs = $self.table.history_abs_start;
             }
-            let mut update_abs = $self.table.skip_insert_until_abs;
+            let update_abs = $self.table.skip_insert_until_abs;
             // No rebase guard: `arm_block_positions` cleared every position in
             // this block before the parse began, and the catch-up only inserts
             // positions below `$abs_pos`, which is in it.
             debug_assert!($self.table.can_skip_rebase_check($abs_pos));
-            while update_abs < $abs_pos {
-                let forward = unsafe {
+            if update_abs < $abs_pos {
+                // SAFETY: caller is in the same target_feature umbrella as
+                // `$bt_insert_range`; the runtime kernel detector gated entry.
+                let _ = unsafe {
                     $self
                         .table
-                        .$bt_insert_step(update_abs, $current_abs_end, $abs_pos)
+                        .$bt_insert_range(update_abs, $abs_pos, $current_abs_end, $abs_pos)
                 };
-                update_abs += forward.max(1);
             }
             $self.table.skip_insert_until_abs = $abs_pos;
         }
@@ -2253,11 +2252,10 @@ impl HcMatchGenerator {
         }
     }
 
-    /// NEON-umbrella variant. Every inner helper (`bt_update_tree_until_neon`,
-    /// `for_each_repcode_candidate_with_reps_neon`, `hash3_candidate_neon`,
-    /// `bt_insert_and_collect_matches_neon`, `fastpath::neon::
-    /// common_prefix_len_ptr`) shares the NEON umbrella so the per-position
-    /// pipeline executes as a single straight-line inline sequence.
+    /// NEON-umbrella variant: the repeat and hash3 probes, the tree walk and
+    /// `fastpath::neon::common_prefix_len_ptr` share the NEON umbrella so the
+    /// per-position search runs as one straight-line sequence, and the tree
+    /// catch-up (`bt_insert_range_neon`) runs under the same tier.
     #[cfg(all(
         target_arch = "aarch64",
         target_endian = "little",
@@ -2285,7 +2283,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
-            bt_insert_step_no_rebase_neon,
+            bt_insert_range_neon,
             crate::encoding::fastpath::neon::common_prefix_len_ptr,
             crate::encoding::fastpath::neon::count_match_from_indices,
         )
@@ -2317,7 +2315,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
-            bt_insert_step_no_rebase_sse2,
+            bt_insert_range_sse2,
             crate::encoding::fastpath::sse2::common_prefix_len_ptr,
             crate::encoding::fastpath::sse2::count_match_from_indices,
         )
@@ -2355,7 +2353,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
-            bt_insert_step_no_rebase_sse2,
+            bt_insert_range_sse2,
             crate::encoding::fastpath::sse2::common_prefix_len_ptr,
             crate::encoding::fastpath::sse2::count_match_from_indices,
         )
@@ -2387,7 +2385,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
-            bt_insert_step_no_rebase_avx2_bmi2,
+            bt_insert_range_avx2_bmi2,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
             crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
         )
@@ -2426,7 +2424,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
-            bt_insert_step_no_rebase_simd128,
+            bt_insert_range_simd128,
             crate::encoding::fastpath::simd128::common_prefix_len_ptr,
             crate::encoding::fastpath::simd128::count_match_from_indices,
         )
@@ -2461,7 +2459,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
-            bt_insert_step_no_rebase_scalar,
+            bt_insert_range_scalar,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
             crate::encoding::fastpath::scalar::count_match_from_indices,
         )

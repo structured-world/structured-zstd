@@ -1679,17 +1679,17 @@ impl MatchTable {
         (start_cursor, start_cursor)
     }
 
-    /// Stage D: BT walker step. Cross-platform dispatcher that picks
-    /// the per-kernel variant so the per-iteration
-    /// `count_match_from_indices` symbol inlines under the kernel's
-    /// `target_feature` umbrella. Previously lived on `BtMatcher`
-    /// but the body uses only table state plus `self.search_depth`,
-    /// so it migrates onto `MatchTable` and clears the cross-struct
-    /// borrow that blocked the rest of the BT update chain.
+    /// Insert the positions `[from, stop)` into the binary tree, with the
+    /// window floor taken at `target_abs`, and return the cursor after the
+    /// last insertion (a long match can carry it past `stop`). Cross-platform
+    /// dispatcher: the per-kernel variant runs the whole range under its
+    /// `target_feature` umbrella. Every position in the range must already be
+    /// representable (see [`Self::arm_block_positions`]).
     #[inline(always)]
-    pub(crate) fn bt_insert_step_no_rebase(
+    pub(crate) fn bt_insert_range(
         &mut self,
-        abs_pos: usize,
+        from: usize,
+        stop: usize,
         current_abs_end: usize,
         target_abs: usize,
     ) -> usize {
@@ -1699,7 +1699,7 @@ impl MatchTable {
             feature = "kernel-neon"
         ))]
         unsafe {
-            self.bt_insert_step_no_rebase_neon(abs_pos, current_abs_end, target_abs)
+            self.bt_insert_range_neon(from, stop, current_abs_end, target_abs)
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
@@ -1707,14 +1707,14 @@ impl MatchTable {
             match self.kernel {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.bt_insert_step_no_rebase_avx2_bmi2(abs_pos, current_abs_end, target_abs)
+                    self.bt_insert_range_avx2_bmi2(from, stop, current_abs_end, target_abs)
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    self.bt_insert_step_no_rebase_sse2(abs_pos, current_abs_end, target_abs)
+                    self.bt_insert_range_sse2(from, stop, current_abs_end, target_abs)
                 },
                 FastpathKernel::Scalar => {
-                    self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
+                    self.bt_insert_range_scalar(from, stop, current_abs_end, target_abs)
                 }
             }
         }
@@ -1728,7 +1728,7 @@ impl MatchTable {
         // SAFETY: the `cfg` above establishes `simd128` at compile time, which
         // is exactly the umbrella the callee declares.
         unsafe {
-            self.bt_insert_step_no_rebase_simd128(abs_pos, current_abs_end, target_abs)
+            self.bt_insert_range_simd128(from, stop, current_abs_end, target_abs)
         }
         #[cfg(not(any(
             all(
@@ -1745,11 +1745,11 @@ impl MatchTable {
             )
         )))]
         {
-            self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
+            self.bt_insert_range_scalar(from, stop, current_abs_end, target_abs)
         }
     }
 
-    /// NEON umbrella BT walker step.
+    /// NEON umbrella binary-tree range insertion.
     ///
     /// # Safety
     /// AArch64 with NEON (baseline).
@@ -1759,24 +1759,26 @@ impl MatchTable {
         feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
-    pub(crate) unsafe fn bt_insert_step_no_rebase_neon(
+    pub(crate) unsafe fn bt_insert_range_neon(
         &mut self,
-        abs_pos: usize,
+        from: usize,
+        stop: usize,
         current_abs_end: usize,
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        super::super::hc::generator::bt_insert_step_no_rebase_body!(
+        super::super::hc::generator::bt_insert_range_body!(
             self,
             search_depth,
-            abs_pos,
+            from,
+            stop,
             current_abs_end,
             target_abs,
             crate::encoding::fastpath::neon::count_match_from_indices
         )
     }
 
-    /// SSE2 umbrella BT walker step.
+    /// SSE2 umbrella binary-tree range insertion.
     ///
     /// # Safety
     /// x86/x86_64 with SSE2.
@@ -1785,24 +1787,26 @@ impl MatchTable {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
-    pub(crate) unsafe fn bt_insert_step_no_rebase_sse2(
+    pub(crate) unsafe fn bt_insert_range_sse2(
         &mut self,
-        abs_pos: usize,
+        from: usize,
+        stop: usize,
         current_abs_end: usize,
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        super::super::hc::generator::bt_insert_step_no_rebase_body!(
+        super::super::hc::generator::bt_insert_range_body!(
             self,
             search_depth,
-            abs_pos,
+            from,
+            stop,
             current_abs_end,
             target_abs,
             crate::encoding::fastpath::sse2::count_match_from_indices
         )
     }
 
-    /// AVX2+BMI2 umbrella BT walker step.
+    /// AVX2+BMI2 umbrella binary-tree range insertion.
     ///
     /// # Safety
     /// x86/x86_64 with AVX2 + BMI2.
@@ -1811,24 +1815,26 @@ impl MatchTable {
         feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
-    pub(crate) unsafe fn bt_insert_step_no_rebase_avx2_bmi2(
+    pub(crate) unsafe fn bt_insert_range_avx2_bmi2(
         &mut self,
-        abs_pos: usize,
+        from: usize,
+        stop: usize,
         current_abs_end: usize,
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        super::super::hc::generator::bt_insert_step_no_rebase_body!(
+        super::super::hc::generator::bt_insert_range_body!(
             self,
             search_depth,
-            abs_pos,
+            from,
+            stop,
             current_abs_end,
             target_abs,
             crate::encoding::fastpath::avx2_bmi2::count_match_from_indices
         )
     }
 
-    /// WebAssembly `simd128` umbrella BT walker step.
+    /// WebAssembly `simd128` umbrella binary-tree range insertion.
     ///
     /// # Safety
     /// wasm32 with `simd128` enabled at compile time.
@@ -1838,42 +1844,46 @@ impl MatchTable {
         feature = "kernel-simd128"
     ))]
     #[target_feature(enable = "simd128")]
-    pub(crate) unsafe fn bt_insert_step_no_rebase_simd128(
+    pub(crate) unsafe fn bt_insert_range_simd128(
         &mut self,
-        abs_pos: usize,
+        from: usize,
+        stop: usize,
         current_abs_end: usize,
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        super::super::hc::generator::bt_insert_step_no_rebase_body!(
+        super::super::hc::generator::bt_insert_range_body!(
             self,
             search_depth,
-            abs_pos,
+            from,
+            stop,
             current_abs_end,
             target_abs,
             crate::encoding::fastpath::simd128::count_match_from_indices
         )
     }
 
-    /// Scalar fallback BT walker step. Compiled unless the NEON tier covers
-    /// this target, i.e. on every non-AArch64 target and on AArch64 when
-    /// `kernel-neon` is off.
+    /// Scalar fallback binary-tree range insertion. Compiled unless the NEON
+    /// tier covers this target, i.e. on every non-AArch64 target and on
+    /// AArch64 when `kernel-neon` is off.
     #[cfg(not(all(
         target_arch = "aarch64",
         target_endian = "little",
         feature = "kernel-neon"
     )))]
-    pub(crate) fn bt_insert_step_no_rebase_scalar(
+    pub(crate) fn bt_insert_range_scalar(
         &mut self,
-        abs_pos: usize,
+        from: usize,
+        stop: usize,
         current_abs_end: usize,
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        super::super::hc::generator::bt_insert_step_no_rebase_body!(
+        super::super::hc::generator::bt_insert_range_body!(
             self,
             search_depth,
-            abs_pos,
+            from,
+            stop,
             current_abs_end,
             target_abs,
             crate::encoding::fastpath::scalar::count_match_from_indices
@@ -1881,259 +1891,42 @@ impl MatchTable {
     }
 
     /// BT-side history replay after [`Self::begin_rebase`]. Re-walks
-    /// `history_start..abs_pos` through the BT step so the pointer-pair
+    /// `history_start..abs_pos` through the tree insertion so the pointer-pair
     /// table is consistent with the freshly reset `position_base`.
     pub(crate) fn replay_history_for_rebase_bt(&mut self, history_start: usize, abs_pos: usize) {
         let rebuild_end = self.history_abs_end();
-        let mut pos = history_start;
-        while pos < abs_pos {
-            let forward = self.bt_insert_step_no_rebase(pos, rebuild_end, abs_pos);
-            // `pos` is a frame-lifetime absolute cursor that can approach
-            // `usize::MAX` on long 32-bit streams. Cap the step at the
-            // remaining distance to `abs_pos` so the addition stays
-            // within `usize` even when the BT walker returns a large
-            // `forward` near the stream end.
-            let step = forward.max(1).min(abs_pos - pos);
-            pos += step;
-        }
+        let _ = self.bt_insert_range(history_start, abs_pos, rebuild_end, abs_pos);
     }
 
-    /// Stage D: BT-tree update dispatcher. Picks the kernel-specific
-    /// variant so the per-iteration BT walker inlines under the
-    /// surrounding `target_feature` umbrella.
-    #[inline(always)]
+    /// Insert every position from the insertion frontier up to `abs_pos`
+    /// into the binary tree (upstream zstd `ZSTD_updateTree`).
+    ///
+    /// A long match carries the cursor past `abs_pos` with no clamp, as
+    /// upstream's `idx += ZSTD_insertBt1(...)` does, and the frontier is then
+    /// set to `abs_pos` (`nextToUpdate = target`): the positions the match
+    /// covered stay out of the tree. Clamping to `abs_pos` inserted them and
+    /// gave the tree candidates upstream never surfaces (a longer but farther
+    /// match the optimal parser then forced over a cheaper closer one).
     pub(crate) fn bt_update_tree_until(&mut self, abs_pos: usize, current_abs_end: usize) {
-        #[cfg(all(
-            target_arch = "aarch64",
-            target_endian = "little",
-            feature = "kernel-neon"
-        ))]
-        unsafe {
-            self.bt_update_tree_until_neon(abs_pos, current_abs_end)
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
         }
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            use crate::encoding::fastpath::FastpathKernel;
-            match self.kernel {
-                #[cfg(feature = "kernel-avx2")]
-                FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.bt_update_tree_until_avx2_bmi2(abs_pos, current_abs_end)
-                },
-                #[cfg(feature = "kernel-sse")]
-                FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    self.bt_update_tree_until_sse2(abs_pos, current_abs_end)
-                },
-                FastpathKernel::Scalar => {
-                    self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
+        let mut update_abs = self.skip_insert_until_abs;
+        if update_abs < abs_pos {
+            if self.can_skip_rebase_check(abs_pos) {
+                // Every position up to the target is representable: one run.
+                let _ = self.bt_insert_range(update_abs, abs_pos, current_abs_end, abs_pos);
+            } else {
+                // A rebase may be due inside the run, and it moves the
+                // coordinates the range hoists, so go one position at a time.
+                while update_abs < abs_pos {
+                    if !self.can_skip_rebase_check(abs_pos) {
+                        self.maybe_rebase_positions(update_abs);
+                    }
+                    update_abs =
+                        self.bt_insert_range(update_abs, update_abs + 1, current_abs_end, abs_pos);
                 }
             }
-        }
-        #[cfg(all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel-simd128"
-        ))]
-        unsafe {
-            self.bt_update_tree_until_simd128(abs_pos, current_abs_end)
-        }
-        #[cfg(not(any(
-            all(
-                target_arch = "aarch64",
-                target_endian = "little",
-                feature = "kernel-neon"
-            ),
-            all(
-                target_arch = "wasm32",
-                target_feature = "simd128",
-                feature = "kernel-simd128"
-            ),
-            target_arch = "x86",
-            target_arch = "x86_64"
-        )))]
-        {
-            self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
-        }
-    }
-
-    /// WebAssembly `simd128` umbrella variant: the per-iteration
-    /// `bt_insert_step_no_rebase_simd128` inlines into the body because both
-    /// share the `target_feature = "simd128"` umbrella, so the tree walk runs
-    /// the same tier as the insert step it drives.
-    ///
-    /// # Safety
-    /// wasm32 with `simd128` enabled at compile time.
-    #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        feature = "kernel-simd128"
-    ))]
-    #[target_feature(enable = "simd128")]
-    pub(crate) unsafe fn bt_update_tree_until_simd128(
-        &mut self,
-        abs_pos: usize,
-        current_abs_end: usize,
-    ) {
-        if self.skip_insert_until_abs < self.history_abs_start {
-            self.skip_insert_until_abs = self.history_abs_start;
-        }
-        let mut update_abs = self.skip_insert_until_abs;
-        while update_abs < abs_pos {
-            if !self.can_skip_rebase_check(abs_pos) {
-                self.maybe_rebase_positions(update_abs);
-            }
-            let forward = unsafe {
-                self.bt_insert_step_no_rebase_simd128(update_abs, current_abs_end, abs_pos)
-            };
-            // Upstream zstd `ZSTD_updateTree`: no clamp to the target, so a long
-            // match's covered positions stay out of the tree exactly as C leaves
-            // them.
-            update_abs += forward.max(1);
-        }
-        self.skip_insert_until_abs = abs_pos;
-    }
-
-    /// NEON-umbrella variant: per-iteration `bt_insert_step_no_rebase_neon`
-    /// inlines into the body because both share the
-    /// `target_feature = "neon"` umbrella.
-    ///
-    /// # Safety
-    /// AArch64 with NEON (baseline).
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_endian = "little",
-        feature = "kernel-neon"
-    ))]
-    #[target_feature(enable = "neon")]
-    pub(crate) unsafe fn bt_update_tree_until_neon(
-        &mut self,
-        abs_pos: usize,
-        current_abs_end: usize,
-    ) {
-        if self.skip_insert_until_abs < self.history_abs_start {
-            self.skip_insert_until_abs = self.history_abs_start;
-        }
-        let mut update_abs = self.skip_insert_until_abs;
-        while update_abs < abs_pos {
-            if !self.can_skip_rebase_check(abs_pos) {
-                self.maybe_rebase_positions(update_abs);
-            }
-            // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
-            let forward =
-                unsafe { self.bt_insert_step_no_rebase_neon(update_abs, current_abs_end, abs_pos) };
-            // Upstream zstd `ZSTD_updateTree`: `idx += ZSTD_insertBt1(...)` with
-            // NO clamp to the target. The insert step's `forward` skips the
-            // positions a long match already covers, so letting it overshoot
-            // `abs_pos` leaves those positions OUT of the tree exactly as C does
-            // (`nextToUpdate = target` afterwards). Clamping to `abs_pos` inserted
-            // those covered positions, giving our tree extra candidates C never
-            // surfaces (e.g. a longer-but-farther match the optimal parser then
-            // wrongly forces over a cheaper closer one).
-            update_abs += forward.max(1);
-        }
-        self.skip_insert_until_abs = abs_pos;
-    }
-
-    /// SSE4.2 umbrella variant.
-    ///
-    /// # Safety
-    /// x86/x86_64 with SSE2.
-    #[cfg(all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel-sse"
-    ))]
-    #[target_feature(enable = "sse2")]
-    pub(crate) unsafe fn bt_update_tree_until_sse2(
-        &mut self,
-        abs_pos: usize,
-        current_abs_end: usize,
-    ) {
-        if self.skip_insert_until_abs < self.history_abs_start {
-            self.skip_insert_until_abs = self.history_abs_start;
-        }
-        let mut update_abs = self.skip_insert_until_abs;
-        while update_abs < abs_pos {
-            if !self.can_skip_rebase_check(abs_pos) {
-                self.maybe_rebase_positions(update_abs);
-            }
-            let forward =
-                unsafe { self.bt_insert_step_no_rebase_sse2(update_abs, current_abs_end, abs_pos) };
-            // Upstream zstd `ZSTD_updateTree`: `idx += ZSTD_insertBt1(...)` with
-            // NO clamp to the target. The insert step's `forward` skips the
-            // positions a long match already covers, so letting it overshoot
-            // `abs_pos` leaves those positions OUT of the tree exactly as C does
-            // (`nextToUpdate = target` afterwards). Clamping to `abs_pos` inserted
-            // those covered positions, giving our tree extra candidates C never
-            // surfaces (e.g. a longer-but-farther match the optimal parser then
-            // wrongly forces over a cheaper closer one).
-            update_abs += forward.max(1);
-        }
-        self.skip_insert_until_abs = abs_pos;
-    }
-
-    /// AVX2+BMI2 umbrella variant.
-    ///
-    /// # Safety
-    /// x86/x86_64 with AVX2 + BMI2.
-    #[cfg(all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel-avx2"
-    ))]
-    #[target_feature(enable = "avx2,bmi2")]
-    pub(crate) unsafe fn bt_update_tree_until_avx2_bmi2(
-        &mut self,
-        abs_pos: usize,
-        current_abs_end: usize,
-    ) {
-        if self.skip_insert_until_abs < self.history_abs_start {
-            self.skip_insert_until_abs = self.history_abs_start;
-        }
-        let mut update_abs = self.skip_insert_until_abs;
-        while update_abs < abs_pos {
-            if !self.can_skip_rebase_check(abs_pos) {
-                self.maybe_rebase_positions(update_abs);
-            }
-            let forward = unsafe {
-                self.bt_insert_step_no_rebase_avx2_bmi2(update_abs, current_abs_end, abs_pos)
-            };
-            // Upstream zstd `ZSTD_updateTree`: `idx += ZSTD_insertBt1(...)` with
-            // NO clamp to the target. The insert step's `forward` skips the
-            // positions a long match already covers, so letting it overshoot
-            // `abs_pos` leaves those positions OUT of the tree exactly as C does
-            // (`nextToUpdate = target` afterwards). Clamping to `abs_pos` inserted
-            // those covered positions, giving our tree extra candidates C never
-            // surfaces (e.g. a longer-but-farther match the optimal parser then
-            // wrongly forces over a cheaper closer one).
-            update_abs += forward.max(1);
-        }
-        self.skip_insert_until_abs = abs_pos;
-    }
-
-    /// Scalar fallback, compiled unless the NEON tier covers this target.
-    #[cfg(not(all(
-        target_arch = "aarch64",
-        target_endian = "little",
-        feature = "kernel-neon"
-    )))]
-    pub(crate) fn bt_update_tree_until_scalar(&mut self, abs_pos: usize, current_abs_end: usize) {
-        if self.skip_insert_until_abs < self.history_abs_start {
-            self.skip_insert_until_abs = self.history_abs_start;
-        }
-        let mut update_abs = self.skip_insert_until_abs;
-        while update_abs < abs_pos {
-            if !self.can_skip_rebase_check(abs_pos) {
-                self.maybe_rebase_positions(update_abs);
-            }
-            let forward =
-                self.bt_insert_step_no_rebase_scalar(update_abs, current_abs_end, abs_pos);
-            // Upstream zstd `ZSTD_updateTree`: `idx += ZSTD_insertBt1(...)` with
-            // NO clamp to the target. The insert step's `forward` skips the
-            // positions a long match already covers, so letting it overshoot
-            // `abs_pos` leaves those positions OUT of the tree exactly as C does
-            // (`nextToUpdate = target` afterwards). Clamping to `abs_pos` inserted
-            // those covered positions, giving our tree extra candidates C never
-            // surfaces (e.g. a longer-but-farther match the optimal parser then
-            // wrongly forces over a cheaper closer one).
-            update_abs += forward.max(1);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -2514,7 +2307,7 @@ impl MatchTable {
         let mut pos = current_abs_start;
         while pos < current_abs_end {
             self.maybe_rebase_positions(pos);
-            let _ = self.bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
+            let _ = self.bt_insert_range(pos, pos + 1, current_abs_end, current_abs_end);
             self.insert_hash3_only_no_rebase(pos);
             let next = pos.saturating_add(INCOMPRESSIBLE_SKIP_STEP);
             if next <= pos {
@@ -2533,7 +2326,7 @@ impl MatchTable {
                 continue;
             }
             self.maybe_rebase_positions(pos);
-            let _ = self.bt_insert_step_no_rebase(pos, current_abs_end, current_abs_end);
+            let _ = self.bt_insert_range(pos, pos + 1, current_abs_end, current_abs_end);
             self.insert_hash3_only_no_rebase(pos);
         }
 
