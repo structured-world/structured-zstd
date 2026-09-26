@@ -111,8 +111,9 @@ anything but zstd and `--rsyncable`, which needs the worker threads this build
 does not have. `-M` is treated as the safety promise it is: on the
 runs that decode, a limit covering the 128 MiB window, the decoder's buffers
 and the `-D` dictionary is kept and a tighter one is refused rather than
-ignored. Compressing, listing and training allocate no decoder, so the flag is
-accepted there and describes nothing, as upstream has it.
+ignored. Compressing and listing allocate no decoder, so the flag is accepted
+there and describes nothing, as upstream has it; for `--train-legacy` it caps
+the samples loaded, as below.
 
 `--train` and `--train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#]` train
 with FastCOVER, the algorithm upstream also defaults to (a knob set to zero
@@ -121,8 +122,9 @@ with the COVER trainer. Its tuning, `--train-cover=...`, is refused rather
 than misread: the reference-side parameters name knobs this trainer does not
 have. `--train-legacy[=s=#]` (or `-s#`) runs upstream's original trainer, which
 counts samples: they are loaded as upstream loads them (each file one sample of
-up to 128 KiB, or cut into `-B#` pieces), and for the same file list the
-dictionary carries the same content as upstream's. `-D` takes either a dictionary produced by `--train` or any file at
+up to 128 KiB, or cut into `-B#` pieces, whole samples up to 2 GiB or `-M` when
+that is smaller), and for the same file list the dictionary carries the same
+content as upstream's. `-D` takes either a dictionary produced by `--train` or any file at
 all, which is then used as raw content the way upstream does; such a
 dictionary has no ID, so the same bytes must be supplied when decoding.
 

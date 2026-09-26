@@ -296,7 +296,7 @@ impl SequencePrefixSums {
 
 /// One collected sequence.
 ///
-/// `off_base` holds the offset the matcher found until [`fill_wire_offsets`]
+/// `off_base` holds the offset the matcher found until [`fill_and_count`]
 /// runs over the sequence, and the wire code from then on: 1/2/3 for the repeat
 /// offsets, N+3 for an explicit N. It is one field rather than two because the
 /// found offset has no reader once its code exists, and a fourth word would
@@ -989,7 +989,7 @@ enum HuffOutcome {
     New(huff0_encoder::HuffmanTable),
 }
 
-/// [`estimate_block_parts_size`] for sequences whose length codes are already
+/// `estimate_block_parts_size` for sequences whose length codes are already
 /// derived: the splitter's probes, which price many ranges of one block. The
 /// Huffman table the section may repeat is `previous`, and what the section
 /// does with it is returned beside the size; the FSE repeat tables and the

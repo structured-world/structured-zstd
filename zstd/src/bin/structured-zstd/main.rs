@@ -3325,6 +3325,10 @@ fn train_dictionary(opts: &Options) -> Result<()> {
             // The legacy trainer counts samples, so they are loaded as the
             // reference's command loads them: shuffled, capped per file, and
             // cut by `-B`. The same files then yield the same content.
+            // `-M` caps what is loaded, as the reference's command passes its
+            // memory limit to `DiB_trainFromFiles` (zstdcli.c), which keeps
+            // whole samples up to it (dibio.c); dropping it would train on a
+            // different corpus than the reference for the same command line.
             let set = load_training_samples(&opts.inputs, opts.block_size, opts.memory_limit)?;
             create_legacy_dict_from_slice(
                 &set.corpus,

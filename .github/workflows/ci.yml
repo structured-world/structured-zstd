@@ -348,9 +348,10 @@ jobs:
       - name: FFI parity + cross-validation tests
         # The libzstd-linking parity / cross-validation / corpus tests live in
         # `ffi-bench`; `bench-internals` activates the white-box-facade targets
-        # gated behind it. Corpus fixtures resolve from the manifest dir, so no
+        # gated behind it, and `dict-builder` the trainer parity targets.
+        # Corpus fixtures resolve from the manifest dir, so no
         # working-directory is needed.
-        run: cargo nextest run --profile ci -p ffi-bench --features bench-internals
+        run: cargo nextest run --profile ci -p ffi-bench --features bench-internals,dict-builder
 
   cross-i686:
     needs: lint
