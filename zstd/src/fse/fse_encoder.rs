@@ -425,6 +425,7 @@ pub fn build_table_from_data(
     build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
 }
 
+#[cfg(any(test, feature = "fuzz-exports", feature = "dict-builder"))]
 pub(crate) fn build_table_from_symbol_counts(
     counts: &[usize],
     max_log: u8,
@@ -498,6 +499,7 @@ pub(crate) fn build_seq_ctable_into(
     build_table_from_probabilities_into(&probs[..=max_symbol], table_log, out);
 }
 
+#[cfg(any(test, feature = "fuzz-exports", feature = "dict-builder"))]
 fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {
     let mut out = FSETable::blank();
     build_table_from_counts_into(counts, max_log, avoid_0_numbit, &mut out);
