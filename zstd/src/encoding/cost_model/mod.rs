@@ -442,7 +442,6 @@ impl HcOptState {
 
 #[derive(Copy, Clone)]
 pub(crate) struct HcOptimalCostProfile {
-    pub(crate) max_chain_depth: usize,
     pub(crate) sufficient_match_len: usize,
     pub(crate) favor_small_offsets: bool,
 }
@@ -455,10 +454,10 @@ impl HcOptimalCostProfile {
     /// this entry — there is no runtime peer.
     ///
     /// The `debug_assert!(S::USE_BT, …)` enforces that
-    /// `MAX_CHAIN_DEPTH` / `SUFFICIENT_MATCH_LEN` are only consulted
+    /// `SUFFICIENT_MATCH_LEN` is only consulted
     /// for BT-walking strategies, since non-BT strategies
     /// (`Fast` / `Dfast` / `Greedy` / `Lazy`) carry placeholder
-    /// values for those consts — see the `MAX_CHAIN_DEPTH` doc
+    /// values for the BT consts; see the `MAX_CHAIN_DEPTH` doc
     /// comment on each of those strategy types.
     #[inline]
     pub(crate) fn const_for_strategy<S: super::strategy::Strategy>() -> Self {
@@ -469,7 +468,6 @@ impl HcOptimalCostProfile {
              profile is only meaningful when the BT walker is active.",
         );
         Self {
-            max_chain_depth: S::MAX_CHAIN_DEPTH,
             sufficient_match_len: S::SUFFICIENT_MATCH_LEN,
             favor_small_offsets: S::FAVOR_SMALL_OFFSETS,
         }

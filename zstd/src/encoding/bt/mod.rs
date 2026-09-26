@@ -155,6 +155,21 @@ impl BtMatcher {
         false
     }
 
+    /// Append the long-distance candidate after the search when it is at
+    /// least `min_match_len` and longer than every candidate the search found
+    /// (upstream zstd `ZSTD_optLdm_maybeAddMatch`, zstd_opt.c). The search
+    /// ladder keeps `out` sorted by strictly increasing length, so its last
+    /// entry is the bar.
+    #[inline(always)]
+    pub(crate) fn push_ldm_candidate(
+        out: &mut Vec<MatchCandidate>,
+        ldm: MatchCandidate,
+        min_match_len: usize,
+    ) {
+        let mut best_len = out.last().map_or(0, |c| c.match_len);
+        let _ = Self::push_candidate_ladder(out, &mut best_len, ldm, min_match_len);
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             opt_state: HcOptState::new(),

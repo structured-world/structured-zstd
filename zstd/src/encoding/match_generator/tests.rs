@@ -959,19 +959,19 @@ fn btultra2_profile_disables_small_offset_handicap() {
 }
 
 #[test]
-fn btultra_profile_keeps_search_depth_budget() {
-    let p = HcOptimalCostProfile::const_for_strategy::<super::super::strategy::BtUltra>();
+fn btultra_keeps_search_depth_budget() {
     assert_eq!(
-        p.max_chain_depth, 64,
+        <super::super::strategy::BtUltra as super::super::strategy::Strategy>::MAX_CHAIN_DEPTH,
+        64,
         "btultra chain-depth budget must match clevels.h level 18 searchLog 6 (1 << 6 = 64)"
     );
 }
 
 #[test]
-fn btopt_profile_keeps_search_depth_budget() {
-    let p = HcOptimalCostProfile::const_for_strategy::<super::super::strategy::BtOpt>();
+fn btopt_keeps_search_depth_budget() {
     assert_eq!(
-        p.max_chain_depth, 32,
+        <super::super::strategy::BtOpt as super::super::strategy::Strategy>::MAX_CHAIN_DEPTH,
+        32,
         "btopt should not cap chain depth below upstream zstd btopt search budget"
     );
 }
@@ -1667,6 +1667,51 @@ fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
             |candidate| candidate.offset == ldm.offset && candidate.match_len == ldm.match_len
         ),
         "LDM candidate should be present in optimal candidate set"
+    );
+}
+
+/// A repeat match past the sufficient length ends the search early, and the
+/// long-distance candidate must still join afterwards: upstream adds it after
+/// `ZSTD_btGetAllMatches` whatever the search did (zstd_opt.c,
+/// `ZSTD_optLdm_processMatchCandidate`). Merged inside the search, it was lost
+/// on every early exit.
+#[test]
+fn hc_ldm_candidate_survives_the_search_early_exit() {
+    let mut hc = HcMatchGenerator::new(512);
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
+    // rep0 = 10 matches `abcde` at position 10, then `Y` meets `X`: length 5.
+    hc.table.history = b"abcdeXXXXXabcdeYYYYYYYYYYYYYYYYYYYY".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.search_depth = 32;
+
+    let abs_pos = 10usize;
+    let ldm = MatchCandidate {
+        start: abs_pos,
+        offset: 7,
+        match_len: 12,
+    };
+    let mut out = Vec::new();
+    hc.collect_optimal_candidates(
+        abs_pos,
+        hc.table.history.len(),
+        // Below the repeat match's length, so the repeat probe ends the search.
+        4,
+        HcCandidateQuery {
+            reps: [10, 20, 30],
+            lit_len: 1,
+            ldm_candidate: Some(ldm),
+        },
+        &mut out,
+    );
+    assert!(
+        out.iter().any(|c| c.offset == 10 && c.match_len == 5),
+        "the repeat match that ends the search is kept"
+    );
+    assert_eq!(
+        out.last().map(|c| (c.offset, c.match_len)),
+        Some((ldm.offset, ldm.match_len)),
+        "the longer long-distance candidate joins after the early exit"
     );
 }
 

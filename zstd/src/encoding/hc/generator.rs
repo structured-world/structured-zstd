@@ -588,7 +588,7 @@ macro_rules! bt_insert_and_collect_matches_body {
         $best_len_for_skip:ident,
         $out:ident,
         $reps:ident,
-        $lit_len:ident,
+        $ll0:ident,
         $use_hash3:expr,
         $cpl:path,
         $cmf:path $(,)?
@@ -693,7 +693,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                     )
                 };
             }
-            if $lit_len == 0 {
+            if $ll0 {
                 probe!($reps[1] as usize);
                 probe!($reps[2] as usize);
                 probe!(($reps[0] as usize).wrapping_sub(1));

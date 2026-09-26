@@ -61,9 +61,10 @@ pub(crate) struct HcOptimalSequence {
     pub(crate) lit_len: u32,
 }
 
-/// Inputs to the per-position candidate collection step. Bundled so the
-/// `collect_optimal_candidates_initialized_body!` macro can hand-roll the
-/// argument list once.
+/// One position's search as the test entry `collect_optimal_candidates` takes
+/// it: the repeat history, the pending literal run, and an optional
+/// long-distance candidate merged after the search.
+#[cfg(test)]
 #[derive(Copy, Clone)]
 pub(crate) struct HcCandidateQuery {
     pub(crate) reps: [u32; 3],

@@ -24,6 +24,8 @@ use alloc::vec::Vec;
 // does not count macro-body references, so it reports every one of these as
 // "unused" even though each macro expansion requires them (gating or removing
 // any one breaks the lib build). Suppress the false positive on the group.
+#[cfg(test)]
+use crate::encoding::opt::types::HcCandidateQuery;
 #[allow(unused_imports)]
 use crate::encoding::{
     bt::BtMatcher,
@@ -37,8 +39,8 @@ use crate::encoding::{
     match_table::storage::HC3_HASH_LOG,
     opt::ldm::{HcOptLdmState, HcRawSeqStore},
     opt::types::{
-        HcBlockPass, HcCandidateQuery, HcOptimalNode, HcOptimalPlanBuffers, HcOptimalPlanState,
-        HcOptimalSequence, MatchCandidate,
+        HcBlockPass, HcOptimalNode, HcOptimalPlanBuffers, HcOptimalPlanState, HcOptimalSequence,
+        MatchCandidate,
     },
 };
 
@@ -210,11 +212,8 @@ macro_rules! build_optimal_plan_impl_body {
                         $current_abs_start + skipped_literals,
                         current_abs_end,
                         profile.sufficient_match_len,
-                        HcCandidateQuery {
-                            reps: initial_reps,
-                            lit_len: initial_litlen + skipped_literals,
-                            ldm_candidate: None,
-                        },
+                        &initial_reps,
+                        initial_litlen + skipped_literals == 0,
                         &mut *candidates,
                     )
                 };
@@ -318,14 +317,16 @@ macro_rules! build_optimal_plan_impl_body {
                         $current_abs_start,
                         current_abs_end,
                         profile.sufficient_match_len,
-                        HcCandidateQuery {
-                            reps: initial_reps,
-                            lit_len: initial_litlen,
-                            ldm_candidate: seed_ldm,
-                        },
+                        &initial_reps,
+                        initial_litlen == 0,
                         &mut *candidates,
                     )
                 };
+                // The long-distance candidate joins after the search, as
+                // upstream's `ZSTD_optLdm_processMatchCandidate` does.
+                if let Some(ldm) = seed_ldm {
+                    BtMatcher::push_ldm_candidate(&mut *candidates, ldm, min_match_len);
+                }
             }
             if !candidates.is_empty() {
                 // Deferred price-cache setup: the arena slices are two disjoint
@@ -687,34 +688,35 @@ macro_rules! build_optimal_plan_impl_body {
             }
 
             let abs_pos = $current_abs_start + pos;
-            let ldm_candidate = if HAS_LDM {
-                $self.backend.bt_mut().ldm_process_match_candidate(
-                    &mut opt_ldm,
-                    pos,
-                    $current_len - pos,
-                    min_match_len,
-                )
-            } else {
-                None
-            };
             candidates.clear();
-            // SAFETY: same umbrella as `$collect`. Query fields are read
-            // fresh here (consumed into the call's argument) so they do not
-            // stay live across the call; the post-call reads below are a
-            // separate, fresh load of the same stable `nodes[pos]`.
+            // SAFETY: same umbrella as `$collect`. The search reads the repeat
+            // history in place through `nodes[pos]`, as upstream passes
+            // `opt[cur].rep`, so nothing is copied into the call and nothing
+            // stays live across it; the post-call reads below are a fresh load
+            // of the same stable `nodes[pos]`.
             unsafe {
                 $self.$collect::<$strategy_ty>(
                     abs_pos,
                     current_abs_end,
                     profile.sufficient_match_len,
-                    HcCandidateQuery {
-                        reps: (*nodes.add(pos)).reps,
-                        lit_len: (*nodes.add(pos)).litlen as usize,
-                        ldm_candidate,
-                    },
+                    &(*nodes.add(pos)).reps,
+                    (*nodes.add(pos)).litlen == 0,
                     &mut *candidates,
                 )
             };
+            if HAS_LDM {
+                // Upstream `ZSTD_optLdm_processMatchCandidate`: the producer
+                // advances past this position and its candidate joins after
+                // the search.
+                if let Some(ldm) = $self.backend.bt_mut().ldm_process_match_candidate(
+                    &mut opt_ldm,
+                    pos,
+                    $current_len - pos,
+                    min_match_len,
+                ) {
+                    BtMatcher::push_ldm_candidate(&mut *candidates, ldm, min_match_len);
+                }
+            }
             // Post-call reads of opt[cur]: fresh, born after `$collect`, so
             // never part of the cross-call live set (see memory-resident note
             // above). `nodes[pos]` is untouched by `$collect`.
@@ -1147,7 +1149,8 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $abs_pos:ident,
         $current_abs_end:ident,
         $sufficient_match_len:ident,
-        $query:ident,
+        $reps:ident,
+        $ll0:ident,
         $out:ident,
         $bt_insert_step:ident,
         $cpl:path,
@@ -1170,20 +1173,8 @@ macro_rules! collect_optimal_candidates_initialized_body {
         );
         debug_assert!(!$self.table.chain_table().is_empty());
         let min_match_len = HC_OPT_MIN_MATCH_LEN;
-        let reps = $query.reps;
-        let lit_len = $query.lit_len;
-        let ldm_candidate = $query.ldm_candidate;
         $out.clear();
         if $abs_pos < $self.table.skip_insert_until_abs {
-            if let Some(ldm) = ldm_candidate {
-                let mut best_len_for_skip = 0usize;
-                let _ = crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                    $out,
-                    &mut best_len_for_skip,
-                    ldm,
-                    min_match_len,
-                );
-            }
             return;
         }
         {
@@ -1214,15 +1205,6 @@ macro_rules! collect_optimal_candidates_initialized_body {
         }
         let current_idx = $abs_pos - $self.table.history_abs_start;
         if current_idx + 4 > $self.table.live_history().len() {
-            if let Some(ldm) = ldm_candidate {
-                let mut best_len_for_skip = 0usize;
-                let _ = crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                    $out,
-                    &mut best_len_for_skip,
-                    ldm,
-                    min_match_len,
-                );
-            }
             return;
         }
         let mut best_len_for_skip = 0usize;
@@ -1248,19 +1230,11 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 min_match_len,
                 best_len_ref,
                 $out,
-                reps,
-                lit_len,
+                $reps,
+                $ll0,
                 use_hash3,
                 $cpl,
                 $cmf,
-            );
-        }
-        if let Some(ldm) = ldm_candidate {
-            let _ = crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                $out,
-                &mut best_len_for_skip,
-                ldm,
-                min_match_len,
             );
         }
     }};
@@ -2081,6 +2055,8 @@ impl HcMatchGenerator {
     ) {
         use crate::encoding::strategy::{self, StrategyTag};
         self.table.ensure_tables();
+        let reps = &query.reps;
+        let ll0 = query.lit_len == 0;
         // Dispatch purely from `self.strategy_tag` (set by
         // `configure()`). Tests must configure the matcher the same
         // way production does — wiring up `table.hash3_log` directly
@@ -2092,7 +2068,8 @@ impl HcMatchGenerator {
                     abs_pos,
                     current_abs_end,
                     sufficient_match_len,
-                    query,
+                    reps,
+                    ll0,
                     out,
                 ),
             StrategyTag::BtUltra => self
@@ -2100,7 +2077,8 @@ impl HcMatchGenerator {
                     abs_pos,
                     current_abs_end,
                     sufficient_match_len,
-                    query,
+                    reps,
+                    ll0,
                     out,
                 ),
             StrategyTag::Btlazy2 => self
@@ -2108,14 +2086,16 @@ impl HcMatchGenerator {
                     abs_pos,
                     current_abs_end,
                     sufficient_match_len,
-                    query,
+                    reps,
+                    ll0,
                     out,
                 ),
             StrategyTag::BtOpt => self.collect_optimal_candidates_initialized::<strategy::BtOpt>(
                 abs_pos,
                 current_abs_end,
                 sufficient_match_len,
-                query,
+                reps,
+                ll0,
                 out,
             ),
             StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
@@ -2130,6 +2110,9 @@ impl HcMatchGenerator {
                      non-BT strategies use their own match finder"
                 )
             }
+        }
+        if let Some(ldm) = query.ldm_candidate {
+            BtMatcher::push_ldm_candidate(out, ldm, HC_OPT_MIN_MATCH_LEN);
         }
     }
 
@@ -2159,7 +2142,8 @@ impl HcMatchGenerator {
         abs_pos: usize,
         current_abs_end: usize,
         sufficient_match_len: usize,
-        query: HcCandidateQuery,
+        reps: &[u32; 3],
+        ll0: bool,
         out: &mut Vec<MatchCandidate>,
     ) {
         #[cfg(all(
@@ -2172,7 +2156,8 @@ impl HcMatchGenerator {
                 abs_pos,
                 current_abs_end,
                 sufficient_match_len,
-                query,
+                reps,
+                ll0,
                 out,
             )
         }
@@ -2186,7 +2171,8 @@ impl HcMatchGenerator {
                         abs_pos,
                         current_abs_end,
                         sufficient_match_len,
-                        query,
+                        reps,
+                        ll0,
                         out,
                     )
                 },
@@ -2196,7 +2182,8 @@ impl HcMatchGenerator {
                         abs_pos,
                         current_abs_end,
                         sufficient_match_len,
-                        query,
+                        reps,
+                        ll0,
                         out,
                     )
                 },
@@ -2206,7 +2193,8 @@ impl HcMatchGenerator {
                         abs_pos,
                         current_abs_end,
                         sufficient_match_len,
-                        query,
+                        reps,
+                        ll0,
                         out,
                     )
                 },
@@ -2214,7 +2202,8 @@ impl HcMatchGenerator {
                     abs_pos,
                     current_abs_end,
                     sufficient_match_len,
-                    query,
+                    reps,
+                    ll0,
                     out,
                 ),
             }
@@ -2233,7 +2222,8 @@ impl HcMatchGenerator {
                 abs_pos,
                 current_abs_end,
                 sufficient_match_len,
-                query,
+                reps,
+                ll0,
                 out,
             )
         }
@@ -2256,7 +2246,8 @@ impl HcMatchGenerator {
                 abs_pos,
                 current_abs_end,
                 sufficient_match_len,
-                query,
+                reps,
+                ll0,
                 out,
             )
         }
@@ -2281,7 +2272,8 @@ impl HcMatchGenerator {
         abs_pos: usize,
         current_abs_end: usize,
         sufficient_match_len: usize,
-        query: HcCandidateQuery,
+        reps: &[u32; 3],
+        ll0: bool,
         out: &mut Vec<MatchCandidate>,
     ) {
         collect_optimal_candidates_initialized_body!(
@@ -2290,7 +2282,8 @@ impl HcMatchGenerator {
             abs_pos,
             current_abs_end,
             sufficient_match_len,
-            query,
+            reps,
+            ll0,
             out,
             bt_insert_step_no_rebase_neon,
             crate::encoding::fastpath::neon::common_prefix_len_ptr,
@@ -2311,7 +2304,8 @@ impl HcMatchGenerator {
         abs_pos: usize,
         current_abs_end: usize,
         sufficient_match_len: usize,
-        query: HcCandidateQuery,
+        reps: &[u32; 3],
+        ll0: bool,
         out: &mut Vec<MatchCandidate>,
     ) {
         collect_optimal_candidates_initialized_body!(
@@ -2320,7 +2314,8 @@ impl HcMatchGenerator {
             abs_pos,
             current_abs_end,
             sufficient_match_len,
-            query,
+            reps,
+            ll0,
             out,
             bt_insert_step_no_rebase_sse2,
             crate::encoding::fastpath::sse2::common_prefix_len_ptr,
@@ -2347,7 +2342,8 @@ impl HcMatchGenerator {
         abs_pos: usize,
         current_abs_end: usize,
         sufficient_match_len: usize,
-        query: HcCandidateQuery,
+        reps: &[u32; 3],
+        ll0: bool,
         out: &mut Vec<MatchCandidate>,
     ) {
         collect_optimal_candidates_initialized_body!(
@@ -2356,7 +2352,8 @@ impl HcMatchGenerator {
             abs_pos,
             current_abs_end,
             sufficient_match_len,
-            query,
+            reps,
+            ll0,
             out,
             bt_insert_step_no_rebase_sse2,
             crate::encoding::fastpath::sse2::common_prefix_len_ptr,
@@ -2377,7 +2374,8 @@ impl HcMatchGenerator {
         abs_pos: usize,
         current_abs_end: usize,
         sufficient_match_len: usize,
-        query: HcCandidateQuery,
+        reps: &[u32; 3],
+        ll0: bool,
         out: &mut Vec<MatchCandidate>,
     ) {
         collect_optimal_candidates_initialized_body!(
@@ -2386,7 +2384,8 @@ impl HcMatchGenerator {
             abs_pos,
             current_abs_end,
             sufficient_match_len,
-            query,
+            reps,
+            ll0,
             out,
             bt_insert_step_no_rebase_avx2_bmi2,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
@@ -2414,7 +2413,8 @@ impl HcMatchGenerator {
         abs_pos: usize,
         current_abs_end: usize,
         sufficient_match_len: usize,
-        query: HcCandidateQuery,
+        reps: &[u32; 3],
+        ll0: bool,
         out: &mut Vec<MatchCandidate>,
     ) {
         collect_optimal_candidates_initialized_body!(
@@ -2423,7 +2423,8 @@ impl HcMatchGenerator {
             abs_pos,
             current_abs_end,
             sufficient_match_len,
-            query,
+            reps,
+            ll0,
             out,
             bt_insert_step_no_rebase_simd128,
             crate::encoding::fastpath::simd128::common_prefix_len_ptr,
@@ -2447,7 +2448,8 @@ impl HcMatchGenerator {
         abs_pos: usize,
         current_abs_end: usize,
         sufficient_match_len: usize,
-        query: HcCandidateQuery,
+        reps: &[u32; 3],
+        ll0: bool,
         out: &mut Vec<MatchCandidate>,
     ) {
         collect_optimal_candidates_initialized_body!(
@@ -2456,7 +2458,8 @@ impl HcMatchGenerator {
             abs_pos,
             current_abs_end,
             sufficient_match_len,
-            query,
+            reps,
+            ll0,
             out,
             bt_insert_step_no_rebase_scalar,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
