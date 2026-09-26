@@ -13,6 +13,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::suffix_array::suffix_array;
+use crate::encoding::fastpath::{
+    FastpathKernel, dispatch_common_prefix_len_ptr_with_kernel, select_kernel,
+};
 
 /// Fewest repetitions that make a prefix a candidate (`MINRATIO`).
 const MIN_RATIO: u32 = 4;
@@ -80,6 +83,8 @@ fn noise_band() -> [u8; NOISE_LENGTH] {
 struct Corpus<'a> {
     samples: &'a [u8],
     noise: [u8; NOISE_LENGTH],
+    /// The compare kernel for this CPU, resolved once for the whole run.
+    kernel: FastpathKernel,
 }
 
 impl<'a> Corpus<'a> {
@@ -87,6 +92,7 @@ impl<'a> Corpus<'a> {
         Self {
             samples,
             noise: noise_band(),
+            kernel: select_kernel(),
         }
     }
 
@@ -135,42 +141,37 @@ impl<'a> Corpus<'a> {
         self.read::<8>(at).map(u64::from_le_bytes)
     }
 
-    /// Bytes `a` and `b` have in common (`ZDICT_count`), compared a word at
-    /// a time as the reference compares them while both words lie in the
-    /// samples, then a byte at a time across into the band.
+    /// Bytes `a` and `b` have in common (`ZDICT_count`): through the CPU's
+    /// vector compare while both runs lie in the samples, where the corpus'
+    /// long repeats make the comparison most of the analysis, then a byte at
+    /// a time across into the band.
     #[inline]
     fn common(&self, a: usize, b: usize) -> usize {
         let samples = self.samples;
-        // A comparison that starts in the band has no word to read in the
+        // A comparison that starts in the band has nothing to compare in the
         // samples.
         let Some(in_samples) = samples.len().checked_sub(a.max(b)) else {
             return self.common_tail(a, b, 0);
         };
         let base = samples.as_ptr();
-        let mut n = 0;
-        while n + 8 <= in_samples {
-            // SAFETY: `a, b <= max(a, b)` and `n + 8 <= samples.len() -
-            // max(a, b)`, so both eight-byte reads end inside the samples.
-            // Read unchecked: through a slice index the bound is tested on
-            // every word, since the loop limit does not tell the optimiser
-            // that each index stays inside.
-            let (x, y) = unsafe {
-                (
-                    base.add(a + n).cast::<u64>().read_unaligned(),
-                    base.add(b + n).cast::<u64>().read_unaligned(),
-                )
-            };
-            let diff = u64::from_le(x) ^ u64::from_le(y);
-            if diff != 0 {
-                return n + (diff.trailing_zeros() / 8) as usize;
-            }
-            n += 8;
+        // SAFETY: `a, b <= max(a, b)` and `in_samples == samples.len() -
+        // max(a, b)`, so both runs of `in_samples` bytes lie in the samples.
+        let n = unsafe {
+            dispatch_common_prefix_len_ptr_with_kernel(
+                self.kernel,
+                base.add(a),
+                base.add(b),
+                in_samples,
+            )
+        };
+        if n < in_samples {
+            return n;
         }
         self.common_tail(a, b, n)
     }
 
-    /// The last bytes of [`Self::common`] from `n` on, fewer than a word of
-    /// them in the samples, then on into the band.
+    /// The bytes of [`Self::common`] from `n` on, where the shorter run has
+    /// reached the end of the samples: on into the band.
     #[cold]
     #[inline(never)]
     fn common_tail(&self, a: usize, b: usize, mut n: usize) -> usize {
