@@ -183,6 +183,28 @@ macro_rules! bt_insert_step_no_rebase_body {
         // sentinel that ALWAYS triggers.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
         let window_low = $table.window_low_abs_for_target($target_abs);
+        // The walk carries one coordinate, the stored index, as the collect body
+        // does and as upstream carries `matchIndex`: the window bound becomes one
+        // unsigned range test on it (HC_EMPTY, 0, decodes below the window and
+        // ends the walk), and the absolute position, the history index and the
+        // pair slot are each one add of a bias taken here, instead of reloading
+        // `position_base` / `index_shift` / `history_abs_start` through the
+        // table on every node. See the collect body for the derivation.
+        let abs_bias = $table
+            .position_base
+            .wrapping_sub(1)
+            .wrapping_sub($table.index_shift);
+        let win_off = abs_bias.wrapping_sub(window_low);
+        // The window floor follows the tree update's target, which may lie past
+        // this position by more than the window; nothing is in range then, as
+        // upstream's `matchIndex >= windowLow` finds on its first test.
+        let win_range = if window_low < $abs_pos {
+            $abs_pos - window_low
+        } else {
+            0
+        };
+        let idx_bias = abs_bias.wrapping_sub($table.history_abs_start);
+        let bt_bias = $table.position_base.wrapping_sub(1);
         // `abs_pos + 9` is safe in raw form: `MatchTable::add_data` caps
         // total input at `usize::MAX - STREAM_ABS_HEADROOM` (where
         // `STREAM_ABS_HEADROOM = HC_OPT_NUM + 16`), so every
@@ -206,40 +228,25 @@ macro_rules! bt_insert_step_no_rebase_body {
         let mut match_stored = unsafe { *hash_ptr.add(hash) };
         unsafe { *hash_ptr.add(hash) = stored };
 
-        while compares_left > 0 {
-            if match_stored == $crate::encoding::match_table::storage::HC_EMPTY {
-                break;
-            }
-            // Reject stale post-rebase slots whose pre-shift position is below
-            // `index_shift` explicitly. A `wrapping_sub` maps such a slot to a
-            // near-`usize::MAX` value that the `>= abs_pos` test only rejects
-            // while `abs_pos` is far from the integer ceiling; on a
-            // long-running rebased stream (reachable on 32-bit) `abs_pos` can
-            // approach the ceiling and the wrapped value can land back inside
-            // `[window_low, abs_pos)`. Ending the walk on the underflow avoids
-            // that. `match_stored != HC_EMPTY` here, so the `- 1` cannot
-            // underflow. The shift is taken off the stored index before the
-            // floor is added, because on a 32-bit word the floor plus a stored
-            // index need not fit; a slot under the shift decodes below
-            // `position_base`, which the window floor rejects anyway.
-            let match_relative = match_stored as usize - 1;
-            if match_relative < $table.index_shift {
-                break;
-            }
-            let candidate_abs = $table.position_base + (match_relative - $table.index_shift);
-            if candidate_abs < window_low || candidate_abs >= $abs_pos {
-                break;
-            }
+        while compares_left > 0 && (match_stored as usize).wrapping_add(win_off) < win_range {
             compares_left -= 1;
-
-            let next_pair_idx = $table.bt_pair_index_for_abs(candidate_abs);
+            let stored = match_stored as usize;
+            // A slot written under an earlier encoding would sit below the
+            // shift; the block was armed, and a rebase rewrites every slot, so
+            // none reaches an in-window test.
+            debug_assert!(stored > $table.index_shift);
+            let candidate_abs = stored.wrapping_add(abs_bias);
+            debug_assert!(candidate_abs >= window_low && candidate_abs < $abs_pos);
+            // `2*((candidate_abs + index_shift) & bt_mask)`, with the shift
+            // folded: `candidate_abs + index_shift == stored + bt_bias`.
+            let next_pair_idx = 2 * (stored.wrapping_add(bt_bias) & bt_mask);
             // SAFETY: `next_pair_idx (+1)` = `2*(candidate_abs & bt_mask) (+1)`
             // ≤ `chain_table.len()-1`; `chain_ptr` is the hoisted live base,
             // table not realloc'd during the walk.
             let next_smaller = unsafe { *chain_ptr.add(next_pair_idx) };
             let next_larger = unsafe { *chain_ptr.add(next_pair_idx + 1) };
             let seed_len = common_length_smaller.min(common_length_larger);
-            let candidate_idx = candidate_abs - $table.history_abs_start;
+            let candidate_idx = stored.wrapping_add(idx_bias);
             // SAFETY: BT walk invariant — `candidate_idx + tail_limit ≤
             // concat.len()` since the candidate is within
             // `[history_abs_start, abs_pos)` and `tail_limit ≤
