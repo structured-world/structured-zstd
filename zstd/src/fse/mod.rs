@@ -49,14 +49,11 @@ pub fn round_trip(data: &[u8]) {
     }
 
     let mut writer = BitWriter::new();
-    let mut encoder = FSEEncoder::new(
-        fse_encoder::build_table_from_data(data.iter().copied(), 6, false),
-        &mut writer,
-    );
+    let enc_table = fse_encoder::build_table_from_data(data.iter().copied(), 6, false);
+    let mut encoder = FSEEncoder::new(&enc_table, &mut writer);
     let mut dec_table = FSETable::new(255);
     encoder.encode(data);
     let acc_log = encoder.acc_log();
-    let enc_table = encoder.into_table();
     let encoded = writer.dump();
 
     let table_bytes = dec_table.build_decoder(&encoded, acc_log).unwrap();

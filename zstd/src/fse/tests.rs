@@ -22,6 +22,39 @@ fn an_encoder_table_holds_nothing_on_the_heap() {
 }
 
 #[test]
+fn rebuilding_a_used_table_matches_a_fresh_build() {
+    // Block tables are rebuilt in place. A symbol the earlier build had and the
+    // new one lacks, inside the new alphabet or past it, must read as absent:
+    // the dictionary cost seed takes `max_num_bits_for_symbol` of an absent
+    // symbol as zero, and a stale width there prices it as codable.
+    let mut wide = [0usize; 64];
+    for (symbol, count) in wide.iter_mut().enumerate() {
+        *count = symbol + 1;
+    }
+    let mut narrow = [0usize; 40];
+    for (symbol, count) in narrow.iter_mut().enumerate() {
+        *count = if symbol == 5 { 0 } else { 2 * symbol + 3 };
+    }
+    let mut reused = fse_encoder::FSETable::blank();
+    fse_encoder::build_table_from_symbol_counts_into(&wide, 9, false, &mut reused);
+    fse_encoder::build_table_from_symbol_counts_into(&narrow, 9, false, &mut reused);
+    let fresh = fse_encoder::build_table_from_symbol_counts(&narrow, 9, false);
+    for symbol in 0..=255u8 {
+        assert_eq!(
+            reused.symbol_probability(symbol),
+            fresh.symbol_probability(symbol),
+            "probability of symbol {symbol}"
+        );
+        assert_eq!(
+            reused.max_num_bits_for_symbol(symbol),
+            fresh.max_num_bits_for_symbol(symbol),
+            "max bits of symbol {symbol}"
+        );
+    }
+    assert_eq!(reused.table_header_bits(), fresh.table_header_bits());
+}
+
+#[test]
 fn decoder_entry_layout_is_four_bytes_for_huffman_weights() {
     assert_eq!(core::mem::size_of::<fse_decoder::Entry>(), 4);
     assert_eq!(core::mem::offset_of!(fse_decoder::Entry, new_state), 0);

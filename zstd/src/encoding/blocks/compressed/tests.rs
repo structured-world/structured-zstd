@@ -232,7 +232,7 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
     skewed_literals.extend((0..16u8).map(|i| 200 + i));
     let mut new_tbl = huff0_encoder::HuffmanTable::build_from_data(&skewed_literals);
     let new_desc = new_tbl
-        .writeable_table_description_size()
+        .writeable_table_description_size(&mut crate::fse::fse_encoder::FSETable::blank())
         .expect("non-empty table emits a description");
 
     // The decision reads its sizes off the histogram of the very literals it

@@ -45,10 +45,8 @@ fn build_decoder_rejects_fse_streams_with_256_explicit_weights() {
         for &w in &weights {
             counts[w as usize] += 1;
         }
-        let mut encoder = FSEEncoder::new(
-            build_table_from_symbol_counts(&counts, 6, false),
-            &mut writer,
-        );
+        let table = build_table_from_symbol_counts(&counts, 6, false);
+        let mut encoder = FSEEncoder::new(&table, &mut writer);
         encoder.encode_interleaved(&weights);
         writer.flush();
     }

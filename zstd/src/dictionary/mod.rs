@@ -364,7 +364,10 @@ fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result
     }
 
     let mut table = HuffmanEncoderTable::build_from_data(stats.as_slice());
-    if table.writeable_table_description_size().is_none() {
+    if table
+        .writeable_table_description_size(&mut crate::fse::fse_encoder::FSETable::blank())
+        .is_none()
+    {
         // Sampled real data can land on the same shape: a flat alphabet wider
         // than 128 symbols. Fall back to the synthetic narrow one, which always
         // has a description.

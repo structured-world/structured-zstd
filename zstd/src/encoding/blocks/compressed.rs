@@ -471,15 +471,30 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     estimator.derive_block_splits(0, scratch.parts.sequences.len(), &mut scratch.partitions);
     scratch.partitions.push(scratch.parts.sequences.len());
     workspace = estimator.workspace;
-    scratch.estimator_workspace = Some(workspace);
     // Stash the inner scratch back for the next frame (its buffers stay
     // allocated; the estimator clears them per use), and take the weight
     // builder's buffers back so the emitter and the next block reuse them.
     let CompressState {
         block_scratch: inner_block_scratch,
         mut huff_weights,
+        fse_tables: probe_tables,
         ..
     } = estimator.scratch_state;
+    // The last probe's tables join the pool for the next block's probes.
+    workspace.recycle_previous(probe_tables.ll_previous);
+    workspace.recycle_previous(probe_tables.ml_previous);
+    workspace.recycle_previous(probe_tables.of_previous);
+    for handle in [
+        probe_tables.ll_next,
+        probe_tables.ml_next,
+        probe_tables.of_next,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        workspace.recycle_fse(handle);
+    }
+    scratch.estimator_workspace = Some(workspace);
     // The tables the probes built go back to the builder for its next tables.
     for table in estimator.built_huff {
         huff_weights.recycle(table);
@@ -886,12 +901,35 @@ struct EstimatorWorkspace {
     ll_counts: Box<[usize; 256]>,
     ml_counts: Box<[usize; 256]>,
     of_counts: Box<[usize; 256]>,
+    /// FSE table handles no probe state holds any more, for the next probe to
+    /// build into. Every one is unique, so a build writes it in place.
+    spare_fse: Vec<SharedFseTable>,
 }
 
 impl EstimatorWorkspace {
-    /// The four boxed count tables, always present once the workspace exists.
+    /// The four boxed count tables, always present once the workspace exists,
+    /// and the pooled tables with their reference counts.
     fn heap_size(&self) -> usize {
         4 * core::mem::size_of::<[usize; 256]>()
+            + self.spare_fse.capacity() * core::mem::size_of::<SharedFseTable>()
+            + self.spare_fse.len()
+                * (core::mem::size_of::<FSETable>()
+                    + crate::encoding::frame_compressor::shared_table_overhead())
+    }
+
+    /// Pool a handle, unless something else still holds it: a shared table
+    /// cannot be built into, so it is only let go.
+    fn recycle_fse(&mut self, mut handle: SharedFseTable) {
+        if SharedFseTable::get_mut(&mut handle).is_some() {
+            self.spare_fse.push(handle);
+        }
+    }
+
+    /// Pool the custom tables of an axis state that is going away.
+    fn recycle_previous(&mut self, previous: Option<PreviousFseTable>) {
+        if let Some(PreviousFseTable::Custom(handle)) = previous {
+            self.recycle_fse(handle);
+        }
     }
 }
 
@@ -902,6 +940,7 @@ impl Default for EstimatorWorkspace {
             ll_counts: Box::new([0; 256]),
             ml_counts: Box::new([0; 256]),
             of_counts: Box::new([0; 256]),
+            spare_fse: Vec::new(),
         }
     }
 }
@@ -1086,7 +1125,9 @@ fn estimate_literals_section_bytes(
         weight_scratch,
     );
 
-    let Some(new_desc) = new_table.writeable_table_description_size() else {
+    let Some(new_desc) =
+        new_table.writeable_table_description_size(weight_scratch.weight_fse_table())
+    else {
         // Nothing downstream reads this table; hand its buffers to the next
         // build rather than dropping them.
         weight_scratch.recycle(new_table);
@@ -1302,11 +1343,17 @@ fn estimate_sequences_section_bytes(
     // The emitter keeps the handle a commit displaces, to build the next
     // block's table into. A probe must not: the splitter holds many of these
     // states at once, and a spare per axis per probe doubles the tables alive
-    // at any moment. Dropping it leaves a probe with exactly what it needs,
-    // which is what the allocate-per-table form gave it.
-    fse_tables.ll_next = None;
-    fse_tables.ml_next = None;
-    fse_tables.of_next = None;
+    // at any moment. It goes to the workspace pool instead, which every probe
+    // draws its build slots from.
+    for next in [
+        &mut fse_tables.ll_next,
+        &mut fse_tables.ml_next,
+        &mut fse_tables.of_next,
+    ] {
+        if let Some(handle) = next.take() {
+            workspace.recycle_fse(handle);
+        }
+    }
 
     nb_seq_header
         + mode_byte
@@ -1896,10 +1943,33 @@ impl SplitEstimator<'_> {
             lit_start + lit_len
         };
         // The FSE repeat tables are shared handles, so seeding them is a
-        // reference-count bump; the Huffman table is only borrowed.
-        self.scratch_state.fse_tables.ll_previous = entry.ll_previous.clone();
-        self.scratch_state.fse_tables.ml_previous = entry.ml_previous.clone();
-        self.scratch_state.fse_tables.of_previous = entry.of_previous.clone();
+        // reference-count bump; the Huffman table is only borrowed. What the
+        // last probe left behind goes to the pool, and a build slot comes from
+        // it, so a probe that builds a table writes into one it already has.
+        let tables = &mut self.scratch_state.fse_tables;
+        for (previous, next, seed) in [
+            (
+                &mut tables.ll_previous,
+                &mut tables.ll_next,
+                &entry.ll_previous,
+            ),
+            (
+                &mut tables.ml_previous,
+                &mut tables.ml_next,
+                &entry.ml_previous,
+            ),
+            (
+                &mut tables.of_previous,
+                &mut tables.of_next,
+                &entry.of_previous,
+            ),
+        ] {
+            self.workspace
+                .recycle_previous(core::mem::replace(previous, seed.clone()));
+            if next.is_none() {
+                *next = self.workspace.spare_fse.pop();
+            }
+        }
         self.scratch_state.offset_hist = entry.offset_hist;
         let previous = match entry.huff {
             HuffRef::None => None,
@@ -1949,6 +2019,13 @@ impl SplitEstimator<'_> {
         (cost, raw_fallback, post)
     }
 
+    /// Pool the tables of a probe state nothing will read again.
+    fn recycle_state(&mut self, state: ProbeEntryState) {
+        self.workspace.recycle_previous(state.ll_previous);
+        self.workspace.recycle_previous(state.ml_previous);
+        self.workspace.recycle_previous(state.of_previous);
+    }
+
     fn derive_block_splits(
         &mut self,
         start_idx: usize,
@@ -1961,7 +2038,9 @@ impl SplitEstimator<'_> {
             return;
         }
         let entry = self.block_entry.clone();
-        let (full, full_raw_fallback, _) = self.estimate_subblock_size(start_idx, end_idx, &entry);
+        let (full, full_raw_fallback, full_post) =
+            self.estimate_subblock_size(start_idx, end_idx, &entry);
+        self.recycle_state(full_post);
         // G3 — whole-block bail-out before partition split. Upstream zstd
         // `ZSTD_compressSubBlock_multi` (`zstd_compress_superblock.c:530-532`)
         // bails when `estBlockSize > srcSize` (strict). Our trigger is
@@ -2007,7 +2086,8 @@ impl SplitEstimator<'_> {
         if full_raw_fallback {
             return;
         }
-        self.derive_block_splits_with_full(start_idx, end_idx, full, entry, partitions);
+        let exit = self.derive_block_splits_with_full(start_idx, end_idx, full, entry, partitions);
+        self.recycle_state(exit);
     }
 
     /// Returns the post-emit state at `end_idx` produced by whichever
@@ -2030,6 +2110,7 @@ impl SplitEstimator<'_> {
             // exit state is the post-state of that single-partition probe.
             let (_cost, _raw_fallback, post) =
                 self.estimate_subblock_size(start_idx, end_idx, &entry);
+            self.recycle_state(entry);
             return post;
         }
         let mid_idx = (start_idx + end_idx) / 2;
@@ -2038,7 +2119,9 @@ impl SplitEstimator<'_> {
         // not from the parent's block-entry state. Without this propagation
         // `second` is evaluated as a fresh-block start, biasing the
         // `first + second < full` decision toward overly optimistic splits.
-        let (second, _, _) = self.estimate_subblock_size(mid_idx, end_idx, &first_post);
+        let (second, _, second_post) = self.estimate_subblock_size(mid_idx, end_idx, &first_post);
+        self.recycle_state(second_post);
+        self.recycle_state(first_post);
         if first + second < full {
             // If the left side gets further split, the true state at
             // `mid_idx` is the left subtree's exit state, not `first_post`.
@@ -2055,6 +2138,7 @@ impl SplitEstimator<'_> {
         }
         // No split here — this range will be emitted as one partition.
         let (_cost, _raw_fallback, post) = self.estimate_subblock_size(start_idx, end_idx, &entry);
+        self.recycle_state(entry);
         post
     }
 }
@@ -3177,7 +3261,8 @@ fn compress_literals(
         weight_scratch,
     );
 
-    let Some(new_table_description_size) = new_encoder_table.writeable_table_description_size()
+    let Some(new_table_description_size) =
+        new_encoder_table.writeable_table_description_size(weight_scratch.weight_fse_table())
     else {
         raw_literals(literals, writer);
         weight_scratch.recycle(new_encoder_table);

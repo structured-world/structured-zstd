@@ -26,7 +26,7 @@ pub fn round_trip(data: &[u8]) {
     let mut writer = BitWriter::new();
     let mut encoder_table = huff0_encoder::HuffmanTable::build_from_data(data);
     encoder_table
-        .writeable_table_description_size()
+        .writeable_table_description_size(&mut crate::fse::fse_encoder::FSETable::blank())
         .expect("round_trip must only build Huffman tables with a writeable description");
     let mut encoder = huff0_encoder::HuffmanEncoder::new(&encoder_table, &mut writer);
 

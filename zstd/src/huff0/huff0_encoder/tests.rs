@@ -88,7 +88,7 @@ fn the_cached_weight_description_counts_as_retained() {
     let before = table.heap_size();
 
     let cached_len = table
-        .writeable_table_description_size()
+        .writeable_table_description_size(&mut fse_encoder::FSETable::blank())
         .expect("the full-alphabet fixture caches an encoded description")
         - 1;
 
@@ -404,7 +404,7 @@ fn cheap_desc_size_proxy_is_conservative_vs_exact() {
         // `try_table_description_size` trims internally; mirror that
         // on the proxy call so both score the same slice.
         let trimmed = &weights[..weights.len() - 1];
-        let exact = table.try_table_description_size();
+        let exact = table.try_table_description_size(&mut fse_encoder::FSETable::blank());
         let proxy = cheap_desc_size_proxy(trimmed);
         match (proxy, exact) {
             (Some(p), Some(e)) => {
@@ -523,6 +523,9 @@ fn fse_weight_descriptions_roundtrip() {
     // alphabet such as 4 symbols → weights [1,1,1] produced a description the
     // decoder rejected.
     let mut fails: Vec<(usize, u32, alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
+    // One table for every case, as a compressor keeps one: each description
+    // is built over whatever the previous case left in it.
+    let mut fse_table = fse_encoder::FSETable::blank();
     for card in 2usize..=255 {
         for skew in 0u32..4 {
             let mut data: Vec<u8> = Vec::new();
@@ -553,7 +556,11 @@ fn fse_weight_descriptions_roundtrip() {
             // for streams it actually FSE-encodes; None means it chose the raw
             // description (nothing to round-trip). Every Some MUST decode back.
             let mut encoded = Vec::new();
-            if !HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(&weights, &mut encoded) {
+            if !HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(
+                &weights,
+                &mut encoded,
+                &mut fse_table,
+            ) {
                 continue;
             }
             let mut description = Vec::with_capacity(encoded.len() + 1);
@@ -608,7 +615,11 @@ fn large_alphabet_weight_description_uses_fse_when_raw_is_unrepresentable() {
 
     let mut encoded = Vec::new();
     assert!(
-        HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(&weights, &mut encoded),
+        HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(
+            &weights,
+            &mut encoded,
+            &mut fse_encoder::FSETable::blank(),
+        ),
         "FSE weight description must be available when raw weights cannot be represented",
     );
     let mut description = Vec::with_capacity(encoded.len() + 1);
@@ -644,7 +655,7 @@ fn cached_encoded_weight_description_is_reused_for_write_table() {
     }
     let mut table = HuffmanTable::build_from_data(&data);
     let desc_size = table
-        .writeable_table_description_size()
+        .writeable_table_description_size(&mut fse_encoder::FSETable::blank())
         .expect("table description must be writable");
     let cached = table
         .cached_encoded_weight_description()
@@ -674,7 +685,9 @@ fn flat_wide_alphabet_has_no_writeable_description() {
     let alphabet: Vec<u8> = (0u8..=255).collect();
     let mut table = HuffmanTable::build_from_data(&alphabet);
     assert!(
-        table.writeable_table_description_size().is_none(),
+        table
+            .writeable_table_description_size(&mut fse_encoder::FSETable::blank())
+            .is_none(),
         "a table this wide and this flat has no representation to write"
     );
 }
@@ -710,7 +723,11 @@ fn a_rejected_description_is_recorded_and_the_raw_form_written() {
     }
 
     // The size query is what encodes, and it is what a writer is preceded by.
-    assert!(table.writeable_table_description_size().is_some());
+    assert!(
+        table
+            .writeable_table_description_size(&mut fse_encoder::FSETable::blank())
+            .is_some()
+    );
     assert_eq!(
         table.weight_description_state(),
         DescriptionState::NotEncodable,

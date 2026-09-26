@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
@@ -380,7 +381,8 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             let weights = self.weights_into(&mut buf);
             let weights = &weights[..weights.len() - 1];
             let mut encoded = Vec::new();
-            if Self::encode_weight_description_into(weights, &mut encoded) {
+            let mut fse_table = fse_encoder::FSETable::blank();
+            if Self::encode_weight_description_into(weights, &mut encoded, &mut fse_table) {
                 self.writer.write_bits(encoded.len() as u8, 8);
                 self.writer.append_bytes(&encoded);
             } else {
@@ -396,7 +398,8 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             let len = weights.len();
             let weights = &buf[..len - 1];
             let mut encoded = Vec::new();
-            if Self::encode_weight_description_into(weights, &mut encoded) {
+            let mut fse_table = fse_encoder::FSETable::blank();
+            if Self::encode_weight_description_into(weights, &mut encoded, &mut fse_table) {
                 self.writer.write_bits(encoded.len() as u8, 8);
                 self.writer.append_bytes(&encoded);
             } else {
@@ -413,7 +416,13 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     /// rebuilt many times per frame reuses one allocation; on `false` its
     /// contents are meaningless and the raw nibble description is written
     /// instead.
-    fn encode_weight_description_into(weights: &[u8], encoded: &mut Vec<u8>) -> bool {
+    /// `fse_table` is where the weights' FSE table is built; the caller keeps it
+    /// between tables, as upstream keeps its `HUF_CompressWeightsWksp`.
+    fn encode_weight_description_into(
+        weights: &[u8],
+        encoded: &mut Vec<u8>,
+        fse_table: &mut fse_encoder::FSETable,
+    ) -> bool {
         encoded.clear();
         if weights.len() <= 2 {
             return false;
@@ -454,11 +463,9 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             encoded.reserve(want - encoded.len());
         }
         {
+            fse_encoder::build_table_from_symbol_counts_into(&counts, 6, false, fse_table);
             let mut writer = BitWriter::from(&mut *encoded);
-            let mut encoder = FSEEncoder::new(
-                fse_encoder::build_table_from_symbol_counts(&counts, 6, false),
-                &mut writer,
-            );
+            let mut encoder = FSEEncoder::new(fse_table, &mut writer);
             encoder.encode_interleaved(weights);
             writer.flush();
         }
@@ -817,15 +824,19 @@ impl HuffmanTable {
     /// std build path: consults the lazy cache to avoid re-encoding the
     /// weight stream when both planner and emitter call this for the
     /// same table. no_std build path: recomputes via the direct encoder
-    /// every call (cache field absent — preserves `Sync`).
-    pub(crate) fn try_table_description_size(&mut self) -> Option<usize> {
+    /// every call (cache field absent — preserves `Sync`). `fse_table` is the
+    /// caller's storage for the weights' FSE table.
+    pub(crate) fn try_table_description_size(
+        &mut self,
+        fse_table: &mut fse_encoder::FSETable,
+    ) -> Option<usize> {
         #[cfg(feature = "std")]
         {
             // Encodes on the first call for these contents and caches it, so
             // the writer that follows reads rather than repeats the work. This
             // is also where the caching happens at all: it is the only step in
             // the emit path holding the table mutably.
-            self.fill_weight_description_from_codes();
+            self.fill_weight_description_from_codes(fse_table);
             if let Some(fse_description) = self.cached_encoded_weight_description() {
                 return Some(fse_description.len() + 1);
             }
@@ -843,7 +854,11 @@ impl HuffmanTable {
             let len = weights.len();
             let weights = &buf[..len - 1];
             let mut encoded = Vec::new();
-            if HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(weights, &mut encoded) {
+            if HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(
+                weights,
+                &mut encoded,
+                fse_table,
+            ) {
                 return Some(encoded.len() + 1);
             }
             if weights.len() <= 128 {
@@ -855,8 +870,11 @@ impl HuffmanTable {
     }
 
     /// Alias for `try_table_description_size` used by call sites that require explicit writeability.
-    pub(crate) fn writeable_table_description_size(&mut self) -> Option<usize> {
-        self.try_table_description_size()
+    pub(crate) fn writeable_table_description_size(
+        &mut self,
+        fse_table: &mut fse_encoder::FSETable,
+    ) -> Option<usize> {
+        self.try_table_description_size(fse_table)
     }
 
     /// Owning form of [`Self::weights_into`], for tests that want the weights
@@ -884,21 +902,24 @@ impl HuffmanTable {
     /// which is the whole point: the previous lazy form populated through
     /// `&self` and so had to hand the cache a freshly allocated one.
     #[cfg(feature = "std")]
-    fn fill_weight_description(&mut self, weights: &[u8]) {
+    fn fill_weight_description(&mut self, weights: &[u8], fse_table: &mut fse_encoder::FSETable) {
         if self.cached_encoded_weight_description.state != DescriptionState::NotComputed {
             return;
         }
         let cache = &mut self.cached_encoded_weight_description;
-        cache.state =
-            if HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(weights, &mut cache.buf) {
-                DescriptionState::Encoded(cache.buf.len())
-            } else {
-                DescriptionState::NotEncodable
-            };
+        cache.state = if HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(
+            weights,
+            &mut cache.buf,
+            fse_table,
+        ) {
+            DescriptionState::Encoded(cache.buf.len())
+        } else {
+            DescriptionState::NotEncodable
+        };
     }
 
     #[cfg(feature = "std")]
-    fn fill_weight_description_from_codes(&mut self) {
+    fn fill_weight_description_from_codes(&mut self, fse_table: &mut fse_encoder::FSETable) {
         // Before deriving the weights, not after: they cost a pass over the
         // whole alphabet, and a warm cache needs none of it.
         if self.cached_encoded_weight_description.state != DescriptionState::NotComputed {
@@ -910,7 +931,7 @@ impl HuffmanTable {
         let weights = self.weights_into(&mut buf);
         let len = weights.len();
         let weights = &buf[..len - 1];
-        self.fill_weight_description(weights);
+        self.fill_weight_description(weights, fse_table);
     }
 
     /// The cached encoding, or `None` when the FSE form was rejected OR has not
@@ -1579,6 +1600,9 @@ pub(crate) struct WeightScratch {
     /// The last table the caller built and threw away, handed back so the next
     /// build fills its buffers instead of taking new ones.
     spare_table: Option<HuffmanTable>,
+    /// Where each table's weight description builds its FSE table. Taken on
+    /// first use and kept, so a description costs no table allocation or copy.
+    weight_fse_table: Option<Box<fse_encoder::FSETable>>,
 }
 
 impl WeightScratch {
@@ -1595,11 +1619,21 @@ impl WeightScratch {
             + self.work.capacity() * core::mem::size_of::<HuffNode>()
             + self.weights.capacity() * core::mem::size_of::<usize>()
             + self.spare_table.as_ref().map_or(0, HuffmanTable::heap_size)
+            + self
+                .weight_fse_table
+                .as_ref()
+                .map_or(0, |_| core::mem::size_of::<fse_encoder::FSETable>())
     }
 
     /// Park a table the caller is done with, for the next build to fill.
     pub(crate) fn recycle(&mut self, table: HuffmanTable) {
         self.spare_table = Some(table);
+    }
+
+    /// The storage a weight description builds its FSE table in.
+    pub(crate) fn weight_fse_table(&mut self) -> &mut fse_encoder::FSETable {
+        self.weight_fse_table
+            .get_or_insert_with(|| Box::new(fse_encoder::FSETable::blank()))
     }
 }
 
@@ -1902,7 +1936,11 @@ pub(crate) fn huf_weight_description_for_test(data: &[u8]) -> (Vec<u8>, Vec<u8>)
     weights.pop();
     let mut encoded = Vec::new();
     assert!(
-        HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(&weights, &mut encoded),
+        HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(
+            &weights,
+            &mut encoded,
+            &mut fse_encoder::FSETable::blank(),
+        ),
         "expected FSE weights",
     );
     let mut description = Vec::with_capacity(encoded.len() + 1);
