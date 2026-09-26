@@ -4500,7 +4500,9 @@ fn a_max_frame_round_trips() {
 #[test]
 #[cfg(not(target_pointer_width = "64"))]
 fn max_is_refused_on_a_32_bit_target() {
-    let err = parse(&["--max", "f"]).unwrap_err();
+    let Err(err) = parse(&["--max", "f"]) else {
+        panic!("--max must be refused on a 32-bit target");
+    };
     assert!(err.to_string().contains("32-bit"), "{err}");
 }
 
