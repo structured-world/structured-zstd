@@ -2970,19 +2970,18 @@ fn read_inputs_bounded(inputs: &[PathBuf], sizes: &[u64]) -> Result<Vec<u8>> {
 /// one of at least [`MIN_BENCH_BLOCK_SIZE`] is given. An empty input yields no
 /// frame. This is the reference's block table (`benchzstd.c`,
 /// `BMK_benchMemAdvancedNoAlloc`), so ratio and speed describe the same frames.
-fn bench_chunk_lengths(file_sizes: &[u64], block_size: Option<u64>) -> Vec<u64> {
+///
+/// Yielded, not listed: with a small `-B` over a large input a list would hold
+/// a word per frame that the `-M` ceiling never counted.
+fn bench_chunk_lengths(
+    file_sizes: &[u64],
+    block_size: Option<u64>,
+) -> impl Iterator<Item = u64> + '_ {
     let block = block_size.filter(|&size| size >= MIN_BENCH_BLOCK_SIZE);
-    let mut chunks = Vec::new();
-    for &size in file_sizes {
+    file_sizes.iter().flat_map(move |&size| {
         let piece = block.unwrap_or(size.max(1));
-        let mut left = size;
-        while left > 0 {
-            let take = left.min(piece);
-            chunks.push(take);
-            left -= take;
-        }
-    }
-    chunks
+        (0..size.div_ceil(piece)).map(move |at| piece.min(size - at * piece))
+    })
 }
 
 /// The frames [`bench_chunk_lengths`] cuts `file_sizes` into, measured without
@@ -3053,9 +3052,8 @@ fn benchmark_one(
         );
     }
 
-    let chunks = bench_chunk_lengths(file_sizes, opts.block_size);
     debug_assert_eq!(
-        chunks.iter().sum::<u64>(),
+        bench_chunk_lengths(file_sizes, opts.block_size).sum::<u64>(),
         data.len() as u64,
         "the frames cover the input exactly"
     );
@@ -3088,7 +3086,7 @@ fn benchmark_one(
             compressed.clear();
             let t = Instant::now();
             let mut rest = data;
-            for &chunk in &chunks {
+            for chunk in bench_chunk_lengths(file_sizes, opts.block_size) {
                 // Each piece is a frame of its own, as the reference's
                 // benchmark compresses every block independently. The length is
                 // exact, so it is pledged rather than estimated.
@@ -3546,15 +3544,19 @@ fn load_training_samples(
              split files into fixed-size samples with -B#"
         );
     }
-    let budget = wanted
-        .min(TRAINING_DATA_MAX)
-        .min(memory_limit.unwrap_or(u64::MAX));
-    let budget = usize::try_from(budget)
+    // The budget holds each sample's recorded length as well as its bytes: under
+    // a small `-B` the lengths outweigh the bytes they describe, a word per byte
+    // at `-B1`, and a limit on the bytes alone would be exceeded by the list.
+    const SIZE_ENTRY: u64 = core::mem::size_of::<usize>() as u64;
+    let budget = TRAINING_DATA_MAX.min(memory_limit.unwrap_or(u64::MAX));
+    let corpus_room = usize::try_from(wanted.min(budget))
         .map_err(|_| eyre!("{budget} bytes of samples is more than this machine can hold"))?;
+    // At most as many entries as the smallest samples fit in the budget.
+    let entries = samples.min(budget / (SIZE_ENTRY + block_size.unwrap_or(1)));
 
     let mut set = TrainingSet {
-        corpus: Vec::with_capacity(budget),
-        sizes: Vec::new(),
+        corpus: Vec::with_capacity(corpus_room),
+        sizes: Vec::with_capacity(entries as usize),
         sources: Vec::new(),
     };
     'files: for input in order {
@@ -3577,7 +3579,8 @@ fn load_training_samples(
                 Some(block) => (size - taken).min(block),
                 None => size.min(TRAINING_SAMPLE_MAX),
             };
-            if set.corpus.len() as u64 + piece > budget as u64 {
+            let held = set.corpus.len() as u64 + (set.sizes.len() as u64 + 1) * SIZE_ENTRY;
+            if held + piece > budget {
                 if taken == 0 {
                     break 'files;
                 }

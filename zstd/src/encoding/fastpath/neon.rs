@@ -37,6 +37,13 @@ fn first_unequal(eq: uint8x16_t) -> usize {
 /// joined and their minimum lane tested, and the mismatch is only located on
 /// the step that has one.
 ///
+/// Measured on M1 against the 16-byte step with two lane tests it replaced,
+/// interleaved: the legacy dictionary trainer, whose comparisons run long,
+/// 4.96-5.98 s -> 4.19-4.41 s wall (zstd 1.5.7: 4.35-4.67 s); the level-19
+/// encoder on z000033 1.664-1.691 -> 1.613-1.648 G cycles (libzstd:
+/// 1.546-1.617 G) while a decode-only control moved 3.458-3.475 ->
+/// 3.421-3.457 G.
+///
 /// # Safety
 /// `lhs` / `rhs` must point to at least `max` initialized bytes. NEON must be
 /// available — guaranteed on AArch64 baseline but enforced by the

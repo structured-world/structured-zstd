@@ -951,7 +951,7 @@ fn the_frame_extent_matches_the_frames_it_describes() {
     let files: [&[u64]; 4] = [&[], &[0, 1, 5000], &[1 << 20, 3], &[70_000, 0, 131_071]];
     for sizes in files {
         for block in [None, Some(1024), Some(MIN_BENCH_BLOCK_SIZE), Some(40_000)] {
-            let chunks = bench_chunk_lengths(sizes, block);
+            let chunks: Vec<u64> = bench_chunk_lengths(sizes, block).collect();
             let room: u64 = chunks
                 .iter()
                 .map(|&len| structured_zstd::encoding::compress_bound(len as usize) as u64)
@@ -964,6 +964,28 @@ fn the_frame_extent_matches_the_frames_it_describes() {
             );
         }
     }
+}
+
+/// The training budget holds the sample sizes as well as the samples. Under
+/// `-B1` every byte is a sample whose recorded length is a word, eight times
+/// the byte it describes, so a budget spent on the bytes alone was exceeded
+/// several times over by the list beside them.
+#[test]
+fn training_sample_sizes_count_against_the_budget() {
+    let input = std::env::temp_dir().join(format!("szstd-train-b1-{}", std::process::id()));
+    fs::write(&input, [3u8; 64]).unwrap();
+
+    let set = load_training_samples(std::slice::from_ref(&input), Some(1), Some(200));
+
+    let _ = fs::remove_file(&input);
+    let set = set.expect("the samples load within the budget");
+    assert!(!set.sizes.is_empty(), "some samples fit");
+    assert!(
+        set.corpus.len() + set.sizes.len() * core::mem::size_of::<usize>() <= 200,
+        "{} bytes of samples and {} sizes exceed the 200-byte budget",
+        set.corpus.len(),
+        set.sizes.len()
+    );
 }
 
 /// File sizes that add up past `u64::MAX` (sparse files report any length) do
@@ -2055,6 +2077,8 @@ fn block_size_is_read_like_the_reference_reads_it() {
 /// input yields no frame, and a smaller `-B` cuts nothing.
 #[test]
 fn benchmark_frames_follow_the_inputs_and_the_block_size() {
+    let bench_chunk_lengths =
+        |sizes: &[u64], block| super::bench_chunk_lengths(sizes, block).collect::<Vec<_>>();
     assert_eq!(bench_chunk_lengths(&[100, 50], None), vec![100, 50]);
     assert_eq!(
         bench_chunk_lengths(&[100, 50], Some(40)),

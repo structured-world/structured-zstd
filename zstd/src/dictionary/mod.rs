@@ -774,6 +774,10 @@ pub fn create_legacy_dict_from_slice<W: io::Write>(
             };
             io::Error::new(io::ErrorKind::InvalidInput, reason)
         })?;
+    // Every sample, not only those the content search kept: the reference cuts
+    // the corpus to its size limit inside the search alone, for its suffix
+    // sort (zdict.c, `ZDICT_trainBuffer_legacy`), and builds the entropy tables
+    // from all of them (`ZDICT_trainFromBuffer_unsafe_legacy`).
     let finalized = finalize_raw_dict(content.as_slice(), samples, dict_size, finalize)?;
     output.write_all(finalized.as_slice())
 }

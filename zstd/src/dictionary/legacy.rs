@@ -148,11 +148,11 @@ impl<'a> Corpus<'a> {
     #[inline]
     fn common(&self, a: usize, b: usize) -> usize {
         let samples = self.samples;
-        // A comparison that starts in the band has nothing to compare in the
-        // samples.
-        let Some(in_samples) = samples.len().checked_sub(a.max(b)) else {
-            return self.common_tail(a, b, 0);
-        };
+        // Every position compared is a suffix, below the samples' length, or
+        // the noise slot, at it; one at the slot compares nothing in the
+        // samples and goes straight to the band.
+        debug_assert!(a.max(b) <= samples.len());
+        let in_samples = samples.len() - a.max(b);
         let base = samples.as_ptr();
         // SAFETY: `a, b <= max(a, b)` and `in_samples == samples.len() -
         // max(a, b)`, so both runs of `in_samples` bytes lie in the samples.
