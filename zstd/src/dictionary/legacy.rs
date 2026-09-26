@@ -197,6 +197,14 @@ impl<'a> Corpus<'a> {
     }
 }
 
+/// How many text positions ahead the analysis warms the suffix-array line
+/// around a position's rank.
+const FAR_AHEAD: usize = 16;
+
+/// How many text positions ahead the analysis warms the text of a position's
+/// two neighbours in suffix order.
+const NEAR_AHEAD: usize = 8;
+
 /// The suffix array with one extra slot on each side, both pointing into the
 /// noise band, as the reference lays it out (`suffix0[0]` and
 /// `suffix[bufferSize]`): a walk off either end compares against noise and
@@ -225,6 +233,36 @@ impl Suffixes {
         match self.sa.get(at as u64 as usize) {
             Some(&pos) => pos as usize,
             None => self.noise,
+        }
+    }
+
+    /// Warm what the analysis of text position `cursor` will read, ahead of
+    /// reaching it: its rank is random, so the array around that rank and the
+    /// text of the two neighbours there miss the cache every time. The array
+    /// line is warmed for the position [`FAR_AHEAD`] on, the neighbours' text
+    /// for the one [`NEAR_AHEAD`] on, whose array line that earlier hint has
+    /// brought in. A hint only; ranks at either end read a clamped slot.
+    #[inline(always)]
+    fn prefetch_for(&self, rank: &[u32], samples: &[u8], cursor: usize) {
+        use crate::decoding::prefetch::prefetch_l1_at;
+        let len = self.sa.len();
+        if let Some(&far) = rank.get(cursor + FAR_AHEAD) {
+            prefetch_l1_at(self.sa.as_ptr().wrapping_add(far as usize).cast());
+        }
+        if let Some(&near) = rank.get(cursor + NEAR_AHEAD) {
+            let near = near as usize;
+            // Rank 0 wraps past the end and clamps with the top rank.
+            let below = near.wrapping_sub(1).min(len - 1);
+            let above = (near + 1).min(len - 1);
+            // SAFETY: both are clamped below `len == self.sa.len()`.
+            let (below, above) = unsafe {
+                (
+                    *self.sa.get_unchecked(below) as usize,
+                    *self.sa.get_unchecked(above) as usize,
+                )
+            };
+            prefetch_l1_at(samples.as_ptr().wrapping_add(below));
+            prefetch_l1_at(samples.as_ptr().wrapping_add(above));
         }
     }
 }
@@ -328,6 +366,7 @@ fn find_segments(list: &mut [DictItem], corpus: &Corpus<'_>, len: usize, min_rep
 
     let mut cursor = 0usize;
     while cursor < len {
+        suffixes.prefetch_for(&rank, corpus.samples, cursor);
         if done[cursor] {
             cursor += 1;
             continue;
