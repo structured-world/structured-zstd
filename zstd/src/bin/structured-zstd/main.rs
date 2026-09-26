@@ -1191,9 +1191,12 @@ fn parse_args_into(
                     } else if let Some(v) = option_text(long, "threads", arg_os, &mut iter)? {
                         let _ = v.parse::<u32>().wrap_err("invalid --threads")?;
                     } else if let Some(v) = option_text(long, "block-size", arg_os, &mut iter)? {
-                        // The job size of a multi-threaded run: nothing here,
-                        // but a malformed size is still a broken command line.
-                        parse_size(&v).wrap_err("invalid --block-size")?;
+                        // The long spelling of `-B#`: the reference reads both
+                        // into one setting (zstdcli.c, `--block-size` and `-B`),
+                        // which cuts the benchmark's frames and the training
+                        // samples, and is a multi-threaded job size otherwise.
+                        let size = parse_size(&v).wrap_err("invalid --block-size")?;
+                        opts.block_size = (size != 0).then_some(size);
                     } else if let Some(list) = option_value(long, "filelist", arg_os, &mut iter)? {
                         opts.filelists.push(list);
                     } else if let Some(dir) =
@@ -3479,6 +3482,10 @@ struct TrainingSet {
 /// Reorder the sample files the way the reference does before loading
 /// (`DiB_shuffle`), so a sample set too large to load keeps a spread of files
 /// rather than the first ones, and the corpus is laid out as there.
+///
+/// The same loop step for step (dibio.c, `DiB_shuffle` and `DiB_rand`, alike in
+/// 1.5.7 and later): from the last position down to 1, swap with
+/// `rand % (i + 1)`, the generator seeded with `0xFD2FB528`.
 fn shuffle_training_files<T>(files: &mut [T]) {
     let mut seed: u32 = 0xFD2F_B528;
     let mut next = || {

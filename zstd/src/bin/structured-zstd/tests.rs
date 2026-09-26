@@ -2106,6 +2106,28 @@ fn block_size_is_read_like_the_reference_reads_it() {
     assert!(parse(&["-b", "-Bx", "f"]).is_err());
 }
 
+/// `--block-size=#` is the long spelling of `-B#`, as in the reference, which
+/// reads both into the one setting the benchmark and the trainers cut by.
+#[test]
+fn the_long_block_size_sets_what_b_sets() {
+    assert_eq!(
+        parse(&["-b", "--block-size=64K", "f"]).unwrap().block_size,
+        Some(64 << 10)
+    );
+    assert_eq!(
+        parse(&["-b", "--block-size", "4096", "f"])
+            .unwrap()
+            .block_size,
+        Some(4096)
+    );
+    assert_eq!(
+        parse(&["-b", "--block-size=0", "f"]).unwrap().block_size,
+        None,
+        "zero is no block size, as for -B0"
+    );
+    assert!(parse(&["-b", "--block-size=x", "f"]).is_err());
+}
+
 /// The benchmark compresses every input as frames of its own, cut into `-B`
 /// pieces from 32 bytes up, as the reference's block table does; an empty
 /// input yields no frame, and a smaller `-B` cuts nothing.
