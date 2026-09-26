@@ -208,14 +208,58 @@ impl CompressedBlockScratch {
 struct SequencePrefixSums {
     lit: Vec<usize>,
     ml: Vec<usize>,
+    /// Each sequence's literal-length and match-length codes, and a prefix sum
+    /// of the extra bits the two carry. Neither depends on the offset history,
+    /// so they are derived once per block (upstream zstd `ZSTD_seqToCodes`) and
+    /// every split probe reads its range from here.
+    ll_code: Vec<u8>,
+    ml_code: Vec<u8>,
+    length_bits: Vec<usize>,
+}
+
+/// The precomputed length codes of a run of sequences.
+#[derive(Clone, Copy)]
+struct LengthCodes<'a> {
+    ll: &'a [u8],
+    ml: &'a [u8],
+    /// Extra bits of every literal and match length in the run.
+    bits: usize,
 }
 
 impl SequencePrefixSums {
     fn heap_size(&self) -> usize {
-        (self.lit.capacity() + self.ml.capacity()) * core::mem::size_of::<usize>()
+        (self.lit.capacity() + self.ml.capacity() + self.length_bits.capacity())
+            * core::mem::size_of::<usize>()
+            + self.ll_code.capacity()
+            + self.ml_code.capacity()
+    }
+
+    /// The length codes of sequences `start..end`.
+    fn codes(&self, start: usize, end: usize) -> LengthCodes<'_> {
+        LengthCodes {
+            ll: &self.ll_code[start..end],
+            ml: &self.ml_code[start..end],
+            bits: self.length_bits[end] - self.length_bits[start],
+        }
     }
 
     fn rebuild(&mut self, sequences: &[RawSequence]) {
+        self.ll_code.clear();
+        self.ml_code.clear();
+        self.length_bits.clear();
+        self.ll_code.reserve(sequences.len());
+        self.ml_code.reserve(sequences.len());
+        self.length_bits.reserve(sequences.len() + 1);
+        let mut bits = 0usize;
+        self.length_bits.push(0);
+        for seq in sequences {
+            let (ll, _, ll_bits) = encode_literal_length(seq.ll);
+            let (ml, _, ml_bits) = encode_match_len(seq.ml);
+            self.ll_code.push(ll);
+            self.ml_code.push(ml);
+            bits += ll_bits + ml_bits;
+            self.length_bits.push(bits);
+        }
         self.lit.clear();
         self.ml.clear();
         // `Vec::reserve_exact(additional)` adds `additional` elements ABOVE
@@ -830,15 +874,12 @@ struct EstimatorWorkspace {
     ll_counts: Box<[usize; 256]>,
     ml_counts: Box<[usize; 256]>,
     of_counts: Box<[usize; 256]>,
-    sequences: Vec<RawSequence>,
 }
 
 impl EstimatorWorkspace {
-    /// The four boxed count tables plus whatever the sequence buffer has grown
-    /// to. All four boxes are always present once the workspace exists.
+    /// The four boxed count tables, always present once the workspace exists.
     fn heap_size(&self) -> usize {
         4 * core::mem::size_of::<[usize; 256]>()
-            + self.sequences.capacity() * core::mem::size_of::<RawSequence>()
     }
 }
 
@@ -849,7 +890,6 @@ impl Default for EstimatorWorkspace {
             ll_counts: Box::new([0; 256]),
             ml_counts: Box::new([0; 256]),
             of_counts: Box::new([0; 256]),
-            sequences: Vec::new(),
         }
     }
 }
@@ -862,33 +902,33 @@ impl Default for EstimatorWorkspace {
 /// FSE bit-level write. Splitter probes use this path to get the same byte
 /// count `encode_block_parts` would produce while saving the dominant
 /// `encode_sequences` write cost on every probe.
+#[cfg(test)]
 fn estimate_block_parts_size<M: Matcher>(
     state: &mut CompressState<M>,
     literals_vec: &[u8],
     raw_sequences: &[RawSequence],
     workspace: &mut EstimatorWorkspace,
 ) -> usize {
-    // The probe cannot fill in place: it walks sub-ranges of the block's
-    // sequences repeatedly, from a scratch history, while the array itself is
-    // borrowed immutably by the estimator for the whole search. So it keeps a
-    // copy — which costs nothing that matters, since block splitting only runs
-    // from level 11 up and never on the band this array's copy was hurting.
-    workspace.sequences.clear();
-    if workspace.sequences.capacity() < raw_sequences.len() {
-        workspace
-            .sequences
-            .reserve_exact(raw_sequences.len() - workspace.sequences.len());
-    }
-    workspace.sequences.extend_from_slice(raw_sequences);
-    fill_wire_offsets(
-        &mut workspace.sequences,
-        &mut state.offset_hist,
-        matches!(
-            state.strategy_tag,
-            crate::encoding::strategy::StrategyTag::Fast
-        ),
-    );
+    let mut sums = SequencePrefixSums::default();
+    sums.rebuild(raw_sequences);
+    estimate_block_parts_size_with(
+        state,
+        literals_vec,
+        raw_sequences,
+        sums.codes(0, raw_sequences.len()),
+        workspace,
+    )
+}
 
+/// [`estimate_block_parts_size`] for sequences whose length codes are already
+/// derived: the splitter's probes, which price many ranges of one block.
+fn estimate_block_parts_size_with<M: Matcher>(
+    state: &mut CompressState<M>,
+    literals_vec: &[u8],
+    raw_sequences: &[RawSequence],
+    codes: LengthCodes<'_>,
+    workspace: &mut EstimatorWorkspace,
+) -> usize {
     let lit_bytes = estimate_literals_section_bytes(
         literals_vec,
         &mut state.last_huff_table,
@@ -900,15 +940,15 @@ fn estimate_block_parts_size<M: Matcher>(
         literals_suspected_incompressible(literals_vec.len(), raw_sequences.len()),
     );
 
-    let seq_bytes = if workspace.sequences.is_empty() {
+    let seq_bytes = if raw_sequences.is_empty() {
         1
     } else {
         estimate_sequences_section_bytes(
-            &workspace.sequences,
+            raw_sequences,
+            codes,
+            &mut state.offset_hist,
             &mut state.fse_tables,
-            &mut workspace.ll_counts,
-            &mut workspace.ml_counts,
-            &mut workspace.of_counts,
+            workspace,
             state.strategy_tag,
         )
     };
@@ -1091,28 +1131,65 @@ fn estimate_literals_section_bytes(
     total
 }
 
+/// Price a sequence section. The offset codes are the one part that depends on
+/// the history the section starts from, so they are resolved here, in one pass
+/// that advances `offset_hist` as the emitter would; the length codes and
+/// their extra bits come precomputed in `codes`. Each histogram is built once
+/// and handed to the table selection, which the emitter's path counts again.
 fn estimate_sequences_section_bytes(
     sequences: &[RawSequence],
+    codes: LengthCodes<'_>,
+    offset_hist: &mut [u32; 3],
     fse_tables: &mut FseTables,
-    ll_counts: &mut [usize; 256],
-    ml_counts: &mut [usize; 256],
-    of_counts: &mut [usize; 256],
+    workspace: &mut EstimatorWorkspace,
     strategy: crate::encoding::strategy::StrategyTag,
 ) -> usize {
-    ll_counts.fill(0);
-    ml_counts.fill(0);
+    let EstimatorWorkspace {
+        ll_counts,
+        ml_counts,
+        of_counts,
+        ..
+    } = workspace;
+    let (ll_counts, ml_counts, of_counts) = (&mut **ll_counts, &mut **ml_counts, &mut **of_counts);
+    debug_assert_eq!(codes.ll.len(), sequences.len());
+    let histogram = |codes: &[u8], counts: &mut [usize; 256]| {
+        counts.fill(0);
+        let mut max = 0u8;
+        for &code in codes {
+            counts[code as usize] += 1;
+            max = max.max(code);
+        }
+        max as usize
+    };
+    let ll_max = histogram(codes.ll, ll_counts);
+    let ml_max = histogram(codes.ml, ml_counts);
     of_counts.fill(0);
-    let mut extra_bits: usize = 0;
-    for seq in sequences {
-        let (ll, _, ll_bits) = encode_literal_length(seq.ll);
-        let (ml, _, ml_bits) = encode_match_len(seq.ml);
-        let (of, _, _) = encode_offset(seq.off_base);
-        ll_counts[ll as usize] += 1;
-        ml_counts[ml as usize] += 1;
+    let mut of_max = 0usize;
+    let mut of_bits = 0usize;
+    let mut hist = *offset_hist;
+    let mut count_offset = |off_base: u32| {
+        let (of, _, _) = encode_offset(off_base);
         of_counts[of as usize] += 1;
+        of_max = of_max.max(of as usize);
         // Upstream zstd: OF code's value equals its additional-bits width.
-        extra_bits += ll_bits + ml_bits + of as usize;
+        of_bits += of as usize;
+    };
+    if matches!(strategy, crate::encoding::strategy::StrategyTag::Fast) {
+        for seq in sequences {
+            count_offset(encode_offset_with_history_fast(
+                seq.off_base,
+                seq.ll,
+                &mut hist,
+            ));
+        }
+    } else {
+        for seq in sequences {
+            count_offset(encode_offset_with_history(seq.off_base, seq.ll, &mut hist));
+        }
     }
+    *offset_hist = hist;
+    let extra_bits = codes.bits + of_bits;
+    let total = sequences.len();
 
     // Destructured for the same reason as the emitter: the default accessors
     // borrow the whole struct, which would collide with the `*_next` slots.
@@ -1131,30 +1208,38 @@ fn estimate_sequences_section_bytes(
     let ml_default: &FSETable = ml_default;
     let of_default: &FSETable = of_default;
 
-    // Same `choose_table` calls as the real encoder — counts the iterator
-    // internally, identical decision path.
-    let ll_mode = choose_table(
+    // The table selection the real encoder makes, from the same histograms.
+    let ll_mode = choose_table_from_counts(
         ll_previous.as_ref(),
         ll_default,
-        sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
+        ll_counts,
+        total,
+        ll_max,
         9,
         strategy,
+        None,
         ll_next,
     );
-    let ml_mode = choose_table(
+    let ml_mode = choose_table_from_counts(
         ml_previous.as_ref(),
         ml_default,
-        sequences.iter().map(|seq| encode_match_len(seq.ml).0),
+        ml_counts,
+        total,
+        ml_max,
         9,
         strategy,
+        None,
         ml_next,
     );
-    let of_mode = choose_table(
+    let of_mode = choose_table_from_counts(
         of_previous.as_ref(),
         of_default,
-        sequences.iter().map(|seq| encode_offset(seq.off_base).0),
+        of_counts,
+        total,
+        of_max,
         8,
         strategy,
+        None,
         of_next,
     );
 
@@ -1687,27 +1772,6 @@ fn highest_used_code<const MAX_CODE: usize>(counts: &[usize; 256]) -> usize {
         .unwrap_or(0)
 }
 
-/// [`fill_and_count`] without the histogram, for the block-split estimator: it
-/// prices sub-ranges repeatedly from a scratch history and counts them itself.
-fn fill_wire_offsets(
-    raw_sequences: &mut [RawSequence],
-    offset_hist: &mut [u32; 3],
-    fast_repcode: bool,
-) {
-    // Local copy for the same reason as `fill_and_count`.
-    let mut hist = *offset_hist;
-    if fast_repcode {
-        for seq in raw_sequences.iter_mut() {
-            seq.off_base = encode_offset_with_history_fast(seq.off_base, seq.ll, &mut hist);
-        }
-    } else {
-        for seq in raw_sequences.iter_mut() {
-            seq.off_base = encode_offset_with_history(seq.off_base, seq.ll, &mut hist);
-        }
-    }
-    *offset_hist = hist;
-}
-
 fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
     // The `*_default` fields are cfg-typed via the
     // [`crate::fse::fse_encoder::FseDefaultTable`] alias —
@@ -1799,10 +1863,11 @@ impl SplitEstimator<'_> {
         self.scratch_state.fse_tables.ml_previous = entry.ml_previous.clone();
         self.scratch_state.fse_tables.of_previous = entry.of_previous.clone();
         self.scratch_state.offset_hist = entry.offset_hist;
-        let emitted_payload = estimate_block_parts_size(
+        let emitted_payload = estimate_block_parts_size_with(
             &mut self.scratch_state,
             &self.parts.literals[lit_start..lit_end],
             &self.parts.sequences[start_idx..end_idx],
+            self.prefix_sums.codes(start_idx, end_idx),
             &mut self.workspace,
         );
         let source_len = (lit_end - lit_start) + match_len;
@@ -2045,47 +2110,8 @@ fn fse_bit_cost(counts: &[usize; 256], max_symbol: usize, table: &FSETable) -> O
     Some(cost >> 8)
 }
 
-fn choose_table<'a>(
-    previous: Option<&'a PreviousFseTable>,
-    default_table: &'a FSETable,
-    data: impl Iterator<Item = u8>,
-    max_log: u8,
-    strategy: crate::encoding::strategy::StrategyTag,
-    next: &'a mut Option<SharedFseTable>,
-) -> FseTableMode<'a> {
-    // Collect symbol distribution, tracking the highest code so the selector
-    // skips the full-256 reverse scan (see `choose_table_from_counts`).
-    let mut counts = [0usize; 256];
-    let mut total = 0usize;
-    let mut max_symbol = 0usize;
-    for symbol in data {
-        let symbol = symbol as usize;
-        counts[symbol] += 1;
-        total += 1;
-        max_symbol = max_symbol.max(symbol);
-    }
-    choose_table_from_counts(
-        previous,
-        default_table,
-        &mut counts,
-        total,
-        max_symbol,
-        max_log,
-        strategy,
-        // Estimator-only path (no emitted table): price the unadjusted histogram,
-        // matching upstream's `ZSTD_NCountCost`.
-        None,
-        next,
-    )
-}
-
-/// Same decision logic as [`choose_table`] but takes pre-computed
-/// symbol counts and total directly. Hot-path callers in
-/// `compress_literals_and_sequences` use this overload to avoid
-/// re-iterating the sequence vec three times (one pass per
-/// ll/ml/of stream); the iterator form is kept for the cost
-/// estimator's call sites where the data is already in iterator
-/// form.
+/// Choose an FSE table mode from a stream's symbol counts, which every caller
+/// has already built while visiting the codes once.
 // The eight inputs are the cohesive FSE-table-selection set, each carrying its
 // own perf / correctness rationale below (the `&mut` histogram for the no-copy
 // emit build, the caller-tracked `max_symbol` / `last_code` that avoid a

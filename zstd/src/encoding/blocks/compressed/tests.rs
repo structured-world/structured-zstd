@@ -1,13 +1,47 @@
 use super::{
-    FseTableMode, LastUsedTable, RawSequence, choose_table, emit_single_sequence_block,
+    FseTableMode, LastUsedTable, RawSequence, choose_table_from_counts, emit_single_sequence_block,
     encode_literal_length, encode_match_len, encode_offset_with_history, min_gain,
     min_literals_to_compress, previous_table, remember_last_used_tables,
 };
-use crate::encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable};
+use crate::encoding::frame_compressor::{
+    CompressState, FseTables, PreviousFseTable, SharedFseTable,
+};
 use crate::encoding::strategy::StrategyTag;
-use crate::fse::fse_encoder::build_table_from_symbol_counts;
+use crate::fse::fse_encoder::{FSETable, build_table_from_symbol_counts};
 use crate::huff0::huff0_encoder;
 use alloc::vec::Vec;
+
+/// The table selection for a stream given as codes: counts them, then selects
+/// as the encoder does, pricing the unadjusted histogram.
+fn choose_table<'a>(
+    previous: Option<&'a PreviousFseTable>,
+    default_table: &'a FSETable,
+    data: impl Iterator<Item = u8>,
+    max_log: u8,
+    strategy: StrategyTag,
+    next: &'a mut Option<SharedFseTable>,
+) -> FseTableMode<'a> {
+    let mut counts = [0usize; 256];
+    let mut total = 0usize;
+    let mut max_symbol = 0usize;
+    for symbol in data {
+        let symbol = symbol as usize;
+        counts[symbol] += 1;
+        total += 1;
+        max_symbol = max_symbol.max(symbol);
+    }
+    choose_table_from_counts(
+        previous,
+        default_table,
+        &mut counts,
+        total,
+        max_symbol,
+        max_log,
+        strategy,
+        None,
+        next,
+    )
+}
 
 fn tables_match(
     lhs: &crate::fse::fse_encoder::FSETable,

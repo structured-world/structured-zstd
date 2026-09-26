@@ -572,6 +572,12 @@ pub(crate) fn compress_block_encoded_borrowed(
 /// (`zstd_compress.c`, `ZSTD_resolveBlockSplitterMode`: `strategy >= btopt &&
 /// windowLog >= 17`), so a parameter set that moves the strategy moves the
 /// pass with it.
+///
+/// Turning the pass off is not a speed lever. Gated by level it was skipped on
+/// the btopt / btultra frames of L13-15, which ran faster there only by paying
+/// 6-9% in bytes (z000033[..200000], L13: 90378 against 85017 with the pass).
+/// Where the pass costs time, the cost is in the splitter itself, and that is
+/// what has to get cheaper.
 #[inline]
 fn post_split_enabled(strategy_tag: StrategyTag, window_size: u64) -> bool {
     matches!(
