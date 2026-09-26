@@ -489,12 +489,11 @@ macro_rules! build_optimal_plan_impl_body {
                         let node_price = unsafe { *node_prices.add(match_len) };
                         if match_len > last_pos || next_cost < node_price {
                             unsafe {
-                                *nodes.add(match_len) = HcOptimalNode {
-                                    off: candidate.offset as u32,
-                                    mlen: match_len as u32,
-                                    litlen: 0,
-                                    reps: initial_reps,
-                                };
+                                HcOptimalNode::write_match_end(
+                                    nodes.add(match_len),
+                                    candidate.offset as u32,
+                                    match_len as u32,
+                                );
                                 *node_prices.add(match_len) = next_cost;
                             }
                             if match_len > last_pos {
@@ -546,14 +545,20 @@ macro_rules! build_optimal_plan_impl_body {
                 // below) — also the price of `prev_match`, the pre-overwrite copy.
                 let node_pos_price = unsafe { *node_prices.add(pos) };
                 if lit_cost <= node_pos_price {
-                    // An unreached cell has no node to read; the default node
-                    // (`litlen != 0`) fails the end-of-match test below exactly
-                    // as a reset node would.
-                    let prev_match = if node_pos_price != u32::MAX {
-                        unsafe { *nodes.add(pos) }
-                    } else {
-                        HcOptimalNode::default()
-                    };
+                    // The cell being replaced, read field by field: a match
+                    // written it without a repeat history (the pass derives that
+                    // on arrival), so the node as a whole may not be initialised.
+                    // An unreached cell has no node to read; a zero length fails
+                    // the end-of-match test below exactly as a reset node would.
+                    let (prev_match_off, prev_match_mlen, prev_match_litlen) =
+                        if node_pos_price != u32::MAX {
+                            unsafe {
+                                let cell = nodes.add(pos);
+                                ((*cell).off, (*cell).mlen, (*cell).litlen)
+                            }
+                        } else {
+                            (0, 0, u32::MAX)
+                        };
                     unsafe {
                         *nodes.add(pos) = HcOptimalNode {
                             litlen: lit_len as u32,
@@ -563,8 +568,8 @@ macro_rules! build_optimal_plan_impl_body {
                     }
                     #[allow(clippy::collapsible_if)]
                     if opt_level
-                        && prev_match.mlen > 0
-                        && prev_match.litlen == 0
+                        && prev_match_mlen > 0
+                        && prev_match_litlen == 0
                         && pos < $current_len
                     {
                         if ll1_price < ll0_price {
@@ -598,13 +603,13 @@ macro_rules! build_optimal_plan_impl_body {
                             let next_price = unsafe { *node_prices.add(next) };
                             if with1literal < with_more_literals && with1literal < next_price {
                                 // Upstream zstd parity (zstd_opt.c:1232): `cur >= prevMatch.mlen`.
-                                debug_assert!(pos >= prev_match.mlen as usize);
-                                let prev_pos = pos - prev_match.mlen as usize;
+                                debug_assert!(pos >= prev_match_mlen as usize);
+                                let prev_pos = pos - prev_match_mlen as usize;
                                 {
                                     debug_assert!(unsafe { *node_prices.add(prev_pos) } != u32::MAX);
                                     let prev_state = unsafe { *nodes.add(prev_pos) };
                                     let (_, reps_after_match) = BtMatcher::encode_offset_with_reps(
-                                        prev_match.off,
+                                        prev_match_off,
                                         prev_state.litlen as usize,
                                         prev_state.reps,
                                     );
@@ -613,9 +618,10 @@ macro_rules! build_optimal_plan_impl_body {
                                     // joins the frontier below.
                                     unsafe {
                                         *nodes.add(next) = HcOptimalNode {
-                                            reps: reps_after_match,
+                                            off: prev_match_off,
+                                            mlen: prev_match_mlen,
                                             litlen: 1,
-                                            ..prev_match
+                                            reps: reps_after_match,
                                         };
                                         *node_prices.add(next) = with1literal;
                                     }
@@ -649,15 +655,20 @@ macro_rules! build_optimal_plan_impl_body {
                 continue;
             }
             {
-                let base_node = unsafe { *nodes.add(pos) };
-                if base_node.mlen > 0 && base_node.litlen == 0 {
+                // Field by field: a match-written cell has no repeat history
+                // yet, which this block is about to derive.
+                let (base_off, base_mlen, base_litlen) = unsafe {
+                    let cell = nodes.add(pos);
+                    ((*cell).off, (*cell).mlen, (*cell).litlen)
+                };
+                if base_mlen > 0 && base_litlen == 0 {
                     // Upstream zstd parity (zstd_opt.c:1255): `cur >= opt[cur].mlen`.
-                    debug_assert!(pos >= base_node.mlen as usize);
-                    let prev_pos = pos - base_node.mlen as usize;
+                    debug_assert!(pos >= base_mlen as usize);
+                    let prev_pos = pos - base_mlen as usize;
                     debug_assert!(unsafe { *node_prices.add(prev_pos) } != u32::MAX);
                     let prev_state = unsafe { *nodes.add(prev_pos) };
                     let (_, reps_after_match) = BtMatcher::encode_offset_with_reps(
-                        base_node.off,
+                        base_off,
                         prev_state.litlen as usize,
                         prev_state.reps,
                     );
@@ -815,12 +826,11 @@ macro_rules! build_optimal_plan_impl_body {
                         let node_next_price = unsafe { *node_prices.add(next) };
                         if next > last_pos || next_cost < node_next_price {
                             unsafe {
-                                *nodes.add(next) = HcOptimalNode {
-                                    off: candidate.offset as u32,
-                                    mlen: match_len as u32,
-                                    litlen: 0,
-                                    reps: base_reps,
-                                };
+                                HcOptimalNode::write_match_end(
+                                    nodes.add(next),
+                                    candidate.offset as u32,
+                                    match_len as u32,
+                                );
                                 *node_prices.add(next) = next_cost;
                             }
                             if next > last_pos {
@@ -869,7 +879,6 @@ macro_rules! build_optimal_plan_impl_body {
                                 off_price,
                                 base_cost,
                                 candidate.offset as u32,
-                                base_reps,
                                 last_pos,
                             )
                         });

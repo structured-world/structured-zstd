@@ -40,6 +40,27 @@ pub(crate) struct HcOptimalNode {
     pub(crate) reps: [u32; 3],
 }
 
+impl HcOptimalNode {
+    /// Record a match ending at `cell`: its offset, its length and an empty
+    /// literal run. The repeat history is left as it was, possibly
+    /// uninitialised: the forward pass derives it when it reaches the cell, as
+    /// upstream's does (`ZSTD_compressBlock_opt_generic` stores `mlen`, `off`,
+    /// `litlen` and the price, and applies `ZSTD_newRep` at `cur`).
+    ///
+    /// # Safety
+    /// `cell` must be valid for writes.
+    #[inline(always)]
+    pub(crate) unsafe fn write_match_end(cell: *mut Self, off: u32, mlen: u32) {
+        // SAFETY: field places of a writable cell; no reference to the whole
+        // (possibly uninitialised) node is formed.
+        unsafe {
+            core::ptr::addr_of_mut!((*cell).off).write(off);
+            core::ptr::addr_of_mut!((*cell).mlen).write(mlen);
+            core::ptr::addr_of_mut!((*cell).litlen).write(0);
+        }
+    }
+}
+
 impl Default for HcOptimalNode {
     fn default() -> Self {
         Self {

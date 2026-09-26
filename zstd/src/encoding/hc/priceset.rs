@@ -109,7 +109,6 @@ pub(crate) fn priceset_range_nonabort_scalar<const ACCURATE: bool>(
     off_price: u32,
     base_cost: u32,
     off: u32,
-    reps: [u32; 3],
     last_pos: usize,
 ) -> usize {
     let mut new_last = last_pos;
@@ -120,12 +119,8 @@ pub(crate) fn priceset_range_nonabort_scalar<const ACCURATE: bool>(
         let next = pos + ml;
         if next_cost < node_prices[next] {
             node_prices[next] = next_cost;
-            nodes[next].write(HcOptimalNode {
-                off,
-                mlen: ml as u32,
-                litlen: 0,
-                reps,
-            });
+            // SAFETY: `nodes[next]` is an in-bounds cell of the slice.
+            unsafe { HcOptimalNode::write_match_end(nodes[next].as_mut_ptr(), off, ml as u32) };
             if next > new_last {
                 new_last = next;
             }
@@ -177,7 +172,6 @@ fn priceset_range_vec<const W: usize, const ACCURATE: bool>(
     off_price: u32,
     base_cost: u32,
     off: u32,
-    reps: [u32; 3],
     last_pos: usize,
     deint: impl Fn(&[[u32; 2]], u32) -> Option<[u32; W]>,
     mask: impl Fn(&[u32; W], &[u32]) -> u8,
@@ -235,12 +229,10 @@ fn priceset_range_vec<const W: usize, const ACCURATE: bool>(
             bits &= bits - 1;
             let next = base_next + k;
             node_prices[next] = buf[k];
-            nodes[next].write(HcOptimalNode {
-                off,
-                mlen: (ml + k) as u32,
-                litlen: 0,
-                reps,
-            });
+            // SAFETY: `nodes[next]` is an in-bounds cell of the slice.
+            unsafe {
+                HcOptimalNode::write_match_end(nodes[next].as_mut_ptr(), off, (ml + k) as u32)
+            };
             if next > new_last {
                 new_last = next;
             }
@@ -254,12 +246,8 @@ fn priceset_range_vec<const W: usize, const ACCURATE: bool>(
         let next = pos + ml;
         if next_cost < node_prices[next] {
             node_prices[next] = next_cost;
-            nodes[next].write(HcOptimalNode {
-                off,
-                mlen: ml as u32,
-                litlen: 0,
-                reps,
-            });
+            // SAFETY: `nodes[next]` is an in-bounds cell of the slice.
+            unsafe { HcOptimalNode::write_match_end(nodes[next].as_mut_ptr(), off, ml as u32) };
             if next > new_last {
                 new_last = next;
             }
@@ -337,7 +325,6 @@ pub(crate) unsafe fn priceset_range_nonabort_avx2<const ACCURATE: bool>(
     off_price: u32,
     base_cost: u32,
     off: u32,
-    reps: [u32; 3],
     last_pos: usize,
 ) -> usize {
     priceset_range_vec::<8, ACCURATE>(
@@ -354,7 +341,6 @@ pub(crate) unsafe fn priceset_range_nonabort_avx2<const ACCURATE: bool>(
         off_price,
         base_cost,
         off,
-        reps,
         last_pos,
         // SAFETY: both closures run inside this fn's avx2 target_feature umbrella.
         |cells, stamp| unsafe { priceset_cached_prices8_avx2(cells, stamp) },
@@ -420,7 +406,6 @@ pub(crate) unsafe fn priceset_range_nonabort_neon<const ACCURATE: bool>(
     off_price: u32,
     base_cost: u32,
     off: u32,
-    reps: [u32; 3],
     last_pos: usize,
 ) -> usize {
     priceset_range_vec::<4, ACCURATE>(
@@ -437,7 +422,6 @@ pub(crate) unsafe fn priceset_range_nonabort_neon<const ACCURATE: bool>(
         off_price,
         base_cost,
         off,
-        reps,
         last_pos,
         // SAFETY: both closures run inside this fn's neon target_feature umbrella.
         |cells, stamp| unsafe { priceset_cached_prices4_neon(cells, stamp) },
@@ -552,7 +536,6 @@ pub(crate) unsafe fn priceset_range_nonabort_sse41<const ACCURATE: bool>(
     off_price: u32,
     base_cost: u32,
     off: u32,
-    reps: [u32; 3],
     last_pos: usize,
 ) -> usize {
     priceset_range_vec::<4, ACCURATE>(
@@ -569,7 +552,6 @@ pub(crate) unsafe fn priceset_range_nonabort_sse41<const ACCURATE: bool>(
         off_price,
         base_cost,
         off,
-        reps,
         last_pos,
         // SAFETY: both closures run inside this fn's sse4.2 target_feature
         // umbrella, which covers the SSE2 loader and the SSE4.1 mask.
@@ -599,7 +581,6 @@ pub(crate) unsafe fn priceset_range_nonabort_sse2<const ACCURATE: bool>(
     off_price: u32,
     base_cost: u32,
     off: u32,
-    reps: [u32; 3],
     last_pos: usize,
 ) -> usize {
     priceset_range_vec::<4, ACCURATE>(
@@ -616,7 +597,6 @@ pub(crate) unsafe fn priceset_range_nonabort_sse2<const ACCURATE: bool>(
         off_price,
         base_cost,
         off,
-        reps,
         last_pos,
         // SAFETY: both closures run inside this fn's sse2 target_feature umbrella.
         |cells, stamp| unsafe { priceset_cached_prices4_sse2(cells, stamp) },
@@ -693,7 +673,6 @@ pub(crate) unsafe fn priceset_range_nonabort_simd128<const ACCURATE: bool>(
     off_price: u32,
     base_cost: u32,
     off: u32,
-    reps: [u32; 3],
     last_pos: usize,
 ) -> usize {
     priceset_range_vec::<4, ACCURATE>(
@@ -710,7 +689,6 @@ pub(crate) unsafe fn priceset_range_nonabort_simd128<const ACCURATE: bool>(
         off_price,
         base_cost,
         off,
-        reps,
         last_pos,
         // SAFETY: both closures run inside this fn's simd128 target_feature umbrella.
         |cells, stamp| unsafe { priceset_cached_prices4_simd128(cells, stamp) },
