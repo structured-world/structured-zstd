@@ -137,6 +137,16 @@ const FRESH_PAGES_FROM: usize = 512 * 1024;
 #[cfg(all(not(target_env = "musl"), not(target_pointer_width = "32")))]
 const FRESH_PAGES_FROM: usize = 32 * 1024 * 1024;
 
+/// Whether the workspace allocates from the target's system allocator, the only
+/// kind [`FRESH_PAGES_FROM`] describes. A `no_std` build always runs on one the
+/// application supplies, often a fixed heap that clears recycled memory to
+/// answer a zeroed request, so it takes a zeroed allocation only where the
+/// zero tables alone justify it. With `std` an application may still install
+/// its own `#[global_allocator]`, which nothing here can detect; the assumption
+/// then costs one memset of the bytes a frame leaves untouched when the
+/// workspace grows, never a wrong result.
+const SYSTEM_ALLOCATOR: bool = cfg!(feature = "std");
+
 // SAFETY: the workspace owns its allocation outright; the raw pointer is what
 // makes the type `!Send`/`!Sync` by default, not any shared state.
 unsafe impl Send for Workspace {}
@@ -329,14 +339,14 @@ impl Workspace {
             self.sparse_table_bytes <= leading,
             "zero tables are part of the leading bytes"
         );
-        let zero_all = total >= FRESH_PAGES_FROM
+        let zero_all = (SYSTEM_ALLOCATOR && total >= FRESH_PAGES_FROM)
             || (self.sparse_table_bytes > 0
                 && total - self.sparse_table_bytes <= self.sparse_table_bytes / 3);
         if reallocate {
             self.grow(total, zero_all);
         }
         self.zeroed = reallocate && zero_all;
-        self.fresh_pages = self.zeroed && self.capacity >= FRESH_PAGES_FROM;
+        self.fresh_pages = SYSTEM_ALLOCATOR && self.zeroed && self.capacity >= FRESH_PAGES_FROM;
         self.front = 0;
         self.leading = leading;
         self.history_front = leading;
