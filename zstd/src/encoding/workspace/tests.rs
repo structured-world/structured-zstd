@@ -132,6 +132,15 @@ fn only_tables_that_fill_the_workspace_take_it_zeroed() {
     assert!(fresh.as_slice().iter().all(|&v| v == 0));
 }
 
+// Heap accounting reports what was allocated, not what can be carved: the
+// allocation carries up to ALIGN - 1 bytes of padding ahead of the aligned start.
+#[test]
+fn heap_bytes_count_the_alignment_padding() {
+    let ws = opened(region_bytes::<u32>(64));
+    assert_eq!(ws.heap_bytes(), ws.capacity() + ALIGN - 1);
+    assert_eq!(Workspace::new().heap_bytes(), 0);
+}
+
 // From the size the system allocator always serves with fresh pages, the
 // workspace is taken zeroed however small its tables: zeroing costs nothing
 // there, and filling the tables would fault in pages the frame never indexes.

@@ -1971,6 +1971,21 @@ impl FastKernelMatcher {
         self.history.leave_workspace();
     }
 
+    /// Drops, ahead of the next frame's layout, the history [`Self::reset`]
+    /// would drop: everything but a primed dictionary it may re-borrow. The
+    /// reset reads nothing else off the history, so it needs nothing kept.
+    pub(crate) fn retire_history(&mut self) {
+        self.history.truncate(self.committed_len());
+        self.uncommitted_len = 0;
+        let region = self.dict.region_len();
+        let kept = if self.dict.is_primed() && region > 0 && self.history.len() >= region {
+            region
+        } else {
+            0
+        };
+        self.history.truncate(kept);
+    }
+
     /// Workspace bytes the history takes for a frame that needs `bytes` of it.
     pub(crate) fn history_workspace_bytes(&self, bytes: usize) -> usize {
         self.history.workspace_bytes(bytes)

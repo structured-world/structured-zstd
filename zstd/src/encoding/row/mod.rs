@@ -22,7 +22,7 @@ use super::match_generator::{
     ROW_EMPTY_SLOT, ROW_HASH_BITS, ROW_HASH_KEY_LEN, ROW_LOG, ROW_MIN_MATCH_LEN, ROW_SEARCH_DEPTH,
     ROW_TAG_BITS, ROW_TARGET_LEN,
 };
-use super::workspace::{HistoryBuf, Table, Workspace, region_bytes};
+use super::workspace::{HistoryBuf, RetiredHistory, Table, Workspace, region_bytes};
 
 /// Upstream zstd lazy-parse bounds (`zstd_lazy.c`): the row parse stops
 /// `8 + ZSTD_ROW_HASH_CACHE_SIZE` bytes before the block end, a miss steps
@@ -2486,6 +2486,11 @@ pub(crate) struct RowMatchGenerator {
     /// them instead of being handed the dictionary again. The frame compressor
     /// reads this to skip the re-commit entirely.
     dict_resident: bool,
+    /// Set by [`Self::retire_history`] ahead of a layout and taken by the next
+    /// [`Self::reset`], which would otherwise read the floor off a history
+    /// already cut down to what it keeps. `kept` is the dictionary prefix
+    /// before the reset checks its tables, which only the layout settles.
+    retired: Option<RetiredHistory>,
 }
 
 impl RowMatchGenerator {
@@ -2530,6 +2535,7 @@ impl RowMatchGenerator {
             borrowed_input: None,
             borrowed_block: None,
             borrowed_extent: 0,
+            retired: None,
         }
     }
 
@@ -2714,17 +2720,16 @@ impl RowMatchGenerator {
         self.dict_plan = plan;
     }
 
-    pub(crate) fn reset(&mut self) {
-        // Floor-advance reset (same shape as the dfast/HC backends): instead
-        // of re-zeroing the row tables per frame (a multi-MiB memset that
-        // dominated small/medium-frame encode), advance the absolute
-        // coordinate floor past everything ever inserted. Stale entries all
-        // hold positions below the new floor, so the probes' existing
-        // `candidate_pos < self.history_abs_start` window check rejects them
-        // without any clearing — the upstream zstd's persistent-index design. Stale
-        // TAGS can still produce the occasional false mask hit whose
-        // candidate then fails the window check; the upstream zstd's tag table
-        // persists across frames with the same behaviour.
+    /// Settles, ahead of the next frame's layout, what [`Self::reset`] can keep
+    /// of the history, and drops the rest, so the layout sizes the room for and
+    /// carries over only that. Once per frame; the reset takes the result.
+    pub(crate) fn retire_history(&mut self) {
+        if self.retired.is_none() {
+            self.retired = Some(self.retire());
+        }
+    }
+
+    fn retire(&mut self) -> RetiredHistory {
         // Bytes an abandoned frame ingested but never claimed are not part of
         // the next frame, and they must not count towards the floor advance.
         // Dropped first because every tail-relative bound subtracts this count
@@ -2737,6 +2742,37 @@ impl RowMatchGenerator {
         let next_floor = self.history_abs_start
             + (self.history.len() - self.history_start).max(self.borrowed_extent);
         self.borrowed_extent = 0;
+        // The dictionary prefix a re-borrow would keep; the reset still asks
+        // whether the tables it is indexed in survived the layout.
+        let kept = if self.dict.is_primed()
+            && self.history_start == 0
+            && next_floor <= REBASE_RESET_FLOOR_CEILING
+        {
+            let r = self.dict.region_len();
+            (r > 0 && self.history.len() >= r).then_some(r)
+        } else {
+            None
+        };
+        // Keep `[0, region)`, drop what the previous frame put after it.
+        self.history.truncate(kept.unwrap_or(0));
+        RetiredHistory { next_floor, kept }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        // Floor-advance reset (same shape as the dfast/HC backends): instead
+        // of re-zeroing the row tables per frame (a multi-MiB memset that
+        // dominated small/medium-frame encode), advance the absolute
+        // coordinate floor past everything ever inserted. Stale entries all
+        // hold positions below the new floor, so the probes' existing
+        // `candidate_pos < self.history_abs_start` window check rejects them
+        // without any clearing — the upstream zstd's persistent-index design. Stale
+        // TAGS can still produce the occasional false mask hit whose
+        // candidate then fails the window check; the upstream zstd's tag table
+        // persists across frames with the same behaviour.
+        let RetiredHistory {
+            next_floor,
+            kept: resident_dict,
+        } = self.retired.take().unwrap_or_else(|| self.retire());
         self.offset_hist = [1, 4, 8];
         // Re-borrow, the shape the dfast and Fast backends already have: a
         // dictionary frame keeps its bytes resident at the front of history
@@ -2753,19 +2789,8 @@ impl RowMatchGenerator {
         // are empty, as a matcher that has not allocated them yet would be.
         let tables_allocated = !self.tables.is_empty() && !self.tables_fresh;
         self.tables_fresh = false;
-        let reborrow_region = if self.dict.is_primed()
-            && self.history_start == 0
-            && next_floor <= REBASE_RESET_FLOOR_CEILING
-            && tables_allocated
-        {
-            let r = self.dict.region_len();
-            (r > 0 && self.history.len() >= r).then_some(r)
-        } else {
-            None
-        };
+        let reborrow_region = resident_dict.filter(|_| tables_allocated);
         if let Some(region) = reborrow_region {
-            // Keep `[0, region)`, drop what the previous frame put after it.
-            self.history.truncate(region);
             self.window_size = region;
         } else {
             self.window_size = 0;

@@ -1092,7 +1092,7 @@ impl Matcher for MatchGeneratorDriver {
             .primed
             .as_ref()
             .map_or(0, |(storage, _, _)| storage.heap_size());
-        self.storage.heap_size() + snapshot + self.own_workspace.capacity()
+        self.storage.heap_size() + snapshot + self.own_workspace.heap_bytes()
     }
 
     fn clear_param_overrides(&mut self) {
@@ -1463,6 +1463,8 @@ impl Matcher for MatchGeneratorDriver {
                     crate::encoding::simple::fast_kernel::hash_table::FastHashTable::workspace_bytes(
                         hash_log,
                     );
+                // The history keeps only what the reset will, as on the dfast arm.
+                m.retire_history();
                 workspace.open_for_match_finder(
                     tables + m.history_workspace_bytes(history_bytes),
                     tables,
@@ -1532,6 +1534,10 @@ impl Matcher for MatchGeneratorDriver {
                 // The history binds first, carrying its bytes out from under
                 // where the tables may now land.
                 let tables = dfast.tables_workspace_bytes();
+                // The history keeps only what the reset will: laid out and
+                // carried over at its full length, a long stream's window would
+                // be moved into room the next frame never reads.
+                dfast.retire_history();
                 workspace.open_for_match_finder(
                     tables + dfast.history.workspace_bytes(history_bytes),
                     tables,
@@ -1576,7 +1582,9 @@ impl Matcher for MatchGeneratorDriver {
                 resolved_table_bits = row.hash_bits();
                 // The finder and its widths are settled by `configure`, so the
                 // tables can be laid out; the reset reads whether they continue
-                // the last frame's.
+                // the last frame's. The history keeps only what the reset can,
+                // as on the dfast arm.
+                row.retire_history();
                 workspace.open_for_match_finder(
                     row.tables_workspace_bytes() + row.history.workspace_bytes(history_bytes),
                     row.zero_table_bytes(),
@@ -1631,6 +1639,8 @@ impl Matcher for MatchGeneratorDriver {
                 // laid out before the reset retires the previous frame's
                 // entries in them.
                 let tables = hc.table.tables_workspace_bytes();
+                // The history keeps only what the reset will, as on the dfast arm.
+                hc.table.retire_history();
                 workspace.open_for_match_finder(
                     tables + hc.table.history.workspace_bytes(history_bytes),
                     tables,
@@ -1708,6 +1718,11 @@ impl Matcher for MatchGeneratorDriver {
             None
         };
         self.reset_shape = Some((params, resolved_table_bits, fast_attach, active_ldm));
+        // Everything is laid out in `workspace` now. A driver reset on its own
+        // before it joined a context still holds the workspace it used then,
+        // which nothing points into any more; on its own the field is empty
+        // here, since `reset` has it out for the call.
+        self.own_workspace = crate::encoding::workspace::Workspace::new();
     }
 
     // Dictionary entry points forward to the `dict_prime` child module, which

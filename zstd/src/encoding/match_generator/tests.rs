@@ -5225,3 +5225,65 @@ fn the_chain_finder_keeps_a_dictionary_worth_attaching() {
         bare.len(),
     );
 }
+
+/// A frame after a long stream lays out room for what its reset keeps, not for
+/// the whole window the stream left behind.
+///
+/// The reset drops the previous input and keeps at most a resident dictionary,
+/// so sizing the history room by its length before the reset, and copying those
+/// bytes into it, holds and moves megabytes the frame never reads.
+#[test]
+fn a_frame_after_a_stream_lays_out_only_what_its_reset_keeps() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let block = 128 * 1024;
+    for level in [1, 3, 5, 16] {
+        let mut driver = MatchGeneratorDriver::new(block, 1);
+        driver.reset(CompressionLevel::Level(level));
+        let mut state = 0x9E37_79B9_u32;
+        for _ in 0..16 {
+            let bytes: Vec<u8> = (0..block)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect();
+            driver.commit_input(&bytes);
+            driver.start_matching(|_| {});
+        }
+        driver.set_source_size_hint(1024);
+        let mut context = Workspace::new();
+        context.begin_layout(block, no_trailing, IngestPlan::Stream);
+        driver.reset_in_workspace(CompressionLevel::Level(level), &mut context);
+        assert!(
+            context.capacity() < 512 * 1024,
+            "level {level}: a 1 KiB frame laid out {} bytes",
+            context.capacity(),
+        );
+    }
+}
+
+/// A driver reset on its own and then laid out in a context's workspace lets go
+/// of the workspace it used alone: its tables and history have moved, so the old
+/// allocation holds nothing live, and keeping it would double what the
+/// compressor holds for the rest of its life.
+#[test]
+fn a_driver_moved_into_a_context_releases_its_own_workspace() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+    driver.reset(CompressionLevel::Level(3));
+    assert!(
+        driver.own_workspace.capacity() > 0,
+        "a reset on its own lays the driver out in a workspace of its own",
+    );
+    let mut context = Workspace::new();
+    context.begin_layout(1 << 17, no_trailing, IngestPlan::Stream);
+    driver.reset_in_workspace(CompressionLevel::Level(3), &mut context);
+    assert_eq!(driver.own_workspace.capacity(), 0);
+    // The driver still works from the context's workspace.
+    driver.commit_input(b"abcabcabcabcabcabcabcabc");
+    let mut sequences = 0;
+    driver.start_matching(|_| sequences += 1);
+    assert!(sequences > 0);
+}

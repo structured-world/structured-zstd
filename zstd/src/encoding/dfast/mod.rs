@@ -27,7 +27,7 @@ use super::match_generator::{
 use super::match_table::helpers::{common_prefix_len_with_kernel, extend_backwards_shared};
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
-use super::workspace::{HistoryBuf, Table, Workspace, region_bytes};
+use super::workspace::{HistoryBuf, RetiredHistory, Table, Workspace, region_bytes};
 
 /// Upstream zstd `HASH_READ_SIZE` (`zstd_compress_internal.h`): the largest probe
 /// width any hash / equality check in the dfast hot path reads at once.
@@ -186,6 +186,10 @@ pub(crate) struct DfastMatchGenerator {
     /// read them as positions of its own frame and a reused matcher would
     /// compress differently from a fresh one.
     pub(crate) tables_hold_earlier_frames: bool,
+    /// Set by [`Self::retire_history`] ahead of a layout and taken by the next
+    /// [`Self::reset`], which would otherwise read the floor off a history
+    /// already cut down to what it keeps.
+    pub(crate) retired: Option<RetiredHistory>,
 }
 
 /// The dfast backend's immutable dictionary tables — a long+short pair mirroring
@@ -254,6 +258,7 @@ impl DfastMatchGenerator {
             borrowed_block: None,
             dict_resident: false,
             tables_hold_earlier_frames: false,
+            retired: None,
         }
     }
 
@@ -445,6 +450,47 @@ impl DfastMatchGenerator {
                 .map_or(0, |t| (t.long.capacity() + t.short.capacity()) * u32_sz)
     }
 
+    /// Settles, ahead of the next frame's layout, what [`Self::reset`] keeps of
+    /// the history, and drops the rest, so the layout sizes the room for and
+    /// carries over only that. Once per frame; the reset takes the result.
+    pub(crate) fn retire_history(&mut self) {
+        if self.retired.is_none() {
+            self.retired = Some(self.retire());
+        }
+    }
+
+    fn retire(&mut self) -> RetiredHistory {
+        // Bytes an abandoned frame ingested but never claimed are not part of
+        // the next frame, and they must not count towards the floor advance.
+        // Dropped first because every tail-relative bound subtracts this count
+        // from the buffer length and would underflow once history is cleared.
+        self.history
+            .truncate(self.history.len() - self.uncommitted_len);
+        self.uncommitted_len = 0;
+        let next_floor = self.history_abs_start + (self.history.len() - self.history_start);
+        // Re-borrow: an attach-mode reused dict frame keeps its bytes resident at
+        // the front of history (`[0, region)`) + the cached concat-keyed dict
+        // tables, so the per-frame dict re-commit (the dominant ~37% memmove on
+        // a profiled small dfast frame) is skipped — the frame compressor then
+        // skips `prime_with_dictionary`. The floor-advance still rejects the
+        // previous frame's INPUT (its abs falls below `next_floor`); the dict
+        // matches come from the separate dict tables, which bypass the floor.
+        // Gated on the dict being fully resident at `history_start == 0` and the
+        // floor-advance staying bounded.
+        let kept = if self.dict.is_primed()
+            && self.history_start == 0
+            && next_floor <= REBASE_RESET_FLOOR_CEILING
+        {
+            let r = self.dict.region_len();
+            (r > 0 && self.history.len() >= r).then_some(r)
+        } else {
+            None
+        };
+        // Keep `[0, region)` (the dict); drop the previous frame's input.
+        self.history.truncate(kept.unwrap_or(0));
+        RetiredHistory { next_floor, kept }
+    }
+
     pub(crate) fn reset(&mut self) {
         // Floor-advance reset (issue #337 technique, completing it for the
         // dfast backend — `MatchTable` already does this). Instead of
@@ -459,36 +505,12 @@ impl DfastMatchGenerator {
         // `position_base` is left untouched so stale slots still decode to
         // their (now sub-floor) absolute positions; `ensure_room_for` /
         // `reduce` keep the `u32` packing bounded as the cursor climbs.
-        // Bytes an abandoned frame ingested but never claimed are not part of
-        // the next frame, and they must not count towards the floor advance.
-        // Dropped first because every tail-relative bound subtracts this count
-        // from the buffer length and would underflow once history is cleared.
-        self.history
-            .truncate(self.history.len() - self.uncommitted_len);
-        self.uncommitted_len = 0;
-        let next_floor = self.history_abs_start + (self.history.len() - self.history_start);
+        let RetiredHistory {
+            next_floor,
+            kept: reborrow_region,
+        } = self.retired.take().unwrap_or_else(|| self.retire());
         self.offset_hist = [1, 4, 8];
-        // Re-borrow: an attach-mode reused dict frame keeps its bytes resident at
-        // the front of history (`[0, region)`) + the cached concat-keyed dict
-        // tables, so the per-frame dict re-commit (the dominant ~37% memmove on
-        // a profiled small dfast frame) is skipped — the frame compressor then
-        // skips `prime_with_dictionary`. The floor-advance still rejects the
-        // previous frame's INPUT (its abs falls below `next_floor`); the dict
-        // matches come from the separate dict tables, which bypass the floor.
-        // Gated on the dict being fully resident at `history_start == 0` and the
-        // floor-advance staying bounded.
-        let reborrow_region = if self.dict.is_primed()
-            && self.history_start == 0
-            && next_floor <= REBASE_RESET_FLOOR_CEILING
-        {
-            let r = self.dict.region_len();
-            (r > 0 && self.history.len() >= r).then_some(r)
-        } else {
-            None
-        };
         if let Some(region) = reborrow_region {
-            // Keep `[0, region)` (the dict); drop the previous frame's input.
-            self.history.truncate(region);
             self.window_size = region;
             self.window_blocks.clear();
             self.window_blocks.push_back(region);

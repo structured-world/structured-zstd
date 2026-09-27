@@ -2960,7 +2960,7 @@ fn a_matcher_taken_out_of_a_compressor_outlives_it() {
         let mut first: FrameCompressor = FrameCompressor::new(level);
         first.set_dictionary_from_bytes(dict_raw).unwrap();
         let _ = first.compress_independent_frame(&payload);
-        let workspace_bytes = first.state.workspace.capacity();
+        let workspace_bytes = first.state.workspace.heap_bytes();
         let matcher = first.replace_matcher(MatchGeneratorDriver::new(1024 * 128, 1));
         drop(first);
         let garbage = vec![0xEEu8; workspace_bytes];

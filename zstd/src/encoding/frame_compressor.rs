@@ -1491,7 +1491,7 @@ impl<M: Matcher> CompressState<M> {
                 .as_ref()
                 .map_or(0, |table| table.heap_size())
             + self.block_scratch.retained_heap_size()
-            + self.workspace.capacity()
+            + self.workspace.heap_bytes()
     }
 
     /// Clears `last_huff_table`, parking the table's buffers in

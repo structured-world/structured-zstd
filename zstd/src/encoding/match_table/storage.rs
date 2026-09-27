@@ -322,6 +322,10 @@ pub(crate) struct MatchTable {
     /// cached value instead of re-detecting in the hot path. Mirrors the
     /// `kernel` field the Fast / Row / Dfast matchers already cache.
     pub(crate) kernel: crate::encoding::fastpath::FastpathKernel,
+    /// Set by [`Self::retire_history`] ahead of a layout and taken by the next
+    /// [`Self::reset`], which would otherwise read the floor off a history
+    /// already cut down to what it keeps.
+    pub(crate) retired: Option<crate::encoding::workspace::RetiredHistory>,
 }
 
 // Manual `Clone` (not derived) so the per-frame dictionary-snapshot restore can
@@ -364,6 +368,7 @@ impl Clone for MatchTable {
             borrowed_input: self.borrowed_input,
             borrowed_block: self.borrowed_block,
             kernel: self.kernel,
+            retired: self.retired,
         }
     }
 
@@ -406,6 +411,7 @@ impl Clone for MatchTable {
         self.borrowed_input = source.borrowed_input;
         self.borrowed_block = source.borrowed_block;
         self.kernel = source.kernel;
+        self.retired = source.retired;
     }
 }
 
@@ -538,6 +544,7 @@ impl MatchTable {
             borrowed_input: None,
             borrowed_block: None,
             kernel: crate::encoding::fastpath::select_kernel(),
+            retired: None,
         }
     }
 
@@ -1469,7 +1476,16 @@ impl MatchTable {
     /// [`REBASE_RESET_FLOOR_CEILING`], the original full zeroing runs and
     /// the floor rewinds to `0`, bounding the absolute cursor so
     /// [`check_stream_abs_headroom`] stays satisfiable on 32-bit targets.
-    pub(crate) fn reset(&mut self) {
+    /// Settles, ahead of the next frame's layout, what [`Self::reset`] keeps of
+    /// the history, and drops the rest, so the layout sizes the room for and
+    /// carries over only that. Once per frame; the reset takes the result.
+    pub(crate) fn retire_history(&mut self) {
+        if self.retired.is_none() {
+            self.retired = Some(self.retire());
+        }
+    }
+
+    fn retire(&mut self) -> crate::encoding::workspace::RetiredHistory {
         // Bytes an abandoned frame ingested but never claimed are not part of
         // the next frame. Drop them FIRST: every tail-relative bound below
         // (and `history_abs_end`) subtracts this count from the buffer length,
@@ -1491,20 +1507,29 @@ impl MatchTable {
         // it whenever `search_mls` changes (a level switch). So a primed dms is
         // always one built with the CURRENT `search_mls`; the reborrow can never
         // reuse a dms whose tables were built under a stale mls.
-        let reborrow_region =
-            if self.dictionary_active && self.dms.is_primed() && self.history_start == 0 {
-                // `checked_sub`, not `-`: after the dict chunk is evicted,
-                // `compact_history` can reset `history_start` to 0 while
-                // `history_abs_start` has already advanced PAST
-                // `dictionary_limit_abs`. The plain subtraction would underflow
-                // (panic under overflow checks) before the `r > 0` filter rejects
-                // the stale region; `checked_sub` -> `None` lets the filter run.
-                self.dictionary_limit_abs
-                    .and_then(|limit| limit.checked_sub(self.history_abs_start))
-                    .filter(|&r| r > 0 && r <= self.history.len())
-            } else {
-                None
-            };
+        let kept = if self.dictionary_active && self.dms.is_primed() && self.history_start == 0 {
+            // `checked_sub`, not `-`: after the dict chunk is evicted,
+            // `compact_history` can reset `history_start` to 0 while
+            // `history_abs_start` has already advanced PAST
+            // `dictionary_limit_abs`. The plain subtraction would underflow
+            // (panic under overflow checks) before the `r > 0` filter rejects
+            // the stale region; `checked_sub` -> `None` lets the filter run.
+            self.dictionary_limit_abs
+                .and_then(|limit| limit.checked_sub(self.history_abs_start))
+                .filter(|&r| r > 0 && r <= self.history.len())
+        } else {
+            None
+        };
+        // Keep `[0, region)` (the dict); drop the previous frame's input.
+        self.history.truncate(kept.unwrap_or(0));
+        crate::encoding::workspace::RetiredHistory { next_floor, kept }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        let crate::encoding::workspace::RetiredHistory {
+            next_floor,
+            kept: reborrow_region,
+        } = self.retired.take().unwrap_or_else(|| self.retire());
         self.window_size = 0;
         self.offset_hist = [1, 4, 8];
         self.skip_insert_until_abs = 0;

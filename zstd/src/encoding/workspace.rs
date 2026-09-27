@@ -162,9 +162,24 @@ impl Workspace {
         }
     }
 
-    /// Bytes the workspace holds.
+    /// Bytes the workspace holds, what the layouts carve from.
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Bytes the workspace has allocated, for heap accounting: its capacity
+    /// with the padding that aligns its start, and an allocation a growth
+    /// retired that has not been freed yet.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let allocated = |capacity: usize| {
+            if capacity == 0 {
+                0
+            } else {
+                allocation_layout(capacity).size()
+            }
+        };
+        allocated(self.capacity) + self.retired.map_or(0, |(_, capacity)| allocated(capacity))
     }
 
     /// Starts a frame's layout. The context will carve `trailing_for(block)`
@@ -253,8 +268,12 @@ impl Workspace {
         let reallocate = if total > self.capacity {
             true
         } else {
-            // A need so large that three of it overflow cannot be exceeded
-            // three times over by what is left, so it is never too large.
+            // What is LEFT over, not the whole allocation, is held against
+            // three needs, as upstream holds its free space against them
+            // (`ZSTD_cwksp_check_too_large` -> `ZSTD_cwksp_check_available(ws,
+            // needed * ZSTD_WORKSPACETOOLARGE_FACTOR)`). A need so large that
+            // three of it overflow cannot be exceeded three times over by what
+            // is left, so it is never too large.
             let too_large = total
                 .checked_mul(TOO_LARGE_FACTOR)
                 .is_some_and(|wasted| self.capacity - total >= wasted);
@@ -1024,6 +1043,17 @@ impl core::fmt::Debug for HistoryBuf {
             .field("capacity", &self.capacity)
             .finish()
     }
+}
+
+/// What a match finder settles about its history before the next frame is laid
+/// out: the floor past every position the previous frame indexed, which is
+/// read off the history's length, and the resident dictionary prefix the reset
+/// may keep. Taking both first lets the history drop everything else before
+/// the layout sizes its room and carries its bytes into it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetiredHistory {
+    pub(crate) next_floor: usize,
+    pub(crate) kept: Option<usize>,
 }
 
 /// A byte buffer a block is read into: the match finder's history, or the

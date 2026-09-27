@@ -521,7 +521,11 @@ impl SeenContentGrid {
             }
             // The start run on a frame's first block cannot hit anything: the
             // table is empty until that block records into it, and a frame of a
-            // few kilobytes is one block.
+            // few kilobytes is one block. The midpoint run stays even on a
+            // frame's only block: a block whose second half copies its first
+            // reads as noise to every sample the classifier takes, and without
+            // this run it goes out raw with a half-block match inside it. It is
+            // the one check between the skip and that loss.
             // Nothing to ask once the answer is in: a probe is read-only and
             // the run reports one bool, so every lookup after the first hit is
             // a random table access for a verdict already reached.
