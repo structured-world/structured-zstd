@@ -439,21 +439,22 @@ fn hc_attaches_dictionary(hc: &HcMatchGenerator, size_log: Option<u8>) -> bool {
     size_log.is_none_or(|log| log <= cutoff)
 }
 
-/// History bytes a frame lays out: the dictionary primed at its head, the
-/// input it is expected to bring, and one block of slack for the last read,
-/// which asks for a whole block even when only a tail remains. Input that can
-/// fill the window slides it, and the history then grows to the most it ever
-/// holds, which is laid out from the start, as upstream sizes its input buffer
-/// from the window: for the Fast backend twice the window grown by the
-/// dictionary (it drains back to one window when an append would pass two),
-/// for the others that window plus the quarter of it compaction leaves behind;
-/// either way plus one pending block.
+/// History bytes a frame lays out: the dictionary primed at its head and the
+/// input it is expected to bring. Input that can fill the window slides it, and
+/// the history then grows to the most it ever holds, which is laid out from the
+/// start, as upstream sizes its input buffer from the window: for the Fast
+/// backend twice the window grown by the dictionary (it drains back to one
+/// window when an append would pass two), for the others that window plus the
+/// quarter of it compaction leaves behind; either way plus one pending block of
+/// the frame's size.
 ///
 /// A size known exactly (a slice, or a pledge the context enforces) is taken as
-/// it is. A size hint on a stream is a claim about data not yet read, trusted
-/// only up to the window the LEVEL would choose for it; overriding the window
-/// is a claim of its own that only the data can confirm. An unknown size may
-/// fill any window.
+/// it is, and its reads are held to what remains, so nothing past it is ever
+/// asked for. A size hint on a stream is a claim about data not yet read,
+/// trusted only up to the window the LEVEL would choose for it, and a read may
+/// find more than it said, so it keeps one block of slack; overriding the
+/// window is a claim of its own that only the data can confirm. An unknown size
+/// may fill any window.
 fn frame_history_bytes(
     backend: super::strategy::BackendTag,
     workspace: &crate::encoding::workspace::Workspace,
@@ -475,25 +476,29 @@ fn frame_history_bytes(
         super::strategy::BackendTag::Simple => window,
         _ => window >> 2,
     };
-    let ceiling = window + slack + crate::common::MAX_BLOCK_SIZE as usize;
+    let ceiling = window + slack + block;
     // A size past `usize` is past the ceiling too.
     let bytes = hint.map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX));
-    let input = match workspace.ingest() {
+    // The input and the room past it its last read may ask for.
+    let (input, read_slack) = match workspace.ingest() {
         IngestPlan::Raw => return 0,
         IngestPlan::Slice if in_place => return dict_len.min(ceiling),
-        IngestPlan::Slice | IngestPlan::PledgedStream => bytes,
-        IngestPlan::Stream => bytes.map(|bytes| {
-            let level_window_log =
-                crate::encoding::levels::config::resolve_level_params(level, hint).window_log;
-            bytes.min(1usize << level_window_log)
-        }),
+        IngestPlan::Slice | IngestPlan::PledgedStream => (bytes, 0),
+        IngestPlan::Stream => (
+            bytes.map(|bytes| {
+                let level_window_log =
+                    crate::encoding::levels::config::resolve_level_params(level, hint).window_log;
+                bytes.min(1usize << level_window_log)
+            }),
+            block,
+        ),
     };
     match input {
-        // A window stays below 2^31 and a block below 2^17, so `bytes + block`
-        // fits; a dictionary large enough to overflow the rest is past the
-        // ceiling anyway.
+        // A window stays below 2^31 and a block below 2^17, so
+        // `bytes + read_slack` fits; a dictionary large enough to overflow the
+        // rest is past the ceiling anyway.
         Some(bytes) if bytes < max_window_size => dict_len
-            .checked_add(bytes + block)
+            .checked_add(bytes + read_slack)
             .map_or(ceiling, |sum| sum.min(ceiling)),
         _ => ceiling,
     }
@@ -1104,9 +1109,12 @@ impl Matcher for MatchGeneratorDriver {
         // On its own the driver lays its tables out in a workspace of its own,
         // which is moved out for the call and back: moving it leaves the
         // allocation, and so every region carved from it, where it is.
+        // Driven directly, it takes blocks of any size up to the format's, so
+        // that is the block its history leaves room for; it carves no block
+        // buffers of its own.
         let mut own = core::mem::take(&mut self.own_workspace);
         own.begin_layout(
-            0,
+            crate::common::MAX_BLOCK_SIZE as usize,
             crate::encoding::workspace::no_trailing,
             crate::encoding::workspace::IngestPlan::Stream,
         );

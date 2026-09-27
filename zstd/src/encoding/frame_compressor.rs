@@ -1599,9 +1599,20 @@ pub(crate) trait OwnedBlockSource {
         block_capacity: usize,
         size_hint_remaining: Option<u64>,
     ) -> (usize, bool);
+
+    /// Bytes left, when the source knows them exactly. The matcher reserves
+    /// room for a read before it is made, so a read held to this asks for no
+    /// room past the end of the input.
+    fn exact_remaining(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl OwnedBlockSource for &[u8] {
+    fn exact_remaining(&self) -> Option<usize> {
+        Some(self.len())
+    }
+
     fn fill_block<B: IngestBuffer>(
         &mut self,
         buf: &mut B,
@@ -2710,8 +2721,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     _ => None,
                 };
                 // A carried remainder is what a pre-split left of a full block,
-                // so it is shorter than one.
-                let want = block_capacity - self.state.matcher.uncommitted_input().len();
+                // so it is shorter than one. Held to what an exact source has
+                // left: its history was laid out for its bytes and no more.
+                let want = (block_capacity - self.state.matcher.uncommitted_input().len())
+                    .min(source.exact_remaining().unwrap_or(usize::MAX));
                 let (appended, eof) = self.state.matcher.fill_in_place(want, &mut |buf| {
                     source.fill_block(buf, buf.len() + want, size_hint_remaining)
                 });

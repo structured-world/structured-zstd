@@ -1870,28 +1870,56 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
     driver.skip_matching_with_hint(None);
 }
 
-/// The history's slack for the last read is the frame's own block, which a
-/// small window shrinks below the format maximum: a fixed 128 KiB on top would
-/// dwarf a small frame's whole history.
+/// An input of exact size lays out exactly its bytes: its reads are held to
+/// what remains, so no read asks for room past the end. An advisory hint may
+/// under-count, so a stream sized by one keeps a block of slack for the read
+/// that finds more, and that slack is the frame's own block, which a small
+/// window shrinks below the format maximum.
 #[test]
-fn the_history_slack_is_the_frames_block_not_the_format_maximum() {
+fn only_an_advisory_size_lays_out_slack_for_the_last_read() {
     use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
-    let mut workspace = Workspace::new();
-    workspace.begin_layout(
-        crate::common::MAX_BLOCK_SIZE as usize,
-        no_trailing,
-        IngestPlan::Slice,
+    let history = |ingest| {
+        let mut workspace = Workspace::new();
+        workspace.begin_layout(crate::common::MAX_BLOCK_SIZE as usize, no_trailing, ingest);
+        super::frame_history_bytes(
+            super::super::strategy::BackendTag::Dfast,
+            &workspace,
+            false,
+            Some(1000),
+            0,
+            1024,
+            CompressionLevel::Level(3),
+        )
+    };
+    assert_eq!(history(IngestPlan::Slice), 1000, "a slice is its bytes");
+    assert_eq!(history(IngestPlan::PledgedStream), 1000, "so is a pledge");
+    assert_eq!(
+        history(IngestPlan::Stream),
+        1000 + 1024,
+        "a hinted stream adds one 1 KiB block"
     );
+}
+
+/// A stream that can fill its window lays out the window, what sliding leaves
+/// behind, and one pending block, and that block is the frame's: a target block
+/// size below the format maximum shrinks it, rather than leaving the difference
+/// laid out and never written.
+#[test]
+fn the_history_ceiling_takes_the_frames_block() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let window = 1usize << 20;
+    let mut workspace = Workspace::new();
+    workspace.begin_layout(1024, no_trailing, IngestPlan::Stream);
     let bytes = super::frame_history_bytes(
         super::super::strategy::BackendTag::Dfast,
         &workspace,
         false,
-        Some(1000),
+        None,
         0,
-        1024,
+        window,
         CompressionLevel::Level(3),
     );
-    assert_eq!(bytes, 1000 + 1024, "the input plus one 1 KiB block");
+    assert_eq!(bytes, window + (window >> 2) + 1024);
 }
 
 /// A pledged stream's size is exact, since the context refuses any other
@@ -1924,7 +1952,7 @@ fn a_pledged_stream_lays_out_history_for_all_of_its_input() {
         window,
         level,
     );
-    assert_eq!(bytes, pledged + block, "the pledged input plus one block");
+    assert_eq!(bytes, pledged, "the pledged input, which is exact");
 
     // An advisory hint on a stream stays capped at the level's window.
     let mut workspace = Workspace::new();

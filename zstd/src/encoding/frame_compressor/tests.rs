@@ -1948,6 +1948,29 @@ fn custom_matcher_without_dictionary_priming_does_not_advertise_dict_id() {
     assert_eq!(decoded, payload);
 }
 
+/// A slice the matcher cannot scan in place (a dictionary is primed ahead of
+/// it) is read into a history laid out for exactly the dictionary and the
+/// slice: every read is held to what the slice has left, so the last one asks
+/// for no room past its end and the history never leaves the workspace.
+#[test]
+fn a_copied_slice_reads_only_what_its_history_was_laid_out_for() {
+    let dict =
+        crate::decoding::Dictionary::from_raw_content(0xABCD_0042, generate_data(7, 4 * 1024))
+            .expect("raw dictionary should be valid");
+    let payload = generate_data(11, 5000);
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(3));
+    compressor
+        .set_dictionary(dict)
+        .expect("dictionary should attach");
+    let mut out = Vec::new();
+    compressor.compress_independent_frame_into(&payload, &mut out);
+    assert_eq!(
+        compressor.state.matcher.owned_table_and_history_bytes().1,
+        0,
+        "the last read asked for room the layout did not hold"
+    );
+}
+
 /// A custom matcher holds nothing in the compressor's workspace, so replacing
 /// it hands back the matcher that ran, and the compressor goes on with the new
 /// one.
