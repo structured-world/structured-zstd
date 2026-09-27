@@ -1575,7 +1575,15 @@ impl Matcher for MatchGeneratorDriver {
                     expected_input,
                 );
                 dfast.history.bind(workspace, history_bytes);
-                dfast.bind_tables(workspace);
+                // Tagged slots unless the dictionary is attached (its loop reads
+                // the live tables bare) or the window, dictionary included, is
+                // past what a tagged slot's position range keeps across a rebase.
+                let dict_len = dict_hint.map_or(0, |sizes| sizes.content);
+                let tagged = !dfast_attach_next
+                    && max_window_size.checked_add(dict_len).is_some_and(|window| {
+                        window <= crate::encoding::dfast::DFAST_TAGGED_WINDOW_LIMIT
+                    });
+                dfast.bind_tables(workspace, tagged);
                 dfast.reset();
             }
             MatcherStorage::Row(row) => {
