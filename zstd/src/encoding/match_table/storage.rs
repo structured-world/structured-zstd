@@ -1489,10 +1489,13 @@ impl MatchTable {
     }
 
     fn retire(&mut self) -> crate::encoding::workspace::RetiredHistory {
-        // Bytes an abandoned frame ingested but never claimed are not part of
-        // the next frame. Drop them FIRST: every tail-relative bound below
-        // (and `history_abs_end`) subtracts this count from the buffer length,
-        // so leaving it set underflows once the history is cleared.
+        // Bytes an abandoned frame ingested but never claimed were never
+        // indexed and are not part of the next frame. Cut them off the buffer
+        // before the count goes: every tail-relative bound below (and
+        // `history_abs_end`) subtracts the count from the buffer length, so
+        // zeroing it alone would count them as committed and move the floor.
+        let committed = self.history.len() - self.uncommitted_len;
+        self.history.truncate(committed);
         self.uncommitted_len = 0;
         // Snapshot the previous frame's one-past-the-end absolute
         // position before clearing the history that `history_abs_end`

@@ -525,6 +525,26 @@ fn a_hash3_width_change_keeps_the_hash_and_chain_and_empties_the_tail() {
     assert!(t.hash_table().iter().all(|&v| v == 11));
 }
 
+/// Bytes an abandoned frame read but never committed were never indexed, so
+/// they do not move the next frame's floor: counting them spends the floor's
+/// headroom on nothing and brings the full table clear at its ceiling closer.
+#[test]
+fn an_abandoned_frames_uncommitted_bytes_do_not_advance_the_floor() {
+    let mut t = new_table(64);
+    t.push_test_chunk(vec![7u8; 32]);
+    let committed_end = t.history_abs_end();
+    t.fill_uncommitted(8, |buf| {
+        buf.extend_from_slice(b"abcdefgh");
+        (8, true)
+    });
+    let retired = t.retire();
+    assert_eq!(
+        retired.next_floor, committed_end,
+        "the floor moves past the committed input only"
+    );
+    assert!(t.uncommitted().is_empty());
+}
+
 #[test]
 fn clone_from_replaces_the_uncommitted_count_with_the_sources() {
     // `clone_from` is the primed-dictionary restore path: it overwrites the
