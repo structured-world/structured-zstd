@@ -68,7 +68,7 @@ fn the_content_grid_reports_a_repeat_that_is_shifted() {
 fn the_content_grid_answers_a_block_that_copies_itself() {
     const BLOCK: usize = 128 * 1024;
     const WIDE: usize = 8 * 1024 * 1024;
-    let step = SeenContentGrid::record_step_for(WIDE);
+    let step = SeenContentGrid::RECORD_STEP;
     let spacing = BLOCK / SeenContentGrid::PROBE_FRACTION;
     let span = spacing + step + SeenContentGrid::KEY_LEN;
 
@@ -109,25 +109,6 @@ fn the_content_grid_answers_a_block_that_copies_itself() {
     );
 }
 
-/// The record step follows the frame's block ceiling, so the runs and records a
-/// block pays for scale with it rather than being fixed for the largest block.
-#[test]
-fn the_record_step_follows_the_block_ceiling() {
-    assert_eq!(SeenContentGrid::record_step_for(0), 128, "unknown window");
-    assert_eq!(
-        SeenContentGrid::record_step_for(8 << 20),
-        128,
-        "128 KiB blocks"
-    );
-    assert_eq!(SeenContentGrid::record_step_for(32 * 1024), 64);
-    assert_eq!(SeenContentGrid::record_step_for(8 * 1024), 32);
-    assert_eq!(
-        SeenContentGrid::record_step_for(1024),
-        SeenContentGrid::MIN_RECORD_STEP,
-        "a tiny window takes the floor",
-    );
-}
-
 /// A frame long enough to exhaust the step index has to keep the records the
 /// window still reaches.
 ///
@@ -140,7 +121,7 @@ fn the_record_step_follows_the_block_ceiling() {
 fn the_content_grid_keeps_what_the_window_reaches_across_a_rebase() {
     const BLOCK: usize = 128 * 1024;
     const WIDE: usize = 8 * 1024 * 1024;
-    let limit = (u64::from(u32::MAX) + 1) * SeenContentGrid::record_step_for(WIDE) as u64;
+    let limit = (u64::from(u32::MAX) + 1) * SeenContentGrid::RECORD_STEP as u64;
 
     let block = deterministic_bytes(0x51DE, BLOCK);
     let mut grid = SeenContentGrid::default();
@@ -169,7 +150,7 @@ fn the_content_grid_keeps_what_the_window_reaches_across_a_rebase() {
 fn the_content_grid_bounds_the_origin_across_an_unasked_prefix() {
     const BLOCK: usize = 128 * 1024;
     const WIDE: usize = 8 * 1024 * 1024;
-    let limit = (u64::from(u32::MAX) + 1) * SeenContentGrid::record_step_for(WIDE) as u64;
+    let limit = (u64::from(u32::MAX) + 1) * SeenContentGrid::RECORD_STEP as u64;
 
     let block = deterministic_bytes(0x51DE, BLOCK);
     let mut grid = SeenContentGrid::default();
@@ -199,7 +180,7 @@ fn the_content_grid_bounds_the_origin_across_an_unasked_prefix() {
 fn the_content_grid_carries_its_records_when_a_skip_crosses_the_index() {
     const BLOCK: usize = 128 * 1024;
     const WIDE: usize = 8 * 1024 * 1024;
-    let step = SeenContentGrid::record_step_for(WIDE) as u64;
+    let step = SeenContentGrid::RECORD_STEP as u64;
     let limit = (u64::from(u32::MAX) + 1) * step;
 
     let block = deterministic_bytes(0x51DE, BLOCK);
@@ -304,7 +285,8 @@ fn the_content_grid_keeps_reporting_a_run_of_the_same_block() {
         .map(|word| SeenSample::unpack(*word))
         .filter(|slot| {
             slot.fingerprint != 0
-                && u64::from(slot.at_step) * (grid.step as u64) < block.len() as u64
+                && u64::from(slot.at_step) * (SeenContentGrid::RECORD_STEP as u64)
+                    < block.len() as u64
         })
         .count();
     assert_eq!(
@@ -329,15 +311,15 @@ fn the_content_grid_answers_a_block_shorter_than_its_key() {
     }
 }
 
-/// Both grid mixes spread keys over the slots and keep the tag independent of
-/// the slot.
+/// The grid's placement and both of its full mixes spread keys over the slots
+/// and keep the tag independent of the slot.
 ///
-/// The slot, the tag and the fingerprint are all cut from one mixed word. A mix
-/// that correlates them fails in a way no single-key test sees: keys crowding
-/// into fewer slots evict each other's records, and a repeat whose record was
-/// evicted is missed outright. So the check is statistical, over the key shapes
-/// the grid is fed: overlapping eight-byte windows of noise and of structured
-/// text, and counters that differ only in their low bits.
+/// A mix that correlates them fails in a way no single-key test sees: keys
+/// crowding into fewer slots evict each other's records, and a repeat whose
+/// record was evicted is missed outright. So the check is statistical, over the
+/// key shapes the grid is fed: overlapping eight-byte windows of noise and of
+/// structured text, and counters that differ only in their low bits. Every mix
+/// lays the slot in its high half and the tag in bits 16 to 23.
 #[test]
 fn the_grid_mixes_spread_slots_and_keep_the_tag_independent() {
     const SLOT_BITS: u32 = 16;
@@ -363,11 +345,23 @@ fn the_grid_mixes_spread_slots_and_keep_the_tag_independent() {
     keys.dedup();
 
     type Mix = fn(u64) -> u64;
-    let mixes: [(&str, Mix); 2] = [
-        ("wide", SeenContentGrid::avalanche_wide),
-        ("narrow", SeenContentGrid::avalanche_narrow),
+    // The full mixes are meant to look random, so a deviation either way is a
+    // defect. The placement is a multiplicative hash, which spreads counters
+    // more evenly than random — fewer empty slots and fewer shared tags than a
+    // random mix — so for it only crowding, a deviation upward, is one.
+    let mixes: [(&str, Mix, bool); 3] = [
+        ("placement", SeenContentGrid::placement, false),
+        ("wide", SeenContentGrid::avalanche_wide, true),
+        ("narrow", SeenContentGrid::avalanche_narrow, true),
     ];
-    for (name, mix) in mixes {
+    for (name, mix, random) in mixes {
+        let within = |ratio: f64| {
+            if random {
+                (0.85..1.15).contains(&ratio)
+            } else {
+                ratio < 1.15
+            }
+        };
         let mut fields: Vec<(u32, u8)> = keys
             .iter()
             .map(|&key| {
@@ -411,14 +405,14 @@ fn the_grid_mixes_spread_slots_and_keep_the_tag_independent() {
         let empty = (slots - used) as f64;
         let expected_empty = slots as f64 * (-lambda).exp();
         assert!(
-            (0.85..1.15).contains(&(empty / expected_empty)),
+            within(empty / expected_empty),
             "{name}: {empty} empty slots against {expected_empty:.0} expected at load {lambda:.2}",
         );
         // The tag keeps seven free bits, so two keys sharing a slot share a tag
         // one time in 128 when the two are independent.
         let expected_tag_pairs = slot_pairs as f64 / 128.0;
         assert!(
-            (0.85..1.15).contains(&(tag_pairs as f64 / expected_tag_pairs)),
+            within(tag_pairs as f64 / expected_tag_pairs),
             "{name}: {tag_pairs} same-slot pairs share a tag against {expected_tag_pairs:.0} expected",
         );
     }
