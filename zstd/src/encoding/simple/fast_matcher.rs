@@ -56,7 +56,9 @@ use crate::encoding::Sequence;
 use crate::encoding::dict_attach::DictAttach;
 use crate::encoding::workspace::HistoryBuf;
 
-use super::fast_kernel::hash_table::{FastHashTable, hash_ptr_raw};
+use super::fast_kernel::hash_table::{
+    FastHashTable, TAG_BITS, TAGGED_POSITION_LIMIT, hash_ptr_raw,
+};
 use super::fast_kernel::kernel::compress_block_fast;
 use super::fast_kernel::kernel::{DICT_TAG_BITS, DICT_TAG_MASK};
 
@@ -604,7 +606,13 @@ impl FastKernelMatcher {
         // Re-borrow detection: set to the resident dict region when the
         // epoch-reuse branch below keeps the dict bytes in place (see there).
         let mut reborrow_region: Option<usize> = None;
-        if !self.hash_table.bind(workspace, hash_log, mls) {
+        // Tagged slots unless the frame attaches a dictionary (its epoch bias
+        // needs the position range the tag takes) or its history could reach
+        // past what a tagged slot holds.
+        let tagged = carry != TableCarry::AdvanceEpoch
+            && hash_log + TAG_BITS <= 32
+            && tagged_positions_fit(1usize << window_log);
+        if !self.hash_table.bind(workspace, hash_log, mls, tagged) {
             // A new table: the first frame, a new shape, or a workspace that
             // moved. It starts empty, so there is nothing to clear, and the
             // cached dict table goes with it: its absolute positions index a
@@ -786,6 +794,12 @@ impl FastKernelMatcher {
             self.borrowed.is_none(),
             "set_borrowed_window called without a preceding reset()/clear_borrowed_window",
         );
+        // A borrowed scan stores absolute input positions, up to the whole
+        // buffer; past what a tagged slot holds, the frame runs untagged. The
+        // reset that precedes this left the table empty.
+        if self.hash_table.is_tagged() && buffer.len() > TAGGED_POSITION_LIMIT {
+            self.hash_table.untag_empty();
+        }
         self.borrowed = Some((buffer.as_ptr(), buffer.len()));
         self.last_borrowed_block = None;
         // Stale hash-table entries from a prior window are invalidated by the
@@ -1811,7 +1825,7 @@ impl FastKernelMatcher {
                 let pos = s + p;
                 // SAFETY: `pos <= s + 2 <= last_hashable` by the loop bound.
                 let hash = unsafe { self.hash_table.hash_ptr::<MLS>(base.add(pos)) };
-                if unsafe { self.hash_table.get(hash) } == 0 {
+                if unsafe { self.hash_table.slot_is_empty(hash) } {
                     unsafe { self.hash_table.put(hash, pos as u32) };
                 }
             }
@@ -1961,6 +1975,15 @@ impl FastKernelMatcher {
     pub(crate) fn skip_matching_for_dict_prime(&mut self, dict_len: usize) {
         let block_start = self.take_staged_block();
         self.prime_dict_table_for_range(block_start, dict_len);
+    }
+
+    /// Stops tagging the main table when a dictionary has widened the window
+    /// past what a tagged slot can index. Runs before the dictionary is
+    /// committed, while the table still holds nothing.
+    pub(crate) fn fit_table_to_window(&mut self) {
+        if self.hash_table.is_tagged() && !tagged_positions_fit(self.max_window_size) {
+            self.hash_table.untag_empty();
+        }
     }
 
     /// Moves the main table and the history out of the context's workspace, for
@@ -2258,6 +2281,16 @@ impl FastKernelMatcher {
 /// explicit parameter sidesteps the `&self`-vs-`&mut self.hash_table`
 /// conflict a `&self` accessor would create, the same reason the window
 /// slice is selected by the caller and handed in.
+/// Whether every position an owned history can reach fits a tagged slot: the
+/// history drains back to one window once an append would pass twice that, so
+/// it never holds more than two windows and one pending block.
+fn tagged_positions_fit(max_window_size: usize) -> bool {
+    max_window_size
+        .checked_mul(2)
+        .and_then(|band| band.checked_add(crate::common::MAX_BLOCK_SIZE as usize))
+        .is_some_and(|len| len <= TAGGED_POSITION_LIMIT)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_fast_kernel_block(
     history: &[u8],
@@ -2277,100 +2310,44 @@ fn run_fast_kernel_block(
         prefix_start_index,
         window_low,
     };
-    // Dispatch on (mls, use_cmov) — each pair monomorphises the kernel
-    // hot loop independently. `_` is unreachable: `FastHashTable::new`
+    // Dispatch on (mls, use_cmov, tagged) — each triple monomorphises the
+    // kernel hot loop independently. `_` is unreachable: `FastHashTable::new`
     // rejects mls outside 4..=8 at construction.
-    let result = match (mls, use_cmov) {
-        (4, false) => compress_block_fast::<4, false>(
-            history,
-            block_start,
-            bounds,
-            hash_table,
-            rep_in,
-            step_size,
-            &mut handle_sequence,
-        ),
-        (4, true) => compress_block_fast::<4, true>(
-            history,
-            block_start,
-            bounds,
-            hash_table,
-            rep_in,
-            step_size,
-            &mut handle_sequence,
-        ),
-        (5, false) => compress_block_fast::<5, false>(
-            history,
-            block_start,
-            bounds,
-            hash_table,
-            rep_in,
-            step_size,
-            &mut handle_sequence,
-        ),
-        (5, true) => compress_block_fast::<5, true>(
-            history,
-            block_start,
-            bounds,
-            hash_table,
-            rep_in,
-            step_size,
-            &mut handle_sequence,
-        ),
-        (6, false) => compress_block_fast::<6, false>(
-            history,
-            block_start,
-            bounds,
-            hash_table,
-            rep_in,
-            step_size,
-            &mut handle_sequence,
-        ),
-        (6, true) => compress_block_fast::<6, true>(
-            history,
-            block_start,
-            bounds,
-            hash_table,
-            rep_in,
-            step_size,
-            &mut handle_sequence,
-        ),
-        (7, false) => compress_block_fast::<7, false>(
-            history,
-            block_start,
-            bounds,
-            hash_table,
-            rep_in,
-            step_size,
-            &mut handle_sequence,
-        ),
-        (7, true) => compress_block_fast::<7, true>(
-            history,
-            block_start,
-            bounds,
-            hash_table,
-            rep_in,
-            step_size,
-            &mut handle_sequence,
-        ),
-        (8, false) => compress_block_fast::<8, false>(
-            history,
-            block_start,
-            bounds,
-            hash_table,
-            rep_in,
-            step_size,
-            &mut handle_sequence,
-        ),
-        (8, true) => compress_block_fast::<8, true>(
-            history,
-            block_start,
-            bounds,
-            hash_table,
-            rep_in,
-            step_size,
-            &mut handle_sequence,
-        ),
+    let tagged = hash_table.is_tagged();
+    macro_rules! run {
+        ($mls:literal, $cmov:literal, $tagged:literal) => {
+            compress_block_fast::<$mls, $cmov, $tagged>(
+                history,
+                block_start,
+                bounds,
+                hash_table,
+                rep_in,
+                step_size,
+                &mut handle_sequence,
+            )
+        };
+    }
+    let result = match (mls, use_cmov, tagged) {
+        (4, false, false) => run!(4, false, false),
+        (4, false, true) => run!(4, false, true),
+        (4, true, false) => run!(4, true, false),
+        (4, true, true) => run!(4, true, true),
+        (5, false, false) => run!(5, false, false),
+        (5, false, true) => run!(5, false, true),
+        (5, true, false) => run!(5, true, false),
+        (5, true, true) => run!(5, true, true),
+        (6, false, false) => run!(6, false, false),
+        (6, false, true) => run!(6, false, true),
+        (6, true, false) => run!(6, true, false),
+        (6, true, true) => run!(6, true, true),
+        (7, false, false) => run!(7, false, false),
+        (7, false, true) => run!(7, false, true),
+        (7, true, false) => run!(7, true, false),
+        (7, true, true) => run!(7, true, true),
+        (8, false, false) => run!(8, false, false),
+        (8, false, true) => run!(8, false, true),
+        (8, true, false) => run!(8, true, false),
+        (8, true, true) => run!(8, true, true),
         _ => unreachable!(
             "FastHashTable construction rejects mls outside 4..=8 — \
              got mls={mls} which means the table was bypassed",

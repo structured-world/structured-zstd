@@ -147,6 +147,7 @@ impl MatchGeneratorDriver {
                     .max_window_size
                     .saturating_add(requested_dict_budget)
                     .min(MAX_PRIMED_WINDOW_SIZE);
+                matcher.fit_table_to_window();
             }
             super::super::strategy::BackendTag::Dfast => {
                 let matcher = self.dfast_matcher_mut();

@@ -29,7 +29,7 @@ fn run_block(
     let mut replay = BlockReplay::new(data);
     let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
     let result = match mls {
-        4 => compress_block_fast::<4, false>(
+        4 => compress_block_fast::<4, false, false>(
             data,
             0,
             PrefixBounds {
@@ -46,7 +46,7 @@ fn run_block(
             2,
             &mut handle,
         ),
-        5 => compress_block_fast::<5, false>(
+        5 => compress_block_fast::<5, false, false>(
             data,
             0,
             PrefixBounds {
@@ -136,7 +136,7 @@ fn run_block_with_rep(
     let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
     let mut replay = BlockReplay::new(data);
     let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
-    let result = compress_block_fast::<4, false>(
+    let result = compress_block_fast::<4, false, false>(
         data,
         0,
         PrefixBounds {
@@ -275,7 +275,7 @@ fn prefix_start_index_filter_rejects_below_window() {
     let mut replay = BlockReplay::new(&data);
     let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
     // prefix_start_index=5 blocks index 0.
-    let _ = compress_block_fast::<4, false>(
+    let _ = compress_block_fast::<4, false, false>(
         &data,
         0,
         PrefixBounds {
@@ -359,7 +359,7 @@ fn match_found_rejects_stale_entry_below_prefix_floor() {
     // prefix_start_index = 50 — match_idx=5 is below the floor and
     // must be rejected by the upstream zstd-parity prefix filter in
     // `match_found`.
-    let _ = compress_block_fast::<4, false>(
+    let _ = compress_block_fast::<4, false, false>(
         &data,
         50,
         PrefixBounds {
@@ -442,7 +442,7 @@ fn rep_offset_save_restore_when_out_of_range() {
     let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
     let mut replay = BlockReplay::new(&data);
     let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
-    let result = compress_block_fast::<4, false>(
+    let result = compress_block_fast::<4, false, false>(
         &data,
         0,
         PrefixBounds {
@@ -489,7 +489,7 @@ fn cmov_variant_matches_branch_variant_output() {
         let mut replay = BlockReplay::new(&data);
         let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
         if use_cmov {
-            let _ = compress_block_fast::<4, true>(
+            let _ = compress_block_fast::<4, true, false>(
                 &data,
                 0,
                 PrefixBounds {
@@ -505,7 +505,7 @@ fn cmov_variant_matches_branch_variant_output() {
                 &mut handle,
             );
         } else {
-            let _ = compress_block_fast::<4, false>(
+            let _ = compress_block_fast::<4, false, false>(
                 &data,
                 0,
                 PrefixBounds {
@@ -559,17 +559,42 @@ fn cmov_variant_rejects_out_of_window_when_ip_equals_dummy() {
     let base = data.as_ptr();
     let ip_pos = 16usize;
     let ip = unsafe { base.add(ip_pos) };
-    let branch_result = unsafe { match_found::<false>(ip, base, 4, 10) };
+    let branch_result = unsafe { match_found::<false>(ip, base, 4, 10, true) };
     assert!(
         !branch_result,
         "branch variant must reject out-of-window match_idx"
     );
-    let cmov_result = unsafe { match_found::<true>(ip, base, 4, 10) };
+    let cmov_result = unsafe { match_found::<true>(ip, base, 4, 10, true) };
     assert!(
         !cmov_result,
         "cmov variant must reject out-of-window match_idx even when \
              ip bytes coincide with CMOV_DUMMY",
     );
+}
+
+/// A candidate whose short-cache tag differs is rejected even when its bytes
+/// match, in both variants: the tag check stands in for the byte compare, and
+/// a byte load it lets through would be the window access tagging exists to
+/// skip. The same candidate with the tag agreeing is accepted.
+#[test]
+fn match_found_rejects_a_candidate_whose_tag_differs() {
+    let data: alloc::vec::Vec<u8> = b"abcdXXXXabcdYYYY".to_vec();
+    let base = data.as_ptr();
+    // SAFETY (test fixture): position 8 has 8 readable bytes, and the
+    // candidate at 0 has 4.
+    let ip = unsafe { base.add(8) };
+    for (tag_ok, expected) in [(false, false), (true, true)] {
+        assert_eq!(
+            unsafe { match_found::<false>(ip, base, 0, 0, tag_ok) },
+            expected,
+            "branch variant, tag_ok={tag_ok}",
+        );
+        assert_eq!(
+            unsafe { match_found::<true>(ip, base, 0, 0, tag_ok) },
+            expected,
+            "cmov variant, tag_ok={tag_ok}",
+        );
+    }
 }
 
 /// Drive the borrowed dual-base dict kernel directly (Scalar tier — always

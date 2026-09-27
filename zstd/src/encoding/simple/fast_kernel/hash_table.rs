@@ -41,6 +41,18 @@ fn validate_params(hash_log: u32, mls: u32) {
     );
 }
 
+/// Short-cache tag width (upstream zstd `ZSTD_SHORT_CACHE_TAG_BITS`,
+/// `zstd_compress_internal.h`). A tagged slot packs `(position << TAG_BITS) |
+/// tag`, the tag being the low bits of a `hash_log + TAG_BITS`-wide hash whose
+/// top `hash_log` bits are exactly the untagged slot index. A probe whose tag
+/// differs is rejected without loading the candidate's bytes, which is a random
+/// access into the window.
+pub(crate) const TAG_BITS: u32 = 8;
+pub(crate) const TAG_MASK: u32 = (1 << TAG_BITS) - 1;
+
+/// Positions a tagged slot can hold: what is left of a `u32` beside the tag.
+pub(crate) const TAGGED_POSITION_LIMIT: usize = 1 << (32 - TAG_BITS);
+
 const PRIME_4_BYTES: u32 = 0x9E3779B1;
 const PRIME_5_BYTES: u64 = 889_523_592_379;
 const PRIME_6_BYTES: u64 = 227_718_039_650_203;
@@ -75,6 +87,10 @@ pub(crate) struct FastHashTable {
     /// ([`Self::hot_state`] — the no-dict kernels) and on cached dict
     /// tables; only the dict-attach main table advances it.
     bias: u32,
+    /// `TAG_BITS` when slots are tagged, `0` when they hold bare positions.
+    /// A tagged table is never biased: the bias needs the position range the
+    /// tag takes.
+    tag_bits: u32,
 }
 
 impl Clone for FastHashTable {
@@ -84,6 +100,7 @@ impl Clone for FastHashTable {
             hash_log: self.hash_log,
             mls: self.mls,
             bias: self.bias,
+            tag_bits: self.tag_bits,
         }
     }
 
@@ -96,6 +113,7 @@ impl Clone for FastHashTable {
         self.hash_log = source.hash_log;
         self.mls = source.mls;
         self.bias = source.bias;
+        self.tag_bits = source.tag_bits;
     }
 }
 
@@ -152,6 +170,7 @@ impl FastHashTable {
             hash_log,
             mls,
             bias: 0,
+            tag_bits: 0,
         }
     }
 
@@ -160,30 +179,62 @@ impl FastHashTable {
         region_bytes::<u32>(entry_count(hash_log))
     }
 
-    /// Lays the table out in the open `workspace` at `(hash_log, mls)`.
-    /// Returns `true` when it continues the previous frame's table at the same
-    /// shape, contents and epoch bias intact; otherwise every entry is the
-    /// empty sentinel and the bias is `0`, as [`Self::new`] leaves them.
+    /// Lays the table out in the open `workspace` at `(hash_log, mls)`, its
+    /// slots tagged when `tagged`. Returns `true` when it continues the
+    /// previous frame's table at the same shape, contents and epoch bias
+    /// intact; otherwise every entry is the empty sentinel and the bias is `0`,
+    /// as [`Self::new`] leaves them.
     ///
     /// # Panics
     ///
-    /// On the parameters [`Self::new`] refuses.
-    pub(crate) fn bind(&mut self, workspace: &mut Workspace, hash_log: u32, mls: u32) -> bool {
+    /// On the parameters [`Self::new`] refuses, and on a tagged table whose
+    /// tagged hash would not fit a `u32`.
+    pub(crate) fn bind(
+        &mut self,
+        workspace: &mut Workspace,
+        hash_log: u32,
+        mls: u32,
+        tagged: bool,
+    ) -> bool {
         validate_params(hash_log, mls);
-        let same_shape = self.hash_log == hash_log && self.mls == mls;
+        let tag_bits = if tagged { TAG_BITS } else { 0 };
+        assert!(
+            hash_log + tag_bits <= 32,
+            "a tagged table needs hash_log <= {} (got {hash_log})",
+            32 - TAG_BITS,
+        );
+        let same_shape = self.hash_log == hash_log && self.mls == mls && self.tag_bits == tag_bits;
         let kept = self.table.bind(workspace, entry_count(hash_log), 0);
         self.hash_log = hash_log;
         self.mls = mls;
+        self.tag_bits = tag_bits;
         if kept && same_shape {
             return true;
         }
         if kept {
-            // The same bytes, keyed by a different hash: nothing in them
-            // names what the new shape would look up.
+            // The same bytes, keyed by a different hash or in another slot
+            // format: nothing in them names what the new shape would look up.
             self.table.fill(0);
         }
         self.bias = 0;
         false
+    }
+
+    /// Whether slots are tagged (see [`TAG_BITS`]).
+    #[inline(always)]
+    pub(crate) fn is_tagged(&self) -> bool {
+        self.tag_bits != 0
+    }
+
+    /// Stops tagging, for a frame whose positions outgrow what a tagged slot
+    /// holds. Only valid on a table holding nothing, which the caller asserts
+    /// by calling this before the frame stores anything.
+    pub(crate) fn untag_empty(&mut self) {
+        debug_assert!(
+            self.table.iter().all(|&slot| slot == 0),
+            "untag_empty on a table that holds entries"
+        );
+        self.tag_bits = 0;
     }
 
     /// Moves the entries out of the context's workspace (see
@@ -206,6 +257,7 @@ impl FastHashTable {
             hash_log,
             mls,
             bias: 0,
+            tag_bits: 0,
         }
     }
 
@@ -263,7 +315,14 @@ impl FastHashTable {
             "epoch bias {} plus a {drop_n}-byte slide overflows a stored position",
             self.bias,
         );
-        let correction = self.bias + drop_n;
+        // A tagged slot is `position << TAG_BITS | tag`: subtracting the shifted
+        // count moves the position and keeps the tag, and a position at or
+        // under the count floors to a slot that is empty or names position 0,
+        // which the kernels' `prefix_start_index >= 1` rejects. A tagged table
+        // is never biased, and its positions stay under `TAGGED_POSITION_LIMIT`,
+        // so the shift cannot overflow.
+        debug_assert!(self.tag_bits == 0 || self.bias == 0);
+        let correction = (self.bias + drop_n) << self.tag_bits;
         for slot in self.table.iter_mut() {
             *slot = slot.saturating_sub(correction);
         }
@@ -285,6 +344,7 @@ impl FastHashTable {
         // so a bias at or below `u32::MAX - 2^31` can never overflow in
         // `put`.
         const POSITION_CEILING: u32 = 1 << 31;
+        debug_assert!(!self.is_tagged(), "a tagged table is never biased");
         match self.bias.checked_add(span) {
             Some(new_bias) if new_bias <= u32::MAX - POSITION_CEILING => self.bias = new_bias,
             _ => self.clear(),
@@ -292,7 +352,9 @@ impl FastHashTable {
     }
 
     /// Upstream zstd-parity `ZSTD_hashPtr` — multiply-shift hash over the first
-    /// `mls` bytes at `ptr`, output reduced to `hash_log` bits.
+    /// `mls` bytes at `ptr`, output reduced to `hash_log` bits, or to
+    /// `hash_log + TAG_BITS` on a tagged table (the form [`Self::get`] and
+    /// [`Self::put`] take).
     ///
     /// # Safety
     ///
@@ -329,8 +391,8 @@ impl FastHashTable {
     pub(crate) unsafe fn hash_ptr<const MLS: u32>(&self, ptr: *const u8) -> u32 {
         debug_assert_eq!(MLS, self.mls, "monomorphised MLS must match table mls");
         // SAFETY: forwarded — caller upholds `hash_ptr`'s readable-bytes
-        // contract; `self.hash_log` is the table's own log.
-        unsafe { hash_ptr_raw::<MLS>(ptr, self.hash_log) }
+        // contract; `bind` checked that the tagged width fits a `u32`.
+        unsafe { hash_ptr_raw::<MLS>(ptr, self.hash_log + self.tag_bits) }
     }
 
     /// Hoist the table's backing slice + `hash_log` into locals for a hot
@@ -345,7 +407,8 @@ impl FastHashTable {
         // The raw-slice consumers (no-dict kernels) store and read
         // UNBIASED positions; they may only run on a bias-0 table (the
         // matcher clears — rather than epoch-advances — whenever the next
-        // frame is not a dict-attach frame).
+        // frame is not a dict-attach frame). The slot format (tagged or not)
+        // is the caller's monomorph, read from [`Self::is_tagged`].
         debug_assert_eq!(self.bias, 0, "hot_state requires an unbiased table");
         (self.table.as_mut_slice(), self.hash_log)
     }
@@ -360,25 +423,32 @@ impl FastHashTable {
     /// access (`saturating_sub(0)` / `+ 0` fold away).
     #[inline(always)]
     pub(crate) fn hot_state_biased(&mut self) -> (&mut [u32], u32, u32) {
+        debug_assert!(!self.is_tagged(), "the biased kernels read bare positions");
         (self.table.as_mut_slice(), self.hash_log, self.bias)
     }
 
-    /// Direct table access — `table[hash]`. Bounds-check at index time
-    /// is provably redundant because `hash >> (64 - hash_log)` produces
-    /// a value `< 1 << hash_log == table.len()`; LLVM cannot infer
-    /// this across the `as u32` truncation so we use `get_unchecked`.
+    /// The position stored under `hash`, or the empty sentinel `0` when the
+    /// slot is empty, was stored before the last epoch advance, or (tagged)
+    /// carries another tag. Bounds-check at index time is provably redundant
+    /// because the slot index `hash >> tag_bits` is `< 1 << hash_log ==
+    /// table.len()`; LLVM cannot infer this across the `as u32` truncation so
+    /// we use `get_unchecked`.
     ///
     /// # Safety
     ///
     /// `hash` MUST be a value returned by [`Self::hash_ptr`] on this table
-    /// (or on another table with the same `hash_log`), so that
-    /// `hash < 1 << hash_log = table.len()`.
+    /// (or on another table of the same shape).
     #[inline(always)]
     pub(crate) unsafe fn get(&self, hash: u32) -> u32 {
-        debug_assert!((hash as usize) < self.table.len());
-        // SAFETY: see method-level doc — `hash` is bounded by the
-        // table-size invariant from `hash_ptr`.
-        let raw = unsafe { *self.table.get_unchecked(hash as usize) };
+        let raw = unsafe { self.slot(hash) };
+        if self.tag_bits != 0 {
+            let tag_mask = (1 << self.tag_bits) - 1;
+            return if (raw ^ hash) & tag_mask == 0 {
+                raw >> self.tag_bits
+            } else {
+                0
+            };
+        }
         // Epoch filter: entries stored before the last `advance_epoch`
         // (raw < bias, including the all-zero sentinel) must read as the
         // empty sentinel 0 — the saturation floor IS the semantics here.
@@ -387,22 +457,52 @@ impl FastHashTable {
         raw.saturating_sub(self.bias)
     }
 
-    /// Direct table write — `table[hash] = pos`. Same bounds reasoning
-    /// as [`Self::get`].
+    /// Whether the slot `hash` lands on has never been written, whatever
+    /// tag it would carry: the fill that writes only into still-empty slots
+    /// asks this (upstream zstd `ZSTD_fillHashTableForCDict`).
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::get`].
+    #[inline(always)]
+    pub(crate) unsafe fn slot_is_empty(&self, hash: u32) -> bool {
+        unsafe { self.slot(hash) }.saturating_sub(self.bias) == 0
+    }
+
+    /// Direct table write of `pos` under `hash`. Same bounds reasoning as
+    /// [`Self::get`].
     ///
     /// # Safety
     ///
     /// `hash` MUST be a value returned by [`Self::hash_ptr`] on this table.
     #[inline(always)]
     pub(crate) unsafe fn put(&mut self, hash: u32, pos: u32) {
-        debug_assert!((hash as usize) < self.table.len());
+        let index = (hash >> self.tag_bits) as usize;
+        debug_assert!(index < self.table.len());
         // Cannot overflow: `advance_epoch` caps the bias at
-        // `u32::MAX - 2^31` and `pos` is bounded by the eviction band.
-        let biased = pos + self.bias;
+        // `u32::MAX - 2^31` and `pos` is bounded by the eviction band; a
+        // tagged table is unbiased and its positions stay under
+        // `TAGGED_POSITION_LIMIT`.
+        debug_assert!(self.tag_bits == 0 || (pos as usize) < TAGGED_POSITION_LIMIT);
+        let tag_mask = (1u32 << self.tag_bits) - 1;
+        let stored = ((pos + self.bias) << self.tag_bits) | (hash & tag_mask);
         // SAFETY: see method-level doc.
         unsafe {
-            *self.table.get_unchecked_mut(hash as usize) = biased;
+            *self.table.get_unchecked_mut(index) = stored;
         }
+    }
+
+    /// The raw word in the slot `hash` lands on.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::get`].
+    #[inline(always)]
+    unsafe fn slot(&self, hash: u32) -> u32 {
+        let index = (hash >> self.tag_bits) as usize;
+        debug_assert!(index < self.table.len());
+        // SAFETY: the caller's contract bounds the index by the table size.
+        unsafe { *self.table.get_unchecked(index) }
     }
 }
 

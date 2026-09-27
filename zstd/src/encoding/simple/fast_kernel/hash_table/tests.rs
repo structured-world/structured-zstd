@@ -43,6 +43,81 @@ fn get_put_round_trip_under_known_hash() {
     }
 }
 
+/// A table laid out in a workspace at `(hash_log, 4)`, tagged or not.
+fn bound_table(
+    workspace: &mut crate::encoding::workspace::Workspace,
+    hash_log: u32,
+    tagged: bool,
+) -> FastHashTable {
+    workspace.begin_layout(
+        0,
+        crate::encoding::workspace::no_trailing,
+        crate::encoding::workspace::IngestPlan::Stream,
+    );
+    workspace.open(FastHashTable::workspace_bytes(hash_log), usize::MAX);
+    let mut table = FastHashTable::new_deferred(hash_log, 4);
+    assert!(!table.bind(workspace, hash_log, 4, tagged));
+    table
+}
+
+/// A tagged table keys the slot by the untagged hash (the tag only adds a
+/// reject), reads back the position stored under the same tag, reads a
+/// different tag in the same slot as empty while the slot itself counts as
+/// occupied, and slides positions without disturbing their tags.
+#[test]
+fn a_tagged_table_rejects_other_tags_and_slides_positions() {
+    let mut workspace = crate::encoding::workspace::Workspace::new();
+    let mut table = bound_table(&mut workspace, 10, true);
+    let data = *b"abcdefgh";
+    // SAFETY: 8 readable bytes.
+    let hash = unsafe { table.hash_ptr::<4>(data.as_ptr()) };
+    let untagged = unsafe { hash_ptr_raw::<4>(data.as_ptr(), 10) };
+    assert_eq!(hash >> TAG_BITS, untagged, "the slot is the untagged hash");
+
+    // SAFETY: every hash below came from this table's hash_ptr (or differs
+    // from one only in its tag bits, which leaves the slot index in range).
+    unsafe {
+        assert!(table.slot_is_empty(hash));
+        table.put(hash, 1000);
+        assert_eq!(table.get(hash), 1000);
+        let other_tag = hash ^ 1;
+        assert_eq!(table.get(other_tag), 0, "another tag reads as empty");
+        assert!(!table.slot_is_empty(other_tag), "but the slot is taken");
+
+        table.reduce_indices(400);
+        assert_eq!(table.get(hash), 600, "the slide keeps the tag");
+        table.reduce_indices(600);
+        assert_eq!(table.get(hash), 0, "a slid-out position names 0");
+    }
+}
+
+/// Switching the slot format is a change of shape: a table laid out again
+/// in the other format does not continue the old one, and starts empty.
+#[test]
+fn changing_the_slot_format_does_not_continue_the_table() {
+    let mut workspace = crate::encoding::workspace::Workspace::new();
+    let mut table = bound_table(&mut workspace, 10, true);
+    let data = *b"abcdefgh";
+    // SAFETY: 8 readable bytes; the hash is this table's.
+    unsafe {
+        let hash = table.hash_ptr::<4>(data.as_ptr());
+        table.put(hash, 7);
+    }
+    workspace.begin_layout(
+        0,
+        crate::encoding::workspace::no_trailing,
+        crate::encoding::workspace::IngestPlan::Stream,
+    );
+    workspace.open(FastHashTable::workspace_bytes(10), usize::MAX);
+    assert!(!table.bind(&mut workspace, 10, 4, false));
+    assert!(!table.is_tagged());
+    // SAFETY: as above.
+    unsafe {
+        let hash = table.hash_ptr::<4>(data.as_ptr());
+        assert_eq!(table.get(hash), 0);
+    }
+}
+
 #[test]
 fn clear_resets_all_entries_to_sentinel() {
     let mut table = FastHashTable::new(6, 4);
