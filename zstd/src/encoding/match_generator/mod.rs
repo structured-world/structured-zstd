@@ -1225,7 +1225,7 @@ impl Matcher for MatchGeneratorDriver {
                     // arm below (and serves the same peak-memory
                     // purpose: release the table-allocation footprint
                     // before constructing the replacement variant).
-                    m.tables = Vec::new();
+                    m.tables = crate::encoding::workspace::Table::empty();
                     m.reset();
                 }
                 MatcherStorage::Row(m) => {
@@ -1401,7 +1401,6 @@ impl Matcher for MatchGeneratorDriver {
                 );
             }
             MatcherStorage::Dfast(dfast) => {
-                workspace.open(0, max_window_size);
                 dfast.max_window_size = max_window_size;
                 let dcfg = params
                     .dfast
@@ -1447,6 +1446,10 @@ impl Matcher for MatchGeneratorDriver {
                 if dict_hint.is_some() && !dfast_attach_next {
                     dfast.invalidate_dict_cache();
                 }
+                // The widths are settled, so the tables can be laid out; the
+                // reset below reads whether they continue the last frame's.
+                workspace.open(dfast.tables_workspace_bytes(), max_window_size);
+                dfast.bind_tables(workspace);
                 // Dfast holds no per-block input Vecs (history owns the
                 // bytes and `add_data` returns each Vec eagerly), so
                 // `reset` takes no `reuse_space` callback.

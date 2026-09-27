@@ -28,6 +28,7 @@ use super::match_generator::{
 use super::match_table::helpers::{common_prefix_len_with_kernel, extend_backwards_shared};
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
+use super::workspace::{Table, Workspace, region_bytes};
 
 /// Upstream zstd `HASH_READ_SIZE` (`zstd_compress_internal.h`): the largest probe
 /// width any hash / equality check in the dfast hot path reads at once.
@@ -110,8 +111,12 @@ pub(crate) struct DfastMatchGenerator {
     /// long_len + short_len)`. One allocation instead of two halves the
     /// per-fresh-frame large-table allocator churn (the page-fault / calloc
     /// storm that dominated dfast on medium inputs). Access through the
-    /// `long_*` / `short_*` helpers, which apply the short-region offset.
-    pub(crate) tables: Vec<u32>,
+    /// `long_*` / `short_*` helpers, which apply the short-region offset. In
+    /// the context's workspace when a context drives the matcher.
+    pub(crate) tables: Table<u32>,
+    /// Set by [`Self::bind_tables`] when the tables were laid out anew, so
+    /// hold nothing an earlier frame wrote; read and cleared by [`Self::reset`].
+    tables_fresh: bool,
     /// Absolute position whose `(abs_pos - position_base + 1)` slot
     /// encoding evaluates to `1`. Advances only via [`Self::reduce`]
     /// when an insert is about to overflow the u32 window — the
@@ -238,7 +243,8 @@ impl DfastMatchGenerator {
             history_start: 0,
             history_abs_start: 0,
             offset_hist: [1, 4, 8],
-            tables: Vec::new(),
+            tables: Table::empty(),
+            tables_fresh: false,
             position_base: 0,
             long_hash_bits: DFAST_HASH_BITS,
             short_hash_bits: DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA,
@@ -313,9 +319,9 @@ impl DfastMatchGenerator {
         if resized {
             self.long_hash_bits = long_clamped;
             self.short_hash_bits = short_clamped;
-            // Drop the combined backing so `ensure_hash_tables` reallocates at
-            // the new (long_len + short_len).
-            self.tables = Vec::new();
+            // Drop the combined backing so the tables are laid out (or
+            // allocated) again at the new (long_len + short_len).
+            self.tables = Table::empty();
         }
         if resized {
             // A table-size change makes the cached dict tables (sized to the old
@@ -395,13 +401,27 @@ impl DfastMatchGenerator {
         self.position_base += reducer as usize;
     }
 
-    /// Heap bytes this matcher owns: history, the long/short hash tables, the
-    /// window-block deque, and any attached dictionary tables.
+    /// Workspace bytes the long and short tables take at the current widths.
+    pub(crate) fn tables_workspace_bytes(&self) -> usize {
+        region_bytes::<u32>(self.long_len() + self.short_len())
+    }
+
+    /// Lays the long and short tables out in the open `workspace`. When they
+    /// do not continue the previous frame's tables they start empty, and the
+    /// next [`Self::reset`] knows they hold nothing an earlier frame wrote.
+    pub(crate) fn bind_tables(&mut self, workspace: &mut Workspace) {
+        let total = self.long_len() + self.short_len();
+        self.tables_fresh = !self.tables.bind(workspace, total, DFAST_EMPTY_SLOT);
+    }
+
+    /// Heap bytes this matcher owns: history, the long/short hash tables when
+    /// they are not in a context's workspace, the window-block deque, and any
+    /// attached dictionary tables.
     pub(crate) fn heap_size(&self) -> usize {
         let u32_sz = core::mem::size_of::<u32>();
         self.window_blocks.capacity() * core::mem::size_of::<usize>()
             + self.history.capacity()
-            + self.tables.capacity() * u32_sz
+            + self.tables.owned_bytes()
             + self
                 .dict
                 .table()
@@ -495,7 +515,8 @@ impl DfastMatchGenerator {
         // owned or borrowed (a width change drops them before this runs),
         // unless the fallback above has just cleared them.
         let cleared = reborrow_region.is_none() && next_floor > REBASE_RESET_FLOOR_CEILING;
-        self.tables_hold_earlier_frames = !self.tables.is_empty() && !cleared;
+        self.tables_hold_earlier_frames = !self.tables.is_empty() && !self.tables_fresh && !cleared;
+        self.tables_fresh = false;
         // No Vec<u8> blocks to recycle: `add_data` returns each input
         // Vec to the caller eagerly via its own `reuse_space`, and the
         // history Vec is owned solely by the matcher. There is nothing
@@ -1739,10 +1760,9 @@ impl DfastMatchGenerator {
         // Fastest/Uncompressed never pay the dfast-level memory cost.
         let total = self.long_len() + self.short_len();
         if self.tables.len() != total {
-            // Single zeroed allocation for both regions (`vec![0; n]` lowers to
-            // `alloc_zeroed`). One buffer instead of two cuts the large-table
-            // allocator churn on fresh-per-frame compressors.
-            self.tables = alloc::vec![DFAST_EMPTY_SLOT; total];
+            // A matcher no context laid out (driven on its own) allocates the
+            // tables itself: one zeroed allocation for both regions.
+            self.tables = Table::owned(alloc::vec![DFAST_EMPTY_SLOT; total]);
         }
     }
 
