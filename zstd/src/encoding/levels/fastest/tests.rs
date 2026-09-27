@@ -112,11 +112,46 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
     );
 }
 
+/// A single-block frame of noise that copies its own content, the copy beginning
+/// between where fixed start and middle probe runs would sit, is searched and
+/// coded as a match at every level rather than written out raw.
+#[test]
+fn a_copy_inside_one_block_of_noise_is_coded_as_a_match() {
+    let mut state = 0x6C07_8965_u32;
+    let mut noise = |len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    };
+    let first = noise(16 * 1024 - 256);
+    let mut input = first.clone();
+    input.extend_from_slice(&first);
+    input.extend(noise(32 * 1024 + 512));
+    for level in [-7, -1, 1, 3, 5, 13, 19] {
+        let compressed =
+            crate::encoding::compress_to_vec(input.as_slice(), CompressionLevel::Level(level));
+        assert!(
+            compressed.len() < input.len() - 12 * 1024,
+            "level {level}: {} bytes from {}, the copy went out raw",
+            compressed.len(),
+            input.len(),
+        );
+        let mut decoded = Vec::with_capacity(input.len());
+        crate::decoding::FrameDecoder::new()
+            .decode_all_to_vec(&compressed, &mut decoded)
+            .unwrap();
+        assert_eq!(decoded, input, "level {level}");
+    }
+}
+
 /// A one-shot frame at a negative level whose window cuts it into 16 KiB
-/// blocks searches them without asking the classifier. The first block copies
-/// its own head after its midpoint, where neither probe run of the grid starts,
-/// so only the search finds that copy: a block handed to the classifier would
-/// read as noise and go out raw with it.
+/// blocks searches them without asking the classifier, and the search codes the
+/// copy the first block makes of its own head.
 #[test]
 fn a_small_block_at_a_negative_level_is_searched_without_the_classifier() {
     use crate::encoding::{CompressionParameters, compress_with_parameters};

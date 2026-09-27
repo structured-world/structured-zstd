@@ -18,9 +18,9 @@ use core::mem::MaybeUninit;
 /// of CONSECUTIVE positions, which is what makes a shifted duplicate findable
 /// without reading the whole block: a copy sits some distance from its
 /// original, the probed positions map to original positions that far lower, and
-/// among [`Self::PROBE_RUN`] consecutive values exactly one is a multiple of
-/// [`Self::RECORD_STEP`] — so exactly one probe meets a recorded key, whatever
-/// the distance is. Probing on the same grid it records on would instead see a
+/// among as many consecutive values as the record step exactly one is a
+/// multiple of it, so exactly one probe meets a recorded key, whatever the
+/// distance is. Probing on the same grid it records on would instead see a
 /// repeat only at distances that happen to be a multiple of the step, and miss,
 /// say, a block that repeats the previous one after two inserted bytes.
 ///
@@ -80,6 +80,12 @@ pub(crate) struct SeenContentGrid {
     /// first incompressible one. A duplicate of a block that compressed well is
     /// itself compressible, so it is not at risk of the skip in the first place.
     asked: bool,
+    /// Bytes between recorded offsets, chosen by [`Self::record_step_for`] when
+    /// the frame first records and fixed for the rest of it: records sit on its
+    /// multiples in the frame's coordinates and store their offset in its
+    /// units, so a step that changed would leave every earlier record off the
+    /// grid. 0 until then.
+    step: usize,
 }
 
 /// One slot, unpacked from the eight bytes it is stored in. Widening any field
@@ -92,9 +98,8 @@ pub(crate) struct SeenSample {
     /// thousands.
     fingerprint: u16,
     epoch: u16,
-    /// The record's offset in units of [`SeenContentGrid::RECORD_STEP`], which
-    /// is what every record sits on. A frame would have to run past two
-    /// tebibytes for this to be too narrow.
+    /// The record's offset in units of the frame's record step, which is what
+    /// every record sits on. A frame past four billion steps rebases instead.
     at_step: u32,
 }
 
@@ -124,47 +129,39 @@ impl SeenContentGrid {
     /// evicting: a probe run meets exactly ONE recorded key, so an evicted
     /// record is a repeat missed outright, where the previous scheme had a
     /// couple of hundred chances per block and could afford to lose most of
-    /// them. At sixteen bytes a slot this is a megabyte, and only a frame whose
-    /// window is that large ever allocates it.
+    /// them. At nine bytes a slot (the packed sample and its tag) this is
+    /// 576 KiB, taken only by a frame whose window holds that many records.
     const SLOTS: usize = 64 * 1024;
     /// Floor on the table, so a tiny window still has room for a few anchors
     /// without a slot collision reading as a repeat on every one.
     const MIN_SLOTS: usize = 64;
     /// Bytes read per sample.
     const KEY_LEN: usize = 8;
-    /// Stream offsets that get recorded: every one that is a multiple of this,
-    /// in the frame's own coordinates rather than the block's, so the same
-    /// content lands on the same offsets however the blocks are cut. 256 records
-    /// per 128 KiB block, and a 4 MiB window's worth fits the table without
-    /// evicting most of itself.
-    const RECORD_STEP: usize = 512;
-    /// Consecutive positions probed per run. Equal to [`Self::RECORD_STEP`] by
-    /// construction, not by coincidence: among that many consecutive stream
-    /// offsets exactly one is a multiple of the step, so a copy at ANY distance
-    /// from its original has exactly one probe that meets a recorded key.
-    const PROBE_RUN: usize = Self::RECORD_STEP;
-    /// Runs per block: one at the start, one at the middle.
-    ///
-    /// A run answers a copy at any distance, but only where the run begins, so a
-    /// block carrying a copy of its own earlier content that starts elsewhere
-    /// goes out raw with the match inside it. Two ways of closing that were
-    /// measured on the bench host against this placement, three interleaved
-    /// readings a side of two prebuilt binaries, on a mebibyte of incompressible
-    /// input — the input the whole heuristic exists to make cheap:
-    ///
-    /// * a run every 16 KiB, eight on a 128 KiB block: 1.70x at the fast levels,
-    ///   1.60x at dfast, 1.10x at lazy. The runs ARE the grid's cost — each
-    ///   probe is a random slot lookup — so their number is the price.
-    /// * probing each grid point as it is recorded, which answers a copy
-    ///   anywhere in the block at a distance that is a whole number of steps:
-    ///   1.02x to 1.03x at the fast levels and dfast, 1.04x at greedy. Cheap,
-    ///   but not free — and it changed no compressed size anywhere in the
-    ///   fixture matrix, so it was paying on every block of noise for a case
-    ///   nothing measured reaches.
-    ///
-    /// So the bound is deliberate: a copy that begins away from both runs is
-    /// missed, and what that costs is capped by the block.
-    const PROBE_RUNS_PER_BLOCK: usize = 2;
+    /// A probe run starts every this fraction of a block, so a copy the grid
+    /// misses is shorter than that fraction plus one run, wherever in the block
+    /// it begins. A run answers a copy at any distance but only one that it
+    /// begins inside, so with runs at fixed places a block carrying a copy of
+    /// its own content between them went out raw with the match in it.
+    const PROBE_FRACTION: usize = 8;
+    /// Floor on the record step, which is also the run length: below it the
+    /// records of a small window cost more per byte than its runs save.
+    const MIN_RECORD_STEP: usize = 16;
+
+    /// The record step for a frame whose blocks reach `window_size` (0 when
+    /// unknown). Each run is one step long and a block of `b` bytes takes
+    /// [`Self::PROBE_FRACTION`] of them and `b / step` records, so its lookups
+    /// are fewest where the two counts meet: a step at the square root of the
+    /// run spacing. Rounded down to a power of two, which only makes the runs
+    /// shorter and the records denser.
+    pub(crate) fn record_step_for(window_size: usize) -> usize {
+        let block = if window_size == 0 {
+            MAX_BLOCK_SIZE as usize
+        } else {
+            window_size.min(MAX_BLOCK_SIZE as usize)
+        };
+        let spacing = (block / Self::PROBE_FRACTION).max(1);
+        (1usize << (spacing.ilog2() / 2)).max(Self::MIN_RECORD_STEP)
+    }
     /// What a rebase keeps: the widest window the format admits, so a record
     /// dropped there was out of every matcher's reach already.
     const REBASE_RETAIN_BYTES: u64 = 1 << 31;
@@ -191,15 +188,16 @@ impl SeenContentGrid {
     /// last [`Self::REBASE_RETAIN_BYTES`], which covers the widest window the
     /// format admits, so nothing droppable was reachable anyway.
     ///
-    /// Out of line and cold: this walks the whole table and runs once per couple
-    /// of tebibytes of stream, while its callers run per block. Letting it inline
+    /// Out of line and cold: this walks the whole table and runs once per four
+    /// billion record steps of stream (64 GiB at the smallest step), while its
+    /// callers run per block. Letting it inline
     /// into the caller that skips a block cost 22% of the encode of a repeated
     /// log stream at level 1 — 807-814 us against 983-986 us — for a body that
     /// never executes there.
     #[cold]
     #[inline(never)]
     fn rebase_offsets(&mut self) {
-        let step = Self::RECORD_STEP as u64;
+        let step = self.index_step();
         let retain_steps = Self::REBASE_RETAIN_BYTES / step;
         let Some(base_steps) = (self.frame_offset / step).checked_sub(retain_steps) else {
             // Not far enough along to have anything to drop, which the caller's
@@ -250,6 +248,15 @@ impl SeenContentGrid {
         self.frame_offset = 0;
         self.repeat_until = 0;
         self.asked = false;
+        self.step = 0;
+    }
+
+    /// The unit offsets are indexed in: the frame's record step, or before it
+    /// has one the smallest step it could take, which bounds the origin at
+    /// least as tightly as any step it takes later.
+    #[inline]
+    fn index_step(&self) -> u64 {
+        self.step.max(Self::MIN_RECORD_STEP) as u64
     }
 
     pub(crate) fn heap_size(&self) -> usize {
@@ -302,7 +309,7 @@ impl SeenContentGrid {
         if held.epoch != self.epoch || held.fingerprint != fingerprint {
             return false;
         }
-        let recorded = u64::from(held.at_step) * Self::RECORD_STEP as u64;
+        let recorded = u64::from(held.at_step) * self.step as u64;
         // A record is never ahead of a probe that meets it: records for a run go
         // in before the run, and both walk the block forwards. The subtraction
         // is checked all the same — the alternative is a wrap in release that
@@ -333,13 +340,13 @@ impl SeenContentGrid {
         }
         let here = self.frame_offset + at as u64;
         debug_assert!(
-            here.is_multiple_of(Self::RECORD_STEP as u64),
+            here.is_multiple_of(self.step as u64),
             "records sit on the grid, which is what lets the offset be stored in steps",
         );
         let packed = SeenSample {
             fingerprint,
             epoch: self.epoch,
-            at_step: (here / Self::RECORD_STEP as u64) as u32,
+            at_step: (here / self.step as u64) as u32,
         }
         .pack();
         // SAFETY: a masked slot is in bounds for both tables; see `probe_key`.
@@ -370,7 +377,7 @@ impl SeenContentGrid {
     /// blocks unrecorded means a later block made mostly of one of them looks
     /// like noise, finds nothing, and goes out raw with an almost block-sized
     /// match sitting in history. The probe is what costs; recording is a key
-    /// every `RECORD_STEP` bytes.
+    /// every record step.
     ///
     /// Nothing is recorded until the frame has asked the grid something at least
     /// once (see [`Self::asked`]); the offset still advances, so what follows
@@ -419,7 +426,7 @@ impl SeenContentGrid {
     /// search on for most of an index span.
     #[inline]
     fn skip_block(&mut self, len: usize) {
-        let step = Self::RECORD_STEP as u64;
+        let step = self.index_step();
         if (self.frame_offset + len as u64) / step > u64::from(u32::MAX) {
             self.rebase_offsets();
         }
@@ -433,7 +440,10 @@ impl SeenContentGrid {
             self.skip_block(block.len());
             return false;
         }
-        let wanted = Self::slots_for(window_size);
+        if self.step == 0 {
+            self.step = Self::record_step_for(window_size);
+        }
+        let wanted = Self::slots_for(window_size, self.step);
         if self.slots.len() < wanted {
             // Both zeroed allocations, which the allocator can serve as pages
             // the kernel has not written; see the field's own note.
@@ -466,43 +476,43 @@ impl SeenContentGrid {
         // without re-deriving the same bound per position.
         let block_ptr = block.as_ptr();
         // Neither side reads the whole block. Recording lands on a FIXED grid in
-        // the frame's own coordinates — every `RECORD_STEP` bytes of stream, so
-        // the same content recorded once is recorded at the same stream offsets
-        // however the blocks around it are cut. Probing takes `RECORD_STEP`
-        // CONSECUTIVE positions, and that is what makes any shift work: a copy
-        // sits at some distance D from its original, the probed positions map to
-        // original positions D lower, and among `RECORD_STEP` consecutive values
-        // exactly one is a multiple of `RECORD_STEP` — so exactly one probe
-        // meets a recorded key, whatever D is.
+        // the frame's own coordinates — every `step` bytes of stream, so the
+        // same content recorded once is recorded at the same stream offsets
+        // however the blocks around it are cut. Probing takes `step` CONSECUTIVE
+        // positions, and that is what makes any shift work: a copy sits at some
+        // distance D from its original, the probed positions map to original
+        // positions D lower, and among `step` consecutive values exactly one is
+        // a multiple of `step` — so exactly one probe meets a recorded key,
+        // whatever D is.
         //
         // The pass this replaces read every byte looking for content-defined
         // anchors. It was correct and it was the cost: on a fast level a whole
         // extra pass over the block doubles the encode of incompressible input,
-        // where the raw path is little more than a copy. This touches about
-        // eight kilobytes of a hundred-and-twenty-eight-kilobyte block.
+        // where the raw path is little more than a copy.
         //
-        // Several runs, not one: the run at the start answers a duplicate of
-        // anything recorded earlier, and every later run answers a block that
-        // carries a copy of its own earlier content — a hundred and twenty-eight
-        // kilobytes holding a fifty-kilobyte copy of itself reads as
-        // incompressible by any sample of it and is a block-sized match if the
-        // search runs. A run only answers a copy that it begins inside, so runs
-        // every [`Self::PROBE_SPACING`] bound what a copy has to be to hide.
+        // Runs at every `PROBE_FRACTION` of the block: the one at the start
+        // answers a duplicate of anything recorded earlier, and every later one
+        // a block that carries a copy of its own earlier content, which reads as
+        // incompressible by any sample of it and is a match the size of the copy
+        // if the search runs. A run only answers a copy that it begins inside, so
+        // the spacing bounds what a copy has to be to hide.
         //
-        // Dropping the second run on every block after a frame's first was
-        // tried, for half the grid's cost: it loses ratio. Four megabytes
-        // repeated at a shifted distance went from 4,129,240 bytes to 4,194,762
-        // at level 17. The later runs are not only about a block's own copies —
-        // each is another independent chance for the one aligned probe to meet a
-        // record that an earlier run's slot has since been written over.
-        let step = Self::RECORD_STEP as u64;
-        // A full run covers every distance a copy could sit at, and on a block
-        // of any size it is a rounding error. On a block of a couple of
-        // kilobytes it is half the block, and the grid then costs more than the
-        // duplicate it could find is worth — a missed one there is bounded by
-        // the block. So the run is capped at a probe per sixteen bytes, which
-        // reaches the full width by eight kilobytes and stays whole above it.
-        let run = Self::PROBE_RUN.min((block.len() / 16).max(8));
+        // Every run is also another independent chance for the one aligned probe
+        // to meet a record that an earlier run's slot has since been written
+        // over. Dropping the second of two runs on every block after a frame's
+        // first cost ratio: four megabytes repeated at a shifted distance went
+        // from 4,129,240 bytes to 4,194,762 at level 17.
+        let step_bytes = self.step;
+        let step = step_bytes as u64;
+        // A full run covers every distance a copy could sit at. On a block of a
+        // couple of kilobytes it is a large share of the block, and the grid
+        // then costs more than the duplicate it could find is worth — a missed
+        // one there is bounded by the block. So the run is capped at a probe per
+        // sixteen bytes, and the runs are spaced no closer than sixteen runs'
+        // worth: a block short beside the frame's ceiling (a pre-split piece, a
+        // last block) keeps the ceiling's step without paying for eight runs.
+        let run = step_bytes.min((block.len() / 16).max(8));
+        let spacing = (block.len() / Self::PROBE_FRACTION).max(16 * step_bytes);
         // A record's offset is stored in grid steps, so a frame that runs past
         // what that index can hold moves its origin rather than wraps — a
         // wrapped offset reads as being near the start of the frame, and a
@@ -514,9 +524,9 @@ impl SeenContentGrid {
         }
         let mut abs = self.frame_offset.next_multiple_of(step);
         let block_end = self.frame_offset + last as u64;
-        let runs = Self::PROBE_RUNS_PER_BLOCK;
+        let runs = block.len().div_ceil(spacing);
         for idx in 0..runs {
-            let start = idx * (block.len() / runs);
+            let start = idx * spacing;
             // Records for everything before this run go in FIRST, because
             // meeting them is the run's whole job — a block whose own first half
             // is the original is invisible to a run that probes before that half
@@ -533,11 +543,11 @@ impl SeenContentGrid {
             }
             // The start run on a frame's first block cannot hit anything: the
             // table is empty until that block records into it, and a frame of a
-            // few kilobytes is one block. The midpoint run stays even on a
-            // frame's only block: a block whose second half copies its first
-            // reads as noise to every sample the classifier takes, and without
-            // this run it goes out raw with a half-block match inside it. It is
-            // the one check between the skip and that loss.
+            // few kilobytes is one block. The later runs stay even on a frame's
+            // only block: a block that copies its own content reads as noise to
+            // every sample the classifier takes, and without them it goes out
+            // raw with the match inside it. They are the one check between the
+            // skip and that loss.
             // Nothing to ask once the answer is in: a probe is read-only and
             // the run reports one bool, so every lookup after the first hit is
             // a random table access for a verdict already reached.
@@ -593,11 +603,11 @@ impl SeenContentGrid {
     /// taking a 64 KiB table for the handful of anchors it could ever record,
     /// which on the cheapest levels was a third of the encode. Four slots per
     /// anchor keeps eviction rare.
-    fn slots_for(window_size: usize) -> usize {
+    fn slots_for(window_size: usize, step: usize) -> usize {
         if window_size == 0 {
             return Self::SLOTS;
         }
-        let records = (window_size / Self::RECORD_STEP).max(1) as u64;
+        let records = (window_size / step).max(1) as u64;
         let wanted = (records * 4).next_power_of_two();
         (wanted as usize).clamp(Self::MIN_SLOTS, Self::SLOTS)
     }

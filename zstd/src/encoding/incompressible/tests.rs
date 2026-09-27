@@ -57,18 +57,20 @@ fn the_content_grid_reports_a_repeat_that_is_shifted() {
     );
 }
 
-/// A block carrying a copy of its own earlier content is answered where a run
-/// begins inside the copy, and missed where none does.
+/// A block carrying a copy of its own earlier content is answered wherever the
+/// copy begins, once it is longer than a run spacing and a run.
 ///
 /// Such a block reads as incompressible to every sample of it, and the copy is a
-/// block-sized match the search would have found, so the first half is what the
-/// midpoint run is for. The second half pins the bound at the placement two
-/// measurements chose (see `PROBE_RUNS_PER_BLOCK`): a change that starts
-/// answering it has changed the run placement and owes its own numbers.
+/// match the search would have found. Runs at fixed places (the start and the
+/// middle) missed a copy that began between them; runs every eighth of the
+/// block bound what a copy has to be to hide, whatever its offset.
 #[test]
 fn the_content_grid_answers_a_block_that_copies_itself() {
     const BLOCK: usize = 128 * 1024;
     const WIDE: usize = 8 * 1024 * 1024;
+    let step = SeenContentGrid::record_step_for(WIDE);
+    let spacing = BLOCK / SeenContentGrid::PROBE_FRACTION;
+    let span = spacing + step + SeenContentGrid::KEY_LEN;
 
     let mut halves = deterministic_bytes(0xBEEF, BLOCK);
     halves.copy_within(0..BLOCK / 2, BLOCK / 2);
@@ -79,16 +81,50 @@ fn the_content_grid_answers_a_block_that_copies_itself() {
         "a block of two identical halves is half a block of match",
     );
 
-    // Away from both runs: the documented bound.
-    let mut offset = deterministic_bytes(0xBEEF, BLOCK);
-    let span = BLOCK - 76 * 1024;
-    offset.copy_within(8 * 1024..8 * 1024 + span, 76 * 1024);
+    // Copies of the guaranteed length at offsets that avoid every run start,
+    // including the one that sat between the old start and middle runs.
+    // Every offset leaves the original `[0, span)` intact.
+    for at in [span + 1, 3 * spacing + 777, 76 * 1024, BLOCK - span] {
+        let mut block = deterministic_bytes(0xBEEF, BLOCK);
+        block.copy_within(0..span, at);
+        let mut grid = SeenContentGrid::default();
+        grid.reset_for_frame();
+        assert!(
+            grid.record_and_report_repeat(&block, WIDE),
+            "a {span}-byte copy at {at} must be answered",
+        );
+    }
+
+    // A copy shorter than a spacing between two run starts can hide: the bound
+    // the spacing buys. A change that answers it has changed the run spacing
+    // and owes its cost on incompressible input.
+    let short = spacing / 2;
+    let mut block = deterministic_bytes(0xBEEF, BLOCK);
+    block.copy_within(0..short, spacing + step + 64);
     let mut grid = SeenContentGrid::default();
     grid.reset_for_frame();
     assert!(
-        !grid.record_and_report_repeat(&offset, WIDE),
-        "a copy away from both runs is now answered, so the placement changed \
-         and its cost on incompressible input has to be re-measured",
+        !grid.record_and_report_repeat(&block, WIDE),
+        "a copy between two runs is answered, so the spacing changed",
+    );
+}
+
+/// The record step follows the frame's block ceiling, so the runs and records a
+/// block pays for scale with it rather than being fixed for the largest block.
+#[test]
+fn the_record_step_follows_the_block_ceiling() {
+    assert_eq!(SeenContentGrid::record_step_for(0), 128, "unknown window");
+    assert_eq!(
+        SeenContentGrid::record_step_for(8 << 20),
+        128,
+        "128 KiB blocks"
+    );
+    assert_eq!(SeenContentGrid::record_step_for(32 * 1024), 64);
+    assert_eq!(SeenContentGrid::record_step_for(8 * 1024), 32);
+    assert_eq!(
+        SeenContentGrid::record_step_for(1024),
+        SeenContentGrid::MIN_RECORD_STEP,
+        "a tiny window takes the floor",
     );
 }
 
@@ -104,7 +140,7 @@ fn the_content_grid_answers_a_block_that_copies_itself() {
 fn the_content_grid_keeps_what_the_window_reaches_across_a_rebase() {
     const BLOCK: usize = 128 * 1024;
     const WIDE: usize = 8 * 1024 * 1024;
-    let limit = (u64::from(u32::MAX) + 1) * SeenContentGrid::RECORD_STEP as u64;
+    let limit = (u64::from(u32::MAX) + 1) * SeenContentGrid::record_step_for(WIDE) as u64;
 
     let block = deterministic_bytes(0x51DE, BLOCK);
     let mut grid = SeenContentGrid::default();
@@ -133,7 +169,7 @@ fn the_content_grid_keeps_what_the_window_reaches_across_a_rebase() {
 fn the_content_grid_bounds_the_origin_across_an_unasked_prefix() {
     const BLOCK: usize = 128 * 1024;
     const WIDE: usize = 8 * 1024 * 1024;
-    let limit = (u64::from(u32::MAX) + 1) * SeenContentGrid::RECORD_STEP as u64;
+    let limit = (u64::from(u32::MAX) + 1) * SeenContentGrid::record_step_for(WIDE) as u64;
 
     let block = deterministic_bytes(0x51DE, BLOCK);
     let mut grid = SeenContentGrid::default();
@@ -163,7 +199,7 @@ fn the_content_grid_bounds_the_origin_across_an_unasked_prefix() {
 fn the_content_grid_carries_its_records_when_a_skip_crosses_the_index() {
     const BLOCK: usize = 128 * 1024;
     const WIDE: usize = 8 * 1024 * 1024;
-    let step = SeenContentGrid::RECORD_STEP as u64;
+    let step = SeenContentGrid::record_step_for(WIDE) as u64;
     let limit = (u64::from(u32::MAX) + 1) * step;
 
     let block = deterministic_bytes(0x51DE, BLOCK);
@@ -268,8 +304,7 @@ fn the_content_grid_keeps_reporting_a_run_of_the_same_block() {
         .map(|word| SeenSample::unpack(*word))
         .filter(|slot| {
             slot.fingerprint != 0
-                && u64::from(slot.at_step) * (SeenContentGrid::RECORD_STEP as u64)
-                    < block.len() as u64
+                && u64::from(slot.at_step) * (grid.step as u64) < block.len() as u64
         })
         .count();
     assert_eq!(
