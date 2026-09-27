@@ -454,7 +454,12 @@ fn hc_attaches_dictionary(hc: &HcMatchGenerator, size_log: Option<u8>) -> bool {
 /// trusted only up to the window the LEVEL would choose for it, and a read may
 /// find more than it said, so it keeps one block of slack; overriding the
 /// window is a claim of its own that only the data can confirm. An unknown size
-/// may fill any window.
+/// may fill any window, and is laid out for it up front, as upstream's buffered
+/// stream takes `windowSize + blockSize` of input buffer for an unknown pledge
+/// (`ZSTD_resetCCtx_internal`, `zstd_compress.c:2131-2139`). Room no input
+/// reaches is never written, so it is never resident: a one-byte stream through
+/// the CLI at levels 3, 19 and 22 peaks at the same RSS as a history grown by
+/// reading, and growing it instead measured no faster.
 fn frame_history_bytes(
     backend: super::strategy::BackendTag,
     workspace: &crate::encoding::workspace::Workspace,
