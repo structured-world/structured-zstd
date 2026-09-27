@@ -91,14 +91,15 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // on where no block may go out raw, and recording there would take its
     // tables and hash a run of every block for an answer no one asks for.
     let raw_skip_reachable = compression_level_allows_raw_fast_path(compression_level, window_size);
+    let classifier_asked = raw_skip_worth_asking(
+        state.literal_compression_disabled,
+        state.workspace.on_fresh_pages(),
+        block_len,
+    );
     let looks_incompressible = rle_byte_opt.is_none()
         && !dict_rejects_raw
         && raw_skip_reachable
-        && raw_skip_worth_asking(
-            state.literal_compression_disabled,
-            state.workspace.on_fresh_pages(),
-            block_len,
-        )
+        && classifier_asked
         && should_emit_raw_fast_path(compression_level, bytes);
     let repeats_earlier_content = if looks_incompressible {
         state
@@ -114,12 +115,19 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         // duplicates it is itself one repeated byte, and such a block is
         // answered as RLE above without ever asking the grid. Recording it is a
         // key every `RECORD_STEP` bytes for a question nobody puts.
-        if raw_skip_reachable && rle_byte_opt.is_none() {
+        //
+        // Nor is a frame's last block recorded: nothing reads the grid after
+        // it, so the keys would be hashed for nobody.
+        if raw_skip_reachable && (rle_byte_opt.is_some() || last_block) {
+            state.seen_content.skip_recording(bytes.len());
+        } else if raw_skip_reachable && !classifier_asked {
+            state
+                .seen_content
+                .record_unclassified(bytes, window_size as usize);
+        } else if raw_skip_reachable {
             state
                 .seen_content
                 .record_searched(bytes, window_size as usize);
-        } else if raw_skip_reachable {
-            state.seen_content.skip_recording(bytes.len());
         }
         false
     };
@@ -361,14 +369,15 @@ pub(crate) fn compress_block_encoded_borrowed(
     // As on the owned path: where no block may go out raw, the grid has nothing
     // to answer and is left alone.
     let raw_skip_reachable = compression_level_allows_raw_fast_path(compression_level, window_size);
+    let classifier_asked = raw_skip_worth_asking(
+        state.literal_compression_disabled,
+        state.workspace.on_fresh_pages(),
+        block.len(),
+    );
     let looks_incompressible = !is_rle
         && !dict_rejects_raw
         && raw_skip_reachable
-        && raw_skip_worth_asking(
-            state.literal_compression_disabled,
-            state.workspace.on_fresh_pages(),
-            block.len(),
-        )
+        && classifier_asked
         && should_emit_raw_fast_path(compression_level, block);
     let repeats_earlier_content = if looks_incompressible {
         state
@@ -376,14 +385,19 @@ pub(crate) fn compress_block_encoded_borrowed(
             .record_and_report_repeat(block, window_size as usize)
     } else {
         // As on the owned path: a searched block is recorded, not merely
-        // stepped over — except a block of one repeated byte, which nothing
-        // will ever ask the grid about.
-        if raw_skip_reachable && !is_rle {
+        // stepped over, except a block of one repeated byte, which nothing
+        // will ever ask the grid about, and a frame's last block, which
+        // nothing reads the grid after.
+        if raw_skip_reachable && (is_rle || last_block) {
+            state.seen_content.skip_recording(block.len());
+        } else if raw_skip_reachable && !classifier_asked {
+            state
+                .seen_content
+                .record_unclassified(block, window_size as usize);
+        } else if raw_skip_reachable {
             state
                 .seen_content
                 .record_searched(block, window_size as usize);
-        } else if raw_skip_reachable {
-            state.seen_content.skip_recording(block.len());
         }
         false
     };

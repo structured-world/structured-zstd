@@ -1692,3 +1692,46 @@ fn set_dictionary_from_bytes_takes_unmagicked_bytes_as_raw_content() {
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
 }
+
+/// A small block the negative levels search without asking the classifier is
+/// still recorded on the repeat grid. A later block that carries a copy of it
+/// among unique noise reads as noise to the classifier, and only the grid can
+/// send it to the search that finds the copy; left unrecorded, the block went
+/// out raw with the match sitting in the matcher's history.
+#[test]
+fn a_block_searched_without_the_classifier_is_found_again() {
+    let noise = |mut state: u32, len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    };
+    let small = noise(0x1234_5678, 10 * 1024);
+    let mut large = small.clone();
+    large.extend(noise(0x9E37_79B9, 118 * 1024));
+
+    for level in [-7, -1] {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(level));
+        encoder.write_all(&small).unwrap();
+        encoder.flush().unwrap();
+        encoder.write_all(&large).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let total = small.len() + large.len();
+        assert!(
+            compressed.len() < total - 8 * 1024,
+            "level {level}: {} bytes from {total}, the copy of the first block was not found",
+            compressed.len(),
+        );
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded.len(), total);
+        assert_eq!(&decoded[..small.len()], &small[..]);
+        assert_eq!(&decoded[small.len()..], &large[..]);
+    }
+}

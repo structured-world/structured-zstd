@@ -383,6 +383,18 @@ impl SeenContentGrid {
         self.take_block(block, window_size, false);
     }
 
+    /// Record a block the caller searches without asking the classifier (see
+    /// [`raw_skip_worth_asking`]), and count the frame as using the grid.
+    ///
+    /// Such a block may well be noise, so the reason [`Self::asked`] lets a
+    /// searched block go unrecorded does not hold for it: a later block made of
+    /// its copy among unique noise reads as noise to the classifier, and only a
+    /// record of this block can send it to the search.
+    pub(crate) fn record_unclassified(&mut self, block: &[u8], window_size: usize) {
+        self.asked = true;
+        self.take_block(block, window_size, false);
+    }
+
     /// Advance past a block the caller has decided not to record, keeping every
     /// later record at its true distance in the stream.
     pub(crate) fn skip_recording(&mut self, len: usize) {
