@@ -14,6 +14,14 @@
 //! two parts: the match finder opens it with the bytes it needs and carves them,
 //! then the context carves its per-block buffers from what the opening reserved
 //! for it.
+//!
+//! Tables whose empty value is zero are the one exception: they are carved from
+//! a second allocation, taken zeroed. Only the allocator knows whether the
+//! memory it returns is fresh from the kernel (already zero, paid for only
+//! where touched) or recycled (zeroed by a memset), so asking it for zeros costs
+//! at most the fill those tables would need anyway, and nothing on the pages a
+//! frame never indexes. Asked of the whole workspace instead, the recycled case
+//! zeroes the history and buffers as well.
 
 use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc, handle_alloc_error};
 use alloc::vec::Vec;
@@ -99,12 +107,19 @@ pub struct Workspace {
     /// Consecutive layouts that found the allocation far larger than they
     /// need, for giving back one that has stayed so.
     oversized_layouts: u32,
-    /// Bytes of zero-start tables in this layout when they are larger than the
-    /// input expected to write them, else 0 (see [`Self::open_for_match_finder`]).
-    sparse_table_bytes: usize,
-    /// The open layout made the allocation, zeroed, so its regions hold
-    /// zeros until their holders write them.
-    zeroed: bool,
+    /// The allocation the zero-start tables are carved from, as `ptr` / `base`
+    /// / `capacity` are for the rest. Allocated zeroed, and replaced together
+    /// with the main one so both share a generation.
+    zero_ptr: NonNull<u8>,
+    zero_base: NonNull<u8>,
+    zero_capacity: usize,
+    /// Bytes of zero-start tables the open layout carves, and how many are
+    /// carved so far.
+    zero_leading: usize,
+    zero_front: usize,
+    /// The open layout made the zero allocation, so a zero table carved from it
+    /// already holds zeros.
+    zero_fresh: bool,
 }
 
 /// Upstream `ZSTD_WORKSPACETOOLARGE_FACTOR` / `_MAXDURATION`
@@ -139,14 +154,18 @@ impl Workspace {
             block_capacity: 0,
             open: false,
             oversized_layouts: 0,
-            sparse_table_bytes: 0,
-            zeroed: false,
+            zero_ptr: NonNull::<Aligned>::dangling().cast(),
+            zero_base: NonNull::dangling(),
+            zero_capacity: 0,
+            zero_leading: 0,
+            zero_front: 0,
+            zero_fresh: false,
         }
     }
 
-    /// Bytes the workspace holds.
+    /// Bytes the workspace holds, its zero-table allocation included.
     pub(crate) fn capacity(&self) -> usize {
-        self.capacity
+        self.capacity + self.zero_capacity
     }
 
     /// Starts a frame's layout. The context will carve `trailing_for(block)`
@@ -163,34 +182,29 @@ impl Workspace {
         self.block_target = block_target;
         self.trailing_for = trailing_for;
         self.ingest = ingest;
-        self.sparse_table_bytes = 0;
+        self.zero_leading = 0;
         self.open = false;
     }
 
-    /// Opens the layout for a match finder, as [`Self::open`], whose tables
-    /// include `zero_tables` bytes of tables that start as zeros, for a frame
-    /// expected to bring `expected_input` bytes.
+    /// Opens the layout for a match finder, as [`Self::open`], whose `leading`
+    /// bytes include `zero_tables` bytes of tables that start as zeros. Those
+    /// are carved from the zero allocation (see the module note); every table
+    /// the finder binds with a zero empty value must be counted in them.
     ///
-    /// Zero tables larger than that input keep most of their pages untouched,
-    /// so a new allocation that they make up most of is then taken zeroed and
-    /// those tables left as they are: only the pages the frame indexes are
-    /// ever faulted in. Otherwise a plain allocation that fills only the
-    /// tables costs less: the input writes dense tables anyway, and an
-    /// allocator zeroes a block it hands out again in full, the history and
-    /// buffers included, which for a small frame is several times its tables.
+    /// # Panics
+    ///
+    /// As [`Self::open`], and when `zero_tables` exceeds `leading`.
     pub(crate) fn open_for_match_finder(
         &mut self,
         leading: usize,
         zero_tables: usize,
         window: usize,
-        expected_input: usize,
     ) {
-        self.sparse_table_bytes = if zero_tables > expected_input {
-            zero_tables
-        } else {
-            0
-        };
-        self.open(leading, window);
+        let rest = leading
+            .checked_sub(zero_tables)
+            .expect("zero tables are part of the leading bytes");
+        self.zero_leading = zero_tables;
+        self.open(rest, window);
     }
 
     /// Whether this layout has been opened.
@@ -232,14 +246,19 @@ impl Workspace {
         let total = leading
             .checked_add((self.trailing_for)(self.block_capacity))
             .expect("workspace size overflows usize");
-        let reallocate = if total > self.capacity {
+        let zero = self.zero_leading;
+        let reallocate = if total > self.capacity || zero > self.zero_capacity {
             true
         } else {
-            // A need so large that three of it overflow cannot be exceeded
-            // three times over by what is left, so it is never too large.
-            let too_large = total
+            // Judged on both allocations together, which is what the frame
+            // holds. A need so large that three of it overflow cannot be
+            // exceeded three times over by what is left, so it is never too
+            // large.
+            let need = total + zero;
+            let held = self.capacity + self.zero_capacity;
+            let too_large = need
                 .checked_mul(TOO_LARGE_FACTOR)
-                .is_some_and(|wasted| self.capacity - total >= wasted);
+                .is_some_and(|wasted| held - need >= wasted);
             // Counted only while it stays too large, and reset by any layout
             // it fits (upstream `ZSTD_cwksp_bump_oversized_duration`). Only
             // "more than the limit" is ever asked of the count, so pinning it
@@ -252,25 +271,11 @@ impl Workspace {
             };
             self.oversized_layouts > TOO_LARGE_MAX_LAYOUTS
         };
-        // A zeroed allocation costs nothing on pages the kernel hands out
-        // fresh and a memset of all of it on memory the allocator recycles,
-        // which is where a context rebuilt per frame lands. So it is taken
-        // only when the rest is at most a third of the tables, which caps that
-        // case at a third over filling the tables alone. A small frame's
-        // tables sit beside buffers of their own size: at 10 KiB and level 1
-        // they were 56% of the workspace, and zeroing it all measured 23%
-        // slower than filling them. A small input at a high level, where the
-        // tables are most of it, keeps its untouched pages (78% at level 13).
-        debug_assert!(
-            self.sparse_table_bytes <= leading,
-            "zero tables are part of the leading bytes"
-        );
-        let zero_all = self.sparse_table_bytes > 0
-            && total - self.sparse_table_bytes <= self.sparse_table_bytes / 3;
         if reallocate {
-            self.grow(total, zero_all);
+            self.grow(total, zero);
         }
-        self.zeroed = reallocate && zero_all;
+        self.zero_fresh = reallocate;
+        self.zero_front = 0;
         self.front = 0;
         self.leading = leading;
         self.history_front = leading;
@@ -296,17 +301,24 @@ impl Workspace {
         previous: &Region<T>,
         empty: T,
     ) -> (Region<T>, bool) {
-        let offset = self.carve_front(region_bytes::<T>(count));
-        let mut region = self.region_at::<T>(offset, count);
+        let bytes = region_bytes::<T>(count);
+        let from_zero = empty.is_zero() && self.zero_leading != 0;
+        let mut region = if from_zero {
+            let offset = self.carve_zero(bytes);
+            self.region_in::<T>(self.zero_ptr, offset, count)
+        } else {
+            let offset = self.carve_front(bytes);
+            self.region_at::<T>(offset, count)
+        };
         let kept = count > 0
             && previous.generation == region.generation
             && previous.ptr == region.ptr
             && previous.len == count;
-        // An allocation this layout made is zeroed and no region of it has
-        // been written yet, so a table of zeros is already in place. Leaving
-        // it unwritten keeps its pages demand-zero: a large table a small
-        // frame barely touches faults in only the pages it indexes.
-        if !kept && !(self.zeroed && empty.is_zero()) {
+        // A zero allocation this layout made holds zeros nobody has written
+        // over, so the table is already in place. Leaving it unwritten keeps
+        // whatever pages the allocator got fresh from the kernel untouched: a
+        // large table a small frame barely indexes faults in only what it uses.
+        if !kept && !(from_zero && self.zero_fresh) {
             region.fill(empty);
         }
         (region, kept)
@@ -379,7 +391,28 @@ impl Workspace {
         offset
     }
 
+    /// Advances the zero allocation's cursor past `bytes`, returning where
+    /// they start.
+    fn carve_zero(&mut self, bytes: usize) -> usize {
+        assert!(
+            self.open,
+            "carving from a workspace layout that is not open"
+        );
+        assert!(
+            bytes <= self.zero_leading - self.zero_front,
+            "zero tables carved past what the layout counted"
+        );
+        let offset = self.zero_front;
+        self.zero_front += bytes;
+        offset
+    }
+
     fn region_at<T>(&self, offset: usize, count: usize) -> Region<T> {
+        self.region_in(self.ptr, offset, count)
+    }
+
+    /// A region at `offset` into the allocation that starts at `start`.
+    fn region_in<T>(&self, start: NonNull<u8>, offset: usize, count: usize) -> Region<T> {
         const {
             assert!(
                 align_of::<T>() <= ALIGN,
@@ -387,8 +420,9 @@ impl Workspace {
             );
         }
         // SAFETY: the callers checked `offset + region_bytes::<T>(count)` against
-        // the carving cursors, which never leave `0..=capacity`.
-        let ptr = unsafe { self.ptr.as_ptr().add(offset) };
+        // the carving cursors of that allocation, which never leave its usable
+        // bytes.
+        let ptr = unsafe { start.as_ptr().add(offset) };
         Region {
             // SAFETY: an offset into a non-null allocation is non-null.
             ptr: unsafe { NonNull::new_unchecked(ptr.cast::<T>()) },
@@ -397,11 +431,12 @@ impl Workspace {
         }
     }
 
-    /// Replaces the allocation with one of `bytes`, discarding every table:
-    /// the generation moves on, so no later region can pass for a continuation
-    /// of one carved before. The old allocation is retired rather than freed,
-    /// until the history has carried its bytes out of it.
-    fn grow(&mut self, bytes: usize, zeroed: bool) {
+    /// Replaces the allocations with ones of `bytes` and `zero_bytes`,
+    /// discarding every table: the generation moves on, so no later region can
+    /// pass for a continuation of one carved before. The old main allocation is
+    /// retired rather than freed, until the history has carried its bytes out
+    /// of it; the old zero one holds only tables and goes at once.
+    fn grow(&mut self, bytes: usize, zero_bytes: usize) {
         self.release_retired();
         if self.capacity != 0 {
             self.retired = Some((self.base, self.capacity));
@@ -409,36 +444,17 @@ impl Workspace {
             self.ptr = NonNull::<Aligned>::dangling().cast();
             self.capacity = 0;
         }
+        self.release_zero();
         self.generation += 1;
         self.oversized_layouts = 0;
-        if bytes == 0 {
-            return;
+        if bytes != 0 {
+            (self.base, self.ptr) = allocate(bytes, false);
+            self.capacity = bytes;
         }
-        let layout = allocation_layout(bytes);
-        // Zeroed for sparse tables (see `open`), and at byte alignment so the
-        // allocator can take it as a `calloc`: a large one comes back as fresh
-        // pages the kernel zeroes on first touch. An over-aligned zeroed
-        // request is a plain allocation followed by a memset of all of it,
-        // which faults in every page up front, so the start is aligned by hand
-        // instead.
-        // SAFETY: `layout` has a non-zero size.
-        let raw = unsafe {
-            if zeroed {
-                alloc_zeroed(layout)
-            } else {
-                alloc(layout)
-            }
-        };
-        let Some(base) = NonNull::new(raw) else {
-            handle_alloc_error(layout);
-        };
-        let offset = raw.align_offset(ALIGN);
-        debug_assert!(offset < ALIGN, "a byte pointer aligns within ALIGN bytes");
-        self.base = base;
-        // SAFETY: `offset < ALIGN`, and the allocation holds `bytes + ALIGN - 1`
-        // bytes, so the aligned start leaves `bytes` of them after it.
-        self.ptr = unsafe { NonNull::new_unchecked(raw.add(offset)) };
-        self.capacity = bytes;
+        if zero_bytes != 0 {
+            (self.zero_base, self.zero_ptr) = allocate(zero_bytes, true);
+            self.zero_capacity = zero_bytes;
+        }
     }
 
     /// Frees the allocation a growth retired. Every holder has been laid out
@@ -453,6 +469,7 @@ impl Workspace {
 
     fn release(&mut self) {
         self.release_retired();
+        self.release_zero();
         if self.capacity == 0 {
             return;
         }
@@ -463,6 +480,47 @@ impl Workspace {
         self.ptr = NonNull::<Aligned>::dangling().cast();
         self.capacity = 0;
     }
+
+    fn release_zero(&mut self) {
+        if self.zero_capacity == 0 {
+            return;
+        }
+        // SAFETY: the current zero allocation; `zero_capacity` is reset below so
+        // it is never freed twice.
+        unsafe { free(self.zero_base, self.zero_capacity) };
+        self.zero_base = NonNull::dangling();
+        self.zero_ptr = NonNull::<Aligned>::dangling().cast();
+        self.zero_capacity = 0;
+    }
+}
+
+/// An allocation of `bytes` usable bytes, zeroed if asked, returned as its base
+/// and its start aligned to [`ALIGN`].
+///
+/// Taken at byte alignment and aligned by hand, so a zeroed one reaches the
+/// allocator as a `calloc`, which hands back pages fresh from the kernel
+/// without writing them. An over-aligned zeroed request is instead a plain
+/// allocation followed by a memset of all of it, which faults in every page up
+/// front.
+fn allocate(bytes: usize, zeroed: bool) -> (NonNull<u8>, NonNull<u8>) {
+    let layout = allocation_layout(bytes);
+    // SAFETY: `layout` has a non-zero size: `bytes + ALIGN - 1`.
+    let raw = unsafe {
+        if zeroed {
+            alloc_zeroed(layout)
+        } else {
+            alloc(layout)
+        }
+    };
+    let Some(base) = NonNull::new(raw) else {
+        handle_alloc_error(layout);
+    };
+    let offset = raw.align_offset(ALIGN);
+    debug_assert!(offset < ALIGN, "a byte pointer aligns within ALIGN bytes");
+    // SAFETY: `offset < ALIGN`, and the allocation holds `bytes + ALIGN - 1`
+    // bytes, so the aligned start leaves `bytes` of them after it.
+    let start = unsafe { NonNull::new_unchecked(raw.add(offset)) };
+    (base, start)
 }
 
 /// The allocation behind a workspace of `capacity` usable bytes: byte-aligned,
