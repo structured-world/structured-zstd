@@ -1439,11 +1439,15 @@ impl<M: Matcher> CompressState<M> {
         block_target: usize,
         ingest: crate::encoding::workspace::IngestPlan,
     ) {
-        self.workspace.begin_layout(
-            block_target,
-            crate::encoding::blocks::CompressedBlockScratch::workspace_bytes,
-            ingest,
-        );
+        // A raw frame builds no compressed block, so it reserves no buffers
+        // for one.
+        let trailing_for = if ingest == crate::encoding::workspace::IngestPlan::Raw {
+            crate::encoding::workspace::no_trailing
+        } else {
+            crate::encoding::blocks::CompressedBlockScratch::workspace_bytes
+        };
+        self.workspace
+            .begin_layout(block_target, trailing_for, ingest);
         self.matcher.reset_in_workspace(level, &mut self.workspace);
     }
 
@@ -1463,7 +1467,11 @@ impl<M: Matcher> CompressState<M> {
             block_capacity <= reserved,
             "a {block_capacity}-byte block exceeds the {reserved} bytes the workspace reserved"
         );
-        self.block_scratch.bind(&mut self.workspace, reserved);
+        if self.workspace.ingest() == crate::encoding::workspace::IngestPlan::Raw {
+            self.block_scratch.unbind();
+        } else {
+            self.block_scratch.bind(&mut self.workspace, reserved);
+        }
         // Everything is laid out in the current allocation by now.
         self.workspace.release_retired();
     }

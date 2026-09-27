@@ -413,13 +413,31 @@ impl DfastMatchGenerator {
         self.tables_fresh = !self.tables.bind(workspace, total, DFAST_EMPTY_SLOT);
     }
 
-    /// Heap bytes this matcher owns: history, the long/short hash tables when
-    /// they are not in a context's workspace, the window-block deque, and any
-    /// attached dictionary tables.
+    /// Becomes `snapshot`, copying its tables and history into the rooms this
+    /// matcher already holds (in a context's workspace) instead of cloning them
+    /// into new allocations. The two buffers are lent out of `snapshot` for
+    /// the clone of the rest and put back.
+    pub(crate) fn restore_snapshot(&mut self, snapshot: &mut Self) {
+        let snapshot_tables = core::mem::take(&mut snapshot.tables);
+        let snapshot_history = core::mem::take(&mut snapshot.history);
+        let mut tables = core::mem::take(&mut self.tables);
+        let mut history = core::mem::take(&mut self.history);
+        tables.clone_from(&snapshot_tables);
+        history.clone_from(&snapshot_history);
+        *self = snapshot.clone();
+        self.tables = tables;
+        self.history = history;
+        snapshot.tables = snapshot_tables;
+        snapshot.history = snapshot_history;
+    }
+
+    /// Heap bytes this matcher owns: the history and the long/short hash
+    /// tables when they are not in a context's workspace, the window-block
+    /// deque, and any attached dictionary tables.
     pub(crate) fn heap_size(&self) -> usize {
         let u32_sz = core::mem::size_of::<u32>();
         self.window_blocks.capacity() * core::mem::size_of::<usize>()
-            + self.history.capacity()
+            + self.history.owned_bytes()
             + self.tables.owned_bytes()
             + self
                 .dict

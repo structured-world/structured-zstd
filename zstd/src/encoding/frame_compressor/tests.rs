@@ -3759,6 +3759,25 @@ fn uncompressed_level_keeps_the_payload_with_a_custom_matcher() {
     assert_eq!(decoded, data);
 }
 
+/// An uncompressed frame never builds a literals or sequences section, so its
+/// context must not lay out the buffers for them: a fresh raw-only context
+/// would otherwise allocate the whole compressed-block scratch for nothing.
+#[test]
+fn uncompressed_frame_lays_out_no_compressed_block_scratch() {
+    let data = generate_data(0x5eed, 2 * MAX_BLOCK_SIZE as usize);
+    let mut compressor: FrameCompressor =
+        FrameCompressor::new(super::CompressionLevel::Uncompressed);
+    let frame = compressor.compress_independent_frame(&data);
+    assert!(!frame.is_empty());
+    let scratch =
+        crate::encoding::blocks::CompressedBlockScratch::workspace_bytes(MAX_BLOCK_SIZE as usize);
+    assert!(
+        compressor.state.workspace.capacity() < scratch,
+        "a raw frame's workspace ({} bytes) holds the {scratch}-byte compressed-block scratch",
+        compressor.state.workspace.capacity(),
+    );
+}
+
 #[test]
 fn dictionary_frame_outgrowing_its_window_stays_decodable() {
     // A dictionary inflates `max_window_size` so the primed bytes stay
@@ -3802,6 +3821,33 @@ fn dictionary_frame_outgrowing_its_window_stays_decodable() {
         .decode_all_to_vec(&out, &mut decoded)
         .expect("frame must stay within the window it advertises");
     assert_eq!(decoded, data);
+}
+
+/// A reused compressor restores its primed-dictionary snapshot every frame.
+/// The restore must land in the tables and history the reset laid out in the
+/// context's workspace: replacing them with fresh clones left the workspace
+/// regions idle, held a second copy of every table, and allocated it again on
+/// every frame. Covers the dfast, row and binary-tree backends.
+#[test]
+fn a_restored_dictionary_snapshot_stays_in_the_workspace() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let data = generate_data(0xd1c7, 200_000);
+    for level in [3, 5, 16] {
+        let dict = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Level(level));
+        compressor
+            .set_dictionary(dict)
+            .expect("valid dictionary should attach");
+        let first = compressor.compress_independent_frame(&data);
+        let second = compressor.compress_independent_frame(&data);
+        assert_eq!(first, second, "L{level}: a restored frame differs");
+        assert_eq!(
+            compressor.state.matcher.owned_table_and_history_bytes(),
+            (0, 0),
+            "L{level}: the restore moved the tables or history out of the workspace",
+        );
+    }
 }
 
 /// A prepared dictionary is attached by value, so every frame it primes clones

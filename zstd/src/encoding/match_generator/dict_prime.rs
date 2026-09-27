@@ -322,7 +322,7 @@ impl MatchGeneratorDriver {
             fast_attach,
             ldm,
         };
-        let Some((snapshot, budget, captured_key)) = &self.primed else {
+        let Some((snapshot, budget, captured_key)) = &mut self.primed else {
             return false;
         };
         if *captured_key != key {
@@ -330,6 +330,15 @@ impl MatchGeneratorDriver {
         }
         let budget = *budget;
         match (&mut self.storage, snapshot) {
+            // The same for Dfast and Row: the tables and history land in the
+            // rooms the reset laid out in the workspace, so a restore is the
+            // copy upstream's CDict reuse pays and allocates nothing.
+            (MatcherStorage::Dfast(live), MatcherStorage::Dfast(snap)) => {
+                live.restore_snapshot(snap);
+            }
+            (MatcherStorage::Row(live), MatcherStorage::Row(snap)) => {
+                live.restore_snapshot(snap);
+            }
             // Same-variant Fast restore: copy the snapshot into the retained
             // live storage. `clone_from` reuses the history / hash-table /
             // dict-table buffers, so this is the upstream zstd CDict table-copy
@@ -355,41 +364,42 @@ impl MatchGeneratorDriver {
                 // backend is `HcBackend::Hc` (zero-sized) for non-BT levels;
                 // the live one is already correct for this resolved key.
             }
-            (live, snapshot_storage) => {
-                let mut storage = snapshot_storage.clone();
-                // This arm handles the binary-tree backend. In ATTACH mode the
-                // snapshot was stored WITHOUT its live hash / chain / hash3
-                // tables (they hold no dictionary entries — the dict lives in
-                // `dms` + history; see `capture_primed_dictionary`), so
-                // `ensure_tables` re-allocates them zeroed to the snapshot's
-                // geometry, exactly reproducing the post-prime state (all
-                // `HC_EMPTY`). In COPY mode the snapshot retained its FULL live
-                // tree (the dict was merged into it, no `dms`), so the tables are
-                // already present at the right length and `ensure_tables` — which
-                // only allocates on a length mismatch — leaves them untouched.
-                // Either way this is a full storage replace, so no stale
-                // live-table entry from a prior frame can survive.
-                if let MatcherStorage::HashChain(hc) = &mut storage {
-                    hc.table.ensure_tables();
+            // Binary tree: the history and, in COPY mode, the tree land in the
+            // rooms the reset laid out in the workspace. An ATTACH-mode
+            // snapshot holds no tree (see `capture_primed_dictionary`), so the
+            // laid-out tables are emptied where they are, reproducing the
+            // post-prime state (all `HC_EMPTY`) without an allocation.
+            (MatcherStorage::HashChain(live), MatcherStorage::HashChain(snap)) => {
+                let snapshot_tables = core::mem::take(&mut snap.table.tables);
+                let snapshot_history = core::mem::take(&mut snap.table.history);
+                let mut tables = core::mem::take(&mut live.table.tables);
+                let mut history = core::mem::take(&mut live.table.history);
+                history.clone_from(&snapshot_history);
+                let tree_in_snapshot = !snapshot_tables.is_empty();
+                if tree_in_snapshot {
+                    tables.clone_from(&snapshot_tables);
                 }
                 // The snapshot does not retain the LDM producer (it holds no
                 // dict state; see `capture_primed_dictionary`). Carry over the
-                // frame's freshly-reset producer — built this frame by `reset`
-                // with the same params the snapshot key pins, and empty (no
-                // input processed yet), so it is equivalent to the producer
-                // the snapshot was captured with.
+                // frame's freshly-reset producer, built this frame by `reset`
+                // with the same params the snapshot key pins.
                 #[cfg(feature = "ldm")]
-                {
-                    let fresh_ldm = if let MatcherStorage::HashChain(hc) = live {
-                        hc.take_ldm_producer()
-                    } else {
-                        None
-                    };
-                    if let MatcherStorage::HashChain(hc) = &mut storage {
-                        hc.set_ldm_producer(fresh_ldm);
-                    }
+                let fresh_ldm = live.take_ldm_producer();
+                *live = snap.clone();
+                live.table.tables = tables;
+                live.table.history = history;
+                if !tree_in_snapshot {
+                    live.table.ensure_tables();
                 }
-                *live = storage;
+                #[cfg(feature = "ldm")]
+                live.set_ldm_producer(fresh_ldm);
+                snap.table.tables = snapshot_tables;
+                snap.table.history = snapshot_history;
+            }
+            // The key pins the backend, so a snapshot of another variant is
+            // never restored; should one be, it replaces the storage whole.
+            (live, snapshot_storage) => {
+                *live = snapshot_storage.clone();
             }
         }
         self.dictionary_retained_budget = budget;

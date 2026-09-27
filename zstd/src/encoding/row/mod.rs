@@ -2533,6 +2533,24 @@ impl RowMatchGenerator {
         }
     }
 
+    /// Becomes `snapshot`, copying its tables and history into the rooms this
+    /// matcher already holds (in a context's workspace) instead of cloning them
+    /// into new allocations. The two buffers are lent out of `snapshot` for
+    /// the clone of the rest and put back.
+    pub(crate) fn restore_snapshot(&mut self, snapshot: &mut Self) {
+        let snapshot_tables = core::mem::take(&mut snapshot.tables);
+        let snapshot_history = core::mem::take(&mut snapshot.history);
+        let mut tables = core::mem::take(&mut self.tables);
+        let mut history = core::mem::take(&mut self.history);
+        tables.clone_from(&snapshot_tables);
+        history.clone_from(&snapshot_history);
+        *self = snapshot.clone();
+        self.tables = tables;
+        self.history = history;
+        snapshot.tables = snapshot_tables;
+        snapshot.history = snapshot_history;
+    }
+
     /// Heap bytes this matcher owns: history, the row head/position/tag tables,
     /// the chunk-length deque, and any attached dictionary row index.
     pub(crate) fn heap_size(&self) -> usize {

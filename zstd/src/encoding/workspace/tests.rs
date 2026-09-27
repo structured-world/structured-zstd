@@ -68,6 +68,23 @@ fn a_new_table_starts_filled() {
     assert!(table.as_slice().iter().all(|&v| v == 0x1234));
 }
 
+// A table of zeros is left unwritten only in the layout that made the (zeroed)
+// allocation. A later layout carving it over bytes another holder wrote still
+// empties it: the zeros it relies on are gone by then.
+#[test]
+fn a_zero_table_over_written_bytes_still_starts_empty() {
+    let mut ws = opened(region_bytes::<u32>(64));
+    let fresh = ws.table::<u32>(64, 0);
+    assert!(fresh.as_slice().iter().all(|&v| v == 0));
+    let mut other: Table<u32> = Table::empty();
+    lay_out(&mut ws, region_bytes::<u32>(64), 0);
+    other.bind(&mut ws, 64, 7);
+    assert!(other.iter().all(|&v| v == 7));
+    lay_out(&mut ws, region_bytes::<u32>(64), 0);
+    let later = ws.table::<u32>(64, 0);
+    assert!(later.as_slice().iter().all(|&v| v == 0));
+}
+
 // The next frame's layout puts a table of the same size back on the same bytes,
 // and its holder keeps what it wrote: that is what lets a match finder carry a
 // table across frames without clearing it.
@@ -261,6 +278,20 @@ fn a_workspace_far_larger_than_its_frames_is_given_back_after_the_limit() {
     }
     lay_out(&mut ws, 1024, 0);
     assert_eq!(ws.capacity(), 1024);
+}
+
+// Only a run of layouts that all found the workspace too large gives it back,
+// as upstream counts the oversized duration rather than the allocation's age:
+// a context that meets one small frame among many large ones keeps its
+// allocation for the next large frame.
+#[test]
+fn one_small_frame_after_many_large_ones_keeps_the_workspace() {
+    let mut ws = Workspace::new();
+    for _ in 0..(2 * TOO_LARGE_MAX_LAYOUTS) {
+        lay_out(&mut ws, 4096, 0);
+    }
+    lay_out(&mut ws, 1024, 0);
+    assert_eq!(ws.capacity(), 4096);
 }
 
 // A workspace that is larger than the frames need, but by less than the factor,

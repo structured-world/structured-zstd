@@ -15,7 +15,7 @@
 //! then the context carves its per-block buffers from what the opening reserved
 //! for it.
 
-use alloc::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use alloc::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use alloc::vec::Vec;
 use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
@@ -92,16 +92,18 @@ pub struct Workspace {
     /// The block size the open layout's trailing part was sized for.
     block_capacity: usize,
     open: bool,
-    /// Layouts since the allocation was last made, for giving back one that
-    /// has stayed far larger than the frames need.
-    layouts_since_allocation: u32,
+    /// Consecutive layouts that found the allocation far larger than they
+    /// need, for giving back one that has stayed so.
+    oversized_layouts: u32,
+    /// The open layout made the allocation, zeroed, so its regions hold
+    /// zeros until their holders write them.
+    zeroed: bool,
 }
 
 /// Upstream `ZSTD_WORKSPACETOOLARGE_FACTOR` / `_MAXDURATION`
 /// (`zstd_internal.h:258-265`): a workspace left with at least three times a
-/// frame's need unused, more than this many frames after it was allocated, is
-/// allocated again at the need (`ZSTD_resetCCtx_internal`,
-/// `zstd_compress.c:2154-2159`).
+/// frame's need unused for more than this many frames in a row is allocated
+/// again at the need (`ZSTD_resetCCtx_internal`, `zstd_compress.c:2154-2159`).
 const TOO_LARGE_FACTOR: usize = 3;
 const TOO_LARGE_MAX_LAYOUTS: u32 = 128;
 
@@ -128,7 +130,8 @@ impl Workspace {
             ingest: IngestPlan::Stream,
             block_capacity: 0,
             open: false,
-            layouts_since_allocation: 0,
+            oversized_layouts: 0,
+            zeroed: false,
         }
     }
 
@@ -193,23 +196,30 @@ impl Workspace {
         let total = leading
             .checked_add((self.trailing_for)(self.block_capacity))
             .expect("workspace size overflows usize");
-        // Only "more than the limit" is ever asked of the count, so pinning it
-        // at the top of its range keeps the answer right on a context that
-        // outlives four billion frames.
-        self.layouts_since_allocation = self.layouts_since_allocation.saturating_add(1);
         let reallocate = if total > self.capacity {
             true
         } else {
             // A need so large that three of it overflow cannot be exceeded
-            // three times over by what is left, so it is never wasteful.
-            self.layouts_since_allocation > TOO_LARGE_MAX_LAYOUTS
-                && total
-                    .checked_mul(TOO_LARGE_FACTOR)
-                    .is_some_and(|wasted| self.capacity - total >= wasted)
+            // three times over by what is left, so it is never too large.
+            let too_large = total
+                .checked_mul(TOO_LARGE_FACTOR)
+                .is_some_and(|wasted| self.capacity - total >= wasted);
+            // Counted only while it stays too large, and reset by any layout
+            // it fits (upstream `ZSTD_cwksp_bump_oversized_duration`). Only
+            // "more than the limit" is ever asked of the count, so pinning it
+            // at the top of its range keeps the answer right on a context that
+            // outlives four billion frames.
+            self.oversized_layouts = if too_large {
+                self.oversized_layouts.saturating_add(1)
+            } else {
+                0
+            };
+            self.oversized_layouts > TOO_LARGE_MAX_LAYOUTS
         };
         if reallocate {
             self.grow(total);
         }
+        self.zeroed = reallocate;
         self.front = 0;
         self.leading = leading;
         self.history_front = leading;
@@ -229,7 +239,7 @@ impl Workspace {
     /// # Panics
     ///
     /// Panics when the layout is not open or was sized below what it carves.
-    pub(crate) fn table_after<T: Copy>(
+    pub(crate) fn table_after<T: TableValue>(
         &mut self,
         count: usize,
         previous: &Region<T>,
@@ -241,7 +251,11 @@ impl Workspace {
             && previous.generation == region.generation
             && previous.ptr == region.ptr
             && previous.len == count;
-        if !kept {
+        // An allocation this layout made is zeroed and no region of it has
+        // been written yet, so a table of zeros is already in place. Leaving
+        // it unwritten keeps its pages demand-zero: a large table a small
+        // frame barely touches faults in only the pages it indexes.
+        if !kept && !(self.zeroed && empty.is_zero()) {
             region.fill(empty);
         }
         (region, kept)
@@ -255,7 +269,7 @@ impl Workspace {
     ///
     /// As [`Self::table_after`].
     #[cfg(test)]
-    pub(crate) fn table<T: Copy>(&mut self, count: usize, value: T) -> Region<T> {
+    pub(crate) fn table<T: TableValue>(&mut self, count: usize, value: T) -> Region<T> {
         self.table_after(count, &Region::empty(), value).0
     }
 
@@ -344,13 +358,16 @@ impl Workspace {
             self.capacity = 0;
         }
         self.generation += 1;
-        self.layouts_since_allocation = 0;
+        self.oversized_layouts = 0;
         if bytes == 0 {
             return;
         }
         let layout = Layout::from_size_align(bytes, ALIGN).expect("workspace size overflows isize");
+        // Zeroed: the allocator hands a large request back as pages the kernel
+        // zeroes on first touch, so a table of zeros costs only the pages its
+        // frame indexes (see `table_after`).
         // SAFETY: `layout` has a non-zero size, checked above.
-        let raw = unsafe { alloc(layout) };
+        let raw = unsafe { alloc_zeroed(layout) };
         let Some(ptr) = NonNull::new(raw) else {
             handle_alloc_error(layout);
         };
@@ -418,6 +435,24 @@ pub(crate) fn no_trailing(_block: usize) -> usize {
 struct Aligned;
 
 const _: () = assert!(align_of::<Aligned>() == ALIGN);
+
+/// A value a workspace table holds: a plain integer, whose zero is all-zero
+/// bytes, so a zeroed allocation already holds a table of zeros.
+pub(crate) trait TableValue: Copy {
+    fn is_zero(self) -> bool;
+}
+
+macro_rules! table_value {
+    ($($int:ty),*) => {$(
+        impl TableValue for $int {
+            fn is_zero(self) -> bool {
+                self == 0
+            }
+        }
+    )*};
+}
+
+table_value!(u8, u32, u64);
 
 /// A fixed-length run of values in a workspace.
 ///
@@ -527,7 +562,10 @@ impl<T: Copy> Table<T> {
     /// Lays the table out in `workspace` at `count` values. Returns `true` when
     /// it continues the region it had, contents intact; otherwise every value
     /// is `empty`.
-    pub(crate) fn bind(&mut self, workspace: &mut Workspace, count: usize, empty: T) -> bool {
+    pub(crate) fn bind(&mut self, workspace: &mut Workspace, count: usize, empty: T) -> bool
+    where
+        T: TableValue,
+    {
         let (view, kept) = workspace.table_after(count, &self.view, empty);
         self.view = view;
         self.own = Vec::new();

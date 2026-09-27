@@ -221,6 +221,14 @@ impl CompressedBlockScratch {
         self.parts.sequences = workspace.buffer(sequences);
         self.sequence_codes = workspace.buffer(sequences);
     }
+
+    /// Drops the buffers, for a frame that builds no compressed block and so
+    /// lays none out; a region of an earlier layout must not outlive it.
+    pub(crate) fn unbind(&mut self) {
+        self.parts.literals = RegionVec::empty();
+        self.parts.sequences = RegionVec::empty();
+        self.sequence_codes = RegionVec::empty();
+    }
 }
 
 /// The shortest match a sequence can carry: RFC 8878 3.1.1.3.2.1.1 maps

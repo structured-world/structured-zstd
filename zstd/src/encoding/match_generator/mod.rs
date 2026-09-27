@@ -505,6 +505,20 @@ impl MatchGeneratorDriver {
         self.storage.ingest_capacity()
     }
 
+    /// `(tables, history)` bytes the active window backend holds in
+    /// allocations of its own rather than in a context's workspace.
+    #[cfg(test)]
+    pub(crate) fn owned_table_and_history_bytes(&self) -> (usize, usize) {
+        match &self.storage {
+            MatcherStorage::Simple(_) => panic!("asked of a window backend only"),
+            MatcherStorage::Dfast(m) => (m.tables.owned_bytes(), m.history.owned_bytes()),
+            MatcherStorage::Row(m) => (m.tables.owned_bytes(), m.history.owned_bytes()),
+            MatcherStorage::HashChain(m) => {
+                (m.table.tables.owned_bytes(), m.table.history.owned_bytes())
+            }
+        }
+    }
+
     /// Read `input` in and commit it as one block, the way the frame loop
     /// does in two calls.
     #[cfg(any(test, feature = "bench-internals"))]

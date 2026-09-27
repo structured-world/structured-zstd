@@ -4251,6 +4251,26 @@ fn hc_rebase_rebuilds_only_inserted_prefix() {
     );
 }
 
+/// A Dfast history laid out in a context's workspace is the context's memory,
+/// counted with the workspace; the matcher reporting its room as well counted
+/// the same bytes twice in the context's footprint.
+#[test]
+fn dfast_heap_size_leaves_a_workspace_history_to_the_context() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let room = 64 * 1024;
+    let mut matcher = DfastMatchGenerator::new(1 << 17);
+    let alone = matcher.heap_size();
+    let mut workspace = Workspace::new();
+    workspace.begin_layout(0, no_trailing, IngestPlan::Stream);
+    workspace.open(matcher.history.workspace_bytes(room), 1 << 17);
+    matcher.history.bind(&mut workspace, room);
+    assert_eq!(
+        matcher.heap_size(),
+        alone,
+        "a history in the workspace adds nothing to the matcher's own heap bytes",
+    );
+}
+
 #[test]
 fn dfast_skip_matching_handles_window_eviction() {
     let mut matcher = DfastMatchGenerator::new(16);
