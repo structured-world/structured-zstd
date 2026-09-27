@@ -75,7 +75,8 @@ fn a_new_table_starts_filled() {
 fn a_zero_table_over_written_bytes_still_starts_empty() {
     let sparse = |ws: &mut Workspace| {
         ws.begin_layout(0, no_trailing, IngestPlan::Stream);
-        ws.open_for_match_finder(region_bytes::<u32>(64), 0, usize::MAX, 0);
+        let table = region_bytes::<u32>(64);
+        ws.open_for_match_finder(table, table, usize::MAX, 0);
     };
     let mut ws = Workspace::new();
     sparse(&mut ws);

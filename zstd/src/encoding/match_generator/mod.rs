@@ -1459,11 +1459,15 @@ impl Matcher for MatchGeneratorDriver {
                     )
                     .hash_log
                 }));
-                workspace.open(
+                let tables =
                     crate::encoding::simple::fast_kernel::hash_table::FastHashTable::workspace_bytes(
                         hash_log,
-                    ) + m.history_workspace_bytes(history_bytes),
+                    );
+                workspace.open_for_match_finder(
+                    tables + m.history_workspace_bytes(history_bytes),
+                    tables,
                     max_window_size,
+                    expected_input,
                 );
                 // The history binds first, carrying its bytes out from under
                 // where the table may now land.
@@ -1527,9 +1531,10 @@ impl Matcher for MatchGeneratorDriver {
                 // reset below reads whether they continue the last frame's.
                 // The history binds first, carrying its bytes out from under
                 // where the tables may now land.
+                let tables = dfast.tables_workspace_bytes();
                 workspace.open_for_match_finder(
-                    dfast.tables_workspace_bytes(),
-                    dfast.history.workspace_bytes(history_bytes),
+                    tables + dfast.history.workspace_bytes(history_bytes),
+                    tables,
                     max_window_size,
                     expected_input,
                 );
@@ -1572,11 +1577,11 @@ impl Matcher for MatchGeneratorDriver {
                 // The finder and its widths are settled by `configure`, so the
                 // tables can be laid out; the reset reads whether they continue
                 // the last frame's.
-                // Row slots start at `ROW_EMPTY_SLOT`, not zero, so a zeroed
-                // allocation would spare them nothing.
-                workspace.open(
+                workspace.open_for_match_finder(
                     row.tables_workspace_bytes() + row.history.workspace_bytes(history_bytes),
+                    row.zero_table_bytes(),
                     max_window_size,
+                    expected_input,
                 );
                 row.history.bind(workspace, history_bytes);
                 row.bind_tables(workspace);
@@ -1625,9 +1630,10 @@ impl Matcher for MatchGeneratorDriver {
                 // The widths are settled by `configure`, so the tables can be
                 // laid out before the reset retires the previous frame's
                 // entries in them.
+                let tables = hc.table.tables_workspace_bytes();
                 workspace.open_for_match_finder(
-                    hc.table.tables_workspace_bytes(),
-                    hc.table.history.workspace_bytes(history_bytes),
+                    tables + hc.table.history.workspace_bytes(history_bytes),
+                    tables,
                     max_window_size,
                     expected_input,
                 );

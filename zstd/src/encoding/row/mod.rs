@@ -3459,6 +3459,16 @@ impl RowMatchGenerator {
         region_bytes::<u32>(self.table_layout().0)
     }
 
+    /// The part of [`Self::tables_workspace_bytes`] that starts as zeros: all
+    /// of it for the tree, none for the rows and the chain, whose empty slot
+    /// is `ROW_EMPTY_SLOT`.
+    pub(crate) fn zero_table_bytes(&self) -> usize {
+        match self.table_layout() {
+            (len, 0) => region_bytes::<u32>(len),
+            _ => 0,
+        }
+    }
+
     /// Lays the active finder's tables out in the open `workspace`. Tables
     /// that continue the previous frame's keep their contents; otherwise they
     /// start empty and laid out, and the next [`Self::reset`] knows they hold

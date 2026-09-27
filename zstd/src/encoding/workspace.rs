@@ -167,26 +167,24 @@ impl Workspace {
         self.open = false;
     }
 
-    /// Opens the layout for a match finder's `tables` and `history` bytes, as
-    /// [`Self::open`], for a frame expected to bring `expected_input` bytes.
+    /// Opens the layout for a match finder, as [`Self::open`], whose tables
+    /// include `zero_tables` bytes of tables that start as zeros, for a frame
+    /// expected to bring `expected_input` bytes.
     ///
-    /// Tables larger than that input keep most of their pages untouched, so a
-    /// new allocation is then taken zeroed and a table of zeros left as it is:
-    /// only the pages the frame indexes are ever faulted in. Otherwise the
-    /// input writes the tables densely anyway, and a plain allocation that
+    /// Zero tables larger than that input keep most of their pages untouched,
+    /// so a new allocation is then taken zeroed and those tables left as they
+    /// are: only the pages the frame indexes are ever faulted in. Otherwise
+    /// the input writes the tables densely anyway, and a plain allocation that
     /// fills only the tables costs less than zeroing all of it, the history
     /// room included (the allocator zeroes a reused block in full).
     pub(crate) fn open_for_match_finder(
         &mut self,
-        tables: usize,
-        history: usize,
+        leading: usize,
+        zero_tables: usize,
         window: usize,
         expected_input: usize,
     ) {
-        self.sparse_tables = tables > expected_input;
-        let leading = tables
-            .checked_add(history)
-            .expect("workspace size overflows usize");
+        self.sparse_tables = zero_tables > expected_input;
         self.open(leading, window);
     }
 
