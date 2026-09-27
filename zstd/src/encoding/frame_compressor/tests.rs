@@ -2762,6 +2762,52 @@ fn compress_independent_frame_reuse_matches_fresh_on_the_optimal_band() {
     assert!(diverged.is_empty(), "{diverged:#?}");
 }
 
+/// One compressor moved across levels whose match finders differ (Fast, the
+/// optimal parser, dfast, the tree, rows, back to Fast) lays its workspace out
+/// anew every frame: tables grow, shrink and shift behind each other, and a
+/// region that lands on bytes another backend wrote must not be read as its
+/// own. Every frame must still be the one a fresh compressor writes and decode
+/// back, on both the one-shot and the streaming path. Small enough to run
+/// under Miri, which checks the regions' pointer discipline.
+#[test]
+fn a_compressor_moved_across_levels_lays_its_workspace_out_again() {
+    use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+    let text: Vec<u8> = (0..60u32)
+        .flat_map(|i| alloc::format!("line {} of {} says {}\n", i % 17, i % 5, i % 11).into_bytes())
+        .collect();
+    let mut cctx: FrameCompressor<&[u8], Vec<u8>> =
+        FrameCompressor::new(CompressionLevel::Level(1));
+    for level in [1, 19, 3, 22, 5, 13, 1, 4] {
+        let level = CompressionLevel::Level(level);
+        cctx.set_compression_level(level);
+        let reused = cctx.compress_independent_frame(&text);
+        assert_eq!(
+            reused,
+            compress_slice_to_vec(&text, level),
+            "one-shot frame at {level:?} differs from a fresh compressor's"
+        );
+        let mut decoded = Vec::with_capacity(text.len());
+        FrameDecoder::new()
+            .decode_all_to_vec(&reused, &mut decoded)
+            .unwrap();
+        assert_eq!(decoded, text, "one-shot frame at {level:?} decodes wrongly");
+
+        cctx.set_source(text.as_slice());
+        cctx.set_drain(Vec::new());
+        cctx.compress();
+        let streamed = cctx.take_drain().expect("the drain was set");
+        let mut fresh: FrameCompressor<&[u8], Vec<u8>> = FrameCompressor::new(level);
+        fresh.set_source(text.as_slice());
+        fresh.set_drain(Vec::new());
+        fresh.compress();
+        assert_eq!(
+            Some(streamed),
+            fresh.take_drain(),
+            "streamed frame at {level:?} differs from a fresh compressor's"
+        );
+    }
+}
+
 /// A compressor kept for one-shot frame after frame, with its parameters set
 /// again before each (what a C context compressing through
 /// `ZSTD_compress2` does), writes each 4 KiB piece of a stream exactly as a

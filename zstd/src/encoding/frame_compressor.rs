@@ -1361,8 +1361,9 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) huff_weights: crate::huff0::huff0_encoder::WeightScratch,
     pub(crate) fse_tables: FseTables,
     pub(crate) block_scratch: crate::encoding::blocks::CompressedBlockScratch,
-    /// The one allocation the per-block buffers are carved from, laid out at
-    /// each frame start by [`Self::lay_out_workspace`].
+    /// The one allocation the match finder's tables and the per-block buffers
+    /// are carved from, laid out at each frame start by
+    /// [`Self::reset_for_frame`] and [`Self::finish_layout`].
     pub(crate) workspace: crate::encoding::workspace::Workspace,
     /// Offset history for repeat offset encoding: [rep0, rep1, rep2].
     /// Initialized to [1, 4, 8] per RFC 8878 §3.1.2.5.
@@ -2055,24 +2056,28 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         unsafe {
             self.state.matcher.set_borrowed_window(input);
         }
+        // Fixed for the whole frame, so resolved before the loop takes the
+        // state.
+        let block_capacity = self.block_capacity();
+        let pre_split = self.pre_split_level();
+        let dict_active =
+            self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
         // Panic-safety: clear the borrowed `(ptr, len)` on EVERY exit,
         // including an unwind from an `assert!` inside the block loop, so
         // a caught-and-reused compressor never retains a dangling window.
         // (The next frame's `reset()` also clears it before any read, but
-        // this guard makes the invariant local and unwind-proof.)
-        struct ClearBorrowedOnDrop(*mut MatchGeneratorDriver);
-        impl Drop for ClearBorrowedOnDrop {
+        // this guard makes the invariant local and unwind-proof.) The guard
+        // holds the state's `&mut` and the loop reaches the state through it:
+        // a raw pointer kept beside the loop's own `&mut self.state` would be
+        // invalidated by it (Stacked Borrows), making the drop's access
+        // undefined.
+        struct ClearBorrowedOnDrop<'a>(&'a mut CompressState<MatchGeneratorDriver>);
+        impl Drop for ClearBorrowedOnDrop<'_> {
             fn drop(&mut self) {
-                // SAFETY: at drop (normal return or unwind) the loop's
-                // borrows of the matcher have ended, so this is the only
-                // access. `addr_of_mut!` produced this pointer without an
-                // intermediate `&mut`, so the interleaved `&mut` uses in
-                // the loop did not invalidate it.
-                unsafe { (*self.0).clear_borrowed_window() };
+                self.0.matcher.clear_borrowed_window();
             }
         }
-        let _clear_guard = ClearBorrowedOnDrop(core::ptr::addr_of_mut!(self.state.matcher));
-        let block_capacity = self.block_capacity();
+        let guard = ClearBorrowedOnDrop(&mut self.state);
         let mut start = 0usize;
         while start < input.len() {
             reserve_for_next_block(
@@ -2098,7 +2103,6 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             // splitter actually runs) — so non-pre-split levels, the first
             // block, and the trailing partial block pay nothing. See
             // `warm_presplit_window`.
-            let pre_split = self.pre_split_level();
             if savings >= 3
                 && input.len() - start >= MAX_BLOCK_SIZE as usize
                 && block_capacity >= MAX_BLOCK_SIZE as usize
@@ -2120,10 +2124,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if self.content_checksum {
                 self.hasher.write(block);
             }
-            let dict_active =
-                self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
             crate::encoding::levels::compress_block_encoded_borrowed(
-                &mut self.state,
+                &mut *guard.0,
                 self.compression_level,
                 last_block,
                 block,
@@ -2138,7 +2140,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             );
             start = end;
         }
-        // `_clear_guard` drops here, clearing the borrowed window.
+        // `guard` drops here, clearing the borrowed window.
+        drop(guard);
         total_uncompressed
     }
 }
