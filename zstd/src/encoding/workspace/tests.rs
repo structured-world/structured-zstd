@@ -111,6 +111,16 @@ fn only_tables_that_fill_the_workspace_take_it_zeroed() {
         "tables a quarter of the workspace must be filled, not the workspace zeroed",
     );
 
+    // Just over half, the share a 10 KiB frame's tables have at level 1:
+    // zeroing the rest still costs more than the fill saves.
+    fn buffers_four_fifths_of_the_table(_block: usize) -> usize {
+        4 * region_bytes::<u32>(64) / 5
+    }
+    let mut ws = Workspace::new();
+    ws.begin_layout(1 << 17, buffers_four_fifths_of_the_table, IngestPlan::Slice);
+    ws.open_for_match_finder(table, table, 1 << 14, 0);
+    assert!(!ws.zeroed, "tables just over half the workspace are filled");
+
     let mut ws = Workspace::new();
     ws.begin_layout(1 << 17, no_trailing, IngestPlan::Slice);
     ws.open_for_match_finder(table, table, 1 << 14, 0);

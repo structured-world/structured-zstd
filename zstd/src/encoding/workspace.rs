@@ -252,14 +252,21 @@ impl Workspace {
             };
             self.oversized_layouts > TOO_LARGE_MAX_LAYOUTS
         };
-        // Zeroing all of it costs at most twice filling the tables when they
-        // are at least half of it, and nothing on pages the kernel hands out
-        // zeroed; below half, the worst case is the larger bill.
+        // A zeroed allocation costs nothing on pages the kernel hands out
+        // fresh and a memset of all of it on memory the allocator recycles,
+        // which is where a context rebuilt per frame lands. So it is taken
+        // only when the rest is at most a third of the tables, which caps that
+        // case at a third over filling the tables alone. A small frame's
+        // tables sit beside buffers of their own size: at 10 KiB and level 1
+        // they were 56% of the workspace, and zeroing it all measured 23%
+        // slower than filling them. A small input at a high level, where the
+        // tables are most of it, keeps its untouched pages (78% at level 13).
         debug_assert!(
             self.sparse_table_bytes <= leading,
             "zero tables are part of the leading bytes"
         );
-        let zero_all = self.sparse_table_bytes >= total - self.sparse_table_bytes;
+        let zero_all = self.sparse_table_bytes > 0
+            && total - self.sparse_table_bytes <= self.sparse_table_bytes / 3;
         if reallocate {
             self.grow(total, zero_all);
         }
