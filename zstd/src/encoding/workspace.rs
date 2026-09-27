@@ -15,7 +15,7 @@
 //! then the context carves its per-block buffers from what the opening reserved
 //! for it.
 
-use alloc::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
+use alloc::alloc::{Layout, alloc, alloc_zeroed, dealloc, handle_alloc_error};
 use alloc::vec::Vec;
 use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
@@ -99,6 +99,9 @@ pub struct Workspace {
     /// Consecutive layouts that found the allocation far larger than they
     /// need, for giving back one that has stayed so.
     oversized_layouts: u32,
+    /// The layout's tables are larger than the input expected to write them,
+    /// so a new allocation is taken zeroed (see [`Self::open_for_match_finder`]).
+    sparse_tables: bool,
     /// The open layout made the allocation, zeroed, so its regions hold
     /// zeros until their holders write them.
     zeroed: bool,
@@ -136,6 +139,7 @@ impl Workspace {
             block_capacity: 0,
             open: false,
             oversized_layouts: 0,
+            sparse_tables: false,
             zeroed: false,
         }
     }
@@ -159,7 +163,31 @@ impl Workspace {
         self.block_target = block_target;
         self.trailing_for = trailing_for;
         self.ingest = ingest;
+        self.sparse_tables = false;
         self.open = false;
+    }
+
+    /// Opens the layout for a match finder's `tables` and `history` bytes, as
+    /// [`Self::open`], for a frame expected to bring `expected_input` bytes.
+    ///
+    /// Tables larger than that input keep most of their pages untouched, so a
+    /// new allocation is then taken zeroed and a table of zeros left as it is:
+    /// only the pages the frame indexes are ever faulted in. Otherwise the
+    /// input writes the tables densely anyway, and a plain allocation that
+    /// fills only the tables costs less than zeroing all of it, the history
+    /// room included (the allocator zeroes a reused block in full).
+    pub(crate) fn open_for_match_finder(
+        &mut self,
+        tables: usize,
+        history: usize,
+        window: usize,
+        expected_input: usize,
+    ) {
+        self.sparse_tables = tables > expected_input;
+        let leading = tables
+            .checked_add(history)
+            .expect("workspace size overflows usize");
+        self.open(leading, window);
     }
 
     /// Whether this layout has been opened.
@@ -224,7 +252,7 @@ impl Workspace {
         if reallocate {
             self.grow(total);
         }
-        self.zeroed = reallocate;
+        self.zeroed = reallocate && self.sparse_tables;
         self.front = 0;
         self.leading = leading;
         self.history_front = leading;
@@ -369,14 +397,20 @@ impl Workspace {
             return;
         }
         let layout = allocation_layout(bytes);
-        // Zeroed, and at byte alignment so the allocator can take it as a
-        // `calloc`: a large one comes back as fresh pages the kernel zeroes on
-        // first touch, so a table of zeros costs only the pages its frame
-        // indexes (see `table_after`). An over-aligned zeroed request is a
-        // plain allocation followed by a memset of all of it, which faults in
-        // every page up front. The start is aligned by hand instead.
+        // Zeroed for sparse tables (see `open_for_match_finder`), and at byte
+        // alignment so the allocator can take it as a `calloc`: a large one
+        // comes back as fresh pages the kernel zeroes on first touch. An
+        // over-aligned zeroed request is a plain allocation followed by a
+        // memset of all of it, which faults in every page up front, so the
+        // start is aligned by hand instead.
         // SAFETY: `layout` has a non-zero size.
-        let raw = unsafe { alloc_zeroed(layout) };
+        let raw = unsafe {
+            if self.sparse_tables {
+                alloc_zeroed(layout)
+            } else {
+                alloc(layout)
+            }
+        };
         let Some(base) = NonNull::new(raw) else {
             handle_alloc_error(layout);
         };

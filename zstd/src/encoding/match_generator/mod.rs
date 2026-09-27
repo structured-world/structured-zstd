@@ -1376,6 +1376,11 @@ impl Matcher for MatchGeneratorDriver {
             max_window_size,
             level,
         );
+        // The input the frame can write into its tables: the size when known,
+        // otherwise the most its history is laid out to hold.
+        let expected_input = hint.map_or(history_bytes, |bytes| {
+            usize::try_from(bytes).unwrap_or(usize::MAX)
+        });
         // The hint-dependent hash-table width the active backend applies, for
         // the primed-snapshot key. Dfast/Row compute it from `table_window_size`
         // below; HC/Fast leave it `0` because their widths live in `params`
@@ -1522,9 +1527,11 @@ impl Matcher for MatchGeneratorDriver {
                 // reset below reads whether they continue the last frame's.
                 // The history binds first, carrying its bytes out from under
                 // where the tables may now land.
-                workspace.open(
-                    dfast.tables_workspace_bytes() + dfast.history.workspace_bytes(history_bytes),
+                workspace.open_for_match_finder(
+                    dfast.tables_workspace_bytes(),
+                    dfast.history.workspace_bytes(history_bytes),
                     max_window_size,
+                    expected_input,
                 );
                 dfast.history.bind(workspace, history_bytes);
                 dfast.bind_tables(workspace);
@@ -1565,6 +1572,8 @@ impl Matcher for MatchGeneratorDriver {
                 // The finder and its widths are settled by `configure`, so the
                 // tables can be laid out; the reset reads whether they continue
                 // the last frame's.
+                // Row slots start at `ROW_EMPTY_SLOT`, not zero, so a zeroed
+                // allocation would spare them nothing.
                 workspace.open(
                     row.tables_workspace_bytes() + row.history.workspace_bytes(history_bytes),
                     max_window_size,
@@ -1616,10 +1625,11 @@ impl Matcher for MatchGeneratorDriver {
                 // The widths are settled by `configure`, so the tables can be
                 // laid out before the reset retires the previous frame's
                 // entries in them.
-                workspace.open(
-                    hc.table.tables_workspace_bytes()
-                        + hc.table.history.workspace_bytes(history_bytes),
+                workspace.open_for_match_finder(
+                    hc.table.tables_workspace_bytes(),
+                    hc.table.history.workspace_bytes(history_bytes),
                     max_window_size,
+                    expected_input,
                 );
                 hc.table.history.bind(workspace, history_bytes);
                 hc.table.bind_tables(workspace);
