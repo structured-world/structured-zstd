@@ -485,6 +485,46 @@ fn ensure_tables_releases_the_buffer_when_the_layout_shrinks() {
     );
 }
 
+/// A level change that moves only the hash3 width keeps the hash and chain
+/// entries and leaves the hash3 table empty at its new width: entries hashed at
+/// the old width would sit in slots the new hash never maps them to.
+#[test]
+fn a_hash3_width_change_keeps_the_hash_and_chain_and_empties_the_tail() {
+    let mut t = new_table(64);
+    t.hash3_log = 4;
+    t.ensure_tables();
+    t.hash_table_mut().fill(11);
+    t.chain_table_mut().fill(12);
+    t.hash3_table_mut().fill(13);
+
+    t.hash3_log = 5;
+    t.ensure_tables();
+    assert_eq!(t.hash_table().len(), 1 << 8);
+    assert_eq!(t.chain_table().len(), 1 << 8);
+    assert_eq!(t.hash3_table().len(), 1 << 5);
+    assert!(
+        t.hash_table().iter().all(|&v| v == 11),
+        "hash entries survive"
+    );
+    assert!(
+        t.chain_table().iter().all(|&v| v == 12),
+        "chain entries survive"
+    );
+    assert!(
+        t.hash3_table().iter().all(|&v| v == HC_EMPTY),
+        "the hash3 table starts empty at its new width"
+    );
+
+    t.hash3_table_mut().fill(13);
+    t.hash3_log = 0;
+    t.ensure_tables();
+    assert!(
+        t.hash3_table().is_empty(),
+        "a disabled hash3 table takes no room"
+    );
+    assert!(t.hash_table().iter().all(|&v| v == 11));
+}
+
 #[test]
 fn clone_from_replaces_the_uncommitted_count_with_the_sources() {
     // `clone_from` is the primed-dictionary restore path: it overwrites the

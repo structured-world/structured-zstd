@@ -733,7 +733,10 @@ impl MatchTable {
         } else if self.tables.len() != total {
             // Only the hash3 tail changed width: the hash and chain regions
             // keep their entries, the tail is empty at the new width.
-            let mut resized = self.tables.to_vec();
+            // Only the hash and chain regions are carried over; old hash3
+            // entries were hashed at the old width.
+            let mut resized = Vec::with_capacity(total);
+            resized.extend_from_slice(&self.tables[..self.hash3_off]);
             resized.resize(total, HC_EMPTY);
             self.tables = Table::owned(resized);
         }
