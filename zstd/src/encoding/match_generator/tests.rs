@@ -5287,3 +5287,32 @@ fn a_driver_moved_into_a_context_releases_its_own_workspace() {
     driver.start_matching(|_| sequences += 1);
     assert!(sequences > 0);
 }
+
+/// Every backend counts the tables and history of a workspace it owns, and
+/// none of a context's: those bytes are the context's to report, and counting
+/// them on both sides would report the frame's memory twice.
+#[test]
+fn a_driver_counts_its_own_workspace_and_not_a_contexts() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    for level in [1, 3, 5, 16] {
+        let level = CompressionLevel::Level(level);
+        let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+        driver.reset(level);
+        let own = driver.heap_size();
+        assert!(
+            own >= driver.own_workspace.heap_bytes() && driver.own_workspace.heap_bytes() > 0,
+            "{level:?}: {own} bytes reported for a workspace of {}",
+            driver.own_workspace.heap_bytes(),
+        );
+
+        let mut context = Workspace::new();
+        context.begin_layout(1 << 17, no_trailing, IngestPlan::Stream);
+        driver.reset_in_workspace(level, &mut context);
+        let in_context = driver.heap_size();
+        assert!(
+            in_context < own - context.heap_bytes() / 2,
+            "{level:?}: {in_context} bytes reported in a context of {}, {own} on its own",
+            context.heap_bytes(),
+        );
+    }
+}

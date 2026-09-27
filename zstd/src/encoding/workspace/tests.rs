@@ -164,6 +164,62 @@ fn a_workspace_on_fresh_pages_is_taken_zeroed() {
     assert!(!ws.on_fresh_pages());
 }
 
+// A region whose byte size fits but whose alignment padding does not is refused
+// loudly, as the multiplication overflow is, rather than wrapping to a small size.
+#[test]
+#[should_panic(expected = "workspace region size overflows usize")]
+fn a_region_that_overflows_with_its_padding_panics() {
+    let _ = region_bytes::<u8>(usize::MAX);
+}
+
+// A context that lays out nothing for longer than the give-back limit returns
+// its whole allocation, as one left three times too large does.
+#[test]
+fn a_workspace_left_unused_is_given_back() {
+    let mut ws = opened(region_bytes::<u32>(1024));
+    for _ in 0..TOO_LARGE_MAX_LAYOUTS {
+        lay_out(&mut ws, 0, 0);
+        assert!(ws.heap_bytes() > 0, "kept while under the limit");
+    }
+    lay_out(&mut ws, 0, 0);
+    assert_eq!(ws.capacity(), 0, "replaced by nothing past the limit");
+    // The replaced allocation is kept until the next layout, for a history to
+    // carry its bytes out of, and freed there.
+    lay_out(&mut ws, 0, 0);
+    assert_eq!(ws.heap_bytes(), 0, "given back past the limit");
+}
+
+// Restoring a table from one of another length replaces it with an owned copy;
+// only a same-length restore can copy in place.
+#[test]
+fn a_table_restored_from_another_length_takes_a_copy() {
+    let mut ws = opened(region_bytes::<u32>(64));
+    let mut table: Table<u32> = Table::empty();
+    table.bind(&mut ws, 64, 0);
+    let source = Table::owned(alloc::vec![7u32; 16]);
+    table.clone_from(&source);
+    assert_eq!(table.len(), 16);
+    assert!(table.iter().all(|&v| v == 7));
+    assert_eq!(table.owned_bytes(), 16 * core::mem::size_of::<u32>());
+}
+
+// The public history buffer reports emptiness and formats its length and
+// room, not its bytes, which may be a whole window of input.
+#[test]
+fn a_history_buffer_reports_its_length_and_room() {
+    let mut history = HistoryBuf::new();
+    assert!(history.is_empty());
+    history.extend_from_slice(b"abc");
+    assert!(!history.is_empty());
+    let shown = alloc::format!("{history:?}");
+    assert!(shown.starts_with("HistoryBuf"));
+    assert!(shown.contains("len: 3"));
+    assert!(
+        !shown.contains("97"),
+        "the bytes themselves stay out: {shown}"
+    );
+}
+
 // The next frame's layout puts a table of the same size back on the same bytes,
 // and its holder keeps what it wrote: that is what lets a match finder carry a
 // table across frames without clearing it.

@@ -1735,3 +1735,44 @@ fn a_block_searched_without_the_classifier_is_found_again() {
         assert_eq!(&decoded[small.len()..], &large[..]);
     }
 }
+
+/// A streamed uncompressed frame hashes each block as it goes out, so its
+/// content checksum verifies on decode.
+#[cfg(feature = "hash")]
+#[test]
+fn a_streamed_raw_frame_carries_a_valid_checksum() {
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 253) as u8).collect();
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Uncompressed);
+    encoder.set_content_checksum(true).unwrap();
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+    // Content_Checksum_flag (RFC 8878 3.1.1.1.1.5).
+    assert_ne!(compressed[4] & 0b100, 0);
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}
+
+/// A full final buffer is cut like any other block: where the content changes
+/// inside it, the pre-split sends the prefix out as a block of its own before
+/// the last one, and the frame still decodes to its input.
+#[test]
+fn a_full_last_buffer_is_pre_split_where_its_content_changes() {
+    let mut payload = b"log line with a steady shape, ".repeat(64 * 1024 / 30);
+    payload.truncate(64 * 1024);
+    let mut state = 0x2545_F491_u32;
+    payload.extend((0..64 * 1024).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state as u8
+    }));
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(19));
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}

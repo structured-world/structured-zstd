@@ -103,6 +103,30 @@ fn very_simple_raw_compress() {
     compressor.compress();
 }
 
+/// An uncompressed frame read from a stream hashes every block it writes, so
+/// its content checksum verifies on decode: the blocks go straight into the
+/// output, and the checksum has to be taken from there.
+#[cfg(feature = "hash")]
+#[test]
+fn a_raw_frame_from_a_reader_carries_a_valid_checksum() {
+    use crate::io::Read;
+    let input: Vec<u8> = (0..300_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    let mut output: Vec<u8> = Vec::new();
+    let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
+    compressor.set_content_checksum(true);
+    compressor.set_source(input.as_slice());
+    compressor.set_drain(&mut output);
+    compressor.compress();
+
+    let mut decoder = crate::decoding::StreamingDecoder::new(output.as_slice()).unwrap();
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, input);
+    // The frame declares the checksum the decoder verified
+    // (Content_Checksum_flag, RFC 8878 3.1.1.1.1.5).
+    assert_ne!(output[4] & 0b100, 0);
+}
+
 #[test]
 fn very_simple_compress() {
     let mut mock_data = vec![0; 1 << 17];
@@ -1922,6 +1946,37 @@ fn custom_matcher_without_dictionary_priming_does_not_advertise_dict_id() {
     let mut decoded = Vec::with_capacity(payload.len());
     decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
     assert_eq!(decoded, payload);
+}
+
+/// A custom matcher holds nothing in the compressor's workspace, so replacing
+/// it hands back the matcher that ran, and the compressor goes on with the new
+/// one.
+#[test]
+fn a_custom_matcher_is_handed_back_whole_when_replaced() {
+    let payload = b"abcdefghabcdefgh";
+    let mut compressor = FrameCompressor::new_with_matcher(
+        NoDictionaryMatcher::new(64),
+        super::CompressionLevel::Fastest,
+    );
+    let mut first = Vec::new();
+    compressor.set_source(payload.as_slice());
+    compressor.set_drain(&mut first);
+    compressor.compress();
+
+    let outgoing = compressor.replace_matcher(NoDictionaryMatcher::new(128));
+    assert_eq!(outgoing.window_size, 64, "the matcher that ran comes back");
+
+    let mut second = Vec::new();
+    compressor.set_source(payload.as_slice());
+    compressor.set_drain(&mut second);
+    compressor.compress();
+    for frame in [&first, &second] {
+        let mut decoded = Vec::with_capacity(payload.len());
+        FrameDecoder::new()
+            .decode_all_to_vec(frame, &mut decoded)
+            .unwrap();
+        assert_eq!(decoded, payload);
+    }
 }
 
 #[cfg(feature = "hash")]

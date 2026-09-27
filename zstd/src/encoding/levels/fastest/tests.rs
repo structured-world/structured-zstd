@@ -111,3 +111,47 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         "RLE is already known compressible; skip_matching should bypass incompressible sampling"
     );
 }
+
+/// A one-shot frame at a negative level whose window cuts it into 16 KiB
+/// blocks searches them without asking the classifier. The first block copies
+/// its own head after its midpoint, where neither probe run of the grid starts,
+/// so only the search finds that copy: a block handed to the classifier would
+/// read as noise and go out raw with it.
+#[test]
+fn a_small_block_at_a_negative_level_is_searched_without_the_classifier() {
+    use crate::encoding::{CompressionParameters, compress_with_parameters};
+    let mut state = 0x6C07_8965_u32;
+    let mut noise = |len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    };
+    let head = noise(9 * 1024);
+    let mut input = head.clone();
+    input.extend_from_slice(&head[..5 * 1024]);
+    input.extend(noise(2 * 1024));
+    // A second block, so the first is not the frame's last and is recorded.
+    input.extend(noise(16 * 1024));
+
+    let params = CompressionParameters::builder(CompressionLevel::Level(-1))
+        .window_log(14)
+        .build()
+        .expect("level -1 with a 16 KiB window is a valid configuration");
+    let compressed = compress_with_parameters(&input, &params);
+    assert!(
+        compressed.len() < input.len() - 4 * 1024,
+        "{} bytes from {}: the copy inside the first block was not coded as a match",
+        compressed.len(),
+        input.len(),
+    );
+    let mut decoded = Vec::with_capacity(input.len());
+    crate::decoding::FrameDecoder::new()
+        .decode_all_to_vec(&compressed, &mut decoded)
+        .unwrap();
+    assert_eq!(decoded, input);
+}

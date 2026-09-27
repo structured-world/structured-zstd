@@ -653,12 +653,6 @@ impl<T: Copy> Region<T> {
     }
 }
 
-impl<T> Default for Region<T> {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
 /// A match-finder table: a region of the context's workspace, or an allocation
 /// of its own for a copy that must outlive a layout (a dictionary snapshot, a
 /// table a caller built by hand).

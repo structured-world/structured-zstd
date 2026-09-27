@@ -4728,6 +4728,9 @@ impl RowMatchGenerator {
 #[cfg(test)]
 mod rebase_tests;
 
+#[cfg(test)]
+mod layout_tests;
+
 #[cfg(all(
     test,
     feature = "std",

@@ -159,3 +159,19 @@ fn panics_on_mls_below_four() {
 fn panics_on_mls_above_eight() {
     let _ = FastHashTable::new(12, 9);
 }
+
+/// A table whose entry count does not fit the target's `usize` is refused with
+/// a message naming the width, not left to wrap into a small table.
+#[test]
+#[should_panic(expected = "overflows")]
+fn a_table_wider_than_usize_panics() {
+    let _ = entry_count(usize::BITS);
+}
+
+/// A table whose entries fit but whose byte size does not is refused the same
+/// way, before any allocation is attempted.
+#[test]
+#[should_panic(expected = "byte size overflows")]
+fn a_table_whose_bytes_overflow_usize_panics() {
+    let _ = entry_count(usize::BITS - 1);
+}

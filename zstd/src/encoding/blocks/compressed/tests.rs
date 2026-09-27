@@ -1068,6 +1068,27 @@ fn match_length_coding_agrees_with_the_ranges_over_every_length() {
     }
 }
 
+/// Literals that outgrow the buffer stop the encoder rather than write past it:
+/// the short-run copy writes through a raw pointer, and a caller whose buffer
+/// was sized for less must reach the checked append instead.
+#[test]
+#[should_panic(expected = "workspace buffer sized below what the frame put in it")]
+fn literals_past_the_buffer_stop_instead_of_overflowing() {
+    let mut ws = Workspace::new();
+    ws.begin_layout(
+        region_bytes::<u8>(4),
+        |bytes| bytes,
+        crate::encoding::workspace::IngestPlan::Stream,
+    );
+    ws.open(0, usize::MAX);
+    let mut literals: RegionVec<u8> = ws.buffer(4);
+    super::append_literals(
+        &mut literals,
+        &[0xA5; 8],
+        crate::decoding::simd_copy::ExactCopyTier::Scalar,
+    );
+}
+
 #[test]
 fn choose_table_without_previous_does_not_unwrap_none() {
     let only_zero_one_table = build_table_from_symbol_counts(&[1, 1], 5, false);
