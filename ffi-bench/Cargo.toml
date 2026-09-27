@@ -242,6 +242,10 @@ name = "encode_loop_z000033"
 path = "../zstd/examples/encode_loop_z000033.rs"
 
 [[example]]
+name = "encode_loop_stream_z000033"
+path = "../zstd/examples/encode_loop_stream_z000033.rs"
+
+[[example]]
 name = "oneshot_loop"
 path = "../zstd/examples/oneshot_loop.rs"
 
