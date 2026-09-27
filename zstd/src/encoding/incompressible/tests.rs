@@ -62,8 +62,9 @@ fn the_content_grid_reports_a_repeat_that_is_shifted() {
 ///
 /// Such a block reads as incompressible to every sample of it, and the copy is a
 /// match the search would have found. Runs at fixed places (the start and the
-/// middle) missed a copy that began between them; runs every eighth of the
-/// block bound what a copy has to be to hide, whatever its offset.
+/// middle) missed a copy that began between them; runs every
+/// `PROBE_FRACTION` of the block bound what a copy has to be to hide, whatever
+/// its offset.
 #[test]
 fn the_content_grid_answers_a_block_that_copies_itself() {
     const BLOCK: usize = 128 * 1024;
@@ -84,7 +85,7 @@ fn the_content_grid_answers_a_block_that_copies_itself() {
     // Copies of the guaranteed length at offsets that avoid every run start,
     // including the one that sat between the old start and middle runs.
     // Every offset leaves the original `[0, span)` intact.
-    for at in [span + 1, 3 * spacing + 777, 76 * 1024, BLOCK - span] {
+    for at in [span + 1, 76 * 1024, BLOCK - span - 777, BLOCK - span] {
         let mut block = deterministic_bytes(0xBEEF, BLOCK);
         block.copy_within(0..span, at);
         let mut grid = SeenContentGrid::default();

@@ -154,7 +154,13 @@ impl SeenContentGrid {
     /// begins inside, so with runs only at the start and the middle a block
     /// carrying a copy of its own content between them went out raw with the
     /// match in it.
-    const PROBE_FRACTION: usize = 8;
+    ///
+    /// A quarter rather than an eighth: on a mebibyte of noise at levels -7 to
+    /// 3 on x86_64, eight runs a block cost 13-19% over the two-run placement
+    /// and four runs cost 9-12% less than eight, three interleaved runs of
+    /// prebuilt binaries each. A copy a quarter of a block long still codes
+    /// most of what the eighth would have found.
+    const PROBE_FRACTION: usize = 4;
     /// What a rebase keeps: the widest window the format admits, so a record
     /// dropped there was out of every matcher's reach already.
     const REBASE_RETAIN_BYTES: u64 = 1 << 31;
