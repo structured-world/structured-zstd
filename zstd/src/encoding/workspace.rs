@@ -68,7 +68,10 @@ pub(crate) enum IngestPlan {
 ///
 /// [`Matcher::reset_in_workspace`]: crate::encoding::Matcher::reset_in_workspace
 pub struct Workspace {
+    /// Start of the usable bytes, aligned to [`ALIGN`] inside the allocation
+    /// that starts at `base`.
     ptr: NonNull<u8>,
+    base: NonNull<u8>,
     capacity: usize,
     /// Counts allocations; a region is only the continuation of an earlier one
     /// if both were carved from the same allocation.
@@ -80,8 +83,9 @@ pub struct Workspace {
     history_front: usize,
     leading: usize,
     back: usize,
-    /// The allocation a growth replaced, kept until the history has been
-    /// bound again so its bytes can be carried over.
+    /// The allocation a growth replaced (its base and usable bytes), kept
+    /// until the history has been bound again so its bytes can be carried
+    /// over.
     retired: Option<(NonNull<u8>, usize)>,
     /// The block ceiling the context set before the window was known, and the
     /// bytes it carves after the match finder for a given block size.
@@ -118,6 +122,7 @@ impl Workspace {
     pub(crate) const fn new() -> Self {
         Self {
             ptr: NonNull::<Aligned>::dangling().cast(),
+            base: NonNull::dangling(),
             capacity: 0,
             generation: 0,
             front: 0,
@@ -353,7 +358,8 @@ impl Workspace {
     fn grow(&mut self, bytes: usize) {
         self.release_retired();
         if self.capacity != 0 {
-            self.retired = Some((self.ptr, self.capacity));
+            self.retired = Some((self.base, self.capacity));
+            self.base = NonNull::dangling();
             self.ptr = NonNull::<Aligned>::dangling().cast();
             self.capacity = 0;
         }
@@ -362,26 +368,34 @@ impl Workspace {
         if bytes == 0 {
             return;
         }
-        let layout = Layout::from_size_align(bytes, ALIGN).expect("workspace size overflows isize");
-        // Zeroed: the allocator hands a large request back as pages the kernel
-        // zeroes on first touch, so a table of zeros costs only the pages its
-        // frame indexes (see `table_after`).
-        // SAFETY: `layout` has a non-zero size, checked above.
+        let layout = allocation_layout(bytes);
+        // Zeroed, and at byte alignment so the allocator can take it as a
+        // `calloc`: a large one comes back as fresh pages the kernel zeroes on
+        // first touch, so a table of zeros costs only the pages its frame
+        // indexes (see `table_after`). An over-aligned zeroed request is a
+        // plain allocation followed by a memset of all of it, which faults in
+        // every page up front. The start is aligned by hand instead.
+        // SAFETY: `layout` has a non-zero size.
         let raw = unsafe { alloc_zeroed(layout) };
-        let Some(ptr) = NonNull::new(raw) else {
+        let Some(base) = NonNull::new(raw) else {
             handle_alloc_error(layout);
         };
-        self.ptr = ptr;
+        let offset = raw.align_offset(ALIGN);
+        debug_assert!(offset < ALIGN, "a byte pointer aligns within ALIGN bytes");
+        self.base = base;
+        // SAFETY: `offset < ALIGN`, and the allocation holds `bytes + ALIGN - 1`
+        // bytes, so the aligned start leaves `bytes` of them after it.
+        self.ptr = unsafe { NonNull::new_unchecked(raw.add(offset)) };
         self.capacity = bytes;
     }
 
     /// Frees the allocation a growth retired. Every holder has been laid out
     /// in the new one by the time this runs.
     pub(crate) fn release_retired(&mut self) {
-        if let Some((ptr, capacity)) = self.retired.take() {
+        if let Some((base, capacity)) = self.retired.take() {
             // SAFETY: `grow` retired this allocation and `take` dropped the
             // only record of it.
-            unsafe { free(ptr, capacity) };
+            unsafe { free(base, capacity) };
         }
     }
 
@@ -392,23 +406,31 @@ impl Workspace {
         }
         // SAFETY: the current allocation; `capacity` is reset below so it is
         // never freed twice.
-        unsafe { free(self.ptr, self.capacity) };
+        unsafe { free(self.base, self.capacity) };
+        self.base = NonNull::dangling();
         self.ptr = NonNull::<Aligned>::dangling().cast();
         self.capacity = 0;
     }
 }
 
-/// Frees a workspace allocation of `capacity` bytes.
+/// The allocation behind a workspace of `capacity` usable bytes: byte-aligned,
+/// with room to align the start to [`ALIGN`] by hand.
+fn allocation_layout(capacity: usize) -> Layout {
+    let bytes = capacity
+        .checked_add(ALIGN - 1)
+        .expect("workspace size overflows usize");
+    Layout::from_size_align(bytes, 1).expect("workspace size overflows isize")
+}
+
+/// Frees a workspace allocation of `capacity` usable bytes.
 ///
 /// # Safety
 ///
-/// `ptr` must be an allocation `grow` made at `capacity` bytes, not yet freed,
-/// and the caller must drop its handle to it.
-unsafe fn free(ptr: NonNull<u8>, capacity: usize) {
-    let layout =
-        Layout::from_size_align(capacity, ALIGN).expect("the layout was valid when allocated");
+/// `base` must be the start of an allocation `grow` made for `capacity`
+/// bytes, not yet freed, and the caller must drop its handle to it.
+unsafe fn free(base: NonNull<u8>, capacity: usize) {
     // SAFETY: the caller's contract: this layout, allocated and live.
-    unsafe { dealloc(ptr.as_ptr(), layout) };
+    unsafe { dealloc(base.as_ptr(), allocation_layout(capacity)) };
 }
 
 impl Default for Workspace {
