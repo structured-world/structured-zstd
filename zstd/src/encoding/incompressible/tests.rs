@@ -598,6 +598,34 @@ fn the_rewritten_scan_decides_every_block_as_before() {
     );
 }
 
+/// A frame that stores its literals raw searches its 2-24 KiB blocks instead of
+/// asking the classifier, where the search is the cheaper of the two; every
+/// other block, and every block of a frame that codes its literals, still asks.
+#[test]
+fn only_small_blocks_of_raw_literal_frames_skip_the_classifier() {
+    for len in [2 * 1024, 10 * 1024, 24 * 1024] {
+        assert!(
+            !raw_skip_worth_asking(true, len),
+            "{len} bytes, raw literals"
+        );
+        assert!(
+            raw_skip_worth_asking(false, len),
+            "{len} bytes, coded literals"
+        );
+    }
+    for len in [
+        RAW_FAST_PATH_MIN_BLOCK_LEN,
+        2 * 1024 - 1,
+        24 * 1024 + 1,
+        128 * 1024,
+    ] {
+        assert!(
+            raw_skip_worth_asking(true, len),
+            "{len} bytes, raw literals"
+        );
+    }
+}
+
 /// The window, not the level, is what closes the skip: a match that may reach
 /// further back is worth more than one written off unsearched.
 #[test]

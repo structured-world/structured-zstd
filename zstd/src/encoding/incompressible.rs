@@ -648,6 +648,29 @@ impl SeenContentGrid {
     }
 }
 
+/// Block sizes at which a frame that stores its literals raw searches rather
+/// than asks the classifier.
+///
+/// With literals stored raw (the fast strategy with a positive target length,
+/// the negative levels) a search that finds nothing costs one pass of the fast
+/// kernel plus the raw fallback, which is also all upstream does there. The
+/// classifier's cost is fixed per block, so on a small block it is the larger
+/// of the two. Measured with the classifier on and off in one binary, per
+/// frame of noise, levels -7 to -1: from 2 KiB to 24 KiB searching was 1-57%
+/// faster in all but two of the seventy cells on x86_64 and i686, at 32 and
+/// 48 KiB the two were even, and from 64 KiB searching was 12-270% slower.
+/// Below 2 KiB the levels split (-7 faster, -1 up to 48% slower on i686), and
+/// every positive level searched slower at nearly every size, so both keep the
+/// classifier.
+const SEARCH_INSTEAD_OF_CLASSIFIER: core::ops::RangeInclusive<usize> = 2 * 1024..=24 * 1024;
+
+/// Whether a block is worth the classifier's fixed cost, given whether the
+/// frame stores its literals raw. See [`SEARCH_INSTEAD_OF_CLASSIFIER`].
+#[inline]
+pub(crate) fn raw_skip_worth_asking(literals_stored_raw: bool, block_len: usize) -> bool {
+    !(literals_stored_raw && SEARCH_INSTEAD_OF_CLASSIFIER.contains(&block_len))
+}
+
 pub(crate) const RAW_FAST_PATH_MIN_BLOCK_LEN: usize = 512;
 pub(crate) const RAW_FAST_PATH_MAX_SAMPLE_LEN: usize = 4096;
 pub(crate) const RAW_FAST_PATH_MIN_SAMPLE_LEN: usize = 32;

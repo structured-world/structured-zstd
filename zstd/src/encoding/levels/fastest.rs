@@ -8,7 +8,7 @@ use crate::{
         frame_compressor::CompressState,
         incompressible::{
             block_looks_incompressible, block_looks_incompressible_strict,
-            compression_level_allows_raw_fast_path,
+            compression_level_allows_raw_fast_path, raw_skip_worth_asking,
         },
         match_generator::MatchGeneratorDriver,
         strategy::StrategyTag,
@@ -94,6 +94,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     let looks_incompressible = rle_byte_opt.is_none()
         && !dict_rejects_raw
         && raw_skip_reachable
+        && raw_skip_worth_asking(state.literal_compression_disabled, block_len)
         && should_emit_raw_fast_path(compression_level, bytes);
     let repeats_earlier_content = if looks_incompressible {
         state
@@ -359,6 +360,7 @@ pub(crate) fn compress_block_encoded_borrowed(
     let looks_incompressible = !is_rle
         && !dict_rejects_raw
         && raw_skip_reachable
+        && raw_skip_worth_asking(state.literal_compression_disabled, block.len())
         && should_emit_raw_fast_path(compression_level, block);
     let repeats_earlier_content = if looks_incompressible {
         state
