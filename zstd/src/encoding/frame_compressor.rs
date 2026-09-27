@@ -1451,8 +1451,9 @@ impl<M: Matcher> CompressState<M> {
         self.matcher.reset_in_workspace(level, &mut self.workspace);
     }
 
-    /// Carves the block buffers for blocks of up to `block_capacity` bytes,
-    /// opening the layout first when the matcher took no tables from it.
+    /// Carves the block buffers for blocks of up to `block_capacity` bytes, or
+    /// of the frame's length when that is exact and shorter, opening the layout
+    /// first when the matcher took no tables from it.
     ///
     /// # Panics
     ///
@@ -1463,9 +1464,12 @@ impl<M: Matcher> CompressState<M> {
             self.workspace.open(0, block_capacity);
         }
         let reserved = self.workspace.block_capacity();
+        // A frame of exact length never carries a block longer than itself, and
+        // the layout reserved for no more.
+        let largest = block_capacity.min(self.workspace.ingest().exact_len().unwrap_or(usize::MAX));
         assert!(
-            block_capacity <= reserved,
-            "a {block_capacity}-byte block exceeds the {reserved} bytes the workspace reserved"
+            largest <= reserved,
+            "a {largest}-byte block exceeds the {reserved} bytes the workspace reserved"
         );
         if self.workspace.ingest() == crate::encoding::workspace::IngestPlan::Raw {
             self.block_scratch.unbind();
@@ -1900,8 +1904,16 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             }
             // Dictionary frames: only the Simple (Fast) backend in attach mode
             // has a borrowed (no input copy) dict scan. Copy-mode dict frames
-            // and the other backends still take the owned path.
-            return self.state.matcher.borrowed_dict_supported();
+            // and the other backends still take the owned path. The reset laid
+            // the history out on a prediction of this, which must hold, or the
+            // history is either unused or outgrown.
+            let attached = self.state.matcher.borrowed_dict_supported();
+            debug_assert_eq!(
+                attached,
+                self.state.matcher.frame_scans_in_place(),
+                "the reset's in-place prediction disagrees with the primed dictionary mode",
+            );
+            return attached;
         }
         // The borrowed (no-copy, in-place over-window) scan exists for the
         // Simple (Fast), Dfast, and Row backends, and for the HashChain
@@ -1990,7 +2002,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // previous call may have left behind (a wrong hint would change the
         // resolved window/header and could flip borrowed eligibility).
         self.source_size_hint = Some(input.len() as u64);
-        let prep = self.prepare_frame(crate::encoding::workspace::IngestPlan::Slice);
+        let prep = self.prepare_frame(crate::encoding::workspace::IngestPlan::Slice(input.len()));
         // Content size is known up front (one-shot), so write the frame
         // header FIRST and emit blocks STRAIGHT into `out` — no separate
         // `all_blocks` accumulator and no header+blocks copy (which was the

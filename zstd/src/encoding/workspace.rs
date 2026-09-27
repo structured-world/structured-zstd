@@ -42,19 +42,30 @@ pub(crate) const fn region_bytes<T>(count: usize) -> usize {
 
 /// How a frame's input will reach the match finder, as the context knows it
 /// before the match finder resets. This is what sizes the match finder's input
-/// history; the input's length, when known, comes with the source-size hint.
+/// history and the block buffers; a length carried here is exact, an advisory
+/// one comes with the source-size hint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IngestPlan {
     /// The frame writes its blocks raw and keeps no history.
     Raw,
-    /// One contiguous slice, handed over whole: the match finder may scan it
-    /// in place and keep no copy of it.
-    Slice,
+    /// One contiguous slice of this many bytes, handed over whole: the match
+    /// finder may scan it in place and keep no copy of it.
+    Slice(usize),
     /// A stream, read block by block into the history.
     Stream,
-    /// A stream of a pledged size, read like [`Self::Stream`]. The context
-    /// refuses input of any other length, so the size is exact.
-    PledgedStream,
+    /// A stream of this many pledged bytes, read like [`Self::Stream`]. The
+    /// context refuses input of any other length, so the size is exact.
+    PledgedStream(usize),
+}
+
+impl IngestPlan {
+    /// The frame's length when the plan knows it exactly.
+    pub(crate) fn exact_len(self) -> Option<usize> {
+        match self {
+            Self::Slice(len) | Self::PledgedStream(len) => Some(len),
+            Self::Raw | Self::Stream => None,
+        }
+    }
 }
 
 /// The single allocation a compression context carves its match-finder tables,
@@ -263,9 +274,14 @@ impl Workspace {
 
     /// The largest block a frame with a `window`-byte window carries: the
     /// ceiling [`Self::begin_layout`] set, capped by the window (upstream
-    /// `blockSize = MIN(maxBlockSize, windowSize)`), and at least one byte.
+    /// `blockSize = MIN(maxBlockSize, windowSize)`) and by a frame length the
+    /// plan knows exactly, since no block holds more than the frame; at least
+    /// one byte.
     pub(crate) fn block_for_window(&self, window: usize) -> usize {
-        self.block_target.min(window).max(1)
+        self.block_target
+            .min(window)
+            .min(self.ingest.exact_len().unwrap_or(usize::MAX))
+            .max(1)
     }
 
     /// The block size the open layout reserved the trailing part for.

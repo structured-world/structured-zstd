@@ -482,8 +482,8 @@ fn frame_history_bytes(
     // The input and the room past it its last read may ask for.
     let (input, read_slack) = match workspace.ingest() {
         IngestPlan::Raw => return 0,
-        IngestPlan::Slice if in_place => return dict_len.min(ceiling),
-        IngestPlan::Slice | IngestPlan::PledgedStream => (bytes, 0),
+        IngestPlan::Slice(_) if in_place => return dict_len.min(ceiling),
+        IngestPlan::Slice(len) | IngestPlan::PledgedStream(len) => (Some(len), 0),
         IngestPlan::Stream => (
             bytes.map(|bytes| {
                 let level_window_log =
@@ -1368,14 +1368,30 @@ impl Matcher for MatchGeneratorDriver {
             }
             None => max_window_size,
         };
-        // A slice with no dictionary on a backend that can scan it in place
-        // never enters the history; the frame loop reads this decision back
-        // (`frame_scans_in_place`) instead of taking it again. The kernels keep
-        // positions in `u32`, so a longer slice is copied.
-        self.frame_in_place = workspace.ingest() == crate::encoding::workspace::IngestPlan::Slice
-            && dict_hint.is_none()
-            && self.borrowed_supported()
-            && hint.is_some_and(|len| len <= u64::from(u32::MAX));
+        // The Fast backend's dictionary mode, which `prime_with_dictionary`
+        // takes from the same `reset_size_log`: attached, the dictionary goes
+        // into a table of its own and the input is scanned in place.
+        let fast_attach = matches!(next_backend, super::strategy::BackendTag::Simple)
+            && self.reset_dict_attach_ok
+            && self
+                .reset_size_log
+                .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
+        // A slice on a backend that can scan it in place never enters the
+        // history, with no dictionary or one the Fast backend attaches; the frame
+        // loop reads this decision back (`frame_scans_in_place`) instead of
+        // taking it again. The kernels keep positions in `u32`, counting a
+        // dictionary ahead of the slice, so a longer one is copied.
+        let dict_len = dict_hint.map_or(0, |sizes| sizes.content);
+        self.frame_in_place = match workspace.ingest() {
+            crate::encoding::workspace::IngestPlan::Slice(len) => {
+                (dict_hint.is_none() || fast_attach)
+                    && self.borrowed_supported()
+                    && len
+                        .checked_add(dict_len)
+                        .is_some_and(|len| len <= u32::MAX as usize)
+            }
+            _ => false,
+        };
         let history_bytes = frame_history_bytes(
             next_backend,
             workspace,
@@ -1705,14 +1721,8 @@ impl Matcher for MatchGeneratorDriver {
         // Dfast/Row/HashChain have their OWN attach/copy regimes, but this bit
         // models only the Fast table split; those backends are keyed by the
         // resolved matcher geometry instead, so folding the Fast bit into their
-        // key would over-key identical resolved shapes. When it applies it
-        // matches the decision `prime_with_dictionary` makes from the same
-        // `reset_size_log`.
-        let fast_attach = matches!(next_backend, super::strategy::BackendTag::Simple)
-            && self.reset_dict_attach_ok
-            && self
-                .reset_size_log
-                .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
+        // key would over-key identical resolved shapes. `fast_attach` is the
+        // decision `prime_with_dictionary` makes from the same `reset_size_log`.
         // The LDM override is part of the snapshot identity ONLY on the
         // optimal (BinaryTree) path: that is the only backend whose cloned
         // `storage` carries a `BtMatcher::ldm_producer`. On Fast / Dfast /

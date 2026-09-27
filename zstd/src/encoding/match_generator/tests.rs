@@ -1891,8 +1891,16 @@ fn only_an_advisory_size_lays_out_slack_for_the_last_read() {
             CompressionLevel::Level(3),
         )
     };
-    assert_eq!(history(IngestPlan::Slice), 1000, "a slice is its bytes");
-    assert_eq!(history(IngestPlan::PledgedStream), 1000, "so is a pledge");
+    assert_eq!(
+        history(IngestPlan::Slice(1000)),
+        1000,
+        "a slice is its bytes"
+    );
+    assert_eq!(
+        history(IngestPlan::PledgedStream(1000)),
+        1000,
+        "so is a pledge"
+    );
     assert_eq!(
         history(IngestPlan::Stream),
         1000 + 1024,
@@ -1942,7 +1950,7 @@ fn a_pledged_stream_lays_out_history_for_all_of_its_input() {
 
     let block = crate::common::MAX_BLOCK_SIZE as usize;
     let mut workspace = Workspace::new();
-    workspace.begin_layout(block, no_trailing, IngestPlan::PledgedStream);
+    workspace.begin_layout(block, no_trailing, IngestPlan::PledgedStream(pledged));
     let bytes = super::frame_history_bytes(
         super::super::strategy::BackendTag::Dfast,
         &workspace,

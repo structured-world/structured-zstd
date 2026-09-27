@@ -104,7 +104,11 @@ fn only_tables_that_fill_the_workspace_take_it_zeroed() {
     let table = region_bytes::<u32>(64);
 
     let mut ws = Workspace::new();
-    ws.begin_layout(1 << 17, buffers_thrice_the_table, IngestPlan::Slice);
+    ws.begin_layout(
+        1 << 17,
+        buffers_thrice_the_table,
+        IngestPlan::Slice(1 << 17),
+    );
     ws.open_for_match_finder(table, table, 1 << 14, 0);
     assert!(
         !ws.zeroed,
@@ -117,12 +121,16 @@ fn only_tables_that_fill_the_workspace_take_it_zeroed() {
         4 * region_bytes::<u32>(64) / 5
     }
     let mut ws = Workspace::new();
-    ws.begin_layout(1 << 17, buffers_four_fifths_of_the_table, IngestPlan::Slice);
+    ws.begin_layout(
+        1 << 17,
+        buffers_four_fifths_of_the_table,
+        IngestPlan::Slice(1 << 17),
+    );
     ws.open_for_match_finder(table, table, 1 << 14, 0);
     assert!(!ws.zeroed, "tables just over half the workspace are filled");
 
     let mut ws = Workspace::new();
-    ws.begin_layout(1 << 17, no_trailing, IngestPlan::Slice);
+    ws.begin_layout(1 << 17, no_trailing, IngestPlan::Slice(1 << 17));
     ws.open_for_match_finder(table, table, 1 << 14, 0);
     assert!(
         ws.zeroed,
@@ -151,7 +159,11 @@ fn a_workspace_on_fresh_pages_is_taken_zeroed() {
     }
     let table = region_bytes::<u32>(64);
     let mut ws = Workspace::new();
-    ws.begin_layout(1 << 17, buffers_up_to_fresh_pages, IngestPlan::Slice);
+    ws.begin_layout(
+        1 << 17,
+        buffers_up_to_fresh_pages,
+        IngestPlan::Slice(1 << 17),
+    );
     // The tables are not even sparse: the input is expected to fill them.
     ws.open_for_match_finder(table, table, 1 << 14, usize::MAX);
     assert!(ws.zeroed, "a workspace past the fresh-page size is zeroed");
@@ -159,7 +171,11 @@ fn a_workspace_on_fresh_pages_is_taken_zeroed() {
     let zeros = ws.table::<u32>(64, 0);
     assert!(zeros.as_slice().iter().all(|&v| v == 0));
     // The next frame lays out on the same allocation: its pages are warm.
-    ws.begin_layout(1 << 17, buffers_up_to_fresh_pages, IngestPlan::Slice);
+    ws.begin_layout(
+        1 << 17,
+        buffers_up_to_fresh_pages,
+        IngestPlan::Slice(1 << 17),
+    );
     ws.open_for_match_finder(table, table, 1 << 14, usize::MAX);
     assert!(!ws.on_fresh_pages());
 }

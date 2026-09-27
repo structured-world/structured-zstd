@@ -884,11 +884,15 @@ impl<M: Matcher> CompressionContext<M> {
             .target_block_size
             .map_or(MAX_BLOCK_SIZE as usize, |t| t as usize);
         // Raw frames keep no history; everything else is read block by block,
-        // and a pledge makes its length exact.
+        // and a pledge makes its length exact. One past what the address space
+        // holds is laid out as a stream, which sizes to the window anyway.
         let ingest = if matches!(self.compression_level, CompressionLevel::Uncompressed) {
             crate::encoding::workspace::IngestPlan::Raw
-        } else if self.pledged_content_size.is_some() {
-            crate::encoding::workspace::IngestPlan::PledgedStream
+        } else if let Some(pledged) = self
+            .pledged_content_size
+            .and_then(|pledged| usize::try_from(pledged).ok())
+        {
+            crate::encoding::workspace::IngestPlan::PledgedStream(pledged)
         } else {
             crate::encoding::workspace::IngestPlan::Stream
         };

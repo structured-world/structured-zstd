@@ -1971,6 +1971,64 @@ fn a_copied_slice_reads_only_what_its_history_was_laid_out_for() {
     );
 }
 
+/// A frame of exact length carves its block buffers for a block no longer than
+/// itself: its window is rounded up to a power of two, and buffers sized from
+/// the window are kept for bytes no block of the frame can hold.
+#[test]
+fn a_frame_of_exact_length_reserves_block_buffers_for_its_length() {
+    let payload = generate_data(17, 5000);
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(3));
+    let mut out = Vec::new();
+    compressor.compress_independent_frame_into(&payload, &mut out);
+    assert!(
+        compressor.state.matcher.window_size() as usize > payload.len(),
+        "fixture: the window rounds past the frame"
+    );
+    assert_eq!(compressor.state.workspace.block_capacity(), payload.len());
+    let mut decoded = Vec::with_capacity(payload.len());
+    FrameDecoder::new()
+        .decode_all_to_vec(&out, &mut decoded)
+        .unwrap();
+    assert_eq!(decoded, payload);
+}
+
+/// A small slice under an attached dictionary at the fast levels is scanned in
+/// place, so only the dictionary enters the history, and only it is laid out:
+/// room for the slice would be reserved on every frame and never written.
+#[test]
+fn an_attached_dictionary_frame_lays_out_only_the_dictionary() {
+    let dict_len = 4 * 1024;
+    let dict =
+        crate::decoding::Dictionary::from_raw_content(0xABCD_0043, generate_data(5, dict_len))
+            .expect("raw dictionary should be valid");
+    let payload = generate_data(13, 2000);
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    compressor
+        .set_dictionary(dict)
+        .expect("dictionary should attach");
+    let mut out = Vec::new();
+    compressor.compress_independent_frame_into(&payload, &mut out);
+    assert!(
+        compressor.state.matcher.borrowed_dict_supported(),
+        "fixture: the dictionary is attached and the slice scanned in place"
+    );
+    assert_eq!(
+        compressor.state.matcher.ingest_capacity(),
+        dict_len,
+        "the history holds the dictionary and nothing else"
+    );
+    let mut decoded = Vec::with_capacity(payload.len());
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .add_dict(
+            crate::decoding::Dictionary::from_raw_content(0xABCD_0043, generate_data(5, dict_len))
+                .unwrap(),
+        )
+        .unwrap();
+    decoder.decode_all_to_vec(&out, &mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}
+
 /// A custom matcher holds nothing in the compressor's workspace, so replacing
 /// it hands back the matcher that ran, and the compressor goes on with the new
 /// one.
