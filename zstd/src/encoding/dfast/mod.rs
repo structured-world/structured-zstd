@@ -28,7 +28,7 @@ use super::match_generator::{
 use super::match_table::helpers::{common_prefix_len_with_kernel, extend_backwards_shared};
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
-use super::workspace::{Table, Workspace, region_bytes};
+use super::workspace::{HistoryBuf, Table, Workspace, region_bytes};
 
 /// Upstream zstd `HASH_READ_SIZE` (`zstd_compress_internal.h`): the largest probe
 /// width any hash / equality check in the dfast hot path reads at once.
@@ -89,8 +89,9 @@ pub(crate) struct DfastMatchGenerator {
     /// `history.len()`.
     pub(crate) uncommitted_len: usize,
     // We keep a contiguous searchable history to avoid rebuilding and reseeding
-    // the matcher state from disjoint block buffers on every block.
-    pub(crate) history: Vec<u8>,
+    // the matcher state from disjoint block buffers on every block. In the
+    // context's workspace when a context drives the matcher.
+    pub(crate) history: HistoryBuf,
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
     pub(crate) offset_hist: [u32; 3],
@@ -239,7 +240,7 @@ impl DfastMatchGenerator {
             window_blocks: VecDeque::new(),
             window_size: 0,
             uncommitted_len: 0,
-            history: Vec::new(),
+            history: HistoryBuf::new(),
             history_start: 0,
             history_abs_start: 0,
             offset_hist: [1, 4, 8],
@@ -668,7 +669,7 @@ impl DfastMatchGenerator {
     pub(crate) fn fill_uncommitted(
         &mut self,
         capacity: usize,
-        fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
+        fill: impl FnOnce(&mut HistoryBuf) -> (usize, bool),
     ) -> (usize, bool) {
         // Count the bytes already carried, not just this top-up: `capacity` is
         // `block_capacity - carried` (and zero on the EOF re-inspection), yet
@@ -695,25 +696,6 @@ impl DfastMatchGenerator {
         );
         self.uncommitted_len += appended;
         (appended, eof)
-    }
-
-    /// Size `history` for a whole frame in one allocation instead of letting
-    /// the per-block `reserve` walk a doubling chain. Clamped to the eviction
-    /// ceiling, which is the largest the buffer ever grows anyway.
-    pub(crate) fn reserve_for_frame(&mut self, bytes: usize) {
-        let ceiling = self.max_window_size
-            + (self.max_window_size >> 2)
-            + crate::common::MAX_BLOCK_SIZE as usize;
-        // `bytes` already carries the caller's block-sized slack, sized off the
-        // active block capacity — adding the format maximum here would reserve
-        // ~128 KiB for a frame whose window (and therefore block) is 1 KiB.
-        // Counted on top of what the buffer already holds: a dictionary is
-        // primed into it before this runs, so sizing to the frame alone would
-        // leave the dictionary's bytes to be grown into afterwards.
-        let target = self.history.len().saturating_add(bytes).min(ceiling);
-        if self.history.capacity() < target {
-            self.history.reserve_exact(target - self.history.len());
-        }
     }
 
     /// Bytes read but not yet claimed by a block: the pre-split pass picks the
@@ -823,11 +805,10 @@ impl DfastMatchGenerator {
             self.history_abs_start += removed_len;
         }
         if self.history_start != 0 {
-            // `split_off` returns the suffix in a fresh allocation;
-            // the original Vec (still owning [..history_start]) is
-            // dropped on the assignment below, releasing the dead
-            // prefix back to the allocator.
-            self.history = self.history.split_off(self.history_start);
+            // Drop the dead prefix. Its room is the context's (or the
+            // buffer's own, released with it), not the allocator's to take
+            // back now.
+            self.history.drain_front(self.history_start);
             self.history_start = 0;
         }
     }
@@ -1780,7 +1761,7 @@ impl DfastMatchGenerator {
         if self.history_start >= (self.max_window_size >> 2)
             || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
-            self.history.drain(..self.history_start);
+            self.history.drain_front(self.history_start);
             self.history_start = 0;
         }
     }

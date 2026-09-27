@@ -7,7 +7,7 @@ use crate::encoding::match_table::storage::MatchTable;
 
 fn table_with_history(buf: &[u8]) -> MatchTable {
     let mut t = MatchTable::new(buf.len().max(8));
-    t.history = buf.to_vec();
+    t.history = buf.to_vec().into();
     t.history_start = 0;
     t.history_abs_start = 0;
     t.window_size = buf.len();
@@ -70,7 +70,7 @@ fn find_best_match_returns_none_for_short_suffix() {
 #[test]
 fn hash_chain_candidate_picks_longest_forward_over_shorter_with_backward_room() {
     let mut t = MatchTable::new(64);
-    t.history = b"AAAabcdefZMQabcdefIJBAAAabcdefIJKKKKKKKK".to_vec();
+    t.history = b"AAAabcdefZMQabcdefIJBAAAabcdefIJKKKKKKKK".to_vec().into();
     t.history_start = 0;
     t.history_abs_start = 0;
     t.window_size = t.history.len();
@@ -112,7 +112,7 @@ fn hash_chain_candidate_picks_longest_forward_over_shorter_with_backward_room() 
 #[test]
 fn hash_chain_candidate_forward_ties_keep_first_visited() {
     let mut t = MatchTable::new(64);
-    t.history = b"abcdefghAabcdefghBabcdefghCabcdefghDZZZZ".to_vec();
+    t.history = b"abcdefghAabcdefghBabcdefghCabcdefghDZZZZ".to_vec().into();
     assert_eq!(t.history.len(), 40);
     t.history_start = 0;
     t.history_abs_start = 0;

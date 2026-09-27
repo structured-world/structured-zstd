@@ -22,7 +22,7 @@ use super::match_generator::{
     ROW_EMPTY_SLOT, ROW_HASH_BITS, ROW_HASH_KEY_LEN, ROW_LOG, ROW_MIN_MATCH_LEN, ROW_SEARCH_DEPTH,
     ROW_TAG_BITS, ROW_TARGET_LEN,
 };
-use super::workspace::{Table, Workspace, region_bytes};
+use super::workspace::{HistoryBuf, Table, Workspace, region_bytes};
 
 /// Upstream zstd lazy-parse bounds (`zstd_lazy.c`): the row parse stops
 /// `8 + ZSTD_ROW_HASH_CACHE_SIZE` bytes before the block end, a miss steps
@@ -2336,7 +2336,7 @@ pub(crate) struct RowMatchGenerator {
     /// (in-place ingest). Zero on the staged path. Explicit rather than derived
     /// from `window_size`, since a primed dictionary also lives in `history`.
     pub(crate) uncommitted_len: usize,
-    pub(crate) history: Vec<u8>,
+    pub(crate) history: HistoryBuf,
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
     pub(crate) offset_hist: [u32; 3],
@@ -2499,7 +2499,7 @@ impl RowMatchGenerator {
             chunk_lens: VecDeque::new(),
             window_size: 0,
             uncommitted_len: 0,
-            history: Vec::new(),
+            history: HistoryBuf::new(),
             history_start: 0,
             history_abs_start: 0,
             offset_hist: [1, 4, 8],
@@ -2542,11 +2542,11 @@ impl RowMatchGenerator {
     pub(crate) fn heap_size(&self) -> usize {
         let u32_sz = core::mem::size_of::<u32>();
         self.chunk_lens.capacity() * core::mem::size_of::<usize>()
-            + self.history.capacity()
-            // One buffer for whichever finder is live: the row positions with
-            // the cursors and tags in its byte tail, or the chain / tree hash
-            // and link tables. Counted here only when it is not in a context's
-            // workspace.
+            // The history and one buffer for whichever finder is live (the row
+            // positions with the cursors and tags in its byte tail, or the
+            // chain / tree hash and link tables), each counted here only when
+            // it is not in a context's workspace.
+            + self.history.owned_bytes()
             + self.tables.owned_bytes()
             + self.dict.table().map_or(0, |t| {
                 t.heads.capacity()
@@ -2864,7 +2864,7 @@ impl RowMatchGenerator {
     pub(crate) fn fill_uncommitted(
         &mut self,
         capacity: usize,
-        fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
+        fill: impl FnOnce(&mut HistoryBuf) -> (usize, bool),
     ) -> (usize, bool) {
         // Count the bytes already carried, not just this top-up: `capacity` is
         // `block_capacity - carried` (and zero on the EOF re-inspection), yet
@@ -2890,25 +2890,6 @@ impl RowMatchGenerator {
         );
         self.uncommitted_len += appended;
         (appended, eof)
-    }
-
-    /// Size `history` for a whole frame in one allocation instead of letting
-    /// the per-block `reserve` walk a doubling chain. Clamped to the eviction
-    /// ceiling, which is the largest the buffer ever grows anyway.
-    pub(crate) fn reserve_for_frame(&mut self, bytes: usize) {
-        let ceiling = self.max_window_size
-            + (self.max_window_size >> 2)
-            + crate::common::MAX_BLOCK_SIZE as usize;
-        // `bytes` already carries the caller's block-sized slack, sized off the
-        // active block capacity — adding the format maximum here would reserve
-        // ~128 KiB for a frame whose window (and therefore block) is 1 KiB.
-        // Counted on top of what the buffer already holds: a dictionary is
-        // primed into it before this runs, so sizing to the frame alone would
-        // leave the dictionary's bytes to be grown into afterwards.
-        let target = self.history.len().saturating_add(bytes).min(ceiling);
-        if self.history.capacity() < target {
-            self.history.reserve_exact(target - self.history.len());
-        }
     }
 
     /// Bytes read but not yet claimed by a block.
@@ -3605,7 +3586,7 @@ impl RowMatchGenerator {
         if self.history_start >= (self.max_window_size >> 2)
             || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
-            self.history.drain(..self.history_start);
+            self.history.drain_front(self.history_start);
             self.history_start = 0;
         }
     }

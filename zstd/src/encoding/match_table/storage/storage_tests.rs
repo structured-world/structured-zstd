@@ -110,7 +110,7 @@ fn replay_history_for_rebase_bt_walks_inserted_prefix() {
     let mut t = new_table(64);
     // Construct a contiguous mirror long enough for the BT walker
     // (`bt_insert_range` reads 8-byte prefixes).
-    t.history = vec![0u8; 64];
+    t.history = vec![0u8; 64].into();
     for (i, slot) in t.history.iter_mut().enumerate() {
         *slot = (i % 17) as u8;
     }
@@ -168,7 +168,7 @@ fn the_hoisted_hash3_fill_matches_the_per_position_loop() {
     for (floor, index_shift) in [(0, 0), (12, 70_000)] {
         let build = |hoisted: bool| {
             let mut t = new_table(64);
-            t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec();
+            t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec().into();
             t.history_start = 0;
             t.history_abs_start = floor;
             t.position_base = floor;
@@ -225,7 +225,7 @@ fn the_hoisted_hash3_fill_matches_the_per_position_loop() {
 #[test]
 fn arming_a_block_re_encodes_when_its_last_position_would_not_fit() {
     let mut t = new_table(64);
-    t.history = b"abcdef_abcdef_abcdef_abcdef".to_vec();
+    t.history = b"abcdef_abcdef_abcdef_abcdef".to_vec().into();
     t.history_start = 0;
     t.history_abs_start = 0;
     t.window_size = t.history.len();
@@ -252,7 +252,7 @@ fn arming_a_block_re_encodes_when_its_last_position_would_not_fit() {
 #[test]
 fn arming_a_block_that_already_fits_changes_nothing() {
     let mut t = new_table(64);
-    t.history = b"abcdef_abcdef_abcdef_abcdef".to_vec();
+    t.history = b"abcdef_abcdef_abcdef_abcdef".to_vec().into();
     t.history_start = 0;
     t.history_abs_start = 0;
     t.window_size = t.history.len();
@@ -272,7 +272,7 @@ fn arming_a_block_that_already_fits_changes_nothing() {
 #[test]
 fn a_hash3_catch_up_past_the_index_range_rebases_first() {
     let mut t = new_table(64);
-    t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec();
+    t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec().into();
     t.history_start = 0;
     t.history_abs_start = 0;
     t.window_size = t.history.len();
@@ -302,7 +302,7 @@ fn a_hash3_catch_up_past_the_index_range_rebases_first() {
 #[test]
 fn rebase_positions_cold_rebuilds_hash3_for_btultra2() {
     let mut t = new_table(64);
-    t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec();
+    t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec().into();
     t.history_start = 0;
     t.history_abs_start = 0;
     t.window_size = t.history.len();
@@ -336,7 +336,7 @@ fn rebase_positions_cold_rebuilds_hash3_for_btultra2() {
 #[test]
 fn insert_positions_with_step_zero_step_is_noop() {
     let mut t = new_table(32);
-    t.history = vec![0u8; 32];
+    t.history = vec![0u8; 32].into();
     t.push_test_chunk(vec![0u8; 32]);
     t.ensure_tables();
     let next_to_update3_before = t.next_to_update3;
@@ -352,7 +352,7 @@ fn insert_positions_with_step_saturating_step_breaks_loop() {
     // `pos.saturating_add(step)` to usize::MAX, then the `next <= pos`
     // guard breaks out of the loop after one insert.
     let mut t = new_table(32);
-    t.history = vec![1u8; 32];
+    t.history = vec![1u8; 32].into();
     t.push_test_chunk(vec![1u8; 32]);
     t.ensure_tables();
     t.insert_positions_with_step(0, 16, usize::MAX);
@@ -456,21 +456,6 @@ fn reset_clears_uncommitted_bytes_left_by_an_abandoned_fill() {
         "reset must drop bytes no block claimed"
     );
     assert!(t.live_history().is_empty(), "reset must clear the window");
-}
-
-#[test]
-fn reserve_for_frame_takes_the_request_as_given() {
-    // The caller sizes the slack off the ACTIVE block capacity, which a small
-    // window shrinks below the format maximum. Adding a fixed 128 KiB here
-    // would dwarf a small hinted frame's whole buffer.
-    let mut t = new_table(1 << 20);
-    t.reserve_for_frame(1024);
-    assert!(t.history.capacity() >= 1024, "the request must be honoured");
-    assert!(
-        t.history.capacity() < 64 * 1024,
-        "reservation must not add a format-maximum block on top: got {}",
-        t.history.capacity()
-    );
 }
 
 #[test]

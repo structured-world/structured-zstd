@@ -8,11 +8,12 @@
 //! set in again. Carving everything out of one allocation keeps the pages the
 //! context's own, on any allocator.
 //!
-//! The layout follows upstream: tables are carved from the front, buffers from
-//! the back, and every region starts on an [`ALIGN`]-byte boundary. A frame lays
-//! the workspace out in two parts: the match finder opens it with the bytes its
-//! tables need and carves them, then the context carves its per-block buffers
-//! from what the opening reserved for it.
+//! The layout follows upstream: the match finder's tables and its input history
+//! are carved from the front, the per-block buffers from the back, and every
+//! region starts on an [`ALIGN`]-byte boundary. A frame lays the workspace out in
+//! two parts: the match finder opens it with the bytes it needs and carves them,
+//! then the context carves its per-block buffers from what the opening reserved
+//! for it.
 
 use alloc::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use alloc::vec::Vec;
@@ -39,14 +40,28 @@ pub(crate) const fn region_bytes<T>(count: usize) -> usize {
     padded & !(ALIGN - 1)
 }
 
-/// The single allocation a compression context carves its match-finder tables
-/// and per-block buffers from.
+/// How a frame's input will reach the match finder, as the context knows it
+/// before the match finder resets. This is what sizes the match finder's input
+/// history; the input's length, when known, comes with the source-size hint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IngestPlan {
+    /// The frame writes its blocks raw and keeps no history.
+    Raw,
+    /// One contiguous slice, handed over whole: the match finder may scan it
+    /// in place and keep no copy of it.
+    Slice,
+    /// A stream, read block by block into the history.
+    Stream,
+}
+
+/// The single allocation a compression context carves its match-finder tables,
+/// input history and per-block buffers from.
 ///
 /// It grows when a frame needs more than it holds and is kept otherwise, so a
-/// context allocates once for as long as its parameters do not grow. A table
+/// context allocates once for as long as its parameters do not grow. A region
 /// laid out at the same place in the same allocation as on the previous frame
-/// keeps its contents, which is what lets a match finder carry a table across
-/// frames.
+/// keeps its contents, which is what lets a match finder carry a table, or a
+/// dictionary at the head of its history, across frames.
 ///
 /// `pub` only so it can appear in [`Matcher::reset_in_workspace`]; the module
 /// is private, so no code outside this crate can name, build or receive one.
@@ -58,16 +73,22 @@ pub struct Workspace {
     /// Counts allocations; a region is only the continuation of an earlier one
     /// if both were carved from the same allocation.
     generation: u64,
-    /// Every byte below this offset has been written since the allocation was
-    /// made, so a region inside it may be read before its holder writes it.
-    valid_front: usize,
-    /// Carving cursors of the current layout.
+    /// Carving cursors of the current layout: tables from the front up, the
+    /// history from the end of the leading part down, buffers from the back
+    /// down.
     front: usize,
+    history_front: usize,
+    leading: usize,
     back: usize,
+    /// The allocation a growth replaced, kept until the history has been
+    /// bound again so its bytes can be carried over.
+    retired: Option<(NonNull<u8>, usize)>,
     /// The block ceiling the context set before the window was known, and the
     /// bytes it carves after the match finder for a given block size.
     block_target: usize,
     trailing_for: fn(usize) -> usize,
+    /// How the frame's input reaches the match finder, set with the layout.
+    ingest: IngestPlan,
     /// The block size the open layout's trailing part was sized for.
     block_capacity: usize,
     open: bool,
@@ -97,11 +118,14 @@ impl Workspace {
             ptr: NonNull::<Aligned>::dangling().cast(),
             capacity: 0,
             generation: 0,
-            valid_front: 0,
             front: 0,
+            history_front: 0,
+            leading: 0,
             back: 0,
+            retired: None,
             block_target: 0,
             trailing_for: no_trailing,
+            ingest: IngestPlan::Stream,
             block_capacity: 0,
             open: false,
             layouts_since_allocation: 0,
@@ -115,10 +139,18 @@ impl Workspace {
 
     /// Starts a frame's layout. The context will carve `trailing_for(block)`
     /// bytes after the match finder, where `block` is `block_target` capped by
-    /// the frame's window; nothing may be carved until [`Self::open`].
-    pub(crate) fn begin_layout(&mut self, block_target: usize, trailing_for: fn(usize) -> usize) {
+    /// the frame's window, and its input reaches the match finder as `ingest`
+    /// says; nothing may be carved until [`Self::open`].
+    pub(crate) fn begin_layout(
+        &mut self,
+        block_target: usize,
+        trailing_for: fn(usize) -> usize,
+        ingest: IngestPlan,
+    ) {
+        self.release_retired();
         self.block_target = block_target;
         self.trailing_for = trailing_for;
+        self.ingest = ingest;
         self.open = false;
     }
 
@@ -127,28 +159,37 @@ impl Workspace {
         self.open
     }
 
-    /// The block size the open layout reserved the trailing part for: the
-    /// ceiling [`Self::begin_layout`] set, capped by the window [`Self::open`]
-    /// was given.
+    /// How the frame being laid out takes its input.
+    pub(crate) fn ingest(&self) -> IngestPlan {
+        self.ingest
+    }
+
+    /// The largest block a frame with a `window`-byte window carries: the
+    /// ceiling [`Self::begin_layout`] set, capped by the window (upstream
+    /// `blockSize = MIN(maxBlockSize, windowSize)`), and at least one byte.
+    pub(crate) fn block_for_window(&self, window: usize) -> usize {
+        self.block_target.min(window).max(1)
+    }
+
+    /// The block size the open layout reserved the trailing part for.
     pub(crate) fn block_capacity(&self) -> usize {
         self.block_capacity
     }
 
-    /// Opens the layout with `leading` bytes for the caller's tables ahead of
-    /// the trailing part sized for a frame with a `window`-byte window,
-    /// allocating anew when the two together do not fit, or when the
-    /// allocation has stayed far larger than the frames need. A new allocation
-    /// discards every region carved before, so a holder whose region is not a
-    /// continuation must reinitialise it.
+    /// Opens the layout with `leading` bytes for the caller's tables and
+    /// history ahead of the trailing part sized for a frame with a
+    /// `window`-byte window, allocating anew when the two together do not fit,
+    /// or when the allocation has stayed far larger than the frames need. A new
+    /// allocation discards every table carved before, so a holder whose table
+    /// is not a continuation must reinitialise it; a history carries its bytes
+    /// over (see [`HistoryBuf::bind`]).
     ///
     /// # Panics
     ///
     /// Panics when the layout is already open, or its size overflows `usize`.
     pub(crate) fn open(&mut self, leading: usize, window: usize) {
         assert!(!self.open, "a workspace layout opens once per frame");
-        // Upstream `blockSize = MIN(maxBlockSize, windowSize)`; a block holds
-        // at least one byte.
-        self.block_capacity = self.block_target.min(window).max(1);
+        self.block_capacity = self.block_for_window(window);
         let total = leading
             .checked_add((self.trailing_for)(self.block_capacity))
             .expect("workspace size overflows usize");
@@ -170,6 +211,8 @@ impl Workspace {
             self.grow(total);
         }
         self.front = 0;
+        self.leading = leading;
+        self.history_front = leading;
         self.back = self.capacity;
         self.open = true;
     }
@@ -177,6 +220,11 @@ impl Workspace {
     /// A table of `count` values that continues `previous` when it lands on the
     /// same bytes of the same allocation, returned with `true`; otherwise every
     /// value is set to `empty` and it is returned with `false`.
+    ///
+    /// A continuation holds only what its holder wrote: the holder filled the
+    /// region when it was first carved and is the only one to have written it
+    /// since, because every holder is laid out anew with every layout and no
+    /// two regions of one layout share a byte.
     ///
     /// # Panics
     ///
@@ -187,27 +235,15 @@ impl Workspace {
         previous: &Region<T>,
         empty: T,
     ) -> (Region<T>, bool) {
-        assert!(
-            self.open,
-            "carving from a workspace layout that is not open"
-        );
-        let bytes = region_bytes::<T>(count);
-        assert!(
-            bytes <= self.back - self.front,
-            "workspace sized below its layout"
-        );
-        let mut region = self.region_at::<T>(self.front, count);
-        let end = self.front + bytes;
+        let offset = self.carve_front(region_bytes::<T>(count));
+        let mut region = self.region_at::<T>(offset, count);
         let kept = count > 0
             && previous.generation == region.generation
             && previous.ptr == region.ptr
-            && previous.len == count
-            && end <= self.valid_front;
+            && previous.len == count;
         if !kept {
             region.fill(empty);
         }
-        self.front = end;
-        self.valid_front = self.valid_front.max(end);
         (region, kept)
     }
 
@@ -235,16 +271,47 @@ impl Workspace {
         );
         let bytes = region_bytes::<T>(capacity);
         assert!(
-            bytes <= self.back - self.front,
+            bytes <= self.back - self.leading,
             "workspace sized below its layout"
         );
         self.back -= bytes;
-        // A buffer may take bytes a table of an earlier layout had written; it
-        // only ever writes them, so the written prefix stays written.
         RegionVec {
             region: self.region_at::<T>(self.back, capacity),
             len: 0,
         }
+    }
+
+    /// Room for `capacity` history bytes at the end of the leading part, after
+    /// the tables, left unwritten: a [`HistoryBuf`] only ever reads what it
+    /// wrote. Its place depends only on how much of the leading part the
+    /// tables take, so a history can be bound before the tables are.
+    fn history_room(&mut self, capacity: usize) -> Region<u8> {
+        assert!(
+            self.open,
+            "carving from a workspace layout that is not open"
+        );
+        let bytes = region_bytes::<u8>(capacity);
+        assert!(
+            bytes <= self.history_front - self.front,
+            "workspace sized below its layout"
+        );
+        self.history_front -= bytes;
+        self.region_at::<u8>(self.history_front, capacity)
+    }
+
+    /// Advances the front cursor past `bytes`, returning where they start.
+    fn carve_front(&mut self, bytes: usize) -> usize {
+        assert!(
+            self.open,
+            "carving from a workspace layout that is not open"
+        );
+        assert!(
+            bytes <= self.history_front - self.front,
+            "workspace sized below its layout"
+        );
+        let offset = self.front;
+        self.front += bytes;
+        offset
     }
 
     fn region_at<T>(&self, offset: usize, count: usize) -> Region<T> {
@@ -265,13 +332,18 @@ impl Workspace {
         }
     }
 
-    /// Replaces the allocation with one of `bytes`, discarding every region:
+    /// Replaces the allocation with one of `bytes`, discarding every table:
     /// the generation moves on, so no later region can pass for a continuation
-    /// of one carved before, even at the same address.
+    /// of one carved before. The old allocation is retired rather than freed,
+    /// until the history has carried its bytes out of it.
     fn grow(&mut self, bytes: usize) {
-        self.release();
+        self.release_retired();
+        if self.capacity != 0 {
+            self.retired = Some((self.ptr, self.capacity));
+            self.ptr = NonNull::<Aligned>::dangling().cast();
+            self.capacity = 0;
+        }
         self.generation += 1;
-        self.valid_front = 0;
         self.layouts_since_allocation = 0;
         if bytes == 0 {
             return;
@@ -286,18 +358,40 @@ impl Workspace {
         self.capacity = bytes;
     }
 
+    /// Frees the allocation a growth retired. Every holder has been laid out
+    /// in the new one by the time this runs.
+    pub(crate) fn release_retired(&mut self) {
+        if let Some((ptr, capacity)) = self.retired.take() {
+            // SAFETY: `grow` retired this allocation and `take` dropped the
+            // only record of it.
+            unsafe { free(ptr, capacity) };
+        }
+    }
+
     fn release(&mut self) {
+        self.release_retired();
         if self.capacity == 0 {
             return;
         }
-        let layout = Layout::from_size_align(self.capacity, ALIGN)
-            .expect("the layout was valid when allocated");
-        // SAFETY: `ptr` came from `alloc` with this same layout and has not been
-        // freed; `capacity` is reset below so it is never freed twice.
-        unsafe { dealloc(self.ptr.as_ptr(), layout) };
+        // SAFETY: the current allocation; `capacity` is reset below so it is
+        // never freed twice.
+        unsafe { free(self.ptr, self.capacity) };
         self.ptr = NonNull::<Aligned>::dangling().cast();
         self.capacity = 0;
     }
+}
+
+/// Frees a workspace allocation of `capacity` bytes.
+///
+/// # Safety
+///
+/// `ptr` must be an allocation `grow` made at `capacity` bytes, not yet freed,
+/// and the caller must drop its handle to it.
+unsafe fn free(ptr: NonNull<u8>, capacity: usize) {
+    let layout =
+        Layout::from_size_align(capacity, ALIGN).expect("the layout was valid when allocated");
+    // SAFETY: the caller's contract: this layout, allocated and live.
+    unsafe { dealloc(ptr.as_ptr(), layout) };
 }
 
 impl Default for Workspace {
@@ -460,6 +554,14 @@ impl<T: Copy> Table<T> {
     pub(crate) fn owned_bytes(&self) -> usize {
         self.own.capacity() * size_of::<T>()
     }
+
+    /// Moves the values into an allocation of their own, for a matcher leaving
+    /// the context whose workspace holds them.
+    pub(crate) fn leave_workspace(&mut self) {
+        if self.own.is_empty() && !self.is_empty() {
+            *self = self.clone();
+        }
+    }
 }
 
 impl<T: Copy> Clone for Table<T> {
@@ -496,6 +598,312 @@ impl<T: Copy> core::ops::Deref for Table<T> {
 impl<T: Copy> core::ops::DerefMut for Table<T> {
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
+    }
+}
+
+/// A match finder's input history: bytes appended block by block, trimmed at
+/// the front as the window slides, used like a `Vec<u8>`.
+///
+/// It lives in the context's workspace at the capacity the frame was laid out
+/// for, and moves into an allocation of its own if a frame brings more than
+/// that (a size hint that undercounted). Only the first `len` bytes are ever
+/// read; the rest of the room is left unwritten.
+///
+/// Its bytes survive every layout: [`Self::bind`] carries them into the new
+/// room wherever it lands. A matcher keeps its dictionary at the head of the
+/// history from one frame to the next, so losing them would lose it.
+///
+/// The room is always live memory: a workspace room lasts until the next
+/// bind (the workspace keeps an allocation it replaced until then), and a
+/// matcher leaving its context moves its history into a room of its own.
+///
+/// `pub` only so it can appear in [`Matcher::fill_in_place`]; the module is
+/// private, so no code outside this crate can name, build or receive one.
+///
+/// [`Matcher::fill_in_place`]: crate::encoding::Matcher::fill_in_place
+pub struct HistoryBuf {
+    ptr: NonNull<u8>,
+    capacity: usize,
+    len: usize,
+    /// Backs the room when the buffer owns it: its length stays `0` and its
+    /// capacity is the room, which this type manages.
+    own: Vec<u8>,
+}
+
+// SAFETY: the buffer is the sole handle to its room, whether carved from the
+// context's workspace or owned.
+unsafe impl Send for HistoryBuf {}
+// SAFETY: `&HistoryBuf` only reads.
+unsafe impl Sync for HistoryBuf {}
+
+impl HistoryBuf {
+    /// An empty buffer with no room.
+    pub(crate) const fn new() -> Self {
+        Self {
+            ptr: NonNull::dangling(),
+            capacity: 0,
+            len: 0,
+            own: Vec::new(),
+        }
+    }
+
+    /// Workspace bytes [`Self::bind`] carves for a frame that needs `capacity`
+    /// bytes: never less than the buffer already holds.
+    pub(crate) fn workspace_bytes(&self, capacity: usize) -> usize {
+        region_bytes::<u8>(capacity.max(self.len))
+    }
+
+    /// Lays the room out in `workspace` after the tables, at `capacity` bytes
+    /// or the length already held if that is more, carrying the bytes over.
+    ///
+    /// Binds before the tables of the same layout, so nothing has written the
+    /// workspace since the previous layout: the old room is intact whether it
+    /// is where it was, elsewhere in the same allocation, in the allocation the
+    /// workspace retired, or owned.
+    pub(crate) fn bind(&mut self, workspace: &mut Workspace, capacity: usize) {
+        let capacity = capacity.max(self.len);
+        let room = workspace.history_room(capacity);
+        if self.ptr != room.ptr {
+            // SAFETY: the old room is live and holds `len` written bytes (see
+            // above), and the new one has room for them; `copy` allows the two
+            // to overlap within one allocation.
+            unsafe { core::ptr::copy(self.ptr.as_ptr(), room.ptr.as_ptr(), self.len) };
+        }
+        self.ptr = room.ptr;
+        self.capacity = capacity;
+        self.own = Vec::new();
+        workspace.release_retired();
+    }
+
+    /// Moves the bytes into a room of their own, for a matcher leaving the
+    /// context whose workspace holds them.
+    pub(crate) fn leave_workspace(&mut self) {
+        if self.own.capacity() == 0 && self.capacity != 0 {
+            self.move_room(self.len);
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Heap bytes the buffer owns; room in a context's workspace is counted
+    /// with the workspace.
+    pub(crate) fn owned_bytes(&self) -> usize {
+        self.own.capacity()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
+
+    /// Makes room for `additional` more bytes, at least doubling the room when
+    /// it has to move, as a `Vec` does.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        let needed = self
+            .len
+            .checked_add(additional)
+            .expect("history length overflows usize");
+        if needed > self.capacity {
+            // A room too large to double is outgrown by exactly what is needed.
+            let doubled = self.capacity.checked_mul(2).unwrap_or(needed);
+            self.move_room(needed.max(doubled));
+        }
+    }
+
+    /// Makes room for exactly `additional` more bytes when it has to move.
+    pub(crate) fn reserve_exact(&mut self, additional: usize) {
+        let needed = self
+            .len
+            .checked_add(additional)
+            .expect("history length overflows usize");
+        if needed > self.capacity {
+            self.move_room(needed);
+        }
+    }
+
+    pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.reserve(bytes.len());
+        // SAFETY: `reserve` left room for `bytes.len()` more bytes past `len`,
+        // and `bytes` is borrowed from elsewhere, never from this room.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.ptr.as_ptr().add(self.len),
+                bytes.len(),
+            );
+        }
+        self.len += bytes.len();
+    }
+
+    pub(crate) fn push(&mut self, byte: u8) {
+        self.reserve(1);
+        // SAFETY: `reserve` left room for one more byte past `len`.
+        unsafe { self.ptr.as_ptr().add(self.len).write(byte) };
+        self.len += 1;
+    }
+
+    /// Sets the length to `len`, writing `value` into any bytes it adds.
+    pub(crate) fn resize(&mut self, len: usize, value: u8) {
+        if len > self.len {
+            self.reserve(len - self.len);
+            // SAFETY: `reserve` left room up to `len`.
+            unsafe {
+                core::ptr::write_bytes(self.ptr.as_ptr().add(self.len), value, len - self.len);
+            }
+        }
+        self.len = len;
+    }
+
+    /// Drops the first `count` bytes, moving the rest to the front.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `count` exceeds the length.
+    pub(crate) fn drain_front(&mut self, count: usize) {
+        assert!(count <= self.len, "draining past the history's end");
+        // SAFETY: both ranges lie within the written `len` bytes; `copy`
+        // handles the overlap.
+        unsafe {
+            core::ptr::copy(
+                self.ptr.as_ptr().add(count),
+                self.ptr.as_ptr(),
+                self.len - count,
+            );
+        }
+        self.len -= count;
+    }
+
+    /// Moves the written bytes into an owned room of `capacity` bytes.
+    fn move_room(&mut self, capacity: usize) {
+        let mut own: Vec<u8> = Vec::with_capacity(capacity);
+        // SAFETY: the new room has space for `len` bytes, and the old room
+        // holds them; the two allocations are distinct.
+        unsafe { core::ptr::copy_nonoverlapping(self.ptr.as_ptr(), own.as_mut_ptr(), self.len) };
+        // SAFETY: a `Vec`'s buffer pointer is never null.
+        self.ptr = unsafe { NonNull::new_unchecked(own.as_mut_ptr()) };
+        self.capacity = own.capacity();
+        self.own = own;
+    }
+}
+
+impl Default for HistoryBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for HistoryBuf {
+    /// A copy owning its bytes, whatever the source's storage.
+    fn clone(&self) -> Self {
+        let mut copy = Self::new();
+        copy.extend_from_slice(self);
+        copy
+    }
+
+    /// Copies the bytes into the room this buffer already has when they fit,
+    /// so restoring a snapshot keeps the history where it was laid out.
+    fn clone_from(&mut self, source: &Self) {
+        self.clear();
+        self.extend_from_slice(source);
+    }
+}
+
+/// A buffer owning `bytes`, for tests that set a history up by hand.
+#[cfg(test)]
+impl From<Vec<u8>> for HistoryBuf {
+    fn from(mut bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
+        // The owned room keeps length 0 (see the field); the bytes stay
+        // written, and this buffer's `len` claims them.
+        // SAFETY: shrinking a `Vec`'s length to 0 needs no drop for `u8`.
+        unsafe { bytes.set_len(0) };
+        Self {
+            // SAFETY: a `Vec`'s buffer pointer is never null.
+            ptr: unsafe { NonNull::new_unchecked(bytes.as_mut_ptr()) },
+            capacity: bytes.capacity(),
+            len,
+            own: bytes,
+        }
+    }
+}
+
+impl core::ops::Deref for HistoryBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: the first `len` bytes were written by this buffer, and its
+        // room is live.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl core::ops::DerefMut for HistoryBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `deref`, with `&mut self` making the access exclusive.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl core::fmt::Debug for HistoryBuf {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HistoryBuf")
+            .field("len", &self.len)
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
+/// A byte buffer a block is read into: the history for in-place ingest, or a
+/// staging `Vec` otherwise.
+pub(crate) trait IngestBuffer: core::ops::DerefMut<Target = [u8]> {
+    fn extend_from_slice(&mut self, bytes: &[u8]);
+    fn resize(&mut self, len: usize, value: u8);
+    fn truncate(&mut self, len: usize);
+    fn push(&mut self, byte: u8);
+}
+
+impl IngestBuffer for Vec<u8> {
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        Vec::extend_from_slice(self, bytes);
+    }
+
+    fn resize(&mut self, len: usize, value: u8) {
+        Vec::resize(self, len, value);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        Vec::truncate(self, len);
+    }
+
+    fn push(&mut self, byte: u8) {
+        Vec::push(self, byte);
+    }
+}
+
+impl IngestBuffer for HistoryBuf {
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        HistoryBuf::extend_from_slice(self, bytes);
+    }
+
+    fn resize(&mut self, len: usize, value: u8) {
+        HistoryBuf::resize(self, len, value);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        HistoryBuf::truncate(self, len);
+    }
+
+    fn push(&mut self, byte: u8) {
+        HistoryBuf::push(self, byte);
     }
 }
 

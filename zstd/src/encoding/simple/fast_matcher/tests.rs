@@ -11,7 +11,11 @@ fn reset_in(
     (window_log, hash_log, mls, step_size): (u8, u32, u32, usize),
     carry: TableCarry,
 ) {
-    ws.begin_layout(0, no_trailing);
+    ws.begin_layout(
+        0,
+        no_trailing,
+        crate::encoding::workspace::IngestPlan::Stream,
+    );
     ws.open(FastHashTable::workspace_bytes(hash_log), 0);
     m.reset(window_log, hash_log, mls, step_size, carry, ws);
 }
@@ -48,7 +52,7 @@ fn new_uses_level_1_defaults() {
 fn borrowed_window_reads_match_owned_then_restores() {
     let mut m = FastKernelMatcher::new();
     // Owned path: history_bytes mirrors the owned buffer.
-    m.history = b"owned-history-bytes".to_vec();
+    m.history = b"owned-history-bytes".to_vec().into();
     assert_eq!(m.history_bytes(), b"owned-history-bytes");
 
     // Borrowed path: history_bytes views the caller's buffer, not
@@ -58,7 +62,7 @@ fn borrowed_window_reads_match_owned_then_restores() {
     // and is cleared before it drops at end of scope.
     unsafe { m.set_borrowed_window(&external) };
     assert_eq!(m.history_bytes(), &external[..]);
-    assert_eq!(m.history, b"owned-history-bytes");
+    assert_eq!(&m.history[..], b"owned-history-bytes");
 
     // Clearing returns to the owned path with the original bytes.
     m.clear_borrowed_window();

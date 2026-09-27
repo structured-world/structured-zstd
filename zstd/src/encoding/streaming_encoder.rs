@@ -887,8 +887,14 @@ impl<M: Matcher> CompressionContext<M> {
         let block_target = self
             .target_block_size
             .map_or(MAX_BLOCK_SIZE as usize, |t| t as usize);
+        // Raw frames keep no history; everything else is read block by block.
+        let ingest = if matches!(self.compression_level, CompressionLevel::Uncompressed) {
+            crate::encoding::workspace::IngestPlan::Raw
+        } else {
+            crate::encoding::workspace::IngestPlan::Stream
+        };
         self.state
-            .reset_for_frame(self.compression_level, block_target);
+            .reset_for_frame(self.compression_level, block_target, ingest);
         let block_capacity = self.block_capacity();
         self.state.finish_layout(block_capacity);
         // Sync `state.strategy_tag` / `state.pre_split` to the strategy the

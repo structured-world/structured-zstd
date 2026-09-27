@@ -549,7 +549,11 @@ fn retained_heap_size_counts_the_block_buffers() {
     };
     let before = state.retained_scratch_heap_size();
     let block = 64 * 1024;
-    state.reset_for_frame(crate::encoding::CompressionLevel::Fastest, block);
+    state.reset_for_frame(
+        crate::encoding::CompressionLevel::Fastest,
+        block,
+        crate::encoding::workspace::IngestPlan::Stream,
+    );
     state.finish_layout(block);
     let after = state.retained_scratch_heap_size();
     let needed = super::CompressedBlockScratch::workspace_bytes(block);
@@ -562,8 +566,13 @@ fn retained_heap_size_counts_the_block_buffers() {
 
 /// A buffer for `count` sequence codes, carved from `ws`, which must outlive it.
 fn code_buffer(ws: &mut Workspace, count: usize) -> RegionVec<u32> {
-    ws.begin_layout(0, |_| 0);
-    ws.open(region_bytes::<u32>(count), 0);
+    // The block target stands for the trailing part's size in bytes.
+    ws.begin_layout(
+        region_bytes::<u32>(count),
+        |bytes| bytes,
+        crate::encoding::workspace::IngestPlan::Stream,
+    );
+    ws.open(0, usize::MAX);
     ws.buffer(count)
 }
 

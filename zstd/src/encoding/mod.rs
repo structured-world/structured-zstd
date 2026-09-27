@@ -481,11 +481,14 @@ pub trait Matcher {
     /// remainder costs no copy.
     ///
     /// Returns `None` if this matcher has no in-place ingest, which is the
-    /// default: the caller then keeps the staged-copy path.
+    /// default: the caller then keeps the staged-copy path. The buffer lives
+    /// in the compression context's workspace, so only the crate's own
+    /// matchers can take this path.
+    #[doc(hidden)]
     fn fill_in_place(
         &mut self,
         _capacity: usize,
-        _fill: &mut dyn FnMut(&mut alloc::vec::Vec<u8>) -> (usize, bool),
+        _fill: &mut dyn FnMut(&mut workspace::HistoryBuf) -> (usize, bool),
     ) -> Option<(usize, bool)> {
         None
     }
@@ -497,12 +500,6 @@ pub trait Matcher {
     /// Claim `len` bytes from the head of
     /// [`uncommitted_input`](Self::uncommitted_input) as the next block.
     fn commit_filled(&mut self, _len: usize) {}
-    /// Size the ingest buffer for a frame of `bytes` up front, so filling it
-    /// block by block doesn't walk a doubling chain of reallocations. Clamped
-    /// internally to the buffer's eviction ceiling, so an over-long or absent
-    /// hint can never reserve more than a bounded window. No-op unless
-    /// [`fill_in_place`](Self::fill_in_place) is implemented.
-    fn reserve_for_frame(&mut self, _bytes: usize) {}
     /// Just process the data in the last committed space for future matching.
     fn skip_matching(&mut self);
     /// Hint-aware skip path used internally to thread a precomputed block
@@ -535,6 +532,12 @@ pub trait Matcher {
     ) {
         self.reset(level);
     }
+    /// Move whatever this matcher holds in a compression context's workspace
+    /// into allocations of its own, before it leaves that context. Only a
+    /// matcher that takes [`reset_in_workspace`](Self::reset_in_workspace)
+    /// holds anything there.
+    #[doc(hidden)]
+    fn leave_workspace(&mut self) {}
     /// Provide a hint about the total uncompressed size for the next frame.
     ///
     /// Implementations may use this to select smaller hash tables and windows

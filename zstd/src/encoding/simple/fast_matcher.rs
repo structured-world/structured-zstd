@@ -56,6 +56,7 @@ use alloc::vec::Vec;
 
 use crate::encoding::Sequence;
 use crate::encoding::dict_attach::DictAttach;
+use crate::encoding::workspace::HistoryBuf;
 
 use super::fast_kernel::hash_table::{FastHashTable, hash_ptr_raw};
 use super::fast_kernel::kernel::compress_block_fast;
@@ -158,8 +159,9 @@ pub(crate) enum TableCarry {
 ///   `start_matching` appends it onto `history` and runs the kernel.
 pub(crate) struct FastKernelMatcher {
     /// Concatenated input history: prior-block bytes followed by the
-    /// most-recently-committed (still pending-matching) tail.
-    history: Vec<u8>,
+    /// most-recently-committed (still pending-matching) tail. In the context's
+    /// workspace when a context drives the matcher.
+    history: HistoryBuf,
     /// Upstream zstd `prefixStartIndex` — earliest position any match may
     /// reference.
     prefix_start_index: u32,
@@ -549,7 +551,8 @@ impl FastKernelMatcher {
         // Sentinel-0 protection comes from prefix_start_index =
         // INITIAL_PREFIX_START_INDEX = 1, which filters hash table
         // lookups returning the empty-slot value 0.
-        let history = alloc::vec![0u8; HISTORY_DRAIN_BASE];
+        let mut history = HistoryBuf::new();
+        history.resize(HISTORY_DRAIN_BASE, 0);
         Self {
             last_block_start: HISTORY_DRAIN_BASE,
             recycled_space: None,
@@ -715,7 +718,7 @@ impl FastKernelMatcher {
     /// Heap bytes this matcher owns: the history buffer, the hash table, the
     /// recycle/pending slots, and any attached dictionary hash table.
     pub(crate) fn heap_size(&self) -> usize {
-        self.history.capacity()
+        self.history.owned_bytes()
             + self.hash_table.heap_size()
             + self.pending.as_ref().map_or(0, |v| v.capacity())
             + self.recycled_space.as_ref().map_or(0, |v| v.capacity())
@@ -987,8 +990,13 @@ impl FastKernelMatcher {
     /// settled here: only the slide arm has been measured, and the rehash arm
     /// is what the comparison still needs.
     fn drain_real_prefix(&mut self, drop_n: usize) {
-        let drain_end = HISTORY_DRAIN_BASE + drop_n;
-        self.history.drain(HISTORY_DRAIN_BASE..drain_end);
+        const {
+            assert!(
+                HISTORY_DRAIN_BASE == 0,
+                "the drain takes the history's front"
+            )
+        };
+        self.history.drain_front(drop_n);
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
         // Any drain rebases the retained tail to position 0, invalidating
         // the immutable dict table's absolute positions (and likely
@@ -1069,31 +1077,11 @@ impl FastKernelMatcher {
         self.recycled_space.take()
     }
 
-    /// Capacity of the buffer blocks are appended into; see
-    /// [`Self::reserve_for_frame`].
+    /// Capacity of the buffer blocks are appended into, which the context
+    /// lays out for the whole frame.
     #[cfg(test)]
     pub(crate) fn history_capacity(&self) -> usize {
         self.history.capacity()
-    }
-
-    /// Size `history` for a whole frame in one allocation, so the per-block
-    /// appends do not walk a doubling chain. A fresh matcher starts with an
-    /// empty buffer, so without this every frame climbs that chain again and
-    /// hands the pages back at the end of it. Clamped to the eviction ceiling,
-    /// which is the largest the buffer ever grows anyway: `accept_data` drains
-    /// back to a `max_window_size` tail once the append would pass twice that.
-    ///
-    /// `bytes` is what the frame will bring, counted on top of what the buffer
-    /// already holds: a dictionary is primed into it before this runs, so
-    /// sizing to the frame alone would leave the dictionary's bytes to be
-    /// grown into afterwards — the chain this exists to avoid, on exactly the
-    /// path where one dictionary serves many small frames.
-    pub(crate) fn reserve_for_frame(&mut self, bytes: usize) {
-        let ceiling = 2 * self.max_window_size + crate::common::MAX_BLOCK_SIZE as usize;
-        let target = self.history.len().saturating_add(bytes).min(ceiling);
-        if self.history.capacity() < target {
-            self.history.reserve_exact(target - self.history.len());
-        }
     }
 
     /// Process the pending block with the upstream zstd-shape kernel,
@@ -1995,6 +1983,29 @@ impl FastKernelMatcher {
     pub(crate) fn skip_matching_for_dict_prime(&mut self, dict_len: usize) {
         let block_start = self.extend_history_with_pending();
         self.prime_dict_table_for_range(block_start, dict_len);
+    }
+
+    /// Moves the main table and the history out of the context's workspace, for
+    /// a matcher leaving that context.
+    pub(crate) fn leave_workspace(&mut self) {
+        self.hash_table.leave_workspace();
+        self.history.leave_workspace();
+    }
+
+    /// Workspace bytes the history takes for a frame that needs `bytes` of it.
+    pub(crate) fn history_workspace_bytes(&self, bytes: usize) -> usize {
+        self.history.workspace_bytes(bytes)
+    }
+
+    /// Lays the history out in `workspace` for a frame that needs `bytes` of
+    /// it. Runs before [`Self::reset`] lays the table out: see
+    /// [`HistoryBuf::bind`].
+    pub(crate) fn bind_history(
+        &mut self,
+        workspace: &mut crate::encoding::workspace::Workspace,
+        bytes: usize,
+    ) {
+        self.history.bind(workspace, bytes);
     }
 
     /// The dictionary table's `hashLog` for the next dictionary frame: the

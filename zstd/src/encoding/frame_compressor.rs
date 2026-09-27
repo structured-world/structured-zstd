@@ -11,6 +11,7 @@ use core::hash::Hasher;
 use super::{
     CompressionLevel, LiteralCompressionMode, Matcher, block_header::BlockHeader,
     frame_header::FrameHeader, levels::*, match_generator::MatchGeneratorDriver,
+    workspace::IngestBuffer,
 };
 use crate::common::MAX_BLOCK_SIZE;
 use crate::fse::fse_encoder::{FSETable, default_ll_table, default_ml_table, default_of_table};
@@ -1429,13 +1430,20 @@ pub(crate) fn huf_search_enabled(
 
 impl<M: Matcher> CompressState<M> {
     /// Resets the matcher for the next frame at `level` and lets it lay its
-    /// tables out in the workspace, reserving room behind them for the block
-    /// buffers of blocks up to `block_target` bytes (capped by the frame's
-    /// window). [`Self::finish_layout`] completes the layout.
-    pub(crate) fn reset_for_frame(&mut self, level: CompressionLevel, block_target: usize) {
+    /// tables and history out in the workspace, reserving room behind them for
+    /// the block buffers of blocks up to `block_target` bytes (capped by the
+    /// frame's window). `ingest` is how the frame's input reaches the matcher,
+    /// which sizes its history. [`Self::finish_layout`] completes the layout.
+    pub(crate) fn reset_for_frame(
+        &mut self,
+        level: CompressionLevel,
+        block_target: usize,
+        ingest: crate::encoding::workspace::IngestPlan,
+    ) {
         self.workspace.begin_layout(
             block_target,
             crate::encoding::blocks::CompressedBlockScratch::workspace_bytes,
+            ingest,
         );
         self.matcher.reset_in_workspace(level, &mut self.workspace);
     }
@@ -1457,6 +1465,8 @@ impl<M: Matcher> CompressState<M> {
             "a {block_capacity}-byte block exceeds the {reserved} bytes the workspace reserved"
         );
         self.block_scratch.bind(&mut self.workspace, reserved);
+        // Everything is laid out in the current allocation by now.
+        self.workspace.release_retired();
     }
 
     /// Heap bytes the compressor keeps between blocks and frames beyond the
@@ -1572,19 +1582,22 @@ fn initial_all_blocks_cap(initial_size_hint: Option<u64>, block_capacity: usize)
 /// append with one `extend_from_slice` — the generic reader impl must
 /// `resize` an initialized target region before `Read::read` can fill it,
 /// which costs a zero-fill memset of the whole block on every frame.
+///
+/// `buf` is the matcher's history on the in-place path and a staging `Vec`
+/// otherwise.
 pub(crate) trait OwnedBlockSource {
-    fn fill_block(
+    fn fill_block<B: IngestBuffer>(
         &mut self,
-        buf: &mut Vec<u8>,
+        buf: &mut B,
         block_capacity: usize,
         size_hint_remaining: Option<u64>,
     ) -> (usize, bool);
 }
 
 impl OwnedBlockSource for &[u8] {
-    fn fill_block(
+    fn fill_block<B: IngestBuffer>(
         &mut self,
-        buf: &mut Vec<u8>,
+        buf: &mut B,
         block_capacity: usize,
         _size_hint_remaining: Option<u64>,
     ) -> (usize, bool) {
@@ -1629,9 +1642,9 @@ impl<Rd> ReaderBlockSource<Rd> {
 }
 
 impl<Rd: Read> OwnedBlockSource for ReaderBlockSource<Rd> {
-    fn fill_block(
+    fn fill_block<B: IngestBuffer>(
         &mut self,
-        buf: &mut Vec<u8>,
+        buf: &mut B,
         block_capacity: usize,
         size_hint_remaining: Option<u64>,
     ) -> (usize, bool) {
@@ -1878,8 +1891,9 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // the owned path. Every borrowed scan applies the per-position
         // `window_low = abs_ip - advertised_window` offset cap so over-window
         // inputs are matched in place (no input->history copy), matching C's
-        // continuous-index + windowLow one-shot behaviour.
-        self.state.matcher.borrowed_supported()
+        // continuous-index + windowLow one-shot behaviour. The reset decided
+        // it, and laid the history out to match.
+        self.state.matcher.frame_scans_in_place()
     }
 
     /// Compress `input` as one frame's worth of blocks into `out` (appended
@@ -1958,7 +1972,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // previous call may have left behind (a wrong hint would change the
         // resolved window/header and could flip borrowed eligibility).
         self.source_size_hint = Some(input.len() as u64);
-        let prep = self.prepare_frame();
+        let prep = self.prepare_frame(crate::encoding::workspace::IngestPlan::Slice);
         // Content size is known up front (one-shot), so write the frame
         // header FIRST and emit blocks STRAIGHT into `out` — no separate
         // `all_blocks` accumulator and no header+blocks copy (which was the
@@ -2403,7 +2417,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // `prepare_frame` / `finish_frame` are shared with the borrowed
         // one-shot path, so both run the same reset / dict-prime /
         // entropy-seed setup and frame tail.
-        let prep = self.prepare_frame();
+        let prep = self.prepare_frame(crate::encoding::workspace::IngestPlan::Stream);
         // Take the reader out so `run_owned_block_loop` can borrow it
         // mutably alongside `&mut self` (the rest of the loop touches
         // `self.state` / `self.hasher`, disjoint from the reader). Restored
@@ -2439,7 +2453,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.finish_frame(all_blocks, total_uncompressed, &prep);
     }
 
-    fn prepare_frame(&mut self) -> FramePrep {
+    /// Resets the compressor for the next frame, whose input reaches the
+    /// match finder as `ingest` says.
+    fn prepare_frame(&mut self, ingest: crate::encoding::workspace::IngestPlan) -> FramePrep {
         // The raw-skip's memory of what this frame has already emitted. Frames
         // are independent, so carrying it over would let one frame's content
         // hold the skip off for the next; the allocation is kept.
@@ -2483,8 +2499,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         let block_target = self
             .target_block_size
             .map_or(crate::common::MAX_BLOCK_SIZE as usize, |t| t as usize);
+        // Raw frames emit straight from the staged buffer and never consult
+        // the match finder, so they keep no history.
+        let ingest = if matches!(self.compression_level, CompressionLevel::Uncompressed) {
+            crate::encoding::workspace::IngestPlan::Raw
+        } else {
+            ingest
+        };
         self.state
-            .reset_for_frame(self.compression_level, block_target);
+            .reset_for_frame(self.compression_level, block_target, ingest);
         let block_capacity = self.block_capacity();
         self.state.finish_layout(block_capacity);
         self.state.offset_hist = [1, 4, 8];
@@ -2659,58 +2682,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         let mut pending_input: Vec<u8> = Vec::new();
         let mut reached_eof = false;
         let mut savings = 0i64;
-        // One allocation for the whole frame's ingest buffer, instead of a
-        // doubling chain of reallocations as the blocks arrive. A fresh
-        // compressor starts with an empty buffer, so without this every frame
-        // climbs the ladder again and hands the pages back at the end of it:
-        // measured at level 3 over a 1 MB frame, three growth steps per frame
-        // and about 2.4 MB of pages faulted back in each time, against none for
-        // a reference that sizes its workspace once.
-        //
-        // An inexact hint is sized on too. The worry it would otherwise raise —
-        // that a wild overestimate reserves memory the reader never fills — is
-        // already answered twice over: the same hint has by this point sized
-        // the window and the match-finder tables (it reaches the matcher
-        // through `set_source_size_hint`, and the level parameters cap the
-        // window by it), and `reserve_for_frame` clamps to the eviction ceiling
-        // the buffer would reach anyway. So the reservation is proportionate to
-        // allocations the hint has already caused, not a new class of waste.
-        // The slack is one block, so the final top-up (which asks for a whole
-        // block even when only a tail remains) does not reallocate; sized off
-        // the ACTIVE block capacity, since a small window shrinks the block
-        // below the format maximum.
-        // Raw frames are excluded: they emit straight from the staged buffer
-        // and never consult the match finder (the `in_place` gate below keeps
-        // them off it whatever the backend supports), so sizing its history for
-        // them holds a window's worth of memory the frame has no use for.
-        if let Some(hint) = initial_size_hint
-            && !matches!(self.compression_level, CompressionLevel::Uncompressed)
-        {
-            // `saturating_add`: a caller may pledge `u64::MAX`, and clamping a
-            // reservation request at the address-space limit is the meaningful
-            // answer — the matcher caps it at its eviction ceiling anyway.
-            let mut target =
-                (hint.min(usize::MAX as u64) as usize).saturating_add(self.block_capacity());
-            if !hint_is_exact {
-                // An advisory number is a claim about data that has not arrived,
-                // so it is trusted only as far as the frame's own configuration
-                // makes plausible: the window this LEVEL would choose, never an
-                // overridden one. Overriding the window is itself a claim about
-                // the data — one only the data can confirm — and taking it here
-                // let a caller who promised gibibytes and delivered ten bytes
-                // reserve two of them. Beyond this bound the buffer grows as it
-                // did before, which costs a few reallocations on frames already
-                // large enough for that to be noise.
-                let level_window = crate::encoding::levels::config::resolve_level_params(
-                    self.compression_level,
-                    initial_size_hint,
-                )
-                .window_log;
-                let plausible = (1usize << level_window).saturating_add(self.block_capacity());
-                target = target.min(plausible);
-            }
-            self.state.matcher.reserve_for_frame(target);
-        }
+        // The matcher's history was laid out for the whole frame when the
+        // context was (`frame_history_bytes`), so the blocks read into it below
+        // never reallocate it.
         // Compress block by block
         loop {
             // Read up to one upstream zstd block. When the pre-block splitter keeps a
@@ -3305,6 +3279,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Before calling [FrameCompressor::compress] you can replace the matcher
     pub fn replace_matcher(&mut self, mut match_generator: M) -> M {
         core::mem::swap(&mut match_generator, &mut self.state.matcher);
+        // The outgoing matcher may hold tables and history in this
+        // compressor's workspace, which it must not outlive.
+        match_generator.leave_workspace();
         match_generator
     }
 

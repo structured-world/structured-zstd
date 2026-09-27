@@ -186,6 +186,12 @@ impl FastHashTable {
         false
     }
 
+    /// Moves the entries out of the context's workspace (see
+    /// [`Table::leave_workspace`]).
+    pub(crate) fn leave_workspace(&mut self) {
+        self.table.leave_workspace();
+    }
+
     /// Construct without the entry storage. Records the requested
     /// `(hash_log, mls)` and validates them, but leaves `table` empty: the
     /// first per-frame reset lays it out in the workspace at the

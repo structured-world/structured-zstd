@@ -9,24 +9,32 @@ fn one_byte_per_block_byte(block: usize) -> usize {
 /// context's buffers, the window leaving the block ceiling as it is.
 fn lay_out(ws: &mut Workspace, leading: usize, trailing: usize) {
     if trailing == 0 {
-        ws.begin_layout(0, no_trailing);
+        ws.begin_layout(0, no_trailing, IngestPlan::Stream);
     } else {
-        ws.begin_layout(trailing, one_byte_per_block_byte);
+        ws.begin_layout(trailing, one_byte_per_block_byte, IngestPlan::Stream);
     }
     ws.open(leading, usize::MAX);
 }
 
 /// An open layout of exactly `bytes`, all of them leading.
 fn opened(bytes: usize) -> Workspace {
+    opened_with(bytes, 0)
+}
+
+/// An open layout of `leading` bytes for tables and `trailing` for buffers.
+fn opened_with(leading: usize, trailing: usize) -> Workspace {
     let mut ws = Workspace::new();
-    lay_out(&mut ws, bytes, 0);
+    lay_out(&mut ws, leading, trailing);
     ws
 }
 
 // Every region begins on the workspace alignment, from either end.
 #[test]
 fn regions_start_aligned_from_both_ends() {
-    let mut ws = opened(region_bytes::<u32>(10) + region_bytes::<u8>(3) + region_bytes::<u16>(7));
+    let mut ws = opened_with(
+        region_bytes::<u32>(10),
+        region_bytes::<u8>(3) + region_bytes::<u16>(7),
+    );
     let table = ws.table::<u32>(10, 0);
     let mut bytes = ws.buffer::<u8>(3);
     let mut halves = ws.buffer::<u16>(7);
@@ -39,7 +47,7 @@ fn regions_start_aligned_from_both_ends() {
 // exactly as they were.
 #[test]
 fn regions_of_one_layout_are_disjoint() {
-    let mut ws = opened(2 * region_bytes::<u32>(20) + region_bytes::<u8>(100));
+    let mut ws = opened_with(2 * region_bytes::<u32>(20), region_bytes::<u8>(100));
     let mut first = ws.table::<u32>(20, 7);
     let second = ws.table::<u32>(20, 9);
     let mut tail = ws.buffer::<u8>(100);
@@ -99,18 +107,21 @@ fn a_table_that_moves_starts_over() {
     assert!(table.iter().all(|&v| v == 7));
 }
 
-// Every new allocation starts a new generation with nothing known written: an
-// allocator may hand the same address back, and only the generation then tells
-// a holder that the bytes under its old pointer are not its table any more.
+// Every new allocation starts a new generation: an allocator may hand the same
+// address back, and only the generation then tells a holder that the bytes
+// under its old pointer are not its table any more. Giving an oversized
+// allocation back is a new allocation too.
 #[test]
 fn a_new_allocation_starts_a_new_generation() {
     let mut ws = opened(region_bytes::<u32>(16));
-    let _ = ws.table::<u32>(16, 0);
-    let (generation, written) = (ws.generation, ws.valid_front);
-    assert!(written > 0);
+    let generation = ws.generation;
     lay_out(&mut ws, region_bytes::<u32>(1024), 0);
-    assert_ne!(ws.generation, generation);
-    assert_eq!(ws.valid_front, 0);
+    assert_ne!(ws.generation, generation, "a grown allocation");
+    let generation = ws.generation;
+    for _ in 0..=TOO_LARGE_MAX_LAYOUTS {
+        lay_out(&mut ws, region_bytes::<u32>(16), 0);
+    }
+    assert_ne!(ws.generation, generation, "an allocation given back");
 }
 
 // A table carved behind another that changed size lands elsewhere and must not
@@ -154,7 +165,7 @@ fn a_table_copy_is_independent_and_restores_in_place() {
 // manual length all agree with the slice it exposes.
 #[test]
 fn a_buffer_tracks_its_length() {
-    let mut ws = opened(region_bytes::<u32>(8));
+    let mut ws = opened_with(0, region_bytes::<u32>(8));
     let mut buf = ws.buffer::<u32>(8);
     assert_eq!(buf.capacity(), 8);
     assert!(buf.is_empty());
@@ -175,7 +186,7 @@ fn a_buffer_tracks_its_length() {
 #[test]
 #[should_panic(expected = "workspace buffer sized below")]
 fn a_full_buffer_refuses_a_push() {
-    let mut ws = opened(region_bytes::<u8>(ALIGN));
+    let mut ws = opened_with(0, region_bytes::<u8>(ALIGN));
     let mut buf = ws.buffer::<u8>(ALIGN);
     buf.extend_from_slice(&[0; ALIGN]);
     buf.push(1);
@@ -185,7 +196,7 @@ fn a_full_buffer_refuses_a_push() {
 #[test]
 #[should_panic(expected = "workspace buffer sized below")]
 fn a_buffer_refuses_a_slice_that_overruns_it() {
-    let mut ws = opened(region_bytes::<u8>(4));
+    let mut ws = opened_with(0, region_bytes::<u8>(4));
     let mut buf = ws.buffer::<u8>(4);
     buf.extend_from_slice(&[0; 5]);
 }
@@ -206,7 +217,7 @@ fn carving_past_the_workspace_is_refused() {
 #[should_panic(expected = "not open")]
 fn carving_before_the_opening_is_refused() {
     let mut ws = Workspace::new();
-    ws.begin_layout(64, one_byte_per_block_byte);
+    ws.begin_layout(64, one_byte_per_block_byte, IngestPlan::Stream);
     let _ = ws.buffer::<u8>(1);
 }
 
@@ -231,7 +242,7 @@ fn opening_reserves_the_trailing_part_and_grows_only_when_short() {
 #[test]
 fn the_window_caps_the_block_the_trailing_part_is_sized_for() {
     let mut ws = Workspace::new();
-    ws.begin_layout(128 * 1024, one_byte_per_block_byte);
+    ws.begin_layout(128 * 1024, one_byte_per_block_byte, IngestPlan::Stream);
     ws.open(0, 4096);
     assert_eq!(ws.block_capacity(), 4096);
     assert_eq!(ws.capacity(), 4096);
@@ -262,6 +273,150 @@ fn a_workspace_moderately_larger_than_its_frames_is_kept() {
         lay_out(&mut ws, 1500, 0);
     }
     assert_eq!(ws.capacity(), 4096);
+}
+
+/// Binds `history` at `capacity` and then a `table_len` table, in a fresh
+/// layout sized for exactly the two: the order a match finder lays itself out
+/// in.
+fn lay_out_history_and_table(
+    ws: &mut Workspace,
+    history: &mut HistoryBuf,
+    capacity: usize,
+    table: &mut Table<u32>,
+    table_len: usize,
+) {
+    lay_out(
+        ws,
+        region_bytes::<u32>(table_len) + history.workspace_bytes(capacity),
+        0,
+    );
+    history.bind(ws, capacity);
+    table.bind(ws, table_len, 0xFFFF_FFFF);
+}
+
+// A history laid out again keeps what it held, in place, however small the
+// next frame's need: that is how a dictionary left at its head survives to
+// the next frame. It sits after the tables, never under them.
+#[test]
+fn a_history_laid_out_again_keeps_its_bytes() {
+    let mut ws = Workspace::new();
+    let mut table: Table<u32> = Table::empty();
+    let mut history = HistoryBuf::new();
+    lay_out_history_and_table(&mut ws, &mut history, 256, &mut table, 16);
+    history.extend_from_slice(b"dictionary bytes");
+    let before = history.as_ptr();
+    assert_eq!(
+        before as usize,
+        table.as_slice().as_ptr_range().end as usize,
+        "the history follows the table"
+    );
+
+    lay_out_history_and_table(&mut ws, &mut history, 8, &mut table, 16);
+    assert_eq!(&history[..], b"dictionary bytes");
+    assert_eq!(history.as_ptr(), before, "kept in place");
+    assert!(history.capacity() >= history.len());
+}
+
+// Tables that change size move the history within the same allocation; its
+// bytes move with it, ahead of the tables that are then filled over where they
+// used to be.
+#[test]
+fn a_history_moved_by_its_tables_keeps_its_bytes() {
+    let mut ws = Workspace::new();
+    let mut table: Table<u32> = Table::empty();
+    let mut history = HistoryBuf::new();
+    lay_out_history_and_table(&mut ws, &mut history, 2048, &mut table, 16);
+    history.extend_from_slice(&[0x5A; 1000]);
+    let capacity = ws.capacity();
+
+    lay_out_history_and_table(&mut ws, &mut history, 64, &mut table, 64);
+    assert_eq!(ws.capacity(), capacity, "same allocation");
+    assert!(history.iter().all(|&b| b == 0x5A));
+    assert_eq!(history.len(), 1000);
+}
+
+// A history laid out in a new allocation carries its bytes out of the one the
+// workspace replaced, which lives until then.
+#[test]
+fn a_history_in_a_new_allocation_keeps_its_bytes() {
+    let mut ws = Workspace::new();
+    let mut table: Table<u32> = Table::empty();
+    let mut history = HistoryBuf::new();
+    lay_out_history_and_table(&mut ws, &mut history, 64, &mut table, 16);
+    history.extend_from_slice(b"kept across a reallocation");
+    let generation = ws.generation;
+
+    lay_out_history_and_table(&mut ws, &mut history, 4096, &mut table, 1024);
+    assert_ne!(ws.generation, generation, "fixture: the workspace grew");
+    assert_eq!(&history[..], b"kept across a reallocation");
+    assert!(
+        ws.retired.is_none(),
+        "the old allocation is freed once bound"
+    );
+}
+
+// A matcher leaving its context takes its history and tables into rooms of
+// their own, so they stay readable after the context's workspace is gone.
+#[test]
+fn a_history_and_table_leaving_the_workspace_outlive_it() {
+    let mut ws = Workspace::new();
+    let mut table: Table<u32> = Table::empty();
+    let mut history = HistoryBuf::new();
+    lay_out_history_and_table(&mut ws, &mut history, 64, &mut table, 16);
+    history.extend_from_slice(b"still here");
+    table.as_mut_slice()[3] = 7;
+
+    history.leave_workspace();
+    table.leave_workspace();
+    drop(ws);
+    assert_eq!(&history[..], b"still here");
+    assert_eq!(table[3], 7);
+    assert!(history.owned_bytes() >= history.len());
+    assert_eq!(table.owned_bytes(), 16 * size_of::<u32>());
+}
+
+// A frame that brings more than its history was laid out for (a size hint that
+// undercounted) moves the bytes into an allocation of the history's own, keeps
+// them, and brings them back into the workspace at the next layout.
+#[test]
+fn a_history_outgrowing_its_room_keeps_its_bytes() {
+    let mut ws = opened(region_bytes::<u8>(8));
+    let mut history = HistoryBuf::new();
+    history.bind(&mut ws, 8);
+    history.extend_from_slice(b"12345678");
+    assert_eq!(history.owned_bytes(), 0);
+    history.extend_from_slice(b"9");
+    assert!(history.owned_bytes() >= 9, "moved out of the workspace");
+    assert_eq!(&history[..], b"123456789");
+
+    lay_out(&mut ws, region_bytes::<u8>(64), 0);
+    history.bind(&mut ws, 64);
+    assert_eq!(history.owned_bytes(), 0, "back in the workspace");
+    assert_eq!(&history[..], b"123456789");
+}
+
+// Dropping the front moves the rest down, as `Vec::drain(..n)` does; resize and
+// truncate move the length, and a restore copies into the room it already has.
+#[test]
+fn a_history_behaves_like_the_vec_it_replaces() {
+    let mut ws = opened(region_bytes::<u8>(64));
+    let mut history = HistoryBuf::new();
+    history.bind(&mut ws, 64);
+    history.extend_from_slice(b"abcdef");
+    history.drain_front(2);
+    assert_eq!(&history[..], b"cdef");
+    history.resize(6, b'z');
+    assert_eq!(&history[..], b"cdefzz");
+    history.truncate(3);
+    assert_eq!(&history[..], b"cde");
+    history.push(b'!');
+    assert_eq!(&history[..], b"cde!");
+
+    let snapshot = history.clone();
+    history.clear();
+    history.clone_from(&snapshot);
+    assert_eq!(&history[..], b"cde!");
+    assert_eq!(history.owned_bytes(), 0, "restored in place");
 }
 
 // Region sizes round up to the alignment and refuse to overflow.

@@ -44,6 +44,7 @@ use super::row::RowMatchGenerator;
 use super::simple::fast_matcher::{
     FAST_LEVEL_1_HASH_LOG, FAST_LEVEL_1_MLS, FastKernelMatcher, TableCarry,
 };
+use super::workspace::HistoryBuf;
 
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
 // Bytes the dfast short hash reads (upstream zstd `mls = 5`). Seeding / lookahead
@@ -358,6 +359,10 @@ pub struct MatchGeneratorDriver {
     /// [`Matcher::reset`]; inside a compression context they live in the
     /// context's workspace instead and this stays empty.
     own_workspace: crate::encoding::workspace::Workspace,
+    /// Whether this frame's input, handed over as one slice, is scanned in
+    /// place rather than copied into the history. Decided at the reset,
+    /// because it decides how large the history is laid out.
+    frame_in_place: bool,
 }
 
 /// Identity of the matcher configuration a primed snapshot was captured under:
@@ -431,6 +436,65 @@ fn hc_attaches_dictionary(hc: &HcMatchGenerator, size_log: Option<u8>) -> bool {
         HC_ATTACH_DICT_CUTOFF_LOG
     };
     size_log.is_none_or(|log| log <= cutoff)
+}
+
+/// History bytes a frame lays out: the dictionary primed at its head, the
+/// input it is expected to bring, and one block of slack for the last read,
+/// which asks for a whole block even when only a tail remains. Input that can
+/// fill the window slides it, and the history then grows to the most it ever
+/// holds, which is laid out from the start, as upstream sizes its input buffer
+/// from the window: for the Fast backend twice the window grown by the
+/// dictionary (it drains back to one window when an append would pass two),
+/// for the others that window plus the quarter of it compaction leaves behind;
+/// either way plus one pending block.
+///
+/// A size known exactly (a slice) is taken as it is. A size hint on a stream is
+/// a claim about data not yet read, trusted only up to the window the LEVEL
+/// would choose for it; overriding the window is a claim of its own that only
+/// the data can confirm. An unknown size may fill any window.
+fn frame_history_bytes(
+    backend: super::strategy::BackendTag,
+    workspace: &crate::encoding::workspace::Workspace,
+    in_place: bool,
+    hint: Option<u64>,
+    dict_len: usize,
+    max_window_size: usize,
+    level: CompressionLevel,
+) -> usize {
+    use super::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
+    use crate::encoding::workspace::IngestPlan;
+    let block = workspace.block_for_window(max_window_size);
+    // `MAX_PRIMED_WINDOW_SIZE` is `(u32::MAX - MAX_BLOCK_SIZE) / 2`, so either
+    // ceiling stays inside `usize` on a 32-bit target.
+    let window = max_window_size
+        .checked_add(dict_len)
+        .map_or(MAX_PRIMED_WINDOW_SIZE, |w| w.min(MAX_PRIMED_WINDOW_SIZE));
+    let slack = match backend {
+        super::strategy::BackendTag::Simple => window,
+        _ => window >> 2,
+    };
+    let ceiling = window + slack + crate::common::MAX_BLOCK_SIZE as usize;
+    // A size past `usize` is past the ceiling too.
+    let bytes = hint.map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX));
+    let input = match workspace.ingest() {
+        IngestPlan::Raw => return 0,
+        IngestPlan::Slice if in_place => return dict_len.min(ceiling),
+        IngestPlan::Slice => bytes,
+        IngestPlan::Stream => bytes.map(|bytes| {
+            let level_window_log =
+                crate::encoding::levels::config::resolve_level_params(level, hint).window_log;
+            bytes.min(1usize << level_window_log)
+        }),
+    };
+    match input {
+        // A window stays below 2^31 and a block below 2^17, so `bytes + block`
+        // fits; a dictionary large enough to overflow the rest is past the
+        // ceiling anyway.
+        Some(bytes) if bytes < max_window_size => dict_len
+            .checked_add(bytes + block)
+            .map_or(ceiling, |sum| sum.min(ceiling)),
+        _ => ceiling,
+    }
 }
 
 impl MatchGeneratorDriver {
@@ -530,6 +594,7 @@ impl MatchGeneratorDriver {
             borrowed_pending: None,
             primed: None,
             own_workspace: crate::encoding::workspace::Workspace::new(),
+            frame_in_place: false,
         }
     }
 
@@ -576,6 +641,13 @@ impl MatchGeneratorDriver {
             // staged on the borrowed path even via an internal caller.
             BackendTag::HashChain => matches!(self.search, SearchMethod::HashChain),
         }
+    }
+
+    /// Whether this frame, handed over as one slice with no dictionary, is
+    /// scanned in place. Settled by the reset, which laid the history out for
+    /// it, so the frame loop must take the path this names.
+    pub(crate) fn frame_scans_in_place(&self) -> bool {
+        self.frame_in_place
     }
 
     /// Whether a borrowed scan starting now sees nothing of an earlier frame,
@@ -1061,8 +1133,13 @@ impl Matcher for MatchGeneratorDriver {
         // which is moved out for the call and back: moving it leaves the
         // allocation, and so every region carved from it, where it is.
         let mut own = core::mem::take(&mut self.own_workspace);
-        own.begin_layout(0, crate::encoding::workspace::no_trailing);
+        own.begin_layout(
+            0,
+            crate::encoding::workspace::no_trailing,
+            crate::encoding::workspace::IngestPlan::Stream,
+        );
         self.reset_in_workspace(level, &mut own);
+        own.release_retired();
         self.own_workspace = own;
     }
 
@@ -1315,6 +1392,23 @@ impl Matcher for MatchGeneratorDriver {
             }
             None => max_window_size,
         };
+        // A slice with no dictionary on a backend that can scan it in place
+        // never enters the history; the frame loop reads this decision back
+        // (`frame_scans_in_place`) instead of taking it again. The kernels keep
+        // positions in `u32`, so a longer slice is copied.
+        self.frame_in_place = workspace.ingest() == crate::encoding::workspace::IngestPlan::Slice
+            && dict_hint.is_none()
+            && self.borrowed_supported()
+            && hint.is_some_and(|len| len <= u64::from(u32::MAX));
+        let history_bytes = frame_history_bytes(
+            next_backend,
+            workspace,
+            self.frame_in_place,
+            hint,
+            dict_hint.map_or(0, |sizes| sizes.content),
+            max_window_size,
+            level,
+        );
         // The hint-dependent hash-table width the active backend applies, for
         // the primed-snapshot key. Dfast/Row compute it from `table_window_size`
         // below; HC/Fast leave it `0` because their widths live in `params`
@@ -1396,9 +1490,12 @@ impl Matcher for MatchGeneratorDriver {
                 workspace.open(
                     crate::encoding::simple::fast_kernel::hash_table::FastHashTable::workspace_bytes(
                         hash_log,
-                    ),
+                    ) + m.history_workspace_bytes(history_bytes),
                     max_window_size,
                 );
+                // The history binds first, carrying its bytes out from under
+                // where the table may now land.
+                m.bind_history(workspace, history_bytes);
                 m.reset(
                     params.window_log,
                     hash_log,
@@ -1456,7 +1553,13 @@ impl Matcher for MatchGeneratorDriver {
                 }
                 // The widths are settled, so the tables can be laid out; the
                 // reset below reads whether they continue the last frame's.
-                workspace.open(dfast.tables_workspace_bytes(), max_window_size);
+                // The history binds first, carrying its bytes out from under
+                // where the tables may now land.
+                workspace.open(
+                    dfast.tables_workspace_bytes() + dfast.history.workspace_bytes(history_bytes),
+                    max_window_size,
+                );
+                dfast.history.bind(workspace, history_bytes);
                 dfast.bind_tables(workspace);
                 // Dfast holds no per-block input Vecs (history owns the
                 // bytes and `add_data` returns each Vec eagerly), so
@@ -1498,7 +1601,11 @@ impl Matcher for MatchGeneratorDriver {
                 // The finder and its widths are settled by `configure`, so the
                 // tables can be laid out; the reset reads whether they continue
                 // the last frame's.
-                workspace.open(row.tables_workspace_bytes(), max_window_size);
+                workspace.open(
+                    row.tables_workspace_bytes() + row.history.workspace_bytes(history_bytes),
+                    max_window_size,
+                );
+                row.history.bind(workspace, history_bytes);
                 row.bind_tables(workspace);
                 row.reset();
             }
@@ -1545,31 +1652,18 @@ impl Matcher for MatchGeneratorDriver {
                 // The widths are settled by `configure`, so the tables can be
                 // laid out before the reset retires the previous frame's
                 // entries in them.
-                workspace.open(hc.table.tables_workspace_bytes(), max_window_size);
+                workspace.open(
+                    hc.table.tables_workspace_bytes()
+                        + hc.table.history.workspace_bytes(history_bytes),
+                    max_window_size,
+                );
+                hc.table.history.bind(workspace, history_bytes);
                 hc.table.bind_tables(workspace);
                 let vec_pool = &mut self.vec_pool;
                 hc.reset(|mut data| {
                     data.resize(data.capacity(), 0);
                     vec_pool.push(data);
                 });
-                // When the source size is known, pre-size the history mirror to
-                // the expected total (dictionary + payload) so per-block growth
-                // does not overshoot via Vec capacity doubling (upstream zstd sizes its
-                // window buffer exactly). Dominates peak once the match-finder
-                // tables are dictionary-tier-small. Unhinted streams skip this
-                // and keep doubling growth.
-                if let Some(src) = hint {
-                    // `src` is a u64 hint and may be the u64::MAX "unknown
-                    // size" sentinel, which truncates under `as usize` on
-                    // 32-bit targets and overflows when the dict hint is
-                    // added. Saturate the source size, then saturate the
-                    // dict-hint addition; `reserve_history` applies the
-                    // tighter window ceiling to the result.
-                    let src_hint = usize::try_from(src).unwrap_or(usize::MAX);
-                    let expected =
-                        src_hint.saturating_add(dict_hint.map_or(0, |sizes| sizes.content));
-                    hc.table.reserve_history(expected);
-                }
             }
         }
         // LDM wiring (#27): attach (or clear) the long-distance-match
@@ -1685,6 +1779,24 @@ impl Matcher for MatchGeneratorDriver {
         self.seed_dictionary_entropy_impl(huff, ll, ml, of)
     }
 
+    fn leave_workspace(&mut self) {
+        match &mut self.storage {
+            MatcherStorage::Simple(m) => m.leave_workspace(),
+            MatcherStorage::Dfast(m) => {
+                m.tables.leave_workspace();
+                m.history.leave_workspace();
+            }
+            MatcherStorage::Row(m) => {
+                m.tables.leave_workspace();
+                m.history.leave_workspace();
+            }
+            MatcherStorage::HashChain(m) => {
+                m.table.tables.leave_workspace();
+                m.table.history.leave_workspace();
+            }
+        }
+    }
+
     fn window_size(&self) -> u64 {
         self.reported_window_size as u64
     }
@@ -1726,22 +1838,13 @@ impl Matcher for MatchGeneratorDriver {
     fn fill_in_place(
         &mut self,
         capacity: usize,
-        fill: &mut dyn FnMut(&mut Vec<u8>) -> (usize, bool),
+        fill: &mut dyn FnMut(&mut HistoryBuf) -> (usize, bool),
     ) -> Option<(usize, bool)> {
         match &mut self.storage {
             MatcherStorage::Dfast(m) => Some(m.fill_uncommitted(capacity, fill)),
             MatcherStorage::Row(m) => Some(m.fill_uncommitted(capacity, fill)),
             MatcherStorage::HashChain(m) => Some(m.table.fill_uncommitted(capacity, fill)),
             MatcherStorage::Simple(_) => None,
-        }
-    }
-
-    fn reserve_for_frame(&mut self, bytes: usize) {
-        match &mut self.storage {
-            MatcherStorage::Dfast(m) => m.reserve_for_frame(bytes),
-            MatcherStorage::Row(m) => m.reserve_for_frame(bytes),
-            MatcherStorage::HashChain(m) => m.table.reserve_for_frame(bytes),
-            MatcherStorage::Simple(m) => m.reserve_for_frame(bytes),
         }
     }
 

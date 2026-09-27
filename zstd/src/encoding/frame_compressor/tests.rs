@@ -8,6 +8,7 @@ use alloc::vec;
 use super::FrameCompressor;
 use crate::common::{MAGIC_NUM, MAX_BLOCK_SIZE};
 use crate::decoding::FrameDecoder;
+use crate::encoding::workspace::HistoryBuf;
 use crate::encoding::{Matcher, Sequence};
 use alloc::vec::Vec;
 
@@ -2931,6 +2932,45 @@ fn compress_independent_frame_reuses_sticky_dictionary() {
     }
 }
 
+/// A matcher taken out of a compressor must not keep pointing into that
+/// compressor's workspace: its tables and its history, with the dictionary
+/// resident at the head, live there. Moved into a second compressor after the
+/// first is gone, it has to compress exactly as a fresh one does. Pointing into
+/// the freed workspace instead reads whatever took its place, which the
+/// allocation below arranges to be garbage (and Miri reports as a use after
+/// free).
+#[test]
+fn a_matcher_taken_out_of_a_compressor_outlives_it() {
+    use crate::encoding::CompressionLevel;
+    use crate::encoding::match_generator::MatchGeneratorDriver;
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let dict_content = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+    let payload = dict_content.dict_content[..1024].to_vec();
+
+    for level in [3, 5, 9, 16] {
+        let level = CompressionLevel::Level(level);
+        let mut first: FrameCompressor = FrameCompressor::new(level);
+        first.set_dictionary_from_bytes(dict_raw).unwrap();
+        let _ = first.compress_independent_frame(&payload);
+        let workspace_bytes = first.state.workspace.capacity();
+        let matcher = first.replace_matcher(MatchGeneratorDriver::new(1024 * 128, 1));
+        drop(first);
+        let garbage = vec![0xEEu8; workspace_bytes];
+
+        let mut second: FrameCompressor = FrameCompressor::new(level);
+        second.set_dictionary_from_bytes(dict_raw).unwrap();
+        let _ = second.replace_matcher(matcher);
+        let moved = second.compress_independent_frame(&payload);
+
+        let mut fresh: FrameCompressor = FrameCompressor::new(level);
+        fresh.set_dictionary_from_bytes(dict_raw).unwrap();
+        let _ = fresh.compress_independent_frame(&payload);
+        let expected = fresh.compress_independent_frame(&payload);
+        assert_eq!(moved, expected, "{level:?}: the moved matcher diverged");
+        assert!(garbage.iter().all(|&b| b == 0xEE));
+    }
+}
+
 /// Walk a frame's block list, returning `(block_type, block_size, last)` per
 /// physical block. `block_type`: 0 = Raw, 1 = RLE, 2 = Compressed.
 fn frame_block_list(frame: &[u8]) -> Vec<(u8, usize, bool)> {
@@ -3692,7 +3732,7 @@ fn reused_compressor_borrowed_chain_frames_are_byte_identical() {
 /// Simple backend. `Uncompressed` frames must still round-trip: the level, not
 /// the backend, decides whether the staged path is required.
 struct InPlaceMatcher {
-    buffer: Vec<u8>,
+    buffer: HistoryBuf,
     committed: usize,
     window_size: u64,
 }
@@ -3700,7 +3740,7 @@ struct InPlaceMatcher {
 impl InPlaceMatcher {
     fn new(window_size: u64) -> Self {
         Self {
-            buffer: Vec::new(),
+            buffer: HistoryBuf::new(),
             committed: 0,
             window_size,
         }
@@ -3717,14 +3757,14 @@ impl Matcher for InPlaceMatcher {
     }
 
     fn commit_space(&mut self, space: Vec<u8>) {
-        self.buffer = space;
+        self.buffer = space.into();
         self.committed = self.buffer.len();
     }
 
     fn fill_in_place(
         &mut self,
         capacity: usize,
-        fill: &mut dyn FnMut(&mut Vec<u8>) -> (usize, bool),
+        fill: &mut dyn FnMut(&mut HistoryBuf) -> (usize, bool),
     ) -> Option<(usize, bool)> {
         self.buffer.reserve(capacity);
         Some(fill(&mut self.buffer))
@@ -3957,24 +3997,24 @@ fn a_dictionary_frame_reserves_room_for_the_dictionary_too() {
             "level {level}: the dictionary and the frame both live in this \
              buffer, so both have to fit: {capacity} < {needed}"
         );
-        // And fit by reservation rather than by overshooting into them: the
-        // slack is the one block the final top-up asks for, where a buffer that
-        // grew lands on a doubling step well past it.
-        //
-        // Level 1 is excluded from the tight bound: the Fast backend's
-        // dictionary is not in the buffer when the frame is sized — priming
-        // widens its eviction band by the dictionary's length and the bytes
-        // arrive afterwards — so its buffer still ends past the reservation.
-        // Left as it is rather than asserted loosely in the other direction,
-        // since the reason it lands where it does is not established here.
-        if level != 1 {
-            assert!(
-                capacity <= needed + 256 * 1024,
-                "level {level}: {capacity} is past what the frame and \
-                 dictionary need ({needed}), which is what growth by doubling \
-                 leaves behind"
-            );
-        }
+        // And fit by layout rather than by overshooting into them: the slack is
+        // the one block the final top-up asks for, where a buffer that grew
+        // lands on a doubling step well past it. At level 1 the frame is
+        // larger than the window, so the Fast history slides, and it holds up
+        // to twice the window grown by the dictionary before it drains: that
+        // ceiling is laid out from the start.
+        let window = compressor.state.matcher.window_size() as usize;
+        let bound = if level == 1 {
+            2 * (window + dictionary.len()) + crate::common::MAX_BLOCK_SIZE as usize
+        } else {
+            needed + 256 * 1024
+        };
+        assert!(
+            capacity <= bound,
+            "level {level}: {capacity} is past what the frame and \
+             dictionary need ({bound}), which is what growth by doubling \
+             leaves behind"
+        );
     }
 }
 

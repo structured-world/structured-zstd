@@ -24,7 +24,7 @@ use super::super::cost_model::HC_OPT_NUM;
 use super::super::dict_attach::DictAttach;
 use super::super::hc::HC_MIN_MATCH_LEN;
 use super::super::opt::types::{HcOptimalSequence, MatchCandidate};
-use super::super::workspace::{Table, Workspace, region_bytes};
+use super::super::workspace::{HistoryBuf, Table, Workspace, region_bytes};
 use super::helpers::INCOMPRESSIBLE_SKIP_STEP;
 
 /// Lookahead bytes the BT walker / optimal parser will read past the
@@ -236,7 +236,7 @@ pub(crate) struct MatchTable {
     /// (in-place ingest). Zero on the staged path. Explicit rather than derived
     /// from `window_size`, since a primed dictionary also lives in `history`.
     pub(crate) uncommitted_len: usize,
-    pub(crate) history: Vec<u8>,
+    pub(crate) history: HistoryBuf,
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
     pub(crate) position_base: usize,
@@ -511,7 +511,7 @@ impl MatchTable {
             chunk_lens: VecDeque::new(),
             window_size: 0,
             uncommitted_len: 0,
-            history: Vec::new(),
+            history: HistoryBuf::new(),
             history_start: 0,
             history_abs_start: 0,
             position_base: 0,
@@ -1048,56 +1048,20 @@ impl MatchTable {
         );
     }
 
-    /// Append a freshly committed buffer to the rolling window. Drops
-    /// chunk-length entries for the oldest slices until the new total
-    /// fits inside `max_window_size`, extends the contiguous `history`
-    /// mirror with the new bytes, then hands the *input* buffer back
-    /// through `reuse_space` for pool reuse — `history` now owns the
-    /// bytes, so the input buffer carries no live data. (Callers must
-    /// therefore treat the callback as recycle-only, not as an eviction
-    /// report; eviction bytes come from the `window_size` delta.)
-    /// Pre-size the contiguous `history` mirror to `expected_bytes` (capped to
-    /// the window eviction bound) so the per-block `add_data`
-    /// `extend_from_slice` growth does not overshoot through `Vec` capacity
-    /// doubling. Upstream zstd allocates its window buffer at `windowSize + blockSize`
-    /// exactly; left to `Vec` doubling, a ~1 MiB history lands in a 2 MiB
-    /// allocation — wasted peak that dominates once the match-finder tables are
-    /// dictionary-tier-small. Correctness-neutral: the mirror still grows on
-    /// demand if `expected_bytes` underestimates. Only worth calling when the
-    /// total is known (source-size hinted); an unhinted stream keeps doubling.
     /// Heap bytes this table owns: history, the hash / hash3 / chain tables,
     /// the chunk-length deque, and any attached immutable dictionary tables.
     pub(crate) fn heap_size(&self) -> usize {
         let u32_sz = core::mem::size_of::<u32>();
         let usize_sz = core::mem::size_of::<usize>();
         self.chunk_lens.capacity() * usize_sz
-            + self.history.capacity()
-            // One buffer for the hash, chain and hash3 regions together,
-            // counted here only when it is not in a context's workspace.
+            // The history and one buffer for the hash, chain and hash3 regions
+            // together, each counted here only when it is not in a context's
+            // workspace.
+            + self.history.owned_bytes()
             + self.tables.owned_bytes()
             + self.dms.table().map_or(0, |t| {
                 (t.hash_table.capacity() + t.chain_table.capacity()) * u32_sz
             })
-    }
-
-    pub(crate) fn reserve_history(&mut self, expected_bytes: usize) {
-        // Eviction keeps the live mirror within `max_window_size`; the dead
-        // prefix is drained at a quarter window (see `compact_history`) and one
-        // pending block can sit on top, so the steady-state ceiling is
-        // `max_window_size + max_window_size/4 + MAX_BLOCK_SIZE` — matching the
-        // `add_data` eviction reserve so the two never fight over capacity.
-        // Plain arithmetic (not `saturating_*`): `max_window_size = 1 <<
-        // window_log` with `window_log <= ZSTD_WINDOWLOG_MAX` (31), so the sum
-        // is at most `2^31 + 2^29 + 2^17 < usize::MAX` even on 32-bit targets —
-        // overflow is unreachable, and a silent saturation here would only mask
-        // a window_log bound violation upstream.
-        let cap = self.max_window_size
-            + (self.max_window_size >> 2)
-            + crate::common::MAX_BLOCK_SIZE as usize;
-        let want = expected_bytes.min(cap);
-        if want > self.history.capacity() {
-            self.history.reserve_exact(want - self.history.len());
-        }
     }
 
     /// Phase 1 of in-place ingest: `fill` writes the next block STRAIGHT into
@@ -1112,7 +1076,7 @@ impl MatchTable {
     pub(crate) fn fill_uncommitted(
         &mut self,
         capacity: usize,
-        fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
+        fill: impl FnOnce(&mut HistoryBuf) -> (usize, bool),
     ) -> (usize, bool) {
         // Count the bytes already carried, not just this top-up: `capacity` is
         // `block_capacity - carried` (and zero on the EOF re-inspection), yet
@@ -1139,25 +1103,6 @@ impl MatchTable {
         );
         self.uncommitted_len += appended;
         (appended, eof)
-    }
-
-    /// Size `history` for a whole frame in one allocation instead of letting
-    /// the per-block `reserve` walk a doubling chain. Clamped to the eviction
-    /// ceiling, which is the largest the buffer ever grows anyway.
-    pub(crate) fn reserve_for_frame(&mut self, bytes: usize) {
-        let ceiling = self.max_window_size
-            + (self.max_window_size >> 2)
-            + crate::common::MAX_BLOCK_SIZE as usize;
-        // `bytes` already carries the caller's block-sized slack, sized off the
-        // active block capacity — adding the format maximum here would reserve
-        // ~128 KiB for a frame whose window (and therefore block) is 1 KiB.
-        // Counted on top of what the buffer already holds: a dictionary is
-        // primed into it before this runs, so sizing to the frame alone would
-        // leave the dictionary's bytes to be grown into afterwards.
-        let target = self.history.len().saturating_add(bytes).min(ceiling);
-        if self.history.capacity() < target {
-            self.history.reserve_exact(target - self.history.len());
-        }
     }
 
     /// Bytes read but not yet claimed by a block.
@@ -1207,6 +1152,14 @@ impl MatchTable {
         self.uncommitted_len -= len;
     }
 
+    /// Append a freshly committed buffer to the rolling window. Drops
+    /// chunk-length entries for the oldest slices until the new total
+    /// fits inside `max_window_size`, extends the contiguous `history`
+    /// mirror with the new bytes, then hands the *input* buffer back
+    /// through `reuse_space` for pool reuse — `history` now owns the
+    /// bytes, so the input buffer carries no live data. (Callers must
+    /// therefore treat the callback as recycle-only, not as an eviction
+    /// report; eviction bytes come from the `window_size` delta.)
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
         check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
@@ -1270,7 +1223,7 @@ impl MatchTable {
         if self.history_start >= (self.max_window_size >> 2)
             || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
-            self.history.drain(..self.history_start);
+            self.history.drain_front(self.history_start);
             self.history_start = 0;
         }
     }

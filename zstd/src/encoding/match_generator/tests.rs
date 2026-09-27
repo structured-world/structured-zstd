@@ -1356,7 +1356,7 @@ fn dictionary_huffman_seed_ignored_when_literals_uncompressed() {
 #[test]
 fn hc_repcode_candidates_respect_litlen_dependent_rep_order() {
     let mut hc = HcMatchGenerator::new(64);
-    hc.table.history = b"xxxxxxABCDEFABCDEF".to_vec();
+    hc.table.history = b"xxxxxxABCDEFABCDEF".to_vec().into();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
 
@@ -1412,7 +1412,7 @@ fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
     // reads it; `hc.search_depth` above is the configure-time source and does
     // not reach the walk on its own.
     hc.table.search_depth = 0;
-    hc.table.history = b"xyzxyzxyzxyz".to_vec();
+    hc.table.history = b"xyzxyzxyzxyz".to_vec().into();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
 
@@ -1448,7 +1448,7 @@ fn hc_collect_optimal_candidates_panics_for_non_bt_strategy() {
     // rather than walk the HC chain_table as BT pair slots.
     let mut hc = HcMatchGenerator::new(64);
     hc.strategy_tag = crate::encoding::strategy::StrategyTag::Lazy;
-    hc.table.history = b"abcabcabcabc".to_vec();
+    hc.table.history = b"abcabcabcabc".to_vec().into();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
     hc.table.ensure_tables();
@@ -1486,7 +1486,7 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
         let mut hc = HcMatchGenerator::new(64);
         hc.strategy_tag = tag;
         hc.table.kernel = FastpathKernel::Scalar;
-        hc.table.history = b"abcQ00000000abcZ00000000".to_vec();
+        hc.table.history = b"abcQ00000000abcZ00000000".to_vec().into();
         hc.table.history_start = 0;
         hc.table.history_abs_start = 0;
         hc.table.hash_log = 8;
@@ -1523,7 +1523,7 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
 fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
     let mut hc = HcMatchGenerator::new(64);
     hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
-    hc.table.history = b"aaaaaaaaaa".to_vec();
+    hc.table.history = b"aaaaaaaaaa".to_vec().into();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
     hc.table.position_base = 0;
@@ -1557,7 +1557,7 @@ fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
 fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
     let mut hc = HcMatchGenerator::new(128);
     hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
-    hc.table.history = b"abcabcabcabcabcabcabcabc".to_vec();
+    hc.table.history = b"abcabcabcabcabcabcabcabc".to_vec().into();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
     hc.table.position_base = 0;
@@ -1591,7 +1591,7 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
 fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
     let mut hc = HcMatchGenerator::new(256);
     hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
-    hc.table.history = b"abcdefghijklmnop".to_vec();
+    hc.table.history = b"abcdefghijklmnop".to_vec().into();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
     hc.table.position_base = 0;
@@ -1637,7 +1637,10 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
 fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
     let mut hc = HcMatchGenerator::new(512);
     hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
-    hc.table.history = (0..256).map(|i| (i % 251) as u8).collect();
+    hc.table.history = (0..256)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<u8>>()
+        .into();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
 
@@ -1680,7 +1683,7 @@ fn hc_ldm_candidate_survives_the_search_early_exit() {
     let mut hc = HcMatchGenerator::new(512);
     hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
     // rep0 = 10 matches `abcde` at position 10, then `Y` meets `X`: length 5.
-    hc.table.history = b"abcdeXXXXXabcdeYYYYYYYYYYYYYYYYYYYY".to_vec();
+    hc.table.history = b"abcdeXXXXXabcdeYYYYYYYYYYYYYYYYYYYY".to_vec().into();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
     hc.table.search_depth = 32;
@@ -1736,7 +1739,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     let window_log = 20u8;
 
     let prepare_history = |hc: &mut HcMatchGenerator, abs_pos: usize| {
-        hc.table.history = alloc::vec![0u8; 160];
+        hc.table.history = alloc::vec![0u8; 160].into();
         for i in 0..64 {
             hc.table.history[i] = b'a' + (i % 7) as u8;
         }
@@ -1866,25 +1869,23 @@ fn driver_huge_source_hint_does_not_overflow_table_window_shift() {
 
 #[test]
 fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
-    // Regression: the HC/BT history-mirror pre-size adds the dictionary
-    // hint to the source-size hint before `reserve_history` clamps to the
-    // window ceiling. A `u64::MAX` pledged source size (the "unknown size"
-    // sentinel) plus any positive dictionary hint overflows `usize` in
-    // `(src as usize) + dict_hint` — debug panic / release wrap on 64-bit,
-    // and `src as usize` truncation on 32-bit targets. Level 16 (BtOpt)
-    // routes through the HashChain/BT storage arm that owns this reserve.
-    // Must size the mirror to the real window, never panic, wrap, or
-    // truncate.
+    // Regression: the HC/BT history is sized from the dictionary hint plus the
+    // source-size hint, clamped to the window ceiling. A `u64::MAX` pledged
+    // source size (the "unknown size" sentinel) plus any positive dictionary
+    // hint overflows `usize` in `(src as usize) + dict_hint` — debug panic /
+    // release wrap on 64-bit, and `src as usize` truncation on 32-bit targets.
+    // Level 16 (BtOpt) routes through the HashChain/BT storage arm. Must size
+    // the history to the real window, never panic, wrap, or truncate.
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.set_source_size_hint(u64::MAX);
     driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(64 * 1024));
     driver.reset(CompressionLevel::Level(16));
 
-    // The saturated `usize::MAX` reserve target must be clamped to the HC
-    // history ceiling, not reserved literally (which would OOM/panic). Level 16
-    // has window_log 22, so the ceiling is `window + window/4 + one block`
-    // (the `reserve_history` formula). Assert the reserve actually reached it —
-    // a no-panic-only check would also pass on an under-reserved mirror.
+    // The saturated `usize::MAX` size must be clamped to the HC history
+    // ceiling, not laid out literally (which would OOM/panic). Level 16 has
+    // window_log 22, so the ceiling is `window + window/4 + one block`. Assert
+    // the history actually reached it — a no-panic-only check would also pass
+    // on an under-sized history.
     let window = 1usize << 22;
     let expected_history_ceiling = window + (window >> 2) + crate::common::MAX_BLOCK_SIZE as usize;
     assert!(
@@ -1898,6 +1899,30 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
+}
+
+/// The history's slack for the last read is the frame's own block, which a
+/// small window shrinks below the format maximum: a fixed 128 KiB on top would
+/// dwarf a small frame's whole history.
+#[test]
+fn the_history_slack_is_the_frames_block_not_the_format_maximum() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let mut workspace = Workspace::new();
+    workspace.begin_layout(
+        crate::common::MAX_BLOCK_SIZE as usize,
+        no_trailing,
+        IngestPlan::Slice,
+    );
+    let bytes = super::frame_history_bytes(
+        super::super::strategy::BackendTag::Dfast,
+        &workspace,
+        false,
+        Some(1000),
+        0,
+        1024,
+        CompressionLevel::Level(3),
+    );
+    assert_eq!(bytes, 1000 + 1024, "the input plus one 1 KiB block");
 }
 
 /// Regression: a dictionary frame runs the CDict's strategy even when the
@@ -3865,7 +3890,7 @@ fn row_hash_and_row_extracts_high_bits() {
 fn row_repcode_skips_candidate_before_history_start() {
     let mut matcher = RowMatchGenerator::new(1 << 22);
     matcher.configure(ROW_CONFIG);
-    matcher.history = alloc::vec![b'a'; 20];
+    matcher.history = alloc::vec![b'a'; 20].into();
     matcher.history_start = 0;
     matcher.history_abs_start = 10;
     matcher.offset_hist = [3, 0, 0];
@@ -3877,7 +3902,7 @@ fn row_repcode_skips_candidate_before_history_start() {
 fn row_repcode_returns_none_when_position_too_close_to_history_end() {
     let mut matcher = RowMatchGenerator::new(1 << 22);
     matcher.configure(ROW_CONFIG);
-    matcher.history = b"abcde".to_vec();
+    matcher.history = b"abcde".to_vec().into();
     matcher.history_start = 0;
     matcher.history_abs_start = 0;
     matcher.offset_hist = [1, 0, 0];
@@ -3933,7 +3958,7 @@ fn row_candidate_returns_none_when_abs_pos_near_end_of_history() {
     // than `ROW_MIN_MATCH_LEN` bytes left, so the length gate in
     // `row_candidate` must short-circuit to `None` before touching the
     // (here unbuilt) row tables.
-    matcher.history = alloc::vec![b'a'; ROW_MIN_MATCH_LEN - 1];
+    matcher.history = alloc::vec![b'a'; ROW_MIN_MATCH_LEN - 1].into();
     matcher.history_start = 0;
     matcher.history_abs_start = 0;
 
@@ -4149,17 +4174,17 @@ fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
 #[test]
 fn hc_compact_history_drains_when_threshold_crossed() {
     let mut hc = HcMatchGenerator::new(8);
-    hc.table.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    hc.table.history = b"abcdefghijklmnopqrstuvwxyz".to_vec().into();
     hc.table.history_start = 16;
     hc.table.compact_history();
     assert_eq!(hc.table.history_start, 0);
-    assert_eq!(hc.table.history, b"qrstuvwxyz");
+    assert_eq!(&hc.table.history[..], b"qrstuvwxyz");
 }
 
 #[test]
 fn hc_insert_position_no_rebase_returns_when_relative_pos_unavailable() {
     let mut hc = HcMatchGenerator::new(32);
-    hc.table.history = b"abcdefghijklmnop".to_vec();
+    hc.table.history = b"abcdefghijklmnop".to_vec().into();
     hc.table.history_abs_start = 0;
     hc.table.position_base = 1;
     hc.table.ensure_tables();
@@ -4175,7 +4200,7 @@ fn hc_insert_position_no_rebase_returns_when_relative_pos_unavailable() {
 #[test]
 fn hc_insert_positions_advances_next_to_update3_for_contiguous_range() {
     let mut hc = HcMatchGenerator::new(64);
-    hc.table.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    hc.table.history = b"abcdefghijklmnopqrstuvwxyz".to_vec().into();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
     hc.table.position_base = 0;
@@ -4193,7 +4218,7 @@ fn hc_insert_positions_advances_next_to_update3_for_contiguous_range() {
 #[test]
 fn hc_insert_positions_with_step_keeps_next_to_update3_cursor_for_sparse_ranges() {
     let mut hc = HcMatchGenerator::new(64);
-    hc.table.history = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    hc.table.history = b"abcdefghijklmnopqrstuvwxyz".to_vec().into();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
     hc.table.position_base = 0;
