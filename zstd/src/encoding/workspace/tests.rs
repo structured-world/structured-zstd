@@ -132,6 +132,24 @@ fn only_tables_that_fill_the_workspace_take_it_zeroed() {
     assert!(fresh.as_slice().iter().all(|&v| v == 0));
 }
 
+// From the size the system allocator always serves with fresh pages, the
+// workspace is taken zeroed however small its tables: zeroing costs nothing
+// there, and filling the tables would fault in pages the frame never indexes.
+#[test]
+fn a_workspace_on_fresh_pages_is_taken_zeroed() {
+    fn buffers_up_to_fresh_pages(_block: usize) -> usize {
+        FRESH_PAGES_FROM
+    }
+    let table = region_bytes::<u32>(64);
+    let mut ws = Workspace::new();
+    ws.begin_layout(1 << 17, buffers_up_to_fresh_pages, IngestPlan::Slice);
+    // The tables are not even sparse: the input is expected to fill them.
+    ws.open_for_match_finder(table, table, 1 << 14, usize::MAX);
+    assert!(ws.zeroed, "a workspace past the fresh-page size is zeroed");
+    let zeros = ws.table::<u32>(64, 0);
+    assert!(zeros.as_slice().iter().all(|&v| v == 0));
+}
+
 // The next frame's layout puts a table of the same size back on the same bytes,
 // and its holder keeps what it wrote: that is what lets a match finder carry a
 // table across frames without clearing it.

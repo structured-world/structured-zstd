@@ -114,6 +114,24 @@ pub struct Workspace {
 const TOO_LARGE_FACTOR: usize = 3;
 const TOO_LARGE_MAX_LAYOUTS: u32 = 128;
 
+/// Size from which the target's system allocator serves every request with
+/// pages fresh from the kernel, so a zeroed allocation costs no memset and
+/// faults in only what is touched. Below it memory is recycled and zeroing
+/// it is a memset of all of it.
+///
+/// musl's mallocng maps anything above `MMAP_THRESHOLD` (131052 bytes,
+/// `src/malloc/mallocng/meta.h`) on its own. glibc raises its mmap
+/// threshold toward whatever it last freed, so a context rebuilt per frame
+/// lands on recycled heap, but never past `DEFAULT_MMAP_THRESHOLD_MAX`
+/// (`malloc/malloc.c`): 512 KiB on 32-bit targets, 32 MiB on 64-bit ones.
+/// Other allocators take the glibc 64-bit ceiling, the one that assumes least.
+#[cfg(target_env = "musl")]
+const FRESH_PAGES_FROM: usize = 128 * 1024;
+#[cfg(all(not(target_env = "musl"), target_pointer_width = "32"))]
+const FRESH_PAGES_FROM: usize = 512 * 1024;
+#[cfg(all(not(target_env = "musl"), not(target_pointer_width = "32")))]
+const FRESH_PAGES_FROM: usize = 32 * 1024 * 1024;
+
 // SAFETY: the workspace owns its allocation outright; the raw pointer is what
 // makes the type `!Send`/`!Sync` by default, not any shared state.
 unsafe impl Send for Workspace {}
@@ -253,13 +271,17 @@ impl Workspace {
             self.oversized_layouts > TOO_LARGE_MAX_LAYOUTS
         };
         // A zeroed allocation costs nothing on pages the kernel hands out
-        // fresh and a memset of all of it on memory the allocator recycles,
-        // which is where a context rebuilt per frame lands. So it is taken
-        // only when the rest is at most a third of the tables, which caps that
-        // case at a third over filling the tables alone. A small frame's
-        // tables sit beside buffers of their own size: at 10 KiB and level 1
-        // they were 56% of the workspace, and zeroing it all measured 23%
-        // slower than filling them. A small input at a high level, where the
+        // fresh and a memset of all of it on memory the allocator recycles.
+        // At `FRESH_PAGES_FROM` and above the pages are fresh, so it is taken
+        // whatever the tables: filling them there faults in pages the frame
+        // never indexes, 36-42% of the encode at 1 MiB and level 3 on musl
+        // and i686, and 70% at 10 KiB on musl. Below it, where a context
+        // rebuilt per frame lands on recycled memory, it is taken only when
+        // the rest is at most a third of the sparse tables, which caps that
+        // case at a third over filling them. A small frame's tables sit
+        // beside buffers of their own size: at 10 KiB and level 1 they were
+        // 56% of the workspace, and zeroing it all measured 23% slower than
+        // filling them on glibc. A small input at a high level, where the
         // tables are most of it, keeps its untouched pages (78% at level 13).
         //
         // Carving the zero tables from a zeroed allocation of their own instead
@@ -273,8 +295,9 @@ impl Workspace {
             self.sparse_table_bytes <= leading,
             "zero tables are part of the leading bytes"
         );
-        let zero_all = self.sparse_table_bytes > 0
-            && total - self.sparse_table_bytes <= self.sparse_table_bytes / 3;
+        let zero_all = total >= FRESH_PAGES_FROM
+            || (self.sparse_table_bytes > 0
+                && total - self.sparse_table_bytes <= self.sparse_table_bytes / 3);
         if reallocate {
             self.grow(total, zero_all);
         }
