@@ -2,6 +2,7 @@ use super::CompressionLevel;
 use crate::common::MAX_BLOCK_SIZE;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 
 /// What the block's own bytes cannot answer: has this content been seen
 /// earlier in the frame?
@@ -631,7 +632,9 @@ const RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES: u64 = 1u64 << RAW_FAST_PATH_MAX_WINDO
 // cuts per-call stack for repeat tracking from ~8 KiB to ~4 KiB.
 const INCOMPRESSIBLE_REPEAT_TABLE_BITS: usize = 10;
 const INCOMPRESSIBLE_REPEAT_TABLE_LEN: usize = 1 << INCOMPRESSIBLE_REPEAT_TABLE_BITS;
-const INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS: usize = INCOMPRESSIBLE_REPEAT_TABLE_LEN / 64;
+// 32-bit words: a 64-bit shift is two instructions and a branch on a 32-bit
+// target, and the bitset is the only thing the scan writes every quad.
+const INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS: usize = INCOMPRESSIBLE_REPEAT_TABLE_LEN / 32;
 const INCOMPRESSIBLE_REPEAT_HASH_MULT: u32 = 0x9E37_79B1;
 const INCOMPRESSIBLE_MIN_DISTINCT_BYTES: usize = 200;
 // Allow at most ~4.2% concentration for the most frequent symbol in sampled data.
@@ -737,55 +740,53 @@ pub(crate) fn compression_level_allows_raw_fast_path(
 #[inline]
 fn scan_sample_region(
     sample: &[u8],
-    // Wide enough for a whole block, not just a sample: the dictionary-aware
-    // classifier scans the full 128 KiB, and a byte can appear more than 65,535
-    // times there without the quad-repeat guard firing first (distinct quads
-    // sharing one byte value do exactly that), which a narrower counter would
-    // wrap or panic on.
-    counts: &mut [u32; 256],
-    repeat_table: &mut [u32; INCOMPRESSIBLE_REPEAT_TABLE_LEN],
-    repeat_occupied: &mut [u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS],
+    // A sample is at most `RAW_FAST_PATH_MAX_SAMPLE_LEN` bytes, so no byte can
+    // be counted past what sixteen bits hold, and the narrower array is half
+    // the per-call clear.
+    counts: &mut [u16; 256],
+    // Never cleared: a slot is read only once its occupancy bit says this call
+    // wrote it, so the four kilobytes of table cost nothing per call. Filling
+    // it was a fixed memset on every block the classifier looks at, which on a
+    // kilobyte block is a larger share of the call than the scan itself.
+    repeat_table: &mut [MaybeUninit<u32>; INCOMPRESSIBLE_REPEAT_TABLE_LEN],
+    repeat_occupied: &mut [u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS],
     repeats: &mut usize,
     repeat_guard: usize,
 ) -> bool {
-    let mut idx = 0usize;
-    let len = sample.len();
-    while idx + 4 <= len {
-        counts[sample[idx] as usize] += 1;
-        counts[sample[idx + 1] as usize] += 1;
-        counts[sample[idx + 2] as usize] += 1;
-        counts[sample[idx + 3] as usize] += 1;
-        let quad = u32::from_le_bytes([
-            sample[idx],
-            sample[idx + 1],
-            sample[idx + 2],
-            sample[idx + 3],
-        ]);
+    debug_assert!(sample.len() <= RAW_FAST_PATH_MAX_SAMPLE_LEN);
+    let (quads, tail) = sample.as_chunks::<4>();
+    for &chunk in quads {
+        // One unaligned load: the chunk is a `[u8; 4]` by type, so neither the
+        // read nor the byte counts below carry a bounds check.
+        let quad = u32::from_le_bytes(chunk);
+        counts[(quad & 0xFF) as usize] += 1;
+        counts[((quad >> 8) & 0xFF) as usize] += 1;
+        counts[((quad >> 16) & 0xFF) as usize] += 1;
+        counts[(quad >> 24) as usize] += 1;
         // Top `INCOMPRESSIBLE_REPEAT_TABLE_BITS` bits of the 32-bit hash give
         // the slot directly: the `as usize` value is `< 2^32`, so the shift
         // by `32 - BITS` already yields an index in `0..TABLE_LEN`. No mask
         // needed (upstream zstd `ZSTD_hashPtr` shape).
-        let slot = (quad.wrapping_mul(INCOMPRESSIBLE_REPEAT_HASH_MULT) as usize)
-            >> (32 - INCOMPRESSIBLE_REPEAT_TABLE_BITS);
-        let word = slot / 64;
-        let bit = 1_u64 << (slot % 64);
-        let occupied = (repeat_occupied[word] & bit) != 0;
-        if occupied && repeat_table[slot] == quad {
+        let slot = (quad.wrapping_mul(INCOMPRESSIBLE_REPEAT_HASH_MULT)
+            >> (32 - INCOMPRESSIBLE_REPEAT_TABLE_BITS)) as usize;
+        let word = slot / 32;
+        let bit = 1_u32 << (slot % 32);
+        // SAFETY: the occupancy bit is set only in the arm below, right after
+        // that slot is written, so a set bit means an initialised slot.
+        if repeat_occupied[word] & bit != 0 && unsafe { repeat_table[slot].assume_init() } == quad {
             *repeats += 1;
             if *repeats > repeat_guard {
                 return true;
             }
         } else {
-            repeat_table[slot] = quad;
+            repeat_table[slot] = MaybeUninit::new(quad);
             repeat_occupied[word] |= bit;
         }
-        idx += 4;
     }
     // Tail bytes that don't form a full quad still count toward the symbol
     // histogram used by the final distinct / max-frequency verdict.
-    while idx < len {
-        counts[sample[idx] as usize] += 1;
-        idx += 1;
+    for &byte in tail {
+        counts[byte as usize] += 1;
     }
     false
 }
@@ -830,20 +831,10 @@ pub(crate) fn block_looks_incompressible_strict(block: &[u8]) -> bool {
     }
 }
 
-#[inline]
+/// Whether a sample of at most [`RAW_FAST_PATH_MAX_SAMPLE_LEN`] bytes, the whole
+/// block or its head, middle and tail, looks like noise.
 fn sample_looks_incompressible(block: &[u8]) -> bool {
-    sample_looks_incompressible_capped(block, RAW_FAST_PATH_MAX_SAMPLE_LEN)
-}
-
-/// As [`sample_looks_incompressible`] but with an explicit sample cap. A larger
-/// cap scans more of the block, so it detects LONG-RANGE repeats (a region that
-/// re-occurs far away — e.g. a record drawn from a dictionary, or a block whose
-/// second half repeats its first) that the small fixed sample misses by only
-/// looking at disjoint head/mid/tail windows. Used by the dict-aware check,
-/// which samples the whole block: a high-entropy-LOOKING block that actually
-/// repeats (and so will compress, dict or not) must not be skipped to raw.
-fn sample_looks_incompressible_capped(block: &[u8], max_sample_len: usize) -> bool {
-    let sample_len = block.len().min(max_sample_len);
+    let sample_len = block.len().min(RAW_FAST_PATH_MAX_SAMPLE_LEN);
     if sample_len < RAW_FAST_PATH_MIN_SAMPLE_LEN {
         return false;
     }
@@ -874,11 +865,12 @@ fn sample_looks_incompressible_capped(block: &[u8], max_sample_len: usize) -> bo
     let total_quads: usize = regions[..region_count].iter().map(|r| r.len() / 4).sum();
     let repeat_guard = total_quads / INCOMPRESSIBLE_REPEAT_DIVISOR + 1;
 
-    let mut counts = [0u32; 256];
-    let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+    let mut counts = [0u16; 256];
+    let mut repeat_table =
+        [const { MaybeUninit::<u32>::uninit() }; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
     // Bitset occupancy keeps this path no_std-friendly while avoiding the
     // larger per-slot bool map (and extra matcher-level scratch state).
-    let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
+    let mut repeat_occupied = [0_u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
     let mut repeats = 0usize;
 
     for region in &regions[..region_count] {

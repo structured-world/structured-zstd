@@ -309,15 +309,15 @@ fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
 #[test]
 fn sample_metrics_do_not_count_first_u32_max_as_repeat() {
     let sample = [0xFF_u8; 4];
-    let mut counts = [0u32; 256];
-    let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
-    let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
+    let mut counts = [0u16; 256];
+    // Every slot holds `0xFFFFFFFF` before the scan, the value the first quad
+    // is, so only the occupancy bit keeps it from reading as a repeat.
+    let mut repeat_table = [MaybeUninit::new(u32::MAX); INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+    let mut repeat_occupied = [0_u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
     let mut repeats = 0usize;
 
-    // Guard set high so the early-exit never fires: this exercises the
-    // repeat-table init, where `0xFFFFFFFF` matches the `u32::MAX`
-    // sentinel but the occupancy bit is still clear, so the first quad
-    // must NOT be counted as a repeat.
+    // Guard set high so the early-exit never fires, so the first quad is
+    // scanned in full and must NOT be counted as a repeat.
     let bailed = scan_sample_region(
         &sample,
         &mut counts,
@@ -336,9 +336,10 @@ fn scan_sample_region_early_exits_on_repetitive_input() {
     // 32 identical 4-byte quads: the repeat count climbs past any small
     // guard, exercising the early-exit `true` path directly.
     let sample = [0xAB_u8; 128];
-    let mut counts = [0u32; 256];
-    let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
-    let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
+    let mut counts = [0u16; 256];
+    let mut repeat_table =
+        [const { MaybeUninit::<u32>::uninit() }; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+    let mut repeat_occupied = [0_u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
     let mut repeats = 0usize;
 
     // Guard of 1: the first quad seeds the table, the second is the first
@@ -355,6 +356,151 @@ fn scan_sample_region_early_exits_on_repetitive_input() {
 
     assert!(bailed, "repetitive input must trigger the early exit");
     assert!(repeats > 1, "repeat count must have exceeded the guard");
+}
+
+/// The classifier as it stood before its scan was narrowed to 32-bit words,
+/// sixteen-bit counts and an uncleared table, kept verbatim as the reference the
+/// rewrite must agree with.
+fn reference_sample_looks_incompressible(block: &[u8]) -> bool {
+    let sample_len = block.len().min(RAW_FAST_PATH_MAX_SAMPLE_LEN);
+    if sample_len < RAW_FAST_PATH_MIN_SAMPLE_LEN {
+        return false;
+    }
+    let mut regions: [&[u8]; 3] = [&[], &[], &[]];
+    let region_count = if sample_len == block.len() {
+        regions[0] = block;
+        1
+    } else {
+        let head_len = sample_len / 3;
+        let mid_len = sample_len / 3;
+        let tail_len = sample_len - head_len - mid_len;
+        let mid_start = (block.len() - mid_len) / 2;
+        regions[0] = &block[..head_len];
+        regions[1] = &block[mid_start..mid_start + mid_len];
+        regions[2] = &block[block.len() - tail_len..];
+        3
+    };
+    let max_symbol_guard = sample_len / INCOMPRESSIBLE_MAX_SYMBOL_DIVISOR;
+    let total_quads: usize = regions[..region_count].iter().map(|r| r.len() / 4).sum();
+    let repeat_guard = total_quads / INCOMPRESSIBLE_REPEAT_DIVISOR + 1;
+    let mut counts = [0u32; 256];
+    let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+    let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_TABLE_LEN / 64];
+    let mut repeats = 0usize;
+    for sample in &regions[..region_count] {
+        let mut idx = 0usize;
+        let len = sample.len();
+        while idx + 4 <= len {
+            counts[sample[idx] as usize] += 1;
+            counts[sample[idx + 1] as usize] += 1;
+            counts[sample[idx + 2] as usize] += 1;
+            counts[sample[idx + 3] as usize] += 1;
+            let quad = u32::from_le_bytes([
+                sample[idx],
+                sample[idx + 1],
+                sample[idx + 2],
+                sample[idx + 3],
+            ]);
+            let slot = (quad.wrapping_mul(INCOMPRESSIBLE_REPEAT_HASH_MULT) as usize)
+                >> (32 - INCOMPRESSIBLE_REPEAT_TABLE_BITS);
+            let word = slot / 64;
+            let bit = 1_u64 << (slot % 64);
+            let occupied = (repeat_occupied[word] & bit) != 0;
+            if occupied && repeat_table[slot] == quad {
+                repeats += 1;
+                if repeats > repeat_guard {
+                    return false;
+                }
+            } else {
+                repeat_table[slot] = quad;
+                repeat_occupied[word] |= bit;
+            }
+            idx += 4;
+        }
+        while idx < len {
+            counts[sample[idx] as usize] += 1;
+            idx += 1;
+        }
+    }
+    let distinct = counts.iter().filter(|&&count| count != 0).count();
+    let max_freq = counts.iter().copied().max().unwrap_or(0) as usize;
+    distinct >= INCOMPRESSIBLE_MIN_DISTINCT_BYTES
+        && max_freq <= max_symbol_guard
+        && repeats <= repeat_guard
+}
+
+/// The rewritten scan decides every block exactly as the one it replaced.
+///
+/// The verdict picks which blocks go out raw, so a scan that is faster but
+/// disagrees on even one shape changes compressed output. The corpus straddles
+/// every threshold the verdict reads: lengths around the sample cap, the
+/// three-region split and the quad remainder; alphabets around the
+/// distinct-byte floor; a skewed byte around the frequency ceiling; and repeat
+/// densities around the quad-repeat guard. Both outcomes have to occur, or the
+/// corpus is not testing the boundary.
+#[test]
+fn the_rewritten_scan_decides_every_block_as_before() {
+    let lengths = [
+        0,
+        RAW_FAST_PATH_MIN_SAMPLE_LEN - 1,
+        RAW_FAST_PATH_MIN_SAMPLE_LEN,
+        RAW_FAST_PATH_MIN_BLOCK_LEN - 1,
+        RAW_FAST_PATH_MIN_BLOCK_LEN,
+        1000,
+        1024,
+        1027,
+        RAW_FAST_PATH_MAX_SAMPLE_LEN - 1,
+        RAW_FAST_PATH_MAX_SAMPLE_LEN,
+        RAW_FAST_PATH_MAX_SAMPLE_LEN + 1,
+        RAW_FAST_PATH_MAX_SAMPLE_LEN + 3,
+        10 * 1024,
+        64 * 1024 + 5,
+        128 * 1024,
+    ];
+    let mut outcomes = [0usize; 2];
+    let mut seed = 0x1234_5678_9ABC_DEF1_u64;
+    for &len in &lengths {
+        for alphabet in [16usize, 180, 199, 200, 201, 230, 256] {
+            for skew_per_mille in [0usize, 30, 42, 45, 60] {
+                for repeat_per_mille in [0usize, 10, 15, 16, 20, 40, 200] {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    let mut block = deterministic_bytes(seed | 1, len);
+                    for (i, byte) in block.iter_mut().enumerate() {
+                        let pick = (i as u64).wrapping_mul(seed | 1) >> 7;
+                        *byte = if (pick % 1000) < skew_per_mille as u64 {
+                            0x42
+                        } else {
+                            (*byte as usize % alphabet) as u8
+                        };
+                    }
+                    // Copy a quad from four bytes back at the chosen density,
+                    // which is what the repeat guard counts.
+                    let mut i = 8;
+                    while i + 4 <= block.len() {
+                        let pick = (i as u64).wrapping_mul(seed.rotate_left(17) | 1) >> 11;
+                        if (pick % 1000) < repeat_per_mille as u64 {
+                            block.copy_within(i - 8..i - 4, i);
+                        }
+                        i += 4;
+                    }
+                    let expected = reference_sample_looks_incompressible(&block);
+                    assert_eq!(
+                        sample_looks_incompressible(&block),
+                        expected,
+                        "len {len}, alphabet {alphabet}, skew {skew_per_mille}, repeats {repeat_per_mille}",
+                    );
+                    if len >= RAW_FAST_PATH_MIN_BLOCK_LEN {
+                        assert_eq!(block_looks_incompressible(&block), expected);
+                    }
+                    outcomes[usize::from(expected)] += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        outcomes[0] > 0 && outcomes[1] > 0,
+        "the corpus must reach both verdicts, got {outcomes:?}",
+    );
 }
 
 /// The window, not the level, is what closes the skip: a match that may reach
