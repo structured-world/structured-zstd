@@ -108,6 +108,8 @@ pub struct Workspace {
     /// The open layout made the allocation, zeroed, so its regions hold
     /// zeros until their holders write them.
     zeroed: bool,
+    /// See [`Self::on_fresh_pages`].
+    fresh_pages: bool,
 }
 
 /// Upstream `ZSTD_WORKSPACETOOLARGE_FACTOR` / `_MAXDURATION`
@@ -162,6 +164,7 @@ impl Workspace {
             oversized_layouts: 0,
             sparse_table_bytes: 0,
             zeroed: false,
+            fresh_pages: false,
         }
     }
 
@@ -175,8 +178,9 @@ impl Workspace {
     /// it: a new allocation from [`FRESH_PAGES_FROM`] up. The first touch of
     /// each of its pages is a fault, so work that sweeps a table costs more
     /// than on a workspace kept from an earlier frame.
+    /// Settled when the layout opens, so the per-block gate reads one field.
     pub(crate) fn on_fresh_pages(&self) -> bool {
-        self.zeroed && self.capacity >= FRESH_PAGES_FROM
+        self.fresh_pages
     }
 
     /// Bytes the workspace has allocated, for heap accounting: its capacity
@@ -332,6 +336,7 @@ impl Workspace {
             self.grow(total, zero_all);
         }
         self.zeroed = reallocate && zero_all;
+        self.fresh_pages = self.zeroed && self.capacity >= FRESH_PAGES_FROM;
         self.front = 0;
         self.leading = leading;
         self.history_front = leading;
