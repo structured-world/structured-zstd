@@ -670,6 +670,36 @@ fn streaming_encoder_matcher_and_gates_resolve_from_one_size() {
     enc.finish().unwrap();
 }
 
+/// A pledged stream under a window wider than its level's lays its history out
+/// for the whole pledge, so reading it never moves the history out of the
+/// context's workspace into an allocation of its own.
+#[test]
+fn a_pledged_stream_past_the_level_window_keeps_its_history_in_the_workspace() {
+    let level = CompressionLevel::Level(3);
+    let params = crate::encoding::CompressionParameters::builder(level)
+        .window_log(23)
+        .build()
+        .unwrap();
+    let input: Vec<u8> = (0..4u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 & 0x3F)
+        .collect();
+    let mut enc = StreamingEncoder::new(Vec::new(), level);
+    enc.set_parameters(&params).unwrap();
+    enc.set_pledged_content_size(input.len() as u64).unwrap();
+    enc.write_all(&input).unwrap();
+    assert_eq!(
+        enc.context.state.matcher.owned_table_and_history_bytes().1,
+        0,
+        "the history outgrew the room laid out for the pledge"
+    );
+    let compressed = enc.finish().unwrap();
+    let mut decoded = Vec::with_capacity(input.len());
+    crate::decoding::FrameDecoder::new()
+        .decode_all_to_vec(&compressed, &mut decoded)
+        .unwrap();
+    assert_eq!(decoded, input);
+}
+
 /// Regression: a streamed periodic input at the btlazy2 levels round-trips.
 /// The pre-splitter cuts short mid-stream blocks out of full 128 KiB
 /// buffers; the binary-tree lazy backend must accept those short committed

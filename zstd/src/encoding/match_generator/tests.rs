@@ -1894,6 +1894,53 @@ fn the_history_slack_is_the_frames_block_not_the_format_maximum() {
     assert_eq!(bytes, 1000 + 1024, "the input plus one 1 KiB block");
 }
 
+/// A pledged stream's size is exact, since the context refuses any other
+/// length, so its history is laid out for all of it under an overridden
+/// window, as a slice's is. Capped at the level's own window instead, a pledge
+/// past it outgrows the workspace and doubles an owned history on every frame.
+#[test]
+fn a_pledged_stream_lays_out_history_for_all_of_its_input() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let pledged = 4usize << 20;
+    let window = 8usize << 20;
+    let level = CompressionLevel::Level(3);
+    let level_window = 1usize
+        << crate::encoding::levels::config::resolve_level_params(level, Some(pledged as u64))
+            .window_log;
+    assert!(
+        level_window < pledged,
+        "fixture: the pledge is past the level's window"
+    );
+
+    let block = crate::common::MAX_BLOCK_SIZE as usize;
+    let mut workspace = Workspace::new();
+    workspace.begin_layout(block, no_trailing, IngestPlan::PledgedStream);
+    let bytes = super::frame_history_bytes(
+        super::super::strategy::BackendTag::Dfast,
+        &workspace,
+        false,
+        Some(pledged as u64),
+        0,
+        window,
+        level,
+    );
+    assert_eq!(bytes, pledged + block, "the pledged input plus one block");
+
+    // An advisory hint on a stream stays capped at the level's window.
+    let mut workspace = Workspace::new();
+    workspace.begin_layout(block, no_trailing, IngestPlan::Stream);
+    let bytes = super::frame_history_bytes(
+        super::super::strategy::BackendTag::Dfast,
+        &workspace,
+        false,
+        Some(pledged as u64),
+        0,
+        window,
+        level,
+    );
+    assert_eq!(bytes, level_window + block);
+}
+
 /// Regression: a dictionary frame runs the CDict's strategy even when the
 /// source-size tier put the plain level in another backend family
 /// (upstream `ZSTD_resetCCtx_usingCDict` takes the CDict's cParams

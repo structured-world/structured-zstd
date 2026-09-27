@@ -449,10 +449,11 @@ fn hc_attaches_dictionary(hc: &HcMatchGenerator, size_log: Option<u8>) -> bool {
 /// for the others that window plus the quarter of it compaction leaves behind;
 /// either way plus one pending block.
 ///
-/// A size known exactly (a slice) is taken as it is. A size hint on a stream is
-/// a claim about data not yet read, trusted only up to the window the LEVEL
-/// would choose for it; overriding the window is a claim of its own that only
-/// the data can confirm. An unknown size may fill any window.
+/// A size known exactly (a slice, or a pledge the context enforces) is taken as
+/// it is. A size hint on a stream is a claim about data not yet read, trusted
+/// only up to the window the LEVEL would choose for it; overriding the window
+/// is a claim of its own that only the data can confirm. An unknown size may
+/// fill any window.
 fn frame_history_bytes(
     backend: super::strategy::BackendTag,
     workspace: &crate::encoding::workspace::Workspace,
@@ -480,7 +481,7 @@ fn frame_history_bytes(
     let input = match workspace.ingest() {
         IngestPlan::Raw => return 0,
         IngestPlan::Slice if in_place => return dict_len.min(ceiling),
-        IngestPlan::Slice => bytes,
+        IngestPlan::Slice | IngestPlan::PledgedStream => bytes,
         IngestPlan::Stream => bytes.map(|bytes| {
             let level_window_log =
                 crate::encoding::levels::config::resolve_level_params(level, hint).window_log;

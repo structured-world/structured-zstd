@@ -52,6 +52,9 @@ pub(crate) enum IngestPlan {
     Slice,
     /// A stream, read block by block into the history.
     Stream,
+    /// A stream of a pledged size, read like [`Self::Stream`]. The context
+    /// refuses input of any other length, so the size is exact.
+    PledgedStream,
 }
 
 /// The single allocation a compression context carves its match-finder tables,

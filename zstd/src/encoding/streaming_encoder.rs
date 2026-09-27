@@ -883,9 +883,12 @@ impl<M: Matcher> CompressionContext<M> {
         let block_target = self
             .target_block_size
             .map_or(MAX_BLOCK_SIZE as usize, |t| t as usize);
-        // Raw frames keep no history; everything else is read block by block.
+        // Raw frames keep no history; everything else is read block by block,
+        // and a pledge makes its length exact.
         let ingest = if matches!(self.compression_level, CompressionLevel::Uncompressed) {
             crate::encoding::workspace::IngestPlan::Raw
+        } else if self.pledged_content_size.is_some() {
+            crate::encoding::workspace::IngestPlan::PledgedStream
         } else {
             crate::encoding::workspace::IngestPlan::Stream
         };
