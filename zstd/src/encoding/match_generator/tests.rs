@@ -1908,6 +1908,50 @@ fn only_an_advisory_size_lays_out_slack_for_the_last_read() {
     );
 }
 
+/// Restoring a primed snapshot copies the block-length queue into the one the
+/// matcher already holds, as it does its tables and history: a clone of the
+/// snapshot's queue is a new allocation on every reused dictionary frame, and
+/// drops the capacity the reset just kept.
+#[test]
+fn restoring_a_snapshot_keeps_the_block_queue_allocation() {
+    use alloc::collections::VecDeque;
+    let queue = |len: usize| -> VecDeque<usize> { (0..len).collect() };
+
+    let mut live = DfastMatchGenerator::new(1 << 16);
+    live.window_blocks = queue(64);
+    live.window_blocks.clear();
+    let kept = live.window_blocks.capacity();
+    let mut snapshot = DfastMatchGenerator::new(1 << 16);
+    snapshot.window_blocks = queue(2);
+    live.restore_snapshot(&mut snapshot);
+    assert_eq!(live.window_blocks, queue(2));
+    assert!(
+        live.window_blocks.capacity() >= kept,
+        "the dfast queue was reallocated at {} for a room of {kept}",
+        live.window_blocks.capacity()
+    );
+    assert_eq!(
+        snapshot.window_blocks,
+        queue(2),
+        "the snapshot keeps its own"
+    );
+
+    let mut live = RowMatchGenerator::new(1 << 16);
+    live.chunk_lens = queue(64);
+    live.chunk_lens.clear();
+    let kept = live.chunk_lens.capacity();
+    let mut snapshot = RowMatchGenerator::new(1 << 16);
+    snapshot.chunk_lens = queue(2);
+    live.restore_snapshot(&mut snapshot);
+    assert_eq!(live.chunk_lens, queue(2));
+    assert!(
+        live.chunk_lens.capacity() >= kept,
+        "the row queue was reallocated at {} for a room of {kept}",
+        live.chunk_lens.capacity()
+    );
+    assert_eq!(snapshot.chunk_lens, queue(2), "the snapshot keeps its own");
+}
+
 /// A stream that can fill its window lays out the window, what sliding leaves
 /// behind, and one pending block, and that block is the frame's: a target block
 /// size below the format maximum shrinks it, rather than leaving the difference

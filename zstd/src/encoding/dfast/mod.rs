@@ -418,22 +418,28 @@ impl DfastMatchGenerator {
         self.tables_fresh = !self.tables.bind(workspace, total, DFAST_EMPTY_SLOT);
     }
 
-    /// Becomes `snapshot`, copying its tables and history into the rooms this
-    /// matcher already holds (in a context's workspace) instead of cloning them
-    /// into new allocations. The two buffers are lent out of `snapshot` for
-    /// the clone of the rest and put back.
+    /// Becomes `snapshot`, copying its tables, history and block-length queue
+    /// into the buffers this matcher already holds (the first two in a
+    /// context's workspace) instead of cloning them into new allocations. The
+    /// buffers are lent out of `snapshot` for the clone of the rest and put
+    /// back.
     pub(crate) fn restore_snapshot(&mut self, snapshot: &mut Self) {
         let snapshot_tables = core::mem::take(&mut snapshot.tables);
         let snapshot_history = core::mem::take(&mut snapshot.history);
+        let snapshot_blocks = core::mem::take(&mut snapshot.window_blocks);
         let mut tables = core::mem::take(&mut self.tables);
         let mut history = core::mem::take(&mut self.history);
+        let mut blocks = core::mem::take(&mut self.window_blocks);
         tables.clone_from(&snapshot_tables);
         history.clone_from(&snapshot_history);
+        blocks.clone_from(&snapshot_blocks);
         *self = snapshot.clone();
         self.tables = tables;
         self.history = history;
+        self.window_blocks = blocks;
         snapshot.tables = snapshot_tables;
         snapshot.history = snapshot_history;
+        snapshot.window_blocks = snapshot_blocks;
     }
 
     /// Heap bytes this matcher owns: the history and the long/short hash
