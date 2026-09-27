@@ -68,6 +68,7 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         seen_content: Default::default(),
         fse_tables: FseTables::new(),
         block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
+        workspace: crate::encoding::workspace::Workspace::new(),
         offset_hist: [1, 4, 8],
         strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
         pre_split: None,

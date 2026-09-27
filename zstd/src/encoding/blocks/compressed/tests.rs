@@ -7,6 +7,7 @@ use crate::encoding::frame_compressor::{
     CompressState, FseTables, PreviousFseTable, SharedFseTable,
 };
 use crate::encoding::strategy::StrategyTag;
+use crate::encoding::workspace::{RegionVec, Workspace, region_bytes};
 use crate::fse::fse_encoder::{FSETable, build_table_from_symbol_counts};
 use crate::huff0::huff0_encoder;
 use alloc::vec::Vec;
@@ -392,6 +393,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: CompressedBlockScratch::new(),
+                workspace: Workspace::new(),
                 offset_hist: [1, 4, 8],
                 strategy_tag: *strat,
                 pre_split: None,
@@ -408,6 +410,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: CompressedBlockScratch::new(),
+                workspace: Workspace::new(),
                 offset_hist: [1, 4, 8],
                 strategy_tag: *strat,
                 pre_split: None,
@@ -417,11 +420,12 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             let mut workspace = EstimatorWorkspace::default();
             let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
             let mut emitted: Vec<u8> = Vec::new();
+            let mut codes_ws = Workspace::new();
             encode_block_parts(
                 &mut emit_state,
                 &literals,
                 &mut [],
-                &mut Vec::new(),
+                &mut code_buffer(&mut codes_ws, 0),
                 &mut emitted,
             );
             assert_eq!(
@@ -471,6 +475,7 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
         seen_content: Default::default(),
         fse_tables: FseTables::new(),
         block_scratch: CompressedBlockScratch::new(),
+        workspace: Workspace::new(),
         offset_hist: [1, 4, 8],
         strategy_tag: StrategyTag::Lazy,
         pre_split: None,
@@ -483,11 +488,12 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
     let mut workspace = EstimatorWorkspace::default();
     let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
     let mut emitted: Vec<u8> = Vec::new();
+    let mut codes_ws = Workspace::new();
     encode_block_parts(
         &mut emit_state,
         &literals,
         &mut [],
-        &mut Vec::new(),
+        &mut code_buffer(&mut codes_ws, 0),
         &mut emitted,
     );
 
@@ -518,22 +524,45 @@ fn encode_match_len_uses_correct_upper_range_base() {
     assert_eq!(encode_match_len(131074), (52, 65535, 16));
 }
 
-/// The scratch is taken and put back around a block, so every buffer it keeps
-/// is retained allocation a context reports through `ZSTD_sizeof_CCtx`. The
-/// per-sequence code buffer is one of them, and a caller budgeting memory sees
-/// whatever this sum leaves out.
+/// The literal, sequence and code buffers live in the context's workspace, which
+/// survives every frame, so it is retained allocation a context reports through
+/// `ZSTD_sizeof_CCtx`. A caller budgeting memory sees whatever this sum leaves
+/// out.
 #[test]
-fn retained_heap_size_counts_the_sequence_code_buffer() {
-    let mut scratch = super::CompressedBlockScratch::new();
-    let before = scratch.retained_heap_size();
-    let codes = 1024;
-    scratch.sequence_codes.reserve_exact(codes);
-    let after = scratch.retained_heap_size();
+fn retained_heap_size_counts_the_block_buffers() {
+    let mut state = CompressState {
+        matcher: super::EntropyOnlyMatcher,
+        copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
+        last_huff_table: None,
+        huff_table_spare: None,
+        huff_rollback: None,
+        huff_weights: Default::default(),
+        seen_content: Default::default(),
+        fse_tables: FseTables::new(),
+        block_scratch: super::CompressedBlockScratch::new(),
+        workspace: Workspace::new(),
+        offset_hist: [1, 4, 8],
+        strategy_tag: StrategyTag::Fast,
+        pre_split: None,
+        huf_optimal_search: true,
+        literal_compression_disabled: false,
+    };
+    let before = state.retained_scratch_heap_size();
+    let block = 64 * 1024;
+    state.lay_out_workspace(block);
+    let after = state.retained_scratch_heap_size();
+    let needed = super::CompressedBlockScratch::workspace_bytes(block);
     assert!(
-        after - before >= codes * core::mem::size_of::<u32>(),
-        "reserving {codes} sequence codes grew the reported retained size by only {} bytes",
+        after - before >= needed,
+        "laying out {needed} bytes of block buffers grew the reported retained size by only {} bytes",
         after - before,
     );
+}
+
+/// A buffer for `count` sequence codes, carved from `ws`, which must outlive it.
+fn code_buffer(ws: &mut Workspace, count: usize) -> RegionVec<u32> {
+    ws.ensure(region_bytes::<u32>(count));
+    ws.carver().buffer(count)
 }
 
 /// The estimator prices a block the splitter is thinking about; the emitter
@@ -580,6 +609,7 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
             seen_content: Default::default(),
             fse_tables: FseTables::new(),
             block_scratch: CompressedBlockScratch::new(),
+            workspace: Workspace::new(),
             offset_hist: [1, 4, 8],
             strategy_tag: strat,
             pre_split: None,
@@ -594,11 +624,13 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
 
         let mut emitted: Vec<u8> = Vec::new();
         let mut to_emit = sequences.clone();
+        let mut codes_ws = Workspace::new();
+        let mut codes = code_buffer(&mut codes_ws, to_emit.len());
         encode_block_parts(
             &mut emit_state,
             &literals,
             &mut to_emit,
-            &mut Vec::new(),
+            &mut codes,
             &mut emitted,
         );
 
@@ -641,6 +673,7 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         seen_content: Default::default(),
         fse_tables: FseTables::new(),
         block_scratch: super::CompressedBlockScratch::new(),
+        workspace: Workspace::new(),
         offset_hist: [10, 20, 30],
         strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
         pre_split: None,
@@ -656,7 +689,8 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
     let mut output = Vec::new();
     let mut compressed_scratch = Vec::new();
 
-    let mut code_scratch = Vec::new();
+    let mut codes_ws = Workspace::new();
+    let mut code_scratch = code_buffer(&mut codes_ws, sequences.len());
     let mut emit_buffers = super::SingleSequenceEmitBuffers {
         output: &mut output,
         compressed: &mut compressed_scratch,

@@ -87,6 +87,7 @@ pub(crate) mod opt;
 pub(crate) mod row;
 pub(crate) mod simple;
 pub(crate) mod strategy;
+pub(crate) mod workspace;
 
 pub(crate) mod frame_compressor;
 #[cfg(feature = "lsm")]

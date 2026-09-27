@@ -399,6 +399,7 @@ impl<M: Matcher> CompressionContext<M> {
                 seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
+                workspace: crate::encoding::workspace::Workspace::new(),
                 offset_hist: [1, 4, 8],
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
@@ -884,6 +885,8 @@ impl<M: Matcher> CompressionContext<M> {
             self.state.matcher.set_source_size_hint(size);
         }
         self.state.matcher.reset(self.compression_level);
+        let block_capacity = self.block_capacity();
+        self.state.lay_out_workspace(block_capacity);
         // Sync `state.strategy_tag` / `state.pre_split` to the strategy the
         // matcher's reset resolved (size- and dictionary-adaptive; a public
         // strategy override wins) so the literal-compression gates, the block

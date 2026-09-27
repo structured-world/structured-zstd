@@ -6,6 +6,7 @@ use crate::{
     decoding::simd_copy::ExactCopyTier,
     encoding::block_header::BlockHeader,
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
+    encoding::workspace::{RegionVec, WorkspaceCarver, region_bytes},
     encoding::{Matcher, Sequence},
     fse::fse_encoder::{
         FSETable, build_seq_ctable_into, build_table_from_symbol_counts_into,
@@ -132,10 +133,11 @@ const INVERSE_PROBABILITY_LOG_256: [usize; 256] = [
 /// Compile-time guarantee that MAX_BLOCK_SIZE fits in the 18-bit size format.
 const _: () = assert!(crate::common::MAX_BLOCK_SIZE <= 262_143);
 
+/// A block's literals and sequences, in the context's workspace.
 #[derive(Default)]
 struct EncodedBlockParts {
-    literals: Vec<u8>,
-    sequences: Vec<RawSequence>,
+    literals: RegionVec<u8>,
+    sequences: RegionVec<RawSequence>,
 }
 
 #[derive(Default)]
@@ -143,9 +145,8 @@ pub(crate) struct CompressedBlockScratch {
     parts: EncodedBlockParts,
     /// One packed [`SequenceCode`] per sequence of the partition being
     /// encoded, filled by the pass that derives the offset codes and read by
-    /// the bit writer. Kept here so it is allocated once for the compressor
-    /// rather than per block.
-    sequence_codes: Vec<u32>,
+    /// the bit writer.
+    sequence_codes: RegionVec<u32>,
     partitions: Vec<usize>,
     prefix_sums: SequencePrefixSums,
     compressed: Vec<u8>,
@@ -179,11 +180,11 @@ impl CompressedBlockScratch {
     /// owner's `size_of` covers the pointer, not what it points at, and leaving
     /// the box out understated a context that has taken the post-split path by
     /// the whole struct.
+    ///
+    /// The literal, sequence and code buffers live in the context's workspace
+    /// and are counted with it, not here.
     pub(crate) fn retained_heap_size(&self) -> usize {
-        self.parts.literals.capacity()
-            + self.parts.sequences.capacity() * core::mem::size_of::<RawSequence>()
-            + self.sequence_codes.capacity() * core::mem::size_of::<u32>()
-            + self.partitions.capacity() * core::mem::size_of::<usize>()
+        self.partitions.capacity() * core::mem::size_of::<usize>()
             + self.prefix_sums.heap_size()
             + self.compressed.capacity()
             + self
@@ -202,6 +203,35 @@ impl CompressedBlockScratch {
     pub(crate) fn new() -> Self {
         Self::default()
     }
+
+    /// Workspace bytes the buffers need for blocks of up to `block_capacity`
+    /// source bytes.
+    pub(crate) fn workspace_bytes(block_capacity: usize) -> usize {
+        let sequences = max_sequences(block_capacity);
+        region_bytes::<u8>(block_capacity)
+            + region_bytes::<RawSequence>(sequences)
+            + region_bytes::<u32>(sequences)
+    }
+
+    /// Takes the buffers from `carver`, sized for blocks of up to
+    /// `block_capacity` source bytes.
+    pub(crate) fn bind(&mut self, carver: &mut WorkspaceCarver<'_>, block_capacity: usize) {
+        let sequences = max_sequences(block_capacity);
+        self.parts.literals = carver.buffer(block_capacity);
+        self.parts.sequences = carver.buffer(sequences);
+        self.sequence_codes = carver.buffer(sequences);
+    }
+}
+
+/// The shortest match a sequence can carry: RFC 8878 3.1.1.3.2.1.1 maps
+/// `Match_Length_Code` 0 to a length of 3.
+const FORMAT_MIN_MATCH: usize = 3;
+
+/// The most sequences a block of `block_len` source bytes can hold, since each
+/// covers at least [`FORMAT_MIN_MATCH`] of them (upstream `ZSTD_maxNbSeq`,
+/// zstd_compress.c:1697, with its divider of 3).
+fn max_sequences(block_len: usize) -> usize {
+    block_len / FORMAT_MIN_MATCH
 }
 
 #[derive(Default)]
@@ -461,6 +491,9 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             huff_weights: core::mem::take(&mut state.huff_weights),
             fse_tables: probe_fse_tables(&state.fse_tables),
             block_scratch: inner_scratch,
+            // The probes estimate from the outer block's buffers and never
+            // collect or encode a block of their own, so nothing is carved.
+            workspace: crate::encoding::workspace::Workspace::new(),
             offset_hist: state.offset_hist,
             strategy_tag: state.strategy_tag,
             pre_split: state.pre_split,
@@ -593,7 +626,7 @@ const LITERAL_INLINE_COPY_MAX: usize = 2048;
 /// sites, so inlining even a short body there buys decode pressure in the
 /// loop worth more than the calls it saves.
 #[inline]
-fn append_literals(dst: &mut Vec<u8>, lits: &[u8], copy_tier: ExactCopyTier) {
+fn append_literals(dst: &mut RegionVec<u8>, lits: &[u8], copy_tier: ExactCopyTier) {
     let lit_len = lits.len();
     if lit_len == 0 {
         return;
@@ -602,21 +635,20 @@ fn append_literals(dst: &mut Vec<u8>, lits: &[u8], copy_tier: ExactCopyTier) {
         dst.extend_from_slice(lits);
         return;
     }
-    // Production callers (`collect_block_parts`) pre-reserve `src_len` of
-    // spare capacity, so the sum of all literal runs across a block fits
-    // without grow. This is a SAFE fn, so enforce the precondition in
-    // release too — a future caller skipping the pre-reserve would
-    // otherwise get an OOB write past the `Vec`'s allocation. The branch
-    // is cold on the production hot path.
+    // The buffer holds a whole block's source, which bounds the sum of its
+    // literal runs. This is a SAFE fn, so the bound is still checked: the
+    // branch is cold, and a caller whose buffer was sized for less must stop
+    // here rather than write past it.
     let cur_len = dst.len();
     if dst.capacity() - cur_len < lit_len {
-        dst.reserve(lit_len);
+        dst.extend_from_slice(lits);
+        return;
     }
     let dst_ptr = unsafe { dst.as_mut_ptr().add(cur_len) };
     // SAFETY: `lits` is a valid slice (reading `lit_len` bytes from
-    // `lits.as_ptr()` is in-bounds); the `dst.reserve(lit_len)` above
-    // guarantees `dst_ptr` has `lit_len` bytes of spare capacity. Both
-    // paths write EXACTLY `lit_len` bytes (no overshoot).
+    // `lits.as_ptr()` is in-bounds); the capacity test above guarantees
+    // `dst_ptr` has `lit_len` bytes of room. Both paths write EXACTLY
+    // `lit_len` bytes (no overshoot).
     unsafe {
         if lit_len <= 32 {
             crate::decoding::simd_copy::copy_bytes_overshooting(
@@ -637,23 +669,11 @@ fn append_literals(dst: &mut Vec<u8>, lits: &[u8], copy_tier: ExactCopyTier) {
 }
 
 fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut EncodedBlockParts) {
-    let src_len = state.matcher.get_last_space().len();
     parts.literals.clear();
     parts.sequences.clear();
-    // `reserve_exact(N)` adds capacity above LENGTH, not above existing
-    // capacity. Both `literals` and `sequences` were just `clear()`-ed (len
-    // = 0), so subtracting `len()` ensures `cap >= N` after the call — the
-    // older `cap - cap` form left the Vec under-provisioned whenever the
-    // existing capacity was less than half of the target.
-    if parts.literals.capacity() < src_len {
-        parts.literals.reserve_exact(src_len - parts.literals.len());
-    }
-    let sequence_capacity = src_len / 8;
-    if parts.sequences.capacity() < sequence_capacity {
-        parts
-            .sequences
-            .reserve_exact(sequence_capacity - parts.sequences.len());
-    }
+    // Sized when the frame laid out its workspace, for the largest block it
+    // can emit.
+    debug_assert!(state.matcher.get_last_space().len() <= parts.literals.capacity());
     // Hoisted out of the closure: the tier was settled when the compressor was
     // built, and the emit loop just carries the value.
     let copy_tier = state.copy_tier;
@@ -687,7 +707,7 @@ fn encode_block_parts<M: Matcher>(
     raw_sequences: &mut [RawSequence],
     // Scratch for the packed per-sequence codes, carried by the caller so it is
     // allocated once rather than per block.
-    codes: &mut Vec<u32>,
+    codes: &mut RegionVec<u32>,
     output: &mut Vec<u8>,
     // What each axis decided, for the caller to apply once it knows the block
     // is kept. LL, ML, OF.
@@ -1610,7 +1630,7 @@ fn compressed_literals_header_bytes(lit_size: usize) -> usize {
 struct SingleSequenceEmitBuffers<'a> {
     output: &'a mut Vec<u8>,
     compressed: &'a mut Vec<u8>,
-    codes: &'a mut Vec<u32>,
+    codes: &'a mut RegionVec<u32>,
 }
 
 fn emit_single_sequence_block<M: Matcher>(
@@ -1787,26 +1807,26 @@ fn fill_and_count<const FAST_REPCODE: bool>(
     raw_sequences: &mut [RawSequence],
     offset_hist: &mut [u32; 3],
     counts: SequenceCodeCounts<'_>,
-    codes: &mut Vec<u32>,
+    codes: &mut RegionVec<u32>,
 ) -> (usize, usize, usize) {
     let SequenceCodeCounts {
         ll: ll_counts,
         ml: ml_counts,
         of: of_counts,
     } = counts;
-    // Written through the spare capacity rather than pushed: the length is
-    // known, so a push's capacity test per sequence buys nothing, and resizing
-    // first would zero the buffer only to overwrite all of it.
+    // Written past the length rather than pushed: the count is known, so a
+    // push's capacity test per sequence buys nothing. The buffer holds as many
+    // codes as a block holds sequences, and this slice is part of one block.
     codes.clear();
-    codes.reserve(raw_sequences.len());
-    let code_slots = &mut codes.spare_capacity_mut()[..raw_sequences.len()];
+    assert!(raw_sequences.len() <= codes.capacity());
+    let code_base = codes.as_mut_ptr();
     // The history is rotated by every sequence and read by the next one. Held
     // behind the caller's reference it was three stores into the compressor per
     // sequence, because the loop also writes through the sequence slice and the
     // optimiser would not keep the array in registers across that. A local copy
     // written back once is the same three words, moved once.
     let mut hist = *offset_hist;
-    for (slot, seq) in code_slots.iter_mut().zip(raw_sequences.iter_mut()) {
+    for (i, seq) in raw_sequences.iter_mut().enumerate() {
         let off_base = if FAST_REPCODE {
             encode_offset_with_history_fast(seq.off_base, seq.ll, &mut hist)
         } else {
@@ -1816,16 +1836,19 @@ fn fill_and_count<const FAST_REPCODE: bool>(
         let (ll_code, _, ll_bits) = encode_literal_length(seq.ll);
         let (ml_code, _, ml_bits) = encode_match_len(seq.ml);
         let (of_code, _, _) = encode_offset(off_base);
-        slot.write(SequenceCode::pack(
-            ll_code, ml_code, of_code, ll_bits, ml_bits,
-        ));
+        // SAFETY: `i < raw_sequences.len() <= capacity`, asserted above.
+        unsafe {
+            code_base.add(i).write(SequenceCode::pack(
+                ll_code, ml_code, of_code, ll_bits, ml_bits,
+            ));
+        }
         ll_counts[ll_code as usize] += 1;
         ml_counts[ml_code as usize] += 1;
         of_counts[of_code as usize] += 1;
     }
     *offset_hist = hist;
-    // SAFETY: the loop wrote every one of the `raw_sequences.len()` slots it
-    // took from the spare capacity, which `reserve` above guaranteed.
+    // SAFETY: the loop wrote every one of the `raw_sequences.len()` slots, all
+    // within the capacity asserted above.
     unsafe {
         codes.set_len(raw_sequences.len());
     }

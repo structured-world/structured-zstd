@@ -1361,6 +1361,9 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) huff_weights: crate::huff0::huff0_encoder::WeightScratch,
     pub(crate) fse_tables: FseTables,
     pub(crate) block_scratch: crate::encoding::blocks::CompressedBlockScratch,
+    /// The one allocation the per-block buffers are carved from, laid out at
+    /// each frame start by [`Self::lay_out_workspace`].
+    pub(crate) workspace: crate::encoding::workspace::Workspace,
     /// Offset history for repeat offset encoding: [rep0, rep1, rep2].
     /// Initialized to [1, 4, 8] per RFC 8878 §3.1.2.5.
     pub(crate) offset_hist: [u32; 3],
@@ -1424,15 +1427,24 @@ pub(crate) fn huf_search_enabled(
 }
 
 impl<M: Matcher> CompressState<M> {
-    /// Clears `last_huff_table`, parking the table's buffers in
-    /// `huff_table_spare` for reuse instead of dropping them.
-    #[inline]
+    /// Lays the workspace out for a frame whose blocks carry up to
+    /// `block_capacity` source bytes, growing it first if it is too small, and
+    /// binds every buffer carved from it. Called once per frame, after the
+    /// matcher's reset has settled the frame's parameters.
+    pub(crate) fn lay_out_workspace(&mut self, block_capacity: usize) {
+        let bytes =
+            crate::encoding::blocks::CompressedBlockScratch::workspace_bytes(block_capacity);
+        self.workspace.ensure(bytes);
+        let mut carver = self.workspace.carver();
+        self.block_scratch.bind(&mut carver, block_capacity);
+    }
+
     /// Heap bytes the compressor keeps between blocks and frames beyond the
     /// match finder: the FSE tables both slots of each axis hold, the rollback
     /// slot the emit paths copy a Huffman table into before a block that may not
-    /// be kept, and the block scratch with everything it holds — its literal and
-    /// sequence buffers, the splitter's workspace, and the nested estimator
-    /// scratch.
+    /// be kept, the block scratch with everything it holds (the splitter's
+    /// workspace and the nested estimator scratch), and the context workspace
+    /// the literal and sequence buffers are carved from.
     ///
     /// All of it survives a frame, so a caller sizing a context has to see it.
     pub(crate) fn retained_scratch_heap_size(&self) -> usize {
@@ -1442,8 +1454,12 @@ impl<M: Matcher> CompressState<M> {
                 .as_ref()
                 .map_or(0, |table| table.heap_size())
             + self.block_scratch.retained_heap_size()
+            + self.workspace.capacity()
     }
 
+    /// Clears `last_huff_table`, parking the table's buffers in
+    /// `huff_table_spare` for reuse instead of dropping them.
+    #[inline]
     pub(crate) fn clear_huff_table(&mut self) {
         if let Some(table) = self.last_huff_table.take() {
             self.park_huff_table(table);
@@ -1698,6 +1714,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
+                workspace: crate::encoding::workspace::Workspace::new(),
                 offset_hist: [1, 4, 8],
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
@@ -2125,6 +2142,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
+                workspace: crate::encoding::workspace::Workspace::new(),
                 offset_hist: [1, 4, 8],
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
@@ -2441,6 +2459,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         }
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
+        let block_capacity = self.block_capacity();
+        self.state.lay_out_workspace(block_capacity);
         self.state.offset_hist = [1, 4, 8];
         // Sync `state.strategy_tag` to the level resolved at this reset so
         // the literal-compression gates (`min_literals_to_compress` /
