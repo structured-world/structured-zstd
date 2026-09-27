@@ -586,9 +586,9 @@ impl SeenContentGrid {
         (wanted as usize).clamp(Self::MIN_SLOTS, Self::SLOTS)
     }
 
-    /// Full 64-bit avalanche (splitmix64's finalizer): every output bit depends
-    /// on every input bit, which a single multiply does not give — its low half
-    /// is barely mixed.
+    /// Full 64-bit avalanche (splitmix64's finalizer, or a two-word equivalent
+    /// on a 32-bit machine): every output bit depends on every input bit, which
+    /// a single multiply does not give — its low half is barely mixed.
     ///
     /// Three multiplies is a lot for something a probe run pays five hundred
     /// times a block, and one multiply with a fold was tried in its place. It
@@ -599,10 +599,52 @@ impl SeenContentGrid {
     /// a miss.
     #[inline]
     fn avalanche(key: u64) -> u64 {
+        #[cfg(not(all(target_pointer_width = "32", not(target_family = "wasm"))))]
+        {
+            Self::avalanche_wide(key)
+        }
+        // A 32-bit machine has no 64-bit multiply, so each of the wide mix's
+        // three becomes three of its own plus the carries; wasm32 is left on
+        // the wide mix because its `i64.mul` is native.
+        #[cfg(all(target_pointer_width = "32", not(target_family = "wasm")))]
+        {
+            Self::avalanche_narrow(key)
+        }
+    }
+
+    #[cfg(any(
+        test,
+        not(all(target_pointer_width = "32", not(target_family = "wasm")))
+    ))]
+    #[inline]
+    fn avalanche_wide(key: u64) -> u64 {
         let mut z = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
+    }
+
+    /// The same contract from five 32-bit multiplies: the low word, which the
+    /// fingerprint and tag are cut from, mixes both halves of the key, and the
+    /// high word, which the slot is cut from, is that word mixed again with the
+    /// key's high half, so the slot and the bits checked against it are
+    /// separate avalanches rather than one word read twice.
+    #[cfg(any(test, all(target_pointer_width = "32", not(target_family = "wasm"))))]
+    #[inline]
+    fn avalanche_narrow(key: u64) -> u64 {
+        // murmur3's 32-bit finaliser.
+        fn fmix32(mut h: u32) -> u32 {
+            h ^= h >> 16;
+            h = h.wrapping_mul(0x85EB_CA6B);
+            h ^= h >> 13;
+            h = h.wrapping_mul(0xC2B2_AE35);
+            h ^ (h >> 16)
+        }
+        let lo = key as u32;
+        let hi = (key >> 32) as u32;
+        let low = fmix32(lo ^ hi.wrapping_mul(0x9E37_79B1));
+        let high = fmix32(low ^ hi ^ 0x27D4_EB2F);
+        (u64::from(high) << 32) | u64::from(low)
     }
 }
 

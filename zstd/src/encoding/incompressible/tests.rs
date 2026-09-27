@@ -294,6 +294,101 @@ fn the_content_grid_answers_a_block_shorter_than_its_key() {
     }
 }
 
+/// Both grid mixes spread keys over the slots and keep the tag independent of
+/// the slot.
+///
+/// The slot, the tag and the fingerprint are all cut from one mixed word. A mix
+/// that correlates them fails in a way no single-key test sees: keys crowding
+/// into fewer slots evict each other's records, and a repeat whose record was
+/// evicted is missed outright. So the check is statistical, over the key shapes
+/// the grid is fed: overlapping eight-byte windows of noise and of structured
+/// text, and counters that differ only in their low bits.
+#[test]
+fn the_grid_mixes_spread_slots_and_keep_the_tag_independent() {
+    const SLOT_BITS: u32 = 16;
+    let noise = deterministic_bytes(0x5EED, 96 * 1024);
+    let mut text = Vec::new();
+    let mut line = 0u32;
+    while text.len() < 96 * 1024 {
+        text.extend_from_slice(
+            alloc::format!("record {line}: value {}\n", line * 7 % 1000).as_bytes(),
+        );
+        line += 1;
+    }
+    let mut keys: Vec<u64> = Vec::new();
+    for source in [&noise, &text] {
+        keys.extend(
+            source
+                .windows(8)
+                .map(|w| u64::from_le_bytes(w.try_into().unwrap())),
+        );
+    }
+    keys.extend(0..64 * 1024u64);
+    keys.sort_unstable();
+    keys.dedup();
+
+    type Mix = fn(u64) -> u64;
+    let mixes: [(&str, Mix); 2] = [
+        ("wide", SeenContentGrid::avalanche_wide),
+        ("narrow", SeenContentGrid::avalanche_narrow),
+    ];
+    for (name, mix) in mixes {
+        let mut fields: Vec<(u32, u8)> = keys
+            .iter()
+            .map(|&key| {
+                let mixed = mix(key);
+                (
+                    ((mixed >> 32) as u32) & ((1 << SLOT_BITS) - 1),
+                    (mixed >> 16) as u8 | 1,
+                )
+            })
+            .collect();
+        fields.sort_unstable();
+
+        // Poisson occupancy: at a load of `lambda` keys per slot, a share
+        // `e^-lambda` of the slots stays empty.
+        let slots = 1usize << SLOT_BITS;
+        let lambda = keys.len() as f64 / slots as f64;
+        let mut used = 0usize;
+        let mut slot_pairs = 0usize;
+        let mut tag_pairs = 0usize;
+        let mut i = 0;
+        while i < fields.len() {
+            let slot = fields[i].0;
+            let mut j = i;
+            while j < fields.len() && fields[j].0 == slot {
+                j += 1;
+            }
+            used += 1;
+            let n = j - i;
+            slot_pairs += n * (n - 1) / 2;
+            let mut k = i;
+            while k < j {
+                let mut m = k;
+                while m < j && fields[m].1 == fields[k].1 {
+                    m += 1;
+                }
+                tag_pairs += (m - k) * (m - k - 1) / 2;
+                k = m;
+            }
+            i = j;
+        }
+        let empty = (slots - used) as f64;
+        let expected_empty = slots as f64 * (-lambda).exp();
+        assert!(
+            (0.85..1.15).contains(&(empty / expected_empty)),
+            "{name}: {empty} empty slots against {expected_empty:.0} expected at load {lambda:.2}",
+        );
+        // The tag keeps seven free bits, so two keys sharing a slot share a tag
+        // one time in 128 when the two are independent.
+        let expected_tag_pairs = slot_pairs as f64 / 128.0;
+        assert!(
+            (0.85..1.15).contains(&(tag_pairs as f64 / expected_tag_pairs)),
+            "{name}: {tag_pairs} same-slot pairs share a tag against {expected_tag_pairs:.0} expected",
+        );
+    }
+}
+
 fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed;
     let mut out = vec![0u8; len];
