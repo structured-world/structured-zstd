@@ -99,9 +99,9 @@ pub struct Workspace {
     /// Consecutive layouts that found the allocation far larger than they
     /// need, for giving back one that has stayed so.
     oversized_layouts: u32,
-    /// The layout's tables are larger than the input expected to write them,
-    /// so a new allocation is taken zeroed (see [`Self::open_for_match_finder`]).
-    sparse_tables: bool,
+    /// Bytes of zero-start tables in this layout when they are larger than the
+    /// input expected to write them, else 0 (see [`Self::open_for_match_finder`]).
+    sparse_table_bytes: usize,
     /// The open layout made the allocation, zeroed, so its regions hold
     /// zeros until their holders write them.
     zeroed: bool,
@@ -139,7 +139,7 @@ impl Workspace {
             block_capacity: 0,
             open: false,
             oversized_layouts: 0,
-            sparse_tables: false,
+            sparse_table_bytes: 0,
             zeroed: false,
         }
     }
@@ -163,7 +163,7 @@ impl Workspace {
         self.block_target = block_target;
         self.trailing_for = trailing_for;
         self.ingest = ingest;
-        self.sparse_tables = false;
+        self.sparse_table_bytes = 0;
         self.open = false;
     }
 
@@ -172,11 +172,12 @@ impl Workspace {
     /// expected to bring `expected_input` bytes.
     ///
     /// Zero tables larger than that input keep most of their pages untouched,
-    /// so a new allocation is then taken zeroed and those tables left as they
-    /// are: only the pages the frame indexes are ever faulted in. Otherwise
-    /// the input writes the tables densely anyway, and a plain allocation that
-    /// fills only the tables costs less than zeroing all of it, the history
-    /// room included (the allocator zeroes a reused block in full).
+    /// so a new allocation that they make up most of is then taken zeroed and
+    /// those tables left as they are: only the pages the frame indexes are
+    /// ever faulted in. Otherwise a plain allocation that fills only the
+    /// tables costs less: the input writes dense tables anyway, and an
+    /// allocator zeroes a block it hands out again in full, the history and
+    /// buffers included, which for a small frame is several times its tables.
     pub(crate) fn open_for_match_finder(
         &mut self,
         leading: usize,
@@ -184,7 +185,11 @@ impl Workspace {
         window: usize,
         expected_input: usize,
     ) {
-        self.sparse_tables = zero_tables > expected_input;
+        self.sparse_table_bytes = if zero_tables > expected_input {
+            zero_tables
+        } else {
+            0
+        };
         self.open(leading, window);
     }
 
@@ -247,10 +252,18 @@ impl Workspace {
             };
             self.oversized_layouts > TOO_LARGE_MAX_LAYOUTS
         };
+        // Zeroing all of it costs at most twice filling the tables when they
+        // are at least half of it, and nothing on pages the kernel hands out
+        // zeroed; below half, the worst case is the larger bill.
+        debug_assert!(
+            self.sparse_table_bytes <= leading,
+            "zero tables are part of the leading bytes"
+        );
+        let zero_all = self.sparse_table_bytes >= total - self.sparse_table_bytes;
         if reallocate {
-            self.grow(total);
+            self.grow(total, zero_all);
         }
-        self.zeroed = reallocate && self.sparse_tables;
+        self.zeroed = reallocate && zero_all;
         self.front = 0;
         self.leading = leading;
         self.history_front = leading;
@@ -381,7 +394,7 @@ impl Workspace {
     /// the generation moves on, so no later region can pass for a continuation
     /// of one carved before. The old allocation is retired rather than freed,
     /// until the history has carried its bytes out of it.
-    fn grow(&mut self, bytes: usize) {
+    fn grow(&mut self, bytes: usize, zeroed: bool) {
         self.release_retired();
         if self.capacity != 0 {
             self.retired = Some((self.base, self.capacity));
@@ -395,15 +408,15 @@ impl Workspace {
             return;
         }
         let layout = allocation_layout(bytes);
-        // Zeroed for sparse tables (see `open_for_match_finder`), and at byte
-        // alignment so the allocator can take it as a `calloc`: a large one
-        // comes back as fresh pages the kernel zeroes on first touch. An
-        // over-aligned zeroed request is a plain allocation followed by a
-        // memset of all of it, which faults in every page up front, so the
-        // start is aligned by hand instead.
+        // Zeroed for sparse tables (see `open`), and at byte alignment so the
+        // allocator can take it as a `calloc`: a large one comes back as fresh
+        // pages the kernel zeroes on first touch. An over-aligned zeroed
+        // request is a plain allocation followed by a memset of all of it,
+        // which faults in every page up front, so the start is aligned by hand
+        // instead.
         // SAFETY: `layout` has a non-zero size.
         let raw = unsafe {
-            if self.sparse_tables {
+            if zeroed {
                 alloc_zeroed(layout)
             } else {
                 alloc(layout)

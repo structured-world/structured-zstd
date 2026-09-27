@@ -91,6 +91,37 @@ fn a_zero_table_over_written_bytes_still_starts_empty() {
     assert!(later.as_slice().iter().all(|&v| v == 0));
 }
 
+// A zeroed allocation is worth taking only when the zero tables are most of it.
+// An allocator that serves it from memory it has handed out before zeroes the
+// whole of it, the buffers behind the tables included, so a small frame whose
+// per-block buffers outweigh its tables would pay several times the fill it
+// saves on every fresh context.
+#[test]
+fn only_tables_that_fill_the_workspace_take_it_zeroed() {
+    fn buffers_thrice_the_table(_block: usize) -> usize {
+        3 * region_bytes::<u32>(64)
+    }
+    let table = region_bytes::<u32>(64);
+
+    let mut ws = Workspace::new();
+    ws.begin_layout(1 << 17, buffers_thrice_the_table, IngestPlan::Slice);
+    ws.open_for_match_finder(table, table, 1 << 14, 0);
+    assert!(
+        !ws.zeroed,
+        "tables a quarter of the workspace must be filled, not the workspace zeroed",
+    );
+
+    let mut ws = Workspace::new();
+    ws.begin_layout(1 << 17, no_trailing, IngestPlan::Slice);
+    ws.open_for_match_finder(table, table, 1 << 14, 0);
+    assert!(
+        ws.zeroed,
+        "tables that are the whole workspace take it zeroed"
+    );
+    let fresh = ws.table::<u32>(64, 0);
+    assert!(fresh.as_slice().iter().all(|&v| v == 0));
+}
+
 // The next frame's layout puts a table of the same size back on the same bytes,
 // and its holder keeps what it wrote: that is what lets a match finder carry a
 // table across frames without clearing it.
