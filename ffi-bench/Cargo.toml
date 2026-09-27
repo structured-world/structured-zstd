@@ -234,6 +234,10 @@ name = "encode_loop_reuse_z000033"
 path = "../zstd/examples/encode_loop_reuse_z000033.rs"
 
 [[example]]
+name = "encode_loop_fresh_z000033"
+path = "../zstd/examples/encode_loop_fresh_z000033.rs"
+
+[[example]]
 name = "encode_loop_z000033"
 path = "../zstd/examples/encode_loop_z000033.rs"
 
