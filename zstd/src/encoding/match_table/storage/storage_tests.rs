@@ -138,7 +138,7 @@ fn begin_rebase_clears_index_tables_and_resets_base() {
     let mut t = new_table(32);
     // The three regions share one buffer; seed it through the seams so each
     // region carries a distinct non-empty marker.
-    t.tables = vec![7; 48];
+    t.tables = crate::encoding::workspace::Table::owned(vec![7; 48]);
     t.chain_off = 16;
     t.hash3_off = 32;
     t.chain_table_mut().fill(9);
@@ -484,16 +484,19 @@ fn ensure_tables_releases_the_buffer_when_the_layout_shrinks() {
     t.chain_log = 20;
     t.hash3_log = 0;
     t.ensure_tables();
-    let large = t.tables.capacity();
-    assert!(large >= 2 << 20, "fixture precondition: a large layout");
+    let large = t.tables.owned_bytes();
+    assert!(
+        large >= (2 << 20) * core::mem::size_of::<u32>(),
+        "fixture precondition: a large layout"
+    );
 
     t.hash_log = 10;
     t.chain_log = 10;
     t.ensure_tables();
     assert!(
-        t.tables.capacity() < large / 2,
+        t.tables.owned_bytes() < large / 2,
         "a smaller layout must release the oversized buffer, kept {} of {large}",
-        t.tables.capacity()
+        t.tables.owned_bytes()
     );
 }
 

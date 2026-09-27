@@ -1242,7 +1242,7 @@ impl Matcher for MatchGeneratorDriver {
                     // otherwise stay pinned across the backend switch,
                     // even though no future caller of this backend will
                     // touch them.
-                    m.table.tables = Vec::new();
+                    m.table.tables = crate::encoding::workspace::Table::empty();
                     m.table.chain_off = 0;
                     m.table.hash3_off = 0;
                     let vec_pool = &mut self.vec_pool;
@@ -1495,7 +1495,6 @@ impl Matcher for MatchGeneratorDriver {
                 row.reset();
             }
             MatcherStorage::HashChain(hc) => {
-                workspace.open(0, max_window_size);
                 hc.table.max_window_size = max_window_size;
                 hc.hc.lazy_depth = params.lazy_depth;
                 let mut hc_cfg = params.hc.expect("HashChain level row carries an HcConfig");
@@ -1535,6 +1534,11 @@ impl Matcher for MatchGeneratorDriver {
                 if dict_hint.is_some() && !hc_attaches_dictionary(hc, self.reset_size_log) {
                     hc.table.dms.invalidate();
                 }
+                // The widths are settled by `configure`, so the tables can be
+                // laid out before the reset retires the previous frame's
+                // entries in them.
+                workspace.open(hc.table.tables_workspace_bytes(), max_window_size);
+                hc.table.bind_tables(workspace);
                 let vec_pool = &mut self.vec_pool;
                 hc.reset(|mut data| {
                     data.resize(data.capacity(), 0);

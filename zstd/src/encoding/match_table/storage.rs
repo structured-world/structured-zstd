@@ -24,6 +24,7 @@ use super::super::cost_model::HC_OPT_NUM;
 use super::super::dict_attach::DictAttach;
 use super::super::hc::HC_MIN_MATCH_LEN;
 use super::super::opt::types::{HcOptimalSequence, MatchCandidate};
+use super::super::workspace::{Table, Workspace, region_bytes};
 use super::helpers::INCOMPRESSIBLE_SKIP_STEP;
 
 /// Lookahead bytes the BT walker / optimal parser will read past the
@@ -248,7 +249,8 @@ pub(crate) struct MatchTable {
     /// allocation per compressor instead of three keeps the allocator seeing a
     /// single size class, which is what decides whether the tables keep their
     /// pages between frames rather than being handed back and faulted in again.
-    pub(crate) tables: Vec<u32>,
+    /// In the context's workspace when a context drives the matcher.
+    pub(crate) tables: Table<u32>,
     /// Start of the chain table inside [`Self::tables`] (== hash table length).
     pub(crate) chain_off: usize,
     /// Start of the hash3 table inside [`Self::tables`]; equals the buffer
@@ -515,7 +517,7 @@ impl MatchTable {
             position_base: 0,
             index_shift: 0,
             offset_hist: [1, 4, 8],
-            tables: Vec::new(),
+            tables: Table::empty(),
             chain_off: 0,
             hash3_off: 0,
             hash_log: HC_HASH_LOG,
@@ -706,6 +708,33 @@ impl MatchTable {
     /// reaches via `get_unchecked`, so a stale-width table after a
     /// level change would index out of bounds (UB) on the next encode.
     pub(crate) fn ensure_tables(&mut self) {
+        let (hash_size, chain_size, total) = self.table_sizes();
+        // The three regions share one buffer, so a width change on any of them
+        // re-lays out all three. That costs the same fill the separate vectors
+        // paid for the region that changed, and saves two allocations.
+        if self.chain_off != hash_size || self.hash3_off != hash_size + chain_size {
+            // A buffer of the right length is refilled in place; a matcher no
+            // context laid out (driven on its own) allocates one at the exact
+            // size.
+            if self.tables.len() == total {
+                self.tables.fill(HC_EMPTY);
+            } else {
+                self.tables = Table::owned(alloc::vec![HC_EMPTY; total]);
+            }
+            self.chain_off = hash_size;
+            self.hash3_off = hash_size + chain_size;
+        } else if self.tables.len() != total {
+            // Only the hash3 tail changed width: the hash and chain regions
+            // keep their entries, the tail is empty at the new width.
+            let mut resized = self.tables.to_vec();
+            resized.resize(total, HC_EMPTY);
+            self.tables = Table::owned(resized);
+        }
+    }
+
+    /// The hash and chain region lengths and the buffer length at the current
+    /// widths; the hash3 region, when enabled, takes the rest.
+    fn table_sizes(&self) -> (usize, usize, usize) {
         let hash_size = 1 << self.hash_log;
         let chain_size = 1 << self.chain_log;
         let hash3_size = if self.hash3_log == 0 {
@@ -713,42 +742,24 @@ impl MatchTable {
         } else {
             1 << self.hash3_log
         };
-        let total = hash_size + chain_size + hash3_size;
-        // The three regions share one buffer, so a width change on any of them
-        // re-lays out all three. That costs the same fill the separate vectors
-        // paid for the region that changed, and saves two allocations.
-        if self.chain_off != hash_size || self.hash3_off != hash_size + chain_size {
-            // Two shapes want opposite things here, so the buffer it already
-            // has decides which one this is.
-            //
-            // A matcher taken FRESH per frame has none, and then the fresh
-            // `vec![HC_EMPTY; total]` is what matters: the sentinel is zero, so
-            // the allocator is asked for zeroed memory and a large request comes
-            // back as pages the kernel has not had to write and this frame does
-            // not touch until it indexes them. Resizing writes every element
-            // instead, which for that shape meant faulting and zeroing the whole
-            // table every frame — at level 22 on eight mebibytes, 40% of the
-            // encode in `memset` and half of it in the kernel.
-            //
-            // A REUSED one alternating between layouts — levels 16 and 18 on the
-            // same compressor — has a buffer that fits, and taking a fresh one
-            // there is an allocate and free per frame. Refilling it instead, on
-            // forty frames of a mebibyte, ran 267/265/231 ms against 253/239/219
-            // and halved the page faults, 23,640 to 11,263, for 1.8 M more
-            // instructions. The oversize test keeps the release a level-down
-            // from the tree finder needs.
-            if self.tables.capacity() >= total
-                && !capacity_is_oversized(self.tables.capacity(), total)
-            {
-                self.tables.clear();
-                self.tables.resize(total, HC_EMPTY);
-            } else {
-                self.tables = alloc::vec![HC_EMPTY; total];
-            }
+        (hash_size, chain_size, hash_size + chain_size + hash3_size)
+    }
+
+    /// Workspace bytes the hash, chain and hash3 tables take at the current
+    /// widths.
+    pub(crate) fn tables_workspace_bytes(&self) -> usize {
+        region_bytes::<u32>(self.table_sizes().2)
+    }
+
+    /// Lays the hash, chain and hash3 tables out in the open `workspace`.
+    /// Tables that continue the previous frame's keep their contents for the
+    /// floor-advance reset; otherwise they start empty with their seams set,
+    /// so the first block does not lay them out again.
+    pub(crate) fn bind_tables(&mut self, workspace: &mut Workspace) {
+        let (hash_size, chain_size, total) = self.table_sizes();
+        if !self.tables.bind(workspace, total, HC_EMPTY) {
             self.chain_off = hash_size;
             self.hash3_off = hash_size + chain_size;
-        } else if self.tables.len() != total {
-            self.tables.resize(total, HC_EMPTY);
         }
     }
 
@@ -1061,9 +1072,9 @@ impl MatchTable {
         let usize_sz = core::mem::size_of::<usize>();
         self.chunk_lens.capacity() * usize_sz
             + self.history.capacity()
-            // One buffer for the hash, chain and hash3 regions together.
-            + (self.tables.capacity())
-                * u32_sz
+            // One buffer for the hash, chain and hash3 regions together,
+            // counted here only when it is not in a context's workspace.
+            + self.tables.owned_bytes()
             + self.dms.table().map_or(0, |t| {
                 (t.hash_table.capacity() + t.chain_table.capacity()) * u32_sz
             })

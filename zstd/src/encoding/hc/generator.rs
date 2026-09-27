@@ -1353,9 +1353,9 @@ impl HcMatchGenerator {
             _ => {}
         }
         if resize && !self.table.tables.is_empty() {
-            // Force reallocation on next ensure_tables() call. The seams go
-            // with the buffer, so `ensure_tables` sees a fresh layout.
-            self.table.tables.clear();
+            // Drop the tables so they are laid out (or allocated) again at the
+            // new widths. The seams go with the buffer.
+            self.table.tables = crate::encoding::workspace::Table::empty();
             self.table.chain_off = 0;
             self.table.hash3_off = 0;
         }
