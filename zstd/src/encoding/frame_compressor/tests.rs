@@ -8,8 +8,8 @@ use alloc::vec;
 use super::FrameCompressor;
 use crate::common::{MAGIC_NUM, MAX_BLOCK_SIZE};
 use crate::decoding::FrameDecoder;
-use crate::encoding::workspace::HistoryBuf;
-use crate::encoding::{Matcher, Sequence};
+use crate::encoding::test_input::TestInput;
+use crate::encoding::{HistoryBuf, Matcher, Sequence};
 use alloc::vec::Vec;
 
 fn generate_data(seed: u64, len: usize) -> Vec<u8> {
@@ -29,42 +29,50 @@ fn generate_data(seed: u64, len: usize) -> Vec<u8> {
 // library crate never links libzstd.
 
 struct NoDictionaryMatcher {
-    last_space: Vec<u8>,
+    input: TestInput,
     window_size: u64,
 }
 
 impl NoDictionaryMatcher {
     fn new(window_size: u64) -> Self {
         Self {
-            last_space: Vec::new(),
+            input: TestInput::default(),
             window_size,
         }
     }
 }
 
 impl Matcher for NoDictionaryMatcher {
-    fn get_next_space(&mut self) -> Vec<u8> {
-        vec![0; self.window_size as usize]
-    }
-
     fn get_last_space(&mut self) -> &[u8] {
-        self.last_space.as_slice()
+        self.input.last_block()
     }
 
-    fn commit_space(&mut self, space: Vec<u8>) {
-        self.last_space = space;
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool) {
+        self.input.fill(capacity, fill)
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        self.input.uncommitted()
+    }
+
+    fn commit_filled(&mut self, len: usize) {
+        self.input.commit(len);
     }
 
     fn skip_matching(&mut self) {}
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         handle_sequence(Sequence::Literals {
-            literals: self.last_space.as_slice(),
+            literals: self.input.last_block(),
         });
     }
 
     fn reset(&mut self, _level: super::CompressionLevel) {
-        self.last_space.clear();
+        self.input.clear();
     }
 
     fn window_size(&self) -> u64 {
@@ -2344,7 +2352,7 @@ fn periodic_stream_roundtrips_at_every_presplit_tier() {
 /// 0), so the first block is a homogeneous compressible run that banks
 /// savings, and the second block is the one whose intra-block transition
 /// `split_block_by_chunks()` resolves into a sub-block boundary (the
-/// `pending_input.split_off(...)` path). The test asserts that split
+/// remainder stays uncommitted for the next block). The test asserts that split
 /// decision directly so it cannot silently stop exercising the path if
 /// the fixture or params drift, then proves the emitted split frame
 /// round-trips. Level 13 (lazy) no longer pre-splits, hence Level 5.
@@ -3728,81 +3736,17 @@ fn reused_compressor_borrowed_chain_frames_are_byte_identical() {
     }
 }
 
-/// A matcher that DOES implement in-place ingest, unlike the built-in driver's
-/// Simple backend. `Uncompressed` frames must still round-trip: the level, not
-/// the backend, decides whether the staged path is required.
-struct InPlaceMatcher {
-    buffer: HistoryBuf,
-    committed: usize,
-    window_size: u64,
-}
-
-impl InPlaceMatcher {
-    fn new(window_size: u64) -> Self {
-        Self {
-            buffer: HistoryBuf::new(),
-            committed: 0,
-            window_size,
-        }
-    }
-}
-
-impl Matcher for InPlaceMatcher {
-    fn get_next_space(&mut self) -> Vec<u8> {
-        vec![0; self.window_size as usize]
-    }
-
-    fn get_last_space(&mut self) -> &[u8] {
-        &self.buffer[..self.committed]
-    }
-
-    fn commit_space(&mut self, space: Vec<u8>) {
-        self.buffer = space.into();
-        self.committed = self.buffer.len();
-    }
-
-    fn fill_in_place(
-        &mut self,
-        capacity: usize,
-        fill: &mut dyn FnMut(&mut HistoryBuf) -> (usize, bool),
-    ) -> Option<(usize, bool)> {
-        self.buffer.reserve(capacity);
-        Some(fill(&mut self.buffer))
-    }
-
-    fn uncommitted_input(&self) -> &[u8] {
-        &self.buffer[self.committed..]
-    }
-
-    fn commit_filled(&mut self, len: usize) {
-        self.committed += len;
-    }
-
-    fn skip_matching(&mut self) {}
-
-    fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        handle_sequence(Sequence::Literals {
-            literals: &self.buffer[..self.committed],
-        });
-    }
-
-    fn reset(&mut self, _level: super::CompressionLevel) {
-        self.buffer.clear();
-        self.committed = 0;
-    }
-
-    fn window_size(&self) -> u64 {
-        self.window_size
-    }
-}
-
+/// An uncompressed frame is read straight into its output and never reaches
+/// the matcher, whichever matcher the compressor holds; its payload must
+/// still arrive whole, block after block.
 #[test]
-fn uncompressed_level_keeps_the_payload_with_an_in_place_matcher() {
-    let data = generate_data(0x5eed, 4096);
+fn uncompressed_level_keeps_the_payload_with_a_custom_matcher() {
+    // Past one block, and not a multiple of it, so the last block is short.
+    let data = generate_data(0x5eed, 2 * MAX_BLOCK_SIZE as usize + 4096);
     let mut out = Vec::new();
-    let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>, InPlaceMatcher> =
+    let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>, NoDictionaryMatcher> =
         FrameCompressor::new_with_matcher(
-            InPlaceMatcher::new(1 << 20),
+            NoDictionaryMatcher::new(1 << 20),
             super::CompressionLevel::Uncompressed,
         );
     compressor.set_source(&data[..]);
@@ -3812,10 +3756,7 @@ fn uncompressed_level_keeps_the_payload_with_an_in_place_matcher() {
     let mut decoder = FrameDecoder::new();
     let mut decoded = Vec::with_capacity(data.len());
     decoder.decode_all_to_vec(&out, &mut decoded).unwrap();
-    assert_eq!(
-        decoded, data,
-        "Uncompressed frames must carry their payload even when the matcher supports in-place ingest"
-    );
+    assert_eq!(decoded, data);
 }
 
 #[test]

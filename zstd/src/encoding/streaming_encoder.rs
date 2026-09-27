@@ -3,7 +3,6 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::borrow::BorrowMut;
 use core::marker::PhantomData;
-use core::mem;
 
 use crate::common::MAX_BLOCK_SIZE;
 #[cfg(feature = "hash")]
@@ -79,7 +78,10 @@ pub struct StreamingEncoder<
 pub struct CompressionContext<M: Matcher = MatchGeneratorDriver> {
     compression_level: CompressionLevel,
     state: CompressState<M>,
-    pending: Vec<u8>,
+    /// The block being written out. An uncompressed frame also buffers its
+    /// input here, behind the header, so a raw block is assembled where it
+    /// is written from; a compressed frame buffers input in the match
+    /// finder's history, uncommitted until its block is cut.
     encoded_scratch: Vec<u8>,
     errored: bool,
     last_error_kind: Option<ErrorKind>,
@@ -412,7 +414,6 @@ impl<M: Matcher> CompressionContext<M> {
                     CompressionLevel::Level(n) if n < 0
                 ),
             },
-            pending: Vec::new(),
             encoded_scratch: Vec::new(),
             errored: false,
             last_error_kind: None,
@@ -628,9 +629,9 @@ impl<M: Matcher> CompressionContext<M> {
     }
 
     /// Total heap bytes this context's allocations hold, excluding the inline
-    /// struct: match-finder tables / history / recycled buffers, retained
-    /// Huffman tables, the staging `pending` / `encoded_scratch` buffers, the
-    /// retained dictionary content, and its entropy tables. Mirrors
+    /// struct: match-finder tables / history, retained Huffman tables, the
+    /// `encoded_scratch` block buffer, the retained dictionary content, and
+    /// its entropy tables. Mirrors
     /// `FrameCompressor::heap_size` so a context can report its true
     /// footprint through `ZSTD_sizeof_CCtx`.
     pub fn heap_size(&self) -> usize {
@@ -649,7 +650,6 @@ impl<M: Matcher> CompressionContext<M> {
         total += self.state.huff_weights.heap_size();
         total += self.state.retained_scratch_heap_size();
         total += self.state.seen_content.heap_size();
-        total += self.pending.capacity();
         total += self.encoded_scratch.capacity();
         total += self
             .dictionary
@@ -702,18 +702,16 @@ impl<M: Matcher> CompressionContext<M> {
         };
 
         let block_capacity = self.block_capacity();
-        if self.pending.capacity() == 0 {
-            self.pending = self.allocate_pending_space(block_capacity);
-        }
         let mut remaining = buf;
         let mut consumed = 0usize;
 
         while !remaining.is_empty() {
             // A block is emitted the moment it fills, below, and the
             // capacity is fixed for the frame, so there is always room here.
-            debug_assert!(self.pending.len() < block_capacity);
-            let to_take = core::cmp::min(remaining.len(), block_capacity - self.pending.len());
-            self.pending.extend_from_slice(&remaining[..to_take]);
+            let pending = self.pending_len();
+            debug_assert!(pending < block_capacity);
+            let to_take = core::cmp::min(remaining.len(), block_capacity - pending);
+            self.buffer_input(&remaining[..to_take]);
             remaining = &remaining[to_take..];
             consumed += to_take;
 
@@ -730,7 +728,7 @@ impl<M: Matcher> CompressionContext<M> {
     /// Emit the buffered partial block as a non-last block and flush `drain`.
     pub fn flush<D: Write + ?Sized>(&mut self, drain: &mut D) -> Result<(), Error> {
         self.ensure_open()?;
-        if self.pending.is_empty() {
+        if self.pending_len() == 0 {
             return drain.flush().map_err(|err| self.fail(err));
         }
         self.ensure_frame_started(drain)?;
@@ -757,13 +755,9 @@ impl<M: Matcher> CompressionContext<M> {
         }
 
         self.ensure_frame_started(drain)?;
-
-        if self.pending.is_empty() {
-            self.write_empty_last_block(drain)
-                .map_err(|err| self.fail(err))?;
-        } else {
-            self.emit_pending_block(drain, true)?;
-        }
+        // An empty frame, or one whose input ended on a block boundary, closes
+        // with an empty last block.
+        self.emit_pending_block(drain, true)?;
 
         #[cfg(feature = "hash")]
         if self.content_checksum {
@@ -809,7 +803,9 @@ impl<M: Matcher> CompressionContext<M> {
         self.frame_started = false;
         self.bytes_consumed = 0;
         self.pledged_content_size = None;
-        self.pending.clear();
+        // A compressed frame's buffered input is uncommitted in the match
+        // finder, which the next frame's reset drops.
+        self.encoded_scratch.clear();
     }
 
     fn ensure_open(&self) -> Result<(), Error> {
@@ -1045,6 +1041,15 @@ impl<M: Matcher> CompressionContext<M> {
             .write_all(&encoded_header)
             .map_err(|err| self.fail(err))?;
 
+        if matches!(self.compression_level, CompressionLevel::Uncompressed) {
+            // The raw block's header goes in front of its input once the
+            // block's length is known.
+            self.encoded_scratch.clear();
+            self.encoded_scratch
+                .reserve(BLOCK_HEADER_LEN + self.block_capacity());
+            self.encoded_scratch
+                .extend_from_slice(&[0; BLOCK_HEADER_LEN]);
+        }
         self.frame_started = true;
         Ok(())
     }
@@ -1057,23 +1062,32 @@ impl<M: Matcher> CompressionContext<M> {
         core::cmp::max(1, core::cmp::min(matcher_window, ceiling))
     }
 
-    fn allocate_pending_space(&mut self, block_capacity: usize) -> Vec<u8> {
-        let mut space = match self.compression_level {
-            CompressionLevel::Fastest
-            | CompressionLevel::Default
-            | CompressionLevel::Better
-            | CompressionLevel::Best
-            | CompressionLevel::Level(_) => self.state.matcher.get_next_space(),
-            CompressionLevel::Uncompressed => Vec::new(),
-        };
-        space.clear();
-        if space.capacity() > block_capacity {
-            space.shrink_to(block_capacity);
+    /// Input taken for the frame that no block has carried out yet.
+    fn pending_len(&self) -> usize {
+        if !self.frame_started {
+            return 0;
         }
-        if space.capacity() < block_capacity {
-            space.reserve(block_capacity - space.capacity());
+        match self.compression_level {
+            CompressionLevel::Uncompressed => self.encoded_scratch.len() - BLOCK_HEADER_LEN,
+            _ => self.state.matcher.uncommitted_input().len(),
         }
-        space
+    }
+
+    /// Buffers `bytes` for the block being filled: behind the raw block's
+    /// header, or uncommitted in the match finder's history, where the block
+    /// is later matched without another copy.
+    fn buffer_input(&mut self, bytes: &[u8]) {
+        match self.compression_level {
+            CompressionLevel::Uncompressed => self.encoded_scratch.extend_from_slice(bytes),
+            _ => {
+                self.state
+                    .matcher
+                    .fill_in_place(bytes.len(), &mut |history| {
+                        history.extend_from_slice(bytes);
+                        (bytes.len(), false)
+                    });
+            }
+        }
     }
 
     /// Where the full pending block is cut (upstream `ZSTD_compress_frameChunk`
@@ -1084,52 +1098,32 @@ impl<M: Matcher> CompressionContext<M> {
     /// end of the frame.
     fn pre_split_len(&self, block_capacity: usize, remaining: usize) -> usize {
         if matches!(self.compression_level, CompressionLevel::Uncompressed) {
-            return self.pending.len();
+            return self.pending_len();
         }
+        let pending = self.state.matcher.uncommitted_input();
         crate::encoding::frame_compressor::optimal_block_size_with(
             self.state.pre_split.map(usize::from),
-            &self.pending,
+            pending,
             remaining,
             block_capacity,
             self.savings,
         )
-        .min(self.pending.len())
-    }
-
-    /// Emit the first `block_len` pending bytes as a non-last block; the
-    /// suffix stays pending (the next block starts with it, as the frame
-    /// compressor's reader path carries a pre-split suffix). On a drain
-    /// error the whole pending buffer is restored so no input is lost.
-    fn emit_pending_prefix<D: Write + ?Sized>(
-        &mut self,
-        drain: &mut D,
-        block_len: usize,
-        block_capacity: usize,
-    ) -> Result<(), Error> {
-        let mut suffix = self.allocate_pending_space(block_capacity);
-        suffix.extend_from_slice(&self.pending[block_len..]);
-        let mut block = mem::replace(&mut self.pending, suffix);
-        block.truncate(block_len);
-        if let Err((err, mut restored_block)) = self.encode_block(drain, block, false) {
-            restored_block.extend_from_slice(&self.pending);
-            self.pending = restored_block;
-            return Err(err);
-        }
-        Ok(())
+        .min(pending.len())
     }
 
     /// Emit the pending block once it is full, cut where the pre-splitter
-    /// says; a failure leaves the context failed.
+    /// says; the suffix stays pending and heads the next block. A failure
+    /// leaves the context failed.
     fn emit_full_pending_block<D: Write + ?Sized>(
         &mut self,
         drain: &mut D,
         block_capacity: usize,
     ) -> Result<(), Error> {
-        if self.pending.len() != block_capacity {
+        if self.pending_len() != block_capacity {
             return Ok(());
         }
         let block_len = self.pre_split_len(block_capacity, block_capacity);
-        self.emit_pending_prefix(drain, block_len, block_capacity)
+        self.encode_block(drain, block_len, false)
             .map_err(|err| self.fail(err))
     }
 
@@ -1143,24 +1137,18 @@ impl<M: Matcher> CompressionContext<M> {
             // A full final buffer is cut like any other block (the reader
             // path splits it with `remaining = len`); each cut prefix goes
             // out as a non-last block and the suffix is re-examined.
-            while self.pending.len() == block_capacity {
-                let block_len = self.pre_split_len(block_capacity, self.pending.len());
-                if block_len == self.pending.len() {
+            while self.pending_len() == block_capacity {
+                let block_len = self.pre_split_len(block_capacity, block_capacity);
+                if block_len == block_capacity {
                     break;
                 }
-                self.emit_pending_prefix(drain, block_len, block_capacity)
+                self.encode_block(drain, block_len, false)
                     .map_err(|err| self.fail(err))?;
             }
         }
-        let block = mem::take(&mut self.pending);
-        if let Err((err, restored_block)) = self.encode_block(drain, block, last_block) {
-            self.pending = restored_block;
-            return Err(self.fail(err));
-        }
-        if !last_block {
-            self.pending = self.allocate_pending_space(block_capacity);
-        }
-        Ok(())
+        let block_len = self.pending_len();
+        self.encode_block(drain, block_len, last_block)
+            .map_err(|err| self.fail(err))
     }
 
     // Exhaustive match kept intentionally: adding a new CompressionLevel
@@ -1177,99 +1165,70 @@ impl<M: Matcher> CompressionContext<M> {
         }
     }
 
+    /// Writes the first `block_len` pending bytes to `drain` as one block,
+    /// `last_block` if it closes the frame.
     fn encode_block<D: Write + ?Sized>(
         &mut self,
         drain: &mut D,
-        uncompressed_data: Vec<u8>,
+        block_len: usize,
         last_block: bool,
-    ) -> Result<(), (Error, Vec<u8>)> {
-        let mut raw_block = Some(uncompressed_data);
-        let mut encoded = Vec::new();
-        mem::swap(&mut encoded, &mut self.encoded_scratch);
-        encoded.clear();
-        let needed_capacity = self.block_capacity() + 3;
-        if encoded.capacity() < needed_capacity {
-            encoded.reserve(needed_capacity.saturating_sub(encoded.len()));
+    ) -> Result<(), Error> {
+        if matches!(self.compression_level, CompressionLevel::Uncompressed) {
+            // The block was assembled behind its header as it was written.
+            debug_assert_eq!(block_len, self.pending_len());
+            let header = BlockHeader {
+                last_block,
+                block_type: crate::blocks::block::BlockType::Raw,
+                // At most one block, which a block header's 21-bit size holds.
+                block_size: block_len as u32,
+            };
+            self.encoded_scratch[..BLOCK_HEADER_LEN].copy_from_slice(&header.to_le_bytes());
+            drain.write_all(&self.encoded_scratch)?;
+            #[cfg(feature = "hash")]
+            if self.content_checksum {
+                self.hasher.write(&self.encoded_scratch[BLOCK_HEADER_LEN..]);
+            }
+            self.encoded_scratch.truncate(BLOCK_HEADER_LEN);
+            return Ok(());
         }
-        let mut moved_into_matcher = false;
-        let raw_len = raw_block.as_ref().map_or(0, Vec::len);
-        if raw_block.as_ref().is_some_and(|block| block.is_empty()) {
+        self.encoded_scratch.clear();
+        if block_len == 0 {
+            // Only the last block of a frame is ever empty.
             let header = BlockHeader {
                 last_block,
                 block_type: crate::blocks::block::BlockType::Raw,
                 block_size: 0,
             };
-            header.serialize(&mut encoded);
-        } else {
-            match self.compression_level {
-                CompressionLevel::Uncompressed => {
-                    let block = raw_block.as_ref().expect("raw block missing");
-                    let header = BlockHeader {
-                        last_block,
-                        block_type: crate::blocks::block::BlockType::Raw,
-                        block_size: block.len() as u32,
-                    };
-                    header.serialize(&mut encoded);
-                    encoded.extend_from_slice(block);
-                }
-                CompressionLevel::Fastest
-                | CompressionLevel::Default
-                | CompressionLevel::Better
-                | CompressionLevel::Best
-                | CompressionLevel::Level(_) => {
-                    let block = raw_block.take().expect("raw block missing");
-                    debug_assert!(!block.is_empty(), "empty blocks handled above");
-                    let dict_active = self.dictionary.is_some()
-                        && self.state.matcher.supports_dictionary_priming();
-                    compress_block_encoded(
-                        &mut self.state,
-                        self.compression_level,
-                        last_block,
-                        crate::encoding::levels::BlockInput::Staged(block),
-                        &mut encoded,
-                        dict_active,
-                        // No FrameEmitInfo on the streaming encoder path — it
-                        // does not surface per-block layout, so no sidecar.
-                        #[cfg(feature = "lsm")]
-                        None,
-                        #[cfg(all(feature = "lsm", feature = "hash"))]
-                        None,
-                    );
-                    moved_into_matcher = true;
-                }
-            }
+            header.serialize(&mut self.encoded_scratch);
+            return drain.write_all(&self.encoded_scratch);
         }
-
-        if let Err(err) = drain.write_all(&encoded) {
-            encoded.clear();
-            mem::swap(&mut encoded, &mut self.encoded_scratch);
-            let restored = if moved_into_matcher {
-                self.state.matcher.get_last_space().to_vec()
-            } else {
-                raw_block.unwrap_or_default()
-            };
-            return Err((err, restored));
-        }
+        let dict_active =
+            self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
+        compress_block_encoded(
+            &mut self.state,
+            self.compression_level,
+            last_block,
+            block_len,
+            &mut self.encoded_scratch,
+            dict_active,
+            // No FrameEmitInfo on the streaming encoder path: it does not
+            // surface per-block layout, so no sidecar.
+            #[cfg(feature = "lsm")]
+            None,
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            None,
+        );
+        // The block is committed to the match finder whether or not the drain
+        // takes it; a drain that fails leaves the context failed.
+        drain.write_all(&self.encoded_scratch)?;
         // `savings` counts the block header too, as upstream's
         // `ZSTD_compress_frameChunk` does (`cSize` includes it).
-        self.savings += raw_len as i64 - encoded.len() as i64;
-
-        if moved_into_matcher {
-            #[cfg(feature = "hash")]
-            if self.content_checksum {
-                self.hasher.write(self.state.matcher.get_last_space());
-            }
-        } else {
-            self.hash_block(raw_block.as_deref().unwrap_or(&[]));
+        self.savings += block_len as i64 - self.encoded_scratch.len() as i64;
+        #[cfg(feature = "hash")]
+        if self.content_checksum {
+            self.hasher.write(self.state.matcher.get_last_space());
         }
-        encoded.clear();
-        mem::swap(&mut encoded, &mut self.encoded_scratch);
         Ok(())
-    }
-
-    fn write_empty_last_block<D: Write + ?Sized>(&mut self, drain: &mut D) -> Result<(), Error> {
-        self.encode_block(drain, Vec::new(), true)
-            .map_err(|(err, _)| err)
     }
 
     fn fail(&mut self, err: Error) -> Error {
@@ -1282,17 +1241,10 @@ impl<M: Matcher> CompressionContext<M> {
         }
         err
     }
-
-    #[cfg(feature = "hash")]
-    fn hash_block(&mut self, uncompressed_data: &[u8]) {
-        if self.content_checksum {
-            self.hasher.write(uncompressed_data);
-        }
-    }
-
-    #[cfg(not(feature = "hash"))]
-    fn hash_block(&mut self, _uncompressed_data: &[u8]) {}
 }
+
+/// Bytes of a block header (RFC 8878 3.1.1.2).
+const BLOCK_HEADER_LEN: usize = 3;
 
 fn error_from_kind(kind: ErrorKind) -> Error {
     Error::from(kind)

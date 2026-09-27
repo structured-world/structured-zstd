@@ -8,127 +8,7 @@ use crate::encoding::Matcher;
 use crate::encoding::dfast::DfastMatchGenerator;
 #[cfg(test)]
 use crate::encoding::match_generator::MatchGeneratorDriver;
-
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn matches() {
-    let mut matcher = MatchGenerator::new(1000);
-    let mut original_data = Vec::new();
-    let mut reconstructed = Vec::new();
-
-    let replay_sequence = |seq: Sequence<'_>, reconstructed: &mut Vec<u8>| match seq {
-        Sequence::Literals { literals } => {
-            assert!(!literals.is_empty());
-            reconstructed.extend_from_slice(literals);
-        }
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => {
-            assert!(offset > 0);
-            assert!(match_len >= MIN_MATCH_LEN);
-            reconstructed.extend_from_slice(literals);
-            assert!(offset <= reconstructed.len());
-            let start = reconstructed.len() - offset;
-            for i in 0..match_len {
-                let byte = reconstructed[start + i];
-                reconstructed.push(byte);
-            }
-        }
-    };
-
-    matcher.add_data(
-        alloc::vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
-    original_data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-
-    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
-
-    assert!(!matcher.next_sequence(|_| {}));
-
-    matcher.add_data(
-        alloc::vec![
-            1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0,
-        ],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
-    original_data.extend_from_slice(&[
-        1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0,
-    ]);
-
-    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
-    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
-    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
-    assert!(!matcher.next_sequence(|_| {}));
-
-    matcher.add_data(
-        alloc::vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 0, 0, 0, 0],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
-    original_data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 0, 0, 0, 0]);
-
-    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
-    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
-    assert!(!matcher.next_sequence(|_| {}));
-
-    matcher.add_data(
-        alloc::vec![0, 0, 0, 0, 0],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
-    original_data.extend_from_slice(&[0, 0, 0, 0, 0]);
-
-    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
-    assert!(!matcher.next_sequence(|_| {}));
-
-    matcher.add_data(
-        alloc::vec![7, 8, 9, 10, 11],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
-    original_data.extend_from_slice(&[7, 8, 9, 10, 11]);
-
-    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
-    assert!(!matcher.next_sequence(|_| {}));
-
-    matcher.add_data(
-        alloc::vec![1, 3, 5, 7, 9],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
-    matcher.skip_matching();
-    original_data.extend_from_slice(&[1, 3, 5, 7, 9]);
-    reconstructed.extend_from_slice(&[1, 3, 5, 7, 9]);
-    assert!(!matcher.next_sequence(|_| {}));
-
-    matcher.add_data(
-        alloc::vec![1, 3, 5, 7, 9],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
-    original_data.extend_from_slice(&[1, 3, 5, 7, 9]);
-
-    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
-    assert!(!matcher.next_sequence(|_| {}));
-
-    matcher.add_data(
-        alloc::vec![0, 0, 11, 13, 15, 17, 20, 11, 13, 15, 17, 20, 21, 23],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
-    original_data.extend_from_slice(&[0, 0, 11, 13, 15, 17, 20, 11, 13, 15, 17, 20, 21, 23]);
-
-    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
-    matcher.next_sequence(|seq| replay_sequence(seq, &mut reconstructed));
-    assert!(!matcher.next_sequence(|_| {}));
-
-    assert_eq!(reconstructed, original_data);
-}
+use alloc::vec::Vec;
 
 #[test]
 fn dfast_matches_roundtrip_multi_block_pattern() {
@@ -153,12 +33,12 @@ fn dfast_matches_roundtrip_multi_block_pattern() {
         }
     };
 
-    matcher.add_data(first_block.clone(), |_| {});
+    matcher.commit_input(&first_block);
     let mut history = Vec::new();
     matcher.start_matching(|seq| replay_sequence(&mut history, seq));
     assert_eq!(history, first_block);
 
-    matcher.add_data(second_block.clone(), |_| {});
+    matcher.commit_input(&second_block);
     let prefix_len = history.len();
     matcher.start_matching(|seq| replay_sequence(&mut history, seq));
 
@@ -210,7 +90,7 @@ fn dfast_accepts_exact_five_byte_match() {
     assert_eq!(data.len(), 55);
 
     let mut matcher = DfastMatchGenerator::new(1 << 22);
-    matcher.add_data(data.clone(), |_| {});
+    matcher.commit_input(&data);
 
     let mut saw_five_byte_match = false;
     let mut saw_longer_match = false;
@@ -248,17 +128,11 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
     );
     assert_eq!(driver.window_size(), (1u64 << 21));
 
-    let mut first = driver.get_next_space();
-    first[..12].copy_from_slice(b"abcabcabcabc");
-    first.truncate(12);
-    driver.commit_space(first);
+    driver.commit_input(b"abcabcabcabc");
     assert_eq!(driver.get_last_space(), b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
 
-    let mut second = driver.get_next_space();
-    second[..12].copy_from_slice(b"abcabcabcabc");
-    second.truncate(12);
-    driver.commit_space(second);
+    driver.commit_input(b"abcabcabcabc");
 
     let mut reconstructed = b"abcabcabcabc".to_vec();
     driver.start_matching(|seq| match seq {
@@ -321,10 +195,7 @@ fn driver_level4_greedy_round_trip_single_slice() {
     let mut driver = MatchGeneratorDriver::new(64, 2);
     driver.reset(CompressionLevel::Level(4));
     let input = b"abcdefgh_abcdefgh_abcdefgh_abcdefgh";
-    let mut space = driver.get_next_space();
-    space[..input.len()].copy_from_slice(input);
-    space.truncate(input.len());
-    driver.commit_space(space);
+    driver.commit_input(input);
 
     let mut reconstructed: Vec<u8> = Vec::new();
     let mut saw_triple = false;
@@ -366,10 +237,7 @@ fn driver_level4_greedy_round_trip_cross_slice() {
     let chunk = b"the quick brown fox jumps over!!";
     assert_eq!(chunk.len(), 32);
 
-    let mut first = driver.get_next_space();
-    first[..chunk.len()].copy_from_slice(chunk);
-    first.truncate(chunk.len());
-    driver.commit_space(first);
+    driver.commit_input(chunk);
 
     let mut first_recon: Vec<u8> = Vec::new();
     driver.start_matching(|seq| match seq {
@@ -393,10 +261,7 @@ fn driver_level4_greedy_round_trip_cross_slice() {
         "first slice failed to round-trip"
     );
 
-    let mut second = driver.get_next_space();
-    second[..chunk.len()].copy_from_slice(chunk);
-    second.truncate(chunk.len());
-    driver.commit_space(second);
+    driver.commit_input(chunk);
 
     let mut full = first_recon.clone();
     let mut saw_cross_slice_match = false;

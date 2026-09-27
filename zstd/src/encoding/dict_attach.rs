@@ -36,7 +36,7 @@ pub(crate) struct DictAttach<T> {
     primed: bool,
     /// Next history position a multi-slice dict fill should process (upstream
     /// zstd `ms->nextToUpdate`). A dictionary loaded across several
-    /// `accept_data` slices is hashed incrementally; without a persistent
+    /// committed slices is hashed incrementally; without a persistent
     /// high-water the second slice's fill would restart at its own slice
     /// origin and drop the `HASH_READ_SIZE - 1` seam positions just below it
     /// (their wide hash read straddles the slice boundary, so the prior slice

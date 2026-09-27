@@ -7,8 +7,6 @@
 //! verbatim from `match_generator.rs` (no behaviour change); encoding-level
 //! paths are absolute (`crate::encoding::…`) for the deeper module.
 
-use alloc::vec::Vec;
-
 use crate::encoding::Sequence;
 use crate::encoding::blocks::encode_offset_with_history;
 use crate::encoding::cost_model::HC_PREDEF_THRESHOLD;
@@ -218,7 +216,7 @@ macro_rules! bt_insert_range_body {
                 } else {
                     0
                 };
-                // `abs_pos + 9` is safe in raw form: `MatchTable::add_data` caps
+                // `abs_pos + 9` is safe in raw form: `MatchTable::fill_uncommitted` caps
                 // total input at `usize::MAX - STREAM_ABS_HEADROOM` (where
                 // `STREAM_ABS_HEADROOM = HC_OPT_NUM + 16`), so every
                 // frame-lifetime absolute cursor passed to the BT walker stays
@@ -945,7 +943,7 @@ macro_rules! bt_insert_and_collect_matches_body {
         let bt_bias = coords.bt_bias;
         // Raw `+ 9` is safe here — see `bt_insert_range_body!`
         // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
-        // cap in `MatchTable::add_data`.
+        // cap in `MatchTable::fill_uncommitted`.
         let mut match_end_abs = $abs_pos + 9;
         // Both of these are associated consts of the strategy the caller is
         // monomorphized for, so they arrive as literals rather than as fields
@@ -1398,8 +1396,8 @@ impl HcMatchGenerator {
         }
     }
 
-    pub(crate) fn reset(&mut self, reuse_space: impl FnMut(Vec<u8>)) {
-        self.table.reset(reuse_space);
+    pub(crate) fn reset(&mut self) {
+        self.table.reset();
         if let HcBackend::Bt(bt) = &mut self.backend {
             bt.reset();
         }

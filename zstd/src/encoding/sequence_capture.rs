@@ -91,16 +91,24 @@ struct CapturingMatcher {
 }
 
 impl Matcher for CapturingMatcher {
-    fn get_next_space(&mut self) -> Vec<u8> {
-        self.inner.get_next_space()
-    }
-
     fn get_last_space(&mut self) -> &[u8] {
         self.inner.get_last_space()
     }
 
-    fn commit_space(&mut self, space: Vec<u8>) {
-        self.inner.commit_space(space);
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut crate::encoding::HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool) {
+        self.inner.fill_in_place(capacity, fill)
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        self.inner.uncommitted_input()
+    }
+
+    fn commit_filled(&mut self, len: usize) {
+        self.inner.commit_filled(len);
     }
 
     fn skip_matching(&mut self) {
@@ -333,9 +341,9 @@ fn compress_and_collect_sequences_impl(
     //
     // * Pre-split (`Level(11..=15)` borders + `optimal_block_size`,
     //   borders-only): the splitter chooses a shrunken `block_len`
-    //   BEFORE the matcher runs; the suffix is parked in
-    //   `pending_input` and the next compress-loop iteration calls
-    //   the matcher again on the suffix. Each matcher call still
+    //   BEFORE the matcher runs; the suffix stays uncommitted in the
+    //   matcher and the next compress-loop iteration calls the
+    //   matcher again on it. Each matcher call still
     //   maps to exactly ONE physical on-wire block, so
     //   `CapturingMatcher::current_block` tracks correctly.
     //

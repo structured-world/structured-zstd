@@ -351,15 +351,23 @@ enum HuffmanTableUpdate {
 }
 
 impl Matcher for EntropyOnlyMatcher {
-    fn get_next_space(&mut self) -> Vec<u8> {
-        unreachable!("entropy estimator never requests input space")
-    }
-
     fn get_last_space(&mut self) -> &[u8] {
         unreachable!("entropy estimator never reads source bytes")
     }
 
-    fn commit_space(&mut self, _space: Vec<u8>) {
+    fn fill_in_place(
+        &mut self,
+        _capacity: usize,
+        _fill: &mut dyn FnMut(&mut crate::encoding::HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool) {
+        unreachable!("entropy estimator never takes input")
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        unreachable!("entropy estimator never takes input")
+    }
+
+    fn commit_filled(&mut self, _len: usize) {
         unreachable!("entropy estimator never commits input")
     }
 

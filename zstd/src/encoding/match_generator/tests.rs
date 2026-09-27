@@ -3,6 +3,7 @@
 //! optimal round-trips, and dictionary-priming behaviour.
 
 use super::*;
+use alloc::vec::Vec;
 
 // Test-local L22 BtUltra2 HcConfig fixtures. Production resolves L22 through
 // `cparams::get_cparams`; these fixed shapes are test INPUT for exercising the
@@ -77,11 +78,8 @@ fn drive_roundtrip_with_override(
     let mut out: Vec<u8> = Vec::with_capacity(data.len());
     let mut offset_in_data = 0usize;
     while offset_in_data < data.len() {
-        let mut space = driver.get_next_space();
-        let take = (data.len() - offset_in_data).min(space.len());
-        space[..take].copy_from_slice(&data[offset_in_data..offset_in_data + take]);
-        space.truncate(take);
-        driver.commit_space(space);
+        let take = (data.len() - offset_in_data).min(driver.slice_size);
+        driver.commit_input(&data[offset_in_data..offset_in_data + take]);
         offset_in_data += take;
 
         driver.start_matching(|seq| match seq {
@@ -163,7 +161,7 @@ fn row_mls_knob_gates_matches_and_roundtrips() {
         let mut cfg = ROW_CONFIG;
         cfg.mls = mls;
         matcher.configure(cfg);
-        matcher.add_data(data.clone(), |_| {});
+        matcher.commit_input(&data);
 
         let mut out: Vec<u8> = Vec::with_capacity(data.len());
         let mut shortest_match = usize::MAX;
@@ -250,12 +248,8 @@ fn l4_greedy_round_trip(slice_size: usize, max_slices: usize, data: &[u8]) -> (u
     // window.
     let mut offset_in_data = 0usize;
     while offset_in_data < data.len() {
-        let mut space = driver.get_next_space();
-        let space_cap = space.len();
-        let take = (data.len() - offset_in_data).min(space_cap);
-        space[..take].copy_from_slice(&data[offset_in_data..offset_in_data + take]);
-        space.truncate(take);
-        driver.commit_space(space);
+        let take = (data.len() - offset_in_data).min(driver.slice_size);
+        driver.commit_input(&data[offset_in_data..offset_in_data + take]);
         offset_in_data += take;
 
         driver.start_matching(|seq| match seq {
@@ -283,9 +277,7 @@ fn l4_greedy_round_trip(slice_size: usize, max_slices: usize, data: &[u8]) -> (u
     // input path of `start_matching_greedy` (the `current_len == 0`
     // early-return guard) gets exercised.
     if data.is_empty() {
-        let mut space = driver.get_next_space();
-        space.clear();
-        driver.commit_space(space);
+        driver.commit_input(&[]);
         driver.start_matching(|seq| match seq {
             Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
             Sequence::Triple { .. } => panic!("empty input must not emit any matches"),
@@ -328,16 +320,10 @@ fn driver_level5_greedy_tail_rep_only_reachable() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(5));
 
-    let mut first_space = driver.get_next_space();
-    first_space[..first.len()].copy_from_slice(first);
-    first_space.truncate(first.len());
-    driver.commit_space(first_space);
+    driver.commit_input(first);
     driver.start_matching(|_| {});
 
-    let mut second_space = driver.get_next_space();
-    second_space[..second.len()].copy_from_slice(second);
-    second_space.truncate(second.len());
-    driver.commit_space(second_space);
+    driver.commit_input(second);
 
     let mut second_slice_triples = 0usize;
     driver.start_matching(|seq| {
@@ -360,13 +346,11 @@ fn driver_level4_greedy_empty_input_emits_nothing() {
     // the top of `start_matching_greedy`.
     let mut driver = MatchGeneratorDriver::new(64, 2);
     driver.reset(CompressionLevel::Level(4));
-    // Commit an empty space so the matcher has SOMETHING to start
+    // Commit an empty block so the matcher has SOMETHING to start
     // matching on (otherwise `start_matching` panics on the
     // `window.back()` unwrap — that's a separate path covered by
     // existing reset tests).
-    let mut space = driver.get_next_space();
-    space.clear();
-    driver.commit_space(space);
+    driver.commit_input(&[]);
     let mut emitted_anything = false;
     driver.start_matching(|_| emitted_anything = true);
     assert!(!emitted_anything, "empty slice must not emit any sequences",);
@@ -687,7 +671,7 @@ fn btultra2_seed_pass_initializes_opt_state() {
         26,
     );
     let data: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
-    hc.table.add_data(data, |_| {});
+    hc.table.commit_input(&data);
     hc.start_matching(|_| {});
     assert!(
         hc.backend.bt_mut().opt_state.lit_length_sum > 0,
@@ -747,7 +731,7 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
             super::super::strategy::StrategyTag::BtUltra2,
             26,
         );
-        hc.table.add_data(data.clone(), |_| {});
+        hc.table.commit_input(&data);
         hc.table.kernel = tier;
         let mut seqs = Vec::new();
         hc.start_matching(|seq| match seq {
@@ -848,10 +832,7 @@ fn dfast_dictionary_all_kernel_tiers_emit_identical_sequences() {
             "level 3 with a dictionary must run the dfast backend",
         );
         driver.dfast_matcher_mut().kernel = tier;
-        let mut space = driver.get_next_space();
-        space.clear();
-        space.extend_from_slice(&block);
-        driver.commit_space(space);
+        driver.commit_input(&block);
         let mut seqs = Vec::new();
         driver.start_matching(|seq| match seq {
             Sequence::Triple {
@@ -1805,10 +1786,7 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
     driver.reset(CompressionLevel::Level(3));
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
     // Upstream zstd-parity split sizes: long-hash = DFAST_HASH_BITS,
     // short-hash = DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA.
@@ -1822,10 +1800,7 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
 
     driver.set_source_size_hint(1024);
     driver.reset(CompressionLevel::Level(3));
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"xyzxyzxyzxyz");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"xyzxyzxyzxyz");
     driver.skip_matching_with_hint(None);
     let hinted_long = driver.dfast_matcher().long_len();
     let hinted_short = driver.dfast_matcher().short_len();
@@ -1855,10 +1830,7 @@ fn driver_huge_source_hint_does_not_overflow_table_window_shift() {
     driver.set_source_size_hint(u64::MAX);
     driver.reset(CompressionLevel::Level(3));
 
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
 
     assert!(
@@ -1894,10 +1866,7 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
         driver.hc_matcher().table.history.capacity()
     );
 
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
 }
 
@@ -2108,10 +2077,7 @@ fn driver_dictionary_frame_indexes_the_dictionary_with_finder_overrides() {
     // dictionary, through the geometry it was indexed with.
     let mut block = dict[1000..1064].to_vec();
     block.extend_from_slice(&dict[5000..5064]);
-    let mut space = driver.get_next_space();
-    space.clear();
-    space.extend_from_slice(&block);
-    driver.commit_space(space);
+    driver.commit_input(&block);
     let mut dict_matches = 0usize;
     driver.start_matching(|seq| {
         if let Sequence::Triple { offset, .. } = seq
@@ -2176,10 +2142,7 @@ fn driver_rows_frame_releases_the_tree_buffer_capacity() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.set_source_size_hint(1 << 20);
     driver.reset(CompressionLevel::Level(15));
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
     let tree_capacity = driver.row_matcher().tables_len();
     assert!(
@@ -2189,10 +2152,7 @@ fn driver_rows_frame_releases_the_tree_buffer_capacity() {
 
     driver.set_source_size_hint(1 << 20);
     driver.reset(CompressionLevel::Level(5));
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
     assert!(
         driver.row_matcher().tables_len() < tree_capacity,
@@ -2206,10 +2166,7 @@ fn driver_rows_reset_releases_the_tree_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.set_source_size_hint(1 << 20);
     driver.reset(CompressionLevel::Level(15));
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
     assert!(
         driver.row_matcher().hc_tables_len() > 0,
@@ -2217,10 +2174,7 @@ fn driver_rows_reset_releases_the_tree_tables() {
     );
     driver.set_source_size_hint(1 << 20);
     driver.reset(CompressionLevel::Level(5));
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
     assert_eq!(
         driver.row_matcher().hc_tables_len(),
@@ -2231,7 +2185,7 @@ fn driver_rows_reset_releases_the_tree_tables() {
 
 /// Regression: registering a borrowed window rebases the coordinate origin
 /// before the cumulative floor would push stored `u32` positions past
-/// `u32::MAX` (the owned path does this in `add_data`; the borrowed reuse
+/// `u32::MAX` (the owned path does this in `commit_block`; the borrowed reuse
 /// path advanced the floor per frame without ever rebasing, so after ~4 GiB
 /// of reused one-shot frames every inserted position wrapped and matching
 /// silently degraded).
@@ -2323,10 +2277,7 @@ fn driver_chain_log_override_survives_row_to_hc_fallback() {
     driver.set_source_size_hint(1 << 12);
     driver.set_param_overrides(Some(ov));
     driver.reset(CompressionLevel::Level(6));
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
     // The override (10) is below the window cap (14), so the resolved chain
     // table must reflect it — NOT the level's `chainLog`.
@@ -2347,10 +2298,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
     driver.reset(CompressionLevel::Level(5));
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
     let full_rows = driver.row_matcher().row_heads().len();
     // Level 5 uses the upstream row_log (clamp(searchLog=3, 4, 6) = 4) and the
@@ -2365,10 +2313,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     // full hash_bits (19) and the row count drops.
     driver.set_source_size_hint(1 << 16);
     driver.reset(CompressionLevel::Level(5));
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"xyzxyzxyzxyz");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"xyzxyzxyzxyz");
     driver.skip_matching_with_hint(None);
     assert_eq!(
         driver.active_backend(),
@@ -2407,10 +2352,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
 fn driver_btlazy2_levels_search_the_binary_tree_on_the_row_backend() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(13));
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
     assert_eq!(
         driver.active_backend(),
@@ -2420,10 +2362,7 @@ fn driver_btlazy2_levels_search_the_binary_tree_on_the_row_backend() {
 
     driver.set_source_size_hint(1 << 12);
     driver.reset(CompressionLevel::Level(10));
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
     assert_eq!(
         driver.active_backend(),
@@ -2465,12 +2404,12 @@ fn row_matches_roundtrip_multi_block_pattern() {
         }
     };
 
-    matcher.add_data(first_block.clone(), |_| {});
+    matcher.commit_input(&first_block);
     let mut history = Vec::new();
     matcher.start_matching(|seq| replay_sequence(&mut history, seq));
     assert_eq!(history, first_block);
 
-    matcher.add_data(second_block.clone(), |_| {});
+    matcher.commit_input(&second_block);
     let prefix_len = history.len();
     matcher.start_matching(|seq| replay_sequence(&mut history, seq));
 
@@ -2478,7 +2417,7 @@ fn row_matches_roundtrip_multi_block_pattern() {
 
     // Force a literals-only pass so the Sequence::Literals arm is exercised.
     let third_block: Vec<u8> = (0u8..=255).collect();
-    matcher.add_data(third_block.clone(), |_| {});
+    matcher.commit_input(&third_block);
     let third_prefix = history.len();
     matcher.start_matching(|seq| replay_sequence(&mut history, seq));
     assert_eq!(&history[third_prefix..], third_block.as_slice());
@@ -2489,7 +2428,7 @@ fn row_short_block_emits_literals_only() {
     let mut matcher = RowMatchGenerator::new(1 << 22);
     matcher.configure(ROW_CONFIG);
 
-    matcher.add_data(b"abcde".to_vec(), |_| {});
+    matcher.commit_input(b"abcde");
 
     let mut saw_triple = false;
     let mut reconstructed = Vec::new();
@@ -2508,7 +2447,7 @@ fn row_short_block_emits_literals_only() {
     // reachable. The block must exceed the 16-byte tail the lazy parse never
     // searches (upstream zstd `lazy_generic` `ilimit`).
     saw_triple = false;
-    matcher.add_data(b"abcdeabcdeabcdeabcde-padding-past-ilimit".to_vec(), |_| {});
+    matcher.commit_input(b"abcdeabcdeabcdeabcde-padding-past-ilimit");
     matcher.start_matching(|seq| {
         if let Sequence::Triple { .. } = seq {
             saw_triple = true;
@@ -2524,7 +2463,7 @@ fn row_short_block_emits_literals_only() {
 fn row_pick_lazy_returns_best_when_lookahead_is_out_of_bounds() {
     let mut matcher = RowMatchGenerator::new(1 << 22);
     matcher.configure(ROW_CONFIG);
-    matcher.add_data(b"abcabc".to_vec(), |_| {});
+    matcher.commit_input(b"abcabc");
     // Build the row tables before probing: the lookahead path reaches
     // `row_candidate` -> `row_heads[..]` once the accept floor is small
     // enough to pass the length gate, so the tables must be allocated
@@ -2573,12 +2512,12 @@ fn row_backfills_previous_block_tail_for_cross_boundary_match() {
         }
     };
 
-    matcher.add_data(first_block.clone(), |_| {});
+    matcher.commit_input(&first_block);
     let mut reconstructed = Vec::new();
     matcher.start_matching(|seq| replay_sequence(&mut reconstructed, seq));
     assert_eq!(reconstructed, first_block);
 
-    matcher.add_data(second_block.clone(), |_| {});
+    matcher.commit_input(&second_block);
     let mut saw_cross_boundary = false;
     let prefix_len = reconstructed.len();
     matcher.start_matching(|seq| {
@@ -2609,7 +2548,7 @@ fn row_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
 
     let mut dense = RowMatchGenerator::new(1 << 22);
     dense.configure(ROW_CONFIG);
-    dense.add_data(data.clone(), |_| {});
+    dense.commit_input(&data);
     dense.skip_matching_with_hint(Some(false));
     let dense_slots = dense
         .row_positions()
@@ -2619,7 +2558,7 @@ fn row_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
 
     let mut sparse = RowMatchGenerator::new(1 << 22);
     sparse.configure(ROW_CONFIG);
-    sparse.add_data(data, |_| {});
+    sparse.commit_input(&data);
     sparse.skip_matching_with_hint(Some(true));
     let sparse_slots = sparse
         .row_positions()
@@ -2652,7 +2591,7 @@ fn row_skip_matching_with_none_hint_leaves_interior_empty() {
 
     let mut none_hint = RowMatchGenerator::new(1 << 22);
     none_hint.configure(ROW_CONFIG);
-    none_hint.add_data(data.clone(), |_| {});
+    none_hint.commit_input(&data);
     none_hint.skip_matching_with_hint(None);
     let none_slots = none_hint
         .row_positions()
@@ -2664,7 +2603,7 @@ fn row_skip_matching_with_none_hint_leaves_interior_empty() {
     // path inserts every position in the skipped range.
     let mut dense = RowMatchGenerator::new(1 << 22);
     dense.configure(ROW_CONFIG);
-    dense.add_data(data, |_| {});
+    dense.commit_input(&data);
     dense.skip_matching_with_hint(Some(false));
     let dense_slots = dense
         .row_positions()
@@ -2693,10 +2632,7 @@ fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
     driver.reset(CompressionLevel::Level(3));
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
 
     // Upstream zstd-parity split: long-hash at DFAST_HASH_BITS, short-hash one
@@ -2716,33 +2652,6 @@ fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
     );
 }
 
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn simple_backend_rejects_undersized_pooled_suffix_store() {
-    let mut driver = MatchGeneratorDriver::new(128 * 1024, 2);
-    driver.reset(CompressionLevel::Fastest);
-
-    driver.suffix_pool.push(SuffixStore::with_capacity(1024));
-
-    let mut space = driver.get_next_space();
-    space.clear();
-    space.resize(4096, 0xAB);
-    driver.commit_space(space);
-
-    let last_suffix_slots = driver
-        .simple()
-        .window
-        .last()
-        .expect("window entry must exist after commit")
-        .suffixes
-        .slots
-        .len();
-    assert!(
-        last_suffix_slots >= 4096,
-        "undersized pooled suffix store must not be reused for larger blocks"
-    );
-}
-
 #[test]
 fn source_hint_clamps_driver_slice_size_to_window() {
     let mut driver = MatchGeneratorDriver::new(128 * 1024, 2);
@@ -2754,33 +2663,6 @@ fn source_hint_clamps_driver_slice_size_to_window() {
     // floor), and the driver's slice size follows that resolved window.
     assert_eq!(window, 1 << MIN_WINDOW_LOG);
     assert_eq!(driver.slice_size, window);
-
-    let space = driver.get_next_space();
-    assert_eq!(space.len(), window);
-    driver.commit_space(space);
-}
-
-#[test]
-fn pooled_space_keeps_capacity_when_slice_size_shrinks() {
-    let mut driver = MatchGeneratorDriver::new(128 * 1024, 2);
-    driver.reset(CompressionLevel::Default);
-
-    let large = driver.get_next_space();
-    let large_capacity = large.capacity();
-    assert!(large_capacity >= 128 * 1024);
-    driver.commit_space(large);
-
-    driver.set_source_size_hint(1024);
-    driver.reset(CompressionLevel::Default);
-
-    let small = driver.get_next_space();
-    // Slice size follows the C-faithful resolved window: a 1 KiB hint clamps it
-    // to window_log 10 (MIN_WINDOW_LOG), not the old 16 KiB interop floor.
-    assert_eq!(small.len(), 1 << MIN_WINDOW_LOG);
-    assert!(
-        small.capacity() >= large_capacity,
-        "pooled buffer capacity should be preserved to avoid shrink/grow churn"
-    );
 }
 
 #[test]
@@ -2795,26 +2677,16 @@ fn driver_best_to_fastest_releases_oversized_hc_tables() {
     assert_eq!(driver.window_size(), (1u64 << 22));
 
     // Feed data so tables are actually allocated via ensure_tables().
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
 
-    // Switch to Fastest — the [`MatcherStorage`] enum swaps to the
+    // Switch to Fastest: the [`MatcherStorage`] enum swaps to the
     // `Simple` variant and the `HashChain` variant is dropped. The
-    // drain block in `Matcher::reset` reassigns
-    // `m.table.hash_table` / `chain_table` / `hash3_table` to
-    // `Vec::new()` BEFORE constructing the replacement variant so the
-    // table backing allocations are released up front — this caps
-    // peak memory during the swap to "old data buffers being drained
-    // into `vec_pool` + new `MatchGenerator` skeleton" rather than
-    // "old tables still resident + new variant under construction".
-    // The eventual `Drop` on the old variant would release the tables
-    // anyway, but only after the new variant is built, so the early
-    // reassign shifts the peak. Post-switch the HC variant no longer
-    // exists; the assertion that storage is now `Simple` covers the
-    // invariant the old hash_table/chain_table checks were proxying.
+    // drain block in `Matcher::reset` releases the HC tables BEFORE
+    // constructing the replacement variant, so peak memory during the
+    // swap never holds the old tables and the new variant at once.
+    // Post-switch the HC variant no longer exists; the assertion that
+    // storage is now `Simple` covers the invariant.
     driver.reset(CompressionLevel::Fastest);
     assert_eq!(driver.window_size(), (1u64 << 19));
     assert_eq!(
@@ -2834,10 +2706,7 @@ fn driver_better_to_best_resizes_hc_tables() {
     driver.reset(CompressionLevel::Level(16));
     assert_eq!(driver.window_size(), (1u64 << 22));
 
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"abcabcabcabc");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
 
     let hc = driver.hc_matcher();
@@ -2849,10 +2718,7 @@ fn driver_better_to_best_resizes_hc_tables() {
     assert_eq!(driver.window_size(), (1u64 << 25));
 
     // Feed data to trigger ensure_tables with new sizes.
-    let mut space = driver.get_next_space();
-    space[..12].copy_from_slice(b"xyzxyzxyzxyz");
-    space.truncate(12);
-    driver.commit_space(space);
+    driver.commit_input(b"xyzxyzxyzxyz");
     driver.skip_matching_with_hint(None);
 
     let hc = driver.hc_matcher();
@@ -2867,76 +2733,6 @@ fn driver_better_to_best_resizes_hc_tables() {
         "L20 chain_table ({}) should be larger than L16 ({})",
         hc.table.chain_table().len(),
         better_chain_len
-    );
-}
-
-#[cfg(any())]
-// disabled: tests legacy SuffixStore behavior incompatible with upstream zstd-shape kernel's HASH_READ_SIZE geometry
-#[test]
-fn prime_with_dictionary_preserves_history_for_first_full_block() {
-    let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Fastest);
-
-    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
-
-    let mut space = driver.get_next_space();
-    space.clear();
-    space.extend_from_slice(b"abcdefgh");
-    driver.commit_space(space);
-
-    let mut saw_match = false;
-    driver.start_matching(|seq| {
-        if let Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } = seq
-            && literals.is_empty()
-            && offset == 8
-            && match_len >= MIN_MATCH_LEN
-        {
-            saw_match = true;
-        }
-    });
-
-    assert!(
-        saw_match,
-        "first full block should still match dictionary-primed history"
-    );
-}
-
-#[cfg(any())]
-// disabled: tests legacy SuffixStore behavior incompatible with upstream zstd-shape kernel's HASH_READ_SIZE geometry
-#[test]
-fn prime_with_large_dictionary_preserves_early_history_until_first_block() {
-    let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Fastest);
-
-    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
-
-    let mut space = driver.get_next_space();
-    space.clear();
-    space.extend_from_slice(b"abcdefgh");
-    driver.commit_space(space);
-
-    let mut saw_match = false;
-    driver.start_matching(|seq| {
-        if let Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } = seq
-            && literals.is_empty()
-            && offset == 24
-            && match_len >= MIN_MATCH_LEN
-        {
-            saw_match = true;
-        }
-    });
-
-    assert!(
-        saw_match,
-        "dictionary bytes should remain addressable until frame output exceeds the live window"
     );
 }
 
@@ -3042,10 +2838,7 @@ fn a_btultra2_second_pass_sees_no_entry_from_before_it() {
         .enumerate()
     {
         driver.reset(CompressionLevel::Level(22));
-        let mut space = driver.get_next_space();
-        space.clear();
-        space.extend_from_slice(payload);
-        driver.commit_space(space);
+        driver.commit_input(payload);
         driver.start_matching(|_| {});
 
         let table = &driver.hc_matcher().table;
@@ -3104,10 +2897,7 @@ fn a_btultra2_seed_pass_near_the_top_of_the_address_space_parses_like_a_fresh_on
             table.next_to_update3 = abs_start;
             table.skip_insert_until_abs = abs_start;
         }
-        let mut space = driver.get_next_space();
-        space.clear();
-        space.extend_from_slice(&payload);
-        driver.commit_space(space);
+        driver.commit_input(&payload);
         let mut sequences = Vec::new();
         driver.start_matching(|seq| match seq {
             Sequence::Literals { literals } => sequences.push((literals.len(), 0, 0)),
@@ -3164,10 +2954,7 @@ fn dfast_prime_with_dictionary_preserves_history_for_first_full_block() {
     let payload = b"abcdefghijklmnop";
     driver.prime_with_dictionary(payload, [1, 4, 8]);
 
-    let mut space = driver.get_next_space();
-    space.clear();
-    space.extend_from_slice(payload);
-    driver.commit_space(space);
+    driver.commit_input(payload);
 
     let mut saw_match = false;
     driver.start_matching(|seq| {
@@ -3457,26 +3244,6 @@ fn primed_snapshot_fast_attach_does_not_over_key_non_simple_backends() {
     );
 }
 
-#[cfg(any())] // disabled: tested SuffixStore-per-block tail-handling specific to legacy MatchGenerator
-#[test]
-fn prime_with_dictionary_does_not_reuse_tiny_suffix_store() {
-    let mut driver = MatchGeneratorDriver::new(8, 2);
-    driver.reset(CompressionLevel::Fastest);
-
-    // This dictionary leaves a 1-byte tail chunk (capacity=1 suffix table),
-    // which should never be committed to the matcher window.
-    driver.prime_with_dictionary(b"abcdefghi", [1, 4, 8]);
-
-    assert!(
-        driver
-            .simple()
-            .window
-            .iter()
-            .all(|entry| entry.data.len() >= MIN_MATCH_LEN),
-        "dictionary priming must not commit tails shorter than MIN_MATCH_LEN"
-    );
-}
-
 #[test]
 fn prime_with_dictionary_counts_only_committed_tail_budget() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
@@ -3524,10 +3291,7 @@ fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
     let payload = b"abcdefghijklmnopqrstuvwxyz0123456789ABCD";
     driver.prime_with_dictionary(payload, [1, 4, 8]);
 
-    let mut space = driver.get_next_space();
-    space.clear();
-    space.extend_from_slice(payload);
-    driver.commit_space(space);
+    driver.commit_input(payload);
 
     let mut saw_match = false;
     driver.start_matching(|seq| {
@@ -3584,10 +3348,7 @@ fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
     // block's start. The block that fills the window therefore does not yet
     // displace the dictionary; the one after it does.
     for block in [b"AAAAAAAA", b"BBBBBBBB", b"CCCCCCCC"] {
-        let mut space = driver.get_next_space();
-        space.clear();
-        space.extend_from_slice(block);
-        driver.commit_space(space);
+        driver.commit_input(block);
         driver.skip_matching_with_hint(None);
         if block == b"AAAAAAAA" {
             assert_eq!(
@@ -3614,9 +3375,7 @@ fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
 /// is intentionally gone — the `Row` variant no longer exists after
 /// the swap, so there is nothing to inspect by accessor; the "window
 /// cleared" invariant is replaced by "variant dropped", and a
-/// subsequent `row_matcher()` call would panic by design. The
-/// pool-recycling side of the row backend is covered by
-/// [`driver_row_commit_recycles_block_buffer_into_pool`].
+/// subsequent `row_matcher()` call would panic by design.
 #[test]
 fn row_get_last_space_then_reset_to_fastest_drops_row_variant() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
@@ -3626,10 +3385,7 @@ fn row_get_last_space_then_reset_to_fastest_drops_row_variant() {
         super::super::strategy::BackendTag::Row
     );
 
-    let mut space = driver.get_next_space();
-    space.clear();
-    space.extend_from_slice(b"row-data");
-    driver.commit_space(space);
+    driver.commit_input(b"row-data");
 
     assert_eq!(driver.get_last_space(), b"row-data");
 
@@ -3638,43 +3394,6 @@ fn row_get_last_space_then_reset_to_fastest_drops_row_variant() {
         driver.active_backend(),
         super::super::strategy::BackendTag::Simple
     );
-}
-
-/// Committing a Row block must return the input buffer to `vec_pool`
-/// immediately (the bytes are mirrored into the contiguous `history`,
-/// so there is no reason to retain a second copy in the window). This
-/// guards the chunk-length window: the previous `VecDeque<Vec<u8>>`
-/// window retained a full `block_capacity` buffer per committed block,
-/// which on a heavily pre-split frame ballooned peak memory to many
-/// times the live byte count. With the buffer recycled at commit time
-/// the pool grows by exactly one Vec per committed block.
-#[test]
-fn driver_row_commit_recycles_block_buffer_into_pool() {
-    let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Level(5));
-    assert_eq!(
-        driver.active_backend(),
-        super::super::strategy::BackendTag::Row
-    );
-
-    let before_pool = driver.vec_pool.len();
-    let mut space = driver.get_next_space();
-    space.clear();
-    space.extend_from_slice(b"row-data-to-recycle");
-    driver.commit_space(space);
-
-    // `>` not `>=`: a fresh driver starts with `before_pool == 0`, so the
-    // weaker bound passes even if the commit failed to recycle. Strict
-    // growth proves the buffer was returned to the pool at commit time
-    // rather than retained in the window (the pre-`chunk_lens` bug).
-    assert!(
-        driver.vec_pool.len() > before_pool,
-        "row commit must recycle the committed block buffer into vec_pool \
-         (before_pool = {before_pool}, after = {})",
-        driver.vec_pool.len()
-    );
-    // The bytes still resolve through the contiguous history mirror.
-    assert_eq!(driver.get_last_space(), b"row-data-to-recycle");
 }
 
 #[test]
@@ -3758,7 +3477,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
 fn row_pick_lazy_returns_none_when_next_is_better() {
     let mut matcher = RowMatchGenerator::new(1 << 22);
     matcher.configure(ROW_CONFIG);
-    matcher.add_data(alloc::vec![b'a'; 64], |_| {});
+    matcher.commit_input([b'a'; 64]);
     matcher.ensure_tables();
 
     let abs_pos = matcher.history_abs_start + 16;
@@ -3783,7 +3502,7 @@ fn row_pick_lazy_depth2_returns_none_when_next2_significantly_better() {
 
     let mut data = alloc::vec![b'x'; 40];
     data[11..30].copy_from_slice(b"EFABCABCAEFABCAEFAB");
-    matcher.add_data(data, |_| {});
+    matcher.commit_input(&data);
     matcher.ensure_tables();
 
     let abs_pos = matcher.history_abs_start + 20;
@@ -3822,7 +3541,7 @@ fn row_pick_lazy_depth2_keeps_best_when_next2_is_only_one_byte_better() {
 
     let mut data = alloc::vec![b'x'; 40];
     data[11..30].copy_from_slice(b"EFABCABCAEFABCAEFAZ");
-    matcher.add_data(data, |_| {});
+    matcher.commit_input(&data);
     matcher.ensure_tables();
 
     let abs_pos = matcher.history_abs_start + 20;
@@ -3851,13 +3570,10 @@ fn row_pick_lazy_depth2_keeps_best_when_next2_is_only_one_byte_better() {
 fn row_hash_and_row_extracts_high_bits() {
     let mut matcher = RowMatchGenerator::new(1 << 22);
     matcher.configure(ROW_CONFIG);
-    matcher.add_data(
-        alloc::vec![
-            0xAA, 0xBB, 0xCC, 0x11, 0x10, 0x20, 0x30, 0x40, 0xAA, 0xBB, 0xCC, 0x22, 0x50, 0x60,
-            0x70, 0x80,
-        ],
-        |_| {},
-    );
+    matcher.commit_input([
+        0xAA, 0xBB, 0xCC, 0x11, 0x10, 0x20, 0x30, 0x40, 0xAA, 0xBB, 0xCC, 0x22, 0x50, 0x60, 0x70,
+        0x80,
+    ]);
     matcher.ensure_tables();
 
     let pos = matcher.history_abs_start + 8;
@@ -3969,7 +3685,7 @@ fn row_candidate_returns_none_when_abs_pos_near_end_of_history() {
 fn hc_reset_advances_floor_past_prior_frame_entries() {
     use super::super::match_table::storage::MatchTable;
     let mut hc = HcMatchGenerator::new(32);
-    hc.table.add_data(b"abcdeabcde".to_vec(), |_| {});
+    hc.table.commit_input(b"abcdeabcde");
     hc.table.ensure_tables();
     // Populate real hash / chain entries for the first frame's positions.
     hc.table.insert_positions(0, 6);
@@ -3977,7 +3693,7 @@ fn hc_reset_advances_floor_past_prior_frame_entries() {
     assert_eq!(prev_end, 10);
     assert!(hc.table.hash_table().iter().any(|&v| v != HC_EMPTY));
 
-    hc.reset(|_| {});
+    hc.reset();
 
     // Behavioural contract: the previous frame's entries are no longer
     // matchable. `reset` advances the floor past every prior position
@@ -4001,7 +3717,7 @@ fn hc_reset_advances_floor_past_prior_frame_entries() {
 fn hc_reset_full_zeroes_when_floor_would_cross_ceiling() {
     use super::super::match_table::storage::REBASE_RESET_FLOOR_CEILING;
     let mut hc = HcMatchGenerator::new(32);
-    hc.table.add_data(b"abcdeabcde".to_vec(), |_| {});
+    hc.table.commit_input(b"abcdeabcde");
     hc.table.ensure_tables();
     hc.table.hash_table_mut().fill(123);
     hc.table.chain_table_mut().fill(456);
@@ -4011,7 +3727,7 @@ fn hc_reset_full_zeroes_when_floor_would_cross_ceiling() {
     // `usize::MAX` on 32-bit targets.
     hc.table.history_abs_start = REBASE_RESET_FLOOR_CEILING;
 
-    hc.reset(|_| {});
+    hc.reset();
 
     assert_eq!(hc.table.history_abs_start, 0);
     assert_eq!(hc.table.position_base, 0);
@@ -4022,7 +3738,7 @@ fn hc_reset_full_zeroes_when_floor_would_cross_ceiling() {
 #[test]
 fn hc_start_matching_returns_early_for_empty_current_block() {
     let mut hc = HcMatchGenerator::new(32);
-    hc.table.add_data(Vec::new(), |_| {});
+    hc.table.commit_input([]);
     let mut called = false;
     hc.start_matching(|_| called = true);
     assert!(!called, "empty current block should not emit sequences");
@@ -4048,12 +3764,12 @@ fn hc_sparse_skip_matching_preserves_tail_cross_block_match() {
     let mut first = deterministic_high_entropy_bytes(0xD1B5_4A32_9C77_0E19, 4096);
     let tail_start = first.len() - tail.len();
     first[tail_start..].copy_from_slice(tail);
-    matcher.table.add_data(first.clone(), |_| {});
+    matcher.table.commit_input(&first);
     matcher.skip_matching(Some(true));
 
     let mut second = tail.to_vec();
     second.extend_from_slice(b"after-tail-literals");
-    matcher.table.add_data(second, |_| {});
+    matcher.table.commit_input(&second);
 
     let mut first_sequence = None;
     matcher.start_matching(|seq| {
@@ -4099,12 +3815,12 @@ fn btultra2_sparse_skip_matching_preserves_tail_cross_block_match() {
     let mut first = deterministic_high_entropy_bytes(0xA9C3_7F21_D4E8_510B, 4096);
     let tail_start = first.len() - tail.len();
     first[tail_start..].copy_from_slice(tail);
-    matcher.table.add_data(first, |_| {});
+    matcher.table.commit_input(&first);
     matcher.skip_matching(Some(true));
 
     let mut second = tail.to_vec();
     second.extend_from_slice(b"after-tail-literals");
-    matcher.table.add_data(second, |_| {});
+    matcher.table.commit_input(&second);
 
     let mut first_sequence = None;
     matcher.start_matching(|seq| {
@@ -4142,7 +3858,7 @@ fn btultra2_sparse_skip_matching_preserves_tail_cross_block_match() {
 fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
     let mut matcher = HcMatchGenerator::new(1 << 22);
     let first = deterministic_high_entropy_bytes(0xC2B2_AE3D_27D4_EB4F, 4096);
-    matcher.table.add_data(first.clone(), |_| {});
+    matcher.table.commit_input(&first);
     matcher.skip_matching(Some(true));
 
     let current_len = first.len();
@@ -4233,40 +3949,6 @@ fn hc_insert_positions_with_step_keeps_next_to_update3_cursor_for_sparse_ranges(
     );
 }
 
-#[cfg(any())]
-// disabled: tests legacy SuffixStore behavior incompatible with upstream zstd-shape kernel's HASH_READ_SIZE geometry
-#[test]
-fn prime_with_dictionary_budget_shrinks_after_simple_eviction() {
-    let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Fastest);
-    // Use a small live window so dictionary-primed slices are evicted
-    // quickly and budget retirement can be asserted deterministically.
-    driver.simple_mut().max_window_size = 8;
-    driver.reported_window_size = 8;
-
-    let base_window = driver.simple_mut().max_window_size;
-    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
-    assert_eq!(driver.simple_mut().max_window_size, base_window + 24);
-
-    for block in [b"AAAAAAAA", b"BBBBBBBB"] {
-        let mut space = driver.get_next_space();
-        space.clear();
-        space.extend_from_slice(block);
-        driver.commit_space(space);
-        driver.skip_matching_with_hint(None);
-    }
-
-    assert_eq!(
-        driver.dictionary_retained_budget, 0,
-        "dictionary budget should be fully retired once primed dict slices are evicted"
-    );
-    assert_eq!(
-        driver.simple_mut().max_window_size,
-        base_window,
-        "retired dictionary budget must not remain reusable for live history"
-    );
-}
-
 #[test]
 fn prime_with_dictionary_budget_shrinks_after_dfast_eviction() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
@@ -4281,10 +3963,7 @@ fn prime_with_dictionary_budget_shrinks_after_dfast_eviction() {
     assert_eq!(driver.dfast_matcher().max_window_size, base_window + 24);
 
     for block in [b"AAAAAAAA", b"BBBBBBBB"] {
-        let mut space = driver.get_next_space();
-        space.clear();
-        space.extend_from_slice(block);
-        driver.commit_space(space);
+        driver.commit_input(block);
         driver.skip_matching_with_hint(None);
     }
 
@@ -4308,12 +3987,9 @@ fn hc_prime_with_dictionary_preserves_history_for_first_full_block() {
 
     driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
 
-    let mut space = driver.get_next_space();
-    space.clear();
     // Repeat the dictionary content so the HC matcher can find it.
     // HC_MIN_MATCH_LEN is 5, so an 8-byte match is well above threshold.
-    space.extend_from_slice(b"abcdefgh");
-    driver.commit_space(space);
+    driver.commit_input(b"abcdefgh");
 
     let mut saw_match = false;
     driver.start_matching(|seq| {
@@ -4349,10 +4025,7 @@ fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
     assert_eq!(driver.hc_matcher().table.max_window_size, base_window + 24);
 
     for block in [b"AAAAAAAA", b"BBBBBBBB"] {
-        let mut space = driver.get_next_space();
-        space.clear();
-        space.extend_from_slice(block);
-        driver.commit_space(space);
+        driver.commit_input(block);
         driver.skip_matching_with_hint(None);
     }
 
@@ -4417,13 +4090,10 @@ fn resident_reapply_restores_retained_dictionary_budget() {
 
 #[test]
 fn hc_commit_without_eviction_retires_no_dictionary_budget() {
-    // Regression: after the window<->history dedup, MatchTable::add_data
-    // invokes its reuse_space callback for the *input* buffer (recycle),
-    // not for evicted chunks. The HC arm of commit_space must therefore
-    // derive eviction bytes from the window_size delta — counting the
-    // callback argument as evicted would charge the whole committed block
-    // as "evicted" and prematurely retire dictionary budget even when the
-    // window is nowhere near full.
+    // The HC arm of `commit_filled` derives the evicted bytes from the
+    // window_size delta. Charging the committed block itself as evicted
+    // would prematurely retire dictionary budget even when the window is
+    // nowhere near full.
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset_on_hc_lazy(CompressionLevel::Better);
     // A large live window so a small committed block evicts nothing.
@@ -4436,10 +4106,7 @@ fn hc_commit_without_eviction_retires_no_dictionary_budget() {
         "priming must retain a non-zero dictionary budget"
     );
 
-    let mut space = driver.get_next_space();
-    space.clear();
-    space.extend_from_slice(b"AAAAAAAA");
-    driver.commit_space(space);
+    driver.commit_input(b"AAAAAAAA");
     driver.skip_matching_with_hint(None);
 
     assert_eq!(
@@ -4450,14 +4117,10 @@ fn hc_commit_without_eviction_retires_no_dictionary_budget() {
 
 #[test]
 fn row_commit_without_eviction_retires_no_dictionary_budget() {
-    // Regression for the Row arm of commit_space after the window ->
-    // chunk_lens migration: RowMatchGenerator::add_data now invokes its
-    // reuse_space callback for the *input* buffer (per-commit recycle),
-    // not for evicted chunks. The Row arm must derive eviction bytes from
-    // the window_size delta like the Dfast / HashChain arms — counting the
-    // callback argument as evicted charges the whole committed block as
-    // "evicted" and prematurely retires dictionary budget even when the
-    // window is nowhere near full.
+    // The Row arm of `commit_filled` derives the evicted bytes from the
+    // window_size delta like the Dfast / HashChain arms. Charging the
+    // committed block itself as evicted would prematurely retire
+    // dictionary budget even when the window is nowhere near full.
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Level(5));
     assert!(matches!(driver.storage, MatcherStorage::Row(_)));
@@ -4471,10 +4134,7 @@ fn row_commit_without_eviction_retires_no_dictionary_budget() {
         "priming must retain a non-zero dictionary budget"
     );
 
-    let mut space = driver.get_next_space();
-    space.clear();
-    space.extend_from_slice(b"AAAAAAAA");
-    driver.commit_space(space);
+    driver.commit_input(b"AAAAAAAA");
     driver.skip_matching_with_hint(None);
 
     assert_eq!(
@@ -4486,7 +4146,7 @@ fn row_commit_without_eviction_retires_no_dictionary_budget() {
 #[test]
 fn hc_rebases_positions_after_u32_boundary() {
     let mut matcher = HcMatchGenerator::new(64);
-    matcher.table.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
+    matcher.table.commit_input(b"abcdeabcdeabcde");
     matcher.table.ensure_tables();
     matcher.table.position_base = 0;
     let history_abs_start: usize = match (u64::from(u32::MAX) + 64).try_into() {
@@ -4522,25 +4182,25 @@ fn hc_rebases_positions_after_u32_boundary() {
 fn row_rebases_positions_after_u32_boundary() {
     // Row stores absolute match positions as u32. On a long stream the
     // cumulative absolute cursor crosses the u32 range even while the live
-    // window stays bounded; `add_data` must rebase the coordinate origin
+    // window stays bounded; a commit must rebase the coordinate origin
     // down to the oldest live byte instead of asserting. Before the rebase
     // landed this panicked on the `< u32::MAX` assertion, dropping valid
     // long Row-backed frames.
     let mut m = RowMatchGenerator::new(64);
-    m.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
+    m.commit_input(b"abcdeabcdeabcde");
 
     // Simulate ~4 GiB of stream behind a bounded window: the live bytes now
     // sit just under the u32 absolute ceiling.
     let near_ceiling = (u32::MAX as usize) - 16;
     m.history_abs_start = near_ceiling;
 
-    // The next commit would push a u32 position past the ceiling; add_data
-    // must rebase the origin rather than panic.
-    m.add_data(b"fghij".to_vec(), |_| {});
+    // The next commit would push a u32 position past the ceiling; it must
+    // rebase the origin rather than panic.
+    m.commit_input(b"fghij");
 
     assert!(
         m.history_abs_start < near_ceiling,
-        "add_data must rebase the absolute origin down when the cursor nears \
+        "a commit must rebase the absolute origin down when the cursor nears \
          u32::MAX (got {})",
         m.history_abs_start
     );
@@ -4553,7 +4213,7 @@ fn row_rebases_positions_after_u32_boundary() {
 #[test]
 fn hc_rebase_rebuilds_only_inserted_prefix() {
     let mut matcher = HcMatchGenerator::new(64);
-    matcher.table.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
+    matcher.table.commit_input(b"abcdeabcdeabcde");
     matcher.table.ensure_tables();
     matcher.table.position_base = 0;
     let history_abs_start: usize = match (u64::from(u32::MAX) + 64).try_into() {
@@ -4564,7 +4224,7 @@ fn hc_rebase_rebuilds_only_inserted_prefix() {
     let abs_pos = matcher.table.history_abs_start + 6;
 
     let mut expected = HcMatchGenerator::new(64);
-    expected.table.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
+    expected.table.commit_input(b"abcdeabcdeabcde");
     expected.table.ensure_tables();
     expected.table.history_abs_start = history_abs_start;
     expected.table.position_base = expected.table.history_abs_start;
@@ -4591,299 +4251,15 @@ fn hc_rebase_rebuilds_only_inserted_prefix() {
     );
 }
 
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn suffix_store_with_single_slot_does_not_panic_on_keying() {
-    let mut suffixes = SuffixStore::with_capacity(1);
-    suffixes.insert(b"abcde", 0);
-    assert!(suffixes.contains_key(b"abcde"));
-    assert_eq!(suffixes.get(b"abcde"), Some(0));
-}
-
-#[cfg(any())]
-// disabled: hash_fill_step is a legacy MatchGenerator field; FastKernelMatcher walks stride=1 today
-#[test]
-fn fastest_reset_uses_interleaved_hash_fill_step() {
-    let mut driver = MatchGeneratorDriver::new(32, 2);
-
-    driver.reset(CompressionLevel::Uncompressed);
-    assert_eq!(driver.simple().hash_fill_step, 1);
-
-    driver.reset(CompressionLevel::Fastest);
-    assert_eq!(driver.simple().hash_fill_step, FAST_HASH_FILL_STEP);
-
-    // Better uses the HashChain backend with lazy2; verify that the backend switch
-    // happened and the lazy_depth is configured correctly.
-    driver.reset(CompressionLevel::Better);
-    assert_eq!(
-        driver.active_backend(),
-        super::super::strategy::BackendTag::HashChain
-    );
-    assert_eq!(driver.window_size(), (1u64 << 23));
-    assert_eq!(driver.hc_matcher().hc.lazy_depth, 2);
-}
-
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn simple_matcher_updates_offset_history_after_emitting_match() {
-    let mut matcher = MatchGenerator::new(64);
-    matcher.add_data(
-        b"abcdeabcdeabcde".to_vec(),
-        SuffixStore::with_capacity(64),
-        |_, _| {},
-    );
-
-    assert!(matcher.next_sequence(|seq| {
-        assert_eq!(
-            seq,
-            Sequence::Triple {
-                literals: b"abcde",
-                offset: 5,
-                match_len: 10,
-            }
-        );
-    }));
-    assert_eq!(matcher.offset_hist, [5, 1, 4]);
-}
-
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn simple_matcher_zero_literal_repcode_checks_rep1_before_hash_lookup() {
-    let mut matcher = MatchGenerator::new(64);
-    matcher.add_data(
-        b"abcdefghijabcdefghij".to_vec(),
-        SuffixStore::with_capacity(64),
-        |_, _| {},
-    );
-
-    matcher.suffix_idx = 10;
-    matcher.last_idx_in_sequence = 10;
-    matcher.offset_hist = [99, 10, 4];
-
-    let candidate = matcher.repcode_candidate(&matcher.window.last().unwrap().data[10..], 0);
-    assert_eq!(candidate, Some((10, 10)));
-}
-
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn simple_matcher_repcode_can_target_previous_window_entry() {
-    let mut matcher = MatchGenerator::new(64);
-    matcher.add_data(
-        b"abcdefghij".to_vec(),
-        SuffixStore::with_capacity(64),
-        |_, _| {},
-    );
-    matcher.skip_matching();
-    matcher.add_data(
-        b"abcdefghij".to_vec(),
-        SuffixStore::with_capacity(64),
-        |_, _| {},
-    );
-
-    matcher.offset_hist = [99, 10, 4];
-
-    let candidate = matcher.repcode_candidate(&matcher.window.last().unwrap().data, 0);
-    assert_eq!(candidate, Some((10, 10)));
-}
-
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn simple_matcher_zero_literal_repcode_checks_rep2() {
-    let mut matcher = MatchGenerator::new(64);
-    matcher.add_data(
-        b"abcdefghijabcdefghij".to_vec(),
-        SuffixStore::with_capacity(64),
-        |_, _| {},
-    );
-    matcher.suffix_idx = 10;
-    matcher.last_idx_in_sequence = 10;
-    // rep1=4 does not match at idx 10, rep2=10 does.
-    matcher.offset_hist = [99, 4, 10];
-
-    let candidate = matcher.repcode_candidate(&matcher.window.last().unwrap().data[10..], 0);
-    assert_eq!(candidate, Some((10, 10)));
-}
-
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn simple_matcher_zero_literal_repcode_checks_rep0_minus1() {
-    let mut matcher = MatchGenerator::new(64);
-    matcher.add_data(
-        b"abcdefghijabcdefghij".to_vec(),
-        SuffixStore::with_capacity(64),
-        |_, _| {},
-    );
-    matcher.suffix_idx = 10;
-    matcher.last_idx_in_sequence = 10;
-    // rep1=4 and rep2=99 do not match; rep0-1 == 10 does.
-    matcher.offset_hist = [11, 4, 99];
-
-    let candidate = matcher.repcode_candidate(&matcher.window.last().unwrap().data[10..], 0);
-    assert_eq!(candidate, Some((10, 10)));
-}
-
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn simple_matcher_repcode_rejects_offsets_beyond_searchable_prefix() {
-    let mut matcher = MatchGenerator::new(64);
-    matcher.add_data(
-        b"abcdefghij".to_vec(),
-        SuffixStore::with_capacity(64),
-        |_, _| {},
-    );
-    matcher.skip_matching();
-    matcher.add_data(
-        b"klmnopqrst".to_vec(),
-        SuffixStore::with_capacity(64),
-        |_, _| {},
-    );
-    matcher.suffix_idx = 3;
-
-    let candidate = matcher.offset_match_len(14, &matcher.window.last().unwrap().data[3..]);
-    assert_eq!(candidate, None);
-}
-
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn simple_matcher_skip_matching_seeds_every_position_even_with_fast_step() {
-    let mut matcher = MatchGenerator::new(64);
-    matcher.hash_fill_step = FAST_HASH_FILL_STEP;
-    matcher.add_data(
-        b"abcdefghijklmnop".to_vec(),
-        SuffixStore::with_capacity(64),
-        |_, _| {},
-    );
-    matcher.skip_matching();
-    matcher.add_data(b"bcdef".to_vec(), SuffixStore::with_capacity(64), |_, _| {});
-
-    assert!(matcher.next_sequence(|seq| {
-        assert_eq!(
-            seq,
-            Sequence::Triple {
-                literals: b"",
-                offset: 15,
-                match_len: 5,
-            }
-        );
-    }));
-    assert!(!matcher.next_sequence(|_| {}));
-}
-
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn simple_matcher_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
-    let mut matcher = MatchGenerator::new(128);
-    let first = b"abcdefghijklmnopqrstuvwxyz012345".to_vec();
-    let sparse_probe = first[3..3 + MIN_MATCH_LEN].to_vec();
-    let tail_start = first.len() - MIN_MATCH_LEN;
-    let tail_probe = first[tail_start..tail_start + MIN_MATCH_LEN].to_vec();
-    matcher.add_data(first, SuffixStore::with_capacity(256), |_, _| {});
-
-    matcher.skip_matching_with_hint(Some(true));
-
-    // Observable behavior check: sparse-prefix probe should not immediately match.
-    matcher.add_data(sparse_probe, SuffixStore::with_capacity(256), |_, _| {});
-    let mut sparse_first_is_literals = None;
-    assert!(matcher.next_sequence(|seq| {
-        if sparse_first_is_literals.is_none() {
-            sparse_first_is_literals = Some(matches!(seq, Sequence::Literals { .. }));
-        }
-    }));
-    assert!(
-        sparse_first_is_literals.unwrap_or(false),
-        "sparse-start probe should not produce an immediate match"
-    );
-
-    // Dense tail remains indexed for cross-block boundary matching.
-    let mut matcher = MatchGenerator::new(128);
-    matcher.add_data(
-        b"abcdefghijklmnopqrstuvwxyz012345".to_vec(),
-        SuffixStore::with_capacity(256),
-        |_, _| {},
-    );
-    matcher.skip_matching_with_hint(Some(true));
-    matcher.add_data(tail_probe, SuffixStore::with_capacity(256), |_, _| {});
-    let mut tail_first_is_immediate_match = None;
-    assert!(matcher.next_sequence(|seq| {
-        if tail_first_is_immediate_match.is_none() {
-            tail_first_is_immediate_match =
-                Some(matches!(seq, Sequence::Triple { literals, .. } if literals.is_empty()));
-        }
-    }));
-    assert!(
-        tail_first_is_immediate_match.unwrap_or(false),
-        "dense tail probe should match immediately at block start"
-    );
-}
-
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn simple_matcher_add_suffixes_till_backfills_last_searchable_anchor() {
-    let mut matcher = MatchGenerator::new(64);
-    matcher.hash_fill_step = FAST_HASH_FILL_STEP;
-    matcher.add_data(
-        b"01234abcde".to_vec(),
-        SuffixStore::with_capacity(64),
-        |_, _| {},
-    );
-    matcher.add_suffixes_till(10, FAST_HASH_FILL_STEP);
-
-    let last = matcher.window.last().unwrap();
-    let tail = &last.data[5..10];
-    assert_eq!(last.suffixes.get(tail), Some(5));
-}
-
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn simple_matcher_add_suffixes_till_skips_when_idx_below_min_match_len() {
-    let mut matcher = MatchGenerator::new(128);
-    matcher.hash_fill_step = FAST_HASH_FILL_STEP;
-    matcher.add_data(
-        b"abcdefghijklmnopqrstuvwxyz".to_vec(),
-        SuffixStore::with_capacity(1 << 16),
-        |_, _| {},
-    );
-
-    matcher.add_suffixes_till(MIN_MATCH_LEN - 1, FAST_HASH_FILL_STEP);
-
-    let last = matcher.window.last().unwrap();
-    let first_key = &last.data[..MIN_MATCH_LEN];
-    assert_eq!(last.suffixes.get(first_key), None);
-}
-
-#[cfg(any())] // disabled: tested legacy MatchGenerator/SuffixStore behavior removed in phase 1b
-#[test]
-fn simple_matcher_add_suffixes_till_fast_step_registers_interleaved_positions() {
-    let mut matcher = MatchGenerator::new(128);
-    matcher.hash_fill_step = FAST_HASH_FILL_STEP;
-    matcher.add_data(
-        b"abcdefghijklmnopqrstuvwxyz".to_vec(),
-        SuffixStore::with_capacity(1 << 16),
-        |_, _| {},
-    );
-
-    matcher.add_suffixes_till(17, FAST_HASH_FILL_STEP);
-
-    let last = matcher.window.last().unwrap();
-    for pos in [0usize, 3, 6, 9, 12] {
-        let key = &last.data[pos..pos + MIN_MATCH_LEN];
-        assert_eq!(
-            last.suffixes.get(key),
-            Some(pos),
-            "expected interleaved suffix registration at pos {pos}"
-        );
-    }
-}
-
 #[test]
 fn dfast_skip_matching_handles_window_eviction() {
     let mut matcher = DfastMatchGenerator::new(16);
 
-    matcher.add_data(alloc::vec![1, 2, 3, 4, 5, 6], |_| {});
+    matcher.commit_input([1, 2, 3, 4, 5, 6]);
     matcher.skip_matching(None);
-    matcher.add_data(alloc::vec![7, 8, 9, 10, 11, 12], |_| {});
+    matcher.commit_input([7, 8, 9, 10, 11, 12]);
     matcher.skip_matching(None);
-    matcher.add_data(alloc::vec![7, 8, 9, 10, 11, 12], |_| {});
+    matcher.commit_input([7, 8, 9, 10, 11, 12]);
 
     let mut reconstructed = alloc::vec![7, 8, 9, 10, 11, 12];
     matcher.start_matching(|seq| match seq {
@@ -4905,65 +4281,18 @@ fn dfast_skip_matching_handles_window_eviction() {
     assert_eq!(reconstructed, [7, 8, 9, 10, 11, 12, 7, 8, 9, 10, 11, 12]);
 }
 
-#[test]
-fn dfast_add_data_callback_reports_evicted_len_not_capacity() {
-    let mut matcher = DfastMatchGenerator::new(8);
-
-    let mut first = Vec::with_capacity(64);
-    first.extend_from_slice(b"abcdefgh");
-    matcher.add_data(first, |_| {});
-
-    let mut second = Vec::with_capacity(64);
-    second.extend_from_slice(b"ijklmnop");
-
-    let mut observed_evicted_len = None;
-    matcher.add_data(second, |data| {
-        observed_evicted_len = Some(data.len());
-    });
-
-    assert_eq!(
-        observed_evicted_len,
-        Some(8),
-        "eviction callback must report evicted byte length, not backing capacity"
-    );
-}
-
-/// Regression for the `commit_space` Dfast-branch eviction accounting bug
-/// (CodeRabbit Critical on PR #146). Old code counted the INPUT buffer
-/// length as `evicted_bytes` because Dfast's `add_data` callback receives
-/// the input `Vec<u8>` for pool recycling (Dfast stores bytes in `history`,
-/// not per-block Vecs). On the saturated-window 1:1 path the two coincide
-/// so the previous test fixture passed by accident; this test forces the
-/// divergent case where evicted != input by sequencing block lengths
-/// `[4, 4, 5]` against `max_window_size = 10`:
+/// The driver's Dfast commit must retire the dictionary budget by the bytes
+/// the commit EVICTED, which differs from the committed block's length when
+/// the popped block and the new one have different sizes.
 ///
-///   * after 1st commit: `window_blocks = [4]`, `window_size = 4`
-///   * after 2nd commit: `window_blocks = [4, 4]`, `window_size = 8`
-///   * 3rd commit (5 bytes): `8 + 5 > 10` → pop one 4-byte block (evict=4),
-///     then push 5 (window_size=9). Bug counts `5`, fix counts `4`.
-///
-/// The fix derives eviction from `window_size` delta + input length:
-/// `evicted = pre + space_len - post`. Verified via the
-/// `dictionary_retained_budget` observable: starting budget 100, after
-/// the third commit (4 bytes actually evicted) the budget must read 96,
-/// not 95.
-/// Driver-path regression for the `commit_space` Dfast eviction accounting
-/// bug. Exercises `MatchGeneratorDriver::commit_space` directly (not just
-/// `DfastMatchGenerator::add_data`) so the assertion catches a future
-/// regression that swaps the Dfast branch in `commit_space` back to
-/// `evicted_bytes += data.len()` — the older draft of this regression
-/// hand-recomputed the formula on the matcher and would pass either way.
-///
-/// Fixture: `max_window_size = 10`, commit sequence `[4, 4, 5]`. The
-/// divergent case where the popped block (4 bytes) and the new input
-/// (5 bytes) have different sizes:
+/// Fixture: `max_window_size = 10`, commit sequence `[4, 4, 5]`:
 ///
 ///   * after commit `"abcd"` (4 B): window_blocks=[4], ws=4
 ///   * after commit `"efgh"` (4 B): window_blocks=[4,4], ws=8
 ///   * commit `"ijklm"` (5 B): 8+5>10 → pop front [4] (evict=4),
 ///     push 5 → window_blocks=[4,5], ws=9
 ///
-/// `commit_space` then calls `retire_dictionary_budget(evicted)`. With
+/// `commit_filled` then calls `retire_dictionary_budget(evicted)`. With
 /// the fix `evicted=4`; with the bug it would be `evicted=5`. The
 /// downstream `trim_after_budget_retire` cascade (which fires whenever
 /// `retire_dictionary_budget` returns true) drives the budget further
@@ -4992,7 +4321,7 @@ fn dfast_add_data_callback_reports_evicted_len_not_capacity() {
 /// to panic on `data.len() <= max_window_size`). Either way the
 /// regression surfaces as a test failure.
 #[test]
-fn dfast_commit_space_eviction_uses_window_size_delta() {
+fn dfast_commit_eviction_uses_window_size_delta() {
     use crate::encoding::CompressionLevel;
 
     let mut driver = MatchGeneratorDriver::new(10, 1);
@@ -5006,25 +4335,19 @@ fn dfast_commit_space_eviction_uses_window_size_delta() {
     driver.dfast_matcher_mut().max_window_size = 10;
     driver.dictionary_retained_budget = 100;
 
-    let mut space1 = Vec::with_capacity(64);
-    space1.extend_from_slice(b"abcd");
-    driver.commit_space(space1);
+    driver.commit_input(b"abcd");
     assert_eq!(
         driver.dictionary_retained_budget, 100,
         "1st commit fills window 0 → 4, no eviction, no retire"
     );
 
-    let mut space2 = Vec::with_capacity(64);
-    space2.extend_from_slice(b"efgh");
-    driver.commit_space(space2);
+    driver.commit_input(b"efgh");
     assert_eq!(
         driver.dictionary_retained_budget, 100,
         "2nd commit fills window 4 → 8, no eviction, no retire"
     );
 
-    let mut space3 = Vec::with_capacity(64);
-    space3.extend_from_slice(b"ijklm");
-    driver.commit_space(space3);
+    driver.commit_input(b"ijklm");
     assert_eq!(
         driver.dictionary_retained_budget, 87,
         "3rd commit + trim_after_budget_retire cascade. With the fix \
@@ -5044,23 +4367,12 @@ fn dfast_commit_space_eviction_uses_window_size_delta() {
 
 #[test]
 fn dfast_trim_to_window_evicts_oldest_block_by_length() {
-    // After the history-only storage refactor (#111 Phase 7c step 3),
-    // Dfast no longer retains input `Vec<u8>`s — the `history`
-    // contiguous buffer is the sole byte store, and `add_data`
-    // returns the input Vec to the caller's pool eagerly. So
-    // `trim_to_window` doesn't have anything to hand back to the
-    // closure (no Vec exists to give). The eviction is observable
-    // instead through `window_size` shrinking by the per-block
-    // length recorded in `window_blocks`.
+    // The eviction is observable through `window_size` shrinking by the
+    // per-block length recorded in `window_blocks`.
     let mut matcher = DfastMatchGenerator::new(16);
 
-    let mut first = Vec::with_capacity(64);
-    first.extend_from_slice(b"abcdefgh");
-    matcher.add_data(first, |_| {});
-
-    let mut second = Vec::with_capacity(64);
-    second.extend_from_slice(b"ijklmnop");
-    matcher.add_data(second, |_| {});
+    matcher.commit_input(b"abcdefgh");
+    matcher.commit_input(b"ijklmnop");
 
     assert_eq!(matcher.window_size, 16);
     assert_eq!(matcher.window_blocks.len(), 2);
@@ -5069,13 +4381,6 @@ fn dfast_trim_to_window_evicts_oldest_block_by_length() {
 
     matcher.trim_to_window();
 
-    // No callback signature to assert on: the Dfast variant of
-    // `trim_to_window` takes none. That signature shape (vs HC/Row
-    // which accept `impl FnMut(Vec<u8>)`) is the property locking in
-    // the contract — there is no closure to invoke or skip, so no
-    // future change can "start invoking the callback" without a
-    // compile-time signature break that the dispatcher and this test
-    // would force the author to address.
     assert_eq!(
         matcher.window_size, 8,
         "exactly one 8-byte block must remain"
@@ -5088,7 +4393,7 @@ fn dfast_trim_to_window_evicts_oldest_block_by_length() {
 fn dfast_inserts_tail_positions_for_next_block_matching() {
     let mut matcher = DfastMatchGenerator::new(1 << 22);
 
-    matcher.add_data(b"012345bcdea".to_vec(), |_| {});
+    matcher.commit_input(b"012345bcdea");
     let mut history = Vec::new();
     matcher.start_matching(|seq| match seq {
         Sequence::Literals { literals } => history.extend_from_slice(literals),
@@ -5096,7 +4401,7 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
     });
     assert_eq!(history, b"012345bcdea");
 
-    matcher.add_data(b"bcdeabcdeab".to_vec(), |_| {});
+    matcher.commit_input(b"bcdeabcdeab");
     let mut saw_first_sequence = false;
     matcher.start_matching(|seq| {
         assert!(!saw_first_sequence, "expected a single cross-block match");
@@ -5160,7 +4465,7 @@ fn hashchain_inserts_tail_positions_for_next_block_matching() {
     let mut matcher = HcMatchGenerator::new(1 << 22);
     matcher.configure(HC_CONFIG, super::super::strategy::StrategyTag::Lazy, 22);
 
-    matcher.table.add_data(b"PQRSTBCD".to_vec(), |_| {});
+    matcher.table.commit_input(b"PQRSTBCD");
     let mut history = alloc::vec::Vec::new();
     matcher.start_matching(|seq| match seq {
         Sequence::Literals { literals } => history.extend_from_slice(literals),
@@ -5168,7 +4473,7 @@ fn hashchain_inserts_tail_positions_for_next_block_matching() {
     });
     assert_eq!(history, b"PQRSTBCD");
 
-    matcher.table.add_data(b"BCDBCDBCDB".to_vec(), |_| {});
+    matcher.table.commit_input(b"BCDBCDBCDB");
     let mut first_sequence_offset: Option<usize> = None;
     let mut first_sequence_match_len: Option<usize> = None;
     matcher.start_matching(|seq| {
@@ -5221,12 +4526,12 @@ fn dfast_dense_skip_matching_backfills_previous_tail_for_next_block() {
     let tail = b"Qz9kLm2Rp";
     let mut first = b"0123456789abcdef".to_vec();
     first.extend_from_slice(tail);
-    matcher.add_data(first.clone(), |_| {});
+    matcher.commit_input(&first);
     matcher.skip_matching(Some(false));
 
     let mut second = tail.to_vec();
     second.extend_from_slice(b"after-tail-literals");
-    matcher.add_data(second, |_| {});
+    matcher.commit_input(&second);
 
     let mut first_sequence = None;
     matcher.start_matching(|seq| {
@@ -5266,13 +4571,13 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
     let mut first = deterministic_high_entropy_bytes(0x9E37_79B9_7F4A_7C15, 4096);
     let tail_start = first.len() - tail.len();
     first[tail_start..].copy_from_slice(tail);
-    matcher.add_data(first.clone(), |_| {});
+    matcher.commit_input(&first);
 
     matcher.skip_matching(Some(true));
 
     let mut second = tail.to_vec();
     second.extend_from_slice(b"after-tail-literals");
-    matcher.add_data(second, |_| {});
+    matcher.commit_input(&second);
 
     let mut first_sequence = None;
     matcher.start_matching(|seq| {
@@ -5310,12 +4615,12 @@ fn dfast_skip_matching_dense_backfills_newly_hashable_long_tail_positions() {
     let mut matcher = DfastMatchGenerator::new(1 << 22);
     let first = deterministic_high_entropy_bytes(0x7A64_0315_D4E1_91C3, 4096);
     let first_len = first.len();
-    matcher.add_data(first, |_| {});
+    matcher.commit_input(&first);
     matcher.skip_matching_dense();
 
     // Appending one byte makes exactly the previous block's last 7 starts
     // newly eligible for 8-byte long-hash insertion.
-    matcher.add_data(alloc::vec![0xAB], |_| {});
+    matcher.commit_input([0xAB]);
     matcher.skip_matching_dense();
 
     let target_abs_pos = first_len - 7;
@@ -5343,7 +4648,7 @@ fn dfast_skip_matching_dense_backfills_newly_hashable_long_tail_positions() {
 fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
     let mut matcher = DfastMatchGenerator::new(1 << 20);
     let block = deterministic_high_entropy_bytes(0x13F0_9A6D_55CE_7B21, 64);
-    matcher.add_data(block, |_| {});
+    matcher.commit_input(&block);
     matcher.ensure_hash_tables();
 
     let current_len = matcher.window_blocks.back().copied().unwrap_or(0);
@@ -5375,7 +4680,7 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
 fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
     let mut matcher = DfastMatchGenerator::new(1 << 20);
     let block = deterministic_high_entropy_bytes(0x7BB2_DA91_441E_C0EF, 64);
-    matcher.add_data(block, |_| {});
+    matcher.commit_input(&block);
     matcher.ensure_hash_tables();
 
     let current_len = matcher.window_blocks.back().copied().unwrap_or(0);
@@ -5486,18 +4791,18 @@ fn dfast_sparse_skip_matching_backfills_previous_tail_for_consecutive_sparse_blo
     let mut first = deterministic_high_entropy_bytes(0xA5A5_5A5A_C3C3_3C3C, 4096);
     let first_tail_start = first.len() - boundary_prefix.len();
     first[first_tail_start..].copy_from_slice(&boundary_prefix);
-    matcher.add_data(first, |_| {});
+    matcher.commit_input(&first);
     matcher.skip_matching(Some(true));
 
     let mut second = deterministic_high_entropy_bytes(0xA5A5_5A5A_C3C3_3C3C, 4096);
     second[..boundary_suffix.len()].copy_from_slice(&boundary_suffix);
-    matcher.add_data(second.clone(), |_| {});
+    matcher.commit_input(&second);
     matcher.skip_matching(Some(true));
 
     let mut third = boundary_prefix.to_vec();
     third.extend_from_slice(&boundary_suffix);
     third.extend_from_slice(b"-trailing-literals");
-    matcher.add_data(third, |_| {});
+    matcher.commit_input(&third);
 
     let mut first_sequence = None;
     matcher.start_matching(|seq| {
@@ -5556,10 +4861,7 @@ fn fastest_hint_iteration_23_sequences_reconstruct_source() {
     let mut driver = MatchGeneratorDriver::new(1024 * 128, 1);
     driver.set_source_size_hint(data.len() as u64);
     driver.reset(CompressionLevel::Fastest);
-    let mut space = driver.get_next_space();
-    space[..data.len()].copy_from_slice(&data);
-    space.truncate(data.len());
-    driver.commit_space(space);
+    driver.commit_input(&data);
 
     let mut rebuilt = Vec::with_capacity(data.len());
     let mut saw_triple = false;

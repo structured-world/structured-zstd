@@ -11,7 +11,6 @@
 //! through the `dfast::` import path.
 
 use alloc::collections::VecDeque;
-use alloc::vec::Vec;
 use core::convert::TryInto;
 
 use super::Sequence;
@@ -83,10 +82,9 @@ pub(crate) struct DfastMatchGenerator {
     pub(crate) window_blocks: VecDeque<usize>,
     pub(crate) window_size: usize,
     /// Bytes at the tail of `history` that have been read but not yet claimed
-    /// by a block (in-place ingest, see `fill_uncommitted`). Zero on the staged
-    /// path. Tracked explicitly rather than derived from `window_size`, because
-    /// a primed dictionary also lives in `history` and the two do not sum to
-    /// `history.len()`.
+    /// by a block (see `fill_uncommitted`). Tracked explicitly rather than
+    /// derived from `window_size`, because a primed dictionary also lives in
+    /// `history` and the two do not sum to `history.len()`.
     pub(crate) uncommitted_len: usize,
     // We keep a contiguous searchable history to avoid rebuilding and reseeding
     // the matcher state from disjoint block buffers on every block. In the
@@ -518,13 +516,6 @@ impl DfastMatchGenerator {
         let cleared = reborrow_region.is_none() && next_floor > REBASE_RESET_FLOOR_CEILING;
         self.tables_hold_earlier_frames = !self.tables.is_empty() && !self.tables_fresh && !cleared;
         self.tables_fresh = false;
-        // No Vec<u8> blocks to recycle: `add_data` returns each input
-        // Vec to the caller eagerly via its own `reuse_space`, and the
-        // history Vec is owned solely by the matcher. There is nothing
-        // for an outer pool helper to do at reset time, so the dfast
-        // signature does not take one (HC / Row do because they hold
-        // per-block input Vecs internally; the dispatcher in
-        // `match_generator.rs` resolves the per-backend shape).
         // NOTE: `window_blocks` is cleared per-branch above (the reborrow branch
         // keeps its `[region]` dict entry; the non-reborrow branch clears). It
         // must NOT be cleared unconditionally here — doing so dropped the
@@ -537,21 +528,8 @@ impl DfastMatchGenerator {
         self.borrowed_block = None;
     }
 
-    /// Slice of bytes from the most recently appended block. Returns
-    /// the trailing `last_block_len` bytes of `history`, or an empty
-    /// slice if no block has been ingested yet.
-    ///
-    /// Mirrors the inline gate pattern used by `skip_matching` /
-    /// `skip_matching_dense` / `start_matching` / `emit_candidate` /
-    /// `emit_trailing_literals`: read
-    /// `window_blocks.back().copied().unwrap_or(0)` and slice the
-    /// trailing `last_len` bytes (which is empty when `last_len == 0`).
-    /// All current external callers — streaming encoder, block
-    /// compressor, per-level helpers — invoke this only after at
-    /// least one `add_data`, but returning an empty slice on the
-    /// empty case keeps the trait surface aligned with the internal
-    /// usage and avoids a panic-vs-gate divergence that would
-    /// surprise a future refactor consolidating the call sites.
+    /// The most recently committed block, or an empty slice if none has been
+    /// committed yet (the same gate `skip_matching` / `start_matching` use).
     pub(crate) fn get_last_space(&self) -> &[u8] {
         if let (Some((ptr, _total)), Some((block_start, block_end))) =
             (self.borrowed_input, self.borrowed_block)
@@ -570,90 +548,19 @@ impl DfastMatchGenerator {
             ..self.history.len() - self.uncommitted_len]
     }
 
-    pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
-        assert!(data.len() <= self.max_window_size);
-        // Run the headroom check first so the safety invariant
-        // (`history_abs_start + window_size + len + STREAM_ABS_HEADROOM
-        // <= usize::MAX`) is enforced at the function boundary, not
-        // hidden behind the empty-chunk short-circuit below. With
-        // `data.len() == 0` the check is a cheap no-op on the cumulative
-        // state today, but keeping the call here means the invariant
-        // doesn't depend on "empty data implies nothing changes"
-        // reasoning if a future change ever attaches side effects to
-        // the empty path.
-        check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
-        // Empty chunks have nothing to record: pushing a `0` into
-        // `window_blocks` would let a streaming caller that flushes
-        // empty chunks grow the deque without bound (`window_size`
-        // stays unchanged so `trim_to_window` never has cause to
-        // evict the zero-length entries). Hand the Vec straight back
-        // to the pool and short-circuit.
-        //
-        // Side effect: this short-circuits BEFORE the eviction `while`
-        // loop below. If a caller shrinks `max_window_size` and then
-        // calls `add_data(vec![])` hoping to trigger trim, the trim
-        // won't fire here. Use `trim_to_window` directly for that
-        // case — it's the dedicated path for shedding retained bytes
-        // and now actually frees the prefix (via `split_off`) instead
-        // of leaving it pinned in the `history` allocation.
-        //
-        // In-tree caller audit (`grep -rn '\.commit_space(' src/encoding/`):
-        // every production path that reaches the driver's
-        // `commit_space` → `add_data` chain originates in
-        // `levels/fastest.rs`'s block emitter, which produces
-        // non-empty blocks gated by `should_emit_raw_fast_path` /
-        // RLE-detect on the source bytes — none of them pass
-        // `Vec::new()`. The streaming encoder's block-sourcing loop
-        // also filters empty reads before forwarding to the matcher.
-        // Tests are the only callers that exercise the empty path
-        // explicitly, and the regression covers eviction-driven trim
-        // semantics through `trim_to_window` directly. So this
-        // behaviour change is observable only by a hypothetical
-        // future caller that relies on `add_data(empty)` as a
-        // side-effecting trim trigger — and we deliberately want
-        // such a caller to use `trim_to_window` instead.
-        if data.is_empty() {
-            reuse_space(data);
-            return;
-        }
-        if self.window_size + data.len() > self.max_window_size {
-            // Eviction advances `history_start`, so the dict tables' concat
-            // indices (primed at `history_start == 0`) no longer address the
-            // dict bytes — drop the attach (dict ratio benefit lost once the
-            // dict slides out of the window, like the Fast backend).
-            self.dict.invalidate();
-            // Cap the history buffer near the live window: reserve exactly
-            // (window + window/4 + one block) once eviction starts so the Vec
-            // grows linearly to that ceiling instead of power-of-two doubling
-            // to ~2x window; `compact_history`'s quarter-window drain keeps len
-            // under it, so the Vec never reallocates again. Small frames that
-            // never fill the window keep their tight data-sized buffer.
-            let target = self.max_window_size
-                + (self.max_window_size >> 2)
-                + crate::common::MAX_BLOCK_SIZE as usize;
-            if target > self.history.len() && self.history.capacity() < target {
-                self.history.reserve_exact(target - self.history.len());
-            }
-        }
-        while self.window_size + data.len() > self.max_window_size {
-            let removed_len = self.window_blocks.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
-        }
-        self.compact_history();
-        self.history.extend_from_slice(&data);
-        self.window_size += data.len();
-        self.window_blocks.push_back(data.len());
-        // Eager Vec recycle: the only purpose of holding the input Vec
-        // was to return it to the caller's pool on eviction. Now that
-        // `history` owns the bytes, hand the Vec back immediately so
-        // the pool grows on first add instead of waiting for window
-        // overflow.
-        reuse_space(data);
+    /// Read `input` in and commit it as one block, the way the driver does
+    /// in two calls.
+    #[cfg(test)]
+    pub(crate) fn commit_input(&mut self, input: impl AsRef<[u8]>) {
+        let input = input.as_ref();
+        self.fill_uncommitted(input.len(), |history| {
+            history.extend_from_slice(input);
+            (input.len(), false)
+        });
+        self.commit_block(input.len());
     }
 
-    /// Phase 1 of in-place ingest: let `fill` write STRAIGHT into the tail of
+    /// Phase 1 of ingest: let `fill` write STRAIGHT into the tail of
     /// `history`, with room reserved for `capacity` more bytes. Returns
     /// `(appended, eof)` from `fill`.
     ///
@@ -661,9 +568,7 @@ impl DfastMatchGenerator {
     /// block boundary is only chosen afterwards, by the pre-split pass looking
     /// at [`Self::uncommitted`]. Whatever the splitter leaves over simply stays
     /// in `history` and becomes the head of the next block, so a carried
-    /// suffix costs no copy at all — the old shape had to stage the read in a
-    /// scratch `Vec`, copy it into `history`, and copy any split remainder back
-    /// out into a pending buffer.
+    /// suffix costs no copy.
     ///
     /// Call [`Self::commit_block`] once the length is known.
     pub(crate) fn fill_uncommitted(
@@ -704,10 +609,13 @@ impl DfastMatchGenerator {
         &self.history[self.history.len() - self.uncommitted_len..]
     }
 
-    /// Phase 2 of in-place ingest: claim `len` bytes from the head of
-    /// [`Self::uncommitted`] as the next block, running the window bookkeeping
-    /// `add_data` would have done. Any remainder stays put for the next block.
+    /// Phase 2 of ingest: claim `len` bytes from the head of
+    /// [`Self::uncommitted`] as the next block. Any remainder stays put for
+    /// the next block.
     pub(crate) fn commit_block(&mut self, len: usize) {
+        // An empty block records nothing: a `0` in `window_blocks` would let
+        // a caller that commits empty blocks grow the deque without bound,
+        // since `window_size` never grows to evict them.
         if len == 0 {
             return;
         }
@@ -723,10 +631,13 @@ impl DfastMatchGenerator {
         if self.window_size + len > self.max_window_size {
             // Eviction advances `history_start`, so the dict tables' concat
             // indices (primed at `history_start == 0`) stop addressing the dict
-            // bytes — drop the attach, exactly as `add_data` does.
+            // bytes: drop the attach (the dict's ratio benefit ends once it
+            // slides out of the window, as on the Fast backend).
             self.dict.invalidate();
-            // Same one-time ceiling as `add_data`: once eviction starts, grow
-            // linearly to window + window/4 + one block rather than doubling.
+            // Cap the history near the live window: once eviction starts, grow
+            // linearly to window + window/4 + one block rather than doubling;
+            // `compact_history`'s quarter-window drain keeps the length under
+            // it. Small frames that never fill the window stay data-sized.
             let target = self.max_window_size
                 + (self.max_window_size >> 2)
                 + crate::common::MAX_BLOCK_SIZE as usize;
@@ -740,58 +651,17 @@ impl DfastMatchGenerator {
             self.history_start += removed_len;
             self.history_abs_start += removed_len;
         }
-        // Same position in the sequence as `add_data`: compact AFTER the
-        // eviction that raised `history_start`, so the drain trigger sees the
-        // same state and the buffer evolves identically.
+        // Compact AFTER the eviction that raised `history_start`, so the drain
+        // trigger sees the dead prefix this block's eviction created.
         self.compact_history();
         self.window_size += len;
         self.window_blocks.push_back(len);
         self.uncommitted_len -= len;
     }
 
-    /// Trim retained blocks until the window fits `max_window_size`.
-    ///
-    /// Unlike `MatchGenerator::trim_to_window`,
-    /// `RowMatchGenerator::trim_to_window`, and
-    /// `HcMatchGenerator::trim_to_window`, this backend does NOT take a
-    /// `reuse_space` callback because it doesn't retain per-block
-    /// `Vec<u8>` storage to recycle (history is the sole byte buffer
-    /// and `add_data` returns each input Vec eagerly). The dispatcher
-    /// in `match_generator.rs` knows the variant and threads the right
-    /// signature; callers needing the eviction byte count derive it
-    /// from the `window_size` delta before/after this call.
-    ///
-    /// The explicit-trim-before-idle path is the reason this helper
-    /// exists: a caller that trims to shed memory before a long
-    /// quiescent period must see the resident size drop immediately,
-    /// not "eventually, on the next ingest".
-    ///
-    /// `compact_history` is NOT the right tool for that — it uses
-    /// `Vec::drain(..history_start)`, which moves elements down in
-    /// the existing allocation and leaves capacity untouched (per
-    /// `Vec` docs, only `shrink_to_fit` releases capacity). So even
-    /// when compact ran, the original buffer stayed alive. Instead,
-    /// rebuild `history` via `split_off`: it allocates a fresh
-    /// buffer sized to the retained suffix, and the assignment
-    /// drops the original (full-capacity) buffer. On a normal block
-    /// loop `add_data` will compact again the next iter — the cost
-    /// is one extra realloc on the trim boundary in exchange for
-    /// actually shedding the prefix to the system allocator.
-    ///
-    /// Unlike `HashChainTable::trim_to_window` /
-    /// `RowMatcher::trim_to_window` this signature deliberately takes
-    /// no `reuse_space` callback — Dfast stores its raw bytes in the
-    /// single contiguous `history` buffer (no per-block `Vec<u8>` to
-    /// recycle), releases the dead prefix via `split_off`, and
-    /// surfaces eviction byte count to the dispatcher via the
-    /// `window_size` delta rather than a callback. A uniform-signature
-    /// trim helper would force every call site to monomorphize an
-    /// `impl FnMut(Vec<u8>)` that is documented to never fire, paying
-    /// codegen + inlining cost on the cold path for zero behaviour
-    /// difference; the dispatcher in `match_generator.rs` already
-    /// branches per backend (matchers diverge on `reset` and a few
-    /// other lifecycle calls) so adding one more per-backend arm is
-    /// free.
+    /// Evict retained blocks until the window fits `max_window_size`, and
+    /// drop the dead prefix at once rather than at the next commit. Callers
+    /// needing the evicted byte count derive it from the `window_size` delta.
     pub(crate) fn trim_to_window(&mut self) {
         if self.window_size > self.max_window_size || self.history_start != 0 {
             // Any history shift slides the dictionary out of (or within) the
@@ -817,12 +687,8 @@ impl DfastMatchGenerator {
         self.ensure_hash_tables();
         let current_len = self.window_blocks.back().copied().unwrap_or(0);
         if current_len == 0 {
-            // `add_data` short-circuits on empty input and does NOT push
-            // a zero-length entry onto `window_blocks`. A caller that
-            // invokes skip-matching after a streaming flush of an empty
-            // chunk would otherwise re-seed the previous block's
-            // retained tail on every empty write. Mirror the gate that
-            // `start_matching` already uses.
+            // No block committed yet, so none to seed. Mirrors the gate
+            // `start_matching` uses.
             return;
         }
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
@@ -860,11 +726,8 @@ impl DfastMatchGenerator {
         self.ensure_hash_tables();
         let current_len = self.window_blocks.back().copied().unwrap_or(0);
         if current_len == 0 {
-            // Same gate as `skip_matching` and `start_matching`: empty
-            // chunks fed through `add_data` no longer push a block
-            // entry, so a streaming caller that flushes empty chunks
-            // would otherwise re-seed the retained tail on every
-            // empty write.
+            // Same gate as `skip_matching` and `start_matching`: no block
+            // committed yet, so none to seed.
             return;
         }
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
@@ -1131,7 +994,7 @@ impl DfastMatchGenerator {
 
     /// Borrowed one-shot equivalent of [`Self::start_matching`]: scan
     /// `[block_start, block_end)` of the registered borrowed window in place
-    /// (no `commit_space` copy). Produces a byte-identical sequence stream to
+    /// (no copy into the history). Produces a byte-identical sequence stream to
     /// the owned path for in-window inputs — positions are absolute input
     /// offsets, candidate reads land in the same buffer, and the seam re-seed
     /// re-hashes the prior block's short-key tail exactly as the owned loop
@@ -1548,7 +1411,7 @@ impl DfastMatchGenerator {
             // offsets, so the rebase coordinates collapse to zero
             // (`start_offset = abs_start = position_base = 0`) and the
             // readable length is the active block's end. No history concat,
-            // no `commit_space` copy. Candidate reads from earlier blocks
+            // no copy into it. Candidate reads from earlier blocks
             // land at `ptr + earlier_abs_pos` (< block_end), in range.
             return (ptr, 0, 0, 0, block_end);
         }
@@ -1595,9 +1458,9 @@ impl DfastMatchGenerator {
             start_offset,
             self.history_abs_start,
             self.position_base,
-            // Committed bytes only: in-place ingest can have the next block's
-            // bytes already sitting past the end, and a forward match count
-            // must not reach into them.
+            // Committed bytes only: the next block's bytes can already sit
+            // past the end, and a forward match count must not reach into
+            // them.
             self.history.len() - self.uncommitted_len - start_offset,
         )
     }
@@ -1621,8 +1484,8 @@ impl DfastMatchGenerator {
             )
         } else {
             let last_len = self.window_blocks.back().copied().unwrap_or(0);
-            // Measure back from the COMMITTED end: in-place ingest can leave
-            // unclaimed bytes past it.
+            // Measure back from the COMMITTED end: unclaimed input can sit
+            // past it.
             let off = self.history.len() - self.uncommitted_len - last_len;
             // SAFETY: `off + last_len` is the committed end, in bounds.
             (unsafe { self.history.as_ptr().add(off) }, last_len)
@@ -1752,12 +1615,11 @@ impl DfastMatchGenerator {
             return;
         }
         // Drain the dead prefix at a quarter window (paired with the one-time
-        // `reserve_exact` in `add_data`) so the buffer stays near
+        // `reserve_exact` in `commit_block`) so the buffer stays near
         // `window + window/4` instead of doubling to ~2x window on long streams.
-        // Compare against the COMMITTED length: with in-place ingest
-        // `history.len()` also counts bytes no block has claimed yet, which
-        // would push this trigger later than on the staged path and change
-        // when the buffer is drained.
+        // Compare against the COMMITTED length: `history.len()` also counts
+        // bytes no block has claimed yet, which would delay the trigger by
+        // however much input happens to be read ahead.
         if self.history_start >= (self.max_window_size >> 2)
             || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
@@ -1767,10 +1629,10 @@ impl DfastMatchGenerator {
     }
 
     pub(crate) fn live_history(&self) -> &[u8] {
-        // Stop at the committed end, not at `history.len()`: in-place ingest
-        // may have already read the next block's bytes into the tail, and a
-        // scan must not see past the block it is compressing (a forward match
-        // count would otherwise run into bytes the staged path did not have).
+        // Stop at the committed end, not at `history.len()`: the next block's
+        // bytes may already be read into the tail, and a scan must not see
+        // past the block it is compressing (a forward match count would
+        // otherwise run into input the block does not own).
         &self.history[self.history_start..self.history.len() - self.uncommitted_len]
     }
 

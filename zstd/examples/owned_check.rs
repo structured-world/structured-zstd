@@ -1,5 +1,5 @@
-//! Hash the owned (reader-path) frame for every level, so the in-place ingest
-//! can be proven byte-identical to the staged path it replaced.
+//! Hash the owned (reader-path) frame for every level, so a change to the
+//! ingest path can be proven byte-identical to the build before it.
 use std::env;
 use std::fs;
 

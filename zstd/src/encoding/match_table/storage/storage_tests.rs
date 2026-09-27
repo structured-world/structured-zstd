@@ -450,7 +450,7 @@ fn reset_clears_uncommitted_bytes_left_by_an_abandoned_fill() {
         (8, true)
     });
     assert_eq!(t.uncommitted().len(), 8, "fill must stage the bytes");
-    t.reset(|_| {});
+    t.reset();
     assert!(
         t.uncommitted().is_empty(),
         "reset must drop bytes no block claimed"

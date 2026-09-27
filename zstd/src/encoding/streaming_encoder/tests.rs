@@ -456,42 +456,50 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 struct TinyMatcher {
-    last_space: Vec<u8>,
+    input: crate::encoding::test_input::TestInput,
     window_size: u64,
 }
 
 impl TinyMatcher {
     fn new(window_size: u64) -> Self {
         Self {
-            last_space: Vec::new(),
+            input: Default::default(),
             window_size,
         }
     }
 }
 
 impl Matcher for TinyMatcher {
-    fn get_next_space(&mut self) -> Vec<u8> {
-        vec![0; self.window_size as usize]
-    }
-
     fn get_last_space(&mut self) -> &[u8] {
-        self.last_space.as_slice()
+        self.input.last_block()
     }
 
-    fn commit_space(&mut self, space: Vec<u8>) {
-        self.last_space = space;
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut crate::encoding::HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool) {
+        self.input.fill(capacity, fill)
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        self.input.uncommitted()
+    }
+
+    fn commit_filled(&mut self, len: usize) {
+        self.input.commit(len);
     }
 
     fn skip_matching(&mut self) {}
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         handle_sequence(Sequence::Literals {
-            literals: self.last_space.as_slice(),
+            literals: self.input.last_block(),
         });
     }
 
     fn reset(&mut self, _level: CompressionLevel) {
-        self.last_space.clear();
+        self.input.clear();
     }
 
     fn window_size(&self) -> u64 {

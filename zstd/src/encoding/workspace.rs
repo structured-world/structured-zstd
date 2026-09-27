@@ -604,23 +604,30 @@ impl<T: Copy> core::ops::DerefMut for Table<T> {
 /// A match finder's input history: bytes appended block by block, trimmed at
 /// the front as the window slides, used like a `Vec<u8>`.
 ///
-/// It lives in the context's workspace at the capacity the frame was laid out
-/// for, and moves into an allocation of its own if a frame brings more than
-/// that (a size hint that undercounted). Only the first `len` bytes are ever
-/// read; the rest of the room is left unwritten.
+/// The encoder reads input straight into it through
+/// [`Matcher::fill_in_place`], so a [`Matcher`] keeps its window in one. A
+/// matcher defined outside this crate owns its buffer outright.
 ///
-/// Its bytes survive every layout: [`Self::bind`] carries them into the new
-/// room wherever it lands. A matcher keeps its dictionary at the head of the
-/// history from one frame to the next, so losing them would lose it.
+/// The crate's own match finders keep theirs in the compression context's
+/// single allocation at the capacity the frame was laid out for; one moves
+/// into an allocation of its own if a frame brings more than that (a size
+/// hint that undercounted). Only the first `len` bytes are ever read; the rest
+/// of the room is left unwritten. Its bytes survive every layout: `bind`
+/// carries them into the new room wherever it lands, since a matcher keeps its
+/// dictionary at the head of the history from one frame to the next.
 ///
-/// The room is always live memory: a workspace room lasts until the next
-/// bind (the workspace keeps an allocation it replaced until then), and a
-/// matcher leaving its context moves its history into a room of its own.
+/// # Examples
+/// ```
+/// use structured_zstd::encoding::HistoryBuf;
 ///
-/// `pub` only so it can appear in [`Matcher::fill_in_place`]; the module is
-/// private, so no code outside this crate can name, build or receive one.
+/// let mut history = HistoryBuf::new();
+/// history.extend_from_slice(b"older block, newer block");
+/// history.drain_front(b"older block, ".len());
+/// assert_eq!(&history[..], b"newer block");
+/// ```
 ///
 /// [`Matcher::fill_in_place`]: crate::encoding::Matcher::fill_in_place
+/// [`Matcher`]: crate::encoding::Matcher
 pub struct HistoryBuf {
     ptr: NonNull<u8>,
     capacity: usize,
@@ -638,7 +645,7 @@ unsafe impl Sync for HistoryBuf {}
 
 impl HistoryBuf {
     /// An empty buffer with no room.
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             ptr: NonNull::dangling(),
             capacity: 0,
@@ -683,11 +690,18 @@ impl HistoryBuf {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
+    /// Bytes held.
+    pub fn len(&self) -> usize {
         self.len
     }
 
-    pub(crate) fn capacity(&self) -> usize {
+    /// Whether no bytes are held.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Bytes the buffer holds room for without moving.
+    pub fn capacity(&self) -> usize {
         self.capacity
     }
 
@@ -697,17 +711,23 @@ impl HistoryBuf {
         self.own.capacity()
     }
 
-    pub(crate) fn clear(&mut self) {
+    /// Drops every byte, keeping the room.
+    pub fn clear(&mut self) {
         self.len = 0;
     }
 
-    pub(crate) fn truncate(&mut self, len: usize) {
+    /// Keeps the first `len` bytes; a no-op when fewer are held.
+    pub fn truncate(&mut self, len: usize) {
         self.len = self.len.min(len);
     }
 
     /// Makes room for `additional` more bytes, at least doubling the room when
     /// it has to move, as a `Vec` does.
-    pub(crate) fn reserve(&mut self, additional: usize) {
+    ///
+    /// # Panics
+    ///
+    /// Panics when the length would overflow `usize`.
+    pub fn reserve(&mut self, additional: usize) {
         let needed = self
             .len
             .checked_add(additional)
@@ -730,7 +750,8 @@ impl HistoryBuf {
         }
     }
 
-    pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
+    /// Appends `bytes`.
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) {
         self.reserve(bytes.len());
         // SAFETY: `reserve` left room for `bytes.len()` more bytes past `len`,
         // and `bytes` is borrowed from elsewhere, never from this room.
@@ -768,7 +789,7 @@ impl HistoryBuf {
     /// # Panics
     ///
     /// Panics when `count` exceeds the length.
-    pub(crate) fn drain_front(&mut self, count: usize) {
+    pub fn drain_front(&mut self, count: usize) {
         assert!(count <= self.len, "draining past the history's end");
         // SAFETY: both ranges lie within the written `len` bytes; `copy`
         // handles the overlap.
@@ -862,8 +883,8 @@ impl core::fmt::Debug for HistoryBuf {
     }
 }
 
-/// A byte buffer a block is read into: the history for in-place ingest, or a
-/// staging `Vec` otherwise.
+/// A byte buffer a block is read into: the match finder's history, or the
+/// output of an uncompressed frame, which carries its blocks raw.
 pub(crate) trait IngestBuffer: core::ops::DerefMut<Target = [u8]> {
     fn extend_from_slice(&mut self, bytes: &[u8]);
     fn resize(&mut self, len: usize, value: u8);

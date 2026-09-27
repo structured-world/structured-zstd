@@ -30,7 +30,7 @@ use super::helpers::INCOMPRESSIBLE_SKIP_STEP;
 /// Lookahead bytes the BT walker / optimal parser will read past the
 /// per-position absolute cursor (`abs_pos + 9` for match-end sentinels,
 /// `abs_pos + HC_OPT_NUM` for the optimal-parser match-length cap, etc.).
-/// `MatchTable::add_data` rejects input that would advance
+/// `MatchTable::fill_uncommitted` rejects input that would advance
 /// `history_abs_end` past `usize::MAX - STREAM_ABS_HEADROOM`, which lets
 /// every downstream raw `abs_pos + N` arithmetic stay within `usize` on
 /// 32-bit targets without per-call saturating guards.
@@ -89,8 +89,8 @@ pub(crate) fn capacity_is_oversized(capacity: usize, wanted: usize) -> bool {
 /// with the still-resident `window_size`, must leave at least
 /// `STREAM_ABS_HEADROOM` slack below `usize::MAX`. Failing fast here
 /// lets every downstream `abs_pos + N` site stay raw and keeps i686
-/// streams correct. New match-finder backends with their own
-/// `add_data` path must route through this helper.
+/// streams correct. Every match-finder backend's `fill_uncommitted`
+/// must route through this helper.
 #[inline]
 pub(crate) fn check_stream_abs_headroom(
     history_abs_start: usize,
@@ -232,9 +232,9 @@ pub(crate) struct MatchTable {
     /// so the live region is never duplicated.
     pub(crate) chunk_lens: VecDeque<usize>,
     pub(crate) window_size: usize,
-    /// Bytes at the tail of `history` read but not yet claimed by a block
-    /// (in-place ingest). Zero on the staged path. Explicit rather than derived
-    /// from `window_size`, since a primed dictionary also lives in `history`.
+    /// Bytes at the tail of `history` read but not yet claimed by a block.
+    /// Explicit rather than derived from `window_size`, since a primed
+    /// dictionary also lives in `history`.
     pub(crate) uncommitted_len: usize,
     pub(crate) history: HistoryBuf,
     pub(crate) history_start: usize,
@@ -1064,9 +1064,8 @@ impl MatchTable {
             })
     }
 
-    /// Phase 1 of in-place ingest: `fill` writes the next block STRAIGHT into
-    /// the tail of `history`, instead of a scratch `Vec` that [`Self::add_data`]
-    /// then copies in. Room for `capacity` more bytes is reserved first.
+    /// Phase 1 of ingest: `fill` writes the next block STRAIGHT into the tail
+    /// of `history`. Room for `capacity` more bytes is reserved first.
     ///
     /// The bytes are readable through [`Self::uncommitted`] but are not part of
     /// the window until [`Self::commit_block`] claims them — the block boundary
@@ -1110,7 +1109,7 @@ impl MatchTable {
         &self.history[self.history.len() - self.uncommitted_len..]
     }
 
-    /// Phase 2 of in-place ingest: claim `len` bytes from the head of
+    /// Phase 2 of ingest: claim `len` bytes from the head of
     /// [`Self::uncommitted`] as the next block.
     pub(crate) fn commit_block(&mut self, len: usize) {
         if len == 0 {
@@ -1126,9 +1125,12 @@ impl MatchTable {
             self.uncommitted().len(),
         );
         if self.window_size + len > self.max_window_size {
-            // Same one-time ceiling as `add_data`, applied at the same point in
-            // the sequence: once eviction starts, grow the mirror linearly to
-            // (window + window/4 + one block) instead of doubling.
+            // Cap the history mirror near the live window once eviction starts:
+            // reserve exactly (window + window/4 + one block) so it grows
+            // linearly to that ceiling instead of doubling to ~2x window;
+            // `compact_history`'s quarter-window drain keeps the length under
+            // it, so it never moves again. Small frames that never fill the
+            // window keep their tight data-sized buffer.
             let target = self.max_window_size
                 + (self.max_window_size >> 2)
                 + crate::common::MAX_BLOCK_SIZE as usize;
@@ -1142,9 +1144,8 @@ impl MatchTable {
             self.history_start += removed_len;
             self.history_abs_start += removed_len;
         }
-        // Same position in the sequence as `add_data`: compact AFTER the
-        // eviction that raised `history_start`, so the drain trigger sees the
-        // same state and the buffer evolves identically.
+        // Compact AFTER the eviction that raised `history_start`, so the drain
+        // trigger sees the dead prefix this block's eviction created.
         self.compact_history();
         self.next_to_update3 = self.next_to_update3.max(self.history_abs_start);
         self.window_size += len;
@@ -1152,47 +1153,16 @@ impl MatchTable {
         self.uncommitted_len -= len;
     }
 
-    /// Append a freshly committed buffer to the rolling window. Drops
-    /// chunk-length entries for the oldest slices until the new total
-    /// fits inside `max_window_size`, extends the contiguous `history`
-    /// mirror with the new bytes, then hands the *input* buffer back
-    /// through `reuse_space` for pool reuse — `history` now owns the
-    /// bytes, so the input buffer carries no live data. (Callers must
-    /// therefore treat the callback as recycle-only, not as an eviction
-    /// report; eviction bytes come from the `window_size` delta.)
-    pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
-        assert!(data.len() <= self.max_window_size);
-        check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
-        if self.window_size + data.len() > self.max_window_size {
-            // Cap the history mirror near the live window once eviction starts:
-            // reserve exactly (window + window/4 + one block) so the Vec grows
-            // linearly to that ceiling instead of power-of-two doubling to ~2x
-            // window; `compact_history`'s quarter-window drain keeps len under
-            // it, so the Vec never reallocates again. Small frames that never
-            // fill the window keep their tight data-sized buffer.
-            let target = self.max_window_size
-                + (self.max_window_size >> 2)
-                + crate::common::MAX_BLOCK_SIZE as usize;
-            if target > self.history.len() && self.history.capacity() < target {
-                self.history.reserve_exact(target - self.history.len());
-            }
-        }
-        while self.window_size + data.len() > self.max_window_size {
-            let removed_len = self.chunk_lens.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
-        }
-        self.compact_history();
-        let added = data.len();
-        self.history.extend_from_slice(&data);
-        self.next_to_update3 = self.next_to_update3.max(self.history_abs_start);
-        self.window_size += added;
-        self.chunk_lens.push_back(added);
-        // The input buffer's bytes now live in `history`; hand the buffer
-        // straight back to the caller's pool instead of holding a second
-        // copy in the window (the source of the per-compress duplicate).
-        reuse_space(data);
+    /// Read `input` in and commit it as one block, the way the driver does
+    /// in two calls.
+    #[cfg(test)]
+    pub(crate) fn commit_input(&mut self, input: impl AsRef<[u8]>) {
+        let input = input.as_ref();
+        self.fill_uncommitted(input.len(), |history| {
+            history.extend_from_slice(input);
+            (input.len(), false)
+        });
+        self.commit_block(input.len());
     }
 
     /// Drop window slices that have rolled past `max_window_size`.
@@ -1215,11 +1185,11 @@ impl MatchTable {
             return;
         }
         // Drain the dead prefix at a quarter window (paired with the eviction
-        // reserve in `add_data`) so the mirror stays near `window + window/4`
-        // rather than doubling to ~2x window on long streams.
-        // Compare against the COMMITTED length: with in-place ingest
-        // `history.len()` also counts bytes no block has claimed yet, which
-        // would push this trigger later than on the staged path.
+        // reserve in `commit_block`) so the mirror stays near `window +
+        // window/4` rather than doubling to ~2x window on long streams.
+        // Compare against the COMMITTED length: `history.len()` also counts
+        // bytes no block has claimed yet, which would delay the trigger by
+        // however much input happens to be read ahead.
         if self.history_start >= (self.max_window_size >> 2)
             || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
@@ -1248,9 +1218,9 @@ impl MatchTable {
             // `end <= total` in bounds.
             return unsafe { core::slice::from_raw_parts(ptr, end) };
         }
-        // Stop at the committed end, not at `history.len()`: in-place ingest
-        // may have already read the next block's bytes into the tail, and a
-        // scan must not see past the block it is compressing.
+        // Stop at the committed end, not at `history.len()`: the next block's
+        // bytes may already be read into the tail, and a scan must not see
+        // past the block it is compressing.
         &self.history[self.history_start..self.history.len() - self.uncommitted_len]
     }
 
@@ -1278,8 +1248,8 @@ impl MatchTable {
 
     /// Register the borrowed input window. Zeroes `history_abs_start` so
     /// borrowed positions are absolute input offsets (the owned floor-advance
-    /// reset leaves it non-zero across frames; borrowed never `add_data`s, so
-    /// it stays 0 for the frame). Every probed candidate is byte-verified, so
+    /// reset leaves it non-zero across frames; a borrowed frame commits
+    /// nothing, so it stays 0 for the frame). Every probed candidate is byte-verified, so
     /// stale table entries from a prior frame are rejected (or, if their bytes
     /// coincidentally match, are genuine in-window matches).
     ///
@@ -1310,12 +1280,13 @@ impl MatchTable {
     }
 
     /// `(current_abs_start, current_len)` for the active scan. Borrowed: the
-    /// staged block range. Owned: the last committed chunk in the live window.
+    /// staged block range. Owned: the last committed chunk in the live window,
+    /// or an empty range at the window's end when none has been committed.
     pub(crate) fn current_block_range(&self) -> (usize, usize) {
         if let Some((start, end)) = self.borrowed_block {
             (start, end - start)
         } else {
-            let current_len = *self.chunk_lens.back().unwrap();
+            let current_len = self.chunk_lens.back().copied().unwrap_or(0);
             (
                 self.history_abs_start + self.window_size - current_len,
                 current_len,
@@ -1323,10 +1294,8 @@ impl MatchTable {
         }
     }
 
-    /// Test-only: append a chunk to the live window without eviction /
-    /// compaction, mirroring the storage side of [`add_data`]. Replaces
-    /// the old `window.push_back(vec)` setup now that chunk bytes live
-    /// only in `history`.
+    /// Test-only: append a chunk to the live window without eviction or
+    /// compaction.
     #[cfg(test)]
     pub(crate) fn push_test_chunk(&mut self, data: Vec<u8>) {
         self.history.extend_from_slice(&data);
@@ -1500,11 +1469,7 @@ impl MatchTable {
     /// [`REBASE_RESET_FLOOR_CEILING`], the original full zeroing runs and
     /// the floor rewinds to `0`, bounding the absolute cursor so
     /// [`check_stream_abs_headroom`] stays satisfiable on 32-bit targets.
-    /// The window is just `chunk_lens` (the bytes live in `history`,
-    /// cleared below), so there are no per-block buffers to drain;
-    /// `_reuse_space` is retained only for caller signature compatibility
-    /// and is intentionally unused.
-    pub(crate) fn reset(&mut self, _reuse_space: impl FnMut(Vec<u8>)) {
+    pub(crate) fn reset(&mut self) {
         // Bytes an abandoned frame ingested but never claimed are not part of
         // the next frame. Drop them FIRST: every tail-relative bound below
         // (and `history_abs_end`) subtracts this count from the buffer length,

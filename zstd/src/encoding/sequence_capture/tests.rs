@@ -268,8 +268,8 @@ fn captures_through_best_preset() {
 }
 
 /// Positive coverage for the pre-split numeric range
-/// (`Level(11..=15)`). The borders splitter parks the tail in
-/// `pending_input` BEFORE the matcher runs, so each shrunken
+/// (`Level(11..=15)`). The borders splitter leaves the tail
+/// uncommitted BEFORE the matcher runs, so each shrunken
 /// portion gets its own matcher call and the counter stays
 /// accurate. Without this test, a future tightening of the
 /// guard to reject `Level(11..=15)` would regress a valid

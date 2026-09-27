@@ -5,6 +5,7 @@
 //!
 //! The task here is to efficiently find matches in the already encoded data for the current suffix of the not yet encoded data.
 
+#[cfg(feature = "bench-internals")]
 use alloc::vec::Vec;
 // SIMD/CRC intrinsics now live in `crate::encoding::fastpath::*` where they
 // sit under per-CPU `#[target_feature]` umbrellas; no architecture-specific
@@ -168,9 +169,9 @@ mod dict_prime;
 
 /// Backend storage for [`MatchGeneratorDriver`]. Exactly one match-finder
 /// state lives in the driver at a time — the active variant. Backend
-/// transitions in [`Matcher::reset`] drain the current variant's allocations
-/// into the shared `vec_pool` and then replace `storage` with a freshly
-/// constructed variant for the new backend.
+/// transitions in [`Matcher::reset`] release the current variant's tables and
+/// then replace `storage` with a freshly constructed variant for the new
+/// backend.
 ///
 /// Replaces the prior pattern of four parallel fields (`match_generator`,
 /// `dfast_match_generator: Option<…>`, `row_match_generator: Option<…>`,
@@ -252,10 +253,8 @@ impl MatcherStorage {
 
 /// This is the default implementation of the `Matcher` trait. It allocates and reuses the buffers when possible.
 pub struct MatchGeneratorDriver {
-    vec_pool: Vec<Vec<u8>>,
     /// Active match-finder state. Exactly one backend lives here at a
-    /// time; [`Matcher::reset`] drains the previous variant into
-    /// `vec_pool` before swapping in a freshly constructed variant for
+    /// time; [`Matcher::reset`] swaps in a freshly constructed variant for
     /// the new backend. `storage.backend()` is the canonical source of
     /// truth for the parse family; `strategy_tag` carries the
     /// compile-time strategy chosen at the last `reset()`.
@@ -292,6 +291,8 @@ pub struct MatchGeneratorDriver {
     /// across resets (it is frame configuration, not a one-shot) until
     /// the caller changes it.
     param_overrides: Option<super::parameters::ParamOverrides>,
+    /// Chunk a dictionary is primed in: `base_slice_size` capped by the
+    /// frame's window.
     slice_size: usize,
     base_slice_size: usize,
     // Frame header window size must stay at the configured live-window budget.
@@ -504,7 +505,18 @@ impl MatchGeneratorDriver {
         self.storage.ingest_capacity()
     }
 
-    /// `slice_size` sets the base block allocation size used for matcher input chunks.
+    /// Read `input` in and commit it as one block, the way the frame loop
+    /// does in two calls.
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub(crate) fn commit_input(&mut self, input: &[u8]) {
+        self.fill_in_place(input.len(), &mut |history| {
+            history.extend_from_slice(input);
+            (input.len(), false)
+        });
+        self.commit_filled(input.len());
+    }
+
+    /// `slice_size` sets the chunk a dictionary is primed in.
     /// `max_slices_in_window` determines the initial window capacity at construction
     /// time. Effective window sizing is recalculated on every [`reset`](Self::reset)
     /// from the resolved compression level and optional source-size hint.
@@ -556,7 +568,6 @@ impl MatchGeneratorDriver {
         );
         let window_log_init = next_pow2.trailing_zeros() as u8;
         Self {
-            vec_pool: Vec::new(),
             // Deferred table: `new` runs before any source size or resolved
             // LevelParams exist, so allocating at the level-default hash_log
             // here would be thrown away by the first frame's reset (which
@@ -693,36 +704,6 @@ impl MatchGeneratorDriver {
         }
     }
 
-    /// Reclaim the per-block input buffer that the Simple backend
-    /// just spent inside `start_matching` / `skip_matching_with_hint`.
-    ///
-    /// `FastKernelMatcher::take_recycled_space` returns the cleared
-    /// (capacity-retained) `Vec<u8>` from the last
-    /// `extend_history_with_pending`. We push it onto `vec_pool`
-    /// as-is (with `len = 0`); `get_next_space()` is responsible for
-    /// resizing the buffer back to `slice_size` on its next pop. The
-    /// pushed length is irrelevant — only the capacity matters, and
-    /// `extend_history_with_pending` preserves it. Without this
-    /// recycle path, the Simple backend would allocate a new
-    /// `Vec<u8>` per block — a measurable hot-path cost when blocks
-    /// are small (~128 KiB) and processed at hundreds of MiB/s.
-    fn recycle_simple_space(&mut self) {
-        if let Some(space) = self.simple_mut().take_recycled_space() {
-            // `space` is already cleared (len = 0) by
-            // `extend_history_with_pending`; capacity is retained.
-            // Leaving `len = 0` here avoids the cost of zero-filling
-            // the entire allocation — `get_next_space()` resizes the
-            // popped buffer up to `slice_size` on demand, so the
-            // length the pool holds is irrelevant. This matters most
-            // after a small-source-size hint has shrunk `slice_size`
-            // mid-frame: the recycled buffer can be much larger than
-            // the current `slice_size`, and zero-filling 128 KiB+ on
-            // every block would erase the perf win the recycle path
-            // is meant to deliver.
-            self.vec_pool.push(space);
-        }
-    }
-
     /// Register a caller-owned input buffer as the Simple backend's
     /// borrowed one-shot match window. Only valid on the Simple (Fast)
     /// backend; the one-shot frame path gates on that before calling.
@@ -766,7 +747,7 @@ impl MatchGeneratorDriver {
 
     /// Stage the borrowed block range `[block_start, block_end)` for the
     /// NEXT `start_matching` / `skip_matching_with_hint`, which the
-    /// borrowed Fast frame path uses in place of `commit_space`. While
+    /// borrowed frame path uses in place of `commit_filled`. While
     /// staged, those trait calls route to the Simple backend's borrowed
     /// scan/skip (consuming the stage) instead of the owned committed
     /// block. See [`Matcher::start_matching`] /
@@ -903,49 +884,28 @@ impl MatchGeneratorDriver {
         loop {
             let mut evicted_bytes = 0usize;
             match self.active_backend() {
+                // The Fast backend drains the oldest bytes in place and
+                // reports the count; the window backends evict whole blocks,
+                // so their count is the `window_size` delta.
                 super::strategy::BackendTag::Simple => {
-                    // FastKernelMatcher owns its history as a single
-                    // flat `Vec<u8>` (upstream zstd's flat-buffer layout)
-                    // rather than the legacy per-block `WindowEntry`
-                    // stack. There are no per-block Vec allocations
-                    // to recycle into `vec_pool` — `trim_to_window`
-                    // drains the oldest bytes in-place and returns
-                    // the count for the dictionary-budget loop's
-                    // termination check.
                     let MatcherStorage::Simple(m) = &mut self.storage else {
                         unreachable!("active_backend() == Simple proven above");
                     };
                     evicted_bytes += m.trim_to_window();
                 }
                 super::strategy::BackendTag::Dfast => {
-                    // Dfast doesn't retain input Vecs — `history` is the
-                    // only byte store, so there is no per-block buffer
-                    // to push back through a callback. Eviction byte
-                    // count is derived from the `window_size` delta
-                    // before/after; the Dfast variant of
-                    // `trim_to_window` takes no closure, sidestepping
-                    // an unused-`impl FnMut` monomorphization that
-                    // would otherwise contractually never fire.
                     let dfast = self.dfast_matcher_mut();
                     let pre = dfast.window_size;
                     dfast.trim_to_window();
                     evicted_bytes += pre - dfast.window_size;
                 }
                 super::strategy::BackendTag::Row => {
-                    // Row keeps bytes only in the contiguous `history` mirror
-                    // (block buffers are returned to the pool per block in
-                    // `add_data`), so derive the eviction count from the
-                    // `window_size` delta, mirroring the Dfast / HashChain arms.
                     let row = self.row_matcher_mut();
                     let pre = row.window_size;
                     row.trim_to_window();
                     evicted_bytes += pre - row.window_size;
                 }
                 super::strategy::BackendTag::HashChain => {
-                    // HC keeps bytes only in the contiguous `history` mirror
-                    // (no per-block Vecs to recycle since the window<->history
-                    // dedup), so derive the eviction count from the
-                    // `window_size` delta, mirroring the Dfast arm above.
                     let table = &mut self.hc_matcher_mut().table;
                     let pre = table.window_size;
                     table.trim_to_window();
@@ -1014,7 +974,6 @@ impl MatchGeneratorDriver {
                 } else {
                     self.simple_mut().skip_matching_for_dict_copy();
                 }
-                self.recycle_simple_space();
             }
             super::strategy::BackendTag::Dfast => {
                 // Upstream zstd `ZSTD_dictMatchState` mode selection for dfast (cutoff
@@ -1109,19 +1068,17 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     /// Heap bytes this driver owns: the active backend's tables/history, the
-    /// recycled input-buffer pool, the primed-dictionary snapshot (a cloned
-    /// backend kept for CDict-equivalent reuse), and the workspace its tables
-    /// live in when it is reset on its own. Tables laid out in a compression
-    /// context's workspace are the context's to count. The inline struct itself
-    /// is accounted by the owner's `size_of`.
+    /// primed-dictionary snapshot (a cloned backend kept for CDict-equivalent
+    /// reuse), and the workspace its tables live in when it is reset on its
+    /// own. Tables laid out in a compression context's workspace are the
+    /// context's to count. The inline struct itself is accounted by the
+    /// owner's `size_of`.
     fn heap_size(&self) -> usize {
-        let pool: usize = self.vec_pool.capacity() * core::mem::size_of::<Vec<u8>>()
-            + self.vec_pool.iter().map(Vec::capacity).sum::<usize>();
         let snapshot = self
             .primed
             .as_ref()
             .map_or(0, |(storage, _, _)| storage.heap_size());
-        pool + self.storage.heap_size() + snapshot + self.own_workspace.capacity()
+        self.storage.heap_size() + snapshot + self.own_workspace.capacity()
     }
 
     fn clear_param_overrides(&mut self) {
@@ -1324,11 +1281,7 @@ impl Matcher for MatchGeneratorDriver {
                     m.table.tables = crate::encoding::workspace::Table::empty();
                     m.table.chain_off = 0;
                     m.table.hash3_off = 0;
-                    let vec_pool = &mut self.vec_pool;
-                    m.reset(|mut data| {
-                        data.resize(data.capacity(), 0);
-                        vec_pool.push(data);
-                    });
+                    m.reset();
                 }
             }
             // Swap in a fresh variant for the new backend. The previous
@@ -1561,9 +1514,6 @@ impl Matcher for MatchGeneratorDriver {
                 );
                 dfast.history.bind(workspace, history_bytes);
                 dfast.bind_tables(workspace);
-                // Dfast holds no per-block input Vecs (history owns the
-                // bytes and `add_data` returns each Vec eagerly), so
-                // `reset` takes no `reuse_space` callback.
                 dfast.reset();
             }
             MatcherStorage::Row(row) => {
@@ -1659,11 +1609,7 @@ impl Matcher for MatchGeneratorDriver {
                 );
                 hc.table.history.bind(workspace, history_bytes);
                 hc.table.bind_tables(workspace);
-                let vec_pool = &mut self.vec_pool;
-                hc.reset(|mut data| {
-                    data.resize(data.capacity(), 0);
-                    vec_pool.push(data);
-                });
+                hc.reset();
             }
         }
         // LDM wiring (#27): attach (or clear) the long-distance-match
@@ -1801,19 +1747,6 @@ impl Matcher for MatchGeneratorDriver {
         self.reported_window_size as u64
     }
 
-    fn get_next_space(&mut self) -> Vec<u8> {
-        if let Some(mut space) = self.vec_pool.pop() {
-            if space.len() > self.slice_size {
-                space.truncate(self.slice_size);
-            }
-            if space.len() < self.slice_size {
-                space.resize(self.slice_size, 0);
-            }
-            return space;
-        }
-        alloc::vec![0; self.slice_size]
-    }
-
     fn get_last_space(&mut self) -> &[u8] {
         match &self.storage {
             MatcherStorage::Simple(m) => m.last_committed_space(),
@@ -1823,208 +1756,68 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
-    /// Read the next block STRAIGHT into the backend's history buffer, so the
-    /// owned block loop does not stage it in a scratch `Vec` and copy it in.
+    /// Read the next block STRAIGHT into the backend's history buffer.
     ///
-    /// Returns `None` when the active backend has no in-place ingest, in which
-    /// case the caller keeps the staged-copy path. Dfast, Row and HashChain
-    /// implement it; Simple stages the block in a `pending` slot that the
-    /// kernel consumes, so its bytes do not reach `history` until match time
-    /// and the two-phase shape does not apply to it as written.
-    ///
-    /// On `Some`, the bytes are in the buffer but not yet part of the window:
-    /// the caller picks the block boundary from
-    /// [`Self::uncommitted_input`] and then calls [`Self::commit_filled`].
+    /// The bytes are in the buffer but not yet part of the window: the caller
+    /// picks the block boundary from [`Self::uncommitted_input`] and then
+    /// calls [`Self::commit_filled`].
     fn fill_in_place(
         &mut self,
         capacity: usize,
         fill: &mut dyn FnMut(&mut HistoryBuf) -> (usize, bool),
-    ) -> Option<(usize, bool)> {
+    ) -> (usize, bool) {
         match &mut self.storage {
-            MatcherStorage::Dfast(m) => Some(m.fill_uncommitted(capacity, fill)),
-            MatcherStorage::Row(m) => Some(m.fill_uncommitted(capacity, fill)),
-            MatcherStorage::HashChain(m) => Some(m.table.fill_uncommitted(capacity, fill)),
-            MatcherStorage::Simple(_) => None,
+            MatcherStorage::Simple(m) => m.fill_uncommitted(capacity, fill),
+            MatcherStorage::Dfast(m) => m.fill_uncommitted(capacity, fill),
+            MatcherStorage::Row(m) => m.fill_uncommitted(capacity, fill),
+            MatcherStorage::HashChain(m) => m.table.fill_uncommitted(capacity, fill),
         }
     }
 
     /// Bytes read by [`Self::fill_in_place`] that no block has claimed yet.
     fn uncommitted_input(&self) -> &[u8] {
         match &self.storage {
+            MatcherStorage::Simple(m) => m.uncommitted(),
             MatcherStorage::Dfast(m) => m.uncommitted(),
             MatcherStorage::Row(m) => m.uncommitted(),
             MatcherStorage::HashChain(m) => m.table.uncommitted(),
-            MatcherStorage::Simple(_) => &[],
         }
     }
 
     /// Claim `len` bytes of [`Self::uncommitted_input`] as the next block.
     ///
-    /// Runs the same eviction accounting as [`Self::commit_space`]: a
-    /// dictionary inflates `max_window_size` so the primed bytes stay
+    /// A dictionary inflates `max_window_size` so the primed bytes stay
     /// reachable, and once eviction carries them out of the window that
     /// inflation has to be retired. Skipping it leaves the backend admitting
     /// matches older than the window the frame header reports, which encodes
     /// an offset no decoder can resolve.
     fn commit_filled(&mut self, len: usize) {
-        // Same derivation as `commit_space`: the eviction loop decrements
-        // `window_size` per evicted block before the commit adds `len`, so
-        // `evicted = pre + len - post`.
-        let pre = match &self.storage {
-            MatcherStorage::Dfast(m) => m.window_size,
-            MatcherStorage::Row(m) => m.window_size,
-            MatcherStorage::HashChain(m) => m.table.window_size,
-            MatcherStorage::Simple(_) => 0,
-        };
-        match &mut self.storage {
-            MatcherStorage::Dfast(m) => m.commit_block(len),
-            MatcherStorage::Row(m) => m.commit_block(len),
-            MatcherStorage::HashChain(m) => m.table.commit_block(len),
-            MatcherStorage::Simple(_) => return,
-        }
-        let post = match &self.storage {
-            MatcherStorage::Dfast(m) => m.window_size,
-            MatcherStorage::Row(m) => m.window_size,
-            MatcherStorage::HashChain(m) => m.table.window_size,
-            MatcherStorage::Simple(_) => 0,
-        };
-        // `saturating_sub` floors the no-eviction case at 0; `pre + len` are
-        // byte counts bounded by the window, so the sum cannot overflow.
-        let evicted_bytes = (pre + len).saturating_sub(post);
-        if self.retire_dictionary_budget(evicted_bytes) {
-            self.trim_after_budget_retire();
-        }
-    }
-
-    fn commit_space(&mut self, space: Vec<u8>) {
-        let mut evicted_bytes = 0usize;
-        // Split borrows manually so the `add_data` closures can write
-        // into `vec_pool` while the backend itself holds an exclusive
-        // borrow via `storage`. (Suffix-store recycling went away
-        // with the legacy `MatchGenerator`; the FastKernelMatcher
-        // arm below has no pool interaction.)
-        let vec_pool = &mut self.vec_pool;
-        match &mut self.storage {
-            MatcherStorage::Simple(m) => {
-                // FastKernelMatcher owns its history as a single
-                // flat Vec<u8> and the hash table as a Vec<u32> —
-                // neither recycles into the driver-side pools. The
-                // eager pre-commit eviction inside
-                // `FastKernelMatcher::accept_data` drops bytes when
-                // accepting this block would push history past 2×
-                // max_window_size; that delta is what feeds
-                // `evicted_bytes` here via the `pre / post`
-                // history-length comparison.
-                let pre = m.history_len_for_eviction_accounting();
-                m.accept_data(space);
-                let post = m.history_len_for_eviction_accounting();
-                // `accept_data` performs eager pre-commit window
-                // eviction (so this `pre - post` delta correctly
-                // feeds the dictionary-budget retire flow). See
-                // `FastKernelMatcher::accept_data` for the
-                // commit-time-visibility rationale (closes #216
-                // CodeRabbit review #5 / Copilot review #1: without
-                // eager eviction, the delta was always 0 and the
-                // dict budget never retired, leaving max_window_size
-                // inflated post-dict-prime → matcher could emit
-                // offsets exceeding the frame header's window).
-                evicted_bytes += pre.saturating_sub(post);
-            }
+        // The window backends evict whole blocks inside `commit_block`,
+        // subtracting each evicted block from `window_size` and then adding
+        // `len`, so `pre + len - post` is exactly what was evicted and never
+        // negative; the sum is two byte counts bounded by the window. The Fast
+        // backend reports the bytes it drained itself.
+        let evicted_bytes = match &mut self.storage {
+            MatcherStorage::Simple(m) => m.commit_block(len),
             MatcherStorage::Dfast(m) => {
-                // Dfast's `add_data` callback receives the INPUT
-                // `Vec<u8>` for pool recycling (Dfast stores its
-                // bytes in the contiguous `history` buffer, not in
-                // per-block Vecs — there is no per-block buffer to
-                // pop off and hand back). Counting `data.len()` as
-                // evicted bytes would conflate "new bytes ingested"
-                // with "old bytes evicted from window"; the two
-                // happen to coincide when the previous window was
-                // saturated and the new input fills it 1:1, but
-                // diverge when the eviction pop-loop drops blocks
-                // of a different size than the incoming input. The
-                // `dictionary_retained_budget` retire decision
-                // downstream then gets driven by inflated eviction
-                // counts and shrinks `max_window_size` prematurely.
-                //
-                // Derive the real eviction delta from `window_size`
-                // before/after the call. The pop loop inside
-                // `add_data` decrements `window_size` by each
-                // evicted block length and then the final
-                // `extend_from_slice + push_back` adds `space_len`,
-                // so `evicted = pre + space_len - post`.
                 let pre = m.window_size;
-                let space_len = space.len();
-                m.add_data(space, |data| {
-                    // Same per-block recycle as the HashChain arm: push
-                    // the spent input buffer back as-is rather than
-                    // zero-filling to capacity. `add_data` mirrors the
-                    // bytes into `history` and calls this every block, so
-                    // capacity-wide zeroing would be hot-path waste;
-                    // `get_next_space` zeroes at most `slice_size` bytes
-                    // when it later reuses the buffer.
-                    vec_pool.push(data);
-                });
-                // Plain `+` (the `saturating_sub` floors at 0): `pre` + one
-                // block are byte counts bounded by the window, no overflow.
-                evicted_bytes += (pre + space_len).saturating_sub(m.window_size);
+                m.commit_block(len);
+                pre + len - m.window_size
             }
             MatcherStorage::Row(m) => {
-                // RowMatchGenerator::add_data recycles the *input* buffer
-                // through this callback every commit (its bytes are mirrored
-                // into `history`), not the evicted chunks. Derive the eviction
-                // delta from `window_size` before/after — `evicted = pre +
-                // space_len - post` — exactly like the Simple / HashChain arms.
-                // Counting the callback argument as evicted would charge the
-                // whole committed block as evicted and prematurely retire
-                // dictionary budget on a window that evicts nothing.
                 let pre = m.window_size;
-                let space_len = space.len();
-                m.add_data(space, |data| {
-                    // Recycle the spent buffer as-is; `add_data` runs this for
-                    // every committed block, so zero-filling to capacity here
-                    // would be hot-path waste (`get_next_space` zeroes at most
-                    // `slice_size` on reuse).
-                    vec_pool.push(data);
-                });
-                // Plain `+` (the `saturating_sub` floors at 0): `pre` + one
-                // block are byte counts bounded by the window, no overflow.
-                evicted_bytes += (pre + space_len).saturating_sub(m.window_size);
+                m.commit_block(len);
+                pre + len - m.window_size
             }
             MatcherStorage::HashChain(m) => {
-                // MatchTable::add_data now recycles the *incoming* buffer
-                // through `reuse_space` (its bytes are copied into the
-                // contiguous `history` mirror), so the callback no longer
-                // reports evicted chunks. Derive the eviction delta from
-                // `window_size` before/after, exactly like the Simple arm:
-                // `evicted = pre + space_len - post`.
                 let pre = m.table.window_size;
-                let space_len = space.len();
-                m.table.add_data(space, |data| {
-                    // Recycle the spent input buffer to the pool as-is.
-                    // `add_data` runs this callback for every committed
-                    // block (the bytes are mirrored into `history`), so
-                    // growing the buffer to its full capacity here would
-                    // zero the whole allocation on the hot path.
-                    // `get_next_space` resizes a popped buffer to
-                    // `slice_size` on demand, touching at most
-                    // `slice_size` bytes — never the larger capacity the
-                    // pool retains.
-                    vec_pool.push(data);
-                });
-                // Plain `+` (the `saturating_sub` floors at 0): byte counts
-                // bounded by the window, no overflow.
-                evicted_bytes += (pre + space_len).saturating_sub(m.table.window_size);
+                m.table.commit_block(len);
+                pre + len - m.table.window_size
             }
-        }
-        // Gate the second backend trim pass on actual budget
-        // reclamation. Without it, every slice commit on the
-        // no-dictionary / no-eviction path (the common case) would
-        // run a backend `match` ladder + `trim_to_window` early-out
-        // for no reason — `trim_after_budget_retire` only does
-        // meaningful work when `retire_dictionary_budget` shrank
-        // `max_window_size` enough to make the backend's
-        // `window_size > max_window_size` invariant trigger
-        // eviction.
+        };
+        // The second trim pass only does work when retiring the budget shrank
+        // `max_window_size` below the backend's window, so the common
+        // no-dictionary commit skips it.
         if self.retire_dictionary_budget(evicted_bytes) {
             self.trim_after_budget_retire();
         }
@@ -2092,7 +1885,6 @@ impl Matcher for MatchGeneratorDriver {
         match self.search {
             SearchMethod::Fast => {
                 self.simple_mut().start_matching(&mut handle_sequence);
-                self.recycle_simple_space();
             }
             SearchMethod::DoubleFast => {
                 self.dfast_matcher_mut()
@@ -2161,7 +1953,6 @@ impl Matcher for MatchGeneratorDriver {
             super::strategy::BackendTag::Simple => {
                 self.simple_mut()
                     .skip_matching_with_hint(incompressible_hint);
-                self.recycle_simple_space();
             }
             super::strategy::BackendTag::Dfast => {
                 self.dfast_matcher_mut().skip_matching(incompressible_hint)
@@ -2291,11 +2082,7 @@ fn collect_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, 
 
     let mut sequences = Vec::new();
     for (chunk_start, chunk_len) in level22_block_ranges(data) {
-        let chunk = &data[chunk_start..chunk_start + chunk_len];
-        let mut space = driver.get_next_space();
-        space[..chunk.len()].copy_from_slice(chunk);
-        space.truncate(chunk.len());
-        driver.commit_space(space);
+        driver.commit_input(&data[chunk_start..chunk_start + chunk_len]);
         driver.start_matching(|seq| {
             let entry = match seq {
                 Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),

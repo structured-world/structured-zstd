@@ -21,7 +21,7 @@
 //!
 //! Wired into production: the driver's `MatcherStorage::Simple` variant
 //! holds `FastKernelMatcher` directly; the driver's Matcher trait
-//! methods (`commit_space` / `start_matching` / `skip_matching_with_hint`
+//! methods (`commit_filled` / `start_matching` / `skip_matching_with_hint`
 //! / `reset` / `prime_with_dictionary` / `trim_after_budget_retire`)
 //! all route through this module's inherent API.
 //!
@@ -36,8 +36,8 @@
 //!   the buffer is rebased to position 0 and `prefix_start_index`
 //!   resets to 1, making the first retained byte (`history[0]`)
 //!   unmatchable — small ratio cost, accepted for sentinel safety.
-//! - `history.len()` is bounded by `2 × max_window_size` post-append.
-//!   See [`FastKernelMatcher::extend_history_with_pending`].
+//! - The committed history is bounded by `2 × max_window_size` once a
+//!   block is committed. See [`FastKernelMatcher::commit_block`].
 //! - `rep[0..2]` is the functional repcode state: the kernel's
 //!   two-deep stack, overwritten from `FastBlockResult.rep` after every
 //!   `start_matching`, and what the NEXT block's kernel probes against.
@@ -51,8 +51,6 @@
 //!   Do NOT reintroduce per-match `offset_hist` rotation here: it is
 //!   pure overhead on this backend (it was removed because the coded
 //!   offset it produced was discarded).
-
-use alloc::vec::Vec;
 
 use crate::encoding::Sequence;
 use crate::encoding::dict_attach::DictAttach;
@@ -155,13 +153,17 @@ pub(crate) enum TableCarry {
 ///   the matcher's own two-deep stack for the kernel).
 /// - `hash_table` is the upstream zstd's flat `u32` hash table, persistent
 ///   across blocks (cleared only on full `reset`).
-/// - `pending` holds the most recently `commit_space`'d block before
-///   `start_matching` appends it onto `history` and runs the kernel.
+/// - `staged_block` marks the most recently committed block, already at the
+///   end of the window, until `start_matching` / a skip consumes it.
 pub(crate) struct FastKernelMatcher {
-    /// Concatenated input history: prior-block bytes followed by the
-    /// most-recently-committed (still pending-matching) tail. In the context's
-    /// workspace when a context drives the matcher.
+    /// Concatenated input history: the window (prior blocks and the block
+    /// being matched), followed by `uncommitted_len` bytes read in place that
+    /// no block has claimed yet. In the context's workspace when a context
+    /// drives the matcher.
     history: HistoryBuf,
+    /// Bytes at the tail of `history` read by [`Self::fill_uncommitted`] but
+    /// not yet claimed by a block: never part of the window.
+    uncommitted_len: usize,
     /// Upstream zstd `prefixStartIndex` — earliest position any match may
     /// reference.
     prefix_start_index: u32,
@@ -213,29 +215,15 @@ pub(crate) struct FastKernelMatcher {
     /// recreate upstream zstd's acceleration gradient; Level(1) and other
     /// Fast levels keep step_size=2.
     step_size: usize,
-    /// Holds a `commit_space`'d block until `start_matching` consumes
-    /// it. `None` between frames and immediately after `start_matching`
-    /// returns. The driver guarantees at most one outstanding pending
-    /// space at a time (single-block-per-cycle protocol).
-    pending: Option<Vec<u8>>,
-    /// Absolute history position where the MOST RECENTLY appended
-    /// block starts — `extend_history_with_pending` updates this so
-    /// [`Self::last_committed_space`] can return that block's bytes
-    /// AFTER processing (upstream zstd / legacy MatchGenerator parity: the
-    /// driver's frame compressor reads `get_last_space` after
-    /// `start_matching` to fetch the raw bytes for raw-block
-    /// emission). Initialised to 0 — overwritten by every
-    /// extend_history_with_pending call.
+    /// Length of the block [`Self::commit_block`] claimed, until
+    /// `start_matching` / a skip consumes it. `None` between frames and after
+    /// the block is processed. The driver commits at most one block per
+    /// match / skip call.
+    staged_block: Option<usize>,
+    /// Absolute history position where the most recently committed block
+    /// starts, so [`Self::last_committed_space`] can return its bytes for
+    /// raw-block emission before and after it is matched.
     last_block_start: usize,
-    /// Per-block input buffer recycle slot. After
-    /// `extend_history_with_pending` copies bytes from the pending
-    /// buffer into `history`, the now-spent `Vec<u8>` allocation is
-    /// stashed here (cleared, capacity retained). The driver pulls
-    /// it via [`Self::take_recycled_space`] after every
-    /// `start_matching` / `skip_matching_with_hint` and returns it
-    /// to its `vec_pool` — avoiding a fresh allocation per block on
-    /// the hot path.
-    recycled_space: Option<Vec<u8>>,
     /// One-shot borrowed match window: `(ptr, len)` into a caller-owned
     /// input buffer that holds the entire frame. When `Some`, all window
     /// *reads* ([`Self::history_bytes`] and the kernel match-slice) view
@@ -276,7 +264,7 @@ pub(crate) struct FastKernelMatcher {
     dict: DictAttach<FastHashTable>,
     /// High-water mark of any position storable into [`Self::hash_table`]
     /// since the last table clear / epoch advance: the largest history
-    /// length seen by [`Self::extend_history_with_pending`] and the largest
+    /// committed length seen by `take_staged_block` and the largest
     /// borrowed `block_end` scanned. `reset` feeds it to
     /// [`FastHashTable::advance_epoch`] as the span that makes every
     /// previously-stored entry stale, then rearms it at 0.
@@ -312,6 +300,7 @@ impl Clone for FastKernelMatcher {
     fn clone(&self) -> Self {
         Self {
             history: self.history.clone(),
+            uncommitted_len: self.uncommitted_len,
             prefix_start_index: self.prefix_start_index,
             rep: self.rep,
             offset_hist: self.offset_hist,
@@ -321,9 +310,8 @@ impl Clone for FastKernelMatcher {
             use_cmov: self.use_cmov,
             kernel: self.kernel,
             step_size: self.step_size,
-            pending: self.pending.clone(),
+            staged_block: self.staged_block,
             last_block_start: self.last_block_start,
-            recycled_space: self.recycled_space.clone(),
             borrowed: self.borrowed,
             last_borrowed_block: self.last_borrowed_block,
             dict: self.dict.clone(),
@@ -341,6 +329,7 @@ impl Clone for FastKernelMatcher {
     // is what the upstream zstd's CDict table-copy regime pays.
     fn clone_from(&mut self, source: &Self) {
         self.history.clone_from(&source.history);
+        self.uncommitted_len = source.uncommitted_len;
         self.prefix_start_index = source.prefix_start_index;
         self.rep = source.rep;
         self.offset_hist = source.offset_hist;
@@ -350,9 +339,8 @@ impl Clone for FastKernelMatcher {
         self.use_cmov = source.use_cmov;
         self.kernel = source.kernel;
         self.step_size = source.step_size;
-        self.pending.clone_from(&source.pending);
+        self.staged_block = source.staged_block;
         self.last_block_start = source.last_block_start;
-        self.recycled_space.clone_from(&source.recycled_space);
         self.borrowed = source.borrowed;
         self.last_borrowed_block = source.last_borrowed_block;
         self.dict.clone_from(&source.dict);
@@ -428,7 +416,7 @@ impl FastKernelMatcher {
             return false;
         };
         let dict_end = self.dict.region_len();
-        if dict_end > self.history.len() || dict_end < HASH_READ_SIZE {
+        if dict_end > self.committed_len() || dict_end < HASH_READ_SIZE {
             return false;
         }
         let dict_bytes = &self.history[..dict_end];
@@ -533,7 +521,7 @@ impl FastKernelMatcher {
             step_size >= 2,
             "FastKernelMatcher requires step_size >= 2 (got {step_size})"
         );
-        // Kernel indices are `u32`. `accept_data` lets history grow
+        // Kernel indices are `u32`. `commit_block` lets history grow
         // up to `2 * max_window_size` before draining (upstream zstd parity
         // for the eager-eviction band), so `max_window_size` is
         // capped at 2^30 to keep that band ≤ 2^31 < `u32::MAX` and
@@ -555,12 +543,12 @@ impl FastKernelMatcher {
         history.resize(HISTORY_DRAIN_BASE, 0);
         Self {
             last_block_start: HISTORY_DRAIN_BASE,
-            recycled_space: None,
             history,
+            uncommitted_len: 0,
             // Filter `match_idx >= prefix_start_index` rejects the
             // hash table's empty-slot value 0. Eviction in
-            // `extend_history_with_pending` rebases the retained
-            // tail and resets prefix_start_index back to 1.
+            // `commit_block` rebases the retained tail and resets
+            // prefix_start_index back to 1.
             prefix_start_index: INITIAL_PREFIX_START_INDEX,
             rep: FAST_INITIAL_REP,
             offset_hist: FAST_INITIAL_OFFSET_HIST,
@@ -570,7 +558,7 @@ impl FastKernelMatcher {
             use_cmov: window_log < 19,
             kernel: crate::encoding::fastpath::select_kernel(),
             step_size,
-            pending: None,
+            staged_block: None,
             borrowed: None,
             last_borrowed_block: None,
             dict: DictAttach::new(),
@@ -608,6 +596,11 @@ impl FastKernelMatcher {
             window_log <= 30,
             "FastKernelMatcher requires window_log <= 30 (got {window_log})"
         );
+        // Bytes an abandoned frame read but never claimed are not part of the
+        // next frame; drop them before anything measures the history.
+        self.history.truncate(self.committed_len());
+        self.uncommitted_len = 0;
+        self.staged_block = None;
         // Re-borrow detection: set to the resident dict region when the
         // epoch-reuse branch below keeps the dict bytes in place (see there).
         let mut reborrow_region: Option<usize> = None;
@@ -691,12 +684,10 @@ impl FastKernelMatcher {
                 - self.max_window_size;
             self.max_window_size += region.min(headroom);
         }
-        self.pending = None;
         // Input starts after the resident dict on a re-borrow frame; otherwise
-        // at the drain base. (The first `extend_history` re-derives this, but
-        // keep it consistent for any pre-append reads.)
+        // at the drain base. (The first commit re-derives this, but keep it
+        // consistent for any earlier reads.)
         self.last_block_start = reborrow_region.unwrap_or(HISTORY_DRAIN_BASE);
-        self.recycled_space = None;
         // Drop any borrowed window: the next frame's input buffer is a
         // different allocation, so a stale (ptr, len) would dangle.
         self.borrowed = None;
@@ -715,14 +706,20 @@ impl FastKernelMatcher {
         1u64 << self.window_log
     }
 
-    /// Heap bytes this matcher owns: the history buffer, the hash table, the
-    /// recycle/pending slots, and any attached dictionary hash table.
+    /// Heap bytes this matcher owns: the history buffer and hash table when
+    /// they are not in a context's workspace, and any attached dictionary hash
+    /// table.
     pub(crate) fn heap_size(&self) -> usize {
         self.history.owned_bytes()
             + self.hash_table.heap_size()
-            + self.pending.as_ref().map_or(0, |v| v.capacity())
-            + self.recycled_space.as_ref().map_or(0, |v| v.capacity())
             + self.dict.table().map_or(0, |t| t.heap_size())
+    }
+
+    /// Length of the window: the history without the bytes read in place that
+    /// no block has claimed yet.
+    #[inline(always)]
+    fn committed_len(&self) -> usize {
+        self.history.len() - self.uncommitted_len
     }
 
     /// Flat byte view of the match window the kernel scans against.
@@ -750,7 +747,7 @@ impl FastKernelMatcher {
             // buffer drops). `len` is the exact length passed in, so the
             // reconstructed slice never exceeds the original allocation.
             Some((ptr, len)) => unsafe { core::slice::from_raw_parts(ptr, len) },
-            None => &self.history,
+            None => &self.history[..self.committed_len()],
         }
     }
 
@@ -765,17 +762,16 @@ impl FastKernelMatcher {
     /// window is cleared (via [`Self::clear_borrowed_window`] or
     /// [`Self::reset`]) before `buffer` is dropped or the matcher is
     /// reused for a different frame. The owned-buffer mutation paths
-    /// (`accept_data`, `extend_history_with_pending`, drain, prime) must
-    /// not run while a borrowed window is active.
+    /// (`fill_uncommitted`, `commit_block`, drain, prime) must not run while
+    /// a borrowed window is active.
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
-        // A staged owned `pending` block would make `last_committed_space`
-        // return the pending buffer (it checks `pending` first) instead of
-        // the borrowed range, breaking the borrowed/owned equivalence the
-        // emit path relies on. The borrowed one-shot caller resets before
-        // registering (so `pending` is None), but this is an unsafe mode
-        // switch — make the precondition explicit and loud.
+        // A staged owned block would leave an owned block waiting for a scan
+        // the borrowed window replaces, breaking the borrowed/owned
+        // equivalence the emit path relies on. The borrowed one-shot caller
+        // resets before registering, but this is an unsafe mode switch —
+        // make the precondition explicit and loud.
         assert!(
-            self.pending.is_none(),
+            self.staged_block.is_none() && self.uncommitted_len == 0,
             "set_borrowed_window requires no staged owned block; reset before switching to a borrowed window",
         );
         // A live borrowed window at entry means a prior frame's window was never
@@ -801,8 +797,7 @@ impl FastKernelMatcher {
         // whole table a SECOND time per frame and, on the dict-attach path,
         // throw away the epoch advance the reset just performed (measured: the
         // redundant clear was ~12% of the borrowed-dict encode). The
-        // mode-switch precondition (no stale owned `pending`) is asserted
-        // above. Re-flooring `prefix_start_index` is a single store (not a
+        // mode-switch precondition (no staged owned block) is asserted above. Re-flooring `prefix_start_index` is a single store (not a
         // memset), so keep it for self-containment.
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
     }
@@ -830,19 +825,10 @@ impl FastKernelMatcher {
     }
 
     /// Read-only view of the most recently committed block — upstream zstd /
-    /// legacy MatchGenerator's `window.last().data` equivalent.
-    ///
-    /// Three states:
-    /// - Pre-`accept_data`: empty slice — `history` is empty and
-    ///   `last_block_start` is 0, so `history[last_block_start..]`
-    ///   degenerates to a zero-length slice.
-    /// - Between `accept_data` and processing: the pending buffer.
-    /// - Post-processing: `history` slice of the just-processed
-    ///   block — frame compressor's raw-block emission reads this.
+    /// legacy MatchGenerator's `window.last().data` equivalent: empty before
+    /// the first commit, then the block's bytes at the end of the window,
+    /// before and after it is matched (raw-block emission reads this).
     pub(crate) fn last_committed_space(&self) -> &[u8] {
-        if let Some(slice) = self.pending.as_deref() {
-            return slice;
-        }
         // Borrowed one-shot path: the just-scanned block lives at
         // `[start, end)` of the borrowed window, which `history_bytes()`
         // views in place — return it zero-copy for the emit path.
@@ -852,48 +838,83 @@ impl FastKernelMatcher {
         &self.history_bytes()[self.last_block_start..]
     }
 
-    /// Accept a freshly-committed block from the driver.
-    ///
-    /// Upstream zstd's `ZSTD_window_update`: the new bytes are stashed for
-    /// the next [`Self::start_matching`] / [`Self::skip_matching_with_hint`]
-    /// call but NOT yet appended to `history` — that delay lets the
-    /// driver-side `get_last_space` peek at the still-pending buffer
-    /// without committing it to the matcher's hot path.
-    ///
-    /// History budget is enforced EAGERLY in this function (not lazily
-    /// inside [`Self::extend_history_with_pending`]) so the driver's
-    /// `commit_space` can observe the eviction delta via a pre/post
-    /// `history.len()` comparison. That delta feeds
-    /// `retire_dictionary_budget`, which shrinks `max_window_size`
-    /// back to the frame's contracted window after dictionary priming
-    /// inflated it. Without commit-time visibility the dict-budget
-    /// retire never runs and the matcher can emit offsets exceeding
-    /// the frame header's reported window size (format-correctness
-    /// risk).
-    pub(crate) fn accept_data(&mut self, space: Vec<u8>) {
-        assert!(
-            self.pending.is_none(),
-            "FastKernelMatcher: accept_data called with a still-pending buffer; \
-             the driver must run start_matching / skip_matching between commits",
+    /// Read the next input STRAIGHT into the tail of `history`: `fill` is
+    /// handed the buffer with room reserved for `capacity` more bytes and
+    /// returns `(appended, eof)`. The bytes are readable through
+    /// [`Self::uncommitted`] but are not part of the window until
+    /// [`Self::commit_block`] claims them; whatever a block leaves stays for
+    /// the next.
+    pub(crate) fn fill_uncommitted(
+        &mut self,
+        capacity: usize,
+        fill: impl FnOnce(&mut HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool) {
+        debug_assert!(
+            self.borrowed.is_none(),
+            "fill_uncommitted is the owned path; a borrowed window is active",
         );
+        self.history.reserve(capacity);
+        let before = self.history.len();
+        let (appended, eof) = fill(&mut self.history);
+        debug_assert_eq!(
+            self.history.len(),
+            before + appended,
+            "fill_uncommitted: fill reported {appended} bytes but grew history by {}",
+            self.history.len() - before,
+        );
+        self.uncommitted_len += appended;
+        (appended, eof)
+    }
 
-        // Eager window eviction: drop oldest history bytes NOW if
-        // accepting this block would push the total past upstream zstd's
-        // `2 × max_window_size` soft cap. This fires at commit time
-        // (not at append time inside `extend_history_with_pending`)
-        // so the driver's `commit_space` can observe the byte delta
-        // via a `pre/post history.len()` comparison — that delta
-        // feeds `retire_dictionary_budget` which shrinks
-        // `max_window_size` back to the frame's contracted window
-        // after dictionary priming inflated it. Without commit-time
-        // visibility the dict-budget retire never runs and the
-        // matcher can emit offsets exceeding the frame header's
-        // reported window size (format-correctness risk).
-        // Eviction operates on REAL data length. Post-M8 there is
-        // no dummy prefix at the head of `history`, so `real_len` is
-        // just `history.len()` minus the `HISTORY_DRAIN_BASE`
-        // sentinel-slot offset — not a placeholder block subtraction.
-        let real_len = self.history.len().saturating_sub(HISTORY_DRAIN_BASE);
+    /// Bytes read but not yet claimed by a block.
+    pub(crate) fn uncommitted(&self) -> &[u8] {
+        &self.history[self.committed_len()..]
+    }
+
+    /// Read `input` in and commit it as one block, the way the driver does
+    /// in two calls. Returns the window bytes the commit evicted.
+    #[cfg(test)]
+    pub(crate) fn commit_input(&mut self, input: impl AsRef<[u8]>) -> usize {
+        let input = input.as_ref();
+        self.fill_uncommitted(input.len(), |history| {
+            history.extend_from_slice(input);
+            (input.len(), false)
+        });
+        self.commit_block(input.len())
+    }
+
+    /// Claim the first `len` bytes of [`Self::uncommitted`] as the next
+    /// block, for the next [`Self::start_matching`] / skip to process
+    /// (upstream zstd's `ZSTD_window_update`). Returns the window bytes this
+    /// evicted.
+    ///
+    /// The window budget is enforced here, at commit time, so the driver
+    /// learns the eviction before the block is processed and can retire the
+    /// dictionary budget, which shrinks `max_window_size` back to the frame's
+    /// contracted window after dictionary priming inflated it. Without it the
+    /// matcher could emit offsets past the window the frame header reports
+    /// (format-correctness risk).
+    pub(crate) fn commit_block(&mut self, len: usize) -> usize {
+        assert!(
+            self.staged_block.is_none(),
+            "FastKernelMatcher: a block was committed while the previous one is \
+             still waiting; the driver must run start_matching / a skip between commits",
+        );
+        // Hard assert, not debug: an over-long claim would wrap
+        // `uncommitted_len` in release and surface far from the cause.
+        assert!(
+            len <= self.uncommitted_len,
+            "commit_block: {len} exceeds the {} uncommitted bytes",
+            self.uncommitted_len,
+        );
+        // Eager window eviction: drop the oldest window bytes NOW if this
+        // block would push the window past upstream zstd's `2 ×
+        // max_window_size` soft cap. The drain moves the uncommitted tail
+        // down with the window, so the block keeps its place right after it.
+        // Eviction operates on REAL data length. Post-M8 there is no dummy
+        // prefix at the head of `history`, so `real_len` is just the window
+        // length minus the `HISTORY_DRAIN_BASE` sentinel-slot offset.
+        let real_len = self.committed_len().saturating_sub(HISTORY_DRAIN_BASE);
         // Plain `*`: `max_window_size` starts at `1 << window_log` (window_log
         // <= 30 from `with_params`/`reset`) but dictionary priming widens it,
         // always capped via `.min(MAX_PRIMED_WINDOW_SIZE)` where
@@ -908,18 +929,17 @@ impl FastKernelMatcher {
         // the advertised cap (retain_real saturates to 0 but the
         // full block still appends, violating the invariant).
         assert!(
-            space.len() <= cap,
+            len <= cap,
             "FastKernelMatcher requires block_size <= 2 × max_window_size \
-             (block={}, cap={})",
-            space.len(),
-            cap,
+             (block={len}, cap={cap})",
         );
-        // Subtraction, not `real_len + space.len() > cap`: the assert above
-        // guarantees `space.len() <= cap`, so `cap - space.len()` cannot
-        // underflow. With a primed `cap` approaching `u32::MAX - MAX_BLOCK_SIZE`,
-        // both `real_len` and `space.len()` can each be large enough that the
-        // addition would overflow usize on 32-bit targets before the comparison.
-        if real_len > cap - space.len() {
+        // Subtraction, not `real_len + len > cap`: the assert above
+        // guarantees `len <= cap`, so `cap - len` cannot underflow. With a
+        // primed `cap` approaching `u32::MAX - MAX_BLOCK_SIZE`, both
+        // `real_len` and `len` can each be large enough that the addition
+        // would overflow usize on 32-bit targets before the comparison.
+        let mut evicted = 0;
+        if real_len > cap - len {
             // Compute how many real bytes to KEEP, then drop the
             // delta. Pre-fix code naively kept `max_window_size`
             // regardless of incoming block size — for a committed
@@ -932,20 +952,24 @@ impl FastKernelMatcher {
             // exceeds cap, retained = 0 (no historical context kept,
             // but the cap is still as close as we can get without
             // truncating the caller's block).
-            let retain_real = cap.saturating_sub(space.len()).min(self.max_window_size);
+            let retain_real = cap.saturating_sub(len).min(self.max_window_size);
             let drop_n = real_len.saturating_sub(retain_real);
             if drop_n > 0 {
                 self.drain_real_prefix(drop_n);
+                evicted = drop_n;
             }
         }
 
-        self.pending = Some(space);
+        self.uncommitted_len -= len;
+        self.last_block_start = self.committed_len() - len;
+        self.staged_block = Some(len);
+        evicted
     }
 
     /// Drop the OLDEST `drop_n` real bytes from history and rebase
     /// the retained tail to start at position 0 (M8 layout: no
     /// dummy region). Used by both the eager commit-time eviction
-    /// in [`Self::accept_data`] and the dictionary-budget retire
+    /// in [`Self::commit_block`] and the dictionary-budget retire
     /// loop's [`Self::trim_to_window`].
     ///
     /// Side effects:
@@ -1019,62 +1043,28 @@ impl FastKernelMatcher {
         self.last_block_start = self.last_block_start.saturating_sub(drop_n);
     }
 
-    /// Internal: drain `self.pending` into `self.history`, applying
-    /// the window-budget eviction first. Returns the absolute position
-    /// at which the newly-appended block starts (upstream zstd's
-    /// `currentBlockStart` — what the kernel receives as
-    /// `block_start`).
+    /// Take the block [`Self::commit_block`] staged for processing. Returns
+    /// the absolute position it starts at (upstream zstd's
+    /// `currentBlockStart`, what the kernel receives as `block_start`).
     ///
-    /// Eviction happens earlier, in `accept_data`: when total retained bytes
-    /// would exceed `2 × max_window_size`, the oldest bytes are dropped back
-    /// down to a `max_window_size` tail and the hash table's stored positions
-    /// slide down by the same amount ([`Self::drain_real_prefix`], upstream
-    /// zstd `ZSTD_reduceIndex`), so the retained entries keep naming the same
-    /// bytes. One eviction every `max_window_size` of input: amortised
-    /// constant.
-    fn extend_history_with_pending(&mut self) -> usize {
-        let mut space = self
-            .pending
+    /// The block is already in place at the end of the window, and the
+    /// window was already trimmed for it at commit: when the retained bytes
+    /// would exceed `2 × max_window_size`, the oldest are dropped back down to
+    /// a `max_window_size` tail and the hash table's stored positions slide
+    /// down by the same amount ([`Self::drain_real_prefix`], upstream zstd
+    /// `ZSTD_reduceIndex`). One eviction every `max_window_size` of input:
+    /// amortised constant.
+    fn take_staged_block(&mut self) -> usize {
+        let len = self
+            .staged_block
             .take()
-            .expect("extend_history_with_pending without a pending buffer");
-
-        // Eviction was already applied during `accept_data` (eager
-        // pre-commit drain so the driver's `commit_space` accounting
-        // sees the byte delta). At this point the matcher's
-        // invariant `history.len() + space.len() <= 2 *
-        // max_window_size` already holds — just append.
-        let block_start = self.history.len();
-        self.history.extend_from_slice(&space);
+            .expect("a block is processed only after commit_block staged it");
+        let window_end = self.committed_len();
         // Track the largest position any kernel scan over this history
         // could store into the hash table (consumed by `reset`'s epoch
         // advance).
-        self.table_pos_high_water = self.table_pos_high_water.max(self.history.len());
-        // Record where this newly-appended block starts so
-        // `last_committed_space` can return its bytes AFTER the
-        // kernel call consumes pending.
-        self.last_block_start = block_start;
-        // Stash the now-spent space buffer (cleared, capacity
-        // retained) for the driver to pull via
-        // `take_recycled_space()` and return to its vec_pool. Avoids
-        // a fresh per-block allocation on the hot path. If a previous
-        // recycled buffer was never taken (e.g. driver crashed mid-
-        // cycle) we drop it here — only ONE buffer is recycled per
-        // cycle, matching the single-pending-block protocol.
-        space.clear();
-        self.recycled_space = Some(space);
-        block_start
-    }
-
-    /// Reclaim the most recently spent input buffer (the `Vec<u8>`
-    /// passed in via `accept_data` after its bytes were copied into
-    /// `history`). The buffer is empty but retains its capacity —
-    /// the driver can resize it back to `slice_size` and push onto
-    /// `vec_pool` to amortise per-block allocation cost.
-    ///
-    /// Returns `None` if no block has been processed since the last
-    /// `take_recycled_space` (or since construction / reset).
-    pub(crate) fn take_recycled_space(&mut self) -> Option<Vec<u8>> {
-        self.recycled_space.take()
+        self.table_pos_high_water = self.table_pos_high_water.max(window_end);
+        window_end - len
     }
 
     /// Capacity of the buffer blocks are appended into, which the context
@@ -1099,8 +1089,8 @@ impl FastKernelMatcher {
     pub(crate) fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         // Owned scan path. A borrowed one-shot window (set via
         // `set_borrowed_window`) is mutually exclusive with this path:
-        // `extend_history_with_pending` appends into `self.history` and
-        // `block_start` indexes that owned buffer, so matching against a
+        // a committed block lives in `self.history` and `block_start`
+        // indexes that owned buffer, so matching against a
         // borrowed window here would index it with an owned-history
         // offset, and the kernel would read `self.history` at hash-table
         // indices that were populated against the (possibly larger)
@@ -1113,7 +1103,7 @@ impl FastKernelMatcher {
             self.borrowed.is_none(),
             "start_matching is the owned path; clear the borrowed window first (use start_matching_borrowed)",
         );
-        let block_start = self.extend_history_with_pending();
+        let block_start = self.take_staged_block();
         // Compute the EFFECTIVE prefix floor for this scan against
         // the ADVERTISED frame window (`1 << window_log`), NOT
         // `max_window_size` — the driver may temporarily inflate
@@ -1191,7 +1181,7 @@ impl FastKernelMatcher {
         // emitted offsets (`ip0 - pos`) stay within the advertised window,
         // including the pre-drain 1x..2x-window band where `window_low > 0`.
         let use_dict = self.dict.is_attached();
-        let history: &[u8] = &self.history;
+        let history: &[u8] = &self.history[..self.committed_len()];
         let rep_out = if use_dict {
             use super::fast_kernel::kernel::PrefixBounds;
             let dict_end = self.dict.region_len() as u32;
@@ -1513,7 +1503,7 @@ impl FastKernelMatcher {
     ///   appended range. This matches the
     ///   `skip_matching_for_dictionary_priming` flow on the driver.
     pub(crate) fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
-        let block_start = self.extend_history_with_pending();
+        let block_start = self.take_staged_block();
         // Rep state survives unchanged: skip should look idempotent
         // to the next block's matcher (no fake match implies no rep
         // promotion). offset_hist likewise unchanged.
@@ -1577,9 +1567,9 @@ impl FastKernelMatcher {
         // and the 0.9% of cycles that moved is the size of a code-layout
         // change. The stash bought nothing and is not here.
         self.dict.invalidate();
-        self.extend_history_with_pending();
+        self.take_staged_block();
         self.prime_hash_table_for_dict_copy();
-        self.loaded_dict_end = self.history.len();
+        self.loaded_dict_end = self.committed_len();
     }
 
     /// Borrowed-window equivalent of [`Self::skip_matching_with_hint`]:
@@ -1726,30 +1716,18 @@ impl FastKernelMatcher {
         self.rep = [offset_hist[0], offset_hist[1]];
     }
 
-    /// Read-only view of history's real-data length for the driver's
-    /// eviction accounting (`commit_space` →
-    /// `retire_dictionary_budget` flow). The driver compares pre/post
-    /// values to derive a byte-delta; under M8 history holds only
-    /// real bytes from position 0 onward (HISTORY_DRAIN_BASE is 0),
-    /// so this is just the history length — the `saturating_sub` is
-    /// kept symmetric with `trim_to_window` below in case the drain
-    /// base ever moves off 0.
-    pub(crate) fn history_len_for_eviction_accounting(&self) -> usize {
-        self.history.len().saturating_sub(HISTORY_DRAIN_BASE)
-    }
-
     /// Drop history bytes past `max_window_size` via
     /// [`Self::drain_real_prefix`] (resets `prefix_start_index` to
     /// `INITIAL_PREFIX_START_INDEX` = 1, the sentinel-0 floor, and slides
     /// the table's stored positions down by the evicted count). Returns
     /// evicted byte count; idempotent when `real_len <= max_window_size`.
     pub(crate) fn trim_to_window(&mut self) -> usize {
-        let real_len = self.history.len().saturating_sub(HISTORY_DRAIN_BASE);
+        let real_len = self.committed_len().saturating_sub(HISTORY_DRAIN_BASE);
         if real_len <= self.max_window_size {
             return 0;
         }
         let drop_n = real_len - self.max_window_size;
-        // Front-drain bookkeeping shared with `accept_data`'s
+        // Front-drain bookkeeping shared with `commit_block`'s
         // eager-eviction branch — see `drain_real_prefix` for the
         // full invariant list. Keeping the two sites in lockstep
         // (rather than inlined-and-duplicated) prevents the next
@@ -1792,7 +1770,7 @@ impl FastKernelMatcher {
     /// seam are reached by the next slice) exactly as the attach fill does.
     fn prime_hash_table_for_dict_copy(&mut self) {
         const HASH_READ_SIZE: usize = 8;
-        let history_len = self.history.len();
+        let history_len = self.committed_len();
         if history_len < HASH_READ_SIZE {
             return;
         }
@@ -1845,7 +1823,8 @@ impl FastKernelMatcher {
 
     /// [`Self::prime_hash_table_for_range`] taking every `step`-th position.
     fn prime_hash_table_for_range_stepped(&mut self, range_start: usize, step: usize) {
-        let history_len = self.history.len();
+        // The window only: bytes read ahead in place are not hashable yet.
+        let history_len = self.committed_len();
         // HASH_READ_SIZE = 8 is the kernel's load-width invariant
         // (upstream zstd `MEM_readST` cadence). Hashing a position with fewer
         // forward bytes would compute a hash over uninitialised /
@@ -1981,7 +1960,7 @@ impl FastKernelMatcher {
     /// dictionary matches (dict fallback), matching the upstream zstd's
     /// `prefixStart`/dict split.
     pub(crate) fn skip_matching_for_dict_prime(&mut self, dict_len: usize) {
-        let block_start = self.extend_history_with_pending();
+        let block_start = self.take_staged_block();
         self.prime_dict_table_for_range(block_start, dict_len);
     }
 
@@ -2065,7 +2044,7 @@ impl FastKernelMatcher {
     /// main table's `mls`, so one hash keys both.
     fn prime_dict_table_for_range(&mut self, range_start: usize, dict_len: usize) {
         const HASH_READ_SIZE: usize = 8;
-        let history_len = self.history.len();
+        let history_len = self.committed_len();
         // Record the dict/input boundary regardless of whether any position
         // is hashable (a sub-8-byte dict still bounds the input floor).
         self.dict.set_region_len(history_len);
@@ -2147,7 +2126,7 @@ impl FastKernelMatcher {
     /// loop is sound — the loop never touches `history`, which stays put.
     /// Returns the carried-forward fill origin (the first stride position not
     /// yet processed), stored as [`DictAttach::next_to_update`] so the next
-    /// `accept_data` slice resumes there with the stride phase intact.
+    /// committed slice resumes there with the stride phase intact.
     fn prime_dict_table_impl<const MLS: u32>(
         &mut self,
         base: *const u8,

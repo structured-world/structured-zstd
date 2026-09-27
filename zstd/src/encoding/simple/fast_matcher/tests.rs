@@ -1,5 +1,6 @@
 use super::*;
 use crate::encoding::workspace::{Workspace, no_trailing};
+use alloc::vec::Vec;
 
 /// Resets `m` to `(window_log, hash_log, mls, step_size)` with its hash table
 /// laid out in `ws`, which the test keeps alive for as long as it uses `m`. A
@@ -45,7 +46,8 @@ fn new_uses_level_1_defaults() {
     // the hash table's empty-slot value 0 can't be confused
     // with a real match.
     assert_eq!(m.prefix_start_index, INITIAL_PREFIX_START_INDEX);
-    assert!(m.pending.is_none());
+    assert!(m.staged_block.is_none());
+    assert_eq!(m.uncommitted_len, 0);
 }
 
 #[test]
@@ -110,7 +112,7 @@ fn borrowed_window_matches_owned_sequence_stream() {
     // Owned path: commit each block, then scan.
     let mut owned = FastKernelMatcher::with_params(15, 12, 5, 2);
     let mut owned_seqs: alloc::vec::Vec<Seq> = alloc::vec::Vec::new();
-    owned.accept_data(whole[..split].to_vec());
+    owned.commit_input(&whole[..split]);
     owned.start_matching(|seq| match seq {
         Sequence::Triple {
             literals,
@@ -119,7 +121,7 @@ fn borrowed_window_matches_owned_sequence_stream() {
         } => owned_seqs.push(Seq::Triple(literals.to_vec(), offset, match_len)),
         Sequence::Literals { literals } => owned_seqs.push(Seq::Lits(literals.to_vec())),
     });
-    owned.accept_data(whole[split..].to_vec());
+    owned.commit_input(&whole[split..]);
     owned.start_matching(|seq| match seq {
         Sequence::Triple {
             literals,
@@ -205,14 +207,19 @@ fn reset_clears_history_and_state() {
     let mut ws = Workspace::new();
     let mut m = FastKernelMatcher::new();
     // Simulate prior-frame state — non-empty history, advanced
-    // prefix, non-default rep/offset stacks, a leftover pending
-    // block. Reset must restore the matcher to a from-scratch
-    // appearance regardless of which fields were dirtied.
+    // prefix, non-default rep/offset stacks, a committed block left
+    // unprocessed and bytes read in place but never claimed. Reset must
+    // restore the matcher to a from-scratch appearance regardless of which
+    // fields were dirtied.
     m.history.extend_from_slice(&[1, 2, 3, 4]);
     m.prefix_start_index = 7;
     m.rep = [42, 99];
     m.offset_hist = [10, 20, 30];
-    m.pending = Some(alloc::vec![5, 6, 7]);
+    m.commit_input([5, 6, 7]);
+    m.fill_uncommitted(2, |history| {
+        history.extend_from_slice(&[8, 9]);
+        (2, false)
+    });
 
     reset_in(&mut m, &mut ws, LEVEL_1_SHAPE, TableCarry::Clear);
 
@@ -222,7 +229,8 @@ fn reset_clears_history_and_state() {
     assert_eq!(m.prefix_start_index, INITIAL_PREFIX_START_INDEX);
     assert_eq!(m.rep, FAST_INITIAL_REP);
     assert_eq!(m.offset_hist, FAST_INITIAL_OFFSET_HIST);
-    assert!(m.pending.is_none());
+    assert!(m.staged_block.is_none());
+    assert_eq!(m.uncommitted_len, 0);
     // Hash-table identity preserved (same shape) — `clear()` path,
     // not a fresh `new()`. Equality test is over the params, not
     // the buffer pointer, because the `Vec`-internal allocation
@@ -322,7 +330,7 @@ fn accept_then_start_matching_emits_match_for_repeated_run() {
     // hash collisions on a 64-byte synthetic input are noisier
     // for mls>=5.
     let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
-    m.accept_data(data.clone());
+    m.commit_input(data.clone());
 
     let mut emitted_match_lens: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
     let mut emitted_literal_byte_count: usize = 0;
@@ -351,8 +359,8 @@ fn accept_then_start_matching_emits_match_for_repeated_run() {
         emitted_match_lens.iter().any(|&m| m >= 4),
         "kernel must emit at least one Triple with match_len >= MIN_MATCH (got {emitted_match_lens:?})",
     );
-    // Pending buffer was consumed.
-    assert!(m.pending.is_none());
+    // The staged block was consumed.
+    assert!(m.staged_block.is_none());
     // History grew by exactly the block size (plus the
     // no dummy carried since construction — M8).
     assert_eq!(m.history.len(), data.len() + HISTORY_DRAIN_BASE);
@@ -374,7 +382,7 @@ fn skip_matching_extends_history_without_emissions() {
     let pre_offset_hist = m.offset_hist;
 
     let payload: alloc::vec::Vec<u8> = (0..40u8).collect();
-    m.accept_data(payload.clone());
+    m.commit_input(payload.clone());
     // Take a count of state pre-skip.
     assert_eq!(m.last_committed_space().len(), payload.len());
 
@@ -383,14 +391,14 @@ fn skip_matching_extends_history_without_emissions() {
     assert_eq!(
         m.history.len(),
         payload.len() + HISTORY_DRAIN_BASE,
-        "skip_matching must append the pending buffer to history",
+        "skip_matching must leave the committed block in history",
     );
     assert_eq!(m.rep, pre_rep, "skip must not touch rep state");
     assert_eq!(
         m.offset_hist, pre_offset_hist,
         "skip must not touch offset_hist",
     );
-    assert!(m.pending.is_none());
+    assert!(m.staged_block.is_none());
 }
 
 /// Two-block run with literal block then matchable block — the
@@ -426,11 +434,11 @@ fn cross_block_match_finds_first_block_payload() {
     let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
 
     // Block 1 — drain emissions, ignore.
-    m.accept_data(block1.clone());
+    m.commit_input(block1.clone());
     m.start_matching(|_seq| {});
 
     // Block 2 — capture emissions.
-    m.accept_data(block2.clone());
+    m.commit_input(block2.clone());
     let mut max_match: usize = 0;
     let mut saw_cross_block = false;
     m.start_matching(|seq| {
@@ -482,7 +490,7 @@ fn skip_matching_with_false_hint_populates_hashes_for_dict_priming() {
     }
 
     let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
-    m.accept_data(dict_block.clone());
+    m.commit_input(dict_block.clone());
     m.skip_matching_with_hint(Some(false)); // dictionary-priming skip
 
     // Sanity: history grew, prefix_start_index unchanged.
@@ -495,7 +503,7 @@ fn skip_matching_with_false_hint_populates_hashes_for_dict_priming() {
     block2.extend(100..116u8);
     block2.extend_from_slice(&dict_block[0..16]);
     block2.extend(120..136u8);
-    m.accept_data(block2.clone());
+    m.commit_input(block2.clone());
 
     let mut saw_cross_block = false;
     m.start_matching(|seq| {
@@ -524,14 +532,14 @@ fn skip_matching_with_none_hint_skips_hash_population() {
     }
 
     let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
-    m.accept_data(dict_block.clone());
+    m.commit_input(dict_block.clone());
     m.skip_matching_with_hint(None); // plain skip — no hash pre-population
 
     let mut block2 = alloc::vec::Vec::with_capacity(48);
     block2.extend(100..116u8);
     block2.extend_from_slice(&dict_block[0..16]);
     block2.extend(120..136u8);
-    m.accept_data(block2.clone());
+    m.commit_input(block2.clone());
 
     let mut saw_cross_block = false;
     m.start_matching(|seq| {
@@ -573,14 +581,14 @@ fn extend_history_drains_old_prefix_past_two_window_sizes() {
         let block: alloc::vec::Vec<u8> = (0..200u8)
             .map(|i| i.wrapping_add(round as u8 * 17))
             .collect();
-        m.accept_data(block);
+        m.commit_input(block);
         m.skip_matching_with_hint(None);
     }
     // Hard bound: post-append history can hold up to
     // `max_window_size + block_size` (retained prefix + the
     // just-appended block). The eviction policy keeps total
     // strictly below `2 × max_window_size` for the next
-    // accept_data call, so the invariant we assert here is the
+    // commit, so the invariant we assert here is the
     // post-append upper bound.
     assert!(
         m.history.len() <= m.max_window_size * 2 + HISTORY_DRAIN_BASE,
@@ -619,7 +627,7 @@ fn skip_matching_dict_prime_handles_exactly_hash_read_size_bytes() {
     // HISTORY_DRAIN_BASE (= 0), hashed range = [0..=0] (one
     // position).
     let payload: alloc::vec::Vec<u8> = (0..8u8).collect();
-    m.accept_data(payload);
+    m.commit_input(payload);
     m.skip_matching_with_hint(Some(false));
     assert_eq!(m.history.len(), 8 + HISTORY_DRAIN_BASE);
     // No assertion on hash entries — the bug we're guarding
@@ -646,7 +654,7 @@ fn copy_mode_dictionary_fill_keeps_the_upstream_occurrence_per_bucket() {
     // phase outright.
     let dict: alloc::vec::Vec<u8> = b"abcd".iter().copied().cycle().take(96).collect();
     let mut m = FastKernelMatcher::with_params(12, 12, 4, 2);
-    m.accept_data(dict);
+    m.commit_input(dict);
     m.skip_matching_for_dict_copy();
 
     let base = m.history.as_ptr();
@@ -680,7 +688,7 @@ fn copy_mode_dictionary_fill_keeps_the_upstream_occurrence_per_bucket() {
 #[test]
 fn copy_mode_dictionary_fill_leaves_a_dictionary_too_short_to_hash() {
     let mut m = FastKernelMatcher::with_params(12, 12, 4, 2);
-    m.accept_data(alloc::vec![0xABu8; 5]);
+    m.commit_input(alloc::vec![0xABu8; 5]);
     m.skip_matching_for_dict_copy();
     assert_eq!(
         m.dict_copy_fill_next, 0,
@@ -698,7 +706,7 @@ fn copy_mode_dictionary_fill_leaves_a_dictionary_too_short_to_hash() {
 fn copy_mode_dictionary_fill_indexes_nothing_when_the_stride_is_already_past() {
     let dict: alloc::vec::Vec<u8> = b"abcd".iter().copied().cycle().take(64).collect();
     let mut m = FastKernelMatcher::with_params(12, 12, 4, 2);
-    m.accept_data(dict);
+    m.commit_input(dict);
     m.skip_matching_for_dict_copy();
     let after_first = m.dict_copy_fill_next;
     assert!(
@@ -710,7 +718,7 @@ fn copy_mode_dictionary_fill_indexes_nothing_when_the_stride_is_already_past() {
     // A further slice that adds no bytes: the cursor is already past what the
     // history makes hashable, which is the guard's case. It is also what a
     // history that shrank under eviction would leave behind.
-    m.accept_data(alloc::vec::Vec::new());
+    m.commit_input(alloc::vec::Vec::new());
     m.skip_matching_for_dict_copy();
     assert_eq!(m.dict_copy_fill_next, after_first);
 }
@@ -723,7 +731,7 @@ fn copy_mode_dictionary_fill_runs_at_every_hash_width() {
     for mls in 4u32..=8 {
         let dict: alloc::vec::Vec<u8> = (0..96u8).map(|b| b.wrapping_mul(7)).collect();
         let mut m = FastKernelMatcher::with_params(12, 14, mls, 2);
-        m.accept_data(dict);
+        m.commit_input(dict);
         m.skip_matching_for_dict_copy();
         assert!(
             m.dict_copy_fill_next > 0,
@@ -740,7 +748,7 @@ fn copy_mode_dictionary_fill_runs_at_every_hash_width() {
 fn skip_matching_dict_prime_handles_below_hash_read_size_bytes() {
     let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
     let payload: alloc::vec::Vec<u8> = (0..4u8).collect();
-    m.accept_data(payload);
+    m.commit_input(payload);
     // history will be 4 bytes after append < HASH_READ_SIZE (8).
     // prime_hash_table_for_range must short-circuit on the
     // `history_len < HASH_READ_SIZE` guard.
@@ -765,13 +773,13 @@ fn dict_prime_indexes_positions_across_chunk_seam() {
     let chunk1: alloc::vec::Vec<u8> = (0..16u8)
         .map(|i| i.wrapping_mul(37).wrapping_add(13))
         .collect();
-    m.accept_data(chunk1);
+    m.commit_input(chunk1);
     m.skip_matching_for_dict_prime(32);
     let seam = m.history.len(); // end of first chunk
     let chunk2: alloc::vec::Vec<u8> = (16..32u8)
         .map(|i| i.wrapping_mul(37).wrapping_add(13))
         .collect();
-    m.accept_data(chunk2);
+    m.commit_input(chunk2);
     m.skip_matching_for_dict_prime(32);
 
     // A position in the (HASH_READ_SIZE - 1)-byte gap just below the
@@ -805,16 +813,16 @@ fn dict_prime_in_slices_matches_single_pass_fill() {
         .map(|i| i.wrapping_mul(37).wrapping_add(13))
         .collect();
     let mut whole = FastKernelMatcher::with_params(16, 16, 4, 2);
-    whole.accept_data(dict.clone());
+    whole.commit_input(dict.clone());
     whole.skip_matching_for_dict_prime(dict.len());
 
     // A 30-byte first slice hashes up to position 22: the stride groups
     // 0..=18 complete and the group at 21 cannot (its step is past the
     // slice's hashable end), so the second slice must resume at 21.
     let mut sliced = FastKernelMatcher::with_params(16, 16, 4, 2);
-    sliced.accept_data(dict[..30].to_vec());
+    sliced.commit_input(&dict[..30]);
     sliced.skip_matching_for_dict_prime(dict.len());
-    sliced.accept_data(dict[30..].to_vec());
+    sliced.commit_input(&dict[30..]);
     sliced.skip_matching_for_dict_prime(dict.len());
 
     let a = whole.dict.table().expect("single-pass dict table");
@@ -839,9 +847,9 @@ fn dict_prime_sizes_the_table_from_the_whole_dictionary() {
         .map(|i| (i.wrapping_mul(37) ^ (i >> 5)) as u8)
         .collect();
     let mut m = FastKernelMatcher::with_params(20, 20, 4, 2);
-    m.accept_data(dict[..30].to_vec());
+    m.commit_input(&dict[..30]);
     m.skip_matching_for_dict_prime(dict.len());
-    m.accept_data(dict[30..].to_vec());
+    m.commit_input(&dict[30..]);
     m.skip_matching_for_dict_prime(dict.len());
     let (expected, _) =
         crate::encoding::cparams::create_cdict_table_logs(20, 20, 20, false, dict.len());
@@ -860,7 +868,7 @@ fn block_samples_match_dict_fires_only_on_extendable_dict_match() {
         .map(|i| i.wrapping_mul(37).wrapping_add(13))
         .collect();
     let mut m = FastKernelMatcher::with_params(20, 20, 4, 2);
-    m.accept_data(dict.clone());
+    m.commit_input(dict.clone());
     m.skip_matching_for_dict_prime(dict.len());
     assert!(m.dict_is_attached(), "dict must be attached after prime");
 
@@ -921,13 +929,13 @@ fn main_table_prime_indexes_positions_across_slice_seam() {
     let chunk1: alloc::vec::Vec<u8> = (0..16u8)
         .map(|i| i.wrapping_mul(53).wrapping_add(7))
         .collect();
-    m.accept_data(chunk1);
+    m.commit_input(chunk1);
     m.skip_matching_with_hint(Some(false));
     let seam = m.history.len();
     let chunk2: alloc::vec::Vec<u8> = (16..32u8)
         .map(|i| i.wrapping_mul(53).wrapping_add(7))
         .collect();
-    m.accept_data(chunk2);
+    m.commit_input(chunk2);
     m.skip_matching_with_hint(Some(false));
 
     let p = seam - 4;
@@ -960,7 +968,7 @@ fn rep_tracks_last_explicit_offset_and_offset_hist_is_not_matched() {
     data.extend_from_within(0..48);
 
     let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
-    m.accept_data(data.clone());
+    m.commit_input(data.clone());
 
     let mut emitted_offsets: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
     m.start_matching(|seq| {
@@ -1008,15 +1016,15 @@ fn eviction_during_dict_priming_drops_stale_prime_entries() {
     // one triggers eviction.
     let mut m = FastKernelMatcher::with_params(8, 6, 4, 2);
     let block1: alloc::vec::Vec<u8> = (0..200u8).collect();
-    m.accept_data(block1);
+    m.commit_input(block1);
     m.skip_matching_with_hint(Some(false));
     let block2: alloc::vec::Vec<u8> = (0..200u8).map(|i| i.wrapping_add(50)).collect();
-    m.accept_data(block2);
+    m.commit_input(block2);
     // Second skip would push total to 400, still under 512 — no
     // eviction yet. Make sure two more rounds trigger it.
     m.skip_matching_with_hint(Some(false));
     let block3: alloc::vec::Vec<u8> = (0..200u8).map(|i| i.wrapping_add(100)).collect();
-    m.accept_data(block3);
+    m.commit_input(block3);
     // Now 400+200=600 > 512 → eviction fires inside extend.
     m.skip_matching_with_hint(Some(false));
 
@@ -1031,25 +1039,21 @@ fn eviction_during_dict_priming_drops_stale_prime_entries() {
     assert!(m.history.len() <= m.max_window_size * 2);
 }
 
-/// Regression for #216 review #1: `accept_data` MUST perform
-/// window eviction immediately so the driver's `commit_space`
-/// can observe the byte delta via a pre/post `history.len()`
-/// comparison. Without commit-time eviction visibility, the
-/// driver's `retire_dictionary_budget` never runs for this
-/// backend → `max_window_size` stays inflated post-dict-prime
-/// → matcher can emit offsets exceeding the frame header's
-/// reported window (format-correctness risk).
+/// `commit_block` MUST perform window eviction immediately and report
+/// the evicted bytes, so the driver's `commit_filled` can retire the
+/// dictionary budget. Without that, `max_window_size` stays inflated
+/// post-dict-prime and the matcher can emit offsets exceeding the
+/// frame header's reported window (format-correctness risk).
 #[test]
-fn accept_data_evicts_eagerly_so_commit_observes_byte_delta() {
+fn commit_evicts_eagerly_and_reports_the_evicted_bytes() {
     // window_log = 8 → max_window_size = 256, eviction threshold
-    // = 512. Stage three 200-byte blocks via accept_data + a
-    // start_matching cycle each so history accumulates without
-    // eviction (200, 400 bytes). The THIRD accept_data crosses
-    // the 512-byte threshold; its eviction MUST be visible at
-    // accept_data return-time via the history.len() drop.
+    // = 512. Commit three 200-byte blocks, each followed by a skip,
+    // so history accumulates without eviction (200, 400 bytes). The
+    // THIRD commit crosses the 512-byte threshold; its eviction MUST
+    // be visible when `commit_block` returns.
     let mut m = FastKernelMatcher::with_params(8, 6, 4, 2);
 
-    m.accept_data((0..200u8).collect());
+    m.commit_input((0..200u8).collect::<Vec<u8>>());
     m.skip_matching_with_hint(None);
     assert_eq!(m.history.len(), 200 + HISTORY_DRAIN_BASE);
     assert_eq!(
@@ -1057,7 +1061,7 @@ fn accept_data_evicts_eagerly_so_commit_observes_byte_delta() {
         "no eviction yet"
     );
 
-    m.accept_data((0..200u8).map(|i| i.wrapping_add(50)).collect());
+    m.commit_input((0..200u8).map(|i| i.wrapping_add(50)).collect::<Vec<u8>>());
     m.skip_matching_with_hint(None);
     assert_eq!(m.history.len(), 400 + HISTORY_DRAIN_BASE);
     assert_eq!(
@@ -1065,24 +1069,21 @@ fn accept_data_evicts_eagerly_so_commit_observes_byte_delta() {
         "still no eviction (400 < 512)",
     );
 
-    // Third commit: real history (400) + new space (200) = 600 > 512.
-    // Eviction MUST fire inside accept_data, dropping history
-    // back to max_window_size (256) BEFORE the kernel runs.
-    // `history_len_for_eviction_accounting` returns the real-data
-    // length (history.len() minus HISTORY_DRAIN_BASE, which is 0
-    // under M8), so pre/post compare cleanly in real-byte units.
-    let pre = m.history_len_for_eviction_accounting();
-    m.accept_data((0..200u8).map(|i| i.wrapping_add(100)).collect());
-    let post = m.history_len_for_eviction_accounting();
-    assert!(
-        pre > post,
-        "accept_data must shrink history at the eviction threshold \
-             (pre={pre}, post={post}) — driver's commit_space relies on \
-             this delta for retire_dictionary_budget accounting",
+    // Third commit: real history (400) + new block (200) = 600 > 512.
+    // Eviction MUST fire inside commit_block, dropping the window back
+    // to max_window_size (256) before the block and BEFORE the kernel
+    // runs, and report what it dropped: the driver's retire of the
+    // dictionary budget relies on that count.
+    let evicted = m.commit_input((0..200u8).map(|i| i.wrapping_add(100)).collect::<Vec<u8>>());
+    assert_eq!(
+        evicted,
+        400 - 256,
+        "commit_block must evict at the threshold and report the bytes",
     );
     assert_eq!(
-        post, 256,
-        "post-eviction retained must equal max_window_size",
+        m.committed_len(),
+        256 + 200,
+        "post-eviction retained must equal max_window_size, then the block",
     );
     assert_eq!(
         m.prefix_start_index, INITIAL_PREFIX_START_INDEX,
@@ -1110,7 +1111,7 @@ fn trim_to_window_keeps_last_committed_space_consistent() {
     // a valid in-bounds slice.
     let mut m = FastKernelMatcher::with_params(8, 6, 4, 2);
     let payload: alloc::vec::Vec<u8> = (0..200u8).collect();
-    m.accept_data(payload);
+    m.commit_input(payload);
     m.skip_matching_with_hint(None);
     // First block lands at history[RESERVED..RESERVED+200] after
     // the seed dummy at [0..RESERVED). last_block_start tracks
@@ -1123,7 +1124,7 @@ fn trim_to_window_keeps_last_committed_space_consistent() {
     // bug surface, use a SECOND block so last_block_start is
     // somewhere AFTER the dummy + first block.
     let payload2: alloc::vec::Vec<u8> = (50..150u8).collect();
-    m.accept_data(payload2);
+    m.commit_input(payload2);
     m.skip_matching_with_hint(None);
     // history = [dummy] + [0..200] + [50..150] = 1 + 200 + 100 = 301.
     // last_block_start = RESERVED + 200 = start of second block.
@@ -1200,7 +1201,7 @@ fn prime_offset_history_keeps_rep_and_offset_hist_in_lockstep() {
 /// the documented `2 × max_window_size` post-append bound.
 /// Fix retains a SMALLER prefix (or none) so the bound holds.
 #[test]
-fn accept_data_evicts_more_aggressively_when_block_larger_than_window() {
+fn commit_evicts_more_aggressively_when_block_larger_than_window() {
     let mut m = FastKernelMatcher::with_params(8, 6, 4, 2);
     // max_window_size = 256 (1 << 8). Threshold = 512.
 
@@ -1208,10 +1209,10 @@ fn accept_data_evicts_more_aggressively_when_block_larger_than_window() {
     // skip_matching_with_hint (no kernel-side trimming). u8 range
     // tops at 255, so the 256-byte preamble cycles via modulo.
     let preamble: alloc::vec::Vec<u8> = (0..256u32).map(|i| i as u8).collect();
-    m.accept_data(preamble);
+    m.commit_input(preamble);
     m.skip_matching_with_hint(None);
     assert_eq!(
-        m.history_len_for_eviction_accounting(),
+        m.committed_len(),
         256,
         "history pre-filled to one full window of real bytes",
     );
@@ -1222,32 +1223,25 @@ fn accept_data_evicts_more_aggressively_when_block_larger_than_window() {
     let oversize: alloc::vec::Vec<u8> = (0..400u32)
         .map(|i| (i as u8).wrapping_mul(7).wrapping_add(11))
         .collect();
-    m.accept_data(oversize);
+    let evicted = m.commit_input(oversize);
 
-    // Post-append real_len + space.len() MUST stay within 2×
-    // max_window_size (the documented invariant). Pre-fix it
-    // jumped to 256 + 400 = 656 = 2.56× — bound violated.
-    let real_len_after = m.history_len_for_eviction_accounting();
-    // accept_data stashes pending without appending, so the
-    // 400-byte block is in pending. real_len reflects post-
-    // drain retained real bytes. To verify the bound, run
-    // start_matching to commit the append.
+    // Window + block MUST stay within 2× max_window_size (the documented
+    // invariant). Pre-fix it jumped to 256 + 400 = 656 = 2.56× — bound
+    // violated.
     m.start_matching(|_| {});
-    let real_total = m.history_len_for_eviction_accounting();
+    let real_total = m.committed_len();
     assert!(
         real_total <= m.max_window_size * 2,
         "post-append history MUST stay within 2 × max_window_size \
              (got real_total={real_total}, cap={})",
         m.max_window_size * 2,
     );
-    // Sanity: pre-append eviction did drain something (we had
-    // 256 real bytes, can't accept 400 more while staying under
-    // 512 unless we drop at least 144).
+    // Sanity: the commit did drain something (we had 256 real bytes,
+    // can't take 400 more while staying under 512 unless we drop at
+    // least 144).
     assert!(
-        real_len_after < 256,
-        "pre-append drain must have shed historical bytes \
-             (got real_len_after_drain={real_len_after}, was 256 \
-             before accept)",
+        evicted >= 144,
+        "the commit must have shed historical bytes (evicted {evicted})",
     );
 }
 
@@ -1273,7 +1267,7 @@ fn start_matching_enforces_max_window_size_offset_bound() {
     // Block 1: 200 bytes of a distinct ASCII pattern that
     // populates the hash table at positions 0..200.
     let block1: alloc::vec::Vec<u8> = (0..200u8).map(|i| 0x30 + (i % 64)).collect();
-    m.accept_data(block1.clone());
+    m.commit_input(block1.clone());
     m.start_matching(|_| {});
 
     // Block 2: 200 bytes that RE-USE block1's content from
@@ -1281,7 +1275,7 @@ fn start_matching_enforces_max_window_size_offset_bound() {
     // kernel would happily emit Triples with offset
     // ≈ history_len (~200..400) — well past max_window=128.
     let block2 = block1.clone();
-    m.accept_data(block2);
+    m.commit_input(block2);
 
     let mut max_emitted_offset = 0usize;
     let mut emitted_match_count = 0usize;
@@ -1354,7 +1348,7 @@ fn start_matching_caps_offsets_at_window_log_not_inflated_max() {
     // floor and 192 falls in the step-skip gap, leaving the test
     // with zero emittable matches.
     let dict: alloc::vec::Vec<u8> = (0..200u8).map(|i| 0x40 + (i % 4)).collect();
-    m.accept_data(dict.clone());
+    m.commit_input(dict.clone());
     m.start_matching(|_| {}); // populate hash table from dict
     m.max_window_size = m.max_window_size.saturating_add(200);
 
@@ -1364,7 +1358,7 @@ fn start_matching_caps_offsets_at_window_log_not_inflated_max() {
     // (328) keeps even the dict's earliest bytes inside the
     // sliding floor.
     let block: alloc::vec::Vec<u8> = (0..100u8).map(|i| 0x40 + (i % 4)).collect();
-    m.accept_data(block);
+    m.commit_input(block);
 
     let mut max_emitted_offset = 0usize;
     let mut emitted_match_count = 0usize;
@@ -1431,7 +1425,7 @@ fn block_zero_prologue_preserves_default_rep_offset_one() {
     data.resize(200, 0x42);
 
     let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
-    m.accept_data(data.clone());
+    m.commit_input(data.clone());
 
     let mut first_literals_len: Option<usize> = None;
     let mut first_offset: Option<usize> = None;

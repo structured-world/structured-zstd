@@ -1,27 +1,36 @@
 use super::*;
 use crate::encoding::{
-    Matcher, Sequence,
+    HistoryBuf, Matcher, Sequence,
     frame_compressor::{CompressState, FseTables},
+    test_input::TestInput,
 };
 use alloc::vec;
 
 #[derive(Default)]
 struct HintProbeMatcher {
-    last_space: Vec<u8>,
+    input: TestInput,
     skip_hints: Vec<Option<bool>>,
 }
 
 impl Matcher for HintProbeMatcher {
-    fn get_next_space(&mut self) -> Vec<u8> {
-        vec![0; 1024]
-    }
-
     fn get_last_space(&mut self) -> &[u8] {
-        &self.last_space
+        self.input.last_block()
     }
 
-    fn commit_space(&mut self, space: Vec<u8>) {
-        self.last_space = space;
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool) {
+        self.input.fill(capacity, fill)
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        self.input.uncommitted()
+    }
+
+    fn commit_filled(&mut self, len: usize) {
+        self.input.commit(len);
     }
 
     fn skip_matching(&mut self) {
@@ -76,12 +85,17 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         literal_compression_disabled: false,
     };
     let mut output = Vec::new();
+    let block = vec![0xAB; 1024];
+    state.matcher.fill_in_place(block.len(), &mut |history| {
+        history.extend_from_slice(&block);
+        (block.len(), false)
+    });
 
     let emitted = compress_block_encoded(
         &mut state,
         CompressionLevel::Fastest,
         true,
-        super::BlockInput::Staged(vec![0xAB; 1024]),
+        block.len(),
         &mut output,
         false,
         #[cfg(feature = "lsm")]

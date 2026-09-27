@@ -50,7 +50,7 @@ fn build_dfast_with(data: &[u8]) -> DfastMatchGenerator {
     // trimming history mid-test.
     let mut dfast = DfastMatchGenerator::new(data.len().next_power_of_two().max(64));
     dfast.ensure_hash_tables();
-    dfast.add_data(data.to_vec(), |_| {});
+    dfast.commit_input(data);
     dfast
 }
 
@@ -143,8 +143,8 @@ fn dfast_repcode_extension_walks_into_retained_history() {
     let block_b: Vec<u8> = vec![b'C'; 32];
     let mut dfast = DfastMatchGenerator::new(256);
     dfast.ensure_hash_tables();
-    dfast.add_data(block_a, |_| {});
-    dfast.add_data(block_b.clone(), |_| {});
+    dfast.commit_input(&block_a);
+    dfast.commit_input(&block_b);
 
     // Post-primary-match state targeting cross-block rep: probe
     // offset = 40 (a candidate inside block A bytes), block-local
@@ -220,7 +220,7 @@ fn dfast_repcode_extension_accepts_exactly_four_byte_rep() {
     assert_eq!(data.len(), 32, "fixture invariant: 32 bytes");
     let mut dfast = DfastMatchGenerator::new(64);
     dfast.ensure_hash_tables();
-    dfast.add_data(data.clone(), |_| {});
+    dfast.commit_input(&data);
 
     dfast.offset_hist = [12, 8, 4];
     let current_abs_start = dfast.history_abs_start + dfast.window_size - data.len();
@@ -352,7 +352,7 @@ fn dfast_default_level_roundtrip_with_repetitive_breaks_exercises_fast_loop() {
     );
 }
 
-/// The borrowed one-shot scan (no per-block `commit_space` copy) must
+/// The borrowed one-shot scan (no per-block copy into history) must
 /// emit the byte-identical sequence stream as the owned `history`-copying
 /// path for an in-window input: the window far exceeds the input so the
 /// owned path never evicts, making its accumulated `history` identical to
@@ -374,12 +374,12 @@ fn dfast_borrowed_window_matches_owned_sequence_stream() {
     let mut owned = DfastMatchGenerator::new(window);
     owned.ensure_hash_tables();
     let mut owned_seqs: Vec<CapturedSeq> = Vec::new();
-    owned.add_data(whole[..split].to_vec(), |_| {});
+    owned.commit_input(&whole[..split]);
     {
         let mut rec = record_seq(&mut owned_seqs);
         owned.start_matching(&mut rec);
     }
-    owned.add_data(whole[split..].to_vec(), |_| {});
+    owned.commit_input(&whole[split..]);
     {
         let mut rec = record_seq(&mut owned_seqs);
         owned.start_matching(&mut rec);

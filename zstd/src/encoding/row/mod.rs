@@ -2325,16 +2325,12 @@ pub(crate) struct RowMatchGenerator {
     pub(crate) max_window_size: usize,
     /// Per-committed-block lengths of the live window, mirroring the
     /// `HashChain` backend's `chunk_lens`. The block bytes themselves live
-    /// only in the contiguous `history` mirror; the input buffers are handed
-    /// straight back to the caller's pool in `add_data` rather than retained
-    /// here. Retaining them (the old `VecDeque<Vec<u8>>`) held a full
-    /// `block_capacity`-sized buffer per committed block, which on a heavily
-    /// pre-split frame ballooned the window to many times the live byte count.
+    /// only in the contiguous `history` mirror.
     pub(crate) chunk_lens: VecDeque<usize>,
     pub(crate) window_size: usize,
-    /// Bytes at the tail of `history` read but not yet claimed by a block
-    /// (in-place ingest). Zero on the staged path. Explicit rather than derived
-    /// from `window_size`, since a primed dictionary also lives in `history`.
+    /// Bytes at the tail of `history` read but not yet claimed by a block.
+    /// Explicit rather than derived from `window_size`, since a primed
+    /// dictionary also lives in `history`.
     pub(crate) uncommitted_len: usize,
     pub(crate) history: HistoryBuf,
     pub(crate) history_start: usize,
@@ -2447,7 +2443,7 @@ pub(crate) struct RowMatchGenerator {
     // footprint vs the upstream zstd-parity `U32` layout. `ROW_EMPTY_SLOT == u32::MAX`
     // is the empty sentinel, so every stored position must stay strictly below
     // it. On a long stream the cumulative absolute cursor would cross `u32::MAX`
-    // even while the live window is bounded; `add_data` rebases the coordinate
+    // even while the live window is bounded; `commit_block` rebases the coordinate
     // origin down to the oldest live byte before that happens (see
     // [`Self::rebase_positions`]), keeping positions representable without
     // capping frame length. The tags and the slot cursors live in the byte
@@ -2775,7 +2771,7 @@ impl RowMatchGenerator {
             // Bounded fallback: rewind the coordinate space and zero the
             // tables so the absolute cursor cannot climb without bound
             // (mirrors dfast; the u32 packing is separately kept in range
-            // by `rebase_positions` in `add_data`).
+            // by `rebase_positions` in `commit_block`).
             self.history_abs_start = 0;
             // The shared buffer holds whichever finder's tables are live, so
             // it takes that finder's empty sentinel.
@@ -2799,8 +2795,6 @@ impl RowMatchGenerator {
         // starts at the frame start with no dictionary (a dictionary frame
         // primes these right after).
         self.lazy_reps = None;
-        // Block buffers are returned to the caller's pool per block in
-        // `add_data`, so there is nothing window-side to recycle here.
         self.chunk_lens.clear();
         let Some(region) = reborrow_region else {
             self.lazy_next_to_update = self.history_abs_start;
@@ -2855,10 +2849,8 @@ impl RowMatchGenerator {
             ..self.history.len() - self.uncommitted_len]
     }
 
-    /// Phase 1 of in-place ingest: `fill` writes the next block STRAIGHT into
-    /// the tail of `history` rather than into a scratch `Vec` that
-    /// [`Self::add_data`] then copies in. See `MatchTable::fill_uncommitted`
-    /// for the two-phase rationale; the bytes only join the window once
+    /// Phase 1 of ingest: `fill` writes the next block STRAIGHT into the tail
+    /// of `history`. The bytes only join the window once
     /// [`Self::commit_block`] claims them, so the pre-split remainder stays
     /// where it is and heads the next block at no copy cost.
     pub(crate) fn fill_uncommitted(
@@ -2897,10 +2889,9 @@ impl RowMatchGenerator {
         &self.history[self.history.len() - self.uncommitted_len..]
     }
 
-    /// Phase 2 of in-place ingest: claim `len` bytes from the head of
-    /// [`Self::uncommitted`] as the next block, running the same coordinate
-    /// rebase, eviction, dict retire and valid-data floor updates
-    /// [`Self::add_data`] performs.
+    /// Phase 2 of ingest: claim `len` bytes from the head of
+    /// [`Self::uncommitted`] as the next block, with the coordinate rebase,
+    /// eviction, dict retire and valid-data floor updates that go with it.
     pub(crate) fn commit_block(&mut self, len: usize) {
         if len == 0 {
             return;
@@ -2914,6 +2905,14 @@ impl RowMatchGenerator {
             "commit_block: {len} exceeds the {} uncommitted bytes",
             self.uncommitted().len(),
         );
+        // Row stores absolute match positions as `u32` (with `u32::MAX` the
+        // empty sentinel). On a long stream the cumulative absolute cursor
+        // crosses the u32 range even while the live window stays bounded, so
+        // rebase the coordinate origin down to the oldest live byte before the
+        // block's positions would overflow. Cold path: fires at most once per
+        // ~4 GiB of stream, and one rebase always suffices because the live
+        // window is far smaller than u32::MAX. `check_stream_abs_headroom` in
+        // `fill_uncommitted` guards the 32-bit-target `usize` overflow.
         if self.history_abs_start + self.window_size + len >= u32::MAX as usize - 1 - BT_IDX_BASE {
             self.rebase_positions();
         }
@@ -2939,74 +2938,11 @@ impl RowMatchGenerator {
         // what is legal there.
         if self.history_start != evicted_from {
             self.dict.invalidate();
-            // Same one-time ceiling as `add_data`: once eviction starts, grow
-            // the mirror linearly to (window + window/4 + one block).
-            let target = self.max_window_size
-                + (self.max_window_size >> 2)
-                + crate::common::MAX_BLOCK_SIZE as usize;
-            if target > self.history.len() && self.history.capacity() < target {
-                self.history.reserve_exact(target - self.history.len());
-            }
-        }
-        if self.low_limit < self.history_abs_start {
-            self.low_limit = self.history_abs_start;
-        }
-        if self.prefix_low < self.low_limit {
-            self.prefix_low = self.low_limit;
-        }
-        // Same position in the sequence as `add_data`: compact AFTER the
-        // eviction that raised `history_start`, so the drain trigger sees the
-        // same state and the buffer evolves identically.
-        self.compact_history();
-        self.window_size += len;
-        self.chunk_lens.push_back(len);
-        self.uncommitted_len -= len;
-    }
-
-    pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
-        assert!(data.len() <= self.max_window_size);
-        super::match_table::storage::check_stream_abs_headroom(
-            self.history_abs_start,
-            self.window_size,
-            data.len(),
-        );
-        // Row stores absolute match positions as `u32` (with `u32::MAX` the
-        // empty sentinel). On a long stream the cumulative absolute cursor
-        // crosses the u32 range even while the live window stays bounded, so
-        // rebase the coordinate origin down to the oldest live byte before the
-        // upcoming block's positions would overflow. Cold path — fires at most
-        // once per ~4 GiB of stream, and one rebase always suffices because the
-        // live window is far smaller than u32::MAX. `check_stream_abs_headroom`
-        // above already guards the 32-bit-target `usize` overflow separately.
-        if self.history_abs_start + self.window_size + data.len()
-            >= u32::MAX as usize - 1 - BT_IDX_BASE
-        {
-            self.rebase_positions();
-        }
-        // Same reach as `commit_block`: a full window stays behind the incoming
-        // block, because the floor is measured from the block's start.
-        let evicted_from = self.history_start;
-        while self.window_size > self.max_window_size {
-            let removed_len = self.chunk_lens.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
-        }
-        if self.history_start != evicted_from {
-            // Eviction advanced `history_start`, staling the dict row index's
-            // concat positions — drop the attach (dict slid within/out window).
-            // Conditioned on what the eviction DID, not on what adding this
-            // block would need: between the two the dictionary is still whole
-            // and still reachable from the block's first byte.
-            self.dict.invalidate();
-            // Cap the history buffer near the live window instead of letting
-            // the Vec power-of-two double to ~2x window on long streams. Once
-            // eviction starts, reserve exactly (window + window/4 + one block)
-            // so the buffer grows linearly to that ceiling; `compact_history`'s
-            // quarter-window drain then keeps `len` under it, so the Vec never
-            // reallocates again. Only fires in the eviction regime (large
-            // inputs that fill the window) — small frames keep their tight
-            // data-sized buffer untouched.
+            // Cap the history near the live window: once eviction starts, grow
+            // it linearly to (window + window/4 + one block) rather than
+            // doubling; `compact_history`'s quarter-window drain keeps the
+            // length under it. Small frames that never fill the window stay
+            // data-sized.
             let target = self.max_window_size
                 + (self.max_window_size >> 2)
                 + crate::common::MAX_BLOCK_SIZE as usize;
@@ -3018,7 +2954,7 @@ impl RowMatchGenerator {
         // rises with them (upstream `window.lowLimit`: the oldest byte the
         // buffer still holds). The distance-only window floor
         // (`pos - search_window`) can trail the eviction by up to a block, and
-        // the DUBT walks floor on `low_limit` — without this they would
+        // the DUBT walks floor on `low_limit`; without this they would
         // dereference evicted positions that are still inside the advertised
         // window.
         if self.low_limit < self.history_abs_start {
@@ -3027,14 +2963,24 @@ impl RowMatchGenerator {
         if self.prefix_low < self.low_limit {
             self.prefix_low = self.low_limit;
         }
+        // Compact AFTER the eviction that raised `history_start`, so the drain
+        // trigger sees the dead prefix this block's eviction created.
         self.compact_history();
-        let added = data.len();
-        self.history.extend_from_slice(&data);
-        self.window_size += added;
-        self.chunk_lens.push_back(added);
-        // The bytes now live in `history`; return the input buffer to the
-        // caller's pool instead of holding a second copy in the window.
-        reuse_space(data);
+        self.window_size += len;
+        self.chunk_lens.push_back(len);
+        self.uncommitted_len -= len;
+    }
+
+    /// Read `input` in and commit it as one block, the way the driver does
+    /// in two calls.
+    #[cfg(test)]
+    pub(crate) fn commit_input(&mut self, input: impl AsRef<[u8]>) {
+        let input = input.as_ref();
+        self.fill_uncommitted(input.len(), |history| {
+            history.extend_from_slice(input);
+            (input.len(), false)
+        });
+        self.commit_block(input.len());
     }
 
     pub(crate) fn trim_to_window(&mut self) {
@@ -3047,7 +2993,7 @@ impl RowMatchGenerator {
             self.history_start += removed_len;
             self.history_abs_start += removed_len;
         }
-        // Same valid-data floor raise as `add_data`'s eviction loop.
+        // Same valid-data floor raise as `commit_block`'s eviction loop.
         if self.low_limit < self.history_abs_start {
             self.low_limit = self.history_abs_start;
         }
@@ -3058,7 +3004,7 @@ impl RowMatchGenerator {
 
     /// Rebase the absolute coordinate origin down to the oldest live byte so
     /// stored `u32` match positions stay representable on long (multi-GiB)
-    /// streams. Cold path, driven from [`Self::add_data`] when the cursor
+    /// streams. Cold path, driven from [`Self::commit_block`] when the cursor
     /// nears `u32::MAX`. Subtracts the current `history_abs_start` from every
     /// live `row_positions` entry; entries older than the new origin (already
     /// unreachable through the `candidate_pos < history_abs_start` read guard)
@@ -3576,13 +3522,13 @@ impl RowMatchGenerator {
         // Drain the (unreachable) dead prefix once it reaches a quarter window
         // so the buffer stays near `window + window/4` rather than growing to
         // ~2x window before the old full-window trigger fired. Paired with the
-        // one-time `reserve_exact` in `add_data`, this keeps the Vec at a fixed
-        // ~1.25x-window capacity on long streams. The drain memmoves the live
-        // window, so a quarter-window trigger bounds the write amplification
-        // (~4x the eviction stride) while closing most of the peak gap.
-        // Compare against the COMMITTED length: with in-place ingest
-        // `history.len()` also counts bytes no block has claimed yet, which
-        // would push this trigger later than on the staged path.
+        // one-time `reserve_exact` in `commit_block`, this keeps the buffer at
+        // a fixed ~1.25x-window capacity on long streams. The drain memmoves
+        // the live window, so a quarter-window trigger bounds the write
+        // amplification (~4x the eviction stride) while closing most of the
+        // peak gap. Compare against the COMMITTED length: `history.len()` also
+        // counts bytes no block has claimed yet, which would delay the trigger
+        // by however much input happens to be read ahead.
         if self.history_start >= (self.max_window_size >> 2)
             || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
@@ -3609,9 +3555,9 @@ impl RowMatchGenerator {
             // in bounds.
             return unsafe { core::slice::from_raw_parts(ptr, end) };
         }
-        // Stop at the committed end, not at `history.len()`: in-place ingest
-        // may have already read the next block's bytes into the tail, and a
-        // scan must not see past the block it is compressing.
+        // Stop at the committed end, not at `history.len()`: the next block's
+        // bytes may already be read into the tail, and a scan must not see
+        // past the block it is compressing.
         &self.history[self.history_start..self.history.len() - self.uncommitted_len]
     }
 
@@ -3628,16 +3574,16 @@ impl RowMatchGenerator {
     /// earlier frame lies below the window floor and is never taken, and
     /// the chain / tree walks never meet a position at or past the one they
     /// search (offset 0 "self-matches" from a zeroed floor were a corrupt
-    /// frame). The owned history is unused while borrowed (no `add_data`
-    /// copy).
+    /// frame). The owned history is unused while borrowed (no copy into
+    /// it).
     ///
     /// # Safety
     /// `buffer` must stay live and unmodified until `clear_borrowed_window`
     /// or `reset` — the matcher stores a raw pointer into it.
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
-        // Same `u32` headroom guard as `add_data`: the borrowed reuse path
+        // Same `u32` headroom guard as `commit_block`: the borrowed reuse path
         // advances the coordinate floor per frame without ever committing
-        // through `add_data`, so after ~4 GiB of cumulative reused frames the
+        // a block, so after ~4 GiB of cumulative reused frames the
         // inserted positions would wrap `u32` and every candidate would read
         // as stale. Rebase the origin down before this frame's positions are
         // stored (`rebase_positions` zeroes the floor; the previous frame's
@@ -3990,8 +3936,8 @@ impl RowMatchGenerator {
     /// stage `[block_start, block_end)` of the registered borrowed window,
     /// then run the SAME parse dispatch. The parse body reads its block range
     /// via `current_block_range()` and its bytes via `live_history()`, both
-    /// borrowed-aware, so the staged block is scanned in place (no
-    /// `add_data` copy into the owned mirror). `history_abs_start` was forced
+    /// borrowed-aware, so the staged block is scanned in place (no copy
+    /// into the owned mirror). `history_abs_start` was forced
     /// to 0 in `set_borrowed_window`, so positions stay absolute input
     /// offsets and the window-low candidate cap bounds offsets to the window.
     pub(crate) fn start_matching_borrowed(
@@ -4252,7 +4198,7 @@ impl RowMatchGenerator {
             };
             *self.row_heads_mut().get_unchecked_mut(row) = next as u8;
             *self.row_tags_mut().get_unchecked_mut(row_base + next) = tag;
-            // `abs_pos < u32::MAX` holds: `add_data` caps a Row frame's
+            // `abs_pos < u32::MAX` holds: `commit_block` caps a Row frame's
             // absolute cursor below `u32::MAX`, so the cast is lossless and
             // never collides with the `ROW_EMPTY_SLOT == u32::MAX` sentinel.
             *self.row_positions_mut().get_unchecked_mut(row_base + next) = abs_pos as u32;
