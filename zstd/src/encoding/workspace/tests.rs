@@ -155,8 +155,13 @@ fn a_workspace_on_fresh_pages_is_taken_zeroed() {
     // The tables are not even sparse: the input is expected to fill them.
     ws.open_for_match_finder(table, table, 1 << 14, usize::MAX);
     assert!(ws.zeroed, "a workspace past the fresh-page size is zeroed");
+    assert!(ws.on_fresh_pages());
     let zeros = ws.table::<u32>(64, 0);
     assert!(zeros.as_slice().iter().all(|&v| v == 0));
+    // The next frame lays out on the same allocation: its pages are warm.
+    ws.begin_layout(1 << 17, buffers_up_to_fresh_pages, IngestPlan::Slice);
+    ws.open_for_match_finder(table, table, 1 << 14, usize::MAX);
+    assert!(!ws.on_fresh_pages());
 }
 
 // The next frame's layout puts a table of the same size back on the same bytes,

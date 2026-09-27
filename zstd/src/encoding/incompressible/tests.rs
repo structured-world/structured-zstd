@@ -600,17 +600,22 @@ fn the_rewritten_scan_decides_every_block_as_before() {
 
 /// A frame that stores its literals raw searches its 2-24 KiB blocks instead of
 /// asking the classifier, where the search is the cheaper of the two; every
-/// other block, and every block of a frame that codes its literals, still asks.
+/// other block, every block of a frame that codes its literals, and every block
+/// of a frame whose tables sit on freshly mapped pages still asks.
 #[test]
 fn only_small_blocks_of_raw_literal_frames_skip_the_classifier() {
     for len in [2 * 1024, 10 * 1024, 24 * 1024] {
         assert!(
-            !raw_skip_worth_asking(true, len),
+            !raw_skip_worth_asking(true, false, len),
             "{len} bytes, raw literals"
         );
         assert!(
-            raw_skip_worth_asking(false, len),
+            raw_skip_worth_asking(false, false, len),
             "{len} bytes, coded literals"
+        );
+        assert!(
+            raw_skip_worth_asking(true, true, len),
+            "{len} bytes, fresh pages"
         );
     }
     for len in [
@@ -620,7 +625,7 @@ fn only_small_blocks_of_raw_literal_frames_skip_the_classifier() {
         128 * 1024,
     ] {
         assert!(
-            raw_skip_worth_asking(true, len),
+            raw_skip_worth_asking(true, false, len),
             "{len} bytes, raw literals"
         );
     }

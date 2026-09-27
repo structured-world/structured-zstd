@@ -666,13 +666,26 @@ impl SeenContentGrid {
 /// Below 2 KiB the levels split (-7 faster, -1 up to 48% slower on i686), and
 /// every positive level searched slower at nearly every size, so both keep the
 /// classifier.
+///
+/// All of that is on tables the frame finds warm. A search over noise touches
+/// every page of its hash table, while the raw skip indexes a position in 512,
+/// so on a workspace mapped fresh for the frame the search pays a fault per
+/// table page: on musl, where a 10 KiB frame's workspace is past the mmap
+/// threshold, searching made levels -7 and -1 63% slower, 73 us to 120 us.
 const SEARCH_INSTEAD_OF_CLASSIFIER: core::ops::RangeInclusive<usize> = 2 * 1024..=24 * 1024;
 
 /// Whether a block is worth the classifier's fixed cost, given whether the
-/// frame stores its literals raw. See [`SEARCH_INSTEAD_OF_CLASSIFIER`].
+/// frame stores its literals raw and whether its tables sit on pages mapped
+/// fresh for it. See [`SEARCH_INSTEAD_OF_CLASSIFIER`].
 #[inline]
-pub(crate) fn raw_skip_worth_asking(literals_stored_raw: bool, block_len: usize) -> bool {
-    !(literals_stored_raw && SEARCH_INSTEAD_OF_CLASSIFIER.contains(&block_len))
+pub(crate) fn raw_skip_worth_asking(
+    literals_stored_raw: bool,
+    tables_on_fresh_pages: bool,
+    block_len: usize,
+) -> bool {
+    !(literals_stored_raw
+        && !tables_on_fresh_pages
+        && SEARCH_INSTEAD_OF_CLASSIFIER.contains(&block_len))
 }
 
 pub(crate) const RAW_FAST_PATH_MIN_BLOCK_LEN: usize = 512;

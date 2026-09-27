@@ -168,6 +168,14 @@ impl Workspace {
         self.capacity
     }
 
+    /// Whether the open layout sits on pages the allocator mapped fresh for
+    /// it: a new allocation from [`FRESH_PAGES_FROM`] up. The first touch of
+    /// each of its pages is a fault, so work that sweeps a table costs more
+    /// than on a workspace kept from an earlier frame.
+    pub(crate) fn on_fresh_pages(&self) -> bool {
+        self.zeroed && self.capacity >= FRESH_PAGES_FROM
+    }
+
     /// Bytes the workspace has allocated, for heap accounting: its capacity
     /// with the padding that aligns its start, and an allocation a growth
     /// retired that has not been freed yet.
