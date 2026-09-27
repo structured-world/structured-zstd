@@ -702,6 +702,11 @@ impl SeenContentGrid {
 /// so on a workspace mapped fresh for the frame the search pays a fault per
 /// table page: on musl, where a 10 KiB frame's workspace is past the mmap
 /// threshold, searching made levels -7 and -1 63% slower, 73 us to 120 us.
+///
+/// Those measurements were on glibc, and musl does not follow them on warm
+/// tables either: with a 10 KiB frame's workspace below musl's mmap threshold,
+/// searching made levels -7 and -1 11-15% slower than asking the classifier (78
+/// to 81 us against 89 to 91), so musl keeps the classifier at every size.
 const SEARCH_INSTEAD_OF_CLASSIFIER: core::ops::RangeInclusive<usize> = 2 * 1024..=24 * 1024;
 
 /// Whether a block is worth the classifier's fixed cost, given whether the
@@ -713,7 +718,8 @@ pub(crate) fn raw_skip_worth_asking(
     tables_on_fresh_pages: bool,
     block_len: usize,
 ) -> bool {
-    !(literals_stored_raw
+    !(!cfg!(target_env = "musl")
+        && literals_stored_raw
         && !tables_on_fresh_pages
         && SEARCH_INSTEAD_OF_CLASSIFIER.contains(&block_len))
 }
