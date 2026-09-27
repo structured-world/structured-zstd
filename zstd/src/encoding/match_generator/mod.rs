@@ -41,7 +41,9 @@ use super::opt::ldm::HcRawSeq;
 #[cfg(test)]
 use super::opt::types::{HcCandidateQuery, MatchCandidate};
 use super::row::RowMatchGenerator;
-use super::simple::fast_matcher::{FAST_LEVEL_1_HASH_LOG, FAST_LEVEL_1_MLS, FastKernelMatcher};
+use super::simple::fast_matcher::{
+    FAST_LEVEL_1_HASH_LOG, FAST_LEVEL_1_MLS, FastKernelMatcher, TableCarry,
+};
 
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
 // Bytes the dfast short hash reads (upstream zstd `mls = 5`). Seeding / lookahead
@@ -1356,6 +1358,13 @@ impl Matcher for MatchGeneratorDriver {
                                 ldm: None,
                             }
                     });
+                let carry = if table_overwritten_by_restore {
+                    TableCarry::OverwrittenByRestore
+                } else if dict_attach_epoch {
+                    TableCarry::AdvanceEpoch
+                } else {
+                    TableCarry::Clear
+                };
                 // Cap `hash_log <= window_log + 1` (upstream zstd
                 // `ZSTD_adjustCParams_internal`): once `window_log` is resized
                 // down for a small source, a level-default `1 << hash_log`
@@ -1395,8 +1404,7 @@ impl Matcher for MatchGeneratorDriver {
                     hash_log,
                     fast.mls,
                     fast.step_size,
-                    dict_attach_epoch,
-                    table_overwritten_by_restore,
+                    carry,
                     workspace,
                 );
             }

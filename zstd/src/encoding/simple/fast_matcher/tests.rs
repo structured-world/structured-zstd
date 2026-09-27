@@ -9,20 +9,11 @@ fn reset_in(
     m: &mut FastKernelMatcher,
     ws: &mut Workspace,
     (window_log, hash_log, mls, step_size): (u8, u32, u32, usize),
-    dict_attach_epoch: bool,
-    table_overwritten_by_restore: bool,
+    carry: TableCarry,
 ) {
     ws.begin_layout(0, no_trailing);
     ws.open(FastHashTable::workspace_bytes(hash_log), 0);
-    m.reset(
-        window_log,
-        hash_log,
-        mls,
-        step_size,
-        dict_attach_epoch,
-        table_overwritten_by_restore,
-        ws,
-    );
+    m.reset(window_log, hash_log, mls, step_size, carry, ws);
 }
 
 const LEVEL_1_SHAPE: (u8, u32, u32, usize) = (
@@ -81,7 +72,7 @@ fn reset_clears_borrowed_window() {
     let external = b"borrowed".to_vec();
     // SAFETY: `external` outlives the reset call below.
     unsafe { m.set_borrowed_window(&external) };
-    reset_in(&mut m, &mut ws, LEVEL_1_SHAPE, false, false);
+    reset_in(&mut m, &mut ws, LEVEL_1_SHAPE, TableCarry::Clear);
     // After reset the borrowed window is dropped — back to the
     // (now empty) owned buffer, never the dangling external range.
     assert!(m.borrowed.is_none());
@@ -219,7 +210,7 @@ fn reset_clears_history_and_state() {
     m.offset_hist = [10, 20, 30];
     m.pending = Some(alloc::vec![5, 6, 7]);
 
-    reset_in(&mut m, &mut ws, LEVEL_1_SHAPE, false, false);
+    reset_in(&mut m, &mut ws, LEVEL_1_SHAPE, TableCarry::Clear);
 
     // Post-reset: history empty (HISTORY_DRAIN_BASE=0; no
     // dummy only; prefix_start_index pinned to that baseline.
@@ -241,7 +232,7 @@ fn reset_with_changed_params_rebuilds_hash_table() {
     let mut ws = Workspace::new();
     let mut m = FastKernelMatcher::new();
     // Force a parameter change: the table is laid out anew at the new width.
-    reset_in(&mut m, &mut ws, (16, 10, 4, 2), false, false);
+    reset_in(&mut m, &mut ws, (16, 10, 4, 2), TableCarry::Clear);
     assert_eq!(m.hash_table.hash_log(), 10);
     assert_eq!(m.hash_table.mls(), 4);
     assert_eq!(m.window_log, 16);
@@ -258,13 +249,18 @@ fn reset_with_changed_params_rebuilds_hash_table() {
 fn reset_keeps_table_when_overwritten_by_restore() {
     let mut ws = Workspace::new();
     let mut m = FastKernelMatcher::new();
-    reset_in(&mut m, &mut ws, (16, 10, 4, 2), false, false);
+    reset_in(&mut m, &mut ws, (16, 10, 4, 2), TableCarry::Clear);
     let probe_hash = 7u32;
     // SAFETY: hash 7 < (1 << hash_log = 1024) table entries.
     unsafe { m.hash_table.put(probe_hash, 0xCAFE) };
 
     // Same shape + restore-pending: contents survive the reset.
-    reset_in(&mut m, &mut ws, (16, 10, 4, 2), false, true);
+    reset_in(
+        &mut m,
+        &mut ws,
+        (16, 10, 4, 2),
+        TableCarry::OverwrittenByRestore,
+    );
     // SAFETY: same bounds as the put above.
     assert_eq!(
         unsafe { m.hash_table.get(probe_hash) },
@@ -273,7 +269,7 @@ fn reset_keeps_table_when_overwritten_by_restore() {
     );
 
     // Plain same-shape reset: contents are memset back to empty.
-    reset_in(&mut m, &mut ws, (16, 10, 4, 2), false, false);
+    reset_in(&mut m, &mut ws, (16, 10, 4, 2), TableCarry::Clear);
     // SAFETY: same bounds as the put above.
     assert_eq!(
         unsafe { m.hash_table.get(probe_hash) },
@@ -284,7 +280,12 @@ fn reset_keeps_table_when_overwritten_by_restore() {
     // Shape change overrides the flag: the table is rebuilt at the
     // new geometry even when a restore is claimed to be pending.
     unsafe { m.hash_table.put(probe_hash, 0xCAFE) };
-    reset_in(&mut m, &mut ws, (16, 11, 4, 2), false, true);
+    reset_in(
+        &mut m,
+        &mut ws,
+        (16, 11, 4, 2),
+        TableCarry::OverwrittenByRestore,
+    );
     assert_eq!(m.hash_table.hash_log(), 11);
     // SAFETY: hash 7 < (1 << 11) table entries.
     assert_eq!(

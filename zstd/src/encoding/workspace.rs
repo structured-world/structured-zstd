@@ -211,11 +211,14 @@ impl Workspace {
         (region, kept)
     }
 
-    /// A table of `count` values, every one set to `value`.
+    /// A table of `count` values, every one set to `value`. Holders go
+    /// through [`Table::bind`], which also reports a continuation; this is the
+    /// bare carve the layout tests check.
     ///
     /// # Panics
     ///
     /// As [`Self::table_after`].
+    #[cfg(test)]
     pub(crate) fn table<T: Copy>(&mut self, count: usize, value: T) -> Region<T> {
         self.table_after(count, &Region::empty(), value).0
     }
@@ -350,6 +353,7 @@ impl<T> Region<T> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.len
     }

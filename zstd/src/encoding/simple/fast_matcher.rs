@@ -116,6 +116,23 @@ pub(crate) const HISTORY_DRAIN_BASE: usize = 0;
 /// position-0 emit rate is too small to be worth that breakage.
 const INITIAL_PREFIX_START_INDEX: u32 = 1;
 
+/// What a reset does with a hash table that continues the previous frame's
+/// (a new table always starts empty).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TableCarry {
+    /// Empty it, so the raw-slice no-dict kernels see a bias-0 table.
+    Clear,
+    /// The frame re-primes the same dictionary in attach mode: advance the
+    /// epoch bias past everything the previous frames stored instead of a
+    /// full-table memset (upstream zstd `ZSTD_continueCCtx`), provided the
+    /// cached dict table is still primed; otherwise empty it.
+    AdvanceEpoch,
+    /// A primed snapshot matching this exact shape is copied over the table
+    /// right after the reset (the copy-mode dictionary restore), replacing its
+    /// contents and bias wholesale: leave it.
+    OverwrittenByRestore,
+}
+
 /// Upstream zstd-shape Fast-strategy matcher state.
 ///
 /// State layout mirrors the upstream zstd's `ZSTD_compressBlock_fast_*` entry
@@ -468,12 +485,10 @@ impl FastKernelMatcher {
         self.hash_table.mls()
     }
 
-    /// Explicit-parameter constructor used by the wiring commit when
-    /// the level resolution produced a non-default `(window_log,
-    /// hash_log, mls, step_size)` tuple (typically because a small
-    /// source-size hint clamped the window). Tests can also call this
-    /// directly.
-    /// Construct with the hash table allocated up front at `hash_log`.
+    /// Construct with the hash table allocated up front at `hash_log`, for a
+    /// matcher driven on its own. Test-only: the driver builds the matcher
+    /// deferred and lays the table out in the context workspace.
+    #[cfg(test)]
     pub(crate) fn with_params(window_log: u8, hash_log: u32, mls: u32, step_size: usize) -> Self {
         Self::with_params_table(
             window_log,
@@ -484,13 +499,10 @@ impl FastKernelMatcher {
         )
     }
 
-    /// Construct with the hash table allocation deferred to the first
-    /// [`Self::reset`]. Used by `MatchGeneratorDriver::new`, which runs before
-    /// any source size is known and would otherwise allocate the table at the
-    /// level-default `hash_log` only to realloc it the moment the first frame
-    /// clamps the window to a smaller input — a wasted malloc + zero-fill on
-    /// every fresh compressor (the `compare_ffi` bench shape). The reset path
-    /// allocates the table once at the resolved size before the kernel runs.
+    /// Construct with the hash table deferred to the first [`Self::reset`],
+    /// which lays it out in the workspace at the frame's resolved width. Used
+    /// by `MatchGeneratorDriver`, which builds the matcher before any source
+    /// size is known.
     pub(crate) fn with_params_deferred(
         window_log: u8,
         hash_log: u32,
@@ -569,33 +581,18 @@ impl FastKernelMatcher {
 
     /// Reset for the next frame.
     ///
-    /// Drops all history, clears the repcode and offset stacks, and
-    /// either clears the existing hash table (if `(hash_log, mls)` are
-    /// unchanged) or reallocates it. The window_log update redirects
-    /// the soft-eviction bound and the decoder-side reported window.
-    ///
-    /// `dict_attach_epoch`: the upcoming frame re-primes the SAME
-    /// dictionary in attach mode (separate cached dict table, dual-probe
-    /// kernel). When the cached dict table is still primed, the main
-    /// table is then invalidated via an epoch advance (upstream zstd
-    /// `ZSTD_continueCCtx` cadence — stale entries filtered by the bias,
-    /// no full-table memset); every other shape keeps the historical
-    /// `clear()` so the raw-slice no-dict kernels always see a bias-0
-    /// table.
+    /// Drops all history, clears the repcode and offset stacks, and lays the
+    /// hash table out in `workspace` at `(hash_log, mls)`. A table that
+    /// continues the previous frame's is then handled as `carry` says; a new
+    /// one starts empty. The window_log update redirects the soft-eviction
+    /// bound and the decoder-side reported window.
     pub(crate) fn reset(
         &mut self,
         window_log: u8,
         hash_log: u32,
         mls: u32,
         step_size: usize,
-        dict_attach_epoch: bool,
-        // The caller (driver) has a primed-snapshot whose key matches this
-        // exact reset shape and WILL `clone_from` it over this matcher
-        // right after the reset (the copy-mode dictionary restore). The
-        // table contents and epoch bias are about to be replaced
-        // wholesale, so the full-table memset here would be pure waste.
-        table_overwritten_by_restore: bool,
-        // The open layout the hash table is carved from.
+        carry: TableCarry,
         workspace: &mut crate::encoding::workspace::Workspace,
     ) {
         assert!(
@@ -617,10 +614,10 @@ impl FastKernelMatcher {
             // cached dict table goes with it: its absolute positions index a
             // table this one no longer continues.
             self.dict.invalidate();
-        } else if table_overwritten_by_restore {
+        } else if carry == TableCarry::OverwrittenByRestore {
             // Leave the table untouched: the snapshot restore copies the
             // primed contents (and bias) over it immediately after.
-        } else if dict_attach_epoch && self.dict.is_primed() {
+        } else if carry == TableCarry::AdvanceEpoch && self.dict.is_primed() {
             // Dict-attach frame over the same primed dictionary: advance
             // the epoch bias past every position the previous frames could
             // have stored instead of memsetting the whole table (upstream zstd
