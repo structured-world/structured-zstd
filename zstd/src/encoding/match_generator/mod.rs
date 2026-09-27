@@ -1376,6 +1376,11 @@ impl Matcher for MatchGeneratorDriver {
             max_window_size,
             level,
         );
+        // The input the frame can write into its tables: the size when known,
+        // otherwise the most its history is laid out to hold.
+        let expected_input = hint.map_or(history_bytes, |bytes| {
+            usize::try_from(bytes).unwrap_or(usize::MAX)
+        });
         // The hint-dependent hash-table width the active backend applies, for
         // the primed-snapshot key. Dfast/Row compute it from `table_window_size`
         // below; HC/Fast leave it `0` because their widths live in `params`
@@ -1462,6 +1467,7 @@ impl Matcher for MatchGeneratorDriver {
                     tables + m.history_workspace_bytes(history_bytes),
                     tables,
                     max_window_size,
+                    expected_input,
                 );
                 // The history binds first, carrying its bytes out from under
                 // where the table may now land.
@@ -1530,6 +1536,7 @@ impl Matcher for MatchGeneratorDriver {
                     tables + dfast.history.workspace_bytes(history_bytes),
                     tables,
                     max_window_size,
+                    expected_input,
                 );
                 dfast.history.bind(workspace, history_bytes);
                 dfast.bind_tables(workspace);
@@ -1574,6 +1581,7 @@ impl Matcher for MatchGeneratorDriver {
                     row.tables_workspace_bytes() + row.history.workspace_bytes(history_bytes),
                     row.zero_table_bytes(),
                     max_window_size,
+                    expected_input,
                 );
                 row.history.bind(workspace, history_bytes);
                 row.bind_tables(workspace);
@@ -1627,6 +1635,7 @@ impl Matcher for MatchGeneratorDriver {
                     tables + hc.table.history.workspace_bytes(history_bytes),
                     tables,
                     max_window_size,
+                    expected_input,
                 );
                 hc.table.history.bind(workspace, history_bytes);
                 hc.table.bind_tables(workspace);

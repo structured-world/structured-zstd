@@ -68,56 +68,68 @@ fn a_new_table_starts_filled() {
     assert!(table.as_slice().iter().all(|&v| v == 0x1234));
 }
 
-/// Opens `ws` for a match finder whose only table is `count` zero-start `u32`s.
-fn lay_out_zero_table(ws: &mut Workspace, count: usize) {
-    ws.begin_layout(0, no_trailing, IngestPlan::Stream);
-    let table = region_bytes::<u32>(count);
-    ws.open_for_match_finder(table, table, usize::MAX);
-}
-
-// A table of zeros is left unwritten only in the layout that made its (zeroed)
-// allocation. A later layout carving it over bytes a holder wrote still empties
-// it: the zeros it relies on are gone by then.
+// A table of zeros is left unwritten only in the layout that made the (zeroed)
+// allocation. A later layout carving it over bytes another holder wrote still
+// empties it: the zeros it relies on are gone by then.
 #[test]
 fn a_zero_table_over_written_bytes_still_starts_empty() {
+    let sparse = |ws: &mut Workspace| {
+        ws.begin_layout(0, no_trailing, IngestPlan::Stream);
+        let table = region_bytes::<u32>(64);
+        ws.open_for_match_finder(table, table, usize::MAX, 0);
+    };
     let mut ws = Workspace::new();
-    lay_out_zero_table(&mut ws, 64);
-    let mut fresh = ws.table::<u32>(64, 0);
+    sparse(&mut ws);
+    let fresh = ws.table::<u32>(64, 0);
     assert!(fresh.as_slice().iter().all(|&v| v == 0));
-    fresh.as_mut_slice().fill(7);
-    lay_out_zero_table(&mut ws, 64);
+    let mut other: Table<u32> = Table::empty();
+    lay_out(&mut ws, region_bytes::<u32>(64), 0);
+    other.bind(&mut ws, 64, 7);
+    assert!(other.iter().all(|&v| v == 7));
+    sparse(&mut ws);
     let later = ws.table::<u32>(64, 0);
     assert!(later.as_slice().iter().all(|&v| v == 0));
 }
 
-// Zero-start tables come from an allocation of their own, sized to them, and
-// everything else from the main one. Asking the allocator for zeros costs at
-// most the fill those tables need anyway; asked for the whole workspace, memory
-// it recycles is zeroed in full, buffers included, which on a context rebuilt
-// per frame is several times the tables of a small frame.
+// A zeroed allocation is worth taking only when the zero tables are most of it.
+// An allocator that serves it from memory it has handed out before zeroes the
+// whole of it, the buffers behind the tables included, so a small frame whose
+// per-block buffers outweigh its tables would pay several times the fill it
+// saves on every fresh context.
 #[test]
-fn zero_tables_have_an_allocation_of_their_own() {
+fn only_tables_that_fill_the_workspace_take_it_zeroed() {
     fn buffers_thrice_the_table(_block: usize) -> usize {
         3 * region_bytes::<u32>(64)
     }
     let table = region_bytes::<u32>(64);
+
     let mut ws = Workspace::new();
     ws.begin_layout(1 << 17, buffers_thrice_the_table, IngestPlan::Slice);
-    ws.open_for_match_finder(2 * table, table, 1 << 14);
-    assert_eq!(ws.zero_capacity, table);
-    assert_eq!(ws.capacity(), 5 * table);
+    ws.open_for_match_finder(table, table, 1 << 14, 0);
+    assert!(
+        !ws.zeroed,
+        "tables a quarter of the workspace must be filled, not the workspace zeroed",
+    );
 
-    let zeros = ws.table::<u32>(64, 0);
-    let sentinels = ws.table::<u32>(64, u32::MAX);
-    let mut buffers = ws.buffer::<u8>(3 * table);
-    let inside = |ptr: *const u8, start: NonNull<u8>, len: usize| {
-        (start.as_ptr() as usize..start.as_ptr() as usize + len).contains(&(ptr as usize))
-    };
-    assert!(inside(zeros.as_ptr().cast(), ws.zero_ptr, ws.zero_capacity));
-    assert!(inside(sentinels.as_ptr().cast(), ws.ptr, ws.capacity));
-    assert!(inside(buffers.as_mut_ptr(), ws.ptr, ws.capacity));
-    assert!(zeros.as_slice().iter().all(|&v| v == 0));
-    assert!(sentinels.as_slice().iter().all(|&v| v == u32::MAX));
+    // Just over half, the share a 10 KiB frame's tables have at level 1:
+    // zeroing the rest still costs more than the fill saves.
+    fn buffers_four_fifths_of_the_table(_block: usize) -> usize {
+        4 * region_bytes::<u32>(64) / 5
+    }
+    let mut ws = Workspace::new();
+    ws.begin_layout(1 << 17, buffers_four_fifths_of_the_table, IngestPlan::Slice);
+    ws.open_for_match_finder(table, table, 1 << 14, 0);
+    assert!(!ws.zeroed, "tables just over half the workspace are filled");
+
+    let mut ws = Workspace::new();
+    ws.begin_layout(1 << 17, no_trailing, IngestPlan::Slice);
+    ws.open_for_match_finder(table, table, 1 << 14, 0);
+    assert!(
+        ws.zeroed,
+        "tables that are the whole workspace take it zeroed"
+    );
+    let fresh = ws.table::<u32>(64, 0);
+    assert!(fresh.as_slice().iter().all(|&v| v == 0));
 }
 
 // The next frame's layout puts a table of the same size back on the same bytes,
