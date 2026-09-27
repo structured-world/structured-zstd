@@ -22,6 +22,7 @@ use super::match_generator::{
     ROW_EMPTY_SLOT, ROW_HASH_BITS, ROW_HASH_KEY_LEN, ROW_LOG, ROW_MIN_MATCH_LEN, ROW_SEARCH_DEPTH,
     ROW_TAG_BITS, ROW_TARGET_LEN,
 };
+use super::workspace::{Table, Workspace, region_bytes};
 
 /// Upstream zstd lazy-parse bounds (`zstd_lazy.c`): the row parse stops
 /// `8 + ZSTD_ROW_HASH_CACHE_SIZE` bytes before the block end, a miss steps
@@ -2412,8 +2413,12 @@ pub(crate) struct RowMatchGenerator {
     /// positions, in chain / tree mode the hash table followed by the chain
     /// table at `hc_split`. One allocation per compressor instead of three
     /// keeps the allocator seeing a single size class, which is what decides
-    /// whether the tables keep their pages between frames.
-    pub(crate) tables: Vec<u32>,
+    /// whether the tables keep their pages between frames. In the context's
+    /// workspace when a context drives the matcher.
+    pub(crate) tables: Table<u32>,
+    /// Set by [`Self::bind_tables`] when the tables were laid out anew and so
+    /// hold nothing an earlier frame wrote; read and cleared by [`Self::reset`].
+    tables_fresh: bool,
     /// Start of the chain / tree table inside [`Self::tables`]; the hash table
     /// occupies everything before it. Zero in row mode, where the buffer holds
     /// row positions followed by the two byte tables.
@@ -2500,7 +2505,8 @@ impl RowMatchGenerator {
             offset_hist: [1, 4, 8],
             finder: LazyFinder::Rows,
             hc_chain_log: ROW_HASH_BITS,
-            tables: Vec::new(),
+            tables: Table::empty(),
+            tables_fresh: false,
             hc_split: 0,
             hc_layout: LazyFinder::Chain,
             loaded_dict_end: 0,
@@ -2539,8 +2545,9 @@ impl RowMatchGenerator {
             + self.history.capacity()
             // One buffer for whichever finder is live: the row positions with
             // the cursors and tags in its byte tail, or the chain / tree hash
-            // and link tables.
-            + self.tables.capacity() * u32_sz
+            // and link tables. Counted here only when it is not in a context's
+            // workspace.
+            + self.tables.owned_bytes()
             + self.dict.table().map_or(0, |t| {
                 t.heads.capacity()
                     + t.positions.capacity() * u32_sz
@@ -2618,8 +2625,9 @@ impl RowMatchGenerator {
         if self.row_hash_log != row_hash_log {
             self.row_hash_log = row_hash_log;
             // One buffer carries the positions and the two byte tables, so
-            // clearing it drops all three; `ensure_tables` re-lays them out.
-            self.tables.clear();
+            // dropping it drops all three; they are laid out again at the new
+            // width.
+            self.tables = Table::empty();
             self.hc_split = 0;
             self.rows_len = 0;
             self.heads_len = 0;
@@ -2727,10 +2735,14 @@ impl RowMatchGenerator {
         // The floor advance below still rejects the previous frame's INPUT, and
         // the dictionary's own matches come from `self.dict`, whose positions
         // are dictionary-relative and so bypass the floor.
+        // Tables that hold what earlier frames indexed; freshly laid-out ones
+        // are empty, as a matcher that has not allocated them yet would be.
+        let tables_allocated = !self.tables.is_empty() && !self.tables_fresh;
+        self.tables_fresh = false;
         let reborrow_region = if self.dict.is_primed()
             && self.history_start == 0
             && next_floor <= REBASE_RESET_FLOOR_CEILING
-            && !self.tables.is_empty()
+            && tables_allocated
         {
             let r = self.dict.region_len();
             (r > 0 && self.history.len() >= r).then_some(r)
@@ -2753,9 +2765,12 @@ impl RowMatchGenerator {
         // `set_borrowed_window` after this reset.
         self.borrowed_input = None;
         self.borrowed_block = None;
-        let tables_allocated = !self.tables.is_empty();
         if next_floor <= REBASE_RESET_FLOOR_CEILING && tables_allocated {
             self.history_abs_start = next_floor;
+        } else if !tables_allocated {
+            // Nothing is indexed: fresh tables are already empty, so only the
+            // coordinate space restarts.
+            self.history_abs_start = 0;
         } else {
             // Bounded fallback: rewind the coordinate space and zero the
             // tables so the absolute cursor cannot climb without bound
@@ -3316,7 +3331,7 @@ impl RowMatchGenerator {
     /// Drop the shared table allocation, for the backend switch that wants the
     /// footprint gone before building the replacement variant.
     pub(crate) fn release_tables(&mut self) {
-        self.tables = Vec::new();
+        self.tables = Table::empty();
         self.hc_split = 0;
         // The cursors and tags lived in the same buffer, so releasing it
         // releases them; their lengths have to say so.
@@ -3446,107 +3461,100 @@ impl RowMatchGenerator {
         self.tables.split_at_mut(self.hc_split)
     }
 
-    pub(crate) fn ensure_tables(&mut self) {
-        let row_count = 1usize << self.row_hash_log;
-        let row_entries = 1usize << self.row_log;
-        // Only the active finder's tables are held: the chain / tree
-        // finders never read the rows (tens of MiB at the btlazy2 levels).
-        let total = if self.finder == LazyFinder::Rows {
-            row_count * row_entries
+    /// The table layout the active finder needs: the buffer length in `u32`s
+    /// and the empty value its leading region takes.
+    ///
+    /// Rows: `row_count * row_entries` positions, then the `row_count` slot
+    /// cursors and as many tags packed into the byte tail. Chain / tree: the
+    /// `1 << hashLog` hash table (the full row hash width, no tag bits), then
+    /// the `1 << chainLog` link table (the tree: two links per node over
+    /// `chainLog - 1` bits). Only the active finder's tables are held; the
+    /// chain / tree finders never read the rows (tens of MiB at the btlazy2
+    /// levels).
+    fn table_layout(&self) -> (usize, u32) {
+        if self.finder == LazyFinder::Rows {
+            let row_count = 1usize << self.row_hash_log;
+            let total = row_count << self.row_log;
+            (total + (row_count + total).div_ceil(4), ROW_EMPTY_SLOT)
         } else {
-            0
-        };
-        // The three row tables share one buffer: `total` positions, then the
-        // `row_count` slot cursors and `total` tags packed into its byte tail.
-        // Held separately they were three allocations of three different size
-        // classes per frame, and a fresh compressor takes them anew for every
-        // frame — the pages of all three then went back to the kernel between
-        // frames, which is what the reference avoids by carving one workspace.
-        let tail_u32 = (row_count + total).div_ceil(4);
-        let want = total + tail_u32;
-        if total == 0 {
-            self.rows_len = 0;
-            self.heads_len = 0;
-            self.tags_len = 0;
-        } else if self.rows_len != total || self.tables.len() != want || self.hc_split != 0 {
-            // Sized to the final width in one step: from an empty buffer
-            // `resize` alone walks a doubling chain whose intermediate steps
-            // the frame allocates and discards. A reused matcher already has
-            // the capacity, so this is a no-op there.
-            if super::match_table::storage::capacity_is_oversized(self.tables.capacity(), want) {
-                // Coming down from the chain / tree finder (or a wider row
-                // layout): `clear` + `resize` would keep that allocation —
-                // tens of MiB at the btlazy2 levels — resident for every later
-                // row frame, which is what the separate vectors released.
-                self.tables = alloc::vec![ROW_EMPTY_SLOT; want];
-            } else {
-                self.tables.clear();
-                self.tables.reserve_exact(want);
-                self.tables.resize(want, ROW_EMPTY_SLOT);
-            }
+            let hash_len = 1usize << (self.row_hash_log + self.row_log);
+            (
+                hash_len + (1usize << self.hc_chain_log),
+                self.hc_empty_slot(),
+            )
+        }
+    }
+
+    /// Records that the buffer, already at the active finder's length with its
+    /// leading region empty, is laid out for that finder: the seams, and for
+    /// rows the zeroed cursors and tags of the byte tail.
+    fn mark_tables_laid_out(&mut self) {
+        if self.finder == LazyFinder::Rows {
+            let row_count = 1usize << self.row_hash_log;
+            let total = row_count << self.row_log;
             self.hc_split = 0;
             self.rows_len = total;
             self.heads_len = row_count;
             self.tags_len = total;
             // The positions want the empty sentinel, the byte tables want
-            // zeroes, and one fill cannot give both: the tail is re-zeroed
-            // after the buffer-wide fill above.
+            // zeroes, and one fill cannot give both: the tail is zeroed after
+            // the buffer-wide fill.
             self.tail_bytes_mut().fill(0);
-        }
-        if self.finder != LazyFinder::Rows {
-            // Chain / tree mode: `hashTable` is `1 << hashLog` wide (the full
-            // row hash width, no tag bits), `chainTable` `1 << chainLog` (the
-            // tree: two links per node over `chainLog - 1` bits). The two
-            // finders use different empty conventions, so tables laid out for
-            // the other one are refilled.
-            let hash_len = 1usize << (self.row_hash_log + self.row_log);
-            let chain_len = 1usize << self.hc_chain_log;
-            let empty = self.hc_empty_slot();
-            let relayout = self.hc_layout != self.finder;
-            // Both tables share the one buffer, so they are sized together:
-            // the hash occupies `[0, hash_len)` and the chain the rest. A
-            // width change on either therefore rewrites both, which costs the
-            // same fill the separate vectors paid and saves an allocation.
-            if self.hc_split != hash_len || self.tables.len() != hash_len + chain_len || relayout {
-                let total = hash_len + chain_len;
-                // A zero sentinel is worth a fresh allocation: the request comes
-                // back as pages the kernel has not had to write, where resizing
-                // writes every element — for a matcher taken fresh per frame
-                // that meant faulting and zeroing the whole table every time.
-                // The chain finder's sentinel is not zero, so it pays the fill
-                // either way and an allocation on top; it keeps the buffer it
-                // has. Either way an oversized one is released, which a level
-                // downgrade needs anyway.
-                if empty == 0
-                    || super::match_table::storage::capacity_is_oversized(
-                        self.tables.capacity(),
-                        total,
-                    )
-                {
-                    self.tables = alloc::vec![empty; total];
-                } else {
-                    self.tables.clear();
-                    self.tables.reserve_exact(total);
-                    self.tables.resize(total, empty);
-                }
-                self.hc_split = hash_len;
-            }
-            self.hc_layout = self.finder;
         } else {
-            // Rows mode never reads the chain / tree tables; a reused
-            // compressor coming back from a btlazy2 level (same Row storage,
-            // no backend swap) must not retain them (tens of MiB) alongside
-            // the live row tables. The row branch above re-sizes the shared
-            // buffer, so nothing to release here beyond the split marker.
-            self.hc_split = 0;
+            self.rows_len = 0;
+            self.heads_len = 0;
+            self.tags_len = 0;
+            self.hc_split = 1usize << (self.row_hash_log + self.row_log);
+            self.hc_layout = self.finder;
         }
     }
 
-    /// Capacity of the shared table buffer, to check that a level downgrade
-    /// hands the oversized allocation back. Test-only.
+    /// Workspace bytes the active finder's tables take.
+    pub(crate) fn tables_workspace_bytes(&self) -> usize {
+        region_bytes::<u32>(self.table_layout().0)
+    }
+
+    /// Lays the active finder's tables out in the open `workspace`. Tables
+    /// that continue the previous frame's keep their contents; otherwise they
+    /// start empty and laid out, and the next [`Self::reset`] knows they hold
+    /// nothing an earlier frame indexed.
+    pub(crate) fn bind_tables(&mut self, workspace: &mut Workspace) {
+        let (len, empty) = self.table_layout();
+        let kept = self.tables.bind(workspace, len, empty);
+        self.tables_fresh = !kept;
+        if !kept {
+            self.mark_tables_laid_out();
+        }
+    }
+
+    pub(crate) fn ensure_tables(&mut self) {
+        let (want, empty) = self.table_layout();
+        let laid_out = if self.finder == LazyFinder::Rows {
+            self.rows_len == (1usize << self.row_hash_log) << self.row_log && self.hc_split == 0
+        } else {
+            self.hc_split == 1usize << (self.row_hash_log + self.row_log)
+                && self.hc_layout == self.finder
+        };
+        if laid_out && self.tables.len() == want {
+            return;
+        }
+        // Laid out for another finder or width. The two finders use different
+        // empty conventions, so the whole buffer is refilled; a matcher no
+        // context laid out (driven on its own) allocates it here at the exact
+        // size.
+        if self.tables.len() == want {
+            self.tables.fill(empty);
+        } else {
+            self.tables = Table::owned(alloc::vec![empty; want]);
+        }
+        self.mark_tables_laid_out();
+    }
+
+    /// Length of the shared table buffer, to check that a level downgrade lays
+    /// out only what the new finder reads. Test-only.
     #[cfg(test)]
-    pub(crate) fn tables_capacity(&self) -> usize {
-        self.tables.capacity()
+    pub(crate) fn tables_len(&self) -> usize {
+        self.tables.len()
     }
 
     /// Combined length of the chain / tree tables. Test-only.

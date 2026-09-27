@@ -2139,14 +2139,15 @@ fn driver_no_dictionary_reset_drops_the_attached_tables() {
 }
 
 /// Regression: switching a reused compressor from a tree level back to a
-/// rows level (both on the Row backend, so no backend swap runs) releases
-/// the chain / tree tables — they are tens of MiB at the btlazy2 levels and
-/// the rows finder never reads them.
+/// rows level (both on the Row backend, so no backend swap runs) lays out
+/// only the rows tables — the chain / tree tables are tens of MiB at the
+/// btlazy2 levels and the rows finder never reads them. The allocation they
+/// were carved from is the workspace's, which gives it back on its own terms
+/// (`a_workspace_far_larger_than_its_frames_is_given_back_after_the_limit`).
 #[test]
 fn driver_rows_frame_releases_the_tree_buffer_capacity() {
     // Coming back from a btlazy2 level, the row frame must not keep the tree
-    // tables' allocation resident: reporting a zero length while holding tens
-    // of MiB of capacity is the same leak in a different accounting column.
+    // tables laid out alongside its own.
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.set_source_size_hint(1 << 20);
     driver.reset(CompressionLevel::Level(15));
@@ -2155,7 +2156,7 @@ fn driver_rows_frame_releases_the_tree_buffer_capacity() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    let tree_capacity = driver.row_matcher().tables_capacity();
+    let tree_capacity = driver.row_matcher().tables_len();
     assert!(
         tree_capacity > 0,
         "fixture precondition: the tree tables are allocated at L15"
@@ -2169,9 +2170,9 @@ fn driver_rows_frame_releases_the_tree_buffer_capacity() {
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
     assert!(
-        driver.row_matcher().tables_capacity() < tree_capacity,
-        "a rows frame must hand back the oversized tree buffer, kept {} of {tree_capacity}",
-        driver.row_matcher().tables_capacity()
+        driver.row_matcher().tables_len() < tree_capacity,
+        "a rows frame must lay out only its rows, kept {} of {tree_capacity}",
+        driver.row_matcher().tables_len()
     );
 }
 

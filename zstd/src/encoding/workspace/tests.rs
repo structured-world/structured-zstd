@@ -99,6 +99,20 @@ fn a_table_that_moves_starts_over() {
     assert!(table.iter().all(|&v| v == 7));
 }
 
+// Every new allocation starts a new generation with nothing known written: an
+// allocator may hand the same address back, and only the generation then tells
+// a holder that the bytes under its old pointer are not its table any more.
+#[test]
+fn a_new_allocation_starts_a_new_generation() {
+    let mut ws = opened(region_bytes::<u32>(16));
+    let _ = ws.table::<u32>(16, 0);
+    let (generation, written) = (ws.generation, ws.valid_front);
+    assert!(written > 0);
+    lay_out(&mut ws, region_bytes::<u32>(1024), 0);
+    assert_ne!(ws.generation, generation);
+    assert_eq!(ws.valid_front, 0);
+}
+
 // A table carved behind another that changed size lands elsewhere and must not
 // read the bytes it finds there as its own.
 #[test]
@@ -220,6 +234,33 @@ fn the_window_caps_the_block_the_trailing_part_is_sized_for() {
     ws.begin_layout(128 * 1024, one_byte_per_block_byte);
     ws.open(0, 4096);
     assert_eq!(ws.block_capacity(), 4096);
+    assert_eq!(ws.capacity(), 4096);
+}
+
+// A context that ran one large frame and then only small ones must not hold the
+// large allocation forever: after the limit it is allocated again at what the
+// frames need, as upstream gives back a workspace left three times too large.
+#[test]
+fn a_workspace_far_larger_than_its_frames_is_given_back_after_the_limit() {
+    let mut ws = Workspace::new();
+    lay_out(&mut ws, 4096, 0);
+    for _ in 0..TOO_LARGE_MAX_LAYOUTS {
+        lay_out(&mut ws, 1024, 0);
+        assert_eq!(ws.capacity(), 4096, "given back before the limit");
+    }
+    lay_out(&mut ws, 1024, 0);
+    assert_eq!(ws.capacity(), 1024);
+}
+
+// A workspace that is larger than the frames need, but by less than the factor,
+// is kept however long it is used: reallocating it would only move the pages.
+#[test]
+fn a_workspace_moderately_larger_than_its_frames_is_kept() {
+    let mut ws = Workspace::new();
+    lay_out(&mut ws, 4096, 0);
+    for _ in 0..(2 * TOO_LARGE_MAX_LAYOUTS) {
+        lay_out(&mut ws, 1500, 0);
+    }
     assert_eq!(ws.capacity(), 4096);
 }
 

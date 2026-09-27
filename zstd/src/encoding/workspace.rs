@@ -71,7 +71,18 @@ pub struct Workspace {
     /// The block size the open layout's trailing part was sized for.
     block_capacity: usize,
     open: bool,
+    /// Layouts since the allocation was last made, for giving back one that
+    /// has stayed far larger than the frames need.
+    layouts_since_allocation: u32,
 }
+
+/// Upstream `ZSTD_WORKSPACETOOLARGE_FACTOR` / `_MAXDURATION`
+/// (`zstd_internal.h:258-265`): a workspace left with at least three times a
+/// frame's need unused, more than this many frames after it was allocated, is
+/// allocated again at the need (`ZSTD_resetCCtx_internal`,
+/// `zstd_compress.c:2154-2159`).
+const TOO_LARGE_FACTOR: usize = 3;
+const TOO_LARGE_MAX_LAYOUTS: u32 = 128;
 
 // SAFETY: the workspace owns its allocation outright; the raw pointer is what
 // makes the type `!Send`/`!Sync` by default, not any shared state.
@@ -93,6 +104,7 @@ impl Workspace {
             trailing_for: no_trailing,
             block_capacity: 0,
             open: false,
+            layouts_since_allocation: 0,
         }
     }
 
@@ -123,10 +135,11 @@ impl Workspace {
     }
 
     /// Opens the layout with `leading` bytes for the caller's tables ahead of
-    /// the trailing part sized for a frame with a `window`-byte window, growing
-    /// the allocation if the two together do not fit. Growing discards every
-    /// region carved before, so a holder whose region is not a continuation
-    /// must reinitialise it.
+    /// the trailing part sized for a frame with a `window`-byte window,
+    /// allocating anew when the two together do not fit, or when the
+    /// allocation has stayed far larger than the frames need. A new allocation
+    /// discards every region carved before, so a holder whose region is not a
+    /// continuation must reinitialise it.
     ///
     /// # Panics
     ///
@@ -139,7 +152,21 @@ impl Workspace {
         let total = leading
             .checked_add((self.trailing_for)(self.block_capacity))
             .expect("workspace size overflows usize");
-        if total > self.capacity {
+        // Only "more than the limit" is ever asked of the count, so pinning it
+        // at the top of its range keeps the answer right on a context that
+        // outlives four billion frames.
+        self.layouts_since_allocation = self.layouts_since_allocation.saturating_add(1);
+        let reallocate = if total > self.capacity {
+            true
+        } else {
+            // A need so large that three of it overflow cannot be exceeded
+            // three times over by what is left, so it is never wasteful.
+            self.layouts_since_allocation > TOO_LARGE_MAX_LAYOUTS
+                && total
+                    .checked_mul(TOO_LARGE_FACTOR)
+                    .is_some_and(|wasted| self.capacity - total >= wasted)
+        };
+        if reallocate {
             self.grow(total);
         }
         self.front = 0;
@@ -235,18 +262,25 @@ impl Workspace {
         }
     }
 
+    /// Replaces the allocation with one of `bytes`, discarding every region:
+    /// the generation moves on, so no later region can pass for a continuation
+    /// of one carved before, even at the same address.
     fn grow(&mut self, bytes: usize) {
         self.release();
+        self.generation += 1;
+        self.valid_front = 0;
+        self.layouts_since_allocation = 0;
+        if bytes == 0 {
+            return;
+        }
         let layout = Layout::from_size_align(bytes, ALIGN).expect("workspace size overflows isize");
-        // SAFETY: `layout` has a non-zero size, since `bytes > capacity >= 0`.
+        // SAFETY: `layout` has a non-zero size, checked above.
         let raw = unsafe { alloc(layout) };
         let Some(ptr) = NonNull::new(raw) else {
             handle_alloc_error(layout);
         };
         self.ptr = ptr;
         self.capacity = bytes;
-        self.generation += 1;
-        self.valid_front = 0;
     }
 
     fn release(&mut self) {

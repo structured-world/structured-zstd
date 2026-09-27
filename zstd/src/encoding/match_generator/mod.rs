@@ -1456,7 +1456,6 @@ impl Matcher for MatchGeneratorDriver {
                 dfast.reset();
             }
             MatcherStorage::Row(row) => {
-                workspace.open(0, max_window_size);
                 row.max_window_size = max_window_size;
                 row.lazy_depth = params.lazy_depth;
                 row.set_dict_plan(dict_plan);
@@ -1488,6 +1487,11 @@ impl Matcher for MatchGeneratorDriver {
                 // identical table geometries apart and forces needless
                 // dictionary re-primes.
                 resolved_table_bits = row.hash_bits();
+                // The finder and its widths are settled by `configure`, so the
+                // tables can be laid out; the reset reads whether they continue
+                // the last frame's.
+                workspace.open(row.tables_workspace_bytes(), max_window_size);
+                row.bind_tables(workspace);
                 row.reset();
             }
             MatcherStorage::HashChain(hc) => {
