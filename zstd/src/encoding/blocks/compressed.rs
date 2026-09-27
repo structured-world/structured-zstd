@@ -6,7 +6,7 @@ use crate::{
     decoding::simd_copy::ExactCopyTier,
     encoding::block_header::BlockHeader,
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
-    encoding::workspace::{RegionVec, WorkspaceCarver, region_bytes},
+    encoding::workspace::{RegionVec, Workspace, region_bytes},
     encoding::{Matcher, Sequence},
     fse::fse_encoder::{
         FSETable, build_seq_ctable_into, build_table_from_symbol_counts_into,
@@ -213,13 +213,13 @@ impl CompressedBlockScratch {
             + region_bytes::<u32>(sequences)
     }
 
-    /// Takes the buffers from `carver`, sized for blocks of up to
-    /// `block_capacity` source bytes.
-    pub(crate) fn bind(&mut self, carver: &mut WorkspaceCarver<'_>, block_capacity: usize) {
+    /// Takes the buffers from the open `workspace` layout, sized for blocks of
+    /// up to `block_capacity` source bytes.
+    pub(crate) fn bind(&mut self, workspace: &mut Workspace, block_capacity: usize) {
         let sequences = max_sequences(block_capacity);
-        self.parts.literals = carver.buffer(block_capacity);
-        self.parts.sequences = carver.buffer(sequences);
-        self.sequence_codes = carver.buffer(sequences);
+        self.parts.literals = workspace.buffer(block_capacity);
+        self.parts.sequences = workspace.buffer(sequences);
+        self.sequence_codes = workspace.buffer(sequences);
     }
 }
 

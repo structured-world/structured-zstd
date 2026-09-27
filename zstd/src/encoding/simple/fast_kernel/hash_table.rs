@@ -6,7 +6,8 @@
 //! sized `1 << hash_log` entries.
 
 use alloc::vec;
-use alloc::vec::Vec;
+
+use crate::encoding::workspace::{Table, Workspace, region_bytes};
 
 /// Upstream zstd `ZSTD_HASHLOG_MAX` (`lib/zstd.h`). The cap applies uniformly
 /// across all five `mls` instantiations (`mls ∈ {4, 5, 6, 7, 8}`): even
@@ -54,7 +55,9 @@ const PRIME_8_BYTES: u64 = 0xCF1BBCDCB7A56463;
 /// loop entry skips it) or is below `prefixStartIndex` and filtered by
 /// the in-range check.
 pub(crate) struct FastHashTable {
-    table: Vec<u32>,
+    /// In the context's workspace for the live table; an allocation of its own
+    /// for a dictionary table or a snapshot copy.
+    table: Table<u32>,
     /// Upstream zstd `hash_log` — number of bits the hash output is reduced to.
     hash_log: u32,
     /// Upstream zstd `mls` — minimum match length used as the hash input width.
@@ -144,40 +147,43 @@ impl FastHashTable {
     /// state.
     pub(crate) fn new(hash_log: u32, mls: u32) -> Self {
         validate_params(hash_log, mls);
-        // Per-target allocation feasibility: `1 << hash_log` u32 entries
-        // = `1 << (hash_log + 2)` bytes. On 32-bit hosts that overflows
-        // `usize` at `hash_log >= 30` (4 GiB exceeds the address space).
-        // `validate_params` already pins `hash_log <= ZSTD_HASHLOG_MAX
-        // = 30`, but on 32-bit the maximum that actually fits is `<=
-        // 29` (2 GiB) — anything larger panics deep inside `Vec::with_
-        // capacity` with a generic allocation message. Surface a clear
-        // panic at construction so the failure mode is obvious instead.
-        let entries = 1usize.checked_shl(hash_log).unwrap_or_else(|| {
-            panic!(
-                "FastHashTable cannot allocate 2^{hash_log} u32 entries on this target: \
-                 `1usize << {hash_log}` overflows {0}-bit usize",
-                usize::BITS,
-            )
-        });
-        let bytes = entries
-            .checked_mul(core::mem::size_of::<u32>())
-            .unwrap_or_else(|| {
-                panic!(
-                    "FastHashTable cannot allocate {entries} u32 entries on this target: \
-                 byte size overflows {0}-bit usize",
-                    usize::BITS,
-                )
-            });
-        // Use `bytes` to compute as a tripwire — actual allocation
-        // still goes through `vec![]` so the global allocator picks
-        // the strategy (zeroed page mapping, etc.).
-        let _ = bytes;
         Self {
-            table: vec![0u32; entries],
+            table: Table::owned(vec![0u32; entry_count(hash_log)]),
             hash_log,
             mls,
             bias: 0,
         }
+    }
+
+    /// Workspace bytes a table of `1 << hash_log` entries takes.
+    pub(crate) fn workspace_bytes(hash_log: u32) -> usize {
+        region_bytes::<u32>(entry_count(hash_log))
+    }
+
+    /// Lays the table out in the open `workspace` at `(hash_log, mls)`.
+    /// Returns `true` when it continues the previous frame's table at the same
+    /// shape, contents and epoch bias intact; otherwise every entry is the
+    /// empty sentinel and the bias is `0`, as [`Self::new`] leaves them.
+    ///
+    /// # Panics
+    ///
+    /// On the parameters [`Self::new`] refuses.
+    pub(crate) fn bind(&mut self, workspace: &mut Workspace, hash_log: u32, mls: u32) -> bool {
+        validate_params(hash_log, mls);
+        let same_shape = self.hash_log == hash_log && self.mls == mls;
+        let kept = self.table.bind(workspace, entry_count(hash_log), 0);
+        self.hash_log = hash_log;
+        self.mls = mls;
+        if kept && same_shape {
+            return true;
+        }
+        if kept {
+            // The same bytes, keyed by a different hash: nothing in them
+            // names what the new shape would look up.
+            self.table.fill(0);
+        }
+        self.bias = 0;
+        false
     }
 
     /// Construct without allocating the entry storage. Records the requested
@@ -192,7 +198,7 @@ impl FastHashTable {
     pub(crate) fn new_deferred(hash_log: u32, mls: u32) -> Self {
         validate_params(hash_log, mls);
         Self {
-            table: Vec::new(),
+            table: Table::empty(),
             hash_log,
             mls,
             bias: 0,
@@ -216,9 +222,10 @@ impl FastHashTable {
         self.mls
     }
 
-    /// Heap bytes held by the table's `Vec<u32>` (its allocated capacity).
+    /// Heap bytes the table owns; a table in the context's workspace is
+    /// counted with the workspace.
     pub(crate) fn heap_size(&self) -> usize {
-        self.table.capacity() * core::mem::size_of::<u32>()
+        self.table.owned_bytes()
     }
 
     /// Clear the table back to all-sentinel. Used on encoder reset
@@ -400,6 +407,32 @@ impl FastHashTable {
             *self.table.get_unchecked_mut(hash as usize) = biased;
         }
     }
+}
+
+/// Entries of a table of `hash_log` bits.
+///
+/// # Panics
+///
+/// When `1 << hash_log` entries do not fit this target: `validate_params` caps
+/// `hash_log` at `ZSTD_HASHLOG_MAX = 30`, which is still 4 GiB of `u32`s, past
+/// a 32-bit address space. Surfaced here rather than as a generic allocation
+/// failure.
+fn entry_count(hash_log: u32) -> usize {
+    let entries = 1usize.checked_shl(hash_log).unwrap_or_else(|| {
+        panic!(
+            "FastHashTable cannot allocate 2^{hash_log} u32 entries on this target: \
+             `1usize << {hash_log}` overflows {0}-bit usize",
+            usize::BITS,
+        )
+    });
+    if entries.checked_mul(core::mem::size_of::<u32>()).is_none() {
+        panic!(
+            "FastHashTable cannot allocate {entries} u32 entries on this target: \
+             byte size overflows {0}-bit usize",
+            usize::BITS,
+        );
+    }
+    entries
 }
 
 /// Free-function form of [`FastHashTable::hash_ptr`] taking `hash_log`

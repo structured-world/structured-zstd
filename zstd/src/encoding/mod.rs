@@ -517,6 +517,24 @@ pub trait Matcher {
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);
+    /// Reset for the next frame at `level`, as [`reset`](Self::reset), with
+    /// the compression context's workspace to take tables from rather than
+    /// allocating them. The context calls this in place of `reset`, once per
+    /// frame.
+    ///
+    /// The workspace type cannot be named outside this crate, so a matcher
+    /// defined elsewhere can neither override nor call this: it keeps the
+    /// default, which resets and keeps its own allocations. That is what makes
+    /// the workspace's regions sound to hand out: only the context lays it out,
+    /// and only for the matcher it is resetting.
+    #[doc(hidden)]
+    fn reset_in_workspace(
+        &mut self,
+        level: CompressionLevel,
+        _workspace: &mut workspace::Workspace,
+    ) {
+        self.reset(level);
+    }
     /// Provide a hint about the total uncompressed size for the next frame.
     ///
     /// Implementations may use this to select smaller hash tables and windows

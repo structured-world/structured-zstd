@@ -595,6 +595,8 @@ impl FastKernelMatcher {
         // table contents and epoch bias are about to be replaced
         // wholesale, so the full-table memset here would be pure waste.
         table_overwritten_by_restore: bool,
+        // The open layout the hash table is carved from.
+        workspace: &mut crate::encoding::workspace::Workspace,
     ) {
         assert!(
             step_size >= 2,
@@ -609,27 +611,15 @@ impl FastKernelMatcher {
         // Re-borrow detection: set to the resident dict region when the
         // epoch-reuse branch below keeps the dict bytes in place (see there).
         let mut reborrow_region: Option<usize> = None;
-        if !self.hash_table.is_allocated() {
-            // Deferred table from `with_params`: this first reset is where the
-            // source-size-clamped (hash_log, mls) is finally known, so allocate
-            // once at the resolved size. Subsequent frames take the
-            // same-shape `clear()` / epoch branches below.
-            self.hash_table = FastHashTable::new(hash_log, mls);
+        if !self.hash_table.bind(workspace, hash_log, mls) {
+            // A new table: the first frame, a new shape, or a workspace that
+            // moved. It starts empty, so there is nothing to clear, and the
+            // cached dict table goes with it: its absolute positions index a
+            // table this one no longer continues.
             self.dict.invalidate();
-        } else if table_overwritten_by_restore
-            && self.hash_table.hash_log() == hash_log
-            && self.hash_table.mls() == mls
-        {
+        } else if table_overwritten_by_restore {
             // Leave the table untouched: the snapshot restore copies the
             // primed contents (and bias) over it immediately after.
-        } else if self.hash_table.hash_log() != hash_log || self.hash_table.mls() != mls {
-            // Parameters changed — rebuild the table at the new size.
-            // Cannot reuse the old allocation because the hash table
-            // dimensions are baked in at construction. A reshape also
-            // invalidates the cached dict table: its absolute positions
-            // index a table whose shape no longer matches.
-            self.hash_table = FastHashTable::new(hash_log, mls);
-            self.dict.invalidate();
         } else if dict_attach_epoch && self.dict.is_primed() {
             // Dict-attach frame over the same primed dictionary: advance
             // the epoch bias past every position the previous frames could

@@ -1427,16 +1427,35 @@ pub(crate) fn huf_search_enabled(
 }
 
 impl<M: Matcher> CompressState<M> {
-    /// Lays the workspace out for a frame whose blocks carry up to
-    /// `block_capacity` source bytes, growing it first if it is too small, and
-    /// binds every buffer carved from it. Called once per frame, after the
-    /// matcher's reset has settled the frame's parameters.
-    pub(crate) fn lay_out_workspace(&mut self, block_capacity: usize) {
-        let bytes =
-            crate::encoding::blocks::CompressedBlockScratch::workspace_bytes(block_capacity);
-        self.workspace.ensure(bytes);
-        let mut carver = self.workspace.carver();
-        self.block_scratch.bind(&mut carver, block_capacity);
+    /// Resets the matcher for the next frame at `level` and lets it lay its
+    /// tables out in the workspace, reserving room behind them for the block
+    /// buffers of blocks up to `block_target` bytes (capped by the frame's
+    /// window). [`Self::finish_layout`] completes the layout.
+    pub(crate) fn reset_for_frame(&mut self, level: CompressionLevel, block_target: usize) {
+        self.workspace.begin_layout(
+            block_target,
+            crate::encoding::blocks::CompressedBlockScratch::workspace_bytes,
+        );
+        self.matcher.reset_in_workspace(level, &mut self.workspace);
+    }
+
+    /// Carves the block buffers for blocks of up to `block_capacity` bytes,
+    /// opening the layout first when the matcher took no tables from it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `block_capacity` exceeds what the layout reserved for, which
+    /// would mean the frame and the matcher disagree on the window.
+    pub(crate) fn finish_layout(&mut self, block_capacity: usize) {
+        if !self.workspace.is_open() {
+            self.workspace.open(0, block_capacity);
+        }
+        let reserved = self.workspace.block_capacity();
+        assert!(
+            block_capacity <= reserved,
+            "a {block_capacity}-byte block exceeds the {reserved} bytes the workspace reserved"
+        );
+        self.block_scratch.bind(&mut self.workspace, reserved);
     }
 
     /// Heap bytes the compressor keeps between blocks and frames beyond the
@@ -2458,9 +2477,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             self.state.matcher.set_dictionary_size_hint(dict.sizes());
         }
         // Clearing buffers to allow re-using of the compressor
-        self.state.matcher.reset(self.compression_level);
+        let block_target = self
+            .target_block_size
+            .map_or(crate::common::MAX_BLOCK_SIZE as usize, |t| t as usize);
+        self.state
+            .reset_for_frame(self.compression_level, block_target);
         let block_capacity = self.block_capacity();
-        self.state.lay_out_workspace(block_capacity);
+        self.state.finish_layout(block_capacity);
         self.state.offset_hist = [1, 4, 8];
         // Sync `state.strategy_tag` to the level resolved at this reset so
         // the literal-compression gates (`min_literals_to_compress` /

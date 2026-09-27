@@ -549,7 +549,8 @@ fn retained_heap_size_counts_the_block_buffers() {
     };
     let before = state.retained_scratch_heap_size();
     let block = 64 * 1024;
-    state.lay_out_workspace(block);
+    state.reset_for_frame(crate::encoding::CompressionLevel::Fastest, block);
+    state.finish_layout(block);
     let after = state.retained_scratch_heap_size();
     let needed = super::CompressedBlockScratch::workspace_bytes(block);
     assert!(
@@ -561,8 +562,9 @@ fn retained_heap_size_counts_the_block_buffers() {
 
 /// A buffer for `count` sequence codes, carved from `ws`, which must outlive it.
 fn code_buffer(ws: &mut Workspace, count: usize) -> RegionVec<u32> {
-    ws.ensure(region_bytes::<u32>(count));
-    ws.carver().buffer(count)
+    ws.begin_layout(0, |_| 0);
+    ws.open(region_bytes::<u32>(count), 0);
+    ws.buffer(count)
 }
 
 /// The estimator prices a block the splitter is thinking about; the emitter

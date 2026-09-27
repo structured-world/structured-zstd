@@ -884,9 +884,13 @@ impl<M: Matcher> CompressionContext<M> {
         if let Some(size) = self.pledged_content_size.or(self.source_size_hint) {
             self.state.matcher.set_source_size_hint(size);
         }
-        self.state.matcher.reset(self.compression_level);
+        let block_target = self
+            .target_block_size
+            .map_or(MAX_BLOCK_SIZE as usize, |t| t as usize);
+        self.state
+            .reset_for_frame(self.compression_level, block_target);
         let block_capacity = self.block_capacity();
-        self.state.lay_out_workspace(block_capacity);
+        self.state.finish_layout(block_capacity);
         // Sync `state.strategy_tag` / `state.pre_split` to the strategy the
         // matcher's reset resolved (size- and dictionary-adaptive; a public
         // strategy override wins) so the literal-compression gates, the block

@@ -1,4 +1,36 @@
 use super::*;
+use crate::encoding::workspace::{Workspace, no_trailing};
+
+/// Resets `m` to `(window_log, hash_log, mls, step_size)` with its hash table
+/// laid out in `ws`, which the test keeps alive for as long as it uses `m`. A
+/// test that resets twice through the same `ws` gets the table continued, as a
+/// compression context would.
+fn reset_in(
+    m: &mut FastKernelMatcher,
+    ws: &mut Workspace,
+    (window_log, hash_log, mls, step_size): (u8, u32, u32, usize),
+    dict_attach_epoch: bool,
+    table_overwritten_by_restore: bool,
+) {
+    ws.begin_layout(0, no_trailing);
+    ws.open(FastHashTable::workspace_bytes(hash_log), 0);
+    m.reset(
+        window_log,
+        hash_log,
+        mls,
+        step_size,
+        dict_attach_epoch,
+        table_overwritten_by_restore,
+        ws,
+    );
+}
+
+const LEVEL_1_SHAPE: (u8, u32, u32, usize) = (
+    FAST_LEVEL_1_WINDOW_LOG,
+    FAST_LEVEL_1_HASH_LOG,
+    FAST_LEVEL_1_MLS,
+    2,
+);
 
 #[test]
 fn new_uses_level_1_defaults() {
@@ -44,18 +76,12 @@ fn borrowed_window_reads_match_owned_then_restores() {
 
 #[test]
 fn reset_clears_borrowed_window() {
+    let mut ws = Workspace::new();
     let mut m = FastKernelMatcher::new();
     let external = b"borrowed".to_vec();
     // SAFETY: `external` outlives the reset call below.
     unsafe { m.set_borrowed_window(&external) };
-    m.reset(
-        FAST_LEVEL_1_WINDOW_LOG,
-        FAST_LEVEL_1_HASH_LOG,
-        FAST_LEVEL_1_MLS,
-        2,
-        false,
-        false,
-    );
+    reset_in(&mut m, &mut ws, LEVEL_1_SHAPE, false, false);
     // After reset the borrowed window is dropped — back to the
     // (now empty) owned buffer, never the dangling external range.
     assert!(m.borrowed.is_none());
@@ -181,6 +207,7 @@ fn last_committed_space_empty_before_commit() {
 
 #[test]
 fn reset_clears_history_and_state() {
+    let mut ws = Workspace::new();
     let mut m = FastKernelMatcher::new();
     // Simulate prior-frame state — non-empty history, advanced
     // prefix, non-default rep/offset stacks, a leftover pending
@@ -192,14 +219,7 @@ fn reset_clears_history_and_state() {
     m.offset_hist = [10, 20, 30];
     m.pending = Some(alloc::vec![5, 6, 7]);
 
-    m.reset(
-        FAST_LEVEL_1_WINDOW_LOG,
-        FAST_LEVEL_1_HASH_LOG,
-        FAST_LEVEL_1_MLS,
-        2,
-        false,
-        false,
-    );
+    reset_in(&mut m, &mut ws, LEVEL_1_SHAPE, false, false);
 
     // Post-reset: history empty (HISTORY_DRAIN_BASE=0; no
     // dummy only; prefix_start_index pinned to that baseline.
@@ -218,10 +238,10 @@ fn reset_clears_history_and_state() {
 
 #[test]
 fn reset_with_changed_params_rebuilds_hash_table() {
+    let mut ws = Workspace::new();
     let mut m = FastKernelMatcher::new();
-    // Force a parameter change — every Vec we hand the new
-    // FastHashTable will be a fresh allocation.
-    m.reset(16, 10, 4, 2, false, false);
+    // Force a parameter change: the table is laid out anew at the new width.
+    reset_in(&mut m, &mut ws, (16, 10, 4, 2), false, false);
     assert_eq!(m.hash_table.hash_log(), 10);
     assert_eq!(m.hash_table.mls(), 4);
     assert_eq!(m.window_log, 16);
@@ -236,14 +256,15 @@ fn reset_with_changed_params_rebuilds_hash_table() {
 // worse, dropping the clear on the plain path.
 #[test]
 fn reset_keeps_table_when_overwritten_by_restore() {
+    let mut ws = Workspace::new();
     let mut m = FastKernelMatcher::new();
-    m.reset(16, 10, 4, 2, false, false);
+    reset_in(&mut m, &mut ws, (16, 10, 4, 2), false, false);
     let probe_hash = 7u32;
     // SAFETY: hash 7 < (1 << hash_log = 1024) table entries.
     unsafe { m.hash_table.put(probe_hash, 0xCAFE) };
 
     // Same shape + restore-pending: contents survive the reset.
-    m.reset(16, 10, 4, 2, false, true);
+    reset_in(&mut m, &mut ws, (16, 10, 4, 2), false, true);
     // SAFETY: same bounds as the put above.
     assert_eq!(
         unsafe { m.hash_table.get(probe_hash) },
@@ -252,7 +273,7 @@ fn reset_keeps_table_when_overwritten_by_restore() {
     );
 
     // Plain same-shape reset: contents are memset back to empty.
-    m.reset(16, 10, 4, 2, false, false);
+    reset_in(&mut m, &mut ws, (16, 10, 4, 2), false, false);
     // SAFETY: same bounds as the put above.
     assert_eq!(
         unsafe { m.hash_table.get(probe_hash) },
@@ -263,7 +284,7 @@ fn reset_keeps_table_when_overwritten_by_restore() {
     // Shape change overrides the flag: the table is rebuilt at the
     // new geometry even when a restore is claimed to be pending.
     unsafe { m.hash_table.put(probe_hash, 0xCAFE) };
-    m.reset(16, 11, 4, 2, false, true);
+    reset_in(&mut m, &mut ws, (16, 11, 4, 2), false, true);
     assert_eq!(m.hash_table.hash_log(), 11);
     // SAFETY: hash 7 < (1 << 11) table entries.
     assert_eq!(

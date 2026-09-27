@@ -352,6 +352,10 @@ pub struct MatchGeneratorDriver {
     /// is only restored into a reset that produces the same matcher — see
     /// `restore_primed_dictionary`.
     primed: Option<(MatcherStorage, usize, PrimedKey)>,
+    /// Where the tables live when the driver is reset on its own through
+    /// [`Matcher::reset`]; inside a compression context they live in the
+    /// context's workspace instead and this stays empty.
+    own_workspace: crate::encoding::workspace::Workspace,
 }
 
 /// Identity of the matcher configuration a primed snapshot was captured under:
@@ -523,6 +527,7 @@ impl MatchGeneratorDriver {
             dictionary_size_hint: None,
             borrowed_pending: None,
             primed: None,
+            own_workspace: crate::encoding::workspace::Workspace::new(),
         }
     }
 
@@ -1030,9 +1035,11 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     /// Heap bytes this driver owns: the active backend's tables/history, the
-    /// recycled input-buffer pool, and the primed-dictionary snapshot (a cloned
-    /// backend kept for CDict-equivalent reuse). The inline struct itself is
-    /// accounted by the owner's `size_of`.
+    /// recycled input-buffer pool, the primed-dictionary snapshot (a cloned
+    /// backend kept for CDict-equivalent reuse), and the workspace its tables
+    /// live in when it is reset on its own. Tables laid out in a compression
+    /// context's workspace are the context's to count. The inline struct itself
+    /// is accounted by the owner's `size_of`.
     fn heap_size(&self) -> usize {
         let pool: usize = self.vec_pool.capacity() * core::mem::size_of::<Vec<u8>>()
             + self.vec_pool.iter().map(Vec::capacity).sum::<usize>();
@@ -1040,7 +1047,7 @@ impl Matcher for MatchGeneratorDriver {
             .primed
             .as_ref()
             .map_or(0, |(storage, _, _)| storage.heap_size());
-        pool + self.storage.heap_size() + snapshot
+        pool + self.storage.heap_size() + snapshot + self.own_workspace.capacity()
     }
 
     fn clear_param_overrides(&mut self) {
@@ -1048,6 +1055,20 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn reset(&mut self, level: CompressionLevel) {
+        // On its own the driver lays its tables out in a workspace of its own,
+        // which is moved out for the call and back: moving it leaves the
+        // allocation, and so every region carved from it, where it is.
+        let mut own = core::mem::take(&mut self.own_workspace);
+        own.begin_layout(0, crate::encoding::workspace::no_trailing);
+        self.reset_in_workspace(level, &mut own);
+        self.own_workspace = own;
+    }
+
+    fn reset_in_workspace(
+        &mut self,
+        level: CompressionLevel,
+        workspace: &mut crate::encoding::workspace::Workspace,
+    ) {
         let hint = self.source_size_hint.take();
         // An empty dictionary is "no dictionary": it primes nothing, so every
         // dictionary-frame decision below must see `None` for it.
@@ -1241,7 +1262,9 @@ impl Matcher for MatchGeneratorDriver {
                     // Uncompressed keep (hash_log=14, mls=6). See
                     // resolve_level_params for rationale.
                     let fast = params.fast.expect("Fast level row carries a FastConfig");
-                    MatcherStorage::Simple(FastKernelMatcher::with_params(
+                    // Deferred: the reset below lays the table out in the
+                    // workspace at the frame's resolved width.
+                    MatcherStorage::Simple(FastKernelMatcher::with_params_deferred(
                         params.window_log,
                         fast.hash_log,
                         fast.mls,
@@ -1361,6 +1384,12 @@ impl Matcher for MatchGeneratorDriver {
                     )
                     .hash_log
                 }));
+                workspace.open(
+                    crate::encoding::simple::fast_kernel::hash_table::FastHashTable::workspace_bytes(
+                        hash_log,
+                    ),
+                    max_window_size,
+                );
                 m.reset(
                     params.window_log,
                     hash_log,
@@ -1368,9 +1397,11 @@ impl Matcher for MatchGeneratorDriver {
                     fast.step_size,
                     dict_attach_epoch,
                     table_overwritten_by_restore,
+                    workspace,
                 );
             }
             MatcherStorage::Dfast(dfast) => {
+                workspace.open(0, max_window_size);
                 dfast.max_window_size = max_window_size;
                 let dcfg = params
                     .dfast
@@ -1422,6 +1453,7 @@ impl Matcher for MatchGeneratorDriver {
                 dfast.reset();
             }
             MatcherStorage::Row(row) => {
+                workspace.open(0, max_window_size);
                 row.max_window_size = max_window_size;
                 row.lazy_depth = params.lazy_depth;
                 row.set_dict_plan(dict_plan);
@@ -1456,6 +1488,7 @@ impl Matcher for MatchGeneratorDriver {
                 row.reset();
             }
             MatcherStorage::HashChain(hc) => {
+                workspace.open(0, max_window_size);
                 hc.table.max_window_size = max_window_size;
                 hc.hc.lazy_depth = params.lazy_depth;
                 let mut hc_cfg = params.hc.expect("HashChain level row carries an HcConfig");
