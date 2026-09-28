@@ -119,7 +119,7 @@ pub enum TrainingError {
     /// bytes.
     Samples,
     /// The dictionary asked for is smaller than
-    /// [`SEGMENT_DICT_SIZE_MIN`](super::SEGMENT_DICT_SIZE_MIN).
+    /// [`TRAINER_DICT_SIZE_MIN`](super::TRAINER_DICT_SIZE_MIN).
     DictionaryTooSmall,
 }
 

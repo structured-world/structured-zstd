@@ -711,7 +711,7 @@ fn check_samples_and_dict_size<'s>(
 /// # Errors
 ///
 /// `InvalidInput` when `k` or `d` is zero or `d > k`, when `k` exceeds
-/// `dict_size`, when `dict_size` is under [`SEGMENT_DICT_SIZE_MIN`], when there
+/// `dict_size`, when `dict_size` is under [`TRAINER_DICT_SIZE_MIN`], when there
 /// are fewer than five samples or they do not add up to `samples.len()`;
 /// [`TrainingError::of`] tells these causes apart.
 ///
