@@ -1110,10 +1110,6 @@ impl Matcher for MatchGeneratorDriver {
         self.param_overrides = None;
     }
 
-    fn apply_parameters(&mut self, params: &super::CompressionParameters) {
-        self.param_overrides = Some(params.overrides());
-    }
-
     fn reset(&mut self, level: CompressionLevel) {
         // On its own the driver lays its tables out in a workspace of its own,
         // which is moved out for the call and back: moving it leaves the

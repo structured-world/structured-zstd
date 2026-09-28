@@ -124,68 +124,29 @@ fn literal_tables_take_the_depth_of_their_longest_code() {
     assert_eq!(parsed as usize, description.len());
 }
 
-/// Only a sample's first block is counted (upstream zstd `ZDICT_countEStats`
-/// compresses `MIN(128 KiB, 1 << windowLog)` bytes as one block, the window of
-/// the average sample plus the content). Samples averaging a line with half a
-/// KiB of content keep that window at its 1 KiB floor; two versions of an
-/// 8 KiB sample that differ only past 4 KiB must finalize to the same bytes.
-#[test]
-fn only_the_first_block_of_a_sample_is_counted() {
-    let (mut data, mut sizes) = log_samples();
-    let content: Vec<u8> = data[..512].to_vec();
-    let head = data[..4096].to_vec();
-    let mut state = 0x2545_F491_4F6C_DD1Du64;
-    let noise: Vec<u8> = (0..4096)
+/// Random bytes, different for each seed.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    (0..len)
         .map(|_| {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
             state as u8
         })
-        .collect();
-    sizes.push(8192);
-    let finalized = |tail: &[u8], data: &mut Vec<u8>| {
-        let base = data.len();
-        data.extend_from_slice(&head);
-        data.extend_from_slice(tail);
-        let samples = SampleSet::new(data, &sizes).unwrap();
-        let dict = finalize(
-            &content,
-            &samples,
-            samples.count(),
-            8192,
-            FinalizeOptions::default(),
-        )
-        .unwrap();
-        data.truncate(base);
-        dict
-    };
-    let with_runs = finalized(&[b'z'; 4096], &mut data);
-    let with_noise = finalized(&noise, &mut data);
-    assert!(
-        with_runs == with_noise,
-        "a sample's second block reached the tables"
-    );
+        .collect()
 }
 
-/// The first block spans the window of the average sample plus the content,
-/// not of the sample alone: with 4 KiB of content that window is 8 KiB, so the
-/// second half of an 8 KiB sample is counted and two versions differing there
-/// finalize differently.
+/// A block written raw teaches nothing: its bytes are no literals of any
+/// compressed block. Samples averaging a line keep the blocks at 1 KiB, so an
+/// 8 KiB sample of 4 KiB of log lines and 4 KiB of noise is four compressed
+/// blocks and four raw ones; two versions differing only in the noise must
+/// finalize to the same bytes.
 #[test]
-fn the_first_block_spans_the_window_of_sample_and_content() {
+fn a_block_written_raw_is_not_counted() {
     let (mut data, mut sizes) = log_samples();
     let content: Vec<u8> = data[..4096].to_vec();
     let head = data[..4096].to_vec();
-    let mut state = 0x2545_F491_4F6C_DD1Du64;
-    let noise: Vec<u8> = (0..4096)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state as u8
-        })
-        .collect();
     sizes.push(8192);
     let finalized = |tail: &[u8], data: &mut Vec<u8>| {
         let base = data.len();
@@ -203,12 +164,9 @@ fn the_first_block_spans_the_window_of_sample_and_content() {
         data.truncate(base);
         dict
     };
-    let with_runs = finalized(&[b'z'; 4096], &mut data);
-    let with_noise = finalized(&noise, &mut data);
-    assert!(
-        with_runs != with_noise,
-        "the second half of the sample's first block was not counted"
-    );
+    let one = finalized(&noise(0x2545_F491_4F6C_DD1D, 4096), &mut data);
+    let other = finalized(&noise(0x9E37_79B9_7F4A_7C15, 4096), &mut data);
+    assert!(one == other, "a raw block's bytes reached the tables");
 }
 
 /// Offset codes are counted with the repeat policy the frame's blocks used.
@@ -254,26 +212,25 @@ fn offset_codes_follow_the_frames_repeat_policy() {
     assert_eq!(offset_code_one(1), 1);
 }
 
-/// Only a frame whose first block is compressed counts as one.
+/// Each block's kind is read from the frame, one entry per block, and nothing
+/// from bytes that are not a frame.
 #[test]
-fn first_block_kind_is_read_from_the_frame() {
+fn block_kinds_are_read_from_the_frame() {
+    let mut kinds = Vec::new();
     let text: String = core::iter::repeat_n("compressible text ", 200).collect();
-    assert!(first_block_is_compressed(&compress_slice_to_vec(
-        text.as_bytes(),
-        CompressionLevel::Default
-    )));
-    let mut state = 1u32;
-    let noise: Vec<u8> = (0..4096)
-        .map(|_| {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (state >> 24) as u8
-        })
-        .collect();
-    assert!(!first_block_is_compressed(&compress_slice_to_vec(
-        &noise,
-        CompressionLevel::Default
-    )));
-    assert!(!first_block_is_compressed(b"not a frame"));
+    compressed_blocks(
+        &compress_slice_to_vec(text.as_bytes(), CompressionLevel::Default),
+        &mut kinds,
+    );
+    assert_eq!(kinds, [true]);
+    // Past one full block of noise: two blocks, both written raw.
+    compressed_blocks(
+        &compress_slice_to_vec(&noise(1, 200_000), CompressionLevel::Default),
+        &mut kinds,
+    );
+    assert_eq!(kinds, [false, false]);
+    compressed_blocks(b"not a frame", &mut kinds);
+    assert!(kinds.is_empty());
 }
 
 /// The id is derived from the content when none is given, inside the range

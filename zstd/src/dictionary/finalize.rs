@@ -16,8 +16,8 @@ use crate::encoding::blocks::{
 };
 use crate::encoding::workspace::Workspace;
 use crate::encoding::{
-    CompressionLevel, CompressionParameters, DictionarySizes, EncoderDictionary, FrameCompressor,
-    HistoryBuf, LevelParameters, MatchGeneratorDriver, Matcher, Sequence,
+    CompressionLevel, DictionarySizes, EncoderDictionary, FrameCompressor, HistoryBuf,
+    MatchGeneratorDriver, Matcher, Sequence,
 };
 use crate::fse::fse_encoder::{FSETable, write_ncount_at_log};
 use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable};
@@ -162,8 +162,8 @@ fn analyze_entropy(
     Ok(())
 }
 
-/// Compress the first block of each of the first `count` samples with
-/// `content` as a raw dictionary and count what the compressed blocks hold.
+/// Compress the first 128 KiB of each of the first `count` samples with
+/// `content` as a raw dictionary and count what its compressed blocks hold.
 fn count_samples(
     counts: &mut EntropyCounts,
     content: &[u8],
@@ -175,8 +175,7 @@ fn count_samples(
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     let recorder = Recorder {
         inner: MatchGeneratorDriver::new(BLOCK_SIZE_MAX, 1),
-        armed: false,
-        literals: [0; 256],
+        blocks: Vec::new(),
         sequences: Vec::new(),
     };
     let mut compressor: FrameCompressor<&[u8], Vec<u8>, Recorder> =
@@ -184,61 +183,59 @@ fn count_samples(
     compressor
         .set_encoder_dictionary(EncoderDictionary::from_dictionary(dictionary))
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    // Every sample runs the parameters of the average one with this content,
-    // as upstream's analysis does (`ZSTD_getParams(level, averageSampleSize,
-    // dictSize)`): one set of tables for the whole pass, which also keeps the
-    // dictionary resident from one sample to the next instead of indexing it
-    // again.
+    // Every sample runs the parameters of the average one, as upstream's
+    // analysis does (`ZSTD_getParams(level, averageSampleSize, dictSize)`):
+    // one set of tables for the whole pass, which also keeps the dictionary
+    // resident from one sample to the next instead of indexing it again.
     let average = samples.leading(count).len() / count.max(1);
-    let params = LevelParameters::for_level(
-        level,
-        Some(average as u64).filter(|&size| size != 0),
-        content.len(),
-    );
-    compressor.set_parameters(
-        &CompressionParameters::builder(CompressionLevel::from_level(level))
-            .window_log(params.window_log)
-            .hash_log(params.hash_log)
-            .chain_log(params.chain_log)
-            .search_log(params.search_log)
-            .min_match(params.min_match)
-            .target_length(params.target_length)
-            .strategy(params.strategy)
-            .build()
-            .expect("the level table's parameters are in range"),
-    );
-    // Only a sample's first block is counted, `MIN(128 KiB, 1 << windowLog)`
-    // bytes compressed as one block (upstream zstd `ZDICT_countEStats`). The
-    // rest of a sample is not fed at all.
-    let block_size = BLOCK_SIZE_MAX.min(1 << params.window_log);
-    // A frame's window is fitted to its source, and upstream's analysis sizes
-    // it for the sample and the content together (`ZSTD_adjustCParams`,
-    // `tSize = srcSize + dictSize`), so that is the size every frame hints.
-    let sized_as = (average + content.len()) as u64;
+    // Every block of a sample is counted, not only the first as upstream's
+    // `ZDICT_countEStats` does: counting the first block alone, at our window
+    // or at upstream's, measured worse on the repository files (the samples
+    // compressed 0.013% and 0.05% larger in total across COVER, FastCOVER
+    // and the default search), so the rest of a sample is signal, not noise.
     let mut frame = Vec::new();
+    let mut compressed = Vec::new();
     for index in 0..count {
         let sample = samples.sample(index);
-        let block = &sample[..sample.len().min(block_size)];
+        let block = &sample[..sample.len().min(BLOCK_SIZE_MAX)];
         if block.is_empty() {
             continue;
         }
         frame.clear();
-        compressor.matcher_mut().armed = true;
         compressor.set_source(block);
         compressor.set_drain(frame);
-        compressor.set_source_size_hint(sized_as);
+        compressor.set_source_size_hint(average as u64);
         compressor.compress();
         frame = compressor.take_drain().expect("the drain was set above");
         let fast_offset_codes = compressor.uses_fast_offset_codes();
+        compressed_blocks(&frame, &mut compressed);
         let recorder = compressor.matcher_mut();
-        // A block written raw holds no sequences to learn from, and its bytes
-        // are no literals of any compressed block (upstream skips it too).
-        if first_block_is_compressed(&frame) {
-            for (total, &seen) in counts.literals.iter_mut().zip(&recorder.literals) {
+        // A block written raw or as one repeated byte holds no sequences to
+        // learn from, and its bytes are no literals of any compressed block.
+        // Blocks are recorded one per block the frame holds; when one was
+        // split after matching the pieces cannot be told apart, and the
+        // frame's blocks count only if every piece was compressed.
+        let one_to_one = compressed.len() == recorder.blocks.len();
+        let all_compressed = compressed.iter().all(|&kind| kind);
+        let mut reps = START_REPS;
+        let mut start = 0;
+        for (index, block) in recorder.blocks.iter().enumerate() {
+            let block_sequences = &recorder.sequences[start..block.sequences_end];
+            start = block.sequences_end;
+            let counted = if one_to_one {
+                compressed[index]
+            } else {
+                all_compressed
+            };
+            // A block left out does not advance the repeat offsets either: the
+            // encoder restores them when it writes a block raw.
+            if !counted {
+                continue;
+            }
+            for (total, &seen) in counts.literals.iter_mut().zip(&block.literals) {
                 *total += seen as usize;
             }
-            let mut reps = START_REPS;
-            for &(ll, offset, ml) in &recorder.sequences {
+            for &(ll, offset, ml) in block_sequences {
                 // The code the block wrote for this offset, under its policy.
                 let off_base = if fast_offset_codes {
                     encode_offset_with_history_fast(offset, ll, &mut reps)
@@ -255,22 +252,33 @@ fn count_samples(
                 }
             }
         }
-        recorder.literals = [0; 256];
+        recorder.blocks.clear();
         recorder.sequences.clear();
     }
     Ok(())
 }
 
-/// Whether `frame`'s first block is a compressed one.
-fn first_block_is_compressed(frame: &[u8]) -> bool {
+/// Whether each block of `frame` is a compressed one, into `out`; nothing for
+/// bytes that are not a frame.
+fn compressed_blocks(frame: &[u8], out: &mut Vec<bool>) {
+    out.clear();
     let Ok((_, header_len)) = crate::decoding::frame::read_frame_header_with_format(frame, false)
     else {
-        return false;
+        return;
     };
-    // Block_Type is bits 1-2 of the block header (RFC 8878 3.1.1.2).
-    frame
-        .get(usize::from(header_len))
-        .is_some_and(|&byte| (byte >> 1) & 3 == 2)
+    let mut at = usize::from(header_len);
+    while let Some(header) = frame.get(at..at + 3) {
+        // Block header (RFC 8878 3.1.1.2): Last_Block is bit 0, Block_Type
+        // bits 1-2, Block_Size the rest; an RLE block carries one byte.
+        let word = u32::from(header[0]) | u32::from(header[1]) << 8 | u32::from(header[2]) << 16;
+        let kind = (word >> 1) & 3;
+        out.push(kind == 2);
+        if word & 1 == 1 {
+            return;
+        }
+        let body = if kind == 1 { 1 } else { (word >> 3) as usize };
+        at += 3 + body;
+    }
 }
 
 /// The literals code for `counts`, its weights scaled to its longest code
@@ -290,16 +298,32 @@ fn literals_table(counts: &[usize; 256]) -> HuffmanTable {
     }
 }
 
-/// The production matcher, recording the literals and sequences of the first
-/// block it matches after being armed. Everything else is forwarded, so frames
+/// The production matcher, recording the literals and sequences of every block
+/// it matches, block by block. Everything else is forwarded, so frames
 /// compress as any compressor's would, dictionary reuse included.
 struct Recorder {
     inner: MatchGeneratorDriver,
-    /// Whether the next matched block is recorded; cleared once it is.
-    armed: bool,
-    literals: [u32; 256],
+    /// One entry per block of the frame, matched or skipped, in order.
+    blocks: Vec<RecordedBlock>,
     /// Literal length, offset and match length of each sequence.
     sequences: Vec<(u32, u32, u32)>,
+}
+
+/// What one block handed to the matcher produced.
+struct RecordedBlock {
+    literals: [u32; 256],
+    /// Where the block's sequences end in [`Recorder::sequences`].
+    sequences_end: usize,
+}
+
+impl Recorder {
+    /// A block the matcher did not search: it yields nothing.
+    fn record_skipped(&mut self) {
+        self.blocks.push(RecordedBlock {
+            literals: [0; 256],
+            sequences_end: self.sequences.len(),
+        });
+    }
 }
 
 impl Matcher for Recorder {
@@ -325,22 +349,18 @@ impl Matcher for Recorder {
 
     fn skip_matching(&mut self) {
         self.inner.skip_matching();
+        self.record_skipped();
     }
 
     fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
         self.inner.skip_matching_with_hint(incompressible_hint);
+        self.record_skipped();
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        if !core::mem::take(&mut self.armed) {
-            self.inner.start_matching(handle_sequence);
-            return;
-        }
+        let mut literals = [0u32; 256];
         let Self {
-            inner,
-            literals,
-            sequences,
-            ..
+            inner, sequences, ..
         } = self;
         inner.start_matching(|sequence| {
             match &sequence {
@@ -362,6 +382,11 @@ impl Matcher for Recorder {
                 }
             }
             handle_sequence(sequence);
+        });
+        let sequences_end = self.sequences.len();
+        self.blocks.push(RecordedBlock {
+            literals,
+            sequences_end,
         });
     }
 
@@ -387,10 +412,6 @@ impl Matcher for Recorder {
 
     fn clear_param_overrides(&mut self) {
         self.inner.clear_param_overrides();
-    }
-
-    fn apply_parameters(&mut self, params: &CompressionParameters) {
-        self.inner.apply_parameters(params);
     }
 
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
