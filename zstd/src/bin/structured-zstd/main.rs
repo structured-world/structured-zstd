@@ -3400,7 +3400,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
                 chosen.k,
                 chosen.d,
                 chosen.steps,
-                (chosen.split_point * 100.0) as u32
+                split_percent(chosen.split_point)
             );
             dict
         }
@@ -3420,7 +3420,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
                 chosen.cover.d,
                 chosen.f,
                 chosen.cover.steps,
-                (chosen.cover.split_point * 100.0) as u32,
+                split_percent(chosen.cover.split_point),
                 chosen.accel
             );
             dict
@@ -3679,6 +3679,13 @@ fn cover_options(
     level: i32,
 ) -> Result<structured_zstd::dictionary::CoverOptions> {
     cover_tuning(params, level, "--train-cover")
+}
+
+/// The split a tuning report shows: the percentage `split=` was given as.
+fn split_percent(split_point: f64) -> u32 {
+    // Rounded: a percentage over a hundred is not exact in binary, and 0.29
+    // scales back to 28.999...
+    (split_point * 100.0).round() as u32
 }
 
 fn cover_tuning(

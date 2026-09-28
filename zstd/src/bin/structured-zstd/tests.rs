@@ -629,6 +629,21 @@ fn an_impossible_dictionary_size_is_refused_before_the_samples_are_read() {
     }
 }
 
+/// The split a tuning report shows is the percentage it was given as, for
+/// every percentage: `29 / 100.0 * 100.0` is 28.999..., which a truncating
+/// conversion reported as 28.
+#[test]
+fn the_reported_split_is_the_percentage_given() {
+    for percent in 0..=100u32 {
+        let params = TrainerParams {
+            split_percent: Some(percent),
+            ..TrainerParams::default()
+        };
+        let options = cover_tuning(&params, 3, "--train-cover").unwrap();
+        assert_eq!(split_percent(options.split_point), percent);
+    }
+}
+
 /// `-c` and `-o` clear one another, so `--train -o wanted.dict -c` leaves no
 /// destination at all and the default `dictionary` stands in — the run writes a
 /// file nobody named, and with `-f` over whatever was there. The reference
