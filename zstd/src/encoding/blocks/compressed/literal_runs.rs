@@ -64,11 +64,19 @@ pub(super) fn gather_literals(
     }
 }
 
-/// One pass over the runs with `$medium` as the `33..2048`-byte kernel. A macro
-/// so each tier's loop is compiled inside its own `#[target_feature]` function
-/// and the kernel inlines into it.
+/// Bytes of the block that must remain past a run for it to be copied in whole
+/// chunks: the widest chunk rounds a run up by at most 31 bytes, read from the
+/// block and written into the literals buffer, which is at least as long.
+const WILDCOPY_SLACK: usize = 32;
+
+/// One pass over the runs. A run with [`WILDCOPY_SLACK`] bytes of block after
+/// it is copied in whole `$chunk`-byte chunks by `$wild`, overshooting into
+/// bytes the next run overwrites (upstream zstd `ZSTD_storeSeq` +
+/// `ZSTD_wildcopy`); the runs near the block's end take the exact ladder, with
+/// `$medium` for `33..2048` bytes. A macro so each tier's loop is compiled
+/// inside its own `#[target_feature]` function and its kernels inline into it.
 macro_rules! gather_body {
-    ($block:expr, $sequences:expr, $tail:expr, $dst:expr, $medium:path) => {{
+    ($block:expr, $sequences:expr, $tail:expr, $dst:expr, $medium:path, $wild:path, $chunk:expr) => {{
         let block: &[u8] = $block;
         let dst: &mut RegionVec<u8> = $dst;
         let src = block.as_ptr();
@@ -80,25 +88,33 @@ macro_rules! gather_body {
         macro_rules! copy_run {
             ($len:expr) => {{
                 let len = $len;
-                assert!(
-                    len <= src_len - pos,
-                    "sequences reach past the block they describe"
-                );
-                // SAFETY: `pos + len <= src_len` (just checked) bounds the
-                // read, and `written + len <= pos + len <= src_len`, which the
-                // capacity assert in `gather_literals` bounds on the write
-                // side. Every kernel writes exactly `len` bytes.
+                // `pos <= src_len` holds on every iteration.
+                let room = src_len - pos;
+                // SAFETY (both arms): `written <= pos`, and the capacity check in
+                // `gather_literals` gives the buffer `src_len` bytes past
+                // `start`. The chunked arm reads and writes at most
+                // `len + $chunk - 1 < len + WILDCOPY_SLACK <= room` bytes from
+                // `pos` / `written`; the exact arm, `len <= room` bytes.
                 unsafe {
                     let s = src.add(pos);
                     let d = out.add(written);
-                    if len <= 32 {
-                        if len != 0 {
-                            simd_copy::copy_exact_small(s, d, len);
+                    if room >= WILDCOPY_SLACK && len <= room - WILDCOPY_SLACK {
+                        if len < LITERAL_INLINE_COPY_MAX {
+                            $wild(s, d, len.next_multiple_of($chunk));
+                        } else {
+                            core::ptr::copy_nonoverlapping(s, d, len);
                         }
-                    } else if len < LITERAL_INLINE_COPY_MAX {
-                        $medium(s, d, len);
                     } else {
-                        core::ptr::copy_nonoverlapping(s, d, len);
+                        assert!(len <= room, "sequences reach past the block they describe");
+                        if len <= 32 {
+                            if len != 0 {
+                                simd_copy::copy_exact_small(s, d, len);
+                            }
+                        } else if len < LITERAL_INLINE_COPY_MAX {
+                            $medium(s, d, len);
+                        } else {
+                            core::ptr::copy_nonoverlapping(s, d, len);
+                        }
                     }
                 }
                 written += len;
@@ -135,7 +151,15 @@ unsafe fn gather_avx2(
     tail: usize,
     dst: &mut RegionVec<u8>,
 ) {
-    gather_body!(block, sequences, tail, dst, simd_copy::copy_exact_avx2)
+    gather_body!(
+        block,
+        sequences,
+        tail,
+        dst,
+        simd_copy::copy_exact_avx2,
+        simd_copy::copy_avx2,
+        32
+    )
 }
 
 #[cfg(all(
@@ -149,7 +173,15 @@ unsafe fn gather_sse2(
     tail: usize,
     dst: &mut RegionVec<u8>,
 ) {
-    gather_body!(block, sequences, tail, dst, simd_copy::copy_exact_sse2)
+    gather_body!(
+        block,
+        sequences,
+        tail,
+        dst,
+        simd_copy::copy_exact_sse2,
+        simd_copy::copy_sse2,
+        16
+    )
 }
 
 #[cfg(all(
@@ -159,11 +191,35 @@ unsafe fn gather_sse2(
 ))]
 fn gather_neon(block: &[u8], sequences: &[RawSequence], tail: usize, dst: &mut RegionVec<u8>) {
     #[cfg(target_feature = "neon")]
-    gather_body!(block, sequences, tail, dst, simd_copy::copy_exact_neon);
+    gather_body!(
+        block,
+        sequences,
+        tail,
+        dst,
+        simd_copy::copy_exact_neon,
+        simd_copy::copy_neon,
+        16
+    );
     #[cfg(not(target_feature = "neon"))]
-    gather_body!(block, sequences, tail, dst, simd_copy::copy_exact_u64);
+    gather_body!(
+        block,
+        sequences,
+        tail,
+        dst,
+        simd_copy::copy_exact_u64,
+        simd_copy::copy_scalar,
+        core::mem::size_of::<usize>()
+    );
 }
 
 fn gather_scalar(block: &[u8], sequences: &[RawSequence], tail: usize, dst: &mut RegionVec<u8>) {
-    gather_body!(block, sequences, tail, dst, simd_copy::copy_exact_u64)
+    gather_body!(
+        block,
+        sequences,
+        tail,
+        dst,
+        simd_copy::copy_exact_u64,
+        simd_copy::copy_scalar,
+        core::mem::size_of::<usize>()
+    )
 }

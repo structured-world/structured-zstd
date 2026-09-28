@@ -624,8 +624,12 @@ pub(crate) fn active_chunk_size_for_tests() -> usize {
     }
 }
 
+/// Copies `len` bytes, a multiple of `usize`, one `usize` at a time.
+///
+/// # Safety
+/// `src` readable and `dst` writable for `len` bytes; regions non-overlapping.
 #[inline(always)]
-unsafe fn copy_scalar(mut src: *const u8, mut dst: *mut u8, len: usize) {
+pub(crate) unsafe fn copy_scalar(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
     while src < end {
         unsafe {
@@ -750,8 +754,9 @@ fn detect_x86_caps() -> X86Caps {
     feature = "kernel-sse"
 ))]
 #[target_feature(enable = "sse2")]
+#[inline]
 #[allow(dead_code)]
-unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
+pub(crate) unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
     while src < end {
         unsafe {
@@ -785,8 +790,9 @@ unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     feature = "kernel-avx2"
 ))]
 #[target_feature(enable = "avx2")]
+#[inline]
 #[allow(dead_code)]
-unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
+pub(crate) unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     debug_assert!(
         len.is_multiple_of(32),
         "copy_avx2 expects len to be a multiple of 32 (dispatcher rounds up)",
@@ -839,7 +845,7 @@ unsafe fn copy_avx512(mut src: *const u8, mut dst: *mut u8, len: usize) {
     feature = "kernel-neon"
 ))]
 #[inline(always)]
-unsafe fn copy_neon(mut src: *const u8, mut dst: *mut u8, len: usize) {
+pub(crate) unsafe fn copy_neon(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
     while src < end {
         unsafe {
