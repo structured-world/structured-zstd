@@ -3,7 +3,6 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::{
     bit_io::BitWriter,
     blocks::block::BlockType,
-    decoding::simd_copy::ExactCopyTier,
     encoding::block_header::BlockHeader,
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
     encoding::workspace::{RegionVec, Workspace, region_bytes},
@@ -492,9 +491,6 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             // The splitter's scratch state never reaches the raw-skip, which
             // is decided one level up on the whole block.
             seen_content: Default::default(),
-            // Inherited rather than re-resolved: this scratch state stands in
-            // for the same compressor on the same CPU.
-            copy_tier: state.copy_tier,
             // Probes read the table they repeat from `entry_huff` /
             // `built_huff`; this slot stays empty.
             last_huff_table: None,
@@ -622,16 +618,16 @@ const LITERAL_INLINE_COPY_MAX: usize = 2048;
 /// per-emit libc call dominated the hot path (flamegraph:
 /// `__memmove_avx_unaligned_erms` chain ≈ 16 % of L1 encode CPU).
 ///
-/// - `len ≤ 32`: `simd_copy::copy_bytes_overshooting` with
-///   `src.1 == dst.1 == lit_len` (no overshoot READ — the caller's slice
-///   readable slack is unknown), which drops into the byte / overlapping-
-///   u64 path, fully inlineable.
-/// - `32 < len < 2048`: `simd_copy::copy_exact_medium` — the widest
-///   available SIMD tier (AVX2 32B / SSE2 16B / NEON / scalar) doing an
-///   EXACT copy (floor bulk + overlapping tier-width tail), the safe
-///   upstream zstd-wildcopy analog: matches glibc's store width but drops the
-///   libc call, and never overshoots reads (borrowed-input safe).
+/// - `len ≤ 32`: `simd_copy::copy_exact_small`, byte / overlapping-`u64`
+///   stores that read and write exactly `len` bytes (the caller's slice has
+///   no known slack).
+/// - `32 < len < 2048`: `simd_copy::copy_exact_medium`, the build's baseline
+///   vector width doing an exact copy (bulk plus one overlapping tail), the
+///   safe upstream zstd-wildcopy analog.
 /// - `len ≥ 2048`: `extend_from_slice` — bandwidth-bound, ERMS wins.
+///
+/// Neither copy picks a kernel at run time, so the emit loop carries no tier
+/// and no branch on one.
 ///
 /// Called, not inlined, even though upstream inlines the equivalent
 /// (`ZSTD_storeSeq` stores sixteen bytes on the spot) and even though the runs
@@ -642,7 +638,7 @@ const LITERAL_INLINE_COPY_MAX: usize = 2048;
 /// sites, so inlining even a short body there buys decode pressure in the
 /// loop worth more than the calls it saves.
 #[inline]
-fn append_literals(dst: &mut RegionVec<u8>, lits: &[u8], copy_tier: ExactCopyTier) {
+fn append_literals(dst: &mut RegionVec<u8>, lits: &[u8]) {
     let lit_len = lits.len();
     if lit_len == 0 {
         return;
@@ -667,18 +663,9 @@ fn append_literals(dst: &mut RegionVec<u8>, lits: &[u8], copy_tier: ExactCopyTie
     // `lit_len` bytes (no overshoot).
     unsafe {
         if lit_len <= 32 {
-            crate::decoding::simd_copy::copy_bytes_overshooting(
-                (lits.as_ptr(), lit_len),
-                (dst_ptr, lit_len),
-                lit_len,
-            );
+            crate::decoding::simd_copy::copy_exact_small(lits.as_ptr(), dst_ptr, lit_len);
         } else {
-            crate::decoding::simd_copy::copy_exact_medium(
-                lits.as_ptr(),
-                dst_ptr,
-                lit_len,
-                copy_tier,
-            );
+            crate::decoding::simd_copy::copy_exact_medium(lits.as_ptr(), dst_ptr, lit_len);
         }
         dst.set_len(cur_len + lit_len);
     }
@@ -690,20 +677,15 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
     // Sized when the frame laid out its workspace, for the largest block it
     // can emit.
     debug_assert!(state.matcher.get_last_space().len() <= parts.literals.capacity());
-    // Hoisted out of the closure: the tier was settled when the compressor was
-    // built, and the emit loop just carries the value.
-    let copy_tier = state.copy_tier;
     state.matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => {
-            append_literals(&mut parts.literals, literals, copy_tier)
-        }
+        Sequence::Literals { literals } => append_literals(&mut parts.literals, literals),
         Sequence::Triple {
             literals,
             offset,
             match_len,
         } => {
             let ll = literals.len() as u32;
-            append_literals(&mut parts.literals, literals, copy_tier);
+            append_literals(&mut parts.literals, literals);
             parts.sequences.push(RawSequence {
                 ll,
                 ml: match_len as u32,

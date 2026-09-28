@@ -240,49 +240,9 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     // range (1..=24 bytes seen on the profiled corpus) and stays within
     // a single straight-line block on the I-cache.
     if copy_at_least <= 32 {
-        // SAFETY: `copy_at_least <= min(src.1, dst.1)` by this function's
-        // contract, so all branches below read/write strictly within the
-        // caller's reported readable / writable spans.
-        unsafe {
-            if copy_at_least <= 8 {
-                // Byte-by-byte for 1..=8 bytes. The fixed-size loop unrolls
-                // into a sequence of immediate-offset loads/stores on every
-                // sane backend, so for the common 1..=8 case this is
-                // typically 2-3 cycles inline vs the ~10+ cycle call into
-                // libc memmove the previous fallback paid.
-                let mut i = 0;
-                while i < copy_at_least {
-                    dst.0.add(i).write(src.0.add(i).read());
-                    i += 1;
-                }
-            } else if copy_at_least <= 16 {
-                // 9..=16 bytes via two overlapping unaligned u64 ops. The
-                // overlap region is written twice with the same source
-                // bytes, so the net effect is exactly `copy_at_least` bytes
-                // copied — no overshoot past dst.0 + copy_at_least.
-                let lo: u64 = src.0.cast::<u64>().read_unaligned();
-                let hi_offset = copy_at_least - 8;
-                let hi: u64 = src.0.add(hi_offset).cast::<u64>().read_unaligned();
-                dst.0.cast::<u64>().write_unaligned(lo);
-                dst.0.add(hi_offset).cast::<u64>().write_unaligned(hi);
-            } else {
-                // 17..=32 bytes: first 16 via two adjacent u64 stores, the
-                // trailing 1..=16 via the same overlapping-pair trick.
-                // Four loads + four stores total, all branch-free.
-                let lo: u64 = src.0.cast::<u64>().read_unaligned();
-                let hi: u64 = src.0.add(8).cast::<u64>().read_unaligned();
-                dst.0.cast::<u64>().write_unaligned(lo);
-                dst.0.add(8).cast::<u64>().write_unaligned(hi);
-                let tail_off = copy_at_least - 16;
-                let tail_lo: u64 = src.0.add(tail_off).cast::<u64>().read_unaligned();
-                let tail_hi: u64 = src.0.add(copy_at_least - 8).cast::<u64>().read_unaligned();
-                dst.0.add(tail_off).cast::<u64>().write_unaligned(tail_lo);
-                dst.0
-                    .add(copy_at_least - 8)
-                    .cast::<u64>()
-                    .write_unaligned(tail_hi);
-            }
-        }
+        // SAFETY: `1 <= copy_at_least <= min(src.1, dst.1)` by this
+        // function's contract and the zero check above.
+        unsafe { copy_exact_small(src.0, dst.0, copy_at_least) };
         debug_assert_eq_copy(src, dst, copy_at_least);
         return;
     }
@@ -447,34 +407,7 @@ pub(crate) unsafe fn copy_bytes_overshooting_avx2(
     }
 
     if copy_at_least <= 32 {
-        unsafe {
-            if copy_at_least <= 8 {
-                let mut i = 0;
-                while i < copy_at_least {
-                    dst.0.add(i).write(src.0.add(i).read());
-                    i += 1;
-                }
-            } else if copy_at_least <= 16 {
-                let lo: u64 = src.0.cast::<u64>().read_unaligned();
-                let hi_offset = copy_at_least - 8;
-                let hi: u64 = src.0.add(hi_offset).cast::<u64>().read_unaligned();
-                dst.0.cast::<u64>().write_unaligned(lo);
-                dst.0.add(hi_offset).cast::<u64>().write_unaligned(hi);
-            } else {
-                let lo: u64 = src.0.cast::<u64>().read_unaligned();
-                let hi: u64 = src.0.add(8).cast::<u64>().read_unaligned();
-                dst.0.cast::<u64>().write_unaligned(lo);
-                dst.0.add(8).cast::<u64>().write_unaligned(hi);
-                let tail_off = copy_at_least - 16;
-                let tail_lo: u64 = src.0.add(tail_off).cast::<u64>().read_unaligned();
-                let tail_hi: u64 = src.0.add(copy_at_least - 8).cast::<u64>().read_unaligned();
-                dst.0.add(tail_off).cast::<u64>().write_unaligned(tail_lo);
-                dst.0
-                    .add(copy_at_least - 8)
-                    .cast::<u64>()
-                    .write_unaligned(tail_hi);
-            }
-        }
+        unsafe { copy_exact_small(src.0, dst.0, copy_at_least) };
         debug_assert_eq_copy(src, dst, copy_at_least);
         return;
     }
@@ -942,48 +875,72 @@ unsafe fn copy_simd128(mut src: *const u8, mut dst: *mut u8, len: usize) {
     }
 }
 
-/// AVX2 (32-byte) inline exact copy: 32-byte unaligned stores for the
-/// floor-aligned bulk plus one **overlapping** 32-byte store ending exactly
-/// at `len`. Reads and writes strictly `[0, len)` (no read-overshoot), so it
-/// is safe for sources without WILDCOPY slack (encoder literal slices into
-/// possibly-borrowed input). Requires `len >= 33` (the `append_literals`
-/// `> 32` gate), so the overlapping 32-byte tail never underflows.
-///
-/// Carries `#[target_feature]` rather than a `cfg(target_feature = "avx2")`
-/// gate so the tier exists in a stock `x86_64` artifact, where AVX2 is not in
-/// the baseline: which tier runs is a property of the CPU executing the
-/// binary, not of the machine that built it.
+/// Exact copy of `1..=32` bytes that reads and writes strictly `[0, len)`:
+/// bytes for `1..=8`, two overlapping `u64` for `9..=16`, four for `17..=32`.
+/// Branch on the size class only, never on the CPU.
 ///
 /// # Safety
-/// Caller must have established AVX2 availability — [`ExactCopyTier::resolve`]
-/// is the only thing that returns the tag selecting this arm.
-///
-/// **Unrolled 2×32B (64 B/iter)** to match `copy_avx2`'s kernel shape: a
-/// single-store-per-iter loop is throughput-bound by the loop branch on long
-/// runs (measured: it degraded vs libc for `len > 128`); two independent
-/// load/store pairs per iteration expose ILP and amortise the branch.
+/// `src` readable and `dst` writable for `len` bytes; regions non-overlapping;
+/// `1 <= len <= 32`.
+#[inline(always)]
+pub(crate) unsafe fn copy_exact_small(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!((1..=32).contains(&len), "copy_exact_small takes 1..=32");
+    unsafe {
+        if len <= 8 {
+            // The fixed-size loop unrolls into immediate-offset loads and
+            // stores on every sane backend: a few cycles inline against the
+            // call into libc memmove it replaces.
+            let mut i = 0;
+            while i < len {
+                dst.add(i).write(src.add(i).read());
+                i += 1;
+            }
+        } else if len <= 16 {
+            // The overlap is written twice with the same source bytes, so the
+            // net effect is exactly `len` bytes and nothing past them.
+            let lo: u64 = src.cast::<u64>().read_unaligned();
+            let hi_offset = len - 8;
+            let hi: u64 = src.add(hi_offset).cast::<u64>().read_unaligned();
+            dst.cast::<u64>().write_unaligned(lo);
+            dst.add(hi_offset).cast::<u64>().write_unaligned(hi);
+        } else {
+            // First 16 via two adjacent u64, the trailing 1..=16 via the same
+            // overlapping pair. Four loads and four stores, no branch.
+            let lo: u64 = src.cast::<u64>().read_unaligned();
+            let hi: u64 = src.add(8).cast::<u64>().read_unaligned();
+            dst.cast::<u64>().write_unaligned(lo);
+            dst.add(8).cast::<u64>().write_unaligned(hi);
+            let tail_off = len - 16;
+            let tail_lo: u64 = src.add(tail_off).cast::<u64>().read_unaligned();
+            let tail_hi: u64 = src.add(len - 8).cast::<u64>().read_unaligned();
+            dst.add(tail_off).cast::<u64>().write_unaligned(tail_lo);
+            dst.add(len - 8).cast::<u64>().write_unaligned(tail_hi);
+        }
+    }
+}
+
+/// AVX2 exact copy for `len >= 33`, in builds whose baseline carries AVX2
+/// (`-C target-cpu=x86-64-v3` and up): branchless size classes up to 128
+/// bytes, then a 2×32B-unrolled loop, an exact 32B cleanup and one
+/// overlapping 32B tail.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "avx2",
     feature = "kernel-avx2",
-    any(feature = "std", target_feature = "avx2"),
 ))]
-#[target_feature(enable = "avx2")]
-unsafe fn copy_exact_inline_avx2(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert!(len >= 33, "copy_exact_inline_avx2 requires len >= 33");
+#[inline]
+unsafe fn copy_exact_avx2(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(len >= 33, "copy_exact_avx2 requires len >= 33");
     unsafe {
         if len <= 64 {
-            // 33..=64: two overlapping 32B blocks, BRANCHLESS. glibc's tiny
-            // path beats a per-block loop here purely on the loop's branch
-            // overhead (measured: a loop lost +23% to glibc at len=40, the
-            // dominant medium bucket); the straight-line 2-store form ties /
-            // beats it. Load both before storing — regions don't overlap in
-            // src, and the dst overlap is store-after-store (last wins).
+            // Two overlapping 32B blocks. A loop here lost to glibc's tiny
+            // path on its branch alone (+23% at len=40, the dominant medium
+            // bucket); the straight-line form ties or beats it.
             let a = _mm256_loadu_si256(src.cast::<__m256i>());
             let b = _mm256_loadu_si256(src.add(len - 32).cast::<__m256i>());
             _mm256_storeu_si256(dst.cast::<__m256i>(), a);
             _mm256_storeu_si256(dst.add(len - 32).cast::<__m256i>(), b);
         } else if len <= 128 {
-            // 65..=128: head 64 + tail 64 (overlapping), branchless 4 stores.
             let a = _mm256_loadu_si256(src.cast::<__m256i>());
             let b = _mm256_loadu_si256(src.add(32).cast::<__m256i>());
             let c = _mm256_loadu_si256(src.add(len - 64).cast::<__m256i>());
@@ -993,12 +950,10 @@ unsafe fn copy_exact_inline_avx2(src: *const u8, dst: *mut u8, len: usize) {
             _mm256_storeu_si256(dst.add(len - 64).cast::<__m256i>(), c);
             _mm256_storeu_si256(dst.add(len - 32).cast::<__m256i>(), d);
         } else {
-            // >128: 2×32B-unrolled 64 B/iter loop, then an EXACT 32B cleanup
-            // loop, then at most one overlapping 32B tail. The tail overlaps
-            // the preceding block by <=31 bytes and fires AT MOST ONCE — unlike
-            // a 2×32B tail whose first store overlaps the block the 64B loop
-            // JUST wrote, which on Skylake hits a store-buffer partial-overlap
-            // penalty every iteration (measured +69% at len=800 vs this form).
+            // The single 32B tail overlaps the block before it at most once. A
+            // 2×32B tail overlapping the block the loop just wrote hits a
+            // store-buffer partial-overlap penalty on Skylake every iteration
+            // (+69% at len=800).
             let mut o = 0usize;
             while o + 64 <= len {
                 let v0 = _mm256_loadu_si256(src.add(o).cast::<__m256i>());
@@ -1021,25 +976,19 @@ unsafe fn copy_exact_inline_avx2(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
-/// SSE2 inline exact copy — 16-byte-width analog of
-/// [`copy_exact_inline_avx2`] (branchless size-class for `len <= 64`, then
-/// 2×16B-unrolled loop + exact cleanup + one overlapping 16B tail). Selected
-/// on any x86 CPU carrying SSE2 but not AVX2. On 32-bit x86 the libc-memcpy
-/// call is relatively MORE expensive (cdecl stack args, few registers), so
-/// inlining wins even vs glibc's tuned SSE2 memcpy; on musl/no_std (scalar
-/// memcpy) it wins outright. Requires `len >= 33`.
-///
-/// # Safety
-/// Caller must have established SSE2 availability — [`ExactCopyTier::resolve`]
-/// is the only thing that returns the tag selecting this arm.
+/// SSE2 exact copy for `len >= 33`: branchless size class for `len <= 64`,
+/// then a 2×16B-unrolled loop, an exact 16B cleanup and one overlapping 16B
+/// tail. SSE2 is in the baseline of every x86_64 target, so the body inlines
+/// into the emit loop with no call boundary and no CPU check.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "sse2",
     feature = "kernel-sse",
-    any(feature = "std", target_feature = "sse2"),
+    any(test, not(all(target_feature = "avx2", feature = "kernel-avx2"))),
 ))]
-#[target_feature(enable = "sse2")]
-unsafe fn copy_exact_inline_sse2(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert!(len >= 33, "copy_exact_inline_sse2 requires len >= 33");
+#[inline]
+unsafe fn copy_exact_sse2(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(len >= 33, "copy_exact_sse2 requires len >= 33");
     unsafe {
         if len <= 64 {
             let a = _mm_loadu_si128(src.cast::<__m128i>());
@@ -1077,18 +1026,17 @@ unsafe fn copy_exact_inline_sse2(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
-/// NEON inline exact copy — aarch64 analog of `copy_exact_inline_avx2`,
-/// **unrolled 2×16B (32 B/iter)**. NEON is the aarch64 baseline
-/// (`cfg(target_feature = "neon")`), so the body inlines with no boundary.
-/// Requires `len >= 33`.
+/// NEON exact copy for `len >= 33`, unrolled 2×16B (32 B/iter) with one
+/// overlapping 16B tail. NEON is the aarch64 baseline, so the body inlines
+/// with no boundary.
 #[cfg(all(
     target_arch = "aarch64",
     target_feature = "neon",
     feature = "kernel-neon"
 ))]
 #[inline]
-unsafe fn copy_exact_inline_neon(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert!(len >= 33, "copy_exact_inline_neon requires len >= 33");
+unsafe fn copy_exact_neon(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(len >= 33, "copy_exact_neon requires len >= 33");
     let mut o = 0usize;
     unsafe {
         while o + 32 <= len {
@@ -1109,169 +1057,111 @@ unsafe fn copy_exact_inline_neon(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
-/// Widest exact-copy kernel the running CPU can execute, out of those the
-/// build baked in.
+/// `u64` exact copy for `len >= 33`: 8-byte strides and one overlapping 8-byte
+/// tail. The kernel where the build baseline has no vector unit, and the
+/// reference the vector kernels are tested against.
+#[cfg(any(
+    test,
+    not(any(
+        all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "avx2",
+            feature = "kernel-avx2",
+        ),
+        all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "sse2",
+            feature = "kernel-sse",
+        ),
+        all(
+            target_arch = "aarch64",
+            target_feature = "neon",
+            feature = "kernel-neon"
+        ),
+    ))
+))]
+#[inline]
+unsafe fn copy_exact_u64(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(len >= 33, "copy_exact_u64 requires len >= 33");
+    unsafe {
+        let mut o = 0usize;
+        while o + 8 <= len {
+            let v: u64 = src.add(o).cast::<u64>().read_unaligned();
+            dst.add(o).cast::<u64>().write_unaligned(v);
+            o += 8;
+        }
+        if o < len {
+            let t = len - 8;
+            let v: u64 = src.add(t).cast::<u64>().read_unaligned();
+            dst.add(t).cast::<u64>().write_unaligned(v);
+        }
+    }
+}
+
+/// Exact copy of `33 <= len < `[`BULK_MEMCPY_THRESHOLD`] bytes for encoder
+/// literal runs, the safe analog of upstream zstd `ZSTD_wildcopy`: it reads and
+/// writes strictly `[0, len)`, so a source without slack is fine.
 ///
-/// Which kernels EXIST is a compile-time question, answered by the arch and the
-/// `kernel-*` features. Which one RUNS is a property of the CPU executing the
-/// binary, so it is answered by [`resolve`](ExactCopyTier::resolve) once, ahead
-/// of the work, and carried as a value from there on. A compressor resolves it
-/// at construction and hands it to every copy it performs, so nothing on the
-/// emit path re-asks.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ExactCopyTier {
-    /// libc `memcpy`. Also the answer on a CPU that has none of the tiers the
-    /// build carries.
-    Scalar,
-    /// Reachable when a CPU can be asked at runtime (`std`), or when the build
-    /// baseline already guarantees the feature. Without either, no code path
-    /// can ever name this tier — same shape as `CpuKernelTag`'s SVE variant.
+/// The width is the widest vector in the build's baseline (AVX2 when the build
+/// targets it, else SSE2 on x86, NEON on aarch64, `u64` elsewhere), fixed at
+/// compile time the way upstream fixes its own. The emit loop therefore carries
+/// no kernel choice at all: no tier value, no branch on it, no CPU read.
+///
+/// # Safety
+/// `src` readable and `dst` writable for `len` bytes; regions non-overlapping.
+/// `len` MUST be `>= 33`: the kernels write an overlapping tail at `len - 32`,
+/// `len - 16` or `len - 8`, and callers route `<= 32` through
+/// [`copy_exact_small`].
+#[inline]
+pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(
+        len >= 33,
+        "copy_exact_medium requires len >= 33 (the overlapping tail underflows below that)",
+    );
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel-sse",
-        any(feature = "std", target_feature = "sse2"),
-    ))]
-    Sse2,
-    #[cfg(all(
-        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "avx2",
         feature = "kernel-avx2",
-        any(feature = "std", target_feature = "avx2"),
     ))]
-    Avx2,
+    unsafe {
+        copy_exact_avx2(src, dst, len)
+    }
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2",
+        feature = "kernel-sse",
+        not(all(target_feature = "avx2", feature = "kernel-avx2")),
+    ))]
+    unsafe {
+        copy_exact_sse2(src, dst, len)
+    }
     #[cfg(all(
         target_arch = "aarch64",
         target_feature = "neon",
         feature = "kernel-neon"
     ))]
-    Neon,
-}
-
-impl ExactCopyTier {
-    /// Ask the CPU what it supports and pick the widest kernel this build
-    /// carries. Call once, before the work — never per block and never per
-    /// copy.
-    pub(crate) fn resolve() -> Self {
-        // x86 with runtime detection available: ask the CPU. Routing through
-        // `detect_x86_caps` keeps the copy path on the crate's single
-        // capability source of truth, so it can never disagree with the
-        // entropy/sequence path about the machine it is running on.
-        #[cfg(all(
-            feature = "std",
-            feature = "kernel-sse",
-            any(target_arch = "x86", target_arch = "x86_64")
-        ))]
-        {
-            let caps = detect_x86_caps();
-            #[cfg(feature = "kernel-avx2")]
-            if caps.avx2 {
-                return Self::Avx2;
-            }
-            if caps.sse2 {
-                return Self::Sse2;
-            }
-        }
-        // x86 without it (no-std, or the SSE tier trimmed out): there is
-        // nothing to probe, so the build's own baseline is the only evidence
-        // of what the CPU can run — the same convention the bulk-copy
-        // dispatcher uses on no-std.
-        #[cfg(all(
-            not(all(feature = "std", feature = "kernel-sse")),
-            any(target_arch = "x86", target_arch = "x86_64")
-        ))]
-        #[allow(unreachable_code)]
-        {
-            #[cfg(all(target_feature = "avx2", feature = "kernel-avx2"))]
-            if crate::cpu_kernel::cpu_allows(crate::cpu_kernel::CpuLevel::Avx2) {
-                return Self::Avx2;
-            }
-            #[cfg(all(target_feature = "sse2", feature = "kernel-sse"))]
-            if crate::cpu_kernel::cpu_allows(crate::cpu_kernel::CpuLevel::Sse2) {
-                return Self::Sse2;
-            }
-        }
-        // NEON is architectural on aarch64, so the build flag alone settles
-        // whether the CPU has it; only the ceiling can still rule it out.
-        #[cfg(all(
-            target_arch = "aarch64",
-            target_feature = "neon",
-            feature = "kernel-neon"
-        ))]
-        if crate::cpu_kernel::cpu_allows(crate::cpu_kernel::CpuLevel::Neon) {
-            return Self::Neon;
-        }
-        #[allow(unreachable_code)]
-        Self::Scalar
+    unsafe {
+        copy_exact_neon(src, dst, len)
     }
-}
-
-/// Exact medium-size copy (`33 <= len < `[`BULK_MEMCPY_THRESHOLD`]) for encoder
-/// literal runs — the safe analog of upstream zstd `ZSTD_wildcopy`.
-///
-/// `tier` comes from the caller, resolved once before any compression began;
-/// this function never probes the CPU. What is left is the dispatch itself, one
-/// predictable branch selecting a kernel whose own size-class paths are already
-/// laid out straight-line. Widening that to a per-tier monomorph of the whole
-/// emit loop was not taken: it would replicate the match loop per tier for the
-/// sake of this one branch, and monomorphizing that loop has measured as an
-/// instruction-cache regression here before.
-///
-/// Falling through to `Scalar` reaches libc `memcpy`, whose per-CPU IFUNC
-/// routine is a good medium-run implementation — it is a real fallback, not a
-/// degraded one.
-///
-/// What the tiers cost, so this is not "optimised" back to a compile-time gate:
-/// runtime selection means the SIMD kernels carry `#[target_feature]` and are
-/// therefore CALLED, where a baseline-gated kernel could inline. Measured on the
-/// i9 against the previous compile-time build, which inlined a 16-byte SSE2 body
-/// there, the out-of-line 32-byte AVX2 path came out +0.2% instructions and
-/// +0.7% cycles on decodecorpus z000033 at level 3 — inside the run-to-run band,
-/// so the wider stores and the call boundary roughly cancel on literal runs this
-/// short. The reason to dispatch at runtime is therefore reach, not speed: under
-/// the compile-time gate a stock `x86_64` artifact could not execute the AVX2
-/// kernel at all, on any CPU. Do not read the near-neutral result as licence to
-/// go back — that gate also silently narrowed the path, and once fell all the
-/// way through to a `memcpy` call in a routine written to avoid one.
-///
-/// # Safety
-/// `src` readable and `dst` writable for `len` bytes; regions non-overlapping.
-/// `len` MUST be `>= 33`: every SIMD kernel reads/writes an overlapping tail at
-/// `len - 32` (AVX2) or `len - 16` (SSE2/NEON), which underflows for smaller
-/// `len`. Callers route `<= 32` through a separate exact path, so the dispatcher
-/// only ever sees `>= 33`; the `debug_assert!` below guards future misuse.
-#[inline]
-pub(crate) unsafe fn copy_exact_medium(
-    src: *const u8,
-    dst: *mut u8,
-    len: usize,
-    tier: ExactCopyTier,
-) {
-    debug_assert!(
-        len >= 33,
-        "copy_exact_medium requires len >= 33 (overlapping SIMD tail underflows below that)",
-    );
-    match tier {
-        // SAFETY: the tier is only ever produced by `ExactCopyTier::resolve`,
-        // which returns each SIMD arm exclusively after confirming that CPU
-        // feature; `len >= 33` is the shared precondition asserted above.
-        #[cfg(all(
+    #[cfg(not(any(
+        all(
             any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "avx2",
             feature = "kernel-avx2",
-            any(feature = "std", target_feature = "avx2"),
-        ))]
-        ExactCopyTier::Avx2 => unsafe { copy_exact_inline_avx2(src, dst, len) },
-        #[cfg(all(
+        ),
+        all(
             any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "sse2",
             feature = "kernel-sse",
-            any(feature = "std", target_feature = "sse2"),
-        ))]
-        ExactCopyTier::Sse2 => unsafe { copy_exact_inline_sse2(src, dst, len) },
-        #[cfg(all(
+        ),
+        all(
             target_arch = "aarch64",
             target_feature = "neon",
             feature = "kernel-neon"
-        ))]
-        ExactCopyTier::Neon => unsafe { copy_exact_inline_neon(src, dst, len) },
-        ExactCopyTier::Scalar => unsafe { core::ptr::copy_nonoverlapping(src, dst, len) },
+        ),
+    )))]
+    unsafe {
+        copy_exact_u64(src, dst, len)
     }
 }
 

@@ -385,7 +385,6 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             };
             let mut est_state = CompressState::<EntropyOnlyMatcher> {
                 matcher: EntropyOnlyMatcher,
-                copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: seed_table.clone(),
                 huff_table_spare: None,
                 huff_rollback: None,
@@ -402,7 +401,6 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             };
             let mut emit_state = CompressState::<EntropyOnlyMatcher> {
                 matcher: EntropyOnlyMatcher,
-                copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: seed_table,
                 huff_table_spare: None,
                 huff_rollback: None,
@@ -467,7 +465,6 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
 
     let make_state = || CompressState::<EntropyOnlyMatcher> {
         matcher: EntropyOnlyMatcher,
-        copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
         last_huff_table: None,
         huff_table_spare: None,
         huff_rollback: None,
@@ -532,7 +529,6 @@ fn encode_match_len_uses_correct_upper_range_base() {
 fn retained_heap_size_counts_the_block_buffers() {
     let mut state = CompressState {
         matcher: super::EntropyOnlyMatcher,
-        copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
         last_huff_table: None,
         huff_table_spare: None,
         huff_rollback: None,
@@ -612,7 +608,6 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
     for strat in [StrategyTag::Fast, StrategyTag::Lazy, StrategyTag::BtUltra2] {
         let make_state = || CompressState::<EntropyOnlyMatcher> {
             matcher: EntropyOnlyMatcher,
-            copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
             last_huff_table: None,
             huff_table_spare: None,
             huff_rollback: None,
@@ -676,7 +671,6 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
 fn raw_partition_fallback_restores_repeat_offset_history() {
     let mut state = CompressState {
         matcher: super::EntropyOnlyMatcher,
-        copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
         last_huff_table: None,
         huff_table_spare: None,
         huff_rollback: None,
@@ -1082,11 +1076,7 @@ fn literals_past_the_buffer_stop_instead_of_overflowing() {
     );
     ws.open(0, usize::MAX);
     let mut literals: RegionVec<u8> = ws.buffer(4);
-    super::append_literals(
-        &mut literals,
-        &[0xA5; 8],
-        crate::decoding::simd_copy::ExactCopyTier::Scalar,
-    );
+    super::append_literals(&mut literals, &[0xA5; 8]);
 }
 
 #[test]

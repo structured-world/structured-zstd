@@ -88,10 +88,6 @@ fn ceiling_set_first_governs_every_tier_and_then_freezes() {
     assert_eq!(active_cpu_kernel_name(), "scalar");
     assert_eq!(crate::encoding::active_match_kernel_name(), "scalar");
     assert_eq!(
-        crate::decoding::simd_copy::ExactCopyTier::resolve(),
-        crate::decoding::simd_copy::ExactCopyTier::Scalar
-    );
-    assert_eq!(
         set_cpu_ceiling(CpuLevel::Scalar),
         Err(CpuCeilingError::AlreadyResolved)
     );

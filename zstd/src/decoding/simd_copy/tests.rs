@@ -1,69 +1,65 @@
 use super::*;
 use alloc::vec;
 
-/// Every tier this CPU can actually execute, not just the one `resolve`
-/// prefers. Each SIMD tier now lives in the artifact regardless of the build's
-/// baseline, so the narrower ones are reachable here and can be held to the
-/// same output as the widest.
-fn runnable_tiers() -> vec::Vec<ExactCopyTier> {
-    let mut tiers = vec::Vec::with_capacity(4);
-    tiers.push(ExactCopyTier::Scalar);
-    #[cfg(all(
-        feature = "std",
-        feature = "kernel-sse",
-        any(target_arch = "x86", target_arch = "x86_64")
-    ))]
-    {
-        let caps = detect_x86_caps();
-        if caps.sse2 {
-            tiers.push(ExactCopyTier::Sse2);
-        }
-        #[cfg(feature = "kernel-avx2")]
-        if caps.avx2 {
-            tiers.push(ExactCopyTier::Avx2);
-        }
-    }
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_feature = "neon",
-        feature = "kernel-neon"
-    ))]
-    tiers.push(ExactCopyTier::Neon);
-    tiers
-}
-
-#[test]
-fn every_runnable_tier_copies_the_same_bytes_as_memcpy() {
-    // Exact byte-for-byte equivalence across the medium range, incl.
-    // non-multiples of every tier width (16/32) so the overlapping
-    // tail is exercised. Swept per tier: a kernel that only runs on some CPUs
-    // is otherwise never compared against the scalar reference, which is how a
-    // tail bug in the narrow tier would reach a machine unnoticed.
-    let src: vec::Vec<u8> = (0..4096u32)
+/// Copies `len` bytes with `copy` into a buffer fenced by sentinel bytes on
+/// both sides, and checks the copy is exact: every byte of the source, and not
+/// one byte written before or after it.
+fn assert_exact_copy(name: &str, len: usize, copy: unsafe fn(*const u8, *mut u8, usize)) {
+    const FENCE: usize = 64;
+    let src: vec::Vec<u8> = (0..len as u32)
         .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
         .collect();
-    for tier in runnable_tiers() {
-        for len in 33..2048usize {
-            let mut got = vec![0u8; len];
-            unsafe { copy_exact_medium(src.as_ptr(), got.as_mut_ptr(), len, tier) };
-            assert_eq!(
-                &got[..],
-                &src[..len],
-                "copy_exact_medium mismatch at len={len} on {tier:?}"
-            );
-        }
+    let mut dst = vec![0xEEu8; FENCE + len + FENCE];
+    unsafe { copy(src.as_ptr(), dst.as_mut_ptr().add(FENCE), len) };
+    assert_eq!(&dst[FENCE..FENCE + len], &src[..], "{name} len={len}");
+    assert!(
+        dst[..FENCE]
+            .iter()
+            .chain(&dst[FENCE + len..])
+            .all(|&b| b == 0xEE),
+        "{name} len={len} wrote outside [0, len)"
+    );
+}
+
+#[test]
+fn small_exact_copy_writes_exactly_the_run() {
+    // Encoder literal runs have no slack after them: a store past `len` would
+    // overwrite the next run or the end of the buffer.
+    for len in 1..=32usize {
+        assert_exact_copy("copy_exact_small", len, copy_exact_small);
     }
 }
 
 #[test]
-fn the_resolved_tier_is_one_this_cpu_can_run() {
-    // Guards the dispatch contract the `unsafe` arms rest on: `resolve` must
-    // never name a kernel whose CPU feature is absent. A wrong answer here is
-    // SIGILL in production, so pin it rather than trusting the ladder by eye.
-    assert!(
-        runnable_tiers().contains(&ExactCopyTier::resolve()),
-        "resolve() picked a tier this CPU cannot execute",
-    );
+fn medium_exact_copy_writes_exactly_the_run() {
+    // Every length, so each non-multiple of the 8/16-byte strides exercises
+    // the overlapping tail of the kernel this build compiles in.
+    for len in 33..2048usize {
+        assert_exact_copy("copy_exact_medium", len, copy_exact_medium);
+    }
+}
+
+#[test]
+fn u64_exact_copy_writes_exactly_the_run() {
+    // The fallback for builds without a baseline vector unit; compiled into
+    // every test build so it is checked on hosts that never select it.
+    for len in 33..2048usize {
+        assert_exact_copy("copy_exact_u64", len, copy_exact_u64);
+    }
+}
+
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "sse2",
+    feature = "kernel-sse",
+))]
+#[test]
+fn sse2_exact_copy_writes_exactly_the_run() {
+    // A build whose baseline carries AVX2 never reaches the SSE2 kernel through
+    // `copy_exact_medium`; test it directly so such a host still checks it.
+    for len in 33..2048usize {
+        assert_exact_copy("copy_exact_sse2", len, copy_exact_sse2);
+    }
 }
 
 #[test]
