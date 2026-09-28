@@ -427,6 +427,17 @@ impl FastHashTable {
         (self.table.as_mut_slice(), self.hash_log, self.bias)
     }
 
+    /// The slots of a cached dictionary table, for a scan loop to hoist once.
+    /// Its words pack their own tag (`(pos << DICT_TAG_BITS) | tag`) into an
+    /// untagged, never epoch-advanced table, so a probe reads them raw and
+    /// skips the slot-format and bias handling of [`Self::get`].
+    #[inline(always)]
+    pub(crate) fn dict_slots(&self) -> &[u32] {
+        debug_assert!(!self.is_tagged(), "dictionary slots carry their own tag");
+        debug_assert_eq!(self.bias, 0, "a dictionary table is never epoch-advanced");
+        self.table.as_slice()
+    }
+
     /// The position stored under `hash`, or the empty sentinel `0` when the
     /// slot is empty, was stored before the last epoch advance, or (tagged)
     /// carries another tag. Bounds-check at index time is provably redundant

@@ -227,8 +227,9 @@ const DFAST_TAG_MASK: u32 = (1 << DFAST_TAG_BITS) - 1;
 pub(crate) const DFAST_ATTACH_DICT_MAX_LEN: usize = (1usize << (32 - DFAST_TAG_BITS)) - 2;
 
 /// Largest relative position a tagged live slot holds (`rel + 1` beside the
-/// tag in a `u32`).
-const DFAST_TAGGED_MAX_REL: usize = (1usize << (32 - DFAST_TAG_BITS)) - 2;
+/// tag in a `u32`); a slice scanned in place never rebases, so it is also the
+/// longest one whose tables can be tagged.
+pub(crate) const DFAST_TAGGED_MAX_REL: usize = (1usize << (32 - DFAST_TAG_BITS)) - 2;
 /// How far a tagged table's rebase moves its base. What survives a rebase is
 /// everything newer than `DFAST_TAGGED_MAX_REL - DFAST_TAGGED_REBASE`, so
 /// that span has to cover the window and a pending block.
@@ -509,16 +510,6 @@ impl DfastMatchGenerator {
         }
         self.tagged = tagged;
         self.tables_fresh = !continued;
-    }
-
-    /// Stops tagging for a borrowed input whose positions outgrow a tagged
-    /// slot, emptying the tables (a borrowed frame numbers its input from
-    /// zero and keeps nothing of an earlier one).
-    fn untag_for_borrowed(&mut self) {
-        self.tables.fill(DFAST_EMPTY_SLOT);
-        self.position_base = 0;
-        self.tables_hold_earlier_frames = false;
-        self.tagged = false;
     }
 
     /// Becomes `snapshot`, copying its tables, history and block-length queue
@@ -1122,11 +1113,13 @@ impl DfastMatchGenerator {
     /// (or [`Self::reset`]) — the matcher stores a raw pointer into it and
     /// dereferences it during every staged block scan.
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
-        // A borrowed scan packs absolute input positions; past what a tagged
-        // slot holds, the frame runs untagged.
-        if self.tagged && buffer.len() > DFAST_TAGGED_MAX_REL {
-            self.untag_for_borrowed();
-        }
+        // A borrowed scan packs absolute input positions, so the layout left a
+        // slice longer than a tagged slot holds untagged.
+        assert!(
+            !self.tagged || buffer.len() <= DFAST_TAGGED_MAX_REL,
+            "a borrowed input of {} bytes needs untagged tables",
+            buffer.len()
+        );
         self.borrowed_input = Some((buffer.as_ptr(), buffer.len()));
         self.borrowed_block = None;
     }

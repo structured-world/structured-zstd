@@ -158,18 +158,20 @@ pub(crate) const DICT_TAG_MASK: u32 = (1 << DICT_TAG_BITS) - 1;
 ///
 /// # Safety
 /// `ptr` must have the readable-bytes context `hash_ptr_raw::<MLS>` requires;
-/// `dict_hash_log + DICT_TAG_BITS <= 32` so the slot index stays in range.
+/// `dict_slots` is [`FastHashTable::dict_slots`] of a table of
+/// `dict_hash_log` bits, and `dict_hash_log + DICT_TAG_BITS <= 32` so the slot
+/// index stays in range.
 #[inline(always)]
 pub(crate) unsafe fn dict_lookup<const MLS: u32>(
-    dict_table: &FastHashTable,
+    dict_slots: &[u32],
     ptr: *const u8,
     dict_hash_log: u32,
 ) -> u32 {
     let hat = unsafe { hash_ptr_raw::<MLS>(ptr, dict_hash_log + DICT_TAG_BITS) };
-    // SAFETY: `hat >> DICT_TAG_BITS` < `1 << dict_hash_log` = table len. The dict
-    // table is never epoch-advanced (bias 0), so `get` returns the raw stored
-    // `(pos << TAG) | tag` word unchanged.
-    let stored = unsafe { dict_table.get(hat >> DICT_TAG_BITS) };
+    let index = (hat >> DICT_TAG_BITS) as usize;
+    debug_assert!(index < dict_slots.len());
+    // SAFETY: `index` < `1 << dict_hash_log` = the slot count.
+    let stored = unsafe { *dict_slots.get_unchecked(index) };
     if stored & DICT_TAG_MASK == hat & DICT_TAG_MASK {
         stored >> DICT_TAG_BITS
     } else {
@@ -1261,6 +1263,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     // so the bias is applied inline (`saturating_sub` on read, `+ bias` on write)
     // exactly as `FastHashTable::get`/`put` do — byte-identical, reload-free.
     let (main_tbl, main_hlog, main_bias) = main_table.hot_state_biased();
+    let dict_slots = dict_table.dict_slots();
 
     // Inner-loop result: literals end (where the match copy begins), the raw
     // match offset, the match length, and the upstream zstd `curr` (probe position,
@@ -1277,7 +1280,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
         let mut hash0 = unsafe { hash_ptr_raw::<MLS>(base.add(ip0), main_hlog) };
         let mut main_idx =
             unsafe { (*main_tbl.get_unchecked(hash0 as usize)).saturating_sub(main_bias) };
-        let mut dict_idx = unsafe { dict_lookup::<MLS>(dict_table, base.add(ip0), dict_hash_log) };
+        let mut dict_idx = unsafe { dict_lookup::<MLS>(dict_slots, base.add(ip0), dict_hash_log) };
         let mut curr = ip0;
 
         // No-match step accelerator (upstream zstd `zstd_fast.c:552-554`):
@@ -1393,7 +1396,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
             }
 
             // Prepare next iteration (upstream zstd 616-630).
-            dict_idx = unsafe { dict_lookup::<MLS>(dict_table, base.add(ip1), dict_hash_log) };
+            dict_idx = unsafe { dict_lookup::<MLS>(dict_slots, base.add(ip1), dict_hash_log) };
             main_idx =
                 unsafe { (*main_tbl.get_unchecked(hash1 as usize)).saturating_sub(main_bias) };
             if ip1 >= next_step {
@@ -1656,6 +1659,7 @@ fn compress_block_fast_dict_borrowed_impl<
     // through `&mut FastHashTable` on every access; bias is applied inline exactly
     // as `get`/`put` do (matches the owned dict kernel).
     let (main_tbl, main_hlog, main_bias) = main_table.hot_state_biased();
+    let dict_slots = dict_table.dict_slots();
 
     // Inner-loop result: literals end (input offset), raw match offset, match
     // length, and the upstream zstd `curr` probe offset for the post-match `curr + 2`
@@ -1673,7 +1677,7 @@ fn compress_block_fast_dict_borrowed_impl<
         let mut main_idx =
             unsafe { (*main_tbl.get_unchecked(hash0 as usize)).saturating_sub(main_bias) };
         let mut dict_idx =
-            unsafe { dict_lookup::<MLS>(dict_table, inp_base.add(ip0), dict_hash_log) };
+            unsafe { dict_lookup::<MLS>(dict_slots, inp_base.add(ip0), dict_hash_log) };
         let mut curr = ip0;
 
         // No-match step accelerator (upstream zstd `zstd_fast.c:552-554`),
@@ -1866,7 +1870,7 @@ fn compress_block_fast_dict_borrowed_impl<
             }
 
             // Prepare next iteration.
-            dict_idx = unsafe { dict_lookup::<MLS>(dict_table, inp_base.add(ip1), dict_hash_log) };
+            dict_idx = unsafe { dict_lookup::<MLS>(dict_slots, inp_base.add(ip1), dict_hash_log) };
             main_idx =
                 unsafe { (*main_tbl.get_unchecked(hash1 as usize)).saturating_sub(main_bias) };
             if ip1 >= next_step {

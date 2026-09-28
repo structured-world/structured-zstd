@@ -5317,6 +5317,31 @@ fn a_frame_after_a_stream_lays_out_only_what_its_reset_keeps() {
     }
 }
 
+/// A slice scanned in place numbers its positions across the whole input, so
+/// one longer than a tagged slot holds is laid out untagged from the start,
+/// whatever its window: choosing tagged tables from the window alone had the
+/// borrowed scan empty them a second time before its first block.
+#[test]
+fn a_borrowed_slice_past_the_tagged_range_is_laid_out_untagged() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let len = crate::encoding::dfast::DFAST_TAGGED_MAX_REL + 1;
+    let level = CompressionLevel::Level(3);
+    let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+    driver.set_source_size_hint(len as u64);
+    let mut context = Workspace::new();
+    context.begin_layout(1 << 17, no_trailing, IngestPlan::Slice(len));
+    driver.reset_in_workspace(level, &mut context);
+    assert!(
+        driver.frame_scans_in_place(),
+        "fixture: the slice is scanned in place"
+    );
+    assert!(
+        driver.dfast_matcher().max_window_size <= crate::encoding::dfast::DFAST_TAGGED_WINDOW_LIMIT,
+        "fixture: the window alone would allow tagged slots"
+    );
+    assert!(!driver.dfast_matcher().tagged);
+}
+
 /// A driver reset on its own and then laid out in a context's workspace lets go
 /// of the workspace it used alone: its tables and history have moved, so the old
 /// allocation holds nothing live, and keeping it would double what the

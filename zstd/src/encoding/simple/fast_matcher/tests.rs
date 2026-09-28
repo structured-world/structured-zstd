@@ -758,7 +758,7 @@ fn dict_prime_indexes_positions_across_chunk_seam() {
     // return the stored dict position for that slot (0 if empty).
     let found = unsafe {
         crate::encoding::simple::fast_kernel::kernel::dict_lookup::<4>(
-            dt,
+            dt.dict_slots(),
             m.history.as_ptr().add(p),
             dt.hash_log(),
         )

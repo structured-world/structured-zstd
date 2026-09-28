@@ -423,6 +423,7 @@ impl FastKernelMatcher {
         }
         let dict_bytes = &self.history[..dict_end];
         let dhl = dict_tab.hash_log();
+        let dict_slots = dict_tab.dict_slots();
         let mls = self.hash_table.mls();
         let last = block.len() - HASH_READ_SIZE;
         // ~32 evenly-spread probes (every position for tiny blocks); a dict that
@@ -435,11 +436,11 @@ impl FastKernelMatcher {
             // bytes, the context `dict_lookup`/`hash_ptr_raw` require.
             let dpos = unsafe {
                 match mls {
-                    4 => dict_lookup::<4>(dict_tab, base.add(pos), dhl),
-                    5 => dict_lookup::<5>(dict_tab, base.add(pos), dhl),
-                    6 => dict_lookup::<6>(dict_tab, base.add(pos), dhl),
-                    7 => dict_lookup::<7>(dict_tab, base.add(pos), dhl),
-                    _ => dict_lookup::<8>(dict_tab, base.add(pos), dhl),
+                    4 => dict_lookup::<4>(dict_slots, base.add(pos), dhl),
+                    5 => dict_lookup::<5>(dict_slots, base.add(pos), dhl),
+                    6 => dict_lookup::<6>(dict_slots, base.add(pos), dhl),
+                    7 => dict_lookup::<7>(dict_slots, base.add(pos), dhl),
+                    _ => dict_lookup::<8>(dict_slots, base.add(pos), dhl),
                 }
             } as usize;
             // `dpos >= 1` rejects the empty sentinel; verify a real 4-byte match
