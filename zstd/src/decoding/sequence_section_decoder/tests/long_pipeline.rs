@@ -51,7 +51,11 @@ const BITSTREAM: &[u8] = &[
 
 fn supported_kernels() -> Vec<CpuKernelTag> {
     let mut kernels = alloc::vec![CpuKernelTag::Scalar];
-    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-sse"))]
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
     if std::is_x86_feature_detected!("sse2") {
         kernels.push(CpuKernelTag::Sse2);
     }

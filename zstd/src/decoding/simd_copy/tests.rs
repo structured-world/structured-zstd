@@ -115,6 +115,17 @@ fn check_overshooting_copy<K: crate::cpu_kernel::CpuKernel>(kernel: &str) {
 #[test]
 fn every_runnable_kernel_keeps_the_wildcopy_contract() {
     check_overshooting_copy::<crate::cpu_kernel::ScalarKernel>("scalar");
+    check_overshooting_copy::<crate::cpu_kernel::BaselineKernel>("baseline");
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
+    if std::arch::is_x86_feature_detected!("sse2") {
+        check_overshooting_copy::<crate::cpu_kernel::Sse2Kernel>("sse2");
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
+    check_overshooting_copy::<crate::cpu_kernel::NeonKernel>("neon");
     #[cfg(all(
         feature = "std",
         any(target_arch = "x86", target_arch = "x86_64"),

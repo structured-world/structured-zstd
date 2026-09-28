@@ -8,7 +8,7 @@ use super::sequence_section_decoder::decode_and_execute_sequences;
 use crate::common::MAX_BLOCK_SIZE;
 #[cfg(any(test, feature = "bench-internals"))]
 use crate::cpu_kernel::detect_cpu_kernel;
-use crate::cpu_kernel::{CpuKernelTag, ScalarKernel};
+use crate::cpu_kernel::{BaselineKernel, CpuKernelTag};
 use crate::decoding::errors::DecodeSequenceError;
 use crate::decoding::errors::{
     BlockHeaderReadError, BlockSizeError, BlockTypeError, DecodeBlockContentError,
@@ -88,11 +88,11 @@ fn write_literals_only<B: super::buffer_backend::BufferBackend>(
     // One copy per block, handed to `memcpy` above a couple of kilobytes: the
     // baseline width serves it and no tier is asked for.
     if !B::FIXED_CAPACITY {
-        buffer.push::<ScalarKernel>(literals);
+        buffer.push::<BaselineKernel>(literals);
         return Ok(());
     }
     buffer
-        .try_push::<ScalarKernel>(literals)
+        .try_push::<BaselineKernel>(literals)
         .map_err(|overflow| DecompressBlockError::LiteralsOutputOverflow {
             tail: overflow.tail,
             requested: overflow.requested,
@@ -203,7 +203,7 @@ impl BlockDecoder {
                 // One copy per block, as for a literals-only block.
                 parts
                     .buffer
-                    .try_push::<ScalarKernel>(payload)
+                    .try_push::<BaselineKernel>(payload)
                     .map_err(|_| DecodeBlockContentError::BackendOverflow { step: block_type })?;
                 *source = tail;
                 self.internal_state = State::ReadyToDecodeNextHeader;

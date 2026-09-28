@@ -269,38 +269,45 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 dict,
             )
         }
-        #[cfg(all(target_arch = "x86_64", feature = "kernel-sse"))]
+        // SSE2 has no bit extract, so the walk is the portable one; what the
+        // tier changes is the copies. 32-bit x86 at the BMI2 tier takes it
+        // too: its `bzhi` is 32 bits wide, and two of them cost the sequence
+        // loop more than the table does, while the CPU has SSE2.
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel-sse"
+        ))]
         CpuKernelTag::Sse2 => {
-            // SSE2 has no FSE-relevant divergence (no `_bzhi_u64`); the
-            // mask_lower_bits hot op is identical to Scalar. SSE2's only
-            // distinct body is match-copy (gated per-backend via
-            // SUPPORTS_INLINE_SEQUENCE_EXEC), not the sequence FSE walk,
-            // so route to the portable scalar sequence decoder.
-            super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
-                section,
-                source,
-                fse,
-                buffer,
-                offset_hist,
-                literals_buffer,
-                literals_len,
-                dict,
-            )
+            // SAFETY: detect confirmed SSE2.
+            unsafe {
+                decode_and_execute_sequences_sse2::<B>(
+                    section,
+                    source,
+                    fse,
+                    buffer,
+                    offset_hist,
+                    literals_buffer,
+                    literals_len,
+                    dict,
+                )
+            }
         }
-        // 32-bit x86 reaches the BMI2 tier for the entropy tables (the HUF
-        // state advance takes `bzhi` through `K`), but the BMI2 sequence entry
-        // is x86_64-only, so the portable walk runs here.
         #[cfg(all(target_arch = "x86", feature = "kernel-bmi2"))]
-        CpuKernelTag::Bmi2 => super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
-            section,
-            source,
-            fse,
-            buffer,
-            offset_hist,
-            literals_buffer,
-            literals_len,
-            dict,
-        ),
+        CpuKernelTag::Bmi2 => {
+            // SAFETY: a BMI2 CPU has SSE2.
+            unsafe {
+                decode_and_execute_sequences_sse2::<B>(
+                    section,
+                    source,
+                    fse,
+                    buffer,
+                    offset_hist,
+                    literals_buffer,
+                    literals_len,
+                    dict,
+                )
+            }
+        }
         #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
         CpuKernelTag::Bmi2 => {
             // SAFETY: `detect_cpu_kernel()` only returns Bmi2 when
@@ -371,10 +378,13 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 )
             }
         }
+        // NEON and SVE use the scalar bit operations and NEON copies; NEON is
+        // the aarch64 baseline, so the walk needs no `target_feature` entry.
         #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
-        // NEON and SVE use the same scalar bit operations. Their copy kernels
-        // are selected by the buffer; share the optimized sequence loop.
-        CpuKernelTag::Neon => super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
+        CpuKernelTag::Neon => super::seq_decoder_scalar::decode_and_execute_sequences_impl::<
+            B,
+            crate::cpu_kernel::NeonKernel,
+        >(
             section,
             source,
             fse,
@@ -389,7 +399,10 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
             feature = "kernel-sve",
             any(feature = "std", target_feature = "sve"),
         ))]
-        CpuKernelTag::Sve => super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
+        CpuKernelTag::Sve => super::seq_decoder_scalar::decode_and_execute_sequences_impl::<
+            B,
+            crate::cpu_kernel::SveKernel,
+        >(
             section,
             source,
             fse,
@@ -407,6 +420,39 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
 // `seq_decoder_vbmi2.rs`. Each owns its `#[target_feature]` attribute
 // and is called from the dispatch matcher above. See issue #279
 // round 3 for the per-kernel architecture rationale.
+
+/// The SSE2 tier: the portable sequence walk compiled under SSE2, so the
+/// kernel's 16-byte copies inline into it.
+///
+/// # Safety
+/// The caller must have verified SSE2 on the running CPU.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
+))]
+#[target_feature(enable = "sse2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn decode_and_execute_sequences_sse2<'fse, B: super::buffer_backend::BufferBackend>(
+    section: &SequencesHeader,
+    source: &[u8],
+    fse: &'fse mut FSEScratch,
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    offset_hist: &mut [u32; 3],
+    literals_buffer: &[u8],
+    literals_len: usize,
+    dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
+) -> Result<(), DecompressBlockError> {
+    super::seq_decoder_scalar::decode_and_execute_sequences_impl::<B, crate::cpu_kernel::Sse2Kernel>(
+        section,
+        source,
+        fse,
+        buffer,
+        offset_hist,
+        literals_buffer,
+        literals_len,
+        dict,
+    )
+}
 
 /// The 32-bit x86 AVX2 tier: the portable sequence walk compiled under AVX2
 /// and BMI2, so the kernel's masks and 32-byte copies inline into it.

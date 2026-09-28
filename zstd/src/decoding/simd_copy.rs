@@ -305,6 +305,72 @@ pub(crate) unsafe fn copy16_baseline(src: *const u8, dst: *mut u8) {
     }
 }
 
+/// Chunk width of [`copy_chunks_portable`]: a machine word, or the `simd128`
+/// vector on wasm, where a build's SIMD is fixed at compile time and there is
+/// no run-time tier to choose it.
+pub(crate) const PORTABLE_COPY_CHUNK: usize = if cfg!(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel-simd128"
+)) {
+    16
+} else {
+    core::mem::size_of::<usize>()
+};
+
+/// Copies `len` bytes, a multiple of [`PORTABLE_COPY_CHUNK`], in whole chunks
+/// of portable code: the scalar tier's copies.
+///
+/// # Safety
+/// `src` readable and `dst` writable for `len` bytes; regions non-overlapping.
+#[inline(always)]
+pub(crate) unsafe fn copy_chunks_portable(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    unsafe {
+        copy_simd128(src, dst, len)
+    }
+    #[cfg(not(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    )))]
+    unsafe {
+        copy_scalar(src, dst, len)
+    }
+}
+
+/// Copies exactly 16 bytes with portable code: two machine loads and stores,
+/// or one `simd128` transfer on wasm.
+///
+/// # Safety
+/// `src` readable and `dst` writable for 16 bytes; regions non-overlapping.
+#[inline(always)]
+pub(crate) unsafe fn copy16_portable(src: *const u8, dst: *mut u8) {
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    unsafe {
+        copy_simd128(src, dst, 16)
+    }
+    #[cfg(not(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    )))]
+    unsafe {
+        let lo: u64 = src.cast::<u64>().read_unaligned();
+        let hi: u64 = src.add(8).cast::<u64>().read_unaligned();
+        dst.cast::<u64>().write_unaligned(lo);
+        dst.add(8).cast::<u64>().write_unaligned(hi);
+    }
+}
+
 /// Copies at least `copy_at_least` bytes from `src` to `dst` with the copy
 /// kernels of `K`, the CPU tier the caller was monomorphised for.
 ///
@@ -398,15 +464,15 @@ pub(crate) unsafe fn copy_bytes_overshooting<K: CpuKernel>(
         return;
     }
 
-    // A tier wider than the baseline steps down to the baseline width before
-    // the machine word: near the end of a buffer the slack often fits 16 but
-    // not 32. The comparison is between constants and folds away.
-    if K::COPY_CHUNK > BASELINE_COPY_CHUNK {
-        let rounded = copy_at_least.next_multiple_of(BASELINE_COPY_CHUNK);
+    // A tier with a narrower step steps down to it before the machine word:
+    // near the end of a buffer the slack often fits 16 but not 32. The
+    // comparison is between constants and folds away.
+    if K::STEP_CHUNK < K::COPY_CHUNK {
+        let rounded = copy_at_least.next_multiple_of(K::STEP_CHUNK);
         if min_buffer_size >= rounded {
-            // SAFETY: `rounded` bytes fit both spans (just checked); the
-            // baseline runs on every CPU the build does.
-            unsafe { copy_chunks_baseline(src.0, dst.0, rounded) };
+            // SAFETY: `rounded` bytes fit both spans (just checked); the tier
+            // is the caller's contract.
+            unsafe { K::copy_step(src.0, dst.0, rounded) };
             debug_assert_eq_copy(src, dst, copy_at_least);
             return;
         }
