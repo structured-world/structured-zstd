@@ -80,6 +80,77 @@ impl Matcher for NoDictionaryMatcher {
     }
 }
 
+/// Reports one sequence whose literal length does not fit in 32 bits and
+/// whose low 32 bits would fit the block: `(1 << 32) + 1` literals, a match
+/// of 4, and the rest of the block as trailing literals.
+#[cfg(target_pointer_width = "64")]
+struct OversizedLiteralsMatcher {
+    input: TestInput,
+}
+
+#[cfg(target_pointer_width = "64")]
+impl Matcher for OversizedLiteralsMatcher {
+    fn get_last_space(&mut self) -> &[u8] {
+        self.input.last_block()
+    }
+
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool) {
+        self.input.fill(capacity, fill)
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        self.input.uncommitted()
+    }
+
+    fn commit_filled(&mut self, len: usize) {
+        self.input.commit(len);
+    }
+
+    fn skip_matching(&mut self) {}
+
+    fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
+        let len = self.input.last_block().len();
+        handle_sequence(Sequence::Triple {
+            literal_len: (1usize << 32) + 1,
+            offset: 1,
+            match_len: 4,
+        });
+        handle_sequence(Sequence::Literals { len: len - 5 });
+    }
+
+    fn reset(&mut self, _level: super::CompressionLevel) {
+        self.input.clear();
+    }
+
+    fn window_size(&self) -> u64 {
+        1 << 17
+    }
+}
+
+/// A length a custom matcher reports is checked before it is narrowed to the
+/// 32 bits a sequence stores: `(1 << 32) + 1` literals would otherwise pass
+/// as one and encode a block that does not describe its input.
+#[cfg(target_pointer_width = "64")]
+#[test]
+#[should_panic(expected = "a sequence length exceeds 32 bits")]
+fn a_sequence_length_past_32_bits_is_refused() {
+    let data: Vec<u8> = (0..100u8).collect();
+    let mut compressor = FrameCompressor::new_with_matcher(
+        OversizedLiteralsMatcher {
+            input: TestInput::default(),
+        },
+        super::CompressionLevel::Default,
+    );
+    let mut output = Vec::new();
+    compressor.set_source(data.as_slice());
+    compressor.set_drain(&mut output);
+    compressor.compress();
+}
+
 #[test]
 fn frame_starts_with_magic_num() {
     let mock_data = [1_u8, 2, 3].as_slice();

@@ -631,6 +631,14 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
             match_len,
         } => {
             debug_assert_eq!(tail, 0, "literals reported before a sequence");
+            // A custom matcher's report is checked before it is narrowed: a
+            // length that lost its high bits could still fit the block and
+            // pass the gather's bounds check. One compare for all three; it
+            // folds away where `usize` is 32 bits.
+            assert!(
+                (literal_len | match_len | offset) <= u32::MAX as usize,
+                "a sequence length exceeds 32 bits"
+            );
             parts.sequences.push(RawSequence {
                 ll: literal_len as u32,
                 ml: match_len as u32,

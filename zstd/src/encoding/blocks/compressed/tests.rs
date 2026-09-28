@@ -1118,8 +1118,48 @@ fn sequences_past_the_block_are_refused() {
     );
 }
 
-/// The gather reproduces the literal runs exactly, under the scalar tier and
-/// the tier this CPU selects, across run lengths that cross every kernel's
+/// Every literal-gather tier this CPU can run, not only the one it selects, so
+/// a narrower tier's path is exercised on a wider machine.
+fn runnable_fastpath_kernels() -> Vec<crate::encoding::fastpath::FastpathKernel> {
+    use crate::encoding::fastpath::FastpathKernel;
+    #[allow(unused_mut)]
+    let mut kernels = alloc::vec![FastpathKernel::Scalar];
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
+    if std::is_x86_feature_detected!("sse2") {
+        kernels.push(FastpathKernel::Sse2);
+        if std::is_x86_feature_detected!("sse4.2") {
+            kernels.push(FastpathKernel::Sse42);
+        }
+    }
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
+        kernels.push(FastpathKernel::Avx2Bmi2);
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    ))]
+    kernels.push(FastpathKernel::Neon);
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    kernels.push(FastpathKernel::Simd128);
+    kernels
+}
+
+/// The gather reproduces the literal runs exactly, under every tier this CPU
+/// can run, across run lengths that cross every kernel's
 /// size classes (the small copy, the vector kernel and its overlapping tail,
 /// and the `memcpy` hand-off).
 #[test]
@@ -1146,10 +1186,7 @@ fn gathered_literals_are_the_runs_in_order() {
         pos += ll + 5;
     }
     expected.extend_from_slice(&block[pos..]);
-    for kernel in [
-        crate::encoding::fastpath::FastpathKernel::Scalar,
-        crate::encoding::fastpath::select_kernel(),
-    ] {
+    for kernel in runnable_fastpath_kernels() {
         let (_ws, mut literals) = literals_buffer(block_len);
         super::literal_runs::gather_literals(kernel, &block, &sequences, 13, &mut literals);
         assert_eq!(&literals[..], &expected[..], "{kernel:?}");
