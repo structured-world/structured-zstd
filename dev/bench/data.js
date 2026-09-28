@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790498152026,
+  "lastUpdate": 1790554452028,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -9179,6 +9179,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.177,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6b1ee58864e71228c03a6eb155a29d8c2ab79826",
+          "message": "perf(encode)!: one context workspace and one ingest path (#530)\n\n* bench: add fresh-context one-shot encode loop\n\nTimes the shape compare_ffi measures: a new FrameCompressor per frame,\ncompress_independent_frame_into, one reused output buffer.\n\n* perf(encode): carve the block buffers from one context workspace\n\n- Add Workspace, a single 64-byte-aligned allocation per context that\n  tables and buffers are carved from (upstream ZSTD_cwksp): tables from\n  the front, buffers from the back, grown only when a frame needs more.\n- The literal, sequence and sequence-code buffers of a block now live in\n  it, sized once per frame from the block capacity (literals: the block,\n  sequences and codes: block / 3, upstream ZSTD_maxNbSeq) instead of\n  growing as separate Vecs a fresh context allocates and frees per frame.\n- Both frame starts (FrameCompressor::prepare_frame and the streaming\n  context) lay the workspace out right after the matcher reset.\n\nPart of #478\n\n* perf(encode): lay the Fast hash table out in the context workspace\n\n- The workspace is laid out in two parts per frame: the match finder\n  opens it with the bytes its tables need (reserving room behind them for\n  the block buffers, sized from the block ceiling capped by the frame's\n  window) and carves them; the context then carves the block buffers.\n- Matcher gains a hidden reset_in_workspace hook; its workspace type is\n  unnameable outside the crate, so only the context can lay the\n  workspace out and only for the matcher it resets. External matchers\n  keep the default, which resets with their own allocations.\n- A table laid out on the same bytes of the same allocation as the\n  previous frame keeps its contents (Table::bind reports it), which is\n  what the Fast backend's epoch advance and snapshot restore rely on; any\n  other layout starts the table empty and drops the cached dict table.\n- MatchGeneratorDriver reset on its own lays its tables out in a\n  workspace of its own.\n\nPart of #478\n\n* perf(encode): lay the dfast tables out in the context workspace\n\nThe long and short tables are carved from the context workspace once\ntheir widths are settled; tables that continue the previous frame's keep\ntheir contents for the floor-advance reset, and a fresh layout tells the\nreset they hold no earlier frame. A matcher driven on its own still\nallocates them itself.\n\nPart of #478\n\n* perf(encode): lay the row and chain tables out in the context workspace\n\n- The Row backend's shared buffer (rows with their cursors and tags, or\n  the chain / tree hash and link tables) is carved from the context\n  workspace once the finder and widths are settled, laid out and emptied\n  in the same step so the first block does not fill it again.\n- The workspace is allocated again at the need once it has stayed three\n  times larger than the frames for more than 128 layouts (upstream\n  ZSTD_WORKSPACETOOLARGE_FACTOR / _MAXDURATION), which is what now gives\n  a tree level's tables back to a context that moved to rows.\n- Every new allocation starts a new generation with nothing known\n  written, so a region at an address the allocator handed back is never\n  taken for a continuation; a_new_allocation_starts_a_new_generation\n  covers it.\n\nPart of #478\n\n* perf(encode): lay the hash-chain and tree tables out in the context workspace\n\nThe hash, chain and hash3 regions of the hash-chain / binary-tree\nbackend are carved from the context workspace once configure has set\ntheir widths, with the seams set in the same step; continued tables keep\ntheir entries for the floor-advance reset. A matcher driven on its own\nstill allocates them itself, at the exact size.\n\nPart of #478\n\n* fix(encode): keep the borrowed-window guard sound under Stacked Borrows\n\nThe one-shot borrowed block loop cleared the matcher's borrowed window\nfrom a Drop guard holding a raw pointer taken with addr_of_mut! beside\nthe loop's own &mut self.state. Every such &mut retags the whole state\nas Unique, which invalidates the raw pointer under Stacked Borrows, so\nthe guard's access at drop was undefined. The guard now holds the\nstate's &mut and the loop reaches the state through it; the frame-wide\nblock capacity, pre-split tier and dictionary gate are resolved before\nthe loop.\n\nCarries a_compressor_moved_across_levels_lays_its_workspace_out_again,\nwhich moves one compressor across levels whose match finders differ and\nchecks every one-shot and streamed frame against a fresh compressor's.\nUnder Miri it failed on the guard before the change.\n\nPart of #478\n\n* refactor(encode): name the Fast table's carry-over, drop dead helpers\n\n- FastKernelMatcher::reset takes a TableCarry (clear, advance the\n  epoch, or leave it for a snapshot restore) in place of two booleans\n  that were mutually exclusive by construction.\n- with_params is test-only now that the driver builds the matcher\n  deferred; is_allocated had no reader left; the bare Workspace::table\n  carve and Region::len serve only the layout tests.\n\nPart of #478\n\n* perf(encode): lay the match-finder history out in the context workspace\n\n- Every backend's input history is a HistoryBuf carved from the context\n  workspace after the tables, sized once per frame from how its input\n  arrives: nothing for a raw frame or a slice scanned in place, the\n  dictionary plus the input plus one block for a known size, the most\n  the history ever holds for a stream that can fill the window\n- The history binds before the tables and carries its bytes into the new\n  room wherever it lands; the workspace keeps an allocation it replaced\n  until then, so a resident dictionary survives a reallocation\n- The reset decides whether a slice is scanned in place and the frame\n  loop reads that decision back instead of taking it again\n- reserve_for_frame and reserve_history are gone: the layout sizes the\n  history for the whole frame\n- replace_matcher moves the outgoing matcher's tables and history out of\n  the compressor's workspace; before, a matcher taken out kept pointing\n  into memory freed with the compressor (regression test included)\n\nPart of #478\n\n* refactor(encode)!: read all input straight into the matcher\n\nOne ingest path for every frame, owned or streamed, and for dictionary\npriming: bytes are read into the match finder's history, wait there\nuncommitted while the block boundary is chosen, and are claimed with\ncommit_filled. The staged-buffer path and everything that fed it are gone.\n\n- Matcher: get_next_space and commit_space removed; fill_in_place,\n  uncommitted_input and commit_filled are required. HistoryBuf is public so\n  a matcher defined outside the crate can hold its input\n- FrameCompressor: one block loop with no staged copy; an uncompressed frame\n  reads each block straight into the output behind its header\n- StreamingEncoder: input waits uncommitted in the matcher history (a raw\n  frame assembles its block in the output buffer); the pending Vec and the\n  restore-on-error copy are gone\n- driver: the recycled buffer pool is gone; the backends lose add_data and\n  the unused recycle callbacks on reset\n- Fast backend: commits in place like the others, no pending block copy\n- MatchTable: an empty block range when nothing is committed, not a panic\n\nBREAKING CHANGE: Matcher no longer has get_next_space or commit_space;\nfill_in_place, uncommitted_input and commit_filled are required methods.\n\nPart of #478\n\n* test(bench): add a streaming encode loop harness\n\nOne reused CompressionContext writes the corpus in fixed chunks, the path\na Write sink takes, and prints a digest of the frame so two builds can be\ncompared byte for byte.\n\nPart of #478\n\n* fix(encode): keep reused state in the context workspace\n\n- Dfast heap_size counted a workspace history as its own, so a\n  context reported it twice\n- An uncompressed frame laid out the literal, sequence and code\n  buffers it never uses (about 800 KiB on a fresh context)\n- A primed-dictionary restore replaced the dfast, row and binary-tree\n  tables and history laid out in the workspace with fresh clones every\n  frame; it now copies into them, and an attach-mode tree is emptied\n  in place\n- The workspace was given back after 128 layouts of any size; it now\n  counts only consecutive layouts that find it too large, as upstream\n  does\n- A new workspace is allocated zeroed and a table of zeros laid out in\n  that same layout is left unwritten, keeping its pages demand-zero\n\nEach defect carries a regression test that fails without its fix.\n\nPart of #478\n\n* perf(encode): allocate the workspace as zeroed pages\n\nThe over-aligned zeroed request fell back to a plain allocation and a\nmemset of all of it, so a fresh context faulted in its whole workspace,\nthe untouched history room included. A byte-aligned zeroed request is a\ncalloc, which takes a large allocation as fresh pages the kernel zeroes\non first touch; the start is aligned by hand.\n\nPart of #478\n\n* perf(encode): zero the workspace only for sparse tables\n\nA zeroed allocation pays off only when the tables are larger than the\ninput the frame can write into them: then most of their pages are never\ntouched and stay demand-zero. When the input covers them, the tables\nare written densely anyway, and a zeroed block the allocator reuses is\ncleared in full, history room included, which costs more than filling\nthe tables alone. The match finder now tells the workspace which case\nit is from the frame's size, or the history it lays out when the size\nis unknown.\n\nPart of #478\n\n* perf(encode): count only zero-start tables as sparse\n\nThe Fast table and the lazy backend's tree start as zeros too; the\nearlier change left the Fast table on the plain path and the lazy\nbackend out entirely. The match finder now tells the workspace how\nmany of its table bytes start as zeros (none for the row and chain\nlayouts, whose empty slot is not zero), and only those count toward\nthe choice.\n\nPart of #478\n\n* perf(encode): narrow the incompressibility scan\n\nThe classifier runs on every block a raw skip could take, and on a small\nblock at the accelerated fast levels its fixed cost outweighed the search:\n\n- read each quad as a typed [u8; 4], so the load and the byte counts carry\n  no bounds checks\n- leave the 4 KiB repeat table uninitialised; a slot is read only once its\n  occupancy bit says this call wrote it\n- keep the occupancy bitset in 32-bit words, which a 32-bit target shifts\n  natively\n- count bytes in u16: a sample is at most 4 KiB since the dictionary-aware\n  full-block scan was removed, and the explicit-cap entry point it needed\n  goes with it\n\nThe verdict is unchanged: a test keeps the previous scan verbatim and\ncompares both on a corpus straddling every threshold the verdict reads.\n\n* perf(encode): mix grid keys in 32-bit words on 32-bit targets\n\nThe repeat grid mixes a key per probe, up to a thousand per block, and\nsplitmix64's three 64-bit multiplies are each several 32-bit ones on a\nmachine without a 64-bit multiply. Such targets now build the same 64-bit\noutput from two murmur3 32-bit finalisers: the low word, which the\nfingerprint and tag are cut from, mixes both halves of the key, and the\nslot word mixes that again with the high half. wasm32 keeps the wide mix,\nits i64.mul is native.\n\nA new statistical test holds both mixes to Poisson slot occupancy and to\ntag agreement at chance among same-slot keys, over the key shapes the grid\nsees; the single-multiply mix that once cost the grid its repeats fails it\nat three times the expected empty slots.\n\n* fix(encode): zero a workspace only when its tables fill it\n\nA layout whose zero-start tables outgrew the expected input took its\nallocation zeroed, whatever else it held. A 10 KiB one-shot frame at the\nfast levels lays out 32 KiB of tables ahead of about 100 KiB of per-block\nbuffers; once glibc serves a fresh context's allocation from the heap, as\nits adaptive mmap threshold does after the first free, calloc zeroes all\n136 KiB on every frame. That was a third of the frame, and small frames\nran 14-36% slower than before the one-workspace change.\n\nThe zeroed allocation is now taken only when the sparse tables are at\nleast half the workspace, which bounds the worst case at twice the table\nfill and keeps the win where the tables are the allocation (a small input\nat a high level). A regression test holds both sides of the rule.\n\n* fix(encode): zero a workspace only when its tables are three quarters of it\n\nHalf was not enough. At 10 KiB and level 1 the tables are 56% of the\nworkspace, and a context rebuilt per frame gets its allocation from\nrecycled heap, where calloc zeroes all 229 KiB: still 23% slower than\nfilling the 128 KiB of tables, which is what the context did before the\none-workspace change and what upstream does (malloc, then clean the\ntables).\n\nThe zeroed allocation now needs the rest to be at most a third of the\ntables, capping that case at a third over the fill. A small input at a\nhigh level keeps it: its tables are 78% of the workspace at level 13 and\n88% at level 19 when the size is unknown. The regression test gains the\njust-over-half case, which fails under the previous rule.\n\n* fix(encode): carve zero-start tables from a zeroed allocation of their own\n\nNo share of the workspace makes one zeroed-or-not choice right for both\nkinds of memory an allocator returns. Recycled memory is zeroed by a\nmemset, so zeroing the workspace charges the history and buffers too:\nat 10 KiB on glibc, where a context rebuilt per frame lands on recycled\nheap, that cost 14-36% at every level. Fresh pages cost only where\ntouched, so filling the tables instead writes pages the frame never\nindexes: at 1 MiB of noise on musl and i686, where the skip indexes one\nposition in 512, it cost 35-40% at level 3.\n\nBefore the one-workspace change each table was its own zeroed Vec, and\nthe allocator made that choice per table. The workspace now does the\nsame: tables whose empty value is zero are carved from a second\nallocation, always taken zeroed; the rest stays in the main one, taken\nplain. Either kind of memory then costs at most the fill the tables need,\nand the sparse-table heuristic and its expected-input argument go.\n\n* revert(encode): keep zero-start tables in the one workspace allocation\n\nCarving them from a zeroed allocation of their own matched the old\nper-table behaviour on musl and i686, but two allocations of similar\nsize keep glibc's heap on its trim threshold: at 1 MiB and level 3 a\ncontext rebuilt per frame gave its pages back and faulted them in again\nevery frame, 154 faults and 3.9x the time against 4 faults before. One\nallocation is what the workspace exists for, so the tables stay in it\nunder the three-quarters zeroing rule, and a comment at that rule records\nwhy the split is not the answer.\n\nThis reverts commit 9b3d7238.\n\n* fix(encode): zero a workspace on pages the allocator maps fresh\n\nFilling the tables is the cheaper start only on memory the allocator\nrecycles. From the size where the target's system allocator maps every\nrequest fresh - musl's MMAP_THRESHOLD (about 128 KiB), glibc's\nDEFAULT_MMAP_THRESHOLD_MAX (512 KiB on 32-bit, 32 MiB on 64-bit) - a\nzeroed allocation costs no memset and faults in only what the frame\ntouches, while a fill faults in every table page. Against the release\nbefore the one-workspace change that fill cost 36-42% of the encode at\n1 MiB and level 3 on musl and i686, and 37-70% at 10 KiB and levels 1\nand 3 on musl.\n\nThe workspace is now taken zeroed at that size whatever its tables,\nand below it under the existing three-quarters rule. A regression test\nholds the new case with dense tables.\n\n* perf(encode): search small blocks at the negative levels unclassified\n\nThe raw-skip classifier costs a fixed sample scan per block. At the\nnegative levels, where literals are stored raw, a search that finds\nnothing costs one pass of the fast kernel plus the raw fallback, which is\nwhat upstream does there, and on a small block that is the cheaper of the\ntwo. A size x level sweep with the classifier switched on and off in one\nbinary put the crossover at 32-48 KiB on x86_64 and i686: from 2 KiB to\n24 KiB searching was 1-57% faster, from 64 KiB 12-270% slower, below\n2 KiB the levels split, and the positive levels lost almost everywhere.\n\nFrames that store literals raw now skip the classifier on 2-24 KiB\nblocks; everything else still asks it. Output is unchanged on noise\n(the search falls back to the same raw block) and on the other fixture\nshapes: 60 of 60 frames match main byte for byte.\n\n* fix(encode): keep only what a frame reads in the workspace\n\n- A driver reset on its own and then moved into a context kept the\n  workspace it used alone, with nothing live in it, for the life of the\n  compressor (3.5 MiB at level 3). The reset in a context now drops it.\n- A frame after a long stream laid out and copied the whole previous\n  window into its history room, although the reset keeps at most a\n  resident dictionary: a 1 KiB frame after 2 MiB laid out 1 MiB. Each\n  backend now settles its floor and the dictionary prefix it may keep\n  before the layout, drops the rest of the history, and the reset takes\n  the settled values instead of reading them off a history already cut\n  down.\n- Heap accounting counted a workspace's carvable capacity, not the\n  allocation, which carries up to ALIGN - 1 bytes of alignment padding,\n  and missed an allocation retired but not yet freed.\n\nEach carries a regression test that failed before it. Two comments record\nwhy the shrink check holds the unused bytes against three needs (as\nupstream does) and why the grid's midpoint run stays on a one-block frame.\n\n* perf(encode): keep the classifier on tables mapped fresh for the frame\n\nA search over noise touches every page of its hash table; the raw skip\nindexes one position in 512. On a workspace mapped fresh for the frame\neach of those pages is a fault, and on musl, where a 10 KiB frame's\nworkspace is past the mmap threshold, searching the small blocks of the\nnegative levels turned 73 us into 120 us (+63%, three interleaved rounds\nagainst main). The sweep that set the search range ran on warm tables.\n\nThe workspace now reports whether its layout sits on pages mapped fresh\nfor it (a new allocation from the fresh-page size up), and the gate keeps\nthe classifier there. glibc keeps workspaces of that size on recycled\nheap, so x86_64 and i686 keep the search.\n\n* fix(encode): record blocks searched without the classifier\n\nThe repeat grid records nothing until the frame first asks it, on the\ngrounds that a block searched before then was compressible and so is any\ncopy of it. A block the negative levels search without asking the\nclassifier breaks that: it may be noise, and a later block carrying its\ncopy among unique noise reads as noise too, finds an empty grid and goes\nout raw with the match in history. At levels -7 and -1 a streamed 10 KiB\nblock followed by a 128 KiB block starting with its copy came out larger\nthan its input.\n\nSuch a block is now recorded and marks the grid as in use for the frame.\nA searched block that is the frame's last is no longer recorded at all,\nsince nothing reads the grid after it. A regression test covers the\nstreamed case.\n\n* fix(encode): empty the hash3 table when only its width changes\n\nWith the hash, chain and hash3 tables in one buffer, a level change that\nmoved only the hash3 width kept the old tail and appended empty slots,\nso a wider hash3 table started with entries hashed at the old width.\nOnly the hash and chain regions are carried over now.\n\nThe regression test grows and then drops the hash3 width over filled\ntables and checks that the hash and chain entries survive while the\nhash3 table is empty at its new width.\n\n* test(encode): cover the workspace and unclassified-search paths\n\n- workspace: zeroing on fresh pages and for sparse tables, heap bytes\n  with the alignment padding, the overflow panic, a retired allocation\n  given back, a restored table of another length, history accessors\n- drivers: every backend counts its own workspace and none of a\n  context's; a custom matcher comes back whole from replace_matcher;\n  a Row layout switch between finders of one length refills the buffer\n- a small block at a negative level is searched without the classifier\n  and finds a copy the grid cannot see\n- streamed raw frames and raw frames from a reader carry a valid\n  checksum; a full last buffer is pre-split where its content changes\n- hash table width overflow panics; literals past the output buffer stop\n- drop the unused Default impl for Region\n\n* fix(encode): lay out a pledged stream's history for all of it\n\nA stream's size hint is advisory, so its history is laid out only up to\nthe window the level would choose. A pledge is different: the context\nrefuses any other length, so the size is exact. Treated as advisory, a\npledge past the level's window under a wider window override outgrew\nthe room laid out for it, moved the history out of the workspace and\ndoubled an owned allocation on every frame.\n\nThe context now opens a pledged frame with its own ingest plan, and the\nhistory is sized from the pledge as a slice's is. Regression tests cover\nthe sizing rule and a 4 MiB pledged stream at level 3 with window_log 23,\nwhose history now stays in the workspace.\n\n* fix(encode): keep abandoned bytes out of the hash-chain floor\n\nRetiring a hash-chain history zeroed the uncommitted count before\nmeasuring the history's end, so bytes an abandoned frame read but never\ncommitted counted as committed and moved the next frame's floor. They\nwere never indexed; counting them spent the floor's headroom and brought\nthe full table clear at its ceiling closer on a reused context. The\nuncommitted tail is now cut off the buffer first, as the other backends\nalready do.\n\nThe regression test retires a table holding committed and uncommitted\nbytes and checks the floor lands at the committed end.\n\n* perf(encode): settle the fresh-page flag when the layout opens\n\nThe per-block raw-skip gate read the workspace's zeroed flag and capacity and compared the capacity with the allocator threshold on every block, though both are fixed once the layout opens. The flag is now computed there and the gate reads one field.\n\n* fix(encode): probe the repeat grid every eighth of a block\n\nThe grid probed two runs per block, at its start and middle, so a block\nof noise carrying a copy of its own content that began between them\nwent out raw with the match inside it: 16 KiB repeated inside a 64 KiB\nframe came out at 65,546 bytes against upstream's 49,435, at every\nlevel.\n\nRuns now start every eighth of the block, so a copy longer than that\nplus one run is answered wherever it begins. The record step, which is\nalso the run length, is chosen once per frame from its block ceiling at\nthe square root of the run spacing, where a block's probes and records\ncost the same: 128 bytes for 128 KiB blocks, down to a floor of 16.\nBlocks shorter than the ceiling space their runs no closer than sixteen\nruns apart.\n\nRegression tests cover copies at offsets that avoid every run start,\nthe bound below which a copy can still hide, the step per block\nceiling, and the fixture above at levels -7 to 19.\n\n* perf(encode): keep the record step and cheapen the grid probe\n\nRecords every 128 bytes, with a table four times the size, cost 33-42%\nof the encode of a mebibyte of noise at the fast levels and dfast and\n27% on kilobyte frames on x86_64 (three interleaved runs of prebuilt\nbinaries). A record is a random write, and the wider table left the\ncache.\n\nThe step goes back to 512 bytes, so the table is the size it was, and\nruns still start every eighth of the block. What made eight runs of 512\ncostly before is the probe: three multiplies of full mix for a position\nthat almost always misses. A probe now locates its slot and tag with one\nfold and one multiply, and computes the full-mix fingerprint only when\nthe tag matches; the fingerprint comes from an independent mix, so a\ncheap placement no longer correlates with what confirms a hit.\n\n* perf(encode): probe the repeat grid every quarter of a block\n\nFour runs a block instead of eight cost 9-12% less on a mebibyte of noise at levels -7 to 3 on x86_64 (three interleaved runs of prebuilt binaries), leaving 3-5% over the two-run placement, and nothing on small frames: at 10 KiB and level 1 the grid executes 6% fewer instructions than before it probed more often. A copy a quarter of a block long is now the one guaranteed to be found.\n\n* fix(encode): size the history to the frame's block and exact inputs\n\n- The ceiling for a stream that can fill its window left room for a\n  pending block of the format maximum, though a block is at most the\n  frame's own (target size and window capped). A 1 KiB target left\n  about 127 KiB laid out and never written.\n- An input of exact size (a slice, or a pledged stream) still took a\n  block of slack for the last read. A pledged stream only ever asks for\n  the bytes it writes; a slice's last read asked for a whole block past\n  its end, so the slice source now reports what it has left and the read\n  is held to it. Only a stream sized by an advisory hint keeps the slack.\n- A driver reset on its own laid its history out for a one-byte block;\n  driven directly it takes blocks up to the format's, which is now the\n  block its layout leaves room for.\n\nRegression tests cover the sizing rule for each ingest plan, the ceiling\nunder a small target block, and a dictionary frame over a slice whose\nhistory stays in the workspace, which failed with the read unclamped.\n\n* fix(encode): take the size-based zeroed workspace only on std\n\nThe workspace takes a zeroed allocation outright from the size at which the target's system allocator maps fresh pages, which assumes that allocator. A no_std build always runs on one the application supplies, often a fixed heap that answers a zeroed request with a memset of recycled memory, so there only the sparse-table rule takes it, and a workspace is never reported as sitting on fresh pages. With std a custom global allocator cannot be detected; the comment on the flag says what the assumption costs then.\n\n* fix(encode): lay out small exact frames for what they hold\n\n- A slice under a dictionary the Fast backend attaches is scanned in\n  place, but the reset sized its history as a copied slice, reserving\n  room for input only the dictionary ever filled. The reset now predicts\n  the attach mode from the same rule the prime applies, lays out the\n  dictionary alone, and a debug assertion checks the prediction against\n  the primed mode on every dictionary frame.\n- The block buffers were carved for the window's block, and a small\n  frame's window rounds up past it: a 5000-byte slice kept buffers for\n  8 KiB blocks. The ingest plan now carries a slice's or a pledge's exact\n  length, the layout's block is capped by it, and the history sizing\n  reads the length from the plan.\n\nRegression tests: an attached-dictionary frame whose history is the\ndictionary's length, and a 5000-byte frame whose block buffers are sized\nfor 5000 bytes; both failed before the change.\n\n* fix(encode): keep the block queues when restoring a snapshot\n\nRestoring a primed snapshot copied the tables and history into the buffers the matcher held, but cloned the rest wholesale, so the dfast window-block queue and the row chunk-length queue were allocated anew on every reused dictionary frame, dropping the capacity the reset had just kept. Both queues are now lent out of the snapshot and copied in place like the other two buffers. The regression test restores into a queue with room and checks the room survives, on both backends.\n\n* perf(encode): keep the classifier at every block size on musl\n\nSearching 2-24 KiB blocks instead of asking the classifier at the negative levels was calibrated on glibc. With a 10 KiB frame's workspace below musl's mmap threshold, the search made levels -7 and -1 11-15% slower on musl (78-81 us against 89-91), so musl asks the classifier at every size. glibc builds are unchanged.\n\n* docs(encode): say why an unknown-size stream lays out its window\n\nAn unknown-size stream lays out history for its whole window up front, as upstream's buffered stream takes windowSize + blockSize of input buffer for an unknown pledge. Measured through the CLI on a one-byte stream at levels 3, 19 and 22: peak RSS matches main, where the history grew as it read, and a variant growing it measured no faster.",
+          "timestamp": "2026-09-28T02:32:54+03:00",
+          "tree_id": "5cbc2dba62616e061ccd06f0ae46fce925b1be42",
+          "url": "https://github.com/structured-world/structured-zstd/commit/6b1ee58864e71228c03a6eb155a29d8c2ab79826"
+        },
+        "date": 1790554437897,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.065,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 164.042,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 226.585,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.529,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.132,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.455,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.93,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.487,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.962,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.006,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.006,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 8.125,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.457,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.102,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.19,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.253,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.165,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.376,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.25,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.135,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.133,
             "unit": "ms"
           }
         ]
