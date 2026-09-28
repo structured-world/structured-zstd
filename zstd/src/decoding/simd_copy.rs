@@ -1180,13 +1180,12 @@ impl ExactCopyTier {
         ))]
         #[allow(unreachable_code)]
         {
-            use crate::cpu_kernel::{CpuLevel, cpu_allows};
             #[cfg(all(target_feature = "avx2", feature = "kernel-avx2"))]
-            if cpu_allows(CpuLevel::Avx2) {
+            if crate::cpu_kernel::cpu_allows(crate::cpu_kernel::CpuLevel::Avx2) {
                 return Self::Avx2;
             }
             #[cfg(all(target_feature = "sse2", feature = "kernel-sse"))]
-            if cpu_allows(CpuLevel::Sse2) {
+            if crate::cpu_kernel::cpu_allows(crate::cpu_kernel::CpuLevel::Sse2) {
                 return Self::Sse2;
             }
         }
