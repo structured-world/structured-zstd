@@ -398,6 +398,20 @@ pub(crate) unsafe fn copy_bytes_overshooting<K: CpuKernel>(
         return;
     }
 
+    // A tier wider than the baseline steps down to the baseline width before
+    // the machine word: near the end of a buffer the slack often fits 16 but
+    // not 32. The comparison is between constants and folds away.
+    if K::COPY_CHUNK > BASELINE_COPY_CHUNK {
+        let rounded = copy_at_least.next_multiple_of(BASELINE_COPY_CHUNK);
+        if min_buffer_size >= rounded {
+            // SAFETY: `rounded` bytes fit both spans (just checked); the
+            // baseline runs on every CPU the build does.
+            unsafe { copy_chunks_baseline(src.0, dst.0, rounded) };
+            debug_assert_eq_copy(src, dst, copy_at_least);
+            return;
+        }
+    }
+
     // Final fallback: machine-word chunks if the slack permits, else an exact
     // byte copy.
     let scalar_chunk = core::mem::size_of::<usize>();
