@@ -22,7 +22,8 @@ pub(super) struct Scored {
 /// Finalizes candidate content and prices it against the scoring samples.
 ///
 /// One compressor serves every candidate: each is attached in turn, and the
-/// frame buffer is reused across samples.
+/// frame buffer is reused across samples. The compressor is built at the
+/// first pricing, so a run that only finalizes never pays for it.
 pub(super) struct Evaluator<'s> {
     samples: &'s SampleSet<'s>,
     /// Samples the entropy tables are drawn from.
@@ -30,8 +31,9 @@ pub(super) struct Evaluator<'s> {
     /// Samples a dictionary is scored on.
     scoring: Range<usize>,
     capacity: usize,
+    level: i32,
     finalize: FinalizeOptions,
-    compressor: FrameCompressor,
+    compressor: Option<FrameCompressor>,
     frame: Vec<u8>,
 }
 
@@ -49,8 +51,9 @@ impl<'s> Evaluator<'s> {
             finalize_samples,
             scoring,
             capacity,
+            level,
             finalize,
-            compressor: FrameCompressor::new(CompressionLevel::from_level(level)),
+            compressor: None,
             frame: Vec::new(),
         }
     }
@@ -69,13 +72,16 @@ impl<'s> Evaluator<'s> {
     fn price(&mut self, dict: &[u8]) -> io::Result<usize> {
         let prepared = EncoderDictionary::from_bytes(dict)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        self.compressor
+        let level = self.level;
+        let compressor = self
+            .compressor
+            .get_or_insert_with(|| FrameCompressor::new(CompressionLevel::from_level(level)));
+        compressor
             .set_encoder_dictionary(prepared)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let mut total = dict.len();
         for index in self.scoring.clone() {
-            self.compressor
-                .compress_independent_frame_into(self.samples.sample(index), &mut self.frame);
+            compressor.compress_independent_frame_into(self.samples.sample(index), &mut self.frame);
             total += self.frame.len();
         }
         Ok(total)

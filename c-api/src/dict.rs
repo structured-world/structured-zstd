@@ -146,8 +146,8 @@ pub struct ZDICT_cover_params_t {
     pub nbThreads: c_uint,
     /// Share of samples trained on, the rest scoring (0 = 1.0: all do both).
     pub splitPoint: f64,
-    /// Non-zero: keep the smallest dictionary within
-    /// `shrinkDictMaxRegression` percent of the full one.
+    /// Non-zero: try the content's trailing 256, 512, ... bytes and keep the
+    /// first within `shrinkDictMaxRegression` percent of the full one.
     pub shrinkDict: c_uint,
     /// Regression the shrinking search allows, in percent.
     pub shrinkDictMaxRegression: c_uint,
@@ -297,7 +297,10 @@ pub unsafe extern "C" fn ZDICT_optimizeTrainFromBuffer_cover(
 pub struct ZDICT_fastCover_params_t {
     /// Segment size (0 = optimize over the default candidate grid).
     pub k: c_uint,
-    /// Dmer size (0 = optimize; only 6 / 8 are meaningful upstream).
+    /// Dmer size (0 = optimize). Upstream accepts only 6 and 8 here; this
+    /// build trains any `d` of 4 or more, as its Rust trainer does, so a
+    /// caller asking for another size gets a dictionary rather than
+    /// `parameter_outOfBound`.
     pub d: c_uint,
     /// Frequency-array log size (0 = default 20).
     pub f: c_uint,
@@ -309,8 +312,8 @@ pub struct ZDICT_fastCover_params_t {
     pub splitPoint: f64,
     /// Acceleration factor (0 = default 1).
     pub accel: c_uint,
-    /// Non-zero: keep the smallest dictionary within
-    /// `shrinkDictMaxRegression` percent of the full one.
+    /// Non-zero: try the content's trailing 256, 512, ... bytes and keep the
+    /// first within `shrinkDictMaxRegression` percent of the full one.
     pub shrinkDict: c_uint,
     /// Regression the shrinking search allows, in percent.
     pub shrinkDictMaxRegression: c_uint,

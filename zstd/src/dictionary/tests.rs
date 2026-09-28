@@ -315,6 +315,32 @@ fn the_split_must_leave_samples_on_both_sides() {
     }
 }
 
+/// A split point that is not a number lies outside `(0, 1]` too: every
+/// comparison with NaN is false, so it must be refused explicitly rather than
+/// slip through as "every sample builds and scores".
+#[test]
+fn a_split_point_that_is_not_a_number_is_refused() {
+    let (data, sizes) = training_samples();
+    for split_point in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let err = optimize_cover_dict(
+            &data,
+            &sizes,
+            4096,
+            &CoverOptions {
+                split_point,
+                ..CoverOptions::default()
+            },
+            FinalizeOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            TrainingError::of(&err),
+            Some(TrainingError::Parameter),
+            "{split_point}"
+        );
+    }
+}
+
 /// A frequency table or acceleration past the reference's range is refused,
 /// as is a dmer shorter than the hash reads.
 #[test]

@@ -90,8 +90,11 @@ pub struct CoverOptions {
     /// score them. At 1 every sample does both. Zero or below is the trainer's
     /// default: 1 for COVER, 0.75 for FastCOVER.
     pub split_point: f64,
-    /// Accept the smallest dictionary whose scoring samples compress to at most
-    /// this many percent more than with the full-size one.
+    /// Try the content's last 256, 512, 1024, ... bytes, each finalized into a
+    /// dictionary of its own, and keep the first whose scoring samples
+    /// compress to at most this many percent more than with the whole content
+    /// (upstream zstd `COVER_selectDict`). A dictionary so found is its header
+    /// plus that tail, so none is smaller than the header plus 256 bytes.
     pub shrink: Option<u32>,
     /// Compression level candidates are scored at; zero is the default level.
     pub level: i32,
@@ -594,6 +597,13 @@ impl SearchSpace {
     /// Upstream zstd `ZDICT_optimizeTrainFromBuffer_cover`: zero `d` tries 6
     /// and 8, zero `k` tries 50..=2000 in `steps` strides.
     fn optimizing(options: &CoverOptions, default_split: f64) -> io::Result<Self> {
+        // NaN fails every comparison below, so it is refused on its own.
+        if !options.split_point.is_finite() {
+            return Err(refuse(
+                TrainingError::Parameter,
+                "the split point must lie in (0, 1]",
+            ));
+        }
         let split_point = if options.split_point <= 0.0 {
             default_split
         } else {
