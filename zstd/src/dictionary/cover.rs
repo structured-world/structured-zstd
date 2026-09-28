@@ -113,15 +113,11 @@ impl<'s> CoverContext<'s> {
                 "the training samples are too large for COVER (4 GiB at most)",
             ));
         }
-        let (dmer_at, freqs) = if d <= 8 {
+        let (dmer_at, initial) = if d <= 8 {
             index_dmers::<false>(data, nb_dmers, d, samples.offsets())
         } else {
             index_dmers::<true>(data, nb_dmers, d, samples.offsets())
         };
-        let initial = freqs
-            .into_iter()
-            .map(|freq| DmerState { freq, active: 0 })
-            .collect();
         Ok(Self {
             data,
             dmer_at,
@@ -266,18 +262,24 @@ fn long_digest(data: &[u8], pos: usize, d: usize) -> u64 {
 }
 
 /// Give every distinct dmer of `data` a dense id and count the samples it
-/// occurs in: returns the id at each position and the frequency of each id.
+/// occurs in: returns the id at each position and each id's frequency, with
+/// window counts zero.
 ///
 /// Upstream zstd groups positions by sorting them on their dmer; ids here come
 /// from a hash index in one pass instead. Which label a dmer carries does not
 /// change a single selection, and the pass does no comparison sort. A dmer is
 /// counted once per sample it lies wholly inside.
+///
+/// Memory stays within a few words per position however many distinct dmers
+/// there are: a slot holds only the first position of its dmer (its id is
+/// `dmer_at` there, and its key is read back from `data`), and the sample a
+/// dmer was last counted in lives in the window-count field it returns zeroed.
 fn index_dmers<const LONG: bool>(
     data: &[u8],
     nb_dmers: usize,
     d: usize,
     offsets: &[usize],
-) -> (Vec<u32>, Vec<u32>) {
+) -> (Vec<u32>, Vec<DmerState>) {
     let mask = if d >= 8 {
         u64::MAX
     } else {
@@ -290,63 +292,80 @@ fn index_dmers<const LONG: bool>(
             short_key(data, pos, mask)
         }
     };
-    // Slots hold (tag, id); a short dmer's tag is the dmer itself.
-    let mut slots: Vec<(u64, u32)> = vec![(0, EMPTY); 1 << 12];
+    let same_dmer = |a: usize, b: usize| {
+        if LONG {
+            data[a..a + d] == data[b..b + d]
+        } else {
+            short_key(data, a, mask) == short_key(data, b, mask)
+        }
+    };
+    // Slots hold the first position of a dmer; positions fit `u32` below
+    // `EMPTY`, which the caller's size check guarantees.
+    let mut slots: Vec<u32> = vec![EMPTY; 1 << 12];
     let mut shift = 64 - 12;
-    let mut first_pos: Vec<u32> = Vec::new();
-    let mut freqs: Vec<u32> = Vec::new();
-    let mut last_sample: Vec<u32> = Vec::new();
-    let mut dmer_at = Vec::with_capacity(nb_dmers);
+    // `active` holds the last sample a dmer was counted in until the end.
+    let mut dmers: Vec<DmerState> = Vec::new();
+    let mut dmer_at: Vec<u32> = Vec::with_capacity(nb_dmers);
     let mut sample = 0usize;
     for pos in 0..nb_dmers {
         while offsets[sample + 1] <= pos {
             sample += 1;
         }
-        let tag = tag_at(pos);
         let mask = slots.len() - 1;
-        let mut slot = (tag.wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
+        let mut slot = (tag_at(pos).wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
         let id = loop {
-            let (slot_tag, slot_id) = slots[slot];
-            if slot_id == EMPTY {
-                let id = first_pos.len() as u32;
-                slots[slot] = (tag, id);
-                first_pos.push(pos as u32);
-                freqs.push(0);
-                last_sample.push(EMPTY);
+            let first = slots[slot];
+            if first == EMPTY {
+                let id = dmers.len() as u32;
+                slots[slot] = pos as u32;
+                dmers.push(DmerState {
+                    freq: 0,
+                    active: EMPTY,
+                });
                 break id;
             }
-            if slot_tag == tag {
-                let first = first_pos[slot_id as usize] as usize;
-                if !LONG || data[first..first + d] == data[pos..pos + d] {
-                    break slot_id;
-                }
+            if same_dmer(first as usize, pos) {
+                break dmer_at[first as usize];
             }
             slot = (slot + 1) & mask;
         };
         // A dmer spilling into the next sample exists only in the
         // concatenation, so it earns nothing.
-        if pos + d <= offsets[sample + 1] && last_sample[id as usize] != sample as u32 {
-            last_sample[id as usize] = sample as u32;
-            freqs[id as usize] += 1;
+        let dmer = &mut dmers[id as usize];
+        if pos + d <= offsets[sample + 1] && dmer.active != sample as u32 {
+            dmer.active = sample as u32;
+            dmer.freq += 1;
         }
         dmer_at.push(id);
-        // Keep the load at or under a half.
-        if first_pos.len() * 2 > slots.len() {
+        // Keep the load at or under a half. First occurrences appear in
+        // `dmer_at` in id order, so the new table is filled from it without
+        // keeping the old one.
+        if dmers.len() * 2 > slots.len() {
             let len = slots.len() * 2;
             shift -= 1;
             slots.clear();
-            slots.resize(len, (0, EMPTY));
-            for (id, &first) in first_pos.iter().enumerate() {
-                let tag = tag_at(first as usize);
-                let mut slot = (tag.wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
-                while slots[slot].1 != EMPTY {
+            slots.resize(len, EMPTY);
+            let mut next = 0u32;
+            for (first, &id) in dmer_at.iter().enumerate() {
+                if id != next {
+                    continue;
+                }
+                next += 1;
+                let mut slot = (tag_at(first).wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
+                while slots[slot] != EMPTY {
                     slot = (slot + 1) & (len - 1);
                 }
-                slots[slot] = (tag, id as u32);
+                slots[slot] = first as u32;
+                if next as usize == dmers.len() {
+                    break;
+                }
             }
         }
     }
-    (dmer_at, freqs)
+    for dmer in &mut dmers {
+        dmer.active = 0;
+    }
+    (dmer_at, dmers)
 }
 
 #[cfg(test)]
