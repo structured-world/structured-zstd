@@ -320,6 +320,24 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 )
             }
         }
+        // 32-bit x86 has no AVX2 sequence body either; the portable walk runs
+        // with the AVX2 kernel, so its buffer copies take 32-byte chunks.
+        #[cfg(all(target_arch = "x86", feature = "kernel-avx2"))]
+        CpuKernelTag::Avx2 => {
+            // SAFETY: detect confirmed BMI2 + AVX2.
+            unsafe {
+                decode_and_execute_sequences_x86_avx2::<B>(
+                    section,
+                    source,
+                    fse,
+                    buffer,
+                    offset_hist,
+                    literals_buffer,
+                    literals_len,
+                    dict,
+                )
+            }
+        }
         #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
         CpuKernelTag::Avx2 => {
             // SAFETY: detect confirmed BMI2 + AVX2.
@@ -384,11 +402,41 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
     }
 }
 
-// Per-tier x86 trampolines (`decode_and_execute_sequences_{bmi2,avx2,vbmi2}`)
+// Per-tier x86_64 trampolines (`decode_and_execute_sequences_{bmi2,avx2,vbmi2}`)
 // live in `seq_decoder_bmi2.rs` / `seq_decoder_avx2.rs` /
 // `seq_decoder_vbmi2.rs`. Each owns its `#[target_feature]` attribute
 // and is called from the dispatch matcher above. See issue #279
 // round 3 for the per-kernel architecture rationale.
+
+/// The 32-bit x86 AVX2 tier: the portable sequence walk compiled under AVX2
+/// and BMI2, so the kernel's masks and 32-byte copies inline into it.
+///
+/// # Safety
+/// The caller must have verified AVX2 and BMI2 on the running CPU.
+#[cfg(all(target_arch = "x86", feature = "kernel-avx2"))]
+#[target_feature(enable = "bmi2,avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn decode_and_execute_sequences_x86_avx2<'fse, B: super::buffer_backend::BufferBackend>(
+    section: &SequencesHeader,
+    source: &[u8],
+    fse: &'fse mut FSEScratch,
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    offset_hist: &mut [u32; 3],
+    literals_buffer: &[u8],
+    literals_len: usize,
+    dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
+) -> Result<(), DecompressBlockError> {
+    super::seq_decoder_scalar::decode_and_execute_sequences_impl::<B, crate::cpu_kernel::Avx2Kernel>(
+        section,
+        source,
+        fse,
+        buffer,
+        offset_hist,
+        literals_buffer,
+        literals_len,
+        dict,
+    )
+}
 
 /// Post-resolve sequence shape carried by the pipelined ring. Stores
 /// only the fields the executor actually reads: literal length, match

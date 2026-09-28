@@ -5,7 +5,10 @@ use super::super::blocks::literals_section::{LiteralsSection, LiteralsSectionTyp
 use super::buffer_backend::WILDCOPY_OVERLENGTH;
 use super::scratch::HuffmanScratch;
 use crate::bit_io::BitReaderReversed;
-#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
+))]
 use crate::cpu_kernel::Avx2Kernel;
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
@@ -233,7 +236,10 @@ fn decompress_literals(
         CpuKernelTag::Vbmi2 => unsafe {
             decompress_literals_vbmi2(section, scratch, dict, source, target)
         },
-        #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel-avx2"
+        ))]
         CpuKernelTag::Avx2 => unsafe {
             decompress_literals_avx2(section, scratch, dict, source, target)
         },
@@ -265,7 +271,10 @@ fn decompress_literals(
     }
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
+))]
 #[target_feature(enable = "bmi2,avx2")]
 unsafe fn decompress_literals_avx2(
     section: &LiteralsSection,

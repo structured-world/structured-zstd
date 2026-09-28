@@ -123,7 +123,11 @@ fn every_runnable_kernel_keeps_the_wildcopy_contract() {
     if std::arch::is_x86_feature_detected!("bmi2") {
         check_overshooting_copy::<crate::cpu_kernel::Bmi2Kernel>("bmi2");
     }
-    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-avx2"))]
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
     if std::arch::is_x86_feature_detected!("avx2") {
         check_overshooting_copy::<crate::cpu_kernel::Avx2Kernel>("avx2");
     }

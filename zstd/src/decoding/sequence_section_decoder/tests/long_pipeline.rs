@@ -55,11 +55,19 @@ fn supported_kernels() -> Vec<CpuKernelTag> {
     if std::is_x86_feature_detected!("sse2") {
         kernels.push(CpuKernelTag::Sse2);
     }
-    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-bmi2"
+    ))]
     if std::is_x86_feature_detected!("bmi2") {
         kernels.push(CpuKernelTag::Bmi2);
     }
-    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-avx2"))]
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
     if std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("avx2") {
         kernels.push(CpuKernelTag::Avx2);
     }

@@ -467,15 +467,22 @@ impl CpuKernel for Bmi2Kernel {
     }
 }
 
-/// x86_64 AVX2 + BMI2 kernel (x86-64-v3 baseline). The common modern
+/// x86 AVX2 + BMI2 kernel (x86-64-v3 baseline). The common modern
 /// x86 case — most CPUs released since 2013 (Haswell) have AVX2+BMI2.
-/// Uses `_bzhi_u64` for mask ops; future trait methods will use AVX2
-/// 256-bit moves for `copy_chunk` and pext for HUF burst.
-#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+/// Uses `bzhi` for mask ops and 256-bit moves for the buffer copies. Present
+/// on 32-bit x86 too, where the copies are what it changes: without it such a
+/// build copies at the SSE2 width whatever the CPU offers.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
+))]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct Avx2Kernel;
 
-#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
+))]
 impl CpuKernel for Avx2Kernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
@@ -669,7 +676,12 @@ pub(crate) enum CpuKernelTag {
         feature = "kernel-bmi2"
     ))]
     Bmi2,
-    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    /// On 32-bit x86 it runs the portable sequence walk with this kernel's
+    /// 32-byte copies.
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
     Avx2,
     #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
     Vbmi2,
@@ -724,15 +736,20 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
                 && is_x86_feature_detected!("sse2"),
         );
     }
-    // 32-bit x86 carries only the BMI2 tier: the wider tiers' kernels and
-    // their `target_feature` bodies are x86_64-only, so there is nothing
-    // above `bzhi` to select here.
+    // 32-bit x86 carries the BMI2 and AVX2 tiers: `bzhi` for the entropy
+    // tables and the AVX2 buffer copies. The VBMI2 bodies are x86_64-only.
     #[cfg(target_arch = "x86")]
     {
-        #[cfg(feature = "kernel-bmi2")]
+        #[cfg(any(feature = "kernel-bmi2", feature = "kernel-avx2"))]
         {
             use std::arch::is_x86_feature_detected;
-            if cpu_allows(CpuLevel::Bmi2) && is_x86_feature_detected!("bmi2") {
+            let bmi2 = cpu_allows(CpuLevel::Bmi2) && is_x86_feature_detected!("bmi2");
+            #[cfg(feature = "kernel-avx2")]
+            if bmi2 && cpu_allows(CpuLevel::Avx2) && is_x86_feature_detected!("avx2") {
+                return CpuKernelTag::Avx2;
+            }
+            #[cfg(feature = "kernel-bmi2")]
+            if bmi2 {
                 return CpuKernelTag::Bmi2;
             }
         }
@@ -779,10 +796,16 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
             cpu_allows(CpuLevel::Sse2) && cfg!(target_feature = "sse2"),
         );
     }
-    #[cfg(target_arch = "x86")]
+    // `cfg!` rather than `#[cfg]`, as `select_x86_kernel` does: the tests fold
+    // at compile time, and the tiers stay constructed in every build.
+    #[cfg(all(target_arch = "x86", feature = "kernel-bmi2"))]
     {
-        #[cfg(all(feature = "kernel-bmi2", target_feature = "bmi2"))]
-        if cpu_allows(CpuLevel::Bmi2) {
+        let bmi2 = cpu_allows(CpuLevel::Bmi2) && cfg!(target_feature = "bmi2");
+        #[cfg(feature = "kernel-avx2")]
+        if bmi2 && cpu_allows(CpuLevel::Avx2) && cfg!(target_feature = "avx2") {
+            return CpuKernelTag::Avx2;
+        }
+        if bmi2 {
             return CpuKernelTag::Bmi2;
         }
     }
@@ -816,7 +839,10 @@ impl CpuKernelTag {
                 feature = "kernel-bmi2"
             ))]
             CpuKernelTag::Bmi2 => "bmi2",
-            #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-avx2"
+            ))]
             CpuKernelTag::Avx2 => "avx2",
             #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
             CpuKernelTag::Vbmi2 => "vbmi2",
