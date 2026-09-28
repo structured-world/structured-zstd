@@ -17,6 +17,7 @@
 //! +43–58 % regression on small-frame decompress benchmarks, so the
 //! compile-time generic shape is load-bearing.
 
+use crate::cpu_kernel::CpuKernel;
 use crate::io::{Error, Read};
 
 /// Trailing-slack count both backends pad their physical allocation
@@ -526,8 +527,9 @@ pub(crate) trait BufferBackend: Sized {
     ///   by the caller and never read again.
     unsafe fn set_tail(&mut self, new_tail: usize);
 
-    /// Append `data` to the tail.
-    fn extend(&mut self, data: &[u8]);
+    /// Append `data` to the tail, copying with the kernels of `K`, the tier
+    /// the caller was monomorphised for.
+    fn extend<K: CpuKernel>(&mut self, data: &[u8]);
 
     /// Append `fill_length` copies of `fill_with` to the tail.
     /// Backs the RLE block path.
@@ -544,7 +546,8 @@ pub(crate) trait BufferBackend: Sized {
     /// - `start + len <= self.len()`.
     /// - Capacity for `len` additional bytes past the current tail
     ///   was reserved by the caller.
-    unsafe fn extend_from_within_unchecked(&mut self, start: usize, len: usize);
+    /// - The running CPU supports `K`'s tier.
+    unsafe fn extend_from_within_unchecked<K: CpuKernel>(&mut self, start: usize, len: usize);
 
     /// Branchless variant used on x86 builds where the unchecked
     /// non-overlap precondition allows the chunked wildcopy to skip
@@ -554,7 +557,11 @@ pub(crate) trait BufferBackend: Sized {
     ///
     /// # Safety
     /// Same as [`Self::extend_from_within_unchecked`].
-    unsafe fn extend_from_within_unchecked_branchless(&mut self, start: usize, len: usize);
+    unsafe fn extend_from_within_unchecked_branchless<K: CpuKernel>(
+        &mut self,
+        start: usize,
+        len: usize,
+    );
 
     /// Two-slice view of the live region. The second slice is empty
     /// on backends that don't wrap (flat path) — the API shape is
@@ -614,8 +621,8 @@ pub(crate) trait BufferBackend: Sized {
     /// contract). Default impl delegates to the panic-on-overflow
     /// [`Self::extend`] — backends with non-growable capacity MUST
     /// override.
-    fn try_extend(&mut self, data: &[u8]) -> Result<(), BackendOverflow> {
-        self.extend(data);
+    fn try_extend<K: CpuKernel>(&mut self, data: &[u8]) -> Result<(), BackendOverflow> {
+        self.extend::<K>(data);
         Ok(())
     }
 
@@ -657,7 +664,11 @@ pub(crate) trait BufferBackend: Sized {
     /// `try_extend_and_fill` / `try_extend`. So every adversarial
     /// overshoot already surfaces as a structured error.
     #[allow(dead_code)]
-    fn try_extend_from_within(&mut self, start: usize, len: usize) -> Result<(), BackendOverflow> {
+    fn try_extend_from_within<K: CpuKernel>(
+        &mut self,
+        start: usize,
+        len: usize,
+    ) -> Result<(), BackendOverflow> {
         // Default impl: a SAFE method must NOT delegate to the
         // unsafe variant without validating its safety contract.
         // Validate the source range (`start + len <= self.len()`),
@@ -708,7 +719,7 @@ pub(crate) trait BufferBackend: Sized {
         // `reserve(len)`, both linear (FlatBuf) and wrap-aware
         // (RingBuffer). Wrap-unaware fixed-capacity backends
         // override this method.
-        unsafe { self.extend_from_within_unchecked(start, len) };
+        unsafe { self.extend_from_within_unchecked::<K>(start, len) };
         Ok(())
     }
 }

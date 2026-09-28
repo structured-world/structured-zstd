@@ -5,6 +5,7 @@
 //! overflow, and source-range violation. Plus the `Display` impl
 //! that the decoder formats `BackendOverflow` through.
 use super::*;
+use crate::cpu_kernel::ScalarKernel;
 use crate::decoding::flat_buf::FlatBuf;
 
 #[test]
@@ -12,10 +13,11 @@ fn default_try_extend_from_within_happy_path_copies_from_live_region() {
     // FlatBuf uses the default impl — grow on demand, no
     // capacity overshoot path on a growable backend.
     let mut b = FlatBuf::with_capacity(32);
-    b.extend(&[1u8, 2, 3, 4, 5]);
+    b.extend::<ScalarKernel>(&[1u8, 2, 3, 4, 5]);
     assert_eq!(b.len(), 5);
     // Copy `[1, 2, 3]` from the head into the tail.
-    b.try_extend_from_within(0, 3).expect("happy path");
+    b.try_extend_from_within::<ScalarKernel>(0, 3)
+        .expect("happy path");
     assert_eq!(b.len(), 8);
     let (s, t) = b.as_slices();
     assert_eq!(s, &[1u8, 2, 3, 4, 5, 1, 2, 3]);
@@ -29,10 +31,10 @@ fn default_try_extend_from_within_arithmetic_overflow_returns_err() {
     // surface that as `Err(BackendOverflow)` without touching the
     // backend.
     let mut b = FlatBuf::with_capacity(32);
-    b.extend(&[1u8, 2, 3, 4]);
+    b.extend::<ScalarKernel>(&[1u8, 2, 3, 4]);
     let live_before = b.len();
     let err = b
-        .try_extend_from_within(usize::MAX, 1)
+        .try_extend_from_within::<ScalarKernel>(usize::MAX, 1)
         .expect_err("usize wrap must Err");
     assert_eq!(err.requested, 1);
     assert_eq!(b.len(), live_before, "backend untouched on Err");
@@ -44,9 +46,9 @@ fn default_try_extend_from_within_source_past_live_region_returns_err() {
     // region. The default impl must Err without growing or
     // writing.
     let mut b = FlatBuf::with_capacity(32);
-    b.extend(&[10u8, 20, 30]);
+    b.extend::<ScalarKernel>(&[10u8, 20, 30]);
     let err = b
-        .try_extend_from_within(2, 10)
+        .try_extend_from_within::<ScalarKernel>(2, 10)
         .expect_err("start+len past live region must Err");
     assert_eq!(err.requested, 10);
     assert_eq!(b.len(), 3, "backend untouched on Err");

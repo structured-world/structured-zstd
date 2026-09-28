@@ -107,7 +107,7 @@ fn check_pipeline<B: BufferBackend>(kernel: CpuKernelTag, fail_at: Option<usize>
     // Reserve before the checkpoint, as the block decoder does, so an error
     // can restore the cursor without an intervening allocation invalidating it.
     scratch.buffer.reserve_exact(4096);
-    scratch.buffer.push(PREFIX);
+    scratch.buffer.push::<ScalarKernel>(PREFIX);
     {
         let setup = init_sequence_stream::<B, ScalarKernel>(
             &header,

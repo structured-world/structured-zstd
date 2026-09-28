@@ -1,4 +1,5 @@
 use super::{DecodeBuffer, RingBuffer};
+use crate::cpu_kernel::ScalarKernel;
 use crate::decoding::buffer_backend::BufferBackend;
 use crate::io::{Error, ErrorKind, Write};
 
@@ -26,14 +27,14 @@ fn dict_offsets_rejected_after_direct_path_window_drop() {
 
     // Mimic the inline executor: produce 250 bytes without touching
     // `total_output_counter`, exceeding the 100-byte window.
-    BufferBackend::extend(&mut buf.buffer, &[1u8; 250]);
+    BufferBackend::extend::<ScalarKernel>(&mut buf.buffer, &[1u8; 250]);
     buf.drop_to_window_size();
     assert_eq!(buf.len(), 100, "visible buffer capped to the window");
 
     // offset 110 > len 100 reaches 10 bytes into the dictionary;
     // cumulative output (250) already exceeds the window (100), so
     // this must be rejected, not served from the dictionary.
-    let result = buf.repeat_from_dict(Some(handle.as_dict()), 110, 5);
+    let result = buf.repeat_from_dict::<ScalarKernel>(Some(handle.as_dict()), 110, 5);
     assert!(
         result.is_err(),
         "dict-backed offset must be unreachable once output exceeded the window, got {result:?}"
@@ -49,13 +50,13 @@ fn from_backend_clears_prepopulated_backend() {
     // wires up a non-fresh backend should not silently leak stale
     // bytes into the new decode.
     let mut backend = RingBuffer::new();
-    BufferBackend::extend(&mut backend, b"stale");
+    BufferBackend::extend::<ScalarKernel>(&mut backend, b"stale");
     assert!(BufferBackend::len(&backend) > 0);
 
     let mut buf = DecodeBuffer::<RingBuffer>::from_backend(backend, 1024);
     assert_eq!(buf.len(), 0, "from_backend must clear pre-populated bytes");
 
-    buf.push(b"ok");
+    buf.push::<ScalarKernel>(b"ok");
     assert_eq!(buf.drain(), b"ok");
 }
 
@@ -88,8 +89,10 @@ fn test_repeat_doubling_matches_reference_across_offsets() {
         for &match_length in &lengths {
             let prefix_slice = &prefix[..offset.max(1)];
             let mut buffer = DecodeBuffer::<RingBuffer>::new(usize::MAX);
-            buffer.push(prefix_slice);
-            buffer.repeat(None, offset, match_length).unwrap();
+            buffer.push::<ScalarKernel>(prefix_slice);
+            buffer
+                .repeat::<ScalarKernel>(None, offset, match_length)
+                .unwrap();
             let expected = reference_repeat(prefix_slice, offset, match_length);
             let mut got: Vec<u8> = Vec::new();
             buffer.drain_to_writer(&mut got).unwrap();
@@ -114,9 +117,9 @@ fn checkpoint_restore_undoes_pushes() {
     // RingBuffer reallocation happens between checkpoint and restore
     // (restore_checkpoint requires a stable underlying allocation).
     buf.reserve_exact(64);
-    buf.push(&[1, 2, 3]);
+    buf.push::<ScalarKernel>(&[1, 2, 3]);
     let cp = buf.checkpoint();
-    buf.push(&[4, 5, 6, 7]);
+    buf.push::<ScalarKernel>(&[4, 5, 6, 7]);
     assert_eq!(buf.len(), 7);
     assert!(
         buf.try_restore_checkpoint(cp),
@@ -126,7 +129,7 @@ fn checkpoint_restore_undoes_pushes() {
 
     // After restore, fresh writes must land contiguously where the
     // first push left off (no stale tail bytes leaking through).
-    buf.push(&[0xAA, 0xBB]);
+    buf.push::<ScalarKernel>(&[0xAA, 0xBB]);
     assert_eq!(buf.len(), 5);
     // Drain & verify content.
     let mut drained: Vec<u8> = Vec::new();
@@ -148,13 +151,13 @@ fn restore_checkpoint_after_realloc_returns_false() {
     // crash-bfb3bc55... originally exercised this branch via the
     // panic guard added in the previous round.
     let mut buf = DecodeBuffer::<RingBuffer>::new(64);
-    buf.push(&[0; 16]);
+    buf.push::<ScalarKernel>(&[0; 16]);
     let cp = buf.checkpoint();
     // Force a reallocation. RingBuffer grows by powers of two and
     // 4 MiB is well above the initial 64-byte starting capacity, so
     // reserve() must hit reserve_amortized().
     buf.reserve_exact(4 * 1024 * 1024);
-    buf.push(&[0; 16]);
+    buf.push::<ScalarKernel>(&[0; 16]);
     assert!(
         !buf.try_restore_checkpoint(cp),
         "realloc happened → rollback must be refused"
@@ -192,12 +195,12 @@ fn short_writer() {
     };
 
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(100);
-    decode_buf.push(b"0123456789");
-    decode_buf.repeat(None, 10, 90).unwrap();
+    decode_buf.push::<ScalarKernel>(b"0123456789");
+    decode_buf.repeat::<ScalarKernel>(None, 10, 90).unwrap();
     let repeats = 1000;
     for _ in 0..repeats {
         assert_eq!(decode_buf.len(), 100);
-        decode_buf.repeat(None, 10, 50).unwrap();
+        decode_buf.repeat::<ScalarKernel>(None, 10, 50).unwrap();
         assert_eq!(decode_buf.len(), 150);
         decode_buf
             .drain_to_window_size_writer(&mut short_writer)
@@ -242,12 +245,12 @@ fn wouldblock_writer() {
     };
 
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(100);
-    decode_buf.push(b"0123456789");
-    decode_buf.repeat(None, 10, 90).unwrap();
+    decode_buf.push::<ScalarKernel>(b"0123456789");
+    decode_buf.repeat::<ScalarKernel>(None, 10, 90).unwrap();
     let repeats = 1000;
     for _ in 0..repeats {
         assert_eq!(decode_buf.len(), 100);
-        decode_buf.repeat(None, 10, 50).unwrap();
+        decode_buf.repeat::<ScalarKernel>(None, 10, 50).unwrap();
         assert_eq!(decode_buf.len(), 150);
         loop {
             match decode_buf.drain_to_window_size_writer(&mut short_writer) {
@@ -302,8 +305,10 @@ fn repeat_overlap_fast_paths_match_reference_behavior() {
 
     for (offset, match_len) in cases {
         let mut decode_buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
-        decode_buf.push(seed);
-        decode_buf.repeat(None, offset, match_len).unwrap();
+        decode_buf.push::<ScalarKernel>(seed);
+        decode_buf
+            .repeat::<ScalarKernel>(None, offset, match_len)
+            .unwrap();
         let got = decode_buf.drain();
         let expected = expected_match_expansion(seed, offset, match_len);
         assert_eq!(got, expected, "offset={offset}, match_len={match_len}");
@@ -313,8 +318,8 @@ fn repeat_overlap_fast_paths_match_reference_behavior() {
 #[test]
 fn repeat_zero_offset_returns_error() {
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(1024);
-    decode_buf.push(b"abcdef");
-    let err = decode_buf.repeat(None, 0, 5).unwrap_err();
+    decode_buf.push::<ScalarKernel>(b"abcdef");
+    let err = decode_buf.repeat::<ScalarKernel>(None, 0, 5).unwrap_err();
     assert!(matches!(
         err,
         crate::decoding::errors::DecodeBufferError::ZeroOffset
@@ -334,9 +339,9 @@ fn repeat_rejects_output_past_block_ceiling() {
     // ran — a decompression-bomb OOM. The match needing growth surfaces
     // as `OutputBufferOverflow` (the backend's structured reject).
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
-    decode_buf.push(b"abcdef"); // len = 6
+    decode_buf.push::<ScalarKernel>(b"abcdef"); // len = 6
     decode_buf.set_block_output_ceiling(8); // max_capacity = 6 + 8 = 14
-    let err = decode_buf.repeat(None, 4, 16).unwrap_err(); // 6 + 16 = 22 > 14
+    let err = decode_buf.repeat::<ScalarKernel>(None, 4, 16).unwrap_err(); // 6 + 16 = 22 > 14
     assert!(
         matches!(
             err,
@@ -352,10 +357,10 @@ fn repeat_within_block_ceiling_still_succeeds() {
     // must NOT be rejected — the guard fires only on growth past the
     // ceiling, never on legitimate in-bounds output.
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
-    decode_buf.push(b"abcdef"); // len = 6
+    decode_buf.push::<ScalarKernel>(b"abcdef"); // len = 6
     decode_buf.set_block_output_ceiling(8); // max_capacity = 14
     decode_buf
-        .repeat(None, 4, 8)
+        .repeat::<ScalarKernel>(None, 4, 8)
         .expect("6 + 8 = 14 == ceiling is allowed");
     assert_eq!(decode_buf.len(), 14);
 }
@@ -379,7 +384,7 @@ fn repeat_from_dict_rejects_output_past_block_ceiling() {
     let full_dict = dict();
     full.set_block_output_ceiling(8); // max_capacity = 0 + 8 = 8
     let err = full
-        .repeat(Some(full_dict.as_dict()), 200, 100)
+        .repeat::<ScalarKernel>(Some(full_dict.as_dict()), 200, 100)
         .unwrap_err(); // 0 + 100 > 8, all from dict
     assert!(
         matches!(
@@ -392,10 +397,10 @@ fn repeat_from_dict_rejects_output_past_block_ceiling() {
     // Mixed match: part from dict, remainder from buffer history.
     let mut mixed = DecodeBuffer::<RingBuffer>::new(4 * 1024);
     let mixed_dict = dict();
-    mixed.push(b"abcd"); // len = 4
+    mixed.push::<ScalarKernel>(b"abcd"); // len = 4
     mixed.set_block_output_ceiling(8); // max_capacity = 4 + 8 = 12
     let err = mixed
-        .repeat(Some(mixed_dict.as_dict()), 10, 100)
+        .repeat::<ScalarKernel>(Some(mixed_dict.as_dict()), 10, 100)
         .unwrap_err(); // 6 from dict + rest, 4 + 100 > 12
     assert!(
         matches!(
@@ -414,9 +419,11 @@ fn repeat_from_dict_full_copy_updates_total_output_counter() {
             .unwrap(),
     );
 
-    decode_buf.repeat(Some(handle.as_dict()), 10, 2).unwrap();
+    decode_buf
+        .repeat::<ScalarKernel>(Some(handle.as_dict()), 10, 2)
+        .unwrap();
     let err = decode_buf
-        .repeat(Some(handle.as_dict()), 10, 1)
+        .repeat::<ScalarKernel>(Some(handle.as_dict()), 10, 1)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -431,9 +438,9 @@ fn repeat_overlap_fast_paths_match_reference_behavior_with_wrapped_ringbuffer() 
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(window);
     let mut model = Vec::new();
 
-    decode_buf.push(seed);
+    decode_buf.push::<ScalarKernel>(seed);
     model_push(&mut model, seed);
-    decode_buf.repeat(None, 16, 16).unwrap();
+    decode_buf.repeat::<ScalarKernel>(None, 16, 16).unwrap();
     model_repeat(&mut model, 16, 16);
 
     let drained = decode_buf.drain_to_window_size().unwrap();
@@ -442,7 +449,9 @@ fn repeat_overlap_fast_paths_match_reference_behavior_with_wrapped_ringbuffer() 
 
     let cases = [(3usize, 97usize), (16usize, 64usize), (7usize, 73usize)];
     for (offset, match_len) in cases {
-        decode_buf.repeat(None, offset, match_len).unwrap();
+        decode_buf
+            .repeat::<ScalarKernel>(None, offset, match_len)
+            .unwrap();
         model_repeat(&mut model, offset, match_len);
 
         if let Some(got) = decode_buf.drain_to_window_size() {
@@ -507,10 +516,11 @@ fn repeat_short_offset_matches_canonical_for_all_offsets_and_lengths() {
             127, 128, 4096,
         ] {
             let mut buf = DecodeBuffer::<RingBuffer>::new(8192);
-            buf.push(&base[..offset]);
-            buf.repeat(None, offset, match_length).unwrap_or_else(|e| {
-                panic!("repeat failed for offset={offset} match_length={match_length}: {e:?}")
-            });
+            buf.push::<ScalarKernel>(&base[..offset]);
+            buf.repeat::<ScalarKernel>(None, offset, match_length)
+                .unwrap_or_else(|e| {
+                    panic!("repeat failed for offset={offset} match_length={match_length}: {e:?}")
+                });
 
             let actual = buf.drain();
             let mut expected = Vec::with_capacity(offset + match_length);
@@ -534,7 +544,7 @@ fn prefetch_lookahead_in_range_does_not_panic() {
     // simply that the call completes without panic / UB.
     let mut buf = DecodeBuffer::<RingBuffer>::new(1024);
     buf.reserve_exact(512);
-    buf.push(&[0xAA; 256]);
+    buf.push::<ScalarKernel>(&[0xAA; 256]);
     buf.prefetch_lookahead_match_source(0);
     buf.prefetch_lookahead_match_source(128);
     buf.prefetch_lookahead_match_source(buf.len() - 1);
@@ -548,7 +558,7 @@ fn prefetch_lookahead_out_of_range_returns_without_panic() {
     // slice past the live region.
     let mut buf = DecodeBuffer::<RingBuffer>::new(1024);
     buf.reserve_exact(64);
-    buf.push(&[0x55; 32]);
+    buf.push::<ScalarKernel>(&[0x55; 32]);
     buf.prefetch_lookahead_match_source(buf.len());
     buf.prefetch_lookahead_match_source(buf.len() + 1);
     buf.prefetch_lookahead_match_source(usize::MAX);
@@ -569,10 +579,10 @@ fn prefetch_lookahead_at_wrap_boundary() {
     let mut buf = DecodeBuffer::<RingBuffer>::new(256);
     // Fill with two passes so the underlying ringbuffer wraps.
     let payload = [0xCD_u8; 320];
-    buf.push(&payload);
+    buf.push::<ScalarKernel>(&payload);
     // Drain to free read cursor capacity (write side can then wrap).
     let _ = buf.drain_to_window_size();
-    buf.push(&payload);
+    buf.push::<ScalarKernel>(&payload);
     // Probe a handful of indices inside and across the wrap.
     let n = buf.len();
     if n > 0 {
@@ -635,7 +645,7 @@ mod dict_match_source {
 
     fn buffer_with(window: usize) -> DecodeBuffer<RingBuffer> {
         let mut buf = DecodeBuffer::<RingBuffer>::new(window);
-        buf.push(&[0xEEu8; PRODUCED]);
+        buf.push::<ScalarKernel>(&[0xEEu8; PRODUCED]);
         buf
     }
 

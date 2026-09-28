@@ -853,7 +853,9 @@ fn reserve_buffer_reserves_the_shortfall_not_the_full_window_again() {
     scratch.reserve_buffer(window, window);
     let data = alloc::vec![0u8; window];
     match &mut scratch {
-        super::DecoderScratchKind::Flat(s) => s.buffer.push(&data),
+        super::DecoderScratchKind::Flat(s) => {
+            s.buffer.push::<crate::cpu_kernel::ScalarKernel>(&data)
+        }
         super::DecoderScratchKind::Ring(_) => unreachable!("new_flat builds Flat"),
     }
     scratch.reserve_buffer(window, window);

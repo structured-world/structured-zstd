@@ -5,24 +5,12 @@
 use core::arch::x86::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
 #[cfg(all(target_arch = "x86", feature = "kernel-avx2"))]
 use core::arch::x86::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
-#[cfg(all(target_arch = "x86", feature = "kernel-vbmi2"))]
-use core::arch::x86::{__m512i, _mm512_loadu_si512, _mm512_storeu_si512};
 #[cfg(all(target_arch = "x86_64", feature = "kernel-sse"))]
 use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
-#[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
-use core::arch::x86_64::{__m512i, _mm512_loadu_si512, _mm512_storeu_si512};
-// Only the 32-bit x86 `detect_x86_caps` body queries CPU features at
-// runtime; the x86_64 body derives them from `detect_cpu_kernel()`.
-#[cfg(all(feature = "std", feature = "kernel-sse", target_arch = "x86"))]
-use std::arch::is_x86_feature_detected;
-#[cfg(all(
-    feature = "std",
-    feature = "kernel-sse",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
-use std::sync::OnceLock;
+
+use crate::cpu_kernel::CpuKernel;
 
 #[cfg(all(
     target_arch = "aarch64",
@@ -185,24 +173,158 @@ pub mod shape_stats {
 /// match copies, squarely in raw-block / long-match territory.
 const BULK_MEMCPY_THRESHOLD: usize = 2048;
 
-/// Copies at least `copy_at_least` bytes from `src` to `dst`.
+/// Chunk width of [`copy_chunks_baseline`]: the vector the build's baseline
+/// guarantees on every CPU it runs on (SSE2 on x86 targets that carry it, NEON
+/// on aarch64, simd128 on wasm), or a machine word where there is none. Wider
+/// x86 tiers are a property of the running CPU and come from its kernel.
+pub(crate) const BASELINE_COPY_CHUNK: usize = if cfg!(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2",
+        feature = "kernel-sse"
+    ),
+    all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        feature = "kernel-neon"
+    ),
+    all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ),
+)) {
+    16
+} else {
+    core::mem::size_of::<usize>()
+};
+
+/// Copies `len` bytes, a multiple of [`BASELINE_COPY_CHUNK`], in whole chunks
+/// of the build's baseline width.
 ///
-/// This helper may over-copy up to the chunk size of the chosen SIMD/scalar
-/// kernel (16, 32, or 64 bytes — at most chunk_size - 1 extra bytes), mirroring
-/// zstd wildcopy semantics for faster inner loops.
+/// # Safety
+/// `src` readable and `dst` writable for `len` bytes; regions non-overlapping.
+#[inline(always)]
+pub(crate) unsafe fn copy_chunks_baseline(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2",
+        feature = "kernel-sse"
+    ))]
+    // SAFETY: SSE2 is in the build's baseline, so every CPU it runs on has it.
+    unsafe {
+        copy_sse2(src, dst, len)
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        feature = "kernel-neon"
+    ))]
+    unsafe {
+        copy_neon(src, dst, len)
+    }
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    unsafe {
+        copy_simd128(src, dst, len)
+    }
+    #[cfg(not(any(
+        all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "sse2",
+            feature = "kernel-sse"
+        ),
+        all(
+            target_arch = "aarch64",
+            target_feature = "neon",
+            feature = "kernel-neon"
+        ),
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel-simd128"
+        ),
+    )))]
+    unsafe {
+        copy_scalar(src, dst, len)
+    }
+}
+
+/// Copies exactly 16 bytes with the build's baseline vector, or two machine
+/// loads and stores where there is none.
+///
+/// # Safety
+/// `src` readable and `dst` writable for 16 bytes; regions non-overlapping.
+#[inline(always)]
+pub(crate) unsafe fn copy16_baseline(src: *const u8, dst: *mut u8) {
+    #[cfg(any(
+        all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "sse2",
+            feature = "kernel-sse"
+        ),
+        all(
+            target_arch = "aarch64",
+            target_feature = "neon",
+            feature = "kernel-neon"
+        ),
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel-simd128"
+        ),
+    ))]
+    unsafe {
+        copy_chunks_baseline(src, dst, 16)
+    }
+    #[cfg(not(any(
+        all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "sse2",
+            feature = "kernel-sse"
+        ),
+        all(
+            target_arch = "aarch64",
+            target_feature = "neon",
+            feature = "kernel-neon"
+        ),
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel-simd128"
+        ),
+    )))]
+    unsafe {
+        let lo: u64 = src.cast::<u64>().read_unaligned();
+        let hi: u64 = src.add(8).cast::<u64>().read_unaligned();
+        dst.cast::<u64>().write_unaligned(lo);
+        dst.add(8).cast::<u64>().write_unaligned(hi);
+    }
+}
+
+/// Copies at least `copy_at_least` bytes from `src` to `dst` with the copy
+/// kernels of `K`, the CPU tier the caller was monomorphised for.
+///
+/// This helper may over-copy up to `K::COPY_CHUNK - 1` bytes (or 15 on the
+/// single-store path), mirroring zstd wildcopy semantics for faster inner
+/// loops. Nothing here asks the CPU anything: the tier is the type.
 ///
 /// # Safety
 /// Caller must guarantee:
 /// - `src.0` points to at least `src.1` readable bytes.
 /// - `dst.0` points to at least `dst.1` writable bytes.
 /// - `copy_at_least <= src.1` and `copy_at_least <= dst.1`.
-/// - `src.1` and `dst.1` are large enough for the selected kernel:
-///   if `min(src.1, dst.1) >= copy_at_least` rounded up to the chunk size,
-///   the SIMD/scalar chunk loop may copy that rounded-up amount.
-///   Otherwise the function copies exactly `copy_at_least` bytes.
+/// - `src.1` and `dst.1` are large enough for the overshoot: if
+///   `min(src.1, dst.1) >= copy_at_least` rounded up to the chunk size, the
+///   chunk loop may copy that rounded-up amount. Otherwise the function
+///   copies exactly `copy_at_least` bytes.
 /// - Source and destination regions do not overlap.
+/// - The running CPU supports `K`'s tier.
 #[inline(always)]
-pub(crate) unsafe fn copy_bytes_overshooting(
+pub(crate) unsafe fn copy_bytes_overshooting<K: CpuKernel>(
     src: (*const u8, usize),
     dst: (*mut u8, usize),
     copy_at_least: usize,
@@ -223,7 +345,9 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     // loop-setup cost on every one of them. The single-op path collapses
     // that to one load + one store, which is the upstream zstd wildcopy pattern.
     if copy_at_least <= 16 && min_buffer_size >= 16 {
-        unsafe { single_op_copy_16(src.0, dst.0, copy_at_least) };
+        // SAFETY: 16 bytes of room on both sides (just checked); the tier is
+        // the caller's contract.
+        unsafe { K::copy16(src.0, dst.0) };
         debug_assert_eq_copy(src, dst, copy_at_least);
         return;
     }
@@ -264,86 +388,18 @@ pub(crate) unsafe fn copy_bytes_overshooting(
         return;
     }
 
-    // Chunked SIMD fast paths for larger copies. Each branch consults the
-    // appropriate feature-detection mechanism (cached runtime detect under
-    // std, compile-time target_feature otherwise) and falls through on miss
-    // so a single dispatcher covers every arch + feature combination.
-    // May have no callers in some builds: every invocation site is behind an
-    // arch + `kernel_*` cfg, so the macro is unused on non-x86/non-aarch64
-    // targets (no arch-specific sites compile) and on x86/aarch64 builds that
-    // trim the SIMD tiers (e.g. scalar-only). Hence `allow(unused_macros)`.
-    #[allow(unused_macros)]
-    macro_rules! try_chunk_kernel {
-        ($chunk:expr, $kernel:ident) => {{
-            if copy_at_least >= $chunk {
-                let rounded = copy_at_least.next_multiple_of($chunk);
-                if min_buffer_size >= rounded {
-                    unsafe { $kernel(src.0, dst.0, rounded) };
-                    debug_assert_eq_copy(src, dst, copy_at_least);
-                    return;
-                }
-            }
-        }};
+    // Chunked path in the tier's width, when the rounded-up copy fits.
+    let rounded = copy_at_least.next_multiple_of(K::COPY_CHUNK);
+    if min_buffer_size >= rounded {
+        // SAFETY: `rounded` bytes fit both spans (just checked); the tier is
+        // the caller's contract.
+        unsafe { K::copy_chunks(src.0, dst.0, rounded) };
+        debug_assert_eq_copy(src, dst, copy_at_least);
+        return;
     }
 
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        // Bound only when at least the SSE2 tier is enabled (the lowest x86
-        // SIMD kernel; every higher tier implies it). A `kernel-scalar` trim
-        // drops the binding along with all three dispatch arms below.
-        #[cfg(feature = "kernel-sse")]
-        let caps = detect_x86_caps();
-        // Each call site is gated on its `kernel_*` feature so it disappears
-        // alongside the cfg-gated helper def in a tier-trimmed build. `caps.*`
-        // is already false when the feature is off (see `detect_x86_caps`), so
-        // this only prunes already-dead branches.
-        #[cfg(feature = "kernel-vbmi2")]
-        if caps.avx512f {
-            try_chunk_kernel!(64, copy_avx512);
-        }
-        #[cfg(feature = "kernel-avx2")]
-        if caps.avx2 {
-            try_chunk_kernel!(32, copy_avx2);
-        }
-        #[cfg(feature = "kernel-sse")]
-        if caps.sse2 {
-            try_chunk_kernel!(16, copy_sse2);
-        }
-    }
-
-    #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        // Gate the 64-byte copy on `avx512vbmi2`, not bare `avx512f`, to
-        // match the std tag ladder: `detect_x86_caps` sets `avx512f` (→ 64B)
-        // only for the `Vbmi2` tag, so an `avx512f`-but-not-VBMI2 target
-        // (e.g. `-C target-cpu=skylake-avx512`) is the `Avx2` tier and uses
-        // the 32B copy. Using bare `avx512f` here would diverge — no_std
-        // would emit 64B copies where std emits 32B on the same CPU.
-        #[cfg(all(target_feature = "avx512vbmi2", feature = "kernel-vbmi2"))]
-        try_chunk_kernel!(64, copy_avx512);
-        #[cfg(all(target_feature = "avx2", feature = "kernel-avx2"))]
-        try_chunk_kernel!(32, copy_avx2);
-        #[cfg(all(target_feature = "sse2", feature = "kernel-sse"))]
-        try_chunk_kernel!(16, copy_sse2);
-    }
-
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_feature = "neon",
-        feature = "kernel-neon"
-    ))]
-    try_chunk_kernel!(16, copy_neon);
-
-    #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        feature = "kernel-simd128"
-    ))]
-    try_chunk_kernel!(16, copy_simd128);
-
-    // Final fallback: scalar 8-byte chunk loop if alignment permits, else
-    // an exact byte copy. Inlined directly to avoid the per-call dispatcher
-    // overhead the previous CopyFn function-pointer abstraction imposed.
+    // Final fallback: machine-word chunks if the slack permits, else an exact
+    // byte copy.
     let scalar_chunk = core::mem::size_of::<usize>();
     let rounded = copy_at_least.next_multiple_of(scalar_chunk);
     if min_buffer_size >= rounded {
@@ -352,170 +408,6 @@ pub(crate) unsafe fn copy_bytes_overshooting(
         unsafe { dst.0.copy_from_nonoverlapping(src.0, copy_at_least) };
     }
     debug_assert_eq_copy(src, dst, copy_at_least);
-}
-
-/// AVX2-tier wildcopy variant: same shape as [`copy_bytes_overshooting`]
-/// but the chunked-SIMD path goes DIRECT to `copy_avx2` (32-byte
-/// chunks) without consulting `detect_x86_caps()`. Issue #279 round 3
-/// Phase 4: when called from inside a target_feature(avx2,bmi2)-scoped
-/// caller, the inlined `copy_avx2` body emits `_mm256_storeu_si256`
-/// ymm stores directly; the runtime dispatch branch + cached-OnceLock
-/// load that `copy_bytes_overshooting` paid per call is gone.
-///
-/// Small-request paths (≤16 fast, ≤32 exact-length) are identical to
-/// the dispatcher version — they don't need a chunk kernel and stay
-/// inline. The AVX-512 chunk path is omitted (this variant targets
-/// the AVX2-tier scope, which is the strict subset).
-///
-/// # Safety
-/// `src` and `dst` must each point to at least `src.1` / `dst.1`
-/// readable / writable bytes, regions must not overlap, and the
-/// caller MUST itself be in `target_feature(enable = "avx2,bmi2")`
-/// scope.
-///
-/// # Status
-/// Currently unused in production: the AVX2 match-copy inline path
-/// in PR #285 routes through `BufferBackend::exec_sequence_inline_avx2`
-/// which uses the 32-byte wildcopy helpers in
-/// `exec_sequence_inline::x86` directly. This standalone variant is
-/// the bottom-layer building block for the next iteration
-/// (`perf/#279-r4-1c-avx2-layered-chain`) — it will be wired into the
-/// per-tier `repeat_in_chunks_avx2` for the RingBuffer / FlatBuf
-/// (non-inline) backend paths. Keep the function until that work
-/// lands; remove if the layered-chain experiment ends up not retained.
-#[cfg(all(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    feature = "kernel-avx2"
-))]
-#[target_feature(enable = "avx2")]
-#[allow(dead_code)]
-pub(crate) unsafe fn copy_bytes_overshooting_avx2(
-    src: (*const u8, usize),
-    dst: (*mut u8, usize),
-    copy_at_least: usize,
-) {
-    if copy_at_least == 0 {
-        return;
-    }
-
-    let min_buffer_size = core::cmp::min(src.1, dst.1);
-
-    if copy_at_least <= 16 && min_buffer_size >= 16 {
-        unsafe { single_op_copy_16(src.0, dst.0, copy_at_least) };
-        debug_assert_eq_copy(src, dst, copy_at_least);
-        return;
-    }
-
-    if copy_at_least <= 32 {
-        unsafe { copy_exact_small(src.0, dst.0, copy_at_least) };
-        debug_assert_eq_copy(src, dst, copy_at_least);
-        return;
-    }
-
-    // Direct AVX2 chunk path: rounds up to 32-byte multiple, calls
-    // copy_avx2 if slack permits. No dispatcher, no detect_x86_caps —
-    // target_feature(avx2) on this fn guarantees the kernel is
-    // callable.
-    let rounded = copy_at_least.next_multiple_of(32);
-    if min_buffer_size >= rounded {
-        unsafe { copy_avx2(src.0, dst.0, rounded) };
-        debug_assert_eq_copy(src, dst, copy_at_least);
-        return;
-    }
-
-    // Slack-less tail: scalar 8-byte chunk loop if alignment permits,
-    // else exact byte copy. Same fallback as `copy_bytes_overshooting`.
-    let scalar_chunk = core::mem::size_of::<usize>();
-    let rounded_scalar = copy_at_least.next_multiple_of(scalar_chunk);
-    if min_buffer_size >= rounded_scalar {
-        unsafe { copy_scalar(src.0, dst.0, rounded_scalar) };
-    } else {
-        unsafe { dst.0.copy_from_nonoverlapping(src.0, copy_at_least) };
-    }
-    debug_assert_eq_copy(src, dst, copy_at_least);
-}
-
-/// Single 16-byte transfer covering any 1..=16 byte request. The caller
-/// guarantees 16 bytes of readable / writable slack on both sides so a full
-/// vector store is safe even when only the first `len` bytes are required —
-/// trailing bytes are written but the caller treats them as wildcopy overshoot.
-///
-/// # Safety
-/// `src` and `dst` must each point to at least 16 readable / writable bytes;
-/// regions must not overlap.
-#[inline(always)]
-unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert!(len <= 16);
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_feature = "neon",
-        feature = "kernel-neon"
-    ))]
-    unsafe {
-        let v: uint8x16_t = vld1q_u8(src);
-        vst1q_u8(dst, v);
-        return;
-    }
-    #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        feature = "kernel-simd128"
-    ))]
-    unsafe {
-        let v: v128 = v128_load(src.cast::<v128>());
-        v128_store(dst.cast::<v128>(), v);
-        return;
-    }
-    #[cfg(all(
-        feature = "std",
-        feature = "kernel-sse",
-        any(target_arch = "x86", target_arch = "x86_64")
-    ))]
-    unsafe {
-        if detect_x86_caps().sse2 {
-            copy_sse2(src, dst, 16);
-            return;
-        }
-    }
-    #[cfg(all(
-        not(feature = "std"),
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "sse2",
-        feature = "kernel-sse"
-    ))]
-    unsafe {
-        copy_sse2(src, dst, 16);
-        return;
-    }
-    // Portable fallback: two overlapping unaligned u64 writes cover 1..=16
-    // bytes. Still cheaper than the scalar-strategy loop + indirect call the
-    // previous dispatcher imposed on every small copy.
-    //
-    // Reachability matrix (kept here so any future arch arm slotted
-    // between the existing arms knows it must terminate with `return`
-    // or its code will be silently dead). The explicit-SIMD arms are
-    // gated on the matching `kernel_*` feature so a `kernel-scalar` trim
-    // falls through to the portable path (matching the chunked-copy
-    // dispatch above):
-    //   • aarch64+neon + kernel-neon                   → arm above returns
-    //   • aarch64+neon, NO kernel-neon                 → reaches here
-    //   • std + x86 + kernel-sse + runtime-SSE2 tag   → arm above returns
-    //   • std + x86 + kernel-sse + Scalar tag         → reaches here
-    //   • std + x86, NO kernel-sse                    → reaches here
-    //   • no-std + x86 + target_feature sse2+kernel-sse → arm above returns
-    //   • no-std + x86, kernel-sse off (or no sse2)   → reaches here
-    //   • wasm32 + simd128 + kernel-simd128            → arm above returns
-    //   • wasm32, NO simd128 (or kernel off)           → reaches here
-    //   • any other arch (riscv64, …)                  → reaches here
-    // Anything new MUST `return` from its own arm before this comment.
-    #[allow(unreachable_code)]
-    unsafe {
-        let lo: u64 = src.cast::<u64>().read_unaligned();
-        let hi_offset = len.saturating_sub(8);
-        let hi: u64 = src.add(hi_offset).cast::<u64>().read_unaligned();
-        dst.cast::<u64>().write_unaligned(lo);
-        dst.add(hi_offset).cast::<u64>().write_unaligned(hi);
-    }
 }
 
 #[inline(always)]
@@ -543,85 +435,32 @@ pub(crate) unsafe fn copy_bytes_overshooting_for_bench(
     dst: (*mut u8, usize),
     copy_at_least: usize,
 ) {
-    // Keep an explicit unsafe block here because the crate enforces
-    // `unsafe_op_in_unsafe_fn` under `-D warnings`.
-    unsafe { copy_bytes_overshooting(src, dst, copy_at_least) };
+    // A standalone entry, so the tier is resolved here, on the way in, the way
+    // the decoder resolves it once per block.
+    use crate::cpu_kernel::{ScalarKernel, detect_cpu_kernel};
+    match detect_cpu_kernel() {
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+        crate::cpu_kernel::CpuKernelTag::Avx2 => unsafe {
+            copy_bytes_overshooting::<crate::cpu_kernel::Avx2Kernel>(src, dst, copy_at_least)
+        },
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
+        crate::cpu_kernel::CpuKernelTag::Vbmi2 => unsafe {
+            copy_bytes_overshooting::<crate::cpu_kernel::Vbmi2Kernel>(src, dst, copy_at_least)
+        },
+        _ => unsafe { copy_bytes_overshooting::<ScalarKernel>(src, dst, copy_at_least) },
+    }
 }
 
-/// Active chunk size for the chunk-loop dispatcher on this build. Used by
-/// `RingBuffer` tests to size scenarios that exercise single-chunk,
-/// multi-chunk, and capacity-tight (`chunk + 1`) copy shapes — keeping the
-/// tests architecture-agnostic.
+/// Chunk width of the kernel the backend tests copy with ([`ScalarKernel`],
+/// the build's baseline). Used by `RingBuffer` tests to size scenarios that
+/// exercise single-chunk, multi-chunk, and capacity-tight (`chunk + 1`) copy
+/// shapes on every architecture.
+///
+/// [`ScalarKernel`]: crate::cpu_kernel::ScalarKernel
 #[cfg(test)]
 #[inline]
 pub(crate) fn active_chunk_size_for_tests() -> usize {
-    #[cfg(all(
-        feature = "std",
-        feature = "kernel-sse",
-        any(target_arch = "x86", target_arch = "x86_64")
-    ))]
-    {
-        let caps = detect_x86_caps();
-        // Mirror the dispatcher: a tier is selectable only when BOTH its
-        // kernel_* feature is on AND the CPU exposes it, so a tier-trimmed
-        // build reports the chunk the dispatcher can actually pick.
-        #[cfg(feature = "kernel-vbmi2")]
-        if caps.avx512f {
-            return 64;
-        }
-        #[cfg(feature = "kernel-avx2")]
-        if caps.avx2 {
-            return 32;
-        }
-        if caps.sse2 {
-            return 16;
-        }
-    }
-    // The no-std arms must mirror the dispatcher's compile-time chunk
-    // selection EXACTLY (both `target_feature` AND the matching `kernel_*`
-    // gate), otherwise a tier-trimmed build would size test scenarios for a
-    // chunk the dispatcher can never select — masking tier-gating
-    // regressions. The 64B arm keys off `avx512vbmi2` (not bare `avx512f`),
-    // matching the dispatcher's `kernel-vbmi2` 64B copy.
-    #[cfg(all(
-        not(feature = "std"),
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "avx512vbmi2",
-        feature = "kernel-vbmi2"
-    ))]
-    {
-        return 64;
-    }
-    #[cfg(all(
-        not(feature = "std"),
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "avx2",
-        feature = "kernel-avx2"
-    ))]
-    {
-        return 32;
-    }
-    #[cfg(all(
-        not(feature = "std"),
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "sse2",
-        feature = "kernel-sse"
-    ))]
-    {
-        return 16;
-    }
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_feature = "neon",
-        feature = "kernel-neon"
-    ))]
-    {
-        return 16;
-    }
-    #[allow(unreachable_code)]
-    {
-        core::mem::size_of::<usize>()
-    }
+    <crate::cpu_kernel::ScalarKernel as CpuKernel>::COPY_CHUNK
 }
 
 /// Copies `len` bytes, a multiple of `usize`, one `usize` at a time.
@@ -641,121 +480,18 @@ pub(crate) unsafe fn copy_scalar(mut src: *const u8, mut dst: *mut u8, len: usiz
     }
 }
 
-#[cfg(all(
-    feature = "std",
-    feature = "kernel-sse",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
-#[derive(Clone, Copy)]
-// `avx512f` / `avx2` are unread in a `kernel-sse`-only trim (their dispatch
-// arms are cfg-gated out), so the fields are intentionally dead there.
-#[allow(dead_code)]
-struct X86Caps {
-    avx512f: bool,
-    avx2: bool,
-    sse2: bool,
-}
-
-/// SIMD-copy capability flags for the chunked wildcopy dispatcher.
+/// Copies `len` bytes, a multiple of 16, in 16-byte SSE2 chunks. Gated on
+/// `kernel-sse` so a `kernel-scalar`-only trim prunes it at the source level.
 ///
-/// On `x86_64` these are DERIVED from the unified `detect_cpu_kernel()`
-/// tag rather than detected independently, so the whole crate has a
-/// single CPU-capability source of truth (the copy path can never
-/// disagree with the entropy/sequence path about the running CPU). The
-/// mapping follows the kernel ladder: Vbmi2 → 64/32/16-byte copies,
-/// Avx2 → 32/16, Bmi2 / Sse2 → 16, Scalar → none. One subtle
-/// consequence: an `avx512f`-but-not-VBMI2 CPU (e.g. Skylake-X) is
-/// tagged `Avx2`, so it uses the 32-byte `copy_avx2` chunk instead of
-/// the 64-byte `copy_avx512`. That is a negligible difference on match
-/// copies (which are short) and keeps the taxonomy single-axis; modern
-/// AVX-512 parts (Ice Lake+) carry VBMI2 and still reach `copy_avx512`.
-///
-/// On 32-bit `x86` the kernel tag carries no SIMD tiers (those are
-/// `x86_64`-gated), so this keeps its own runtime detection to preserve
-/// the SSE2 / AVX2 copy path there.
-#[cfg(all(
-    feature = "std",
-    feature = "kernel-sse",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
-#[inline(always)]
-fn detect_x86_caps() -> X86Caps {
-    static CAPS: OnceLock<X86Caps> = OnceLock::new();
-    *CAPS.get_or_init(|| {
-        #[cfg(target_arch = "x86_64")]
-        {
-            use crate::cpu_kernel::{CpuKernelTag, detect_cpu_kernel};
-            match detect_cpu_kernel() {
-                #[cfg(feature = "kernel-vbmi2")]
-                CpuKernelTag::Vbmi2 => X86Caps {
-                    avx512f: true,
-                    avx2: true,
-                    sse2: true,
-                },
-                #[cfg(feature = "kernel-avx2")]
-                CpuKernelTag::Avx2 => X86Caps {
-                    avx512f: false,
-                    avx2: true,
-                    sse2: true,
-                },
-                #[cfg(feature = "kernel-bmi2")]
-                CpuKernelTag::Bmi2 => X86Caps {
-                    avx512f: false,
-                    avx2: false,
-                    sse2: true,
-                },
-                #[cfg(feature = "kernel-sse")]
-                CpuKernelTag::Sse2 => X86Caps {
-                    avx512f: false,
-                    avx2: false,
-                    sse2: true,
-                },
-                CpuKernelTag::Scalar => X86Caps {
-                    avx512f: false,
-                    avx2: false,
-                    sse2: false,
-                },
-            }
-        }
-        #[cfg(target_arch = "x86")]
-        {
-            // Mirror the x86_64 tag ladder above: each tier is reported only
-            // when BOTH its `kernel_*` feature is enabled AND the CPU exposes
-            // it at runtime, so a tier-trimmed build (e.g.
-            // `--features kernel-scalar`) never selects a SIMD chunk on 32-bit
-            // x86. `avx512f` follows the `Vbmi2` tag exactly — it is set on
-            // `avx512vbmi2` (not bare `avx512f`), matching the rule that an
-            // AVX-512F-but-not-VBMI2 CPU stays on the 32B (AVX2) copy.
-            use crate::cpu_kernel::{CpuLevel, cpu_allows};
-            X86Caps {
-                avx512f: cfg!(feature = "kernel-vbmi2")
-                    && cpu_allows(CpuLevel::Avx512)
-                    && is_x86_feature_detected!("avx512vbmi2"),
-                avx2: cfg!(feature = "kernel-avx2")
-                    && cpu_allows(CpuLevel::Avx2)
-                    && is_x86_feature_detected!("avx2"),
-                sse2: cfg!(feature = "kernel-sse")
-                    && cpu_allows(CpuLevel::Sse2)
-                    && is_x86_feature_detected!("sse2"),
-            }
-        }
-    })
-}
-
-// Gated on `kernel-sse` so a `kernel-scalar`-only trim prunes the SSE2
-// helper at the source level, not just via dead-code elimination.
-// `#[allow(dead_code)]` is still required for one combo the feature gate
-// can't express: std builds reach this through runtime `detect_x86_caps`,
-// so the helper must compile even when no compile-time `target_feature =
-// "sse2"` selects it — leaving it caller-less in a no-std-without-sse2
-// build that still enables `kernel-sse`.
+/// # Safety
+/// The CPU has SSE2; `src` readable and `dst` writable for `len` bytes; the
+/// regions do not overlap.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     feature = "kernel-sse"
 ))]
 #[target_feature(enable = "sse2")]
 #[inline]
-#[allow(dead_code)]
 pub(crate) unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
     while src < end {
@@ -768,30 +504,22 @@ pub(crate) unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize)
     }
 }
 
-// `#[allow(dead_code)]` because in `--no-default-features` builds on x86
-// without `RUSTFLAGS="-C target-feature=+avx2"` the dispatcher cfg-gates
-// out every call site (runtime detection lives behind `feature = "std"`).
-// In std builds and target_feature=+avx2 builds the function is live.
-//
-// Inner loop is unrolled to 2× 32-byte AVX2 vectors per iteration (64
-// bytes / iter), with a single-vector tail handling the residual 32
-// bytes when `len` is a non-multiple of 64. The dispatcher rounds
-// `copy_at_least` up to a multiple of 32 before calling, so `len`
-// here is always a multiple of 32 — the loop body handles
-// `len & !63` bytes, the tail handles the remaining 0 or 32.
-//
-// The two independent load / store pairs per iteration expose more
-// instruction-level parallelism to the out-of-order core and amortise
-// the loop branch, shortening AVX2 wildcopy latency. Actual speed-up
-// is workload-dependent — measured in `benches/wildcopy_candidates.rs`
-// (criterion micro) and end-to-end via `benches/compare_ffi.rs`.
+/// Copies `len` bytes, a multiple of 32, in 32-byte AVX2 chunks.
+///
+/// The loop is unrolled to two 32-byte vectors per iteration (64 bytes),
+/// with one more vector for the residual 32 when `len` is not a multiple of
+/// 64. The two independent load / store pairs expose instruction-level
+/// parallelism and amortise the loop branch.
+///
+/// # Safety
+/// The CPU has AVX2; `src` readable and `dst` writable for `len` bytes; the
+/// regions do not overlap.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     feature = "kernel-avx2"
 ))]
 #[target_feature(enable = "avx2")]
 #[inline]
-#[allow(dead_code)]
 pub(crate) unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     debug_assert!(
         len.is_multiple_of(32),
@@ -815,26 +543,6 @@ pub(crate) unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize)
         unsafe {
             let v: __m256i = _mm256_loadu_si256(src.cast::<__m256i>());
             _mm256_storeu_si256(dst.cast::<__m256i>(), v);
-        }
-    }
-}
-
-// Same `#[allow(dead_code)]` rationale as `copy_avx2`: cfg-gated out in
-// no-std builds without `target_feature=+avx512f`, live elsewhere.
-#[cfg(all(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    feature = "kernel-vbmi2"
-))]
-#[target_feature(enable = "avx512f")]
-#[allow(dead_code)]
-unsafe fn copy_avx512(mut src: *const u8, mut dst: *mut u8, len: usize) {
-    let end = unsafe { src.add(len) };
-    while src < end {
-        unsafe {
-            let v: __m512i = _mm512_loadu_si512(src.cast::<__m512i>());
-            _mm512_storeu_si512(dst.cast::<__m512i>(), v);
-            src = src.add(64);
-            dst = dst.add(64);
         }
     }
 }

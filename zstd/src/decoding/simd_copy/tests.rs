@@ -80,47 +80,44 @@ fn medium_exact_copies_write_exactly_the_run() {
     }
 }
 
-#[test]
-fn copy_bytes_overshooting_zero_len_is_noop() {
+/// The wildcopy contract, checked for one kernel: nothing written for a zero
+/// length; an exact copy when the buffers leave no room to overshoot; the
+/// requested prefix copied whatever the overshoot, across every size class.
+fn check_overshooting_copy<K: crate::cpu_kernel::CpuKernel>(kernel: &str) {
     let src = [1_u8, 2, 3, 4];
     let mut dst = [9_u8, 9, 9, 9];
     unsafe {
-        copy_bytes_overshooting((src.as_ptr(), src.len()), (dst.as_mut_ptr(), dst.len()), 0);
+        copy_bytes_overshooting::<K>((src.as_ptr(), src.len()), (dst.as_mut_ptr(), dst.len()), 0);
     }
-    assert_eq!(dst, [9_u8, 9, 9, 9]);
-}
+    assert_eq!(dst, [9_u8, 9, 9, 9], "{kernel}: zero length");
 
-#[test]
-fn copy_bytes_overshooting_fallback_exact_copy_when_caps_are_tight() {
-    // Pick a size that exceeds the single-op fast path threshold (16)
-    // and the next chunk size on every supported arch, so the fallback
-    // path is exercised regardless of which kernel a given build picks.
-    let len = 65; // > AVX-512 chunk
+    // Past the single-store path and every chunk width, with no room to
+    // overshoot: the fallback must copy exactly.
+    let len = 65;
     let src = vec![5_u8; len];
     let mut dst = vec![0_u8; len];
-
     unsafe {
-        copy_bytes_overshooting((src.as_ptr(), len), (dst.as_mut_ptr(), len), len);
+        copy_bytes_overshooting::<K>((src.as_ptr(), len), (dst.as_mut_ptr(), len), len);
     }
+    assert_eq!(dst, src, "{kernel}: tight buffers");
 
-    assert_eq!(dst, src);
+    let src: vec::Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8).collect();
+    for len in 1..2100usize {
+        let mut dst = vec![0_u8; len + 64];
+        let room = dst.len();
+        unsafe {
+            copy_bytes_overshooting::<K>((src.as_ptr(), src.len()), (dst.as_mut_ptr(), room), len);
+        }
+        assert_eq!(&dst[..len], &src[..len], "{kernel}: len={len}");
+    }
 }
 
 #[test]
-fn copy_bytes_overshooting_single_op_small() {
-    // Sub-16 copy with full 16-byte slack on both sides: single-op fast
-    // path covers it via one SIMD store (or two overlapping u64 stores
-    // on archs without 128-bit SIMD).
-    for len in 1..=16 {
-        let mut src = [0u8; 32];
-        for (i, b) in src.iter_mut().enumerate() {
-            *b = i as u8;
-        }
-        let mut dst = [0u8; 32];
-        unsafe {
-            copy_bytes_overshooting((src.as_ptr(), 32), (dst.as_mut_ptr(), 32), len);
-        }
-        assert_eq!(&dst[..len], &src[..len], "len={len}");
+fn every_runnable_kernel_keeps_the_wildcopy_contract() {
+    check_overshooting_copy::<crate::cpu_kernel::ScalarKernel>("scalar");
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-avx2"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        check_overshooting_copy::<crate::cpu_kernel::Avx2Kernel>("avx2");
     }
 }
 
@@ -205,20 +202,4 @@ fn copy_avx2_copies_unroll2_loop_plus_residual_tail() {
     assert_eq!(&dst[..], &src[..]);
     // Spot-check tail boundary: bytes 60..68 span the unroll/tail seam.
     assert_eq!(&dst[60..68], &[60, 61, 62, 63, 64, 65, 66, 67]);
-}
-
-#[cfg(all(
-    feature = "std",
-    feature = "kernel-vbmi2",
-    any(target_arch = "x86", target_arch = "x86_64")
-))]
-#[test]
-fn copy_avx512_copies_full_chunk_when_available() {
-    if !std::arch::is_x86_feature_detected!("avx512f") {
-        return;
-    }
-    let src = [9_u8; 64];
-    let mut dst = [0_u8; 64];
-    unsafe { copy_avx512(src.as_ptr(), dst.as_mut_ptr(), 64) };
-    assert_eq!(dst, src);
 }

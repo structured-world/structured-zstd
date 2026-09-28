@@ -64,6 +64,7 @@
 //! lives in `FrameDecoder` and is borrowed in by reference for the
 //! call's duration via [`super::scratch::DirectScratch`].
 
+use crate::cpu_kernel::CpuKernel;
 use crate::io::{Error, Read};
 
 use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
@@ -713,7 +714,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     // runtime branch on kernel features — `copy_bytes_overshooting`
     // owns that dispatch internally.
     #[inline(always)]
-    fn extend(&mut self, data: &[u8]) {
+    fn extend<K: CpuKernel>(&mut self, data: &[u8]) {
         let len = data.len();
         let new_tail = self.tail + len;
         // Release-mode capacity assert (mirrors
@@ -758,7 +759,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // `new_tail <= self.slice.len()` (release-mode `assert!`
         // above), so both regions have ≥ `len` valid bytes.
         unsafe {
-            super::simd_copy::copy_bytes_overshooting(
+            super::simd_copy::copy_bytes_overshooting::<K>(
                 (data.as_ptr(), len),
                 (self.slice.as_mut_ptr().add(self.tail), total_writable),
                 len,
@@ -828,7 +829,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     // budget. The per-call boundary save is dwarfed by the
     // duplicated body weight; LLVM's heuristic was right to decline.
     #[inline]
-    unsafe fn extend_from_within_unchecked(&mut self, start: usize, len: usize) {
+    unsafe fn extend_from_within_unchecked<K: CpuKernel>(&mut self, start: usize, len: usize) {
         let dst_off = self.tail;
         let src_off = self.head + start;
         debug_assert!(src_off + len <= dst_off);
@@ -867,7 +868,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // inside the slice even when it overshoots `len`.
         unsafe {
             let base = self.slice.as_mut_ptr();
-            super::simd_copy::copy_bytes_overshooting(
+            super::simd_copy::copy_bytes_overshooting::<K>(
                 (base.add(src_off), total_readable),
                 (base.add(dst_off), total_writable),
                 len,
@@ -877,10 +878,14 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     }
 
     #[inline]
-    unsafe fn extend_from_within_unchecked_branchless(&mut self, start: usize, len: usize) {
+    unsafe fn extend_from_within_unchecked_branchless<K: CpuKernel>(
+        &mut self,
+        start: usize,
+        len: usize,
+    ) {
         // Direct-slice layout never wraps — same forward to the
         // single non-overlapping copy as FlatBuf.
-        unsafe { self.extend_from_within_unchecked(start, len) }
+        unsafe { self.extend_from_within_unchecked::<K>(start, len) }
     }
 
     #[inline]
@@ -903,7 +908,10 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     // demand, so any overshoot must be reported instead of aborting.
 
     #[inline(always)]
-    fn try_extend(&mut self, data: &[u8]) -> Result<(), super::buffer_backend::BackendOverflow> {
+    fn try_extend<K: CpuKernel>(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), super::buffer_backend::BackendOverflow> {
         let len = data.len();
         // Use `checked_add` to catch adversarial input where
         // `self.tail + len` would wrap `usize` — without the wrap
@@ -934,7 +942,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // `data` is non-aliasing with the backend's slice (caller
         // contract — literals buffer / input view).
         unsafe {
-            super::simd_copy::copy_bytes_overshooting(
+            super::simd_copy::copy_bytes_overshooting::<K>(
                 (data.as_ptr(), len),
                 (self.slice.as_mut_ptr().add(self.tail), total_writable),
                 len,
@@ -975,7 +983,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     }
 
     #[inline(always)]
-    fn try_extend_from_within(
+    fn try_extend_from_within<K: CpuKernel>(
         &mut self,
         start: usize,
         len: usize,
@@ -1033,7 +1041,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // SAFETY: both bounds checked above. Forward to the unsafe
         // variant which performs the wildcopy with the same
         // preconditions the bounds checks established.
-        unsafe { self.extend_from_within_unchecked(start, len) };
+        unsafe { self.extend_from_within_unchecked::<K>(start, len) };
         Ok(())
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::cpu_kernel::ScalarKernel;
 
 #[test]
 fn with_capacity_starts_empty() {
@@ -11,9 +12,9 @@ fn with_capacity_starts_empty() {
 #[test]
 fn extend_appends_then_len_matches() {
     let mut f = FlatBuf::with_capacity(64);
-    f.extend(&[1, 2, 3, 4]);
+    f.extend::<ScalarKernel>(&[1, 2, 3, 4]);
     assert_eq!(f.len(), 4);
-    f.extend(&[5, 6]);
+    f.extend::<ScalarKernel>(&[5, 6]);
     assert_eq!(f.len(), 6);
     let (s1, s2) = f.as_slices();
     assert_eq!(s1, &[1, 2, 3, 4, 5, 6]);
@@ -23,7 +24,7 @@ fn extend_appends_then_len_matches() {
 #[test]
 fn extend_and_fill_appends_repeated_byte() {
     let mut f = FlatBuf::with_capacity(64);
-    f.extend(&[0xAA]);
+    f.extend::<ScalarKernel>(&[0xAA]);
     f.extend_and_fill(0xBB, 5);
     let (s1, _) = f.as_slices();
     assert_eq!(s1, &[0xAA, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB]);
@@ -32,9 +33,9 @@ fn extend_and_fill_appends_repeated_byte() {
 #[test]
 fn extend_from_within_unchecked_copies_non_overlapping() {
     let mut f = FlatBuf::with_capacity(64);
-    f.extend(&[10, 20, 30, 40, 50]);
+    f.extend::<ScalarKernel>(&[10, 20, 30, 40, 50]);
     // SAFETY: start+len=3 <= len()=5; capacity covers 5+3.
-    unsafe { f.extend_from_within_unchecked(0, 3) };
+    unsafe { f.extend_from_within_unchecked::<ScalarKernel>(0, 3) };
     let (s1, _) = f.as_slices();
     assert_eq!(s1, &[10, 20, 30, 40, 50, 10, 20, 30]);
 }
@@ -42,7 +43,7 @@ fn extend_from_within_unchecked_copies_non_overlapping() {
 #[test]
 fn drop_first_n_advances_head() {
     let mut f = FlatBuf::with_capacity(64);
-    f.extend(&[1, 2, 3, 4, 5]);
+    f.extend::<ScalarKernel>(&[1, 2, 3, 4, 5]);
     f.drop_first_n(2);
     assert_eq!(f.len(), 3);
     let (s1, _) = f.as_slices();
@@ -50,7 +51,7 @@ fn drop_first_n_advances_head() {
     // Drained bytes remain physically present and back match copies.
     // After head=2, logical start=0 maps to physical index 2.
     // SAFETY: start+len=3 <= len()=3.
-    unsafe { f.extend_from_within_unchecked(0, 3) };
+    unsafe { f.extend_from_within_unchecked::<ScalarKernel>(0, 3) };
     let (s1, _) = f.as_slices();
     assert_eq!(s1, &[3, 4, 5, 3, 4, 5]);
 }
@@ -58,10 +59,10 @@ fn drop_first_n_advances_head() {
 #[test]
 fn set_tail_rolls_back() {
     let mut f = FlatBuf::with_capacity(64);
-    f.extend(&[1, 2, 3]);
+    f.extend::<ScalarKernel>(&[1, 2, 3]);
     let saved_tail = f.tail();
     let saved_cap = f.cap();
-    f.extend(&[4, 5, 6, 7]);
+    f.extend::<ScalarKernel>(&[4, 5, 6, 7]);
     assert_eq!(f.len(), 7);
     assert_eq!(f.cap(), saved_cap, "with_capacity sized to avoid realloc");
     // SAFETY: cap unchanged; new_tail came from prior tail() call.
@@ -74,7 +75,7 @@ fn set_tail_rolls_back() {
 #[test]
 fn clear_resets() {
     let mut f = FlatBuf::with_capacity(64);
-    f.extend(&[1, 2, 3]);
+    f.extend::<ScalarKernel>(&[1, 2, 3]);
     f.drop_first_n(1);
     assert_eq!(f.len(), 2);
     f.clear();
@@ -95,7 +96,7 @@ fn exec_sequence_inline_match_copy_correctness() {
         let mut f = FlatBuf::with_capacity(512);
         // Seed bytes 0..256 with deterministic pattern.
         let seed: Vec<u8> = (0..256u32).map(|i| ((i * 31 + 7) & 0xFF) as u8).collect();
-        f.extend(&seed);
+        f.extend::<ScalarKernel>(&seed);
         let base = f.len();
         let match_length = 96usize;
         // Reference: byte-by-byte repeat starting at base, sourced from base-offset.
@@ -142,7 +143,7 @@ fn exec_sequence_inline_avx2_offset_boundary_correctness() {
     for offset in [20usize, 32, 64] {
         let mut f = FlatBuf::with_capacity(512);
         let seed: Vec<u8> = (0..256u32).map(|i| ((i * 31 + 7) & 0xFF) as u8).collect();
-        f.extend(&seed);
+        f.extend::<ScalarKernel>(&seed);
         let base = f.len();
         let match_length = 96usize;
         let mut reference = alloc::vec![0u8; base + match_length];
@@ -182,7 +183,7 @@ fn exec_sequence_inline_avx2_offset_boundary_correctness() {
 fn exec_sequence_inline_capacity_overflow_returns_err() {
     // Tiny capacity: 32 bytes + WILDCOPY_OVERLENGTH = 64 total.
     let mut f = FlatBuf::with_capacity(32);
-    f.extend(&[0u8; 16]);
+    f.extend::<ScalarKernel>(&[0u8; 16]);
     // Request `lit_length + match_length + 15 = 17 + 100 + 15 = 132`
     // bytes past tail; well over the 64-byte allocation. The literal
     // buffer is `lit_length.next_multiple_of(16) = 32` bytes so the call
@@ -213,7 +214,7 @@ fn exec_sequence_inline_avx2_capacity_overflow_returns_err() {
         return;
     }
     let mut f = FlatBuf::with_capacity(32);
-    f.extend(&[0u8; 16]);
+    f.extend::<ScalarKernel>(&[0u8; 16]);
     // 32-byte literal buffer = `lit_length.next_multiple_of(16)`, so the
     // call satisfies the inline read-slack precondition even if the guard
     // later moves past the first literal read.
@@ -238,7 +239,7 @@ fn exec_sequence_inline_avx2_capacity_overflow_returns_err() {
 #[test]
 fn try_reserve_rejects_growth_past_block_ceiling() {
     let mut f = FlatBuf::with_capacity(64);
-    f.extend(&[0u8; 32]);
+    f.extend::<ScalarKernel>(&[0u8; 32]);
     let ceiling = f.len() + 100; // 132
     f.set_max_capacity(ceiling);
     // Within the ceiling: succeeds (32 + 50 = 82 <= 132).
@@ -263,7 +264,7 @@ fn try_reserve_rejects_growth_past_block_ceiling() {
 #[test]
 fn inline_exec_rejects_output_past_block_ceiling() {
     let mut f = FlatBuf::with_capacity(4096);
-    f.extend(&[0u8; 32]);
+    f.extend::<ScalarKernel>(&[0u8; 32]);
     let ceiling = f.len() + 100; // 132, far below the 4 KiB allocation
     f.set_max_capacity(ceiling);
     // 32 + 20 + 40 = 92 <= 132: within the ceiling, inline is admissible.
@@ -288,7 +289,7 @@ fn inline_exec_rejects_output_past_block_ceiling() {
 #[test]
 fn try_reserve_rejects_within_capacity_but_past_ceiling() {
     let mut f = FlatBuf::with_capacity(4096);
-    f.extend(&[0u8; 32]);
+    f.extend::<ScalarKernel>(&[0u8; 32]);
     let ceiling = f.len() + 100; // 132, far below the 4 KiB allocation
     f.set_max_capacity(ceiling);
     // 32 + 500 = 532 <= 4096 capacity (no growth) but > 132 ceiling.

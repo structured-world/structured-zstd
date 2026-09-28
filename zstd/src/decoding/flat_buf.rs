@@ -13,6 +13,7 @@
 //! +43–58 % regression on small-frame decompress — generic mono-
 //! morphisation strips that match at compile time per call site.
 
+use crate::cpu_kernel::CpuKernel;
 use crate::io::{Error, Read};
 use alloc::vec::Vec;
 
@@ -502,7 +503,7 @@ impl BufferBackend for FlatBuf {
     }
 
     #[inline]
-    fn extend(&mut self, data: &[u8]) {
+    fn extend<K: CpuKernel>(&mut self, data: &[u8]) {
         self.buf.extend_from_slice(data);
     }
 
@@ -546,7 +547,7 @@ impl BufferBackend for FlatBuf {
     }
 
     #[inline]
-    unsafe fn extend_from_within_unchecked(&mut self, start: usize, len: usize) {
+    unsafe fn extend_from_within_unchecked<K: CpuKernel>(&mut self, start: usize, len: usize) {
         let dst_off = self.buf.len();
         let src_off = self.head + start;
         debug_assert!(src_off + len <= dst_off);
@@ -568,7 +569,7 @@ impl BufferBackend for FlatBuf {
         // WILDCOPY_OVERLENGTH slack `reserve` adds).
         unsafe {
             let base = self.buf.as_mut_ptr();
-            super::simd_copy::copy_bytes_overshooting(
+            super::simd_copy::copy_bytes_overshooting::<K>(
                 (base.add(src_off), total_readable),
                 (base.add(dst_off), total_writable),
                 len,
@@ -578,11 +579,15 @@ impl BufferBackend for FlatBuf {
     }
 
     #[inline]
-    unsafe fn extend_from_within_unchecked_branchless(&mut self, start: usize, len: usize) {
+    unsafe fn extend_from_within_unchecked_branchless<K: CpuKernel>(
+        &mut self,
+        start: usize,
+        len: usize,
+    ) {
         // Flat layout never has overlap concerns the branchless variant
         // was designed for — forward to the single non-overlapping copy.
         // SAFETY: forwarded.
-        unsafe { self.extend_from_within_unchecked(start, len) }
+        unsafe { self.extend_from_within_unchecked::<K>(start, len) }
     }
 
     #[inline]

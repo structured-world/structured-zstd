@@ -1,5 +1,6 @@
 extern crate alloc;
 use super::*;
+use crate::cpu_kernel::ScalarKernel;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -7,10 +8,10 @@ use alloc::vec::Vec;
 fn extend_writes_at_tail() {
     let mut buf = vec![0u8; 32];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    b.extend(&[1, 2, 3, 4]);
+    b.extend::<ScalarKernel>(&[1, 2, 3, 4]);
     assert_eq!(b.len(), 4);
     assert_eq!(b.tail(), 4);
-    b.extend(&[5, 6]);
+    b.extend::<ScalarKernel>(&[5, 6]);
     let (s, t) = b.as_slices();
     assert_eq!(s, &[1, 2, 3, 4, 5, 6]);
     assert!(t.is_empty());
@@ -20,7 +21,7 @@ fn extend_writes_at_tail() {
 fn extend_and_fill_repeats_byte() {
     let mut buf = vec![0u8; 16];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    b.extend(&[0xAA]);
+    b.extend::<ScalarKernel>(&[0xAA]);
     b.extend_and_fill(0xBB, 4);
     let (s, _) = b.as_slices();
     assert_eq!(s, &[0xAA, 0xBB, 0xBB, 0xBB, 0xBB]);
@@ -30,9 +31,9 @@ fn extend_and_fill_repeats_byte() {
 fn extend_from_within_unchecked_copies_non_overlapping() {
     let mut buf = vec![0u8; 32];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    b.extend(&[10, 20, 30, 40, 50]);
+    b.extend::<ScalarKernel>(&[10, 20, 30, 40, 50]);
     // SAFETY: 0+3 <= 5 = len; cap 32 covers 5+3.
-    unsafe { b.extend_from_within_unchecked(0, 3) };
+    unsafe { b.extend_from_within_unchecked::<ScalarKernel>(0, 3) };
     let (s, _) = b.as_slices();
     assert_eq!(s, &[10, 20, 30, 40, 50, 10, 20, 30]);
 }
@@ -41,14 +42,14 @@ fn extend_from_within_unchecked_copies_non_overlapping() {
 fn drop_first_n_advances_head_keeps_history() {
     let mut buf = vec![0u8; 32];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    b.extend(&[1, 2, 3, 4, 5]);
+    b.extend::<ScalarKernel>(&[1, 2, 3, 4, 5]);
     b.drop_first_n(2);
     assert_eq!(b.len(), 3);
     let (s, _) = b.as_slices();
     assert_eq!(s, &[3, 4, 5]);
     // After drop, drained bytes remain physically present and can
     // back a match copy via `start` indexed from the post-drop head.
-    unsafe { b.extend_from_within_unchecked(0, 3) };
+    unsafe { b.extend_from_within_unchecked::<ScalarKernel>(0, 3) };
     let (s, _) = b.as_slices();
     assert_eq!(s, &[3, 4, 5, 3, 4, 5]);
 }
@@ -57,9 +58,9 @@ fn drop_first_n_advances_head_keeps_history() {
 fn set_tail_rollback() {
     let mut buf = vec![0u8; 32];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    b.extend(&[1, 2, 3]);
+    b.extend::<ScalarKernel>(&[1, 2, 3]);
     let saved = b.tail();
-    b.extend(&[4, 5, 6, 7]);
+    b.extend::<ScalarKernel>(&[4, 5, 6, 7]);
     assert_eq!(b.len(), 7);
     unsafe { b.set_tail(saved) };
     assert_eq!(b.len(), 3);
@@ -71,7 +72,7 @@ fn set_tail_rollback() {
 fn clear_resets_cursors() {
     let mut buf = vec![0u8; 32];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    b.extend(&[1, 2, 3]);
+    b.extend::<ScalarKernel>(&[1, 2, 3]);
     b.drop_first_n(1);
     b.clear();
     assert_eq!(b.len(), 0);
@@ -109,7 +110,7 @@ use super::super::buffer_backend::BufferBackend;
 fn try_extend_exact_fit_succeeds_and_advances_tail() {
     let mut buf = vec![0u8; 4];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    assert!(b.try_extend(&[1, 2, 3, 4]).is_ok());
+    assert!(b.try_extend::<ScalarKernel>(&[1, 2, 3, 4]).is_ok());
     assert_eq!(b.tail(), 4);
     let (s, _) = b.as_slices();
     assert_eq!(s, &[1, 2, 3, 4]);
@@ -119,7 +120,7 @@ fn try_extend_exact_fit_succeeds_and_advances_tail() {
 fn try_extend_over_capacity_returns_overflow_and_keeps_tail() {
     let mut buf = vec![0u8; 4];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    let err = b.try_extend(&[1, 2, 3, 4, 5]).unwrap_err();
+    let err = b.try_extend::<ScalarKernel>(&[1, 2, 3, 4, 5]).unwrap_err();
     assert_eq!(err.tail, 0);
     assert_eq!(err.requested, 5);
     assert_eq!(err.capacity, 4);
@@ -130,9 +131,9 @@ fn try_extend_over_capacity_returns_overflow_and_keeps_tail() {
 fn try_extend_partially_full_overshoot_reports_current_tail() {
     let mut buf = vec![0u8; 4];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    b.extend(&[1, 2]);
+    b.extend::<ScalarKernel>(&[1, 2]);
     // 3 more bytes would need 5 total, capacity is 4.
-    let err = b.try_extend(&[3, 4, 5]).unwrap_err();
+    let err = b.try_extend::<ScalarKernel>(&[3, 4, 5]).unwrap_err();
     assert_eq!(err.tail, 2);
     assert_eq!(err.requested, 3);
     assert_eq!(err.capacity, 4);
@@ -158,10 +159,10 @@ fn try_extend_zero_length_succeeds_and_leaves_tail_unchanged() {
     // the early-return on `len == 0` could regress silently.
     let mut buf = vec![0u8; 8];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    assert!(b.try_extend(&[]).is_ok());
+    assert!(b.try_extend::<ScalarKernel>(&[]).is_ok());
     assert_eq!(b.tail(), 0);
-    b.extend(&[1, 2, 3]);
-    assert!(b.try_extend(&[]).is_ok());
+    b.extend::<ScalarKernel>(&[1, 2, 3]);
+    assert!(b.try_extend::<ScalarKernel>(&[]).is_ok());
     assert_eq!(b.tail(), 3);
 }
 
@@ -179,7 +180,7 @@ fn try_extend_and_fill_exact_fit_writes_pattern() {
 fn try_extend_and_fill_over_capacity_returns_overflow() {
     let mut buf = vec![0u8; 4];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    b.extend(&[1, 2]);
+    b.extend::<ScalarKernel>(&[1, 2]);
     let err = b.try_extend_and_fill(0xCD, 5).unwrap_err();
     assert_eq!(err.tail, 2);
     assert_eq!(err.requested, 5);
@@ -191,9 +192,9 @@ fn try_extend_and_fill_over_capacity_returns_overflow() {
 fn try_extend_from_within_within_bounds_repeats_history() {
     let mut buf = vec![0u8; 8];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    b.extend(&[1, 2, 3]);
+    b.extend::<ScalarKernel>(&[1, 2, 3]);
     // Repeat the first 3 bytes from history into the next 3 slots.
-    assert!(b.try_extend_from_within(0, 3).is_ok());
+    assert!(b.try_extend_from_within::<ScalarKernel>(0, 3).is_ok());
     let (s, _) = b.as_slices();
     assert_eq!(s, &[1, 2, 3, 1, 2, 3]);
     assert_eq!(b.tail(), 6);
@@ -203,9 +204,9 @@ fn try_extend_from_within_within_bounds_repeats_history() {
 fn try_extend_from_within_source_past_tail_returns_overflow() {
     let mut buf = vec![0u8; 8];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    b.extend(&[1, 2]);
+    b.extend::<ScalarKernel>(&[1, 2]);
     // start=0, len=5 — source range needs bytes 0..5 but tail=2.
-    let err = b.try_extend_from_within(0, 5).unwrap_err();
+    let err = b.try_extend_from_within::<ScalarKernel>(0, 5).unwrap_err();
     assert_eq!(err.tail, 2);
     assert_eq!(err.requested, 5);
     assert_eq!(b.tail(), 2);
@@ -215,10 +216,10 @@ fn try_extend_from_within_source_past_tail_returns_overflow() {
 fn try_extend_from_within_destination_overflow_returns_err() {
     let mut buf = vec![0u8; 4];
     let mut b = UserSliceBackend::from_slice(&mut buf);
-    b.extend(&[1, 2, 3]);
+    b.extend::<ScalarKernel>(&[1, 2, 3]);
     // Source 0..2 valid, but writing 2 more bytes would push tail
     // from 3 to 5, past capacity 4.
-    let err = b.try_extend_from_within(0, 2).unwrap_err();
+    let err = b.try_extend_from_within::<ScalarKernel>(0, 2).unwrap_err();
     assert_eq!(err.tail, 3);
     assert_eq!(err.requested, 2);
     assert_eq!(err.capacity, 4);

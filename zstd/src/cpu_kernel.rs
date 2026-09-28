@@ -371,6 +371,33 @@ pub trait CpuKernel: Copy + 'static {
             Self::mask_lower_bits(packed, n3),
         )
     }
+
+    /// Width in bytes of [`Self::copy_chunks`]'s stores. The default is the
+    /// build's baseline vector; a tier whose wider vector the running CPU
+    /// proved overrides it.
+    const COPY_CHUNK: usize = crate::decoding::simd_copy::BASELINE_COPY_CHUNK;
+
+    /// Copy `len` bytes, a multiple of [`Self::COPY_CHUNK`], in whole chunks:
+    /// the wildcopy body of the decoder's buffer copies.
+    ///
+    /// # Safety
+    /// `src` readable and `dst` writable for `len` bytes; the regions do not
+    /// overlap; the running CPU supports this kernel's tier.
+    #[inline(always)]
+    unsafe fn copy_chunks(src: *const u8, dst: *mut u8, len: usize) {
+        unsafe { crate::decoding::simd_copy::copy_chunks_baseline(src, dst, len) }
+    }
+
+    /// Copy exactly 16 bytes in one transfer, for a short copy whose buffers
+    /// have the room to overshoot to 16.
+    ///
+    /// # Safety
+    /// `src` readable and `dst` writable for 16 bytes; the regions do not
+    /// overlap; the running CPU supports this kernel's tier.
+    #[inline(always)]
+    unsafe fn copy16(src: *const u8, dst: *mut u8) {
+        unsafe { crate::decoding::simd_copy::copy16_baseline(src, dst) }
+    }
 }
 
 /// Scalar fallback — portable, no SIMD or BMI2 intrinsics. Selected
@@ -456,6 +483,15 @@ impl CpuKernel for Avx2Kernel {
         // confirmed both AVX2 and BMI2 — `_bzhi_u64` is callable.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
+
+    // 32 bytes, the width the buffers' trailing slack is sized for.
+    const COPY_CHUNK: usize = 32;
+
+    #[inline(always)]
+    unsafe fn copy_chunks(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: this kernel is selected only after detect confirmed AVX2.
+        unsafe { crate::decoding::simd_copy::copy_avx2(src, dst, len) }
+    }
 }
 
 /// x86_64 AVX-512 VBMI2 + AVX2 + BMI2 kernel. Selected when the CPU
@@ -473,6 +509,16 @@ impl CpuKernel for Vbmi2Kernel {
         // SAFETY: same precondition as Avx2Kernel — BMI2 confirmed
         // at runtime before this kernel is instantiated.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
+    }
+
+    // The AVX2 width: a 64-byte store would need twice the buffers' trailing
+    // slack to fire on the short copies that dominate.
+    const COPY_CHUNK: usize = 32;
+
+    #[inline(always)]
+    unsafe fn copy_chunks(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: the VBMI2 tier is selected only with AVX2 confirmed.
+        unsafe { crate::decoding::simd_copy::copy_avx2(src, dst, len) }
     }
 }
 

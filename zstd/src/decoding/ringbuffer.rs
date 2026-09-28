@@ -4,6 +4,7 @@ use core::{alloc::Layout, ptr::NonNull, slice};
 
 use super::buffer_backend::WILDCOPY_OVERLENGTH;
 use super::simd_copy;
+use crate::cpu_kernel::CpuKernel;
 
 // `WILDCOPY_OVERLENGTH` is shared with `flat_buf` via
 // `buffer_backend.rs` to guarantee both backends size their trailing
@@ -364,7 +365,7 @@ impl RingBuffer {
     /// inline copy; keeping a separate stack frame for that work was a
     /// noticeable fraction of the function-call overhead per literal push.
     #[inline]
-    pub fn extend(&mut self, data: &[u8]) {
+    pub fn extend<K: CpuKernel>(&mut self, data: &[u8]) {
         let len = data.len();
         let ptr = data.as_ptr();
         if len == 0 {
@@ -394,7 +395,7 @@ impl RingBuffer {
             let dst_ptr = unsafe { self.buf.as_ptr().add(self.tail) };
             let dst_cap = (self.cap - self.tail) + WILDCOPY_OVERLENGTH;
             unsafe {
-                simd_copy::copy_bytes_overshooting((ptr, len), (dst_ptr, dst_cap), len);
+                simd_copy::copy_bytes_overshooting::<K>((ptr, len), (dst_ptr, dst_cap), len);
             }
             self.tail += len;
             return;
@@ -414,7 +415,7 @@ impl RingBuffer {
             let dst_ptr = unsafe { self.buf.as_ptr().add(self.tail) };
             let dst_cap = (self.cap - self.tail) + WILDCOPY_OVERLENGTH;
             unsafe {
-                simd_copy::copy_bytes_overshooting((ptr, len), (dst_ptr, dst_cap), len);
+                simd_copy::copy_bytes_overshooting::<K>((ptr, len), (dst_ptr, dst_cap), len);
             }
             self.tail += len;
             if self.tail == self.cap {
@@ -470,10 +471,10 @@ impl RingBuffer {
         };
         unsafe {
             if in_f1 > 0 {
-                simd_copy::copy_bytes_overshooting((ptr, in_f1), (f1_ptr, f1_dst_cap), in_f1);
+                simd_copy::copy_bytes_overshooting::<K>((ptr, in_f1), (f1_ptr, f1_dst_cap), in_f1);
             }
             if in_f2 > 0 {
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (ptr.add(in_f1), in_f2),
                     (f2_ptr, f2_len),
                     in_f2,
@@ -555,7 +556,7 @@ impl RingBuffer {
 
     /// Copies elements from the provided range to the end of the buffer.
     #[allow(dead_code)]
-    pub fn extend_from_within(&mut self, start: usize, len: usize) {
+    pub fn extend_from_within<K: CpuKernel>(&mut self, start: usize, len: usize) {
         if start + len > self.len() {
             panic!(
                 "Calls to this functions must respect start ({}) + len ({}) <= self.len() ({})!",
@@ -570,7 +571,7 @@ impl RingBuffer {
         // SAFETY: Requirements checked:
         // 1. explicitly checked above, resulting in a panic if it does not hold
         // 2. explicitly reserved enough memory
-        unsafe { self.extend_from_within_unchecked(start, len) }
+        unsafe { self.extend_from_within_unchecked::<K>(start, len) }
     }
 
     /// Copies data from the provided range to the end of the buffer, without
@@ -592,7 +593,7 @@ impl RingBuffer {
     /// 2. More then len reserved space so we do not write out-of-bounds
     #[inline]
     #[warn(unsafe_op_in_unsafe_fn)]
-    pub unsafe fn extend_from_within_unchecked(&mut self, start: usize, len: usize) {
+    pub unsafe fn extend_from_within_unchecked<K: CpuKernel>(&mut self, start: usize, len: usize) {
         debug_assert!(start + len <= self.len());
         debug_assert!(self.free() >= len);
 
@@ -636,7 +637,7 @@ impl RingBuffer {
             // `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
             // (`copy_len.next_multiple_of(active_chunk)`) selected by
             // `copy_bytes_overshooting`, and source/destination regions do not overlap.
-            unsafe { simd_copy::copy_bytes_overshooting(src, dst, after_tail) }
+            unsafe { simd_copy::copy_bytes_overshooting::<K>(src, dst, after_tail) }
 
             if after_tail < len {
                 // The write section was not continuous:
@@ -671,7 +672,7 @@ impl RingBuffer {
                 // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
                 // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
                 // and source/destination regions do not overlap.
-                unsafe { simd_copy::copy_bytes_overshooting(src, dst, len - after_tail) }
+                unsafe { simd_copy::copy_bytes_overshooting::<K>(src, dst, len - after_tail) }
             }
         } else {
             #[allow(clippy::collapsible_else_if)]
@@ -711,7 +712,7 @@ impl RingBuffer {
                 // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
                 // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
                 // and source/destination regions do not overlap.
-                unsafe { simd_copy::copy_bytes_overshooting(src, dst, len) }
+                unsafe { simd_copy::copy_bytes_overshooting::<K>(src, dst, len) }
             } else {
                 // Possibly non continuous read section and continuous destination section:
                 //
@@ -747,7 +748,7 @@ impl RingBuffer {
                 // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
                 // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
                 // and source/destination regions do not overlap.
-                unsafe { simd_copy::copy_bytes_overshooting(src, dst, after_start) }
+                unsafe { simd_copy::copy_bytes_overshooting::<K>(src, dst, after_start) }
 
                 if after_start < len {
                     // The read section was not continuous:
@@ -782,7 +783,7 @@ impl RingBuffer {
                     // and the `(ptr, len)` capacities are sized for any rounded-up wildcopy amount
                     // (`copy_len.next_multiple_of(active_chunk)`) selected by `copy_bytes_overshooting`,
                     // and source/destination regions do not overlap.
-                    unsafe { simd_copy::copy_bytes_overshooting(src, dst, len - after_start) }
+                    unsafe { simd_copy::copy_bytes_overshooting::<K>(src, dst, len - after_start) }
                 }
             }
         }
@@ -850,7 +851,7 @@ impl RingBuffer {
     /// `copy_with_nobranch_check` / `simd_copy::copy_bytes_overshooting`. It
     /// therefore cannot trigger `simd_copy`'s SIMD fast paths that require
     /// `min(src.1, dst.1) >= 16` — short copies always take the
-    /// inline byte / overlapping-u64 fallback instead of single_op_copy_16.
+    /// inline byte / overlapping-u64 fallback instead of the 16-byte store.
     /// This is intentional for now: the per-pointer head/tail relationship
     /// needed to decide which capacities are safe to inflate is not
     /// available inside `copy_with_nobranch_check`, and the branchless path
@@ -864,7 +865,11 @@ impl RingBuffer {
     /// Needs start + len <= self.len()
     /// And more then len reserved space
     #[inline]
-    pub unsafe fn extend_from_within_unchecked_branchless(&mut self, start: usize, len: usize) {
+    pub unsafe fn extend_from_within_unchecked_branchless<K: CpuKernel>(
+        &mut self,
+        start: usize,
+        len: usize,
+    ) {
         // SAFETY: caller guarantees the source range is valid and enough free
         // space exists; the raw-pointer arithmetic and copy stay within those bounds.
         unsafe {
@@ -914,7 +919,7 @@ impl RingBuffer {
 
             debug_assert!((m1_in_f2 > 0) ^ (m2_in_f1 > 0) || (m1_in_f2 == 0 && m2_in_f1 == 0));
 
-            copy_with_nobranch_check(
+            copy_with_nobranch_check::<K>(
                 m1_ptr, m2_ptr, f1_ptr, f2_ptr, m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2,
             );
             self.tail = self.wrap(self.tail + len);
@@ -1255,8 +1260,8 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         unsafe { Self::set_tail(self, new_tail) };
     }
     #[inline]
-    fn extend(&mut self, data: &[u8]) {
-        Self::extend(self, data);
+    fn extend<K: CpuKernel>(&mut self, data: &[u8]) {
+        Self::extend::<K>(self, data);
     }
     #[inline]
     fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
@@ -1271,14 +1276,18 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         Self::extend_from_reader(self, read, fill_length)
     }
     #[inline]
-    unsafe fn extend_from_within_unchecked(&mut self, start: usize, len: usize) {
+    unsafe fn extend_from_within_unchecked<K: CpuKernel>(&mut self, start: usize, len: usize) {
         // SAFETY: forwarded.
-        unsafe { Self::extend_from_within_unchecked(self, start, len) };
+        unsafe { Self::extend_from_within_unchecked::<K>(self, start, len) };
     }
     #[inline]
-    unsafe fn extend_from_within_unchecked_branchless(&mut self, start: usize, len: usize) {
+    unsafe fn extend_from_within_unchecked_branchless<K: CpuKernel>(
+        &mut self,
+        start: usize,
+        len: usize,
+    ) {
         // SAFETY: forwarded.
-        unsafe { Self::extend_from_within_unchecked_branchless(self, start, len) };
+        unsafe { Self::extend_from_within_unchecked_branchless::<K>(self, start, len) };
     }
     #[inline]
     fn as_slices(&self) -> (&[u8], &[u8]) {
@@ -1344,14 +1353,14 @@ unsafe fn copy_without_checks(
 /// by `WILDCOPY_OVERLENGTH`. The exact-fit lengths mean `simd_copy`'s
 /// `min_buffer_size >= 16` SIMD fast paths cannot trigger here — short
 /// copies always fall through to the inline byte / overlapping-u64 tail
-/// instead of `single_op_copy_16`. This is intentional for parity with the
+/// instead of the kernel's 16-byte store. This is intentional for parity with the
 /// production branchless path (which has the same property for the same
 /// per-pointer head/tail reason documented on
 /// `extend_from_within_unchecked_branchless`).
 #[allow(dead_code)]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn copy_with_checks(
+unsafe fn copy_with_checks<K: CpuKernel>(
     m1_ptr: *const u8,
     m2_ptr: *const u8,
     f1_ptr: *mut u8,
@@ -1368,14 +1377,14 @@ unsafe fn copy_with_checks(
         let f2_dst_cap = m1_in_f2 + m2_in_f2;
 
         if m1_in_f1 != 0 {
-            simd_copy::copy_bytes_overshooting(
+            simd_copy::copy_bytes_overshooting::<K>(
                 (m1_ptr, m1_src_cap),
                 (f1_ptr, f1_dst_cap),
                 m1_in_f1,
             );
         }
         if m2_in_f1 != 0 {
-            simd_copy::copy_bytes_overshooting(
+            simd_copy::copy_bytes_overshooting::<K>(
                 (m2_ptr, m2_src_cap),
                 (f1_ptr.add(m1_in_f1), m2_in_f1),
                 m2_in_f1,
@@ -1383,14 +1392,14 @@ unsafe fn copy_with_checks(
         }
 
         if m1_in_f2 != 0 {
-            simd_copy::copy_bytes_overshooting(
+            simd_copy::copy_bytes_overshooting::<K>(
                 (m1_ptr.add(m1_in_f1), m1_in_f2),
                 (f2_ptr, f2_dst_cap),
                 m1_in_f2,
             );
         }
         if m2_in_f2 != 0 {
-            simd_copy::copy_bytes_overshooting(
+            simd_copy::copy_bytes_overshooting::<K>(
                 (m2_ptr.add(m2_in_f1), m2_in_f2),
                 (f2_ptr.add(m1_in_f2), m2_in_f2),
                 m2_in_f2,
@@ -1413,14 +1422,14 @@ unsafe fn copy_with_checks(
 /// inflate by `WILDCOPY_OVERLENGTH` the way `extend_from_within_unchecked`
 /// does. Consequence: short copies on the x86 branchless path always fall
 /// into `simd_copy`'s inline byte / overlapping-u64 tail rather than the
-/// `min_buffer_size >= 16` `single_op_copy_16` fast path. Aarch64 hot
+/// `min_buffer_size >= 16` single-store fast path. Aarch64 hot
 /// decode (the WILDCOPY profiling target) uses the unconditional path,
 /// which does inflate, so the slack contract is exercised end-to-end
 /// there.
 #[allow(dead_code)]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn copy_with_nobranch_check(
+unsafe fn copy_with_nobranch_check<K: CpuKernel>(
     m1_ptr: *const u8,
     m2_ptr: *const u8,
     f1_ptr: *mut u8,
@@ -1446,28 +1455,28 @@ unsafe fn copy_with_nobranch_check(
 
             // one bit set
             1 => {
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m1_ptr, m1_src_cap),
                     (f1_ptr, f1_dst_cap),
                     m1_in_f1,
                 );
             }
             2 => {
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m2_ptr, m2_src_cap),
                     (f1_ptr, f1_dst_cap),
                     m2_in_f1,
                 );
             }
             4 => {
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m1_ptr, m1_src_cap),
                     (f2_ptr, f2_dst_cap),
                     m1_in_f2,
                 );
             }
             8 => {
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m2_ptr, m2_src_cap),
                     (f2_ptr, f2_dst_cap),
                     m2_in_f2,
@@ -1476,24 +1485,24 @@ unsafe fn copy_with_nobranch_check(
 
             // two bit set
             3 => {
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m1_ptr, m1_src_cap),
                     (f1_ptr, f1_dst_cap),
                     m1_in_f1,
                 );
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m2_ptr, m2_src_cap),
                     (f1_ptr.add(m1_in_f1), m2_in_f1),
                     m2_in_f1,
                 );
             }
             5 => {
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m1_ptr, m1_src_cap),
                     (f1_ptr, f1_dst_cap),
                     m1_in_f1,
                 );
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m1_ptr.add(m1_in_f1), m1_in_f2),
                     (f2_ptr, f2_dst_cap),
                     m1_in_f2,
@@ -1502,36 +1511,36 @@ unsafe fn copy_with_nobranch_check(
             6 => core::hint::unreachable_unchecked(),
             7 => core::hint::unreachable_unchecked(),
             9 => {
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m1_ptr, m1_src_cap),
                     (f1_ptr, f1_dst_cap),
                     m1_in_f1,
                 );
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m2_ptr, m2_src_cap),
                     (f2_ptr, f2_dst_cap),
                     m2_in_f2,
                 );
             }
             10 => {
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m2_ptr, m2_src_cap),
                     (f1_ptr, f1_dst_cap),
                     m2_in_f1,
                 );
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m2_ptr.add(m2_in_f1), m2_in_f2),
                     (f2_ptr, f2_dst_cap),
                     m2_in_f2,
                 );
             }
             12 => {
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m1_ptr, m1_src_cap),
                     (f2_ptr, f2_dst_cap),
                     m1_in_f2,
                 );
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m2_ptr, m2_src_cap),
                     (f2_ptr.add(m1_in_f2), m2_in_f2),
                     m2_in_f2,
@@ -1540,34 +1549,34 @@ unsafe fn copy_with_nobranch_check(
 
             // three bit set
             11 => {
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m1_ptr, m1_src_cap),
                     (f1_ptr, f1_dst_cap),
                     m1_in_f1,
                 );
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m2_ptr, m2_src_cap),
                     (f1_ptr.add(m1_in_f1), m2_in_f1),
                     m2_in_f1,
                 );
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m2_ptr.add(m2_in_f1), m2_in_f2),
                     (f2_ptr, f2_dst_cap),
                     m2_in_f2,
                 );
             }
             13 => {
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m1_ptr, m1_src_cap),
                     (f1_ptr, f1_dst_cap),
                     m1_in_f1,
                 );
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m1_ptr.add(m1_in_f1), m1_in_f2),
                     (f2_ptr, f2_dst_cap),
                     m1_in_f2,
                 );
-                simd_copy::copy_bytes_overshooting(
+                simd_copy::copy_bytes_overshooting::<K>(
                     (m2_ptr, m2_src_cap),
                     (f2_ptr.add(m1_in_f2), m2_in_f2),
                     m2_in_f2,

@@ -204,10 +204,10 @@ macro_rules! execute_one_body {
                 break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
             }
 
-            if let Err(e) = $buffer.try_push(lits) {
+            if let Err(e) = $buffer.try_push::<Vbmi2Kernel>(lits) {
                 break 'exec_inner Err(ExecuteSequencesError::from(e).into());
             }
-            match $buffer.repeat_lookahead_prefetched(
+            match $buffer.repeat_lookahead_prefetched::<Vbmi2Kernel>(
                 $dict,
                 resolved_offset_v as usize,
                 seq_ml_v as usize,
@@ -432,7 +432,9 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
 
     if lit_cur < literals_buffer_len {
         let rest = &literals_buffer[lit_cur..literals_buffer_len];
-        buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;
+        buffer
+            .try_push::<Vbmi2Kernel>(rest)
+            .map_err(ExecuteSequencesError::from)?;
         seq_sum = seq_sum.wrapping_add(rest.len() as u32);
     }
 

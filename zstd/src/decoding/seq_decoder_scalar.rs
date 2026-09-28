@@ -163,7 +163,8 @@ macro_rules! execute_one_body {
             ml: $seq_ml,
             of: resolved_offset_v,
         };
-        super::sequence_section_decoder::execute_one_sequence_pipelined(
+        // `K` is the tier of the function this expands in.
+        super::sequence_section_decoder::execute_one_sequence_pipelined::<_, K>(
             $buffer,
             $dict,
             $dict_content,
@@ -466,7 +467,9 @@ pub(super) fn decode_and_execute_sequences_impl<'fse, B: BufferBackend, K: CpuKe
     // already held to the block maximum when it was parsed.
     if lit_cur < literals_buffer_len {
         let rest = &literals_buffer[lit_cur..literals_buffer_len];
-        buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;
+        buffer
+            .try_push::<K>(rest)
+            .map_err(ExecuteSequencesError::from)?;
         seq_sum = seq_sum.wrapping_add(rest.len() as u32);
     }
 

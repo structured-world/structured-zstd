@@ -6,6 +6,7 @@ use core::hash::Hasher;
 use super::buffer_backend::BufferBackend;
 use super::prefetch;
 use super::ringbuffer::RingBuffer;
+use crate::cpu_kernel::CpuKernel;
 use crate::decoding::errors::DecodeBufferError;
 
 /// Generic decode-side output buffer parameterised over the storage
@@ -166,8 +167,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// backend the write asserts where a short target must be reported, so
     /// those paths take [`Self::try_push`].
     #[inline]
-    pub fn push(&mut self, data: &[u8]) {
-        self.buffer.extend(data);
+    pub fn push<K: CpuKernel>(&mut self, data: &[u8]) {
+        self.buffer.extend::<K>(data);
         self.total_output_counter += data.len() as u64;
     }
 
@@ -534,8 +535,11 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// structured error instead of panicking. Compressed-block
     /// sequence execution is a follow-up.
     #[inline(always)]
-    pub fn try_push(&mut self, data: &[u8]) -> Result<(), super::buffer_backend::BackendOverflow> {
-        self.buffer.try_extend(data)?;
+    pub fn try_push<K: CpuKernel>(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), super::buffer_backend::BackendOverflow> {
+        self.buffer.try_extend::<K>(data)?;
         self.total_output_counter += data.len() as u64;
         Ok(())
     }
@@ -553,13 +557,16 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         Ok(())
     }
 
-    pub fn repeat(
+    /// Copy `match_length` bytes from `offset` back to the tail, reaching into
+    /// `dict` for the part the output does not hold yet, with the copy kernels
+    /// of `K`.
+    pub fn repeat<K: CpuKernel>(
         &mut self,
         dict: Option<&crate::decoding::dictionary::Dictionary>,
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
-        self.repeat_inner::<false>(dict, offset, match_length)
+        self.repeat_inner::<K, false>(dict, offset, match_length)
     }
 
     /// Same as [`Self::repeat`] but the caller asserts a lookahead
@@ -577,17 +584,17 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// pipelined sequence executor in
     /// [`crate::decoding::sequence_section_decoder`].
     #[inline(always)]
-    pub(crate) fn repeat_lookahead_prefetched(
+    pub(crate) fn repeat_lookahead_prefetched<K: CpuKernel>(
         &mut self,
         dict: Option<&crate::decoding::dictionary::Dictionary>,
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
-        self.repeat_inner::<true>(dict, offset, match_length)
+        self.repeat_inner::<K, true>(dict, offset, match_length)
     }
 
     #[inline(always)]
-    fn repeat_inner<const SKIP_PREFETCH: bool>(
+    fn repeat_inner<K: CpuKernel, const SKIP_PREFETCH: bool>(
         &mut self,
         dict: Option<&crate::decoding::dictionary::Dictionary>,
         offset: usize,
@@ -611,7 +618,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // upfront `reserve(MAX_BLOCK_SIZE)`) never reaches the check.
 
         if offset > self.buffer.len() {
-            self.repeat_from_dict(dict, offset, match_length)
+            self.repeat_from_dict::<K>(dict, offset, match_length)
         } else {
             let buf_len = self.buffer.len();
             let start_idx = buf_len - offset;
@@ -651,7 +658,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
                 self.prefetch_match_source(start_idx, match_length);
             }
             if end_idx > buf_len {
-                self.repeat_overlapping(offset, match_length, start_idx);
+                self.repeat_overlapping::<K>(offset, match_length, start_idx);
             } else {
                 // SAFETY: start_idx + match_length <= self.buffer.len()
                 // (start_idx = buf_len - offset, end_idx = start_idx +
@@ -661,10 +668,10 @@ impl<B: BufferBackend> DecodeBuffer<B> {
                 unsafe {
                     if offset >= 16 && use_branchless_wildcopy() {
                         self.buffer
-                            .extend_from_within_unchecked_branchless(start_idx, match_length);
+                            .extend_from_within_unchecked_branchless::<K>(start_idx, match_length);
                     } else {
                         self.buffer
-                            .extend_from_within_unchecked(start_idx, match_length);
+                            .extend_from_within_unchecked::<K>(start_idx, match_length);
                     }
                 };
             }
@@ -675,13 +682,18 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     }
 
     #[inline(always)]
-    fn repeat_overlapping(&mut self, offset: usize, match_length: usize, start_idx: usize) {
+    fn repeat_overlapping<K: CpuKernel>(
+        &mut self,
+        offset: usize,
+        match_length: usize,
+        start_idx: usize,
+    ) {
         if offset >= 16 {
-            self.repeat_in_chunks(offset, match_length, start_idx, use_branchless_wildcopy());
+            self.repeat_in_chunks::<K>(offset, match_length, start_idx, use_branchless_wildcopy());
         } else if offset >= 8 {
-            self.repeat_in_chunks(offset, match_length, start_idx, false);
+            self.repeat_in_chunks::<K>(offset, match_length, start_idx, false);
         } else {
-            self.repeat_short_offset(offset, match_length, start_idx);
+            self.repeat_short_offset::<K>(offset, match_length, start_idx);
         }
     }
 
@@ -713,7 +725,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// inlining, so the per-call boundary here is irrelevant next to the
     /// copy work it dispatches.
     #[inline]
-    fn repeat_in_chunks(
+    fn repeat_in_chunks<K: CpuKernel>(
         &mut self,
         offset: usize,
         match_length: usize,
@@ -738,9 +750,9 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             unsafe {
                 if use_branchless_copy {
                     self.buffer
-                        .extend_from_within_unchecked_branchless(start_idx, n);
+                        .extend_from_within_unchecked_branchless::<K>(start_idx, n);
                 } else {
-                    self.buffer.extend_from_within_unchecked(start_idx, n);
+                    self.buffer.extend_from_within_unchecked::<K>(start_idx, n);
                 }
             };
             remaining -= n;
@@ -748,7 +760,12 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     }
 
     #[inline(always)]
-    fn repeat_short_offset(&mut self, offset: usize, match_length: usize, start_idx: usize) {
+    fn repeat_short_offset<K: CpuKernel>(
+        &mut self,
+        offset: usize,
+        match_length: usize,
+        start_idx: usize,
+    ) {
         debug_assert!(
             offset > 0,
             "offset must be non-zero to avoid modulo by zero in short-offset path"
@@ -799,12 +816,12 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             };
             let mut copied = 0usize;
             while copied + 16 <= match_length {
-                self.buffer.extend(&chunk16);
+                self.buffer.extend::<K>(&chunk16);
                 copied += 16;
             }
             if copied < match_length {
                 let tail = match_length - copied;
-                self.buffer.extend(&chunk16[..tail]);
+                self.buffer.extend::<K>(&chunk16[..tail]);
             }
             return;
         }
@@ -835,14 +852,14 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         let mut phase = 0usize;
         let mut copied = 0usize;
         while copied + 8 <= match_length {
-            self.buffer.extend(&phase_patterns[phase]);
+            self.buffer.extend::<K>(&phase_patterns[phase]);
             copied += 8;
             phase = (phase + phase_step) % offset;
         }
 
         if copied < match_length {
             let tail = match_length - copied;
-            self.buffer.extend(&phase_patterns[phase][..tail]);
+            self.buffer.extend::<K>(&phase_patterns[phase][..tail]);
         }
     }
 
@@ -967,7 +984,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     // dictionary decode (where this IS the common path, 23 matches a frame) and
     // costs 3.5% on an ordinary one, which is the path that runs far more often.
     #[cold]
-    fn repeat_from_dict(
+    fn repeat_from_dict<K: CpuKernel>(
         &mut self,
         dict: Option<&crate::decoding::dictionary::Dictionary>,
         offset: usize,
@@ -1021,10 +1038,10 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             if bytes_from_dict < match_length {
                 let dict_slice = &dict_content[dict_len - bytes_from_dict..];
                 prefetch::prefetch_slice(dict_slice);
-                self.buffer.extend(dict_slice);
+                self.buffer.extend::<K>(dict_slice);
 
                 self.total_output_counter += bytes_from_dict as u64;
-                return self.repeat_tail_after_dict(
+                return self.repeat_tail_after_dict::<K>(
                     dict,
                     self.buffer.len(),
                     match_length - bytes_from_dict,
@@ -1034,7 +1051,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
                 let high = low + match_length;
                 let dict_slice = &dict_content[low..high];
                 prefetch::prefetch_slice(dict_slice);
-                self.buffer.extend(dict_slice);
+                self.buffer.extend::<K>(dict_slice);
                 self.total_output_counter += match_length as u64;
             }
             Ok(())
@@ -1065,13 +1082,13 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// timer is too coarse to resolve a fraction of a percent, and work that is
     /// gone is gone.
     #[inline(never)]
-    fn repeat_tail_after_dict(
+    fn repeat_tail_after_dict<K: CpuKernel>(
         &mut self,
         dict: Option<&crate::decoding::dictionary::Dictionary>,
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
-        self.repeat(dict, offset, match_length)
+        self.repeat::<K>(dict, offset, match_length)
     }
 
     /// Check if and how many bytes can currently be drawn from the buffer
@@ -1193,7 +1210,10 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// bytes (only those can ever back a match) and validated its length.
     #[cfg(feature = "lsm")]
     pub(crate) fn prime_window(&mut self, prefix: &[u8], total_output: u64) {
-        self.buffer.extend(prefix);
+        // One copy per resume, a window long: it runs at the baseline width
+        // and needs no tier.
+        self.buffer
+            .extend::<crate::cpu_kernel::ScalarKernel>(prefix);
         self.total_output_counter = total_output;
     }
 

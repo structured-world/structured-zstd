@@ -1,6 +1,7 @@
 use alloc::vec;
 
 use super::{RingBuffer, copy_with_checks, copy_with_nobranch_check};
+use crate::cpu_kernel::ScalarKernel;
 use crate::decoding::simd_copy;
 
 fn assert_buffers_equal(expected: &RingBuffer, actual: &RingBuffer) {
@@ -21,8 +22,8 @@ fn assert_branchless_matches_checked(
     assert!(branchless.free() >= len);
 
     unsafe {
-        checked.extend_from_within_unchecked(start, len);
-        branchless.extend_from_within_unchecked_branchless(start, len);
+        checked.extend_from_within_unchecked::<ScalarKernel>(start, len);
+        branchless.extend_from_within_unchecked_branchless::<ScalarKernel>(start, len);
     }
 
     assert_buffers_equal(&checked, &branchless);
@@ -38,7 +39,7 @@ fn growth_stops_at_the_limit_instead_of_doubling_past_it() {
     rb.set_growth_limit(window + block);
     rb.reserve(window);
     assert_eq!(rb.cap, window + 1, "the window itself is a power of two");
-    rb.extend(&alloc::vec![7u8; window]);
+    rb.extend::<ScalarKernel>(&alloc::vec![7u8; window]);
     rb.reserve(block);
     assert_eq!(rb.cap, window + block + 1);
     assert!(rb.free() >= block);
@@ -60,7 +61,7 @@ fn growth_below_the_limit_keeps_doubling() {
 fn a_need_past_the_limit_still_grows() {
     let mut rb = RingBuffer::new();
     rb.set_growth_limit(4096);
-    rb.extend(&alloc::vec![1u8; 4000]);
+    rb.extend::<ScalarKernel>(&alloc::vec![1u8; 4000]);
     rb.reserve(10_000);
     assert!(rb.free() >= 10_000);
     assert_eq!(rb.len(), 4000);
@@ -83,7 +84,7 @@ fn inline_exec_ok_respects_block_output_ceiling() {
     use super::super::buffer_backend::BufferBackend;
     let mut rb = RingBuffer::new();
     rb.reserve(64 * 1024); // plenty of physical slack
-    rb.extend(&[0u8; 1000]); // head = 0, tail = 1000
+    rb.extend::<ScalarKernel>(&[0u8; 1000]); // head = 0, tail = 1000
     // Per-block ceiling with only 100 bytes of output budget remaining.
     rb.set_max_capacity(1000 + 100);
     // lit+match = 500 exceeds the 100-byte budget but fits physically
@@ -178,7 +179,7 @@ fn smoke() {
     rb.reserve(15);
     assert_eq!(17, rb.cap);
 
-    rb.extend(b"0123456789");
+    rb.extend::<ScalarKernel>(b"0123456789");
     assert_eq!(rb.len(), 10);
     assert_eq!(rb.as_slices().0, b"0123456789");
     assert_eq!(rb.as_slices().1, b"");
@@ -188,17 +189,17 @@ fn smoke() {
     assert_eq!(rb.as_slices().0, b"56789");
     assert_eq!(rb.as_slices().1, b"");
 
-    rb.extend_from_within(2, 3);
+    rb.extend_from_within::<ScalarKernel>(2, 3);
     assert_eq!(rb.len(), 8);
     assert_eq!(rb.as_slices().0, b"56789789");
     assert_eq!(rb.as_slices().1, b"");
 
-    rb.extend_from_within(0, 3);
+    rb.extend_from_within::<ScalarKernel>(0, 3);
     assert_eq!(rb.len(), 11);
     assert_eq!(rb.as_slices().0, b"56789789567");
     assert_eq!(rb.as_slices().1, b"");
 
-    rb.extend_from_within(0, 2);
+    rb.extend_from_within::<ScalarKernel>(0, 2);
     assert_eq!(rb.len(), 13);
     assert_eq!(rb.as_slices().0, b"567897895675");
     assert_eq!(rb.as_slices().1, b"6");
@@ -208,7 +209,7 @@ fn smoke() {
     assert_eq!(rb.as_slices().0, b"5");
     assert_eq!(rb.as_slices().1, b"6");
 
-    rb.extend(b"0123456789");
+    rb.extend::<ScalarKernel>(b"0123456789");
     assert_eq!(rb.len(), 12);
     assert_eq!(rb.as_slices().0, b"5");
     assert_eq!(rb.as_slices().1, b"60123456789");
@@ -218,7 +219,7 @@ fn smoke() {
     assert_eq!(rb.as_slices().0, b"9");
     assert_eq!(rb.as_slices().1, b"");
 
-    rb.extend(b"0123456789");
+    rb.extend::<ScalarKernel>(b"0123456789");
     assert_eq!(rb.len(), 11);
     assert_eq!(rb.as_slices().0, b"9012345");
     assert_eq!(rb.as_slices().1, b"6789");
@@ -230,14 +231,14 @@ fn edge_cases() {
     let mut rb = RingBuffer::new();
     rb.reserve(16);
     assert_eq!(17, rb.cap);
-    rb.extend(b"0123456789012345");
+    rb.extend::<ScalarKernel>(b"0123456789012345");
     assert_eq!(17, rb.cap);
     assert_eq!(16, rb.len());
     assert_eq!(0, rb.free());
     rb.drop_first_n(16);
     assert_eq!(0, rb.len());
     assert_eq!(16, rb.free());
-    rb.extend(b"0123456789012345");
+    rb.extend::<ScalarKernel>(b"0123456789012345");
     assert_eq!(16, rb.len());
     assert_eq!(0, rb.free());
     assert_eq!(17, rb.cap);
@@ -247,9 +248,9 @@ fn edge_cases() {
     rb.clear();
 
     // data in both slices and then reserve
-    rb.extend(b"0123456789012345");
+    rb.extend::<ScalarKernel>(b"0123456789012345");
     rb.drop_first_n(8);
-    rb.extend(b"67890123");
+    rb.extend::<ScalarKernel>(b"67890123");
     assert_eq!(16, rb.len());
     assert_eq!(0, rb.free());
     assert_eq!(17, rb.cap);
@@ -265,8 +266,8 @@ fn edge_cases() {
     rb.clear();
 
     // fill exactly, then extend from within
-    rb.extend(b"0123456789012345");
-    rb.extend_from_within(0, 16);
+    rb.extend::<ScalarKernel>(b"0123456789012345");
+    rb.extend_from_within::<ScalarKernel>(0, 16);
     assert_eq!(32, rb.len());
     assert_eq!(0, rb.free());
     assert_eq!(33, rb.cap);
@@ -276,16 +277,16 @@ fn edge_cases() {
     // extend from within cases
     let mut rb = RingBuffer::new();
     rb.reserve(8);
-    rb.extend(b"01234567");
+    rb.extend::<ScalarKernel>(b"01234567");
     rb.drop_first_n(5);
-    rb.extend_from_within(0, 3);
+    rb.extend_from_within::<ScalarKernel>(0, 3);
     assert_eq!(4, rb.as_slices().0.len());
     assert_eq!(2, rb.as_slices().1.len());
 
     rb.drop_first_n(2);
     assert_eq!(2, rb.as_slices().0.len());
     assert_eq!(2, rb.as_slices().1.len());
-    rb.extend_from_within(0, 4);
+    rb.extend_from_within::<ScalarKernel>(0, 4);
     assert_eq!(2, rb.as_slices().0.len());
     assert_eq!(6, rb.as_slices().1.len());
 
@@ -295,18 +296,18 @@ fn edge_cases() {
     rb.drop_first_n(2);
     assert_eq!(4, rb.as_slices().0.len());
     assert_eq!(0, rb.as_slices().1.len());
-    rb.extend_from_within(0, 4);
+    rb.extend_from_within::<ScalarKernel>(0, 4);
     assert_eq!(7, rb.as_slices().0.len());
     assert_eq!(1, rb.as_slices().1.len());
 
     let mut rb = RingBuffer::new();
     rb.reserve(8);
-    rb.extend(b"11111111");
+    rb.extend::<ScalarKernel>(b"11111111");
     rb.drop_first_n(7);
-    rb.extend(b"111");
+    rb.extend::<ScalarKernel>(b"111");
     assert_eq!(2, rb.as_slices().0.len());
     assert_eq!(2, rb.as_slices().1.len());
-    rb.extend_from_within(0, 4);
+    rb.extend_from_within::<ScalarKernel>(0, 4);
     assert_eq!(b"11", rb.as_slices().0);
     assert_eq!(b"111111", rb.as_slices().1);
 }
@@ -316,7 +317,7 @@ fn extend_from_within_branchless_matches_checked_across_layouts() {
     let contiguous = || {
         let mut rb = RingBuffer::new();
         rb.reserve(16);
-        rb.extend(b"0123456789");
+        rb.extend::<ScalarKernel>(b"0123456789");
         rb
     };
     assert_branchless_matches_checked(contiguous(), contiguous(), 2, 5);
@@ -324,7 +325,7 @@ fn extend_from_within_branchless_matches_checked_across_layouts() {
     let wrapped_write = || {
         let mut rb = RingBuffer::new();
         rb.reserve(16);
-        rb.extend(b"0123456789ABC");
+        rb.extend::<ScalarKernel>(b"0123456789ABC");
         rb.drop_first_n(2);
         rb
     };
@@ -333,9 +334,9 @@ fn extend_from_within_branchless_matches_checked_across_layouts() {
     let wrapped_data = || {
         let mut rb = RingBuffer::new();
         rb.reserve(32);
-        rb.extend(b"0123456789abcdefghijklmn");
+        rb.extend::<ScalarKernel>(b"0123456789abcdefghijklmn");
         rb.drop_first_n(18);
-        rb.extend(b"wxyz012345");
+        rb.extend::<ScalarKernel>(b"wxyz012345");
         rb
     };
     assert_branchless_matches_checked(wrapped_data(), wrapped_data(), 8, 2);
@@ -366,7 +367,7 @@ fn copy_with_nobranch_check_matches_checked_for_all_valid_case_masks() {
         let mut actual = [0_u8; 8];
 
         unsafe {
-            copy_with_checks(
+            copy_with_checks::<ScalarKernel>(
                 m1.as_ptr(),
                 m2.as_ptr(),
                 expected.as_mut_ptr(),
@@ -376,7 +377,7 @@ fn copy_with_nobranch_check_matches_checked_for_all_valid_case_masks() {
                 m1_in_f2,
                 m2_in_f2,
             );
-            copy_with_nobranch_check(
+            copy_with_nobranch_check::<ScalarKernel>(
                 m1.as_ptr(),
                 m2.as_ptr(),
                 actual.as_mut_ptr(),
@@ -413,7 +414,7 @@ fn copy_bytes_overshooting_preserves_prefix_for_runtime_chunk_lengths() {
     let src_single = vec![1_u8; cap];
     let mut dst_single = vec![0_u8; cap];
     unsafe {
-        simd_copy::copy_bytes_overshooting(
+        simd_copy::copy_bytes_overshooting::<ScalarKernel>(
             (src_single.as_ptr(), single_len),
             (dst_single.as_mut_ptr(), single_len),
             single_len,
@@ -424,7 +425,7 @@ fn copy_bytes_overshooting_preserves_prefix_for_runtime_chunk_lengths() {
     let src_multi = vec![2_u8; cap];
     let mut dst_multi = vec![0_u8; cap];
     unsafe {
-        simd_copy::copy_bytes_overshooting(
+        simd_copy::copy_bytes_overshooting::<ScalarKernel>(
             (src_multi.as_ptr(), multi_len),
             (dst_multi.as_mut_ptr(), multi_len),
             multi_len,
@@ -435,7 +436,7 @@ fn copy_bytes_overshooting_preserves_prefix_for_runtime_chunk_lengths() {
     let src_fallback = vec![3_u8; cap];
     let mut dst_fallback = vec![0_u8; cap];
     unsafe {
-        simd_copy::copy_bytes_overshooting(
+        simd_copy::copy_bytes_overshooting::<ScalarKernel>(
             (src_fallback.as_ptr(), fallback_len),
             (dst_fallback.as_mut_ptr(), fallback_len),
             fallback_len,
@@ -446,7 +447,7 @@ fn copy_bytes_overshooting_preserves_prefix_for_runtime_chunk_lengths() {
     let src_overshoot = vec![4_u8; cap + 1];
     let mut dst_overshoot = vec![0_u8; cap + 1];
     unsafe {
-        simd_copy::copy_bytes_overshooting(
+        simd_copy::copy_bytes_overshooting::<ScalarKernel>(
             (src_overshoot.as_ptr().add(1), overshoot_cap),
             (dst_overshoot.as_mut_ptr().add(1), overshoot_cap),
             fallback_len,
@@ -469,7 +470,7 @@ fn build_wrapped_buffer(cap: usize, fill_len: usize, pre_byte: u8) -> RingBuffer
     // Push to near-end of the physical buffer.
     let pre_len = actual_cap - 2;
     let prefix = alloc::vec![pre_byte; pre_len];
-    rb.extend(&prefix);
+    rb.extend::<ScalarKernel>(&prefix);
     // Drop those bytes so head advances past them; tail now sits near
     // the end of `cap`, head is in the middle. Subsequent inserts will
     // wrap across the physical end.
@@ -504,7 +505,7 @@ fn build_tail_before_head(cap_hint: usize, head_pos: usize, tail_pos: usize) -> 
     // Fill almost the whole buffer so we can carve out tail < head.
     let fill_len = actual_cap - 2;
     let prefix = alloc::vec![0xCD; fill_len];
-    rb.extend(&prefix);
+    rb.extend::<ScalarKernel>(&prefix);
     // Drop bytes so `head` lands at the target. Tail stays at fill_len.
     rb.drop_first_n(head_pos);
     // Now extend just enough to wrap tail past `cap` and land it at
@@ -512,7 +513,7 @@ fn build_tail_before_head(cap_hint: usize, head_pos: usize, tail_pos: usize) -> 
     // we need `tail_pos = (fill_len + extra) % cap`, so
     // `extra = (tail_pos + cap - fill_len) % cap`.
     let extra = (tail_pos + actual_cap - fill_len) % actual_cap;
-    rb.extend(&alloc::vec![0xCD; extra]);
+    rb.extend::<ScalarKernel>(&alloc::vec![0xCD; extra]);
     assert_eq!(rb.head, head_pos);
     assert_eq!(rb.tail, tail_pos);
     assert!(
@@ -555,7 +556,7 @@ fn extend_wrapped_layout_preserves_bytes_past_head() {
     // exactly the 1-byte sentinel gap the RingBuffer always reserves.
     let free_before = rb.free();
     let payload = alloc::vec![0x42; free_before];
-    rb.extend(&payload);
+    rb.extend::<ScalarKernel>(&payload);
 
     // The bytes at [head, head+16) must still be the original 0xCD
     // prefill — any overshoot would have written 0x42 over them.
@@ -622,7 +623,7 @@ fn extend_from_reader_wrapped_layout() {
 #[test]
 fn extend_from_reader_eof_leaves_state_unchanged() {
     let mut rb = RingBuffer::new();
-    rb.extend(b"prefix");
+    rb.extend::<ScalarKernel>(b"prefix");
     let snapshot_len = rb.len();
     let snapshot_slices: (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) = {
         let (a, b) = rb.as_slices();

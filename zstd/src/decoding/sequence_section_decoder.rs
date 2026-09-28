@@ -6,7 +6,7 @@ use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
-use crate::cpu_kernel::CpuKernelTag;
+use crate::cpu_kernel::{CpuKernel, CpuKernelTag};
 use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
 use crate::fse::SeqFSEDecoder;
 
@@ -419,7 +419,10 @@ pub(crate) struct ExecSeq {
 // registers and onto memory loads, which is the cost this per-sequence
 // boundary exists to avoid.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
+pub(crate) fn execute_one_sequence_pipelined<
+    B: super::buffer_backend::BufferBackend,
+    K: CpuKernel,
+>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     dict: Option<&crate::decoding::dictionary::Dictionary>,
     dict_content: &[u8],
@@ -515,9 +518,11 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
             }
             return Ok(());
         }
-        buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
         buffer
-            .repeat_lookahead_prefetched(dict, offset, seq.ml as usize)
+            .try_push::<K>(lits)
+            .map_err(ExecuteSequencesError::from)?;
+        buffer
+            .repeat_lookahead_prefetched::<K>(dict, offset, seq.ml as usize)
             .map_err(ExecuteSequencesError::from)?;
         return Ok(());
     }
@@ -579,105 +584,11 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
     }
 
     // Fallback: the legacy push + repeat chain.
-    buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
     buffer
-        .repeat_lookahead_prefetched(dict, resolved_offset as usize, seq.ml as usize)
+        .try_push::<K>(lits)
         .map_err(ExecuteSequencesError::from)?;
-    Ok(())
-}
-
-/// AVX2-tier variant of [`execute_one_sequence_pipelined`]. Differs at
-/// exactly one site: the match-copy inline path routes to
-/// `BufferBackend::exec_sequence_inline_avx2` (32-byte ymm wildcopy on
-/// the no-overlap match path) instead of the SSE2 16-byte default.
-/// Issue #279 round 3 Phase 4.
-///
-/// # Safety
-/// Caller MUST be in `#[target_feature(enable = "avx2,bmi2")]` scope
-/// AND have verified the runtime CPU advertises both features (the
-/// dispatcher in `decode_and_execute_sequences` gates this on
-/// `detect_cpu_kernel() == Avx2`).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,bmi2")]
-#[inline]
-#[allow(dead_code)] // vestigial pre-R12 macro-dispatch helper
-pub(crate) unsafe fn execute_one_sequence_pipelined_avx2<
-    B: super::buffer_backend::BufferBackend,
->(
-    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
-    dict: Option<&crate::decoding::dictionary::Dictionary>,
-    literals: &[u8],
-    lit_cur: &mut usize,
-    lit_len: usize,
-    seq: Sequence,
-    resolved_offset: u32,
-) -> Result<(), DecompressBlockError> {
-    let lit_cur_before = *lit_cur;
-    let high = lit_cur_before
-        .checked_add(seq.ll as usize)
-        .filter(|&h| h <= lit_len)
-        .ok_or(ExecuteSequencesError::NotEnoughBytesForSequence {
-            wanted: lit_cur_before.saturating_add(seq.ll as usize),
-            have: lit_len,
-        })?;
-    // SAFETY: high <= lit_len, lit_cur_before <= high (checked above).
-    let lits = unsafe { literals.get_unchecked(lit_cur_before..high) };
-    *lit_cur = high;
-
-    if resolved_offset == 0 {
-        return Err(ExecuteSequencesError::ZeroOffset.into());
-    }
-
-    // Same gate as the SSE2 default — 16-byte literal slack bound
-    // unchanged because the AVX2 override keeps the SSE2 16-byte
-    // literal copy (the divergence is on match-copy only, see
-    // `UserSliceBackend::exec_sequence_inline_avx2`).
-    let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-        && buffer.buffer_mut().inline_exec_ok(
-            seq.ll as usize,
-            seq.ml as usize,
-            resolved_offset as usize,
-        )
-        && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
-        && (seq.ll as usize <= 16
-            || lit_cur_before
-                .checked_add((seq.ll as usize).next_multiple_of(16))
-                .is_some_and(|b| b <= lit_len));
-    if inline_path_safe {
-        let buf_len = buffer.len();
-        let offset = resolved_offset as usize;
-        let prefix_end = buf_len.checked_add(lits.len()).filter(|end| offset <= *end);
-        if prefix_end.is_none() {
-            buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
-            buffer
-                .repeat_lookahead_prefetched(dict, offset, seq.ml as usize)
-                .map_err(ExecuteSequencesError::from)?;
-            return Ok(());
-        }
-        // SAFETY: lit_cur_before + 16 <= lit_len so parent-slice read
-        // of 16 bytes from lit_src is in-bounds. Offset prefix-resident
-        // per the prefix_end check above. exec_sequence_inline_avx2
-        // requires target_feature(avx2) which the enclosing fn carries.
-        let lit_src = unsafe { literals.as_ptr().add(lit_cur_before) };
-        unsafe {
-            buffer
-                .buffer_mut()
-                .exec_sequence_inline_avx2(lit_src, seq.ll as usize, offset, seq.ml as usize)
-                .map_err(DecompressBlockError::ExecuteSequencesError)?;
-        }
-        // Inline path bypasses the wrapper's output counter; keep it current for
-        // backends that read it (Ring/Flat). Const-folded away for UserSlice.
-        if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
-            buffer.advance_output_counter((seq.ll + seq.ml) as u64);
-        }
-        return Ok(());
-    }
-
-    // Fallback: legacy push + repeat chain (K-agnostic, real CALL
-    // through the target_feature boundary). Same as the SSE2 default.
-    buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
     buffer
-        .repeat_lookahead_prefetched(dict, resolved_offset as usize, seq.ml as usize)
+        .repeat_lookahead_prefetched::<K>(dict, resolved_offset as usize, seq.ml as usize)
         .map_err(ExecuteSequencesError::from)?;
     Ok(())
 }
