@@ -357,32 +357,41 @@ impl Matcher for Recorder {
         self.record_skipped();
     }
 
-    fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        let mut literals = [0u32; 256];
+    fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
+        let block_start = self.sequences.len();
+        let mut tail = 0usize;
         let Self {
             inner, sequences, ..
         } = self;
         inner.start_matching(|sequence| {
-            match &sequence {
-                Sequence::Literals { literals: bytes } => {
-                    for &byte in *bytes {
-                        literals[usize::from(byte)] += 1;
-                    }
-                }
+            match sequence {
+                Sequence::Literals { len } => tail += len,
                 Sequence::Triple {
-                    literals: bytes,
+                    literal_len,
                     offset,
                     match_len,
                 } => {
-                    for &byte in *bytes {
-                        literals[usize::from(byte)] += 1;
-                    }
                     // Lengths and offsets of one block, far below `u32::MAX`.
-                    sequences.push((bytes.len() as u32, *offset as u32, *match_len as u32));
+                    sequences.push((literal_len as u32, offset as u32, match_len as u32));
                 }
             }
             handle_sequence(sequence);
         });
+        // The literals are the block's bytes between the matches, read back by
+        // position once matching is done, as the encoder gathers them.
+        let block = self.inner.get_last_space();
+        let mut literals = [0u32; 256];
+        let mut pos = 0usize;
+        let mut count = |bytes: &[u8]| {
+            for &byte in bytes {
+                literals[usize::from(byte)] += 1;
+            }
+        };
+        for &(ll, _, ml) in &self.sequences[block_start..] {
+            count(&block[pos..pos + ll as usize]);
+            pos += ll as usize + ml as usize;
+        }
+        count(&block[pos..pos + tail]);
         let sequences_end = self.sequences.len();
         self.blocks.push(RecordedBlock {
             literals,
