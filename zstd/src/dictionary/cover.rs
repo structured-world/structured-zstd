@@ -113,6 +113,7 @@ impl<'s> CoverContext<'s> {
                 "the training samples are too large for COVER (4 GiB at most)",
             ));
         }
+        samples.check_holds_dmer(train, d)?;
         let (dmer_at, initial) = if d <= 8 {
             index_dmers::<false>(data, nb_dmers, d, samples.offsets())
         } else {

@@ -341,6 +341,55 @@ fn a_split_point_that_is_not_a_number_is_refused() {
     }
 }
 
+/// A shrunk dictionary costing exactly the tolerated percentage more is kept:
+/// the bound is compared in integers, where 300 bytes at 13% allow 339, not in
+/// floating point, where 300 * 1.13 comes out just under 339.
+#[test]
+fn a_shrunk_dictionary_exactly_at_the_bound_is_kept() {
+    assert!(selection::within_regression(339, 300, 13));
+    assert!(!selection::within_regression(340, 300, 13));
+    assert!(selection::within_regression(300, 300, 0));
+    assert!(!selection::within_regression(301, 300, 0));
+    assert!(selection::within_regression(
+        usize::MAX,
+        usize::MAX,
+        u32::MAX
+    ));
+}
+
+/// A dmer counts only inside one sample, so samples all shorter than `d` hold
+/// none however long their concatenation is: nothing can be trained, and the
+/// samples are refused as samples before an index of the whole corpus is built
+/// for nothing.
+#[test]
+fn samples_too_short_for_a_dmer_are_refused() {
+    let data: Vec<u8> = (0..4096u32).map(|i| (i * 7) as u8).collect();
+    let sizes = vec![2usize; data.len() / 2];
+    let cover = CoverOptions {
+        k: 64,
+        d: 8,
+        ..CoverOptions::default()
+    };
+    let err =
+        train_cover_dict(&data, &sizes, 4096, &cover, FinalizeOptions::default()).unwrap_err();
+    assert_eq!(
+        TrainingError::of(&err),
+        Some(TrainingError::Samples),
+        "{err}"
+    );
+    let fastcover = FastCoverOptions {
+        cover,
+        ..FastCoverOptions::default()
+    };
+    let err = train_fastcover_dict(&data, &sizes, 4096, &fastcover, FinalizeOptions::default())
+        .unwrap_err();
+    assert_eq!(
+        TrainingError::of(&err),
+        Some(TrainingError::Samples),
+        "{err}"
+    );
+}
+
 /// When a request fails two checks, the preflight names the cause the trainer
 /// names: a segment that fits no dictionary of that size is checked before the
 /// size itself, as upstream zstd's `COVER_checkParameters` runs before its

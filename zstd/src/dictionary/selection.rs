@@ -147,14 +147,13 @@ impl<'s> Evaluator<'s> {
                 total,
             });
         };
-        let tolerance = 1.0 + f64::from(regression) / 100.0;
         let mut size = SHRINK_START;
         while size < content.len() {
             let mut shrunk = core::mem::take(&mut self.shrunk);
             let priced = self.finalize_and_price(&content[content.len() - size..], &mut shrunk);
             self.shrunk = shrunk;
             let candidate_total = priced?;
-            if candidate_total as f64 <= total as f64 * tolerance {
+            if within_regression(candidate_total, total, regression) {
                 return Ok(Priced {
                     dict: &self.shrunk,
                     total: candidate_total,
@@ -167,6 +166,15 @@ impl<'s> Evaluator<'s> {
             total,
         })
     }
+}
+
+/// Whether `total` costs at most `regression` percent more than `full`,
+/// compared in integers: upstream zstd's `COVER_selectDict` multiplies by a
+/// `double` tolerance, which can land just under an exact bound and reject a
+/// size that meets it. Every product fits `u128` (a `usize` times at most
+/// `u32::MAX + 100`).
+pub(super) fn within_regression(total: usize, full: usize, regression: u32) -> bool {
+    total as u128 * 100 <= full as u128 * (u128::from(regression) + 100)
 }
 
 /// A candidate [`Evaluator::select`] priced, still in the evaluator's buffer.

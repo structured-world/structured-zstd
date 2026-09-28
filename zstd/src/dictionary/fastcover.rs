@@ -138,6 +138,7 @@ impl<'s> FastCoverContext<'s> {
                 "the training samples are too large for FastCOVER (4 GiB at most)",
             ));
         }
+        samples.check_holds_dmer(train, read_len)?;
         let mut freqs = zeroed_counts::<u32>(1usize << f)?;
         let step = accel as usize;
         let offsets = samples.offsets();

@@ -65,6 +65,23 @@ impl<'a> SampleSet<'a> {
     /// is scored on (upstream zstd `COVER_ctx_init`): below 1 the leading
     /// `split_point` share builds and the rest scores; at 1 every sample does
     /// both.
+    /// Refuse the first `train` samples when none of them is `span` bytes
+    /// long: a trainer counts a dmer only inside one sample, so none would be
+    /// counted however long the samples run together. Known from the sizes,
+    /// so it is refused before the dmers are indexed.
+    pub(super) fn check_holds_dmer(&self, train: usize, span: usize) -> io::Result<()> {
+        if self.offsets[..=train]
+            .windows(2)
+            .any(|bounds| bounds[1] - bounds[0] >= span)
+        {
+            return Ok(());
+        }
+        Err(refuse(
+            TrainingError::Samples,
+            &std::format!("no training sample is {span} bytes long, so none holds a dmer to count"),
+        ))
+    }
+
     pub(super) fn split(&self, split_point: f64) -> io::Result<Split> {
         split_count(self.count(), split_point)
     }
