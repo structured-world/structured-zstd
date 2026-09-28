@@ -1802,59 +1802,6 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         }
     }
 
-    /// Configure fine-grained compression parameters.
-    ///
-    /// Resets the base [`CompressionLevel`] to the parameters' level and installs the per-knob overrides
-    /// (window/hash/chain/search logs, strategy, LDM) applied at the next
-    /// frame. Pass `None`-equivalent (a builder that overrides nothing)
-    /// to fall back to plain level-based compression.
-    ///
-    /// ```rust
-    /// use structured_zstd::encoding::{
-    ///     CompressionLevel, CompressionParameters, FrameCompressor, Strategy,
-    /// };
-    /// let params = CompressionParameters::builder(CompressionLevel::Level(19))
-    ///     .strategy(Strategy::Btultra2)
-    ///     .enable_long_distance_matching(true)
-    ///     .build()
-    ///     .unwrap();
-    /// let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
-    /// compressor.set_parameters(&params);
-    /// let compressed = compressor.compress_independent_frame(b"some data to compress");
-    /// assert!(!compressed.is_empty());
-    /// ```
-    pub fn set_parameters(&mut self, params: &crate::encoding::CompressionParameters) {
-        self.compression_level = params.level();
-        let overrides = params.overrides();
-        self.tuning = FrameTuning::from_overrides(&overrides);
-        // Keep `state.strategy_tag` consistent immediately so the borrowed
-        // one-shot eligibility gate (`borrowed_eligible`) and literal gates
-        // are correct even before the next `compress()` re-sync. Resolve it
-        // size-adaptively (same `resolve_level_params` path `prepare_frame`
-        // uses) so a hint already set here yields the same strategy the matcher
-        // will run, not the bare level-only mapping.
-        // The dictionary counts only when the frame will prime it (same gate
-        // as `prepare_frame`'s `use_dictionary_state`): uncompressed mode
-        // ignores an attached dictionary and has no CDict tier to resolve.
-        let with_dictionary = !matches!(self.compression_level, CompressionLevel::Uncompressed)
-            && self.state.matcher.supports_dictionary_priming();
-        let params = self.resolve_frame_params(self.source_size_hint, with_dictionary);
-        self.sync_effective_strategy(&params);
-        self.state.huf_optimal_search =
-            huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
-        self.state.literal_compression_disabled = literal_compression_disabled(
-            self.state.strategy_tag,
-            self.compression_level,
-            gate_target_length(
-                self.compression_level,
-                &self.tuning,
-                self.dictionary.as_ref().filter(|_| with_dictionary),
-            ),
-            self.tuning.literal_compression,
-        );
-        self.state.matcher.set_param_overrides(Some(overrides));
-    }
-
     /// Whether the borrowed (no per-block history copy) one-shot loop is
     /// valid for an `input_len`-byte slice under the resolved `prep`.
     ///
@@ -2376,6 +2323,59 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             params,
             self.tuning.strategy,
         );
+    }
+
+    /// Configure fine-grained compression parameters.
+    ///
+    /// Resets the base [`CompressionLevel`] to the parameters' level and installs the per-knob overrides
+    /// (window/hash/chain/search logs, strategy, LDM) applied at the next
+    /// frame. Pass `None`-equivalent (a builder that overrides nothing)
+    /// to fall back to plain level-based compression. A custom matcher
+    /// receives them through [`Matcher::apply_parameters`].
+    ///
+    /// ```rust
+    /// use structured_zstd::encoding::{
+    ///     CompressionLevel, CompressionParameters, FrameCompressor, Strategy,
+    /// };
+    /// let params = CompressionParameters::builder(CompressionLevel::Level(19))
+    ///     .strategy(Strategy::Btultra2)
+    ///     .enable_long_distance_matching(true)
+    ///     .build()
+    ///     .unwrap();
+    /// let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    /// compressor.set_parameters(&params);
+    /// let compressed = compressor.compress_independent_frame(b"some data to compress");
+    /// assert!(!compressed.is_empty());
+    /// ```
+    pub fn set_parameters(&mut self, params: &crate::encoding::CompressionParameters) {
+        self.compression_level = params.level();
+        self.tuning = FrameTuning::from_overrides(&params.overrides());
+        // Keep `state.strategy_tag` consistent immediately so the borrowed
+        // one-shot eligibility gate (`borrowed_eligible`) and literal gates
+        // are correct even before the next `compress()` re-sync. Resolve it
+        // size-adaptively (same `resolve_level_params` path `prepare_frame`
+        // uses) so a hint already set here yields the same strategy the matcher
+        // will run, not the bare level-only mapping.
+        // The dictionary counts only when the frame will prime it (same gate
+        // as `prepare_frame`'s `use_dictionary_state`): uncompressed mode
+        // ignores an attached dictionary and has no CDict tier to resolve.
+        let with_dictionary = !matches!(self.compression_level, CompressionLevel::Uncompressed)
+            && self.state.matcher.supports_dictionary_priming();
+        let level_params = self.resolve_frame_params(self.source_size_hint, with_dictionary);
+        self.sync_effective_strategy(&level_params);
+        self.state.huf_optimal_search =
+            huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
+        self.state.literal_compression_disabled = literal_compression_disabled(
+            self.state.strategy_tag,
+            self.compression_level,
+            gate_target_length(
+                self.compression_level,
+                &self.tuning,
+                self.dictionary.as_ref().filter(|_| with_dictionary),
+            ),
+            self.tuning.literal_compression,
+        );
+        self.state.matcher.apply_parameters(params);
     }
 
     /// Provide a hint about the total uncompressed size for the next frame.

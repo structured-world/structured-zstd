@@ -16,8 +16,8 @@ use crate::encoding::blocks::{
 };
 use crate::encoding::workspace::Workspace;
 use crate::encoding::{
-    CompressionLevel, DictionarySizes, EncoderDictionary, FrameCompressor, HistoryBuf,
-    MatchGeneratorDriver, Matcher, Sequence,
+    CompressionLevel, CompressionParameters, DictionarySizes, EncoderDictionary, FrameCompressor,
+    HistoryBuf, LevelParameters, MatchGeneratorDriver, Matcher, Sequence,
 };
 use crate::fse::fse_encoder::{FSETable, write_ncount_at_log};
 use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable};
@@ -184,16 +184,37 @@ fn count_samples(
     compressor
         .set_encoder_dictionary(EncoderDictionary::from_dictionary(dictionary))
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    // Every sample runs the parameters of the average one, as upstream's
-    // analysis does (`ZSTD_getParams(level, averageSampleSize, dictSize)`):
-    // one set of tables for the whole pass, which also keeps the dictionary
-    // resident from one sample to the next instead of indexing it again.
+    // Every sample runs the parameters of the average one with this content,
+    // as upstream's analysis does (`ZSTD_getParams(level, averageSampleSize,
+    // dictSize)`): one set of tables for the whole pass, which also keeps the
+    // dictionary resident from one sample to the next instead of indexing it
+    // again.
     let average = samples.leading(count).len() / count.max(1);
-    // Only a sample's first block is counted, `MIN(128 KiB, window)` bytes
-    // (upstream zstd `ZDICT_countEStats`). The window follows the hint alone,
-    // so once one frame has shown it, the rest of each sample is not fed at
-    // all.
-    let mut block_size = BLOCK_SIZE_MAX;
+    let params = LevelParameters::for_level(
+        level,
+        Some(average as u64).filter(|&size| size != 0),
+        content.len(),
+    );
+    compressor.set_parameters(
+        &CompressionParameters::builder(CompressionLevel::from_level(level))
+            .window_log(params.window_log)
+            .hash_log(params.hash_log)
+            .chain_log(params.chain_log)
+            .search_log(params.search_log)
+            .min_match(params.min_match)
+            .target_length(params.target_length)
+            .strategy(params.strategy)
+            .build()
+            .expect("the level table's parameters are in range"),
+    );
+    // Only a sample's first block is counted, `MIN(128 KiB, 1 << windowLog)`
+    // bytes compressed as one block (upstream zstd `ZDICT_countEStats`). The
+    // rest of a sample is not fed at all.
+    let block_size = BLOCK_SIZE_MAX.min(1 << params.window_log);
+    // A frame's window is fitted to its source, and upstream's analysis sizes
+    // it for the sample and the content together (`ZSTD_adjustCParams`,
+    // `tSize = srcSize + dictSize`), so that is the size every frame hints.
+    let sized_as = (average + content.len()) as u64;
     let mut frame = Vec::new();
     for index in 0..count {
         let sample = samples.sample(index);
@@ -205,15 +226,11 @@ fn count_samples(
         compressor.matcher_mut().armed = true;
         compressor.set_source(block);
         compressor.set_drain(frame);
-        compressor.set_source_size_hint(average as u64);
+        compressor.set_source_size_hint(sized_as);
         compressor.compress();
         frame = compressor.take_drain().expect("the drain was set above");
         let fast_offset_codes = compressor.uses_fast_offset_codes();
         let recorder = compressor.matcher_mut();
-        let window = recorder.inner.window_size() as usize;
-        if window > 0 {
-            block_size = block_size.min(window);
-        }
         // A block written raw holds no sequences to learn from, and its bytes
         // are no literals of any compressed block (upstream skips it too).
         if first_block_is_compressed(&frame) {
@@ -370,6 +387,10 @@ impl Matcher for Recorder {
 
     fn clear_param_overrides(&mut self) {
         self.inner.clear_param_overrides();
+    }
+
+    fn apply_parameters(&mut self, params: &CompressionParameters) {
+        self.inner.apply_parameters(params);
     }
 
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {

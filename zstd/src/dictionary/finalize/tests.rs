@@ -125,13 +125,14 @@ fn literal_tables_take_the_depth_of_their_longest_code() {
 }
 
 /// Only a sample's first block is counted (upstream zstd `ZDICT_countEStats`
-/// compresses `MIN(128 KiB, window)` bytes as one block). Samples averaging a
-/// line keep the window, and so the block, far under 4 KiB; two versions of an
+/// compresses `MIN(128 KiB, 1 << windowLog)` bytes as one block, the window of
+/// the average sample plus the content). Samples averaging a line with half a
+/// KiB of content keep that window at its 1 KiB floor; two versions of an
 /// 8 KiB sample that differ only past 4 KiB must finalize to the same bytes.
 #[test]
 fn only_the_first_block_of_a_sample_is_counted() {
     let (mut data, mut sizes) = log_samples();
-    let content: Vec<u8> = data[..4096].to_vec();
+    let content: Vec<u8> = data[..512].to_vec();
     let head = data[..4096].to_vec();
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     let noise: Vec<u8> = (0..4096)
@@ -164,6 +165,49 @@ fn only_the_first_block_of_a_sample_is_counted() {
     assert!(
         with_runs == with_noise,
         "a sample's second block reached the tables"
+    );
+}
+
+/// The first block spans the window of the average sample plus the content,
+/// not of the sample alone: with 4 KiB of content that window is 8 KiB, so the
+/// second half of an 8 KiB sample is counted and two versions differing there
+/// finalize differently.
+#[test]
+fn the_first_block_spans_the_window_of_sample_and_content() {
+    let (mut data, mut sizes) = log_samples();
+    let content: Vec<u8> = data[..4096].to_vec();
+    let head = data[..4096].to_vec();
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let noise: Vec<u8> = (0..4096)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    sizes.push(8192);
+    let finalized = |tail: &[u8], data: &mut Vec<u8>| {
+        let base = data.len();
+        data.extend_from_slice(&head);
+        data.extend_from_slice(tail);
+        let samples = SampleSet::new(data, &sizes).unwrap();
+        let dict = finalize(
+            &content,
+            &samples,
+            samples.count(),
+            8192,
+            FinalizeOptions::default(),
+        )
+        .unwrap();
+        data.truncate(base);
+        dict
+    };
+    let with_runs = finalized(&[b'z'; 4096], &mut data);
+    let with_noise = finalized(&noise, &mut data);
+    assert!(
+        with_runs != with_noise,
+        "the second half of the sample's first block was not counted"
     );
 }
 
