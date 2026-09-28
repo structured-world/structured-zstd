@@ -27,7 +27,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use structured_zstd::decoding::FrameDecoder;
-use structured_zstd::dictionary::{FastCoverOptions, FinalizeOptions, optimize_fastcover_dict};
+use structured_zstd::dictionary::{
+    FastCoverOptions, FinalizeOptions, check_fastcover_sample_count, optimize_fastcover_dict,
+};
 use structured_zstd::encoding::{EncoderDictionary, FrameCompressor};
 use support::{
     LevelConfig, Scenario, ScenarioClass, apply_cpu_ceiling_from_env, benchmark_scenarios,
@@ -1192,6 +1194,13 @@ fn bench_dictionary(c: &mut Criterion) {
         // scenario length, is what each training pass reads.
         let total_training_bytes: usize = rust_sizes.iter().sum();
         let rust_corpus = &scenario.bytes[..total_training_bytes];
+        // A scenario too small to leave FastCOVER's split five training samples
+        // (the 1 KiB one makes four) builds no dictionary on either side,
+        // upstream included, so it has no dictionary rows: skipped up front
+        // rather than through a failed training.
+        if check_fastcover_sample_count(&FastCoverOptions::default(), sample_count).is_err() {
+            continue;
+        }
         // `ZDICT_trainFromBuffer`'s own parameters, so both sides run the
         // same search: FastCOVER over `k` in four steps at `d` of 8, scored at
         // the default level.

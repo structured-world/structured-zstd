@@ -39,6 +39,11 @@ pub(super) struct Evaluator<'s> {
     tables: Option<Vec<u8>>,
     compressor: Option<FrameCompressor>,
     frame: Vec<u8>,
+    /// The candidate being priced, and a shrunk one being tried against it:
+    /// finalized over the same allocations for every candidate, and copied out
+    /// only by a candidate that wins.
+    dict: Vec<u8>,
+    shrunk: Vec<u8>,
 }
 
 impl<'s> Evaluator<'s> {
@@ -60,24 +65,43 @@ impl<'s> Evaluator<'s> {
             tables: sample_entropy_tables(samples.leading(finalize_samples)),
             compressor: None,
             frame: Vec::new(),
+            dict: Vec::new(),
+            shrunk: Vec::new(),
         }
     }
 
     /// `content` finalized into a dictionary of at most the capacity.
     pub(super) fn finalize(&self, content: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.finalize_into(content, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Self::finalize`] over `out`, keeping its allocation.
+    fn finalize_into(&self, content: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
         if let Some(tables) = &self.tables {
             if content.is_empty() {
                 // The full path owns that refusal and its wording.
-                return finalize_raw_dict(content, &[], self.capacity, self.finalize);
+                *out = finalize_raw_dict(content, &[], self.capacity, self.finalize)?;
+                return Ok(());
             }
-            return assemble_dict(content, tables, self.capacity, self.finalize);
+            return assemble_dict(out, content, tables, self.capacity, self.finalize);
         }
-        finalize_raw_dict(
+        // Samples too thin to decide the tables alone: the content decides
+        // them, a path a search takes only on corpora of a handful of bytes.
+        *out = finalize_raw_dict(
             content,
             self.samples.leading(self.finalize_samples),
             self.capacity,
             self.finalize,
-        )
+        )?;
+        Ok(())
+    }
+
+    /// `content` finalized over `buffer` and priced.
+    fn finalize_and_price(&mut self, content: &[u8], buffer: &mut Vec<u8>) -> io::Result<usize> {
+        self.finalize_into(content, buffer)?;
+        self.price(buffer)
     }
 
     /// The dictionary's size plus every scoring sample compressed with it.
@@ -112,27 +136,43 @@ impl<'s> Evaluator<'s> {
     ///
     /// Upstream zstd runs the same search but forces it off in the only path
     /// that reaches it, so its `shrink` has no effect; here it takes effect.
-    pub(super) fn select(&mut self, content: &[u8], shrink: Option<u32>) -> io::Result<Scored> {
-        let dict = self.finalize(content)?;
-        let total = self.price(&dict)?;
+    pub(super) fn select(&mut self, content: &[u8], shrink: Option<u32>) -> io::Result<Priced<'_>> {
+        let mut dict = core::mem::take(&mut self.dict);
+        let priced = self.finalize_and_price(content, &mut dict);
+        self.dict = dict;
+        let total = priced?;
         let Some(regression) = shrink else {
-            return Ok(Scored { dict, total });
+            return Ok(Priced {
+                dict: &self.dict,
+                total,
+            });
         };
         let tolerance = 1.0 + f64::from(regression) / 100.0;
         let mut size = SHRINK_START;
         while size < content.len() {
-            let candidate = self.finalize(&content[content.len() - size..])?;
-            let candidate_total = self.price(&candidate)?;
+            let mut shrunk = core::mem::take(&mut self.shrunk);
+            let priced = self.finalize_and_price(&content[content.len() - size..], &mut shrunk);
+            self.shrunk = shrunk;
+            let candidate_total = priced?;
             if candidate_total as f64 <= total as f64 * tolerance {
-                return Ok(Scored {
-                    dict: candidate,
+                return Ok(Priced {
+                    dict: &self.shrunk,
                     total: candidate_total,
                 });
             }
             size *= 2;
         }
-        Ok(Scored { dict, total })
+        Ok(Priced {
+            dict: &self.dict,
+            total,
+        })
     }
+}
+
+/// A candidate [`Evaluator::select`] priced, still in the evaluator's buffer.
+pub(super) struct Priced<'e> {
+    pub(super) dict: &'e [u8],
+    pub(super) total: usize,
 }
 
 /// The cheapest dictionary seen, and the parameters that built it. A tie keeps
@@ -150,15 +190,29 @@ impl<P> Best<P> {
         }
     }
 
-    pub(super) fn offer(&mut self, candidate: io::Result<Scored>, params: P) {
+    /// Keep `candidate` if it beats the best so far, copying its bytes into the
+    /// buffer the previous winner held; a candidate that loses is not copied.
+    pub(super) fn offer(&mut self, candidate: io::Result<Priced<'_>>, params: P) {
         match candidate {
-            Ok(scored) => {
+            Ok(priced) => {
                 if self
                     .found
                     .as_ref()
-                    .is_none_or(|(best, _)| scored.total < best.total)
+                    .is_none_or(|(best, _)| priced.total < best.total)
                 {
-                    self.found = Some((scored, params));
+                    let mut dict = self
+                        .found
+                        .take()
+                        .map_or_else(Vec::new, |(previous, _)| previous.dict);
+                    dict.clear();
+                    dict.extend_from_slice(priced.dict);
+                    self.found = Some((
+                        Scored {
+                            dict,
+                            total: priced.total,
+                        },
+                        params,
+                    ));
                 }
             }
             Err(err) => self.last_error = Some(err),

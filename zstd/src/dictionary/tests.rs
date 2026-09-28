@@ -341,6 +341,40 @@ fn a_split_point_that_is_not_a_number_is_refused() {
     }
 }
 
+/// When a request fails two checks, the preflight names the cause the trainer
+/// names: a segment that fits no dictionary of that size is checked before the
+/// size itself, as upstream zstd's `COVER_checkParameters` runs before its
+/// `ZDICT_DICTSIZE_MIN` check. A caller that maps the cause to an error code
+/// must get one answer for one request.
+#[test]
+fn the_preflight_names_the_cause_the_trainer_names() {
+    let (data, sizes) = training_samples();
+    let dict_size = TRAINER_DICT_SIZE_MIN - 1;
+    let cover = CoverOptions {
+        k: 300,
+        d: 8,
+        ..CoverOptions::default()
+    };
+    let trained =
+        train_cover_dict(&data, &sizes, dict_size, &cover, FinalizeOptions::default()).unwrap_err();
+    let checked = check_cover_options(&cover, dict_size).unwrap_err();
+    assert_eq!(TrainingError::of(&checked), TrainingError::of(&trained));
+    let fastcover = FastCoverOptions {
+        cover,
+        ..FastCoverOptions::default()
+    };
+    let trained = train_fastcover_dict(
+        &data,
+        &sizes,
+        dict_size,
+        &fastcover,
+        FinalizeOptions::default(),
+    )
+    .unwrap_err();
+    let checked = check_fastcover_options(&fastcover, dict_size).unwrap_err();
+    assert_eq!(TrainingError::of(&checked), TrainingError::of(&trained));
+}
+
 /// The preflight refuses what the trainer it stands in for refuses: a
 /// dictionary under the trainers' minimum fails training whatever segment
 /// fits, so the check a caller runs before loading a corpus fails it too, with

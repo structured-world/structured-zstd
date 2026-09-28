@@ -525,7 +525,9 @@ pub fn finalize_raw_dict(
             max_log,
         )?);
     }
-    assemble_dict(raw_content, &tables, dict_size, options)
+    let mut out = Vec::new();
+    assemble_dict(&mut out, raw_content, &tables, dict_size, options)?;
+    Ok(out)
 }
 
 /// The offset, match-length and literal-length streams, in the order their
@@ -552,14 +554,18 @@ fn sample_entropy_tables(sample_data: &[u8]) -> Option<Vec<u8>> {
     Some(tables)
 }
 
-/// A dictionary of `raw_content` behind already serialized entropy `tables`.
+/// A dictionary of `raw_content` behind already serialized entropy `tables`,
+/// written over `out`, whose allocation a caller finalizing many candidates
+/// keeps from one to the next.
 fn assemble_dict(
+    out: &mut Vec<u8>,
     raw_content: &[u8],
     tables: &[u8],
     dict_size: usize,
     options: FinalizeOptions,
-) -> io::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(dict_size.max(256));
+) -> io::Result<()> {
+    out.clear();
+    out.reserve(dict_size.max(256));
     out.extend_from_slice(&DICT_MAGIC_NUM);
     let dict_id = options
         .dict_id
@@ -596,7 +602,7 @@ fn assemble_dict(
         out.resize(out.len() + (min_content_size - content.len()), 0);
     }
     out.extend_from_slice(content);
-    Ok(out)
+    Ok(())
 }
 
 /// Smallest dictionary, in bytes, any trainer here builds (upstream zstd
@@ -741,9 +747,11 @@ impl SearchSpace {
 /// assert!(check_cover_options(&too_long, 4096).is_err());
 /// ```
 pub fn check_cover_options(options: &CoverOptions, dict_size: usize) -> io::Result<()> {
+    // The trainers' order, and upstream zstd's: `COVER_checkParameters` before
+    // the `ZDICT_DICTSIZE_MIN` check, so both name the same cause.
     let space = SearchSpace::selected(options, 1.0)?;
-    check_dict_size(dict_size)?;
-    space.check_fits(dict_size)
+    space.check_fits(dict_size)?;
+    check_dict_size(dict_size)
 }
 
 /// [`check_cover_options`] for FastCOVER: also refuses `f`, `accel` and a `d`
@@ -768,8 +776,8 @@ pub fn check_cover_options(options: &CoverOptions, dict_size: usize) -> io::Resu
 pub fn check_fastcover_options(options: &FastCoverOptions, dict_size: usize) -> io::Result<()> {
     let space = SearchSpace::selected(&options.cover, 0.75)?;
     fastcover_knobs(options, &space)?;
-    check_dict_size(dict_size)?;
-    space.check_fits(dict_size)
+    space.check_fits(dict_size)?;
+    check_dict_size(dict_size)
 }
 
 /// Refuse `sample_count` samples the COVER training `options` select cannot
