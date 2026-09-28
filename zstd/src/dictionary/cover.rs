@@ -9,7 +9,7 @@
 //! dmers are worth the most, then zeroes their frequencies so later segments
 //! are valued for new coverage only.
 
-use super::samples::{SampleSet, invalid};
+use super::samples::{SampleSet, TrainingError, refuse};
 use std::{io, vec, vec::Vec};
 
 /// A segment of the training bytes, in dmer positions.
@@ -80,14 +80,18 @@ impl<'s> CoverContext<'s> {
         // eight readable bytes (upstream zstd `COVER_ctx_init`).
         let read_len = d.max(8);
         let Some(nb_dmers) = data.len().checked_sub(read_len).map(|n| n + 1) else {
-            return Err(invalid(&std::format!(
-                "the training samples total {} bytes; COVER needs at least {read_len}",
-                data.len()
-            )));
+            return Err(refuse(
+                TrainingError::Samples,
+                &std::format!(
+                    "the training samples total {} bytes; COVER needs at least {read_len}",
+                    data.len()
+                ),
+            ));
         };
         // Ids and positions are held as `u32`, as upstream's are.
         if u32::try_from(nb_dmers).is_err() {
-            return Err(invalid(
+            return Err(refuse(
+                TrainingError::Samples,
                 "the training samples are too large for COVER (4 GiB at most)",
             ));
         }
@@ -108,16 +112,14 @@ impl<'s> CoverContext<'s> {
         })
     }
 
-    /// A fresh copy of the frequencies, for one dictionary build to spend.
-    pub(super) fn fresh_state(&self) -> Vec<DmerState> {
-        self.initial.clone()
-    }
-
     /// Build content of at most `capacity` bytes from segments of `k` bytes
-    /// (upstream zstd `COVER_buildDictionary`), spending `state`. The best
-    /// segments are chosen first and placed last, where the offsets that reach
-    /// them are smallest.
-    pub(super) fn build(&self, state: &mut [DmerState], capacity: usize, k: usize) -> Vec<u8> {
+    /// (upstream zstd `COVER_buildDictionary`). `state` is scratch the build
+    /// refills with the frequencies and spends, so one buffer serves every
+    /// build. The best segments are chosen first and placed last, where the
+    /// offsets that reach them are smallest.
+    pub(super) fn build(&self, state: &mut Vec<DmerState>, capacity: usize, k: usize) -> Vec<u8> {
+        state.clear();
+        state.extend_from_slice(&self.initial);
         let d = self.d;
         debug_assert!(d <= k);
         let nb_dmers = self.dmer_at.len();
@@ -244,7 +246,7 @@ fn long_digest(data: &[u8], pos: usize, d: usize) -> u64 {
 /// Upstream zstd groups positions by sorting them on their dmer; ids here come
 /// from a hash index in one pass instead. Which label a dmer carries does not
 /// change a single selection, and the pass does no comparison sort. A dmer is
-/// counted once per sample it starts in.
+/// counted once per sample it lies wholly inside.
 fn index_dmers<const LONG: bool>(
     data: &[u8],
     nb_dmers: usize,
@@ -296,7 +298,9 @@ fn index_dmers<const LONG: bool>(
             }
             slot = (slot + 1) & mask;
         };
-        if last_sample[id as usize] != sample as u32 {
+        // A dmer spilling into the next sample exists only in the
+        // concatenation, so it earns nothing.
+        if pos + d <= offsets[sample + 1] && last_sample[id as usize] != sample as u32 {
             last_sample[id as usize] = sample as u32;
             freqs[id as usize] += 1;
         }

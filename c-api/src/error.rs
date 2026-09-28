@@ -127,6 +127,20 @@ fn code_from_u32(value: u32) -> ZSTD_ErrorCode {
     }
 }
 
+/// Map a dictionary trainer's error to the code upstream's `ZDICT_*` trainers
+/// return for the same refusal; anything else is `dictionaryCreation_failed`.
+pub fn code_for_training_error(err: &std::io::Error) -> ZSTD_ErrorCode {
+    use ZSTD_ErrorCode::*;
+    use codec::dictionary::TrainingError;
+    match TrainingError::of(err) {
+        Some(TrainingError::Parameter) => ZSTD_error_parameter_outOfBound,
+        Some(TrainingError::Samples) => ZSTD_error_srcSize_wrong,
+        Some(TrainingError::DictionaryTooSmall) => ZSTD_error_dstSize_tooSmall,
+        _ if err.kind() == std::io::ErrorKind::OutOfMemory => ZSTD_error_memory_allocation,
+        _ => ZSTD_error_dictionaryCreation_failed,
+    }
+}
+
 /// Map a decoder error to the closest stable `ZSTD_ErrorCode`. Conservative:
 /// any variant without an exact upstream analogue (including the
 /// feature-gated and future ones caught by the wildcard) collapses to

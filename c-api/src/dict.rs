@@ -80,7 +80,8 @@ unsafe fn train_into(
     };
     let dict = match catch_unwind(AssertUnwindSafe(|| train(samples, sizes))) {
         Ok(Ok(dict)) => dict,
-        _ => return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed),
+        Ok(Err(err)) => return encode(crate::error::code_for_training_error(&err)),
+        Err(_) => return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed),
     };
     if dict.len() > dict_capacity {
         return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
@@ -214,9 +215,6 @@ pub unsafe extern "C" fn ZDICT_trainFromBuffer_cover(
     nb_samples: c_uint,
     parameters: ZDICT_cover_params_t,
 ) -> usize {
-    if parameters.k == 0 || parameters.d == 0 {
-        return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
-    }
     unsafe {
         train_into(
             dict_buffer,
@@ -354,11 +352,6 @@ pub unsafe extern "C" fn ZDICT_trainFromBuffer_fastCover(
     nb_samples: c_uint,
     parameters: ZDICT_fastCover_params_t,
 ) -> usize {
-    // Zero asks for a search, which only the optimizing entry runs; upstream
-    // rejects it here too.
-    if parameters.k == 0 || parameters.d == 0 {
-        return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
-    }
     unsafe {
         train_into(
             dict_buffer,

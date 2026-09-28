@@ -146,7 +146,8 @@ impl<P> Best<P> {
         match (self.found, self.last_error) {
             (Some((scored, params)), _) => Ok((scored.dict, params)),
             (None, Some(err)) => Err(err),
-            (None, None) => Err(super::samples::invalid(
+            (None, None) => Err(super::samples::refuse(
+                super::TrainingError::Parameter,
                 "no parameter combination is valid for this dictionary size",
             )),
         }

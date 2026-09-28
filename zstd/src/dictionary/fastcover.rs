@@ -3,7 +3,7 @@
 //! `accel`-th position counted (upstream zstd `fastcover.c`).
 
 use super::cover::compute_epochs;
-use super::samples::{SampleSet, invalid};
+use super::samples::{SampleSet, TrainingError, refuse};
 use alloc::vec;
 use alloc::vec::Vec;
 use std::io;
@@ -123,10 +123,13 @@ impl<'s> FastCoverContext<'s> {
         let data = samples.leading(train);
         let read_len = dmer_read_len(d);
         let Some(nb_dmers) = data.len().checked_sub(read_len).map(|n| n + 1) else {
-            return Err(invalid(&std::format!(
-                "the training samples total {} bytes; FastCOVER needs at least {read_len}",
-                data.len()
-            )));
+            return Err(refuse(
+                TrainingError::Samples,
+                &std::format!(
+                    "the training samples total {} bytes; FastCOVER needs at least {read_len}",
+                    data.len()
+                ),
+            ));
         };
         let mut freqs = zeroed_counts::<u32>(1usize << f)?;
         let step = accel as usize;
@@ -156,21 +159,25 @@ impl<'s> FastCoverContext<'s> {
         train * self.finalize_percent / 100
     }
 
-    /// A fresh copy of the frequencies, for one dictionary build to spend.
-    pub(super) fn fresh_freqs(&self) -> Vec<u32> {
-        self.freqs.clone()
-    }
-
     /// Build content of at most `capacity` bytes from segments of `k` bytes
-    /// (upstream zstd `FASTCOVER_buildDictionary`), spending `freqs`.
+    /// (upstream zstd `FASTCOVER_buildDictionary`). `freqs` is scratch the
+    /// build refills with the counted frequencies and spends, so one table
+    /// serves every build.
     pub(super) fn build(
         &self,
-        freqs: &mut [u32],
+        freqs: &mut Vec<u32>,
         window: &mut WindowCounts,
         capacity: usize,
         k: usize,
     ) -> Result<Vec<u8>, TableTooLarge> {
         debug_assert!(self.d <= k);
+        freqs.clear();
+        freqs
+            .try_reserve_exact(self.freqs.len())
+            .map_err(|_| TableTooLarge {
+                entries: self.freqs.len(),
+            })?;
+        freqs.extend_from_slice(&self.freqs);
         let epochs = compute_epochs(capacity, self.nb_dmers, k, 1);
         let layout = EpochLayout {
             dmers_in_k: k - self.d + 1,
@@ -254,6 +261,17 @@ impl<'s> FastCoverContext<'s> {
                 segment_freqs[del] -= one;
                 active_begin += 1;
             }
+            // Drop the segment's leading dmers that earlier segments already
+            // cover: they score nothing and would only spend dictionary bytes.
+            // The tail needs no trim, the best segment is recorded as a dmer
+            // that scores enters it.
+            while best_begin < best_end && freqs[hash_dmer_index(sample, best_begin, f, d)] == 0 {
+                best_begin += 1;
+            }
+            debug_assert!(
+                best_score == 0 || freqs[hash_dmer_index(sample, best_end - 1, f, d)] != 0,
+                "the best segment ends on a dmer that scores"
+            );
             // Zero the chosen segment's frequencies: its dmers are covered.
             for pos in best_begin..best_end {
                 freqs[hash_dmer_index(sample, pos, f, d)] = 0;

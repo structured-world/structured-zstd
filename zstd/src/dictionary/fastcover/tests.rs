@@ -64,18 +64,15 @@ fn build_fills_at_most_the_capacity_from_the_training_bytes() {
     let set = SampleSet::new(&data, &sizes).unwrap();
     let ctx = FastCoverContext::new(&set, sizes.len(), 8, 20, 1).unwrap();
     let mut window = WindowCounts::default();
-    let content = ctx
-        .build(&mut ctx.fresh_freqs(), &mut window, 4096, 256)
-        .unwrap();
+    let mut freqs = Vec::new();
+    let content = ctx.build(&mut freqs, &mut window, 4096, 256).unwrap();
     assert!(!content.is_empty() && content.len() <= 4096);
     // The last segment is at least a dmer of training bytes.
     let last = &content[content.len() - 8..];
     assert!(data.windows(8).any(|w| w == last));
-    // The window counts come back zeroed, so the next build starts clean and
-    // repeats the first.
-    let again = ctx
-        .build(&mut ctx.fresh_freqs(), &mut window, 4096, 256)
-        .unwrap();
+    // The window counts come back zeroed and the spent frequencies are
+    // refilled, so the next build on the same scratch repeats the first.
+    let again = ctx.build(&mut freqs, &mut window, 4096, 256).unwrap();
     assert_eq!(content, again);
 }
 
@@ -92,7 +89,7 @@ fn a_segment_longer_than_a_16_bit_count_trains() {
     let set = SampleSet::new(&data, &[each; 5]).unwrap();
     let ctx = FastCoverContext::new(&set, 5, 8, 20, 1).unwrap();
     let content = ctx
-        .build(&mut ctx.fresh_freqs(), &mut WindowCounts::default(), k, k)
+        .build(&mut Vec::new(), &mut WindowCounts::default(), k, k)
         .unwrap();
     assert_eq!(content, [0u8; 8]);
 }
@@ -106,7 +103,7 @@ fn a_segment_longer_than_the_corpus_trains() {
     let ctx = FastCoverContext::new(&set, sizes.len(), 8, 20, 1).unwrap();
     let content = ctx
         .build(
-            &mut ctx.fresh_freqs(),
+            &mut Vec::new(),
             &mut WindowCounts::default(),
             4096,
             usize::MAX / 4,
@@ -115,21 +112,18 @@ fn a_segment_longer_than_the_corpus_trains() {
     assert!(!content.is_empty() && content.len() <= 4096);
 }
 
-/// Every table width the interface takes is used as given.
+/// Every table width the interface takes is used as given, including by a
+/// frequency scratch carried from a build at another width.
 #[test]
 fn every_table_width_trains() {
     let (data, sizes) = lines(200);
     let set = SampleSet::new(&data, &sizes).unwrap();
+    let mut freqs = Vec::new();
     for f in [1, 4, 8, 24] {
         let ctx = FastCoverContext::new(&set, sizes.len(), 8, f, 1).unwrap();
         assert_eq!(ctx.freqs.len(), 1 << f);
         let content = ctx
-            .build(
-                &mut ctx.fresh_freqs(),
-                &mut WindowCounts::default(),
-                2048,
-                128,
-            )
+            .build(&mut freqs, &mut WindowCounts::default(), 2048, 128)
             .unwrap();
         assert!(!content.is_empty(), "f={f}");
     }

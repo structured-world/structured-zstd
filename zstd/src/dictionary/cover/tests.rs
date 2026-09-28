@@ -31,7 +31,7 @@ fn epochs_follow_the_reference_formula() {
     );
 }
 
-/// A dmer's frequency is the number of samples it starts in: repeats inside
+/// A dmer's frequency is the number of samples it lies in: repeats inside
 /// one sample count once, the same dmer in another sample counts again.
 #[test]
 fn a_dmer_counts_once_per_sample() {
@@ -56,7 +56,8 @@ fn a_dmer_counts_once_per_sample() {
 }
 
 /// Every position gets the id of its dmer: equal dmers one id, distinct ones
-/// distinct ids, frequencies the number of samples each starts in. Checked
+/// distinct ids, frequencies the number of samples each lies wholly inside;
+/// a dmer that spills into the next sample earns nothing there. Checked
 /// against a plain map, past the index's first growth, for a short and a long
 /// dmer size.
 #[test]
@@ -86,7 +87,8 @@ fn dmer_ids_agree_with_a_plain_map() {
             assert_eq!(ctx.dmer_at[pos], id, "d={d} pos={pos}");
             let seen = samples_of.entry(dmer).or_default();
             let sample = pos / 12_000;
-            if seen.last() != Some(&sample) {
+            let inside = (pos + d - 1) / 12_000 == sample;
+            if inside && seen.last() != Some(&sample) {
                 seen.push(sample);
             }
         }
@@ -103,8 +105,8 @@ fn dmer_ids_agree_with_a_plain_map() {
 }
 
 /// The segment worth most comes first and lands last; content stays within
-/// the capacity, is made of training bytes, and a second build from a fresh
-/// state repeats the first.
+/// the capacity, is made of training bytes, and a second build on the same
+/// spent scratch repeats the first.
 #[test]
 fn build_places_the_best_segment_last() {
     let mut data = Vec::new();
@@ -116,7 +118,8 @@ fn build_places_the_best_segment_last() {
     }
     let set = SampleSet::new(&data, &sizes).unwrap();
     let ctx = CoverContext::new(&set, sizes.len(), 8).unwrap();
-    let content = ctx.build(&mut ctx.fresh_state(), 256, 32);
+    let mut state = Vec::new();
+    let content = ctx.build(&mut state, 256, 32);
     assert!(!content.is_empty() && content.len() <= 256);
     // "shared-header-" starts every sample, so it is the most frequent run.
     let tail = &content[content.len() - content.len().min(40)..];
@@ -125,7 +128,7 @@ fn build_places_the_best_segment_last() {
         "{:?}",
         std::string::String::from_utf8_lossy(&content)
     );
-    assert_eq!(content, ctx.build(&mut ctx.fresh_state(), 256, 32));
+    assert_eq!(content, ctx.build(&mut state, 256, 32));
 }
 
 #[test]

@@ -44,6 +44,8 @@ use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable as HuffmanEncoder
 use core::cmp::Reverse;
 pub use legacy::DEFAULT_SELECTIVITY;
 use lmc::*;
+pub use samples::TrainingError;
+use samples::refuse;
 use std::{
     boxed::Box,
     collections::{BinaryHeap, HashMap},
@@ -573,9 +575,10 @@ pub fn finalize_raw_dict(
     Ok(out)
 }
 
-/// Smallest dictionary the segment trainers build (upstream zstd
-/// `ZDICT_DICTSIZE_MIN`).
-const SEGMENT_DICT_SIZE_MIN: usize = 256;
+/// Smallest dictionary, in bytes, the COVER and FastCOVER trainers build
+/// (upstream zstd `ZDICT_DICTSIZE_MIN`); a smaller one is refused with
+/// [`TrainingError::DictionaryTooSmall`].
+pub const SEGMENT_DICT_SIZE_MIN: usize = 256;
 
 /// The `k` and `d` values a training run tries, resolved from the options the
 /// way the reference's optimizers resolve theirs.
@@ -597,7 +600,10 @@ impl SearchSpace {
             options.split_point
         };
         if split_point > 1.0 {
-            return Err(samples::invalid("the split point must lie in (0, 1]"));
+            return Err(refuse(
+                TrainingError::Parameter,
+                "the split point must lie in (0, 1]",
+            ));
         }
         let d = if options.d == 0 {
             6..=8
@@ -610,7 +616,7 @@ impl SearchSpace {
             options.k..=options.k
         };
         if *k.start() < *d.end() {
-            return Err(samples::invalid("k must be at least d"));
+            return Err(refuse(TrainingError::Parameter, "k must be at least d"));
         }
         let steps = if options.steps == 0 {
             40
@@ -631,7 +637,8 @@ impl SearchSpace {
     /// building (upstream zstd `ZDICT_trainFromBuffer_cover`).
     fn fixed(options: &CoverOptions) -> io::Result<Self> {
         if options.k == 0 || options.d == 0 {
-            return Err(samples::invalid(
+            return Err(refuse(
+                TrainingError::Parameter,
                 "k and d are required; zero asks for a search, which the optimize_* trainers run",
             ));
         }
@@ -660,13 +667,25 @@ fn segment_fits(k: usize, d: usize, dict_size: usize) -> bool {
     d > 0 && d <= k && k <= dict_size
 }
 
-fn check_dict_size(dict_size: usize) -> io::Result<()> {
-    if dict_size < SEGMENT_DICT_SIZE_MIN {
-        return Err(samples::invalid(&format!(
-            "a dictionary must be at least {SEGMENT_DICT_SIZE_MIN} bytes"
-        )));
+/// The samples and the dictionary size, checked in upstream zstd's order
+/// (`ZDICT_trainFromBuffer_cover`): no samples at all, then a dictionary too
+/// small; the remaining sample checks come after both.
+fn check_samples_and_dict_size<'s>(
+    samples: &'s [u8],
+    sample_sizes: &[usize],
+    dict_size: usize,
+) -> io::Result<samples::SampleSet<'s>> {
+    let set = samples::SampleSet::new(samples, sample_sizes)?;
+    if set.count() == 0 {
+        return Err(refuse(TrainingError::Samples, "there are no samples"));
     }
-    Ok(())
+    if dict_size < SEGMENT_DICT_SIZE_MIN {
+        return Err(refuse(
+            TrainingError::DictionaryTooSmall,
+            &format!("a dictionary must be at least {SEGMENT_DICT_SIZE_MIN} bytes"),
+        ));
+    }
+    Ok(set)
 }
 
 /// Train a COVER dictionary of at most `dict_size` bytes with the `k` and `d`
@@ -680,8 +699,9 @@ fn check_dict_size(dict_size: usize) -> io::Result<()> {
 /// # Errors
 ///
 /// `InvalidInput` when `k` or `d` is zero or `d > k`, when `k` exceeds
-/// `dict_size`, when `dict_size` is under 256 bytes, when there are fewer than
-/// five samples or they do not add up to `samples.len()`.
+/// `dict_size`, when `dict_size` is under [`SEGMENT_DICT_SIZE_MIN`], when there
+/// are fewer than five samples or they do not add up to `samples.len()`;
+/// [`TrainingError::of`] tells these causes apart.
 ///
 /// # Examples
 ///
@@ -769,8 +789,7 @@ fn run_cover(
     finalize: FinalizeOptions,
     space: &SearchSpace,
 ) -> io::Result<(Vec<u8>, CoverOptions)> {
-    check_dict_size(dict_size)?;
-    let set = samples::SampleSet::new(samples, sample_sizes)?;
+    let set = check_samples_and_dict_size(samples, sample_sizes, dict_size)?;
     let split = set.split(space.split_point)?;
     let plain = space.k.start() == space.k.end() && space.d.start() == space.d.end();
     // A plain run with no shrinking prices nothing: its one dictionary is the
@@ -785,6 +804,7 @@ fn run_cover(
         finalize,
     );
     let mut best = selection::Best::new();
+    let mut state = Vec::new();
     let mut context: Option<(usize, cover::CoverContext<'_>)> = None;
     for (d, k) in space.pairs() {
         if !segment_fits(k, d, dict_size) {
@@ -797,7 +817,7 @@ fn run_cover(
             context = Some((d, cover::CoverContext::new(&set, split.train, d)?));
         }
         let (_, ctx) = context.as_ref().expect("built above");
-        let content = ctx.build(&mut ctx.fresh_state(), dict_size, k);
+        let content = ctx.build(&mut state, dict_size, k);
         let chosen = CoverOptions {
             k: k as u32,
             d: d as u32,
@@ -914,26 +934,29 @@ fn run_fastcover(
     let f = if options.f == 0 { 20 } else { options.f };
     let accel = if options.accel == 0 { 1 } else { options.accel };
     if f > fastcover::MAX_F {
-        return Err(samples::invalid(&format!(
-            "f must be in 1..={}, got {f}",
-            fastcover::MAX_F
-        )));
+        return Err(refuse(
+            TrainingError::Parameter,
+            &format!("f must be in 1..={}, got {f}", fastcover::MAX_F),
+        ));
     }
     if accel > fastcover::MAX_ACCEL {
-        return Err(samples::invalid(&format!(
-            "accel must be in 1..={}, got {accel}",
-            fastcover::MAX_ACCEL
-        )));
+        return Err(refuse(
+            TrainingError::Parameter,
+            &format!("accel must be in 1..={}, got {accel}", fastcover::MAX_ACCEL),
+        ));
     }
     if *space.d.start() < 4 {
-        return Err(samples::invalid("FastCOVER needs d of at least 4"));
+        return Err(refuse(
+            TrainingError::Parameter,
+            "FastCOVER needs d of at least 4",
+        ));
     }
-    check_dict_size(dict_size)?;
-    let set = samples::SampleSet::new(samples, sample_sizes)?;
+    let set = check_samples_and_dict_size(samples, sample_sizes, dict_size)?;
     let split = set.split(space.split_point)?;
     let plain = space.k.start() == space.k.end() && space.d.start() == space.d.end();
     let scored = !plain || options.cover.shrink.is_some() || space.split_point < 1.0;
     let mut window = fastcover::WindowCounts::default();
+    let mut freqs = Vec::new();
     let mut best = selection::Best::new();
     let mut context: Option<(usize, fastcover::FastCoverContext<'_>)> = None;
     let mut evaluator: Option<selection::Evaluator<'_>> = None;
@@ -962,7 +985,7 @@ fn run_fastcover(
                 finalize,
             )
         });
-        let content = ctx.build(&mut ctx.fresh_freqs(), &mut window, dict_size, k)?;
+        let content = ctx.build(&mut freqs, &mut window, dict_size, k)?;
         let chosen = FastCoverOptions {
             cover: CoverOptions {
                 k: k as u32,

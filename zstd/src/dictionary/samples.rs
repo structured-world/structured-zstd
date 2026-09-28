@@ -2,7 +2,7 @@
 //! one ends.
 
 use core::ops::Range;
-use std::{io, vec::Vec};
+use std::{io, string::String, vec::Vec};
 
 /// Fewest samples the segment trainers build from (upstream zstd `cover.c`,
 /// `COVER_ctx_init`): a dmer's frequency is the number of samples holding it,
@@ -26,11 +26,19 @@ impl<'a> SampleSet<'a> {
             end = end
                 .checked_add(size)
                 .filter(|&end| end <= data.len())
-                .ok_or_else(|| invalid("the sample sizes add up to more than the samples"))?;
+                .ok_or_else(|| {
+                    refuse(
+                        TrainingError::Samples,
+                        "the sample sizes add up to more than the samples",
+                    )
+                })?;
             offsets.push(end);
         }
         if end != data.len() {
-            return Err(invalid("the sample sizes do not add up to the samples"));
+            return Err(refuse(
+                TrainingError::Samples,
+                "the sample sizes do not add up to the samples",
+            ));
         }
         Ok(Self { data, offsets })
     }
@@ -72,13 +80,17 @@ impl<'a> SampleSet<'a> {
             }
         };
         if split.train < MIN_TRAIN_SAMPLES {
-            return Err(invalid(&std::format!(
-                "{} training sample(s) is too few; at least {MIN_TRAIN_SAMPLES} are needed",
-                split.train
-            )));
+            return Err(refuse(
+                TrainingError::Samples,
+                &std::format!(
+                    "{} training sample(s) is too few; at least {MIN_TRAIN_SAMPLES} are needed",
+                    split.train
+                ),
+            ));
         }
         if split.test.is_empty() {
-            return Err(invalid(
+            return Err(refuse(
+                TrainingError::Samples,
                 "the split leaves no sample to score the dictionary on",
             ));
         }
@@ -95,6 +107,68 @@ pub(super) struct Split {
     pub(super) test: Range<usize>,
 }
 
-pub(super) fn invalid(reason: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, reason)
+/// Why a segment trainer refused its input. It rides inside the
+/// `InvalidInput` error the trainer returns; [`TrainingError::of`] reads it
+/// back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TrainingError {
+    /// A training parameter lies outside its range.
+    Parameter,
+    /// The samples cannot be trained on: none, too few, or too few or too many
+    /// bytes.
+    Samples,
+    /// The dictionary asked for is smaller than
+    /// [`SEGMENT_DICT_SIZE_MIN`](super::SEGMENT_DICT_SIZE_MIN).
+    DictionaryTooSmall,
+}
+
+impl TrainingError {
+    /// The cause carried by an error a trainer returned, or `None` for one it
+    /// did not raise itself (a failed read, write or allocation).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_zstd::dictionary::{
+    ///     CoverOptions, FinalizeOptions, TrainingError, train_cover_dict,
+    /// };
+    ///
+    /// let options = CoverOptions { k: 64, d: 8, ..CoverOptions::default() };
+    /// let err = train_cover_dict(&[0; 64], &[64], 100, &options, FinalizeOptions::default())
+    ///     .unwrap_err();
+    /// assert_eq!(TrainingError::of(&err), Some(TrainingError::DictionaryTooSmall));
+    /// ```
+    pub fn of(error: &io::Error) -> Option<Self> {
+        error
+            .get_ref()?
+            .downcast_ref::<Refusal>()
+            .map(|refusal| refusal.cause)
+    }
+}
+
+/// A trainer's refusal: its cause, and the reason shown to a person.
+#[derive(Debug)]
+struct Refusal {
+    cause: TrainingError,
+    reason: String,
+}
+
+impl core::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// An `InvalidInput` error carrying `cause`.
+pub(super) fn refuse(cause: TrainingError, reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        Refusal {
+            cause,
+            reason: reason.into(),
+        },
+    )
 }
