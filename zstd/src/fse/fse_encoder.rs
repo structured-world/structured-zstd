@@ -287,20 +287,31 @@ impl FSETable {
         // single source of truth shared with the pre-build cost estimate in
         // `fse_header_bits_for_counts` (the table-mode selector prices a
         // candidate table from its normalized counts without building it).
-        let probs: [i32; 256] = core::array::from_fn(|i| self.states[i].probability);
-        ncount_header_bits(&probs, self.acc_log())
+        let states = &self.states;
+        ncount_header_bits(states.len(), |i| states[i].probability, self.acc_log())
     }
 
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
-        let probs: [i32; 256] = core::array::from_fn(|i| self.states[i].probability);
-        write_ncount(&probs, self.acc_log(), writer);
+        let states = &self.states;
+        write_ncount(
+            states.len(),
+            |i| states[i].probability,
+            self.acc_log(),
+            writer,
+        );
     }
 }
 
-/// Write the NCount description of the normalized distribution `probs` at
-/// `acc_log` (RFC 8878 4.1.1), padded to a byte; what [`FSETable::write_table`]
-/// writes for a built table, from the normalized counts alone.
-fn write_ncount<V: AsMut<Vec<u8>>>(probs: &[i32], acc_log: u8, writer: &mut BitWriter<V>) {
+/// Write the NCount description of the normalized distribution of `len`
+/// symbols, `prob(i)` the probability of symbol `i`, at `acc_log` (RFC 8878
+/// 4.1.1), padded to a byte. The probabilities are read where they live, so a
+/// built table and a bare distribution share the writer without a copy.
+fn write_ncount<V: AsMut<Vec<u8>>>(
+    len: usize,
+    prob: impl Fn(usize) -> i32 + Copy,
+    acc_log: u8,
+    writer: &mut BitWriter<V>,
+) {
     assert!(
         writer.index().is_multiple_of(8),
         "FSE table headers must start on a byte boundary"
@@ -318,9 +329,9 @@ fn write_ncount<V: AsMut<Vec<u8>>>(probs: &[i32], acc_log: u8, writer: &mut BitW
         let low_threshold = ((1 << bits_to_write) - 1) - (max_remaining_value);
         let mask = (1 << (bits_to_write - 1)) - 1;
 
-        let prob = probs[prob_idx];
+        let p = prob(prob_idx);
         prob_idx += 1;
-        let value = (prob + 1) as u32;
+        let value = (p + 1) as u32;
         if value < low_threshold as u32 {
             writer.write_bits(value, bits_to_write as usize - 1);
         } else if value > mask {
@@ -329,13 +340,13 @@ fn write_ncount<V: AsMut<Vec<u8>>>(probs: &[i32], acc_log: u8, writer: &mut BitW
             writer.write_bits(value, bits_to_write as usize);
         }
 
-        if prob == -1 {
+        if p == -1 {
             probability_counter += 1;
-        } else if prob > 0 {
-            probability_counter += prob as usize;
+        } else if p > 0 {
+            probability_counter += p as usize;
         } else {
             let mut zeros = 0u8;
-            while prob_idx < probs.len() && probs[prob_idx] == 0 {
+            while prob_idx < len && prob(prob_idx) == 0 {
                 zeros += 1;
                 prob_idx += 1;
                 if zeros == 3 {
@@ -350,7 +361,7 @@ fn write_ncount<V: AsMut<Vec<u8>>>(probs: &[i32], acc_log: u8, writer: &mut BitW
     #[cfg(debug_assertions)]
     {
         let written_bits = writer.index() - start_idx;
-        let computed = ncount_header_bits(probs, acc_log);
+        let computed = ncount_header_bits(len, prob, acc_log);
         debug_assert_eq!(
             written_bits, computed,
             "ncount_header_bits() mismatch: written={written_bits}, computed={computed}"
@@ -533,7 +544,7 @@ pub(crate) fn write_ncount_at_log<V: AsMut<Vec<u8>>>(
         max_symbol,
         true,
     );
-    write_ncount(&probs[..=max_symbol], table_log, writer);
+    write_ncount(max_symbol + 1, |i| probs[i], table_log, writer);
 }
 
 #[cfg(any(test, feature = "fuzz-exports"))]
@@ -578,13 +589,13 @@ pub(crate) fn build_table_from_counts_into(
 }
 
 /// Bit size of the serialized FSE NCount table header for the normalized
-/// distribution `probs` at `acc_log`. This is exactly what
-/// [`FSETable::table_header_bits`] returns (they share this implementation),
-/// but computed from the normalized counts alone — no spread / state-table /
-/// `symbolTT` construction. The table-mode selector uses it to price a
-/// candidate custom table without building its (otherwise discarded) state
-/// tables.
-fn ncount_header_bits(probs: &[i32], acc_log: u8) -> usize {
+/// distribution of `len` symbols, `prob(i)` the probability of symbol `i`, at
+/// `acc_log`. This is exactly what [`FSETable::table_header_bits`] returns
+/// (they share this implementation), but computed from the normalized counts
+/// alone — no spread / state-table / `symbolTT` construction. The table-mode
+/// selector uses it to price a candidate custom table without building its
+/// (otherwise discarded) state tables.
+fn ncount_header_bits(len: usize, prob: impl Fn(usize) -> i32, acc_log: u8) -> usize {
     let mut bits = 4; // acc_log - 5
     let mut probability_counter = 0usize;
     let probability_sum = 1usize << acc_log;
@@ -595,22 +606,22 @@ fn ncount_header_bits(probs: &[i32], acc_log: u8) -> usize {
         let bits_to_write = max_remaining_value.ilog2() + 1;
         let low_threshold = ((1 << bits_to_write) - 1) - max_remaining_value;
 
-        let prob = probs[prob_idx];
+        let p = prob(prob_idx);
         prob_idx += 1;
-        let value = (prob + 1) as u32;
+        let value = (p + 1) as u32;
         if value < low_threshold as u32 {
             bits += bits_to_write as usize - 1;
         } else {
             bits += bits_to_write as usize;
         }
 
-        if prob == -1 {
+        if p == -1 {
             probability_counter += 1;
-        } else if prob > 0 {
-            probability_counter += prob as usize;
+        } else if p > 0 {
+            probability_counter += p as usize;
         } else {
             let mut zeros = 0u8;
-            while prob_idx < probs.len() && probs[prob_idx] == 0 {
+            while prob_idx < len && prob(prob_idx) == 0 {
                 zeros += 1;
                 prob_idx += 1;
                 if zeros == 3 {
@@ -667,7 +678,7 @@ pub(crate) fn fse_header_bits_for_counts(
         max_symbol,
         avoid_0_numbit,
     );
-    ncount_header_bits(&probs[..counts.len()], table_log)
+    ncount_header_bits(counts.len(), |i| probs[i], table_log)
 }
 
 fn min_table_log(total: usize, max_symbol: usize) -> u8 {
