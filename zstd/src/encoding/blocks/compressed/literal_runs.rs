@@ -60,6 +60,12 @@ pub(super) fn gather_literals(
             feature = "kernel-neon"
         ))]
         FastpathKernel::Neon => gather_neon(block, sequences, tail, dst),
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel-simd128"
+        ))]
+        FastpathKernel::Simd128 => gather_simd128(block, sequences, tail, dst),
         _ => gather_scalar(block, sequences, tail, dst),
     }
 }
@@ -216,6 +222,26 @@ fn gather_neon(block: &[u8], sequences: &[RawSequence], tail: usize, dst: &mut R
         simd_copy::copy_scalar,
         core::mem::size_of::<usize>()
     );
+}
+
+/// wasm SIMD is a compile-time feature, so the tier needs no
+/// `#[target_feature]` wrapper; it takes its own loop all the same, with the
+/// 16-byte `v128` kernels.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel-simd128"
+))]
+fn gather_simd128(block: &[u8], sequences: &[RawSequence], tail: usize, dst: &mut RegionVec<u8>) {
+    gather_body!(
+        block,
+        sequences,
+        tail,
+        dst,
+        simd_copy::copy_exact_simd128,
+        simd_copy::copy_simd128,
+        16
+    )
 }
 
 fn gather_scalar(block: &[u8], sequences: &[RawSequence], tail: usize, dst: &mut RegionVec<u8>) {

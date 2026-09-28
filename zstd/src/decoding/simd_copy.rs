@@ -869,7 +869,7 @@ pub(crate) unsafe fn copy_neon(mut src: *const u8, mut dst: *mut u8, len: usize)
     feature = "kernel-simd128"
 ))]
 #[inline(always)]
-unsafe fn copy_simd128(mut src: *const u8, mut dst: *mut u8, len: usize) {
+pub(crate) unsafe fn copy_simd128(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
     while src < end {
         unsafe {
@@ -1068,6 +1068,46 @@ pub(crate) unsafe fn copy_exact_neon(src: *const u8, dst: *mut u8, len: usize) {
         if o < len {
             let t = len - 16;
             vst1q_u8(dst.add(t), vld1q_u8(src.add(t)));
+        }
+    }
+}
+
+/// WebAssembly `simd128` exact copy for `len >= 33`, the shape of
+/// [`copy_exact_neon`]: 2×16B per iteration and one overlapping 16B tail.
+///
+/// # Safety
+/// `src` readable and `dst` writable for `len` bytes, the regions
+/// non-overlapping; `len >= 33`.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel-simd128"
+))]
+#[inline]
+pub(crate) unsafe fn copy_exact_simd128(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(len >= 33, "copy_exact_simd128 requires len >= 33");
+    let mut o = 0usize;
+    unsafe {
+        while o + 32 <= len {
+            let v0 = v128_load(src.add(o).cast::<v128>());
+            let v1 = v128_load(src.add(o + 16).cast::<v128>());
+            v128_store(dst.add(o).cast::<v128>(), v0);
+            v128_store(dst.add(o + 16).cast::<v128>(), v1);
+            o += 32;
+        }
+        while o + 16 <= len {
+            v128_store(
+                dst.add(o).cast::<v128>(),
+                v128_load(src.add(o).cast::<v128>()),
+            );
+            o += 16;
+        }
+        if o < len {
+            let t = len - 16;
+            v128_store(
+                dst.add(t).cast::<v128>(),
+                v128_load(src.add(t).cast::<v128>()),
+            );
         }
     }
 }

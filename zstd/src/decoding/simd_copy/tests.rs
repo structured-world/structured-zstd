@@ -60,6 +60,12 @@ fn runnable_medium_kernels() -> vec::Vec<(&'static str, CopyKernel)> {
         feature = "kernel-neon"
     ))]
     kernels.push(("copy_exact_neon", copy_exact_neon));
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    kernels.push(("copy_exact_simd128", copy_exact_simd128));
     kernels
 }
 
