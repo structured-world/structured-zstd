@@ -220,7 +220,7 @@ const CEILING_NONE: u8 = u8::MAX;
 /// [`CpuCeilingError::AlreadyResolved`] once any kernel has been chosen or a
 /// ceiling set. Building a codec context can already choose kernels (a
 /// decoder does, at construction), and so does querying one
-/// ([`active_cpu_kernel_name`](crate::active_cpu_kernel_name),
+/// ([`active_cpu_kernel_name`],
 /// [`cpu_ceiling`]): set the ceiling before creating any context, not merely
 /// before the first compression or decompression.
 /// [`CpuCeilingError::OtherArchitecture`] for a level of another architecture.
