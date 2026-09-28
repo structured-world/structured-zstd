@@ -115,9 +115,22 @@ fn check_overshooting_copy<K: crate::cpu_kernel::CpuKernel>(kernel: &str) {
 #[test]
 fn every_runnable_kernel_keeps_the_wildcopy_contract() {
     check_overshooting_copy::<crate::cpu_kernel::ScalarKernel>("scalar");
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-bmi2"
+    ))]
+    if std::arch::is_x86_feature_detected!("bmi2") {
+        check_overshooting_copy::<crate::cpu_kernel::Bmi2Kernel>("bmi2");
+    }
     #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-avx2"))]
     if std::arch::is_x86_feature_detected!("avx2") {
         check_overshooting_copy::<crate::cpu_kernel::Avx2Kernel>("avx2");
+    }
+    // The VBMI2 tier copies with AVX2, so AVX2 is all its copy needs here.
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-vbmi2"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        check_overshooting_copy::<crate::cpu_kernel::Vbmi2Kernel>("vbmi2");
     }
 }
 
