@@ -3379,8 +3379,21 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // files then yield the same corpus. `-M` caps what is loaded, as the
     // reference's command passes its memory limit to `DiB_trainFromFiles`
     // (zstdcli.c), which keeps whole samples up to it (dibio.c).
-    let set = load_training_samples(&opts.inputs, opts.block_size, opts.memory_limit)?;
     let failed = |err: std::io::Error| eyre!("dictionary training failed: {err}");
+    // How many samples the trainer builds from after its split is known from
+    // the files' sizes, so a count it must refuse is refused before loading.
+    let enough_samples = |count: usize| match &plan {
+        Plan::FastCover(options) => {
+            structured_zstd::dictionary::check_fastcover_sample_count(options, count)
+        }
+        Plan::Cover(options) => {
+            structured_zstd::dictionary::check_cover_sample_count(options, count)
+        }
+        Plan::Legacy => Ok(()),
+    };
+    let set = load_training_samples(&opts.inputs, opts.block_size, opts.memory_limit, |count| {
+        enough_samples(count).map_err(failed)
+    })?;
     let dict = match plan {
         Plan::Legacy => {
             let mut dict = Vec::new();
@@ -3531,10 +3544,13 @@ fn training_extent(file_sizes: &[u64], block_size: Option<u64>) -> (u128, u128) 
 /// shuffled order, each one sample of at most [`TRAINING_SAMPLE_MAX`] bytes, or
 /// cut whole into `block_size` samples when `-B` gives one; empty files left
 /// out; at most [`TRAINING_DATA_MAX`] bytes, or `memory_limit` when smaller.
+/// `enough_samples` is asked, before any file is read, whether the trainer can
+/// build from as many samples as the files make.
 fn load_training_samples(
     inputs: &[PathBuf],
     block_size: Option<u64>,
     memory_limit: Option<u64>,
+    enough_samples: impl Fn(usize) -> Result<()>,
 ) -> Result<TrainingSet> {
     let mut order: Vec<&PathBuf> = inputs.iter().collect();
     shuffle_training_files(&mut order);
@@ -3554,6 +3570,9 @@ fn load_training_samples(
              split files into fixed-size samples with -B#"
         );
     }
+    // At most this many are loaded, fewer under a memory limit: a count
+    // refused here is refused for whatever subset the limit keeps.
+    enough_samples(usize::try_from(samples).unwrap_or(usize::MAX))?;
     // The budget holds each sample's recorded length as well as its bytes: under
     // a small `-B` the lengths outweigh the bytes they describe, a word per byte
     // at `-B1`, and a limit on the bytes alone would be exceeded by the list.

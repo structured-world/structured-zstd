@@ -66,36 +66,40 @@ impl<'a> SampleSet<'a> {
     /// `split_point` share builds and the rest scores; at 1 every sample does
     /// both.
     pub(super) fn split(&self, split_point: f64) -> io::Result<Split> {
-        let count = self.count();
-        let split = if split_point < 1.0 {
-            let train = (count as f64 * split_point) as usize;
-            Split {
-                train,
-                test: train..count,
-            }
-        } else {
-            Split {
-                train: count,
-                test: 0..count,
-            }
-        };
-        if split.train < MIN_TRAIN_SAMPLES {
-            return Err(refuse(
-                TrainingError::Samples,
-                &std::format!(
-                    "{} training sample(s) is too few; at least {MIN_TRAIN_SAMPLES} are needed",
-                    split.train
-                ),
-            ));
-        }
-        if split.test.is_empty() {
-            return Err(refuse(
-                TrainingError::Samples,
-                "the split leaves no sample to score the dictionary on",
-            ));
-        }
-        Ok(split)
+        split_count(self.count(), split_point)
     }
+}
+
+/// [`SampleSet::split`] of `count` samples, which needs only their number.
+pub(super) fn split_count(count: usize, split_point: f64) -> io::Result<Split> {
+    let split = if split_point < 1.0 {
+        let train = (count as f64 * split_point) as usize;
+        Split {
+            train,
+            test: train..count,
+        }
+    } else {
+        Split {
+            train: count,
+            test: 0..count,
+        }
+    };
+    if split.train < MIN_TRAIN_SAMPLES {
+        return Err(refuse(
+            TrainingError::Samples,
+            &std::format!(
+                "{} training sample(s) is too few; at least {MIN_TRAIN_SAMPLES} are needed",
+                split.train
+            ),
+        ));
+    }
+    if split.test.is_empty() {
+        return Err(refuse(
+            TrainingError::Samples,
+            "the split leaves no sample to score the dictionary on",
+        ));
+    }
+    Ok(split)
 }
 
 /// How the samples divide between building a dictionary and scoring it.

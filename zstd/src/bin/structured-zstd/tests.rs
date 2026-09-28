@@ -658,6 +658,36 @@ fn tuning_that_fits_no_dictionary_is_refused_before_the_samples_are_read() {
     }
 }
 
+/// Six samples pass the count every trainer needs, but the default search
+/// builds from three quarters of them, four, which is too few: that is known
+/// from the files' sizes, so it is refused before any is read. The samples
+/// cannot be opened, so only a check made first can answer; run with the
+/// rights to open them anyway, the refusal comes after loading, with the same
+/// cause.
+#[cfg(unix)]
+#[test]
+fn a_split_that_leaves_too_few_samples_is_refused_before_they_are_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Scratch::new("split-too-few");
+    let mut inputs = Vec::new();
+    for i in 0..6 {
+        let sample = dir.file(&format!("s{i}"), &vec![b'a' + i as u8; 1000]);
+        fs::set_permissions(&sample, fs::Permissions::from_mode(0o000)).unwrap();
+        inputs.push(sample);
+    }
+    let mut opts = parse(&["--train", "--maxdict=4096", "-o", "d", "s"]).unwrap();
+    opts.inputs = inputs;
+    opts.output = Some(dir.path().join("dictionary"));
+    let err = train_dictionary(&opts)
+        .expect_err("four samples build no dictionary")
+        .to_string();
+
+    assert!(
+        err.starts_with("dictionary training failed:") && err.contains("too few"),
+        "the split must be what is refused, before the unreadable samples: {err}"
+    );
+}
+
 /// The split a tuning report shows is the percentage it was given as, for
 /// every percentage: `29 / 100.0 * 100.0` is 28.999..., which a truncating
 /// conversion reported as 28.
@@ -1034,7 +1064,7 @@ fn training_sample_sizes_count_against_the_budget() {
     let input = std::env::temp_dir().join(format!("szstd-train-b1-{}", std::process::id()));
     fs::write(&input, [3u8; 64]).unwrap();
 
-    let set = load_training_samples(std::slice::from_ref(&input), Some(1), Some(200));
+    let set = load_training_samples(std::slice::from_ref(&input), Some(1), Some(200), |_| Ok(()));
 
     let _ = fs::remove_file(&input);
     let set = set.expect("the samples load within the budget");
@@ -1074,6 +1104,7 @@ fn a_block_size_at_the_top_of_the_range_loads_whole_files() {
         ],
         Some(u64::MAX),
         None,
+        |_| Ok(()),
     );
 
     let _ = fs::remove_file(&input);
@@ -1965,11 +1996,11 @@ fn training_samples_are_loaded_the_way_the_reference_loads_them() {
     let inputs = vec![big.clone(), small.clone(), empty.clone()];
 
     assert!(
-        load_training_samples(&inputs, None, None).is_err(),
+        load_training_samples(&inputs, None, None, |_| Ok(())).is_err(),
         "two samples are too few"
     );
 
-    let cut = load_training_samples(&inputs, Some(64 << 10), None).unwrap();
+    let cut = load_training_samples(&inputs, Some(64 << 10), None, |_| Ok(())).unwrap();
     let mut sizes = cut.sizes.clone();
     sizes.sort_unstable();
     assert_eq!(
@@ -1982,13 +2013,13 @@ fn training_samples_are_loaded_the_way_the_reference_loads_them() {
     for i in 0..5 {
         many.push(dir.file(&format!("big{i}"), &vec![b'y'; 200 << 10]));
     }
-    let capped = load_training_samples(&many, None, None).unwrap();
+    let capped = load_training_samples(&many, None, None, |_| Ok(())).unwrap();
     assert_eq!(
         capped.sizes,
         vec![128 << 10; 5],
         "each file capped at 128 KiB"
     );
-    let limited = load_training_samples(&many, None, Some(300 << 10)).unwrap();
+    let limited = load_training_samples(&many, None, Some(300 << 10), |_| Ok(())).unwrap();
     assert_eq!(limited.sizes.len(), 2, "-M bounds what is loaded");
 }
 

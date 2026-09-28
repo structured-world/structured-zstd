@@ -772,6 +772,55 @@ pub fn check_fastcover_options(options: &FastCoverOptions, dict_size: usize) -> 
     space.check_fits(dict_size)
 }
 
+/// Refuse `sample_count` samples the COVER training `options` select cannot
+/// build from: too few once the split takes its scoring share, or none left to
+/// score on. Needs only the count, so a caller can ask before reading a sample.
+///
+/// # Errors
+///
+/// `InvalidInput` for tuning out of range, where [`TrainingError::of`]
+/// reports [`TrainingError::Parameter`], and for too few samples, where it
+/// reports [`TrainingError::Samples`].
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{CoverOptions, check_cover_sample_count};
+///
+/// // The search builds from the leading three quarters of the samples.
+/// let search = CoverOptions { split_point: 0.75, ..CoverOptions::default() };
+/// assert!(check_cover_sample_count(&search, 6).is_err());
+/// assert!(check_cover_sample_count(&search, 8).is_ok());
+/// ```
+pub fn check_cover_sample_count(options: &CoverOptions, sample_count: usize) -> io::Result<()> {
+    let space = SearchSpace::selected(options, 1.0)?;
+    samples::split_count(sample_count, space.split_point).map(drop)
+}
+
+/// [`check_cover_sample_count`] for FastCOVER, whose search scores on a
+/// quarter of the samples unless `split_point` says otherwise.
+///
+/// # Errors
+///
+/// As [`check_cover_sample_count`].
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{FastCoverOptions, check_fastcover_sample_count};
+///
+/// let search = FastCoverOptions::default();
+/// assert!(check_fastcover_sample_count(&search, 6).is_err());
+/// assert!(check_fastcover_sample_count(&search, 8).is_ok());
+/// ```
+pub fn check_fastcover_sample_count(
+    options: &FastCoverOptions,
+    sample_count: usize,
+) -> io::Result<()> {
+    let space = SearchSpace::selected(&options.cover, 0.75)?;
+    samples::split_count(sample_count, space.split_point).map(drop)
+}
+
 /// The table width and acceleration `options` run with, zero meaning upstream
 /// zstd's defaults, refused where FastCOVER cannot run them.
 fn fastcover_knobs(options: &FastCoverOptions, space: &SearchSpace) -> io::Result<(u32, u32)> {
