@@ -2,8 +2,7 @@ use super::*;
 use std::collections::BTreeMap;
 
 /// Upstream zstd `COVER_computeEpochs`: the target count stands while epochs
-/// stay ten segments long, and otherwise fewer epochs of at least ten segments
-/// share the corpus.
+/// stay ten segments long, and otherwise epochs are ten segments each.
 #[test]
 fn epochs_follow_the_reference_formula() {
     assert_eq!(
@@ -20,16 +19,6 @@ fn epochs_follow_the_reference_formula() {
             size: 1_000
         }
     );
-    // Short epochs fall back to fewer of them, which then share the whole
-    // corpus: five epochs of 1,100 dmers, not five of 1,000 that never reach
-    // the last 500.
-    assert_eq!(
-        compute_epochs(4096, 5_500, 100, 4),
-        Epochs {
-            num: 5,
-            size: 1_100
-        }
-    );
     // Fewer dmers than one floor-sized epoch: one epoch of all of them.
     assert_eq!(
         compute_epochs(4096, 300, 100, 4),
@@ -40,6 +29,23 @@ fn epochs_follow_the_reference_formula() {
         compute_epochs(4096, 300, usize::MAX / 4, 1),
         Epochs { num: 1, size: 300 }
     );
+}
+
+/// Five floor-sized epochs of 1,000 dmers leave 500 of 5,500 over; the last
+/// epoch takes them, so no dmer of the corpus goes unscanned.
+#[test]
+fn the_last_epoch_runs_to_the_end_of_the_corpus() {
+    let epochs = compute_epochs(4096, 5_500, 100, 4);
+    assert_eq!(
+        epochs,
+        Epochs {
+            num: 5,
+            size: 1_000
+        }
+    );
+    assert_eq!(epochs.bounds(0, 5_500), (0, 1_000));
+    assert_eq!(epochs.bounds(3, 5_500), (3_000, 4_000));
+    assert_eq!(epochs.bounds(4, 5_500), (4_000, 5_500));
 }
 
 /// A dmer's frequency is the number of samples it lies in: repeats inside

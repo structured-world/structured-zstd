@@ -27,6 +27,24 @@ pub(super) struct Epochs {
     pub(super) size: usize,
 }
 
+impl Epochs {
+    /// The dmers epoch `epoch` spans. The last one runs to the end of the
+    /// corpus: `num * size` can fall short of it by up to one epoch, which
+    /// upstream zstd never scans. Stretching the last epoch covers that tail
+    /// at the cost of one longer epoch per cycle; widening every epoch to share
+    /// it scans more on every visit and measured about a tenth more work.
+    #[inline]
+    pub(super) fn bounds(self, epoch: usize, nb_dmers: usize) -> (usize, usize) {
+        let begin = epoch * self.size;
+        let end = if epoch + 1 == self.num {
+            nb_dmers
+        } else {
+            begin + self.size
+        };
+        (begin, end)
+    }
+}
+
 /// Upstream zstd `COVER_computeEpochs`: aim for `passes` selections per epoch
 /// over a dictionary of `max_dict_size`, but keep an epoch at least ten
 /// segments long so it can hold a useful one. `nb_dmers` is at least one.
@@ -45,13 +63,9 @@ pub(super) fn compute_epochs(
     if size >= min_epoch_size {
         return Epochs { num, size };
     }
-    // Fewer epochs of at least the floor, sized to share the whole corpus.
-    // Upstream keeps them at the floor, which leaves up to one epoch at the
-    // corpus end that no build ever scans.
-    let num = nb_dmers / min_epoch_size;
     Epochs {
-        num,
-        size: nb_dmers / num,
+        num: nb_dmers / min_epoch_size,
+        size: min_epoch_size,
     }
 }
 
@@ -144,10 +158,9 @@ impl<'s> CoverContext<'s> {
         let mut zero_score_run = 0usize;
         let mut epoch = 0usize;
         while tail > 0 {
-            let begin = epoch * epochs.size;
+            let (begin, end) = epochs.bounds(epoch, nb_dmers);
             epoch = (epoch + 1) % epochs.num;
-            let segment =
-                select_segment(&self.dmer_at, state, begin, begin + epochs.size, dmers_in_k);
+            let segment = select_segment(&self.dmer_at, state, begin, end, dmers_in_k);
             if segment.score == 0 {
                 // This epoch is spent; others may not be yet.
                 zero_score_run += 1;

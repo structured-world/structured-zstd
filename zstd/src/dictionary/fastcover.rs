@@ -2,7 +2,7 @@
 //! entries instead of indexed exactly, and optionally only every
 //! `accel`-th position counted (upstream zstd `fastcover.c`).
 
-use super::cover::compute_epochs;
+use super::cover::{Epochs, compute_epochs};
 use super::samples::{SampleSet, TrainingError, refuse};
 use alloc::vec::Vec;
 use std::io;
@@ -186,57 +186,49 @@ impl<'s> FastCoverContext<'s> {
                 entries: self.freqs.len(),
             })?;
         freqs.extend_from_slice(&self.freqs);
-        let epochs = compute_epochs(capacity, self.nb_dmers, k, 1);
         let layout = EpochLayout {
             dmers_in_k: k - self.d + 1,
-            epoch_size: epochs.size,
-            epoch_count: epochs.num,
+            epochs: compute_epochs(capacity, self.nb_dmers, k, 1),
         };
+        // Only bytes past the final `tail` are returned, so what an earlier
+        // build left before it needs no clearing.
+        out.resize(capacity, 0);
         // A window holds at most `dmers_in_k + 1` occurrences of one index (one
         // past the segment before the oldest leaves). Upstream zstd keeps them in
         // `u16` for any `k`; a longer segment than that counts in `u32`.
         let tail = if layout.dmers_in_k < usize::from(u16::MAX) {
             let counts = window.narrow.get_or_insert_with_result(self.f)?;
-            self.select_segments(out, capacity, freqs, counts, layout)
+            self.select_segments(out, freqs, counts, layout)
         } else {
             let counts = window.wide.get_or_insert_with_result(self.f)?;
-            self.select_segments(out, capacity, freqs, counts, layout)
+            self.select_segments(out, freqs, counts, layout)
         };
         Ok(&out[tail..])
     }
 
-    /// Pick a segment per epoch visit until `capacity` bytes are filled, and
-    /// return where the content starts in `out`.
+    /// Pick a segment per epoch visit until `out` is filled from its end, and
+    /// return where the content starts in it.
     fn select_segments<C: WindowCount>(
         &self,
-        out: &mut Vec<u8>,
-        capacity: usize,
+        out: &mut [u8],
         freqs: &mut [u32],
         segment_freqs: &mut [C],
         layout: EpochLayout,
     ) -> usize {
-        let EpochLayout {
-            dmers_in_k,
-            epoch_size,
-            epoch_count,
-        } = layout;
+        let EpochLayout { dmers_in_k, epochs } = layout;
         let (sample, f, d) = (self.data, self.f, self.d);
         let zero = C::from(0);
         let one = C::from(1);
         // Fill from the back (upstream zstd layout) so the best segments sit at
         // the end of the dictionary and get referenced with the smallest offsets.
-        // Only bytes past the final `tail` are returned, so what an earlier
-        // build left before it needs no clearing.
-        out.resize(capacity, 0);
-        let mut tail = capacity;
+        let mut tail = out.len();
         const MAX_ZERO_SCORE_RUN: usize = 10;
         let mut zero_score_run = 0usize;
         let mut epoch = 0usize;
 
         while tail > 0 {
-            let epoch_begin = epoch * epoch_size;
-            let epoch_end = epoch_begin + epoch_size;
-            epoch = (epoch + 1) % epoch_count;
+            let (epoch_begin, epoch_end) = epochs.bounds(epoch, self.nb_dmers);
+            epoch = (epoch + 1) % epochs.num;
 
             // Slide the candidate window across the epoch, tracking the best
             // segment (upstream zstd `FASTCOVER_selectSegment`).
@@ -317,8 +309,7 @@ impl<'s> FastCoverContext<'s> {
 #[derive(Clone, Copy)]
 struct EpochLayout {
     dmers_in_k: usize,
-    epoch_size: usize,
-    epoch_count: usize,
+    epochs: Epochs,
 }
 
 /// A dmer's occurrence count in the candidate window.
