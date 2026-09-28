@@ -196,7 +196,7 @@ pub(crate) const BASELINE_COPY_CHUNK: usize = if cfg!(any(
 )) {
     16
 } else {
-    core::mem::size_of::<usize>()
+    SCALAR_COPY_CHUNK
 };
 
 /// Copies `len` bytes, a multiple of [`BASELINE_COPY_CHUNK`], in whole chunks
@@ -305,7 +305,12 @@ pub(crate) unsafe fn copy16_baseline(src: *const u8, dst: *mut u8) {
     }
 }
 
-/// Chunk width of [`copy_chunks_portable`]: a machine word, or the `simd128`
+/// Chunk width of [`copy_scalar`]: a 64-bit word on every target. A 32-bit
+/// target's pointer-sized word would halve the stride of every copy the
+/// portable paths make.
+pub(crate) const SCALAR_COPY_CHUNK: usize = 8;
+
+/// Chunk width of [`copy_chunks_portable`]: a 64-bit word, or the `simd128`
 /// vector on wasm, where a build's SIMD is fixed at compile time and there is
 /// no run-time tier to choose it.
 pub(crate) const PORTABLE_COPY_CHUNK: usize = if cfg!(all(
@@ -315,7 +320,7 @@ pub(crate) const PORTABLE_COPY_CHUNK: usize = if cfg!(all(
 )) {
     16
 } else {
-    core::mem::size_of::<usize>()
+    SCALAR_COPY_CHUNK
 };
 
 /// Copies `len` bytes, a multiple of [`PORTABLE_COPY_CHUNK`], in whole chunks
@@ -478,10 +483,9 @@ pub(crate) unsafe fn copy_bytes_overshooting<K: CpuKernel>(
         }
     }
 
-    // Final fallback: machine-word chunks if the slack permits, else an exact
-    // byte copy.
-    let scalar_chunk = core::mem::size_of::<usize>();
-    let rounded = copy_at_least.next_multiple_of(scalar_chunk);
+    // Final fallback: 64-bit chunks if the slack permits, else an exact byte
+    // copy.
+    let rounded = copy_at_least.next_multiple_of(SCALAR_COPY_CHUNK);
     if min_buffer_size >= rounded {
         unsafe { copy_scalar(src.0, dst.0, rounded) };
     } else {
@@ -579,7 +583,8 @@ pub(crate) fn active_chunk_size_for_tests() -> usize {
     <crate::cpu_kernel::ScalarKernel as CpuKernel>::COPY_CHUNK
 }
 
-/// Copies `len` bytes, a multiple of `usize`, one `usize` at a time.
+/// Copies `len` bytes, a multiple of [`SCALAR_COPY_CHUNK`], one `u64` at a
+/// time.
 ///
 /// # Safety
 /// `src` readable and `dst` writable for `len` bytes; regions non-overlapping.
@@ -588,10 +593,10 @@ pub(crate) unsafe fn copy_scalar(mut src: *const u8, mut dst: *mut u8, len: usiz
     let end = unsafe { src.add(len) };
     while src < end {
         unsafe {
-            dst.cast::<usize>()
-                .write_unaligned(src.cast::<usize>().read_unaligned());
-            src = src.add(core::mem::size_of::<usize>());
-            dst = dst.add(core::mem::size_of::<usize>());
+            dst.cast::<u64>()
+                .write_unaligned(src.cast::<u64>().read_unaligned());
+            src = src.add(SCALAR_COPY_CHUNK);
+            dst = dst.add(SCALAR_COPY_CHUNK);
         }
     }
 }

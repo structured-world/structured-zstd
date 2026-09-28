@@ -1,13 +1,15 @@
 use super::*;
 
 /// `CpuLevel::Scalar` is portable code only, so the scalar tier copies in
-/// machine words whatever vector the build's baseline carries: a ceiling at
+/// 64-bit words whatever vector the build's baseline carries: a ceiling at
 /// Scalar, or a comparison against it, would otherwise still run SIMD copies.
-/// wasm has no run-time tier, so its build's `simd128` is the one it has.
+/// The word is 64 bits on 32-bit targets too, where a pointer-sized word halves
+/// every copy's stride. wasm has no run-time tier, so its build's `simd128` is
+/// the one it has.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
-fn the_scalar_tier_copies_in_machine_words() {
-    assert_eq!(ScalarKernel::COPY_CHUNK, core::mem::size_of::<usize>());
+fn the_scalar_tier_copies_in_64_bit_words() {
+    assert_eq!(ScalarKernel::COPY_CHUNK, 8);
 }
 
 /// A ceiling admits its own rung and those below it on its own ladder, and
