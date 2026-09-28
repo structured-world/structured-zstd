@@ -919,17 +919,24 @@ pub(crate) unsafe fn copy_exact_small(src: *const u8, dst: *mut u8, len: usize) 
     }
 }
 
-/// AVX2 exact copy for `len >= 33`, in builds whose baseline carries AVX2
-/// (`-C target-cpu=x86-64-v3` and up): branchless size classes up to 128
-/// bytes, then a 2×32B-unrolled loop, an exact 32B cleanup and one
-/// overlapping 32B tail.
+/// AVX2 exact copy for `len >= 33`: branchless size classes up to 128 bytes,
+/// then a 2×32B-unrolled loop, an exact 32B cleanup and one overlapping 32B
+/// tail. Reads and writes strictly `[0, len)`.
+///
+/// `#[target_feature]` so the kernel exists in a stock artifact; it inlines into
+/// a caller compiled under the same feature, which is how the per-tier loops
+/// that use it are built.
+///
+/// # Safety
+/// The CPU has AVX2; `src` readable and `dst` writable for `len` bytes, the
+/// regions non-overlapping; `len >= 33`.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
-    target_feature = "avx2",
     feature = "kernel-avx2",
 ))]
+#[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn copy_exact_avx2(src: *const u8, dst: *mut u8, len: usize) {
+pub(crate) unsafe fn copy_exact_avx2(src: *const u8, dst: *mut u8, len: usize) {
     debug_assert!(len >= 33, "copy_exact_avx2 requires len >= 33");
     unsafe {
         if len <= 64 {
@@ -978,16 +985,18 @@ unsafe fn copy_exact_avx2(src: *const u8, dst: *mut u8, len: usize) {
 
 /// SSE2 exact copy for `len >= 33`: branchless size class for `len <= 64`,
 /// then a 2×16B-unrolled loop, an exact 16B cleanup and one overlapping 16B
-/// tail. SSE2 is in the baseline of every x86_64 target, so the body inlines
-/// into the emit loop with no call boundary and no CPU check.
+/// tail. Reads and writes strictly `[0, len)`.
+///
+/// # Safety
+/// The CPU has SSE2; `src` readable and `dst` writable for `len` bytes, the
+/// regions non-overlapping; `len >= 33`.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
-    target_feature = "sse2",
     feature = "kernel-sse",
-    any(test, not(all(target_feature = "avx2", feature = "kernel-avx2"))),
 ))]
+#[target_feature(enable = "sse2")]
 #[inline]
-unsafe fn copy_exact_sse2(src: *const u8, dst: *mut u8, len: usize) {
+pub(crate) unsafe fn copy_exact_sse2(src: *const u8, dst: *mut u8, len: usize) {
     debug_assert!(len >= 33, "copy_exact_sse2 requires len >= 33");
     unsafe {
         if len <= 64 {
@@ -1035,7 +1044,7 @@ unsafe fn copy_exact_sse2(src: *const u8, dst: *mut u8, len: usize) {
     feature = "kernel-neon"
 ))]
 #[inline]
-unsafe fn copy_exact_neon(src: *const u8, dst: *mut u8, len: usize) {
+pub(crate) unsafe fn copy_exact_neon(src: *const u8, dst: *mut u8, len: usize) {
     debug_assert!(len >= 33, "copy_exact_neon requires len >= 33");
     let mut o = 0usize;
     unsafe {
@@ -1058,30 +1067,13 @@ unsafe fn copy_exact_neon(src: *const u8, dst: *mut u8, len: usize) {
 }
 
 /// `u64` exact copy for `len >= 33`: 8-byte strides and one overlapping 8-byte
-/// tail. The kernel where the build baseline has no vector unit, and the
-/// reference the vector kernels are tested against.
-#[cfg(any(
-    test,
-    not(any(
-        all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            target_feature = "avx2",
-            feature = "kernel-avx2",
-        ),
-        all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            target_feature = "sse2",
-            feature = "kernel-sse",
-        ),
-        all(
-            target_arch = "aarch64",
-            target_feature = "neon",
-            feature = "kernel-neon"
-        ),
-    ))
-))]
+/// tail. Reads and writes strictly `[0, len)`. The scalar tier's kernel.
+///
+/// # Safety
+/// `src` readable and `dst` writable for `len` bytes, the regions
+/// non-overlapping; `len >= 33`.
 #[inline]
-unsafe fn copy_exact_u64(src: *const u8, dst: *mut u8, len: usize) {
+pub(crate) unsafe fn copy_exact_u64(src: *const u8, dst: *mut u8, len: usize) {
     debug_assert!(len >= 33, "copy_exact_u64 requires len >= 33");
     unsafe {
         let mut o = 0usize;
@@ -1095,73 +1087,6 @@ unsafe fn copy_exact_u64(src: *const u8, dst: *mut u8, len: usize) {
             let v: u64 = src.add(t).cast::<u64>().read_unaligned();
             dst.add(t).cast::<u64>().write_unaligned(v);
         }
-    }
-}
-
-/// Exact copy of `33 <= len < `[`BULK_MEMCPY_THRESHOLD`] bytes for encoder
-/// literal runs, the safe analog of upstream zstd `ZSTD_wildcopy`: it reads and
-/// writes strictly `[0, len)`, so a source without slack is fine.
-///
-/// The width is the widest vector in the build's baseline (AVX2 when the build
-/// targets it, else SSE2 on x86, NEON on aarch64, `u64` elsewhere), fixed at
-/// compile time the way upstream fixes its own. The emit loop therefore carries
-/// no kernel choice at all: no tier value, no branch on it, no CPU read.
-///
-/// # Safety
-/// `src` readable and `dst` writable for `len` bytes; regions non-overlapping.
-/// `len` MUST be `>= 33`: the kernels write an overlapping tail at `len - 32`,
-/// `len - 16` or `len - 8`, and callers route `<= 32` through
-/// [`copy_exact_small`].
-#[inline]
-pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert!(
-        len >= 33,
-        "copy_exact_medium requires len >= 33 (the overlapping tail underflows below that)",
-    );
-    #[cfg(all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "avx2",
-        feature = "kernel-avx2",
-    ))]
-    unsafe {
-        copy_exact_avx2(src, dst, len)
-    }
-    #[cfg(all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "sse2",
-        feature = "kernel-sse",
-        not(all(target_feature = "avx2", feature = "kernel-avx2")),
-    ))]
-    unsafe {
-        copy_exact_sse2(src, dst, len)
-    }
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_feature = "neon",
-        feature = "kernel-neon"
-    ))]
-    unsafe {
-        copy_exact_neon(src, dst, len)
-    }
-    #[cfg(not(any(
-        all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            target_feature = "avx2",
-            feature = "kernel-avx2",
-        ),
-        all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            target_feature = "sse2",
-            feature = "kernel-sse",
-        ),
-        all(
-            target_arch = "aarch64",
-            target_feature = "neon",
-            feature = "kernel-neon"
-        ),
-    )))]
-    unsafe {
-        copy_exact_u64(src, dst, len)
     }
 }
 

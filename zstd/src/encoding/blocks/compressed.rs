@@ -1,5 +1,7 @@
 use alloc::{boxed::Box, vec::Vec};
 
+mod literal_runs;
+
 use crate::{
     bit_io::BitWriter,
     blocks::block::BlockType,
@@ -491,6 +493,9 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             // The splitter's scratch state never reaches the raw-skip, which
             // is decided one level up on the whole block.
             seen_content: Default::default(),
+            // Inherited rather than re-resolved: this scratch state stands in
+            // for the same compressor on the same CPU.
+            copy_kernel: state.copy_kernel,
             // Probes read the table they repeat from `entry_huff` /
             // `built_huff`; this slot stays empty.
             last_huff_table: None,
@@ -604,88 +609,45 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     state.block_scratch = scratch;
 }
 
-/// Literal-run length at or above which `append_literals` hands off to
-/// `Vec::extend_from_slice` (libc `memcpy` → ERMS `rep movsb` on x86).
-/// Below it the inline exact-copy loop wins (no libc call + ERMS startup
-/// cost); at/above it the copy is bandwidth-bound and ERMS is faster.
-/// Mirrors `simd_copy::BULK_MEMCPY_THRESHOLD` (the match-copy crossover).
-const LITERAL_INLINE_COPY_MAX: usize = 2048;
-
-/// Append `lits` to `dst` using inline copy ops, avoiding the libc
-/// memcpy call overhead that `Vec::extend_from_slice` lowers to for
-/// runtime-sized `ptr::copy_nonoverlapping`. Fast L1 emits literal runs
-/// of 1-10 bytes typically — at thousands of sequences per block, the
-/// per-emit libc call dominated the hot path (flamegraph:
-/// `__memmove_avx_unaligned_erms` chain ≈ 16 % of L1 encode CPU).
+/// Run the matcher over the block and collect its sequences, then its literals.
 ///
-/// - `len ≤ 32`: `simd_copy::copy_exact_small`, byte / overlapping-`u64`
-///   stores that read and write exactly `len` bytes (the caller's slice has
-///   no known slack).
-/// - `32 < len < 2048`: `simd_copy::copy_exact_medium`, the build's baseline
-///   vector width doing an exact copy (bulk plus one overlapping tail), the
-///   safe upstream zstd-wildcopy analog.
-/// - `len ≥ 2048`: `extend_from_slice` — bandwidth-bound, ERMS wins.
-///
-/// Neither copy picks a kernel at run time, so the emit loop carries no tier
-/// and no branch on one.
-///
-/// Called, not inlined, even though upstream inlines the equivalent
-/// (`ZSTD_storeSeq` stores sixteen bytes on the spot) and even though the runs
-/// are short enough for it — a level-3 decodecorpus frame averages about eight
-/// bytes. Splitting the short case out to `#[inline(always)]` and leaving the
-/// ladder behind a tail cost **2.16% in cycles** at level 3 while removing 1.04%
-/// of the program's instructions. The match loop calls this from a dozen-odd
-/// sites, so inlining even a short body there buys decode pressure in the
-/// loop worth more than the calls it saves.
-#[inline]
-fn append_literals(dst: &mut RegionVec<u8>, lits: &[u8]) {
-    let lit_len = lits.len();
-    if lit_len == 0 {
-        return;
-    }
-    if lit_len >= LITERAL_INLINE_COPY_MAX {
-        dst.extend_from_slice(lits);
-        return;
-    }
-    // The buffer holds a whole block's source, which bounds the sum of its
-    // literal runs. This is a SAFE fn, so the bound is still checked: the
-    // branch is cold, and a caller whose buffer was sized for less must stop
-    // here rather than write past it.
-    let cur_len = dst.len();
-    if dst.capacity() - cur_len < lit_len {
-        dst.extend_from_slice(lits);
-        return;
-    }
-    let dst_ptr = unsafe { dst.as_mut_ptr().add(cur_len) };
-    // SAFETY: `lits` is a valid slice (reading `lit_len` bytes from
-    // `lits.as_ptr()` is in-bounds); the capacity test above guarantees
-    // `dst_ptr` has `lit_len` bytes of room. Both paths write EXACTLY
-    // `lit_len` bytes (no overshoot).
-    unsafe {
-        if lit_len <= 32 {
-            crate::decoding::simd_copy::copy_exact_small(lits.as_ptr(), dst_ptr, lit_len);
-        } else {
-            crate::decoding::simd_copy::copy_exact_medium(lits.as_ptr(), dst_ptr, lit_len);
-        }
-        dst.set_len(cur_len + lit_len);
-    }
-}
-
+/// The emit records a sequence and nothing else; the literal runs are copied
+/// afterwards in one pass (see [`literal_runs`]), under the tier resolved when
+/// the compressor was built. Upstream copies each run as it stores the
+/// sequence (`ZSTD_storeSeq`); here the match loop calls the emit from a dozen
+/// sites, and a copy inlined at each of them costs the loop more in decode
+/// pressure than the calls it saves (+2.16% cycles at level 3, measured).
 fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut EncodedBlockParts) {
     parts.literals.clear();
     parts.sequences.clear();
-    // Sized when the frame laid out its workspace, for the largest block it
-    // can emit.
-    debug_assert!(state.matcher.get_last_space().len() <= parts.literals.capacity());
+    // Trailing literals, reported after the last sequence.
+    let mut tail = 0usize;
+    // The runs are read back from the block by position, so each non-empty run
+    // a matcher reports must sit where that position says, and no sequence may
+    // follow trailing literals.
+    #[cfg(debug_assertions)]
+    let mut next_run = state.matcher.get_last_space().as_ptr() as usize;
     state.matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => append_literals(&mut parts.literals, literals),
+        Sequence::Literals { literals } => {
+            #[cfg(debug_assertions)]
+            {
+                debug_assert!(literals.is_empty() || literals.as_ptr() as usize == next_run);
+                next_run += literals.len();
+            }
+            tail += literals.len();
+        }
         Sequence::Triple {
             literals,
             offset,
             match_len,
         } => {
+            #[cfg(debug_assertions)]
+            {
+                debug_assert_eq!(tail, 0, "literals reported before a sequence");
+                debug_assert!(literals.is_empty() || literals.as_ptr() as usize == next_run);
+                next_run += literals.len() + match_len;
+            }
             let ll = literals.len() as u32;
-            append_literals(&mut parts.literals, literals);
             parts.sequences.push(RawSequence {
                 ll,
                 ml: match_len as u32,
@@ -697,6 +659,14 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
             });
         }
     });
+    let kernel = state.copy_kernel;
+    literal_runs::gather_literals(
+        kernel,
+        state.matcher.get_last_space(),
+        &parts.sequences,
+        tail,
+        &mut parts.literals,
+    );
 }
 
 fn encode_block_parts<M: Matcher>(

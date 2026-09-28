@@ -52,7 +52,9 @@ fn regions_of_one_layout_are_disjoint() {
     let second = ws.table::<u32>(20, 9);
     let mut tail = ws.buffer::<u8>(100);
     first.as_mut_slice().fill(u32::MAX);
-    tail.extend_from_slice(&[0xAB; 100]);
+    for _ in 0..100 {
+        tail.push(0xAB);
+    }
     assert!(second.as_slice().iter().all(|&v| v == 9));
     assert!(first.as_slice().iter().all(|&v| v == u32::MAX));
     assert!(tail.iter().all(|&b| b == 0xAB));
@@ -329,16 +331,17 @@ fn a_table_copy_is_independent_and_restores_in_place() {
     assert_eq!(live.owned_bytes(), 0);
 }
 
-// A buffer behaves like a Vec up to its capacity: push, extend, clear and a
-// manual length all agree with the slice it exposes.
+// A buffer behaves like a Vec up to its capacity: push, clear and a manual
+// length all agree with the slice it exposes.
 #[test]
 fn a_buffer_tracks_its_length() {
     let mut ws = opened_with(0, region_bytes::<u32>(8));
     let mut buf = ws.buffer::<u32>(8);
     assert_eq!(buf.capacity(), 8);
     assert!(buf.is_empty());
-    buf.push(1);
-    buf.extend_from_slice(&[2, 3, 4]);
+    for v in [1, 2, 3, 4] {
+        buf.push(v);
+    }
     assert_eq!(&buf[..], &[1, 2, 3, 4]);
     unsafe {
         buf.as_mut_ptr().add(4).write(5);
@@ -356,17 +359,10 @@ fn a_buffer_tracks_its_length() {
 fn a_full_buffer_refuses_a_push() {
     let mut ws = opened_with(0, region_bytes::<u8>(ALIGN));
     let mut buf = ws.buffer::<u8>(ALIGN);
-    buf.extend_from_slice(&[0; ALIGN]);
+    for _ in 0..ALIGN {
+        buf.push(0);
+    }
     buf.push(1);
-}
-
-// The same for a slice that would overrun it.
-#[test]
-#[should_panic(expected = "workspace buffer sized below")]
-fn a_buffer_refuses_a_slice_that_overruns_it() {
-    let mut ws = opened_with(0, region_bytes::<u8>(4));
-    let mut buf = ws.buffer::<u8>(4);
-    buf.extend_from_slice(&[0; 5]);
 }
 
 // A layout larger than the workspace is refused at the carve, not discovered

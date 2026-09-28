@@ -69,6 +69,7 @@ fn custom_matcher_dict_probe_defaults_to_false() {
 fn rle_branch_passes_compressible_hint_to_skip_matching() {
     let mut state = CompressState {
         matcher: HintProbeMatcher::default(),
+        copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,
         huff_rollback: None,

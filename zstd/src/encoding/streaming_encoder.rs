@@ -393,6 +393,7 @@ impl<M: Matcher> CompressionContext<M> {
             compression_level,
             state: CompressState {
                 matcher,
+                copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huff_table_spare: None,
                 huff_rollback: None,

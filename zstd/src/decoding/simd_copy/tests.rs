@@ -4,7 +4,9 @@ use alloc::vec;
 /// Copies `len` bytes with `copy` into a buffer fenced by sentinel bytes on
 /// both sides, and checks the copy is exact: every byte of the source, and not
 /// one byte written before or after it.
-fn assert_exact_copy(name: &str, len: usize, copy: unsafe fn(*const u8, *mut u8, usize)) {
+type CopyKernel = unsafe fn(*const u8, *mut u8, usize);
+
+fn assert_exact_copy(name: &str, len: usize, copy: CopyKernel) {
     const FENCE: usize = 64;
     let src: vec::Vec<u8> = (0..len as u32)
         .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
@@ -30,35 +32,45 @@ fn small_exact_copy_writes_exactly_the_run() {
     }
 }
 
-#[test]
-fn medium_exact_copy_writes_exactly_the_run() {
-    // Every length, so each non-multiple of the 8/16-byte strides exercises
-    // the overlapping tail of the kernel this build compiles in.
-    for len in 33..2048usize {
-        assert_exact_copy("copy_exact_medium", len, copy_exact_medium);
+/// Every medium exact-copy kernel this CPU can run. Each is swept on its own:
+/// a kernel only the tier dispatch reaches would otherwise be checked only on
+/// the hosts that select it.
+fn runnable_medium_kernels() -> vec::Vec<(&'static str, CopyKernel)> {
+    let mut kernels: vec::Vec<(&'static str, CopyKernel)> =
+        vec![("copy_exact_u64", copy_exact_u64)];
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
+    if std::arch::is_x86_feature_detected!("sse2") {
+        kernels.push(("copy_exact_sse2", copy_exact_sse2));
     }
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        kernels.push(("copy_exact_avx2", copy_exact_avx2));
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        feature = "kernel-neon"
+    ))]
+    kernels.push(("copy_exact_neon", copy_exact_neon));
+    kernels
 }
 
 #[test]
-fn u64_exact_copy_writes_exactly_the_run() {
-    // The fallback for builds without a baseline vector unit; compiled into
-    // every test build so it is checked on hosts that never select it.
-    for len in 33..2048usize {
-        assert_exact_copy("copy_exact_u64", len, copy_exact_u64);
-    }
-}
-
-#[cfg(all(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    target_feature = "sse2",
-    feature = "kernel-sse",
-))]
-#[test]
-fn sse2_exact_copy_writes_exactly_the_run() {
-    // A build whose baseline carries AVX2 never reaches the SSE2 kernel through
-    // `copy_exact_medium`; test it directly so such a host still checks it.
-    for len in 33..2048usize {
-        assert_exact_copy("copy_exact_sse2", len, copy_exact_sse2);
+fn medium_exact_copies_write_exactly_the_run() {
+    // Every length, so each non-multiple of the 8/16/32-byte strides exercises
+    // the kernel's overlapping tail.
+    for (name, kernel) in runnable_medium_kernels() {
+        for len in 33..2048usize {
+            assert_exact_copy(name, len, kernel);
+        }
     }
 }
 

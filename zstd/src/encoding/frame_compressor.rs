@@ -1333,6 +1333,9 @@ pub(crate) struct CompressState<M: Matcher> {
     /// raw-skip that a block duplicating an earlier one is not the noise it
     /// looks like. See [`SeenContentGrid`](crate::encoding::incompressible::SeenContentGrid).
     pub(crate) seen_content: crate::encoding::incompressible::SeenContentGrid,
+    /// CPU tier the literal gather runs under, resolved once when the
+    /// compressor is built and dispatched on once per block.
+    pub(crate) copy_kernel: crate::encoding::fastpath::FastpathKernel,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     /// Recycled `HuffmanTable` buffers: when a block clears or replaces
     /// `last_huff_table`, the old table parks here instead of dropping, so
@@ -1758,6 +1761,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             source_size_hint: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
+                copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huff_table_spare: None,
                 huff_rollback: None,
@@ -2196,6 +2200,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             source_size_hint: None,
             state: CompressState {
                 matcher,
+                copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huff_table_spare: None,
                 huff_rollback: None,

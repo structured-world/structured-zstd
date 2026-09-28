@@ -1175,26 +1175,6 @@ impl<T: Copy> RegionVec<T> {
         self.len += 1;
     }
 
-    /// # Panics
-    ///
-    /// Panics when `values` does not fit, as [`Self::push`].
-    pub(crate) fn extend_from_slice(&mut self, values: &[T]) {
-        if values.len() > self.region.len - self.len {
-            capacity_exhausted();
-        }
-        // SAFETY: the destination range `len..len + values.len()` is inside the
-        // region by the check above, and a workspace region never overlaps a
-        // slice borrowed from elsewhere.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                values.as_ptr(),
-                self.region.as_mut_ptr().add(self.len),
-                values.len(),
-            );
-        }
-        self.len += values.len();
-    }
-
     /// Pointer to the first value, for writes past the length that
     /// [`Self::set_len`] then claims.
     pub(crate) fn as_mut_ptr(&mut self) -> *mut T {
@@ -1236,7 +1216,7 @@ impl<T: Copy> Default for RegionVec<T> {
 
 #[cold]
 #[inline(never)]
-fn capacity_exhausted() -> ! {
+pub(crate) fn capacity_exhausted() -> ! {
     panic!("workspace buffer sized below what the frame put in it")
 }
 
