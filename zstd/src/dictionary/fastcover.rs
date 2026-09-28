@@ -4,7 +4,6 @@
 
 use super::cover::compute_epochs;
 use super::samples::{SampleSet, TrainingError, refuse};
-use alloc::vec;
 use alloc::vec::Vec;
 use std::io;
 
@@ -131,6 +130,14 @@ impl<'s> FastCoverContext<'s> {
                 ),
             ));
         };
+        // Counts are `u32`, as upstream's are (`FASTCOVER_MAX_SAMPLES_SIZE`),
+        // and no bucket counts more positions than there are dmers.
+        if u32::try_from(nb_dmers).is_err() {
+            return Err(refuse(
+                TrainingError::Samples,
+                "the training samples are too large for FastCOVER (4 GiB at most)",
+            ));
+        }
         let mut freqs = zeroed_counts::<u32>(1usize << f)?;
         let step = accel as usize;
         let offsets = samples.offsets();
@@ -138,8 +145,7 @@ impl<'s> FastCoverContext<'s> {
             let end = offsets[sample + 1];
             let mut start = offsets[sample];
             while start + read_len <= end {
-                // A count is bounded by the dmer count, far below `u32::MAX`
-                // for any corpus `SampleSet` accepts here.
+                // Bounded by `nb_dmers`, checked above to fit `u32`.
                 freqs[hash_dmer_index(data, start, f, d)] += 1;
                 start += step;
             }
@@ -162,14 +168,16 @@ impl<'s> FastCoverContext<'s> {
     /// Build content of at most `capacity` bytes from segments of `k` bytes
     /// (upstream zstd `FASTCOVER_buildDictionary`). `freqs` is scratch the
     /// build refills with the counted frequencies and spends, so one table
-    /// serves every build.
-    pub(super) fn build(
+    /// serves every build; `out` is scratch the content is written into, and
+    /// the returned slice borrows it.
+    pub(super) fn build<'o>(
         &self,
         freqs: &mut Vec<u32>,
         window: &mut WindowCounts,
+        out: &'o mut Vec<u8>,
         capacity: usize,
         k: usize,
-    ) -> Result<Vec<u8>, TableTooLarge> {
+    ) -> Result<&'o [u8], TableTooLarge> {
         debug_assert!(self.d <= k);
         freqs.clear();
         freqs
@@ -187,24 +195,26 @@ impl<'s> FastCoverContext<'s> {
         // A window holds at most `dmers_in_k + 1` occurrences of one index (one
         // past the segment before the oldest leaves). Upstream zstd keeps them in
         // `u16` for any `k`; a longer segment than that counts in `u32`.
-        if layout.dmers_in_k < usize::from(u16::MAX) {
+        let tail = if layout.dmers_in_k < usize::from(u16::MAX) {
             let counts = window.narrow.get_or_insert_with_result(self.f)?;
-            Ok(self.select_segments(capacity, freqs, counts, layout))
+            self.select_segments(out, capacity, freqs, counts, layout)
         } else {
             let counts = window.wide.get_or_insert_with_result(self.f)?;
-            Ok(self.select_segments(capacity, freqs, counts, layout))
-        }
+            self.select_segments(out, capacity, freqs, counts, layout)
+        };
+        Ok(&out[tail..])
     }
 
     /// Pick a segment per epoch visit until `capacity` bytes are filled, and
-    /// return them as the dictionary content.
+    /// return where the content starts in `out`.
     fn select_segments<C: WindowCount>(
         &self,
+        out: &mut Vec<u8>,
         capacity: usize,
         freqs: &mut [u32],
         segment_freqs: &mut [C],
         layout: EpochLayout,
-    ) -> Vec<u8> {
+    ) -> usize {
         let EpochLayout {
             dmers_in_k,
             epoch_size,
@@ -215,7 +225,9 @@ impl<'s> FastCoverContext<'s> {
         let one = C::from(1);
         // Fill from the back (upstream zstd layout) so the best segments sit at
         // the end of the dictionary and get referenced with the smallest offsets.
-        let mut out = vec![0u8; capacity];
+        // Only bytes past the final `tail` are returned, so what an earlier
+        // build left before it needs no clearing.
+        out.resize(capacity, 0);
         let mut tail = capacity;
         const MAX_ZERO_SCORE_RUN: usize = 10;
         let mut zero_score_run = 0usize;
@@ -296,9 +308,7 @@ impl<'s> FastCoverContext<'s> {
             out[tail..tail + segment_size]
                 .copy_from_slice(&sample[best_begin..best_begin + segment_size]);
         }
-
-        out.drain(..tail);
-        out
+        tail
     }
 }
 

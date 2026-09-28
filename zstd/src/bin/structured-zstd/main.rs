@@ -3283,16 +3283,15 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     if opts.to_stdout {
         bail!("--train cannot write to stdout; name the dictionary with -o");
     }
-    // A dictionary cannot be smaller than its own header and the offset history
-    // the format requires, so a size below that can only fail — and finding out
-    // inside the trainer means every sample has been read and concatenated
-    // first. The real bound is higher and depends on the entropy tables the
-    // corpus produces, which is why the trainer still checks; this only settles
-    // the part that is knowable without reading anything.
-    if opts.max_dict < structured_zstd::dictionary::MIN_TRAINED_DICT_SIZE {
+    // Every trainer refuses a size below its minimum, and finding out inside
+    // the trainer means every sample has been read and concatenated first. The
+    // real bound is higher and depends on the entropy tables the corpus
+    // produces, which is why the trainer still checks; this only settles the
+    // part that is knowable without reading anything.
+    if opts.max_dict < structured_zstd::dictionary::TRAINER_DICT_SIZE_MIN {
         bail!(
-            "--maxdict must be at least {} bytes; a dictionary cannot be smaller than its header",
-            structured_zstd::dictionary::MIN_TRAINED_DICT_SIZE
+            "--maxdict must be at least {} bytes",
+            structured_zstd::dictionary::TRAINER_DICT_SIZE_MIN
         );
     }
     // Whether the trainer takes the tuning it was given is a question about the

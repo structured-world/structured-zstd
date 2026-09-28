@@ -578,10 +578,12 @@ pub fn finalize_raw_dict(
     Ok(out)
 }
 
-/// Smallest dictionary, in bytes, the COVER and FastCOVER trainers build
-/// (upstream zstd `ZDICT_DICTSIZE_MIN`); a smaller one is refused with
-/// [`TrainingError::DictionaryTooSmall`].
-pub const SEGMENT_DICT_SIZE_MIN: usize = 256;
+/// Smallest dictionary, in bytes, any trainer here builds (upstream zstd
+/// `ZDICT_DICTSIZE_MIN`); a smaller one is refused with
+/// [`TrainingError::DictionaryTooSmall`]. Unlike [`MIN_TRAINED_DICT_SIZE`] it
+/// bounds a training request, so a caller can refuse one before loading the
+/// samples.
+pub const TRAINER_DICT_SIZE_MIN: usize = 256;
 
 /// The `k` and `d` values a training run tries, resolved from the options the
 /// way the reference's optimizers resolve theirs.
@@ -689,10 +691,10 @@ fn check_samples_and_dict_size<'s>(
     if set.count() == 0 {
         return Err(refuse(TrainingError::Samples, "there are no samples"));
     }
-    if dict_size < SEGMENT_DICT_SIZE_MIN {
+    if dict_size < TRAINER_DICT_SIZE_MIN {
         return Err(refuse(
             TrainingError::DictionaryTooSmall,
-            &format!("a dictionary must be at least {SEGMENT_DICT_SIZE_MIN} bytes"),
+            &format!("a dictionary must be at least {TRAINER_DICT_SIZE_MIN} bytes"),
         ));
     }
     Ok(set)
@@ -815,6 +817,7 @@ fn run_cover(
     );
     let mut best = selection::Best::new();
     let mut state = Vec::new();
+    let mut content_scratch = Vec::new();
     let mut context: Option<(usize, cover::CoverContext<'_>)> = None;
     for (d, k) in space.pairs() {
         if !segment_fits(k, d, dict_size) {
@@ -827,7 +830,7 @@ fn run_cover(
             context = Some((d, cover::CoverContext::new(&set, split.train, d)?));
         }
         let (_, ctx) = context.as_ref().expect("built above");
-        let content = ctx.build(&mut state, dict_size, k);
+        let content = ctx.build(&mut state, &mut content_scratch, dict_size, k);
         let chosen = CoverOptions {
             k: k as u32,
             d: d as u32,
@@ -836,9 +839,9 @@ fn run_cover(
             ..*options
         };
         if !scored {
-            return Ok((evaluator.finalize(&content)?, chosen));
+            return Ok((evaluator.finalize(content)?, chosen));
         }
-        best.offer(evaluator.select(&content, options.shrink), chosen);
+        best.offer(evaluator.select(content, options.shrink), chosen);
     }
     best.finish()
 }
@@ -967,6 +970,7 @@ fn run_fastcover(
     let scored = !plain || options.cover.shrink.is_some() || space.split_point < 1.0;
     let mut window = fastcover::WindowCounts::default();
     let mut freqs = Vec::new();
+    let mut content_scratch = Vec::new();
     let mut best = selection::Best::new();
     let mut context: Option<(usize, fastcover::FastCoverContext<'_>)> = None;
     let mut evaluator: Option<selection::Evaluator<'_>> = None;
@@ -995,7 +999,7 @@ fn run_fastcover(
                 finalize,
             )
         });
-        let content = ctx.build(&mut freqs, &mut window, dict_size, k)?;
+        let content = ctx.build(&mut freqs, &mut window, &mut content_scratch, dict_size, k)?;
         let chosen = FastCoverOptions {
             cover: CoverOptions {
                 k: k as u32,
@@ -1008,9 +1012,9 @@ fn run_fastcover(
             accel,
         };
         if !scored {
-            return Ok((evaluator.finalize(&content)?, chosen));
+            return Ok((evaluator.finalize(content)?, chosen));
         }
-        best.offer(evaluator.select(&content, options.cover.shrink), chosen);
+        best.offer(evaluator.select(content, options.cover.shrink), chosen);
     }
     best.finish()
 }

@@ -2,7 +2,8 @@ use super::*;
 use std::collections::BTreeMap;
 
 /// Upstream zstd `COVER_computeEpochs`: the target count stands while epochs
-/// stay ten segments long, and otherwise epochs are ten segments each.
+/// stay ten segments long, and otherwise fewer epochs of at least ten segments
+/// share the corpus.
 #[test]
 fn epochs_follow_the_reference_formula() {
     assert_eq!(
@@ -17,6 +18,16 @@ fn epochs_follow_the_reference_formula() {
         Epochs {
             num: 5,
             size: 1_000
+        }
+    );
+    // Short epochs fall back to fewer of them, which then share the whole
+    // corpus: five epochs of 1,100 dmers, not five of 1,000 that never reach
+    // the last 500.
+    assert_eq!(
+        compute_epochs(4096, 5_500, 100, 4),
+        Epochs {
+            num: 5,
+            size: 1_100
         }
     );
     // Fewer dmers than one floor-sized epoch: one epoch of all of them.
@@ -119,7 +130,8 @@ fn build_places_the_best_segment_last() {
     let set = SampleSet::new(&data, &sizes).unwrap();
     let ctx = CoverContext::new(&set, sizes.len(), 8).unwrap();
     let mut state = Vec::new();
-    let content = ctx.build(&mut state, 256, 32);
+    let mut out = Vec::new();
+    let content = ctx.build(&mut state, &mut out, 256, 32).to_vec();
     assert!(!content.is_empty() && content.len() <= 256);
     // "shared-header-" starts every sample, so it is the most frequent run.
     let tail = &content[content.len() - content.len().min(40)..];
@@ -128,7 +140,8 @@ fn build_places_the_best_segment_last() {
         "{:?}",
         std::string::String::from_utf8_lossy(&content)
     );
-    assert_eq!(content, ctx.build(&mut state, 256, 32));
+    // The same spent scratch, content buffer included, repeats the build.
+    assert_eq!(content, ctx.build(&mut state, &mut out, 256, 32));
 }
 
 #[test]

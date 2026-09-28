@@ -45,9 +45,13 @@ pub(super) fn compute_epochs(
     if size >= min_epoch_size {
         return Epochs { num, size };
     }
+    // Fewer epochs of at least the floor, sized to share the whole corpus.
+    // Upstream keeps them at the floor, which leaves up to one epoch at the
+    // corpus end that no build ever scans.
+    let num = nb_dmers / min_epoch_size;
     Epochs {
-        num: nb_dmers / min_epoch_size,
-        size: min_epoch_size,
+        num,
+        size: nb_dmers / num,
     }
 }
 
@@ -115,9 +119,16 @@ impl<'s> CoverContext<'s> {
     /// Build content of at most `capacity` bytes from segments of `k` bytes
     /// (upstream zstd `COVER_buildDictionary`). `state` is scratch the build
     /// refills with the frequencies and spends, so one buffer serves every
-    /// build. The best segments are chosen first and placed last, where the
-    /// offsets that reach them are smallest.
-    pub(super) fn build(&self, state: &mut Vec<DmerState>, capacity: usize, k: usize) -> Vec<u8> {
+    /// build; `out` is scratch the content is written into, and the returned
+    /// slice borrows it. The best segments are chosen first and placed last,
+    /// where the offsets that reach them are smallest.
+    pub(super) fn build<'o>(
+        &self,
+        state: &mut Vec<DmerState>,
+        out: &'o mut Vec<u8>,
+        capacity: usize,
+        k: usize,
+    ) -> &'o [u8] {
         state.clear();
         state.extend_from_slice(&self.initial);
         let d = self.d;
@@ -126,7 +137,9 @@ impl<'s> CoverContext<'s> {
         let epochs = compute_epochs(capacity, nb_dmers, k, 4);
         let max_zero_score_run = (epochs.num >> 3).clamp(10, 100);
         let dmers_in_k = k - d + 1;
-        let mut dict = vec![0u8; capacity];
+        // Only bytes past the final `tail` are returned, so what an earlier
+        // build left before it needs no clearing.
+        out.resize(capacity, 0);
         let mut tail = capacity;
         let mut zero_score_run = 0usize;
         let mut epoch = 0usize;
@@ -149,11 +162,10 @@ impl<'s> CoverContext<'s> {
                 break;
             }
             tail -= segment_size;
-            dict[tail..tail + segment_size]
+            out[tail..tail + segment_size]
                 .copy_from_slice(&self.data[segment.begin..segment.begin + segment_size]);
         }
-        dict.drain(..tail);
-        dict
+        &out[tail..]
     }
 }
 

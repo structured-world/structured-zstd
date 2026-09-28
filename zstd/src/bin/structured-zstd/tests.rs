@@ -598,27 +598,35 @@ fn training_refuses_to_write_over_its_own_sample() {
     assert_eq!(survived.len(), 4096, "the sample must still be there");
 }
 
-/// A dictionary cannot be smaller than its own header plus the offset history
-/// the format requires, so `--maxdict=1` can only fail. Discovering that after
-/// reading the corpus spends the whole input's I/O and memory on a command that
-/// was never going to produce anything — the test names a sample that cannot be
-/// read, so only a check made first can be what answers.
+/// Every trainer refuses a dictionary under 256 bytes, so `--maxdict=255` or
+/// less can only fail. Discovering that after reading the corpus spends the
+/// whole input's I/O and memory on a command that was never going to produce
+/// anything — the test names a sample that cannot be read, so only a check made
+/// first can be what answers. Checked for each trainer.
 #[test]
 fn an_impossible_dictionary_size_is_refused_before_the_samples_are_read() {
     let missing = std::env::temp_dir().join(format!("szstd-nosuch-{}", std::process::id()));
     let _ = fs::remove_file(&missing);
 
-    let mut opts = parse(&["--train", "--maxdict=1", "-o", "d", "s"]).unwrap();
-    opts.inputs = vec![missing];
-    opts.output = Some(std::env::temp_dir().join(format!("szstd-nodict-{}", std::process::id())));
-    let err = train_dictionary(&opts)
-        .expect_err("one byte cannot hold a dictionary")
-        .to_string();
+    for (trainer, max_dict) in [
+        ("--train", "--maxdict=1"),
+        ("--train", "--maxdict=255"),
+        ("--train-cover", "--maxdict=255"),
+        ("--train-legacy", "--maxdict=255"),
+    ] {
+        let mut opts = parse(&[trainer, max_dict, "-o", "d", "s"]).unwrap();
+        opts.inputs = vec![missing.clone()];
+        opts.output =
+            Some(std::env::temp_dir().join(format!("szstd-nodict-{}", std::process::id())));
+        let err = train_dictionary(&opts)
+            .expect_err("no trainer builds a dictionary that small")
+            .to_string();
 
-    assert!(
-        err.contains("--maxdict"),
-        "the size must be what is refused, before the unreadable sample: {err}"
-    );
+        assert!(
+            err.contains("--maxdict"),
+            "{trainer} {max_dict}: the size must be what is refused, before the unreadable sample: {err}"
+        );
+    }
 }
 
 /// `-c` and `-o` clear one another, so `--train -o wanted.dict -c` leaves no
