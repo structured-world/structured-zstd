@@ -3310,6 +3310,18 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         // as it does in the reference.
         Trainer::Legacy => Plan::Legacy,
     };
+    // Whether any segment the tuning allows fits the dictionary is the
+    // codec's rule, and it needs no sample either.
+    let tuning_fits = match &plan {
+        Plan::FastCover(options) => {
+            structured_zstd::dictionary::check_fastcover_options(options, opts.max_dict)
+        }
+        Plan::Cover(options) => {
+            structured_zstd::dictionary::check_cover_options(options, opts.max_dict)
+        }
+        Plan::Legacy => Ok(()),
+    };
+    tuning_fits.map_err(|err| eyre!("dictionary training failed: {err}"))?;
     let output = opts
         .output
         .clone()

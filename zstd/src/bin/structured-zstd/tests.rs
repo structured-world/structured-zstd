@@ -629,6 +629,35 @@ fn an_impossible_dictionary_size_is_refused_before_the_samples_are_read() {
     }
 }
 
+/// Tuning no segment of which fits the dictionary can only fail, and that is
+/// known from the command line: it is refused before the samples are read.
+/// The sample named cannot be read, so only a check made first can answer.
+#[test]
+fn tuning_that_fits_no_dictionary_is_refused_before_the_samples_are_read() {
+    let missing = std::env::temp_dir().join(format!("szstd-nosuch-tune-{}", std::process::id()));
+    let _ = fs::remove_file(&missing);
+
+    for tuning in [
+        "--train-cover=k=8192,d=8",
+        "--train-fastcover=k=8192,d=8",
+        // The default `k` search tops out at 2000, below a `d` of 2048.
+        "--train-cover=d=2048",
+    ] {
+        let mut opts = parse(&[tuning, "--maxdict=4096", "-o", "d", "s"]).unwrap();
+        opts.inputs = vec![missing.clone()];
+        opts.output =
+            Some(std::env::temp_dir().join(format!("szstd-nodict-tune-{}", std::process::id())));
+        let err = train_dictionary(&opts)
+            .expect_err("no segment fits the dictionary")
+            .to_string();
+
+        assert!(
+            !err.contains("failed to inspect"),
+            "{tuning}: the tuning must be what is refused, before the unreadable sample: {err}"
+        );
+    }
+}
+
 /// The split a tuning report shows is the percentage it was given as, for
 /// every percentage: `29 / 100.0 * 100.0` is 28.999..., which a truncating
 /// conversion reported as 28.

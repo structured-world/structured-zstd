@@ -671,6 +671,105 @@ impl SearchSpace {
                 .map(move |k| (d as usize, k as usize))
         })
     }
+
+    /// Refuse a space with no `k` and `d` a `dict_size` dictionary can hold,
+    /// before any sample is indexed (upstream zstd `COVER_checkParameters`,
+    /// which checks the parameters ahead of the samples).
+    fn check_fits(&self, dict_size: usize) -> io::Result<()> {
+        if self.pairs().any(|(d, k)| segment_fits(k, d, dict_size)) {
+            return Ok(());
+        }
+        Err(refuse(
+            TrainingError::Parameter,
+            "no parameter combination is valid for this dictionary size",
+        ))
+    }
+
+    /// The trainer `options` select, the way the CLI and the C ABI choose it:
+    /// both `k` and `d` given train with them, anything less searches.
+    fn selected(options: &CoverOptions, default_split: f64) -> io::Result<Self> {
+        if options.k != 0 && options.d != 0 {
+            Self::fixed(options)
+        } else {
+            Self::optimizing(options, default_split)
+        }
+    }
+}
+
+/// Refuse COVER tuning no training run can use for a `dict_size` dictionary,
+/// from the options alone: what [`train_cover_dict`] (both `k` and `d` given)
+/// or [`optimize_cover_dict`] (either left zero) would refuse before reading a
+/// sample. Lets a caller holding a large corpus fail before loading it.
+///
+/// # Errors
+///
+/// `InvalidInput` for tuning out of range or for a `k` and `d` that no
+/// dictionary of `dict_size` bytes holds; [`TrainingError::of`] reports
+/// [`TrainingError::Parameter`].
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{CoverOptions, check_cover_options};
+///
+/// let fits = CoverOptions { k: 256, d: 8, ..CoverOptions::default() };
+/// assert!(check_cover_options(&fits, 4096).is_ok());
+/// let too_long = CoverOptions { k: 8192, d: 8, ..CoverOptions::default() };
+/// assert!(check_cover_options(&too_long, 4096).is_err());
+/// ```
+pub fn check_cover_options(options: &CoverOptions, dict_size: usize) -> io::Result<()> {
+    SearchSpace::selected(options, 1.0)?.check_fits(dict_size)
+}
+
+/// [`check_cover_options`] for FastCOVER: also refuses `f`, `accel` and a `d`
+/// below 4 as [`train_fastcover_dict`] and [`optimize_fastcover_dict`] do.
+///
+/// # Errors
+///
+/// As [`check_cover_options`].
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{CoverOptions, FastCoverOptions, check_fastcover_options};
+///
+/// let options = FastCoverOptions {
+///     cover: CoverOptions { k: 256, d: 8, ..FastCoverOptions::default().cover },
+///     ..FastCoverOptions::default()
+/// };
+/// assert!(check_fastcover_options(&options, 4096).is_ok());
+/// assert!(check_fastcover_options(&options, 128).is_err());
+/// ```
+pub fn check_fastcover_options(options: &FastCoverOptions, dict_size: usize) -> io::Result<()> {
+    let space = SearchSpace::selected(&options.cover, 0.75)?;
+    fastcover_knobs(options, &space)?;
+    space.check_fits(dict_size)
+}
+
+/// The table width and acceleration `options` run with, zero meaning upstream
+/// zstd's defaults, refused where FastCOVER cannot run them.
+fn fastcover_knobs(options: &FastCoverOptions, space: &SearchSpace) -> io::Result<(u32, u32)> {
+    let f = if options.f == 0 { 20 } else { options.f };
+    let accel = if options.accel == 0 { 1 } else { options.accel };
+    if f > fastcover::MAX_F {
+        return Err(refuse(
+            TrainingError::Parameter,
+            &format!("f must be in 1..={}, got {f}", fastcover::MAX_F),
+        ));
+    }
+    if accel > fastcover::MAX_ACCEL {
+        return Err(refuse(
+            TrainingError::Parameter,
+            &format!("accel must be in 1..={}, got {accel}", fastcover::MAX_ACCEL),
+        ));
+    }
+    if *space.d.start() < 4 {
+        return Err(refuse(
+            TrainingError::Parameter,
+            "FastCOVER needs d of at least 4",
+        ));
+    }
+    Ok((f, accel))
 }
 
 /// Upstream zstd `COVER_checkParameters`: a segment fits the dictionary and
@@ -801,6 +900,7 @@ fn run_cover(
     finalize: FinalizeOptions,
     space: &SearchSpace,
 ) -> io::Result<(Vec<u8>, CoverOptions)> {
+    space.check_fits(dict_size)?;
     let set = check_samples_and_dict_size(samples, sample_sizes, dict_size)?;
     let split = set.split(space.split_point)?;
     let plain = space.k.start() == space.k.end() && space.d.start() == space.d.end();
@@ -827,6 +927,10 @@ fn run_cover(
             .as_ref()
             .is_none_or(|(built_for, _)| *built_for != d)
         {
+            // The previous index and its scratch are corpus-sized: released
+            // before the next is built, so the two never coexist.
+            drop(context.take());
+            state = Vec::new();
             context = Some((d, cover::CoverContext::new(&set, split.train, d)?));
         }
         let (_, ctx) = context.as_ref().expect("built above");
@@ -944,26 +1048,8 @@ fn run_fastcover(
     finalize: FinalizeOptions,
     space: &SearchSpace,
 ) -> io::Result<(Vec<u8>, FastCoverOptions)> {
-    let f = if options.f == 0 { 20 } else { options.f };
-    let accel = if options.accel == 0 { 1 } else { options.accel };
-    if f > fastcover::MAX_F {
-        return Err(refuse(
-            TrainingError::Parameter,
-            &format!("f must be in 1..={}, got {f}", fastcover::MAX_F),
-        ));
-    }
-    if accel > fastcover::MAX_ACCEL {
-        return Err(refuse(
-            TrainingError::Parameter,
-            &format!("accel must be in 1..={}, got {accel}", fastcover::MAX_ACCEL),
-        ));
-    }
-    if *space.d.start() < 4 {
-        return Err(refuse(
-            TrainingError::Parameter,
-            "FastCOVER needs d of at least 4",
-        ));
-    }
+    let (f, accel) = fastcover_knobs(options, space)?;
+    space.check_fits(dict_size)?;
     let set = check_samples_and_dict_size(samples, sample_sizes, dict_size)?;
     let split = set.split(space.split_point)?;
     let plain = space.k.start() == space.k.end() && space.d.start() == space.d.end();
@@ -982,6 +1068,8 @@ fn run_fastcover(
             .as_ref()
             .is_none_or(|(built_for, _)| *built_for != d)
         {
+            // The previous count table is released before the next is built.
+            drop(context.take());
             context = Some((
                 d,
                 fastcover::FastCoverContext::new(&set, split.train, d, f, accel)?,
