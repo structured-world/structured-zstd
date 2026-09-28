@@ -198,14 +198,25 @@ fn offset_codes_follow_the_frames_repeat_policy() {
     }
     let samples = SampleSet::new(&data, &sizes).unwrap();
     let content = samples.sample(0).to_vec();
-    let offset_code_one = |level| {
+    // One analysis across both levels: the second must not run on the
+    // compressor the first built for another level.
+    let mut analysis = Analysis::default();
+    let mut offset_code_one = |level| {
         let mut counts = EntropyCounts {
             literals: [1; 256],
-            offset_codes: vec![1; OFFCODE_MAX as usize + 1],
+            offset_codes: [1; 32],
             match_lengths: [1; 53],
             literal_lengths: [1; 36],
         };
-        count_samples(&mut counts, &content, &samples, samples.count(), level).unwrap();
+        count_samples(
+            &mut counts,
+            &mut analysis,
+            &content,
+            &samples,
+            samples.count(),
+            level,
+        )
+        .unwrap();
         counts.offset_codes[1]
     };
     assert!(offset_code_one(3) > 1, "the input exercises deeper repeats");

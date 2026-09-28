@@ -21,7 +21,7 @@ use crate::encoding::{
 };
 use crate::fse::fse_encoder::{FSETable, write_ncount_at_log};
 use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable};
-use std::{io, vec, vec::Vec};
+use std::{io, vec::Vec};
 
 /// Smallest dictionary finalized (upstream zstd `ZDICT_DICTSIZE_MIN`).
 pub(super) const DICT_SIZE_MIN: usize = 256;
@@ -44,24 +44,48 @@ const BLOCK_SIZE_MAX: usize = 128 << 10;
 /// Finalize `content` into a dictionary of at most `dict_size` bytes, drawing
 /// the entropy tables from the first `count` samples. Content that does not
 /// fit after the header is cut from the front, keeping the best segments.
-pub(super) fn finalize(
+pub(super) fn finalize<'s>(
     content: &[u8],
-    samples: &SampleSet<'_>,
+    samples: &SampleSet<'s>,
     count: usize,
     dict_size: usize,
     options: FinalizeOptions,
 ) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
-    finalize_into(&mut out, content, samples, count, dict_size, options)?;
+    let mut analysis = Analysis::default();
+    finalize_into(
+        &mut out,
+        &mut analysis,
+        content,
+        samples,
+        count,
+        dict_size,
+        options,
+    )?;
     Ok(out)
 }
 
-/// [`finalize`] over `out`, whose allocation a search keeps from one
-/// candidate to the next.
-pub(super) fn finalize_into(
+/// A compressor over one sample at a time, recording what it matches.
+type AnalysisCompressor<'s> = FrameCompressor<&'s [u8], Vec<u8>, Recorder>;
+
+/// What the entropy analysis keeps from one candidate to the next: the
+/// compressor it runs the samples through, whose matcher and scratch then
+/// survive the change of dictionary, its frame buffer and its block kinds.
+#[derive(Default)]
+pub(super) struct Analysis<'s> {
+    /// The compressor and the level it was built for.
+    compressor: Option<(i32, AnalysisCompressor<'s>)>,
+    frame: Vec<u8>,
+    compressed: Vec<bool>,
+}
+
+/// [`finalize`] over `out` and `analysis`, whose allocations a search keeps
+/// from one candidate to the next.
+pub(super) fn finalize_into<'s>(
     out: &mut Vec<u8>,
+    analysis: &mut Analysis<'s>,
     content: &[u8],
-    samples: &SampleSet<'_>,
+    samples: &SampleSet<'s>,
     count: usize,
     dict_size: usize,
     options: FinalizeOptions,
@@ -81,7 +105,7 @@ pub(super) fn finalize_into(
     out.reserve(dict_size);
     out.extend_from_slice(&DICT_MAGIC_NUM);
     out.extend_from_slice(&dict_id.to_le_bytes());
-    analyze_entropy(out, content, samples, count, options.level)?;
+    analyze_entropy(out, analysis, content, samples, count, options.level)?;
     for rep in START_REPS {
         out.extend_from_slice(&rep.to_le_bytes());
     }
@@ -124,7 +148,10 @@ fn derive_dict_id(raw_content: &[u8]) -> u32 {
 /// be described (upstream zstd `ZDICT_analyzeEntropy`).
 struct EntropyCounts {
     literals: [usize; 256],
-    offset_codes: Vec<usize>,
+    /// Every code a 32-bit offset base has, as upstream's `offcodeCount`
+    /// holds: only the codes up to the alphabet's bound are described, and a
+    /// sequence is counted without asking which side of it its code is on.
+    offset_codes: [usize; 32],
     match_lengths: [usize; 53],
     literal_lengths: [usize; 36],
 }
@@ -132,10 +159,11 @@ struct EntropyCounts {
 /// Append the literals table, the three sequence tables and nothing else to
 /// `out`, from the statistics of the first `count` samples compressed with
 /// `content` as a raw dictionary at `level`.
-fn analyze_entropy(
+fn analyze_entropy<'s>(
     out: &mut Vec<u8>,
+    analysis: &mut Analysis<'s>,
     content: &[u8],
-    samples: &SampleSet<'_>,
+    samples: &SampleSet<'s>,
     count: usize,
     level: i32,
 ) -> io::Result<()> {
@@ -149,11 +177,11 @@ fn analyze_entropy(
     }
     let mut counts = EntropyCounts {
         literals: [1; 256],
-        offset_codes: vec![1; offcode_max as usize + 1],
+        offset_codes: [1; 32],
         match_lengths: [1; 53],
         literal_lengths: [1; 36],
     };
-    count_samples(&mut counts, content, samples, count, level)?;
+    count_samples(&mut counts, analysis, content, samples, count, level)?;
 
     let mut literals = literals_table(&counts.literals);
     if literals.table_log() == 8 {
@@ -171,7 +199,11 @@ fn analyze_entropy(
     // are normalized and described without being built.
     let mut writer = BitWriter::from(&mut *out);
     HuffmanEncoder::new(&literals, &mut writer).write_table();
-    write_ncount_at_log(&counts.offset_codes, OF_LOG, &mut writer);
+    write_ncount_at_log(
+        &counts.offset_codes[..=offcode_max as usize],
+        OF_LOG,
+        &mut writer,
+    );
     write_ncount_at_log(&counts.match_lengths, ML_LOG, &mut writer);
     write_ncount_at_log(&counts.literal_lengths, LL_LOG, &mut writer);
     writer.flush();
@@ -180,10 +212,11 @@ fn analyze_entropy(
 
 /// Compress the first 128 KiB of each of the first `count` samples with
 /// `content` as a raw dictionary and count what its compressed blocks hold.
-fn count_samples(
+fn count_samples<'s>(
     counts: &mut EntropyCounts,
+    analysis: &mut Analysis<'s>,
     content: &[u8],
-    samples: &SampleSet<'_>,
+    samples: &SampleSet<'s>,
     count: usize,
     level: i32,
 ) -> io::Result<()> {
@@ -194,13 +227,25 @@ fn count_samples(
     // on the encoder dictionary for none of it.
     let dictionary = crate::decoding::Dictionary::from_raw_content(0, content.to_vec())
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    let recorder = Recorder {
-        inner: MatchGeneratorDriver::new(BLOCK_SIZE_MAX, 1),
-        blocks: Vec::new(),
-        sequences: Vec::new(),
-    };
-    let mut compressor: FrameCompressor<&[u8], Vec<u8>, Recorder> =
-        FrameCompressor::new_with_matcher(recorder, CompressionLevel::from_level(level));
+    let Analysis {
+        compressor,
+        frame,
+        compressed,
+    } = analysis;
+    // One compressor per level serves every candidate: the dictionary is all
+    // that changes, so its matcher and scratch are kept.
+    if compressor.as_ref().is_none_or(|(built, _)| *built != level) {
+        let recorder = Recorder {
+            inner: MatchGeneratorDriver::new(BLOCK_SIZE_MAX, 1),
+            blocks: Vec::new(),
+            sequences: Vec::new(),
+        };
+        *compressor = Some((
+            level,
+            FrameCompressor::new_with_matcher(recorder, CompressionLevel::from_level(level)),
+        ));
+    }
+    let (_, compressor) = compressor.as_mut().expect("built above");
     compressor
         .set_encoder_dictionary(EncoderDictionary::from_dictionary(dictionary))
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -214,22 +259,17 @@ fn count_samples(
     // or at upstream's, measured worse on the repository files (the samples
     // compressed 0.013% and 0.05% larger in total across COVER, FastCOVER
     // and the default search), so the rest of a sample is signal, not noise.
-    let mut frame = Vec::new();
-    let mut compressed = Vec::new();
     for index in 0..count {
         let sample = samples.sample(index);
         let block = &sample[..sample.len().min(BLOCK_SIZE_MAX)];
         if block.is_empty() {
             continue;
         }
-        frame.clear();
         compressor.set_source(block);
-        compressor.set_drain(frame);
         compressor.set_source_size_hint(average as u64);
-        compressor.compress();
-        frame = compressor.take_drain().expect("the drain was set above");
+        compressor.compress_known_into(block.len() as u64, frame);
         let fast_offset_codes = compressor.uses_fast_offset_codes();
-        compressed_blocks(&frame, &mut compressed);
+        compressed_blocks(frame, compressed);
         let recorder = compressor.matcher_mut();
         // A block written raw or as one repeated byte holds no sequences to
         // learn from, and its bytes are no literals of any compressed block.
@@ -265,12 +305,10 @@ fn count_samples(
                 };
                 counts.literal_lengths[encode_literal_length(ll).0 as usize] += 1;
                 counts.match_lengths[encode_match_len(ml).0 as usize] += 1;
-                if let Some(slot) = counts
-                    .offset_codes
-                    .get_mut(encode_offset(off_base).0 as usize)
-                {
-                    *slot += 1;
-                }
+                // The code is the offset base's highest bit, below 32.
+                let code = encode_offset(off_base).0 as usize;
+                debug_assert!(code < counts.offset_codes.len());
+                counts.offset_codes[code] += 1;
             }
         }
         recorder.blocks.clear();

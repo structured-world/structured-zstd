@@ -3,7 +3,7 @@
 //! `COVER_selectDict` and `COVER_checkTotalCompressedSize`).
 
 use super::FinalizeOptions;
-use super::finalize::finalize_into;
+use super::finalize::{Analysis, finalize_into};
 use super::samples::SampleSet;
 use crate::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
 use core::ops::Range;
@@ -40,6 +40,8 @@ pub(super) struct Evaluator<'s> {
     /// only by a candidate that wins.
     dict: Vec<u8>,
     shrunk: Vec<u8>,
+    /// The entropy analysis every candidate is finalized through.
+    analysis: Analysis<'s>,
 }
 
 impl<'s> Evaluator<'s> {
@@ -60,20 +62,22 @@ impl<'s> Evaluator<'s> {
             frame: Vec::new(),
             dict: Vec::new(),
             shrunk: Vec::new(),
+            analysis: Analysis::default(),
         }
     }
 
     /// `content` finalized into a dictionary of at most the capacity.
-    pub(super) fn finalize(&self, content: &[u8]) -> io::Result<Vec<u8>> {
+    pub(super) fn finalize(&mut self, content: &[u8]) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         self.finalize_into(content, &mut out)?;
         Ok(out)
     }
 
     /// [`Self::finalize`] over `out`, keeping its allocation.
-    fn finalize_into(&self, content: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+    fn finalize_into(&mut self, content: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
         finalize_into(
             out,
+            &mut self.analysis,
             content,
             self.samples,
             self.finalize_samples,

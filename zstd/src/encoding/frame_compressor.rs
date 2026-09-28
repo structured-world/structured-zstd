@@ -2483,6 +2483,41 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.finish_frame(all_blocks, total_uncompressed, &prep);
     }
 
+    /// [`Self::compress`] for a source of `total` bytes, the frame written
+    /// over `out` rather than to the drain: with the content size known up
+    /// front the header goes first and the blocks straight after it, with no
+    /// block accumulator and no copy into the drain. The frame is the one
+    /// `compress` writes for the same source, hint and settings.
+    pub(crate) fn compress_known_into(&mut self, total: u64, out: &mut Vec<u8>) {
+        let prep = self.prepare_frame(crate::encoding::workspace::IngestPlan::Stream);
+        let mut source = self
+            .uncompressed_data
+            .take()
+            .expect("source must be set via set_source before compress_known_into()");
+        out.clear();
+        self.append_frame_header(total, &prep, out);
+        let header_len = out.len();
+        let mut block_source = ReaderBlockSource::new(&mut source);
+        let read = self.run_owned_block_loop(&mut block_source, prep.initial_size_hint, false, out);
+        self.uncompressed_data = Some(source);
+        assert_eq!(
+            read, total,
+            "the source held another length than its frame header"
+        );
+        #[cfg(feature = "hash")]
+        if self.content_checksum {
+            out.extend_from_slice(&(self.hasher.finish() as u32).to_le_bytes());
+        }
+        #[cfg(feature = "lsm")]
+        {
+            let emit_checksum = cfg!(feature = "hash") && self.content_checksum;
+            let blocks_end = out.len() - if emit_checksum { 4 } else { 0 };
+            self.populate_frame_emit_info(header_len, &out[header_len..blocks_end], emit_checksum);
+        }
+        #[cfg(not(feature = "lsm"))]
+        let _ = header_len;
+    }
+
     /// Resets the compressor for the next frame, whose input reaches the
     /// match finder as `ingest` says.
     fn prepare_frame(&mut self, ingest: crate::encoding::workspace::IngestPlan) -> FramePrep {
