@@ -112,19 +112,21 @@ does not have. `-M` is treated as the safety promise it is: on the
 runs that decode, a limit covering the 128 MiB window, the decoder's buffers
 and the `-D` dictionary is kept and a tighter one is refused rather than
 ignored. Compressing and listing allocate no decoder, so the flag is accepted
-there and describes nothing, as upstream has it; for `--train-legacy` it caps
-the samples loaded, as below.
+there and describes nothing, as upstream has it; for `--train` it caps the
+samples loaded, as below.
 
-`--train` and `--train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#]` train
-with FastCOVER, the algorithm upstream also defaults to (a knob set to zero
-keeps its default, as upstream reads it), and a bare `--train-cover` trains
-with the COVER trainer. Its tuning, `--train-cover=...`, is refused rather
-than misread: the reference-side parameters name knobs this trainer does not
-have. `--train-legacy[=s=#]` (or `-s#`) runs upstream's original trainer, which
-counts samples: they are loaded as upstream loads them (each file one sample of
-up to 128 KiB, or cut into `-B#` pieces, whole samples up to 2 GiB or `-M` when
-that is smaller), and for the same file list the dictionary carries the same
-content as upstream's. `-D` takes either a dictionary produced by `--train` or any file at
+`--train` and `--train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#,shrink[=#]]`
+train with FastCOVER, the algorithm upstream also defaults to, and
+`--train-cover[=k=#,d=#,steps=#,split=#,shrink[=#]]` with COVER. As upstream
+reads them, naming both `k` and `d` trains once, anything less searches, and a
+knob set to zero asks for the trainer's default. `shrink` keeps the smallest
+dictionary within the given percentage (1 by default) of the full one;
+upstream parses it and then never applies it, here it takes effect.
+`--train-legacy[=s=#]` (or `-s#`) runs upstream's original trainer. Every
+trainer counts samples, and they are loaded as upstream loads them (each file
+one sample of up to 128 KiB, or cut into `-B#` pieces, whole samples up to
+2 GiB or `-M` when that is smaller); at least five are needed. For the same
+file list the legacy dictionary carries the same content as upstream's. `-D` takes either a dictionary produced by `--train` or any file at
 all, which is then used as raw content the way upstream does; such a
 dictionary has no ID, so the same bytes must be supplied when decoding.
 
@@ -255,9 +257,14 @@ Compression takes the same dictionary format through
 Behind the `dict-builder` feature, the `dictionary` module trains dictionaries
 in pure Rust:
 
-- COVER (`create_raw_dict_from_source`) and FastCOVER (`create_fastcover_raw_dict_from_source`) raw dictionaries
-- `finalize_raw_dict` to produce the full zstd dictionary format
-- `create_fastcover_dict_from_source` for train + finalize in one call
+- COVER and FastCOVER (`train_cover_dict` / `train_fastcover_dict` with a
+  given segment and dmer size, `optimize_cover_dict` /
+  `optimize_fastcover_dict` searching them), the trainers of upstream's
+  `ZDICT_*_cover` / `ZDICT_*_fastCover`, scoring each candidate by how small
+  it compresses the samples; a `shrink` bound keeps a smaller dictionary that
+  does nearly as well
+- `finalize_raw_dict` to turn raw content into the full zstd dictionary format,
+  and `create_raw_dict_from_source` for raw content from an undivided corpus
 - `create_legacy_dict_from_slice`: upstream's original suffix-array trainer
   (`ZDICT_trainFromBuffer_legacy`), whose content matches upstream's byte for
   byte on the same samples

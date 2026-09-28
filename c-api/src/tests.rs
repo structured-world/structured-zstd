@@ -2440,6 +2440,121 @@ fn zdict_fastcover_trains_usable_dictionary() {
     assert_eq!(ZDICT_isError(n), 0, "optimize fastCover failed");
     assert_ne!(params.k, 0, "optimize must write back the chosen k");
     assert_ne!(params.d, 0, "optimize must write back the chosen d");
+    assert_eq!(params.steps, 40, "and the steps it searched with");
+    assert_eq!(params.splitPoint, 0.75, "and the split it scored with");
+}
+
+/// The COVER entry points train from the samples they are given: the plain
+/// one with the caller's `k` and `d`, refusing zero; the optimizing one
+/// searching and writing its choice back, with the dictionary it returns
+/// usable for a round trip.
+#[test]
+fn zdict_cover_trains_usable_dictionary() {
+    use crate::dict::{
+        ZDICT_cover_params_t, ZDICT_optimizeTrainFromBuffer_cover, ZDICT_trainFromBuffer_cover,
+    };
+
+    let mut samples: Vec<u8> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    for i in 0..512u32 {
+        let s = format!("tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbccccc\n");
+        sizes.push(s.len());
+        samples.extend_from_slice(s.as_bytes());
+    }
+    let mut dict = vec![0u8; 8 * 1024];
+    let mut params = ZDICT_cover_params_t {
+        k: 0,
+        d: 8,
+        steps: 0,
+        nbThreads: 0,
+        splitPoint: 0.0,
+        shrinkDict: 0,
+        shrinkDictMaxRegression: 0,
+        zParams: ZDICT_params_t {
+            compressionLevel: 0,
+            notificationLevel: 0,
+            dictID: 4242,
+        },
+    };
+    let refused = unsafe {
+        ZDICT_trainFromBuffer_cover(
+            dict.as_mut_ptr(),
+            dict.len(),
+            samples.as_ptr(),
+            sizes.as_ptr(),
+            sizes.len() as u32,
+            params,
+        )
+    };
+    assert_ne!(ZDICT_isError(refused), 0, "a zero k asks for a search");
+
+    params.k = 128;
+    let n = unsafe {
+        ZDICT_trainFromBuffer_cover(
+            dict.as_mut_ptr(),
+            dict.len(),
+            samples.as_ptr(),
+            sizes.as_ptr(),
+            sizes.len() as u32,
+            params,
+        )
+    };
+    assert_eq!(ZDICT_isError(n), 0, "cover training failed");
+    assert_eq!(unsafe { ZDICT_getDictID(dict.as_ptr(), n) }, 4242);
+
+    params.k = 0;
+    params.steps = 4;
+    let n = unsafe {
+        ZDICT_optimizeTrainFromBuffer_cover(
+            dict.as_mut_ptr(),
+            dict.len(),
+            samples.as_ptr(),
+            sizes.as_ptr(),
+            sizes.len() as u32,
+            &mut params,
+        )
+    };
+    assert_eq!(ZDICT_isError(n), 0, "optimize cover failed");
+    assert!(
+        [50, 537, 1024, 1511, 1998].contains(&params.k),
+        "k={}",
+        params.k
+    );
+    assert_eq!((params.d, params.splitPoint), (8, 1.0));
+
+    let payload = b"tenant=demo table=orders key=77777 region=eu payload=aaaaabbbbbccccc\n";
+    let mut compressed = vec![0u8; 256];
+    let cctx = ZSTD_createCCtx();
+    let written = unsafe {
+        ZSTD_compress_usingDict(
+            cctx,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            payload.as_ptr(),
+            payload.len(),
+            dict.as_ptr(),
+            n,
+            3,
+        )
+    };
+    unsafe { ZSTD_freeCCtx(cctx) };
+    assert_eq!(crate::error::ZSTD_isError(written), 0);
+    let mut restored = vec![0u8; payload.len()];
+    let dctx = ZSTD_createDCtx();
+    let read = unsafe {
+        ZSTD_decompress_usingDict(
+            dctx,
+            restored.as_mut_ptr(),
+            restored.len(),
+            compressed.as_ptr(),
+            written,
+            dict.as_ptr(),
+            n,
+        )
+    };
+    unsafe { ZSTD_freeDCtx(dctx) };
+    assert_eq!(read, payload.len());
+    assert_eq!(&restored[..], &payload[..]);
 }
 
 #[test]

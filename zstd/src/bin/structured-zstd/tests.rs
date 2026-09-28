@@ -250,7 +250,7 @@ fn an_archive_built_from_two_dictionaries_names_neither() {
     /// One frame primed with a dictionary carrying `id`.
     fn frame_with_dictionary(id: u32, payload: &[u8]) -> Vec<u8> {
         use structured_zstd::dictionary::{
-            FastCoverOptions, FinalizeOptions, create_fastcover_dict_from_slice,
+            CoverOptions, FastCoverOptions, FinalizeOptions, train_fastcover_dict,
         };
         // Trained rather than assembled: a serialized dictionary carries
         // entropy tables, and the id the frame header records lives in its
@@ -258,12 +258,18 @@ fn an_archive_built_from_two_dictionaries_names_neither() {
         let corpus: Vec<u8> = (0..40_000u32)
             .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
             .collect();
-        let mut blob = Vec::new();
-        create_fastcover_dict_from_slice(
+        let options = FastCoverOptions {
+            cover: CoverOptions {
+                k: 256,
+                ..FastCoverOptions::default().cover
+            },
+            ..FastCoverOptions::default()
+        };
+        let blob = train_fastcover_dict(
             corpus.as_slice(),
-            &mut blob,
+            &[4_000; 10],
             8 * 1024,
-            &FastCoverOptions::default(),
+            &options,
             FinalizeOptions { dict_id: Some(id) },
         )
         .expect("training the fixture dictionary must succeed");
@@ -896,7 +902,8 @@ fn a_trained_dictionary_is_no_more_readable_than_its_samples() {
     fs::set_permissions(&open, fs::Permissions::from_mode(0o644)).unwrap();
     fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let mut opts = parse(&["--train", "-f", "s"]).unwrap();
+    // Cut into samples: a trainer needs at least five.
+    let mut opts = parse(&["--train", "-f", "-B4096", "s"]).unwrap();
     opts.inputs = vec![open.clone(), private.clone()];
     opts.output = Some(output.clone());
     let trained = train_dictionary(&opts);
@@ -1198,7 +1205,8 @@ fn replacing_a_file_does_not_restore_its_old_permissions() {
     fs::set_permissions(&sample, fs::Permissions::from_mode(0o600)).unwrap();
     fs::set_permissions(&dictionary, fs::Permissions::from_mode(0o644)).unwrap();
 
-    let mut opts = parse(&["--train", "-f", "s"]).unwrap();
+    // Cut into samples: a trainer needs at least five.
+    let mut opts = parse(&["--train", "-f", "-B4096", "s"]).unwrap();
     opts.inputs = vec![sample.clone()];
     opts.output = Some(dictionary.clone());
     let trained = train_dictionary(&opts);
@@ -4650,26 +4658,34 @@ fn literal_compression_flags_reach_the_frame() {
 }
 
 /// The trainer flags take their tuning the way the reference command reads
-/// it, and the FastCOVER options built from it follow the reference's rules:
-/// both `k` and `d` fix the parameters, `steps` widens the search over `k`,
-/// and a value the trainer cannot take is refused.
+/// it, and the options built from it follow the reference's rules: a value
+/// the trainer cannot take is refused, `shrink` defaults its bound to 1%, and
+/// the scoring level is the command's.
 #[test]
 fn trainer_parameters_parse_and_build_options() {
     let params = parse_trainer_params("k=200,d=8,f=20,steps=4,split=75,accel=2", true).unwrap();
     assert_eq!(
         params,
         TrainerParams {
+            listed: true,
             k: Some(200),
             d: Some(8),
             f: Some(20),
             steps: Some(4),
             split_percent: Some(75),
             accel: Some(2),
-            shrink: false,
+            shrink: None,
         }
     );
-    assert!(parse_trainer_params("shrink", false).unwrap().shrink);
-    assert!(parse_trainer_params("k=50,shrink=2", false).unwrap().shrink);
+    assert_eq!(
+        parse_trainer_params("shrink", false).unwrap().shrink,
+        Some(1)
+    );
+    assert_eq!(
+        parse_trainer_params("k=50,shrink=2", false).unwrap().shrink,
+        Some(2)
+    );
+    assert!(parse_trainer_params("shrink=x", false).is_err());
     assert!(
         parse_trainer_params("f=20", false).is_err(),
         "cover has no f"
@@ -4679,50 +4695,35 @@ fn trainer_parameters_parse_and_build_options() {
     assert!(parse_trainer_params("k=x", true).is_err(), "not a number");
     assert!(parse_trainer_params("zzz=1", true).is_err(), "unknown key");
 
-    let fixed = fastcover_options(&params).unwrap();
-    assert!(!fixed.optimize, "k and d given: nothing to search");
-    assert_eq!((fixed.k, fixed.d, fixed.f, fixed.accel), (200, 8, 20, 2));
-    assert_eq!(fixed.split_point, 0.75);
-
-    let searched = fastcover_options(&TrainerParams {
-        steps: Some(10),
-        ..TrainerParams::default()
-    })
-    .unwrap();
-    assert!(searched.optimize);
+    let fixed = fastcover_options(&params, 5).unwrap();
     assert_eq!(
-        searched.k_candidates.len(),
-        11,
-        "50..=2000 in strides of 195"
+        (fixed.cover.k, fixed.cover.d, fixed.f, fixed.accel),
+        (200, 8, 20, 2)
     );
-    assert_eq!(searched.k_candidates[0], 50);
+    assert_eq!(
+        (
+            fixed.cover.steps,
+            fixed.cover.split_point,
+            fixed.cover.level
+        ),
+        (4, 0.75, 5)
+    );
+    let shrunk = cover_options(
+        &parse_trainer_params("k=64,d=8,shrink=3", false).unwrap(),
+        3,
+    )
+    .unwrap();
+    assert_eq!((shrunk.k, shrunk.d, shrunk.shrink), (64, 8, Some(3)));
 
-    let bad = |params: TrainerParams| fastcover_options(&params).is_err();
-    assert!(bad(TrainerParams {
-        d: Some(7),
-        ..TrainerParams::default()
-    }));
-    assert!(bad(TrainerParams {
-        f: Some(32),
-        ..TrainerParams::default()
-    }));
-    assert!(bad(TrainerParams {
-        accel: Some(11),
-        ..TrainerParams::default()
-    }));
-    assert!(bad(TrainerParams {
-        k: Some(4),
-        d: Some(8),
-        ..TrainerParams::default()
-    }));
-    assert!(bad(TrainerParams {
-        split_percent: Some(101),
-        ..TrainerParams::default()
-    }));
-    assert!(bad(TrainerParams {
-        shrink: true,
-        ..TrainerParams::default()
-    }));
+    let bad =
+        |text: &str| fastcover_options(&parse_trainer_params(text, true).unwrap(), 3).is_err();
+    assert!(bad("d=7"));
+    assert!(bad("f=32"));
+    assert!(bad("accel=11"));
+    assert!(bad("k=4,d=8"));
+    assert!(bad("k=6"), "a search over d reaches 8");
+    assert!(bad("split=101"));
+    assert!(cover_options(&parse_trainer_params("k=4,d=8", false).unwrap(), 3).is_err());
 
     let opts = parse(&["--train-fastcover=k=200,d=8", "s1"]).unwrap();
     assert_eq!(opts.mode, Mode::Train);
@@ -4730,7 +4731,7 @@ fn trainer_parameters_parse_and_build_options() {
     assert_eq!(opts.trainer_params.k, Some(200));
     let opts = parse(&["--train-cover", "s1"]).unwrap();
     assert_eq!(opts.trainer, Trainer::Cover);
-    assert!(opts.trainer_params.is_default());
+    assert_eq!(opts.trainer_params, TrainerParams::default());
     assert_eq!(
         parse(&["--train-legacy", "s1"]).unwrap().trainer,
         Trainer::Legacy
@@ -4781,37 +4782,47 @@ fn a_bare_train_keeps_the_trainer_a_flag_named() {
     );
 }
 
-/// Zero is how the reference's trainer options say "the default": its parser
-/// starts from a zeroed structure and its trainer fills in every zero
-/// (`zdict.h`, `ZDICT_optimizeTrainFromBuffer_fastCover`). So
-/// `k=0,d=0,f=0,steps=0,split=0,accel=0` tunes nothing and trains as the bare
-/// flag does, rather than being refused or narrowing the search.
+/// A listed tuning starts from zero in every knob, as the reference's parser
+/// does (it zeroes the structure first), and zero asks the trainer for its own
+/// default or a search: `--train-fastcover=k=0` searches `d` over 6 and 8 in
+/// forty steps at the trainer's split. Only the bare flag starts from the
+/// command's defaults, `d` of 8 in four steps.
 #[test]
-fn zero_trainer_knobs_ask_for_the_defaults() {
-    use structured_zstd::dictionary::FastCoverOptions;
+fn a_listed_tuning_starts_from_zero() {
+    use structured_zstd::dictionary::{CoverOptions, FastCoverOptions};
 
     let zeros = parse_trainer_params("k=0,d=0,f=0,steps=0,split=0,accel=0", true).unwrap();
-    assert!(zeros.is_default(), "{zeros:?}");
-    let options = fastcover_options(&zeros).expect("zero knobs are valid");
-    let defaults = FastCoverOptions::default();
-    assert!(options.optimize);
-    assert_eq!(options.k_candidates, defaults.k_candidates);
-    assert_eq!(options.d_candidates, defaults.d_candidates);
-    assert_eq!(options.f_candidates, defaults.f_candidates);
+    let options = fastcover_options(&zeros, 3).expect("zero knobs are valid");
     assert_eq!(
-        (options.accel, options.split_point),
-        (defaults.accel, defaults.split_point)
+        (options.cover.k, options.cover.d, options.cover.steps),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        (options.f, options.accel, options.cover.split_point),
+        (0, 0, 0.0)
+    );
+    let bare = fastcover_options(&TrainerParams::default(), 3).unwrap();
+    assert_eq!(
+        bare,
+        FastCoverOptions {
+            cover: CoverOptions {
+                level: 3,
+                ..FastCoverOptions::default().cover
+            },
+            ..FastCoverOptions::default()
+        }
+    );
+    let bare_cover = cover_options(&TrainerParams::default(), 3).unwrap();
+    assert_eq!(
+        bare_cover,
+        CoverOptions {
+            level: 3,
+            ..CoverOptions::default()
+        }
     );
     // A zero beside a real value leaves that value in force.
     let mixed = parse_trainer_params("k=0,d=6", true).unwrap();
     assert_eq!((mixed.k, mixed.d), (None, Some(6)));
-    assert!(
-        parse(&["--train-cover=k=0,d=0,steps=0", "s"])
-            .unwrap()
-            .trainer_params
-            .is_default(),
-        "for COVER too, zero is no tuning"
-    );
 }
 
 /// Whether a trainer takes the tuning it was given is known from the command
@@ -4824,7 +4835,10 @@ fn trainer_tuning_is_refused_before_the_samples_are_read() {
     let scratch = Scratch::new("tuneearly");
     let missing = scratch.path().join("absent-sample");
     for (args, expected) in [
-        (&["--train-cover=k=50", "-q", "s"][..], "takes no tuning"),
+        (
+            &["--train-cover=k=4,d=8", "-q", "s"][..],
+            "k must be at least d",
+        ),
         (
             &["--train-fastcover=d=7", "-q", "s"][..],
             "d must be 6 or 8",
@@ -4840,11 +4854,11 @@ fn trainer_tuning_is_refused_before_the_samples_are_read() {
     }
 }
 
-/// `--train-cover` trains with the COVER trainer and writes a real dictionary;
-/// its reference-side tuning names knobs this trainer does not have, so a
-/// tuned request is refused rather than trained under other terms.
+/// `--train-cover` trains with the COVER trainer and writes a real dictionary,
+/// searching when `k` or `d` is missing and training once when both are
+/// given; `shrink` gives a dictionary no larger than the unshrunk one.
 #[test]
-fn cover_training_writes_a_dictionary_and_refuses_tuning() {
+fn cover_training_writes_a_dictionary_with_or_without_tuning() {
     let scratch = Scratch::new("cover");
     let corpus: Vec<u8> = (0..60_000u32)
         .flat_map(|i| format!("record {} value {}\n", i % 500, (i * 7919) % 1000).into_bytes())
@@ -4852,22 +4866,37 @@ fn cover_training_writes_a_dictionary_and_refuses_tuning() {
     let sample = scratch.file("samples.txt", &corpus);
     let output = scratch.path().join("cover.dict");
 
-    let mut opts = parse(&["--train-cover", "-q", "--maxdict=8192", "s"]).unwrap();
-    opts.inputs = vec![sample.clone()];
-    opts.output = Some(output.clone());
-    train_dictionary(&opts).expect("COVER training succeeds");
-    let dictionary = fs::read(&output).unwrap();
-    assert!(dictionary.len() <= 8192);
-    structured_zstd::decoding::Dictionary::decode_dict(&dictionary)
-        .expect("the output is a finalized dictionary");
-
-    let mut tuned = parse(&["--train-cover=k=50", "-q", "-f", "s"]).unwrap();
-    tuned.inputs = vec![sample];
-    tuned.output = Some(output);
-    let err = train_dictionary(&tuned)
-        .expect_err("tuning the reference's COVER has no meaning here")
-        .to_string();
-    assert!(err.contains("takes no tuning"), "{err}");
+    let mut sizes = Vec::new();
+    for args in [
+        &["--train-cover", "-q", "-f", "-B4096", "--maxdict=8192", "s"][..],
+        &[
+            "--train-cover=k=64,d=8",
+            "-q",
+            "-f",
+            "-B4096",
+            "--maxdict=8192",
+            "s",
+        ],
+        &[
+            "--train-cover=k=64,d=8,shrink=50",
+            "-q",
+            "-f",
+            "-B4096",
+            "--maxdict=8192",
+            "s",
+        ],
+    ] {
+        let mut opts = parse(args).unwrap();
+        opts.inputs = vec![sample.clone()];
+        opts.output = Some(output.clone());
+        train_dictionary(&opts).unwrap_or_else(|err| panic!("{args:?}: {err}"));
+        let dictionary = fs::read(&output).unwrap();
+        assert!(dictionary.len() <= 8192, "{args:?}");
+        structured_zstd::decoding::Dictionary::decode_dict(&dictionary)
+            .expect("the output is a finalized dictionary");
+        sizes.push(dictionary.len());
+    }
+    assert!(sizes[2] <= sizes[1], "{sizes:?}");
 }
 
 /// `--patch-from REF` compresses against the reference as raw content with a

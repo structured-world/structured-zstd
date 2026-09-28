@@ -1,32 +1,34 @@
-//! Code for creating a separate content dictionary.
+//! Dictionary training.
 //!
 //! Effective dictionaries are up to 1% the size of the complete training body,
-//! and are trained on many examples of the original data.
+//! and are trained on many examples of the original data. The trainers are
+//! those of the reference implementation, each taking the samples back to back
+//! with their sizes:
 //!
-//! Implemented following the paper "Effective construction of
-//! Relative Lempel-Ziv Dictionaries", by Kewen Liao, Matthias Petri,
-//! Alistair Moffat, and Anthony Wirth
-
-// The algorithm is summarized here
-// 1. The text is split into "epochs", or chunks from the original source
-// 2. From within each epoch, we select the "segment", or 1 KiB contiguous section
-//    that's predicted to be the best option to include in the dictionary. Concatenated,
-//    these segments form the dictionary.
-//
-// This segment scoring algorithm operates as follows:
-// For a given epoch:
-//  - Run a reservoir sampler over the entire epoch, creating a
-//    reservoir of n/t, where `t` is the desired number of occurrences
-//    we want the most common k-mers to have
-//  - Have the ability to estimate
-//    the frequency of a given k-mer: `f(w: k-mer)` calculates
-//    the frequency of w in the reservoir using a rolling karp-rabin hash
-//  - The score of a segment is the sum of `f(w)` called on every kmer within the segment
+//! - COVER ([`train_cover_dict`], [`optimize_cover_dict`]) indexes every dmer
+//!   exactly and fills the dictionary with the segments whose dmers the most
+//!   samples share.
+//! - FastCOVER ([`train_fastcover_dict`], [`optimize_fastcover_dict`]) does the
+//!   same over a hashed frequency table, faster and with less memory; it is
+//!   what `zstd --train` runs.
+//! - The legacy trainer ([`create_legacy_dict_from_slice`]) searches a suffix
+//!   array for repeated segments.
+//!
+//! The `optimize_*` forms search segment and dmer sizes, scoring each candidate
+//! by the total size of the scoring samples compressed with it.
+//!
+//! [`create_raw_dict_from_slice`] and its reader forms build raw content from an
+//! undivided corpus instead, estimating segment value by k-mer frequency in a
+//! reservoir sample (Liao, Petri, Moffat and Wirth, "Effective construction of
+//! Relative Lempel-Ziv Dictionaries").
 mod cover;
 mod fastcover;
 mod frequency;
 mod legacy;
+mod lmc;
 mod reservoir;
+mod samples;
+mod selection;
 mod suffix_array;
 
 use crate::bit_io::BitWriter;
@@ -40,12 +42,8 @@ use crate::fse::fse_encoder::{self, build_table_from_symbol_counts};
 use crate::huff0::HuffmanTable as HuffmanDecoderTable;
 use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable as HuffmanEncoderTable};
 use core::cmp::Reverse;
-use cover::*;
-pub use fastcover::{
-    DEFAULT_D_CANDIDATES, DEFAULT_F_CANDIDATES, DEFAULT_K_CANDIDATES, FastCoverParams,
-    FastCoverTuned,
-};
 pub use legacy::DEFAULT_SELECTIVITY;
+use lmc::*;
 use std::{
     boxed::Box,
     collections::{BinaryHeap, HashMap},
@@ -73,40 +71,79 @@ const MAX_HUFFMAN_STATS_BYTES: usize = 64 * 1024;
 /// entry points can only discover the true bound once those tables are built.
 pub const MIN_TRAINED_DICT_SIZE: usize = DICT_MAGIC_NUM.len() + 4 + 12 + 8;
 
-/// Tuning knobs for pure-Rust FastCOVER training.
-#[derive(Debug, Clone)]
-pub struct FastCoverOptions {
-    pub optimize: bool,
+/// Tuning for COVER training, the knobs of the reference's
+/// `ZDICT_cover_params_t`.
+///
+/// The defaults are those `zstd --train-cover` starts from: `d` of 8, a search
+/// over `k` in four steps, every sample both building and scoring.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoverOptions {
+    /// Segment size in bytes. Zero searches 50..=2000 when optimizing.
+    pub k: u32,
+    /// Dmer size in bytes, at most `k`. Zero searches 6 and 8 when optimizing.
+    pub d: u32,
+    /// How many values of `k` the search tries; zero is 40.
+    pub steps: u32,
+    /// Share of the samples dictionaries are built from, in `(0, 1]`; the rest
+    /// score them. At 1 every sample does both. Zero or below is the trainer's
+    /// default: 1 for COVER, 0.75 for FastCOVER.
     pub split_point: f64,
-    pub accel: usize,
-    pub k: usize,
-    pub d: usize,
+    /// Accept the smallest dictionary whose scoring samples compress to at most
+    /// this many percent more than with the full-size one.
+    pub shrink: Option<u32>,
+    /// Compression level candidates are scored at; zero is the default level.
+    pub level: i32,
+}
+
+impl Default for CoverOptions {
+    fn default() -> Self {
+        Self {
+            k: 0,
+            d: 8,
+            steps: 4,
+            split_point: 1.0,
+            shrink: None,
+            level: 0,
+        }
+    }
+}
+
+/// Tuning for FastCOVER training, the knobs of the reference's
+/// `ZDICT_fastCover_params_t`.
+///
+/// The defaults are those `zstd --train` runs: `d` of 8, a table of 2^20
+/// counts, a search over `k` in four steps, three quarters of the samples
+/// building and the rest scoring.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FastCoverOptions {
+    /// Segment size, dmer size, search, split, shrink and scoring level, as for
+    /// COVER. `d` is at least 4 here; the reference takes 6 and 8.
+    pub cover: CoverOptions,
     /// Width of the dmer frequency table in bits, `1..=31`; its memory grows
-    /// as `2^f`. A value outside the range is brought to the nearest end.
+    /// as `2^f`. Zero is 20.
     pub f: u32,
-    pub k_candidates: Vec<usize>,
-    pub d_candidates: Vec<usize>,
-    pub f_candidates: Vec<u32>,
+    /// Count every `accel`-th position, `1..=10`, and draw the entropy tables
+    /// from a matching share of the samples. Zero is 1.
+    pub accel: u32,
 }
 
 impl Default for FastCoverOptions {
     fn default() -> Self {
         Self {
-            optimize: true,
-            split_point: 0.75,
-            accel: 1,
-            k: 256,
-            d: 8,
+            cover: CoverOptions {
+                split_point: 0.75,
+                ..CoverOptions::default()
+            },
             f: 20,
-            k_candidates: DEFAULT_K_CANDIDATES.to_vec(),
-            d_candidates: DEFAULT_D_CANDIDATES.to_vec(),
-            f_candidates: DEFAULT_F_CANDIDATES.to_vec(),
+            accel: 1,
         }
     }
 }
 
+/// Header options for a finalized dictionary.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FinalizeOptions {
+    /// The dictionary id; `None` derives one from the content.
     pub dict_id: Option<u32>,
 }
 
@@ -450,42 +487,6 @@ fn serialize_fse_table_from_corpus(
     Ok(serialize_fse_table(&table))
 }
 
-fn finalized_content_budget(
-    sample_data: &[u8],
-    raw_fallback: &[u8],
-    dict_size: usize,
-) -> io::Result<usize> {
-    let min_content_size = 8usize;
-    let huf_len = serialize_huffman_table(sample_data, raw_fallback)?.len();
-    let of_len =
-        serialize_fse_table_from_corpus(sample_data, raw_fallback, MAX_OFFSET_CODE, OF_MAX_LOG)?
-            .len();
-    let ml_len = serialize_fse_table_from_corpus(
-        sample_data,
-        raw_fallback,
-        MAX_MATCH_LENGTH_CODE,
-        ML_MAX_LOG,
-    )?
-    .len();
-    let ll_len = serialize_fse_table_from_corpus(
-        sample_data,
-        raw_fallback,
-        MAX_LITERAL_LENGTH_CODE,
-        LL_MAX_LOG,
-    )?
-    .len();
-
-    let header_len = DICT_MAGIC_NUM.len() + 4 + huf_len + of_len + ml_len + ll_len + 12;
-    let max_content_budget = dict_size.saturating_sub(header_len);
-    if max_content_budget < min_content_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "dictionary size too small to fit header and offset history",
-        ));
-    }
-    Ok(max_content_budget)
-}
-
 fn derive_dict_id(raw_content: &[u8]) -> u32 {
     let mut h = 0xcbf29ce484222325u64;
     for &b in raw_content {
@@ -572,138 +573,413 @@ pub fn finalize_raw_dict(
     Ok(out)
 }
 
-/// Train a raw FastCOVER dictionary from a source stream. A frequency table
-/// wider than memory allows is an `OutOfMemory` error.
-fn train_fastcover_internal(
-    sample: &[u8],
-    dict_size: usize,
-    options: &FastCoverOptions,
-) -> io::Result<(Vec<u8>, FastCoverTuned)> {
-    let trained = if options.optimize {
-        fastcover::optimize_fastcover_raw(
-            sample,
-            dict_size,
-            options.split_point,
-            options.accel,
-            options.d_candidates.as_slice(),
-            options.f_candidates.as_slice(),
-            options.k_candidates.as_slice(),
-        )
-    } else {
-        let params = fastcover::normalize_fastcover_params(FastCoverParams {
-            k: options.k,
-            d: options.d,
-            f: options.f,
-            accel: options.accel,
-        });
-        fastcover::train_fastcover_raw(sample, dict_size, params).map(|dict| {
-            (
-                dict,
-                FastCoverTuned {
-                    k: params.k,
-                    d: params.d,
-                    f: params.f,
-                    accel: params.accel,
-                    score: 0,
-                },
-            )
+/// Smallest dictionary the segment trainers build (upstream zstd
+/// `ZDICT_DICTSIZE_MIN`).
+const SEGMENT_DICT_SIZE_MIN: usize = 256;
+
+/// The `k` and `d` values a training run tries, resolved from the options the
+/// way the reference's optimizers resolve theirs.
+struct SearchSpace {
+    d: core::ops::RangeInclusive<u32>,
+    k: core::ops::RangeInclusive<u32>,
+    k_step: usize,
+    steps: u32,
+    split_point: f64,
+}
+
+impl SearchSpace {
+    /// Upstream zstd `ZDICT_optimizeTrainFromBuffer_cover`: zero `d` tries 6
+    /// and 8, zero `k` tries 50..=2000 in `steps` strides.
+    fn optimizing(options: &CoverOptions, default_split: f64) -> io::Result<Self> {
+        let split_point = if options.split_point <= 0.0 {
+            default_split
+        } else {
+            options.split_point
+        };
+        if split_point > 1.0 {
+            return Err(samples::invalid("the split point must lie in (0, 1]"));
+        }
+        let d = if options.d == 0 {
+            6..=8
+        } else {
+            options.d..=options.d
+        };
+        let k = if options.k == 0 {
+            50..=2000
+        } else {
+            options.k..=options.k
+        };
+        if *k.start() < *d.end() {
+            return Err(samples::invalid("k must be at least d"));
+        }
+        let steps = if options.steps == 0 {
+            40
+        } else {
+            options.steps
+        };
+        let k_step = ((k.end() - k.start()) / steps).max(1) as usize;
+        Ok(Self {
+            d,
+            k,
+            k_step,
+            steps,
+            split_point,
         })
-    };
-    trained.map_err(io::Error::from)
-}
+    }
 
-impl From<fastcover::TableTooLarge> for io::Error {
-    fn from(table: fastcover::TableTooLarge) -> Self {
-        io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            format!(
-                "a FastCOVER table of {} entries does not fit in memory; use a smaller f",
-                table.entries
-            ),
-        )
+    /// The single `k` and `d` a plain training run is given, with every sample
+    /// building (upstream zstd `ZDICT_trainFromBuffer_cover`).
+    fn fixed(options: &CoverOptions) -> io::Result<Self> {
+        if options.k == 0 || options.d == 0 {
+            return Err(samples::invalid(
+                "k and d are required; zero asks for a search, which the optimize_* trainers run",
+            ));
+        }
+        Ok(Self {
+            d: options.d..=options.d,
+            k: options.k..=options.k,
+            k_step: 1,
+            steps: options.steps,
+            split_point: 1.0,
+        })
+    }
+
+    fn pairs(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.d.clone().step_by(2).flat_map(move |d| {
+            self.k
+                .clone()
+                .step_by(self.k_step)
+                .map(move |k| (d as usize, k as usize))
+        })
     }
 }
 
-/// Train a raw FastCOVER dictionary directly from an in-memory sample.
-pub fn train_fastcover_raw_from_slice(
-    sample: &[u8],
+/// Upstream zstd `COVER_checkParameters`: a segment fits the dictionary and
+/// holds at least one dmer.
+fn segment_fits(k: usize, d: usize, dict_size: usize) -> bool {
+    d > 0 && d <= k && k <= dict_size
+}
+
+fn check_dict_size(dict_size: usize) -> io::Result<()> {
+    if dict_size < SEGMENT_DICT_SIZE_MIN {
+        return Err(samples::invalid(&format!(
+            "a dictionary must be at least {SEGMENT_DICT_SIZE_MIN} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Train a COVER dictionary of at most `dict_size` bytes with the `k` and `d`
+/// given (the reference's `ZDICT_trainFromBuffer_cover`).
+///
+/// `samples` is every sample back to back and `sample_sizes` their lengths.
+/// Every sample builds, and the entropy tables are drawn from all of them. With
+/// [`CoverOptions::shrink`] the samples also score the shrinking search;
+/// `steps` and `split_point` are ignored.
+///
+/// # Errors
+///
+/// `InvalidInput` when `k` or `d` is zero or `d > k`, when `k` exceeds
+/// `dict_size`, when `dict_size` is under 256 bytes, when there are fewer than
+/// five samples or they do not add up to `samples.len()`.
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{CoverOptions, FinalizeOptions, train_cover_dict};
+///
+/// let mut samples = Vec::new();
+/// let mut sizes = Vec::new();
+/// for i in 0..200u32 {
+///     let line = format!("tenant=demo table=orders key={i} region=eu status=shipped\n");
+///     sizes.push(line.len());
+///     samples.extend_from_slice(line.as_bytes());
+/// }
+/// let options = CoverOptions { k: 64, ..CoverOptions::default() };
+/// let dict = train_cover_dict(&samples, &sizes, 4096, &options, FinalizeOptions::default())
+///     .unwrap();
+/// assert!(dict.starts_with(&[0x37, 0xA4, 0x30, 0xEC]) && dict.len() <= 4096);
+/// ```
+pub fn train_cover_dict(
+    samples: &[u8],
+    sample_sizes: &[usize],
+    dict_size: usize,
+    options: &CoverOptions,
+    finalize: FinalizeOptions,
+) -> io::Result<Vec<u8>> {
+    let space = SearchSpace::fixed(options)?;
+    let (dict, _) = run_cover(samples, sample_sizes, dict_size, options, finalize, &space)?;
+    Ok(dict)
+}
+
+/// Train COVER dictionaries over a range of `k` and `d` and keep the one the
+/// scoring samples compress best with (the reference's
+/// `ZDICT_optimizeTrainFromBuffer_cover`). Returns it with the options that
+/// built it.
+///
+/// A zero `k` searches 50..=2000 in `steps` strides (zero `steps` is 40), a
+/// zero `d` tries 6 and 8. The leading `split_point` of the samples build and
+/// the rest score; at 1 every sample does both. [`CoverOptions::shrink`] takes
+/// effect here, which the reference's optimizer does not honour.
+///
+/// # Errors
+///
+/// As [`train_cover_dict`], and when `split_point` exceeds 1, when `k` is
+/// below `d`, or when the split leaves fewer than five samples to build or
+/// none to score.
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{CoverOptions, FinalizeOptions, optimize_cover_dict};
+///
+/// let mut samples = Vec::new();
+/// let mut sizes = Vec::new();
+/// for i in 0..200u32 {
+///     let line = format!("tenant=demo table=orders key={i} region=eu status=shipped\n");
+///     sizes.push(line.len());
+///     samples.extend_from_slice(line.as_bytes());
+/// }
+/// let (dict, chosen) = optimize_cover_dict(
+///     &samples,
+///     &sizes,
+///     4096,
+///     &CoverOptions::default(),
+///     FinalizeOptions::default(),
+/// )
+/// .unwrap();
+/// assert!(dict.len() <= 4096 && chosen.k >= 50);
+/// ```
+pub fn optimize_cover_dict(
+    samples: &[u8],
+    sample_sizes: &[usize],
+    dict_size: usize,
+    options: &CoverOptions,
+    finalize: FinalizeOptions,
+) -> io::Result<(Vec<u8>, CoverOptions)> {
+    let space = SearchSpace::optimizing(options, 1.0)?;
+    run_cover(samples, sample_sizes, dict_size, options, finalize, &space)
+}
+
+fn run_cover(
+    samples: &[u8],
+    sample_sizes: &[usize],
+    dict_size: usize,
+    options: &CoverOptions,
+    finalize: FinalizeOptions,
+    space: &SearchSpace,
+) -> io::Result<(Vec<u8>, CoverOptions)> {
+    check_dict_size(dict_size)?;
+    let set = samples::SampleSet::new(samples, sample_sizes)?;
+    let split = set.split(space.split_point)?;
+    let plain = space.k.start() == space.k.end() && space.d.start() == space.d.end();
+    // A plain run with no shrinking prices nothing: its one dictionary is the
+    // answer, as the reference's plain trainer returns it unscored.
+    let scored = !plain || options.shrink.is_some() || space.split_point < 1.0;
+    let mut evaluator = selection::Evaluator::new(
+        &set,
+        split.train,
+        split.test.clone(),
+        dict_size,
+        options.level,
+        finalize,
+    );
+    let mut best = selection::Best::new();
+    let mut context: Option<(usize, cover::CoverContext<'_>)> = None;
+    for (d, k) in space.pairs() {
+        if !segment_fits(k, d, dict_size) {
+            continue;
+        }
+        if context
+            .as_ref()
+            .is_none_or(|(built_for, _)| *built_for != d)
+        {
+            context = Some((d, cover::CoverContext::new(&set, split.train, d)?));
+        }
+        let (_, ctx) = context.as_ref().expect("built above");
+        let content = ctx.build(&mut ctx.fresh_state(), dict_size, k);
+        let chosen = CoverOptions {
+            k: k as u32,
+            d: d as u32,
+            steps: space.steps,
+            split_point: space.split_point,
+            ..*options
+        };
+        if !scored {
+            return Ok((evaluator.finalize(&content)?, chosen));
+        }
+        best.offer(evaluator.select(&content, options.shrink), chosen);
+    }
+    best.finish()
+}
+
+/// Train a FastCOVER dictionary of at most `dict_size` bytes with the `k` and
+/// `d` given (the reference's `ZDICT_trainFromBuffer_fastCover`).
+///
+/// As [`train_cover_dict`], over a hashed frequency table of `2^f` counts; the
+/// entropy tables are drawn from the share of samples `accel` sets.
+///
+/// # Errors
+///
+/// As [`train_cover_dict`], and when `d` is below 4, `f` exceeds 31 or `accel`
+/// exceeds 10. A table too large for memory is an `OutOfMemory` error.
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{
+///     CoverOptions, FastCoverOptions, FinalizeOptions, train_fastcover_dict,
+/// };
+///
+/// let mut samples = Vec::new();
+/// let mut sizes = Vec::new();
+/// for i in 0..200u32 {
+///     let line = format!("tenant=demo table=orders key={i} region=eu status=shipped\n");
+///     sizes.push(line.len());
+///     samples.extend_from_slice(line.as_bytes());
+/// }
+/// let options = FastCoverOptions {
+///     cover: CoverOptions { k: 64, ..FastCoverOptions::default().cover },
+///     ..FastCoverOptions::default()
+/// };
+/// let dict = train_fastcover_dict(&samples, &sizes, 4096, &options, FinalizeOptions::default())
+///     .unwrap();
+/// assert!(dict.len() <= 4096);
+/// ```
+pub fn train_fastcover_dict(
+    samples: &[u8],
+    sample_sizes: &[usize],
     dict_size: usize,
     options: &FastCoverOptions,
-) -> io::Result<(Vec<u8>, FastCoverTuned)> {
-    if sample.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "source stream is empty",
-        ));
-    }
-    let (dict, tuned) = train_fastcover_internal(sample, dict_size, options)?;
-    if dict.is_empty() && dict_size > 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "training sample is too small for FastCOVER",
-        ));
-    }
-    Ok((dict, tuned))
+    finalize: FinalizeOptions,
+) -> io::Result<Vec<u8>> {
+    let space = SearchSpace::fixed(&options.cover)?;
+    let (dict, _) = run_fastcover(samples, sample_sizes, dict_size, options, finalize, &space)?;
+    Ok(dict)
 }
 
-/// Train a raw FastCOVER dictionary from a source stream.
+/// Train FastCOVER dictionaries over a range of `k` and `d` and keep the one
+/// the scoring samples compress best with (the reference's
+/// `ZDICT_optimizeTrainFromBuffer_fastCover`, which `zstd --train` and
+/// `ZDICT_trainFromBuffer` run). Returns it with the options that built it.
 ///
-/// This function fully buffers the entire training corpus into memory via
-/// `read_to_end`, which can consume significant RAM for large inputs.
-pub fn create_fastcover_raw_dict_from_source<R: io::Read, W: io::Write>(
-    mut source: R,
-    output: &mut W,
+/// The search is [`optimize_cover_dict`]'s; a non-positive `split_point` is
+/// 0.75 here.
+///
+/// # Errors
+///
+/// As [`optimize_cover_dict`] and [`train_fastcover_dict`].
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{FastCoverOptions, FinalizeOptions, optimize_fastcover_dict};
+///
+/// let mut samples = Vec::new();
+/// let mut sizes = Vec::new();
+/// for i in 0..200u32 {
+///     let line = format!("tenant=demo table=orders key={i} region=eu status=shipped\n");
+///     sizes.push(line.len());
+///     samples.extend_from_slice(line.as_bytes());
+/// }
+/// let (dict, chosen) = optimize_fastcover_dict(
+///     &samples,
+///     &sizes,
+///     4096,
+///     &FastCoverOptions::default(),
+///     FinalizeOptions::default(),
+/// )
+/// .unwrap();
+/// assert!(dict.len() <= 4096 && chosen.cover.d == 8);
+/// ```
+pub fn optimize_fastcover_dict(
+    samples: &[u8],
+    sample_sizes: &[usize],
     dict_size: usize,
     options: &FastCoverOptions,
-) -> io::Result<FastCoverTuned> {
-    let mut sample = Vec::new();
-    source.read_to_end(&mut sample)?;
-    let (dict, tuned) = train_fastcover_raw_from_slice(sample.as_slice(), dict_size, options)?;
-    output.write_all(dict.as_slice())?;
-    Ok(tuned)
+    finalize: FinalizeOptions,
+) -> io::Result<(Vec<u8>, FastCoverOptions)> {
+    let space = SearchSpace::optimizing(&options.cover, 0.75)?;
+    run_fastcover(samples, sample_sizes, dict_size, options, finalize, &space)
 }
 
-/// Train and finalize a FastCOVER dictionary in pure Rust.
-///
-/// This function fully buffers the entire training corpus into memory via
-/// `read_to_end`, which can consume significant RAM for large inputs.
-pub fn create_fastcover_dict_from_source<R: io::Read, W: io::Write>(
-    mut source: R,
-    output: &mut W,
+fn run_fastcover(
+    samples: &[u8],
+    sample_sizes: &[usize],
     dict_size: usize,
-    fastcover: &FastCoverOptions,
+    options: &FastCoverOptions,
     finalize: FinalizeOptions,
-) -> io::Result<FastCoverTuned> {
-    let mut sample = Vec::new();
-    source.read_to_end(&mut sample)?;
-    create_fastcover_dict_from_slice(sample.as_slice(), output, dict_size, fastcover, finalize)
-}
-
-/// Train and finalize a FastCOVER dictionary from a corpus already in memory.
-///
-/// The same work as [`create_fastcover_dict_from_source`] for a caller that
-/// holds the bytes: the corpus is the largest allocation training makes, and
-/// handing it over as a slice keeps it to one copy rather than buffering it a
-/// second time inside.
-pub fn create_fastcover_dict_from_slice<W: io::Write>(
-    sample: &[u8],
-    output: &mut W,
-    dict_size: usize,
-    fastcover: &FastCoverOptions,
-    finalize: FinalizeOptions,
-) -> io::Result<FastCoverTuned> {
-    if sample.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "source stream is empty",
-        ));
+    space: &SearchSpace,
+) -> io::Result<(Vec<u8>, FastCoverOptions)> {
+    let f = if options.f == 0 { 20 } else { options.f };
+    let accel = if options.accel == 0 { 1 } else { options.accel };
+    if f > fastcover::MAX_F {
+        return Err(samples::invalid(&format!(
+            "f must be in 1..={}, got {f}",
+            fastcover::MAX_F
+        )));
     }
-    let content_budget = finalized_content_budget(sample, sample, dict_size)?;
-    let (raw_dict, tuned) = train_fastcover_raw_from_slice(sample, content_budget, fastcover)?;
-
-    let finalized = finalize_raw_dict(raw_dict.as_slice(), sample, dict_size, finalize)?;
-    output.write_all(finalized.as_slice())?;
-    Ok(tuned)
+    if accel > fastcover::MAX_ACCEL {
+        return Err(samples::invalid(&format!(
+            "accel must be in 1..={}, got {accel}",
+            fastcover::MAX_ACCEL
+        )));
+    }
+    if *space.d.start() < 4 {
+        return Err(samples::invalid("FastCOVER needs d of at least 4"));
+    }
+    check_dict_size(dict_size)?;
+    let set = samples::SampleSet::new(samples, sample_sizes)?;
+    let split = set.split(space.split_point)?;
+    let plain = space.k.start() == space.k.end() && space.d.start() == space.d.end();
+    let scored = !plain || options.cover.shrink.is_some() || space.split_point < 1.0;
+    let mut window = fastcover::WindowCounts::default();
+    let mut best = selection::Best::new();
+    let mut context: Option<(usize, fastcover::FastCoverContext<'_>)> = None;
+    let mut evaluator: Option<selection::Evaluator<'_>> = None;
+    for (d, k) in space.pairs() {
+        if !segment_fits(k, d, dict_size) {
+            continue;
+        }
+        if context
+            .as_ref()
+            .is_none_or(|(built_for, _)| *built_for != d)
+        {
+            context = Some((
+                d,
+                fastcover::FastCoverContext::new(&set, split.train, d, f, accel)?,
+            ));
+        }
+        let (_, ctx) = context.as_ref().expect("built above");
+        // The finalize share depends on `accel` alone, so every context agrees.
+        let evaluator = evaluator.get_or_insert_with(|| {
+            selection::Evaluator::new(
+                &set,
+                ctx.finalize_samples(split.train),
+                split.test.clone(),
+                dict_size,
+                options.cover.level,
+                finalize,
+            )
+        });
+        let content = ctx.build(&mut ctx.fresh_freqs(), &mut window, dict_size, k)?;
+        let chosen = FastCoverOptions {
+            cover: CoverOptions {
+                k: k as u32,
+                d: d as u32,
+                steps: space.steps,
+                split_point: space.split_point,
+                ..options.cover
+            },
+            f,
+            accel,
+        };
+        if !scored {
+            return Ok((evaluator.finalize(&content)?, chosen));
+        }
+        best.offer(evaluator.select(&content, options.cover.shrink), chosen);
+    }
+    best.finish()
 }
 
 /// Train and finalize a dictionary with the reference's original trainer, the
@@ -811,36 +1087,30 @@ pub(crate) fn dict_roundtrip_fixture() -> (
     use crate::encoding::{CompressionLevel, FrameCompressor};
 
     let mut sample = alloc::vec::Vec::new();
+    let mut sizes = alloc::vec::Vec::new();
     for i in 0..512u32 {
-        sample.extend_from_slice(
-            alloc::format!(
-                "tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbcccccdddddeeeee\n"
-            )
-            .as_bytes(),
+        let line = alloc::format!(
+            "tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbcccccdddddeeeee\n"
         );
+        sizes.push(line.len());
+        sample.extend_from_slice(line.as_bytes());
     }
 
-    let dict_size = 4096usize;
-    let content_budget = finalized_content_budget(sample.as_slice(), sample.as_slice(), dict_size)
-        .expect("content budget should be computable");
-    let raw = fastcover::train_fastcover_raw(
-        sample.as_slice(),
-        content_budget,
-        fastcover::FastCoverParams {
+    let options = FastCoverOptions {
+        cover: CoverOptions {
             k: 256,
-            d: 8,
-            f: 20,
-            accel: 1,
+            ..FastCoverOptions::default().cover
         },
-    )
-    .expect("a 2^20 table fits");
-    let finalized = finalize_raw_dict(
-        raw.as_slice(),
+        ..FastCoverOptions::default()
+    };
+    let finalized = train_fastcover_dict(
         sample.as_slice(),
-        dict_size,
+        &sizes,
+        4096,
+        &options,
         FinalizeOptions::default(),
     )
-    .expect("finalization should succeed");
+    .expect("training should succeed");
     let parsed =
         Dictionary::decode_dict(finalized.as_slice()).expect("finalized dictionary should parse");
     assert!(!parsed.dict_content.is_empty());

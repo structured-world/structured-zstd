@@ -242,27 +242,25 @@ enum Trainer {
     Legacy,
 }
 
-/// Tuning from `--train-fastcover=k=#,d=#,f=#,steps=#,split=#,accel=#` and
-/// `--train-cover=k=#,d=#,steps=#,split=#`, each knob `None` until given a
-/// value other than zero; zero, as there, asks for the default.
-/// `shrink` is parsed so the command line is validated, and refused at
-/// training time: no trainer here shrinks the dictionary afterwards.
+/// Tuning from `--train-fastcover=k=#,d=#,f=#,steps=#,split=#,accel=#,shrink[=#]`
+/// and `--train-cover=k=#,d=#,steps=#,split=#,shrink[=#]`, each knob `None`
+/// until given a value other than zero.
+///
+/// As in the reference command, a listed tuning starts from zero in every
+/// knob, and zero asks the trainer for its own default or a search; only the
+/// bare flag starts from the command's defaults (`d` of 8, four steps).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 struct TrainerParams {
+    /// Whether the flag carried a `=` list at all.
+    listed: bool,
     k: Option<u32>,
     d: Option<u32>,
     f: Option<u32>,
     steps: Option<u32>,
     split_percent: Option<u32>,
     accel: Option<u32>,
-    shrink: bool,
-}
-
-impl TrainerParams {
-    /// Whether any tuning was given at all.
-    fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
+    /// `shrink[=#]`: the regression the shrinking search allows, in percent.
+    shrink: Option<u32>,
 }
 
 /// Per-knob compression parameters from `--zstd=wlog=#,clog=#,...`
@@ -624,17 +622,23 @@ fn parse_trainer_params(text: &str, fastcover: bool) -> Result<TrainerParams> {
     } else {
         "--train-cover"
     };
-    let mut params = TrainerParams::default();
+    let mut params = TrainerParams {
+        listed: true,
+        ..TrainerParams::default()
+    };
     for field in text.split(',') {
         if field == "shrink" || field.starts_with("shrink=") {
-            if let Some(bound) = field.strip_prefix("shrink=") {
-                let (_, tail) = read_leading_u32(bound)
-                    .wrap_err_with(|| format!("{flag} shrink bound `{bound}` is invalid"))?;
+            // The reference's default bound (`kDefaultRegression`, zstdcli.c).
+            let mut bound = 1;
+            if let Some(text) = field.strip_prefix("shrink=") {
+                let (value, tail) = read_leading_u32(text)
+                    .wrap_err_with(|| format!("{flag} shrink bound `{text}` is invalid"))?;
                 if !tail.is_empty() {
-                    bail!("{flag} shrink bound `{bound}` is invalid");
+                    bail!("{flag} shrink bound `{text}` is invalid");
                 }
+                bound = value;
             }
-            params.shrink = true;
+            params.shrink = Some(bound);
             continue;
         }
         let (key, value) = field
@@ -1780,14 +1784,16 @@ Advanced decompression options:
 
 Dictionary builder:
   --train                       Create a dictionary from a training set of files.
-  --train-cover                 Use the cover algorithm (takes no tuning here).
-  --train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#]
+
+  --train-cover[=k=#,d=#,steps=#,split=#,shrink[=#]]
+                                Use the cover algorithm (with optional arguments).
+  --train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#,shrink[=#]]
                                 Use the fast cover algorithm (with optional arguments).
 
   --train-legacy[=s=#]          Use the legacy algorithm with selectivity #. [Default: 9]
-  -B#                           With --train-legacy, cut each file into samples of size #;
-                                otherwise each file is one sample of up to 128 KiB.
-  -o NAME                       Use NAME as dictionary name. [Default: dictionary]
+  -B#                           Cut each file into samples of size #; otherwise each file
+                                is one sample of up to 128 KiB. At least 5 samples are needed.
+  -o NAME                      Use NAME as dictionary name. [Default: dictionary]
   --maxdict=#                   Limit dictionary to specified size #. [Default: 112640]
   --dictID=#                    Force dictionary ID to #. [Default: Random]
 
@@ -1808,9 +1814,10 @@ multi-threaded run), --adapt, --zstd=ovlog=#, --[no-]sparse,
 single-threaded).
 
 Rejected rather than ignored, because they would change the result: --format=
-other than zstd, --rsyncable (needs worker threads), shrink in the trainer
-tuning, and -M/--memory below the enforced ceiling when decoding.
---train-cover and --train-fastcover read whole files, so -B does not cut them.
+other than zstd, --rsyncable (needs worker threads), and -M/--memory below the
+enforced ceiling when decoding.
+Trainer shrink[=#] takes effect: the smallest dictionary within # percent
+(default 1) of the full one is kept.
 A new output file keeps its source's permissions.
 ";
 
@@ -3253,8 +3260,8 @@ fn bench_display_name(label: &str) -> String {
 /// [--dictID=N]`.
 fn train_dictionary(opts: &Options) -> Result<()> {
     use structured_zstd::dictionary::{
-        FinalizeOptions, create_fastcover_dict_from_slice, create_legacy_dict_from_slice,
-        create_raw_dict_from_slice, finalize_raw_dict,
+        FinalizeOptions, create_legacy_dict_from_slice, optimize_cover_dict,
+        optimize_fastcover_dict, train_cover_dict, train_fastcover_dict,
     };
 
     if opts.inputs.iter().any(|input| input == Path::new("-")) {
@@ -3293,29 +3300,16 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // bound to be refused does not first read a corpus that may be large.
     enum Plan {
         FastCover(structured_zstd::dictionary::FastCoverOptions),
-        Cover,
+        Cover(structured_zstd::dictionary::CoverOptions),
         Legacy,
     }
     let plan = match opts.trainer {
-        Trainer::FastCover => Plan::FastCover(fastcover_options(&opts.trainer_params)?),
+        Trainer::FastCover => Plan::FastCover(fastcover_options(&opts.trainer_params, opts.level)?),
+        Trainer::Cover => Plan::Cover(cover_options(&opts.trainer_params, opts.level)?),
         // The legacy trainer is tuned by selectivity alone; a cover tuning list
         // given before `--train-legacy` names a trainer that no longer runs,
         // as it does in the reference.
         Trainer::Legacy => Plan::Legacy,
-        Trainer::Cover => {
-            // The COVER trainer here scores segments by k-mer frequency, as the
-            // reference's does, but is not parameterised the same way: `k`,
-            // `d`, `steps` and `split` name knobs it does not have, and
-            // `shrink` a pass it does not run. Running it anyway would return
-            // a dictionary trained under different terms than the ones typed.
-            if !opts.trainer_params.is_default() {
-                bail!(
-                    "--train-cover takes no tuning here (k, d, steps, split, shrink); \
-                     use --train-fastcover=... for a tunable trainer"
-                );
-            }
-            Plan::Cover
-        }
     };
     let output = opts
         .output
@@ -3369,17 +3363,16 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     let finalize = FinalizeOptions {
         dict_id: opts.dict_id,
     };
-    let mut dict = Vec::new();
-    let sources = match plan {
+    // Every trainer counts samples, so they are loaded as the reference's
+    // command loads them: shuffled, capped per file, and cut by `-B`. The same
+    // files then yield the same corpus. `-M` caps what is loaded, as the
+    // reference's command passes its memory limit to `DiB_trainFromFiles`
+    // (zstdcli.c), which keeps whole samples up to it (dibio.c).
+    let set = load_training_samples(&opts.inputs, opts.block_size, opts.memory_limit)?;
+    let failed = |err: std::io::Error| eyre!("dictionary training failed: {err}");
+    let dict = match plan {
         Plan::Legacy => {
-            // The legacy trainer counts samples, so they are loaded as the
-            // reference's command loads them: shuffled, capped per file, and
-            // cut by `-B`. The same files then yield the same content.
-            // `-M` caps what is loaded, as the reference's command passes its
-            // memory limit to `DiB_trainFromFiles` (zstdcli.c), which keeps
-            // whole samples up to it (dibio.c); dropping it would train on a
-            // different corpus than the reference for the same command line.
-            let set = load_training_samples(&opts.inputs, opts.block_size, opts.memory_limit)?;
+            let mut dict = Vec::new();
             create_legacy_dict_from_slice(
                 &set.corpus,
                 &set.sizes,
@@ -3388,43 +3381,53 @@ fn train_dictionary(opts: &Options) -> Result<()> {
                 opts.selectivity,
                 finalize,
             )
-            .map_err(|err| eyre!("dictionary training failed: {err}"))?;
-            set.sources
+            .map_err(failed)?;
+            dict
+        }
+        // Both `k` and `d` fix the segment, and anything less asks for the
+        // search, as the reference's command decides (zstdcli.c, `optimize`).
+        Plan::Cover(options) if options.k != 0 && options.d != 0 => {
+            train_cover_dict(&set.corpus, &set.sizes, opts.max_dict, &options, finalize)
+                .map_err(failed)?
+        }
+        Plan::Cover(options) => {
+            let (dict, chosen) =
+                optimize_cover_dict(&set.corpus, &set.sizes, opts.max_dict, &options, finalize)
+                    .map_err(failed)?;
+            display!(
+                opts.verbosity,
+                2,
+                "k={}\nd={}\nsteps={}\nsplit={}",
+                chosen.k,
+                chosen.d,
+                chosen.steps,
+                (chosen.split_point * 100.0) as u32
+            );
+            dict
+        }
+        Plan::FastCover(options) if options.cover.k != 0 && options.cover.d != 0 => {
+            train_fastcover_dict(&set.corpus, &set.sizes, opts.max_dict, &options, finalize)
+                .map_err(failed)?
         }
         Plan::FastCover(options) => {
-            let (corpus, sources) = read_whole_samples(&opts.inputs)?;
-            // From the slice, not through a reader: the corpus is the largest
-            // thing this run holds, and the reader path buffers it a second
-            // time inside.
-            create_fastcover_dict_from_slice(
-                corpus.as_slice(),
-                &mut dict,
-                opts.max_dict,
-                &options,
-                finalize,
-            )
-            .map_err(|err| eyre!("dictionary training failed: {err}"))?;
-            sources
-        }
-        Plan::Cover => {
-            let (corpus, sources) = read_whole_samples(&opts.inputs)?;
-            // From the slice, as FastCOVER is: the reader path would buffer
-            // the whole corpus a second time, and `corpus` has to stay alive
-            // for the finalizing pass below anyway.
-            let mut raw = Vec::new();
-            create_raw_dict_from_slice(corpus.as_slice(), &mut raw, opts.max_dict)
-                .map_err(|err| eyre!("dictionary training failed: {err}"))?;
-            if raw.is_empty() {
-                bail!("dictionary training failed: the samples yield no dictionary content");
-            }
-            // The trainer writes its most valuable segment last, and
-            // finalizing keeps the tail when the header leaves less room than
-            // was asked for, so the best content survives the cut.
-            dict = finalize_raw_dict(raw.as_slice(), corpus.as_slice(), opts.max_dict, finalize)
-                .map_err(|err| eyre!("dictionary training failed: {err}"))?;
-            sources
+            let (dict, chosen) =
+                optimize_fastcover_dict(&set.corpus, &set.sizes, opts.max_dict, &options, finalize)
+                    .map_err(failed)?;
+            display!(
+                opts.verbosity,
+                2,
+                "k={}\nd={}\nf={}\nsteps={}\nsplit={}\naccel={}",
+                chosen.cover.k,
+                chosen.cover.d,
+                chosen.f,
+                chosen.cover.steps,
+                (chosen.cover.split_point * 100.0) as u32,
+                chosen.accel
+            );
+            dict
         }
     };
+    let sources = set.sources;
 
     // A trained dictionary is an output file like any other, so it is written
     // through a temporary that is renamed into place: an interrupted run
@@ -3448,38 +3451,6 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         opts.inputs.len()
     );
     Ok(())
-}
-
-/// Read every sample file whole into one corpus, for the trainers that do not
-/// tell samples apart; `-B` has nothing to cut for them, and they get every
-/// byte, as the reference's do when `-B` cuts files into samples.
-///
-/// Each sample is opened once, and what the dictionary may carry is taken from
-/// that same open file rather than from its path afterwards. A path answers
-/// about whatever it names at the moment it is asked, and training takes long
-/// enough for a sample to be replaced while it runs: asking again at the end
-/// could describe a file whose bytes are not the ones now inside the
-/// dictionary, and grant its permissions to theirs.
-fn read_whole_samples(inputs: &[PathBuf]) -> Result<(Vec<u8>, Vec<fs::Metadata>)> {
-    let mut corpus = Vec::new();
-    let mut sources = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let mut file = File::open(input)
-            .wrap_err_with(|| format!("failed to open training sample {}", input.display()))?;
-        let metadata = file
-            .metadata()
-            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
-        if !metadata.is_file() {
-            bail!(
-                "--train needs regular files: {} is not one",
-                input.display()
-            );
-        }
-        file.read_to_end(&mut corpus)
-            .wrap_err_with(|| format!("failed to read training sample {}", input.display()))?;
-        sources.push(metadata);
-    }
-    Ok((corpus, sources))
 }
 
 /// Most bytes one file contributes as a sample when `-B` does not cut it
@@ -3698,68 +3669,100 @@ fn place_trained_dictionary(output: &Path, dict: &[u8], samples: &[fs::Metadata]
     placed
 }
 
-/// The FastCOVER tuning `--train-fastcover=...` asked for, checked the way the
-/// reference trainer checks it: `d` is 6 or 8, `f` lies in `1..=31`, `accel`
-/// in `1..=10`, `k` is at least `d`, `split` is a percentage. Naming both `k`
-/// and `d` fixes them and skips the parameter search; naming `steps` widens
-/// or narrows the search over `k` instead.
-fn fastcover_options(
+/// The COVER tuning `--train-cover=...` asked for, scored at `level` as the
+/// reference's command scores at its `-#` (zstdcli.c, `dictCLevel`). A listed
+/// tuning starts from zero, a bare flag from the command's defaults. `split`
+/// is a percentage and `k` at least `d` (the most a search over `d` tries,
+/// 8, when `d` is not given); both are settled here, before any sample is
+/// read.
+fn cover_options(
     params: &TrainerParams,
-) -> Result<structured_zstd::dictionary::FastCoverOptions> {
-    use structured_zstd::dictionary::FastCoverOptions;
+    level: i32,
+) -> Result<structured_zstd::dictionary::CoverOptions> {
+    cover_tuning(params, level, "--train-cover")
+}
 
-    if params.shrink {
-        bail!("--train-fastcover shrink is not implemented");
-    }
-    let mut options = FastCoverOptions::default();
-    if let Some(d) = params.d {
-        if d != 6 && d != 8 {
-            bail!("--train-fastcover d must be 6 or 8, got {d}");
+fn cover_tuning(
+    params: &TrainerParams,
+    level: i32,
+    flag: &str,
+) -> Result<structured_zstd::dictionary::CoverOptions> {
+    use structured_zstd::dictionary::CoverOptions;
+
+    let mut options = if params.listed {
+        CoverOptions {
+            k: 0,
+            d: 0,
+            steps: 0,
+            split_point: 0.0,
+            shrink: None,
+            level,
         }
-        options.d = d as usize;
-        options.d_candidates = vec![d as usize];
-    }
-    if let Some(f) = params.f {
-        if f == 0 || f > 31 {
-            bail!("--train-fastcover f must be in 1..=31, got {f}");
+    } else {
+        CoverOptions {
+            level,
+            ..CoverOptions::default()
         }
-        options.f = f;
-        options.f_candidates = vec![f];
-    }
-    if let Some(accel) = params.accel {
-        if accel == 0 || accel > 10 {
-            bail!("--train-fastcover accel must be in 1..=10, got {accel}");
-        }
-        options.accel = accel as usize;
-    }
+    };
     if let Some(split) = params.split_percent {
         if split > 100 {
-            bail!("--train-fastcover split is a percentage, got {split}");
+            bail!("{flag} split is a percentage, got {split}");
         }
         options.split_point = f64::from(split) / 100.0;
     }
-    match (params.k, params.steps) {
-        (Some(k), _) => {
-            if (k as usize) < options.d {
-                bail!(
-                    "--train-fastcover k must be at least d, got k={k} d={}",
-                    options.d
-                );
-            }
-            options.k = k as usize;
-            options.k_candidates = vec![k as usize];
+    if let Some(k) = params.k {
+        let d = params.d.unwrap_or(8);
+        if k < d {
+            bail!("{flag} k must be at least d, got k={k} d={d}");
         }
-        (None, Some(steps)) => {
-            // The reference searches `k` over 50..=2000 in `steps` strides.
-            const K_MIN: usize = 50;
-            const K_MAX: usize = 2000;
-            let stride = ((K_MAX - K_MIN) / steps.max(1) as usize).max(1);
-            options.k_candidates = (K_MIN..=K_MAX).step_by(stride).collect();
-        }
-        (None, None) => {}
+        options.k = k;
     }
-    // With both `k` and `d` given there is nothing left to search for.
-    options.optimize = !(params.k.is_some() && params.d.is_some());
+    options.d = params.d.unwrap_or(options.d);
+    options.steps = params.steps.unwrap_or(options.steps);
+    options.shrink = params.shrink;
+    Ok(options)
+}
+
+/// The FastCOVER tuning `--train-fastcover=...` asked for, checked the way the
+/// reference trainer checks it: `d` is 6 or 8, `f` lies in `1..=31`, `accel`
+/// in `1..=10`, and the rest as [`cover_options`] checks it.
+fn fastcover_options(
+    params: &TrainerParams,
+    level: i32,
+) -> Result<structured_zstd::dictionary::FastCoverOptions> {
+    use structured_zstd::dictionary::FastCoverOptions;
+
+    const FLAG: &str = "--train-fastcover";
+    if let Some(d) = params.d
+        && d != 6
+        && d != 8
+    {
+        bail!("{FLAG} d must be 6 or 8, got {d}");
+    }
+    let mut options = FastCoverOptions {
+        cover: cover_tuning(params, level, FLAG)?,
+        ..FastCoverOptions::default()
+    };
+    if params.listed {
+        // Zero asks the trainer for its own table width and acceleration.
+        options.f = 0;
+        options.accel = 0;
+    } else {
+        // The bare flag's split is FastCOVER's, not COVER's.
+        options.cover.split_point = FastCoverOptions::default().cover.split_point;
+    }
+    if let Some(f) = params.f {
+        if f > 31 {
+            bail!("{FLAG} f must be in 1..=31, got {f}");
+        }
+        options.f = f;
+    }
+    if let Some(accel) = params.accel {
+        if accel > 10 {
+            bail!("{FLAG} accel must be in 1..=10, got {accel}");
+        }
+        options.accel = accel;
+    }
     Ok(options)
 }
 

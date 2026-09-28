@@ -1,5 +1,6 @@
 use super::*;
 use crate::decoding::Dictionary;
+use crate::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
 use std::io::Cursor;
 use std::string::ToString;
 
@@ -39,76 +40,332 @@ fn statistics_are_strided_without_overflowing_the_index() {
 }
 
 fn training_data() -> Vec<u8> {
+    training_samples().0
+}
+
+/// Log lines, one sample each.
+fn training_samples() -> (Vec<u8>, Vec<usize>) {
     let mut data = Vec::new();
+    let mut sizes = Vec::new();
     for i in 0..512u32 {
-        data.extend_from_slice(
-            format!(
-                "tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbcccccdddddeeeee\n"
-            )
-            .as_bytes(),
+        let line = format!(
+            "tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbcccccdddddeeeee op={}\n",
+            ["put", "get", "scan", "delete"][i as usize % 4]
+        );
+        sizes.push(line.len());
+        data.extend_from_slice(line.as_bytes());
+    }
+    (data, sizes)
+}
+
+/// What a dictionary costs on `samples`: its size plus each sample compressed
+/// with it at the default level, the measure the optimizers minimise.
+fn price(dict: &[u8], data: &[u8], sizes: &[usize]) -> usize {
+    let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor
+        .set_encoder_dictionary(EncoderDictionary::from_bytes(dict).unwrap())
+        .unwrap();
+    let mut total = dict.len();
+    let mut start = 0;
+    for &size in sizes {
+        total += compressor
+            .compress_independent_frame(&data[start..start + size])
+            .len();
+        start += size;
+    }
+    total
+}
+
+fn fixed_cover(k: u32, d: u32) -> CoverOptions {
+    CoverOptions {
+        k,
+        d,
+        ..CoverOptions::default()
+    }
+}
+
+fn fixed_fastcover(k: u32, d: u32) -> FastCoverOptions {
+    FastCoverOptions {
+        cover: CoverOptions {
+            k,
+            d,
+            ..FastCoverOptions::default().cover
+        },
+        ..FastCoverOptions::default()
+    }
+}
+
+/// A trained dictionary parses back, fits the size asked for, and carries the
+/// id it was given.
+#[test]
+fn plain_trainers_write_a_parseable_dictionary() {
+    let (data, sizes) = training_samples();
+    let finalize = FinalizeOptions { dict_id: Some(77) };
+    let cover = train_cover_dict(&data, &sizes, 4096, &fixed_cover(128, 8), finalize).unwrap();
+    let fast =
+        train_fastcover_dict(&data, &sizes, 4096, &fixed_fastcover(128, 8), finalize).unwrap();
+    for dict in [cover, fast] {
+        assert!(dict.len() <= 4096);
+        let parsed = Dictionary::decode_dict(&dict).expect("the dictionary parses back");
+        assert_eq!(parsed.id, 77);
+        assert!(!parsed.dict_content.is_empty());
+    }
+}
+
+/// The plain trainers take `k` and `d` as given; zero asks for a search, which
+/// only the optimizers run (upstream zstd rejects it the same way).
+#[test]
+fn plain_trainers_require_k_and_d() {
+    let (data, sizes) = training_samples();
+    for options in [fixed_cover(0, 8), fixed_cover(128, 0)] {
+        let err = train_cover_dict(&data, &sizes, 4096, &options, FinalizeOptions::default())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+    let err = train_fastcover_dict(
+        &data,
+        &sizes,
+        4096,
+        &fixed_fastcover(0, 8),
+        FinalizeOptions::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+}
+
+/// Fewer than five samples, sizes that do not add up to the corpus, and a
+/// dictionary under 256 bytes are refused before any training.
+#[test]
+fn trainers_refuse_what_they_cannot_train_on() {
+    let (data, sizes) = training_samples();
+    let cases: [(&[u8], &[usize], usize); 4] = [
+        (&data[..sizes[..4].iter().sum::<usize>()], &sizes[..4], 4096),
+        (&data, &sizes[..10], 4096),
+        (&data[..10], &[20, 20, 20, 20, 20], 4096),
+        (&data, &sizes, 255),
+    ];
+    for (samples, sample_sizes, dict_size) in cases {
+        let cover = optimize_cover_dict(
+            samples,
+            sample_sizes,
+            dict_size,
+            &CoverOptions::default(),
+            FinalizeOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(cover.kind(), io::ErrorKind::InvalidInput, "{cover}");
+        let fast = optimize_fastcover_dict(
+            samples,
+            sample_sizes,
+            dict_size,
+            &FastCoverOptions::default(),
+            FinalizeOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(fast.kind(), io::ErrorKind::InvalidInput, "{fast}");
+    }
+}
+
+/// The optimizer keeps the candidate the scoring samples compress best with.
+/// With every sample both building and scoring, each candidate is exactly the
+/// plain trainer's dictionary for its `k` and `d`, so pricing those directly
+/// finds the same minimum the optimizer reports.
+#[test]
+fn the_optimizer_keeps_the_cheapest_candidate() {
+    let (data, sizes) = training_samples();
+    let options = CoverOptions {
+        k: 0,
+        d: 8,
+        steps: 4,
+        split_point: 1.0,
+        ..CoverOptions::default()
+    };
+    let (dict, chosen) =
+        optimize_cover_dict(&data, &sizes, 2048, &options, FinalizeOptions::default()).unwrap();
+    // 50..=2000 in four strides of 487.
+    let grid = [50u32, 537, 1024, 1511, 1998];
+    assert!(grid.contains(&chosen.k), "k={}", chosen.k);
+    assert_eq!((chosen.d, chosen.steps, chosen.split_point), (8, 4, 1.0));
+    let chosen_price = price(&dict, &data, &sizes);
+    for k in grid {
+        let candidate = train_cover_dict(
+            &data,
+            &sizes,
+            2048,
+            &fixed_cover(k, 8),
+            FinalizeOptions::default(),
+        )
+        .unwrap();
+        if k == chosen.k {
+            assert_eq!(candidate, dict);
+        }
+        assert!(
+            chosen_price <= price(&candidate, &data, &sizes),
+            "k={k} is cheaper than the chosen k={}",
+            chosen.k
         );
     }
-    data
 }
 
+/// The FastCOVER optimizer searches the same `k` grid and reports the table
+/// width and acceleration it ran with.
 #[test]
-fn create_fastcover_dict_from_source_writes_non_empty_output() {
-    let sample = training_data();
-    let mut out = Vec::new();
-    let tuned = create_fastcover_dict_from_source(
-        Cursor::new(sample.as_slice()),
-        &mut out,
+fn the_fastcover_optimizer_reports_what_it_ran_with() {
+    let (data, sizes) = training_samples();
+    let (dict, chosen) = optimize_fastcover_dict(
+        &data,
+        &sizes,
+        2048,
+        &FastCoverOptions::default(),
+        FinalizeOptions::default(),
+    )
+    .unwrap();
+    assert!(Dictionary::decode_dict(&dict).is_ok());
+    assert!([50u32, 537, 1024, 1511, 1998].contains(&chosen.cover.k));
+    assert_eq!(
+        (
+            chosen.cover.d,
+            chosen.f,
+            chosen.accel,
+            chosen.cover.split_point
+        ),
+        (8, 20, 1, 0.75)
+    );
+    // A zero `d` tries both 6 and 8.
+    let (_, either) = optimize_fastcover_dict(
+        &data,
+        &sizes,
+        2048,
+        &FastCoverOptions {
+            cover: CoverOptions {
+                d: 0,
+                ..FastCoverOptions::default().cover
+            },
+            ..FastCoverOptions::default()
+        },
+        FinalizeOptions::default(),
+    )
+    .unwrap();
+    assert!([6, 8].contains(&either.cover.d));
+}
+
+/// With `shrink`, the smallest trailing share of the content whose scoring
+/// cost stays within the allowed regression is kept. Allowing a large
+/// regression takes the first, 256-byte candidate; allowing none keeps a
+/// dictionary no larger than the unshrunk one and no costlier.
+#[test]
+fn shrink_keeps_a_smaller_dictionary_within_the_regression() {
+    let (data, sizes) = training_samples();
+    let full = train_cover_dict(
+        &data,
+        &sizes,
+        8192,
+        &fixed_cover(256, 8),
+        FinalizeOptions::default(),
+    )
+    .unwrap();
+    let full_price = price(&full, &data, &sizes);
+    let generous = train_cover_dict(
+        &data,
+        &sizes,
+        8192,
+        &CoverOptions {
+            shrink: Some(1000),
+            ..fixed_cover(256, 8)
+        },
+        FinalizeOptions::default(),
+    )
+    .unwrap();
+    let content_len = |dict: &[u8]| Dictionary::decode_dict(dict).unwrap().dict_content.len();
+    assert_eq!(content_len(&generous), 256);
+    assert!(price(&generous, &data, &sizes) as f64 <= full_price as f64 * 11.0);
+    let strict = train_cover_dict(
+        &data,
+        &sizes,
+        8192,
+        &CoverOptions {
+            shrink: Some(0),
+            ..fixed_cover(256, 8)
+        },
+        FinalizeOptions::default(),
+    )
+    .unwrap();
+    assert!(strict.len() <= full.len());
+    assert!(price(&strict, &data, &sizes) <= full_price);
+}
+
+/// A split below 1 scores on the trailing samples only: a split that leaves
+/// none of them, or fewer than five to build from, is refused.
+#[test]
+fn the_split_must_leave_samples_on_both_sides() {
+    let (data, sizes) = training_samples();
+    for split_point in [0.005, 1.5] {
+        let err = optimize_cover_dict(
+            &data,
+            &sizes,
+            4096,
+            &CoverOptions {
+                split_point,
+                ..CoverOptions::default()
+            },
+            FinalizeOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{split_point}");
+    }
+}
+
+/// A frequency table or acceleration past the reference's range is refused,
+/// as is a dmer shorter than the hash reads.
+#[test]
+fn fastcover_refuses_knobs_out_of_range() {
+    let (data, sizes) = training_samples();
+    let base = fixed_fastcover(128, 8);
+    for options in [
+        FastCoverOptions { f: 32, ..base },
+        FastCoverOptions { accel: 11, ..base },
+        fixed_fastcover(128, 3),
+    ] {
+        let err = train_fastcover_dict(&data, &sizes, 4096, &options, FinalizeOptions::default())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+/// The widest frequency table the trainer takes (`f = 31`, 2^31 counts) is
+/// larger than a 32-bit target can lay out. Training at that width reports
+/// that as an error through the `io::Result` rather than panicking on the
+/// allocation.
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn a_frequency_table_too_wide_for_the_target_is_an_error() {
+    let (data, sizes) = training_samples();
+    let options = FastCoverOptions {
+        f: 31,
+        ..fixed_fastcover(256, 8)
+    };
+    let err = train_fastcover_dict(&data, &sizes, 4096, &options, FinalizeOptions::default())
+        .expect_err("a table this wide does not fit a 32-bit target");
+    assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+}
+
+/// A corpus of one repeated byte carries no symbol distribution to describe, so
+/// the serializer substitutes a synthetic alphabet. That substitute has to be
+/// one the Huffman table description can actually express: a flat alphabet
+/// wider than 128 symbols has neither an FSE nor a direct representation, and
+/// training on such a corpus must not take the process down with it.
+#[test]
+fn training_on_a_single_repeated_byte_does_not_crash() {
+    let sample = vec![7u8; 4096];
+    let dict = train_fastcover_dict(
+        &sample,
+        &[512; 8],
         4096,
-        &FastCoverOptions::default(),
-        FinalizeOptions::default(),
+        &fixed_fastcover(256, 8),
+        FinalizeOptions { dict_id: Some(1) },
     )
-    .expect("fastcover+finalize should succeed");
-    assert!(!out.is_empty());
-    assert!(tuned.k > 0);
-    assert!(tuned.d > 0);
-}
-
-#[test]
-fn create_fastcover_raw_dict_from_source_rejects_empty_source() {
-    let mut out = Vec::new();
-    let err = create_fastcover_raw_dict_from_source(
-        Cursor::new(Vec::<u8>::new()),
-        &mut out,
-        1024,
-        &FastCoverOptions::default(),
-    )
-    .expect_err("empty source must be rejected");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-}
-
-#[test]
-fn create_fastcover_dict_from_source_propagates_finalize_error() {
-    let sample = training_data();
-    let mut out = Vec::new();
-    let err = create_fastcover_dict_from_source(
-        Cursor::new(sample.as_slice()),
-        &mut out,
-        32,
-        &FastCoverOptions::default(),
-        FinalizeOptions::default(),
-    )
-    .expect_err("too-small dictionary budget must fail during finalize");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    assert!(err.to_string().contains("dictionary size too small"));
-}
-
-#[test]
-fn create_fastcover_dict_from_source_rejects_empty_source() {
-    let mut out = Vec::new();
-    let err = create_fastcover_dict_from_source(
-        Cursor::new(Vec::<u8>::new()),
-        &mut out,
-        1024,
-        &FastCoverOptions::default(),
-        FinalizeOptions::default(),
-    )
-    .expect_err("empty source must be rejected");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    .expect("a uniform corpus must train");
+    Dictionary::decode_dict(&dict).expect("the trained dictionary must parse back");
 }
 
 #[test]
@@ -222,95 +479,6 @@ fn create_raw_dict_from_source_never_exceeds_requested_size() {
 }
 
 #[test]
-fn train_fastcover_raw_from_slice_rejects_empty_sample() {
-    let err = train_fastcover_raw_from_slice(&[], 1024, &FastCoverOptions::default())
-        .expect_err("empty sample must be rejected");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-}
-
-#[test]
-fn train_fastcover_raw_from_slice_supports_non_optimized_params() {
-    let sample = training_data();
-    let options = FastCoverOptions {
-        optimize: false,
-        k: 128,
-        d: 6,
-        f: 18,
-        ..FastCoverOptions::default()
-    };
-    let (dict, tuned) =
-        train_fastcover_raw_from_slice(sample.as_slice(), 2048, &options).expect("must train");
-    assert!(!dict.is_empty());
-    assert!(dict.len() <= 2048);
-    assert_eq!(tuned.k, 128);
-    assert_eq!(tuned.d, 6);
-    assert_eq!(tuned.f, 18);
-    assert_eq!(tuned.score, 0);
-}
-
-#[test]
-fn train_fastcover_raw_from_slice_rejects_tiny_sample_with_empty_dict() {
-    let sample = b"tiny";
-    let err = train_fastcover_raw_from_slice(sample, 1024, &FastCoverOptions::default())
-        .expect_err("tiny sample should not produce an empty dictionary successfully");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    assert_eq!(
-        err.to_string(),
-        "training sample is too small for FastCOVER"
-    );
-}
-
-/// The widest frequency table the trainer takes (`f = 31`, 2^31 counts) is
-/// larger than a 32-bit target can lay out. Training at that width reports
-/// that as an error through the `io::Result` rather than panicking on the
-/// allocation.
-#[cfg(target_pointer_width = "32")]
-#[test]
-fn a_frequency_table_too_wide_for_the_target_is_an_error() {
-    let sample = training_data();
-    let options = FastCoverOptions {
-        optimize: false,
-        k: 256,
-        d: 8,
-        f: 31,
-        ..FastCoverOptions::default()
-    };
-    let err = train_fastcover_raw_from_slice(sample.as_slice(), 4096, &options)
-        .expect_err("a table this wide does not fit a 32-bit target");
-    assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
-}
-
-/// A table that does not fit reaches the caller as an out-of-memory error
-/// that names the table and the knob that sizes it.
-#[test]
-fn a_table_that_does_not_fit_is_an_out_of_memory_error() {
-    let err = io::Error::from(super::fastcover::TableTooLarge { entries: 1 << 31 });
-    assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
-    let message = err.to_string();
-    assert!(message.contains("2147483648 entries"), "{message}");
-    assert!(message.contains("smaller f"), "{message}");
-}
-
-#[test]
-fn train_fastcover_raw_from_slice_normalizes_non_optimized_params() {
-    let sample = training_data();
-    let options = FastCoverOptions {
-        optimize: false,
-        k: 8,
-        d: 64,
-        // Below the table widths the trainer takes; the top end (31) is
-        // checked without training, since a table that wide is gigabytes.
-        f: 0,
-        ..FastCoverOptions::default()
-    };
-    let (_, tuned) =
-        train_fastcover_raw_from_slice(sample.as_slice(), 2048, &options).expect("must train");
-    assert_eq!(tuned.k, 32);
-    assert_eq!(tuned.d, 32);
-    assert_eq!(tuned.f, 1);
-}
-
-#[test]
 fn finalize_raw_dict_rejects_empty_raw_content() {
     let sample = training_data();
     let err = finalize_raw_dict(&[], sample.as_slice(), 4096, FinalizeOptions::default())
@@ -337,26 +505,6 @@ fn finalize_raw_dict_pads_to_minimum_content_size() {
     let parsed = Dictionary::decode_dict(finalized.as_slice()).expect("finalized dict parses");
     assert!(parsed.dict_content.len() >= 8);
     assert_eq!(parsed.dict_content.last(), Some(&b'x'));
-}
-
-/// A corpus of one repeated byte carries no symbol distribution to describe, so
-/// the serializer substitutes a synthetic alphabet. That substitute has to be
-/// one the Huffman table description can actually express: a flat alphabet
-/// wider than 128 symbols has neither an FSE nor a direct representation, and
-/// training on such a corpus must not take the process down with it.
-#[test]
-fn training_on_a_single_repeated_byte_does_not_crash() {
-    let sample = vec![7u8; 4096];
-    let mut out = Vec::new();
-    create_fastcover_dict_from_source(
-        Cursor::new(sample.as_slice()),
-        &mut out,
-        4096,
-        &FastCoverOptions::default(),
-        FinalizeOptions { dict_id: Some(1) },
-    )
-    .expect("a uniform corpus must train or fail, never panic");
-    Dictionary::decode_dict(out.as_slice()).expect("the trained dictionary must parse back");
 }
 
 #[test]
