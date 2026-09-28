@@ -65,8 +65,10 @@ const _: () = assert!(
 );
 
 /// Cached `DFTRACE` env flag for the dfast commit-path diagnostic (read once;
-/// see the `DFTRACE` gate in the fast-loop commit handler).
-#[cfg(feature = "std")]
+/// see the `DFTRACE` gate in the fast-loop commit handler). Compiled only with
+/// `kernel-trace`, so a production build carries no diagnostic in its match
+/// loop.
+#[cfg(feature = "kernel-trace")]
 static DFTRACE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 #[derive(Clone)]
@@ -2871,13 +2873,11 @@ macro_rules! start_matching_fast_loop_body {
 
             match inner_exit {
                 InnerExit::Committed(candidate, _path_tag, scan_pos) => {
-                    // `DFTRACE` env gate: dump each committed match's path tag +
-                    // (offset, match_len, literal_len) so the match-path / offset
-                    // stream can be diffed against C ffi when chasing a dfast
-                    // ratio divergence. The env is read ONCE into a cached flag
-                    // (a per-commit `getenv` showed up at ~3% of small-frame
-                    // encode); off by default, an atomic load in production.
-                    #[cfg(feature = "std")]
+                    // `DFTRACE` env gate (`kernel-trace` builds): dump each
+                    // committed match's path tag + (offset, match_len,
+                    // literal_len) so the match-path / offset stream can be
+                    // diffed against C ffi when chasing a dfast ratio divergence.
+                    #[cfg(feature = "kernel-trace")]
                     if *DFTRACE_ENABLED.get_or_init(|| std::env::var_os("DFTRACE").is_some()) {
                         std::eprintln!(
                             "DFT path={} off={} ml={} ll={}",
@@ -3363,7 +3363,7 @@ macro_rules! start_matching_dict_loop_body {
 
             match inner_exit {
                 DfastInnerExit::Committed(candidate, _path_tag, scan_pos) => {
-                    #[cfg(feature = "std")]
+                    #[cfg(feature = "kernel-trace")]
                     if *DFTRACE_ENABLED.get_or_init(|| std::env::var_os("DFTRACE").is_some()) {
                         std::eprintln!(
                             "DFT path={} off={} ml={} ll={}",

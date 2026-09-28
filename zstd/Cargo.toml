@@ -204,10 +204,10 @@ fuzz-exports = []
 # deterministic from the compressed input and therefore architecture-
 # independent (only the per-call timing is CPU-tier specific).
 copy-shape-stats = ["std"]
-# Diagnostic tracing of the Fast kernel's inner loop — per-iteration state
-# dumps gated at compile time so production builds carry zero cost. Runtime
-# activation via `STRUCTURED_ZSTD_KERNEL_TRACE=1` env var. Used by the
-# `trace_fast_kernel` example for #220 ratio-divergence investigation.
+# Diagnostic tracing of the match loops — per-iteration state dumps gated at
+# compile time so production builds carry zero cost. Runtime activation via
+# `STRUCTURED_ZSTD_KERNEL_TRACE=1` (Fast kernel, used by the
+# `trace_fast_kernel` example) and `DFTRACE=1` (dfast commits).
 kernel-trace = ["std"]
 # Opt-in storage-format extensions: typed Rust APIs that downstream
 # storage / wire-format consumers (lsm-tree, future graph stores) can
