@@ -146,7 +146,9 @@ macro_rules! gather_body {
             pos += ml;
         }
         copy_run!($tail);
-        debug_assert_eq!(pos + $tail, src_len, "sequences must cover the block");
+        // Once per block, in every build: a custom matcher that stops short
+        // would leave the block's end out of the frame.
+        assert_eq!(pos + $tail, src_len, "sequences must cover the block");
         // SAFETY: `[start, start + written)` was written above, within capacity.
         unsafe { dst.set_len(start + written) };
     }};

@@ -630,7 +630,9 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
             offset,
             match_len,
         } => {
-            debug_assert_eq!(tail, 0, "literals reported before a sequence");
+            // A custom matcher's order is checked in every build: literals out
+            // of order would be copied from the wrong place without an error.
+            assert_eq!(tail, 0, "literals reported before a sequence");
             // A custom matcher's report is checked before it is narrowed: a
             // length that lost its high bits could still fit the block and
             // pass the gather's bounds check. One compare for all three; it

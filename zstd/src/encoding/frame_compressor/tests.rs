@@ -151,6 +151,98 @@ fn a_sequence_length_past_32_bits_is_refused() {
     compressor.compress();
 }
 
+/// Reports a block wrongly for the gather that reads its literals back by
+/// position: literals before a sequence, or sequences and trailing literals
+/// four bytes short of the block.
+struct MisreportingMatcher {
+    input: TestInput,
+    literals_first: bool,
+}
+
+impl Matcher for MisreportingMatcher {
+    fn get_last_space(&mut self) -> &[u8] {
+        self.input.last_block()
+    }
+
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool) {
+        self.input.fill(capacity, fill)
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        self.input.uncommitted()
+    }
+
+    fn commit_filled(&mut self, len: usize) {
+        self.input.commit(len);
+    }
+
+    fn skip_matching(&mut self) {}
+
+    fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
+        let len = self.input.last_block().len();
+        if self.literals_first {
+            handle_sequence(Sequence::Literals { len: 2 });
+            handle_sequence(Sequence::Triple {
+                literal_len: 0,
+                offset: 1,
+                match_len: 4,
+            });
+            handle_sequence(Sequence::Literals { len: len - 6 });
+        } else {
+            handle_sequence(Sequence::Triple {
+                literal_len: 2,
+                offset: 1,
+                match_len: 4,
+            });
+            handle_sequence(Sequence::Literals { len: len - 10 });
+        }
+    }
+
+    fn reset(&mut self, _level: super::CompressionLevel) {
+        self.input.clear();
+    }
+
+    fn window_size(&self) -> u64 {
+        1 << 17
+    }
+}
+
+fn compress_with_misreporting_matcher(literals_first: bool) {
+    let data: Vec<u8> = (0..100u8).collect();
+    let mut compressor = FrameCompressor::new_with_matcher(
+        MisreportingMatcher {
+            input: TestInput::default(),
+            literals_first,
+        },
+        super::CompressionLevel::Default,
+    );
+    let mut output = Vec::new();
+    compressor.set_source(data.as_slice());
+    compressor.set_drain(&mut output);
+    compressor.compress();
+}
+
+/// A custom matcher's literals are read back by position, so literals it
+/// reports before a sequence would be copied from the wrong place: refused in
+/// every build, not only where debug assertions run.
+#[test]
+#[should_panic(expected = "literals reported before a sequence")]
+fn literals_reported_before_a_sequence_are_refused() {
+    compress_with_misreporting_matcher(true);
+}
+
+/// Sequences and trailing literals that stop short of the block would leave
+/// its end out of the frame: refused in every build.
+#[test]
+#[should_panic(expected = "sequences must cover the block")]
+fn sequences_that_do_not_cover_the_block_are_refused() {
+    compress_with_misreporting_matcher(false);
+}
+
 #[test]
 fn frame_starts_with_magic_num() {
     let mock_data = [1_u8, 2, 3].as_slice();
