@@ -470,7 +470,7 @@ impl CpuKernel for Bmi2Kernel {
 /// x86 AVX2 + BMI2 kernel (x86-64-v3 baseline). The common modern
 /// x86 case — most CPUs released since 2013 (Haswell) have AVX2+BMI2.
 /// Uses `bzhi` for mask ops and 256-bit moves for the buffer copies. Present
-/// on 32-bit x86 too, where the copies are what it changes: without it such a
+/// on 32-bit x86 too, where the copies are all it changes: without it such a
 /// build copies at the SSE2 width whatever the CPU offers.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
@@ -488,7 +488,18 @@ impl CpuKernel for Avx2Kernel {
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
         // SAFETY: Avx2Kernel is selected only after runtime detect
         // confirmed both AVX2 and BMI2 — `_bzhi_u64` is callable.
-        unsafe { mask_lower_bits_bmi2_impl(value, n) }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            mask_lower_bits_bmi2_impl(value, n)
+        }
+        // 32-bit x86 has only a 32-bit `bzhi`: two of them and the branches
+        // choosing between them cost more than the table lookup in the
+        // sequence loop, which calls this three times a sequence (decoding
+        // z000033 on i686 measured 12.6% slower at level 1 with them).
+        #[cfg(target_arch = "x86")]
+        {
+            ScalarKernel::mask_lower_bits(value, n)
+        }
     }
 
     // 32 bytes, the width the buffers' trailing slack is sized for.
