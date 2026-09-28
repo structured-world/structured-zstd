@@ -504,6 +504,37 @@ fn create_raw_dict_from_source_never_exceeds_requested_size() {
     );
 }
 
+/// The entropy tables a search builds once finalize every candidate into the
+/// same bytes `finalize_raw_dict` writes for it, including the content cut
+/// to fit and an explicit id; and where the samples are too thin to decide the
+/// tables, each candidate's content still does.
+#[test]
+fn cached_entropy_tables_finalize_as_the_full_path_does() {
+    let (data, sizes) = training_samples();
+    let set = samples::SampleSet::new(&data, &sizes).unwrap();
+    for finalize in [
+        FinalizeOptions::default(),
+        FinalizeOptions {
+            dict_id: Some(0x1234_5678),
+        },
+    ] {
+        let evaluator = selection::Evaluator::new(&set, sizes.len(), 0..0, 1024, 3, finalize);
+        for content in [&data[..300], &data[1000..5000], &data[..8]] {
+            assert_eq!(
+                evaluator.finalize(content).unwrap(),
+                finalize_raw_dict(content, &data, 1024, finalize).unwrap()
+            );
+        }
+    }
+    let thin = samples::SampleSet::new(&data[..1], &[1]).unwrap();
+    let evaluator = selection::Evaluator::new(&thin, 1, 0..0, 1024, 3, FinalizeOptions::default());
+    let content = &data[..600];
+    assert_eq!(
+        evaluator.finalize(content).ok(),
+        finalize_raw_dict(content, &data[..1], 1024, FinalizeOptions::default()).ok()
+    );
+}
+
 #[test]
 fn finalize_raw_dict_rejects_empty_raw_content() {
     let sample = training_data();

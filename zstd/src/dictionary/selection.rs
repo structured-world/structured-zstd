@@ -3,7 +3,7 @@
 //! `COVER_selectDict` and `COVER_checkTotalCompressedSize`).
 
 use super::samples::SampleSet;
-use super::{FinalizeOptions, finalize_raw_dict};
+use super::{FinalizeOptions, assemble_dict, finalize_raw_dict, sample_entropy_tables};
 use crate::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
 use core::ops::Range;
 use std::{io, vec::Vec};
@@ -33,6 +33,10 @@ pub(super) struct Evaluator<'s> {
     capacity: usize,
     level: i32,
     finalize: FinalizeOptions,
+    /// The entropy tables, built once: they come from the finalize samples,
+    /// the same for every candidate. `None` where the samples are too thin
+    /// and each candidate's content decides them.
+    tables: Option<Vec<u8>>,
     compressor: Option<FrameCompressor>,
     frame: Vec<u8>,
 }
@@ -53,6 +57,7 @@ impl<'s> Evaluator<'s> {
             capacity,
             level,
             finalize,
+            tables: sample_entropy_tables(samples.leading(finalize_samples)),
             compressor: None,
             frame: Vec::new(),
         }
@@ -60,6 +65,13 @@ impl<'s> Evaluator<'s> {
 
     /// `content` finalized into a dictionary of at most the capacity.
     pub(super) fn finalize(&self, content: &[u8]) -> io::Result<Vec<u8>> {
+        if let Some(tables) = &self.tables {
+            if content.is_empty() {
+                // The full path owns that refusal and its wording.
+                return finalize_raw_dict(content, &[], self.capacity, self.finalize);
+            }
+            return assemble_dict(content, tables, self.capacity, self.finalize);
+        }
         finalize_raw_dict(
             content,
             self.samples.leading(self.finalize_samples),

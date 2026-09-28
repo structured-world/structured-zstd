@@ -516,6 +516,49 @@ pub fn finalize_raw_dict(
             "raw dictionary content must not be empty",
         ));
     }
+    let mut tables = serialize_huffman_table(sample_data, raw_content)?;
+    for (max_symbol, max_log) in ENTROPY_STREAMS {
+        tables.extend_from_slice(&serialize_fse_table_from_corpus(
+            sample_data,
+            raw_content,
+            max_symbol,
+            max_log,
+        )?);
+    }
+    assemble_dict(raw_content, &tables, dict_size, options)
+}
+
+/// The offset, match-length and literal-length streams, in the order their
+/// tables follow the literals table in a dictionary.
+const ENTROPY_STREAMS: [(u8, u8); 3] = [
+    (MAX_OFFSET_CODE, OF_MAX_LOG),
+    (MAX_MATCH_LENGTH_CODE, ML_MAX_LOG),
+    (MAX_LITERAL_LENGTH_CODE, LL_MAX_LOG),
+];
+
+/// The entropy tables [`finalize_raw_dict`] writes, when `sample_data` alone
+/// decides them; `None` when the samples are too thin and the tables would
+/// fall back on the content, which then has to be finalized in full.
+fn sample_entropy_tables(sample_data: &[u8]) -> Option<Vec<u8>> {
+    if sample_data.len() < 2 {
+        return None;
+    }
+    let mut tables = serialize_huffman_table(sample_data, &[]).ok()?;
+    for (max_symbol, max_log) in ENTROPY_STREAMS {
+        tables.extend_from_slice(
+            &serialize_fse_table_from_corpus(sample_data, &[], max_symbol, max_log).ok()?,
+        );
+    }
+    Some(tables)
+}
+
+/// A dictionary of `raw_content` behind already serialized entropy `tables`.
+fn assemble_dict(
+    raw_content: &[u8],
+    tables: &[u8],
+    dict_size: usize,
+    options: FinalizeOptions,
+) -> io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(dict_size.max(256));
     out.extend_from_slice(&DICT_MAGIC_NUM);
     let dict_id = options
@@ -528,29 +571,7 @@ pub fn finalize_raw_dict(
         ));
     }
     out.extend_from_slice(&dict_id.to_le_bytes());
-    out.extend_from_slice(serialize_huffman_table(sample_data, raw_content)?.as_slice());
-    out.extend_from_slice(
-        serialize_fse_table_from_corpus(sample_data, raw_content, MAX_OFFSET_CODE, OF_MAX_LOG)?
-            .as_slice(),
-    );
-    out.extend_from_slice(
-        serialize_fse_table_from_corpus(
-            sample_data,
-            raw_content,
-            MAX_MATCH_LENGTH_CODE,
-            ML_MAX_LOG,
-        )?
-        .as_slice(),
-    );
-    out.extend_from_slice(
-        serialize_fse_table_from_corpus(
-            sample_data,
-            raw_content,
-            MAX_LITERAL_LENGTH_CODE,
-            LL_MAX_LOG,
-        )?
-        .as_slice(),
-    );
+    out.extend_from_slice(tables);
 
     // Repeat offsets: keep default bootstrap history.
     out.extend_from_slice(&1u32.to_le_bytes());
