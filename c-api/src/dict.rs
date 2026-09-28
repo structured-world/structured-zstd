@@ -163,7 +163,6 @@ impl ZDICT_cover_params_t {
             self.splitPoint,
             self.shrinkDict,
             self.shrinkDictMaxRegression,
-            self.zParams.compressionLevel,
         )
     }
 
@@ -181,7 +180,6 @@ fn cover_options(
     split_point: f64,
     shrink: c_uint,
     max_regression: c_uint,
-    level: c_int,
 ) -> CoverOptions {
     CoverOptions {
         k,
@@ -189,13 +187,15 @@ fn cover_options(
         steps,
         split_point,
         shrink: (shrink != 0).then_some(max_regression),
-        level,
     }
 }
 
+/// `ZDICT_params_t` as the codec takes it: the id (zero derives one) and the
+/// level the dictionary is analysed and scored at (zero is the default).
 fn finalize_options(params: &ZDICT_params_t) -> FinalizeOptions {
     FinalizeOptions {
         dict_id: (params.dictID != 0).then_some(params.dictID),
+        level: params.compressionLevel,
     }
 }
 
@@ -330,7 +330,6 @@ impl ZDICT_fastCover_params_t {
                 self.splitPoint,
                 self.shrinkDict,
                 self.shrinkDictMaxRegression,
-                self.zParams.compressionLevel,
             ),
             f: self.f,
             accel: self.accel,
@@ -436,14 +435,12 @@ pub unsafe extern "C" fn ZDICT_optimizeTrainFromBuffer_fastCover(
 /// const void* dictContent, size_t dictContentSize, const void* samplesBuffer,
 /// const size_t* samplesSizes, unsigned nbSamples, ZDICT_params_t parameters)`.
 ///
-/// Wraps raw `dictContent` (plus entropy tables analysed from the samples) into
-/// a full zstd dictionary, writing up to `maxDictSize` bytes into
-/// `dstDictBuffer`. Returns the dictionary size or an error code.
-///
-/// Of `parameters`, only `dictID` is honoured (0 derives a compliant ID). The
-/// FastCOVER finalizer builds the entropy tables directly from the samples, so
-/// `compressionLevel` does not tune them, and `notificationLevel` (builder
-/// verbosity) has no effect here; both are accepted for ABI compatibility.
+/// Wraps raw `dictContent` into a full zstd dictionary, writing up to
+/// `maxDictSize` bytes into `dstDictBuffer`, with entropy tables measured on
+/// the samples compressed with the content at `compressionLevel` (zero is the
+/// default level). `dictID` zero derives a compliant id; `notificationLevel`
+/// (builder verbosity) has no effect here. Returns the dictionary size or an
+/// error code.
 ///
 /// # Safety
 /// All buffers valid for their stated lengths; `samplesSizes` valid for
@@ -460,36 +457,29 @@ pub unsafe extern "C" fn ZDICT_finalizeDictionary(
     nb_samples: c_uint,
     parameters: ZDICT_params_t,
 ) -> usize {
-    let Some(total) = (unsafe { total_sample_len(samples_sizes, nb_samples) }) else {
-        return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed);
-    };
     // NULL + non-zero length is caller error, not a slice to build.
-    if (samples_buffer.is_null() && total > 0)
-        || (dict_content.is_null() && dict_content_size > 0)
-        || (dst_dict_buffer.is_null() && max_dict_size > 0)
-    {
+    if dict_content.is_null() && dict_content_size > 0 {
         return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed);
     }
     let content = unsafe { in_slice(dict_content, dict_content_size) };
-    let samples = unsafe { in_slice(samples_buffer, total) };
-    // dictID 0 means "derive a compliant id"; any non-zero value is forced.
-    let finalize = FinalizeOptions {
-        dict_id: (parameters.dictID != 0).then_some(parameters.dictID),
-    };
-
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        codec::dictionary::finalize_raw_dict(content, samples, max_dict_size, finalize)
-    }));
-    let dict = match outcome {
-        Ok(Ok(dict)) => dict,
-        _ => return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed),
-    };
-    if dict.len() > max_dict_size {
-        return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
+    unsafe {
+        train_into(
+            dst_dict_buffer,
+            max_dict_size,
+            samples_buffer,
+            samples_sizes,
+            nb_samples,
+            |samples, sizes| {
+                codec::dictionary::finalize_raw_dict(
+                    content,
+                    samples,
+                    sizes,
+                    max_dict_size,
+                    finalize_options(&parameters),
+                )
+            },
+        )
     }
-    let out = unsafe { crate::ffi::out_slice(dst_dict_buffer, max_dict_size) };
-    out[..dict.len()].copy_from_slice(&dict);
-    dict.len()
 }
 
 /// `unsigned ZDICT_getDictID(const void* dictBuffer, size_t dictSize)` — the

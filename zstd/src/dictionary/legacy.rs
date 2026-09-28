@@ -39,7 +39,7 @@ pub(crate) const MIN_SAMPLES_SIZE: usize = CONTENT_SIZE_MIN * MIN_RATIO as usize
 pub const DEFAULT_SELECTIVITY: u32 = 9;
 
 /// Smallest dictionary the trainer is asked for (`ZDICT_DICTSIZE_MIN`).
-pub(crate) const DICT_SIZE_MIN: usize = super::TRAINER_DICT_SIZE_MIN;
+pub(crate) const DICT_SIZE_MIN: usize = super::MIN_TRAINED_DICT_SIZE;
 
 /// What was too small for the legacy trainer to produce a dictionary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

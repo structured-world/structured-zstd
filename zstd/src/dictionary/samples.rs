@@ -128,9 +128,8 @@ pub(super) struct Split {
     pub(super) test: Range<usize>,
 }
 
-/// Why a segment trainer refused its input. It rides inside the
-/// `InvalidInput` error the trainer returns; [`TrainingError::of`] reads it
-/// back.
+/// Why a segment trainer or the finalizer refused its input. It rides inside
+/// the `InvalidInput` error returned; [`TrainingError::of`] reads it back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TrainingError {
@@ -140,7 +139,7 @@ pub enum TrainingError {
     /// bytes.
     Samples,
     /// The dictionary asked for is smaller than
-    /// [`TRAINER_DICT_SIZE_MIN`](super::TRAINER_DICT_SIZE_MIN).
+    /// [`MIN_TRAINED_DICT_SIZE`](super::MIN_TRAINED_DICT_SIZE).
     DictionaryTooSmall,
 }
 

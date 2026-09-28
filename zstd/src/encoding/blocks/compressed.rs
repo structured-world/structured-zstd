@@ -2932,7 +2932,7 @@ const ML_EXTRA_BITS: [u8; 53] = [
 /// table index. Every code's baseline is a multiple of its own extra-bit width,
 /// so masking off those bits is the same subtraction the ranges spelled out.
 #[inline]
-fn encode_literal_length(len: u32) -> (u8, u32, usize) {
+pub(crate) fn encode_literal_length(len: u32) -> (u8, u32, usize) {
     debug_assert!(len < 131_072, "literal length {len} out of encodable range");
     let code = if len < 64 {
         LL_CODE[len as usize]
@@ -2949,7 +2949,7 @@ fn encode_literal_length(len: u32) -> (u8, u32, usize) {
 ///
 /// Table-driven for the same reason as [`encode_literal_length`].
 #[inline]
-fn encode_match_len(len: u32) -> (u8, u32, usize) {
+pub(crate) fn encode_match_len(len: u32) -> (u8, u32, usize) {
     debug_assert!(
         (3..131_075).contains(&len),
         "match length {len} out of encodable range",
@@ -2968,7 +2968,7 @@ fn encode_match_len(len: u32) -> (u8, u32, usize) {
 /// history per RFC 8878 §3.1.2.5. Updates `offset_hist` in place.
 ///
 /// Encoded offset codes: 1/2/3 = repeat offsets, N+3 = new absolute offset N.
-pub(in crate::encoding) fn encode_offset_with_history(
+pub(crate) fn encode_offset_with_history(
     actual_offset: u32,
     lit_len: u32,
     offset_hist: &mut [u32; 3],
@@ -3075,7 +3075,7 @@ fn low_bits(value: u32, bits: usize) -> u32 {
     value & ((1u32 << bits) - 1)
 }
 
-fn encode_offset(len: u32) -> (u8, u32, usize) {
+pub(crate) fn encode_offset(len: u32) -> (u8, u32, usize) {
     let log = len.ilog2();
     let lower = len & ((1 << log) - 1);
     (log as u8, lower, log as usize)

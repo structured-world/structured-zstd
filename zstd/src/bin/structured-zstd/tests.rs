@@ -270,7 +270,10 @@ fn an_archive_built_from_two_dictionaries_names_neither() {
             &[4_000; 10],
             8 * 1024,
             &options,
-            FinalizeOptions { dict_id: Some(id) },
+            FinalizeOptions {
+                dict_id: Some(id),
+                ..FinalizeOptions::default()
+            },
         )
         .expect("training the fixture dictionary must succeed");
         let mut out = Vec::new();
@@ -729,7 +732,7 @@ fn the_reported_split_is_the_percentage_given() {
             split_percent: Some(percent),
             ..TrainerParams::default()
         };
-        let options = cover_tuning(&params, 3, "--train-cover").unwrap();
+        let options = cover_tuning(&params, "--train-cover").unwrap();
         assert_eq!(split_percent(options.split_point), percent);
     }
 }
@@ -4811,35 +4814,23 @@ fn trainer_parameters_parse_and_build_options() {
     assert!(parse_trainer_params("k=x", true).is_err(), "not a number");
     assert!(parse_trainer_params("zzz=1", true).is_err(), "unknown key");
 
-    let fixed = fastcover_options(&params, 5).unwrap();
+    let fixed = fastcover_options(&params).unwrap();
     assert_eq!(
         (fixed.cover.k, fixed.cover.d, fixed.f, fixed.accel),
         (200, 8, 20, 2)
     );
-    assert_eq!(
-        (
-            fixed.cover.steps,
-            fixed.cover.split_point,
-            fixed.cover.level
-        ),
-        (4, 0.75, 5)
-    );
-    let shrunk = cover_options(
-        &parse_trainer_params("k=64,d=8,shrink=3", false).unwrap(),
-        3,
-    )
-    .unwrap();
+    assert_eq!((fixed.cover.steps, fixed.cover.split_point), (4, 0.75));
+    let shrunk = cover_options(&parse_trainer_params("k=64,d=8,shrink=3", false).unwrap()).unwrap();
     assert_eq!((shrunk.k, shrunk.d, shrunk.shrink), (64, 8, Some(3)));
 
-    let bad =
-        |text: &str| fastcover_options(&parse_trainer_params(text, true).unwrap(), 3).is_err();
+    let bad = |text: &str| fastcover_options(&parse_trainer_params(text, true).unwrap()).is_err();
     assert!(bad("d=7"));
     assert!(bad("f=32"));
     assert!(bad("accel=11"));
     assert!(bad("k=4,d=8"));
     assert!(bad("k=6"), "a search over d reaches 8");
     assert!(bad("split=101"));
-    assert!(cover_options(&parse_trainer_params("k=4,d=8", false).unwrap(), 3).is_err());
+    assert!(cover_options(&parse_trainer_params("k=4,d=8", false).unwrap()).is_err());
 
     let opts = parse(&["--train-fastcover=k=200,d=8", "s1"]).unwrap();
     assert_eq!(opts.mode, Mode::Train);
@@ -4908,7 +4899,7 @@ fn a_listed_tuning_starts_from_zero() {
     use structured_zstd::dictionary::{CoverOptions, FastCoverOptions};
 
     let zeros = parse_trainer_params("k=0,d=0,f=0,steps=0,split=0,accel=0", true).unwrap();
-    let options = fastcover_options(&zeros, 3).expect("zero knobs are valid");
+    let options = fastcover_options(&zeros).expect("zero knobs are valid");
     assert_eq!(
         (options.cover.k, options.cover.d, options.cover.steps),
         (0, 0, 0)
@@ -4917,24 +4908,13 @@ fn a_listed_tuning_starts_from_zero() {
         (options.f, options.accel, options.cover.split_point),
         (0, 0, 0.0)
     );
-    let bare = fastcover_options(&TrainerParams::default(), 3).unwrap();
     assert_eq!(
-        bare,
-        FastCoverOptions {
-            cover: CoverOptions {
-                level: 3,
-                ..FastCoverOptions::default().cover
-            },
-            ..FastCoverOptions::default()
-        }
+        fastcover_options(&TrainerParams::default()).unwrap(),
+        FastCoverOptions::default()
     );
-    let bare_cover = cover_options(&TrainerParams::default(), 3).unwrap();
     assert_eq!(
-        bare_cover,
-        CoverOptions {
-            level: 3,
-            ..CoverOptions::default()
-        }
+        cover_options(&TrainerParams::default()).unwrap(),
+        CoverOptions::default()
     );
     // A zero beside a real value leaves that value in force.
     let mixed = parse_trainer_params("k=0,d=6", true).unwrap();

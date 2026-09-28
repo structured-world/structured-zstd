@@ -994,6 +994,15 @@ impl HuffmanTable {
         Self::build_from_weights_reusing(weights, None)
     }
 
+    /// The optimal code for `counts` with no code longer than `max_bits`
+    /// (upstream zstd `HUF_buildCTable_wksp`, as the dictionary finalizer
+    /// calls it). Unlike [`Self::build_from_counts`] it runs no table-log
+    /// search: the table describes future literals, not these.
+    #[cfg(feature = "dict-builder")]
+    pub(crate) fn build_limited(counts: &[usize], max_bits: usize) -> Self {
+        Self::build_from_weights(&build_limited_weights(counts, max_bits))
+    }
+
     /// [`Self::build_from_weights`] filling a discarded table's buffers instead
     /// of taking new ones. A table is built per block and, where the splitter
     /// probes, per split candidate; most are measured and thrown away, so

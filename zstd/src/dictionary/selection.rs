@@ -2,8 +2,9 @@
 //! scoring samples with it, and count the bytes (upstream zstd `cover.c`,
 //! `COVER_selectDict` and `COVER_checkTotalCompressedSize`).
 
+use super::FinalizeOptions;
+use super::finalize::finalize;
 use super::samples::SampleSet;
-use super::{FinalizeOptions, assemble_dict, finalize_raw_dict, sample_entropy_tables};
 use crate::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
 use core::ops::Range;
 use std::{io, vec::Vec};
@@ -31,12 +32,7 @@ pub(super) struct Evaluator<'s> {
     /// Samples a dictionary is scored on.
     scoring: Range<usize>,
     capacity: usize,
-    level: i32,
     finalize: FinalizeOptions,
-    /// The entropy tables, built once: they come from the finalize samples,
-    /// the same for every candidate. `None` where the samples are too thin
-    /// and each candidate's content decides them.
-    tables: Option<Vec<u8>>,
     compressor: Option<FrameCompressor>,
     frame: Vec<u8>,
     /// The candidate being priced, and a shrunk one being tried against it:
@@ -52,7 +48,6 @@ impl<'s> Evaluator<'s> {
         finalize_samples: usize,
         scoring: Range<usize>,
         capacity: usize,
-        level: i32,
         finalize: FinalizeOptions,
     ) -> Self {
         Self {
@@ -60,9 +55,7 @@ impl<'s> Evaluator<'s> {
             finalize_samples,
             scoring,
             capacity,
-            level,
             finalize,
-            tables: sample_entropy_tables(samples.leading(finalize_samples)),
             compressor: None,
             frame: Vec::new(),
             dict: Vec::new(),
@@ -77,21 +70,12 @@ impl<'s> Evaluator<'s> {
         Ok(out)
     }
 
-    /// [`Self::finalize`] over `out`, keeping its allocation.
+    /// [`Self::finalize`] over `out`.
     fn finalize_into(&self, content: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
-        if let Some(tables) = &self.tables {
-            if content.is_empty() {
-                // The full path owns that refusal and its wording.
-                *out = finalize_raw_dict(content, &[], self.capacity, self.finalize)?;
-                return Ok(());
-            }
-            return assemble_dict(out, content, tables, self.capacity, self.finalize);
-        }
-        // Samples too thin to decide the tables alone: the content decides
-        // them, a path a search takes only on corpora of a handful of bytes.
-        *out = finalize_raw_dict(
+        *out = finalize(
             content,
-            self.samples.leading(self.finalize_samples),
+            self.samples,
+            self.finalize_samples,
             self.capacity,
             self.finalize,
         )?;
@@ -114,7 +98,9 @@ impl<'s> Evaluator<'s> {
         // matcher for it, which belongs to the compressor, not here.
         let prepared = EncoderDictionary::from_bytes(dict)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let level = self.level;
+        // Scored at the level the dictionary is finalized for, as upstream uses
+        // its one `compressionLevel` for both.
+        let level = self.finalize.level;
         let compressor = self
             .compressor
             .get_or_insert_with(|| FrameCompressor::new(CompressionLevel::from_level(level)));

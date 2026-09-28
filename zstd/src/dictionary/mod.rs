@@ -22,20 +22,12 @@
 //! FastCOVER search `zstd --train` runs, over the corpus cut into samples.
 mod cover;
 mod fastcover;
+mod finalize;
 mod legacy;
 mod samples;
 mod selection;
 mod suffix_array;
 
-use crate::bit_io::BitWriter;
-use crate::blocks::sequence_section::{
-    MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
-};
-use crate::decoding::dictionary::MAGIC_NUM as DICT_MAGIC_NUM;
-use crate::decoding::sequence_section_decoder::{LL_MAX_LOG, ML_MAX_LOG, OF_MAX_LOG};
-use crate::fse::fse_encoder::{self, build_table_from_symbol_counts};
-use crate::huff0::HuffmanTable as HuffmanDecoderTable;
-use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable as HuffmanEncoderTable};
 pub use legacy::DEFAULT_SELECTIVITY;
 pub use samples::TrainingError;
 use samples::refuse;
@@ -44,25 +36,18 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
-    // `vec` import covers the `vec![..]` macro used below: this crate is
-    // no_std-with-std-feature, so the std prelude isn't pulled in implicitly
-    // for top-level items in this module. Removing this import fails the
-    // build with `cannot find macro 'vec' in this scope` — verified.
-    vec,
     vec::Vec,
 };
 
 const MAX_TRAINING_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
-const MAX_HUFFMAN_STATS_BYTES: usize = 64 * 1024;
 
-/// Smallest size a trained dictionary can occupy, whatever it was trained on.
+/// Smallest `dict_size` a dictionary is trained or finalized into (upstream
+/// zstd `ZDICT_DICTSIZE_MIN`).
 ///
-/// The magic number, the dictionary ID, the three repeat offsets and the
-/// shortest content the writers emit are unconditional; a real dictionary is
-/// larger still, since the entropy tables between them are never empty. Use it
-/// to reject an impossible `dict_size` before spending the corpus: the training
-/// entry points can only discover the true bound once those tables are built.
-pub const MIN_TRAINED_DICT_SIZE: usize = DICT_MAGIC_NUM.len() + 4 + 12 + 8;
+/// Use it to reject an impossible `dict_size` before spending the corpus. A
+/// size at or above it can still be too small once the entropy tables the
+/// samples produce are built, which only training can tell.
+pub const MIN_TRAINED_DICT_SIZE: usize = finalize::DICT_SIZE_MIN;
 
 /// Tuning for COVER training, the knobs of the reference's
 /// `ZDICT_cover_params_t`.
@@ -87,8 +72,6 @@ pub struct CoverOptions {
     /// (upstream zstd `COVER_selectDict`). A dictionary so found is its header
     /// plus that tail, so none is smaller than the header plus 256 bytes.
     pub shrink: Option<u32>,
-    /// Compression level candidates are scored at; zero is the default level.
-    pub level: i32,
 }
 
 impl Default for CoverOptions {
@@ -99,7 +82,6 @@ impl Default for CoverOptions {
             steps: 4,
             split_point: 1.0,
             shrink: None,
-            level: 0,
         }
     }
 }
@@ -112,8 +94,8 @@ impl Default for CoverOptions {
 /// building and the rest scoring.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FastCoverOptions {
-    /// Segment size, dmer size, search, split, shrink and scoring level, as for
-    /// COVER. `d` is at least 4 here; the reference takes 6 and 8.
+    /// Segment size, dmer size, search, split and shrink, as for COVER. `d` is
+    /// at least 4 here; the reference takes 6 and 8.
     pub cover: CoverOptions,
     /// Width of the dmer frequency table in bits, `1..=31`; its memory grows
     /// as `2^f`. Zero is 20.
@@ -136,11 +118,16 @@ impl Default for FastCoverOptions {
     }
 }
 
-/// Header options for a finalized dictionary.
+/// How a dictionary is finalized and trained against, the reference's
+/// `ZDICT_params_t`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FinalizeOptions {
     /// The dictionary id; `None` derives one from the content.
     pub dict_id: Option<u32>,
+    /// The compression level the dictionary is built for: the entropy tables
+    /// come from samples compressed at it, and the trainers score candidates
+    /// at it. Zero is the default level.
+    pub level: i32,
 }
 
 /// Create a "raw content" dictionary of at most `dict_size` bytes, with no
@@ -333,251 +320,51 @@ fn search_raw_content(corpus: &[u8], sizes: &[usize], dict_size: usize) -> io::R
     Ok(content)
 }
 
-/// The `i`th of [`MAX_HUFFMAN_STATS_BYTES`] samples spread evenly over `len`
-/// bytes.
+/// Finalize raw dictionary content into a dictionary of at most `dict_size`
+/// bytes: magic, id, entropy tables, repeat offsets and the content (the
+/// reference's `ZDICT_finalizeDictionary`).
 ///
-/// Computed in 64 bits: `i * len` reaches 2^48 for an addressable corpus, which
-/// a 32-bit `usize` cannot hold — the product overflows for any corpus past
-/// 64 KiB there, and the multiply panics rather than sampling. The quotient is
-/// always below `len`, so the narrowing back is exact.
-fn strided_index(i: usize, len: usize) -> usize {
-    ((i as u64 * len as u64) / MAX_HUFFMAN_STATS_BYTES as u64) as usize
-}
-
-fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result<Vec<u8>> {
-    fn bounded_huffman_stats(data: &[u8]) -> Vec<u8> {
-        if data.len() <= MAX_HUFFMAN_STATS_BYTES {
-            return data.to_vec();
-        }
-
-        let mut stats = Vec::with_capacity(MAX_HUFFMAN_STATS_BYTES);
-        for i in 0..MAX_HUFFMAN_STATS_BYTES {
-            stats.push(data[strided_index(i, data.len())]);
-        }
-        stats
-    }
-
-    let source = if sample_data.len() >= 2 {
-        sample_data
-    } else {
-        raw_content
-    };
-    let mut stats = bounded_huffman_stats(source);
-    if stats.len() < 2 || stats.iter().all(|b| *b == stats[0]) {
-        // A corpus with no distribution to measure gets a synthetic one. It
-        // stops at 128 symbols because a perfectly flat alphabet gives every
-        // symbol the same weight: FSE cannot encode that (an RLE weight
-        // stream), and the direct nibble form addresses at most 128 symbols, so
-        // a full 0..=255 alphabet would have no description at all.
-        stats = (0u8..128).collect();
-    }
-
-    let mut table = HuffmanEncoderTable::build_from_data(stats.as_slice());
-    if table
-        .writeable_table_description_size(&mut crate::fse::fse_encoder::FSETable::blank())
-        .is_none()
-    {
-        // Sampled real data can land on the same shape: a flat alphabet wider
-        // than 128 symbols. Fall back to the synthetic narrow one, which always
-        // has a description.
-        stats = (0u8..128).collect();
-        table = HuffmanEncoderTable::build_from_data(stats.as_slice());
-    }
-    let mut writer = BitWriter::new();
-    let mut encoder = HuffmanEncoder::new(&table, &mut writer);
-    encoder.encode(&[stats[0]], true);
-    let encoded = writer.dump();
-
-    let mut decoder = HuffmanDecoderTable::new();
-    let table_size = decoder
-        .build_decoder(encoded.as_slice())
-        .map_err(|e| io::Error::other(format!("failed to decode generated huffman table: {e}")))?;
-    Ok(encoded[..table_size as usize].to_vec())
-}
-
-fn serialize_fse_table(table: &fse_encoder::FSETable) -> Vec<u8> {
-    let mut writer = BitWriter::new();
-    table.write_table(&mut writer);
-    writer.dump()
-}
-
-fn bounded_fse_symbols(data: &[u8], max_symbol: u8) -> Vec<u8> {
-    let modulo = u16::from(max_symbol) + 1;
-    if data.is_empty() {
-        return Vec::from([0u8]);
-    }
-    if data.len() <= MAX_HUFFMAN_STATS_BYTES {
-        return data
-            .iter()
-            .map(|b| (u16::from(*b) % modulo) as u8)
-            .collect();
-    }
-
-    let mut out = Vec::with_capacity(MAX_HUFFMAN_STATS_BYTES);
-    for i in 0..MAX_HUFFMAN_STATS_BYTES {
-        let idx = strided_index(i, data.len());
-        out.push((u16::from(data[idx]) % modulo) as u8);
-    }
-    out
-}
-
-fn serialize_fse_table_from_corpus(
-    sample_data: &[u8],
-    raw_content: &[u8],
-    max_symbol: u8,
-    max_log: u8,
-) -> io::Result<Vec<u8>> {
-    fn counts_total_for_source(source: &[u8], max_symbol: u8, counts: &mut [usize]) -> usize {
-        counts.fill(0);
-        for symbol in bounded_fse_symbols(source, max_symbol) {
-            counts[usize::from(symbol)] += 1;
-        }
-        counts.iter().sum::<usize>()
-    }
-
-    let mut counts = vec![0usize; usize::from(max_symbol) + 1];
-    let using_sample = !sample_data.is_empty();
-    let mut total = counts_total_for_source(
-        if using_sample {
-            sample_data
-        } else {
-            raw_content
-        },
-        max_symbol,
-        &mut counts,
-    );
-    if total <= 1 && using_sample && !raw_content.is_empty() {
-        total = counts_total_for_source(raw_content, max_symbol, &mut counts);
-    }
-    if total <= 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "insufficient symbol statistics for FSE table",
-        ));
-    }
-    let table = build_table_from_symbol_counts(&counts, max_log, false);
-    Ok(serialize_fse_table(&table))
-}
-
-fn derive_dict_id(raw_content: &[u8]) -> u32 {
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in raw_content {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    let compliant = (h % ((1u64 << 31) - 32768)) + 32768;
-    compliant as u32
-}
-
-/// Finalize raw dictionary content into a full zstd dictionary binary
-/// (`magic + dict_id + entropy tables + offset history + content`).
+/// The entropy tables are measured, not guessed: the first block of each
+/// sample is compressed with `raw_content` as a raw dictionary at
+/// [`FinalizeOptions::level`], and the tables describe the literals and
+/// sequences those blocks produced. `samples` is every sample back to back and
+/// `sample_sizes` their lengths. Content that does not fit after the header is
+/// cut from the front: trainers place their best segments last.
+///
+/// # Errors
+///
+/// `InvalidInput` when `raw_content` is empty, when `dict_size` is below
+/// [`MIN_TRAINED_DICT_SIZE`] or leaves less than eight bytes of content after
+/// the header, when the id is zero, or when `sample_sizes` does not add up to
+/// `samples.len()`.
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{FinalizeOptions, finalize_raw_dict};
+///
+/// let mut samples = Vec::new();
+/// let mut sizes = Vec::new();
+/// for i in 0..50u32 {
+///     let line = format!("tenant=demo table=orders key={i} status=shipped\n");
+///     sizes.push(line.len());
+///     samples.extend_from_slice(line.as_bytes());
+/// }
+/// let content = b"tenant=demo table=orders key= status=shipped\n";
+/// let dict = finalize_raw_dict(content, &samples, &sizes, 1024, FinalizeOptions::default())
+///     .unwrap();
+/// assert!(dict.ends_with(content));
+/// ```
 pub fn finalize_raw_dict(
     raw_content: &[u8],
-    sample_data: &[u8],
+    samples: &[u8],
+    sample_sizes: &[usize],
     dict_size: usize,
     options: FinalizeOptions,
 ) -> io::Result<Vec<u8>> {
-    if raw_content.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "raw dictionary content must not be empty",
-        ));
-    }
-    let mut tables = serialize_huffman_table(sample_data, raw_content)?;
-    for (max_symbol, max_log) in ENTROPY_STREAMS {
-        tables.extend_from_slice(&serialize_fse_table_from_corpus(
-            sample_data,
-            raw_content,
-            max_symbol,
-            max_log,
-        )?);
-    }
-    let mut out = Vec::new();
-    assemble_dict(&mut out, raw_content, &tables, dict_size, options)?;
-    Ok(out)
+    let set = samples::SampleSet::new(samples, sample_sizes)?;
+    finalize::finalize(raw_content, &set, set.count(), dict_size, options)
 }
-
-/// The offset, match-length and literal-length streams, in the order their
-/// tables follow the literals table in a dictionary.
-const ENTROPY_STREAMS: [(u8, u8); 3] = [
-    (MAX_OFFSET_CODE, OF_MAX_LOG),
-    (MAX_MATCH_LENGTH_CODE, ML_MAX_LOG),
-    (MAX_LITERAL_LENGTH_CODE, LL_MAX_LOG),
-];
-
-/// The entropy tables [`finalize_raw_dict`] writes, when `sample_data` alone
-/// decides them; `None` when the samples are too thin and the tables would
-/// fall back on the content, which then has to be finalized in full.
-fn sample_entropy_tables(sample_data: &[u8]) -> Option<Vec<u8>> {
-    if sample_data.len() < 2 {
-        return None;
-    }
-    let mut tables = serialize_huffman_table(sample_data, &[]).ok()?;
-    for (max_symbol, max_log) in ENTROPY_STREAMS {
-        tables.extend_from_slice(
-            &serialize_fse_table_from_corpus(sample_data, &[], max_symbol, max_log).ok()?,
-        );
-    }
-    Some(tables)
-}
-
-/// A dictionary of `raw_content` behind already serialized entropy `tables`,
-/// written over `out`, whose allocation a caller finalizing many candidates
-/// keeps from one to the next.
-fn assemble_dict(
-    out: &mut Vec<u8>,
-    raw_content: &[u8],
-    tables: &[u8],
-    dict_size: usize,
-    options: FinalizeOptions,
-) -> io::Result<()> {
-    out.clear();
-    out.reserve(dict_size.max(256));
-    out.extend_from_slice(&DICT_MAGIC_NUM);
-    let dict_id = options
-        .dict_id
-        .unwrap_or_else(|| derive_dict_id(raw_content));
-    if dict_id == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "dictionary id must be non-zero",
-        ));
-    }
-    out.extend_from_slice(&dict_id.to_le_bytes());
-    out.extend_from_slice(tables);
-
-    // Repeat offsets: keep default bootstrap history.
-    out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&4u32.to_le_bytes());
-    out.extend_from_slice(&8u32.to_le_bytes());
-
-    let min_content_size = 8usize;
-    let max_content_budget = dict_size.saturating_sub(out.len());
-    if max_content_budget < min_content_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "dictionary size too small to fit header and offset history",
-        ));
-    }
-
-    let content = if raw_content.len() > max_content_budget {
-        &raw_content[raw_content.len() - max_content_budget..]
-    } else {
-        raw_content
-    };
-    if content.len() < min_content_size {
-        out.resize(out.len() + (min_content_size - content.len()), 0);
-    }
-    out.extend_from_slice(content);
-    Ok(())
-}
-
-/// Smallest dictionary, in bytes, any trainer here builds (upstream zstd
-/// `ZDICT_DICTSIZE_MIN`); a smaller one is refused with
-/// [`TrainingError::DictionaryTooSmall`]. Unlike [`MIN_TRAINED_DICT_SIZE`] it
-/// bounds a training request, so a caller can refuse one before loading the
-/// samples.
-pub const TRAINER_DICT_SIZE_MIN: usize = 256;
 
 /// The `k` and `d` values a training run tries, resolved from the options the
 /// way the reference's optimizers resolve theirs.
@@ -700,7 +487,7 @@ impl SearchSpace {
 /// `InvalidInput` for tuning out of range or for a `k` and `d` that no
 /// dictionary of `dict_size` bytes holds, where [`TrainingError::of`] reports
 /// [`TrainingError::Parameter`], and for a `dict_size` under
-/// [`TRAINER_DICT_SIZE_MIN`], where it reports
+/// [`MIN_TRAINED_DICT_SIZE`], where it reports
 /// [`TrainingError::DictionaryTooSmall`].
 ///
 /// # Examples
@@ -845,10 +632,10 @@ fn check_samples_and_dict_size<'s>(
 
 /// Refuse a dictionary smaller than any trainer builds.
 fn check_dict_size(dict_size: usize) -> io::Result<()> {
-    if dict_size < TRAINER_DICT_SIZE_MIN {
+    if dict_size < MIN_TRAINED_DICT_SIZE {
         return Err(refuse(
             TrainingError::DictionaryTooSmall,
-            &format!("a dictionary must be at least {TRAINER_DICT_SIZE_MIN} bytes"),
+            &format!("a dictionary must be at least {MIN_TRAINED_DICT_SIZE} bytes"),
         ));
     }
     Ok(())
@@ -865,7 +652,7 @@ fn check_dict_size(dict_size: usize) -> io::Result<()> {
 /// # Errors
 ///
 /// `InvalidInput` when `k` or `d` is zero or `d > k`, when `k` exceeds
-/// `dict_size`, when `dict_size` is under [`TRAINER_DICT_SIZE_MIN`], when there
+/// `dict_size`, when `dict_size` is under [`MIN_TRAINED_DICT_SIZE`], when there
 /// are fewer than five samples or they do not add up to `samples.len()`;
 /// [`TrainingError::of`] tells these causes apart.
 ///
@@ -962,14 +749,8 @@ fn run_cover(
     // A plain run with no shrinking prices nothing: its one dictionary is the
     // answer, as the reference's plain trainer returns it unscored.
     let scored = !plain || options.shrink.is_some() || space.split_point < 1.0;
-    let mut evaluator = selection::Evaluator::new(
-        &set,
-        split.train,
-        split.test.clone(),
-        dict_size,
-        options.level,
-        finalize,
-    );
+    let mut evaluator =
+        selection::Evaluator::new(&set, split.train, split.test.clone(), dict_size, finalize);
     let mut best = selection::Best::new();
     let mut state = Vec::new();
     let mut content_scratch = Vec::new();
@@ -1171,7 +952,6 @@ fn run_fastcover(
                 ctx.finalize_samples(split.train),
                 split.test.clone(),
                 dict_size,
-                options.cover.level,
                 finalize,
             )
         });
@@ -1256,7 +1036,13 @@ pub fn create_legacy_dict_from_slice<W: io::Write>(
     // the corpus to its size limit inside the search alone, for its suffix
     // sort (zdict.c, `ZDICT_trainBuffer_legacy`), and builds the entropy tables
     // from all of them (`ZDICT_trainFromBuffer_unsafe_legacy`).
-    let finalized = finalize_raw_dict(content.as_slice(), samples, dict_size, finalize)?;
+    let finalized = finalize_raw_dict(
+        content.as_slice(),
+        samples,
+        sample_sizes,
+        dict_size,
+        finalize,
+    )?;
     output.write_all(finalized.as_slice())
 }
 

@@ -3231,6 +3231,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.compressed_data.take()
     }
 
+    /// The matcher, for a caller that reads what it recorded between frames.
+    #[cfg(feature = "dict-builder")]
+    pub(crate) fn matcher_mut(&mut self) -> &mut M {
+        &mut self.state.matcher
+    }
+
     /// Before calling [FrameCompressor::compress] you can replace the matcher
     pub fn replace_matcher(&mut self, mut match_generator: M) -> M {
         core::mem::swap(&mut match_generator, &mut self.state.matcher);

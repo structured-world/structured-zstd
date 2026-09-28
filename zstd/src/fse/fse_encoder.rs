@@ -425,7 +425,7 @@ pub fn build_table_from_data(
     build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
 }
 
-#[cfg(any(test, feature = "fuzz-exports", feature = "dict-builder"))]
+#[cfg(any(test, feature = "fuzz-exports"))]
 pub(crate) fn build_table_from_symbol_counts(
     counts: &[usize],
     max_log: u8,
@@ -499,7 +499,32 @@ pub(crate) fn build_seq_ctable_into(
     build_table_from_probabilities_into(&probs[..=max_symbol], table_log, out);
 }
 
-#[cfg(any(test, feature = "fuzz-exports", feature = "dict-builder"))]
+/// An FSE table at exactly `table_log` for `counts`, with low-probability
+/// symbols kept at `-1` (upstream zstd `FSE_normalizeCount` given the log
+/// outright, as the dictionary finalizer calls it, zdict.c
+/// `ZDICT_analyzeEntropy`). `counts` must not be too spread for the log:
+/// every symbol present needs a slot.
+#[cfg(feature = "dict-builder")]
+pub(crate) fn build_table_at_log(counts: &[usize], table_log: u8) -> FSETable {
+    let total = counts.iter().sum::<usize>();
+    let max_symbol = counts
+        .iter()
+        .rposition(|&count| count > 0)
+        .unwrap_or_default();
+    debug_assert!(total > 1 && table_log >= min_table_log(total, max_symbol));
+    let mut probs = [0i32; 256];
+    normalize_counts(
+        &mut probs[..=max_symbol],
+        table_log,
+        &counts[..=max_symbol],
+        total,
+        max_symbol,
+        true,
+    );
+    build_table_from_probabilities(&probs[..=max_symbol], table_log)
+}
+
+#[cfg(any(test, feature = "fuzz-exports"))]
 fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {
     let mut out = FSETable::blank();
     build_table_from_counts_into(counts, max_log, avoid_0_numbit, &mut out);
