@@ -70,7 +70,9 @@ pub struct CoverOptions {
     /// dictionary of its own, and keep the first whose scoring samples
     /// compress to at most this many percent more than with the whole content
     /// (upstream zstd `COVER_selectDict`). A dictionary so found is its header
-    /// plus that tail, so none is smaller than the header plus 256 bytes.
+    /// plus that tail, so none is smaller than the header plus 256 bytes. A
+    /// search cuts its winner down this way; the parameters it chooses are
+    /// unchanged.
     pub shrink: Option<u32>,
 }
 
@@ -781,7 +783,7 @@ fn run_cover(
             let built = match cover::CoverContext::new(&set, split.train, d) {
                 Ok(ctx) => Some(ctx),
                 Err(err) => {
-                    best.offer(Err(err), chosen);
+                    best.offer(Err(err), &[], chosen);
                     None
                 }
             };
@@ -794,9 +796,9 @@ fn run_cover(
         if !scored {
             return Ok((evaluator.finalize(content)?, chosen));
         }
-        best.offer(evaluator.select(content, options.shrink), chosen);
+        best.offer(evaluator.score(content), content, chosen);
     }
-    best.finish()
+    best.finish(&mut evaluator, options.shrink)
 }
 
 /// Train a FastCOVER dictionary of at most `dict_size` bytes with the `k` and
@@ -909,7 +911,13 @@ fn run_fastcover(
     let mut best = selection::Best::new();
     // `None` beside a `d` is a dmer size these samples cannot count.
     let mut context: Option<(usize, Option<fastcover::FastCoverContext<'_>>)> = None;
-    let mut evaluator: Option<selection::Evaluator<'_>> = None;
+    let mut evaluator = selection::Evaluator::new(
+        &set,
+        fastcover::finalize_samples(split.train, accel),
+        split.test.clone(),
+        dict_size,
+        finalize,
+    );
     for (d, k) in space.pairs() {
         if !segment_fits(k, d, dict_size) {
             continue;
@@ -936,7 +944,7 @@ fn run_fastcover(
             let built = match fastcover::FastCoverContext::new(&set, split.train, d, f, accel) {
                 Ok(ctx) => Some(ctx),
                 Err(err) => {
-                    best.offer(Err(err), chosen);
+                    best.offer(Err(err), &[], chosen);
                     None
                 }
             };
@@ -945,23 +953,13 @@ fn run_fastcover(
         let Some(ctx) = context.as_ref().and_then(|(_, built)| built.as_ref()) else {
             continue;
         };
-        // The finalize share depends on `accel` alone, so every context agrees.
-        let evaluator = evaluator.get_or_insert_with(|| {
-            selection::Evaluator::new(
-                &set,
-                ctx.finalize_samples(split.train),
-                split.test.clone(),
-                dict_size,
-                finalize,
-            )
-        });
         let content = ctx.build(&mut freqs, &mut window, &mut content_scratch, dict_size, k)?;
         if !scored {
             return Ok((evaluator.finalize(content)?, chosen));
         }
-        best.offer(evaluator.select(content, options.cover.shrink), chosen);
+        best.offer(evaluator.score(content), content, chosen);
     }
-    best.finish()
+    best.finish(&mut evaluator, options.cover.shrink)
 }
 
 /// Train and finalize a dictionary with the reference's original trainer, the

@@ -115,42 +115,48 @@ impl<'s> Evaluator<'s> {
         Ok(total)
     }
 
-    /// Finalize `content` and price it. With `shrink`, also try the content's
-    /// last 256, 512, ... bytes and keep the first that costs at most
-    /// `shrink` percent more than the whole: a smaller dictionary that does
-    /// nearly as well.
-    ///
-    /// Upstream zstd runs the same search but forces it off in the only path
-    /// that reaches it, so its `shrink` has no effect; here it takes effect.
-    pub(super) fn select(&mut self, content: &[u8], shrink: Option<u32>) -> io::Result<Priced<'_>> {
+    /// Finalize `content` and price it, in the evaluator's candidate buffer.
+    pub(super) fn score(&mut self, content: &[u8]) -> io::Result<Priced<'_>> {
         let mut dict = core::mem::take(&mut self.dict);
         let priced = self.finalize_and_price(content, &mut dict);
         self.dict = dict;
-        let total = priced?;
-        let Some(regression) = shrink else {
-            return Ok(Priced {
-                dict: &self.dict,
-                total,
-            });
-        };
+        Ok(Priced {
+            total: priced?,
+            dict: &self.dict,
+        })
+    }
+
+    /// Try the last 256, 512, ... bytes of `content` and keep the first that
+    /// costs at most `regression` percent more than `full`, the whole
+    /// content's score: a smaller dictionary that does nearly as well.
+    ///
+    /// Upstream zstd runs the same search for every candidate of its
+    /// parameter search, but forces it off in the only path that reaches it,
+    /// so its `shrink` has no effect. Here it runs once, on the winner: the
+    /// size a dictionary is cut to is a separate choice from the `k` and `d`
+    /// that built it, and searching it per candidate multiplies the cost of
+    /// the whole search by the number of sizes tried.
+    pub(super) fn shrink(
+        &mut self,
+        content: &[u8],
+        full: Scored,
+        regression: u32,
+    ) -> io::Result<Scored> {
         let mut size = SHRINK_START;
         while size < content.len() {
             let mut shrunk = core::mem::take(&mut self.shrunk);
             let priced = self.finalize_and_price(&content[content.len() - size..], &mut shrunk);
-            self.shrunk = shrunk;
-            let candidate_total = priced?;
-            if within_regression(candidate_total, total, regression) {
-                return Ok(Priced {
-                    dict: &self.shrunk,
-                    total: candidate_total,
+            let total = priced?;
+            if within_regression(total, full.total, regression) {
+                return Ok(Scored {
+                    dict: shrunk,
+                    total,
                 });
             }
+            self.shrunk = shrunk;
             size *= 2;
         }
-        Ok(Priced {
-            dict: &self.dict,
-            total,
-        })
+        Ok(full)
     }
 }
 
@@ -163,16 +169,17 @@ pub(super) fn within_regression(total: usize, full: usize, regression: u32) -> b
     total as u128 * 100 <= full as u128 * (u128::from(regression) + 100)
 }
 
-/// A candidate [`Evaluator::select`] priced, still in the evaluator's buffer.
+/// A candidate [`Evaluator::score`] priced, still in the evaluator's buffer.
 pub(super) struct Priced<'e> {
     pub(super) dict: &'e [u8],
     pub(super) total: usize,
 }
 
-/// The cheapest dictionary seen, and the parameters that built it. A tie keeps
-/// the earlier one, as upstream's strict comparison does.
+/// The cheapest dictionary seen, the content it was finalized from and the
+/// parameters that built it. A tie keeps the earlier one, as upstream's strict
+/// comparison does.
 pub(super) struct Best<P> {
-    found: Option<(Scored, P)>,
+    found: Option<(Scored, Vec<u8>, P)>,
     last_error: Option<io::Error>,
 }
 
@@ -184,44 +191,54 @@ impl<P> Best<P> {
         }
     }
 
-    /// Keep `candidate` if it beats the best so far, copying its bytes into the
-    /// buffer the previous winner held; a candidate that loses is not copied.
-    pub(super) fn offer(&mut self, candidate: io::Result<Priced<'_>>, params: P) {
+    /// Keep `candidate` if it is the cheapest so far. Its dictionary and
+    /// `content` are copied only then, into the buffers the previous winner
+    /// held; a candidate that loses is not copied at all.
+    pub(super) fn offer(&mut self, candidate: io::Result<Priced<'_>>, content: &[u8], params: P) {
         match candidate {
-            Ok(priced) => {
-                if self
-                    .found
-                    .as_ref()
-                    .is_none_or(|(best, _)| priced.total < best.total)
-                {
-                    let mut dict = self
-                        .found
-                        .take()
-                        .map_or_else(Vec::new, |(previous, _)| previous.dict);
-                    dict.clear();
-                    dict.extend_from_slice(priced.dict);
-                    self.found = Some((
-                        Scored {
-                            dict,
-                            total: priced.total,
-                        },
-                        params,
-                    ));
+            Ok(priced) => match &mut self.found {
+                Some((best, _, _)) if priced.total >= best.total => {}
+                Some((best, kept, kept_params)) => {
+                    best.total = priced.total;
+                    best.dict.clear();
+                    best.dict.extend_from_slice(priced.dict);
+                    kept.clear();
+                    kept.extend_from_slice(content);
+                    *kept_params = params;
                 }
-            }
+                None => {
+                    let best = Scored {
+                        dict: priced.dict.to_vec(),
+                        total: priced.total,
+                    };
+                    self.found = Some((best, content.to_vec(), params));
+                }
+            },
             Err(err) => self.last_error = Some(err),
         }
     }
 
-    /// The winner, or why no candidate could be priced.
-    pub(super) fn finish(self) -> io::Result<(Vec<u8>, P)> {
-        match (self.found, self.last_error) {
-            (Some((scored, params)), _) => Ok((scored.dict, params)),
-            (None, Some(err)) => Err(err),
-            (None, None) => Err(super::samples::refuse(
-                super::TrainingError::Parameter,
-                "no parameter combination is valid for this dictionary size",
-            )),
-        }
+    /// The winner's dictionary, cut down with `shrink` when given, and its
+    /// parameters; or why no candidate could be priced.
+    pub(super) fn finish(
+        self,
+        evaluator: &mut Evaluator<'_>,
+        shrink: Option<u32>,
+    ) -> io::Result<(Vec<u8>, P)> {
+        let (full, content, params) = match (self.found, self.last_error) {
+            (Some(found), _) => found,
+            (None, Some(err)) => return Err(err),
+            (None, None) => {
+                return Err(super::samples::refuse(
+                    super::TrainingError::Parameter,
+                    "no parameter combination is valid for this dictionary size",
+                ));
+            }
+        };
+        let chosen = match shrink {
+            Some(regression) => evaluator.shrink(&content, full, regression)?,
+            None => full,
+        };
+        Ok((chosen.dict, params))
     }
 }

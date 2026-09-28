@@ -263,6 +263,38 @@ fn shrink_keeps_a_smaller_dictionary_within_the_regression() {
     assert!(price(&strict, &data, &sizes) <= full_price);
 }
 
+/// In a search, `shrink` cuts the winner down rather than weighing every
+/// candidate at every size: the parameters chosen are the ones the search
+/// chooses without it, and the dictionary is that winner's, cut or whole.
+#[test]
+fn shrink_cuts_the_search_winner() {
+    let (data, sizes) = training_samples();
+    let options = CoverOptions {
+        split_point: 0.75,
+        ..CoverOptions::default()
+    };
+    let (whole, chosen) =
+        optimize_cover_dict(&data, &sizes, 8192, &options, FinalizeOptions::default()).unwrap();
+    let (cut, chosen_with_shrink) = optimize_cover_dict(
+        &data,
+        &sizes,
+        8192,
+        &CoverOptions {
+            shrink: Some(1000),
+            ..options
+        },
+        FinalizeOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        (chosen_with_shrink.k, chosen_with_shrink.d),
+        (chosen.k, chosen.d)
+    );
+    let content = |dict: &[u8]| Dictionary::decode_dict(dict).unwrap().dict_content;
+    assert!(cut.len() < whole.len());
+    assert!(content(&whole).ends_with(&content(&cut)));
+}
+
 /// A split below 1 scores on the trailing samples only: a split that leaves
 /// none of them, or fewer than five to build from, is refused.
 #[test]

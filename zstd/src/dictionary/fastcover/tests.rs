@@ -39,14 +39,9 @@ fn accel_strides_the_count_and_shrinks_the_finalize_share() {
     // Five positions per 12-byte sample; every other one is positions 0, 2, 4.
     assert_eq!(total(&full), 25);
     assert_eq!(total(&strided), 15);
-    assert_eq!(full.finalize_samples(100), 100);
-    assert_eq!(strided.finalize_samples(100), 50);
-    assert_eq!(
-        FastCoverContext::new(&set, 5, 8, 20, 10)
-            .unwrap()
-            .finalize_samples(100),
-        10
-    );
+    assert_eq!(finalize_samples(100, 1), 100);
+    assert_eq!(finalize_samples(100, 2), 50);
+    assert_eq!(finalize_samples(100, 10), 10);
 }
 
 /// Training bytes shorter than one dmer read are refused rather than yielding

@@ -120,11 +120,16 @@ fn zeroed_counts<C: WindowCount>(len: usize) -> Result<Vec<C>, TableTooLarge> {
     Ok(unsafe { Vec::from_raw_parts(pointer.cast::<C>(), len, len) })
 }
 
-/// Share of the training samples the entropy tables are drawn from, and dmers
-/// skipped between counted ones, per acceleration (upstream zstd
-/// `FASTCOVER_defaultAccelParameters`).
+/// Share of the training samples the entropy tables are drawn from, per
+/// acceleration (upstream zstd `FASTCOVER_defaultAccelParameters`; the dmers
+/// skipped between counted ones are `accel - 1`).
 const ACCEL_FINALIZE_PERCENT: [usize; MAX_ACCEL as usize + 1] =
     [100, 100, 50, 34, 25, 20, 17, 14, 13, 11, 10];
+
+/// How many of `train` samples the entropy tables are drawn from at `accel`.
+pub(super) fn finalize_samples(train: usize, accel: u32) -> usize {
+    train * ACCEL_FINALIZE_PERCENT[accel as usize] / 100
+}
 
 /// Every trainable position of the training samples hashed into a frequency
 /// table. Depends on `d`, `f` and `accel`, so one context serves every `k`.
@@ -134,7 +139,6 @@ pub(super) struct FastCoverContext<'s> {
     freqs: Vec<u32>,
     d: usize,
     f: u32,
-    finalize_percent: usize,
 }
 
 impl<'s> FastCoverContext<'s> {
@@ -179,13 +183,7 @@ impl<'s> FastCoverContext<'s> {
             freqs,
             d,
             f,
-            finalize_percent: ACCEL_FINALIZE_PERCENT[accel as usize],
         })
-    }
-
-    /// How many of `train` samples the entropy tables are drawn from.
-    pub(super) fn finalize_samples(&self, train: usize) -> usize {
-        train * self.finalize_percent / 100
     }
 
     /// Build content of at most `capacity` bytes from segments of `k` bytes
