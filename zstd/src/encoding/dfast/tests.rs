@@ -70,10 +70,32 @@ fn a_tagged_slot_answers_only_its_own_tag() {
     let matcher = bound(&mut workspace, true);
     let shift = 64 - matcher.long_hash_bits;
     let mixed = 0x0123_4567_89AB_CDEFu64;
-    let word = live_slot_as(42, mixed, shift, matcher.slot_format());
+    let word = live_slot::<true>(42, mixed, shift);
     assert_eq!(matcher.packed_in(word, mixed, shift), 42);
     let other = mixed ^ (1u64 << (shift - DFAST_TAG_BITS as usize));
     assert_eq!(matcher.packed_in(word, other, shift), DFAST_EMPTY_SLOT);
+}
+
+/// Fresh tagged tables start at the floor the next frame begins at, not at the
+/// previous frame's start: the layout runs after the history is retired and
+/// before the reset applies the new floor, and a base left behind would make
+/// the first insertion rebase once per `DFAST_TAGGED_REBASE` of the gap, each
+/// a pass over both tables.
+#[test]
+fn fresh_tagged_tables_start_at_the_next_frames_floor() {
+    let mut workspace = Workspace::new();
+    let mut matcher = bound(&mut workspace, false);
+    let floor = 3 * DFAST_TAGGED_REBASE as usize;
+    matcher.retired = Some(RetiredHistory {
+        next_floor: floor,
+        kept: None,
+    });
+    workspace.begin_layout(0, no_trailing, IngestPlan::Stream);
+    workspace.open(matcher.tables_workspace_bytes(), usize::MAX);
+    matcher.bind_tables(&mut workspace, true);
+    matcher.reset();
+    assert_eq!(matcher.history_abs_start, floor);
+    assert_eq!(matcher.position_base, floor);
 }
 
 /// Laying the tables out again in the other slot format is not a

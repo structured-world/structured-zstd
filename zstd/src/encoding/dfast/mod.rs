@@ -251,13 +251,16 @@ fn dfast_tag(mixed: u64, shift: usize) -> u32 {
 }
 
 /// The word a live slot stores for the packed position `packed` under the
-/// hash product `mixed`, in the format `(shift, mask)`
-/// ([`DfastMatchGenerator::slot_format`]) the caller hoisted: `(0, 0)` stores
-/// the bare position, `(DFAST_TAG_BITS, DFAST_TAG_MASK)` the tagged word.
+/// hash product `mixed`: the bare position, or with `TAGGED` the position
+/// above the hash's tag. The format is a constant of the caller, chosen once
+/// above its loop, so neither form carries the other's shift and mask.
 #[inline(always)]
-fn live_slot_as(packed: u32, mixed: u64, shift: usize, format: (u32, u32)) -> u32 {
-    let (tag_shift, tag_mask) = format;
-    (packed << tag_shift) | (dfast_tag(mixed, shift) & tag_mask)
+fn live_slot<const TAGGED: bool>(packed: u32, mixed: u64, shift: usize) -> u32 {
+    if TAGGED {
+        (packed << DFAST_TAG_BITS) | dfast_tag(mixed, shift)
+    } else {
+        packed
+    }
 }
 
 impl DfastMatchGenerator {
@@ -412,16 +415,6 @@ impl DfastMatchGenerator {
         }
     }
 
-    /// `(shift, mask)` of the live slot format, for [`live_slot_as`].
-    #[inline(always)]
-    fn slot_format(&self) -> (u32, u32) {
-        if self.tagged {
-            (DFAST_TAG_BITS, DFAST_TAG_MASK)
-        } else {
-            (0, 0)
-        }
-    }
-
     /// Largest relative position a slot holds in the current format.
     #[inline(always)]
     fn max_rel(&self) -> usize {
@@ -504,10 +497,15 @@ impl DfastMatchGenerator {
         }
         let continued = kept && self.tagged == tagged;
         if !continued && tagged {
-            // Empty tables can take any base; starting it at the history keeps
-            // a tagged slot's short position range from being spent on bytes
-            // earlier frames already retired.
-            self.position_base = self.history_abs_start;
+            // Empty tables can take any base; starting it at the next frame's
+            // floor keeps a tagged slot's short position range from being
+            // spent on bytes earlier frames already retired. The layout runs
+            // before the reset applies that floor, so it is read from the
+            // retired history when there is one.
+            self.position_base = self
+                .retired
+                .as_ref()
+                .map_or(self.history_abs_start, |retired| retired.next_floor);
         }
         self.tagged = tagged;
         self.tables_fresh = !continued;
@@ -1796,9 +1794,17 @@ impl DfastMatchGenerator {
     }
 
     /// Hash every `step`-th position in `[start, end)` into both tables,
-    /// resolving the scan source, the rebase check and the slot bias once for
-    /// the whole range rather than per position.
+    /// resolving the scan source, the rebase check, the slot bias and the slot
+    /// format once for the whole range rather than per position.
     fn insert_range(&mut self, start: usize, end: usize, step: usize) {
+        if self.tagged {
+            self.insert_range_as::<true>(start, end, step);
+        } else {
+            self.insert_range_as::<false>(start, end, step);
+        }
+    }
+
+    fn insert_range_as<const TAGGED: bool>(&mut self, start: usize, end: usize, step: usize) {
         debug_assert!(step >= 1, "insert_range needs a positive step");
         // Source the byte buffer + rebase coordinates through `scan_source()`
         // so a borrowed window's batch re-seed hashes the in-place input
@@ -1836,7 +1842,6 @@ impl DfastMatchGenerator {
         let long_hash_ptr = self.long_mut_ptr();
         let short_shift = 64 - short_hash_bits;
         let long_shift = 64 - long_hash_bits;
-        let format = self.slot_format();
 
         // Two contiguous regions in the input range:
         // * `[start .. long_safe_end)` — every position has at least 8
@@ -1888,12 +1893,12 @@ impl DfastMatchGenerator {
                         let mixed_short = (v8 << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
                         let short_idx = (mixed_short >> short_shift) as usize;
                         *short_hash_ptr.add(short_idx) =
-                            live_slot_as(packed, mixed_short, short_shift, format);
+                            live_slot::<TAGGED>(packed, mixed_short, short_shift);
                         if $dense {
                             let mixed_long = v8.wrapping_mul(0xCF1BBCDCB7A56463_u64);
                             let long_idx = (mixed_long >> long_shift) as usize;
                             *long_hash_ptr.add(long_idx) =
-                                live_slot_as(packed, mixed_long, long_shift, format);
+                                live_slot::<TAGGED>(packed, mixed_long, long_shift);
                         }
                     }
                     $pos += $step;
@@ -1919,7 +1924,7 @@ impl DfastMatchGenerator {
                 let mixed_short = ((lo4 | (b5 << 32)) << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
                 let short_idx = (mixed_short >> short_shift) as usize;
                 *short_hash_ptr.add(short_idx) =
-                    live_slot_as(packed, mixed_short, short_shift, format);
+                    live_slot::<TAGGED>(packed, mixed_short, short_shift);
             }
             pos += step;
         }
@@ -1958,6 +1963,20 @@ impl DfastMatchGenerator {
     /// identifiable on the reference profile.
     #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
     fn insert_complementary(&mut self, curr_plus_2: usize, ip_minus_2: usize, ip_minus_1: usize) {
+        if self.tagged {
+            self.insert_complementary_as::<true>(curr_plus_2, ip_minus_2, ip_minus_1);
+        } else {
+            self.insert_complementary_as::<false>(curr_plus_2, ip_minus_2, ip_minus_1);
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    fn insert_complementary_as<const TAGGED: bool>(
+        &mut self,
+        curr_plus_2: usize,
+        ip_minus_2: usize,
+        ip_minus_1: usize,
+    ) {
         const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
         // `ensure_room_for` is monotone in its argument, so a base with room
         // for the furthest of the three has room for the nearer two, and all
@@ -1974,7 +1993,6 @@ impl DfastMatchGenerator {
         let short_shift = 64 - self.short_hash_bits;
         let long_ptr = self.long_mut_ptr();
         let short_ptr = self.short_mut_ptr();
-        let format = self.slot_format();
         // SAFETY: `base_ptr + start_offset` is the live source start (owned
         // `history[history_start..]` or the borrowed input slice) and
         // `concat_len` its readable byte count, taken exactly as
@@ -2007,7 +2025,7 @@ impl DfastMatchGenerator {
                 debug_assert!(slot < self.long_len());
                 // SAFETY: `long_shift = 64 - long_hash_bits`, so `slot` is
                 // below `1 << long_hash_bits`, the long table's length.
-                unsafe { *long_ptr.add(slot) = live_slot_as(pack(pos), mixed, long_shift, format) };
+                unsafe { *long_ptr.add(slot) = live_slot::<TAGGED>(pack(pos), mixed, long_shift) };
             }
         }
         // Short key is the low 5 bytes (upstream `mls = 5`) in the same
@@ -2031,7 +2049,7 @@ impl DfastMatchGenerator {
                 // below the short table's length, and `short_mut_ptr` already
                 // points at the short region.
                 unsafe {
-                    *short_ptr.add(slot) = live_slot_as(pack(pos), mixed, short_shift, format)
+                    *short_ptr.add(slot) = live_slot::<TAGGED>(pack(pos), mixed, short_shift)
                 };
             }
         }
@@ -2042,6 +2060,15 @@ impl DfastMatchGenerator {
     /// which resolves their shared coordinates once instead of per position.
     #[inline]
     pub(crate) fn insert_position(&mut self, pos: usize) {
+        if self.tagged {
+            self.insert_position_as::<true>(pos);
+        } else {
+            self.insert_position_as::<false>(pos);
+        }
+    }
+
+    #[inline]
+    fn insert_position_as<const TAGGED: bool>(&mut self, pos: usize) {
         // Source the bytes + rebase coordinates through `scan_source()` so a
         // borrowed window's seam / tail re-seeds hash the in-place input
         // exactly as the owned path hashes its `history` concat.
@@ -2082,7 +2109,6 @@ impl DfastMatchGenerator {
         // `start_matching` seam re-seed picks it up once the next block
         // extends the source far enough to form its full 5-byte key.
         let concat = unsafe { core::slice::from_raw_parts(base_ptr.add(start_offset), concat_len) };
-        let format = self.slot_format();
         if idx + 5 <= concat_len {
             let short_shift = 64 - self.short_hash_bits;
             let mixed = short_hash_key(&concat[idx..]).wrapping_mul(DFAST_HASH_PRIME);
@@ -2092,7 +2118,7 @@ impl DfastMatchGenerator {
             let slot = self.long_len() + short;
             unsafe {
                 *self.tables.get_unchecked_mut(slot) =
-                    live_slot_as(packed, mixed, short_shift, format)
+                    live_slot::<TAGGED>(packed, mixed, short_shift)
             };
         }
 
@@ -2104,7 +2130,7 @@ impl DfastMatchGenerator {
             debug_assert!(long < self.long_len());
             unsafe {
                 *self.tables.get_unchecked_mut(long) =
-                    live_slot_as(packed, mixed, long_shift, format)
+                    live_slot::<TAGGED>(packed, mixed, long_shift)
             };
         }
     }
