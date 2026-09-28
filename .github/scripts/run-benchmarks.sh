@@ -173,8 +173,11 @@ DICT_TRAIN_RE = re.compile(
 # Process-global CPU kernel tier the run actually selected (shared
 # encode/decode entropy dispatch). One line per run; attributes every
 # measurement to the kernel + arch + libc that produced it.
+# `match_kernel` is the match-finder tier, which the entropy tier does not
+# determine (a run capped at sse4.2 matches with it, while its entropy tier
+# is sse2).
 KERNEL_RE = re.compile(
-    r'^REPORT_KERNEL kernel=(\S+) arch=(\S+) target_env=(\S+)$'
+    r'^REPORT_KERNEL kernel=(\S+)(?: match_kernel=(\S+))? arch=(\S+) target_env=(\S+)$'
 )
 # The two implementations measured alternately inside one window, which is
 # where the published speed delta comes from. Criterion runs an arm to
@@ -694,8 +697,13 @@ with open(raw_path) as f:
 
         kernel_match = KERNEL_RE.match(line)
         if kernel_match:
-            k_name, k_arch, k_env = kernel_match.groups()
-            kernel_info = {"kernel": k_name, "arch": k_arch, "target_env": k_env}
+            k_name, k_match, k_arch, k_env = kernel_match.groups()
+            kernel_info = {
+                "kernel": k_name,
+                "match_kernel": k_match,
+                "arch": k_arch,
+                "target_env": k_env,
+            }
             continue
 
         report_match = REPORT_RE.match(line)

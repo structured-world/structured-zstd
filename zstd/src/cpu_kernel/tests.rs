@@ -52,11 +52,37 @@ fn levels_parse_from_their_names() {
     );
 }
 
+/// Run `body` as test `name` in a process of its own: the ceiling is
+/// process-wide and frozen at first use, so a test that sets or freezes it
+/// must not share a process with any other test, whatever runner is used.
+/// The parent re-runs this test binary for exactly `name` and checks it
+/// passed; the child, marked by the environment, runs `body`.
+fn in_own_process(name: &str, body: fn()) {
+    const CHILD: &str = "STRUCTURED_ZSTD_CEILING_TEST";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        body();
+        return;
+    }
+    let test = std::format!("cpu_kernel::tests::{name}");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test.as_str(), "--exact", "--test-threads=1"])
+        .env(CHILD, name)
+        .status()
+        .unwrap();
+    assert!(status.success(), "{name} failed in its own process");
+}
+
 /// Set before any kernel is chosen, the ceiling holds for every tier the
-/// process then picks; once it is in force, it cannot be changed. (Each test
-/// runs in its own process, so no other test has chosen a kernel here yet.)
+/// process then picks; once it is in force, it cannot be changed.
 #[test]
 fn a_ceiling_set_first_governs_every_tier_and_then_freezes() {
+    in_own_process(
+        "a_ceiling_set_first_governs_every_tier_and_then_freezes",
+        ceiling_set_first_governs_every_tier_and_then_freezes,
+    );
+}
+
+fn ceiling_set_first_governs_every_tier_and_then_freezes() {
     assert_eq!(set_cpu_ceiling(CpuLevel::Scalar), Ok(()));
     assert_eq!(cpu_ceiling(), Some(CpuLevel::Scalar));
     assert_eq!(active_cpu_kernel_name(), "scalar");
@@ -75,6 +101,13 @@ fn a_ceiling_set_first_governs_every_tier_and_then_freezes() {
 /// leave tiers already in use above it.
 #[test]
 fn a_ceiling_cannot_follow_the_first_kernel_choice() {
+    in_own_process(
+        "a_ceiling_cannot_follow_the_first_kernel_choice",
+        ceiling_cannot_follow_the_first_kernel_choice,
+    );
+}
+
+fn ceiling_cannot_follow_the_first_kernel_choice() {
     let _ = active_cpu_kernel_name();
     assert_eq!(cpu_ceiling(), None);
     assert_eq!(
@@ -86,6 +119,13 @@ fn a_ceiling_cannot_follow_the_first_kernel_choice() {
 /// A level of the other architecture is refused rather than read as scalar.
 #[test]
 fn a_level_of_another_architecture_is_refused() {
+    in_own_process(
+        "a_level_of_another_architecture_is_refused",
+        level_of_another_architecture_is_refused,
+    );
+}
+
+fn level_of_another_architecture_is_refused() {
     let foreign = if cfg!(target_arch = "aarch64") {
         CpuLevel::Avx2
     } else {

@@ -342,8 +342,12 @@ pub(crate) fn apply_cpu_ceiling_from_env() {
     use std::sync::Once;
     static APPLIED: Once = Once::new();
     APPLIED.call_once(|| {
-        let Ok(value) = env::var("STRUCTURED_ZSTD_CPU") else {
-            return;
+        let value = match env::var("STRUCTURED_ZSTD_CPU") {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => return,
+            Err(env::VarError::NotUnicode(raw)) => {
+                panic!("STRUCTURED_ZSTD_CPU={raw:?} is not a readable tier name")
+            }
         };
         let level: structured_zstd::CpuLevel = value
             .trim()
@@ -356,7 +360,7 @@ pub(crate) fn apply_cpu_ceiling_from_env() {
 
 /// The `REPORT_KERNEL` line for this run: the CPU kernel tier actually
 /// selected (the entropy / sequence dispatch is shared by encode and decode,
-/// see #247), plus arch / libc. Lets the dashboard attribute every measurement
+/// see #247), the match-finder tier, plus arch / libc. Lets the dashboard attribute every measurement
 /// to the kernel that produced it. Shared verbatim by both bench binaries so
 /// the format stays in lockstep; each caller decides when to print it.
 pub(crate) fn kernel_report_line() -> String {
@@ -375,8 +379,9 @@ pub(crate) fn kernel_report_line() -> String {
         "other"
     };
     format!(
-        "REPORT_KERNEL kernel={} arch={} target_env={}",
+        "REPORT_KERNEL kernel={} match_kernel={} arch={} target_env={}",
         structured_zstd::active_cpu_kernel_name(),
+        structured_zstd::encoding::active_match_kernel_name(),
         arch,
         target_env
     )

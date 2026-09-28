@@ -38,8 +38,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use structured_zstd::decoding::{DictionaryHandle, FrameDecoder};
 use structured_zstd::encoding::FrameCompressor;
 use support::{
-    LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, build_training_samples,
-    dictionary_size_for, kernel_report_line, ldm_parameters, supported_levels_filtered,
+    LevelConfig, Scenario, ScenarioClass, apply_cpu_ceiling_from_env, benchmark_scenarios,
+    build_training_samples, dictionary_size_for, kernel_report_line, ldm_parameters,
+    supported_levels_filtered,
 };
 
 /// Process-wide byte tracker. Two allocation paths feed the SAME
@@ -469,6 +470,9 @@ fn train_ffi_dictionary(source: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn main() {
+    // Before the report line: reading the tier freezes the ceiling, and the
+    // memory figures must come from the tier the timing run was capped to.
+    apply_cpu_ceiling_from_env();
     // Report the CPU kernel tier this run selected, so the dashboard can
     // attribute every REPORT_MEM line to the kernel that produced it. Printed
     // unconditionally (no STRUCTURED_ZSTD_EMIT_REPORT gate like compare_ffi):

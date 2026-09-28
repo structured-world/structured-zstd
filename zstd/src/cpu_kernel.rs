@@ -217,10 +217,13 @@ const CEILING_NONE: u8 = u8::MAX;
 ///
 /// # Errors
 ///
-/// [`CpuCeilingError::AlreadyResolved`] once any kernel has been chosen (the
-/// first compression or decompression chooses them) or a ceiling set;
-/// [`CpuCeilingError::OtherArchitecture`] for a level of another
-/// architecture.
+/// [`CpuCeilingError::AlreadyResolved`] once any kernel has been chosen or a
+/// ceiling set. Building a codec context can already choose kernels (a
+/// decoder does, at construction), and so does querying one
+/// ([`active_cpu_kernel_name`](crate::active_cpu_kernel_name),
+/// [`cpu_ceiling`]): set the ceiling before creating any context, not merely
+/// before the first compression or decompression.
+/// [`CpuCeilingError::OtherArchitecture`] for a level of another architecture.
 ///
 /// # Examples
 /// ```standalone_crate
@@ -257,11 +260,20 @@ pub fn cpu_ceiling() -> Option<CpuLevel> {
     #[cfg(target_has_atomic = "8")]
     {
         use core::sync::atomic::Ordering;
-        let stored =
-            match CEILING.compare_exchange(0, CEILING_NONE, Ordering::AcqRel, Ordering::Acquire) {
+        // Once frozen the value never changes, so a plain load answers every
+        // later call; only the first read pays the locked compare-exchange.
+        let mut stored = CEILING.load(Ordering::Acquire);
+        if stored == 0 {
+            stored = match CEILING.compare_exchange(
+                0,
+                CEILING_NONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => CEILING_NONE,
                 Err(stored) => stored,
             };
+        }
         (stored != CEILING_NONE).then(|| CpuLevel::ALL[usize::from(stored - 1)])
     }
     #[cfg(not(target_has_atomic = "8"))]
