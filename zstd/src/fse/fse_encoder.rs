@@ -453,7 +453,7 @@ pub(crate) fn build_table_from_symbol_counts(
     build_table_from_counts(counts, max_log, avoid_0_numbit)
 }
 
-/// [`build_table_from_symbol_counts`] writing into a caller-owned table.
+/// `build_table_from_symbol_counts` writing into a caller-owned table.
 pub(crate) fn build_table_from_symbol_counts_into(
     counts: &[usize],
     max_log: u8,
@@ -554,7 +554,7 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) 
     out
 }
 
-/// [`build_table_from_counts`] writing into a caller-owned table.
+/// `build_table_from_counts` writing into a caller-owned table.
 pub(crate) fn build_table_from_counts_into(
     counts: &[usize],
     max_log: u8,
@@ -641,7 +641,7 @@ fn ncount_header_bits(len: usize, prob: impl Fn(usize) -> i32, acc_log: u8) -> u
 }
 
 /// Header bit cost of the custom FSE table that
-/// [`build_table_from_symbol_counts`] would produce for `counts`, without
+/// `build_table_from_symbol_counts` would produce for `counts`, without
 /// building it. Mirrors the front of `build_table_from_counts` (table-log
 /// selection + count normalization) and then sizes the header via
 /// [`ncount_header_bits`]. Returns the exact value the built table's
