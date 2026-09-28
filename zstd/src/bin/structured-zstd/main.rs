@@ -226,6 +226,9 @@ struct Options {
     /// The legacy trainer's selectivity from `-s#` or `--train-legacy=s=#`;
     /// zero is its default.
     selectivity: u32,
+    /// Highest instruction set the kernels may use (`--cpu=LEVEL`); `None`
+    /// lets the CPU's own features decide.
+    cpu: Option<structured_zstd::CpuLevel>,
 }
 
 /// The dictionary trainers `--train` selects between.
@@ -728,6 +731,21 @@ fn main() {
         }
     };
     let verbosity = options.verbosity;
+    // Before anything that compresses or decompresses: the first such call
+    // chooses the kernels, and they stay chosen for the process.
+    if let Some(level) = options.cpu
+        && let Err(err) = structured_zstd::set_cpu_ceiling(level)
+    {
+        display!(verbosity, 1, "zstd: --cpu={level}: {err}");
+        std::process::exit(1);
+    }
+    display!(
+        verbosity,
+        4,
+        "kernels: entropy {}, match finding {}",
+        structured_zstd::active_cpu_kernel_name(),
+        structured_zstd::active_match_kernel_name()
+    );
     // Status goes to stderr through `display!`, so it never contaminates a
     // `-c` stdout data stream.
     let status = match run(options) {
@@ -992,6 +1010,7 @@ fn parse_args_into(
         trainer: Trainer::FastCover,
         trainer_params: TrainerParams::default(),
         selectivity: 0,
+        cpu: None,
     };
     let mut ultra = false;
     // `-e`, when typed. Without it the benchmark ends where it starts, so no
@@ -1226,6 +1245,8 @@ fn parse_args_into(
                         }
                     } else if let Some(v) = long.strip_prefix("zstd=") {
                         apply_advanced_params(v, &mut opts.advanced)?;
+                    } else if let Some(v) = long.strip_prefix("cpu=") {
+                        opts.cpu = Some(v.parse().map_err(|err| eyre!("--cpu={v}: {err}"))?);
                     } else if let Some(v) = long.strip_prefix("train-cover=") {
                         select_mode(&mut opts, Mode::Train);
                         opts.trainer = Trainer::Cover;
@@ -1721,6 +1742,9 @@ Advanced options:
                                 If `-d` is present, ignore/validate checksums during decompression.
 
   --                            Treat remaining arguments after `--` as files.
+
+  --cpu=LEVEL                   Use kernels up to LEVEL only: scalar, sse2, sse4.2, bmi2, avx2, avx512
+                                (x86) or neon, sve (aarch64). [Default: all the CPU supports]
 
 Advanced compression options:
   --ultra                       Enable levels beyond 19, up to 22; requires more memory.

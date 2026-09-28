@@ -333,6 +333,27 @@ fn leak_owned(name: String) -> &'static str {
     Box::leak(name.into_boxed_str())
 }
 
+/// Apply `STRUCTURED_ZSTD_CPU=LEVEL`, the ceiling on the kernel tiers (see
+/// `structured_zstd::set_cpu_ceiling`), before the run chooses any kernel.
+/// Every bench entry calls this first; only the first call acts. A value that
+/// cannot be applied stops the run: measuring the wrong tier silently would be
+/// worse than not measuring.
+pub(crate) fn apply_cpu_ceiling_from_env() {
+    use std::sync::Once;
+    static APPLIED: Once = Once::new();
+    APPLIED.call_once(|| {
+        let Ok(value) = env::var("STRUCTURED_ZSTD_CPU") else {
+            return;
+        };
+        let level: structured_zstd::CpuLevel = value
+            .trim()
+            .parse()
+            .unwrap_or_else(|err| panic!("STRUCTURED_ZSTD_CPU={value}: {err}"));
+        structured_zstd::set_cpu_ceiling(level)
+            .unwrap_or_else(|err| panic!("STRUCTURED_ZSTD_CPU={value}: {err}"));
+    });
+}
+
 /// The `REPORT_KERNEL` line for this run: the CPU kernel tier actually
 /// selected (the entropy / sequence dispatch is shared by encode and decode,
 /// see #247), plus arch / libc. Lets the dashboard attribute every measurement

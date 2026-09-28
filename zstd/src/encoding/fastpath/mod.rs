@@ -63,6 +63,20 @@
 
 pub(crate) mod scalar;
 
+// Every SIMD tier the detection below can pick asks the ceiling first.
+#[cfg(any(
+    all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        any(feature = "kernel-sse", feature = "kernel-avx2")
+    ),
+    all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    )
+))]
+use crate::cpu_kernel::{CpuLevel, cpu_allows};
+
 #[cfg(all(
     target_arch = "aarch64",
     target_endian = "little",
@@ -130,6 +144,42 @@ pub(crate) enum FastpathKernel {
     Simd128,
 }
 
+impl FastpathKernel {
+    /// Stable lowercase name of the tier, for diagnostics.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            FastpathKernel::Scalar => "scalar",
+            #[cfg(all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                feature = "kernel-neon"
+            ))]
+            FastpathKernel::Neon => "neon",
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-sse"
+            ))]
+            FastpathKernel::Sse2 => "sse2",
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-sse"
+            ))]
+            FastpathKernel::Sse42 => "sse4.2",
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-avx2"
+            ))]
+            FastpathKernel::Avx2Bmi2 => "avx2",
+            #[cfg(all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel-simd128"
+            ))]
+            FastpathKernel::Simd128 => "simd128",
+        }
+    }
+}
+
 /// Select the best supported variant for the running CPU. Cached after first
 /// call; intended to be invoked once at the entry point of each encoder call
 /// so the rest of the call graph can keep working with the resolved kernel
@@ -173,7 +223,10 @@ fn detect_kernel_uncached() -> FastpathKernel {
         feature = "kernel-avx2"
     ))]
     {
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
+        if cpu_allows(CpuLevel::Avx2)
+            && std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("bmi2")
+        {
             return FastpathKernel::Avx2Bmi2;
         }
     }
@@ -183,10 +236,10 @@ fn detect_kernel_uncached() -> FastpathKernel {
         feature = "kernel-sse"
     ))]
     {
-        if std::is_x86_feature_detected!("sse4.2") {
+        if cpu_allows(CpuLevel::Sse42) && std::is_x86_feature_detected!("sse4.2") {
             return FastpathKernel::Sse42;
         }
-        if std::is_x86_feature_detected!("sse2") {
+        if cpu_allows(CpuLevel::Sse2) && std::is_x86_feature_detected!("sse2") {
             return FastpathKernel::Sse2;
         }
     }
@@ -197,7 +250,7 @@ fn detect_kernel_uncached() -> FastpathKernel {
         feature = "kernel-neon"
     ))]
     {
-        if std::arch::is_aarch64_feature_detected!("neon") {
+        if cpu_allows(CpuLevel::Neon) && std::arch::is_aarch64_feature_detected!("neon") {
             return FastpathKernel::Neon;
         }
     }
@@ -208,7 +261,10 @@ fn detect_kernel_uncached() -> FastpathKernel {
         feature = "kernel-avx2"
     ))]
     {
-        if cfg!(target_feature = "avx2") && cfg!(target_feature = "bmi2") {
+        if cpu_allows(CpuLevel::Avx2)
+            && cfg!(target_feature = "avx2")
+            && cfg!(target_feature = "bmi2")
+        {
             return FastpathKernel::Avx2Bmi2;
         }
     }
@@ -218,10 +274,10 @@ fn detect_kernel_uncached() -> FastpathKernel {
         feature = "kernel-sse"
     ))]
     {
-        if cfg!(target_feature = "sse4.2") {
+        if cpu_allows(CpuLevel::Sse42) && cfg!(target_feature = "sse4.2") {
             return FastpathKernel::Sse42;
         }
-        if cfg!(target_feature = "sse2") {
+        if cpu_allows(CpuLevel::Sse2) && cfg!(target_feature = "sse2") {
             return FastpathKernel::Sse2;
         }
     }
@@ -232,7 +288,7 @@ fn detect_kernel_uncached() -> FastpathKernel {
         feature = "kernel-neon"
     ))]
     {
-        if cfg!(target_feature = "neon") {
+        if cpu_allows(CpuLevel::Neon) && cfg!(target_feature = "neon") {
             return FastpathKernel::Neon;
         }
     }

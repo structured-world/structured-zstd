@@ -2394,6 +2394,31 @@ fn the_environment_level_is_read_like_the_reference_reads_it() {
     check_threads_env(None, 0);
 }
 
+/// `--cpu=LEVEL` records the ceiling for `main` to set before any work, and a
+/// name that is no level is a broken command line that names the levels.
+#[test]
+fn cpu_takes_a_level() {
+    use structured_zstd::CpuLevel;
+
+    assert_eq!(parse(&["f"]).unwrap().cpu, None);
+    assert_eq!(
+        parse(&["--cpu=sse4.2", "f"]).unwrap().cpu,
+        Some(CpuLevel::Sse42)
+    );
+    assert_eq!(
+        parse(&["--cpu=SCALAR", "f"]).unwrap().cpu,
+        Some(CpuLevel::Scalar)
+    );
+    let err = parse(&["--cpu=avx3", "f"])
+        .err()
+        .expect("avx3 is no level")
+        .to_string();
+    assert!(
+        err.contains("--cpu=avx3") && err.contains("avx512"),
+        "{err}"
+    );
+}
+
 /// Options that take a value take it attached or as the next argument, the
 /// way the reference command's `NEXT_FIELD` reads them; a missing value, or
 /// another option where the value should be, is a broken command line.

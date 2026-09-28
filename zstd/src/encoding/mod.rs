@@ -116,6 +116,19 @@ pub use parameters::{
 pub use streaming_encoder::{CompressionContext, StreamingEncoder};
 pub use workspace::HistoryBuf;
 
+/// Name of the kernel tier the match finders run for this process (`scalar`,
+/// `sse2`, `sse4.2`, `avx2`, `neon`, `simd128`), chosen by run-time CPU
+/// detection under any [`set_cpu_ceiling`](crate::set_cpu_ceiling).
+///
+/// # Examples
+/// ```
+/// let name = structured_zstd::encoding::active_match_kernel_name();
+/// assert!(!name.is_empty());
+/// ```
+pub fn active_match_kernel_name() -> &'static str {
+    fastpath::select_kernel().name()
+}
+
 use crate::io::{Read, Write};
 use alloc::vec::Vec;
 

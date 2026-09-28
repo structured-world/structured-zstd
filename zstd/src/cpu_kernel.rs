@@ -27,6 +27,285 @@
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
 
+/// An instruction-set level the codec's kernels may be limited to, from the
+/// portable scalar code up. The x86 levels (`Sse2` through `Avx512`) and the
+/// aarch64 ones (`Neon`, `Sve`) are separate ladders; `Scalar` sits under
+/// both.
+///
+/// Used with [`set_cpu_ceiling`] to compare kernel tiers on one machine.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CpuLevel {
+    /// Portable code only.
+    Scalar,
+    /// x86 SSE2.
+    Sse2,
+    /// x86 SSE4.2.
+    Sse42,
+    /// x86 BMI2, with everything below it.
+    Bmi2,
+    /// x86 AVX2 (and BMI2), the x86-64-v3 kernels.
+    Avx2,
+    /// x86 AVX-512 (the VBMI2 kernels, when built with `kernel-vbmi2`).
+    Avx512,
+    /// aarch64 NEON.
+    Neon,
+    /// aarch64 SVE and SVE2.
+    Sve,
+}
+
+impl CpuLevel {
+    /// Every level, lowest first within each ladder.
+    pub const ALL: [CpuLevel; 8] = [
+        CpuLevel::Scalar,
+        CpuLevel::Sse2,
+        CpuLevel::Sse42,
+        CpuLevel::Bmi2,
+        CpuLevel::Avx2,
+        CpuLevel::Avx512,
+        CpuLevel::Neon,
+        CpuLevel::Sve,
+    ];
+
+    /// The level's name as [`FromStr`](core::str::FromStr) reads it.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::CpuLevel;
+    ///
+    /// assert_eq!(CpuLevel::Sse42.name(), "sse4.2");
+    /// assert_eq!("avx2".parse::<CpuLevel>(), Ok(CpuLevel::Avx2));
+    /// ```
+    pub const fn name(self) -> &'static str {
+        match self {
+            CpuLevel::Scalar => "scalar",
+            CpuLevel::Sse2 => "sse2",
+            CpuLevel::Sse42 => "sse4.2",
+            CpuLevel::Bmi2 => "bmi2",
+            CpuLevel::Avx2 => "avx2",
+            CpuLevel::Avx512 => "avx512",
+            CpuLevel::Neon => "neon",
+            CpuLevel::Sve => "sve",
+        }
+    }
+
+    /// Which ladder the level is on, and its rung: 0 for `Scalar` on either.
+    const fn ladder(self) -> (Ladder, u8) {
+        match self {
+            CpuLevel::Scalar => (Ladder::Any, 0),
+            CpuLevel::Sse2 => (Ladder::X86, 1),
+            CpuLevel::Sse42 => (Ladder::X86, 2),
+            CpuLevel::Bmi2 => (Ladder::X86, 3),
+            CpuLevel::Avx2 => (Ladder::X86, 4),
+            CpuLevel::Avx512 => (Ladder::X86, 5),
+            CpuLevel::Neon => (Ladder::Arm, 1),
+            CpuLevel::Sve => (Ladder::Arm, 2),
+        }
+    }
+
+    /// Whether the level exists on the architecture this build targets.
+    const fn native(self) -> bool {
+        match self.ladder().0 {
+            Ladder::Any => true,
+            Ladder::X86 => cfg!(any(target_arch = "x86", target_arch = "x86_64")),
+            Ladder::Arm => cfg!(target_arch = "aarch64"),
+        }
+    }
+}
+
+impl core::fmt::Display for CpuLevel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A name that is not a [`CpuLevel`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct UnknownCpuLevel;
+
+impl core::fmt::Display for UnknownCpuLevel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("unknown CPU level; expected one of ")?;
+        for (index, level) in CpuLevel::ALL.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(level.name())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for UnknownCpuLevel {}
+
+impl core::str::FromStr for CpuLevel {
+    type Err = UnknownCpuLevel;
+
+    /// The names [`CpuLevel::name`] gives, case-insensitive, plus the spellings
+    /// `sse42`, `avx-512` and `avx512f`.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let lower = |expected: &str| text.eq_ignore_ascii_case(expected);
+        CpuLevel::ALL
+            .into_iter()
+            .find(|level| lower(level.name()))
+            .or_else(|| {
+                if lower("sse42") {
+                    Some(CpuLevel::Sse42)
+                } else if lower("avx-512") || lower("avx512f") {
+                    Some(CpuLevel::Avx512)
+                } else {
+                    None
+                }
+            })
+            .ok_or(UnknownCpuLevel)
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Ladder {
+    Any,
+    X86,
+    Arm,
+}
+
+/// Why [`set_cpu_ceiling`] could not set the ceiling.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CpuCeilingError {
+    /// A kernel was already chosen, or a ceiling already set: the tiers in
+    /// use cannot change for the rest of the process.
+    AlreadyResolved,
+    /// The level belongs to another architecture than this build's.
+    OtherArchitecture(CpuLevel),
+    /// This target has no atomics to hold a ceiling in.
+    Unsupported,
+}
+
+impl core::fmt::Display for CpuCeilingError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CpuCeilingError::AlreadyResolved => {
+                f.write_str("the CPU kernels were already chosen; set the ceiling before any work")
+            }
+            CpuCeilingError::OtherArchitecture(level) => {
+                write!(f, "{level} is not an instruction set of this architecture")
+            }
+            CpuCeilingError::Unsupported => f.write_str("this target cannot hold a CPU ceiling"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CpuCeilingError {}
+
+/// The ceiling, frozen at its first read: 0 is not yet read or set,
+/// [`CEILING_NONE`] is frozen without a limit, anything else is a level's
+/// index in [`CpuLevel::ALL`] plus one.
+#[cfg(target_has_atomic = "8")]
+static CEILING: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(target_has_atomic = "8")]
+const CEILING_NONE: u8 = u8::MAX;
+
+/// Limit every kernel the codec picks at run time to `level` and below, for
+/// the rest of the process. A kernel is still used only where the CPU
+/// supports it: the ceiling never raises a choice.
+///
+/// Only the run-time choices are limited. A build compiled for a wider
+/// baseline (`-C target-cpu=...`) uses those instructions throughout, below
+/// any ceiling.
+///
+/// # Errors
+///
+/// [`CpuCeilingError::AlreadyResolved`] once any kernel has been chosen (the
+/// first compression or decompression chooses them) or a ceiling set;
+/// [`CpuCeilingError::OtherArchitecture`] for a level of another
+/// architecture.
+///
+/// # Examples
+/// ```standalone_crate
+/// use structured_zstd::{CpuLevel, set_cpu_ceiling};
+///
+/// // Before any compression or decompression in the process.
+/// set_cpu_ceiling(CpuLevel::Scalar).unwrap();
+/// assert_eq!(structured_zstd::cpu_ceiling(), Some(CpuLevel::Scalar));
+/// ```
+pub fn set_cpu_ceiling(level: CpuLevel) -> Result<(), CpuCeilingError> {
+    if !level.native() {
+        return Err(CpuCeilingError::OtherArchitecture(level));
+    }
+    #[cfg(target_has_atomic = "8")]
+    {
+        use core::sync::atomic::Ordering;
+        let index = CpuLevel::ALL
+            .iter()
+            .position(|candidate| *candidate == level)
+            .expect("every level is in ALL") as u8;
+        CEILING
+            .compare_exchange(0, index + 1, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| CpuCeilingError::AlreadyResolved)
+    }
+    #[cfg(not(target_has_atomic = "8"))]
+    {
+        Err(CpuCeilingError::Unsupported)
+    }
+}
+
+/// The ceiling in force, freezing it (as none) if nothing set one yet.
+pub fn cpu_ceiling() -> Option<CpuLevel> {
+    #[cfg(target_has_atomic = "8")]
+    {
+        use core::sync::atomic::Ordering;
+        let stored =
+            match CEILING.compare_exchange(0, CEILING_NONE, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => CEILING_NONE,
+                Err(stored) => stored,
+            };
+        (stored != CEILING_NONE).then(|| CpuLevel::ALL[usize::from(stored - 1)])
+    }
+    #[cfg(not(target_has_atomic = "8"))]
+    {
+        None
+    }
+}
+
+/// Whether a kernel needing `needed` may run under `ceiling`.
+// Only a build that compiles a run-time kernel choice asks; wasm, or a target
+// with its kernel features off, compiles none.
+#[cfg_attr(
+    not(any(
+        test,
+        target_arch = "x86_64",
+        all(target_arch = "x86", feature = "kernel-sse"),
+        all(target_arch = "aarch64", feature = "kernel-neon"),
+    )),
+    allow(dead_code)
+)]
+const fn allowed_under(ceiling: Option<CpuLevel>, needed: CpuLevel) -> bool {
+    let Some(ceiling) = ceiling else {
+        return true;
+    };
+    let (needed_ladder, needed_rung) = needed.ladder();
+    let (ceiling_ladder, ceiling_rung) = ceiling.ladder();
+    needed_rung == 0 || (needed_ladder as u8 == ceiling_ladder as u8 && needed_rung <= ceiling_rung)
+}
+
+/// Whether a kernel needing `needed` may be chosen. Every run-time kernel
+/// selection asks this beside its CPU-feature probe.
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        all(target_arch = "x86", feature = "kernel-sse"),
+        all(target_arch = "aarch64", feature = "kernel-neon"),
+    )),
+    allow(dead_code)
+)]
+#[inline]
+pub(crate) fn cpu_allows(needed: CpuLevel) -> bool {
+    allowed_under(cpu_ceiling(), needed)
+}
+
 /// Trait covering the leaf hot-path operations whose bodies differ
 /// per ISA. Implementations are ZSTs; the trait is `Copy` so it can
 /// be `Default`-constructed at each call site without runtime cost.
@@ -370,14 +649,21 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
         // `&&` short-circuits away the runtime `is_x86_feature_detected!` call
         // (and its CPUID/cache traffic) for tiers the build disabled — the
         // matching `select_x86_kernel` rung is `#[cfg]`-ed out anyway.
+        let avx512 = cfg!(feature = "kernel-vbmi2") && cpu_allows(CpuLevel::Avx512);
         return select_x86_kernel(
-            cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512vbmi2"),
-            cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512f"),
-            cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512vl"),
-            cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512bw"),
-            cfg!(feature = "kernel-bmi2") && is_x86_feature_detected!("bmi2"),
-            cfg!(feature = "kernel-avx2") && is_x86_feature_detected!("avx2"),
-            cfg!(feature = "kernel-sse") && is_x86_feature_detected!("sse2"),
+            avx512 && is_x86_feature_detected!("avx512vbmi2"),
+            avx512 && is_x86_feature_detected!("avx512f"),
+            avx512 && is_x86_feature_detected!("avx512vl"),
+            avx512 && is_x86_feature_detected!("avx512bw"),
+            cfg!(feature = "kernel-bmi2")
+                && cpu_allows(CpuLevel::Bmi2)
+                && is_x86_feature_detected!("bmi2"),
+            cfg!(feature = "kernel-avx2")
+                && cpu_allows(CpuLevel::Avx2)
+                && is_x86_feature_detected!("avx2"),
+            cfg!(feature = "kernel-sse")
+                && cpu_allows(CpuLevel::Sse2)
+                && is_x86_feature_detected!("sse2"),
         );
     }
     // 32-bit x86 carries only the BMI2 tier: the wider tiers' kernels and
@@ -388,7 +674,7 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
         #[cfg(feature = "kernel-bmi2")]
         {
             use std::arch::is_x86_feature_detected;
-            if is_x86_feature_detected!("bmi2") {
+            if cpu_allows(CpuLevel::Bmi2) && is_x86_feature_detected!("bmi2") {
                 return CpuKernelTag::Bmi2;
             }
         }
@@ -399,11 +685,11 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
         #[cfg(any(feature = "kernel-sve", feature = "kernel-neon"))]
         use std::arch::is_aarch64_feature_detected;
         #[cfg(feature = "kernel-sve")]
-        if is_aarch64_feature_detected!("sve") {
+        if cpu_allows(CpuLevel::Sve) && is_aarch64_feature_detected!("sve") {
             return CpuKernelTag::Sve;
         }
         #[cfg(feature = "kernel-neon")]
-        if is_aarch64_feature_detected!("neon") {
+        if cpu_allows(CpuLevel::Neon) && is_aarch64_feature_detected!("neon") {
             return CpuKernelTag::Neon;
         }
         return CpuKernelTag::Scalar;
@@ -424,31 +710,32 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
         // returns a compile-time bool that constant-folds through
         // `select_x86_kernel`, so the runtime call has the same
         // codegen as the previous hand-written #[cfg] chain.
+        let avx512 = cpu_allows(CpuLevel::Avx512);
         return select_x86_kernel(
-            cfg!(target_feature = "avx512vbmi2"),
-            cfg!(target_feature = "avx512f"),
-            cfg!(target_feature = "avx512vl"),
-            cfg!(target_feature = "avx512bw"),
-            cfg!(target_feature = "bmi2"),
-            cfg!(target_feature = "avx2"),
-            cfg!(target_feature = "sse2"),
+            avx512 && cfg!(target_feature = "avx512vbmi2"),
+            avx512 && cfg!(target_feature = "avx512f"),
+            avx512 && cfg!(target_feature = "avx512vl"),
+            avx512 && cfg!(target_feature = "avx512bw"),
+            cpu_allows(CpuLevel::Bmi2) && cfg!(target_feature = "bmi2"),
+            cpu_allows(CpuLevel::Avx2) && cfg!(target_feature = "avx2"),
+            cpu_allows(CpuLevel::Sse2) && cfg!(target_feature = "sse2"),
         );
     }
     #[cfg(target_arch = "x86")]
     {
         #[cfg(all(feature = "kernel-bmi2", target_feature = "bmi2"))]
-        {
+        if cpu_allows(CpuLevel::Bmi2) {
             return CpuKernelTag::Bmi2;
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
         #[cfg(all(feature = "kernel-sve", target_feature = "sve"))]
-        {
+        if cpu_allows(CpuLevel::Sve) {
             return CpuKernelTag::Sve;
         }
         #[cfg(all(feature = "kernel-neon", target_feature = "neon"))]
-        {
+        if cpu_allows(CpuLevel::Neon) {
             return CpuKernelTag::Neon;
         }
     }

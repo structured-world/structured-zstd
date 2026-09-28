@@ -116,6 +116,14 @@ pub use crate::cpu_kernel::{CpuKernel, ScalarKernel};
 /// process — for diagnostics and benchmark/dashboard reporting. See
 /// [`cpu_kernel::active_cpu_kernel_name`].
 pub use crate::cpu_kernel::active_cpu_kernel_name;
+/// The ceiling on the instruction sets the kernels may use: see
+/// [`set_cpu_ceiling`].
+pub use crate::cpu_kernel::{
+    CpuCeilingError, CpuLevel, UnknownCpuLevel, cpu_ceiling, set_cpu_ceiling,
+};
+/// Name of the match-finder kernel tier for this process. See
+/// [`encoding::active_match_kernel_name`].
+pub use crate::encoding::active_match_kernel_name;
 
 #[cfg(not(feature = "fuzz-exports"))]
 pub(crate) mod fse;

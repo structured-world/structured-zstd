@@ -119,12 +119,14 @@ pub(crate) struct HufCStream<'a> {
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 #[inline]
 fn huf_encode_use_bmi2() -> bool {
-    std::arch::is_x86_feature_detected!("bmi2")
+    use crate::cpu_kernel::{CpuLevel, cpu_allows};
+    cpu_allows(CpuLevel::Bmi2) && std::arch::is_x86_feature_detected!("bmi2")
 }
 #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
 #[inline]
 fn huf_encode_use_bmi2() -> bool {
-    cfg!(target_feature = "bmi2")
+    use crate::cpu_kernel::{CpuLevel, cpu_allows};
+    cpu_allows(CpuLevel::Bmi2) && cfg!(target_feature = "bmi2")
 }
 
 /// One symbol into bit container `$bc` / bit position `$bp`. Mirrors

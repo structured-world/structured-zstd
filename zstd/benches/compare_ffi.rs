@@ -32,8 +32,9 @@ use structured_zstd::dictionary::{
 };
 use structured_zstd::encoding::{EncoderDictionary, FrameCompressor};
 use support::{
-    LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, build_training_samples,
-    dictionary_size_for, kernel_report_line, ldm_parameters, supported_levels_filtered,
+    LevelConfig, Scenario, ScenarioClass, apply_cpu_ceiling_from_env, benchmark_scenarios,
+    build_training_samples, dictionary_size_for, kernel_report_line, ldm_parameters,
+    supported_levels_filtered,
 };
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
@@ -283,6 +284,7 @@ fn emit_kernel_report_once() {
 }
 
 fn bench_compress(c: &mut Criterion) {
+    apply_cpu_ceiling_from_env();
     let emit_reports = emit_reports_enabled();
     if emit_reports {
         emit_kernel_report_once();
@@ -372,6 +374,7 @@ fn bench_compress(c: &mut Criterion) {
 }
 
 fn bench_decompress(c: &mut Criterion) {
+    apply_cpu_ceiling_from_env();
     let emit_reports = emit_reports_enabled();
     if emit_reports {
         emit_kernel_report_once();
@@ -1142,6 +1145,7 @@ fn assert_decompress_matches_reference(
 }
 
 fn bench_dictionary(c: &mut Criterion) {
+    apply_cpu_ceiling_from_env();
     let emit_reports = emit_reports_enabled();
     for scenario in benchmark_scenarios_cached().iter() {
         if !matches!(scenario.class, ScenarioClass::Small | ScenarioClass::Corpus) {

@@ -1,5 +1,107 @@
 use super::*;
 
+/// A ceiling admits its own rung and those below it on its own ladder, and
+/// nothing on the other ladder; scalar code is always admitted, and a scalar
+/// ceiling admits nothing else. No ceiling admits everything.
+#[test]
+fn a_ceiling_admits_its_rung_and_below_on_its_ladder() {
+    use CpuLevel::*;
+    assert!(allowed_under(None, Avx512));
+    for ceiling in CpuLevel::ALL {
+        assert!(allowed_under(Some(ceiling), Scalar), "{ceiling}");
+    }
+    let x86 = [Sse2, Sse42, Bmi2, Avx2, Avx512];
+    for (index, ceiling) in x86.iter().enumerate() {
+        for (needed_index, needed) in x86.iter().enumerate() {
+            assert_eq!(
+                allowed_under(Some(*ceiling), *needed),
+                needed_index <= index,
+                "ceiling {ceiling}, needed {needed}"
+            );
+        }
+        assert!(!allowed_under(Some(*ceiling), Neon));
+        assert!(!allowed_under(Some(*ceiling), Sve));
+    }
+    assert!(allowed_under(Some(Sve), Neon));
+    assert!(!allowed_under(Some(Neon), Sve));
+    assert!(!allowed_under(Some(Neon), Sse2));
+    for needed in CpuLevel::ALL.into_iter().filter(|level| *level != Scalar) {
+        assert!(!allowed_under(Some(Scalar), needed), "{needed}");
+    }
+}
+
+/// Every level parses back from its own name, in any case, plus the other
+/// common spellings; anything else is refused and the error lists the names.
+#[test]
+fn levels_parse_from_their_names() {
+    for level in CpuLevel::ALL {
+        assert_eq!(level.name().parse::<CpuLevel>(), Ok(level));
+        assert_eq!(
+            level.name().to_ascii_uppercase().parse::<CpuLevel>(),
+            Ok(level)
+        );
+    }
+    assert_eq!("sse42".parse::<CpuLevel>(), Ok(CpuLevel::Sse42));
+    assert_eq!("AVX-512".parse::<CpuLevel>(), Ok(CpuLevel::Avx512));
+    assert_eq!("avx512f".parse::<CpuLevel>(), Ok(CpuLevel::Avx512));
+    let err = "avx3".parse::<CpuLevel>().unwrap_err();
+    let message = std::string::ToString::to_string(&err);
+    assert!(
+        message.contains("sse4.2") && message.contains("avx512"),
+        "{message}"
+    );
+}
+
+/// Set before any kernel is chosen, the ceiling holds for every tier the
+/// process then picks; once it is in force, it cannot be changed. (Each test
+/// runs in its own process, so no other test has chosen a kernel here yet.)
+#[test]
+fn a_ceiling_set_first_governs_every_tier_and_then_freezes() {
+    assert_eq!(set_cpu_ceiling(CpuLevel::Scalar), Ok(()));
+    assert_eq!(cpu_ceiling(), Some(CpuLevel::Scalar));
+    assert_eq!(active_cpu_kernel_name(), "scalar");
+    assert_eq!(crate::encoding::active_match_kernel_name(), "scalar");
+    assert_eq!(
+        crate::decoding::simd_copy::ExactCopyTier::resolve(),
+        crate::decoding::simd_copy::ExactCopyTier::Scalar
+    );
+    assert_eq!(
+        set_cpu_ceiling(CpuLevel::Scalar),
+        Err(CpuCeilingError::AlreadyResolved)
+    );
+}
+
+/// Choosing a kernel freezes the ceiling as none: setting one afterwards would
+/// leave tiers already in use above it.
+#[test]
+fn a_ceiling_cannot_follow_the_first_kernel_choice() {
+    let _ = active_cpu_kernel_name();
+    assert_eq!(cpu_ceiling(), None);
+    assert_eq!(
+        set_cpu_ceiling(CpuLevel::Scalar),
+        Err(CpuCeilingError::AlreadyResolved)
+    );
+}
+
+/// A level of the other architecture is refused rather than read as scalar.
+#[test]
+fn a_level_of_another_architecture_is_refused() {
+    let foreign = if cfg!(target_arch = "aarch64") {
+        CpuLevel::Avx2
+    } else {
+        CpuLevel::Neon
+    };
+    assert_eq!(
+        set_cpu_ceiling(foreign),
+        Err(CpuCeilingError::OtherArchitecture(foreign))
+    );
+    assert_eq!(
+        cpu_ceiling(),
+        None,
+        "a refused ceiling freezes nothing but the default"
+    );
+}
+
 #[test]
 fn scalar_mask_lower_bits_zero_n_returns_zero() {
     assert_eq!(ScalarKernel::mask_lower_bits(0xDEADBEEF, 0), 0);

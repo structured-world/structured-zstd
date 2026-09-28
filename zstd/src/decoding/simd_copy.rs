@@ -789,10 +789,17 @@ fn detect_x86_caps() -> X86Caps {
             // x86. `avx512f` follows the `Vbmi2` tag exactly — it is set on
             // `avx512vbmi2` (not bare `avx512f`), matching the rule that an
             // AVX-512F-but-not-VBMI2 CPU stays on the 32B (AVX2) copy.
+            use crate::cpu_kernel::{CpuLevel, cpu_allows};
             X86Caps {
-                avx512f: cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512vbmi2"),
-                avx2: cfg!(feature = "kernel-avx2") && is_x86_feature_detected!("avx2"),
-                sse2: cfg!(feature = "kernel-sse") && is_x86_feature_detected!("sse2"),
+                avx512f: cfg!(feature = "kernel-vbmi2")
+                    && cpu_allows(CpuLevel::Avx512)
+                    && is_x86_feature_detected!("avx512vbmi2"),
+                avx2: cfg!(feature = "kernel-avx2")
+                    && cpu_allows(CpuLevel::Avx2)
+                    && is_x86_feature_detected!("avx2"),
+                sse2: cfg!(feature = "kernel-sse")
+                    && cpu_allows(CpuLevel::Sse2)
+                    && is_x86_feature_detected!("sse2"),
             }
         }
     })
@@ -1173,19 +1180,24 @@ impl ExactCopyTier {
         ))]
         #[allow(unreachable_code)]
         {
+            use crate::cpu_kernel::{CpuLevel, cpu_allows};
             #[cfg(all(target_feature = "avx2", feature = "kernel-avx2"))]
-            return Self::Avx2;
+            if cpu_allows(CpuLevel::Avx2) {
+                return Self::Avx2;
+            }
             #[cfg(all(target_feature = "sse2", feature = "kernel-sse"))]
-            return Self::Sse2;
+            if cpu_allows(CpuLevel::Sse2) {
+                return Self::Sse2;
+            }
         }
-        // NEON is architectural on aarch64, so the build flag alone settles it
-        // — there is nothing to probe.
+        // NEON is architectural on aarch64, so the build flag alone settles
+        // whether the CPU has it; only the ceiling can still rule it out.
         #[cfg(all(
             target_arch = "aarch64",
             target_feature = "neon",
             feature = "kernel-neon"
         ))]
-        {
+        if crate::cpu_kernel::cpu_allows(crate::cpu_kernel::CpuLevel::Neon) {
             return Self::Neon;
         }
         #[allow(unreachable_code)]

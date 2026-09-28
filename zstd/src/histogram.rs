@@ -138,7 +138,8 @@ fn count_bytes_dispatch() -> CountBytesFn {
     static DISPATCH: std::sync::OnceLock<CountBytesFn> = std::sync::OnceLock::new();
 
     *DISPATCH.get_or_init(|| {
-        if std::arch::is_aarch64_feature_detected!("sve2") {
+        use crate::cpu_kernel::{CpuLevel, cpu_allows};
+        if cpu_allows(CpuLevel::Sve) && std::arch::is_aarch64_feature_detected!("sve2") {
             count_bytes_sve2_wrapper
         } else {
             count_bytes_parallel
