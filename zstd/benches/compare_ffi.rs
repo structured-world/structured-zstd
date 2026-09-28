@@ -1151,7 +1151,6 @@ fn bench_dictionary(c: &mut Criterion) {
         }
 
         let sample_count = training_sample_count(&scenario.bytes);
-        let total_training_bytes = scenario.bytes.len();
         // FastCOVER (both ours and FFI's) needs MULTIPLE training
         // samples to find cross-sample redundancy — passing the
         // whole scenario as a single slice (the previous shape
@@ -1179,7 +1178,9 @@ fn bench_dictionary(c: &mut Criterion) {
             "build_training_samples and training_sample_count diverged for {}",
             scenario.id
         );
-        let max_dict_size = total_training_bytes.saturating_sub(64);
+        // Sized from the whole scenario, as the memory bench does, so both
+        // benches train the same dictionary.
+        let max_dict_size = scenario.len().saturating_sub(64);
         let dict_size = dictionary_size_for(scenario.len())
             .max(256)
             .min(max_dict_size);
@@ -1187,7 +1188,10 @@ fn bench_dictionary(c: &mut Criterion) {
         // chunks from the start of the scenario, so they are that prefix and
         // its chunk lengths.
         let rust_sizes: Vec<usize> = ffi_samples.iter().map(|sample| sample.len()).collect();
-        let rust_corpus = &scenario.bytes[..rust_sizes.iter().sum::<usize>()];
+        // The samples cap at a prefix of large scenarios, so this, not the
+        // scenario length, is what each training pass reads.
+        let total_training_bytes: usize = rust_sizes.iter().sum();
+        let rust_corpus = &scenario.bytes[..total_training_bytes];
         // `ZDICT_trainFromBuffer`'s own parameters, so both sides run the
         // same search: FastCOVER over `k` in four steps at `d` of 8, scored at
         // the default level.
