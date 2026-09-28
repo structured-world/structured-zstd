@@ -54,6 +54,36 @@ fn rebuilding_a_used_table_matches_a_fresh_build() {
     assert_eq!(reused.table_header_bits(), fresh.table_header_bits());
 }
 
+/// A description written from counts at a given log, with low-probability
+/// symbols and zero runs in it, is the one the table it describes writes: the
+/// decoder reads exactly the bytes written, and the encoder table rebuilt from
+/// what it read writes the same bytes back.
+#[cfg(feature = "dict-builder")]
+#[test]
+fn a_description_written_from_counts_is_the_tables_own() {
+    let mut counts = [0usize; 31];
+    counts[0] = 900;
+    counts[1] = 1;
+    counts[4] = 3;
+    counts[9] = 1;
+    counts[30] = 40;
+    let mut buf = alloc::vec::Vec::new();
+    let mut writer = crate::bit_io::BitWriter::from(&mut buf);
+    fse_encoder::write_ncount_at_log(&counts, 8, &mut writer);
+    writer.flush();
+    let mut dec_table = FSETable::new(255);
+    let read = dec_table.read_table_probabilities(&buf, 8).unwrap();
+    assert_eq!(read, buf.len());
+    let table = dec_table
+        .to_encoder_table()
+        .expect("log 8 has an encoder table");
+    let mut again = alloc::vec::Vec::new();
+    let mut writer = crate::bit_io::BitWriter::from(&mut again);
+    table.write_table(&mut writer);
+    writer.flush();
+    assert_eq!(again, buf);
+}
+
 #[test]
 fn decoder_entry_layout_is_four_bytes_for_huffman_weights() {
     assert_eq!(core::mem::size_of::<fse_decoder::Entry>(), 4);

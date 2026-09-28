@@ -292,61 +292,69 @@ impl FSETable {
     }
 
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
-        assert!(
-            writer.index().is_multiple_of(8),
-            "FSE table headers must start on a byte boundary"
-        );
-        #[cfg(debug_assertions)]
-        let start_idx = writer.index();
-        writer.write_bits(self.acc_log() - 5, 4);
-        let mut probability_counter = 0usize;
-        let probability_sum = 1 << self.acc_log();
+        let probs: [i32; 256] = core::array::from_fn(|i| self.states[i].probability);
+        write_ncount(&probs, self.acc_log(), writer);
+    }
+}
 
-        let mut prob_idx = 0;
-        while probability_counter < probability_sum {
-            let max_remaining_value = probability_sum - probability_counter + 1;
-            let bits_to_write = max_remaining_value.ilog2() + 1;
-            let low_threshold = ((1 << bits_to_write) - 1) - (max_remaining_value);
-            let mask = (1 << (bits_to_write - 1)) - 1;
+/// Write the NCount description of the normalized distribution `probs` at
+/// `acc_log` (RFC 8878 4.1.1), padded to a byte; what [`FSETable::write_table`]
+/// writes for a built table, from the normalized counts alone.
+fn write_ncount<V: AsMut<Vec<u8>>>(probs: &[i32], acc_log: u8, writer: &mut BitWriter<V>) {
+    assert!(
+        writer.index().is_multiple_of(8),
+        "FSE table headers must start on a byte boundary"
+    );
+    #[cfg(debug_assertions)]
+    let start_idx = writer.index();
+    writer.write_bits(acc_log - 5, 4);
+    let mut probability_counter = 0usize;
+    let probability_sum = 1 << acc_log;
 
-            let prob = self.states[prob_idx].probability;
-            prob_idx += 1;
-            let value = (prob + 1) as u32;
-            if value < low_threshold as u32 {
-                writer.write_bits(value, bits_to_write as usize - 1);
-            } else if value > mask {
-                writer.write_bits(value + low_threshold as u32, bits_to_write as usize);
-            } else {
-                writer.write_bits(value, bits_to_write as usize);
-            }
+    let mut prob_idx = 0;
+    while probability_counter < probability_sum {
+        let max_remaining_value = probability_sum - probability_counter + 1;
+        let bits_to_write = max_remaining_value.ilog2() + 1;
+        let low_threshold = ((1 << bits_to_write) - 1) - (max_remaining_value);
+        let mask = (1 << (bits_to_write - 1)) - 1;
 
-            if prob == -1 {
-                probability_counter += 1;
-            } else if prob > 0 {
-                probability_counter += prob as usize;
-            } else {
-                let mut zeros = 0u8;
-                while prob_idx < self.states.len() && self.states[prob_idx].probability == 0 {
-                    zeros += 1;
-                    prob_idx += 1;
-                    if zeros == 3 {
-                        writer.write_bits(3u8, 2);
-                        zeros = 0;
-                    }
+        let prob = probs[prob_idx];
+        prob_idx += 1;
+        let value = (prob + 1) as u32;
+        if value < low_threshold as u32 {
+            writer.write_bits(value, bits_to_write as usize - 1);
+        } else if value > mask {
+            writer.write_bits(value + low_threshold as u32, bits_to_write as usize);
+        } else {
+            writer.write_bits(value, bits_to_write as usize);
+        }
+
+        if prob == -1 {
+            probability_counter += 1;
+        } else if prob > 0 {
+            probability_counter += prob as usize;
+        } else {
+            let mut zeros = 0u8;
+            while prob_idx < probs.len() && probs[prob_idx] == 0 {
+                zeros += 1;
+                prob_idx += 1;
+                if zeros == 3 {
+                    writer.write_bits(3u8, 2);
+                    zeros = 0;
                 }
-                writer.write_bits(zeros, 2);
             }
+            writer.write_bits(zeros, 2);
         }
-        writer.write_bits(0u8, writer.misaligned());
-        #[cfg(debug_assertions)]
-        {
-            let written_bits = writer.index() - start_idx;
-            let computed = self.table_header_bits();
-            debug_assert_eq!(
-                written_bits, computed,
-                "table_header_bits() mismatch: written={written_bits}, computed={computed}"
-            );
-        }
+    }
+    writer.write_bits(0u8, writer.misaligned());
+    #[cfg(debug_assertions)]
+    {
+        let written_bits = writer.index() - start_idx;
+        let computed = ncount_header_bits(probs, acc_log);
+        debug_assert_eq!(
+            written_bits, computed,
+            "ncount_header_bits() mismatch: written={written_bits}, computed={computed}"
+        );
     }
 }
 
@@ -499,13 +507,17 @@ pub(crate) fn build_seq_ctable_into(
     build_table_from_probabilities_into(&probs[..=max_symbol], table_log, out);
 }
 
-/// An FSE table at exactly `table_log` for `counts`, with low-probability
-/// symbols kept at `-1` (upstream zstd `FSE_normalizeCount` given the log
-/// outright, as the dictionary finalizer calls it, zdict.c
-/// `ZDICT_analyzeEntropy`). `counts` must not be too spread for the log:
-/// every symbol present needs a slot.
+/// Write the description of `counts` normalized at exactly `table_log`, with
+/// low-probability symbols kept at `-1` (upstream zstd `FSE_normalizeCount`
+/// given the log outright, then `FSE_writeNCount`, as the dictionary finalizer
+/// calls them, zdict.c `ZDICT_analyzeEntropy`). No table is built. `counts`
+/// must not be too spread for the log: every symbol present needs a slot.
 #[cfg(feature = "dict-builder")]
-pub(crate) fn build_table_at_log(counts: &[usize], table_log: u8) -> FSETable {
+pub(crate) fn write_ncount_at_log<V: AsMut<Vec<u8>>>(
+    counts: &[usize],
+    table_log: u8,
+    writer: &mut BitWriter<V>,
+) {
     let total = counts.iter().sum::<usize>();
     let max_symbol = counts
         .iter()
@@ -521,7 +533,7 @@ pub(crate) fn build_table_at_log(counts: &[usize], table_log: u8) -> FSETable {
         max_symbol,
         true,
     );
-    build_table_from_probabilities(&probs[..=max_symbol], table_log)
+    write_ncount(&probs[..=max_symbol], table_log, writer);
 }
 
 #[cfg(any(test, feature = "fuzz-exports"))]

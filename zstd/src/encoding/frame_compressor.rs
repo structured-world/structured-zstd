@@ -3237,6 +3237,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         &mut self.state.matcher
     }
 
+    /// Whether the last frame's blocks coded offsets with the fast matcher's
+    /// repeat policy, for a caller counting offset codes as they did.
+    #[cfg(feature = "dict-builder")]
+    pub(crate) fn uses_fast_offset_codes(&self) -> bool {
+        crate::encoding::blocks::uses_fast_offset_codes(self.state.strategy_tag)
+    }
+
     /// Before calling [FrameCompressor::compress] you can replace the matcher
     pub fn replace_matcher(&mut self, mut match_generator: M) -> M {
         core::mem::swap(&mut match_generator, &mut self.state.matcher);

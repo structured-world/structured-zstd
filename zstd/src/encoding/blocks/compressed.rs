@@ -773,10 +773,7 @@ fn encode_block_parts<M: Matcher>(
             ml: &mut ml_counts,
             of: &mut of_counts,
         };
-        let (ll_max, ml_max, of_max) = if matches!(
-            state.strategy_tag,
-            crate::encoding::strategy::StrategyTag::Fast
-        ) {
+        let (ll_max, ml_max, of_max) = if uses_fast_offset_codes(state.strategy_tag) {
             fill_and_count::<true>(raw_sequences, &mut state.offset_hist, counts, codes)
         } else {
             fill_and_count::<false>(raw_sequences, &mut state.offset_hist, counts, codes)
@@ -1266,7 +1263,7 @@ fn estimate_sequences_section_bytes(
         // Upstream zstd: OF code's value equals its additional-bits width.
         of_bits += of as usize;
     };
-    if matches!(strategy, crate::encoding::strategy::StrategyTag::Fast) {
+    if uses_fast_offset_codes(strategy) {
         for seq in sequences {
             count_offset(encode_offset_with_history_fast(
                 seq.off_base,
@@ -3033,6 +3030,14 @@ pub(crate) fn encode_offset_with_history(
     encoded
 }
 
+/// Whether blocks at `strategy` code offsets with
+/// [`encode_offset_with_history_fast`] rather than the full repeat search of
+/// [`encode_offset_with_history`].
+#[inline]
+pub(crate) fn uses_fast_offset_codes(strategy: crate::encoding::strategy::StrategyTag) -> bool {
+    matches!(strategy, crate::encoding::strategy::StrategyTag::Fast)
+}
+
 /// Fast-matcher offset→offBase conversion, mirroring upstream zstd's
 /// `ZSTD_compressBlock_fast`: emit offBase 1 only for the immediate repeat
 /// offset (`rep[0]` when `lit_len > 0`, `rep[1]` when `lit_len == 0` — the
@@ -3045,7 +3050,7 @@ pub(crate) fn encode_offset_with_history(
 /// per-sequence probe the fast matcher never pays and can shift the FSE symbol
 /// histogram the wrong way). The repeat-offset history update follows directly
 /// from the emitted code, identical to the full converter's rules.
-pub(in crate::encoding) fn encode_offset_with_history_fast(
+pub(crate) fn encode_offset_with_history_fast(
     actual_offset: u32,
     lit_len: u32,
     offset_hist: &mut [u32; 3],

@@ -338,7 +338,8 @@ fn search_raw_content(corpus: &[u8], sizes: &[usize], dict_size: usize) -> io::R
 /// `InvalidInput` when `raw_content` is empty, when `dict_size` is below
 /// [`MIN_TRAINED_DICT_SIZE`] or leaves less than eight bytes of content after
 /// the header, when the id is zero, or when `sample_sizes` does not add up to
-/// `samples.len()`.
+/// `samples.len()`; a size too small carries
+/// [`TrainingError::DictionaryTooSmall`].
 ///
 /// # Examples
 ///

@@ -348,7 +348,8 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         self.weights_into(&mut buf).to_vec()
     }
 
-    fn write_table(&mut self) {
+    /// Write the table's description alone, ending on a byte boundary.
+    pub(crate) fn write_table(&mut self) {
         #[cfg(feature = "std")]
         {
             // Cached path: the size query that precedes every emit has already

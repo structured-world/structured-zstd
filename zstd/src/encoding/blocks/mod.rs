@@ -10,4 +10,5 @@ pub(super) use compressed::*;
 #[cfg(feature = "dict-builder")]
 pub(crate) use compressed::{
     encode_literal_length, encode_match_len, encode_offset, encode_offset_with_history,
+    encode_offset_with_history_fast, uses_fast_offset_codes,
 };

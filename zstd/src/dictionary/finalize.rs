@@ -12,16 +12,16 @@ use crate::bit_io::BitWriter;
 use crate::decoding::dictionary::MAGIC_NUM as DICT_MAGIC_NUM;
 use crate::encoding::blocks::{
     encode_literal_length, encode_match_len, encode_offset, encode_offset_with_history,
+    encode_offset_with_history_fast,
 };
 use crate::encoding::workspace::Workspace;
 use crate::encoding::{
     CompressionLevel, DictionarySizes, EncoderDictionary, FrameCompressor, HistoryBuf,
     MatchGeneratorDriver, Matcher, Sequence,
 };
-use crate::fse::fse_encoder::{FSETable, build_table_at_log};
-use crate::huff0::HuffmanTable as HuffmanDecoderTable;
+use crate::fse::fse_encoder::{FSETable, write_ncount_at_log};
 use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable};
-use std::{format, io, vec, vec::Vec};
+use std::{io, vec, vec::Vec};
 
 /// Smallest dictionary finalized (upstream zstd `ZDICT_DICTSIZE_MIN`).
 pub(super) const DICT_SIZE_MIN: usize = 256;
@@ -51,11 +51,12 @@ pub(super) fn finalize(
     dict_size: usize,
     options: FinalizeOptions,
 ) -> io::Result<Vec<u8>> {
-    if content.is_empty() {
-        return Err(invalid("raw dictionary content must not be empty"));
-    }
+    // Upstream zstd's order (`ZDICT_finalizeDictionary`): the size first.
     if dict_size < DICT_SIZE_MIN {
         return Err(too_small());
+    }
+    if content.is_empty() {
+        return Err(invalid("raw dictionary content must not be empty"));
     }
     let dict_id = options.dict_id.unwrap_or_else(|| derive_dict_id(content));
     if dict_id == 0 {
@@ -150,14 +151,14 @@ fn analyze_entropy(
         literals = literals_table(&counts.literals);
         debug_assert_eq!(literals.table_log(), 9);
     }
-    out.extend_from_slice(&huffman_description(&literals)?);
-    for table in [
-        build_table_at_log(&counts.offset_codes, OF_LOG),
-        build_table_at_log(&counts.match_lengths, ML_LOG),
-        build_table_at_log(&counts.literal_lengths, LL_LOG),
-    ] {
-        out.extend_from_slice(&fse_description(&table));
-    }
+    // Each description goes straight into the dictionary; the sequence tables
+    // are normalized and described without being built.
+    let mut writer = BitWriter::from(&mut *out);
+    HuffmanEncoder::new(&literals, &mut writer).write_table();
+    write_ncount_at_log(&counts.offset_codes, OF_LOG, &mut writer);
+    write_ncount_at_log(&counts.match_lengths, ML_LOG, &mut writer);
+    write_ncount_at_log(&counts.literal_lengths, LL_LOG, &mut writer);
+    writer.flush();
     Ok(())
 }
 
@@ -174,6 +175,7 @@ fn count_samples(
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     let recorder = Recorder {
         inner: MatchGeneratorDriver::new(BLOCK_SIZE_MAX, 1),
+        armed: false,
         literals: [0; 256],
         sequences: Vec::new(),
     };
@@ -187,20 +189,31 @@ fn count_samples(
     // one set of tables for the whole pass, which also keeps the dictionary
     // resident from one sample to the next instead of indexing it again.
     let average = samples.leading(count).len() / count.max(1);
+    // Only a sample's first block is counted, `MIN(128 KiB, window)` bytes
+    // (upstream zstd `ZDICT_countEStats`). The window follows the hint alone,
+    // so once one frame has shown it, the rest of each sample is not fed at
+    // all.
+    let mut block_size = BLOCK_SIZE_MAX;
     let mut frame = Vec::new();
     for index in 0..count {
         let sample = samples.sample(index);
-        let block = &sample[..sample.len().min(BLOCK_SIZE_MAX)];
+        let block = &sample[..sample.len().min(block_size)];
         if block.is_empty() {
             continue;
         }
         frame.clear();
+        compressor.matcher_mut().armed = true;
         compressor.set_source(block);
         compressor.set_drain(frame);
         compressor.set_source_size_hint(average as u64);
         compressor.compress();
         frame = compressor.take_drain().expect("the drain was set above");
+        let fast_offset_codes = compressor.uses_fast_offset_codes();
         let recorder = compressor.matcher_mut();
+        let window = recorder.inner.window_size() as usize;
+        if window > 0 {
+            block_size = block_size.min(window);
+        }
         // A block written raw holds no sequences to learn from, and its bytes
         // are no literals of any compressed block (upstream skips it too).
         if first_block_is_compressed(&frame) {
@@ -209,7 +222,12 @@ fn count_samples(
             }
             let mut reps = START_REPS;
             for &(ll, offset, ml) in &recorder.sequences {
-                let off_base = encode_offset_with_history(offset, ll, &mut reps);
+                // The code the block wrote for this offset, under its policy.
+                let off_base = if fast_offset_codes {
+                    encode_offset_with_history_fast(offset, ll, &mut reps)
+                } else {
+                    encode_offset_with_history(offset, ll, &mut reps)
+                };
                 counts.literal_lengths[encode_literal_length(ll).0 as usize] += 1;
                 counts.match_lengths[encode_match_len(ml).0 as usize] += 1;
                 if let Some(slot) = counts
@@ -255,33 +273,13 @@ fn literals_table(counts: &[usize; 256]) -> HuffmanTable {
     }
 }
 
-/// The literals table's description as a dictionary stores it.
-fn huffman_description(table: &HuffmanTable) -> io::Result<Vec<u8>> {
-    // The encoder writes the description ahead of the data it codes; one
-    // symbol of data, then the decoder reports where the description ends.
-    let mut writer = BitWriter::new();
-    let mut encoder = HuffmanEncoder::new(table, &mut writer);
-    encoder.encode(&[0], true);
-    let encoded = writer.dump();
-    let mut decoder = HuffmanDecoderTable::new();
-    let description_len = decoder
-        .build_decoder(encoded.as_slice())
-        .map_err(|e| io::Error::other(format!("failed to decode generated huffman table: {e}")))?;
-    Ok(encoded[..description_len as usize].to_vec())
-}
-
-/// A sequence table's normalized counts, as a dictionary stores them.
-fn fse_description(table: &FSETable) -> Vec<u8> {
-    let mut writer = BitWriter::new();
-    table.write_table(&mut writer);
-    writer.dump()
-}
-
-/// The production matcher, recording the literals and sequences each frame's
-/// blocks are built from. Everything else is forwarded, so frames compress as
-/// any compressor's would, dictionary reuse included.
+/// The production matcher, recording the literals and sequences of the first
+/// block it matches after being armed. Everything else is forwarded, so frames
+/// compress as any compressor's would, dictionary reuse included.
 struct Recorder {
     inner: MatchGeneratorDriver,
+    /// Whether the next matched block is recorded; cleared once it is.
+    armed: bool,
     literals: [u32; 256],
     /// Literal length, offset and match length of each sequence.
     sequences: Vec<(u32, u32, u32)>,
@@ -317,10 +315,15 @@ impl Matcher for Recorder {
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        if !core::mem::take(&mut self.armed) {
+            self.inner.start_matching(handle_sequence);
+            return;
+        }
         let Self {
             inner,
             literals,
             sequences,
+            ..
         } = self;
         inner.start_matching(|sequence| {
             match &sequence {

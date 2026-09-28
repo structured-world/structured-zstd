@@ -1,6 +1,6 @@
 use super::*;
 use crate::encoding::compress_slice_to_vec;
-use std::string::String;
+use std::{format, string::String};
 
 /// Log lines with a shared vocabulary, one sample each.
 fn log_samples() -> (Vec<u8>, Vec<usize>) {
@@ -115,7 +115,99 @@ fn literal_tables_take_the_depth_of_their_longest_code() {
     counts[254] = 1;
     let table = literals_table(&counts);
     assert_eq!(table.table_log(), 9);
-    assert!(!huffman_description(&table).unwrap().is_empty());
+    let mut writer = BitWriter::new();
+    HuffmanEncoder::new(&table, &mut writer).write_table();
+    let description = writer.dump();
+    let parsed = crate::huff0::HuffmanTable::new()
+        .build_decoder(&description)
+        .expect("the description parses back");
+    assert_eq!(parsed as usize, description.len());
+}
+
+/// Only a sample's first block is counted (upstream zstd `ZDICT_countEStats`
+/// compresses `MIN(128 KiB, window)` bytes as one block). Samples averaging a
+/// line keep the window, and so the block, far under 4 KiB; two versions of an
+/// 8 KiB sample that differ only past 4 KiB must finalize to the same bytes.
+#[test]
+fn only_the_first_block_of_a_sample_is_counted() {
+    let (mut data, mut sizes) = log_samples();
+    let content: Vec<u8> = data[..4096].to_vec();
+    let head = data[..4096].to_vec();
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let noise: Vec<u8> = (0..4096)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    sizes.push(8192);
+    let finalized = |tail: &[u8], data: &mut Vec<u8>| {
+        let base = data.len();
+        data.extend_from_slice(&head);
+        data.extend_from_slice(tail);
+        let samples = SampleSet::new(data, &sizes).unwrap();
+        let dict = finalize(
+            &content,
+            &samples,
+            samples.count(),
+            8192,
+            FinalizeOptions::default(),
+        )
+        .unwrap();
+        data.truncate(base);
+        dict
+    };
+    let with_runs = finalized(&[b'z'; 4096], &mut data);
+    let with_noise = finalized(&noise, &mut data);
+    assert!(
+        with_runs == with_noise,
+        "a sample's second block reached the tables"
+    );
+}
+
+/// Offset codes are counted with the repeat policy the frame's blocks used.
+/// Two tokens alternating behind short varied gaps make an offset often equal
+/// the one before last: the full search writes it as repeat 2 or 3 (offset
+/// code 1), which the fast strategy never emits, so at level 1 that code keeps
+/// its floor of one while at level 3 it is counted.
+#[test]
+fn offset_codes_follow_the_frames_repeat_policy() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let tokens = [*b"alpha-token-0001", *b"bravo-token-0002"];
+    let mut data = Vec::new();
+    let mut sizes = Vec::new();
+    for _ in 0..64 {
+        let start = data.len();
+        for i in 0..40 {
+            data.extend_from_slice(&tokens[i % 2]);
+            for _ in 0..1 + next() % 2 {
+                data.push(b'!' + (next() % 60) as u8);
+            }
+        }
+        sizes.push(data.len() - start);
+    }
+    let samples = SampleSet::new(&data, &sizes).unwrap();
+    let content = samples.sample(0).to_vec();
+    let offset_code_one = |level| {
+        let mut counts = EntropyCounts {
+            literals: [1; 256],
+            offset_codes: vec![1; OFFCODE_MAX as usize + 1],
+            match_lengths: [1; 53],
+            literal_lengths: [1; 36],
+        };
+        count_samples(&mut counts, &content, &samples, samples.count(), level).unwrap();
+        counts.offset_codes[1]
+    };
+    assert!(offset_code_one(3) > 1, "the input exercises deeper repeats");
+    assert_eq!(offset_code_one(1), 1);
 }
 
 /// Only a frame whose first block is compressed counts as one.
