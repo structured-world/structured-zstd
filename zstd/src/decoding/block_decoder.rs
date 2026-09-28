@@ -8,7 +8,7 @@ use super::sequence_section_decoder::decode_and_execute_sequences;
 use crate::common::MAX_BLOCK_SIZE;
 #[cfg(any(test, feature = "bench-internals"))]
 use crate::cpu_kernel::detect_cpu_kernel;
-use crate::cpu_kernel::{BaselineKernel, CpuKernelTag};
+use crate::cpu_kernel::{BaselineKernel, CpuKernelTag, ScalarKernel};
 use crate::decoding::errors::DecodeSequenceError;
 use crate::decoding::errors::{
     BlockHeaderReadError, BlockSizeError, BlockTypeError, DecodeBlockContentError,
@@ -84,20 +84,36 @@ fn block_fits_the_maximum(
 fn write_literals_only<B: super::buffer_backend::BufferBackend>(
     buffer: &mut crate::decoding::decode_buffer::DecodeBuffer<B>,
     literals: &[u8],
+    kernel: CpuKernelTag,
 ) -> Result<(), DecompressBlockError> {
-    // One copy per block, handed to `memcpy` above a couple of kilobytes: the
-    // baseline width serves it and no tier is asked for.
+    // One copy per block, handed to `memcpy` above a couple of kilobytes, so
+    // one branch on the tier costs nothing here.
+    if kernel == CpuKernelTag::Scalar {
+        write_literals_with::<B, ScalarKernel>(buffer, literals)
+    } else {
+        write_literals_with::<B, BaselineKernel>(buffer, literals)
+    }
+}
+
+/// [`write_literals_only`] under the copy kernel `K`: the scalar tier's
+/// portable copies, or for any other tier the build's baseline vector, which
+/// every CPU running a vector tier has.
+#[inline(always)]
+fn write_literals_with<B: super::buffer_backend::BufferBackend, K: crate::cpu_kernel::CpuKernel>(
+    buffer: &mut crate::decoding::decode_buffer::DecodeBuffer<B>,
+    literals: &[u8],
+) -> Result<(), DecompressBlockError> {
     if !B::FIXED_CAPACITY {
-        buffer.push::<BaselineKernel>(literals);
+        buffer.push::<K>(literals);
         return Ok(());
     }
-    buffer
-        .try_push::<BaselineKernel>(literals)
-        .map_err(|overflow| DecompressBlockError::LiteralsOutputOverflow {
+    buffer.try_push::<K>(literals).map_err(|overflow| {
+        DecompressBlockError::LiteralsOutputOverflow {
             tail: overflow.tail,
             requested: overflow.requested,
             capacity: overflow.capacity,
-        })
+        }
+    })
 }
 
 /// Create a new [BlockDecoder], detecting the CPU kernel. Detection belongs at
@@ -200,10 +216,14 @@ impl BlockDecoder {
                 // grow on demand and always succeed.
                 let parts = workspace.split();
                 block_fits_the_maximum(header, parts.buffer.window_size)?;
-                // One copy per block, as for a literals-only block.
-                parts
-                    .buffer
-                    .try_push::<BaselineKernel>(payload)
+                // One copy per block, under the kernel a literals-only block
+                // takes: the scalar tier stays portable.
+                let pushed = if self.kernel == CpuKernelTag::Scalar {
+                    parts.buffer.try_push::<ScalarKernel>(payload)
+                } else {
+                    parts.buffer.try_push::<BaselineKernel>(payload)
+                };
+                pushed
                     .map_err(|_| DecodeBlockContentError::BackendOverflow { step: block_type })?;
                 *source = tail;
                 self.internal_state = State::ReadyToDecodeNextHeader;
@@ -556,7 +576,7 @@ impl BlockDecoder {
             // write's error path through this body cost 9.9% of cycles on a
             // 1 MiB level-19 stream while issuing 0.6% FEWER instructions: the
             // sequence executor it calls is laid out around this body.
-            return write_literals_only(buffer, &literals_view[..literals_len]);
+            return write_literals_only(buffer, &literals_view[..literals_len], self.kernel);
         }
 
         // Nothing drains the buffer inside a block, so the growth of its live
