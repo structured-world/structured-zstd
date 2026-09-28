@@ -41,7 +41,7 @@ impl Matcher for HintProbeMatcher {
         self.skip_hints.push(incompressible_hint);
     }
 
-    fn start_matching(&mut self, _handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    fn start_matching(&mut self, _handle_sequence: impl FnMut(Sequence)) {
         panic!("start_matching must not run for early-exit paths");
     }
 

@@ -11,11 +11,8 @@ use alloc::vec::Vec;
 
 use super::*;
 
-/// Capture every sequence the matcher emits into an owned record,
-/// so the assertions can match on `lit_len` / `offset` / `match_len`
-/// shape directly. `Sequence::Triple` carries borrowed literals; we
-/// take their length and discard the bytes (the test only cares
-/// about the structural shape, not the literal content).
+/// Capture every sequence the matcher emits into an owned record, so the
+/// assertions can match on `lit_len` / `offset` / `match_len` shape directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CapturedSeq {
     Triple {
@@ -28,20 +25,18 @@ enum CapturedSeq {
     },
 }
 
-fn record_seq<'a>(out: &'a mut Vec<CapturedSeq>) -> impl FnMut(Sequence<'_>) + 'a {
+fn record_seq(out: &mut Vec<CapturedSeq>) -> impl FnMut(Sequence) + '_ {
     move |seq| match seq {
         Sequence::Triple {
-            literals,
+            literal_len,
             offset,
             match_len,
         } => out.push(CapturedSeq::Triple {
-            lit_len: literals.len(),
+            lit_len: literal_len,
             offset,
             match_len,
         }),
-        Sequence::Literals { literals } => out.push(CapturedSeq::Literals {
-            lit_len: literals.len(),
-        }),
+        Sequence::Literals { len } => out.push(CapturedSeq::Literals { lit_len: len }),
     }
 }
 

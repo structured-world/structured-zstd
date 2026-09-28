@@ -8,6 +8,7 @@ use crate::encoding::Matcher;
 use crate::encoding::dfast::DfastMatchGenerator;
 #[cfg(test)]
 use crate::encoding::match_generator::MatchGeneratorDriver;
+use crate::encoding::test_support::BlockReplay;
 use alloc::vec::Vec;
 
 #[test]
@@ -17,30 +18,17 @@ fn dfast_matches_roundtrip_multi_block_pattern() {
     let second_block: Vec<u8> = pattern.iter().copied().cycle().take(128 * 1024).collect();
 
     let mut matcher = DfastMatchGenerator::new(1 << 22);
-    let replay_sequence = |decoded: &mut Vec<u8>, seq: Sequence<'_>| match seq {
-        Sequence::Literals { literals } => decoded.extend_from_slice(literals),
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => {
-            decoded.extend_from_slice(literals);
-            let start = decoded.len() - offset;
-            for i in 0..match_len {
-                let byte = decoded[start + i];
-                decoded.push(byte);
-            }
-        }
-    };
 
     matcher.commit_input(&first_block);
     let mut history = Vec::new();
-    matcher.start_matching(|seq| replay_sequence(&mut history, seq));
+    let mut replay = BlockReplay::new(&first_block);
+    matcher.start_matching(|seq| replay.apply(&mut history, seq));
     assert_eq!(history, first_block);
 
     matcher.commit_input(&second_block);
     let prefix_len = history.len();
-    matcher.start_matching(|seq| replay_sequence(&mut history, seq));
+    let mut replay = BlockReplay::new(&second_block);
+    matcher.start_matching(|seq| replay.apply(&mut history, seq));
 
     assert_eq!(&history[prefix_len..], second_block.as_slice());
 }
@@ -135,21 +123,8 @@ fn driver_switches_backends_and_initializes_dfast_via_reset() {
     driver.commit_input(b"abcabcabcabc");
 
     let mut reconstructed = b"abcabcabcabc".to_vec();
-    driver.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => {
-            reconstructed.extend_from_slice(literals);
-            let start = reconstructed.len() - offset;
-            for i in 0..match_len {
-                let byte = reconstructed[start + i];
-                reconstructed.push(byte);
-            }
-        }
-    });
+    let mut replay = BlockReplay::new(b"abcabcabcabc");
+    driver.start_matching(|seq| replay.apply(&mut reconstructed, seq));
     assert_eq!(reconstructed, b"abcabcabcabcabcabcabcabc");
 
     driver.reset(CompressionLevel::Fastest);
@@ -199,21 +174,10 @@ fn driver_level4_greedy_round_trip_single_slice() {
 
     let mut reconstructed: Vec<u8> = Vec::new();
     let mut saw_triple = false;
-    driver.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => {
-            saw_triple = true;
-            reconstructed.extend_from_slice(literals);
-            let start = reconstructed.len() - offset;
-            for i in 0..match_len {
-                let byte = reconstructed[start + i];
-                reconstructed.push(byte);
-            }
-        }
+    let mut replay = BlockReplay::new(input);
+    driver.start_matching(|seq| {
+        saw_triple |= matches!(seq, Sequence::Triple { .. });
+        replay.apply(&mut reconstructed, seq);
     });
     assert_eq!(
         reconstructed,
@@ -240,21 +204,8 @@ fn driver_level4_greedy_round_trip_cross_slice() {
     driver.commit_input(chunk);
 
     let mut first_recon: Vec<u8> = Vec::new();
-    driver.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => first_recon.extend_from_slice(literals),
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => {
-            first_recon.extend_from_slice(literals);
-            let start = first_recon.len() - offset;
-            for i in 0..match_len {
-                let byte = first_recon[start + i];
-                first_recon.push(byte);
-            }
-        }
-    });
+    let mut replay = BlockReplay::new(chunk);
+    driver.start_matching(|seq| replay.apply(&mut first_recon, seq));
     assert_eq!(
         first_recon,
         chunk.to_vec(),
@@ -265,26 +216,17 @@ fn driver_level4_greedy_round_trip_cross_slice() {
 
     let mut full = first_recon.clone();
     let mut saw_cross_slice_match = false;
-    driver.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => full.extend_from_slice(literals),
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => {
-            // A match whose offset reaches >= the current slice's literal
-            // run plus the second slice's index means we matched into the
-            // first slice — exactly the cross-slice behavior under test.
-            if offset >= chunk.len() {
-                saw_cross_slice_match = true;
-            }
-            full.extend_from_slice(literals);
-            let start = full.len() - offset;
-            for i in 0..match_len {
-                let byte = full[start + i];
-                full.push(byte);
-            }
+    let mut replay = BlockReplay::new(chunk);
+    driver.start_matching(|seq| {
+        // A match whose offset reaches >= the current slice's literal run plus
+        // the second slice's index means we matched into the first slice:
+        // exactly the cross-slice behavior under test.
+        if let Sequence::Triple { offset, .. } = seq
+            && offset >= chunk.len()
+        {
+            saw_cross_slice_match = true;
         }
+        replay.apply(&mut full, seq);
     });
     let mut expected = chunk.to_vec();
     expected.extend_from_slice(chunk);

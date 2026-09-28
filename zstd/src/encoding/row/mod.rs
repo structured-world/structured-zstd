@@ -1593,8 +1593,8 @@ macro_rules! lazy_parse_body {
                     offset_1 = off;
                 }
                 {
-                    let concat = $m.live_history();
-                    let literals = &concat[anchor - hist_start..start - hist_start];
+                    // The catch-up above never passes `anchor`.
+                    debug_assert!(start >= anchor);
                     // The format allows an offset past the advertised window
                     // ONLY into a dictionary that is still valid
                     // (zstd_compression_format.md:918 and 1525-1528); every
@@ -1610,7 +1610,7 @@ macro_rules! lazy_parse_body {
                         $m.max_window_size,
                     );
                     $handle(Sequence::Triple {
-                        literals,
+                        literal_len: start - anchor,
                         offset: offset_1,
                         match_len: match_length,
                     });
@@ -1643,15 +1643,12 @@ macro_rules! lazy_parse_body {
                         $cpl(cur.add(4).sub(offset_2), cur.add(4), block_end - (ip + 4)) + 4
                     };
                     core::mem::swap(&mut offset_1, &mut offset_2);
-                    {
-                        let concat = $m.live_history();
-                        $handle(Sequence::Triple {
-                            literals: &concat[ip - hist_start..ip - hist_start],
-                            offset: offset_1,
-                            match_len: rep_len,
-                        });
-                        let _ = encode_offset_with_history(offset_1 as u32, 0, &mut $m.offset_hist);
-                    }
+                    $handle(Sequence::Triple {
+                        literal_len: 0,
+                        offset: offset_1,
+                        match_len: rep_len,
+                    });
+                    let _ = encode_offset_with_history(offset_1 as u32, 0, &mut $m.offset_hist);
                     ip += rep_len;
                     anchor = ip;
                 }
@@ -1682,9 +1679,8 @@ macro_rules! lazy_parse_body {
                 },
             ]);
             if anchor < block_end {
-                let concat = $m.live_history();
                 $handle(Sequence::Literals {
-                    literals: &concat[anchor - hist_start..],
+                    len: block_end - anchor,
                 });
             }
         }
@@ -1709,7 +1705,7 @@ macro_rules! gen_lazy_monolith {
         #[allow(unused_unsafe)]
         unsafe fn $name<K: RowTags, const ROW_LOG: usize, const FINDER: u8>(
             &mut self,
-            mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+            mut handle_sequence: impl FnMut(Sequence),
         ) {
             lazy_parse_body!(self, handle_sequence, ROW_LOG, FINDER, $use_mask, $maskmac, $cpl)
         }
@@ -3881,7 +3877,7 @@ impl RowMatchGenerator {
     // (driver + tests) use these bare names; the hot loops call the `_rl`
     // siblings directly with the type and const already bound. `skip` does
     // no tag compare, so it dispatches on `row_log` only.
-    pub(crate) fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    pub(crate) fn start_matching(&mut self, handle_sequence: impl FnMut(Sequence)) {
         // SAFETY: same per-tier umbrella contract as `start_matching_greedy`.
         #[cfg(all(
             target_arch = "wasm32",
@@ -4004,7 +4000,7 @@ impl RowMatchGenerator {
         block_start: usize,
         block_end: usize,
         greedy: bool,
-        handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: impl FnMut(Sequence),
     ) {
         self.stage_borrowed_block(block_start, block_end);
         // Greedy runs the same lazy monolith at depth 0.

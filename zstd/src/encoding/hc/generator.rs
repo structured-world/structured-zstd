@@ -1415,7 +1415,7 @@ impl HcMatchGenerator {
     /// which pick the lazy / optimal arm from `S::USE_BT` at
     /// monomorphisation time.
     #[cfg(test)]
-    pub(crate) fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    pub(crate) fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
         use crate::encoding::strategy::{self, StrategyTag};
         // Dispatch on the mirrored `strategy_tag` so each test runs
         // under the same monomorphisation production would pick.
@@ -1451,7 +1451,7 @@ impl HcMatchGenerator {
     /// has been removed); production never invokes that path.
     pub(crate) fn start_matching_strategy<S: crate::encoding::strategy::Strategy>(
         &mut self,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         debug_assert_eq!(
             self.table.uses_bt,
@@ -1469,10 +1469,7 @@ impl HcMatchGenerator {
     /// (attach-mode dictionary), else the no-dict monomorph. Mirrors upstream's
     /// compile-time `dictMode` split — the `DICT = false` body carries no dms
     /// code at all, so the no-dict hot path is unaffected by the dict search.
-    pub(crate) fn start_matching_lazy(
-        &mut self,
-        handle_sequence: impl for<'a> FnMut(Sequence<'a>),
-    ) {
+    pub(crate) fn start_matching_lazy(&mut self, handle_sequence: impl FnMut(Sequence)) {
         if self.table.dms.is_primed() {
             self.start_matching_lazy_impl::<true>(handle_sequence);
         } else {
@@ -1482,7 +1479,7 @@ impl HcMatchGenerator {
 
     pub(crate) fn start_matching_lazy_impl<const DICT: bool>(
         &mut self,
-        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+        mut handle_sequence: impl FnMut(Sequence),
     ) {
         self.table.ensure_tables();
 
@@ -1492,15 +1489,6 @@ impl HcMatchGenerator {
         if current_len == 0 {
             return;
         }
-        // The current block is the tail of `history` (owned) or the staged
-        // borrowed range (`get_last_space()` resolves both). Hoist it as a raw
-        // slice: the routine mutates the hash/chain tables + `offset_hist` but
-        // never reallocates `history`, so the slice stays valid and we avoid
-        // re-borrowing `self.table` (which would conflict with the
-        // `offset_hist` write).
-        let current_ptr = self.table.get_last_space().as_ptr();
-        let current: &[u8] = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
-
         // Full live history (dict + committed blocks + current block), hoisted
         // ONCE for the whole position scan and threaded into every
         // `find_best_match` / `pick_lazy_match` call. `live_history()` is
@@ -1508,8 +1496,9 @@ impl HcMatchGenerator {
         // `offset_hist` but never the history bytes or length), so re-fetching
         // it per find — inside `hash_chain_candidate` + the rep probe, plus
         // again for each lazy lookahead at pos+1 / pos+2 — was pure
-        // per-position overhead. Same raw-slice detach as `current` so the
-        // loop's `&mut self.table` inserts coexist with this `&[u8]`.
+        // per-position overhead. Detached as a raw slice so the loop's
+        // `&mut self.table` inserts coexist with this `&[u8]`; the scan never
+        // reallocates the history.
         let concat: &[u8] = {
             let lh = self.table.live_history();
             unsafe { core::slice::from_raw_parts(lh.as_ptr(), lh.len()) }
@@ -1600,16 +1589,18 @@ impl HcMatchGenerator {
                 let match_len = ext.match_len;
                 self.table
                     .insert_match_span(abs_pos + 1, ext.start + match_len);
+                // The backward extension stops at the literal run's start.
                 let start = ext.start - current_abs_start;
-                let literals = &current[literals_start..start];
+                debug_assert!(start >= literals_start);
+                let literal_len = start - literals_start;
                 handle_sequence(Sequence::Triple {
-                    literals,
+                    literal_len,
                     offset: best.offset,
                     match_len,
                 });
                 let _ = encode_offset_with_history(
                     best.offset as u32,
-                    literals.len() as u32,
+                    literal_len as u32,
                     &mut self.table.offset_hist,
                 );
                 pos = start + match_len;
@@ -1655,7 +1646,7 @@ impl HcMatchGenerator {
 
         if literals_start < current_len {
             handle_sequence(Sequence::Literals {
-                literals: &current[literals_start..],
+                len: current_len - literals_start,
             });
         }
     }
@@ -1681,7 +1672,7 @@ impl HcMatchGenerator {
         &mut self,
         block_start: usize,
         block_end: usize,
-        handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: impl FnMut(Sequence),
     ) {
         self.table.stage_borrowed_block(block_start, block_end);
         self.start_matching_lazy(handle_sequence);

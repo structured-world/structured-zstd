@@ -3,6 +3,7 @@
 //! optimal round-trips, and dictionary-priming behaviour.
 
 use super::*;
+use crate::encoding::test_support::BlockReplay;
 use alloc::vec::Vec;
 
 // Test-local L22 BtUltra2 HcConfig fixtures. Production resolves L22 through
@@ -79,24 +80,12 @@ fn drive_roundtrip_with_override(
     let mut offset_in_data = 0usize;
     while offset_in_data < data.len() {
         let take = (data.len() - offset_in_data).min(driver.slice_size);
-        driver.commit_input(&data[offset_in_data..offset_in_data + take]);
+        let block = &data[offset_in_data..offset_in_data + take];
+        driver.commit_input(block);
         offset_in_data += take;
 
-        driver.start_matching(|seq| match seq {
-            Sequence::Literals { literals } => out.extend_from_slice(literals),
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => {
-                out.extend_from_slice(literals);
-                let start = out.len() - offset;
-                for i in 0..match_len {
-                    let byte = out[start + i];
-                    out.push(byte);
-                }
-            }
-        });
+        let mut replay = BlockReplay::new(block);
+        driver.start_matching(|seq| replay.apply(&mut out, seq));
     }
     out
 }
@@ -165,21 +154,12 @@ fn row_mls_knob_gates_matches_and_roundtrips() {
 
         let mut out: Vec<u8> = Vec::with_capacity(data.len());
         let mut shortest_match = usize::MAX;
-        matcher.start_matching(|seq| match seq {
-            Sequence::Literals { literals } => out.extend_from_slice(literals),
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => {
-                out.extend_from_slice(literals);
+        let mut replay = BlockReplay::new(&data);
+        matcher.start_matching(|seq| {
+            if let Sequence::Triple { match_len, .. } = seq {
                 shortest_match = shortest_match.min(match_len);
-                let start = out.len() - offset;
-                for i in 0..match_len {
-                    let byte = out[start + i];
-                    out.push(byte);
-                }
             }
+            replay.apply(&mut out, seq);
         });
 
         assert_eq!(out, data, "mls={mls} round-trip diverged");
@@ -249,27 +229,17 @@ fn l4_greedy_round_trip(slice_size: usize, max_slices: usize, data: &[u8]) -> (u
     let mut offset_in_data = 0usize;
     while offset_in_data < data.len() {
         let take = (data.len() - offset_in_data).min(driver.slice_size);
-        driver.commit_input(&data[offset_in_data..offset_in_data + take]);
+        let block = &data[offset_in_data..offset_in_data + take];
+        driver.commit_input(block);
         offset_in_data += take;
 
-        driver.start_matching(|seq| match seq {
-            Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => {
+        let mut replay = BlockReplay::new(block);
+        driver.start_matching(|seq| {
+            if let Sequence::Triple { offset, .. } = seq {
                 triple_count += 1;
-                if offset > max_offset {
-                    max_offset = offset;
-                }
-                reconstructed.extend_from_slice(literals);
-                let start = reconstructed.len() - offset;
-                for i in 0..match_len {
-                    let byte = reconstructed[start + i];
-                    reconstructed.push(byte);
-                }
+                max_offset = max_offset.max(offset);
             }
+            replay.apply(&mut reconstructed, seq);
         });
     }
 
@@ -279,7 +249,7 @@ fn l4_greedy_round_trip(slice_size: usize, max_slices: usize, data: &[u8]) -> (u
     if data.is_empty() {
         driver.commit_input(&[]);
         driver.start_matching(|seq| match seq {
-            Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+            Sequence::Literals { len } => assert_eq!(len, 0, "empty input has no literals"),
             Sequence::Triple { .. } => panic!("empty input must not emit any matches"),
         });
     }
@@ -736,11 +706,11 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
         let mut seqs = Vec::new();
         hc.start_matching(|seq| match seq {
             Sequence::Triple {
-                literals,
+                literal_len,
                 offset,
                 match_len,
-            } => seqs.push((literals.len(), offset, match_len)),
-            Sequence::Literals { literals } => seqs.push((literals.len(), 0, 0)),
+            } => seqs.push((literal_len, offset, match_len)),
+            Sequence::Literals { len } => seqs.push((len, 0, 0)),
         });
         seqs
     };
@@ -836,11 +806,11 @@ fn dfast_dictionary_all_kernel_tiers_emit_identical_sequences() {
         let mut seqs = Vec::new();
         driver.start_matching(|seq| match seq {
             Sequence::Triple {
-                literals,
+                literal_len,
                 offset,
                 match_len,
-            } => seqs.push((literals.len(), offset, match_len)),
-            Sequence::Literals { literals } => seqs.push((literals.len(), 0, 0)),
+            } => seqs.push((literal_len, offset, match_len)),
+            Sequence::Literals { len } => seqs.push((len, 0, 0)),
         });
         seqs
     };
@@ -2515,30 +2485,17 @@ fn row_matches_roundtrip_multi_block_pattern() {
     let mut matcher = RowMatchGenerator::new(1 << 22);
     matcher.configure(ROW_CONFIG);
     matcher.ensure_tables();
-    let replay_sequence = |decoded: &mut Vec<u8>, seq: Sequence<'_>| match seq {
-        Sequence::Literals { literals } => decoded.extend_from_slice(literals),
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => {
-            decoded.extend_from_slice(literals);
-            let start = decoded.len() - offset;
-            for i in 0..match_len {
-                let byte = decoded[start + i];
-                decoded.push(byte);
-            }
-        }
-    };
 
     matcher.commit_input(&first_block);
     let mut history = Vec::new();
-    matcher.start_matching(|seq| replay_sequence(&mut history, seq));
+    let mut replay = BlockReplay::new(&first_block);
+    matcher.start_matching(|seq| replay.apply(&mut history, seq));
     assert_eq!(history, first_block);
 
     matcher.commit_input(&second_block);
     let prefix_len = history.len();
-    matcher.start_matching(|seq| replay_sequence(&mut history, seq));
+    let mut replay = BlockReplay::new(&second_block);
+    matcher.start_matching(|seq| replay.apply(&mut history, seq));
 
     assert_eq!(&history[prefix_len..], second_block.as_slice());
 
@@ -2546,7 +2503,8 @@ fn row_matches_roundtrip_multi_block_pattern() {
     let third_block: Vec<u8> = (0u8..=255).collect();
     matcher.commit_input(&third_block);
     let third_prefix = history.len();
-    matcher.start_matching(|seq| replay_sequence(&mut history, seq));
+    let mut replay = BlockReplay::new(&third_block);
+    matcher.start_matching(|seq| replay.apply(&mut history, seq));
     assert_eq!(&history[third_prefix..], third_block.as_slice());
 }
 
@@ -2559,9 +2517,10 @@ fn row_short_block_emits_literals_only() {
 
     let mut saw_triple = false;
     let mut reconstructed = Vec::new();
-    matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
-        Sequence::Triple { .. } => saw_triple = true,
+    let mut replay = BlockReplay::new(b"abcde");
+    matcher.start_matching(|seq| {
+        saw_triple |= matches!(seq, Sequence::Triple { .. });
+        replay.apply(&mut reconstructed, seq);
     });
 
     assert!(
@@ -2623,43 +2582,27 @@ fn row_backfills_previous_block_tail_for_cross_boundary_match() {
     // than that is emitted as literals regardless of history.
     let second_block = b"XYZXYZtail-padding-past-ilimit".to_vec();
 
-    let replay_sequence = |decoded: &mut Vec<u8>, seq: Sequence<'_>| match seq {
-        Sequence::Literals { literals } => decoded.extend_from_slice(literals),
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => {
-            decoded.extend_from_slice(literals);
-            let start = decoded.len() - offset;
-            for i in 0..match_len {
-                let byte = decoded[start + i];
-                decoded.push(byte);
-            }
-        }
-    };
-
     matcher.commit_input(&first_block);
     let mut reconstructed = Vec::new();
-    matcher.start_matching(|seq| replay_sequence(&mut reconstructed, seq));
+    let mut replay = BlockReplay::new(&first_block);
+    matcher.start_matching(|seq| replay.apply(&mut reconstructed, seq));
     assert_eq!(reconstructed, first_block);
 
     matcher.commit_input(&second_block);
     let mut saw_cross_boundary = false;
     let prefix_len = reconstructed.len();
+    let mut replay = BlockReplay::new(&second_block);
     matcher.start_matching(|seq| {
         if let Sequence::Triple {
-            literals,
-            offset,
+            literal_len: 0,
+            offset: 3,
             match_len,
         } = seq
-            && literals.is_empty()
-            && offset == 3
             && match_len >= ROW_MIN_MATCH_LEN
         {
             saw_cross_boundary = true;
         }
-        replay_sequence(&mut reconstructed, seq);
+        replay.apply(&mut reconstructed, seq);
     });
 
     assert!(
@@ -3026,14 +2969,7 @@ fn a_btultra2_seed_pass_near_the_top_of_the_address_space_parses_like_a_fresh_on
         }
         driver.commit_input(&payload);
         let mut sequences = Vec::new();
-        driver.start_matching(|seq| match seq {
-            Sequence::Literals { literals } => sequences.push((literals.len(), 0, 0)),
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => sequences.push((literals.len(), offset, match_len)),
-        });
+        driver.start_matching(|seq| sequences.push(seq));
         sequences
     };
 
@@ -3086,11 +3022,10 @@ fn dfast_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut saw_match = false;
     driver.start_matching(|seq| {
         if let Sequence::Triple {
-            literals,
+            literal_len: 0,
             offset,
             match_len,
         } = seq
-            && literals.is_empty()
             && offset == payload.len()
             && match_len >= DFAST_MIN_MATCH_LEN
         {
@@ -3423,11 +3358,10 @@ fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut saw_match = false;
     driver.start_matching(|seq| {
         if let Sequence::Triple {
-            literals,
+            literal_len: 0,
             offset,
             match_len,
         } = seq
-            && literals.is_empty()
             && offset == payload.len()
             && match_len >= ROW_MIN_MATCH_LEN
         {
@@ -3904,12 +3838,12 @@ fn hc_sparse_skip_matching_preserves_tail_cross_block_match() {
             return;
         }
         first_sequence = Some(match seq {
-            Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+            Sequence::Literals { len } => (len, 0usize, 0usize),
             Sequence::Triple {
-                literals,
+                literal_len,
                 offset,
                 match_len,
-            } => (literals.len(), offset, match_len),
+            } => (literal_len, offset, match_len),
         });
     });
 
@@ -3955,12 +3889,12 @@ fn btultra2_sparse_skip_matching_preserves_tail_cross_block_match() {
             return;
         }
         first_sequence = Some(match seq {
-            Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+            Sequence::Literals { len } => (len, 0usize, 0usize),
             Sequence::Triple {
-                literals,
+                literal_len,
                 offset,
                 match_len,
-            } => (literals.len(), offset, match_len),
+            } => (literal_len, offset, match_len),
         });
     });
 
@@ -4121,12 +4055,10 @@ fn hc_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut saw_match = false;
     driver.start_matching(|seq| {
         if let Sequence::Triple {
-            literals,
-            offset,
+            literal_len: 0,
+            offset: 8,
             match_len,
         } = seq
-            && literals.is_empty()
-            && offset == 8
             && match_len >= HC_MIN_MATCH_LEN
         {
             saw_match = true;
@@ -4409,21 +4341,8 @@ fn dfast_skip_matching_handles_window_eviction() {
     matcher.commit_input([7, 8, 9, 10, 11, 12]);
 
     let mut reconstructed = alloc::vec![7, 8, 9, 10, 11, 12];
-    matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => {
-            reconstructed.extend_from_slice(literals);
-            let start = reconstructed.len() - offset;
-            for i in 0..match_len {
-                let byte = reconstructed[start + i];
-                reconstructed.push(byte);
-            }
-        }
-    });
+    let mut replay = BlockReplay::new(&[7, 8, 9, 10, 11, 12]);
+    matcher.start_matching(|seq| replay.apply(&mut reconstructed, seq));
 
     assert_eq!(reconstructed, [7, 8, 9, 10, 11, 12, 7, 8, 9, 10, 11, 12]);
 }
@@ -4542,9 +4461,13 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
 
     matcher.commit_input(b"012345bcdea");
     let mut history = Vec::new();
-    matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => history.extend_from_slice(literals),
-        Sequence::Triple { .. } => unreachable!("first block should not match history"),
+    let mut replay = BlockReplay::new(b"012345bcdea");
+    matcher.start_matching(|seq| {
+        assert!(
+            matches!(seq, Sequence::Literals { .. }),
+            "first block should not match history"
+        );
+        replay.apply(&mut history, seq);
     });
     assert_eq!(history, b"012345bcdea");
 
@@ -4558,11 +4481,11 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
                 panic!("expected tail-anchored cross-block match before any literals")
             }
             Sequence::Triple {
-                literals,
+                literal_len,
                 offset,
                 match_len,
             } => {
-                assert_eq!(literals, b"");
+                assert_eq!(literal_len, 0);
                 assert_eq!(offset, 5);
                 assert_eq!(match_len, 11);
                 let start = history.len() - offset;
@@ -4614,9 +4537,13 @@ fn hashchain_inserts_tail_positions_for_next_block_matching() {
 
     matcher.table.commit_input(b"PQRSTBCD");
     let mut history = alloc::vec::Vec::new();
-    matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => history.extend_from_slice(literals),
-        Sequence::Triple { .. } => unreachable!("first block has no internal repeats"),
+    let mut replay = BlockReplay::new(b"PQRSTBCD");
+    matcher.start_matching(|seq| {
+        assert!(
+            matches!(seq, Sequence::Literals { .. }),
+            "first block has no internal repeats"
+        );
+        replay.apply(&mut history, seq);
     });
     assert_eq!(history, b"PQRSTBCD");
 
@@ -4635,11 +4562,11 @@ fn hashchain_inserts_tail_positions_for_next_block_matching() {
                 )
             }
             Sequence::Triple {
-                literals,
+                literal_len,
                 offset,
                 match_len,
             } => {
-                assert_eq!(literals, b"", "no leading literals on the boundary match");
+                assert_eq!(literal_len, 0, "no leading literals on the boundary match");
                 first_sequence_offset = Some(offset);
                 first_sequence_match_len = Some(match_len);
             }
@@ -4686,12 +4613,12 @@ fn dfast_dense_skip_matching_backfills_previous_tail_for_next_block() {
             return;
         }
         first_sequence = Some(match seq {
-            Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+            Sequence::Literals { len } => (len, 0usize, 0usize),
             Sequence::Triple {
-                literals,
+                literal_len,
                 offset,
                 match_len,
-            } => (literals.len(), offset, match_len),
+            } => (literal_len, offset, match_len),
         });
     });
 
@@ -4732,12 +4659,12 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
             return;
         }
         first_sequence = Some(match seq {
-            Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+            Sequence::Literals { len } => (len, 0usize, 0usize),
             Sequence::Triple {
-                literals,
+                literal_len,
                 offset,
                 match_len,
-            } => (literals.len(), offset, match_len),
+            } => (literal_len, offset, match_len),
         });
     });
 
@@ -4957,12 +4884,12 @@ fn dfast_sparse_skip_matching_backfills_previous_tail_for_consecutive_sparse_blo
             return;
         }
         first_sequence = Some(match seq {
-            Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+            Sequence::Literals { len } => (len, 0usize, 0usize),
             Sequence::Triple {
-                literals,
+                literal_len,
                 offset,
                 match_len,
-            } => (literals.len(), offset, match_len),
+            } => (literal_len, offset, match_len),
         });
     });
 
@@ -5012,15 +4939,14 @@ fn fastest_hint_iteration_23_sequences_reconstruct_source() {
 
     let mut rebuilt = Vec::with_capacity(data.len());
     let mut saw_triple = false;
+    let mut replay = BlockReplay::new(&data);
     driver.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => rebuilt.extend_from_slice(literals),
+        Sequence::Literals { .. } => rebuilt.extend_from_slice(replay.literals(seq)),
         Sequence::Triple {
-            literals,
-            offset,
-            match_len,
+            offset, match_len, ..
         } => {
             saw_triple = true;
-            rebuilt.extend_from_slice(literals);
+            rebuilt.extend_from_slice(replay.literals(seq));
             assert!(offset > 0, "offset must be non-zero");
             assert!(
                 offset <= rebuilt.len(),

@@ -492,9 +492,9 @@ impl Matcher for TinyMatcher {
 
     fn skip_matching(&mut self) {}
 
-    fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
         handle_sequence(Sequence::Literals {
-            literals: self.input.last_block(),
+            len: self.input.last_block().len(),
         });
     }
 

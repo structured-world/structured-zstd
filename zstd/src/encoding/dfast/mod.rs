@@ -973,7 +973,7 @@ impl DfastMatchGenerator {
         }
     }
 
-    pub(crate) fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    pub(crate) fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
         self.ensure_hash_tables();
 
         let current_len = self.window_blocks.back().copied().unwrap_or(0);
@@ -1049,7 +1049,7 @@ impl DfastMatchGenerator {
         &mut self,
         block_start: usize,
         block_end: usize,
-        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+        mut handle_sequence: impl FnMut(Sequence),
     ) {
         self.stage_borrowed_block(block_start, block_end);
         self.ensure_hash_tables();
@@ -1337,7 +1337,7 @@ impl DfastMatchGenerator {
         current_len: usize,
         mut pos: usize,
         literals_start: &mut usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) -> usize {
         // Source bytes + rebase coordinate through `scan_source()` so a
         // borrowed window's rep-extension reads the in-place input.
@@ -1413,7 +1413,7 @@ impl DfastMatchGenerator {
             self.insert_position(abs_pos);
             // Emit zero-literal rep sequence.
             handle_sequence(Sequence::Triple {
-                literals: &[],
+                literal_len: 0,
                 offset: rep,
                 match_len,
             });
@@ -1549,7 +1549,7 @@ impl DfastMatchGenerator {
         literals_start: &mut usize,
         candidate: MatchCandidate,
         scan_pos: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) -> usize {
         // Upstream zstd `zstd_double_fast.c` parity: the inner search loop already
         // inserts every position it VISITS (step-accelerated), so the literal
@@ -1584,34 +1584,18 @@ impl DfastMatchGenerator {
         let ip_minus_2 = post_match_end - 2;
         let ip_minus_1 = post_match_end - 1;
         self.insert_complementary(curr_plus_2, ip_minus_2, ip_minus_1);
-        // Inline the trailing-block slice rather than calling
-        // `get_last_space()` so this matches the gate pattern used by
-        // `skip_matching` / `start_matching` (read `window_blocks.back()`
-        // with `unwrap_or(0)`). `emit_candidate` runs only after a
-        // successful match was found in the active block, so
-        // `last_len > 0` is a structural precondition — the
-        // `debug_assert!` makes that precondition fail at the source
-        // in tests rather than silently produce an empty slice and
-        // panic on the literals subslice below.
-        let (cur_ptr, cur_len) = self.current_block_ptr_len(current_abs_start);
-        debug_assert!(
-            cur_len > 0,
-            "emit_candidate precondition: active block must be non-empty"
-        );
-        // SAFETY: raw-ptr backed (no borrow on `self`), so the
-        // `&mut self.offset_hist` below coexists. Bytes are the active block
-        // (owned history tail or borrowed input sub-slice).
-        let current = unsafe { core::slice::from_raw_parts(cur_ptr, cur_len) };
+        // A committed match starts at or after the literal run it closes.
         let start = candidate.start - current_abs_start;
-        let literals = &current[*literals_start..start];
+        debug_assert!(start >= *literals_start);
+        let literal_len = start - *literals_start;
         handle_sequence(Sequence::Triple {
-            literals,
+            literal_len,
             offset: candidate.offset,
             match_len: candidate.match_len,
         });
         let _ = encode_offset_with_history(
             candidate.offset as u32,
-            literals.len() as u32,
+            literal_len as u32,
             &mut self.offset_hist,
         );
         *literals_start = start + candidate.match_len;
@@ -1622,16 +1606,12 @@ impl DfastMatchGenerator {
         &self,
         current_abs_start: usize,
         literals_start: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
-        let (cur_ptr, cur_len) = self.current_block_ptr_len(current_abs_start);
+        let (_, cur_len) = self.current_block_ptr_len(current_abs_start);
         if literals_start < cur_len {
-            // SAFETY: raw-ptr backed active-block slice (owned history tail
-            // or borrowed input sub-slice); `literals_start < cur_len` gated
-            // above keeps the subslice in range.
-            let current = unsafe { core::slice::from_raw_parts(cur_ptr, cur_len) };
             handle_sequence(Sequence::Literals {
-                literals: &current[literals_start..],
+                len: cur_len - literals_start,
             });
         }
     }
@@ -3441,7 +3421,7 @@ impl DfastMatchGenerator {
         &mut self,
         current_abs_start: usize,
         current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         // Which loop this block scans with is settled ONCE here, off the hot
         // path, so nothing inside the scan branches on a block-invariant.
@@ -3572,7 +3552,7 @@ impl DfastMatchGenerator {
         &mut self,
         current_abs_start: usize,
         current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         start_matching_fast_loop_body!(
             self,
@@ -3593,7 +3573,7 @@ impl DfastMatchGenerator {
         &mut self,
         current_abs_start: usize,
         current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         start_matching_fast_loop_body!(
             self,
@@ -3614,7 +3594,7 @@ impl DfastMatchGenerator {
         &mut self,
         current_abs_start: usize,
         current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         start_matching_fast_loop_body!(
             self,
@@ -3636,7 +3616,7 @@ impl DfastMatchGenerator {
         &mut self,
         current_abs_start: usize,
         current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         start_matching_fast_loop_body!(
             self,
@@ -3665,7 +3645,7 @@ impl DfastMatchGenerator {
         &mut self,
         current_abs_start: usize,
         current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         start_matching_fast_loop_body!(
             self,
@@ -3687,7 +3667,7 @@ impl DfastMatchGenerator {
         &mut self,
         current_abs_start: usize,
         current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         start_matching_dict_loop_body!(
             self,
@@ -3707,7 +3687,7 @@ impl DfastMatchGenerator {
         &mut self,
         current_abs_start: usize,
         current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         start_matching_dict_loop_body!(
             self,
@@ -3727,7 +3707,7 @@ impl DfastMatchGenerator {
         &mut self,
         current_abs_start: usize,
         current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         start_matching_dict_loop_body!(
             self,
@@ -3748,7 +3728,7 @@ impl DfastMatchGenerator {
         &mut self,
         current_abs_start: usize,
         current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         start_matching_dict_loop_body!(
             self,
@@ -3784,7 +3764,7 @@ impl DfastMatchGenerator {
         &mut self,
         current_abs_start: usize,
         current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         start_matching_dict_loop_body!(
             self,

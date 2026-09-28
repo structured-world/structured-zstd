@@ -384,7 +384,7 @@ impl Matcher for EntropyOnlyMatcher {
         unreachable!("entropy estimator never updates match state")
     }
 
-    fn start_matching(&mut self, _handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    fn start_matching(&mut self, _handle_sequence: impl FnMut(Sequence)) {
         unreachable!("entropy estimator never generates sequences")
     }
 
@@ -620,36 +620,19 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
 fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut EncodedBlockParts) {
     parts.literals.clear();
     parts.sequences.clear();
-    // Trailing literals, reported after the last sequence.
+    // Trailing literals, reported after the last sequence; the runs are read
+    // back by position, so no sequence may follow them.
     let mut tail = 0usize;
-    // The runs are read back from the block by position, so each non-empty run
-    // a matcher reports must sit where that position says, and no sequence may
-    // follow trailing literals.
-    #[cfg(debug_assertions)]
-    let mut next_run = state.matcher.get_last_space().as_ptr() as usize;
     state.matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => {
-            #[cfg(debug_assertions)]
-            {
-                debug_assert!(literals.is_empty() || literals.as_ptr() as usize == next_run);
-                next_run += literals.len();
-            }
-            tail += literals.len();
-        }
+        Sequence::Literals { len } => tail += len,
         Sequence::Triple {
-            literals,
+            literal_len,
             offset,
             match_len,
         } => {
-            #[cfg(debug_assertions)]
-            {
-                debug_assert_eq!(tail, 0, "literals reported before a sequence");
-                debug_assert!(literals.is_empty() || literals.as_ptr() as usize == next_run);
-                next_run += literals.len() + match_len;
-            }
-            let ll = literals.len() as u32;
+            debug_assert_eq!(tail, 0, "literals reported before a sequence");
             parts.sequences.push(RawSequence {
-                ll,
+                ll: literal_len as u32,
                 ml: match_len as u32,
                 // The found offset. `fill_wire_offsets` replaces it with its
                 // code once the partition this sequence lands in is about to be

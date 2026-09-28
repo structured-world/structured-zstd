@@ -1259,7 +1259,7 @@ impl HcMatchGenerator {
     #[allow(unused_unsafe)]
     pub(crate) fn start_matching_optimal<S: crate::encoding::strategy::Strategy>(
         &mut self,
-        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+        mut handle_sequence: impl FnMut(Sequence),
     ) {
         self.table.ensure_tables();
         // Borrowed-aware: owned → last committed chunk; borrowed → staged

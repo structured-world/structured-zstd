@@ -1,14 +1,24 @@
 use super::*;
+use crate::encoding::test_support::BlockReplay;
 use alloc::vec;
 use alloc::vec::Vec;
 
+/// Record `seq` as `(literal bytes, offset, match_len)`, the literal bytes
+/// read from the block through `replay`; trailing literals record offset and
+/// match length 0.
+fn capture(replay: &mut BlockReplay<'_>, seq: Sequence) -> (Vec<u8>, usize, usize) {
+    let (offset, match_len) = match seq {
+        Sequence::Triple {
+            offset, match_len, ..
+        } => (offset, match_len),
+        Sequence::Literals { .. } => (0, 0),
+    };
+    (replay.literals(seq).to_vec(), offset, match_len)
+}
+
 /// Capture every emitted sequence as `(literals_bytes, offset,
 /// match_len)` plus the final `FastBlockResult` so each test can
-/// assert byte-level accounting and the actual match decisions
-/// without fighting the borrow checker over `Sequence<'_>`
-/// lifetimes (a `Sequence` borrow lives only as long as the
-/// closure scope; cloning the literal bytes into the tuple
-/// detaches the capture from that lifetime).
+/// assert byte-level accounting and the actual match decisions.
 fn run_block(
     data: &[u8],
     hash_log: u32,
@@ -16,18 +26,8 @@ fn run_block(
 ) -> (Vec<(Vec<u8>, usize, usize)>, FastBlockResult) {
     let mut table = FastHashTable::new(hash_log, mls);
     let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
-    let mut handle = |seq: Sequence<'_>| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => {
-            tuples.push((literals.to_vec(), offset, match_len));
-        }
-        Sequence::Literals { literals } => {
-            tuples.push((literals.to_vec(), 0, 0));
-        }
-    };
+    let mut replay = BlockReplay::new(data);
+    let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
     let result = match mls {
         4 => compress_block_fast::<4, false>(
             data,
@@ -134,14 +134,8 @@ fn run_block_with_rep(
 ) -> (Vec<(Vec<u8>, usize, usize)>, FastBlockResult) {
     let mut table = FastHashTable::new(hash_log, 4);
     let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
-    let mut handle = |seq: Sequence<'_>| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => tuples.push((literals.to_vec(), offset, match_len)),
-        Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
-    };
+    let mut replay = BlockReplay::new(data);
+    let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
     let result = compress_block_fast::<4, false>(
         data,
         0,
@@ -278,14 +272,8 @@ fn prefix_start_index_filter_rejects_below_window() {
     unsafe { table.put(h, 0) };
 
     let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
-    let mut handle = |seq: Sequence<'_>| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => tuples.push((literals.to_vec(), offset, match_len)),
-        Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
-    };
+    let mut replay = BlockReplay::new(&data);
+    let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
     // prefix_start_index=5 blocks index 0.
     let _ = compress_block_fast::<4, false>(
         &data,
@@ -366,14 +354,8 @@ fn match_found_rejects_stale_entry_below_prefix_floor() {
     unsafe { table.put(h, 5) };
 
     let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
-    let mut handle = |seq: Sequence<'_>| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => tuples.push((literals.to_vec(), offset, match_len)),
-        Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
-    };
+    let mut replay = BlockReplay::new(&data[50..]);
+    let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
     // prefix_start_index = 50 — match_idx=5 is below the floor and
     // must be rejected by the upstream zstd-parity prefix filter in
     // `match_found`.
@@ -458,14 +440,8 @@ fn rep_offset_save_restore_when_out_of_range() {
     let huge = 9999;
     let mut table = FastHashTable::new(10, 4);
     let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
-    let mut handle = |seq: Sequence<'_>| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => tuples.push((literals.to_vec(), offset, match_len)),
-        Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
-    };
+    let mut replay = BlockReplay::new(&data);
+    let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
     let result = compress_block_fast::<4, false>(
         &data,
         0,
@@ -510,18 +486,8 @@ fn cmov_variant_matches_branch_variant_output() {
     let collect = |use_cmov: bool| -> alloc::vec::Vec<(alloc::vec::Vec<u8>, usize, usize)> {
         let mut table = FastHashTable::new(12, 4);
         let mut tuples = alloc::vec::Vec::new();
-        let mut handle = |seq: Sequence<'_>| match seq {
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => {
-                tuples.push((literals.to_vec(), offset, match_len));
-            }
-            Sequence::Literals { literals } => {
-                tuples.push((literals.to_vec(), 0, 0));
-            }
-        };
+        let mut replay = BlockReplay::new(&data);
+        let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
         if use_cmov {
             let _ = compress_block_fast::<4, true>(
                 &data,
@@ -648,14 +614,8 @@ fn borrowed_dict_kernel_reconstructs_via_dual_base() {
     }
 
     let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
-    let mut handle = |seq: Sequence<'_>| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => tuples.push((literals.to_vec(), offset, match_len)),
-        Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
-    };
+    let mut replay = BlockReplay::new(&inp);
+    let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
 
     let result = compress_block_fast_dict_borrowed::<MLS, false>(
         &inp,
@@ -743,14 +703,8 @@ fn borrowed_dict_kernel_takes_a_repcode_whose_candidate_is_in_the_dictionary() {
     let dict_table = FastHashTable::new(hash_log, MLS);
 
     let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
-    let mut handle = |seq: Sequence<'_>| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => tuples.push((literals.to_vec(), offset, match_len)),
-        Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
-    };
+    let mut replay = BlockReplay::new(&inp);
+    let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
 
     let result = compress_block_fast_dict_borrowed::<MLS, false>(
         &inp,
@@ -819,14 +773,8 @@ fn borrowed_dict_kernel_rejects_a_short_repcode_in_the_dictionary_tail() {
     let dict_table = FastHashTable::new(hash_log, MLS);
 
     let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
-    let mut handle = |seq: Sequence<'_>| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => tuples.push((literals.to_vec(), offset, match_len)),
-        Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
-    };
+    let mut replay = BlockReplay::new(&inp);
+    let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
 
     let result = compress_block_fast_dict_borrowed::<MLS, false>(
         &inp,
@@ -892,14 +840,8 @@ fn borrowed_dict_kernel_finds_a_match_starting_in_the_dictionary_tail() {
     };
 
     let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
-    let mut handle = |seq: Sequence<'_>| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => tuples.push((literals.to_vec(), offset, match_len)),
-        Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
-    };
+    let mut replay = BlockReplay::new(&inp);
+    let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
 
     let result = compress_block_fast_dict_borrowed::<MLS, false>(
         &inp,

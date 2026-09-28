@@ -410,7 +410,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     hash_table: &mut FastHashTable,
     rep: [u32; 2],
     step_size: usize,
-    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    mut handle_sequence: impl FnMut(Sequence),
 ) -> FastBlockResult {
     let prefix_start_index = bounds.prefix_start_index;
     let window_low = bounds.window_low;
@@ -922,15 +922,10 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         };
         m_len += forward;
 
-        // Emit.
-        // SAFETY: the backward-extension loop above stops at
-        // `match_ip == anchor` (or a byte mismatch), so `anchor <=
-        // match_ip`; `match_ip <= ip0 < data.len()`. The range is valid,
-        // so the unchecked slice avoids the bounds pair on the per-match
-        // literal gather.
-        let literals = unsafe { data.get_unchecked(anchor..match_ip) };
+        // Emit. The backward-extension loop above stops at `match_ip ==
+        // anchor` (or a byte mismatch), so `anchor <= match_ip`.
         handle_sequence(Sequence::Triple {
-            literals,
+            literal_len: match_ip - anchor,
             offset,
             match_len: m_len,
         });
@@ -1006,13 +1001,11 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 let h_at = unsafe { hash_ptr_raw::<MLS>(base.add(ip0), hlog) };
                 unsafe { *table.get_unchecked_mut(h_at as usize) = ip0 as u32 };
 
-                // Emit lit_len=0 rep1 sequence.
-                // SAFETY: this immediate-rep2 branch runs with `anchor ==
-                // ip0` before the match (lit_len 0), so `anchor <= ip0`
-                // and `ip0 < data.len()`; the unchecked slice avoids the
-                // bounds pair on the per-match literal gather.
+                // Emit a lit_len=0 rep1 sequence: this branch runs with
+                // `anchor == ip0`, set by the emit before it.
+                debug_assert_eq!(anchor, ip0);
                 handle_sequence(Sequence::Triple {
-                    literals: unsafe { data.get_unchecked(anchor..ip0) },
+                    literal_len: 0,
                     offset: r_off,
                     match_len: r_len,
                 });
@@ -1094,7 +1087,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     dict_end: u32,
     rep: [u32; 2],
     step_size: usize,
-    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    mut handle_sequence: impl FnMut(Sequence),
 ) -> FastBlockResult {
     assert!(
         block_start <= data.len(),
@@ -1322,8 +1315,10 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
             break 'outer;
         };
 
+        // The backward extension stops at `anchor`.
+        debug_assert!(m.lit_end >= anchor);
         handle_sequence(Sequence::Triple {
-            literals: &data[anchor..m.lit_end],
+            literal_len: m.lit_end - anchor,
             offset: m.offset,
             match_len: m.m_len,
         });
@@ -1359,8 +1354,10 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
                 core::mem::swap(&mut offset_1, &mut offset_2);
                 let h = unsafe { hash_ptr_raw::<MLS>(base.add(ip0), main_hlog) };
                 unsafe { *main_tbl.get_unchecked_mut(h as usize) = ip0 as u32 + main_bias };
+                // The emit before this loop set `anchor = ip0`.
+                debug_assert_eq!(anchor, ip0);
                 handle_sequence(Sequence::Triple {
-                    literals: &data[anchor..ip0],
+                    literal_len: 0,
                     offset: r_off,
                     match_len: r_len,
                 });
@@ -1483,7 +1480,7 @@ fn compress_block_fast_dict_borrowed_impl<
     bounds: PrefixBounds,
     rep: [u32; 2],
     step_size: usize,
-    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    mut handle_sequence: impl FnMut(Sequence),
     cpl: C,
 ) -> FastBlockResult {
     assert!(
@@ -1791,8 +1788,10 @@ fn compress_block_fast_dict_borrowed_impl<
             break 'outer;
         };
 
+        // The backward extension stops at `anchor`.
+        debug_assert!(m.lit_end >= anchor);
         handle_sequence(Sequence::Triple {
-            literals: &inp[anchor..m.lit_end],
+            literal_len: m.lit_end - anchor,
             offset: m.offset,
             match_len: m.m_len,
         });
@@ -1834,8 +1833,10 @@ fn compress_block_fast_dict_borrowed_impl<
                 unsafe {
                     *main_tbl.get_unchecked_mut(h as usize) = (dict_end + ip0) as u32 + main_bias
                 };
+                // The emit before this loop set `anchor = ip0`.
+                debug_assert_eq!(anchor, ip0);
                 handle_sequence(Sequence::Triple {
-                    literals: &inp[anchor..ip0],
+                    literal_len: 0,
                     offset: r_off,
                     match_len: r_len,
                 });
@@ -1874,7 +1875,7 @@ macro_rules! fast_dict_borrowed_wrapper {
             bounds: PrefixBounds,
             rep: [u32; 2],
             step_size: usize,
-            handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+            handle_sequence: impl FnMut(Sequence),
         ) -> FastBlockResult {
             compress_block_fast_dict_borrowed_impl::<MLS, USE_CMOV, _>(
                 inp,
@@ -1952,7 +1953,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
     bounds: PrefixBounds,
     rep: [u32; 2],
     step_size: usize,
-    handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    handle_sequence: impl FnMut(Sequence),
     kernel: crate::encoding::fastpath::FastpathKernel,
 ) -> FastBlockResult {
     // Used by the per-tier match arms below; on a target with no SIMD tier
@@ -1966,7 +1967,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
                   dict: &[u8],
                   main_table: &mut FastHashTable,
                   dict_table: &FastHashTable,
-                  handle_sequence: &mut dyn for<'a> FnMut(Sequence<'a>)|
+                  handle_sequence: &mut dyn FnMut(Sequence)|
      -> FastBlockResult {
         compress_block_fast_dict_borrowed_impl::<MLS, USE_CMOV, _>(
             inp,

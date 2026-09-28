@@ -406,13 +406,9 @@ fn apply_limited_update_after_long_match_small_gap_is_noop() {
 fn emit_optimal_plan_empty_plan_emits_full_literals() {
     let mut t = new_table(8);
     t.push_test_chunk(b"abcdefgh".to_vec());
-    let mut emitted: Vec<u8> = Vec::new();
-    t.emit_optimal_plan(8, &[], &mut |seq| {
-        if let Sequence::Literals { literals } = seq {
-            emitted.extend_from_slice(literals);
-        }
-    });
-    assert_eq!(emitted, b"abcdefgh");
+    let mut emitted: Vec<Sequence> = Vec::new();
+    t.emit_optimal_plan(8, &[], &mut |seq| emitted.push(seq));
+    assert_eq!(emitted, [Sequence::Literals { len: 8 }]);
 }
 
 #[test]
@@ -426,16 +422,12 @@ fn emit_optimal_plan_skips_oversized_plan_item_and_emits_trailing_literals() {
         lit_len: 4,
         match_len: 99, // overflows the 8-byte window → continue
     }];
-    let mut triples = 0usize;
-    let mut trailing: Vec<u8> = Vec::new();
-    t.emit_optimal_plan(8, &plan, &mut |seq| match seq {
-        Sequence::Triple { .. } => triples += 1,
-        Sequence::Literals { literals } => trailing.extend_from_slice(literals),
-    });
-    assert_eq!(triples, 0, "oversized plan item must be skipped");
+    let mut emitted: Vec<Sequence> = Vec::new();
+    t.emit_optimal_plan(8, &plan, &mut |seq| emitted.push(seq));
     assert_eq!(
-        trailing, b"abcdefgh",
-        "trailing-literals path must emit the full window when plan skipped everything"
+        emitted,
+        [Sequence::Literals { len: 8 }],
+        "an oversized plan item is skipped and the whole window emitted as trailing literals"
     );
 }
 

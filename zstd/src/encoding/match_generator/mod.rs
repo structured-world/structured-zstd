@@ -1892,7 +1892,7 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
-    fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
         use super::strategy::{self, StrategyTag};
         // Borrowed one-shot Fast path: if the frame driver staged a
         // block range via `set_borrowed_block`, scan it in place against
@@ -2048,7 +2048,7 @@ impl MatchGeneratorDriver {
     /// strategies arriving here are HashChain-backed.
     fn compress_block<S: super::strategy::Strategy>(
         &mut self,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
         debug_assert_eq!(S::BACKEND, super::strategy::BackendTag::HashChain);
         debug_assert!(
@@ -2154,12 +2154,12 @@ fn collect_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, 
         driver.commit_input(&data[chunk_start..chunk_start + chunk_len]);
         driver.start_matching(|seq| {
             let entry = match seq {
-                Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+                Sequence::Literals { len } => (len, 0usize, 0usize),
                 Sequence::Triple {
-                    literals,
+                    literal_len,
                     offset,
                     match_len,
-                } => (literals.len(), offset, match_len),
+                } => (literal_len, offset, match_len),
             };
             sequences.push(entry);
         });

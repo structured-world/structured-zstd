@@ -92,12 +92,6 @@ fn reset_clears_borrowed_window() {
 /// it producing identical output without the per-block history copy.
 #[test]
 fn borrowed_window_matches_owned_sequence_stream() {
-    #[derive(PartialEq, Debug)]
-    enum Seq {
-        Triple(alloc::vec::Vec<u8>, usize, usize),
-        Lits(alloc::vec::Vec<u8>),
-    }
-
     // Repeating pattern so the matcher emits real matches, split into
     // two blocks. Window (1 << 15 = 32 KiB) far exceeds the input, so
     // the owned path never evicts — its accumulated `history` is
@@ -111,48 +105,20 @@ fn borrowed_window_matches_owned_sequence_stream() {
 
     // Owned path: commit each block, then scan.
     let mut owned = FastKernelMatcher::with_params(15, 12, 5, 2);
-    let mut owned_seqs: alloc::vec::Vec<Seq> = alloc::vec::Vec::new();
+    let mut owned_seqs: Vec<Sequence> = Vec::new();
     owned.commit_input(&whole[..split]);
-    owned.start_matching(|seq| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => owned_seqs.push(Seq::Triple(literals.to_vec(), offset, match_len)),
-        Sequence::Literals { literals } => owned_seqs.push(Seq::Lits(literals.to_vec())),
-    });
+    owned.start_matching(|seq| owned_seqs.push(seq));
     owned.commit_input(&whole[split..]);
-    owned.start_matching(|seq| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => owned_seqs.push(Seq::Triple(literals.to_vec(), offset, match_len)),
-        Sequence::Literals { literals } => owned_seqs.push(Seq::Lits(literals.to_vec())),
-    });
+    owned.start_matching(|seq| owned_seqs.push(seq));
 
     // Borrowed path: same bytes, scanned in place by block range.
     let mut borrowed = FastKernelMatcher::with_params(15, 12, 5, 2);
-    let mut borrowed_seqs: alloc::vec::Vec<Seq> = alloc::vec::Vec::new();
+    let mut borrowed_seqs: Vec<Sequence> = Vec::new();
     // SAFETY: `whole` outlives both scans below; `borrowed` is dropped
     // at end of scope before `whole`, so the window never dangles.
     unsafe { borrowed.set_borrowed_window(&whole) };
-    borrowed.start_matching_borrowed(0, split, |seq| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => borrowed_seqs.push(Seq::Triple(literals.to_vec(), offset, match_len)),
-        Sequence::Literals { literals } => borrowed_seqs.push(Seq::Lits(literals.to_vec())),
-    });
-    borrowed.start_matching_borrowed(split, whole.len(), |seq| match seq {
-        Sequence::Triple {
-            literals,
-            offset,
-            match_len,
-        } => borrowed_seqs.push(Seq::Triple(literals.to_vec(), offset, match_len)),
-        Sequence::Literals { literals } => borrowed_seqs.push(Seq::Lits(literals.to_vec())),
-    });
+    borrowed.start_matching_borrowed(0, split, |seq| borrowed_seqs.push(seq));
+    borrowed.start_matching_borrowed(split, whole.len(), |seq| borrowed_seqs.push(seq));
 
     assert_eq!(
         owned_seqs, borrowed_seqs,
@@ -169,7 +135,9 @@ fn borrowed_window_matches_owned_sequence_stream() {
     // The borrowed path must have produced at least one match (else
     // the test would trivially pass on an all-literals stream).
     assert!(
-        borrowed_seqs.iter().any(|s| matches!(s, Seq::Triple(..))),
+        borrowed_seqs
+            .iter()
+            .any(|s| matches!(s, Sequence::Triple { .. })),
         "pattern must yield at least one match to make the check meaningful",
     );
 }
@@ -337,15 +305,15 @@ fn accept_then_start_matching_emits_match_for_repeated_run() {
     let mut tail_byte_count: usize = 0;
     m.start_matching(|seq| match seq {
         Sequence::Triple {
-            literals,
+            literal_len,
             offset: _,
             match_len,
         } => {
-            emitted_literal_byte_count += literals.len();
+            emitted_literal_byte_count += literal_len;
             emitted_match_lens.push(match_len);
         }
-        Sequence::Literals { literals } => {
-            tail_byte_count += literals.len();
+        Sequence::Literals { len } => {
+            tail_byte_count += len;
         }
     });
 
@@ -1434,10 +1402,12 @@ fn block_zero_prologue_preserves_default_rep_offset_one() {
             return;
         }
         if let Sequence::Triple {
-            literals, offset, ..
+            literal_len,
+            offset,
+            ..
         } = seq
         {
-            first_literals_len = Some(literals.len());
+            first_literals_len = Some(literal_len);
             first_offset = Some(offset);
         }
     });

@@ -141,46 +141,39 @@ impl Matcher for CapturingMatcher {
         self.current_block += 1;
     }
 
-    fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
         let recorded = self.recorded.clone();
         let block_idx = self.current_block;
         let mut seq_in_block: u32 = 0;
         // `Sequence::Literals` is emitted as the last event of a block
-        // (per the `Matcher` trait doc) and carries the bytes between
+        // (per the `Matcher` trait doc) and carries the length between
         // the final triple and the block end. If no triple is emitted
         // for this block (rare but possible — e.g. fully-literal block
         // routed through `start_matching` instead of `skip_matching`)
-        // the closure may see only a `Literals` event with the whole
-        // block's bytes. If the matcher emits no `Literals` event at
-        // all (block whose last triple consumes exactly to the block
-        // boundary) the default `0` is correct.
+        // the closure may see only a `Literals` event covering the whole
+        // block. If the matcher emits no `Literals` event at all (block
+        // whose last triple consumes exactly to the block boundary) the
+        // default `0` is correct.
         let mut block_tail_ll: u32 = 0;
         self.inner.start_matching(|seq| {
-            // Match by reference so `seq` stays owned for the
-            // forward to `handle_sequence`. Today every field of
-            // `Sequence` is `Copy` (`&[u8]`, `usize`), so a by-value
-            // match would also leave `seq` usable through implicit
-            // copy semantics, but binding by-ref is robust if any
-            // future field on `Sequence` turns non-Copy
-            // (PR #149 review #29).
-            match &seq {
+            match seq {
                 Sequence::Triple {
-                    literals,
+                    literal_len,
                     offset,
                     match_len,
                 } => {
                     recorded.borrow_mut().push(CapturedRawSequence {
                         block_idx,
                         seq_in_block,
-                        ll: literals.len() as u32,
-                        of: *offset as u32,
-                        ml: *match_len as u32,
+                        ll: literal_len as u32,
+                        of: offset as u32,
+                        ml: match_len as u32,
                     });
                     // Plain `+`: sequences per block <= MAX_BLOCK_SIZE, far under u32::MAX.
                     seq_in_block += 1;
                 }
-                Sequence::Literals { literals } => {
-                    block_tail_ll = literals.len() as u32;
+                Sequence::Literals { len } => {
+                    block_tail_ll = len as u32;
                 }
             }
             handle_sequence(seq);

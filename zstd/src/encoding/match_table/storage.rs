@@ -2595,31 +2595,16 @@ impl MatchTable {
     }
 
     /// Upstream zstd parity: replay an optimal-parser plan into the consumer's
-    /// sequence sink. Reads the current input frame off `window` and
-    /// advances `offset_hist` exactly like the upstream zstd block-store walker.
+    /// sequence sink over a block of `current_len` bytes, advancing
+    /// `offset_hist` exactly like the upstream zstd block-store walker.
     pub(crate) fn emit_optimal_plan(
         &mut self,
         current_len: usize,
         plan: &[HcOptimalSequence],
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: &mut impl FnMut(Sequence),
     ) {
-        // Current block bytes. `get_last_space()` is borrowed-aware (owned:
-        // last committed chunk = `history[len-current_len..]`, byte-identical;
-        // borrowed: the staged in-place block). Reborrow-then-raw-ptr so the
-        // slice holds NO borrow and the per-sequence `&mut self.offset_hist`
-        // write below stays valid (the old direct `&self.history[..]` slice
-        // underflowed on the borrowed path, where `history` is empty).
-        let current: &[u8] = unsafe {
-            let ls = self.get_last_space();
-            debug_assert!(
-                current_len <= ls.len(),
-                "current_len ({current_len}) exceeds block size ({})",
-                ls.len()
-            );
-            core::slice::from_raw_parts(ls.as_ptr(), current_len)
-        };
         if plan.is_empty() {
-            handle_sequence(Sequence::Literals { literals: current });
+            handle_sequence(Sequence::Literals { len: current_len });
             return;
         }
 
@@ -2640,19 +2625,18 @@ impl MatchTable {
             if end > current_len {
                 continue;
             }
-            let literals = &current[literals_start..start];
             handle_sequence(Sequence::Triple {
-                literals,
+                literal_len: lit_len,
                 offset: item.offset as usize,
                 match_len,
             });
-            encode_offset_with_history(item.offset, literals.len() as u32, &mut self.offset_hist);
+            encode_offset_with_history(item.offset, lit_len as u32, &mut self.offset_hist);
             literals_start = end;
         }
 
         if literals_start < current_len {
             handle_sequence(Sequence::Literals {
-                literals: &current[literals_start..],
+                len: current_len - literals_start,
             });
         }
     }

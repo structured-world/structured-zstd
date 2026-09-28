@@ -1086,7 +1086,7 @@ impl FastKernelMatcher {
     /// `_ =>` arm is unreachable because `validate_params` in
     /// [`FastHashTable::new`] rejects mls outside 4..=8 at
     /// construction.
-    pub(crate) fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    pub(crate) fn start_matching(&mut self, handle_sequence: impl FnMut(Sequence)) {
         // Owned scan path. A borrowed one-shot window (set via
         // `set_borrowed_window`) is mutually exclusive with this path:
         // a committed block lives in `self.history` and `block_start`
@@ -1252,7 +1252,7 @@ impl FastKernelMatcher {
         &mut self,
         block_start: usize,
         block_end: usize,
-        handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+        handle_sequence: impl FnMut(Sequence),
     ) {
         let (ptr, total_len) = self
             .borrowed
@@ -1330,7 +1330,7 @@ impl FastKernelMatcher {
         &mut self,
         block_start: usize,
         block_end: usize,
-        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+        mut handle_sequence: impl FnMut(Sequence),
     ) {
         use super::fast_kernel::kernel::{PrefixBounds, compress_block_fast_dict_borrowed};
         let (ptr, total_len) = self
@@ -1448,9 +1448,8 @@ impl FastKernelMatcher {
         self.rep = result.rep;
 
         if result.tail_literals_len > 0 {
-            let tail_start = block_end - result.tail_literals_len;
             handle_sequence(Sequence::Literals {
-                literals: &inp[tail_start..block_end],
+                len: result.tail_literals_len,
             });
         }
     }
@@ -2270,7 +2269,7 @@ fn run_fast_kernel_block(
     step_size: usize,
     mls: u32,
     use_cmov: bool,
-    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    mut handle_sequence: impl FnMut(Sequence),
 ) -> [u32; 2] {
     use super::fast_kernel::kernel::PrefixBounds;
 
@@ -2378,13 +2377,10 @@ fn run_fast_kernel_block(
         ),
     };
 
-    // Emit terminal literals if the kernel left a tail. `wrap_emit`'s
-    // borrow of `handle_sequence` has ended (no use past the match), so
-    // calling it directly here is allowed.
+    // Emit terminal literals if the kernel left a tail.
     if result.tail_literals_len > 0 {
-        let tail_start = history.len() - result.tail_literals_len;
         handle_sequence(Sequence::Literals {
-            literals: &history[tail_start..],
+            len: result.tail_literals_len,
         });
     }
 
@@ -2408,7 +2404,7 @@ fn run_fast_kernel_block_dict(
     step_size: usize,
     mls: u32,
     use_cmov: bool,
-    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    mut handle_sequence: impl FnMut(Sequence),
 ) -> [u32; 2] {
     use super::fast_kernel::kernel::compress_block_fast_dict;
 
@@ -2442,9 +2438,8 @@ fn run_fast_kernel_block_dict(
     };
 
     if result.tail_literals_len > 0 {
-        let tail_start = history.len() - result.tail_literals_len;
         handle_sequence(Sequence::Literals {
-            literals: &history[tail_start..],
+            len: result.tail_literals_len,
         });
     }
 

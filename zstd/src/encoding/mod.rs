@@ -507,8 +507,10 @@ pub trait Matcher {
     fn skip_matching_with_hint(&mut self, _incompressible_hint: Option<bool>) {
         self.skip_matching();
     }
-    /// Process the data in the last committed space for future matching AND generate matches for the data
-    fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
+    /// Process the data in the last committed space for future matching AND
+    /// report its sequences, in order, covering the whole block (see
+    /// [`Sequence`]).
+    fn start_matching(&mut self, handle_sequence: impl FnMut(Sequence));
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);
     /// Reset for the next frame at `level`, as [`reset`](Self::reset), with
@@ -629,25 +631,28 @@ pub trait Matcher {
     fn window_size(&self) -> u64;
 }
 
-#[derive(PartialEq, Eq, Debug)]
-/// Sequences that a [`Matcher`] can produce
-pub enum Sequence<'data> {
-    /// Is encoded as a sequence for the decoder sequence execution.
-    ///
-    /// First the literals will be copied to the decoded data,
-    /// then `match_len` bytes are copied from `offset` bytes back in the decoded data
+/// Sequences that a [`Matcher`] can produce, in block order.
+///
+/// A sequence names lengths, not bytes: the literals are the block's own bytes,
+/// and the encoder reads them from the block by position. The sequences of a
+/// block therefore cover it from its first byte, in order, each one's literals
+/// followed by its match, with any trailing literals last.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Sequence {
+    /// `literal_len` literal bytes, then `match_len` bytes copied from `offset`
+    /// bytes back in the decoded data.
     Triple {
-        literals: &'data [u8],
+        literal_len: usize,
         offset: usize,
         match_len: usize,
     },
-    /// This is returned as the last sequence in a block
-    ///
-    /// These literals will just be copied at the end of the sequence execution by the decoder
-    Literals { literals: &'data [u8] },
+    /// The block's trailing literals, after its last match. Reported last.
+    Literals { len: usize },
 }
 
 #[cfg(test)]
 mod compress_bound_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
