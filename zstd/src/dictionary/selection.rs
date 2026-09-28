@@ -3,7 +3,7 @@
 //! `COVER_selectDict` and `COVER_checkTotalCompressedSize`).
 
 use super::FinalizeOptions;
-use super::finalize::finalize;
+use super::finalize::finalize_into;
 use super::samples::SampleSet;
 use crate::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
 use core::ops::Range;
@@ -70,16 +70,16 @@ impl<'s> Evaluator<'s> {
         Ok(out)
     }
 
-    /// [`Self::finalize`] over `out`.
+    /// [`Self::finalize`] over `out`, keeping its allocation.
     fn finalize_into(&self, content: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
-        *out = finalize(
+        finalize_into(
+            out,
             content,
             self.samples,
             self.finalize_samples,
             self.capacity,
             self.finalize,
-        )?;
-        Ok(())
+        )
     }
 
     /// `content` finalized over `buffer` and priced.

@@ -51,6 +51,21 @@ pub(super) fn finalize(
     dict_size: usize,
     options: FinalizeOptions,
 ) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    finalize_into(&mut out, content, samples, count, dict_size, options)?;
+    Ok(out)
+}
+
+/// [`finalize`] over `out`, whose allocation a search keeps from one
+/// candidate to the next.
+pub(super) fn finalize_into(
+    out: &mut Vec<u8>,
+    content: &[u8],
+    samples: &SampleSet<'_>,
+    count: usize,
+    dict_size: usize,
+    options: FinalizeOptions,
+) -> io::Result<()> {
     // Upstream zstd's order (`ZDICT_finalizeDictionary`): the size first.
     if dict_size < DICT_SIZE_MIN {
         return Err(too_small());
@@ -62,10 +77,11 @@ pub(super) fn finalize(
     if dict_id == 0 {
         return Err(invalid("dictionary id must be non-zero"));
     }
-    let mut out = Vec::with_capacity(dict_size);
+    out.clear();
+    out.reserve(dict_size);
     out.extend_from_slice(&DICT_MAGIC_NUM);
     out.extend_from_slice(&dict_id.to_le_bytes());
-    analyze_entropy(&mut out, content, samples, count, options.level)?;
+    analyze_entropy(out, content, samples, count, options.level)?;
     for rep in START_REPS {
         out.extend_from_slice(&rep.to_le_bytes());
     }
@@ -79,7 +95,7 @@ pub(super) fn finalize(
         out.resize(out.len() + MIN_CONTENT_SIZE - content.len(), 0);
     }
     out.extend_from_slice(content);
-    Ok(out)
+    Ok(())
 }
 
 fn too_small() -> io::Error {
@@ -171,6 +187,11 @@ fn count_samples(
     count: usize,
     level: i32,
 ) -> io::Result<()> {
+    // The candidate is copied into the encoder dictionary, where upstream zstd
+    // references it (`ZSTD_dlm_byRef`): under callgrind the copy and the
+    // dictionary's preparation are 0.02% of a default training run, against
+    // 52.7% for compressing the samples with it. Borrowing would put a lifetime
+    // on the encoder dictionary for none of it.
     let dictionary = crate::decoding::Dictionary::from_raw_content(0, content.to_vec())
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     let recorder = Recorder {

@@ -439,7 +439,7 @@ fn samples_too_short_for_a_dmer_are_refused() {
 #[test]
 fn the_preflight_names_the_cause_the_trainer_names() {
     let (data, sizes) = training_samples();
-    let dict_size = TRAINER_DICT_SIZE_MIN - 1;
+    let dict_size = MIN_TRAINED_DICT_SIZE - 1;
     let cover = CoverOptions {
         k: 300,
         d: 8,
