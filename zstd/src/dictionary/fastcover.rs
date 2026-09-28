@@ -223,7 +223,10 @@ impl<'s> FastCoverContext<'s> {
         // Fill from the back (upstream zstd layout) so the best segments sit at
         // the end of the dictionary and get referenced with the smallest offsets.
         let mut tail = out.len();
-        const MAX_ZERO_SCORE_RUN: usize = 10;
+        // Upstream zstd's patience (`maxZeroScoreRun`), but never more than one
+        // pass over the epochs: counts only fall to zero, so a run of empty
+        // epochs as long as there are epochs means none can score again.
+        let max_zero_score_run = epochs.num.min(10);
         let mut zero_score_run = 0usize;
         let mut epoch = 0usize;
 
@@ -286,7 +289,7 @@ impl<'s> FastCoverContext<'s> {
                 // This epoch has no uncovered content left; other epochs may.
                 // Give up after a run of empty epochs (upstream zstd `maxZeroScoreRun`).
                 zero_score_run += 1;
-                if zero_score_run >= MAX_ZERO_SCORE_RUN {
+                if zero_score_run >= max_zero_score_run {
                     break;
                 }
                 continue;

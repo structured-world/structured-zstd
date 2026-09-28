@@ -341,6 +341,46 @@ fn a_split_point_that_is_not_a_number_is_refused() {
     }
 }
 
+/// A dmer shorter than eight bytes that starts in the corpus's last eight
+/// bytes is indexed too: here it is the only one that lies inside a sample
+/// (the last, six bytes long), and dropping it left nothing to train from.
+#[test]
+fn a_short_dmer_at_the_end_of_the_corpus_is_indexed() {
+    let data = *b"abcdefghij";
+    let sizes = [1usize, 1, 1, 1, 6];
+    let cover = CoverOptions {
+        k: 6,
+        d: 6,
+        ..CoverOptions::default()
+    };
+    let dict = train_cover_dict(&data, &sizes, 1024, &cover, FinalizeOptions::default())
+        .expect("the last sample holds a dmer");
+    assert!(dict.ends_with(b"efghij"));
+}
+
+/// A search over dmer sizes keeps what one size built when another cannot
+/// train: six-byte samples hold a COVER dmer of 6 and none of 8, so the search
+/// returns its `d = 6` winner rather than the `d = 8` refusal. (FastCOVER
+/// reads eight bytes for any `d` of 8 or less, as upstream zstd's does, so the
+/// same samples hold none of its dmers at either size.)
+#[test]
+fn a_dmer_size_the_samples_cannot_hold_is_skipped_in_a_search() {
+    let mut data = Vec::new();
+    let mut sizes = Vec::new();
+    for i in 0..40u8 {
+        data.extend_from_slice(&[b'a' + i % 7, b'b', b'c', b'd', i % 5, b'e']);
+        sizes.push(6);
+    }
+    let cover = CoverOptions {
+        k: 8,
+        d: 0,
+        ..CoverOptions::default()
+    };
+    let (_, chosen) = optimize_cover_dict(&data, &sizes, 1024, &cover, FinalizeOptions::default())
+        .expect("d = 6 trains");
+    assert_eq!(chosen.d, 6);
+}
+
 /// A shrunk dictionary costing exactly the tolerated percentage more is kept:
 /// the bound is compared in integers, where 300 bytes at 13% allow 339, not in
 /// floating point, where 300 * 1.13 comes out just under 339.

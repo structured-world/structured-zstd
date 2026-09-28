@@ -86,6 +86,10 @@ pub(super) struct CoverContext<'s> {
     dmer_at: Vec<u32>,
     /// Frequency of each dmer id, window counts all zero.
     initial: Vec<DmerState>,
+    /// The dmer count the epochs are sized by: upstream zstd's, which stops
+    /// where an eight-byte read would run past the corpus. Dmers shorter than
+    /// eight bytes past that point are indexed and fall in the last epoch.
+    epoch_dmers: usize,
     d: usize,
 }
 
@@ -94,18 +98,21 @@ impl<'s> CoverContext<'s> {
     pub(super) fn new(samples: &SampleSet<'s>, train: usize, d: usize) -> io::Result<Self> {
         debug_assert!(d > 0);
         let data = samples.leading(train);
-        // Short dmers are compared as one 8-byte read, so every position needs
-        // eight readable bytes (upstream zstd `COVER_ctx_init`).
-        let read_len = d.max(8);
-        let Some(nb_dmers) = data.len().checked_sub(read_len).map(|n| n + 1) else {
+        // Every position a whole dmer starts at is indexed. Upstream zstd
+        // (`COVER_ctx_init`) stops eight bytes short of the end, where its
+        // one-word read of a short dmer would run past the corpus; a dmer of
+        // fewer bytes starting there can be the only one inside its sample,
+        // and is read through a bounded tail instead (`short_key`).
+        let Some(nb_dmers) = data.len().checked_sub(d).map(|n| n + 1) else {
             return Err(refuse(
                 TrainingError::Samples,
                 &std::format!(
-                    "the training samples total {} bytes; COVER needs at least {read_len}",
+                    "the training samples total {} bytes; COVER needs at least {d}",
                     data.len()
                 ),
             ));
         };
+        let epoch_dmers = data.len().checked_sub(d.max(8)).map_or(nb_dmers, |n| n + 1);
         // Ids and positions are held as `u32`, as upstream's are.
         if u32::try_from(nb_dmers).is_err() {
             return Err(refuse(
@@ -123,6 +130,7 @@ impl<'s> CoverContext<'s> {
             data,
             dmer_at,
             initial,
+            epoch_dmers,
             d,
         })
     }
@@ -145,8 +153,12 @@ impl<'s> CoverContext<'s> {
         let d = self.d;
         debug_assert!(d <= k);
         let nb_dmers = self.dmer_at.len();
-        let epochs = compute_epochs(capacity, nb_dmers, k, 4);
-        let max_zero_score_run = (epochs.num >> 3).clamp(10, 100);
+        let epochs = compute_epochs(capacity, self.epoch_dmers, k, 4);
+        // Upstream zstd's patience (`COVER_buildDictionary`), but never more
+        // than one pass over the epochs: frequencies only fall to zero, so an
+        // epoch that scored nothing never scores again, and once every epoch
+        // in a row has, the rest of the passes can add nothing.
+        let max_zero_score_run = (epochs.num >> 3).clamp(10, 100).min(epochs.num);
         let dmers_in_k = k - d + 1;
         // Only bytes past the final `tail` are returned, so what an earlier
         // build left before it needs no clearing.
@@ -240,26 +252,62 @@ fn select_segment(
 const EMPTY: u32 = u32::MAX;
 const HASH_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// The first `d` bytes at `pos` as a little-endian key; `d <= 8` and eight
-/// bytes are readable there.
+/// The first `d` bytes at `pos` as a little-endian key, `d <= 8`: one word
+/// read, or near the end of the corpus the bytes left, zero-padded (the mask
+/// keeps only the `d` that are always there).
 #[inline]
 fn short_key(data: &[u8], pos: usize, mask: u64) -> u64 {
-    let word: [u8; 8] = data[pos..pos + 8].try_into().expect("eight readable bytes");
+    let word: [u8; 8] = match data.get(pos..pos + 8) {
+        Some(word) => word.try_into().expect("eight bytes"),
+        None => {
+            let mut word = [0u8; 8];
+            let tail = &data[pos..];
+            word[..tail.len()].copy_from_slice(tail);
+            word
+        }
+    };
     u64::from_le_bytes(word) & mask
 }
 
-/// A 64-bit digest of the `d` bytes at `pos`, for dmers longer than one word;
-/// equal digests are confirmed against the bytes.
-fn long_digest(data: &[u8], pos: usize, d: usize) -> u64 {
-    let mut digest = d as u64;
-    for chunk in data[pos..pos + d].chunks(8) {
-        let mut word = [0u8; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        digest = (digest ^ u64::from_le_bytes(word))
-            .wrapping_mul(HASH_MULTIPLIER)
-            .rotate_left(29);
+/// Base of the rolling fingerprint: odd, so every power of it is too and no
+/// byte's weight can vanish modulo 2^64.
+const ROLL_BASE: u64 = 0x100_0000_01B3;
+
+/// A polynomial fingerprint of the `d` bytes at one position, for dmers
+/// longer than one word, moved to the next position in constant time: an
+/// index scanning every position pays O(1) per position whatever `d` is.
+/// Equal fingerprints are confirmed against the bytes.
+#[derive(Default)]
+struct Rolling {
+    fingerprint: u64,
+    /// The weight of the dmer's first byte, `ROLL_BASE^(d - 1)`.
+    first_weight: u64,
+}
+
+impl Rolling {
+    /// The fingerprint of the `d` bytes at `pos`.
+    fn at(data: &[u8], pos: usize, d: usize) -> Self {
+        let mut fingerprint = 0u64;
+        for &byte in &data[pos..pos + d] {
+            fingerprint = fingerprint
+                .wrapping_mul(ROLL_BASE)
+                .wrapping_add(u64::from(byte) + 1);
+        }
+        Self {
+            fingerprint,
+            first_weight: ROLL_BASE.wrapping_pow((d - 1) as u32),
+        }
     }
-    digest
+
+    /// From the dmer at `pos` to the one at `pos + 1`; `data[pos + d]` must
+    /// exist.
+    fn advance(&mut self, data: &[u8], pos: usize, d: usize) {
+        self.fingerprint = self
+            .fingerprint
+            .wrapping_sub((u64::from(data[pos]) + 1).wrapping_mul(self.first_weight))
+            .wrapping_mul(ROLL_BASE)
+            .wrapping_add(u64::from(data[pos + d]) + 1);
+    }
 }
 
 /// Give every distinct dmer of `data` a dense id and count the samples it
@@ -286,9 +334,18 @@ fn index_dmers<const LONG: bool>(
     } else {
         (1u64 << (8 * d)) - 1
     };
-    let tag_at = |pos: usize| {
+    // A long dmer's tag is its rolling fingerprint, carried from one position
+    // to the next; a short one's is its bytes.
+    let start = || {
         if LONG {
-            long_digest(data, pos, d)
+            Rolling::at(data, 0, d)
+        } else {
+            Rolling::default()
+        }
+    };
+    let tag_at = |rolling: &Rolling, pos: usize| {
+        if LONG {
+            rolling.fingerprint
         } else {
             short_key(data, pos, mask)
         }
@@ -308,12 +365,16 @@ fn index_dmers<const LONG: bool>(
     let mut dmers: Vec<DmerState> = Vec::new();
     let mut dmer_at: Vec<u32> = Vec::with_capacity(nb_dmers);
     let mut sample = 0usize;
+    let mut rolling = start();
     for pos in 0..nb_dmers {
+        if LONG && pos > 0 {
+            rolling.advance(data, pos - 1, d);
+        }
         while offsets[sample + 1] <= pos {
             sample += 1;
         }
         let mask = slots.len() - 1;
-        let mut slot = (tag_at(pos).wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
+        let mut slot = (tag_at(&rolling, pos).wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
         let id = loop {
             let first = slots[slot];
             if first == EMPTY {
@@ -347,12 +408,19 @@ fn index_dmers<const LONG: bool>(
             slots.clear();
             slots.resize(len, EMPTY);
             let mut next = 0u32;
+            // Re-rolled from the start alongside the positions, constant time
+            // per position as in the scan.
+            let mut rebuilt = start();
             for (first, &id) in dmer_at.iter().enumerate() {
+                if LONG && first > 0 {
+                    rebuilt.advance(data, first - 1, d);
+                }
                 if id != next {
                     continue;
                 }
                 next += 1;
-                let mut slot = (tag_at(first).wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
+                let mut slot =
+                    (tag_at(&rebuilt, first).wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
                 while slots[slot] != EMPTY {
                     slot = (slot + 1) & (len - 1);
                 }

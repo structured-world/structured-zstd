@@ -74,9 +74,10 @@ fn a_dmer_counts_once_per_sample() {
 
 /// Every position gets the id of its dmer: equal dmers one id, distinct ones
 /// distinct ids, frequencies the number of samples each lies wholly inside;
-/// a dmer that spills into the next sample earns nothing there. Checked
-/// against a plain map, past the index's first growth, for a short and a long
-/// dmer size.
+/// a dmer that spills into the next sample earns nothing there. Every position
+/// a whole dmer starts at is indexed, a short one near the end of the corpus
+/// included. Checked against a plain map, past the index's first growth, for a
+/// short and a long dmer size.
 #[test]
 fn dmer_ids_agree_with_a_plain_map() {
     // A deterministic stream over a small alphabet: many distinct dmers, many
@@ -94,7 +95,7 @@ fn dmer_ids_agree_with_a_plain_map() {
     let set = SampleSet::new(&data, &sizes).unwrap();
     for d in [6usize, 12] {
         let ctx = CoverContext::new(&set, 5, d).unwrap();
-        let nb_dmers = data.len() - d.max(8) + 1;
+        let nb_dmers = data.len() - d + 1;
         assert_eq!(ctx.dmer_at.len(), nb_dmers);
         let mut ids: BTreeMap<&[u8], u32> = BTreeMap::new();
         let mut samples_of: BTreeMap<&[u8], Vec<usize>> = BTreeMap::new();

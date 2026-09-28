@@ -1006,11 +1006,19 @@ fn run_cover(
     let mut best = selection::Best::new();
     let mut state = Vec::new();
     let mut content_scratch = Vec::new();
-    let mut context: Option<(usize, cover::CoverContext<'_>)> = None;
+    // `None` beside a `d` is a dmer size these samples cannot index.
+    let mut context: Option<(usize, Option<cover::CoverContext<'_>>)> = None;
     for (d, k) in space.pairs() {
         if !segment_fits(k, d, dict_size) {
             continue;
         }
+        let chosen = CoverOptions {
+            k: k as u32,
+            d: d as u32,
+            steps: space.steps,
+            split_point: space.split_point,
+            ..*options
+        };
         if context
             .as_ref()
             .is_none_or(|(built_for, _)| *built_for != d)
@@ -1019,17 +1027,22 @@ fn run_cover(
             // before the next is built, so the two never coexist.
             drop(context.take());
             state = Vec::new();
-            context = Some((d, cover::CoverContext::new(&set, split.train, d)?));
+            // A size the samples cannot index is one failed candidate: the
+            // search goes on with the other sizes, and its error is what is
+            // returned only if no size builds anything.
+            let built = match cover::CoverContext::new(&set, split.train, d) {
+                Ok(ctx) => Some(ctx),
+                Err(err) => {
+                    best.offer(Err(err), chosen);
+                    None
+                }
+            };
+            context = Some((d, built));
         }
-        let (_, ctx) = context.as_ref().expect("built above");
-        let content = ctx.build(&mut state, &mut content_scratch, dict_size, k);
-        let chosen = CoverOptions {
-            k: k as u32,
-            d: d as u32,
-            steps: space.steps,
-            split_point: space.split_point,
-            ..*options
+        let Some(ctx) = context.as_ref().and_then(|(_, built)| built.as_ref()) else {
+            continue;
         };
+        let content = ctx.build(&mut state, &mut content_scratch, dict_size, k);
         if !scored {
             return Ok((evaluator.finalize(content)?, chosen));
         }
@@ -1146,24 +1159,44 @@ fn run_fastcover(
     let mut freqs = Vec::new();
     let mut content_scratch = Vec::new();
     let mut best = selection::Best::new();
-    let mut context: Option<(usize, fastcover::FastCoverContext<'_>)> = None;
+    // `None` beside a `d` is a dmer size these samples cannot count.
+    let mut context: Option<(usize, Option<fastcover::FastCoverContext<'_>>)> = None;
     let mut evaluator: Option<selection::Evaluator<'_>> = None;
     for (d, k) in space.pairs() {
         if !segment_fits(k, d, dict_size) {
             continue;
         }
+        let chosen = FastCoverOptions {
+            cover: CoverOptions {
+                k: k as u32,
+                d: d as u32,
+                steps: space.steps,
+                split_point: space.split_point,
+                ..options.cover
+            },
+            f,
+            accel,
+        };
         if context
             .as_ref()
             .is_none_or(|(built_for, _)| *built_for != d)
         {
             // The previous count table is released before the next is built.
             drop(context.take());
-            context = Some((
-                d,
-                fastcover::FastCoverContext::new(&set, split.train, d, f, accel)?,
-            ));
+            // As in the COVER search: a size the samples cannot count is one
+            // failed candidate, returned only if no size builds anything.
+            let built = match fastcover::FastCoverContext::new(&set, split.train, d, f, accel) {
+                Ok(ctx) => Some(ctx),
+                Err(err) => {
+                    best.offer(Err(err), chosen);
+                    None
+                }
+            };
+            context = Some((d, built));
         }
-        let (_, ctx) = context.as_ref().expect("built above");
+        let Some(ctx) = context.as_ref().and_then(|(_, built)| built.as_ref()) else {
+            continue;
+        };
         // The finalize share depends on `accel` alone, so every context agrees.
         let evaluator = evaluator.get_or_insert_with(|| {
             selection::Evaluator::new(
@@ -1176,17 +1209,6 @@ fn run_fastcover(
             )
         });
         let content = ctx.build(&mut freqs, &mut window, &mut content_scratch, dict_size, k)?;
-        let chosen = FastCoverOptions {
-            cover: CoverOptions {
-                k: k as u32,
-                d: d as u32,
-                steps: space.steps,
-                split_point: space.split_point,
-                ..options.cover
-            },
-            f,
-            accel,
-        };
         if !scored {
             return Ok((evaluator.finalize(content)?, chosen));
         }
