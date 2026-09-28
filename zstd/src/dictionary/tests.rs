@@ -370,6 +370,28 @@ fn the_preflight_refuses_a_dictionary_under_the_trainer_minimum() {
     );
 }
 
+/// A dictionary too small is refused before the sample sizes are checked
+/// against the samples, as upstream zstd's `ZDICT_trainFromBuffer_cover` does:
+/// the samples are only walked once the request can produce a dictionary.
+#[test]
+fn an_undersized_dictionary_is_refused_before_the_sample_sizes_are_checked() {
+    let samples = [7u8; 64];
+    // Sizes that overrun the samples: walking them is its own refusal.
+    let sizes = [40usize, 40];
+    let options = CoverOptions {
+        k: 64,
+        d: 8,
+        ..CoverOptions::default()
+    };
+    let err =
+        train_cover_dict(&samples, &sizes, 100, &options, FinalizeOptions::default()).unwrap_err();
+    assert_eq!(
+        TrainingError::of(&err),
+        Some(TrainingError::DictionaryTooSmall),
+        "{err}"
+    );
+}
+
 /// A frequency table or acceleration past the reference's range is refused,
 /// as is a dmer shorter than the hash reads.
 #[test]

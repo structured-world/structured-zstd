@@ -688,6 +688,37 @@ fn a_split_that_leaves_too_few_samples_is_refused_before_they_are_read() {
     );
 }
 
+/// Eight samples are enough for the default search, but a memory limit that
+/// keeps two of them is not, and which ones fit is known from the files'
+/// sizes: the run is refused before any is read, not after the limit's worth
+/// has been loaded. The samples cannot be opened, so only a check made first
+/// can answer.
+#[cfg(unix)]
+#[test]
+fn a_memory_limit_that_keeps_too_few_samples_is_refused_before_they_are_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Scratch::new("limit-too-few");
+    let mut inputs = Vec::new();
+    for i in 0..8 {
+        let sample = dir.file(&format!("s{i}"), &vec![b'a' + i as u8; 1000]);
+        fs::set_permissions(&sample, fs::Permissions::from_mode(0o000)).unwrap();
+        inputs.push(sample);
+    }
+    let mut opts = parse(&["--train", "--maxdict=4096", "-o", "d", "s"]).unwrap();
+    opts.inputs = inputs;
+    opts.output = Some(dir.path().join("dictionary"));
+    // Room for two samples and their recorded lengths.
+    opts.memory_limit = Some(2500);
+    let err = train_dictionary(&opts)
+        .expect_err("two samples build no dictionary")
+        .to_string();
+
+    assert!(
+        err.contains("too few"),
+        "the retained count must be what is refused, before the unreadable samples: {err}"
+    );
+}
+
 /// The split a tuning report shows is the percentage it was given as, for
 /// every percentage: `29 / 100.0 * 100.0` is 28.999..., which a truncating
 /// conversion reported as 28.
@@ -1113,14 +1144,16 @@ fn a_block_size_at_the_top_of_the_range_loads_whole_files() {
 }
 
 /// File sizes that add up past `u64::MAX` (sparse files report any length) are
-/// summed exactly rather than wrapped or stopped at a bound: both the byte
-/// total and the sample count are the true ones.
+/// counted exactly rather than wrapped or stopped at a bound, and a plan over
+/// them stays within its budget.
 #[test]
 fn training_sizes_past_the_integer_range_do_not_wrap() {
     let huge = u64::MAX / 2 + 1;
-    let (samples, wanted) = training_extent(&[huge, huge, 0], Some(4096));
-    assert_eq!(wanted, 2 * u128::from(huge));
+    let samples = training_extent(&[huge, huge, 0], Some(4096));
     assert_eq!(samples, 2 * u128::from(huge.div_ceil(4096)));
+    let (plan, bytes) = plan_training_load(&[huge, huge, 0], Some(4096), 1 << 20, samples);
+    assert!(bytes + plan.iter().sum::<u64>() * TRAINING_SIZE_ENTRY <= 1 << 20);
+    assert_eq!(plan[1..], [0, 0], "loading stops inside the first file");
 }
 
 /// A benchmark input that shrank between being sized and being read is

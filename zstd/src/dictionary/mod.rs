@@ -855,18 +855,17 @@ fn segment_fits(k: usize, d: usize, dict_size: usize) -> bool {
 
 /// The samples and the dictionary size, checked in upstream zstd's order
 /// (`ZDICT_trainFromBuffer_cover`): no samples at all, then a dictionary too
-/// small; the remaining sample checks come after both.
+/// small; the samples are walked, and the remaining checks run, after both.
 fn check_samples_and_dict_size<'s>(
     samples: &'s [u8],
     sample_sizes: &[usize],
     dict_size: usize,
 ) -> io::Result<samples::SampleSet<'s>> {
-    let set = samples::SampleSet::new(samples, sample_sizes)?;
-    if set.count() == 0 {
+    if sample_sizes.is_empty() {
         return Err(refuse(TrainingError::Samples, "there are no samples"));
     }
     check_dict_size(dict_size)?;
-    Ok(set)
+    samples::SampleSet::new(samples, sample_sizes)
 }
 
 /// Refuse a dictionary smaller than any trainer builds.
