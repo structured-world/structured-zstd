@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790625710274,
+  "lastUpdate": 1790628884390,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -9980,6 +9980,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
             "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.187,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "deed49422fb20fb7395ad448643c61b504410d45",
+          "message": "perf(encode)!: gather literal runs after matching, report sequences by length (#538)\n\n* perf(encode): copy literal runs at the baseline width\n\nThe emit loop carried a copy tier resolved when the compressor was built\nand matched on it for every literal run of 33..2047 bytes; a 16-byte run\nwent through the wildcopy helper and read the capability OnceLock. Both\nare a kernel choice below the entry, taken per copy.\n\n- copy_exact_medium uses the widest vector in the build's baseline (AVX2\n  when the build targets it, else SSE2 on x86, NEON on aarch64, u64\n  elsewhere), fixed at compile time and inlined, like upstream zstd's\n  ZSTD_wildcopy\n- runs of 1..=32 bytes go through copy_exact_small, which reads no CPU\n  state; the decoder wildcopy shares the same body\n- ExactCopyTier and the copy_tier field are gone\n\nPart of #535\n\n* perf(encode): gather literal runs after matching\n\nThe literal copy sat in the emit closure, reached from a dozen sites of\nevery match loop, and picked its kernel there: a run-time tier matched\nper copy, or a compile-time width that left a stock x86_64 build on SSE2\non an AVX2 CPU.\n\n- the emit records the sequence and nothing else; the runs are copied\n  from the block by position in one pass afterwards\n- the pass is dispatched once per block on the tier resolved when the\n  compressor is built, and each tier's loop is its own target_feature\n  function with its kernel inlined (AVX2, SSE2, NEON, u64)\n- sequences or a tail reaching past the block panic before any read;\n  a matcher is a public extension point\n- RegionVec::extend_from_slice had no caller left and is gone\n\nPart of #535\n\n* perf(encode)!: report sequences by length, not by slice\n\nThe encoder reads the literal runs from the block by position, so the\nbytes a sequence carried were no longer used. Building the slice cost\nevery match loop an extra live value, a block-pointer lookup and, on\nseveral paths, a bounds-checked sub-slice per emitted sequence.\n\n- Sequence::Triple carries literal_len, Sequence::Literals carries len;\n  the type loses its lifetime and is Copy\n- Matcher::start_matching takes impl FnMut(Sequence) and documents that\n  the sequences cover the block in order\n- every built-in matcher reports lengths it already holds; the dfast\n  emit no longer resolves the block pointer per match\n- the literal gather asserts in debug builds that the sequences and the\n  tail cover the block exactly\n- tests replay blocks through a shared BlockReplay helper\n\nBREAKING CHANGE: Sequence::Triple { literals } becomes { literal_len },\nSequence::Literals { literals } becomes { len }, and Sequence has no\nlifetime parameter; custom matchers report lengths.\n\nPart of #535\n\n* perf(encode): copy literal runs in whole chunks\n\nA run with 32 bytes of block left after it is copied in whole chunks of\nthe tier's width, overshooting into bytes the next run overwrites, the\nshape of upstream zstd's ZSTD_storeSeq + ZSTD_wildcopy. The size-class\nladder (small exact copy, medium kernel, memcpy) is left to the runs at\nthe block's end, so the common run takes one predictable branch.\n\nPart of #535\n\n* perf(dfast): keep the DFTRACE diagnostic out of production builds\n\nThe commit handler of both dfast loops read a OnceLock flag and branched\non it for every committed match, with the eprintln body and the path tag\nit prints kept alive in the loop. The trace is a debugging aid; it now\ncompiles only with the kernel-trace feature, beside the Fast kernel's\ntrace, and a production loop carries neither the load nor the tag.\n\nPart of #535\n\n* fix(encode): check sequence lengths before narrowing them\n\n- A custom matcher's literal length, match length and offset are checked\n  against 32 bits before they are stored in a RawSequence: (1 << 32) + 1\n  literals narrowed to one, fit the block, passed the gather's bounds check\n  and encoded a block that did not describe its input. One compare for the\n  three, folded away where usize is 32 bits. Regression test:\n  a_sequence_length_past_32_bits_is_refused.\n- The literal-gather test runs every tier the CPU can run (scalar, SSE2,\n  SSE4.2, AVX2, NEON, simd128), not only the one it selects.\n\n* perf(encode): skip the wild copy for an empty literal run\n\nA repcode match right after the last one reports no literals, and the\nchunked copy still ran its loop checks for none. Measured on the\ndashboard bench (runner, two interleaved rounds): decodecorpus z000033\ncompress -1.0% at level 1, -0.5% at level 4.\n\n* perf(encode): gather literals with v128 copies under simd128\n\nThe simd128 tier fell through to the scalar gather, whose kernels copy a\nmachine word at a time: four bytes on wasm32. It now has its own loop over\n16-byte v128 chunks, with a v128 exact copy for the runs near the block\nend; the copy test sweeps the new kernel on simd128 builds.\n\n* fix(encode): check a matcher's sequence order and coverage in every build",
+          "timestamp": "2026-09-28T23:09:46+03:00",
+          "tree_id": "86f0b7cb14326d100738caa8ef48bd107bf7e532",
+          "url": "https://github.com/structured-world/structured-zstd/commit/deed49422fb20fb7395ad448643c61b504410d45"
+        },
+        "date": 1790628867244,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.06,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.074,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 173.452,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 194.389,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.979,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.518,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.273,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.843,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.304,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.874,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.143,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.143,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 9.464,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.758,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.092,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.213,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.391,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.19,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.534,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.281,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.021,
             "unit": "ms"
           },
           {
