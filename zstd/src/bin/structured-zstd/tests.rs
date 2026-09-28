@@ -652,7 +652,7 @@ fn tuning_that_fits_no_dictionary_is_refused_before_the_samples_are_read() {
             .to_string();
 
         assert!(
-            !err.contains("failed to inspect"),
+            err.starts_with("dictionary training failed:"),
             "{tuning}: the tuning must be what is refused, before the unreadable sample: {err}"
         );
     }
