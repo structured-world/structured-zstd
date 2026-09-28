@@ -29,54 +29,50 @@ fn dmer_read_len(d: usize) -> usize {
     d.max(8)
 }
 
-/// The shift that takes a `W`-byte dmer hash to an `f`-bit table index.
-fn hash_shift<const W: usize>(f: u32) -> u32 {
-    if W == 4 { 32 - f } else { 64 - f }
-}
-
-/// Upstream zstd `FASTCOVER_hashPtrToIndex`: hash the first `W = min(d, 8)`
-/// bytes of the dmer at `pos` into a table index, `shift` from
-/// [`hash_shift`]. Caller guarantees `pos + dmer_read_len(d) <= sample.len()`.
+/// Upstream zstd `FASTCOVER_hashPtrToIndex`: hash the first `H` bytes of the
+/// dmer at `ptr` (`H = min(d, 8)`) into an `f`-bit table index.
+///
+/// # Safety
+///
+/// `ptr` is readable for eight bytes, which every dmer position is: the
+/// positions stop [`dmer_read_len`] bytes before the end.
 #[inline(always)]
-fn hash_dmer_index<const W: usize>(sample: &[u8], pos: usize, shift: u32) -> usize {
-    if W == 4 {
-        let v = u32::from_le_bytes(sample[pos..pos + 4].try_into().unwrap());
-        return (v.wrapping_mul(PRIME_4_BYTES) >> shift) as usize;
+unsafe fn hash_at<const H: usize>(ptr: *const u8, f: u32) -> usize {
+    // SAFETY: the caller's eight readable bytes.
+    let v = u64::from_le(unsafe { ptr.cast::<u64>().read_unaligned() });
+    match H {
+        4 => ((v as u32).wrapping_mul(PRIME_4_BYTES) >> (32 - f)) as usize,
+        5 => ((v << 24).wrapping_mul(PRIME_5_BYTES) >> (64 - f)) as usize,
+        6 => ((v << 16).wrapping_mul(PRIME_6_BYTES) >> (64 - f)) as usize,
+        7 => ((v << 8).wrapping_mul(PRIME_7_BYTES) >> (64 - f)) as usize,
+        _ => (v.wrapping_mul(PRIME_8_BYTES) >> (64 - f)) as usize,
     }
-    let v = u64::from_le_bytes(sample[pos..pos + 8].try_into().unwrap());
-    let h = match W {
-        5 => (v << 24).wrapping_mul(PRIME_5_BYTES),
-        6 => (v << 16).wrapping_mul(PRIME_6_BYTES),
-        7 => (v << 8).wrapping_mul(PRIME_7_BYTES),
-        _ => v.wrapping_mul(PRIME_8_BYTES),
-    };
-    (h >> shift) as usize
 }
 
-/// Evaluate `$body` with the const `$w` bound to the hash width of `d`-byte
-/// dmers, so the loops inside are compiled once per width and carry no
-/// width branch.
-macro_rules! with_hash_width {
-    ($d:expr, $w:ident => $body:expr) => {
+/// Run `$body` with `$h` bound to the number of bytes a dmer of `$d` hashes,
+/// as a constant: the counting and selecting loops are monomorphised on it
+/// once, rather than branching on `d` at every position.
+macro_rules! with_hashed_bytes {
+    ($d:expr, $h:ident => $body:expr) => {
         match $d.min(8) {
             4 => {
-                const $w: usize = 4;
+                const $h: usize = 4;
                 $body
             }
             5 => {
-                const $w: usize = 5;
+                const $h: usize = 5;
                 $body
             }
             6 => {
-                const $w: usize = 6;
+                const $h: usize = 6;
                 $body
             }
             7 => {
-                const $w: usize = 7;
+                const $h: usize = 7;
                 $body
             }
             _ => {
-                const $w: usize = 8;
+                const $h: usize = 8;
                 $body
             }
         }
@@ -122,29 +118,6 @@ fn zeroed_counts<C: WindowCount>(len: usize) -> Result<Vec<C>, TableTooLarge> {
     // every element is initialised: all-zero bytes are the value 0 of the
     // integer counts `WindowCount` is implemented for (`u16`, `u32`).
     Ok(unsafe { Vec::from_raw_parts(pointer.cast::<C>(), len, len) })
-}
-
-/// Count every `accel`-th dmer that lies wholly inside its sample, the samples
-/// bounded by `offsets`.
-fn count_dmers<const W: usize>(
-    freqs: &mut [u32],
-    data: &[u8],
-    offsets: &[usize],
-    read_len: usize,
-    f: u32,
-    accel: u32,
-) {
-    let shift = hash_shift::<W>(f);
-    let step = accel as usize;
-    for bounds in offsets.windows(2) {
-        let (mut start, end) = (bounds[0], bounds[1]);
-        while start + read_len <= end {
-            // Bounded by the number of dmers, which the caller checked fits
-            // `u32`.
-            freqs[hash_dmer_index::<W>(data, start, shift)] += 1;
-            start += step;
-        }
-    }
 }
 
 /// Share of the training samples the entropy tables are drawn from, and dmers
@@ -199,7 +172,7 @@ impl<'s> FastCoverContext<'s> {
         samples.check_holds_dmer(train, read_len)?;
         let mut freqs = zeroed_counts::<u32>(1usize << f)?;
         let offsets = &samples.offsets()[..=train];
-        with_hash_width!(d, W => count_dmers::<W>(&mut freqs, data, offsets, read_len, f, accel));
+        with_hashed_bytes!(d, H => count_dmers::<H>(data, offsets, read_len, f, accel as usize, &mut freqs));
         Ok(Self {
             data,
             nb_dmers,
@@ -246,31 +219,52 @@ impl<'s> FastCoverContext<'s> {
         // A window holds at most `dmers_in_k + 1` occurrences of one index (one
         // past the segment before the oldest leaves). Upstream zstd keeps them in
         // `u16` for any `k`; a longer segment than that counts in `u32`.
+        let WindowCounts { narrow, wide, ring } = window;
         let tail = if layout.dmers_in_k < usize::from(u16::MAX) {
-            let counts = window.narrow.get_or_insert_with_result(self.f)?;
-            with_hash_width!(self.d, W => self.select_segments::<_, W>(out, freqs, counts, layout))
+            let counts = narrow.get_or_insert_with_result(self.f)?;
+            with_hashed_bytes!(self.d, H => self.select_segments::<H, u16>(out, freqs, counts, ring, layout))
         } else {
-            let counts = window.wide.get_or_insert_with_result(self.f)?;
-            with_hash_width!(self.d, W => self.select_segments::<_, W>(out, freqs, counts, layout))
+            let counts = wide.get_or_insert_with_result(self.f)?;
+            with_hashed_bytes!(self.d, H => self.select_segments::<H, u32>(out, freqs, counts, ring, layout))
         };
         Ok(&out[tail..])
     }
 
     /// Pick a segment per epoch visit until `out` is filled from its end, and
-    /// return where the content starts in it.
-    fn select_segments<C: WindowCount, const W: usize>(
+    /// return where the content starts in it. `H` is the number of bytes a
+    /// dmer hashes.
+    fn select_segments<const H: usize, C: WindowCount>(
         &self,
         out: &mut [u8],
         freqs: &mut [u32],
         segment_freqs: &mut [C],
+        ring: &mut Vec<u32>,
         layout: EpochLayout,
     ) -> usize {
         let EpochLayout { dmers_in_k, epochs } = layout;
-        let (sample, d) = (self.data, self.d);
-        let shift = hash_shift::<W>(self.f);
-        let index = |pos: usize| hash_dmer_index::<W>(sample, pos, shift);
+        let (sample, f, d) = (self.data, self.f, self.d);
         let zero = C::from(0);
         let one = C::from(1);
+        debug_assert!(freqs.len() == 1 << f && segment_freqs.len() == 1 << f);
+        debug_assert!(epochs.num * epochs.size <= self.nb_dmers);
+        // Every position below `nb_dmers` has eight readable bytes and hashes
+        // below `2^f`, the length of both tables, so the loops below read and
+        // index without checks.
+        let base = sample.as_ptr();
+        let freq_ptr = freqs.as_mut_ptr();
+        let window_ptr = segment_freqs.as_mut_ptr();
+        // A window reaching this many positions sheds its oldest.
+        let window_limit = dmers_in_k + 1;
+        // The window's dmer indices in arrival order, so each position is
+        // hashed once as it enters and read back as it leaves. Upstream hashes
+        // it again on the way out. A window never spans more than its epoch,
+        // so a segment longer than the longest epoch, the last one, needs no
+        // more room than that.
+        let longest_epoch = self.nb_dmers - (epochs.num - 1) * epochs.size;
+        let ring_len = window_limit.min(longest_epoch);
+        ring.clear();
+        ring.resize(ring_len, 0);
+        let ring_ptr = ring.as_mut_ptr();
         // Fill from the back (upstream zstd layout) so the best segments sit at
         // the end of the dictionary and get referenced with the smallest offsets.
         let mut tail = out.len();
@@ -293,18 +287,36 @@ impl<'s> FastCoverContext<'s> {
             let mut active_begin = epoch_begin;
             let mut active_end = epoch_begin;
             let mut active_score = 0u64;
+            let mut ring_head = 0usize;
+            let mut ring_tail = 0usize;
             while active_end < epoch_end {
-                let idx = index(active_end);
-                if segment_freqs[idx] == zero {
-                    active_score += u64::from(freqs[idx]);
+                // SAFETY: `active_end < epoch_end <= nb_dmers`; see above.
+                // `ring_tail < ring_len`, the ring's length.
+                let idx = unsafe { hash_at::<H>(base.add(active_end), f) };
+                unsafe { *ring_ptr.add(ring_tail) = idx as u32 };
+                ring_tail += 1;
+                if ring_tail == ring_len {
+                    ring_tail = 0;
                 }
+                // SAFETY: `idx < 2^f`, both tables' length.
+                let count = unsafe { &mut *window_ptr.add(idx) };
+                if *count == zero {
+                    active_score += u64::from(unsafe { *freq_ptr.add(idx) });
+                }
+                *count += one;
                 active_end += 1;
-                segment_freqs[idx] += one;
-                if active_end - active_begin == dmers_in_k + 1 {
-                    let del = index(active_begin);
-                    segment_freqs[del] -= one;
-                    if segment_freqs[del] == zero {
-                        active_score -= u64::from(freqs[del]);
+                if active_end - active_begin == window_limit {
+                    // SAFETY: `ring_head < ring_len`; the index it holds was
+                    // hashed from a position, so it is below `2^f`.
+                    let del = unsafe { *ring_ptr.add(ring_head) } as usize;
+                    ring_head += 1;
+                    if ring_head == ring_len {
+                        ring_head = 0;
+                    }
+                    let count = unsafe { &mut *window_ptr.add(del) };
+                    *count -= one;
+                    if *count == zero {
+                        active_score -= u64::from(unsafe { *freq_ptr.add(del) });
                     }
                     active_begin += 1;
                 }
@@ -316,24 +328,34 @@ impl<'s> FastCoverContext<'s> {
             }
             // Reset the window counts for the next epoch.
             while active_begin < epoch_end {
-                let del = index(active_begin);
-                segment_freqs[del] -= one;
+                // SAFETY: as for the leaving position above.
+                let del = unsafe { *ring_ptr.add(ring_head) } as usize;
+                ring_head += 1;
+                if ring_head == ring_len {
+                    ring_head = 0;
+                }
+                unsafe { *window_ptr.add(del) -= one };
                 active_begin += 1;
             }
             // Drop the segment's leading dmers that earlier segments already
             // cover: they score nothing and would only spend dictionary bytes.
             // The tail needs no trim, the best segment is recorded as a dmer
             // that scores enters it.
-            while best_begin < best_end && freqs[index(best_begin)] == 0 {
+            // SAFETY (both reads): `best_begin < best_end <= epoch_end <= nb_dmers`.
+            while best_begin < best_end
+                && unsafe { *freq_ptr.add(hash_at::<H>(base.add(best_begin), f)) } == 0
+            {
                 best_begin += 1;
             }
             debug_assert!(
-                best_score == 0 || freqs[index(best_end - 1)] != 0,
+                best_score == 0
+                    || unsafe { *freq_ptr.add(hash_at::<H>(base.add(best_end - 1), f)) } != 0,
                 "the best segment ends on a dmer that scores"
             );
             // Zero the chosen segment's frequencies: its dmers are covered.
             for pos in best_begin..best_end {
-                freqs[index(pos)] = 0;
+                // SAFETY: `pos < best_end <= epoch_end <= nb_dmers`.
+                unsafe { *freq_ptr.add(hash_at::<H>(base.add(pos), f)) = 0 };
             }
 
             if best_score == 0 {
@@ -359,6 +381,33 @@ impl<'s> FastCoverContext<'s> {
     }
 }
 
+/// Count every `step`-th dmer lying wholly inside its sample (upstream zstd
+/// `FASTCOVER_computeFrequency`). `offsets` bounds the samples of `data`.
+fn count_dmers<const H: usize>(
+    data: &[u8],
+    offsets: &[usize],
+    read_len: usize,
+    f: u32,
+    step: usize,
+    freqs: &mut [u32],
+) {
+    debug_assert_eq!(freqs.len(), 1 << f);
+    debug_assert_eq!(offsets.last(), Some(&data.len()));
+    let base = data.as_ptr();
+    let counts = freqs.as_mut_ptr();
+    for bounds in offsets.windows(2) {
+        let end = bounds[1];
+        let mut start = bounds[0];
+        while start + read_len <= end {
+            // SAFETY: `start + read_len <= end <= data.len()` and `read_len`
+            // is at least eight; the index is below `2^f`, the table's length.
+            // A count is bounded by the dmer count, far below `u32::MAX`.
+            unsafe { *counts.add(hash_at::<H>(base.add(start), f)) += 1 };
+            start += step;
+        }
+    }
+}
+
 /// How the corpus is walked: the dmers a segment spans, and the epochs it is
 /// split into.
 #[derive(Clone, Copy)]
@@ -373,11 +422,13 @@ impl WindowCount for u16 {}
 impl WindowCount for u32 {}
 
 /// Per-window occurrence counts (upstream zstd `segmentFreqs`), kept across
-/// builds: every build leaves them zero, so one table serves every `k`.
+/// builds: every build leaves them zero, so one table serves every `k`. With
+/// them, the ring of the window's dmer indices.
 #[derive(Default)]
 pub(super) struct WindowCounts {
     narrow: LazyCounts<u16>,
     wide: LazyCounts<u32>,
+    ring: Vec<u32>,
 }
 
 struct LazyCounts<C>(Option<Vec<C>>);
