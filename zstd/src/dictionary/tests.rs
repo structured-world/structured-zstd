@@ -341,6 +341,35 @@ fn a_split_point_that_is_not_a_number_is_refused() {
     }
 }
 
+/// The preflight refuses what the trainer it stands in for refuses: a
+/// dictionary under the trainers' minimum fails training whatever segment
+/// fits, so the check a caller runs before loading a corpus fails it too, with
+/// the same cause.
+#[test]
+fn the_preflight_refuses_a_dictionary_under_the_trainer_minimum() {
+    let (data, sizes) = training_samples();
+    let dict_size = TRAINER_DICT_SIZE_MIN - 1;
+    let cover = CoverOptions::default();
+    let fastcover = FastCoverOptions::default();
+    let trained = optimize_cover_dict(&data, &sizes, dict_size, &cover, FinalizeOptions::default())
+        .unwrap_err();
+    assert_eq!(
+        TrainingError::of(&trained),
+        Some(TrainingError::DictionaryTooSmall)
+    );
+
+    let cover_check = check_cover_options(&cover, dict_size).unwrap_err();
+    assert_eq!(
+        TrainingError::of(&cover_check),
+        Some(TrainingError::DictionaryTooSmall)
+    );
+    let fastcover_check = check_fastcover_options(&fastcover, dict_size).unwrap_err();
+    assert_eq!(
+        TrainingError::of(&fastcover_check),
+        Some(TrainingError::DictionaryTooSmall)
+    );
+}
+
 /// A frequency table or acceleration past the reference's range is refused,
 /// as is a dmer shorter than the hash reads.
 #[test]

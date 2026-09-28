@@ -725,8 +725,10 @@ impl SearchSpace {
 /// # Errors
 ///
 /// `InvalidInput` for tuning out of range or for a `k` and `d` that no
-/// dictionary of `dict_size` bytes holds; [`TrainingError::of`] reports
-/// [`TrainingError::Parameter`].
+/// dictionary of `dict_size` bytes holds, where [`TrainingError::of`] reports
+/// [`TrainingError::Parameter`], and for a `dict_size` under
+/// [`TRAINER_DICT_SIZE_MIN`], where it reports
+/// [`TrainingError::DictionaryTooSmall`].
 ///
 /// # Examples
 ///
@@ -739,7 +741,9 @@ impl SearchSpace {
 /// assert!(check_cover_options(&too_long, 4096).is_err());
 /// ```
 pub fn check_cover_options(options: &CoverOptions, dict_size: usize) -> io::Result<()> {
-    SearchSpace::selected(options, 1.0)?.check_fits(dict_size)
+    let space = SearchSpace::selected(options, 1.0)?;
+    check_dict_size(dict_size)?;
+    space.check_fits(dict_size)
 }
 
 /// [`check_cover_options`] for FastCOVER: also refuses `f`, `accel` and a `d`
@@ -764,6 +768,7 @@ pub fn check_cover_options(options: &CoverOptions, dict_size: usize) -> io::Resu
 pub fn check_fastcover_options(options: &FastCoverOptions, dict_size: usize) -> io::Result<()> {
     let space = SearchSpace::selected(&options.cover, 0.75)?;
     fastcover_knobs(options, &space)?;
+    check_dict_size(dict_size)?;
     space.check_fits(dict_size)
 }
 
@@ -811,13 +816,19 @@ fn check_samples_and_dict_size<'s>(
     if set.count() == 0 {
         return Err(refuse(TrainingError::Samples, "there are no samples"));
     }
+    check_dict_size(dict_size)?;
+    Ok(set)
+}
+
+/// Refuse a dictionary smaller than any trainer builds.
+fn check_dict_size(dict_size: usize) -> io::Result<()> {
     if dict_size < TRAINER_DICT_SIZE_MIN {
         return Err(refuse(
             TrainingError::DictionaryTooSmall,
             &format!("a dictionary must be at least {TRAINER_DICT_SIZE_MIN} bytes"),
         ));
     }
-    Ok(set)
+    Ok(())
 }
 
 /// Train a COVER dictionary of at most `dict_size` bytes with the `k` and `d`
