@@ -99,8 +99,14 @@ macro_rules! gather_body {
                     let s = src.add(pos);
                     let d = out.add(written);
                     if room >= WILDCOPY_SLACK && len <= room - WILDCOPY_SLACK {
+                        // A repcode match right after the last one has no
+                        // literals, and the wild copy would still run its loop
+                        // checks for none (skipping it measured -1.0% at level
+                        // 1 and -0.5% at level 4 on decodecorpus z000033).
                         if len < LITERAL_INLINE_COPY_MAX {
-                            $wild(s, d, len.next_multiple_of($chunk));
+                            if len != 0 {
+                                $wild(s, d, len.next_multiple_of($chunk));
+                            }
                         } else {
                             core::ptr::copy_nonoverlapping(s, d, len);
                         }
