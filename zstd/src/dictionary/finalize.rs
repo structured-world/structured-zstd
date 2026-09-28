@@ -182,6 +182,11 @@ fn count_samples(
     compressor
         .set_encoder_dictionary(EncoderDictionary::from_dictionary(dictionary))
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    // Every sample runs the parameters of the average one, as upstream's
+    // analysis does (`ZSTD_getParams(level, averageSampleSize, dictSize)`):
+    // one set of tables for the whole pass, which also keeps the dictionary
+    // resident from one sample to the next instead of indexing it again.
+    let average = samples.leading(count).len() / count.max(1);
     let mut frame = Vec::new();
     for index in 0..count {
         let sample = samples.sample(index);
@@ -192,7 +197,7 @@ fn count_samples(
         frame.clear();
         compressor.set_source(block);
         compressor.set_drain(frame);
-        compressor.set_source_size_hint(block.len() as u64);
+        compressor.set_source_size_hint(average as u64);
         compressor.compress();
         frame = compressor.take_drain().expect("the drain was set above");
         let recorder = compressor.matcher_mut();
