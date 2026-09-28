@@ -82,6 +82,12 @@ impl<'s> Evaluator<'s> {
 
     /// The dictionary's size plus every scoring sample compressed with it.
     fn price(&mut self, dict: &[u8]) -> io::Result<usize> {
+        // Each candidate is a new dictionary, prepared by copy as upstream zstd
+        // prepares one per candidate (`ZSTD_createCDict` in
+        // `COVER_checkTotalCompressedSize`). The copy and parse are 0.016% of a
+        // COVER search under callgrind; borrowing would put a lifetime on the
+        // encoder dictionary for none of it. The cost is in re-priming the
+        // matcher for it, which belongs to the compressor, not here.
         let prepared = EncoderDictionary::from_bytes(dict)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let level = self.level;
