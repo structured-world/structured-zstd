@@ -555,8 +555,9 @@ impl CpuKernel for Bmi2Kernel {
 /// x86 AVX2 + BMI2 kernel (x86-64-v3 baseline). The common modern
 /// x86 case — most CPUs released since 2013 (Haswell) have AVX2+BMI2.
 /// Uses `bzhi` for mask ops and 256-bit moves for the buffer copies. Present
-/// on 32-bit x86 too, where the copies are all it changes: without it such a
-/// build copies at the SSE2 width whatever the CPU offers.
+/// on 32-bit x86 too, where the kernel's masks are the table ones and its
+/// copies are what it adds; the tier still decodes literals on the BMI2 path,
+/// so, like every tier, it requires the ones below it.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     feature = "kernel-avx2"
@@ -895,6 +896,11 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
             #[cfg(feature = "kernel-bmi2")]
             {
                 let bmi2 = cpu_allows(CpuLevel::Bmi2) && is_x86_feature_detected!("bmi2");
+                // The AVX2 tier sits above BMI2, as on x86_64: its literals take
+                // the BMI2 body, so an AVX2 CPU without BMI2 (in practice a
+                // virtual machine that hides it) runs the SSE2 tier. Its copies
+                // stay 16 bytes wide; a tier of AVX2 copies without BMI2 would be
+                // one more sequence decoder for a CPU no vendor ships.
                 #[cfg(feature = "kernel-avx2")]
                 if bmi2 && cpu_allows(CpuLevel::Avx2) && is_x86_feature_detected!("avx2") {
                     return CpuKernelTag::Avx2;
