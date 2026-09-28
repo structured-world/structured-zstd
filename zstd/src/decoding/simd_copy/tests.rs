@@ -110,6 +110,24 @@ fn check_overshooting_copy<K: crate::cpu_kernel::CpuKernel>(kernel: &str) {
         }
         assert_eq!(&dst[..len], &src[..len], "{kernel}: len={len}");
     }
+
+    // Room rounded only to the tier's step, or only to a machine word: the
+    // wide chunk does not fit, so the narrower paths run, and nothing past the
+    // room may be written.
+    for step in [K::STEP_CHUNK, core::mem::size_of::<usize>()] {
+        for len in 33..1100usize {
+            let room = len.next_multiple_of(step);
+            let mut dst = vec![0xA5_u8; room + 64];
+            unsafe {
+                copy_bytes_overshooting::<K>((src.as_ptr(), room), (dst.as_mut_ptr(), room), len);
+            }
+            assert_eq!(&dst[..len], &src[..len], "{kernel}: len={len} room={room}");
+            assert!(
+                dst[room..].iter().all(|&b| b == 0xA5),
+                "{kernel}: len={len} wrote past room={room}"
+            );
+        }
+    }
 }
 
 #[test]

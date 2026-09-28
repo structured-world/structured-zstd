@@ -516,18 +516,54 @@ pub(crate) unsafe fn copy_bytes_overshooting_for_bench(
     copy_at_least: usize,
 ) {
     // A standalone entry, so the tier is resolved here, on the way in, the way
-    // the decoder resolves it once per block.
-    use crate::cpu_kernel::{ScalarKernel, detect_cpu_kernel};
+    // the decoder resolves it once per block, and to the kernel the sequence
+    // executor copies with for that tier: every arm mirrors its dispatch.
+    use crate::cpu_kernel::{CpuKernelTag, ScalarKernel, detect_cpu_kernel};
+    // SAFETY (every arm): the caller's contract covers the spans, and
+    // `detect_cpu_kernel` names only a tier this CPU runs.
     match detect_cpu_kernel() {
-        #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-        crate::cpu_kernel::CpuKernelTag::Avx2 => unsafe {
+        CpuKernelTag::Scalar => unsafe {
+            copy_bytes_overshooting::<ScalarKernel>(src, dst, copy_at_least)
+        },
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel-sse"
+        ))]
+        CpuKernelTag::Sse2 => unsafe {
+            copy_bytes_overshooting::<crate::cpu_kernel::Sse2Kernel>(src, dst, copy_at_least)
+        },
+        // 32-bit x86 at the BMI2 tier runs the SSE2 walk.
+        #[cfg(all(target_arch = "x86", feature = "kernel-bmi2"))]
+        CpuKernelTag::Bmi2 => unsafe {
+            copy_bytes_overshooting::<crate::cpu_kernel::Sse2Kernel>(src, dst, copy_at_least)
+        },
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+        CpuKernelTag::Bmi2 => unsafe {
+            copy_bytes_overshooting::<crate::cpu_kernel::Bmi2Kernel>(src, dst, copy_at_least)
+        },
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel-avx2"
+        ))]
+        CpuKernelTag::Avx2 => unsafe {
             copy_bytes_overshooting::<crate::cpu_kernel::Avx2Kernel>(src, dst, copy_at_least)
         },
         #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
-        crate::cpu_kernel::CpuKernelTag::Vbmi2 => unsafe {
+        CpuKernelTag::Vbmi2 => unsafe {
             copy_bytes_overshooting::<crate::cpu_kernel::Vbmi2Kernel>(src, dst, copy_at_least)
         },
-        _ => unsafe { copy_bytes_overshooting::<ScalarKernel>(src, dst, copy_at_least) },
+        #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
+        CpuKernelTag::Neon => unsafe {
+            copy_bytes_overshooting::<crate::cpu_kernel::NeonKernel>(src, dst, copy_at_least)
+        },
+        #[cfg(all(
+            target_arch = "aarch64",
+            feature = "kernel-sve",
+            any(feature = "std", target_feature = "sve"),
+        ))]
+        CpuKernelTag::Sve => unsafe {
+            copy_bytes_overshooting::<crate::cpu_kernel::SveKernel>(src, dst, copy_at_least)
+        },
     }
 }
 
