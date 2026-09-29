@@ -350,11 +350,21 @@ fn index_dmers<const LONG: bool>(
             short_key(data, pos, mask)
         }
     };
-    let same_dmer = |a: usize, b: usize| {
+    // Whether the dmer first seen at `first` is the one at `pos`, whose tag is
+    // `tag`: a short dmer's tag is its whole key, a long one's only a hash.
+    let same_dmer = |first: usize, pos: usize, tag: u64| {
         if LONG {
-            data[a..a + d] == data[b..b + d]
+            data[first..first + d] == data[pos..pos + d]
         } else {
-            short_key(data, a, mask) == short_key(data, b, mask)
+            short_key(data, first, mask) == tag
+        }
+    };
+    // The tag of a dmer from its first position alone, for a table rebuild.
+    let tag_of = |first: usize| {
+        if LONG {
+            Rolling::at(data, first, d).fingerprint
+        } else {
+            short_key(data, first, mask)
         }
     };
     // Slots hold the first position of a dmer; positions fit `u32` below
@@ -374,7 +384,8 @@ fn index_dmers<const LONG: bool>(
             sample += 1;
         }
         let mask = slots.len() - 1;
-        let mut slot = (tag_at(&rolling, pos).wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
+        let tag = tag_at(&rolling, pos);
+        let mut slot = (tag.wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
         let id = loop {
             let first = slots[slot];
             if first == EMPTY {
@@ -386,7 +397,7 @@ fn index_dmers<const LONG: bool>(
                 });
                 break id;
             }
-            if same_dmer(first as usize, pos) {
+            if same_dmer(first as usize, pos, tag) {
                 break dmer_at[first as usize];
             }
             slot = (slot + 1) & mask;
@@ -399,35 +410,21 @@ fn index_dmers<const LONG: bool>(
             dmer.freq += 1;
         }
         dmer_at.push(id);
-        // Keep the load at or under a half. First occurrences appear in
-        // `dmer_at` in id order, so the new table is filled from it without
-        // keeping the old one.
+        // Keep the load at or under a half. The new table is filled from the
+        // old one's first positions, so a rebuild costs the distinct dmers
+        // and not every position scanned so far; which slot a dmer lands in
+        // changes no id.
         if dmers.len() * 2 > slots.len() {
             let len = slots.len() * 2;
             shift -= 1;
-            slots.clear();
-            slots.resize(len, EMPTY);
-            let mut next = 0u32;
-            // Re-rolled from the start alongside the positions, constant time
-            // per position as in the scan.
-            let mut rebuilt = start();
-            for (first, &id) in dmer_at.iter().enumerate() {
-                if LONG && first > 0 {
-                    rebuilt.advance(data, first - 1, d);
-                }
-                if id != next {
-                    continue;
-                }
-                next += 1;
+            let old = core::mem::replace(&mut slots, vec![EMPTY; len]);
+            for &first in old.iter().filter(|&&first| first != EMPTY) {
                 let mut slot =
-                    (tag_at(&rebuilt, first).wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
+                    (tag_of(first as usize).wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
                 while slots[slot] != EMPTY {
                     slot = (slot + 1) & (len - 1);
                 }
-                slots[slot] = first as u32;
-                if next as usize == dmers.len() {
-                    break;
-                }
+                slots[slot] = first;
             }
         }
     }
