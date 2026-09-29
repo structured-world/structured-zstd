@@ -434,7 +434,6 @@ fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
 #[test]
 fn sample_metrics_do_not_count_first_u32_max_as_repeat() {
     let sample = [0xFF_u8; 4];
-    let mut counts = [0u16; 256];
     // Every slot holds `0xFFFFFFFF` before the scan, the value the first quad
     // is, so only the occupancy bit keeps it from reading as a repeat.
     let mut repeat_table = [MaybeUninit::new(u32::MAX); INCOMPRESSIBLE_REPEAT_TABLE_LEN];
@@ -443,9 +442,8 @@ fn sample_metrics_do_not_count_first_u32_max_as_repeat() {
 
     // Guard set high so the early-exit never fires, so the first quad is
     // scanned in full and must NOT be counted as a repeat.
-    let bailed = scan_sample_region(
+    let bailed = count_quad_repeats(
         &sample,
-        &mut counts,
         &mut repeat_table,
         &mut repeat_occupied,
         &mut repeats,
@@ -457,11 +455,10 @@ fn sample_metrics_do_not_count_first_u32_max_as_repeat() {
 }
 
 #[test]
-fn scan_sample_region_early_exits_on_repetitive_input() {
+fn count_quad_repeats_early_exits_on_repetitive_input() {
     // 32 identical 4-byte quads: the repeat count climbs past any small
     // guard, exercising the early-exit `true` path directly.
     let sample = [0xAB_u8; 128];
-    let mut counts = [0u16; 256];
     let mut repeat_table =
         [const { MaybeUninit::<u32>::uninit() }; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
     let mut repeat_occupied = [0_u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
@@ -470,9 +467,8 @@ fn scan_sample_region_early_exits_on_repetitive_input() {
     // Guard of 1: the first quad seeds the table, the second is the first
     // counted repeat (repeats == 1), the third pushes repeats past the
     // guard and returns `true`.
-    let bailed = scan_sample_region(
+    let bailed = count_quad_repeats(
         &sample,
-        &mut counts,
         &mut repeat_table,
         &mut repeat_occupied,
         &mut repeats,

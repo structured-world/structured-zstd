@@ -842,26 +842,24 @@ pub(crate) fn compression_level_allows_raw_fast_path(
     }
 }
 
-/// Accumulate byte counts and 4-byte repeat hits for one sample region in a
-/// single pass.
+/// Count the 4-byte quads of one sample region that repeat an earlier quad of
+/// the same slot, across every region scanned with the same table.
 ///
-/// Returns `true` as soon as the running repeat count passes `repeat_guard`.
-/// That guard is the FINAL threshold (fixed before any region is scanned)
-/// and the repeat count only grows, so an early `true` is exactly the
-/// verdict (`false` = compressible) that a full scan would have produced —
-/// the `repeats <= repeat_guard` term of the final verdict is already
-/// settled. On repetitive data (structured text, a single long match) the
-/// quad repeats pass the guard within the first few hundred bytes; on random
-/// data the guard is never reached and the whole region is counted, with no
-/// per-byte branch in the hot path (the byte counts and the quad hashing
-/// share one pass instead of the previous two).
+/// Returns `true` as soon as the running count passes `repeat_guard`. That
+/// guard is the FINAL threshold (fixed before any region is scanned) and the
+/// count only grows, so an early `true` is exactly the verdict (compressible)
+/// that a full scan would have produced. On repetitive data (structured text,
+/// a single long match) the guard passes within the first few hundred bytes,
+/// which is why this pass runs before the byte histogram: such a block never
+/// pays for the histogram at all.
+///
+/// A loop of its own rather than one fused with the byte counts: fused, the
+/// body carried four counter updates, the hash, the occupancy test and two
+/// branches per quad, and its speed swung by more than a tenth with where the
+/// linker happened to place it. Two narrow loops leave each body small.
 #[inline]
-fn scan_sample_region(
+fn count_quad_repeats(
     sample: &[u8],
-    // A sample is at most `RAW_FAST_PATH_MAX_SAMPLE_LEN` bytes, so no byte can
-    // be counted past what sixteen bits hold, and the narrower array is half
-    // the per-call clear.
-    counts: &mut [u16; 256],
     // Never cleared: a slot is read only once its occupancy bit says this call
     // wrote it, so the four kilobytes of table cost nothing per call. Filling
     // it was a fixed memset on every block the classifier looks at, which on a
@@ -872,41 +870,64 @@ fn scan_sample_region(
     repeat_guard: usize,
 ) -> bool {
     debug_assert!(sample.len() <= RAW_FAST_PATH_MAX_SAMPLE_LEN);
-    let (quads, tail) = sample.as_chunks::<4>();
-    for &chunk in quads {
-        // One unaligned load: the chunk is a `[u8; 4]` by type, so neither the
-        // read nor the byte counts below carry a bounds check.
-        let quad = u32::from_le_bytes(chunk);
-        counts[(quad & 0xFF) as usize] += 1;
-        counts[((quad >> 8) & 0xFF) as usize] += 1;
-        counts[((quad >> 16) & 0xFF) as usize] += 1;
-        counts[(quad >> 24) as usize] += 1;
+    // Whether `quad` repeats the one held in its slot; records it when it
+    // does not. On a hit the slot already holds `quad`, so it is left alone.
+    let mut seen = |quad: u32| {
         // Top `INCOMPRESSIBLE_REPEAT_TABLE_BITS` bits of the 32-bit hash give
-        // the slot directly: the `as usize` value is `< 2^32`, so the shift
-        // by `32 - BITS` already yields an index in `0..TABLE_LEN`. No mask
-        // needed (upstream zstd `ZSTD_hashPtr` shape).
+        // the slot directly (upstream zstd `ZSTD_hashPtr` shape).
         let slot = (quad.wrapping_mul(INCOMPRESSIBLE_REPEAT_HASH_MULT)
             >> (32 - INCOMPRESSIBLE_REPEAT_TABLE_BITS)) as usize;
         let word = slot / 32;
         let bit = 1_u32 << (slot % 32);
-        // SAFETY: the occupancy bit is set only in the arm below, right after
-        // that slot is written, so a set bit means an initialised slot.
+        // SAFETY: the occupancy bit is set only below, right after that slot is
+        // written, so a set bit means an initialised slot.
         if repeat_occupied[word] & bit != 0 && unsafe { repeat_table[slot].assume_init() } == quad {
-            *repeats += 1;
-            if *repeats > repeat_guard {
-                return true;
-            }
+            true
         } else {
             repeat_table[slot] = MaybeUninit::new(quad);
             repeat_occupied[word] |= bit;
+            false
+        }
+    };
+    // Two quads per iteration, in order: the second's slot may be the one the
+    // first just wrote, as in a one-at-a-time walk.
+    let (pairs, rest) = sample.as_chunks::<8>();
+    for &pair in pairs {
+        let word = u64::from_le_bytes(pair);
+        *repeats += usize::from(seen(word as u32));
+        *repeats += usize::from(seen((word >> 32) as u32));
+        if *repeats > repeat_guard {
+            return true;
         }
     }
-    // Tail bytes that don't form a full quad still count toward the symbol
-    // histogram used by the final distinct / max-frequency verdict.
-    for &byte in tail {
-        counts[byte as usize] += 1;
+    if let Some(&quad) = rest.as_chunks::<4>().0.first() {
+        *repeats += usize::from(seen(u32::from_le_bytes(quad)));
     }
-    false
+    *repeats > repeat_guard
+}
+
+/// Add every byte of `sample` to `tables`, four tables summed by the caller
+/// (upstream zstd `HIST_count_parallel_wksp`): consecutive bytes land in
+/// different tables, so a run of one byte does not chain every increment on
+/// the one before it through the same counter.
+#[inline]
+fn count_bytes(sample: &[u8], tables: &mut [[u32; 256]; 4]) {
+    let (stripes, tail) = sample.as_chunks::<16>();
+    for &stripe in stripes {
+        let lo = u64::from_le_bytes(stripe[..8].try_into().expect("eight bytes"));
+        let hi = u64::from_le_bytes(stripe[8..].try_into().expect("eight bytes"));
+        for word in [lo, hi] {
+            for half in [word as u32, (word >> 32) as u32] {
+                tables[0][(half & 0xFF) as usize] += 1;
+                tables[1][((half >> 8) & 0xFF) as usize] += 1;
+                tables[2][((half >> 16) & 0xFF) as usize] += 1;
+                tables[3][(half >> 24) as usize] += 1;
+            }
+        }
+    }
+    for &byte in tail {
+        tables[0][usize::from(byte)] += 1;
+    }
 }
 
 #[inline]
@@ -977,24 +998,21 @@ fn sample_looks_incompressible(block: &[u8]) -> bool {
 
     // `repeat_guard` is the FINAL verdict threshold, fixed before scanning.
     // It needs the total 4-byte-quad count up front (one quad per 4 bytes of
-    // each region) so `scan_sample_region` can bail the moment the running
+    // each region) so `count_quad_repeats` can bail the moment the running
     // repeat count passes it.
     let max_symbol_guard = sample_len / INCOMPRESSIBLE_MAX_SYMBOL_DIVISOR;
     let total_quads: usize = regions[..region_count].iter().map(|r| r.len() / 4).sum();
     let repeat_guard = total_quads / INCOMPRESSIBLE_REPEAT_DIVISOR + 1;
 
-    let mut counts = [0u16; 256];
     let mut repeat_table =
         [const { MaybeUninit::<u32>::uninit() }; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
     // Bitset occupancy keeps this path no_std-friendly while avoiding the
     // larger per-slot bool map (and extra matcher-level scratch state).
     let mut repeat_occupied = [0_u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
     let mut repeats = 0usize;
-
     for region in &regions[..region_count] {
-        if scan_sample_region(
+        if count_quad_repeats(
             region,
-            &mut counts,
             &mut repeat_table,
             &mut repeat_occupied,
             &mut repeats,
@@ -1006,11 +1024,19 @@ fn sample_looks_incompressible(block: &[u8]) -> bool {
         }
     }
 
-    let distinct = counts.iter().filter(|&&count| count != 0).count();
-    let max_freq = counts.iter().copied().max().unwrap_or(0) as usize;
-    distinct >= INCOMPRESSIBLE_MIN_DISTINCT_BYTES
-        && max_freq <= max_symbol_guard
-        && repeats <= repeat_guard
+    let mut tables = [[0u32; 256]; 4];
+    for region in &regions[..region_count] {
+        count_bytes(region, &mut tables);
+    }
+    let [first, second, third, fourth] = &tables;
+    let mut distinct = 0usize;
+    let mut max_freq = 0u32;
+    for (((a, b), c), d) in first.iter().zip(second).zip(third).zip(fourth) {
+        let count = a + b + c + d;
+        distinct += usize::from(count != 0);
+        max_freq = max_freq.max(count);
+    }
+    distinct >= INCOMPRESSIBLE_MIN_DISTINCT_BYTES && max_freq as usize <= max_symbol_guard
 }
 
 #[cfg(test)]
