@@ -1455,14 +1455,22 @@ fn block_zero_prologue_preserves_default_rep_offset_one() {
     );
 }
 
-/// Tags go on from a table fill of exactly 3/2, `2 * input / (step << log)`:
-/// at step 8 over 4096 slots that is 24 KiB of input, and one byte less stays
-/// bare. The input size may be anything up to `usize::MAX` without overflow.
+/// Tags go on from a table fill `2 * input / (step << log)` of exactly 3/2 on
+/// a 64-bit target and 5/4 on a 32-bit one: at step 8 over 4096 slots that is
+/// 18 KiB and 20 KiB of input, and one byte less stays bare. The input size
+/// may be anything up to `usize::MAX` without overflow.
 #[test]
-fn fast_tags_start_at_a_fill_of_three_halves() {
-    let threshold = 3 * 8 * 4096 / 4;
+fn fast_tags_start_at_the_target_fill() {
+    let threshold = if cfg!(target_pointer_width = "32") {
+        5 * 8 * 4096 / 8
+    } else {
+        3 * 8 * 4096 / 4
+    };
     assert!(fast_slots_pay_for_tags(threshold, 8, 12));
     assert!(!fast_slots_pay_for_tags(threshold - 1, 8, 12));
-    assert!(fast_slots_pay_for_tags(usize::MAX, 131_074, 30));
+    // Extremes on either side of the comparison must not overflow, on a 32-bit
+    // `usize` as on a 64-bit one.
+    assert!(fast_slots_pay_for_tags(usize::MAX, 2, 30));
+    assert!(!fast_slots_pay_for_tags(1, usize::MAX, 30));
     assert!(!fast_slots_pay_for_tags(0, 2, 10));
 }

@@ -123,17 +123,30 @@ const INITIAL_PREFIX_START_INDEX: u32 = 1;
 /// so the gate is how full the scan leaves the table. The scan stores two
 /// positions per `step_size` bytes, so `expected_input` bytes fill
 /// `2 * expected_input / (step_size << hash_log)` of it, and the tags go on
-/// from a fill of 3/2. Upstream zstd's no-dictionary Fast table carries none
-/// (`zstd_fast.c`, `ZSTD_compressBlock_fast_noDict_generic`).
-///
-/// Measured (x86_64, bare against tagged): a fill of 0.31 (10 KiB at levels
-/// 1 and -7) and 1.25 (20 KiB at level -7) ran 3-11% faster bare; 2.0 (32 KiB
-/// at -7) and up ran 7-16% faster tagged.
+/// from [`FAST_TAG_MIN_FILL`]. Upstream zstd's no-dictionary Fast table
+/// carries none (`zstd_fast.c`, `ZSTD_compressBlock_fast_noDict_generic`).
 fn fast_slots_pay_for_tags(expected_input: usize, step_size: usize, hash_log: u32) -> bool {
-    // fill >= 3/2  <=>  4 * input >= 3 * step * slots, in u128 so no factor
-    // overflows whatever the input size.
-    4 * expected_input as u128 >= 3 * step_size as u128 * (1u128 << hash_log)
+    let (num, den) = FAST_TAG_MIN_FILL;
+    // fill >= num/den  <=>  2 * den * input >= num * step * slots, in u128 so
+    // no factor overflows whatever the input size.
+    2 * den * expected_input as u128 >= num * step_size as u128 * (1u128 << hash_log)
 }
+
+/// Table fill, as `(numerator, denominator)`, from which Fast slots are tagged.
+///
+/// Measured on x86_64 (bare against tagged): a fill of 0.31 (10 KiB at levels
+/// 1 and -7) and 1.25 (20 KiB at -7, 10 KiB at -1) ran 3-11% faster bare; 2.0
+/// (32 KiB at -7) and up ran 7-16% faster tagged.
+#[cfg(not(target_pointer_width = "32"))]
+const FAST_TAG_MIN_FILL: (u128, u128) = (3, 2);
+
+/// Table fill, as `(numerator, denominator)`, from which Fast slots are tagged.
+///
+/// Measured on i686: at a fill of 1.25 (20 KiB at level -7, 10 KiB at -1) the
+/// tagged table ran 2% faster, where x86_64 ran it 3-11% slower; with seven
+/// general registers the candidate load a tag skips costs more.
+#[cfg(target_pointer_width = "32")]
+const FAST_TAG_MIN_FILL: (u128, u128) = (5, 4);
 
 /// What a reset does with a hash table that continues the previous frame's
 /// (a new table always starts empty).

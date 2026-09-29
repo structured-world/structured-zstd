@@ -5344,9 +5344,11 @@ fn a_borrowed_slice_past_the_tagged_range_is_laid_out_untagged() {
 
 /// A short-cache tag pays only when a probe tends to land on a slot another
 /// position holds, which takes a table the scan fills past what a sparse
-/// step writes: a 20 KiB frame at level -7 (step 8, 4096 slots) keeps bare
-/// slots, a 32 KiB frame at the same level and a 20 KiB frame at level 1 are
-/// tagged, and a 10 KiB frame at level 1 (32768 slots) stays bare.
+/// step writes: a 32 KiB frame at level -7 and a 20 KiB frame at level 1 are
+/// tagged, a 10 KiB frame at level 1 (32768 slots) stays bare, and a fill of
+/// 5/4 (20 KiB at level -7, step 8, 4096 slots; 10 KiB at level -1) is tagged
+/// only on a 32-bit target, whose tighter register file makes the skipped
+/// candidate load worth more.
 #[test]
 fn fast_slots_are_tagged_by_how_full_the_scan_leaves_the_table() {
     use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
@@ -5358,7 +5360,17 @@ fn fast_slots_are_tagged_by_how_full_the_scan_leaves_the_table() {
         driver.reset_in_workspace(CompressionLevel::from_level(level), &mut context);
         driver.simple_mut().slots_tagged()
     };
-    assert!(!tagged(-7, 20 * 1024), "level -7, 20 KiB: sparse table");
+    let five_quarters_tagged = cfg!(target_pointer_width = "32");
+    assert_eq!(
+        tagged(-7, 20 * 1024),
+        five_quarters_tagged,
+        "level -7, 20 KiB"
+    );
+    assert_eq!(
+        tagged(-1, 10 * 1024),
+        five_quarters_tagged,
+        "level -1, 10 KiB"
+    );
     assert!(tagged(-7, 32 * 1024), "level -7, 32 KiB: filled table");
     assert!(tagged(1, 20 * 1024), "level 1, 20 KiB: filled table");
     assert!(!tagged(1, 10 * 1024), "level 1, 10 KiB: sparse table");
