@@ -447,7 +447,12 @@ pub(crate) struct PrefixBounds {
 ///
 /// `TAGGED` selects the slot format of `hash_table` (see
 /// [`FastHashTable::is_tagged`]); the caller dispatches on it.
-#[inline(always)]
+///
+/// Each monomorph is a function of its own, as upstream zstd generates one per
+/// (mls, cmov) (`zstd_fast.c`, `ZSTD_GEN_FAST_FN`): inlined into the dispatcher,
+/// every combination shares one frame and one register allocation, and the
+/// scan loop spills on a 32-bit target.
+#[inline(never)]
 pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TAGGED: bool>(
     data: &[u8],
     block_start: usize,
