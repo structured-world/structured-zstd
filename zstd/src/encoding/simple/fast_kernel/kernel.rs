@@ -718,20 +718,6 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             },
         }
         let found: Option<MatchFound> = loop {
-            // Repcode probe at ip2 (upstream zstd line 268). Unconditional
-            // load — upstream zstd `MEM_read32(ip2 - rep_offset1)` always
-            // reads, no `rep_offset1 > 0` short-circuit. Safe even
-            // when rep_offset1 == 0 because `ip2 - 0 = ip2`, which
-            // reads the same 4 bytes as the equality target below
-            // (so the comparison degrades to `read32(ip2) ==
-            // read32(ip2)` and the rep branch is correctly suppressed
-            // by the `rep_offset1 > 0` guard inside the `if`).
-            // SAFETY: ip2 < ilimit ⇒ ≥ 4 readable bytes at ip2; if
-            // rep_offset1 > 0 the save/restore prologue ensures
-            // `ip2 - rep_offset1 >= prefix_start_index >= 1`, so the
-            // backward read stays in-bounds.
-            let rval = unsafe { read32(base.add(ip2 - rep_offset1 as usize)) };
-
             // Writeback hash for ip0 (upstream zstd line 272). Upstream zstd writes
             // BEFORE the rep probe so the hash table reflects ip0
             // even if the iteration's match comes from rep at ip2.
@@ -743,17 +729,16 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
                     slot_value::<TAGGED>(ip0, hash0)
             };
 
-            // Repcode-at-ip2 check. Bitwise `&` (not short-circuit `&&`)
-            // so both operands evaluate unconditionally — the
-            // `read32(ip2)` load is always safe (`ip2 < ilimit` by the
-            // loop invariant `ip3 <= ilimit` with `ip2 < ip3`, and
-            // `ilimit = iend - HASH_READ_SIZE = iend - 8`, so
-            // `ip2 + 4 < iend`) and `rval` is already loaded above, so
-            // dropping the branch on `rep_offset1 > 0` lets the optimizer
-            // fold the combined predicate into a branchless compare (the
-            // upstream zstd/reference shape) instead of a short-circuit branch
-            // before the load.
-            if (rep_offset1 > 0) & (unsafe { read32(base.add(ip2)) } == rval) {
+            // Repcode-at-ip2 check (upstream zstd line 268-275). An invalid
+            // repcode leaves as a branch before either load: zero only until
+            // the block's first match, so it predicts.
+            // SAFETY: ip2 < ilimit ⇒ ≥ 4 readable bytes at ip2; with
+            // rep_offset1 > 0 the save/restore prologue ensures
+            // `ip2 - rep_offset1 >= prefix_start_index >= 1`, so the
+            // backward read stays in-bounds.
+            if rep_offset1 > 0
+                && unsafe { read32(base.add(ip2)) == read32(base.add(ip2 - rep_offset1 as usize)) }
+            {
                 // Repcode match. ip0 fast-forwards to ip2; backward-
                 // extend by 1 if the byte before ip2 also matches.
                 // Upstream zstd's `mLength = ip0[-1] == match0[-1]` is a
