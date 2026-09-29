@@ -760,6 +760,9 @@ const INCOMPRESSIBLE_MIN_DISTINCT_BYTES: usize = 200;
 const INCOMPRESSIBLE_MAX_SYMBOL_DIVISOR: usize = 24;
 // Allow limited 4-byte hash-bucket repeats before treating the sample as structured.
 const INCOMPRESSIBLE_REPEAT_DIVISOR: usize = 64;
+/// Shortest sample counted into four byte tables rather than one (upstream
+/// zstd `HIST_countFast_wksp`'s threshold).
+const PARALLEL_HISTOGRAM_MIN_LEN: usize = 1500;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StrictProbeSelection {
@@ -1024,19 +1027,35 @@ fn sample_looks_incompressible(block: &[u8]) -> bool {
         }
     }
 
+    let looks_random = |counts: &[u32; 256]| {
+        let mut distinct = 0usize;
+        let mut max_freq = 0u32;
+        for &count in counts {
+            distinct += usize::from(count != 0);
+            max_freq = max_freq.max(count);
+        }
+        distinct >= INCOMPRESSIBLE_MIN_DISTINCT_BYTES && max_freq as usize <= max_symbol_guard
+    };
+    // Below this the three extra tables cost more to clear and fold than the
+    // chains they break save (upstream zstd `HIST_countFast_wksp`, hist.c:154).
+    if sample_len < PARALLEL_HISTOGRAM_MIN_LEN {
+        let mut counts = [0u32; 256];
+        for region in &regions[..region_count] {
+            for &byte in *region {
+                counts[usize::from(byte)] += 1;
+            }
+        }
+        return looks_random(&counts);
+    }
     let mut tables = [[0u32; 256]; 4];
     for region in &regions[..region_count] {
         count_bytes(region, &mut tables);
     }
-    let [first, second, third, fourth] = &tables;
-    let mut distinct = 0usize;
-    let mut max_freq = 0u32;
-    for (((a, b), c), d) in first.iter().zip(second).zip(third).zip(fourth) {
-        let count = a + b + c + d;
-        distinct += usize::from(count != 0);
-        max_freq = max_freq.max(count);
+    let [total, second, third, fourth] = &mut tables;
+    for (((a, b), c), d) in total.iter_mut().zip(&*second).zip(&*third).zip(&*fourth) {
+        *a += b + c + d;
     }
-    distinct >= INCOMPRESSIBLE_MIN_DISTINCT_BYTES && max_freq as usize <= max_symbol_guard
+    looks_random(total)
 }
 
 #[cfg(test)]

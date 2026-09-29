@@ -570,6 +570,8 @@ fn the_rewritten_scan_decides_every_block_as_before() {
         1000,
         1024,
         1027,
+        PARALLEL_HISTOGRAM_MIN_LEN - 1,
+        PARALLEL_HISTOGRAM_MIN_LEN,
         RAW_FAST_PATH_MAX_SAMPLE_LEN - 1,
         RAW_FAST_PATH_MAX_SAMPLE_LEN,
         RAW_FAST_PATH_MAX_SAMPLE_LEN + 1,
