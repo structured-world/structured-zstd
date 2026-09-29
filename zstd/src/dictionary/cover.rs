@@ -320,8 +320,9 @@ impl Rolling {
 /// counted once per sample it lies wholly inside.
 ///
 /// Memory stays within a few words per position however many distinct dmers
-/// there are: a slot holds only the first position of its dmer (its id is
-/// `dmer_at` there, and its key is read back from `data`), and the sample a
+/// there are: a slot holds the first position of its dmer (its id is
+/// `dmer_at` there, and its bytes are read back from `data`), plus a long
+/// dmer's fingerprint, and the sample a
 /// dmer was last counted in lives in the window-count field it returns zeroed.
 fn index_dmers<const LONG: bool>(
     data: &[u8],
@@ -350,26 +351,22 @@ fn index_dmers<const LONG: bool>(
             short_key(data, pos, mask)
         }
     };
-    // Whether the dmer first seen at `first` is the one at `pos`, whose tag is
-    // `tag`: a short dmer's tag is its whole key, a long one's only a hash.
-    let same_dmer = |first: usize, pos: usize, tag: u64| {
+    // Slots hold the first position of a dmer; positions fit `u32` below
+    // `EMPTY`, which the caller's size check guarantees. A long dmer's slot
+    // also keeps its fingerprint beside it, so a probe compares bytes only
+    // when the fingerprints agree and a rebuild never re-rolls one; a short
+    // dmer's key is one word read back from `data`.
+    let mut slots: Vec<u32> = vec![EMPTY; 1 << 12];
+    let mut fingerprints: Vec<u64> = if LONG { vec![0; 1 << 12] } else { Vec::new() };
+    // Whether the dmer in `slot`, first seen at `first`, is the one at `pos`,
+    // whose tag is `tag`.
+    let same_dmer = |fingerprints: &[u64], slot: usize, first: usize, pos: usize, tag: u64| {
         if LONG {
-            data[first..first + d] == data[pos..pos + d]
+            fingerprints[slot] == tag && data[first..first + d] == data[pos..pos + d]
         } else {
             short_key(data, first, mask) == tag
         }
     };
-    // The tag of a dmer from its first position alone, for a table rebuild.
-    let tag_of = |first: usize| {
-        if LONG {
-            Rolling::at(data, first, d).fingerprint
-        } else {
-            short_key(data, first, mask)
-        }
-    };
-    // Slots hold the first position of a dmer; positions fit `u32` below
-    // `EMPTY`, which the caller's size check guarantees.
-    let mut slots: Vec<u32> = vec![EMPTY; 1 << 12];
     let mut shift = 64 - 12;
     // `active` holds the last sample a dmer was counted in until the end.
     let mut dmers: Vec<DmerState> = Vec::new();
@@ -383,7 +380,7 @@ fn index_dmers<const LONG: bool>(
         while offsets[sample + 1] <= pos {
             sample += 1;
         }
-        let mask = slots.len() - 1;
+        let slot_mask = slots.len() - 1;
         let tag = tag_at(&rolling, pos);
         let mut slot = (tag.wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
         let id = loop {
@@ -391,16 +388,19 @@ fn index_dmers<const LONG: bool>(
             if first == EMPTY {
                 let id = dmers.len() as u32;
                 slots[slot] = pos as u32;
+                if LONG {
+                    fingerprints[slot] = tag;
+                }
                 dmers.push(DmerState {
                     freq: 0,
                     active: EMPTY,
                 });
                 break id;
             }
-            if same_dmer(first as usize, pos, tag) {
+            if same_dmer(&fingerprints, slot, first as usize, pos, tag) {
                 break dmer_at[first as usize];
             }
-            slot = (slot + 1) & mask;
+            slot = (slot + 1) & slot_mask;
         };
         // A dmer spilling into the next sample exists only in the
         // concatenation, so it earns nothing.
@@ -418,13 +418,28 @@ fn index_dmers<const LONG: bool>(
             let len = slots.len() * 2;
             shift -= 1;
             let old = core::mem::replace(&mut slots, vec![EMPTY; len]);
-            for &first in old.iter().filter(|&&first| first != EMPTY) {
-                let mut slot =
-                    (tag_of(first as usize).wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
+            let old_fingerprints = if LONG {
+                core::mem::replace(&mut fingerprints, vec![0; len])
+            } else {
+                Vec::new()
+            };
+            for (at, &first) in old.iter().enumerate() {
+                if first == EMPTY {
+                    continue;
+                }
+                let tag = if LONG {
+                    old_fingerprints[at]
+                } else {
+                    short_key(data, first as usize, mask)
+                };
+                let mut slot = (tag.wrapping_mul(HASH_MULTIPLIER) >> shift) as usize;
                 while slots[slot] != EMPTY {
                     slot = (slot + 1) & (len - 1);
                 }
                 slots[slot] = first;
+                if LONG {
+                    fingerprints[slot] = tag;
+                }
             }
         }
     }
