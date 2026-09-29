@@ -250,7 +250,7 @@ fn an_archive_built_from_two_dictionaries_names_neither() {
     /// One frame primed with a dictionary carrying `id`.
     fn frame_with_dictionary(id: u32, payload: &[u8]) -> Vec<u8> {
         use structured_zstd::dictionary::{
-            FastCoverOptions, FinalizeOptions, create_fastcover_dict_from_slice,
+            CoverOptions, FastCoverOptions, FinalizeOptions, train_fastcover_dict,
         };
         // Trained rather than assembled: a serialized dictionary carries
         // entropy tables, and the id the frame header records lives in its
@@ -258,12 +258,18 @@ fn an_archive_built_from_two_dictionaries_names_neither() {
         let corpus: Vec<u8> = (0..40_000u32)
             .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
             .collect();
-        let mut blob = Vec::new();
-        create_fastcover_dict_from_slice(
+        let options = FastCoverOptions {
+            cover: CoverOptions {
+                k: 256,
+                ..FastCoverOptions::default().cover
+            },
+            ..FastCoverOptions::default()
+        };
+        let blob = train_fastcover_dict(
             corpus.as_slice(),
-            &mut blob,
+            &[4_000; 10],
             8 * 1024,
-            &FastCoverOptions::default(),
+            &options,
             FinalizeOptions { dict_id: Some(id) },
         )
         .expect("training the fixture dictionary must succeed");
@@ -592,27 +598,140 @@ fn training_refuses_to_write_over_its_own_sample() {
     assert_eq!(survived.len(), 4096, "the sample must still be there");
 }
 
-/// A dictionary cannot be smaller than its own header plus the offset history
-/// the format requires, so `--maxdict=1` can only fail. Discovering that after
-/// reading the corpus spends the whole input's I/O and memory on a command that
-/// was never going to produce anything — the test names a sample that cannot be
-/// read, so only a check made first can be what answers.
+/// Every trainer refuses a dictionary under 256 bytes, so `--maxdict=255` or
+/// less can only fail. Discovering that after reading the corpus spends the
+/// whole input's I/O and memory on a command that was never going to produce
+/// anything — the test names a sample that cannot be read, so only a check made
+/// first can be what answers. Checked for each trainer.
 #[test]
 fn an_impossible_dictionary_size_is_refused_before_the_samples_are_read() {
     let missing = std::env::temp_dir().join(format!("szstd-nosuch-{}", std::process::id()));
     let _ = fs::remove_file(&missing);
 
-    let mut opts = parse(&["--train", "--maxdict=1", "-o", "d", "s"]).unwrap();
-    opts.inputs = vec![missing];
-    opts.output = Some(std::env::temp_dir().join(format!("szstd-nodict-{}", std::process::id())));
+    for (trainer, max_dict) in [
+        ("--train", "--maxdict=1"),
+        ("--train", "--maxdict=255"),
+        ("--train-cover", "--maxdict=255"),
+        ("--train-legacy", "--maxdict=255"),
+    ] {
+        let mut opts = parse(&[trainer, max_dict, "-o", "d", "s"]).unwrap();
+        opts.inputs = vec![missing.clone()];
+        opts.output =
+            Some(std::env::temp_dir().join(format!("szstd-nodict-{}", std::process::id())));
+        let err = train_dictionary(&opts)
+            .expect_err("no trainer builds a dictionary that small")
+            .to_string();
+
+        assert!(
+            err.contains("--maxdict"),
+            "{trainer} {max_dict}: the size must be what is refused, before the unreadable sample: {err}"
+        );
+    }
+}
+
+/// Tuning no segment of which fits the dictionary can only fail, and that is
+/// known from the command line: it is refused before the samples are read.
+/// The sample named cannot be read, so only a check made first can answer.
+#[test]
+fn tuning_that_fits_no_dictionary_is_refused_before_the_samples_are_read() {
+    let missing = std::env::temp_dir().join(format!("szstd-nosuch-tune-{}", std::process::id()));
+    let _ = fs::remove_file(&missing);
+
+    for tuning in [
+        "--train-cover=k=8192,d=8",
+        "--train-fastcover=k=8192,d=8",
+        // The default `k` search tops out at 2000, below a `d` of 2048.
+        "--train-cover=d=2048",
+    ] {
+        let mut opts = parse(&[tuning, "--maxdict=4096", "-o", "d", "s"]).unwrap();
+        opts.inputs = vec![missing.clone()];
+        opts.output =
+            Some(std::env::temp_dir().join(format!("szstd-nodict-tune-{}", std::process::id())));
+        let err = train_dictionary(&opts)
+            .expect_err("no segment fits the dictionary")
+            .to_string();
+
+        assert!(
+            err.starts_with("dictionary training failed:"),
+            "{tuning}: the tuning must be what is refused, before the unreadable sample: {err}"
+        );
+    }
+}
+
+/// Six samples pass the count every trainer needs, but the default search
+/// builds from three quarters of them, four, which is too few: that is known
+/// from the files' sizes, so it is refused before any is read. The samples
+/// cannot be opened, so only a check made first can answer; run with the
+/// rights to open them anyway, the refusal comes after loading, with the same
+/// cause.
+#[cfg(unix)]
+#[test]
+fn a_split_that_leaves_too_few_samples_is_refused_before_they_are_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Scratch::new("split-too-few");
+    let mut inputs = Vec::new();
+    for i in 0..6 {
+        let sample = dir.file(&format!("s{i}"), &vec![b'a' + i as u8; 1000]);
+        fs::set_permissions(&sample, fs::Permissions::from_mode(0o000)).unwrap();
+        inputs.push(sample);
+    }
+    let mut opts = parse(&["--train", "--maxdict=4096", "-o", "d", "s"]).unwrap();
+    opts.inputs = inputs;
+    opts.output = Some(dir.path().join("dictionary"));
     let err = train_dictionary(&opts)
-        .expect_err("one byte cannot hold a dictionary")
+        .expect_err("four samples build no dictionary")
         .to_string();
 
     assert!(
-        err.contains("--maxdict"),
-        "the size must be what is refused, before the unreadable sample: {err}"
+        err.starts_with("dictionary training failed:") && err.contains("too few"),
+        "the split must be what is refused, before the unreadable samples: {err}"
     );
+}
+
+/// Eight samples are enough for the default search, but a memory limit that
+/// keeps two of them is not, and which ones fit is known from the files'
+/// sizes: the run is refused before any is read, not after the limit's worth
+/// has been loaded. The samples cannot be opened, so only a check made first
+/// can answer.
+#[cfg(unix)]
+#[test]
+fn a_memory_limit_that_keeps_too_few_samples_is_refused_before_they_are_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Scratch::new("limit-too-few");
+    let mut inputs = Vec::new();
+    for i in 0..8 {
+        let sample = dir.file(&format!("s{i}"), &vec![b'a' + i as u8; 1000]);
+        fs::set_permissions(&sample, fs::Permissions::from_mode(0o000)).unwrap();
+        inputs.push(sample);
+    }
+    let mut opts = parse(&["--train", "--maxdict=4096", "-o", "d", "s"]).unwrap();
+    opts.inputs = inputs;
+    opts.output = Some(dir.path().join("dictionary"));
+    // Room for two samples and their recorded lengths.
+    opts.memory_limit = Some(2500);
+    let err = train_dictionary(&opts)
+        .expect_err("two samples build no dictionary")
+        .to_string();
+
+    assert!(
+        err.contains("too few"),
+        "the retained count must be what is refused, before the unreadable samples: {err}"
+    );
+}
+
+/// The split a tuning report shows is the percentage it was given as, for
+/// every percentage: `29 / 100.0 * 100.0` is 28.999..., which a truncating
+/// conversion reported as 28.
+#[test]
+fn the_reported_split_is_the_percentage_given() {
+    for percent in 0..=100u32 {
+        let params = TrainerParams {
+            split_percent: Some(percent),
+            ..TrainerParams::default()
+        };
+        let options = cover_tuning(&params, 3, "--train-cover").unwrap();
+        assert_eq!(split_percent(options.split_point), percent);
+    }
 }
 
 /// `-c` and `-o` clear one another, so `--train -o wanted.dict -c` leaves no
@@ -896,7 +1015,8 @@ fn a_trained_dictionary_is_no_more_readable_than_its_samples() {
     fs::set_permissions(&open, fs::Permissions::from_mode(0o644)).unwrap();
     fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let mut opts = parse(&["--train", "-f", "s"]).unwrap();
+    // Cut into samples: a trainer needs at least five.
+    let mut opts = parse(&["--train", "-f", "-B4096", "s"]).unwrap();
     opts.inputs = vec![open.clone(), private.clone()];
     opts.output = Some(output.clone());
     let trained = train_dictionary(&opts);
@@ -975,7 +1095,7 @@ fn training_sample_sizes_count_against_the_budget() {
     let input = std::env::temp_dir().join(format!("szstd-train-b1-{}", std::process::id()));
     fs::write(&input, [3u8; 64]).unwrap();
 
-    let set = load_training_samples(std::slice::from_ref(&input), Some(1), Some(200));
+    let set = load_training_samples(std::slice::from_ref(&input), Some(1), Some(200), |_| Ok(()));
 
     let _ = fs::remove_file(&input);
     let set = set.expect("the samples load within the budget");
@@ -1015,6 +1135,7 @@ fn a_block_size_at_the_top_of_the_range_loads_whole_files() {
         ],
         Some(u64::MAX),
         None,
+        |_| Ok(()),
     );
 
     let _ = fs::remove_file(&input);
@@ -1023,14 +1144,16 @@ fn a_block_size_at_the_top_of_the_range_loads_whole_files() {
 }
 
 /// File sizes that add up past `u64::MAX` (sparse files report any length) are
-/// summed exactly rather than wrapped or stopped at a bound: both the byte
-/// total and the sample count are the true ones.
+/// counted exactly rather than wrapped or stopped at a bound, and a plan over
+/// them stays within its budget.
 #[test]
 fn training_sizes_past_the_integer_range_do_not_wrap() {
     let huge = u64::MAX / 2 + 1;
-    let (samples, wanted) = training_extent(&[huge, huge, 0], Some(4096));
-    assert_eq!(wanted, 2 * u128::from(huge));
+    let samples = training_extent(&[huge, huge, 0], Some(4096));
     assert_eq!(samples, 2 * u128::from(huge.div_ceil(4096)));
+    let (plan, bytes) = plan_training_load(&[huge, huge, 0], Some(4096), 1 << 20, samples);
+    assert!(bytes + plan.iter().sum::<u64>() * TRAINING_SIZE_ENTRY <= 1 << 20);
+    assert_eq!(plan[1..], [0, 0], "loading stops inside the first file");
 }
 
 /// A benchmark input that shrank between being sized and being read is
@@ -1198,7 +1321,8 @@ fn replacing_a_file_does_not_restore_its_old_permissions() {
     fs::set_permissions(&sample, fs::Permissions::from_mode(0o600)).unwrap();
     fs::set_permissions(&dictionary, fs::Permissions::from_mode(0o644)).unwrap();
 
-    let mut opts = parse(&["--train", "-f", "s"]).unwrap();
+    // Cut into samples: a trainer needs at least five.
+    let mut opts = parse(&["--train", "-f", "-B4096", "s"]).unwrap();
     opts.inputs = vec![sample.clone()];
     opts.output = Some(dictionary.clone());
     let trained = train_dictionary(&opts);
@@ -1905,11 +2029,11 @@ fn training_samples_are_loaded_the_way_the_reference_loads_them() {
     let inputs = vec![big.clone(), small.clone(), empty.clone()];
 
     assert!(
-        load_training_samples(&inputs, None, None).is_err(),
+        load_training_samples(&inputs, None, None, |_| Ok(())).is_err(),
         "two samples are too few"
     );
 
-    let cut = load_training_samples(&inputs, Some(64 << 10), None).unwrap();
+    let cut = load_training_samples(&inputs, Some(64 << 10), None, |_| Ok(())).unwrap();
     let mut sizes = cut.sizes.clone();
     sizes.sort_unstable();
     assert_eq!(
@@ -1922,13 +2046,13 @@ fn training_samples_are_loaded_the_way_the_reference_loads_them() {
     for i in 0..5 {
         many.push(dir.file(&format!("big{i}"), &vec![b'y'; 200 << 10]));
     }
-    let capped = load_training_samples(&many, None, None).unwrap();
+    let capped = load_training_samples(&many, None, None, |_| Ok(())).unwrap();
     assert_eq!(
         capped.sizes,
         vec![128 << 10; 5],
         "each file capped at 128 KiB"
     );
-    let limited = load_training_samples(&many, None, Some(300 << 10)).unwrap();
+    let limited = load_training_samples(&many, None, Some(300 << 10), |_| Ok(())).unwrap();
     assert_eq!(limited.sizes.len(), 2, "-M bounds what is loaded");
 }
 
@@ -4650,26 +4774,34 @@ fn literal_compression_flags_reach_the_frame() {
 }
 
 /// The trainer flags take their tuning the way the reference command reads
-/// it, and the FastCOVER options built from it follow the reference's rules:
-/// both `k` and `d` fix the parameters, `steps` widens the search over `k`,
-/// and a value the trainer cannot take is refused.
+/// it, and the options built from it follow the reference's rules: a value
+/// the trainer cannot take is refused, `shrink` defaults its bound to 1%, and
+/// the scoring level is the command's.
 #[test]
 fn trainer_parameters_parse_and_build_options() {
     let params = parse_trainer_params("k=200,d=8,f=20,steps=4,split=75,accel=2", true).unwrap();
     assert_eq!(
         params,
         TrainerParams {
+            listed: true,
             k: Some(200),
             d: Some(8),
             f: Some(20),
             steps: Some(4),
             split_percent: Some(75),
             accel: Some(2),
-            shrink: false,
+            shrink: None,
         }
     );
-    assert!(parse_trainer_params("shrink", false).unwrap().shrink);
-    assert!(parse_trainer_params("k=50,shrink=2", false).unwrap().shrink);
+    assert_eq!(
+        parse_trainer_params("shrink", false).unwrap().shrink,
+        Some(1)
+    );
+    assert_eq!(
+        parse_trainer_params("k=50,shrink=2", false).unwrap().shrink,
+        Some(2)
+    );
+    assert!(parse_trainer_params("shrink=x", false).is_err());
     assert!(
         parse_trainer_params("f=20", false).is_err(),
         "cover has no f"
@@ -4679,50 +4811,35 @@ fn trainer_parameters_parse_and_build_options() {
     assert!(parse_trainer_params("k=x", true).is_err(), "not a number");
     assert!(parse_trainer_params("zzz=1", true).is_err(), "unknown key");
 
-    let fixed = fastcover_options(&params).unwrap();
-    assert!(!fixed.optimize, "k and d given: nothing to search");
-    assert_eq!((fixed.k, fixed.d, fixed.f, fixed.accel), (200, 8, 20, 2));
-    assert_eq!(fixed.split_point, 0.75);
-
-    let searched = fastcover_options(&TrainerParams {
-        steps: Some(10),
-        ..TrainerParams::default()
-    })
-    .unwrap();
-    assert!(searched.optimize);
+    let fixed = fastcover_options(&params, 5).unwrap();
     assert_eq!(
-        searched.k_candidates.len(),
-        11,
-        "50..=2000 in strides of 195"
+        (fixed.cover.k, fixed.cover.d, fixed.f, fixed.accel),
+        (200, 8, 20, 2)
     );
-    assert_eq!(searched.k_candidates[0], 50);
+    assert_eq!(
+        (
+            fixed.cover.steps,
+            fixed.cover.split_point,
+            fixed.cover.level
+        ),
+        (4, 0.75, 5)
+    );
+    let shrunk = cover_options(
+        &parse_trainer_params("k=64,d=8,shrink=3", false).unwrap(),
+        3,
+    )
+    .unwrap();
+    assert_eq!((shrunk.k, shrunk.d, shrunk.shrink), (64, 8, Some(3)));
 
-    let bad = |params: TrainerParams| fastcover_options(&params).is_err();
-    assert!(bad(TrainerParams {
-        d: Some(7),
-        ..TrainerParams::default()
-    }));
-    assert!(bad(TrainerParams {
-        f: Some(32),
-        ..TrainerParams::default()
-    }));
-    assert!(bad(TrainerParams {
-        accel: Some(11),
-        ..TrainerParams::default()
-    }));
-    assert!(bad(TrainerParams {
-        k: Some(4),
-        d: Some(8),
-        ..TrainerParams::default()
-    }));
-    assert!(bad(TrainerParams {
-        split_percent: Some(101),
-        ..TrainerParams::default()
-    }));
-    assert!(bad(TrainerParams {
-        shrink: true,
-        ..TrainerParams::default()
-    }));
+    let bad =
+        |text: &str| fastcover_options(&parse_trainer_params(text, true).unwrap(), 3).is_err();
+    assert!(bad("d=7"));
+    assert!(bad("f=32"));
+    assert!(bad("accel=11"));
+    assert!(bad("k=4,d=8"));
+    assert!(bad("k=6"), "a search over d reaches 8");
+    assert!(bad("split=101"));
+    assert!(cover_options(&parse_trainer_params("k=4,d=8", false).unwrap(), 3).is_err());
 
     let opts = parse(&["--train-fastcover=k=200,d=8", "s1"]).unwrap();
     assert_eq!(opts.mode, Mode::Train);
@@ -4730,7 +4847,7 @@ fn trainer_parameters_parse_and_build_options() {
     assert_eq!(opts.trainer_params.k, Some(200));
     let opts = parse(&["--train-cover", "s1"]).unwrap();
     assert_eq!(opts.trainer, Trainer::Cover);
-    assert!(opts.trainer_params.is_default());
+    assert_eq!(opts.trainer_params, TrainerParams::default());
     assert_eq!(
         parse(&["--train-legacy", "s1"]).unwrap().trainer,
         Trainer::Legacy
@@ -4781,37 +4898,47 @@ fn a_bare_train_keeps_the_trainer_a_flag_named() {
     );
 }
 
-/// Zero is how the reference's trainer options say "the default": its parser
-/// starts from a zeroed structure and its trainer fills in every zero
-/// (`zdict.h`, `ZDICT_optimizeTrainFromBuffer_fastCover`). So
-/// `k=0,d=0,f=0,steps=0,split=0,accel=0` tunes nothing and trains as the bare
-/// flag does, rather than being refused or narrowing the search.
+/// A listed tuning starts from zero in every knob, as the reference's parser
+/// does (it zeroes the structure first), and zero asks the trainer for its own
+/// default or a search: `--train-fastcover=k=0` searches `d` over 6 and 8 in
+/// forty steps at the trainer's split. Only the bare flag starts from the
+/// command's defaults, `d` of 8 in four steps.
 #[test]
-fn zero_trainer_knobs_ask_for_the_defaults() {
-    use structured_zstd::dictionary::FastCoverOptions;
+fn a_listed_tuning_starts_from_zero() {
+    use structured_zstd::dictionary::{CoverOptions, FastCoverOptions};
 
     let zeros = parse_trainer_params("k=0,d=0,f=0,steps=0,split=0,accel=0", true).unwrap();
-    assert!(zeros.is_default(), "{zeros:?}");
-    let options = fastcover_options(&zeros).expect("zero knobs are valid");
-    let defaults = FastCoverOptions::default();
-    assert!(options.optimize);
-    assert_eq!(options.k_candidates, defaults.k_candidates);
-    assert_eq!(options.d_candidates, defaults.d_candidates);
-    assert_eq!(options.f_candidates, defaults.f_candidates);
+    let options = fastcover_options(&zeros, 3).expect("zero knobs are valid");
     assert_eq!(
-        (options.accel, options.split_point),
-        (defaults.accel, defaults.split_point)
+        (options.cover.k, options.cover.d, options.cover.steps),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        (options.f, options.accel, options.cover.split_point),
+        (0, 0, 0.0)
+    );
+    let bare = fastcover_options(&TrainerParams::default(), 3).unwrap();
+    assert_eq!(
+        bare,
+        FastCoverOptions {
+            cover: CoverOptions {
+                level: 3,
+                ..FastCoverOptions::default().cover
+            },
+            ..FastCoverOptions::default()
+        }
+    );
+    let bare_cover = cover_options(&TrainerParams::default(), 3).unwrap();
+    assert_eq!(
+        bare_cover,
+        CoverOptions {
+            level: 3,
+            ..CoverOptions::default()
+        }
     );
     // A zero beside a real value leaves that value in force.
     let mixed = parse_trainer_params("k=0,d=6", true).unwrap();
     assert_eq!((mixed.k, mixed.d), (None, Some(6)));
-    assert!(
-        parse(&["--train-cover=k=0,d=0,steps=0", "s"])
-            .unwrap()
-            .trainer_params
-            .is_default(),
-        "for COVER too, zero is no tuning"
-    );
 }
 
 /// Whether a trainer takes the tuning it was given is known from the command
@@ -4824,7 +4951,10 @@ fn trainer_tuning_is_refused_before_the_samples_are_read() {
     let scratch = Scratch::new("tuneearly");
     let missing = scratch.path().join("absent-sample");
     for (args, expected) in [
-        (&["--train-cover=k=50", "-q", "s"][..], "takes no tuning"),
+        (
+            &["--train-cover=k=4,d=8", "-q", "s"][..],
+            "k must be at least d",
+        ),
         (
             &["--train-fastcover=d=7", "-q", "s"][..],
             "d must be 6 or 8",
@@ -4840,11 +4970,11 @@ fn trainer_tuning_is_refused_before_the_samples_are_read() {
     }
 }
 
-/// `--train-cover` trains with the COVER trainer and writes a real dictionary;
-/// its reference-side tuning names knobs this trainer does not have, so a
-/// tuned request is refused rather than trained under other terms.
+/// `--train-cover` trains with the COVER trainer and writes a real dictionary,
+/// searching when `k` or `d` is missing and training once when both are
+/// given; `shrink` gives a dictionary no larger than the unshrunk one.
 #[test]
-fn cover_training_writes_a_dictionary_and_refuses_tuning() {
+fn cover_training_writes_a_dictionary_with_or_without_tuning() {
     let scratch = Scratch::new("cover");
     let corpus: Vec<u8> = (0..60_000u32)
         .flat_map(|i| format!("record {} value {}\n", i % 500, (i * 7919) % 1000).into_bytes())
@@ -4852,22 +4982,37 @@ fn cover_training_writes_a_dictionary_and_refuses_tuning() {
     let sample = scratch.file("samples.txt", &corpus);
     let output = scratch.path().join("cover.dict");
 
-    let mut opts = parse(&["--train-cover", "-q", "--maxdict=8192", "s"]).unwrap();
-    opts.inputs = vec![sample.clone()];
-    opts.output = Some(output.clone());
-    train_dictionary(&opts).expect("COVER training succeeds");
-    let dictionary = fs::read(&output).unwrap();
-    assert!(dictionary.len() <= 8192);
-    structured_zstd::decoding::Dictionary::decode_dict(&dictionary)
-        .expect("the output is a finalized dictionary");
-
-    let mut tuned = parse(&["--train-cover=k=50", "-q", "-f", "s"]).unwrap();
-    tuned.inputs = vec![sample];
-    tuned.output = Some(output);
-    let err = train_dictionary(&tuned)
-        .expect_err("tuning the reference's COVER has no meaning here")
-        .to_string();
-    assert!(err.contains("takes no tuning"), "{err}");
+    let mut sizes = Vec::new();
+    for args in [
+        &["--train-cover", "-q", "-f", "-B4096", "--maxdict=8192", "s"][..],
+        &[
+            "--train-cover=k=64,d=8",
+            "-q",
+            "-f",
+            "-B4096",
+            "--maxdict=8192",
+            "s",
+        ],
+        &[
+            "--train-cover=k=64,d=8,shrink=50",
+            "-q",
+            "-f",
+            "-B4096",
+            "--maxdict=8192",
+            "s",
+        ],
+    ] {
+        let mut opts = parse(args).unwrap();
+        opts.inputs = vec![sample.clone()];
+        opts.output = Some(output.clone());
+        train_dictionary(&opts).unwrap_or_else(|err| panic!("{args:?}: {err}"));
+        let dictionary = fs::read(&output).unwrap();
+        assert!(dictionary.len() <= 8192, "{args:?}");
+        structured_zstd::decoding::Dictionary::decode_dict(&dictionary)
+            .expect("the output is a finalized dictionary");
+        sizes.push(dictionary.len());
+    }
+    assert!(sizes[2] <= sizes[1], "{sizes:?}");
 }
 
 /// `--patch-from REF` compresses against the reference as raw content with a

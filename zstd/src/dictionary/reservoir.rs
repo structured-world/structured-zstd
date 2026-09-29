@@ -1,4 +1,4 @@
-use super::cover::K;
+use super::lmc::K;
 use alloc::vec::Vec;
 use core::f64::consts::E;
 use fastrand;

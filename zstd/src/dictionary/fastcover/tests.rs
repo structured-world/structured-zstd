@@ -1,160 +1,87 @@
 use super::*;
+use alloc::vec;
 use std::format;
 
-fn corpus() -> Vec<u8> {
+fn lines(count: u32) -> (Vec<u8>, Vec<usize>) {
     let mut data = Vec::new();
-    for i in 0..500u32 {
-        data.extend_from_slice(
-            format!("tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbccccdddd\n")
-                .as_bytes(),
-        );
+    let mut sizes = Vec::new();
+    for i in 0..count {
+        let line =
+            format!("tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbccccdddd\n");
+        sizes.push(line.len());
+        data.extend_from_slice(line.as_bytes());
     }
-    data
+    (data, sizes)
 }
 
+/// A dmer is counted only where it lies wholly inside one sample (upstream
+/// zstd `FASTCOVER_computeFrequency`): the positions whose read crosses into
+/// the next sample are left out, so five 9-byte samples at `d = 8` count two
+/// positions each, not the 38 the concatenation holds.
 #[test]
-fn fastcover_raw_produces_non_empty_dict() {
-    let sample = corpus();
-    let dict = train_fastcover_raw(
-        sample.as_slice(),
-        4096,
-        FastCoverParams {
-            k: 256,
-            d: 8,
-            f: 20,
-            accel: 1,
-        },
-    )
-    .unwrap();
-    assert!(!dict.is_empty());
-    assert!(dict.len() <= 4096);
+fn dmers_are_counted_inside_their_sample_only() {
+    let data: Vec<u8> = (0u8..45).collect();
+    let set = SampleSet::new(&data, &[9; 5]).unwrap();
+    let ctx = FastCoverContext::new(&set, 5, 8, 20, 1).unwrap();
+    assert_eq!(ctx.freqs.iter().map(|&c| u64::from(c)).sum::<u64>(), 10);
+    assert_eq!(ctx.nb_dmers, 45 - 8 + 1);
 }
 
+/// `accel` counts every `accel`-th position of each sample, and draws the
+/// entropy tables from the share of samples upstream's table gives it.
 #[test]
-fn fastcover_raw_returns_empty_for_empty_or_zero_budget() {
-    let sample = corpus();
-    let params = FastCoverParams {
-        k: 256,
-        d: 8,
-        f: 20,
-        accel: 1,
-    };
-    assert!(train_fastcover_raw(&[], 1024, params).unwrap().is_empty());
-    assert!(
-        train_fastcover_raw(sample.as_slice(), 0, params)
+fn accel_strides_the_count_and_shrinks_the_finalize_share() {
+    let data: Vec<u8> = (0u8..60).collect();
+    let set = SampleSet::new(&data, &[12; 5]).unwrap();
+    let full = FastCoverContext::new(&set, 5, 8, 20, 1).unwrap();
+    let strided = FastCoverContext::new(&set, 5, 8, 20, 2).unwrap();
+    let total = |ctx: &FastCoverContext<'_>| ctx.freqs.iter().map(|&c| u64::from(c)).sum::<u64>();
+    // Five positions per 12-byte sample; every other one is positions 0, 2, 4.
+    assert_eq!(total(&full), 25);
+    assert_eq!(total(&strided), 15);
+    assert_eq!(full.finalize_samples(100), 100);
+    assert_eq!(strided.finalize_samples(100), 50);
+    assert_eq!(
+        FastCoverContext::new(&set, 5, 8, 20, 10)
             .unwrap()
-            .is_empty()
+            .finalize_samples(100),
+        10
     );
 }
 
+/// Training bytes shorter than one dmer read are refused rather than yielding
+/// an empty dictionary.
 #[test]
-fn fastcover_optimizer_selects_valid_params() {
-    let sample = corpus();
-    let (dict, tuned) = optimize_fastcover_raw(
-        sample.as_slice(),
-        4096,
-        0.75,
-        1,
-        &[6, 8],
-        &[18, 20],
-        &[128, 256],
-    )
-    .unwrap();
-    assert!(!dict.is_empty());
-    assert!([6, 8].contains(&tuned.d));
-    assert!([18, 20].contains(&tuned.f));
-    assert!([128, 256].contains(&tuned.k));
+fn training_bytes_shorter_than_a_dmer_are_refused() {
+    let data = [1u8; 7];
+    let set = SampleSet::new(&data, &[1, 1, 1, 1, 3]).unwrap();
+    let err = FastCoverContext::new(&set, 5, 6, 20, 1).err().unwrap();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 }
 
 #[test]
-fn fastcover_optimizer_falls_back_when_k_candidates_empty() {
-    let sample = corpus();
-    let (dict, tuned) =
-        optimize_fastcover_raw(sample.as_slice(), 4096, 0.75, 1, &[6, 8], &[18, 20], &[]).unwrap();
-    assert!(!dict.is_empty());
-    assert!(DEFAULT_K_CANDIDATES.contains(&tuned.k));
-}
-
-#[test]
-fn fastcover_optimizer_handles_one_byte_sample_without_panic() {
-    let sample = [0xAB];
-    let (dict, tuned) = optimize_fastcover_raw(&sample, 16, 0.75, 1, &[], &[], &[]).unwrap();
-    assert!(!dict.is_empty());
-    assert!(dict.len() <= 16);
-    assert!(DEFAULT_K_CANDIDATES.contains(&tuned.k));
-    assert!(DEFAULT_D_CANDIDATES.contains(&tuned.d));
-    assert!(DEFAULT_F_CANDIDATES.contains(&tuned.f));
-}
-
-#[test]
-fn fastcover_optimizer_seeds_winner_when_all_scores_are_zero() {
-    let sample = b"abcdefghijklmnopqrst";
-    let (dict, tuned) = optimize_fastcover_raw(sample, 16, 0.9, 1, &[6], &[16], &[8]).unwrap();
-    assert!(!dict.is_empty());
-    assert_eq!(tuned.k, 16);
-    assert_eq!(tuned.d, 6);
-    assert_eq!(tuned.f, 16);
-    assert_eq!(tuned.score, 0);
-}
-
-#[test]
-fn fastcover_optimizer_handles_zero_dict_budget() {
-    let sample = corpus();
-    let (dict, tuned) = optimize_fastcover_raw(
-        sample.as_slice(),
-        0,
-        0.75,
-        1,
-        &[6, 8],
-        &[18, 20],
-        &[128, 256],
-    )
-    .unwrap();
-    assert!(dict.is_empty());
-    assert!([6, 8].contains(&tuned.d));
-    assert!([18, 20].contains(&tuned.f));
-    assert!([128, 256].contains(&tuned.k));
-}
-
-/// The split is honoured as given. At 1 the whole corpus both trains and
-/// scores, as upstream's `splitPoint == 1.0` does (fastcover.c,
-/// `FASTCOVER_ctx_init`), and a small share trains on that share, rather than
-/// either being pulled into a fixed band behind the caller's back.
-#[test]
-fn fastcover_optimizer_honours_the_split_it_is_given() {
-    let sample = corpus();
-    let params = normalize_fastcover_params(FastCoverParams {
-        k: 128,
-        d: 6,
-        f: 18,
-        accel: 1,
-    });
-    let (whole, _) =
-        optimize_fastcover_raw(sample.as_slice(), 2048, 1.0, 1, &[6], &[18], &[128]).unwrap();
-    assert_eq!(
-        whole,
-        build_raw_dict(sample.as_slice(), 2048, params).unwrap()
-    );
-    let share = (sample.len() as f64 * 0.05) as usize;
-    let (small, _) =
-        optimize_fastcover_raw(sample.as_slice(), 2048, 0.05, 1, &[6], &[18], &[128]).unwrap();
-    assert_eq!(
-        small,
-        build_raw_dict(&sample[..share], 2048, params).unwrap()
-    );
-}
-
-#[test]
-fn fastcover_optimizer_handles_extreme_split_points() {
-    let sample = corpus();
-    let (dict_low, tuned_low) =
-        optimize_fastcover_raw(sample.as_slice(), 2048, 0.0, 1, &[6], &[18], &[128]).unwrap();
-    let (dict_high, tuned_high) =
-        optimize_fastcover_raw(sample.as_slice(), 2048, 1.0, 1, &[6], &[18], &[128]).unwrap();
-    assert!(!dict_low.is_empty());
-    assert!(!dict_high.is_empty());
-    assert_eq!(tuned_low.k, 128);
-    assert_eq!(tuned_high.k, 128);
+fn build_fills_at_most_the_capacity_from_the_training_bytes() {
+    let (data, sizes) = lines(500);
+    let set = SampleSet::new(&data, &sizes).unwrap();
+    let ctx = FastCoverContext::new(&set, sizes.len(), 8, 20, 1).unwrap();
+    let mut window = WindowCounts::default();
+    let mut freqs = Vec::new();
+    let mut out = Vec::new();
+    let content = ctx
+        .build(&mut freqs, &mut window, &mut out, 4096, 256)
+        .unwrap()
+        .to_vec();
+    assert!(!content.is_empty() && content.len() <= 4096);
+    // The last segment is at least a dmer of training bytes.
+    let last = &content[content.len() - 8..];
+    assert!(data.windows(8).any(|w| w == last));
+    // The window counts come back zeroed, the spent frequencies are refilled
+    // and the content scratch is overwritten, so the next build on the same
+    // scratch repeats the first.
+    let again = ctx
+        .build(&mut freqs, &mut window, &mut out, 4096, 256)
+        .unwrap();
+    assert_eq!(content, again);
 }
 
 /// A segment longer than 65,535 dmers can hold that many copies of one dmer,
@@ -163,52 +90,66 @@ fn fastcover_optimizer_handles_extreme_split_points() {
 /// scores its distinct dmers, and this corpus has one, so the dictionary is
 /// that dmer's bytes; a count that wrapped would score it again at each wrap.
 #[test]
-fn fastcover_trains_a_segment_longer_than_a_16_bit_count() {
+fn a_segment_longer_than_a_16_bit_count_trains() {
     let k = 66_000;
-    let sample = vec![0u8; 10 * k + 1000];
-    let dict = train_fastcover_raw(
-        sample.as_slice(),
-        k,
-        FastCoverParams {
+    let data = vec![0u8; 10 * k + 1000];
+    let each = data.len() / 5;
+    let set = SampleSet::new(&data, &[each; 5]).unwrap();
+    let ctx = FastCoverContext::new(&set, 5, 8, 20, 1).unwrap();
+    let mut out = Vec::new();
+    let content = ctx
+        .build(
+            &mut Vec::new(),
+            &mut WindowCounts::default(),
+            &mut out,
             k,
-            d: 8,
-            f: 20,
-            accel: 1,
-        },
-    )
-    .unwrap();
-    assert_eq!(dict, [0u8; 8]);
-}
-
-/// `f` is the width of the frequency table, and every width the trainer's
-/// interface takes (1..=31) is used as given rather than moved into a
-/// narrower band the caller never asked for. Training runs at a width on
-/// either side of the band the defaults search.
-#[test]
-fn fastcover_uses_every_table_width_it_is_given() {
-    for f in [1, 4, 8, 20, 24, 31] {
-        let params = normalize_fastcover_params(FastCoverParams {
-            k: 256,
-            d: 8,
-            f,
-            accel: 1,
-        });
-        assert_eq!(params.f, f);
-    }
-    let sample = corpus();
-    for f in [4, 24] {
-        let dict = train_fastcover_raw(
-            sample.as_slice(),
-            4096,
-            FastCoverParams {
-                k: 256,
-                d: 8,
-                f,
-                accel: 1,
-            },
+            k,
         )
         .unwrap();
-        assert!(!dict.is_empty(), "f={f}");
+    assert_eq!(content, [0u8; 8]);
+}
+
+/// A segment far longer than the corpus is capped by it: the epoch floor sized
+/// from it must not overflow on the way.
+#[test]
+fn a_segment_longer_than_the_corpus_trains() {
+    let (data, sizes) = lines(100);
+    let set = SampleSet::new(&data, &sizes).unwrap();
+    let ctx = FastCoverContext::new(&set, sizes.len(), 8, 20, 1).unwrap();
+    let mut out = Vec::new();
+    let content = ctx
+        .build(
+            &mut Vec::new(),
+            &mut WindowCounts::default(),
+            &mut out,
+            4096,
+            usize::MAX / 4,
+        )
+        .unwrap();
+    assert!(!content.is_empty() && content.len() <= 4096);
+}
+
+/// Every table width the interface takes is used as given, including by a
+/// frequency scratch carried from a build at another width.
+#[test]
+fn every_table_width_trains() {
+    let (data, sizes) = lines(200);
+    let set = SampleSet::new(&data, &sizes).unwrap();
+    let mut freqs = Vec::new();
+    let mut out = Vec::new();
+    for f in [1, 4, 8, 24] {
+        let ctx = FastCoverContext::new(&set, sizes.len(), 8, f, 1).unwrap();
+        assert_eq!(ctx.freqs.len(), 1 << f);
+        let content = ctx
+            .build(
+                &mut freqs,
+                &mut WindowCounts::default(),
+                &mut out,
+                2048,
+                128,
+            )
+            .unwrap();
+        assert!(!content.is_empty(), "f={f}");
     }
 }
 
@@ -238,56 +179,13 @@ fn a_count_table_that_does_not_fit_is_an_error() {
     assert!(zeroed_counts::<u16>(0).unwrap().is_empty());
 }
 
-/// A sample shorter than one dmer counts nothing: the table comes back at
-/// its width, every count zero.
+/// A table that does not fit reaches the caller as an out-of-memory error
+/// that names the table and the knob that sizes it.
 #[test]
-fn a_sample_shorter_than_a_dmer_counts_nothing() {
-    let table = build_frequency_table(b"abc", 8, 10, 1).unwrap();
-    assert_eq!(table.len(), 1 << 10);
-    assert!(table.iter().all(|&count| count == 0));
-}
-
-/// A segment far longer than the corpus (a `k` near the top of `usize`, which
-/// a 32-bit build reaches from any large command-line value) is capped by the
-/// corpus: the epoch floor sized from it must not overflow on the way.
-#[test]
-fn fastcover_trains_with_a_segment_longer_than_the_corpus() {
-    let sample = corpus();
-    let dict = train_fastcover_raw(
-        sample.as_slice(),
-        4096,
-        FastCoverParams {
-            k: usize::MAX / 4,
-            d: 8,
-            f: 20,
-            accel: 1,
-        },
-    )
-    .unwrap();
-    assert!(!dict.is_empty());
-    assert!(dict.len() <= 4096);
-}
-
-#[test]
-fn fastcover_optimizer_reports_normalized_params() {
-    let sample = corpus();
-    // A width below the trainer's range comes back at its lower end; the
-    // upper end is checked without training, a table that wide being
-    // gigabytes.
-    let (dict, tuned) =
-        optimize_fastcover_raw(sample.as_slice(), 1024, 0.75, 1, &[64], &[0], &[8]).unwrap();
-    assert!(!dict.is_empty());
-    assert_eq!(tuned.d, 32);
-    assert_eq!(tuned.f, 1);
-    assert_eq!(tuned.k, 32);
-    assert_eq!(
-        normalize_fastcover_params(FastCoverParams {
-            k: 64,
-            d: 8,
-            f: 42,
-            accel: 1
-        })
-        .f,
-        31
-    );
+fn a_table_that_does_not_fit_is_an_out_of_memory_error() {
+    let err = io::Error::from(TableTooLarge { entries: 1 << 31 });
+    assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+    let message = std::string::ToString::to_string(&err);
+    assert!(message.contains("2147483648 entries"), "{message}");
+    assert!(message.contains("smaller f"), "{message}");
 }

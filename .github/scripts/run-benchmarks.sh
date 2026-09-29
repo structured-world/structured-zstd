@@ -168,7 +168,7 @@ DICT_RE = re.compile(
     r'(?: rust_with_dict_bytes=(\d+) rust_with_dict_ratio=([0-9.]+))?$'
 )
 DICT_TRAIN_RE = re.compile(
-    r'^REPORT_DICT_TRAIN scenario=(\S+) label="((?:[^"\\]|\\.)+)" training_bytes=(\d+) dict_bytes_requested=(\d+) rust_train_ms=([0-9.]+) ffi_train_ms=([0-9.]+) rust_dict_bytes=(\d+) ffi_dict_bytes=(\d+) rust_fastcover_score=(\d+)$'
+    r'^REPORT_DICT_TRAIN scenario=(\S+) label="((?:[^"\\]|\\.)+)" training_bytes=(\d+) dict_bytes_requested=(\d+) rust_train_ms=([0-9.]+) ffi_train_ms=([0-9.]+) rust_dict_bytes=(\d+) ffi_dict_bytes=(\d+) rust_k=(\d+)$'
 )
 # Process-global CPU kernel tier the run actually selected (shared
 # encode/decode entropy dispatch). One line per run; attributes every
@@ -803,7 +803,7 @@ with open(raw_path) as f:
                 ffi_train_ms,
                 rust_dict_bytes,
                 ffi_dict_bytes,
-                rust_fastcover_score,
+                rust_k,
             ) = dict_train_match.groups()
             label = unescape_report_label(label)
             delta = None
@@ -820,7 +820,7 @@ with open(raw_path) as f:
                 "ffi_train_ms": ffi_train_ms_float,
                 "rust_dict_bytes": int(rust_dict_bytes),
                 "ffi_dict_bytes": int(ffi_dict_bytes),
-                "rust_fastcover_score": int(rust_fastcover_score),
+                "rust_k": int(rust_k),
                 "delta_ffi_over_rust": delta,
                 "status": classify_speed_delta(delta),
             })
@@ -1389,7 +1389,7 @@ lines.extend([
     "",
     "## Dictionary Training (Rust FastCOVER vs C FFI)",
     "",
-    "| Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |",
+    "| Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust k | Delta (C/Rust) | Status |",
     "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
 ])
 
@@ -1398,7 +1398,7 @@ for row in sorted(dictionary_training_rows, key=lambda item: item["scenario"]):
     delta = row["delta_ffi_over_rust"]
     delta_cell = f"{delta:.4f}" if delta is not None else "n/a"
     lines.append(
-        f'| {row["scenario"]} | {label} | {row["dict_bytes_requested"]} | {row["rust_train_ms"]:.3f} | {row["ffi_train_ms"]:.3f} | {row["rust_dict_bytes"]} | {row["ffi_dict_bytes"]} | {row["rust_fastcover_score"]} | {delta_cell} | {row["status"]} |'
+        f'| {row["scenario"]} | {label} | {row["dict_bytes_requested"]} | {row["rust_train_ms"]:.3f} | {row["ffi_train_ms"]:.3f} | {row["rust_dict_bytes"]} | {row["ffi_dict_bytes"]} | {row["rust_k"]} | {delta_cell} | {row["status"]} |'
     )
 if not dictionary_training_rows:
     lines.append("| _n/a_ | _no dictionary training rows emitted in this run_ | - | - | - | - | - | - | - | - |")
