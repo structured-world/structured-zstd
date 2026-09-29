@@ -288,37 +288,19 @@ fn fastcover_raw_content(
 }
 
 /// The content of the dictionary [`optimize_fastcover_dict`] picks at its
-/// defaults, rebuilt from the parameters it chose: a build is deterministic,
-/// so this is the content the winner was finalized from.
+/// defaults: the search keeps its winner's content and hands that back.
 fn search_raw_content(corpus: &[u8], sizes: &[usize], dict_size: usize) -> io::Result<Vec<u8>> {
-    let (_, chosen) = optimize_fastcover_dict(
+    let options = FastCoverOptions::default();
+    let space = SearchSpace::optimizing(&options.cover, 0.75)?;
+    let (content, _) = run_fastcover(
         corpus,
         sizes,
         dict_size,
-        &FastCoverOptions::default(),
+        &options,
         FinalizeOptions::default(),
+        &space,
+        selection::Keep::Content,
     )?;
-    let set = samples::SampleSet::new(corpus, sizes)?;
-    let split = set.split(chosen.cover.split_point)?;
-    let ctx = fastcover::FastCoverContext::new(
-        &set,
-        split.train,
-        chosen.cover.d as usize,
-        chosen.f,
-        chosen.accel,
-    )?;
-    let mut content = Vec::new();
-    // The build fills its buffer from the back; what it returns is the tail.
-    let kept = ctx
-        .build(
-            &mut Vec::new(),
-            &mut fastcover::WindowCounts::default(),
-            &mut content,
-            dict_size,
-            chosen.cover.k as usize,
-        )?
-        .len();
-    content.drain(..content.len() - kept);
     Ok(content)
 }
 
@@ -779,7 +761,9 @@ fn run_cover(
     let scored = !plain || options.shrink.is_some() || space.split_point < 1.0;
     let mut evaluator =
         selection::Evaluator::new(&set, split.train, split.test.clone(), dict_size, finalize);
-    let mut best = selection::Best::new(options.shrink);
+    let mut best = selection::Best::new(selection::Keep::Dictionary {
+        shrink: options.shrink,
+    });
     let mut state = Vec::new();
     let mut content_scratch = Vec::new();
     // `None` beside a `d` is a dmer size these samples cannot index.
@@ -872,7 +856,18 @@ pub fn train_fastcover_dict(
     finalize: FinalizeOptions,
 ) -> io::Result<Vec<u8>> {
     let space = SearchSpace::fixed(&options.cover)?;
-    let (dict, _) = run_fastcover(samples, sample_sizes, dict_size, options, finalize, &space)?;
+    let keep = selection::Keep::Dictionary {
+        shrink: options.cover.shrink,
+    };
+    let (dict, _) = run_fastcover(
+        samples,
+        sample_sizes,
+        dict_size,
+        options,
+        finalize,
+        &space,
+        keep,
+    )?;
     Ok(dict)
 }
 
@@ -918,7 +913,18 @@ pub fn optimize_fastcover_dict(
     finalize: FinalizeOptions,
 ) -> io::Result<(Vec<u8>, FastCoverOptions)> {
     let space = SearchSpace::optimizing(&options.cover, 0.75)?;
-    run_fastcover(samples, sample_sizes, dict_size, options, finalize, &space)
+    let keep = selection::Keep::Dictionary {
+        shrink: options.cover.shrink,
+    };
+    run_fastcover(
+        samples,
+        sample_sizes,
+        dict_size,
+        options,
+        finalize,
+        &space,
+        keep,
+    )
 }
 
 fn run_fastcover(
@@ -928,6 +934,7 @@ fn run_fastcover(
     options: &FastCoverOptions,
     finalize: FinalizeOptions,
     space: &SearchSpace,
+    keep: selection::Keep,
 ) -> io::Result<(Vec<u8>, FastCoverOptions)> {
     let (f, accel) = fastcover_knobs(options, space)?;
     space.check_fits(dict_size)?;
@@ -938,7 +945,7 @@ fn run_fastcover(
     let mut window = fastcover::WindowCounts::default();
     let mut freqs = Vec::new();
     let mut content_scratch = Vec::new();
-    let mut best = selection::Best::new(options.cover.shrink);
+    let mut best = selection::Best::new(keep);
     // `None` beside a `d` is a dmer size these samples cannot count.
     let mut context: Option<(usize, Option<fastcover::FastCoverContext<'_>>)> = None;
     let mut evaluator = selection::Evaluator::new(
@@ -985,7 +992,10 @@ fn run_fastcover(
         };
         let content = ctx.build(&mut freqs, &mut window, &mut content_scratch, dict_size, k)?;
         if !scored {
-            return Ok((evaluator.finalize(content)?, chosen));
+            return match keep {
+                selection::Keep::Content => Ok((content.to_vec(), chosen)),
+                selection::Keep::Dictionary { .. } => Ok((evaluator.finalize(content)?, chosen)),
+            };
         }
         // Ranked at full size, the winner alone shrunk, as in the COVER search.
         best.offer(evaluator.score(content), content, chosen);

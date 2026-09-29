@@ -179,9 +179,30 @@ pub(super) struct Priced<'e> {
     pub(super) total: usize,
 }
 
-/// The cheapest dictionary seen, the parameters that built it and, when the
-/// winner is to be shrunk, the content it was finalized from. A tie keeps the
-/// earlier one, as upstream's strict comparison does.
+/// What a search hands back of its winner.
+#[derive(Clone, Copy)]
+pub(super) enum Keep {
+    /// The finalized dictionary, cut down with `shrink` when given.
+    Dictionary { shrink: Option<u32> },
+    /// The raw content the dictionary was finalized from.
+    Content,
+}
+
+impl Keep {
+    /// Whether the winner's content has to be kept through the search.
+    fn content(self) -> bool {
+        !matches!(self, Self::Dictionary { shrink: None })
+    }
+
+    /// Whether the winner's finalized dictionary is what is handed back.
+    fn dictionary(self) -> bool {
+        matches!(self, Self::Dictionary { .. })
+    }
+}
+
+/// The cheapest candidate seen, the parameters that built it, and what
+/// [`Keep`] asks for of it: its dictionary, its content, or both. A tie keeps
+/// the earlier one, as upstream's strict comparison does.
 ///
 /// Candidates are ranked at full size and only the winner is shrunk: the size
 /// a dictionary is cut to is a separate choice from the `k` and `d` that built
@@ -189,52 +210,55 @@ pub(super) struct Priced<'e> {
 pub(super) struct Best<P> {
     found: Option<(Scored, Vec<u8>, P)>,
     last_error: Option<io::Error>,
-    shrink: Option<u32>,
+    keep: Keep,
 }
 
 impl<P> Best<P> {
-    /// A search whose winner is cut down with `shrink` when given.
-    pub(super) fn new(shrink: Option<u32>) -> Self {
+    /// A search handing back what `keep` names of its winner.
+    pub(super) fn new(keep: Keep) -> Self {
         Self {
             found: None,
             last_error: None,
-            shrink,
+            keep,
         }
     }
 
-    /// Keep `candidate` if it is the cheapest so far. Its dictionary, and its
-    /// `content` when the winner will be shrunk, are copied only then, into
-    /// the buffers the previous winner held; a candidate that loses is not
-    /// copied at all.
+    /// Keep `candidate` if it is the cheapest so far. What [`Keep`] asks for
+    /// of it is copied only then, into the buffers the previous winner held;
+    /// a candidate that loses is not copied at all.
     pub(super) fn offer(&mut self, candidate: io::Result<Priced<'_>>, content: &[u8], params: P) {
-        let content = if self.shrink.is_some() { content } else { &[] };
+        let content = if self.keep.content() { content } else { &[] };
+        let keep_dictionary = self.keep.dictionary();
         match candidate {
-            Ok(priced) => match &mut self.found {
-                Some((best, _, _)) if priced.total >= best.total => {}
-                Some((best, kept, kept_params)) => {
-                    best.total = priced.total;
-                    best.dict.clear();
-                    best.dict.extend_from_slice(priced.dict);
-                    kept.clear();
-                    kept.extend_from_slice(content);
-                    *kept_params = params;
+            Ok(priced) => {
+                let dict = if keep_dictionary { priced.dict } else { &[] };
+                match &mut self.found {
+                    Some((best, _, _)) if priced.total >= best.total => {}
+                    Some((best, kept, kept_params)) => {
+                        best.total = priced.total;
+                        best.dict.clear();
+                        best.dict.extend_from_slice(dict);
+                        kept.clear();
+                        kept.extend_from_slice(content);
+                        *kept_params = params;
+                    }
+                    None => {
+                        let best = Scored {
+                            dict: dict.to_vec(),
+                            total: priced.total,
+                        };
+                        self.found = Some((best, content.to_vec(), params));
+                    }
                 }
-                None => {
-                    let best = Scored {
-                        dict: priced.dict.to_vec(),
-                        total: priced.total,
-                    };
-                    self.found = Some((best, content.to_vec(), params));
-                }
-            },
+            }
             Err(err) => self.last_error = Some(err),
         }
     }
 
-    /// The winner's dictionary, cut down when the search shrinks, and its
-    /// parameters; or why no candidate could be priced.
+    /// What [`Keep`] asked for of the winner, and its parameters; or why no
+    /// candidate could be priced.
     pub(super) fn finish(self, evaluator: &mut Evaluator<'_>) -> io::Result<(Vec<u8>, P)> {
-        let shrink = self.shrink;
+        let keep = self.keep;
         let (full, content, params) = match (self.found, self.last_error) {
             (Some(found), _) => found,
             (None, Some(err)) => return Err(err),
@@ -245,10 +269,12 @@ impl<P> Best<P> {
                 ));
             }
         };
-        let chosen = match shrink {
-            Some(regression) => evaluator.shrink(&content, full, regression)?,
-            None => full,
-        };
-        Ok((chosen.dict, params))
+        match keep {
+            Keep::Content => Ok((content, params)),
+            Keep::Dictionary { shrink: None } => Ok((full.dict, params)),
+            Keep::Dictionary {
+                shrink: Some(regression),
+            } => Ok((evaluator.shrink(&content, full, regression)?.dict, params)),
+        }
     }
 }
