@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790648447159,
+  "lastUpdate": 1790652788773,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -10393,6 +10393,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
             "value": 0.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.187,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "51fb95626ee75b67ec674f1b6f410bc825beb628",
+          "message": "perf(decode): take the wildcopy width from the kernel type (#540)\n\n* perf(decode): take the wildcopy width from the kernel type\n\ncopy_bytes_overshooting read the capability OnceLock and branched on\nAVX-512 / AVX2 / SSE2 for every copy the ring, flat and user-slice\nbackends made, and its 16-byte store asked the same question. The\nsequence decoders already run monomorphised per tier; the copy now takes\nthat tier as its type.\n\n- CpuKernel gains COPY_CHUNK, copy_chunks and copy16; the default is the\n  build's baseline vector (SSE2 where the target guarantees it, NEON,\n  simd128, else a machine word), Avx2Kernel and Vbmi2Kernel copy in\n  32-byte chunks\n- BufferBackend's copy methods and DecodeBuffer's push / repeat paths are\n  generic over K, threaded from the sequence executor; one copy per block\n  (raw and literals-only blocks, a resumed prefix) runs at the baseline\n- detect_x86_caps, the 64-byte AVX-512 chunk (it needed twice the\n  buffers' slack to fire) and two unused copy helpers are gone\n- the wildcopy contract is tested for every kernel the host can run\n\nPart of #535\n\n* perf(decode): step a wide wildcopy down to the baseline width\n\nA 32-byte tier whose rounded copy did not fit the buffers' slack fell\nstraight to machine words, where the per-copy capability check it\nreplaced had tried 16 bytes first. Near the end of a buffer 16 often\nfits where 32 does not, which small frames hit on most copies. The step\nis a comparison of two constants and folds away for baseline kernels.\n\nPart of #535\n\n* test(decode): run the wildcopy contract under the BMI2 and VBMI2 kernels too\n\n* perf(decode): give 32-bit x86 the AVX2 copy tier\n\n32-bit x86 resolved to the BMI2 or scalar tier only, so every buffer copy\nran at the SSE2 width whatever the CPU offered. Decoding z000033 on i686\nmeasured 1.3% slower at level 1 and 1.8% slower at level 4 than main, which\nchose 32-byte AVX2 copies at run time.\n\nThe AVX2 kernel, its tag and the literals entry now exist on 32-bit x86 as\nwell; the sequence walk there is the portable body compiled under AVX2 and\nBMI2, so the kernel's 32-byte copies inline into it. The tier tests and the\nwildcopy contract test cover it on x86.\n\n* perf(decode): mask with the table under the 32-bit x86 AVX2 tier\n\n* fix(decode): each tier copies with its own kernel\n\n- The scalar tier copies in machine words, as CpuLevel::Scalar promises\n  portable code only; it used to take the build's baseline vector, so a\n  ceiling at Scalar still ran SSE2 or NEON copies. Regression test\n  the_scalar_tier_copies_in_machine_words (16 bytes before, 8 after).\n- An SSE2 kernel and tier exist on 32-bit x86 too, chosen at run time, so a\n  build whose baseline lacks SSE2 (i586) copies in vectors on a CPU that has\n  it. The BMI2 kernel copies with SSE2, and 32-bit x86 at the BMI2 tier walks\n  the sequences with the SSE2 kernel's table masks.\n- NEON and SVE decode with their own kernels, whose copies are the NEON\n  baseline the walk had before.\n- The raw-block and literals-only copies, which run outside any tier, keep\n  the build's baseline width through a baseline kernel.\n- A wide tier steps down to its own narrower chunk (SSE2 for AVX2) rather\n  than to whatever the build's baseline carries.\n\n* test(decode): sweep the narrow-step copies; bench every tier's kernel\n\n* fix(decode): keep raw and literals-only blocks portable at the scalar tier\n\nA raw block's payload and a literals-only block's literals were always\ncopied at the build's baseline vector, so a decoder capped to the scalar\ntier still ran SSE2 or NEON copies for them. Both now take the scalar\nkernel's portable copies at that tier and the baseline vector at every\nother, one branch per block.\n\nNo regression test: the output is the same bytes either way, and which\nkernel copied them is not observable from a test.\n\n* docs(decode): state that the 32-bit x86 AVX2 tier requires BMI2\n\n* perf(decode): copy in 64-bit words at the scalar tier on every target\n\n* perf(decode): prime a resumed window under the decoder's kernel\n\nThe window a resumed partial decode primes was copied with the scalar\nkernel on every tier, which now copies in 64-bit words, while its\ncomment claimed the baseline width. It now takes the kernel a raw\nblock takes: scalar at the scalar tier, the build's baseline vector at\nevery other, the tier threaded from the frame decoder.\n\nThe wildcopy sweep also runs the SVE kernel on aarch64 builds with\n`kernel-sve`; it copies with NEON, which every aarch64 CPU has.",
+          "timestamp": "2026-09-29T05:47:44+03:00",
+          "tree_id": "0fcbea290d7b6c087fd79f9ce331b5658b22070c",
+          "url": "https://github.com/structured-world/structured-zstd/commit/51fb95626ee75b67ec674f1b6f410bc825beb628"
+        },
+        "date": 1790652770549,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.065,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 163.664,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 224.077,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.494,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.415,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.927,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.442,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.954,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 8.364,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.742,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.093,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.207,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.377,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.185,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.52,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.278,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.156,
             "unit": "ms"
           },
           {
