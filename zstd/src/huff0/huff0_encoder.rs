@@ -995,13 +995,34 @@ impl HuffmanTable {
         Self::build_from_weights_reusing(weights, None)
     }
 
-    /// The optimal code for `counts` with no code longer than `max_bits`
-    /// (upstream zstd `HUF_buildCTable_wksp`, as the dictionary finalizer
-    /// calls it). Unlike [`Self::build_from_counts`] it runs no table-log
-    /// search: the table describes future literals, not these.
+    /// The optimal code for `counts` with no code longer than `max_bits`,
+    /// described at its longest code rather than at the limit (upstream zstd
+    /// `HUF_buildCTable_wksp`, whose returned `maxNbBits` the dictionary
+    /// finalizer hands to `HUF_writeCTable`). Unlike
+    /// [`Self::build_from_counts`] it runs no table-log search: the table
+    /// describes future literals, not these. The buffers come from
+    /// `scratch`, where [`WeightScratch::recycle`] returns the table.
     #[cfg(feature = "dict-builder")]
-    pub(crate) fn build_limited(counts: &[usize], max_bits: usize) -> Self {
-        Self::build_from_weights(&build_limited_weights(counts, max_bits))
+    pub(crate) fn build_limited_in(
+        counts: &[usize],
+        max_bits: usize,
+        scratch: &mut WeightScratch,
+    ) -> Self {
+        build_limited_weights_into(counts, max_bits, scratch);
+        // The smallest weight belongs to the longest code. Lowering every
+        // weight until it is one keeps each code's length and makes the table
+        // log the longest code's.
+        let step = scratch
+            .weights
+            .iter()
+            .copied()
+            .filter(|&weight| weight > 0)
+            .min()
+            .map_or(0, |weight| weight - 1);
+        for weight in scratch.weights.iter_mut().filter(|weight| **weight > 0) {
+            *weight -= step;
+        }
+        Self::build_from_weights_reusing(&scratch.weights, scratch.spare_table.take())
     }
 
     /// [`Self::build_from_weights`] filling a discarded table's buffers instead

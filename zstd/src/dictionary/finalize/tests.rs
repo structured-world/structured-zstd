@@ -108,12 +108,15 @@ fn samples_that_do_not_compress_leave_a_describable_flat_table() {
 /// can be written (every weight the same would have none).
 #[test]
 fn literal_tables_take_the_depth_of_their_longest_code() {
-    assert_eq!(literals_table(&[1; 256]).table_log(), 8);
+    let mut scratch = WeightScratch::default();
+    let flat = HuffmanTable::build_limited_in(&[1; 256], HUF_MAX_BITS, &mut scratch);
+    assert_eq!(flat.table_log(), 8);
+    scratch.recycle(flat);
     let mut counts = [2usize; 256];
     counts[0] = 4;
     counts[253] = 1;
     counts[254] = 1;
-    let table = literals_table(&counts);
+    let table = HuffmanTable::build_limited_in(&counts, HUF_MAX_BITS, &mut scratch);
     assert_eq!(table.table_log(), 9);
     let mut writer = BitWriter::new();
     HuffmanEncoder::new(&table, &mut writer).write_table();
@@ -122,6 +125,39 @@ fn literal_tables_take_the_depth_of_their_longest_code() {
         .build_decoder(&description)
         .expect("the description parses back");
     assert_eq!(parsed as usize, description.len());
+}
+
+/// Below the limit a code is described at its longest length with the same
+/// lengths the limit gave it: building under the limit equals building at the
+/// longest code, over a scratch whose recycled table held another code.
+#[test]
+fn a_literal_table_under_the_limit_keeps_its_code_lengths() {
+    let mut counts = [0usize; 256];
+    for (symbol, count) in counts.iter_mut().enumerate() {
+        *count = 10 + (symbol * symbol) % 7;
+    }
+    let mut scratch = WeightScratch::default();
+    let stale = HuffmanTable::build_limited_in(&[1; 256], HUF_MAX_BITS, &mut scratch);
+    scratch.recycle(stale);
+    let under = HuffmanTable::build_limited_in(&counts, HUF_MAX_BITS, &mut scratch);
+    let longest = (0..=255u8)
+        .filter_map(|symbol| under.num_bits_for_symbol(symbol))
+        .max()
+        .map(usize::from)
+        .unwrap();
+    assert!(
+        longest < HUF_MAX_BITS,
+        "the code reaches the limit: {longest}"
+    );
+    assert_eq!(under.table_log() as usize, longest);
+    let at = HuffmanTable::build_limited_in(&counts, longest, &mut WeightScratch::default());
+    assert_eq!(at.table_log(), under.table_log());
+    for symbol in 0..=255u8 {
+        assert_eq!(
+            under.num_bits_for_symbol(symbol),
+            at.num_bits_for_symbol(symbol)
+        );
+    }
 }
 
 /// Random bytes, different for each seed.

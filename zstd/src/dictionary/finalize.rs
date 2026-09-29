@@ -20,7 +20,7 @@ use crate::encoding::{
     MatchGeneratorDriver, Matcher, Sequence,
 };
 use crate::fse::fse_encoder::{FSETable, write_ncount_at_log};
-use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable};
+use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable, WeightScratch};
 use std::{io, vec::Vec};
 
 /// Smallest dictionary finalized (upstream zstd `ZDICT_DICTSIZE_MIN`).
@@ -70,13 +70,15 @@ type AnalysisCompressor<'s> = FrameCompressor<&'s [u8], Vec<u8>, Recorder>;
 
 /// What the entropy analysis keeps from one candidate to the next: the
 /// compressor it runs the samples through, whose matcher and scratch then
-/// survive the change of dictionary, its frame buffer and its block kinds.
+/// survive the change of dictionary, its frame buffer, its block kinds and
+/// the buffers the literals code is built in.
 #[derive(Default)]
 pub(super) struct Analysis<'s> {
     /// The compressor and the level it was built for.
     compressor: Option<(i32, AnalysisCompressor<'s>)>,
     frame: Vec<u8>,
     compressed: Vec<bool>,
+    huffman: WeightScratch,
 }
 
 /// [`finalize`] over `out` and `analysis`, whose allocations a search keeps
@@ -183,7 +185,8 @@ fn analyze_entropy<'s>(
     };
     count_samples(&mut counts, analysis, content, samples, count, level)?;
 
-    let mut literals = literals_table(&counts.literals);
+    let huffman = &mut analysis.huffman;
+    let mut literals = HuffmanTable::build_limited_in(&counts.literals, HUF_MAX_BITS, huffman);
     if literals.table_log() == 8 {
         // Every symbol at eight bits describes nothing and cannot be written;
         // a mostly flat distribution that still compresses stands in
@@ -192,13 +195,15 @@ fn analyze_entropy<'s>(
         counts.literals[0] = 4;
         counts.literals[253] = 1;
         counts.literals[254] = 1;
-        literals = literals_table(&counts.literals);
+        huffman.recycle(literals);
+        literals = HuffmanTable::build_limited_in(&counts.literals, HUF_MAX_BITS, huffman);
         debug_assert_eq!(literals.table_log(), 9);
     }
     // Each description goes straight into the dictionary; the sequence tables
     // are normalized and described without being built.
     let mut writer = BitWriter::from(&mut *out);
     HuffmanEncoder::new(&literals, &mut writer).write_table();
+    huffman.recycle(literals);
     write_ncount_at_log(
         &counts.offset_codes[..=offcode_max as usize],
         OF_LOG,
@@ -231,6 +236,7 @@ fn count_samples<'s>(
         compressor,
         frame,
         compressed,
+        ..
     } = analysis;
     // One compressor per level serves every candidate: the dictionary is all
     // that changes, so its matcher and scratch are kept.
@@ -337,23 +343,6 @@ fn compressed_blocks(frame: &[u8], out: &mut Vec<bool>) {
         }
         let body = if kind == 1 { 1 } else { (word >> 3) as usize };
         at += 3 + body;
-    }
-}
-
-/// The literals code for `counts`, its weights scaled to its longest code
-/// rather than to the length limit, as upstream writes it (`HUF_writeCTable`
-/// takes the `maxNbBits` its build returned): the same codes, and the table
-/// log a decoder derives from the weights is the one the code needs.
-fn literals_table(counts: &[usize; 256]) -> HuffmanTable {
-    let table = HuffmanTable::build_limited(counts, HUF_MAX_BITS);
-    let longest = (0..=255u8)
-        .filter_map(|symbol| table.num_bits_for_symbol(symbol))
-        .max()
-        .map_or(HUF_MAX_BITS, usize::from);
-    if longest < HUF_MAX_BITS {
-        HuffmanTable::build_limited(counts, longest)
-    } else {
-        table
     }
 }
 
