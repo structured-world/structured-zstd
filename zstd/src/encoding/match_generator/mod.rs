@@ -1590,7 +1590,9 @@ impl Matcher for MatchGeneratorDriver {
                 let tagged = !dfast_attach_next
                     && in_place_fits
                     && max_window_size.checked_add(dict_len).is_some_and(|window| {
-                        window <= crate::encoding::dfast::DFAST_TAGGED_WINDOW_LIMIT
+                        (crate::encoding::dfast::DFAST_TAGGED_WINDOW_FLOOR
+                            ..=crate::encoding::dfast::DFAST_TAGGED_WINDOW_LIMIT)
+                            .contains(&window)
                     });
                 dfast.bind_tables(workspace, tagged);
                 dfast.reset();

@@ -5342,6 +5342,40 @@ fn a_borrowed_slice_past_the_tagged_range_is_laid_out_untagged() {
     assert!(!driver.dfast_matcher().tagged);
 }
 
+/// A 32-bit target keeps the dfast tables bare below
+/// `DFAST_TAGGED_WINDOW_FLOOR`: its loop spills the three tags a tagged scan
+/// carries. A 64-bit target tags every eligible window, and both tag a window
+/// past the floor.
+#[test]
+fn a_small_dfast_window_is_tagged_only_on_a_64_bit_target() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let layout = |source: usize| {
+        let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+        driver.set_source_size_hint(source as u64);
+        let mut context = Workspace::new();
+        context.begin_layout(source.min(1 << 17), no_trailing, IngestPlan::Stream);
+        driver.reset_in_workspace(CompressionLevel::Level(3), &mut context);
+        (
+            driver.dfast_matcher().max_window_size,
+            driver.dfast_matcher().tagged,
+        )
+    };
+
+    let (window, tagged) = layout(10 * 1024);
+    assert!(
+        window < 1 << 18,
+        "fixture: a 10 KiB frame's window is under the 32-bit floor",
+    );
+    assert_eq!(tagged, cfg!(target_pointer_width = "64"));
+
+    let (window, tagged) = layout(1 << 20);
+    assert!(
+        window >= 1 << 18,
+        "fixture: a 1 MiB frame's window is past the 32-bit floor",
+    );
+    assert!(tagged, "a window past the floor is tagged on every target");
+}
+
 /// A driver reset on its own and then laid out in a context's workspace lets go
 /// of the workspace it used alone: its tables and history have moved, so the old
 /// allocation holds nothing live, and keeping it would double what the

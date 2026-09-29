@@ -238,6 +238,17 @@ const DFAST_TAGGED_REBASE: u32 = 1 << 23;
 /// the rebase above keeps `DFAST_TAGGED_MAX_REL - DFAST_TAGGED_REBASE` bytes,
 /// a little under 2^23, which covers this window and a block.
 pub(crate) const DFAST_TAGGED_WINDOW_LIMIT: usize = 1 << 22;
+/// Smallest window whose frames tag the live tables. A tagged scan carries
+/// three tags across its loop; a 64-bit register file holds them, a 32-bit one
+/// spills them, and there the tag only pays once the window is large enough
+/// for the candidate load it skips to miss the cache. Measured on i686: bare
+/// slots 3-5% faster at a 16 KiB window and 1.5% at 64 KiB, tags 1-2.5% faster
+/// from 256 KiB; x86_64 tags win at every size.
+#[cfg(target_pointer_width = "32")]
+pub(crate) const DFAST_TAGGED_WINDOW_FLOOR: usize = 1 << 18;
+/// See the 32-bit definition: a 64-bit target tags every eligible window.
+#[cfg(not(target_pointer_width = "32"))]
+pub(crate) const DFAST_TAGGED_WINDOW_FLOOR: usize = 0;
 const _: () = assert!(
     DFAST_TAGGED_MAX_REL - DFAST_TAGGED_REBASE as usize
         >= DFAST_TAGGED_WINDOW_LIMIT + crate::common::MAX_BLOCK_SIZE as usize,
