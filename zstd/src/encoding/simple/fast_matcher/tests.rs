@@ -1445,3 +1445,37 @@ fn block_zero_prologue_preserves_default_rep_offset_one() {
              would indicate the explicit-match catch-up fired instead",
     );
 }
+
+/// The short-cache tag skips loading a colliding candidate, which only pays
+/// when that load can miss the cache. A 16 KiB window (a 10 KiB frame) keeps
+/// every candidate in L1, so its table stays bare; a 32 KiB window is tagged.
+#[test]
+fn only_a_window_past_the_cache_gets_tagged_slots() {
+    let (_, hash_log, mls, step_size) = LEVEL_1_SHAPE;
+
+    let mut ws = Workspace::new();
+    let mut m = FastKernelMatcher::new();
+    reset_in(
+        &mut m,
+        &mut ws,
+        (14, hash_log, mls, step_size),
+        TableCarry::Clear,
+    );
+    assert!(
+        !m.hash_table.is_tagged(),
+        "a 16 KiB window must keep bare slots"
+    );
+
+    let mut ws = Workspace::new();
+    let mut m = FastKernelMatcher::new();
+    reset_in(
+        &mut m,
+        &mut ws,
+        (15, hash_log, mls, step_size),
+        TableCarry::Clear,
+    );
+    assert!(
+        m.hash_table.is_tagged(),
+        "a 32 KiB window must take tagged slots"
+    );
+}

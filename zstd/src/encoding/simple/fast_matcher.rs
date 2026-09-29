@@ -117,6 +117,15 @@ pub(crate) const HISTORY_DRAIN_BASE: usize = 0;
 /// position-0 emit rate is too small to be worth that breakage.
 const INITIAL_PREFIX_START_INDEX: u32 = 1;
 
+/// Smallest window whose main table takes short-cache tags. A tag saves the
+/// load of a colliding candidate, which is only worth its per-probe cost when
+/// that load can miss the cache; a smaller window stays cache-resident, so it
+/// keeps bare slots, as upstream zstd's no-dictionary Fast table always does
+/// (`zstd_fast.c`, `ZSTD_compressBlock_fast_noDict_generic`). Measured on a
+/// 10 KiB frame (16 KiB window) the tag cost 3-11% at levels -7..2; from a
+/// 32 KiB window up it paid, up to 16% at level 1 on 20-32 KiB frames.
+const FAST_TAG_MIN_WINDOW_LOG: u8 = 15;
+
 /// What a reset does with a hash table that continues the previous frame's
 /// (a new table always starts empty).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -607,10 +616,12 @@ impl FastKernelMatcher {
         // Re-borrow detection: set to the resident dict region when the
         // epoch-reuse branch below keeps the dict bytes in place (see there).
         let mut reborrow_region: Option<usize> = None;
-        // Tagged slots unless the frame attaches a dictionary (its epoch bias
-        // needs the position range the tag takes) or its history could reach
-        // past what a tagged slot holds.
-        let tagged = carry != TableCarry::AdvanceEpoch
+        // Tagged slots when the window outgrows the cache (see
+        // `FAST_TAG_MIN_WINDOW_LOG`), unless the frame attaches a dictionary
+        // (its epoch bias needs the position range the tag takes) or its
+        // history could reach past what a tagged slot holds.
+        let tagged = window_log >= FAST_TAG_MIN_WINDOW_LOG
+            && carry != TableCarry::AdvanceEpoch
             && hash_log + TAG_BITS <= 32
             && tagged_positions_fit(1usize << window_log);
         if !self.hash_table.bind(workspace, hash_log, mls, tagged) {
