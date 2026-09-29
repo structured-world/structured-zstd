@@ -125,7 +125,10 @@ upstream parses it and then never applies it, here it takes effect.
 `--train-legacy[=s=#]` (or `-s#`) runs upstream's original trainer. Every
 trainer counts samples, and they are loaded as upstream loads them (each file
 one sample of up to 128 KiB, or cut into `-B#` pieces, whole samples up to
-2 GiB or `-M` when that is smaller); at least five are needed. For the same
+2 GiB or `-M` when that is smaller). The files have to make at least five
+samples; COVER and FastCOVER also need five to build from once the split and
+the `-M` cap are applied, while the legacy trainer, as upstream's, trains on
+whatever the cap keeps. For the same
 file list the legacy dictionary carries the same content as upstream's. `-D` takes either a dictionary produced by `--train` or any file at
 all, which is then used as raw content the way upstream does; such a
 dictionary has no ID, so the same bytes must be supplied when decoding.

@@ -3621,6 +3621,10 @@ fn load_training_samples(
     let budget = TRAINING_DATA_MAX.min(memory_limit.unwrap_or(u64::MAX));
     let (plan, bytes) = plan_training_load(&file_sizes, block_size, budget, samples);
     // What the budget keeps, not what the files hold, is what the trainer gets.
+    // The five-sample floor above is on the files, as upstream's is
+    // (dibio.c, `fs.nbSamples < 5`); the samples kept under the budget go to
+    // the trainer's own check, and the legacy trainer, as upstream's, has
+    // none.
     let retained: u64 = plan.iter().sum();
     enough_samples(usize::try_from(retained).unwrap_or(usize::MAX))?;
     // Both buffers are sized to exactly what the plan loads, which the budget

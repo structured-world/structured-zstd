@@ -2488,6 +2488,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// front the header goes first and the blocks straight after it, with no
     /// block accumulator and no copy into the drain. The frame is the one
     /// `compress` writes for the same source, hint and settings.
+    #[cfg(feature = "dict-builder")]
     pub(crate) fn compress_known_into(&mut self, total: u64, out: &mut Vec<u8>) {
         let prep = self.prepare_frame(crate::encoding::workspace::IngestPlan::Stream);
         let mut source = self

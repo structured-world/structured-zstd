@@ -61,10 +61,6 @@ impl<'a> SampleSet<'a> {
         &self.data[..self.offsets[count]]
     }
 
-    /// Divide the samples into those a dictionary is built from and those it
-    /// is scored on (upstream zstd `COVER_ctx_init`): below 1 the leading
-    /// `split_point` share builds and the rest scores; at 1 every sample does
-    /// both.
     /// Refuse the first `train` samples when none of them is `span` bytes
     /// long: a trainer counts a dmer only inside one sample, so none would be
     /// counted however long the samples run together. Known from the sizes,
@@ -82,6 +78,10 @@ impl<'a> SampleSet<'a> {
         ))
     }
 
+    /// Divide the samples into those a dictionary is built from and those it
+    /// is scored on (upstream zstd `COVER_ctx_init`): below 1 the leading
+    /// `split_point` share builds and the rest scores; at 1 every sample does
+    /// both.
     pub(super) fn split(&self, split_point: f64) -> io::Result<Split> {
         split_count(self.count(), split_point)
     }
