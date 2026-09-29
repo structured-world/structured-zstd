@@ -934,7 +934,11 @@ fn short_sample_looks_incompressible(
     let mut repeat_table =
         [const { MaybeUninit::<u32>::uninit() }; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
     let mut repeat_occupied = [0_u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
-    let mut repeats = 0usize;
+    // Repeats still allowed before the sample is called compressible: one value
+    // where a count and its guard would be two. On i686 the loop has no register
+    // to spare, and the second value pushed the data pointer to the stack, a
+    // store and a reload on every quad.
+    let mut repeats_left = repeat_guard + 1;
     let (quads, tail) = sample.as_chunks::<4>();
     for &chunk in quads {
         let quad = u32::from_le_bytes(chunk);
@@ -948,8 +952,8 @@ fn short_sample_looks_incompressible(
         // SAFETY: the occupancy bit is set only in the arm below, right after
         // that slot is written, so a set bit means an initialised slot.
         if repeat_occupied[word] & bit != 0 && unsafe { repeat_table[slot].assume_init() } == quad {
-            repeats += 1;
-            if repeats > repeat_guard {
+            repeats_left -= 1;
+            if repeats_left == 0 {
                 return false;
             }
         } else {
