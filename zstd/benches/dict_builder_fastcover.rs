@@ -36,7 +36,7 @@ fn bench_dict_builder(c: &mut Criterion) {
         ..FastCoverOptions::default()
     };
 
-    c.bench_function("dict_builder/lmc_raw", |b| {
+    c.bench_function("dict_builder/raw_content", |b| {
         b.iter(|| {
             let mut out = Vec::new();
             create_raw_dict_from_source(

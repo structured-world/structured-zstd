@@ -678,6 +678,79 @@ fn create_raw_dict_from_source_never_exceeds_requested_size() {
     );
 }
 
+/// Raw content is what `zstd --train`'s search picks over the corpus cut into
+/// samples: the dictionary the search finalizes ends with it (the finalizer
+/// only cuts the front to make room for its header).
+#[test]
+fn raw_content_is_the_fastcover_search_winner() {
+    let corpus = training_data();
+    let dict_size = 4096;
+    let mut raw = Vec::new();
+    create_raw_dict_from_slice(&corpus, &mut raw, dict_size).unwrap();
+    assert!(!raw.is_empty() && raw.len() <= dict_size);
+
+    let cut = corpus.len().div_ceil(RAW_SAMPLES_MIN).min(RAW_SAMPLE_MAX);
+    let sizes: Vec<usize> = corpus.chunks(cut).map(<[u8]>::len).collect();
+    let (dict, _) = optimize_fastcover_dict(
+        &corpus,
+        &sizes,
+        dict_size,
+        &FastCoverOptions::default(),
+        FinalizeOptions::default(),
+    )
+    .unwrap();
+    let finalized = Dictionary::decode_dict(&dict).unwrap();
+    assert!(raw.ends_with(&finalized.dict_content));
+}
+
+/// A corpus no larger than the dictionary is all of its content.
+#[test]
+fn a_corpus_that_fits_is_its_own_raw_content() {
+    let corpus = &training_data()[..3000];
+    let mut raw = Vec::new();
+    create_raw_dict_from_slice(corpus, &mut raw, 4096).unwrap();
+    assert_eq!(raw, corpus);
+}
+
+/// A directory trains one sample per file, and its raw dictionary shortens a
+/// small frame of the same kind of data.
+#[test]
+fn raw_content_from_a_directory_helps_a_small_frame() {
+    let dir = std::env::temp_dir().join(std::format!("szstd-raw-dir-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    for file in 0..40u32 {
+        let mut body = std::string::String::new();
+        for line in 0..30u32 {
+            body.push_str(&std::format!(
+                "tenant=demo table=orders key={} region=eu status=shipped\n",
+                file * 30 + line
+            ));
+        }
+        fs::write(dir.join(std::format!("s{file:02}")), body).unwrap();
+    }
+    let mut raw = Vec::new();
+    let trained = create_raw_dict_from_dir(&dir, &mut raw, 2048);
+    fs::remove_dir_all(&dir).unwrap();
+    trained.unwrap();
+    assert!(!raw.is_empty() && raw.len() <= 2048);
+
+    let frame = b"tenant=demo table=orders key=77 region=eu status=shipped\n";
+    let compress = |dict: Option<&[u8]>| {
+        let mut out = Vec::new();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        if let Some(dict) = dict {
+            compressor
+                .set_dictionary(Dictionary::from_raw_content(7, dict.to_vec()).unwrap())
+                .unwrap();
+        }
+        compressor.set_source(&frame[..]);
+        compressor.set_drain(&mut out);
+        compressor.compress();
+        out.len()
+    };
+    assert!(compress(Some(&raw)) < compress(None));
+}
+
 /// The entropy tables a search builds once finalize every candidate into the
 /// same bytes `finalize_raw_dict` writes for it, including the content cut
 /// to fit and an explicit id; and where the samples are too thin to decide the

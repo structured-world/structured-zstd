@@ -428,16 +428,13 @@ fn dictionary_compression_roundtrips_with_dict_builder_dictionary() {
     let decoder_dict =
         crate::decoding::Dictionary::from_raw_content(dict_id, raw_dict.clone()).unwrap();
 
-    // Payload the trained dictionary genuinely covers: training lines in a
-    // permuted order, so whole lines are dictionary matches while the
-    // payload does not simply repeat its previous line. (A payload of
-    // unseen `key=` values is NOT such a case: every line then matches the
-    // previous one through the repeat offset, and upstream too compresses
-    // it smaller WITHOUT the dictionary, the dictionary id and the
-    // dictionary-tier parameters costing more than the first line's
-    // literals.)
+    // A small frame of training lines in a permuted order: the case a
+    // dictionary is for, where the frame alone has too little history to
+    // match against. (A long frame of such lines is NOT such a case: past the
+    // first few lines every line matches the previous one through the repeat
+    // offset, and upstream too compresses it smaller WITHOUT the dictionary.)
     let mut payload = Vec::new();
-    for i in 0..96u32 {
+    for i in 0..12u32 {
         let idx = (i * 37 + 11) % 256;
         payload.extend_from_slice(
             format!("tenant=demo table=orders key={idx} region=eu\n").as_bytes(),

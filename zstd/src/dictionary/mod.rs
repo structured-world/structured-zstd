@@ -17,16 +17,12 @@
 //! The `optimize_*` forms search segment and dmer sizes, scoring each candidate
 //! by the total size of the scoring samples compressed with it.
 //!
-//! [`create_raw_dict_from_slice`] and its reader forms build raw content from an
-//! undivided corpus instead, estimating segment value by k-mer frequency in a
-//! reservoir sample (Liao, Petri, Moffat and Wirth, "Effective construction of
-//! Relative Lempel-Ziv Dictionaries").
+//! [`create_raw_dict_from_slice`] and its reader and directory forms build raw
+//! content, with no entropy tables, from a corpus without sample sizes: the
+//! FastCOVER search `zstd --train` runs, over the corpus cut into samples.
 mod cover;
 mod fastcover;
-mod frequency;
 mod legacy;
-mod lmc;
-mod reservoir;
 mod samples;
 mod selection;
 mod suffix_array;
@@ -37,18 +33,13 @@ use crate::blocks::sequence_section::{
 };
 use crate::decoding::dictionary::MAGIC_NUM as DICT_MAGIC_NUM;
 use crate::decoding::sequence_section_decoder::{LL_MAX_LOG, ML_MAX_LOG, OF_MAX_LOG};
-use crate::dictionary::reservoir::create_sample;
 use crate::fse::fse_encoder::{self, build_table_from_symbol_counts};
 use crate::huff0::HuffmanTable as HuffmanDecoderTable;
 use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable as HuffmanEncoderTable};
-use core::cmp::Reverse;
 pub use legacy::DEFAULT_SELECTIVITY;
-use lmc::*;
 pub use samples::TrainingError;
 use samples::refuse;
 use std::{
-    boxed::Box,
-    collections::{BinaryHeap, HashMap},
     format,
     fs::{self, File},
     io::{self, Read},
@@ -152,32 +143,17 @@ pub struct FinalizeOptions {
     pub dict_id: Option<u32>,
 }
 
-/// A set of values that are used during dictionary construction.
+/// Create a "raw content" dictionary of at most `dict_size` bytes, with no
+/// entropy tables, from every file in this directory and its subdirectories,
+/// and write it to `output`.
 ///
-/// Changing these values can improve the resulting dictionary size for certain datasets.
-// TODO: move `k` here.
-pub(super) struct DictParams {
-    /// Segment size.
-    ///
-    /// As found under "4. Experiments - Varying Segment Size" in the original paper, a
-    /// segment size of 2 kiB was effective.
-    ///
-    /// "We explored a range of \[`segment_size`\] values and found the performance of LMC is insensitive
-    /// to \[`segment_size`\]. We fix \[`segment_size`\] to 2kiB
-    ///
-    /// Reasonable range: [16, 2048+]
-    pub segment_size: u32,
-}
-
-/// Creates a "raw content" dictionary, training off of every file in this directory and all
-/// sub-directories.
-///
-/// The resulting dictionary will be approximately `dict_size` or less, and written to `output`.
+/// Each file is one sample, and the content is what [`optimize_fastcover_dict`]
+/// picks at its defaults, as `zstd --train` does; too few files to search is
+/// trained as [`create_raw_dict_from_slice`] trains an undivided corpus.
 ///
 /// # Errors
-/// This function returns `Ok(())` if the dictionary was created successfully, and an
-/// `Err(io::Error)` if an error was encountered reading the input directory or
-/// writing dictionary bytes to `output`.
+/// Returns an error reading the directory or its files, writing to `output`,
+/// or allocating the trainer's tables.
 ///
 /// # Examples
 /// ```no_run
@@ -209,22 +185,15 @@ pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
     }
     recurse_read(dir, &mut file_paths)?;
 
-    // Open each file and chain the readers together
-    let mut total_file_len: u64 = 0;
-    let mut file_handles: Vec<fs::File> = Vec::new();
+    // Every file is one sample.
+    let mut corpus = Vec::new();
+    let mut sizes = Vec::with_capacity(file_paths.len());
     for path in file_paths {
-        let handle = File::open(path)?;
-        total_file_len += handle.metadata()?.len();
-        file_handles.push(handle);
+        let before = corpus.len();
+        File::open(path)?.read_to_end(&mut corpus)?;
+        sizes.push(corpus.len() - before);
     }
-    let empty_reader: Box<dyn Read> = Box::new(io::empty());
-    let chained_files = file_handles
-        .iter()
-        .fold(empty_reader, |acc, reader| Box::new(acc.chain(reader)));
-
-    // Create a dict using the new reader
-    create_raw_dict_from_source(chained_files, total_file_len as usize, output, dict_size)?;
-    Ok(())
+    output.write_all(&fastcover_raw_content(&corpus, Some(&sizes), dict_size)?)
 }
 
 /// Read from `source` to create a "raw content" dictionary of `dict_size`.
@@ -242,10 +211,11 @@ pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
 /// sources too large to fit comfortably in memory.
 ///
 /// A corpus already in memory trains without this copy through
-/// [`create_raw_dict_from_slice`].
+/// [`create_raw_dict_from_slice`], whose training this is.
 ///
-/// # API note
-/// This public API returns `io::Result<()>` and propagates source/output I/O failures.
+/// # Errors
+/// Returns an error reading `source`, writing to `output`, or allocating the
+/// trainer's tables.
 pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     mut source: R,
     source_size: usize,
@@ -261,15 +231,18 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     create_raw_dict_from_slice(&all, output, dict_size)
 }
 
-/// Create a "raw content" dictionary of at most `dict_size` bytes from a
-/// corpus already in memory, writing it to `output`.
+/// Create a "raw content" dictionary of at most `dict_size` bytes, with no
+/// entropy tables, from a corpus already in memory, writing it to `output`.
 ///
-/// The same training as [`create_raw_dict_from_source`], reading `source` in
-/// place: a caller that holds the samples anyway does not pay for a second
-/// copy of them.
+/// The corpus has no sample sizes, so it is cut into at least sixteen samples
+/// of at most 128 KiB, and the content is what [`optimize_fastcover_dict`]
+/// picks over them at its defaults, as `zstd --train` does. A corpus no larger
+/// than `dict_size` is its own content; one the trainer refuses (a
+/// `dict_size` under [`TRAINER_DICT_SIZE_MIN`], too little to search) gives
+/// its last `dict_size` bytes.
 ///
 /// # Errors
-/// Returns the error `output` reports while the dictionary is written.
+/// Returns an error writing to `output` or allocating the trainer's tables.
 ///
 /// # Examples
 /// ```
@@ -287,83 +260,77 @@ pub fn create_raw_dict_from_slice<W: io::Write>(
     output: &mut W,
     dict_size: usize,
 ) -> io::Result<()> {
-    if dict_size == 0 || all.is_empty() {
-        return Ok(());
+    output.write_all(&fastcover_raw_content(all, None, dict_size)?)
+}
+
+/// Largest sample an undivided corpus is cut into: upstream zstd's largest
+/// block, the most of a sample a dictionary's statistics read.
+const RAW_SAMPLE_MAX: usize = 128 << 10;
+/// Fewest samples an undivided corpus is cut into, so the search has samples
+/// to build from and samples to score on.
+const RAW_SAMPLES_MIN: usize = 16;
+
+/// Raw content of at most `dict_size` bytes from `corpus`, as `zstd --train`
+/// picks it: FastCOVER searching `k` over the samples `sizes` cuts, or over
+/// even cuts of the corpus when there are none or too few to search.
+fn fastcover_raw_content(
+    corpus: &[u8],
+    sizes: Option<&[usize]>,
+    dict_size: usize,
+) -> io::Result<Vec<u8>> {
+    if corpus.len() <= dict_size {
+        return Ok(corpus.to_vec());
     }
-
-    if all.len() < K {
-        let keep = usize::min(all.len(), dict_size);
-        output.write_all(&all[all.len() - keep..])?;
-        return Ok(());
-    }
-
-    let source_size = all.len();
-    vprintln!("create_dict: creating {dict_size} byte dict from {source_size} byte source");
-
-    let params = DictParams { segment_size: 2048 };
-    let num_segments = usize::max(1, source_size / params.segment_size as usize);
-    // According to 4. Experiments - Varying Reservoir Sampler Thresholds,
-    // setting reservoir size to collection size / min{collection size / (2 * number of segments),
-    // 256} was effective
-    let denom = usize::max(1, source_size / (2 * num_segments));
-    let sample_scale = usize::max(1, usize::min(denom, 256));
-    let mut sample_size = source_size / sample_scale;
-    sample_size = usize::max(sample_size, usize::min(source_size, 16));
-    vprintln!("create_dict: creating {sample_size} byte sample of collection");
-    let mut sample_reader = all;
-    let collection_sample = create_sample(&mut sample_reader, sample_size);
-
-    // A collection of segments to be used in the final dictionary.
-    //
-    // Contains the best segment from every epoch.
-    // Reverse is used because we want a min heap, where
-    // the lowest scoring items come first
-    let mut pool: BinaryHeap<Reverse<Segment>> = BinaryHeap::new();
-    let (num_epochs, epoch_size_kmers) = compute_epoch_info(&params, dict_size, source_size / K);
-    // Plain `*`/`+` throughout the epoch walk below: epochs partition the
-    // training source, so `epoch_size_kmers * K`, `epoch_idx * epoch_size`, and
-    // `start + epoch_size` are all bounded by the source length (<= isize::MAX)
-    // and cannot overflow usize.
-    let epoch_size = usize::max(K, epoch_size_kmers * K);
-    vprintln!("create_dict: computed epoch info, using {num_epochs} epochs of {epoch_size} bytes");
-    let mut epoch_counter = 0;
-    let mut ctx = Context {
-        frequencies: HashMap::with_capacity(epoch_size / K),
-    };
-    // Score each segment in each planned epoch and select the highest-scoring
-    // segment for the pool. Keep exactly `num_epochs` windows to avoid
-    // emitting more segments than the requested dictionary budget allows.
-    for epoch_idx in 0..num_epochs {
-        let start = epoch_idx * epoch_size;
-        if start >= all.len() {
-            break;
+    let refused =
+        |result: &io::Result<Vec<u8>>| result.as_ref().err().and_then(TrainingError::of).is_some();
+    if let Some(sizes) = sizes {
+        let trained = search_raw_content(corpus, sizes, dict_size);
+        if !refused(&trained) {
+            return trained;
         }
-        let end = if epoch_idx + 1 == num_epochs {
-            all.len()
-        } else {
-            usize::min(start + epoch_size, all.len())
-        };
-        let epoch = &all[start..end];
-        epoch_counter += 1;
-        let best_segment = pick_best_segment(&params, &mut ctx, epoch, &collection_sample);
-        vprintln!(
-            "\tcreate_dict: epoch {epoch_counter}/{num_epochs} has best segment score {}",
-            best_segment.score
-        );
-        pool.push(Reverse(best_segment));
-        // Wipe frequency list for next epoch
-        ctx.frequencies.clear();
     }
-    vprintln!(
-        "create_dict: {epoch_counter} epochs written, writing {} segments",
-        pool.len()
-    );
-    // Write the dictionary with the highest scoring segment last because
-    // closer items can be represented with a smaller offset
-    while let Some(segment) = pool.pop() {
-        output.write_all(&segment.0.raw)?;
+    let cut = corpus.len().div_ceil(RAW_SAMPLES_MIN).min(RAW_SAMPLE_MAX);
+    let even: Vec<usize> = corpus.chunks(cut).map(<[u8]>::len).collect();
+    let trained = search_raw_content(corpus, &even, dict_size);
+    if refused(&trained) {
+        return Ok(corpus[corpus.len() - dict_size..].to_vec());
     }
-    Ok(())
+    trained
+}
+
+/// The content of the dictionary [`optimize_fastcover_dict`] picks at its
+/// defaults, rebuilt from the parameters it chose: a build is deterministic,
+/// so this is the content the winner was finalized from.
+fn search_raw_content(corpus: &[u8], sizes: &[usize], dict_size: usize) -> io::Result<Vec<u8>> {
+    let (_, chosen) = optimize_fastcover_dict(
+        corpus,
+        sizes,
+        dict_size,
+        &FastCoverOptions::default(),
+        FinalizeOptions::default(),
+    )?;
+    let set = samples::SampleSet::new(corpus, sizes)?;
+    let split = set.split(chosen.cover.split_point)?;
+    let ctx = fastcover::FastCoverContext::new(
+        &set,
+        split.train,
+        chosen.cover.d as usize,
+        chosen.f,
+        chosen.accel,
+    )?;
+    let mut content = Vec::new();
+    // The build fills its buffer from the back; what it returns is the tail.
+    let kept = ctx
+        .build(
+            &mut Vec::new(),
+            &mut fastcover::WindowCounts::default(),
+            &mut content,
+            dict_size,
+            chosen.cover.k as usize,
+        )?
+        .len();
+    content.drain(..content.len() - kept);
+    Ok(content)
 }
 
 /// The `i`th of [`MAX_HUFFMAN_STATS_BYTES`] samples spread evenly over `len`
