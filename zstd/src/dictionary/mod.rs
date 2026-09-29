@@ -227,7 +227,7 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
 /// of at most 128 KiB, and the content is what [`optimize_fastcover_dict`]
 /// picks over them at its defaults, as `zstd --train` does. A corpus no larger
 /// than `dict_size` is its own content; one the trainer refuses (a
-/// `dict_size` under [`TRAINER_DICT_SIZE_MIN`], too little to search) gives
+/// `dict_size` under [`MIN_TRAINED_DICT_SIZE`], too little to search) gives
 /// its last `dict_size` bytes.
 ///
 /// # Errors
