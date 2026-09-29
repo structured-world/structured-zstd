@@ -179,26 +179,35 @@ pub(super) struct Priced<'e> {
     pub(super) total: usize,
 }
 
-/// The cheapest dictionary seen, the content it was finalized from and the
-/// parameters that built it. A tie keeps the earlier one, as upstream's strict
-/// comparison does.
+/// The cheapest dictionary seen, the parameters that built it and, when the
+/// winner is to be shrunk, the content it was finalized from. A tie keeps the
+/// earlier one, as upstream's strict comparison does.
+///
+/// Candidates are ranked at full size and only the winner is shrunk: the size
+/// a dictionary is cut to is a separate choice from the `k` and `d` that built
+/// it (see [`Evaluator::shrink`]).
 pub(super) struct Best<P> {
     found: Option<(Scored, Vec<u8>, P)>,
     last_error: Option<io::Error>,
+    shrink: Option<u32>,
 }
 
 impl<P> Best<P> {
-    pub(super) fn new() -> Self {
+    /// A search whose winner is cut down with `shrink` when given.
+    pub(super) fn new(shrink: Option<u32>) -> Self {
         Self {
             found: None,
             last_error: None,
+            shrink,
         }
     }
 
-    /// Keep `candidate` if it is the cheapest so far. Its dictionary and
-    /// `content` are copied only then, into the buffers the previous winner
-    /// held; a candidate that loses is not copied at all.
+    /// Keep `candidate` if it is the cheapest so far. Its dictionary, and its
+    /// `content` when the winner will be shrunk, are copied only then, into
+    /// the buffers the previous winner held; a candidate that loses is not
+    /// copied at all.
     pub(super) fn offer(&mut self, candidate: io::Result<Priced<'_>>, content: &[u8], params: P) {
+        let content = if self.shrink.is_some() { content } else { &[] };
         match candidate {
             Ok(priced) => match &mut self.found {
                 Some((best, _, _)) if priced.total >= best.total => {}
@@ -222,13 +231,10 @@ impl<P> Best<P> {
         }
     }
 
-    /// The winner's dictionary, cut down with `shrink` when given, and its
+    /// The winner's dictionary, cut down when the search shrinks, and its
     /// parameters; or why no candidate could be priced.
-    pub(super) fn finish(
-        self,
-        evaluator: &mut Evaluator<'_>,
-        shrink: Option<u32>,
-    ) -> io::Result<(Vec<u8>, P)> {
+    pub(super) fn finish(self, evaluator: &mut Evaluator<'_>) -> io::Result<(Vec<u8>, P)> {
+        let shrink = self.shrink;
         let (full, content, params) = match (self.found, self.last_error) {
             (Some(found), _) => found,
             (None, Some(err)) => return Err(err),

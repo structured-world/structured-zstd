@@ -186,19 +186,7 @@ fn analyze_entropy<'s>(
     count_samples(&mut counts, analysis, content, samples, count, level)?;
 
     let huffman = &mut analysis.huffman;
-    let mut literals = HuffmanTable::build_limited_in(&counts.literals, HUF_MAX_BITS, huffman);
-    if literals.table_log() == 8 {
-        // Every symbol at eight bits describes nothing and cannot be written;
-        // a mostly flat distribution that still compresses stands in
-        // (upstream zstd `ZDICT_flatLit`).
-        counts.literals = [2; 256];
-        counts.literals[0] = 4;
-        counts.literals[253] = 1;
-        counts.literals[254] = 1;
-        huffman.recycle(literals);
-        literals = HuffmanTable::build_limited_in(&counts.literals, HUF_MAX_BITS, huffman);
-        debug_assert_eq!(literals.table_log(), 9);
-    }
+    let literals = literals_table(&mut counts.literals, huffman);
     // Each description goes straight into the dictionary; the sequence tables
     // are normalized and described without being built.
     let mut writer = BitWriter::from(&mut *out);
@@ -213,6 +201,34 @@ fn analyze_entropy<'s>(
     write_ncount_at_log(&counts.literal_lengths, LL_LOG, &mut writer);
     writer.flush();
     Ok(())
+}
+
+/// The literals code for `counts`, built in `scratch`.
+fn literals_table(counts: &mut [usize; 256], scratch: &mut WeightScratch) -> HuffmanTable {
+    // Summed over every sample, the counts can pass what a tree node holds
+    // (`u32`); halving keeps their proportions, and rounding up keeps every
+    // symbol that occurred in the code.
+    // The literals counted are bytes held in memory, so the sum fits `u64`.
+    while counts.iter().map(|&count| count as u64).sum::<u64>() >= u64::from(u32::MAX) {
+        for count in counts.iter_mut() {
+            *count = count.div_ceil(2);
+        }
+    }
+    let literals = HuffmanTable::build_limited_in(counts, HUF_MAX_BITS, scratch);
+    if literals.table_log() != 8 {
+        return literals;
+    }
+    // Every symbol at eight bits describes nothing and cannot be written; a
+    // mostly flat distribution that still compresses stands in (upstream zstd
+    // `ZDICT_flatLit`).
+    *counts = [2; 256];
+    counts[0] = 4;
+    counts[253] = 1;
+    counts[254] = 1;
+    scratch.recycle(literals);
+    let flat = HuffmanTable::build_limited_in(counts, HUF_MAX_BITS, scratch);
+    debug_assert_eq!(flat.table_log(), 9);
+    flat
 }
 
 /// Compress the first 128 KiB of each of the first `count` samples with

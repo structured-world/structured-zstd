@@ -754,7 +754,7 @@ fn run_cover(
     let scored = !plain || options.shrink.is_some() || space.split_point < 1.0;
     let mut evaluator =
         selection::Evaluator::new(&set, split.train, split.test.clone(), dict_size, finalize);
-    let mut best = selection::Best::new();
+    let mut best = selection::Best::new(options.shrink);
     let mut state = Vec::new();
     let mut content_scratch = Vec::new();
     // `None` beside a `d` is a dmer size these samples cannot index.
@@ -797,9 +797,13 @@ fn run_cover(
         if !scored {
             return Ok((evaluator.finalize(content)?, chosen));
         }
+        // Ranked at full size; `finish` shrinks only the winner, as
+        // `CoverOptions::shrink` documents. Upstream's optimizer never applies
+        // its shrink at all, and cutting every candidate would multiply the
+        // search by the number of sizes tried.
         best.offer(evaluator.score(content), content, chosen);
     }
-    best.finish(&mut evaluator, options.shrink)
+    best.finish(&mut evaluator)
 }
 
 /// Train a FastCOVER dictionary of at most `dict_size` bytes with the `k` and
@@ -909,7 +913,7 @@ fn run_fastcover(
     let mut window = fastcover::WindowCounts::default();
     let mut freqs = Vec::new();
     let mut content_scratch = Vec::new();
-    let mut best = selection::Best::new();
+    let mut best = selection::Best::new(options.cover.shrink);
     // `None` beside a `d` is a dmer size these samples cannot count.
     let mut context: Option<(usize, Option<fastcover::FastCoverContext<'_>>)> = None;
     let mut evaluator = selection::Evaluator::new(
@@ -958,9 +962,10 @@ fn run_fastcover(
         if !scored {
             return Ok((evaluator.finalize(content)?, chosen));
         }
+        // Ranked at full size, the winner alone shrunk, as in the COVER search.
         best.offer(evaluator.score(content), content, chosen);
     }
-    best.finish(&mut evaluator, options.cover.shrink)
+    best.finish(&mut evaluator)
 }
 
 /// Train and finalize a dictionary with the reference's original trainer, the

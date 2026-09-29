@@ -127,6 +127,22 @@ fn literal_tables_take_the_depth_of_their_longest_code() {
     assert_eq!(parsed as usize, description.len());
 }
 
+/// Literal counts summed over the samples can pass what a Huffman tree node
+/// holds (more than 4 GiB of literals); the code is still built, from the same
+/// proportions, instead of overflowing the tree.
+#[test]
+fn literal_counts_past_a_tree_node_still_build_a_code() {
+    let mut counts = [1usize; 256];
+    counts[b'e' as usize] = 3 << 31;
+    counts[b't' as usize] = 1 << 31;
+    counts[b'a' as usize] = 1 << 28;
+    let table = literals_table(&mut counts, &mut WeightScratch::default());
+    let bits = |symbol: u8| table.num_bits_for_symbol(symbol).unwrap();
+    assert!(bits(b'e') <= bits(b't'));
+    assert!(bits(b't') <= bits(b'a'));
+    assert!(bits(b'a') < bits(b'z'));
+}
+
 /// Below the limit a code is described at its longest length with the same
 /// lengths the limit gave it: building under the limit equals building at the
 /// longest code, over a scratch whose recycled table held another code.

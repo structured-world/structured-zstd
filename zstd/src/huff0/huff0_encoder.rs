@@ -1008,6 +1008,7 @@ impl HuffmanTable {
         max_bits: usize,
         scratch: &mut WeightScratch,
     ) -> Self {
+        assert_histogram_fits_nodes::<false>(counts);
         build_limited_weights_into(counts, max_bits, scratch);
         // The smallest weight belongs to the longest code. Lowering every
         // weight until it is one keeps each code's length and makes the table
