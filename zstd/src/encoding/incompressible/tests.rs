@@ -432,26 +432,24 @@ fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
 }
 
 #[test]
-fn sample_metrics_do_not_count_first_u32_max_as_repeat() {
-    let sample = [0xFF_u8; 4];
-    // Every slot holds `0xFFFFFFFF` before the scan, the value the first quad
-    // is, so only the occupancy bit keeps it from reading as a repeat.
-    let mut repeat_table = [MaybeUninit::new(u32::MAX); INCOMPRESSIBLE_REPEAT_TABLE_LEN];
-    let mut repeat_occupied = [0_u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
+fn a_quad_equal_to_an_empty_slot_is_not_a_repeat() {
+    // 0 and 1 are the values the empty table holds, and u32::MAX the value an
+    // all-ones fill would; each occurs once, so none may count as a repeat.
+    let mut sample = Vec::new();
+    for quad in [0_u32, 1, u32::MAX] {
+        sample.extend_from_slice(&quad.to_le_bytes());
+    }
+    let mut repeat_table = empty_repeat_table();
     let mut repeats = 0usize;
 
-    // Guard set high so the early-exit never fires, so the first quad is
-    // scanned in full and must NOT be counted as a repeat.
-    let bailed = count_quad_repeats(
-        &sample,
-        &mut repeat_table,
-        &mut repeat_occupied,
-        &mut repeats,
-        usize::MAX,
-    );
+    // Guard set high so the early exit never fires and every quad is scanned.
+    let bailed = count_quad_repeats(&sample, &mut repeat_table, &mut repeats, usize::MAX);
 
     assert!(!bailed, "high guards must not trigger an early exit");
-    assert_eq!(repeats, 0, "first quad must not be miscounted as a repeat");
+    assert_eq!(
+        repeats, 0,
+        "a first occurrence must not be counted as a repeat"
+    );
 }
 
 #[test]
@@ -459,21 +457,13 @@ fn count_quad_repeats_early_exits_on_repetitive_input() {
     // 32 identical 4-byte quads: the repeat count climbs past any small
     // guard, exercising the early-exit `true` path directly.
     let sample = [0xAB_u8; 128];
-    let mut repeat_table =
-        [const { MaybeUninit::<u32>::uninit() }; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
-    let mut repeat_occupied = [0_u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
+    let mut repeat_table = empty_repeat_table();
     let mut repeats = 0usize;
 
     // Guard of 1: the first quad seeds the table, the second is the first
     // counted repeat (repeats == 1), the third pushes repeats past the
     // guard and returns `true`.
-    let bailed = count_quad_repeats(
-        &sample,
-        &mut repeat_table,
-        &mut repeat_occupied,
-        &mut repeats,
-        1,
-    );
+    let bailed = count_quad_repeats(&sample, &mut repeat_table, &mut repeats, 1);
 
     assert!(bailed, "repetitive input must trigger the early exit");
     assert!(repeats > 1, "repeat count must have exceeded the guard");
