@@ -1209,11 +1209,21 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// The caller must have already capped `prefix` to the last `window_size`
     /// bytes (only those can ever back a match) and validated its length.
     #[cfg(feature = "lsm")]
-    pub(crate) fn prime_window(&mut self, prefix: &[u8], total_output: u64) {
-        // One copy per resume, a window long: it runs at the baseline width
-        // and needs no tier.
-        self.buffer
-            .extend::<crate::cpu_kernel::ScalarKernel>(prefix);
+    pub(crate) fn prime_window(
+        &mut self,
+        prefix: &[u8],
+        total_output: u64,
+        kernel: crate::cpu_kernel::CpuKernelTag,
+    ) {
+        // One copy per resume, under the kernel a raw block takes: the scalar
+        // tier stays portable, every other one copies at the baseline vector.
+        if kernel == crate::cpu_kernel::CpuKernelTag::Scalar {
+            self.buffer
+                .extend::<crate::cpu_kernel::ScalarKernel>(prefix);
+        } else {
+            self.buffer
+                .extend::<crate::cpu_kernel::BaselineKernel>(prefix);
+        }
         self.total_output_counter = total_output;
     }
 

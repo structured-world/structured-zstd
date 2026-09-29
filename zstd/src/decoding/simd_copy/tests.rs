@@ -144,6 +144,9 @@ fn every_runnable_kernel_keeps_the_wildcopy_contract() {
     }
     #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
     check_overshooting_copy::<crate::cpu_kernel::NeonKernel>("neon");
+    // The SVE tier copies with NEON, which every aarch64 CPU has.
+    #[cfg(all(target_arch = "aarch64", feature = "kernel-sve"))]
+    check_overshooting_copy::<crate::cpu_kernel::SveKernel>("sve");
     #[cfg(all(
         feature = "std",
         any(target_arch = "x86", target_arch = "x86_64"),

@@ -677,10 +677,15 @@ impl DecoderScratchKind {
     /// scratch holds. See
     /// [`DecodeBuffer::prime_window`](crate::decoding::decode_buffer::DecodeBuffer::prime_window).
     #[cfg(feature = "lsm")]
-    fn prime_window(&mut self, prefix: &[u8], total_output: u64) {
+    fn prime_window(
+        &mut self,
+        prefix: &[u8],
+        total_output: u64,
+        kernel: crate::cpu_kernel::CpuKernelTag,
+    ) {
         match self {
-            Self::Ring(s) => s.buffer.prime_window(prefix, total_output),
-            Self::Flat(s) => s.buffer.prime_window(prefix, total_output),
+            Self::Ring(s) => s.buffer.prime_window(prefix, total_output, kernel),
+            Self::Flat(s) => s.buffer.prime_window(prefix, total_output, kernel),
         }
     }
 
@@ -2091,6 +2096,7 @@ impl FrameDecoder {
         #[cfg(feature = "hash")]
         let checksum_mode = self.content_checksum;
         let magicless = self.magicless;
+        let kernel = self.kernel;
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
 
         // Honor the checksum mode before any drain/read can hash: `None` must
@@ -2179,7 +2185,9 @@ impl FrameDecoder {
                 });
             }
             state.decoder_scratch.restore_entropy(r.state);
-            state.decoder_scratch.prime_window(prime, output_offset);
+            state
+                .decoder_scratch
+                .prime_window(prime, output_offset, kernel);
             state.block_counter = effective_start as usize;
             // The caller repositions `source` to the resume block; report
             // consumed bytes relative to that point (reset left this at the
