@@ -18,6 +18,48 @@ fn hash4_matches_expected_value_on_known_input() {
     );
 }
 
+/// The wide hashes (5..8 bytes) keep the top `hash_log` bits of the 64-bit
+/// product for every width a caller passes, including a slot tag's (up to 32):
+/// a 32-bit target takes them from the product's high word, which must give
+/// the same value as the full 64-bit shift.
+#[test]
+fn wide_hashes_keep_the_top_bits_of_the_product_at_every_width() {
+    fn reference<const MLS: u32>(u: u64, prime: u64, hash_log: u32) -> u32 {
+        let lane = if MLS == 8 { u } else { u << (64 - 8 * MLS) };
+        (lane.wrapping_mul(prime) >> (64 - hash_log)) as u32
+    }
+    let inputs = [
+        [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        [0xffu8; 8],
+        [0x80u8, 0, 0, 0, 0, 0, 0, 0x80],
+        [0x9au8, 0x3c, 0xe1, 0x07, 0x5d, 0xb2, 0x44, 0xf9],
+    ];
+    for data in inputs {
+        let u = u64::from_le_bytes(data);
+        for hash_log in 1..=32 {
+            // SAFETY: data has 8 readable bytes.
+            unsafe {
+                assert_eq!(
+                    hash_ptr_raw::<5>(data.as_ptr(), hash_log),
+                    reference::<5>(u, PRIME_5_BYTES, hash_log)
+                );
+                assert_eq!(
+                    hash_ptr_raw::<6>(data.as_ptr(), hash_log),
+                    reference::<6>(u, PRIME_6_BYTES, hash_log)
+                );
+                assert_eq!(
+                    hash_ptr_raw::<7>(data.as_ptr(), hash_log),
+                    reference::<7>(u, PRIME_7_BYTES, hash_log)
+                );
+                assert_eq!(
+                    hash_ptr_raw::<8>(data.as_ptr(), hash_log),
+                    reference::<8>(u, PRIME_8_BYTES, hash_log)
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn hash5_matches_expected_value_on_known_input() {
     let table = FastHashTable::new(13, 5);

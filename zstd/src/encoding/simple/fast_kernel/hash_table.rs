@@ -551,9 +551,14 @@ fn entry_count(hash_log: u32) -> usize {
 /// # Safety
 /// Same readable-bytes contract as [`FastHashTable::hash_ptr`]: `MLS == 4`
 /// needs ≥4 readable bytes at `ptr`, `MLS >= 5` needs ≥8. `hash_log` must be
-/// in `1..=30` (the constructor's accepted band) so the shift is well-defined.
+/// in `1..=32`: the table's own band, widened by a slot tag the callers keep
+/// within 32 bits.
 #[inline(always)]
 pub(crate) unsafe fn hash_ptr_raw<const MLS: u32>(ptr: *const u8, hash_log: u32) -> u32 {
+    debug_assert!(
+        (1..=32).contains(&hash_log),
+        "hash_log {hash_log} out of 1..=32"
+    );
     match MLS {
         4 => {
             // SAFETY: caller guarantees ≥4 readable bytes at ptr.
@@ -563,28 +568,45 @@ pub(crate) unsafe fn hash_ptr_raw<const MLS: u32>(ptr: *const u8, hash_log: u32)
         5 => {
             // SAFETY: caller guarantees ≥8 readable bytes (wide u64 load).
             let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
-            ((u << (64 - 40)).wrapping_mul(PRIME_5_BYTES) >> (64 - hash_log)) as u32
+            top_bits((u << (64 - 40)).wrapping_mul(PRIME_5_BYTES), hash_log)
         }
         6 => {
             // SAFETY: caller guarantees ≥8 readable bytes (u64 load).
             let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
-            ((u << (64 - 48)).wrapping_mul(PRIME_6_BYTES) >> (64 - hash_log)) as u32
+            top_bits((u << (64 - 48)).wrapping_mul(PRIME_6_BYTES), hash_log)
         }
         7 => {
             // SAFETY: caller guarantees ≥8 readable bytes (u64 load).
             let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
-            ((u << (64 - 56)).wrapping_mul(PRIME_7_BYTES) >> (64 - hash_log)) as u32
+            top_bits((u << (64 - 56)).wrapping_mul(PRIME_7_BYTES), hash_log)
         }
         8 => {
             // SAFETY: caller guarantees ≥8 readable bytes (full u64).
             let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
-            (u.wrapping_mul(PRIME_8_BYTES) >> (64 - hash_log)) as u32
+            top_bits(u.wrapping_mul(PRIME_8_BYTES), hash_log)
         }
         _ => {
             debug_assert!(false, "unsupported MLS {MLS}");
             0
         }
     }
+}
+
+/// The top `hash_log` bits (`1..=32`) of a 64-bit hash product.
+#[cfg(not(target_pointer_width = "32"))]
+#[inline(always)]
+fn top_bits(product: u64, hash_log: u32) -> u32 {
+    (product >> (64 - hash_log)) as u32
+}
+
+/// The top `hash_log` bits (`1..=32`) of a 64-bit hash product, taken from its
+/// high word: they all lie there, and a 32-bit target then shifts one register
+/// instead of a register pair by a variable count (`shrd`, `shr`, a test of
+/// bit 5 and a select).
+#[cfg(target_pointer_width = "32")]
+#[inline(always)]
+fn top_bits(product: u64, hash_log: u32) -> u32 {
+    ((product >> 32) as u32) >> (32 - hash_log)
 }
 
 #[cfg(test)]
