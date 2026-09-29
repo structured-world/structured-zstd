@@ -804,6 +804,26 @@ fn finalize_raw_dict_rejects_zero_dict_id() {
     assert_eq!(err.to_string(), "dictionary id must be non-zero");
 }
 
+/// A dictionary too small is refused before the samples are walked, as
+/// upstream's `ZDICT_finalizeDictionary` checks the capacity first: sizes that
+/// do not describe the samples are not what the refusal reports.
+#[test]
+fn finalize_raw_dict_refuses_an_undersized_dictionary_before_the_samples() {
+    let (data, sizes) = training_samples();
+    let err = finalize_raw_dict(
+        b"content",
+        &data,
+        &sizes[1..],
+        MIN_TRAINED_DICT_SIZE - 1,
+        FinalizeOptions::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        TrainingError::of(&err),
+        Some(TrainingError::DictionaryTooSmall)
+    );
+}
+
 /// The sample sizes must describe the samples exactly.
 #[test]
 fn finalize_raw_dict_rejects_sizes_that_do_not_add_up() {

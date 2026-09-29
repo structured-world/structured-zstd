@@ -365,8 +365,33 @@ pub fn finalize_raw_dict(
     dict_size: usize,
     options: FinalizeOptions,
 ) -> io::Result<Vec<u8>> {
+    check_finalize_dict_size(dict_size)?;
     let set = samples::SampleSet::new(samples, sample_sizes)?;
     finalize::finalize(raw_content, &set, set.count(), dict_size, options)
+}
+
+/// Refuse a `dict_size` [`finalize_raw_dict`] cannot fill, from the size
+/// alone: below [`MIN_TRAINED_DICT_SIZE`]. Finalizing checks it first, before
+/// the samples; a caller holding the samples somewhere costly to walk can run
+/// it before that.
+///
+/// # Errors
+///
+/// `InvalidInput` carrying [`TrainingError::DictionaryTooSmall`].
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{
+///     MIN_TRAINED_DICT_SIZE, TrainingError, check_finalize_dict_size,
+/// };
+///
+/// assert!(check_finalize_dict_size(MIN_TRAINED_DICT_SIZE).is_ok());
+/// let err = check_finalize_dict_size(MIN_TRAINED_DICT_SIZE - 1).unwrap_err();
+/// assert_eq!(TrainingError::of(&err), Some(TrainingError::DictionaryTooSmall));
+/// ```
+pub fn check_finalize_dict_size(dict_size: usize) -> io::Result<()> {
+    finalize::check_size(dict_size)
 }
 
 /// The `k` and `d` values a training run tries, resolved from the options the

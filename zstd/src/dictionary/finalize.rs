@@ -92,10 +92,7 @@ pub(super) fn finalize_into<'s>(
     dict_size: usize,
     options: FinalizeOptions,
 ) -> io::Result<()> {
-    // Upstream zstd's order (`ZDICT_finalizeDictionary`): the size first.
-    if dict_size < DICT_SIZE_MIN {
-        return Err(too_small());
-    }
+    check_size(dict_size)?;
     if content.is_empty() {
         return Err(invalid("raw dictionary content must not be empty"));
     }
@@ -121,6 +118,16 @@ pub(super) fn finalize_into<'s>(
         out.resize(out.len() + MIN_CONTENT_SIZE - content.len(), 0);
     }
     out.extend_from_slice(content);
+    Ok(())
+}
+
+/// Refuse a dictionary below the smallest one finalized. Upstream zstd's
+/// order (`ZDICT_finalizeDictionary`): checked before anything else, the
+/// samples included.
+pub(super) fn check_size(dict_size: usize) -> io::Result<()> {
+    if dict_size < DICT_SIZE_MIN {
+        return Err(too_small());
+    }
     Ok(())
 }
 

@@ -549,6 +549,22 @@ fn zdict_trainers_report_upstreams_error_codes() {
         )
     };
     assert_eq!(code_from_result(n), ZSTD_error_dstSize_tooSmall);
+    // Before the sample sizes are summed, too: sizes that overflow are not
+    // what the refusal reports.
+    let overflowing = [usize::MAX, 2];
+    let n = unsafe {
+        crate::dict::ZDICT_finalizeDictionary(
+            dict.as_mut_ptr(),
+            255,
+            samples.as_ptr(),
+            8,
+            samples.as_ptr(),
+            overflowing.as_ptr(),
+            overflowing.len() as u32,
+            zparams,
+        )
+    };
+    assert_eq!(code_from_result(n), ZSTD_error_dstSize_tooSmall);
     // A zero `k` asks the plain trainers for a search they do not run.
     let n = unsafe {
         ZDICT_trainFromBuffer_cover(

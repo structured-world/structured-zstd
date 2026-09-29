@@ -457,6 +457,11 @@ pub unsafe extern "C" fn ZDICT_finalizeDictionary(
     nb_samples: c_uint,
     parameters: ZDICT_params_t,
 ) -> usize {
+    // The finalizer's own first check, run before anything is read, the sample
+    // sizes included.
+    if let Err(err) = codec::dictionary::check_finalize_dict_size(max_dict_size) {
+        return encode(crate::error::code_for_training_error(&err));
+    }
     // NULL + non-zero length is caller error, not a slice to build.
     if dict_content.is_null() && dict_content_size > 0 {
         return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed);
