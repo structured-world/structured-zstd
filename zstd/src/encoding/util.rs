@@ -52,5 +52,31 @@ pub fn find_fcs_field_size(val: u64, single_segment: bool) -> usize {
     8
 }
 
+/// The top `width` bits (`1..=32`) of a 64-bit multiplicative hash product,
+/// the index a hash table of `width` bits takes.
+#[cfg(not(target_pointer_width = "32"))]
+#[inline(always)]
+pub(crate) fn hash_top_bits(product: u64, width: u32) -> u32 {
+    debug_assert!(
+        (1..=32).contains(&width),
+        "hash width {width} out of 1..=32"
+    );
+    (product >> (64 - width)) as u32
+}
+
+/// The top `width` bits (`1..=32`) of a 64-bit multiplicative hash product,
+/// taken from its high word: they all lie there, and a 32-bit target then
+/// shifts one register instead of a register pair by a variable count
+/// (`shrd`, `shr`, a test of bit 5 and a select).
+#[cfg(target_pointer_width = "32")]
+#[inline(always)]
+pub(crate) fn hash_top_bits(product: u64, width: u32) -> u32 {
+    debug_assert!(
+        (1..=32).contains(&width),
+        "hash width {width} out of 1..=32"
+    );
+    ((product >> 32) as u32) >> (32 - width)
+}
+
 #[cfg(test)]
 mod tests;

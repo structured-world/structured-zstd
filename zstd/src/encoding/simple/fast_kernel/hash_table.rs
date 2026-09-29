@@ -7,6 +7,7 @@
 
 use alloc::vec;
 
+use crate::encoding::util::hash_top_bits;
 use crate::encoding::workspace::{Table, Workspace, region_bytes};
 
 /// Upstream zstd `ZSTD_HASHLOG_MAX` (`lib/zstd.h`). The cap applies uniformly
@@ -568,45 +569,28 @@ pub(crate) unsafe fn hash_ptr_raw<const MLS: u32>(ptr: *const u8, hash_log: u32)
         5 => {
             // SAFETY: caller guarantees ≥8 readable bytes (wide u64 load).
             let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
-            top_bits((u << (64 - 40)).wrapping_mul(PRIME_5_BYTES), hash_log)
+            hash_top_bits((u << (64 - 40)).wrapping_mul(PRIME_5_BYTES), hash_log)
         }
         6 => {
             // SAFETY: caller guarantees ≥8 readable bytes (u64 load).
             let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
-            top_bits((u << (64 - 48)).wrapping_mul(PRIME_6_BYTES), hash_log)
+            hash_top_bits((u << (64 - 48)).wrapping_mul(PRIME_6_BYTES), hash_log)
         }
         7 => {
             // SAFETY: caller guarantees ≥8 readable bytes (u64 load).
             let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
-            top_bits((u << (64 - 56)).wrapping_mul(PRIME_7_BYTES), hash_log)
+            hash_top_bits((u << (64 - 56)).wrapping_mul(PRIME_7_BYTES), hash_log)
         }
         8 => {
             // SAFETY: caller guarantees ≥8 readable bytes (full u64).
             let u = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) }.to_le();
-            top_bits(u.wrapping_mul(PRIME_8_BYTES), hash_log)
+            hash_top_bits(u.wrapping_mul(PRIME_8_BYTES), hash_log)
         }
         _ => {
             debug_assert!(false, "unsupported MLS {MLS}");
             0
         }
     }
-}
-
-/// The top `hash_log` bits (`1..=32`) of a 64-bit hash product.
-#[cfg(not(target_pointer_width = "32"))]
-#[inline(always)]
-fn top_bits(product: u64, hash_log: u32) -> u32 {
-    (product >> (64 - hash_log)) as u32
-}
-
-/// The top `hash_log` bits (`1..=32`) of a 64-bit hash product, taken from its
-/// high word: they all lie there, and a 32-bit target then shifts one register
-/// instead of a register pair by a variable count (`shrd`, `shr`, a test of
-/// bit 5 and a select).
-#[cfg(target_pointer_width = "32")]
-#[inline(always)]
-fn top_bits(product: u64, hash_log: u32) -> u32 {
-    ((product >> 32) as u32) >> (32 - hash_log)
 }
 
 #[cfg(test)]

@@ -1,8 +1,33 @@
 use super::find_fcs_field_size;
 use super::find_min_size;
+use super::hash_top_bits;
 use super::write_minified_val;
 use alloc::vec;
 use alloc::vec::Vec;
+
+/// A hash index is the product's top `width` bits for every width a table
+/// takes (1..=32), on a 32-bit target (read from the high word) as on a 64-bit
+/// one (one 64-bit shift).
+#[test]
+fn hash_top_bits_are_the_products_top_bits_at_every_width() {
+    let products = [
+        0u64,
+        u64::MAX,
+        0x8000_0000_0000_0001,
+        0x0000_0000_ffff_ffff,
+        0xcf1b_bcdc_b7a5_6463,
+        0x1234_5678_9abc_def0,
+    ];
+    for product in products {
+        for width in 1..=32 {
+            assert_eq!(
+                hash_top_bits(product, width),
+                (product >> (64 - width)) as u32,
+                "product {product:#x}, width {width}"
+            );
+        }
+    }
+}
 
 fn minify_val(val: u64) -> Vec<u8> {
     let mut out = Vec::new();
