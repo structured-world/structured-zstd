@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790652788773,
+  "lastUpdate": 1790674497719,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -10607,6 +10607,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.187,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9c037c671260cb9226f6bb4b8ebdbd635f25448d",
+          "message": "feat(dict)!: entropy tables measured from the samples (#533)\n\n* feat(dictionary): raw dictionaries from the FastCOVER search\n\n`create_raw_dict_from_dir`, `_source` and `_slice` built their content\nwith a reservoir-sampled local-maximum-coverage trainer. Measured on\nthe repository files against upstream zstd's `--train` dictionary,\nheld-out samples compressed by upstream zstd: it came out 1.38% larger\nat level 3, 1.80% at level 19 and 8.14% on 1 KiB samples, where the\nFastCOVER search is within 0.14% of upstream; one training on 1.4 MB\ntook minutes where the search takes under a second.\n\nThe three functions now return what `optimize_fastcover_dict` picks at\nits defaults, as `zstd --train` does, without entropy tables: a\ndirectory is one sample per file, and a corpus without sizes is cut\ninto at least sixteen samples of at most 128 KiB. A corpus no larger\nthan the dictionary is its own content, and one the trainer refuses\ngives its last `dict_size` bytes, as before for tiny corpora. The old\ntrainer, its reservoir sampler and frequency estimate are removed.\n\nThe frame compressor's dict-builder test now compresses a small frame,\nwhich a dictionary exists for: a long frame of near-identical lines\ncompresses smaller without one, in upstream zstd too (245 against 261\nbytes with this dictionary at level 1).\n\nPart of #128\n\n* feat(dict)!: entropy tables measured from the samples\n\nThe finalizer built its tables from the samples' raw bytes, counting byte\nvalues modulo each alphabet as if they were sequence codes. Such tables\nmade a dictionary compress its own samples worse than its bare content\ndid.\n\n- finalize_raw_dict follows upstream's ZDICT_analyzeEntropy: the first\n  block of each sample is compressed with the content as a raw dictionary,\n  and the literals, literal/match lengths and offset codes those blocks\n  hold are counted; tables at upstream's logs (literals up to 11 bits,\n  offsets 8, lengths 9), a mostly flat stand-in when literals are flat\n- blocks written raw teach nothing and are left out, as upstream does\n- the literals table is scaled to its longest code, as upstream writes it\n- FinalizeOptions carries the level (upstream's zParams.compressionLevel),\n  used both for the analysis and for scoring candidates; CoverOptions no\n  longer has one\n- MIN_TRAINED_DICT_SIZE is upstream's ZDICT_DICTSIZE_MIN, 256\n- ZDICT_finalizeDictionary passes the sample sizes and honours\n  compressionLevel\n\nMeasured on 321 repository files, 16 KiB dictionaries, compressed with\nupstream zstd -3: the dictionary gap to upstream's went from +2.3..3.0%\nto +0.09..0.6% across --train, fixed COVER and fixed FastCOVER.\n\nBREAKING CHANGE: finalize_raw_dict takes the sample sizes; FinalizeOptions\ngains `level` and CoverOptions loses it; MIN_TRAINED_DICT_SIZE is 256.\n\nPart of #128\n\n* perf(dict): FastCOVER hashes each position once, unchecked\n\n- the counting and selecting loops are monomorphised on the number of\n  bytes a dmer hashes, once above the loop, instead of branching on d at\n  every position\n- the window keeps each entering position's table index in a ring and\n  reads it back as the position leaves; upstream hashes it a second time\n- reads and table indexing go through pointers: every position below\n  nb_dmers has eight readable bytes and hashes below 2^f, both tables'\n  length; the ring is bounded by the epoch, which a window never exceeds\n\nDictionaries are byte-identical. x86 (runner2), fixed FastCOVER k=256 d=8\non 6420 samples, task-clock over three interleaved rounds: 5.29 s -> 4.98 s.\n\nPart of #128\n\n* perf(dict): analyse every sample at the average sample's parameters\n\nThe finalizer hinted each sample's own size, so every sample ran its own\ntable sizes and the dictionary was indexed again for each one. Upstream\nanalyses them all with the parameters of the average sample\n(ZSTD_getParams(level, averageSampleSize, dictSize)); doing the same keeps\none set of tables for the pass and the dictionary resident between\nsamples.\n\nx86 (runner2), fixed FastCOVER k=256 d=8 on 6420 samples, task-clock over\nthree interleaved rounds: 4.99 s -> 4.38 s; the dictionary's total over the\ncorpus at upstream -3 went from 1851466 to 1850248 (upstream's own:\n1849508).\n\nPart of #128\n\n* perf(dict): shrink the search's winner, not every candidate\n\nUpstream's selection shrinks each candidate of its parameter search (and\nthen never runs it). The size a dictionary is cut to is a separate choice\nfrom the k and d that built it, and cutting every candidate multiplies the\nwhole search by the number of sizes tried: a zero-k, zero-d FastCOVER\nsearch with shrink took 56.6 s where the search alone takes a few. The\nsearch now keeps the winner's content and cuts only that dictionary.\n\nPart of #128\n\n* fix(dict): count what the analysed block wrote\n\n- Only a sample's first block reaches the entropy tables, as upstream's\n  ZDICT_countEStats compresses MIN(128 KiB, window) bytes as one block. A\n  sample longer than the window used to add every later block, including\n  ones written raw. Once a frame has shown the window, the rest of each\n  sample is not fed at all. Regression test:\n  only_the_first_block_of_a_sample_is_counted.\n- Offset codes are counted with the repeat policy the frame's blocks used:\n  at the fast strategy an offset equal to rep[1] or rep[2] is written\n  explicitly, and the finalizer counted it as repeat 2 or 3. One function,\n  uses_fast_offset_codes, now decides this for the block encoder, its size\n  estimate and the finalizer. Regression test:\n  offset_codes_follow_the_frames_repeat_policy.\n- The four table descriptions are written straight into the dictionary: the\n  sequence tables are normalized and described without building encoder\n  tables (write_ncount, shared with FSETable::write_table), and the\n  literals table writes its description alone instead of encoding a symbol\n  and parsing it back.\n- The finalizer's too-small refusal carries TrainingError::DictionaryTooSmall\n  and is checked first, as upstream does, so ZDICT_finalizeDictionary\n  returns dstSize_tooSmall.\n\n* fix(dict): size the analysed block as upstream does\n\nThe entropy analysis runs upstream's parameters for the average sample and\nthe content, ZSTD_getParams(level, averageSampleSize, dictSize), set\nexplicitly, and hints the frames as a source of both together, the size\nupstream fits the window to. A frame with a dictionary fits its window to\nthe source alone, so hinting the average sample cut the analysed block to\nthe sample's window: on the repository files the fixed COVER dictionary\nlost 999 bytes against the one before.\n\nMatcher gains apply_parameters, a default no-op the built-in matcher\nimplements, so FrameCompressor::set_parameters works with any matcher.\n\nRegression test: the_first_block_spans_the_window_of_sample_and_content.\n\n* fix(dict): count every compressed block, skip raw ones\n\nThe entropy analysis counts every block of a sample again, and now leaves\nout each block written raw or as one repeated byte: its bytes are no\nliterals of any compressed block and it holds no sequences. The recorder\nkeeps one entry per block, matched or skipped, and the frame's block\nheaders say which were compressed.\n\nCounting the first block alone, as upstream's ZDICT_countEStats does,\nmeasured worse on the repository files: at our window the samples\ncompressed 0.013% larger in total across fixed COVER, fixed FastCOVER and\nthe default search, at upstream's window (average sample plus content,\nset with its parameters) 0.05% larger. This replaces both, including the\nMatcher::apply_parameters hook the second one needed.\n\nRegression test: a_block_written_raw_is_not_counted.\n\n* perf(fse): describe a table without copying its probabilities\n\nWriting and sizing an NCount description copied the 256 probabilities of\na built table into an array first, so every new sequence table a block\nemitted, and every header priced for the table-mode choice, paid a 1 KiB\ncopy. The writer and the size count now read the probabilities through\nan accessor, from the table itself or from the normalized counts.\n\n* docs(fse): name the test-only table builders without linking them\n\n* fix(dict): read the recorded literals back by position\n\n* perf(dict): finalize every candidate over the evaluator's buffers\n\n- The finalizer writes over a buffer the caller keeps, and the evaluator\n  finalizes each candidate, and each shrunk one, over two buffers it holds;\n  the best-so-far copies a candidate's dictionary and content only when it\n  wins. Dictionaries are byte-identical.\n- The candidate copied into the encoder dictionary stays a copy: under\n  callgrind the copy and the dictionary's preparation are 0.02% of a default\n  training run, against 52.7% for compressing the samples with it.\n\n* perf(dict): keep the analysis compressor across candidates\n\n- The entropy analysis keeps its compressor, frame buffer and block kinds\n  on the evaluator: between candidates only the dictionary changes, so the\n  matcher and encoder scratch are no longer rebuilt for each one. The\n  compressor is rebuilt when the level changes.\n- Each sample's frame is written straight into the kept buffer\n  (compress_known_into: the header first, the length being known, then the\n  blocks), without the streaming path's block accumulator and copy.\n- Offset codes are counted into a fixed array over every code, as upstream\n  zstd's offcodeCount is, and described up to the alphabet's bound: no\n  branch per sequence, no allocation per analysis.\n\nDictionaries are byte-identical for --train and --train-cover on a frozen\ncorpus. Time on an M1 moved within noise (--train -1.0%, --train-cover\n+1.3% by minimum, both under what two builds resolve).\n\n* perf(dict): build the literals code once, in kept buffers\n\nThe finalizer built the literals code at the length limit and, when its\nlongest code fell short of it, built it again at that length only to\ndescribe it there. Below the limit the height limiter does nothing, so\nboth builds give the same code lengths and the second only lowers every\nweight by the same step: `build_limited_in` now does that step on the\nfirst build's weights, which is the table upstream zstd writes from the\n`maxNbBits` its build returns.\n\nThe weights, the tree nodes and the table's buffers live in a\n`WeightScratch` the analysis keeps from one candidate to the next, so a\nparameter search allocates none of them per candidate.\n\nDictionaries are byte-identical to the previous head for --train,\nCOVER, FastCOVER and FastCOVER with shrink at levels 1, 3, 9 and 19.\nA test checks the code built under the limit against the code built at\nits longest length, over a scratch holding another table.\n\n* fix(dict): fit summed literal counts to the Huffman tree\n\nThe literal counts the finalizer sums over every sample fed the Huffman\nbuilder unchecked: past 2^32 literals, which a direct finalize over\nlarge samples can reach, the tree's u32 node counts wrapped in release\nand panicked in debug. The counts are now halved, rounding up so every\nsymbol that occurred stays in the code, until they fit a node, and\n`build_limited_in` runs the entry check the other builders run.\nRegression test: literal_counts_past_a_tree_node_still_build_a_code.\n\nA search keeps the winner's content only when the winner will be\nshrunk; the shrink setting now lives in `Best`, which ranks candidates\nat full size and cuts only the winner, as `CoverOptions::shrink`\ndocuments.\n\nDictionaries are byte-identical for --train, FastCOVER, COVER with a\nsearch and COVER with shrink.\n\n* fix(dict): refuse an undersized finalize before the samples\n\n`finalize_raw_dict` built its sample set, walking every size and\nallocating the offsets, before it refused a dictionary under 256 bytes,\nand `ZDICT_finalizeDictionary` summed the sample sizes first too: an\nimpossible request over a large corpus paid for the walk, and sizes\nthat did not add up were reported instead of the size. Upstream zstd\nchecks the capacity before anything else.\n\nThe rule is the codec's `check_finalize_dict_size`, which\n`finalize_raw_dict` runs first and the C ABI runs before it reads any\nargument. Regression tests:\nfinalize_raw_dict_refuses_an_undersized_dictionary_before_the_samples,\nand an overflowing size list in zdict_trainers_report_upstreams_error_codes.\n\n* docs(dict): name the raw content's size floor by its current constant\n\n* fix(dict): gate the known-size frame writer, place the split doc\n\n- `FrameCompressor::compress_known_into` has only the dictionary\n  finalizer as a caller, so a build without `dict-builder` failed its\n  dead-code lint; it is compiled with that feature only\n- the paragraph describing `SampleSet::split` sat above\n  `check_holds_dmer`; it now documents `split`\n- the README and the loader say where the five-sample floor applies:\n  to the samples the files make, as upstream's command checks it\n  (dibio.c); COVER and FastCOVER check what the split and the memory\n  limit keep, and the legacy trainer, as upstream's, trains on whatever\n  the limit keeps\n\nPart of #128\n\n* perf(dict): hand back the search winner's raw content\n\nThe raw-dictionary path ran the FastCOVER search, then built a second\ncontext from the parameters it chose and selected the same segments\nagain: another corpus-wide dmer count, another 2^20-entry frequency\ntable and another selection, for content the search already held.\n\nThe search now takes what to keep of its winner: its dictionary, cut\ndown when shrinking, or the raw content it was finalized from. The raw\npath asks for the content and gets it straight from the search, and a\ncontent search no longer copies each winner's finalized dictionary.\nThe content is unchanged; raw_content_is_the_fastcover_search_winner\nchecks it against the dictionary the search finalizes.\n\nPart of #128\n\n* fix(dict): analyse samples one written block per matched block\n\nAt btopt and above with a window of 128 KiB or more, the frame the\nanalysis compresses could cut a matched block into several blocks\nafter matching. The recorder sees one block per matcher call, so the\npieces could not be told apart, and a frame with any raw piece had\nnone of its blocks counted: a 128 KiB sample of 16 KiB of log lines\nand 112 KiB of noise at level 19 went out as two compressed pieces\nand a raw one and taught the tables nothing. The analysis compressor\nnow never cuts after matching, as upstream's analysis compresses a\nsingle block (`ZDICT_countEStats`, `ZSTD_compressBlock`), so every\nwritten block is one recorded block and is counted by its own kind.\nRegression test: a_block_mixing_text_and_noise_is_counted.\n\nThe literals table's description is encoded into the table's own\nbuffer with the analysis' FSE table before it is written, both kept\nfrom one candidate to the next, instead of into a fresh buffer and\ntable per candidate.\n\nDictionaries on the repository files and the decodecorpus files are\nunchanged at levels 3 and 19, where no sample reaches a split.\n\nPart of #128",
+          "timestamp": "2026-09-29T11:30:17+03:00",
+          "tree_id": "71f3b607acc9a465c9edec070789abab382f4c50",
+          "url": "https://github.com/structured-world/structured-zstd/commit/9c037c671260cb9226f6bb4b8ebdbd635f25448d"
+        },
+        "date": 1790674479748,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.065,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 160.931,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 224.579,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.497,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.187,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.401,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.938,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.43,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.964,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.006,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 7.477,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.699,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.189,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.309,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.105,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.445,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.193,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.021,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.125,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.021,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.123,
             "unit": "ms"
           }
         ]
