@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790628884390,
+  "lastUpdate": 1790648447159,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -10184,6 +10184,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
             "value": 0.021,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.187,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "57ea97022ae1dd5f4a8196780e0b97e3d8bef121",
+          "message": "feat(dict)!: upstream COVER and sample-aware trainers (#532)\n\n* feat(dict)!: upstream COVER and sample-aware trainers\n\n- COVER as upstream's cover.c builds it: every dmer indexed exactly,\n  frequency = samples holding it, segments picked per epoch; dmer ids come\n  from one hash pass instead of a comparison sort, which leaves every\n  selection unchanged\n- FastCOVER counts dmers inside their own sample, splits train/test by\n  sample count and draws the entropy tables from the share accel sets\n- the optimizers search k and d the way upstream's do (steps, split) and\n  keep the candidate the scoring samples compress smallest with, instead\n  of a dmer-coverage score\n- shrink takes effect: the smallest trailing share within the regression\n  bound is kept; upstream parses it and never applies it\n- C ABI: ZDICT_trainFromBuffer_cover, ZDICT_optimizeTrainFromBuffer_cover;\n  every ZDICT trainer now passes the sample sizes through and honours\n  steps and shrink; ZDICT_trainFromBuffer runs upstream's parameters\n- CLI: --train-cover takes k, d, steps, split and shrink; shrink works for\n  --train-fastcover; a listed tuning starts from zero as upstream's parser\n  does; every trainer loads samples as upstream does (-B cuts, at least 5)\n- dict-train bench compares the same search on the same samples on both\n  sides, and reports the chosen k\n\nMeasured on 321 repository files, 16 KiB dictionaries, M1: COVER 1.05 s\nagainst upstream's 35.8 s; content quality within 0.12% of upstream's at\nequal size.\n\nBREAKING CHANGE: the dictionary trainers take samples with their sizes:\ntrain_cover_dict, optimize_cover_dict, train_fastcover_dict and\noptimize_fastcover_dict replace create_fastcover_dict_from_source/_slice,\ncreate_fastcover_raw_dict_from_source and train_fastcover_raw_from_slice;\nFastCoverOptions is reshaped around CoverOptions, and FastCoverTuned,\nFastCoverParams and the DEFAULT_*_CANDIDATES lists are gone.\n\nPart of #128\n\n* fix(dict): upstream error codes and cleaner segment coverage\n\n- The C trainers answered every refusal with dictionaryCreation_failed.\n  The codec now tags each refusal with a TrainingError cause (parameter,\n  samples, dictionary too small) and checks them in upstream's order, and\n  the C ABI maps the cause to upstream's code: parameter_outOfBound,\n  srcSize_wrong, dstSize_tooSmall, memory_allocation. The duplicated k/d\n  check in the plain C entries goes; the codec already refuses it.\n  Regression test: zdict_trainers_report_upstreams_error_codes.\n- COVER no longer credits a dmer that spills into the next sample: those\n  bytes exist only in the concatenation. FastCOVER already skipped them.\n- FastCOVER drops the leading dmers of a chosen segment that earlier\n  segments already cover, so they no longer spend dictionary bytes.\n- Every candidate of a parameter search reuses one frequency scratch\n  instead of cloning the table (4 MiB for FastCOVER at f=20); refilling it\n  reports a table that does not fit instead of aborting.\n\n* fix(dict): refuse a NaN split point, score lazily\n\n- A split point that is not a finite number is refused as a parameter out\n  of range: NaN failed every range comparison and silently meant \"every\n  sample builds and scores\". Regression test:\n  a_split_point_that_is_not_a_number_is_refused.\n- The scoring compressor is built at the first pricing, so plain training\n  that only finalizes never builds it.\n- shrink is documented as what it does, the same search as upstream's\n  COVER_selectDict: the content's trailing 256, 512, ... bytes, the first\n  within the regression kept. The C FastCOVER d documents that sizes other\n  than 6 and 8 train here instead of being refused.\n\n* fix(bench): report the bytes dictionary training reads\n\nThe training samples cap at 64 chunks of 8 KiB, so on a large scenario both\narms train on a 512 KiB prefix while training_bytes and the Criterion\nthroughput still counted the whole scenario. Both now use the sum of the\nsamples. The dictionary size stays derived from the scenario length, the\nsame as the memory bench, so the trained dictionaries do not change.\n\n* fix(dictionary): scan the whole corpus, bound FastCOVER counts\n\n- COVER and FastCOVER epochs that fall back to the ten-segment floor now\n  share the whole corpus between them. Kept at the floor, as upstream\n  keeps them, up to one epoch at the end of the corpus was never scanned.\n  Regression case in epochs_follow_the_reference_formula.\n- FastCOVER refuses a corpus whose dmer count does not fit u32, as COVER\n  and upstream FASTCOVER_ctx_init do; past that its u32 counts could wrap.\n  No test: it needs more than 4 GiB of samples.\n- Both segment trainers write their content into one buffer kept across\n  the candidates of a search and hand out a slice of it, instead of\n  allocating and zeroing a fresh one per candidate.\n- TRAINER_DICT_SIZE_MIN (was SEGMENT_DICT_SIZE_MIN) is the minimum every\n  trainer shares, the legacy one included, and the CLI refuses --maxdict\n  below it before loading any sample. Regression cases for each trainer in\n  an_impossible_dictionary_size_is_refused_before_the_samples_are_read.\n\n* perf(dictionary): cover the corpus tail with the last epoch only\n\nWidening every floor-sized epoch to share the corpus scanned more on\nevery epoch visit: FastCOVER at k=256 ran 9.3% more instructions for the\nsame dictionary. Epochs keep upstream's sizes again, and the last one runs\nto the end of the corpus, so the tail is still scanned at the cost of one\nlonger epoch per cycle.\n\nFastCOVER's segment selection now writes into a slice sized by the build.\nAgainst the pushed head, k=256 runs 1.1% fewer instructions with the same\ndictionary (callgrind, 465.3M -> 460.3M).\n\n* docs(dictionary): point the size refusals at TRAINER_DICT_SIZE_MIN\n\n* fix(cli): report the tuned split as the percentage it was given\n\n* perf(dictionary): index COVER dmers in a few words per position\n\nThe dmer index kept a (tag, id) pair per slot at under half load plus the\nfirst position, frequency and last sample of every dmer: on a corpus where\nnearly every dmer is distinct that is about fifty bytes per input byte.\n32 MiB of random samples trained with a 1.6 GB peak against upstream's\n298 MB.\n\nA slot now holds only the first position of its dmer: the id is dmer_at\nthere and the key is read back from the samples. The sample a dmer was last\ncounted in lives in the window-count field the index returns zeroed, and a\ngrown table is refilled from dmer_at, whose first occurrences come in id\norder, so the old table is gone before the new one fills.\n\nSame dictionaries. 32 MiB random: 1.61 GB -> 692 MB peak, 8.38 -> 6.31 s.\nRepository files: --train-cover 2212 -> 2135 ms, k=256,d=8 765 -> 679 ms,\nk=256,d=12 1942 -> 1521 ms.\n\n* fix(dictionary): refuse tuning no segment fits before the samples\n\n- check_cover_options and check_fastcover_options refuse tuning under which\n  no k and d fit the dictionary, from the options alone. The trainers run\n  the check before indexing, as upstream's COVER_checkParameters runs ahead\n  of the samples, and the CLI runs it before loading any sample: a k past\n  --maxdict, or a d the default k search never reaches, used to read the\n  whole corpus first. Regression cases in\n  tuning_that_fits_no_dictionary_is_refused_before_the_samples_are_read.\n- A search over both dmer sizes releases the previous index and its scratch\n  before building the next, so two corpus-sized indexes never coexist.\n\n* perf(dictionary): build the entropy tables once per search\n\n* test(cli): assert the tuning refusal itself, not only its timing\n\n* fix(dictionary): refuse an undersized dictionary in the preflight\n\n* fix(cli): refuse a split that leaves too few samples before loading\n\n* fix(dictionary): refuse before walking or loading samples\n\n- The segment trainers check for an empty sample list and an undersized\n  dictionary before walking the sample sizes, as upstream zstd's\n  ZDICT_trainFromBuffer_cover does (regression test\n  an_undersized_dictionary_is_refused_before_the_sample_sizes_are_checked).\n- The CLI plans which samples its memory budget keeps from the files'\n  sizes, asks the trainer about that count before opening a file, and loads\n  exactly that plan into buffers sized to it (regression test\n  a_memory_limit_that_keeps_too_few_samples_is_refused_before_they_are_read).\n\n* docs(dictionary): record why a priced candidate is prepared by copy\n\n* fix(dictionary): check fit before size, reuse candidate buffers\n\n- The option preflights check whether any segment fits the dictionary before\n  the dictionary size, as the trainers and upstream zstd do\n  (COVER_checkParameters before the ZDICT_DICTSIZE_MIN check), so a request\n  failing both names one cause (regression test\n  the_preflight_names_the_cause_the_trainer_names).\n- The evaluator finalizes every candidate, and every shrunk one, over two\n  buffers it keeps; the best-so-far copies a candidate's bytes into the\n  previous winner's buffer only when it wins. Dictionaries are\n  byte-identical.\n- The dictionary bench skips a scenario whose samples leave FastCOVER's split\n  too few to train, which neither side can build a dictionary from, before\n  training rather than through the failed training.\n\n* fix(dictionary): refuse dmer-less samples, compare shrink bounds exactly\n\n- COVER and FastCOVER refuse training samples none of which is long enough\n  to hold a dmer before indexing them: a dmer counts only inside one sample,\n  so such a corpus trains nothing however long it runs together (regression\n  test samples_too_short_for_a_dmer_are_refused).\n- The shrinking search compares a candidate's cost with the tolerated\n  regression in integers; the floating-point tolerance landed just under an\n  exact bound and dropped a size that met it (regression test\n  a_shrunk_dictionary_exactly_at_the_bound_is_kept).\n\n* fix(dictionary): keep searching past an untrainable dmer size\n\n- A dmer size the samples cannot index is one failed candidate of a search,\n  not the search's end: the other sizes are still tried and the error is\n  returned only if none builds (regression test\n  a_dmer_size_the_samples_cannot_hold_is_skipped_in_a_search).\n- COVER indexes every position a whole dmer starts at: a dmer shorter than\n  eight bytes near the end of the corpus is read through a bounded tail,\n  where it was dropped (regression test\n  a_short_dmer_at_the_end_of_the_corpus_is_indexed). Epochs keep upstream's\n  sizing; the extra positions fall in the last one.\n- A long dmer's tag is a rolling fingerprint carried from one position to\n  the next, so indexing costs constant time per position whatever d is:\n  d = 512 trains 10.7x faster on the repository files, with the same\n  dictionary.\n- COVER and FastCOVER stop after one pass of empty epochs: counts only fall\n  to zero, so further passes cannot add anything.\n\n* perf(dictionary): grow the COVER index from its own slots\n\nA growing dmer index rebuilt its table by walking every position\nscanned so far, re-rolling the fingerprint at each, to find the first\nposition of every id. A corpus with a long repetitive prefix and a\ntail of new dmers paid that prefix once per growth. The rebuild now\nreads the first positions straight from the old table and takes each\ntag from its first position, so it costs the distinct dmers only;\nwhich slot a dmer lands in changes no id, and the dictionaries are\nbyte-identical.\n\nThe probe loop compared a short dmer by reading the current position's\nkey again at every occupied slot; the key computed for the hash is now\nthe one compared.\n\nCOVER on 48 samples of one repeated line followed by 16 random ones,\nM1, minimum of five runs: d=8 210.0 -> 203.5 ms, d=12 278.6 -> 257.8\nms. On the repository files the user time moves 321.6 -> 308.3 ms.\n\n* perf(dictionary): pick the FastCOVER dmer hash once per pass\n\nEvery counted and scanned position re-derived the hash width from `d`\nand the shift from `f`, both fixed for a context, and branched on the\nwidth. The width is now a const parameter chosen once above the\ncounting loop and above segment selection, and the shift is computed\nbefore them, so each position is a read, a multiply and a shift.\n\nDictionaries are byte-identical. M1, repository files, minimum of five\nruns: FastCOVER k=256 d=8 62 -> 54 ms, k=256 d=6 67 -> 54 ms, the d=8\nsearch over k 1480 -> 1284 ms, --train 207 -> 185 ms.\n\n* perf(dictionary): keep long dmers' fingerprints in the COVER index\n\nA slot of the dmer index held only a first position, so a probe for a\ndmer longer than a word compared the bytes at every occupied slot, and\na table rebuild rolled each resident fingerprint again over its d\nbytes. Long dmers now keep their fingerprint beside the slot: a probe\ncompares bytes only when the fingerprints agree, and a rebuild moves\nthe stored ones. Short dmers are unchanged, their key being one word.\n\nDictionaries are byte-identical. On M1 the time delta is not\nestablished: the d=8 control arm, which this cannot touch, moved as\nmuch as the d=12 and d=16 runs.",
+          "timestamp": "2026-09-29T04:30:23+03:00",
+          "tree_id": "b71dc42d9aa081a81ebb4e7d09d43c167cd96bf9",
+          "url": "https://github.com/structured-world/structured-zstd/commit/57ea97022ae1dd5f4a8196780e0b97e3d8bef121"
+        },
+        "date": 1790648424924,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.065,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 161.092,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 226.153,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.503,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.101,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.456,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.93,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.488,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.958,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 8.379,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.721,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.204,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.396,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.186,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.54,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.276,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.022,
             "unit": "ms"
           },
           {
