@@ -1409,6 +1409,12 @@ pub(crate) struct CompressState<M: Matcher> {
     /// size and the encode cost in parity on the negative band. Set per frame
     /// alongside `strategy_tag`.
     pub(crate) literal_compression_disabled: bool,
+    /// Whether a matched block may be cut into several blocks after matching,
+    /// where its strategy and window call for it. `true` for every frame but a
+    /// dictionary's analysis, which has to see one written block per matched
+    /// block, as upstream's single-block analysis does (`ZDICT_countEStats`
+    /// compresses with `ZSTD_compressBlock`, which never splits).
+    pub(crate) post_split_allowed: bool,
 }
 
 /// Whether the HUF literal build should run the #167 table-log search for a
@@ -1781,6 +1787,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                     compression_level,
                     crate::encoding::CompressionLevel::Level(n) if n < 0
                 ),
+                post_split_allowed: true,
             },
             magicless: false,
             content_checksum: false,
@@ -2220,6 +2227,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     compression_level,
                     crate::encoding::CompressionLevel::Level(n) if n < 0
                 ),
+                post_split_allowed: true,
             },
             compression_level,
             magicless: false,
@@ -2481,6 +2489,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         );
         self.uncompressed_data = Some(source);
         self.finish_frame(all_blocks, total_uncompressed, &prep);
+    }
+
+    /// Write every matched block as one block, never cut after matching: what
+    /// a dictionary's analysis needs to tell each block's kind from the frame.
+    #[cfg(feature = "dict-builder")]
+    pub(crate) fn forbid_post_split(&mut self) {
+        self.state.post_split_allowed = false;
     }
 
     /// [`Self::compress`] for a source of `total` bytes, the frame written

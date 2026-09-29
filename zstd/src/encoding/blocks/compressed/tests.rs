@@ -399,6 +399,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 pre_split: None,
                 huf_optimal_search: true,
                 literal_compression_disabled: false,
+                post_split_allowed: true,
             };
             let mut emit_state = CompressState::<EntropyOnlyMatcher> {
                 matcher: EntropyOnlyMatcher,
@@ -416,6 +417,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 pre_split: None,
                 huf_optimal_search: true,
                 literal_compression_disabled: false,
+                post_split_allowed: true,
             };
             let mut workspace = EstimatorWorkspace::default();
             let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
@@ -481,6 +483,7 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
         pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
+        post_split_allowed: true,
     };
     let mut est_state = make_state();
     let mut emit_state = make_state();
@@ -546,6 +549,7 @@ fn retained_heap_size_counts_the_block_buffers() {
         pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
+        post_split_allowed: true,
     };
     let before = state.retained_scratch_heap_size();
     let block = 64 * 1024;
@@ -626,6 +630,7 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
             pre_split: None,
             huf_optimal_search: true,
             literal_compression_disabled: false,
+            post_split_allowed: true,
         };
         let mut est_state = make_state();
         let mut emit_state = make_state();
@@ -690,6 +695,7 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
+        post_split_allowed: true,
     };
     let source = [0xA5; 8];
     let mut sequences = [RawSequence {

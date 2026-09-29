@@ -413,6 +413,7 @@ impl<M: Matcher> CompressionContext<M> {
                     compression_level,
                     CompressionLevel::Level(n) if n < 0
                 ),
+                post_split_allowed: true,
             },
             encoded_scratch: Vec::new(),
             errored: false,

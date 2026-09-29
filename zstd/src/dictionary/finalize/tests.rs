@@ -221,6 +221,53 @@ fn a_block_written_raw_is_not_counted() {
     assert!(one == other, "a raw block's bytes reached the tables");
 }
 
+/// A block of text and noise still teaches its text. At level 19 a 128 KiB
+/// sample of 16 KiB of log lines and 112 KiB of noise is one block for the
+/// matcher; cut after matching, it went out as two compressed pieces and a raw
+/// one, which could not be told apart from the one recorded block, so none of
+/// the sample was counted.
+#[test]
+fn a_block_mixing_text_and_noise_is_counted() {
+    const TEXT: usize = 16 << 10;
+    let mut data = Vec::new();
+    let mut line = 0u32;
+    while data.len() < TEXT {
+        data.extend_from_slice(
+            std::format!(
+                "ts={line} level=info msg=request served path=/api/v1/items/{}\n",
+                line % 97
+            )
+            .as_bytes(),
+        );
+        line += 1;
+    }
+    data.truncate(TEXT);
+    data.extend_from_slice(&noise(0x2545_F491_4F6C_DD1D, (128 << 10) - TEXT));
+    let sizes = [data.len()];
+    let samples = SampleSet::new(&data, &sizes).unwrap();
+    let content = data[..4096].to_vec();
+    let mut counts = EntropyCounts {
+        literals: [1; 256],
+        offset_codes: [1; 32],
+        match_lengths: [1; 53],
+        literal_lengths: [1; 36],
+    };
+    count_samples(
+        &mut counts,
+        &mut Analysis::default(),
+        &content,
+        &samples,
+        1,
+        19,
+    )
+    .unwrap();
+    let matches: usize = counts.match_lengths.iter().sum();
+    assert!(
+        matches > 53 + 100,
+        "the text half's sequences were counted: {matches}"
+    );
+}
+
 /// Offset codes are counted with the repeat policy the frame's blocks used.
 /// Two tokens alternating behind short varied gaps make an offset often equal
 /// the one before last: the full search writes it as repeat 2 or 3 (offset

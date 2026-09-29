@@ -516,6 +516,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             pre_split: state.pre_split,
             huf_optimal_search: state.huf_optimal_search,
             literal_compression_disabled: state.literal_compression_disabled,
+            post_split_allowed: state.post_split_allowed,
         },
         workspace,
     };

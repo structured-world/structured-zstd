@@ -919,8 +919,14 @@ impl HuffmanTable {
         };
     }
 
+    /// Encode the table's description into its own buffer, with `fse_table`
+    /// as the weights' FSE storage, so a writer that follows emits it without
+    /// encoding it again.
     #[cfg(feature = "std")]
-    fn fill_weight_description_from_codes(&mut self, fse_table: &mut fse_encoder::FSETable) {
+    pub(crate) fn fill_weight_description_from_codes(
+        &mut self,
+        fse_table: &mut fse_encoder::FSETable,
+    ) {
         // Before deriving the weights, not after: they cost a pass over the
         // whole alphabet, and a warm cache needs none of it.
         if self.cached_encoded_weight_description.state != DescriptionState::NotComputed {

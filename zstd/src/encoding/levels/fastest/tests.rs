@@ -83,6 +83,7 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
+        post_split_allowed: true,
     };
     let mut output = Vec::new();
     let block = vec![0xAB; 1024];

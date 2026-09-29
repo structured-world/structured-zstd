@@ -193,7 +193,10 @@ fn analyze_entropy<'s>(
     count_samples(&mut counts, analysis, content, samples, count, level)?;
 
     let huffman = &mut analysis.huffman;
-    let literals = literals_table(&mut counts.literals, huffman);
+    let mut literals = literals_table(&mut counts.literals, huffman);
+    // Encoded in the table's own buffer and the scratch's FSE table, both kept
+    // from one candidate to the next, so the writer below reads it back.
+    literals.fill_weight_description_from_codes(huffman.weight_fse_table());
     // Each description goes straight into the dictionary; the sequence tables
     // are normalized and described without being built.
     let mut writer = BitWriter::from(&mut *out);
@@ -269,10 +272,12 @@ fn count_samples<'s>(
             blocks: Vec::new(),
             sequences: Vec::new(),
         };
-        *compressor = Some((
-            level,
-            FrameCompressor::new_with_matcher(recorder, CompressionLevel::from_level(level)),
-        ));
+        let mut built =
+            FrameCompressor::new_with_matcher(recorder, CompressionLevel::from_level(level));
+        // One written block per matched one, so each is counted by its own
+        // kind; upstream's analysis compresses a single block, never split.
+        built.forbid_post_split();
+        *compressor = Some((level, built));
     }
     let (_, compressor) = compressor.as_mut().expect("built above");
     compressor
@@ -302,21 +307,14 @@ fn count_samples<'s>(
         let recorder = compressor.matcher_mut();
         // A block written raw or as one repeated byte holds no sequences to
         // learn from, and its bytes are no literals of any compressed block.
-        // Blocks are recorded one per block the frame holds; when one was
-        // split after matching the pieces cannot be told apart, and the
-        // frame's blocks count only if every piece was compressed.
-        let one_to_one = compressed.len() == recorder.blocks.len();
-        let all_compressed = compressed.iter().all(|&kind| kind);
+        // With no cut after matching, the frame holds one block per recorded
+        // one.
+        debug_assert_eq!(compressed.len(), recorder.blocks.len());
         let mut reps = START_REPS;
         let mut start = 0;
-        for (index, block) in recorder.blocks.iter().enumerate() {
+        for (block, &counted) in recorder.blocks.iter().zip(compressed.iter()) {
             let block_sequences = &recorder.sequences[start..block.sequences_end];
             start = block.sequences_end;
-            let counted = if one_to_one {
-                compressed[index]
-            } else {
-                all_compressed
-            };
             // A block left out does not advance the repeat offsets either: the
             // encoder restores them when it writes a block raw.
             if !counted {
