@@ -1509,6 +1509,7 @@ impl Matcher for MatchGeneratorDriver {
                     hash_log,
                     fast.mls,
                     fast.step_size,
+                    expected_input,
                     carry,
                     workspace,
                 );

@@ -5342,6 +5342,28 @@ fn a_borrowed_slice_past_the_tagged_range_is_laid_out_untagged() {
     assert!(!driver.dfast_matcher().tagged);
 }
 
+/// A short-cache tag pays only when a probe tends to land on a slot another
+/// position holds, which takes a table the scan fills past what a sparse
+/// step writes: a 20 KiB frame at level -7 (step 8, 4096 slots) keeps bare
+/// slots, a 32 KiB frame at the same level and a 20 KiB frame at level 1 are
+/// tagged, and a 10 KiB frame at level 1 (32768 slots) stays bare.
+#[test]
+fn fast_slots_are_tagged_by_how_full_the_scan_leaves_the_table() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let tagged = |level: i32, source: usize| {
+        let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+        driver.set_source_size_hint(source as u64);
+        let mut context = Workspace::new();
+        context.begin_layout(source.min(1 << 17), no_trailing, IngestPlan::Stream);
+        driver.reset_in_workspace(CompressionLevel::from_level(level), &mut context);
+        driver.simple_mut().slots_tagged()
+    };
+    assert!(!tagged(-7, 20 * 1024), "level -7, 20 KiB: sparse table");
+    assert!(tagged(-7, 32 * 1024), "level -7, 32 KiB: filled table");
+    assert!(tagged(1, 20 * 1024), "level 1, 20 KiB: filled table");
+    assert!(!tagged(1, 10 * 1024), "level 1, 10 KiB: sparse table");
+}
+
 /// A 32-bit target keeps the dfast tables bare below
 /// `DFAST_TAGGED_WINDOW_FLOOR`: its loop spills the three tags a tagged scan
 /// carries. A 64-bit target tags every eligible window, and both tag a window

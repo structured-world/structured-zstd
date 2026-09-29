@@ -117,14 +117,23 @@ pub(crate) const HISTORY_DRAIN_BASE: usize = 0;
 /// position-0 emit rate is too small to be worth that breakage.
 const INITIAL_PREFIX_START_INDEX: u32 = 1;
 
-/// Smallest window whose main table takes short-cache tags. A tag saves the
-/// load of a colliding candidate, which is only worth its per-probe cost when
-/// that load can miss the cache; a smaller window stays cache-resident, so it
-/// keeps bare slots, as upstream zstd's no-dictionary Fast table always does
-/// (`zstd_fast.c`, `ZSTD_compressBlock_fast_noDict_generic`). Measured on a
-/// 10 KiB frame (16 KiB window) the tag cost 3-11% at levels -7..2; from a
-/// 32 KiB window up it paid, up to 16% at level 1 on 20-32 KiB frames.
-const FAST_TAG_MIN_WINDOW_LOG: u8 = 15;
+/// Whether a frame's main table pays for short-cache tags. A tag rejects a
+/// probe that lands on a slot another position holds, before its candidate is
+/// selected and loaded; that saves work only as often as such a slot is hit,
+/// so the gate is how full the scan leaves the table. The scan stores two
+/// positions per `step_size` bytes, so `expected_input` bytes fill
+/// `2 * expected_input / (step_size << hash_log)` of it, and the tags go on
+/// from a fill of 3/2. Upstream zstd's no-dictionary Fast table carries none
+/// (`zstd_fast.c`, `ZSTD_compressBlock_fast_noDict_generic`).
+///
+/// Measured (x86_64, bare against tagged): a fill of 0.31 (10 KiB at levels
+/// 1 and -7) and 1.25 (20 KiB at level -7) ran 3-11% faster bare; 2.0 (32 KiB
+/// at -7) and up ran 7-16% faster tagged.
+fn fast_slots_pay_for_tags(expected_input: usize, step_size: usize, hash_log: u32) -> bool {
+    // fill >= 3/2  <=>  4 * input >= 3 * step * slots, in u128 so no factor
+    // overflows whatever the input size.
+    4 * expected_input as u128 >= 3 * step_size as u128 * (1u128 << hash_log)
+}
 
 /// What a reset does with a hash table that continues the previous frame's
 /// (a new table always starts empty).
@@ -588,13 +597,18 @@ impl FastKernelMatcher {
     /// hash table out in `workspace` at `(hash_log, mls)`. A table that
     /// continues the previous frame's is then handled as `carry` says; a new
     /// one starts empty. The window_log update redirects the soft-eviction
-    /// bound and the decoder-side reported window.
+    /// bound and the decoder-side reported window. `expected_input` is the
+    /// input the frame can write into its table (its size when known).
+    // Each argument is an independent axis of the frame, resolved by the driver
+    // from different sources (level, source size, dictionary state, workspace).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reset(
         &mut self,
         window_log: u8,
         hash_log: u32,
         mls: u32,
         step_size: usize,
+        expected_input: usize,
         carry: TableCarry,
         workspace: &mut crate::encoding::workspace::Workspace,
     ) {
@@ -616,11 +630,11 @@ impl FastKernelMatcher {
         // Re-borrow detection: set to the resident dict region when the
         // epoch-reuse branch below keeps the dict bytes in place (see there).
         let mut reborrow_region: Option<usize> = None;
-        // Tagged slots when the window outgrows the cache (see
-        // `FAST_TAG_MIN_WINDOW_LOG`), unless the frame attaches a dictionary
-        // (its epoch bias needs the position range the tag takes) or its
-        // history could reach past what a tagged slot holds.
-        let tagged = window_log >= FAST_TAG_MIN_WINDOW_LOG
+        // Tagged slots when the scan fills the table enough for tags to pay
+        // (see `fast_slots_pay_for_tags`), unless the frame attaches a
+        // dictionary (its epoch bias needs the position range the tag takes)
+        // or its history could reach past what a tagged slot holds.
+        let tagged = fast_slots_pay_for_tags(expected_input, step_size, hash_log)
             && carry != TableCarry::AdvanceEpoch
             && hash_log + TAG_BITS <= 32
             && tagged_positions_fit(1usize << window_log);
@@ -1987,6 +2001,12 @@ impl FastKernelMatcher {
     pub(crate) fn skip_matching_for_dict_prime(&mut self, dict_len: usize) {
         let block_start = self.take_staged_block();
         self.prime_dict_table_for_range(block_start, dict_len);
+    }
+
+    /// Whether the main table's slots are tagged.
+    #[cfg(test)]
+    pub(crate) fn slots_tagged(&self) -> bool {
+        self.hash_table.is_tagged()
     }
 
     /// Stops tagging the main table when a dictionary has widened the window

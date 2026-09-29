@@ -18,7 +18,16 @@ fn reset_in(
         crate::encoding::workspace::IngestPlan::Stream,
     );
     ws.open(FastHashTable::workspace_bytes(hash_log), 0);
-    m.reset(window_log, hash_log, mls, step_size, carry, ws);
+    // A frame of unknown size: the window is the input it can write.
+    m.reset(
+        window_log,
+        hash_log,
+        mls,
+        step_size,
+        1usize << window_log,
+        carry,
+        ws,
+    );
 }
 
 const LEVEL_1_SHAPE: (u8, u32, u32, usize) = (
@@ -1446,36 +1455,14 @@ fn block_zero_prologue_preserves_default_rep_offset_one() {
     );
 }
 
-/// The short-cache tag skips loading a colliding candidate, which only pays
-/// when that load can miss the cache. A 16 KiB window (a 10 KiB frame) keeps
-/// every candidate in L1, so its table stays bare; a 32 KiB window is tagged.
+/// Tags go on from a table fill of exactly 3/2, `2 * input / (step << log)`:
+/// at step 8 over 4096 slots that is 24 KiB of input, and one byte less stays
+/// bare. The input size may be anything up to `usize::MAX` without overflow.
 #[test]
-fn only_a_window_past_the_cache_gets_tagged_slots() {
-    let (_, hash_log, mls, step_size) = LEVEL_1_SHAPE;
-
-    let mut ws = Workspace::new();
-    let mut m = FastKernelMatcher::new();
-    reset_in(
-        &mut m,
-        &mut ws,
-        (14, hash_log, mls, step_size),
-        TableCarry::Clear,
-    );
-    assert!(
-        !m.hash_table.is_tagged(),
-        "a 16 KiB window must keep bare slots"
-    );
-
-    let mut ws = Workspace::new();
-    let mut m = FastKernelMatcher::new();
-    reset_in(
-        &mut m,
-        &mut ws,
-        (15, hash_log, mls, step_size),
-        TableCarry::Clear,
-    );
-    assert!(
-        m.hash_table.is_tagged(),
-        "a 32 KiB window must take tagged slots"
-    );
+fn fast_tags_start_at_a_fill_of_three_halves() {
+    let threshold = 3 * 8 * 4096 / 4;
+    assert!(fast_slots_pay_for_tags(threshold, 8, 12));
+    assert!(!fast_slots_pay_for_tags(threshold - 1, 8, 12));
+    assert!(fast_slots_pay_for_tags(usize::MAX, 131_074, 30));
+    assert!(!fast_slots_pay_for_tags(0, 2, 10));
 }
