@@ -261,6 +261,14 @@ unsafe fn match_found<const USE_CMOV: bool>(
     // dropped on the hot path.
     let match_pos = match_idx as usize;
 
+    // A tag mismatch leaves as a branch before anything else is computed: it
+    // is the common outcome of a probe, so the branch predicts, and the
+    // address select and the candidate load it skips are the work the tag
+    // exists to save. Folded into `in_range` below it would save nothing.
+    if !tag_ok {
+        return false;
+    }
+
     if USE_CMOV {
         // Upstream zstd cmov variant (`ZSTD_match4Found_cmov`): pick either
         // `base + match_pos` or `CMOV_DUMMY` based on the prefix
@@ -283,7 +291,7 @@ unsafe fn match_found<const USE_CMOV: bool>(
         // SAFETY: both candidate addresses have ≥ 4 readable bytes
         // (CMOV_DUMMY is exactly 4 bytes; base+match_pos has ≥ 4
         // by the bounds check above).
-        let in_range = (match_idx >= prefix_start_index) & tag_ok;
+        let in_range = match_idx >= prefix_start_index;
         let mval_addr = if in_range {
             unsafe { base.add(match_pos) }
         } else {
@@ -304,7 +312,7 @@ unsafe fn match_found<const USE_CMOV: bool>(
         // strongly predictable — that's the typical Fast strategy
         // case where almost all hash table entries are within the
         // current window.
-        if !tag_ok || match_idx < prefix_start_index {
+        if match_idx < prefix_start_index {
             return false;
         }
         unsafe { read32(ip) == read32(base.add(match_pos)) }
