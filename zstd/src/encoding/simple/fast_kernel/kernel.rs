@@ -925,6 +925,13 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             // regions.
             if ip2 >= next_step {
                 step += 1;
+                // Upstream zstd `zstd_fast.c:344-345`: the widening step jumps
+                // ahead of the lines the scan has pulled in, so warm the next
+                // two. A prefetch never faults, and `wrapping_add` keeps an
+                // address past the buffer end a plain value, not a pointer
+                // offset out of bounds.
+                crate::decoding::prefetch::prefetch_l1_at(base.wrapping_add(ip1 + 64));
+                crate::decoding::prefetch::prefetch_l1_at(base.wrapping_add(ip1 + 128));
                 next_step = next_step.saturating_add(K_STEP_INCR);
             }
 
