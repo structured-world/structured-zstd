@@ -121,24 +121,34 @@ const INITIAL_PREFIX_START_INDEX: u32 = 1;
 /// Whether a frame's main table pays for short-cache tags. A tag rejects a
 /// probe that lands on a slot another position holds, before its candidate is
 /// selected and loaded; that saves work only as often as such a slot is hit,
-/// so the gate is how full the scan leaves the table. The scan stores two
-/// positions per `step_size` bytes, so `expected_input` bytes fill
-/// `2 * expected_input / (step_size << hash_log)` of it, and the tags go on
-/// from [`FAST_TAG_MIN_FILL`]. Upstream zstd's no-dictionary Fast table
-/// carries none (`zstd_fast.c`, `ZSTD_compressBlock_fast_noDict_generic`).
-fn fast_slots_pay_for_tags(expected_input: usize, step_size: usize, hash_log: u32) -> bool {
+/// so the gate is how full the frame leaves the table. The scan stores two
+/// positions per `step_size` bytes, and a copy-mode dictionary fill at least
+/// one per three dictionary bytes, so the fill is
+/// `(2 * expected_input / step_size + dictionary_len / 3) >> hash_log`, and the
+/// tags go on from [`FAST_TAG_MIN_FILL`]. Upstream zstd's no-dictionary Fast
+/// table carries none (`zstd_fast.c`, `ZSTD_compressBlock_fast_noDict_generic`).
+fn fast_slots_pay_for_tags(
+    expected_input: usize,
+    dictionary_len: usize,
+    step_size: usize,
+    hash_log: u32,
+) -> bool {
     let (num, den) = FAST_TAG_MIN_FILL;
-    // fill >= num/den  <=>  2 * den * input >= num * step * slots, in u128 so
-    // no factor overflows whatever the input size.
-    2 * den * expected_input as u128 >= num * step_size as u128 * (1u128 << hash_log)
+    // (2 * input / step + dict / 3) / slots >= num / den
+    //   <=>  den * (6 * input + step * dict) >= 3 * num * step * slots,
+    // in u128 so no factor overflows whatever the sizes.
+    let step = step_size as u128;
+    den * (6 * expected_input as u128 + step * dictionary_len as u128)
+        >= 3 * num * step * (1u128 << hash_log)
 }
 
 /// Table fill, as `(numerator, denominator)`, from which Fast slots are tagged.
 ///
 /// Measured on x86_64 (bare against tagged): a fill of 0.31 (10 KiB at levels
 /// 1 and -7) and 1.25 (20 KiB at -7, 10 KiB at -1) ran 3-11% faster bare; 2.0
-/// (32 KiB at -7) and up ran 7-16% faster tagged. Targets without a measurement
-/// of their own take this one.
+/// (32 KiB at -7) and up ran 7-16% faster tagged, and a 10 KiB frame at level 1
+/// over a 110 KiB copy-mode dictionary, whose fill takes the table past it, ran
+/// 4% faster tagged. Targets without a measurement of their own take this one.
 #[cfg(not(target_arch = "x86"))]
 const FAST_TAG_MIN_FILL: (u128, u128) = (3, 2);
 
@@ -677,7 +687,7 @@ impl FastKernelMatcher {
             .map_or(MAX_PRIMED_WINDOW_SIZE, |window| {
                 window.min(MAX_PRIMED_WINDOW_SIZE)
             });
-        let tagged = fast_slots_pay_for_tags(expected_input, step_size, hash_log)
+        let tagged = fast_slots_pay_for_tags(expected_input, dictionary_len, step_size, hash_log)
             && carry != TableCarry::AdvanceEpoch
             && hash_log + TAG_BITS <= 32
             && tagged_positions_fit(primed_window);

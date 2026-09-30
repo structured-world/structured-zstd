@@ -5464,6 +5464,19 @@ fn fast_slots_are_tagged_by_how_full_the_scan_leaves_the_table() {
     assert!(tagged(-7, 32 * 1024), "level -7, 32 KiB: filled table");
     assert!(tagged(1, 20 * 1024), "level 1, 20 KiB: filled table");
     assert!(!tagged(1, 10 * 1024), "level 1, 10 KiB: sparse table");
+
+    // The same 10 KiB frame over a copy-mode dictionary: the dictionary fill
+    // takes the table past the target on its own.
+    let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(110 * 1024));
+    driver.set_source_size_hint(10 * 1024);
+    let mut context = Workspace::new();
+    context.begin_layout(10 * 1024, no_trailing, IngestPlan::Stream);
+    driver.reset_in_workspace(CompressionLevel::Level(1), &mut context);
+    assert!(
+        driver.simple_mut().slots_tagged(),
+        "level 1, 10 KiB over a 110 KiB copy-mode dictionary: filled table"
+    );
 }
 
 /// i686 keeps the dfast tables bare below `DFAST_TAGGED_WINDOW_FLOOR`: its loop

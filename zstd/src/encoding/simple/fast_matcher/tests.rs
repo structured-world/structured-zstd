@@ -1477,22 +1477,25 @@ fn block_zero_prologue_preserves_default_rep_offset_one() {
     );
 }
 
-/// Tags go on from a table fill `2 * input / (step << log)` of exactly 3/2, or
-/// 5/4 on i686: at step 8 over 4096 slots that is 24 KiB and 20 KiB of input,
-/// and one byte less stays bare. The input size may be anything up to
-/// `usize::MAX` without overflow.
+/// Tags go on from a table fill `(2 * input / step + dict / 3) >> log` of
+/// exactly 3/2, or 5/4 on i686: at step 8 over 4096 slots that is 24 KiB and
+/// 20 KiB of input alone, or 18 KiB and 15 KiB of copy-mode dictionary alone,
+/// and one byte less stays bare. The sizes may be anything up to `usize::MAX`
+/// without overflow.
 #[test]
 fn fast_tags_start_at_the_target_fill() {
-    let threshold = if cfg!(target_arch = "x86") {
-        5 * 8 * 4096 / 8
+    let (input, dictionary) = if cfg!(target_arch = "x86") {
+        (5 * 8 * 4096 / 8, 3 * 5 * 4096 / 4)
     } else {
-        3 * 8 * 4096 / 4
+        (3 * 8 * 4096 / 4, 3 * 3 * 4096 / 2)
     };
-    assert!(fast_slots_pay_for_tags(threshold, 8, 12));
-    assert!(!fast_slots_pay_for_tags(threshold - 1, 8, 12));
+    assert!(fast_slots_pay_for_tags(input, 0, 8, 12));
+    assert!(!fast_slots_pay_for_tags(input - 1, 0, 8, 12));
+    assert!(fast_slots_pay_for_tags(0, dictionary, 8, 12));
+    assert!(!fast_slots_pay_for_tags(0, dictionary - 1, 8, 12));
     // Extremes on either side of the comparison must not overflow, on a 32-bit
     // `usize` as on a 64-bit one.
-    assert!(fast_slots_pay_for_tags(usize::MAX, 2, 30));
-    assert!(!fast_slots_pay_for_tags(1, usize::MAX, 30));
-    assert!(!fast_slots_pay_for_tags(0, 2, 10));
+    assert!(fast_slots_pay_for_tags(usize::MAX, usize::MAX, 2, 30));
+    assert!(!fast_slots_pay_for_tags(1, 0, usize::MAX, 30));
+    assert!(!fast_slots_pay_for_tags(0, 0, 2, 10));
 }
