@@ -766,6 +766,14 @@ macro_rules! bt_insert_and_collect_matches_body {
         // larger than a 32 KiB L1d: a 4 KiB frame's table stays resident and
         // the request is pure overhead there (+0.8% on 4 KiB logs at level 16,
         // -2.5% on the 1 MiB corpus file at level 19, both layouts aligned).
+        // The hash3 table's base, taken once for the prefetch, the inserts and
+        // the probe below. Nothing between here and the probe reslices the
+        // tables unless the general catch-up runs, which takes it again.
+        let table3_base: *mut u32 = if $use_hash3 {
+            $table.hash3_table_mut().as_mut_ptr()
+        } else {
+            core::ptr::null_mut()
+        };
         #[cfg(all(
             target_feature = "sse",
             any(target_arch = "x86", target_arch = "x86_64")
@@ -784,7 +792,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             // SAFETY: a prefetch never faults, and `hh_next` is masked to
             // `hash3_log` bits, so it indexes inside the table anyway.
             unsafe {
-                _mm_prefetch($table.hash3_table().as_ptr().add(hh_next).cast(), _MM_HINT_T0);
+                _mm_prefetch(table3_base.add(hh_next).cast(), _MM_HINT_T0);
             }
         }
         if $use_hash3 && !skip_further_match_search && *$best_len_for_skip < $min_match_len {
@@ -809,29 +817,33 @@ macro_rules! bt_insert_and_collect_matches_body {
             let h3_start = $table.next_to_update3;
             let h3_ptr: *mut u32 = if h3_log != 0 && h3_start >= hist_start && idx + 4 <= clen {
                 debug_assert_eq!($table.hash3_table().len(), 1usize << h3_log);
-                let table3 = $table.hash3_table_mut().as_mut_ptr();
+                let table3 = table3_base;
+                let insert = |cursor: usize| {
+                    let hh = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                        concat,
+                        cursor - hist_start,
+                        h3_log,
+                        3,
+                    );
+                    // SAFETY: the caller passes `cursor < abs_pos`, so its four
+                    // bytes end before `idx + 4 <= clen`; the hash is masked to
+                    // `h3_log` bits and the table holds that many slots.
+                    // `cursor - abs_bias` is the stored index the table keeps for
+                    // it (`position_base - 1 - index_shift` is the bias), which
+                    // the armed block makes representable.
+                    unsafe { *table3.add(hh) = cursor.wrapping_sub(abs_bias) as u32 };
+                };
                 // A cursor at or past this position inserts nothing and is set
-                // back to it, as the general catch-up's fill does.
+                // back to it, as the general catch-up's fill does. The first
+                // insert stands outside the loop: it is nearly always the only
+                // one, and a loop the compiler unrolls pays its setup even for
+                // one trip.
                 if h3_start < $abs_pos {
-                    let mut cursor = h3_start;
-                    loop {
-                        let hh = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
-                            concat,
-                            cursor - hist_start,
-                            h3_log,
-                            3,
-                        );
-                        // SAFETY: `cursor < abs_pos`, so its four bytes end
-                        // before `idx + 4 <= clen`; the hash is masked to
-                        // `h3_log` bits and the table holds that many slots.
-                        // `cursor - abs_bias` is the stored index the table
-                        // keeps for it (`position_base - 1 - index_shift` is
-                        // the bias), which the armed block makes representable.
-                        unsafe { *table3.add(hh) = cursor.wrapping_sub(abs_bias) as u32 };
+                    insert(h3_start);
+                    let mut cursor = h3_start + 1;
+                    while cursor < $abs_pos {
+                        insert(cursor);
                         cursor += 1;
-                        if cursor == $abs_pos {
-                            break;
-                        }
                     }
                 }
                 $table.next_to_update3 = $abs_pos;
