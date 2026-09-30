@@ -108,6 +108,11 @@ const SEARCH_STRENGTH: usize = 8;
 /// incompressible-region step acceleration.
 const K_STEP_INCR: usize = 1 << (SEARCH_STRENGTH - 1);
 
+/// Largest initial step the kernel takes; upstream zstd's is
+/// `ZSTD_TARGETLENGTH_MAX + 1` (128 KiB + 1). Bounding it keeps the scan's
+/// position sums from wrapping without a check per step.
+const MAX_STEP_SIZE: usize = 1 << 20;
+
 /// Upstream zstd's `kStepIncr` for the **dictMatchState** fast path
 /// (`zstd_fast.c:553`) is `1 << kSearchStrength = 256` — DOUBLE the no-dict /
 /// extDict value (`zstd_fast.c:234`,`:754`). The dict scan therefore ramps its
@@ -482,8 +487,8 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
     // once-per-block branch is negligible relative to the per-block
     // hash/probe work that follows.
     assert!(
-        step_size >= 2,
-        "Fast kernel requires step_size >= 2 (got {step_size}); \
+        (2..=MAX_STEP_SIZE).contains(&step_size),
+        "Fast kernel requires step_size in 2..={MAX_STEP_SIZE} (got {step_size}); \
          the upstream zstd formula clamps to a min of 2",
     );
     // Real runtime check (not debug_assert) — MLS is a const-generic
@@ -580,14 +585,18 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
         ip0 = 1;
     }
 
-    let mut rep_offset1: u32 = rep[0];
-    let mut rep_offset2: u32 = rep[1];
+    // The repcodes are carried as `usize`, the width they are used at, so the
+    // scan holds one register per repcode rather than a `u32` for the zero
+    // test and its widened copy for the address. They leave as `u32` again:
+    // an offset is below `data.len() <= u32::MAX`.
+    let mut rep_offset1 = rep[0] as usize;
+    let mut rep_offset2 = rep[1] as usize;
     // Upstream zstd stashes the repcodes when they're out of range for the
     // current block and restores them at `_cleanup`. For phase 1 we
     // mirror the same save/restore so cross-block repcode history
     // stays correct.
-    let mut offset_saved1: u32 = 0;
-    let mut offset_saved2: u32 = 0;
+    let mut offset_saved1: usize = 0;
+    let mut offset_saved2: usize = 0;
     {
         // Upstream zstd (`zstd_fast.c:240-244`): `maxRep = curr - windowLow`.
         // `windowLow` is the absolute floor of in-window positions
@@ -599,7 +608,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
         // max_rep=0; 1>0), disabling rep-at-ip2 for the entire first
         // block — see the `block_zero_prologue_preserves_default_rep_offset_one`
         // regression test in `fast_matcher.rs`.
-        let max_rep = (ip0 as u32).saturating_sub(window_low);
+        let max_rep = (ip0 as u32).saturating_sub(window_low) as usize;
         if rep_offset2 > max_rep {
             offset_saved2 = rep_offset2;
             rep_offset2 = 0;
@@ -649,18 +658,13 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
         // _start: setup. ip0 already positioned; derive ip1/ip2/ip3
         // from current step. If even ip3 is past ilimit, the loop
         // can't make forward progress on this iteration — drain to
-        // the cleanup path below. `checked_add` here defends against
-        // a wild `step_size` (or a runaway `step` from the doubling
-        // cadence) wrapping past `ilimit` and turning the
-        // out-of-range guard below into a false-pass; on overflow we
-        // take the same break path as a normal ip3-past-ilimit miss.
+        // the cleanup path below. The sums cannot wrap: a position is
+        // below `data.len() <= isize::MAX` and `step` below
+        // `MAX_STEP_SIZE + data.len() / K_STEP_INCR + 1`, together under
+        // `usize::MAX`.
         let mut ip1 = ip0 + 1;
-        let Some(mut ip2) = ip0.checked_add(step) else {
-            break;
-        };
-        let Some(mut ip3) = ip2.checked_add(1) else {
-            break;
-        };
+        let mut ip2 = ip0 + step;
+        let mut ip3 = ip2 + 1;
         if ip3 > ilimit {
             break;
         }
@@ -737,7 +741,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             // `ip2 - rep_offset1 >= prefix_start_index >= 1`, so the
             // backward read stays in-bounds.
             if rep_offset1 > 0
-                && unsafe { read32(base.add(ip2)) == read32(base.add(ip2 - rep_offset1 as usize)) }
+                && unsafe { read32(base.add(ip2)) == read32(base.add(ip2 - rep_offset1)) }
             {
                 // Repcode match. ip0 fast-forwards to ip2; backward-
                 // extend by 1 if the byte before ip2 also matches.
@@ -746,7 +750,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
                 // anchor` AND `match > prefix` checks via the
                 // prologue's save/restore on rep_offset1.
                 let mut new_ip = ip2;
-                let mut match0 = new_ip - rep_offset1 as usize;
+                let mut match0 = new_ip - rep_offset1;
                 let mut m_len: usize = 4;
                 // Upstream zstd bound: `match0 > prefixStart` ≡
                 // `match_pos > windowLow` (upstream zstd's prefixStart and
@@ -890,20 +894,9 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip2), hlog) };
             ip0 = ip1;
             ip1 = ip2;
-            // Same overflow defence as the loop-head setup: a wild
-            // `step` (e.g. after enough step-doubling cycles) could
-            // otherwise wrap `ip0 + step` past `usize::MAX` and bypass
-            // the `ip3 > ilimit` guard. On overflow we drain to the
-            // post-loop cleanup, identical to the normal "ran out of
-            // room" exit.
-            let Some(new_ip2) = ip0.checked_add(step) else {
-                break None;
-            };
-            let Some(new_ip3) = ip1.checked_add(step) else {
-                break None;
-            };
-            ip2 = new_ip2;
-            ip3 = new_ip3;
+            // Cannot wrap, by the bound given at the loop head.
+            ip2 = ip0 + step;
+            ip3 = ip1 + step;
 
             // Step-doubling: upstream zstd lines 342-347. Drives the
             // kSearchStrength-based acceleration on incompressible
@@ -917,7 +910,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
                 // offset out of bounds.
                 crate::decoding::prefetch::prefetch_l1_at(base.wrapping_add(ip1 + 64));
                 crate::decoding::prefetch::prefetch_l1_at(base.wrapping_add(ip1 + 128));
-                next_step = next_step.saturating_add(K_STEP_INCR);
+                next_step += K_STEP_INCR;
             }
 
             // do-while termination: if ip3 walks past ilimit, drain.
@@ -948,7 +941,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
                 match0,
                 m_len,
                 current0: _,
-            } => (new_ip, match0, m_len, rep_offset1 as usize, true),
+            } => (new_ip, match0, m_len, rep_offset1, true),
             MatchFound::Explicit {
                 new_ip,
                 match_idx,
@@ -976,7 +969,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
                 // anchor + prefix_start_index pair; subsequent
                 // iterations get a tighter rep_offset1.
                 rep_offset2 = rep_offset1;
-                rep_offset1 = offset as u32;
+                rep_offset1 = offset;
                 (new_ip, match_pos, 4usize, offset, false)
             }
         };
@@ -1079,13 +1072,13 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             // hit so the just-found offset becomes the new rep1.
             while rep_offset2 > 0
                 && ip0 <= ilimit
-                && ip0 >= rep_offset2 as usize
-                && unsafe { read32(base.add(ip0)) == read32(base.add(ip0 - rep_offset2 as usize)) }
+                && ip0 >= rep_offset2
+                && unsafe { read32(base.add(ip0)) == read32(base.add(ip0 - rep_offset2)) }
             {
                 // 4-byte match guaranteed by the equality probe.
                 // Extend forward via count_forward starting at
                 // ip0 + 4.
-                let r_off = rep_offset2 as usize;
+                let r_off = rep_offset2;
                 let r_extra = unsafe {
                     count_forward(
                         base.add(ip0 + 4),
@@ -1145,12 +1138,12 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             rep_offset1
         } else {
             offset_saved1
-        },
+        } as u32,
         if rep_offset2 != 0 {
             rep_offset2
         } else {
             offset_saved2
-        },
+        } as u32,
     ];
 
     FastBlockResult {
