@@ -1088,9 +1088,12 @@ macro_rules! bt_insert_and_collect_matches_body {
             // folded away: `candidate_abs + index_shift == stored + bt_bias`.
             let next_pair_idx = 2 * (stored.wrapping_add(bt_bias) & bt_mask);
             // Both children are read ahead of the compare, where upstream reads
-            // only the side it descends: issued here, the next node's load
-            // overlaps the compare instead of waiting for it, and reading after
-            // measured 1% slower on z000033 10 KiB at level 19, output unchanged.
+            // only the side it descends, so the next node's load can overlap
+            // the compare. Reading only the chosen side after it measured about
+            // 1% slower on z000033 10 KiB at level 19 with output unchanged,
+            // against a flat level 3 control; that is below what two builds
+            // resolve, so neither order is shown faster and the walk keeps its
+            // existing one.
             // SAFETY: `next_pair_idx (+1)` = `2*(candidate_abs & bt_mask) (+1)`
             // ≤ `chain_table.len()-1`; `chain_ptr` is the hoisted live base,
             // table not realloc'd during the walk.
