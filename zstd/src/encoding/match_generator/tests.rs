@@ -3131,6 +3131,59 @@ fn primed_snapshot_keeps_the_frames_own_fast_slot_format() {
 }
 
 #[test]
+fn the_fast_slot_format_chosen_at_reset_survives_the_dictionary() {
+    // The reset records its slot format in the snapshot key, so priming must
+    // not change it afterwards. A 512 KiB window fits tagged positions on its
+    // own; with an 8 MiB dictionary in front of it the history no longer does,
+    // and the reset has to see that rather than leave it to priming.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let level = CompressionLevel::Level(1);
+    let dict: Vec<u8> = (0..8u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(level);
+    let chosen = driver.simple_mut().slots_tagged();
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    assert_eq!(
+        driver.simple_mut().slots_tagged(),
+        chosen,
+        "priming changed the slot format the reset recorded"
+    );
+}
+
+#[test]
+fn a_frame_the_snapshot_is_not_restored_into_gets_a_cleared_table() {
+    // A dictionary past the attach region forces copy mode at any frame size,
+    // and a frame of unknown size resolves the level's own parameters, which a
+    // 1 MiB frame resolves too: both frames share one snapshot key. The frame
+    // compressor restores only a known size above the Fast cutoff, so the
+    // unknown-size frame primes into its table without a restore; a reset that
+    // left the 1 MiB frame's slots in place would hand the kernel positions
+    // past this frame's end.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let level = CompressionLevel::Level(1);
+    let dict = b"small dict content with some padding here";
+    let oversized = crate::encoding::DictionarySizes::raw_content(MAX_FAST_ATTACH_DICT_REGION + 1);
+    driver.set_dictionary_size_hint(oversized);
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(level);
+    driver.prime_with_dictionary(dict, [1, 4, 8]);
+    driver.capture_primed_dictionary(level);
+    driver.simple_mut().set_table_slot(7, 0xCAFE);
+
+    driver.set_dictionary_size_hint(oversized);
+    driver.reset(level);
+    assert_eq!(
+        driver.simple_mut().table_slot(7),
+        0,
+        "a frame the snapshot will not be restored into must start from an \
+         empty table"
+    );
+}
+
+#[test]
 fn primed_snapshot_restored_for_hints_in_same_window_bucket() {
     // The snapshot key must normalize the source-size hint to the resolved
     // matcher geometry, not the raw hinted byte count. `reset()` derives every

@@ -503,6 +503,15 @@ pub(crate) fn source_size_ceil_log(size: u64) -> u8 {
 /// `prime_with_dictionary` (acts on it).
 pub(crate) const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
 
+/// Whether a dictionary frame in size bucket `size_log` reuses the captured
+/// primed snapshot rather than re-priming: only a known size above the
+/// strategy's attach cutoff `cutoff_log`, the upstream zstd copy regime
+/// (`ZSTD_shouldAttachDict`). The frame compressor restores on this and the
+/// Fast reset keeps its table only on it, so the two cannot disagree.
+pub(crate) fn restores_primed_snapshot(size_log: Option<u8>, cutoff_log: u8) -> bool {
+    size_log.is_some_and(|log| log > cutoff_log)
+}
+
 /// Largest dictionary region (bytes) the Fast attach path can index. The tagged
 /// dict table packs each position into `32 - DICT_TAG_BITS` (= 24) bits, so a
 /// region past `2^24` (16 MiB) would overflow the packed position. Dictionaries

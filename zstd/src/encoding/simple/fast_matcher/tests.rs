@@ -18,13 +18,15 @@ fn reset_in(
         crate::encoding::workspace::IngestPlan::Stream,
     );
     ws.open(FastHashTable::workspace_bytes(hash_log), 0);
-    // A frame of unknown size: the window is the input it can write.
+    // A frame of unknown size without a dictionary: the window is the input
+    // it can write.
     m.reset(
         window_log,
         hash_log,
         mls,
         step_size,
         1usize << window_log,
+        0,
         carry,
         ws,
     );

@@ -1437,13 +1437,15 @@ impl Matcher for MatchGeneratorDriver {
                     && self
                         .reset_size_log
                         .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
-                // Copy-mode dictionary frame whose primed snapshot matches
-                // this exact resolved shape: `restore_primed_dictionary`
-                // (called right after this reset; the caller gates the
-                // restore on the same size bucket and the restore re-checks
-                // the same key) will `clone_from` the snapshot over this
-                // matcher, replacing the table contents and bias wholesale —
-                // the reset's full-table memset would be thrown away. The
+                // Dictionary frame the caller will restore the primed snapshot
+                // into (the same `restores_primed_snapshot` rule on the same
+                // size bucket; a dictionary too large to attach is in copy
+                // mode at every size, but only these frames are restored) and
+                // whose snapshot matches this exact resolved shape:
+                // `restore_primed_dictionary`, called right after this reset,
+                // will `clone_from` the snapshot over this matcher, replacing
+                // the table contents and bias wholesale, so the reset's
+                // full-table memset would be thrown away. The
                 // key components mirror `reset_shape` below: Simple leaves
                 // `resolved_table_bits` 0, never carries an LDM override,
                 // and `fast_attach` is false in copy mode by construction.
@@ -1456,7 +1458,10 @@ impl Matcher for MatchGeneratorDriver {
                     .as_ref()
                     .filter(|(_, _, captured)| {
                         dict_hint.is_some()
-                            && !dict_attach_epoch
+                            && restores_primed_snapshot(
+                                self.reset_size_log,
+                                FAST_ATTACH_DICT_CUTOFF_LOG,
+                            )
                             && *captured
                                 == PrimedKey {
                                     level,
@@ -1524,6 +1529,7 @@ impl Matcher for MatchGeneratorDriver {
                     fast.mls,
                     fast.step_size,
                     expected_input,
+                    dict_hint.map_or(0, |sizes| sizes.content),
                     carry,
                     workspace,
                 );

@@ -1203,8 +1203,10 @@ pub(crate) fn load_frame_dictionary<M: Matcher>(
             .reapply_resident_dictionary(dict.inner.offset_hist);
         return;
     }
-    let prefer_copy_snapshot = size_hint
-        .is_some_and(|s| crate::encoding::levels::config::source_size_ceil_log(s) > cutoff_log);
+    let prefer_copy_snapshot = crate::encoding::levels::config::restores_primed_snapshot(
+        size_hint.map(crate::encoding::levels::config::source_size_ceil_log),
+        cutoff_log,
+    );
     let restored = prefer_copy_snapshot && state.matcher.restore_primed_dictionary(level);
     if !restored {
         state

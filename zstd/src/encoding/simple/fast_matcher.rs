@@ -54,6 +54,7 @@
 
 use crate::encoding::Sequence;
 use crate::encoding::dict_attach::DictAttach;
+use crate::encoding::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
 use crate::encoding::workspace::HistoryBuf;
 
 use super::fast_kernel::hash_table::{
@@ -416,6 +417,23 @@ impl FastKernelMatcher {
         self.hash_table.hash_log()
     }
 
+    /// Raw content of main-table slot `hash`. Test-only crate helper for
+    /// verifying what a driver reset carries over.
+    #[cfg(test)]
+    pub(crate) fn table_slot(&self, hash: u32) -> u32 {
+        assert!(hash < 1 << self.hash_table.hash_log());
+        // SAFETY: `hash` is below the table's `1 << hash_log` entries.
+        unsafe { self.hash_table.get(hash) }
+    }
+
+    /// Store `value` in main-table slot `hash`. Test-only crate helper.
+    #[cfg(test)]
+    pub(crate) fn set_table_slot(&mut self, hash: u32, value: u32) {
+        assert!(hash < 1 << self.hash_table.hash_log());
+        // SAFETY: `hash` is below the table's `1 << hash_log` entries.
+        unsafe { self.hash_table.put(hash, value) }
+    }
+
     /// Whether a dictionary table is attached (drives the dual-probe dispatch:
     /// the borrowed scan must consult the dict when set). Mirrors the owned
     /// path's `self.dict.is_attached()` gate.
@@ -613,7 +631,8 @@ impl FastKernelMatcher {
     /// continues the previous frame's is then handled as `carry` says; a new
     /// one starts empty. The window_log update redirects the soft-eviction
     /// bound and the decoder-side reported window. `expected_input` is the
-    /// input the frame can write into its table (its size when known).
+    /// input the frame can write into its table (its size when known), and
+    /// `dictionary_len` the dictionary priming will put in front of it.
     // Each argument is an independent axis of the frame, resolved by the driver
     // from different sources (level, source size, dictionary state, workspace).
     #[allow(clippy::too_many_arguments)]
@@ -624,6 +643,7 @@ impl FastKernelMatcher {
         mls: u32,
         step_size: usize,
         expected_input: usize,
+        dictionary_len: usize,
         carry: TableCarry,
         workspace: &mut crate::encoding::workspace::Workspace,
     ) {
@@ -648,11 +668,18 @@ impl FastKernelMatcher {
         // Tagged slots when the scan fills the table enough for tags to pay
         // (see `fast_slots_pay_for_tags`), unless the frame attaches a
         // dictionary (its epoch bias needs the position range the tag takes)
-        // or its history could reach past what a tagged slot holds.
+        // or its history could reach past what a tagged slot holds. That
+        // history is the window widened by the dictionary exactly as priming
+        // widens it, so priming never has to change the format recorded here.
+        let primed_window = (1usize << window_log)
+            .checked_add(dictionary_len)
+            .map_or(MAX_PRIMED_WINDOW_SIZE, |window| {
+                window.min(MAX_PRIMED_WINDOW_SIZE)
+            });
         let tagged = fast_slots_pay_for_tags(expected_input, step_size, hash_log)
             && carry != TableCarry::AdvanceEpoch
             && hash_log + TAG_BITS <= 32
-            && tagged_positions_fit(1usize << window_log);
+            && tagged_positions_fit(primed_window);
         if !self.hash_table.bind(workspace, hash_log, mls, tagged) {
             // A new table: the first frame, a new shape, or a workspace that
             // moved. It starts empty, so there is nothing to clear, and the
