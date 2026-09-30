@@ -682,6 +682,14 @@ impl FastKernelMatcher {
         // or its history could reach past what a tagged slot holds. That
         // history is the window widened by the dictionary exactly as priming
         // widens it, so priming never has to change the format recorded here.
+        //
+        // The format is not free of output: with `mls` above 4 a tag rejects a
+        // candidate whose first four bytes match but whose later hashed bytes
+        // do not, which a bare slot accepts as a four-byte match. Bare slots
+        // take exactly upstream zstd's decisions (its no-dictionary table has
+        // no tags), so a frame this gate leaves bare encodes as upstream does.
+        // Measured on levels -7..2 over z000033 prefixes, random input and
+        // records sharing a four-byte prefix: identical sizes bare and tagged.
         let primed_window = (1usize << window_log)
             .checked_add(dictionary_len)
             .map_or(MAX_PRIMED_WINDOW_SIZE, |window| {
