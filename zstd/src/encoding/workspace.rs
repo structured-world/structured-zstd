@@ -748,6 +748,13 @@ impl<T: Copy> Table<T> {
         self.view.as_mut_slice()
     }
 
+    /// The first value's address, taken from the table's own pointer rather
+    /// than through a slice: it stays usable while slices of the table are
+    /// made and dropped around it, until the table is laid out again.
+    pub(crate) fn base_ptr(&mut self) -> *mut T {
+        self.view.as_mut_ptr()
+    }
+
     /// Heap bytes the table owns; a workspace table owns none.
     pub(crate) fn owned_bytes(&self) -> usize {
         self.own.capacity() * size_of::<T>()

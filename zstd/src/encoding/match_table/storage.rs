@@ -302,6 +302,11 @@ pub(crate) struct MatchTable {
     /// Tree coordinates of the block being parsed, taken by
     /// [`Self::capture_block_coords`] before the parse.
     pub(crate) block_coords: BtCoords,
+    /// The live history `(ptr, len)` of the block being parsed, taken with the
+    /// coordinates: the parse never changes the history, so a search reads it
+    /// here instead of re-deriving the slice at every position. Null outside a
+    /// pass; see [`Self::block_live_history`].
+    pub(crate) block_live: (*const u8, usize),
     /// Immutable dictionary match chain (upstream zstd `ZSTD_dictMatchState`),
     /// searched by the BT/optimal collect alongside the live tree. `Some`
     /// once primed from a non-empty dictionary on a BT level.
@@ -364,6 +369,9 @@ impl Clone for MatchTable {
             uses_bt: self.uses_bt,
             search_mls: self.search_mls,
             block_coords: self.block_coords,
+            // Points into this table's history, not the copy's; taken again
+            // when the copy parses a block.
+            block_live: (core::ptr::null(), 0),
             dms: self.dms.clone(),
             borrowed_input: self.borrowed_input,
             borrowed_block: self.borrowed_block,
@@ -408,6 +416,8 @@ impl Clone for MatchTable {
         self.uses_bt = source.uses_bt;
         self.search_mls = source.search_mls;
         self.block_coords = source.block_coords;
+        // The source's view points into the source's history.
+        self.block_live = (core::ptr::null(), 0);
         self.borrowed_input = source.borrowed_input;
         self.borrowed_block = source.borrowed_block;
         self.kernel = source.kernel;
@@ -540,6 +550,7 @@ impl MatchTable {
             uses_bt: false,
             search_mls: 4,
             block_coords: BtCoords::default(),
+            block_live: (core::ptr::null(), 0),
             dms: DictAttach::new(),
             borrowed_input: None,
             borrowed_block: None,
@@ -807,6 +818,20 @@ impl MatchTable {
     #[inline(always)]
     pub(crate) fn hash3_table_mut(&mut self) -> &mut [u32] {
         &mut self.tables[self.hash3_off..]
+    }
+
+    /// Base addresses of the hash, chain and hash3 regions, for a search that
+    /// indexes them by masked hashes and tree slots it has already bounded.
+    /// They come from the buffer's own pointer, so they need no bounds check
+    /// and stay usable across the slices other code takes of the tables, until
+    /// the tables are laid out again.
+    #[inline(always)]
+    pub(crate) fn table_bases(&mut self) -> (*mut u32, *mut u32, *mut u32) {
+        debug_assert!(self.chain_off <= self.hash3_off && self.hash3_off <= self.tables.len());
+        let base = self.tables.base_ptr();
+        // SAFETY: both offsets are inside the buffer (asserted above; the
+        // layout that set them sized the buffer to hold every region).
+        unsafe { (base, base.add(self.chain_off), base.add(self.hash3_off)) }
     }
 
     /// Hash and chain tables at once, for the walkers that read a head and
@@ -1407,6 +1432,30 @@ impl MatchTable {
     /// search reads them from [`Self::block_coords`] on every position.
     pub(crate) fn capture_block_coords(&mut self) {
         self.block_coords = self.bt_coords();
+        let live = self.live_history();
+        self.block_live = (live.as_ptr(), live.len());
+    }
+
+    /// The live history taken by [`Self::capture_block_coords`], for a search
+    /// inside the pass that took it.
+    ///
+    /// The returned slice holds no borrow of `self`, so the search can write
+    /// the tables while it reads the history.
+    ///
+    /// # Safety
+    ///
+    /// Only between `capture_block_coords` and the end of that pass: the
+    /// history must not have been appended to, trimmed or reallocated since.
+    #[inline(always)]
+    pub(crate) unsafe fn block_live_history<'a>(&self) -> &'a [u8] {
+        debug_assert_eq!(
+            self.block_live,
+            (self.live_history().as_ptr(), self.live_history().len()),
+            "the block's live history moved since it was taken"
+        );
+        // SAFETY: the pair was taken from the live history at the start of the
+        // pass, and the caller guarantees the history has not changed since.
+        unsafe { core::slice::from_raw_parts(self.block_live.0, self.block_live.1) }
     }
 
     /// Convert an absolute position into a BT pair index in

@@ -17,6 +17,9 @@ use super::generator::HcMatchGenerator;
 use crate::encoding::Sequence;
 use crate::encoding::blocks::encode_offset_with_history;
 use crate::encoding::hc::MAX_HC_SEARCH_DEPTH;
+use crate::encoding::hc::priceset::{
+    priceset_avx2, priceset_neon, priceset_scalar, priceset_simd128, priceset_sse2, priceset_sse41,
+};
 use alloc::vec::Vec;
 
 // The DP body macros reference these opt-parser types and cost-model constants
@@ -56,7 +59,8 @@ macro_rules! build_optimal_plan_impl_body {
         $out:ident,
         $buffers:expr,
         $collect:ident,
-        $priceset:path,
+        // The tier's price-set macro (`priceset::priceset_<tier>`).
+        $priceset:ident,
         // The whole block and its statistics: the traceback records each
         // sequence it settles into them (upstream `ZSTD_updateStats`).
         $block:ident,
@@ -843,10 +847,11 @@ macro_rules! build_optimal_plan_impl_body {
                 } else {
                     // btultra / btultra2 (OPT_LEVEL >= 2): no abort, each
                     // match_len writes a distinct node => order-independent.
-                    // Dispatch to the per-tier price-set ($priceset is the
-                    // tier's fn: AVX2 SoA-vector compare for the avx2 wrapper,
-                    // inline scalar otherwise) — it folds into this wrapper's
-                    // monomorphisation, so no call ABI / runtime feature check.
+                    // The tier's price-set (`$priceset` is its macro). The AVX2
+                    // one expands its vector loop here, inside this wrapper's
+                    // umbrella, the way upstream walks the matches inside opt2:
+                    // left as an `#[inline]` target_feature function it stayed
+                    // out of line, a call per priced candidate.
                     // The kernel reaches cells `pos + start_len ..= max_next`, so
                     // the arenas go in as slices ending at `max_next`. The prices
                     // there are initialised (`0..=last_pos` written in this call,
@@ -865,7 +870,8 @@ macro_rules! build_optimal_plan_impl_body {
                     #[allow(unused_unsafe)]
                     {
                         last_pos = last_pos.max(unsafe {
-                            $priceset(
+                            $priceset!(
+                                ACCURATE_PRICE;
                                 node_prices_s,
                                 nodes_s,
                                 ml_cache,
@@ -1093,7 +1099,7 @@ macro_rules! optimal_block_body {
         $buffers:ident,
         $keep_plan:expr,
         $collect:ident,
-        $priceset:path $(,)?
+        $priceset:ident $(,)?
     ) => {{
         // The block is armed, so the tree's coordinates hold for the whole pass.
         $self.table.capture_block_coords();
@@ -1218,7 +1224,8 @@ macro_rules! collect_optimal_candidates_initialized_body {
             $self.table.skip_insert_until_abs = $abs_pos;
         }
         let current_idx = $abs_pos - $self.table.history_abs_start;
-        if current_idx + 4 > $self.table.live_history().len() {
+        // The pass's live history length, taken with its coordinates.
+        if current_idx + 4 > $self.table.block_live.1 {
             return;
         }
         let mut best_len_for_skip = 0usize;
@@ -1816,7 +1823,7 @@ impl HcMatchGenerator {
             buffers,
             KEEP_PLAN,
             collect_optimal_candidates_initialized_neon,
-            crate::encoding::hc::priceset::priceset_range_nonabort_neon::<ACCURATE_PRICE>,
+            priceset_neon,
         )
     }
 
@@ -1861,7 +1868,7 @@ impl HcMatchGenerator {
             buffers,
             KEEP_PLAN,
             collect_optimal_candidates_initialized_sse42,
-            crate::encoding::hc::priceset::priceset_range_nonabort_sse41::<ACCURATE_PRICE>,
+            priceset_sse41,
         )
     }
 
@@ -1906,7 +1913,7 @@ impl HcMatchGenerator {
             buffers,
             KEEP_PLAN,
             collect_optimal_candidates_initialized_sse2,
-            crate::encoding::hc::priceset::priceset_range_nonabort_sse2::<ACCURATE_PRICE>,
+            priceset_sse2,
         )
     }
 
@@ -1948,7 +1955,7 @@ impl HcMatchGenerator {
             buffers,
             KEEP_PLAN,
             collect_optimal_candidates_initialized_avx2_bmi2,
-            crate::encoding::hc::priceset::priceset_range_nonabort_avx2::<ACCURATE_PRICE>,
+            priceset_avx2,
         )
     }
 
@@ -2005,7 +2012,7 @@ impl HcMatchGenerator {
             buffers,
             KEEP_PLAN,
             collect_optimal_candidates_initialized_scalar,
-            crate::encoding::hc::priceset::priceset_range_nonabort_scalar::<ACCURATE_PRICE>,
+            priceset_scalar,
         )
     }
 
@@ -2054,7 +2061,7 @@ impl HcMatchGenerator {
             buffers,
             KEEP_PLAN,
             collect_optimal_candidates_initialized_simd128,
-            crate::encoding::hc::priceset::priceset_range_nonabort_simd128::<ACCURATE_PRICE>,
+            priceset_simd128,
         )
     }
 

@@ -109,24 +109,13 @@ macro_rules! bt_insert_range_body {
         let position_base = $table.position_base;
         let index_shift = $table.index_shift;
         let search_depth = $search_depth;
-        // Upstream holds `U32* const hashTable = ms->hashTable` for the whole
-        // body (zstd_opt.c:449). Ours re-derived it from the shared table
-        // buffer at every use, and each re-derivation is a bounds-checked
-        // reslice that reloads the buffer's header and the seam offset through
-        // `&mut self`.
-        //
-        // The BT pointer-pair base is hoisted the same way — see the
-        // collect-matches body for the full rationale (per-step Vec reload +
-        // bounds check through `&mut self` vs the upstream zstd's raw `U32*`
-        // walk). Both bases come out of ONE split borrow: taking the second
-        // through its own `&mut` reslice reborrows the whole buffer, which
-        // invalidates a pointer already taken from the first.
+        // Upstream holds `U32* const hashTable = ms->hashTable` and the tree's
+        // `bt` for the whole body (zstd_opt.c:449); the bases come from the
+        // buffer's own pointer, as in the collect body, with no slice or bounds
+        // check through `&mut self`.
         debug_assert_eq!($table.hash_table().len(), 1usize << hash_log);
         debug_assert_eq!($table.chain_table().len(), 2 << $table.bt_log());
-        let (hash_ptr, chain_ptr) = {
-            let (hash_table, chain_table) = $table.hash_and_chain_mut();
-            (hash_table.as_mut_ptr(), chain_table.as_mut_ptr())
-        };
+        let (hash_ptr, chain_ptr, _) = $table.table_bases();
         let bt_mask = $table.bt_mask();
         let window_low = $table.window_low_abs_for_target($target_abs);
         // The walk carries one coordinate, the stored index, as the collect body
@@ -510,6 +499,35 @@ macro_rules! for_each_repcode_candidate_body {
 }
 pub(crate) use for_each_repcode_candidate_body;
 
+/// Common prefix of `$a` and `$b`, capped at `$limit`, with the first eight
+/// bytes settled in place: `$cpl` is called only when they all match. Most
+/// probed candidates part within one word, and upstream zstd's inlined
+/// `ZSTD_count` answers those from its first 8-byte compare the same way.
+///
+/// # Safety
+///
+/// Both pointers must be readable for `$limit` bytes, and for eight when
+/// `$limit >= 8`; the caller's umbrella must enable `$cpl`.
+macro_rules! prefix_len_first_word {
+    ($cpl:path, $a:expr, $b:expr, $limit:expr) => {{
+        let a: *const u8 = $a;
+        let b: *const u8 = $b;
+        let limit: usize = $limit;
+        if limit >= 8 {
+            let diff =
+                a.cast::<u64>().read_unaligned().to_le() ^ b.cast::<u64>().read_unaligned().to_le();
+            if diff != 0 {
+                (diff.trailing_zeros() / 8) as usize
+            } else {
+                8 + $cpl(a.add(8), b.add(8), limit - 8)
+            }
+        } else {
+            $cpl(a, b, limit)
+        }
+    }};
+}
+pub(crate) use prefix_len_first_word;
+
 /// One repeat-offset probe, expanded per slot. Crate-private (see
 /// `bt_insert_range_body!`).
 ///
@@ -564,23 +582,32 @@ macro_rules! rep_probe_slot {
             if cand_gate != $cur_gate {
                 break 'slot;
             }
-            // SAFETY: same umbrella; both pointers + the limit stay in `concat`.
-            let match_len =
-                unsafe { $cpl($rbase.add(candidate_idx), $rbase.add($idx), $rep_scan_limit) };
+            // SAFETY: same umbrella as `$cpl`; `candidate_idx < idx` and
+            // `rep_scan_limit <= rlen - idx`, so both reads stay inside
+            // `concat` for `rep_scan_limit` bytes.
+            let match_len = unsafe {
+                $crate::encoding::hc::generator::prefix_len_first_word!(
+                    $cpl,
+                    $rbase.add(candidate_idx),
+                    $rbase.add($idx),
+                    $rep_scan_limit
+                )
+            };
             if match_len < $min_match_len {
                 break 'slot;
             }
             $found = true;
-            let _ = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                $out,
-                $best_len_for_skip,
-                $crate::encoding::opt::types::MatchCandidate {
+            // Kept only when it beats the ladder so far (upstream zstd
+            // `if (repLen > bestLength)`, zstd_opt.c:678); the minimum length
+            // was checked just above.
+            if match_len > *$best_len_for_skip {
+                $out.push($crate::encoding::opt::types::MatchCandidate {
                     start: $abs_pos,
                     offset: rep,
                     match_len,
-                },
-                $min_match_len,
-            );
+                });
+                *$best_len_for_skip = match_len;
+            }
             // `abs_pos + match_len >= current_abs_end` is `match_len >=
             // tail_limit` with the block end folded into the length space the
             // probe already works in, so the block end stops being a live
@@ -612,14 +639,13 @@ macro_rules! bt_insert_and_collect_matches_body {
         $cmf:path $(,)?
     ) => {{
         let idx = $abs_pos - $table.history_abs_start;
-        // Borrowed-aware live region (owned: `history[history_start..]`;
-        // borrowed: the in-place input `[0, block_end)`). Reborrow-then-raw-ptr
-        // so the slice holds NO borrow and coexists with the `&mut $table`
-        // binary-tree writes below. Owned is byte-identical (same bytes).
-        let concat: &[u8] = unsafe {
-            let lh = $table.live_history();
-            core::slice::from_raw_parts(lh.as_ptr(), lh.len())
-        };
+        // The block's live history (owned: `history[history_start..]`;
+        // borrowed: the in-place input `[0, block_end)`), taken once for the
+        // pass rather than re-sliced per position. It holds no borrow, so it
+        // coexists with the `&mut $table` tree writes below.
+        // SAFETY: this body runs inside an optimal-parser pass, after
+        // `capture_block_coords`, and nothing in the pass changes the history.
+        let concat: &[u8] = unsafe { $table.block_live_history() };
         debug_assert!(
             $abs_pos <= $current_abs_end,
             "BT collect called past current block end"
@@ -721,25 +747,104 @@ macro_rules! bt_insert_and_collect_matches_body {
                 probe!($reps[2] as usize);
             }
         }
-        if $use_hash3 && !skip_further_match_search && *$best_len_for_skip < $min_match_len {
-            // The parser advances one position at a time, so this catch-up
-            // almost always has a single position to insert and the call
-            // boundary around it is the whole cost: two frames per position,
-            // each re-deriving the live history and re-reading the fields this
-            // body already holds. Upstream inlines the same work into the
-            // finder (`ZSTD_insertAndFindFirstIndexHash3`), which is what
-            // passing the pointers we already have amounts to. The general
-            // form stays for the cases the fast one declines.
-            // SAFETY: `concat` is the live history and nothing here
-            // reallocates it.
-            if !unsafe { $table.fill_hash3_from(concat.as_ptr(), concat.len(), $abs_pos) } {
-                $table.update_hash3_until($abs_pos);
+        // A repeat long enough to end the search makes the parser jump past its
+        // match, so the next position is never searched and nothing below runs.
+        if skip_further_match_search {
+            return;
+        }
+        // The next position's hash3 bucket, requested now: the parser searches
+        // positions in order and the lookup below had nothing to overlap its
+        // miss with. Issued outside the probe's gate because the next search
+        // reads the bucket whether or not this one does, and only for a table
+        // larger than a 32 KiB L1d: a 4 KiB frame's table stays resident and
+        // the request is pure overhead there (+0.8% on 4 KiB logs at level 16,
+        // -2.5% on the 1 MiB corpus file at level 19, both layouts aligned).
+        // The three table regions' bases, taken once from the buffer's own
+        // pointer for every access below: no slice, no bounds check, and still
+        // valid after the general catch-up slices the tables for itself.
+        let (hash_ptr, chain_ptr, table3_base) = $table.table_bases();
+        #[cfg(all(
+            target_feature = "sse",
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
+        if $use_hash3 && $table.hash3_log > 13 && idx + 1 + 4 <= clen {
+            #[cfg(target_arch = "x86")]
+            use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+            #[cfg(target_arch = "x86_64")]
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let hh_next = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                concat,
+                idx + 1,
+                $table.hash3_log,
+                3,
+            );
+            // SAFETY: a prefetch never faults, and `hh_next` is masked to
+            // `hash3_log` bits, so it indexes inside the table anyway.
+            unsafe {
+                _mm_prefetch(table3_base.add(hh_next).cast(), _MM_HINT_T0);
             }
+        }
+        if $use_hash3 && *$best_len_for_skip < $min_match_len {
+            // Upstream's `ZSTD_insertAndFindFirstIndexHash3` inserts the
+            // positions since the last search and reads one bucket through a
+            // table pointer it holds. Ours went through a fill that checked the
+            // table again, sliced it and ran a loop unrolled for long catch-ups,
+            // then sliced the table a second time for the read and decoded the
+            // entry into an absolute position. The parser advances one position
+            // at a time, so the catch-up is nearly always one insert: here it
+            // goes in straight through one table pointer the read then reuses,
+            // and the read stays in the table's stored-index space. The general
+            // catch-up keeps what this declines: a cursor below the history, a
+            // position too close to the end to hash, a table not configured.
+            let h3_log = $table.hash3_log;
+            let abs_bias = $table.block_coords.abs_bias;
+            debug_assert_eq!(
+                $table.block_coords,
+                $table.bt_coords(),
+                "block coordinates are stale"
+            );
+            let h3_start = $table.next_to_update3;
+            let h3_ptr: *mut u32 = if h3_log != 0 && h3_start >= hist_start && idx + 4 <= clen {
+                debug_assert_eq!($table.hash3_table().len(), 1usize << h3_log);
+                let table3 = table3_base;
+                let insert = |cursor: usize| {
+                    let hh = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                        concat,
+                        cursor - hist_start,
+                        h3_log,
+                        3,
+                    );
+                    // SAFETY: the caller passes `cursor < abs_pos`, so its four
+                    // bytes end before `idx + 4 <= clen`; the hash is masked to
+                    // `h3_log` bits and the table holds that many slots.
+                    // `cursor - abs_bias` is the stored index the table keeps for
+                    // it (`position_base - 1 - index_shift` is the bias), which
+                    // the armed block makes representable.
+                    unsafe { *table3.add(hh) = cursor.wrapping_sub(abs_bias) as u32 };
+                };
+                // A cursor at or past this position inserts nothing and is set
+                // back to it, as the general catch-up's fill does. The first
+                // insert stands outside the loop: it is nearly always the only
+                // one, and a loop the compiler unrolls pays its setup even for
+                // one trip.
+                if h3_start < $abs_pos {
+                    insert(h3_start);
+                    let mut cursor = h3_start + 1;
+                    while cursor < $abs_pos {
+                        insert(cursor);
+                        cursor += 1;
+                    }
+                }
+                $table.next_to_update3 = $abs_pos;
+                table3
+            } else {
+                $table.update_hash3_until($abs_pos);
+                table3_base
+            };
             // hash3 short-match probe folded inline (was a separate per-kernel
             // call): table lookup + one common-prefix scan via `$cpl`, reusing
             // the BT collect's `concat` / `idx` / `tail_limit`. Labeled block so
             // the probe's early-outs yield None without returning from the walk.
-            let h3_log = $table.hash3_log;
             let h3_candidate: Option<$crate::encoding::opt::types::MatchCandidate> =
                 if h3_log == 0 || idx + 4 > clen {
                     None
@@ -749,32 +854,42 @@ macro_rules! bt_insert_and_collect_matches_body {
                             $crate::encoding::match_table::storage::MatchTable::hash_position_at(
                                 concat, idx, h3_log, 3,
                             );
-                        // The hash is masked to `h3_log` bits and the table is
-                        // `1 << h3_log` slots wide, so the slot is in range by
-                        // construction and the bounds-checked slice read plus
-                        // its empty-slot fallback were paying for a case that
-                        // cannot arise. Upstream indexes `hashTable3[hash3]`
-                        // directly for the same reason.
-                        debug_assert_eq!($table.hash3_table().len(), 1usize << h3_log);
-                        // SAFETY: `hh < 1 << h3_log == hash3_table().len()`.
-                        let entry = unsafe { *$table.hash3_table().get_unchecked(hh) };
-                        let Some(cand_abs) =
+                        // SAFETY: `hh` is masked to `h3_log` bits, inside the
+                        // table `h3_ptr` points at; upstream indexes
+                        // `hashTable3[hash3]` directly for the same reason.
+                        let entry = unsafe { *h3_ptr.add(hh) };
+                        // In stored-index space: an entry at or below
+                        // `index_shift` is empty or below the representable
+                        // floor, and the distance back from this position must
+                        // land inside the history (`<= idx`), be at least one
+                        // and stay under the hash3 reach. The subtraction wraps
+                        // for an entry ahead of this position, which the one
+                        // unsigned bound then rejects. On the inputs this probe
+                        // serves nearly every entry passes the bound, so it is
+                        // not an early exit worth splitting: written as three
+                        // bare compares (`off > idx`, `off >= HC3_MAX_OFFSET`,
+                        // `off == 0`) it measured 1.1-1.8% slower at levels 16
+                        // and 19 on 4 KiB logs, 10 KiB z000033, 10 KiB random
+                        // with a dictionary and the 1 MiB corpus file, with
+                        // output unchanged and the level 3 control flat.
+                        if entry as usize <= $table.index_shift {
+                            break 'h3 None;
+                        }
+                        let off = ($abs_pos.wrapping_sub(abs_bias) as u32).wrapping_sub(entry) as usize;
+                        if off.wrapping_sub(1)
+                            >= idx.min($crate::encoding::bt::HC3_MAX_OFFSET - 1)
+                        {
+                            break 'h3 None;
+                        }
+                        let cand_idx = idx - off;
+                        debug_assert_eq!(
+                            Some(hist_start + cand_idx),
                             $crate::encoding::match_table::storage::MatchTable::stored_abs_position_fast(
                                 entry,
                                 $table.position_base,
                                 $table.index_shift,
-                            )
-                        else {
-                            break 'h3 None;
-                        };
-                        if cand_abs < hist_start || cand_abs >= $abs_pos {
-                            break 'h3 None;
-                        }
-                        let off = $abs_pos - cand_abs;
-                        if off >= $crate::encoding::bt::HC3_MAX_OFFSET {
-                            break 'h3 None;
-                        }
-                        let cand_idx = cand_abs - hist_start;
+                            ),
+                        );
                         // The bucket is keyed on three bytes and the shortest
                         // match this parser accepts is three, so three bytes
                         // that differ cannot produce a candidate: check them
@@ -794,7 +909,14 @@ macro_rules! bt_insert_and_collect_matches_body {
                             break 'h3 None;
                         }
                         // SAFETY: cand_idx/idx within history; tail_limit bounds the scan.
-                        let ml = unsafe { $cpl(cbase.add(cand_idx), cbase.add(idx), tail_limit) };
+                        let ml = unsafe {
+                            $crate::encoding::hc::generator::prefix_len_first_word!(
+                                $cpl,
+                                cbase.add(cand_idx),
+                                cbase.add(idx),
+                                tail_limit
+                            )
+                        };
                         (ml >= $min_match_len).then_some(
                             $crate::encoding::opt::types::MatchCandidate {
                                 start: $abs_pos,
@@ -805,12 +927,14 @@ macro_rules! bt_insert_and_collect_matches_body {
                     }
                 };
             if let Some(h3) = h3_candidate {
-                let _ = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                    $out,
-                    $best_len_for_skip,
-                    h3,
-                    $min_match_len,
+                // The probe runs only while `best_len_for_skip < min_match_len`
+                // and yields only a match of at least `min_match_len`, so the
+                // candidate is always a new best.
+                debug_assert!(
+                    h3.match_len >= $min_match_len && h3.match_len > *$best_len_for_skip
                 );
+                $out.push(h3);
+                *$best_len_for_skip = h3.match_len;
                 // Same fold as the repeat probe: the block end lives in the
                 // length space the probe already carries.
                 if !rep_len_candidate_found
@@ -833,33 +957,14 @@ macro_rules! bt_insert_and_collect_matches_body {
             $table.hash_log,
             $table.search_mls,
         );
-        // Upstream holds `U32* const hashTable = ms->hashTable` for the whole
-        // body (zstd_opt.c:607). Ours re-derived it from the shared table
-        // buffer at every use, and each re-derivation is a bounds-checked
-        // reslice that reloads the buffer's header and the seam offset through
-        // `&mut self`. One raw base, the way `chain_ptr` below does it.
-        //
-        // The BT pointer-pair table's base is hoisted out of `self` once too:
-        // every access below is `chain_table[computed_index]` through `&mut
-        // self`, which the optimizer cannot prove loop-invariant, so it reloads
-        // the Vec's (ptr,len) from the struct AND bounds-checks on every tree
-        // step (the upstream zstd walks a raw `U32* btable`, zstd_opt.c). The raw
-        // base carries no borrow, so the `&self` helper calls in the loop
-        // (`bt_pair_index_for_abs`, `window_low_abs_for_target`,
-        // `relative_position`) coexist — they read other fields, never
-        // `chain_table`. Indices are in bounds by the BT invariants:
-        // `bt_pair_index_for_abs` returns `2*(abs & bt_mask) (+1)` ≤
-        // `chain_table.len()-1`, and the slots only ever hold those values.
-        // Both bases come out of ONE split borrow: taking the second through
-        // its own `&mut` reslice reborrows the whole buffer, which invalidates
-        // a pointer already taken from the first.
+        // Upstream holds `U32* const hashTable = ms->hashTable` and the tree's
+        // `bt` for the whole body (zstd_opt.c:607); the walk below indexes the
+        // bases taken at the top the same way. Its indices are in bounds by the
+        // BT invariants: a pair slot is `2*(abs & bt_mask) (+1)` <
+        // `chain_table.len()`, and the slots only ever hold those values.
         debug_assert_eq!($table.hash_table().len(), 1usize << $table.hash_log);
         debug_assert_eq!($table.chain_table().len(), 2 << $table.bt_log());
         debug_assert!(hash < 1usize << $table.hash_log);
-        let (hash_ptr, chain_ptr) = {
-            let (hash_table, chain_table) = $table.hash_and_chain_mut();
-            (hash_table.as_mut_ptr(), chain_table.as_mut_ptr())
-        };
         // Prefetch the hash bucket now. For the large L16+ hash table over
         // high-entropy input the bucket is L3/DRAM-cold, and unlike upstream's
         // monolithic ZSTD_btGetAllMatches (which overlaps this miss with its
@@ -994,6 +1099,13 @@ macro_rules! bt_insert_and_collect_matches_body {
             // `2*(candidate_abs + index_shift & bt_mask)` with `index_shift`
             // folded away: `candidate_abs + index_shift == stored + bt_bias`.
             let next_pair_idx = 2 * (stored.wrapping_add(bt_bias) & bt_mask);
+            // Both children are read ahead of the compare, where upstream reads
+            // only the side it descends, so the next node's load can overlap
+            // the compare. Reading only the chosen side after it measured about
+            // 1% slower on z000033 10 KiB at level 19 with output unchanged,
+            // against a flat level 3 control; that is below what two builds
+            // resolve, so neither order is shown faster and the walk keeps its
+            // existing one.
             // SAFETY: `next_pair_idx (+1)` = `2*(candidate_abs & bt_mask) (+1)`
             // ≤ `chain_table.len()-1`; `chain_ptr` is the hoisted live base,
             // table not realloc'd during the walk.
@@ -1006,35 +1118,32 @@ macro_rules! bt_insert_and_collect_matches_body {
             let match_len = unsafe { $cmf(concat, idx, candidate_idx, tail_limit, seed_len) };
 
             if match_len > best_len {
-                let offset = $abs_pos - candidate_abs;
-                let accepted = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                    $out,
-                    $best_len_for_skip,
-                    $crate::encoding::opt::types::MatchCandidate {
-                        start: $abs_pos,
-                        offset,
-                        match_len,
-                    },
-                    $min_match_len,
-                );
-                if accepted {
-                    best_len = match_len;
-                    // BT walker invariants: `candidate_abs < abs_pos`
-                    // and `match_len <= tail_limit = current_abs_end -
-                    // abs_pos`. So `candidate_abs + match_len <
-                    // abs_pos + tail_limit = current_abs_end`, which
-                    // fits in `usize` on every supported target (32-bit
-                    // i686 included) — the addition stays within the
-                    // current block.
-                    let candidate_end = candidate_abs + match_len;
-                    if candidate_end > match_end_abs {
-                        match_end_abs = candidate_end;
-                    }
-                    if match_len >= tail_limit
-                        || match_len > $crate::encoding::cost_model::HC_OPT_NUM
-                    {
-                        break;
-                    }
+                // `best_len` is `max(best_len_for_skip, min_match_len - 1)`,
+                // so a longer match is both at least the minimum and a new
+                // best: it joins the ladder unconditionally, as upstream's
+                // `matches[mnum]` store does (zstd_opt.c:749-752).
+                debug_assert!(match_len >= $min_match_len && match_len > *$best_len_for_skip);
+                $out.push($crate::encoding::opt::types::MatchCandidate {
+                    start: $abs_pos,
+                    offset: $abs_pos - candidate_abs,
+                    match_len,
+                });
+                *$best_len_for_skip = match_len;
+                best_len = match_len;
+                // BT walker invariants: `candidate_abs < abs_pos` and
+                // `match_len <= tail_limit = current_abs_end - abs_pos`. So
+                // `candidate_abs + match_len < abs_pos + tail_limit =
+                // current_abs_end`, which fits in `usize` on every supported
+                // target (32-bit i686 included) — the addition stays within
+                // the current block.
+                let candidate_end = candidate_abs + match_len;
+                if candidate_end > match_end_abs {
+                    match_end_abs = candidate_end;
+                }
+                if match_len >= tail_limit
+                    || match_len > $crate::encoding::cost_model::HC_OPT_NUM
+                {
+                    break;
                 }
             }
 
@@ -1138,55 +1247,51 @@ macro_rules! bt_insert_and_collect_matches_body {
                 // walk's `$cmf`. `seed <= prior match_len <= tail_limit`.
                 let match_len = unsafe { $cmf(concat, idx, dict_idx, tail_limit, seed) };
                 if match_len > best_len {
-                    let offset = idx - dict_idx;
-                    let accepted = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                        $out,
-                        $best_len_for_skip,
-                        $crate::encoding::opt::types::MatchCandidate {
-                            start: $abs_pos,
-                            offset,
-                            match_len,
-                        },
-                        $min_match_len,
+                    // Same ladder invariant as the live walk: a match longer
+                    // than `best_len` is always kept.
+                    debug_assert!(
+                        match_len >= $min_match_len && match_len > *$best_len_for_skip
                     );
-                    if accepted {
-                        best_len = match_len;
-                        // Where the match ends in the SOURCE, not at the
-                        // position being searched (upstream zstd
-                        // `matchEndIdx = matchIndex + matchLength`,
-                        // zstd_opt.c:794-795, the same form the live walk above
-                        // uses). This value becomes the tree's insert cursor,
-                        // and a dictionary candidate sits BEFORE the searched
-                        // position: measuring from the searched position
-                        // instead pushes the cursor forward by the offset, and
-                        // every position it skipped never enters the tree. A
-                        // later search then finds an empty bucket where the
-                        // reference finds a long match. Only a dictionary
-                        // candidate reaches back far enough for it to show.
-                        //
-                        // In ABSOLUTE coordinates, which is what `match_end_abs`
-                        // and the cursor are in: `dict_idx` indexes the live
-                        // history, and a reused dictionary context advances
-                        // `history_abs_start`, so without the base this compares
-                        // a small relative end against an absolute one and never
-                        // advances the cursor at all from the second frame on.
-                        let candidate_end = $table.history_abs_start + dict_idx + match_len;
-                        // Same coordinate space as `match_end_abs` and the
-                        // cursor it feeds. A value left relative to the live
-                        // history satisfies this only while the base is zero,
-                        // which is exactly the first frame of a context — the
-                        // case where a reused dictionary context hides the
-                        // mistake until the base moves.
-                        debug_assert!(
-                            candidate_end >= $table.history_abs_start + match_len,
-                            "dictionary match end must be absolute",
-                        );
-                        if candidate_end > match_end_abs {
-                            match_end_abs = candidate_end;
-                        }
-                        if match_len > $crate::encoding::cost_model::HC_OPT_NUM {
-                            break;
-                        }
+                    $out.push($crate::encoding::opt::types::MatchCandidate {
+                        start: $abs_pos,
+                        offset: idx - dict_idx,
+                        match_len,
+                    });
+                    *$best_len_for_skip = match_len;
+                    best_len = match_len;
+                    // Where the match ends in the SOURCE, not at the position
+                    // being searched (upstream zstd `matchEndIdx = matchIndex +
+                    // matchLength`, zstd_opt.c:794-795, the same form the live
+                    // walk above uses). This value becomes the tree's insert
+                    // cursor, and a dictionary candidate sits BEFORE the
+                    // searched position: measuring from the searched position
+                    // instead pushes the cursor forward by the offset, and every
+                    // position it skipped never enters the tree. A later search
+                    // then finds an empty bucket where the reference finds a
+                    // long match. Only a dictionary candidate reaches back far
+                    // enough for it to show.
+                    //
+                    // In ABSOLUTE coordinates, which is what `match_end_abs` and
+                    // the cursor are in: `dict_idx` indexes the live history,
+                    // and a reused dictionary context advances
+                    // `history_abs_start`, so without the base this compares a
+                    // small relative end against an absolute one and never
+                    // advances the cursor at all from the second frame on.
+                    let candidate_end = $table.history_abs_start + dict_idx + match_len;
+                    // Same coordinate space as `match_end_abs` and the cursor it
+                    // feeds. A value left relative to the live history satisfies
+                    // this only while the base is zero, which is exactly the
+                    // first frame of a context: the case where a reused
+                    // dictionary context hides the mistake until the base moves.
+                    debug_assert!(
+                        candidate_end >= $table.history_abs_start + match_len,
+                        "dictionary match end must be absolute",
+                    );
+                    if candidate_end > match_end_abs {
+                        match_end_abs = candidate_end;
+                    }
+                    if match_len > $crate::encoding::cost_model::HC_OPT_NUM {
+                        break;
                     }
                 }
                 // Match reached the block tail: can't order the pair (upstream zstd
