@@ -1224,7 +1224,8 @@ macro_rules! collect_optimal_candidates_initialized_body {
             $self.table.skip_insert_until_abs = $abs_pos;
         }
         let current_idx = $abs_pos - $self.table.history_abs_start;
-        if current_idx + 4 > $self.table.live_history().len() {
+        // The pass's live history length, taken with its coordinates.
+        if current_idx + 4 > $self.table.block_live.1 {
             return;
         }
         let mut best_len_for_skip = 0usize;

@@ -109,24 +109,13 @@ macro_rules! bt_insert_range_body {
         let position_base = $table.position_base;
         let index_shift = $table.index_shift;
         let search_depth = $search_depth;
-        // Upstream holds `U32* const hashTable = ms->hashTable` for the whole
-        // body (zstd_opt.c:449). Ours re-derived it from the shared table
-        // buffer at every use, and each re-derivation is a bounds-checked
-        // reslice that reloads the buffer's header and the seam offset through
-        // `&mut self`.
-        //
-        // The BT pointer-pair base is hoisted the same way — see the
-        // collect-matches body for the full rationale (per-step Vec reload +
-        // bounds check through `&mut self` vs the upstream zstd's raw `U32*`
-        // walk). Both bases come out of ONE split borrow: taking the second
-        // through its own `&mut` reslice reborrows the whole buffer, which
-        // invalidates a pointer already taken from the first.
+        // Upstream holds `U32* const hashTable = ms->hashTable` and the tree's
+        // `bt` for the whole body (zstd_opt.c:449); the bases come from the
+        // buffer's own pointer, as in the collect body, with no slice or bounds
+        // check through `&mut self`.
         debug_assert_eq!($table.hash_table().len(), 1usize << hash_log);
         debug_assert_eq!($table.chain_table().len(), 2 << $table.bt_log());
-        let (hash_ptr, chain_ptr) = {
-            let (hash_table, chain_table) = $table.hash_and_chain_mut();
-            (hash_table.as_mut_ptr(), chain_table.as_mut_ptr())
-        };
+        let (hash_ptr, chain_ptr, _) = $table.table_bases();
         let bt_mask = $table.bt_mask();
         let window_low = $table.window_low_abs_for_target($target_abs);
         // The walk carries one coordinate, the stored index, as the collect body
@@ -650,14 +639,13 @@ macro_rules! bt_insert_and_collect_matches_body {
         $cmf:path $(,)?
     ) => {{
         let idx = $abs_pos - $table.history_abs_start;
-        // Borrowed-aware live region (owned: `history[history_start..]`;
-        // borrowed: the in-place input `[0, block_end)`). Reborrow-then-raw-ptr
-        // so the slice holds NO borrow and coexists with the `&mut $table`
-        // binary-tree writes below. Owned is byte-identical (same bytes).
-        let concat: &[u8] = unsafe {
-            let lh = $table.live_history();
-            core::slice::from_raw_parts(lh.as_ptr(), lh.len())
-        };
+        // The block's live history (owned: `history[history_start..]`;
+        // borrowed: the in-place input `[0, block_end)`), taken once for the
+        // pass rather than re-sliced per position. It holds no borrow, so it
+        // coexists with the `&mut $table` tree writes below.
+        // SAFETY: this body runs inside an optimal-parser pass, after
+        // `capture_block_coords`, and nothing in the pass changes the history.
+        let concat: &[u8] = unsafe { $table.block_live_history() };
         debug_assert!(
             $abs_pos <= $current_abs_end,
             "BT collect called past current block end"
