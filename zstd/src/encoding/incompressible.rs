@@ -1084,6 +1084,11 @@ fn sample_looks_incompressible(block: &[u8]) -> bool {
 /// Out of line so that its eight kilobytes of tables are a frame of their own:
 /// inlined, the caller carries that frame, and its stack probes, on every
 /// short sample too, which never touches them.
+///
+/// The tables stay on the stack rather than in caller-owned scratch: both must
+/// be emptied for every block anyway, so scratch would save only the stack
+/// probes, and measured with the tables outside the frame that was flat on
+/// x86_64 and 5-6% slower on i686.
 #[inline(never)]
 fn long_sample_looks_incompressible(
     regions: &[&[u8]],
