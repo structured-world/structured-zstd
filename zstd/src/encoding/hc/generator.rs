@@ -747,6 +747,11 @@ macro_rules! bt_insert_and_collect_matches_body {
                 probe!($reps[2] as usize);
             }
         }
+        // A repeat long enough to end the search makes the parser jump past its
+        // match, so the next position is never searched and nothing below runs.
+        if skip_further_match_search {
+            return;
+        }
         // The next position's hash3 bucket, requested now: the parser searches
         // positions in order and the lookup below had nothing to overlap its
         // miss with. Issued outside the probe's gate because the next search
@@ -779,7 +784,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                 _mm_prefetch(table3_base.add(hh_next).cast(), _MM_HINT_T0);
             }
         }
-        if $use_hash3 && !skip_further_match_search && *$best_len_for_skip < $min_match_len {
+        if $use_hash3 && *$best_len_for_skip < $min_match_len {
             // Upstream's `ZSTD_insertAndFindFirstIndexHash3` inserts the
             // positions since the last search and reads one bucket through a
             // table pointer it holds. Ours went through a fill that checked the
@@ -859,7 +864,14 @@ macro_rules! bt_insert_and_collect_matches_body {
                         // land inside the history (`<= idx`), be at least one
                         // and stay under the hash3 reach. The subtraction wraps
                         // for an entry ahead of this position, which the one
-                        // unsigned bound then rejects.
+                        // unsigned bound then rejects. On the inputs this probe
+                        // serves nearly every entry passes the bound, so it is
+                        // not an early exit worth splitting: written as three
+                        // bare compares (`off > idx`, `off >= HC3_MAX_OFFSET`,
+                        // `off == 0`) it measured 1.1-1.8% slower at levels 16
+                        // and 19 on 4 KiB logs, 10 KiB z000033, 10 KiB random
+                        // with a dictionary and the 1 MiB corpus file, with
+                        // output unchanged and the level 3 control flat.
                         if entry as usize <= $table.index_shift {
                             break 'h3 None;
                         }
