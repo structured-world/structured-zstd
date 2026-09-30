@@ -31,9 +31,13 @@ pub(crate) const HC_BITCOST_MULTIPLIER: u32 = 1 << 8;
 pub(crate) const HC_BLOCKSIZE_MAX: usize = crate::common::MAX_BLOCK_SIZE as usize;
 pub(crate) const HC_OPT_NUM: usize = 1 << 12;
 /// Fixed stride of each price/generation region in the optimal-parser price
-/// arena. The DP frontier never exceeds `HC_OPT_NUM`, so `HC_OPT_NUM + 1`
-/// indices (positions `0..=frontier_limit`) always fit.
-pub(crate) const HC_OPT_PRICE_STRIDE: usize = HC_OPT_NUM + 1;
+/// arena: the lengths it caches. It covers every match length the parser
+/// prices below the forced-path length (at most 999 at any level), and a
+/// longer length is priced in place, which is exactly what the cache would
+/// have returned. The arena is zeroed for every new matcher, and at
+/// `HC_OPT_NUM + 1` that was a 64 KiB memset costing 6% of a 4 KiB frame at
+/// level 16, for lengths such a frame never reaches.
+pub(crate) const HC_OPT_PRICE_STRIDE: usize = 1 << 10;
 /// Backing length (in `[price, generation]` pairs) of the single price
 /// arena: two fixed-stride regions (LL pairs, ML pairs). Each `[u32; 2]`
 /// cell co-locates a code's price and its generation stamp so the optimal
