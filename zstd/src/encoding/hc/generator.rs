@@ -510,6 +510,35 @@ macro_rules! for_each_repcode_candidate_body {
 }
 pub(crate) use for_each_repcode_candidate_body;
 
+/// Common prefix of `$a` and `$b`, capped at `$limit`, with the first eight
+/// bytes settled in place: `$cpl` is called only when they all match. Most
+/// probed candidates part within one word, and upstream zstd's inlined
+/// `ZSTD_count` answers those from its first 8-byte compare the same way.
+///
+/// # Safety
+///
+/// Both pointers must be readable for `$limit` bytes, and for eight when
+/// `$limit >= 8`; the caller's umbrella must enable `$cpl`.
+macro_rules! prefix_len_first_word {
+    ($cpl:path, $a:expr, $b:expr, $limit:expr) => {{
+        let a: *const u8 = $a;
+        let b: *const u8 = $b;
+        let limit: usize = $limit;
+        if limit >= 8 {
+            let diff =
+                a.cast::<u64>().read_unaligned().to_le() ^ b.cast::<u64>().read_unaligned().to_le();
+            if diff != 0 {
+                (diff.trailing_zeros() / 8) as usize
+            } else {
+                8 + $cpl(a.add(8), b.add(8), limit - 8)
+            }
+        } else {
+            $cpl(a, b, limit)
+        }
+    }};
+}
+pub(crate) use prefix_len_first_word;
+
 /// One repeat-offset probe, expanded per slot. Crate-private (see
 /// `bt_insert_range_body!`).
 ///
@@ -564,9 +593,17 @@ macro_rules! rep_probe_slot {
             if cand_gate != $cur_gate {
                 break 'slot;
             }
-            // SAFETY: same umbrella; both pointers + the limit stay in `concat`.
-            let match_len =
-                unsafe { $cpl($rbase.add(candidate_idx), $rbase.add($idx), $rep_scan_limit) };
+            // SAFETY: same umbrella as `$cpl`; `candidate_idx < idx` and
+            // `rep_scan_limit <= rlen - idx`, so both reads stay inside
+            // `concat` for `rep_scan_limit` bytes.
+            let match_len = unsafe {
+                $crate::encoding::hc::generator::prefix_len_first_word!(
+                    $cpl,
+                    $rbase.add(candidate_idx),
+                    $rbase.add($idx),
+                    $rep_scan_limit
+                )
+            };
             if match_len < $min_match_len {
                 break 'slot;
             }
@@ -795,7 +832,14 @@ macro_rules! bt_insert_and_collect_matches_body {
                             break 'h3 None;
                         }
                         // SAFETY: cand_idx/idx within history; tail_limit bounds the scan.
-                        let ml = unsafe { $cpl(cbase.add(cand_idx), cbase.add(idx), tail_limit) };
+                        let ml = unsafe {
+                            $crate::encoding::hc::generator::prefix_len_first_word!(
+                                $cpl,
+                                cbase.add(cand_idx),
+                                cbase.add(idx),
+                                tail_limit
+                            )
+                        };
                         (ml >= $min_match_len).then_some(
                             $crate::encoding::opt::types::MatchCandidate {
                                 start: $abs_pos,
