@@ -26,7 +26,7 @@ use core::mem::MaybeUninit;
 /// feature only gates the runtime dispatch, not compilation.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn priceset_improved_mask8_avx2(next_cost: &[u32; 8], node_price: &[u32]) -> u8 {
+pub(crate) unsafe fn priceset_improved_mask8_avx2(next_cost: &[u32; 8], node_price: &[u32]) -> u8 {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::{
         __m256i, _mm256_andnot_si256, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256,
@@ -51,7 +51,7 @@ unsafe fn priceset_improved_mask8_avx2(next_cost: &[u32; 8], node_price: &[u32])
 /// so the SoA vector path stays byte-identical.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn priceset_next_cost<const ACCURATE: bool>(
+pub(crate) fn priceset_next_cost<const ACCURATE: bool>(
     profile: HcOptimalCostProfile,
     stats: &HcOptState,
     ml_cache: &mut [[u32; 2]],
@@ -176,86 +176,162 @@ fn priceset_range_vec<const W: usize, const ACCURATE: bool>(
     deint: impl Fn(&[[u32; 2]], u32) -> Option<[u32; W]>,
     mask: impl Fn(&[u32; W], &[u32]) -> u8,
 ) -> usize {
-    let mut new_last = last_pos;
-    let mut buf = [0u32; W];
-    // Loop-invariant constant of the byte-identical next_cost chain:
-    // next_cost = add_prices(base_cost, add_prices(ll0_price,
-    //   match_price_from_parts(off_price, ml_price))) = c_base + ml_price,
-    // c_base = base_cost + ll0_price + match_price_from_parts(off_price, 0).
-    //
-    // This stays bit-exact with the scalar `priceset_next_cost` because both
-    // helpers are affine in `ml_price`: `BtMatcher::add_prices(a, b) = a + b`
-    // and `match_price_from_parts(off, ml) = off + ml + bias` are plain integer
-    // additions, so `match_price_from_parts(off, ml) = match_price_from_parts(
-    // off, 0) + ml` and the whole chain collapses to `c_base + ml_price`. The
-    // `wrapping_add` here matches the scalar `+` under the cost model's
-    // no-overflow invariant (the `debug_assert`s in both helpers). Factoring the
-    // combine into one helper per the review suggestion would force a per-lane
-    // `match_price_from_parts(off, ml_price)` recompute instead of hoisting the
-    // ml-independent `c_base` once — a regression on this hot DP loop — so the
-    // hoist is kept and the equivalence documented here instead.
-    let c_base = base_cost
-        .wrapping_add(ll0_price)
-        .wrapping_add(profile.match_price_from_parts(off_price, 0, stats));
-    let mut ml = start;
-    while ml + W <= max + 1 {
-        let vectorised = if ml + W <= ml_cache.len() {
-            deint(&ml_cache[ml..ml + W], ml_stamp)
-        } else {
-            None
-        };
-        if let Some(prices) = vectorised {
-            for (k, slot) in buf.iter_mut().enumerate() {
-                *slot = c_base.wrapping_add(prices[k]);
-            }
-        } else {
-            for (k, slot) in buf.iter_mut().enumerate() {
-                *slot = priceset_next_cost::<ACCURATE>(
-                    profile,
-                    stats,
-                    ml_cache,
-                    ml_stamp,
-                    ml + k,
-                    ll0_price,
-                    off_price,
-                    base_cost,
-                );
-            }
-        }
-        let base_next = pos + ml;
-        let mut bits = mask(&buf, &node_prices[base_next..base_next + W]);
-        while bits != 0 {
-            let k = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let next = base_next + k;
-            node_prices[next] = buf[k];
-            // SAFETY: `nodes[next]` is an in-bounds cell of the slice.
-            unsafe {
-                HcOptimalNode::write_match_end(nodes[next].as_mut_ptr(), off, (ml + k) as u32)
-            };
-            if next > new_last {
-                new_last = next;
-            }
-        }
-        ml += W;
-    }
-    while ml <= max {
-        let next_cost = priceset_next_cost::<ACCURATE>(
-            profile, stats, ml_cache, ml_stamp, ml, ll0_price, off_price, base_cost,
-        );
-        let next = pos + ml;
-        if next_cost < node_prices[next] {
-            node_prices[next] = next_cost;
-            // SAFETY: `nodes[next]` is an in-bounds cell of the slice.
-            unsafe { HcOptimalNode::write_match_end(nodes[next].as_mut_ptr(), off, ml as u32) };
-            if next > new_last {
-                new_last = next;
-            }
-        }
-        ml += 1;
-    }
-    new_last
+    crate::encoding::hc::priceset::priceset_vec_body!(
+        W,
+        ACCURATE,
+        node_prices,
+        nodes,
+        ml_cache,
+        ml_stamp,
+        profile,
+        stats,
+        pos,
+        start,
+        max,
+        ll0_price,
+        off_price,
+        base_cost,
+        off,
+        last_pos,
+        deint,
+        mask
+    )
 }
+
+/// The vectorised price-set loop of [`priceset_range_vec`], as a macro so a
+/// tier can expand it inside its own `target_feature` caller: a
+/// `#[target_feature]` function cannot be `#[inline(always)]`, and left to
+/// `#[inline]` the optimiser keeps it out of line, paying a call with most of
+/// its fourteen arguments on the stack for every candidate the parser prices.
+macro_rules! priceset_vec_body {
+    (
+        $w:expr,
+        $accurate:expr,
+        $node_prices:expr,
+        $nodes:expr,
+        $ml_cache:expr,
+        $ml_stamp:expr,
+        $profile:expr,
+        $stats:expr,
+        $pos:expr,
+        $start:expr,
+        $max:expr,
+        $ll0_price:expr,
+        $off_price:expr,
+        $base_cost:expr,
+        $off:expr,
+        $last_pos:expr,
+        $deint:expr,
+        $mask:expr $(,)?
+    ) => {{
+        let node_prices: &mut [u32] = $node_prices;
+        let nodes: &mut [core::mem::MaybeUninit<$crate::encoding::opt::types::HcOptimalNode>] =
+            $nodes;
+        let ml_cache: &mut [[u32; 2]] = $ml_cache;
+        let ml_stamp: u32 = $ml_stamp;
+        let profile: $crate::encoding::cost_model::HcOptimalCostProfile = $profile;
+        let stats: &$crate::encoding::cost_model::HcOptState = $stats;
+        let pos: usize = $pos;
+        let start: usize = $start;
+        let max: usize = $max;
+        let ll0_price: u32 = $ll0_price;
+        let off_price: u32 = $off_price;
+        let base_cost: u32 = $base_cost;
+        let off: u32 = $off;
+        let deint = $deint;
+        let mask = $mask;
+        let mut new_last: usize = $last_pos;
+        let mut buf = [0u32; $w];
+        // Loop-invariant constant of the byte-identical next_cost chain:
+        // next_cost = add_prices(base_cost, add_prices(ll0_price,
+        //   match_price_from_parts(off_price, ml_price))) = c_base + ml_price,
+        // c_base = base_cost + ll0_price + match_price_from_parts(off_price, 0).
+        //
+        // This stays bit-exact with the scalar `priceset_next_cost` because both
+        // helpers are affine in `ml_price`: `BtMatcher::add_prices(a, b) = a + b`
+        // and `match_price_from_parts(off, ml) = off + ml + bias` are plain integer
+        // additions, so `match_price_from_parts(off, ml) = match_price_from_parts(
+        // off, 0) + ml` and the whole chain collapses to `c_base + ml_price`. The
+        // `wrapping_add` here matches the scalar `+` under the cost model's
+        // no-overflow invariant (the `debug_assert`s in both helpers). Factoring the
+        // combine into one helper per the review suggestion would force a per-lane
+        // `match_price_from_parts(off, ml_price)` recompute instead of hoisting the
+        // ml-independent `c_base` once — a regression on this hot DP loop — so the
+        // hoist is kept and the equivalence documented here instead.
+        let c_base = base_cost
+            .wrapping_add(ll0_price)
+            .wrapping_add(profile.match_price_from_parts(off_price, 0, stats));
+        let mut ml = start;
+        while ml + $w <= max + 1 {
+            let vectorised = if ml + $w <= ml_cache.len() {
+                deint(&ml_cache[ml..ml + $w], ml_stamp)
+            } else {
+                None
+            };
+            if let Some(prices) = vectorised {
+                for (k, slot) in buf.iter_mut().enumerate() {
+                    *slot = c_base.wrapping_add(prices[k]);
+                }
+            } else {
+                for (k, slot) in buf.iter_mut().enumerate() {
+                    *slot = $crate::encoding::hc::priceset::priceset_next_cost::<{ $accurate }>(
+                        profile,
+                        stats,
+                        ml_cache,
+                        ml_stamp,
+                        ml + k,
+                        ll0_price,
+                        off_price,
+                        base_cost,
+                    );
+                }
+            }
+            let base_next = pos + ml;
+            let mut bits = mask(&buf, &node_prices[base_next..base_next + $w]);
+            while bits != 0 {
+                let k = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let next = base_next + k;
+                node_prices[next] = buf[k];
+                // SAFETY: `nodes[next]` is an in-bounds cell of the slice.
+                unsafe {
+                    $crate::encoding::opt::types::HcOptimalNode::write_match_end(
+                        nodes[next].as_mut_ptr(),
+                        off,
+                        (ml + k) as u32,
+                    )
+                };
+                if next > new_last {
+                    new_last = next;
+                }
+            }
+            ml += $w;
+        }
+        while ml <= max {
+            let next_cost = $crate::encoding::hc::priceset::priceset_next_cost::<{ $accurate }>(
+                profile, stats, ml_cache, ml_stamp, ml, ll0_price, off_price, base_cost,
+            );
+            let next = pos + ml;
+            if next_cost < node_prices[next] {
+                node_prices[next] = next_cost;
+                // SAFETY: `nodes[next]` is an in-bounds cell of the slice.
+                unsafe {
+                    $crate::encoding::opt::types::HcOptimalNode::write_match_end(
+                        nodes[next].as_mut_ptr(),
+                        off,
+                        ml as u32,
+                    )
+                };
+                if next > new_last {
+                    new_last = next;
+                }
+            }
+            ml += 1;
+        }
+        new_last
+    }};
+}
+pub(crate) use priceset_vec_body;
 
 /// Vector-load 8 cached ml-prices for the optimal parser's price-set, given a
 /// run of 8 contiguous `[price, generation]` cells. Returns `Some(prices)`
@@ -270,7 +346,10 @@ fn priceset_range_vec<const W: usize, const ACCURATE: bool>(
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn priceset_cached_prices8_avx2(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 8]> {
+pub(crate) unsafe fn priceset_cached_prices8_avx2(
+    cells: &[[u32; 2]],
+    stamp: u32,
+) -> Option<[u32; 8]> {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::{
         __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
@@ -695,6 +774,66 @@ pub(crate) unsafe fn priceset_range_nonabort_simd128<const ACCURATE: bool>(
         |nc, np| unsafe { priceset_improved_mask4_simd128(nc, np) },
     )
 }
+
+/// The AVX2 price-set, expanded in place: the optimal parser's avx2 wrapper
+/// already runs under the AVX2 umbrella, so the loop and its intrinsics become
+/// part of it instead of a call per priced candidate.
+// Each tier's macro is expanded only by the parser wrapper its target compiles.
+#[allow(unused_macros)]
+macro_rules! priceset_avx2 {
+    ($accurate:expr; $($arg:expr),+ $(,)?) => {
+        $crate::encoding::hc::priceset::priceset_vec_body!(
+            8,
+            $accurate,
+            $($arg),+,
+            |cells: &[[u32; 2]], stamp: u32| -> Option<[u32; 8]> {
+                unsafe { $crate::encoding::hc::priceset::priceset_cached_prices8_avx2(cells, stamp) }
+            },
+            |nc: &[u32; 8], np: &[u32]| -> u8 {
+                unsafe { $crate::encoding::hc::priceset::priceset_improved_mask8_avx2(nc, np) }
+            },
+        )
+    };
+}
+pub(crate) use priceset_avx2;
+
+/// The price-set of each tier that keeps its own function, in the same
+/// invocation form as [`priceset_avx2`] so the parser body takes either.
+#[allow(unused_macros)]
+macro_rules! priceset_sse41 {
+    ($accurate:expr; $($arg:expr),+ $(,)?) => {
+        $crate::encoding::hc::priceset::priceset_range_nonabort_sse41::<{ $accurate }>($($arg),+)
+    };
+}
+pub(crate) use priceset_sse41;
+#[allow(unused_macros)]
+macro_rules! priceset_sse2 {
+    ($accurate:expr; $($arg:expr),+ $(,)?) => {
+        $crate::encoding::hc::priceset::priceset_range_nonabort_sse2::<{ $accurate }>($($arg),+)
+    };
+}
+pub(crate) use priceset_sse2;
+#[allow(unused_macros)]
+macro_rules! priceset_neon {
+    ($accurate:expr; $($arg:expr),+ $(,)?) => {
+        $crate::encoding::hc::priceset::priceset_range_nonabort_neon::<{ $accurate }>($($arg),+)
+    };
+}
+pub(crate) use priceset_neon;
+#[allow(unused_macros)]
+macro_rules! priceset_simd128 {
+    ($accurate:expr; $($arg:expr),+ $(,)?) => {
+        $crate::encoding::hc::priceset::priceset_range_nonabort_simd128::<{ $accurate }>($($arg),+)
+    };
+}
+pub(crate) use priceset_simd128;
+#[allow(unused_macros)]
+macro_rules! priceset_scalar {
+    ($accurate:expr; $($arg:expr),+ $(,)?) => {
+        $crate::encoding::hc::priceset::priceset_range_nonabort_scalar::<{ $accurate }>($($arg),+)
+    };
+}
+pub(crate) use priceset_scalar;
 
 #[cfg(test)]
 mod tests;
