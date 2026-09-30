@@ -582,9 +582,10 @@ fn code_buffer(ws: &mut Workspace, count: usize) -> RegionVec<u32> {
 
 /// The Fast band codes offsets as the sequences are collected. The codes and
 /// the final history must be what the fast derivation gives over the raw
-/// offsets in order, including the explicit offset that equals `rep[0]` (coded
-/// 1) and the litLength-0 match of `rep[1]` (coded 1, rotating); without
-/// coding, the raw offsets are kept and the history is left alone.
+/// offsets in order, including the explicit offset that equals `rep[0]`
+/// (coded as offBase 1) and the litLength-0 match of `rep[1]` (offBase 1,
+/// rotating); without coding, the raw offsets are kept and the history is left
+/// alone.
 #[test]
 fn collected_fast_band_sequences_carry_the_fast_derivation() {
     use super::{Sequence, encode_offset_with_history_fast, record_sequence};
@@ -623,18 +624,10 @@ fn collected_fast_band_sequences_carry_the_fast_derivation() {
                 offset,
                 match_len,
             };
-            if coded {
-                record_sequence::<true>(seq, &mut tail, &mut sequences, &mut hist);
-            } else {
-                record_sequence::<false>(seq, &mut tail, &mut sequences, &mut hist);
-            }
+            record_sequence(seq, &mut tail, &mut sequences, coded, &mut hist);
         }
         let trailing = Sequence::Literals { len: 11 };
-        if coded {
-            record_sequence::<true>(trailing, &mut tail, &mut sequences, &mut hist);
-        } else {
-            record_sequence::<false>(trailing, &mut tail, &mut sequences, &mut hist);
-        }
+        record_sequence(trailing, &mut tail, &mut sequences, coded, &mut hist);
         assert_eq!(tail, 11);
         let off_bases: Vec<u32> = sequences.iter().map(|seq| seq.off_base).collect();
         if coded {

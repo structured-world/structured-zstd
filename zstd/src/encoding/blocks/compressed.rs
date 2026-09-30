@@ -625,28 +625,29 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
     // back by position, so no sequence may follow them.
     let mut tail = 0usize;
     let sequences = &mut parts.sequences;
-    if uses_fast_offset_codes(state.strategy_tag) {
-        // The Fast band codes each offset as it is emitted, against the
-        // history the block starts from. Upstream decides the offBase at the
-        // store (`ZSTD_storeSeq` in `zstd_fast.c`); here the derivation is
-        // inlined at each of the kernel's emit sites, where the rep-or-explicit
-        // outcome is nearly fixed per site and predicts, instead of in a later
-        // pass where every sequence waits on the history the previous one
-        // rotated. A block written raw restores `offset_hist`, so the next
-        // block starts from the decoder's history either way.
-        let mut hist = state.offset_hist;
-        state.matcher.start_matching(|seq| {
-            record_sequence::<true>(seq, &mut tail, sequences, &mut hist);
-        });
+    // The Fast band codes each offset as it is emitted, against the history the
+    // block starts from. Upstream decides the offBase at the store
+    // (`ZSTD_storeSeq` in `zstd_fast.c`); here the derivation is inlined at
+    // each of the kernel's emit sites, where the rep-or-explicit outcome is
+    // nearly fixed per site and predicts, instead of in a later pass where every
+    // sequence waits on the history the previous one rotated. A block written
+    // raw restores `offset_hist`, so the next block starts from the decoder's
+    // history either way.
+    //
+    // Greedy and above keep the raw offset and are coded once the partition a
+    // sequence lands in is about to be encoded (`fill_and_count`), since the
+    // post-split can rewind the history at a partition boundary.
+    //
+    // A flag rather than a const parameter: one closure type keeps one copy of
+    // every matcher's scan, where two would compile each backend twice, and the
+    // flag is fixed for the block, so its test at each emit site predicts.
+    let code_offsets = uses_fast_offset_codes(state.strategy_tag);
+    let mut hist = state.offset_hist;
+    state.matcher.start_matching(|seq| {
+        record_sequence(seq, &mut tail, sequences, code_offsets, &mut hist);
+    });
+    if code_offsets {
         state.offset_hist = hist;
-    } else {
-        // Coded once the partition a sequence lands in is about to be encoded
-        // (`fill_and_count`), since the post-split can rewind the history at a
-        // partition boundary.
-        let mut unused = [0; 3];
-        state.matcher.start_matching(|seq| {
-            record_sequence::<false>(seq, &mut tail, sequences, &mut unused);
-        });
     }
     let kernel = state.copy_kernel;
     literal_runs::gather_literals(
@@ -658,14 +659,15 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
     );
 }
 
-/// Record one reported sequence. With `CODE_OFFSETS` the offset is replaced by
+/// Record one reported sequence. With `code_offsets` the offset is replaced by
 /// its fast-band wire code against `hist`, which it advances; without it the
-/// raw offset is kept for [`fill_and_count`] to code.
+/// raw offset is kept for [`fill_and_count`] to code and `hist` is untouched.
 #[inline(always)]
-fn record_sequence<const CODE_OFFSETS: bool>(
+fn record_sequence(
     seq: Sequence,
     tail: &mut usize,
     sequences: &mut RegionVec<RawSequence>,
+    code_offsets: bool,
     hist: &mut [u32; 3],
 ) {
     match seq {
@@ -686,7 +688,7 @@ fn record_sequence<const CODE_OFFSETS: bool>(
                 (literal_len | match_len | offset) <= u32::MAX as usize,
                 "a sequence length exceeds 32 bits"
             );
-            let off_base = if CODE_OFFSETS {
+            let off_base = if code_offsets {
                 encode_offset_with_history_fast(offset as u32, literal_len as u32, hist)
             } else {
                 offset as u32
