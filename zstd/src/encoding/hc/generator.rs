@@ -571,16 +571,17 @@ macro_rules! rep_probe_slot {
                 break 'slot;
             }
             $found = true;
-            let _ = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                $out,
-                $best_len_for_skip,
-                $crate::encoding::opt::types::MatchCandidate {
+            // Kept only when it beats the ladder so far (upstream zstd
+            // `if (repLen > bestLength)`, zstd_opt.c:678); the minimum length
+            // was checked just above.
+            if match_len > *$best_len_for_skip {
+                $out.push($crate::encoding::opt::types::MatchCandidate {
                     start: $abs_pos,
                     offset: rep,
                     match_len,
-                },
-                $min_match_len,
-            );
+                });
+                *$best_len_for_skip = match_len;
+            }
             // `abs_pos + match_len >= current_abs_end` is `match_len >=
             // tail_limit` with the block end folded into the length space the
             // probe already works in, so the block end stops being a live
@@ -805,12 +806,14 @@ macro_rules! bt_insert_and_collect_matches_body {
                     }
                 };
             if let Some(h3) = h3_candidate {
-                let _ = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                    $out,
-                    $best_len_for_skip,
-                    h3,
-                    $min_match_len,
+                // The probe runs only while `best_len_for_skip < min_match_len`
+                // and yields only a match of at least `min_match_len`, so the
+                // candidate is always a new best.
+                debug_assert!(
+                    h3.match_len >= $min_match_len && h3.match_len > *$best_len_for_skip
                 );
+                $out.push(h3);
+                *$best_len_for_skip = h3.match_len;
                 // Same fold as the repeat probe: the block end lives in the
                 // length space the probe already carries.
                 if !rep_len_candidate_found
@@ -1006,35 +1009,32 @@ macro_rules! bt_insert_and_collect_matches_body {
             let match_len = unsafe { $cmf(concat, idx, candidate_idx, tail_limit, seed_len) };
 
             if match_len > best_len {
-                let offset = $abs_pos - candidate_abs;
-                let accepted = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                    $out,
-                    $best_len_for_skip,
-                    $crate::encoding::opt::types::MatchCandidate {
-                        start: $abs_pos,
-                        offset,
-                        match_len,
-                    },
-                    $min_match_len,
-                );
-                if accepted {
-                    best_len = match_len;
-                    // BT walker invariants: `candidate_abs < abs_pos`
-                    // and `match_len <= tail_limit = current_abs_end -
-                    // abs_pos`. So `candidate_abs + match_len <
-                    // abs_pos + tail_limit = current_abs_end`, which
-                    // fits in `usize` on every supported target (32-bit
-                    // i686 included) — the addition stays within the
-                    // current block.
-                    let candidate_end = candidate_abs + match_len;
-                    if candidate_end > match_end_abs {
-                        match_end_abs = candidate_end;
-                    }
-                    if match_len >= tail_limit
-                        || match_len > $crate::encoding::cost_model::HC_OPT_NUM
-                    {
-                        break;
-                    }
+                // `best_len` is `max(best_len_for_skip, min_match_len - 1)`,
+                // so a longer match is both at least the minimum and a new
+                // best: it joins the ladder unconditionally, as upstream's
+                // `matches[mnum]` store does (zstd_opt.c:749-752).
+                debug_assert!(match_len >= $min_match_len && match_len > *$best_len_for_skip);
+                $out.push($crate::encoding::opt::types::MatchCandidate {
+                    start: $abs_pos,
+                    offset: $abs_pos - candidate_abs,
+                    match_len,
+                });
+                *$best_len_for_skip = match_len;
+                best_len = match_len;
+                // BT walker invariants: `candidate_abs < abs_pos` and
+                // `match_len <= tail_limit = current_abs_end - abs_pos`. So
+                // `candidate_abs + match_len < abs_pos + tail_limit =
+                // current_abs_end`, which fits in `usize` on every supported
+                // target (32-bit i686 included) — the addition stays within
+                // the current block.
+                let candidate_end = candidate_abs + match_len;
+                if candidate_end > match_end_abs {
+                    match_end_abs = candidate_end;
+                }
+                if match_len >= tail_limit
+                    || match_len > $crate::encoding::cost_model::HC_OPT_NUM
+                {
+                    break;
                 }
             }
 
@@ -1138,55 +1138,51 @@ macro_rules! bt_insert_and_collect_matches_body {
                 // walk's `$cmf`. `seed <= prior match_len <= tail_limit`.
                 let match_len = unsafe { $cmf(concat, idx, dict_idx, tail_limit, seed) };
                 if match_len > best_len {
-                    let offset = idx - dict_idx;
-                    let accepted = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                        $out,
-                        $best_len_for_skip,
-                        $crate::encoding::opt::types::MatchCandidate {
-                            start: $abs_pos,
-                            offset,
-                            match_len,
-                        },
-                        $min_match_len,
+                    // Same ladder invariant as the live walk: a match longer
+                    // than `best_len` is always kept.
+                    debug_assert!(
+                        match_len >= $min_match_len && match_len > *$best_len_for_skip
                     );
-                    if accepted {
-                        best_len = match_len;
-                        // Where the match ends in the SOURCE, not at the
-                        // position being searched (upstream zstd
-                        // `matchEndIdx = matchIndex + matchLength`,
-                        // zstd_opt.c:794-795, the same form the live walk above
-                        // uses). This value becomes the tree's insert cursor,
-                        // and a dictionary candidate sits BEFORE the searched
-                        // position: measuring from the searched position
-                        // instead pushes the cursor forward by the offset, and
-                        // every position it skipped never enters the tree. A
-                        // later search then finds an empty bucket where the
-                        // reference finds a long match. Only a dictionary
-                        // candidate reaches back far enough for it to show.
-                        //
-                        // In ABSOLUTE coordinates, which is what `match_end_abs`
-                        // and the cursor are in: `dict_idx` indexes the live
-                        // history, and a reused dictionary context advances
-                        // `history_abs_start`, so without the base this compares
-                        // a small relative end against an absolute one and never
-                        // advances the cursor at all from the second frame on.
-                        let candidate_end = $table.history_abs_start + dict_idx + match_len;
-                        // Same coordinate space as `match_end_abs` and the
-                        // cursor it feeds. A value left relative to the live
-                        // history satisfies this only while the base is zero,
-                        // which is exactly the first frame of a context — the
-                        // case where a reused dictionary context hides the
-                        // mistake until the base moves.
-                        debug_assert!(
-                            candidate_end >= $table.history_abs_start + match_len,
-                            "dictionary match end must be absolute",
-                        );
-                        if candidate_end > match_end_abs {
-                            match_end_abs = candidate_end;
-                        }
-                        if match_len > $crate::encoding::cost_model::HC_OPT_NUM {
-                            break;
-                        }
+                    $out.push($crate::encoding::opt::types::MatchCandidate {
+                        start: $abs_pos,
+                        offset: idx - dict_idx,
+                        match_len,
+                    });
+                    *$best_len_for_skip = match_len;
+                    best_len = match_len;
+                    // Where the match ends in the SOURCE, not at the position
+                    // being searched (upstream zstd `matchEndIdx = matchIndex +
+                    // matchLength`, zstd_opt.c:794-795, the same form the live
+                    // walk above uses). This value becomes the tree's insert
+                    // cursor, and a dictionary candidate sits BEFORE the
+                    // searched position: measuring from the searched position
+                    // instead pushes the cursor forward by the offset, and every
+                    // position it skipped never enters the tree. A later search
+                    // then finds an empty bucket where the reference finds a
+                    // long match. Only a dictionary candidate reaches back far
+                    // enough for it to show.
+                    //
+                    // In ABSOLUTE coordinates, which is what `match_end_abs` and
+                    // the cursor are in: `dict_idx` indexes the live history,
+                    // and a reused dictionary context advances
+                    // `history_abs_start`, so without the base this compares a
+                    // small relative end against an absolute one and never
+                    // advances the cursor at all from the second frame on.
+                    let candidate_end = $table.history_abs_start + dict_idx + match_len;
+                    // Same coordinate space as `match_end_abs` and the cursor it
+                    // feeds. A value left relative to the live history satisfies
+                    // this only while the base is zero, which is exactly the
+                    // first frame of a context: the case where a reused
+                    // dictionary context hides the mistake until the base moves.
+                    debug_assert!(
+                        candidate_end >= $table.history_abs_start + match_len,
+                        "dictionary match end must be absolute",
+                    );
+                    if candidate_end > match_end_abs {
+                        match_end_abs = candidate_end;
+                    }
+                    if match_len > $crate::encoding::cost_model::HC_OPT_NUM {
+                        break;
                     }
                 }
                 // Match reached the block tail: can't order the pair (upstream zstd
