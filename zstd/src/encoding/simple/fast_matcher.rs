@@ -137,8 +137,9 @@ fn fast_slots_pay_for_tags(expected_input: usize, step_size: usize, hash_log: u3
 ///
 /// Measured on x86_64 (bare against tagged): a fill of 0.31 (10 KiB at levels
 /// 1 and -7) and 1.25 (20 KiB at -7, 10 KiB at -1) ran 3-11% faster bare; 2.0
-/// (32 KiB at -7) and up ran 7-16% faster tagged.
-#[cfg(not(target_pointer_width = "32"))]
+/// (32 KiB at -7) and up ran 7-16% faster tagged. Targets without a measurement
+/// of their own take this one.
+#[cfg(not(target_arch = "x86"))]
 const FAST_TAG_MIN_FILL: (u128, u128) = (3, 2);
 
 /// Table fill, as `(numerator, denominator)`, from which Fast slots are tagged.
@@ -146,7 +147,7 @@ const FAST_TAG_MIN_FILL: (u128, u128) = (3, 2);
 /// Measured on i686: at a fill of 1.25 (20 KiB at level -7, 10 KiB at -1) the
 /// tagged table ran 2% faster, where x86_64 ran it 3-11% slower; with seven
 /// general registers the candidate load a tag skips costs more.
-#[cfg(target_pointer_width = "32")]
+#[cfg(target_arch = "x86")]
 const FAST_TAG_MIN_FILL: (u128, u128) = (5, 4);
 
 /// What a reset does with a hash table that continues the previous frame's

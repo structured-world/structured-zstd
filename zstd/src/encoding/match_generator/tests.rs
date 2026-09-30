@@ -5437,8 +5437,8 @@ fn a_borrowed_slice_past_the_tagged_range_is_laid_out_untagged() {
 /// step writes: a 32 KiB frame at level -7 and a 20 KiB frame at level 1 are
 /// tagged, a 10 KiB frame at level 1 (32768 slots) stays bare, and a fill of
 /// 5/4 (20 KiB at level -7, step 8, 4096 slots; 10 KiB at level -1) is tagged
-/// only on a 32-bit target, whose tighter register file makes the skipped
-/// candidate load worth more.
+/// only on i686, whose seven general registers make the skipped candidate load
+/// worth more.
 #[test]
 fn fast_slots_are_tagged_by_how_full_the_scan_leaves_the_table() {
     use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
@@ -5450,7 +5450,7 @@ fn fast_slots_are_tagged_by_how_full_the_scan_leaves_the_table() {
         driver.reset_in_workspace(CompressionLevel::from_level(level), &mut context);
         driver.simple_mut().slots_tagged()
     };
-    let five_quarters_tagged = cfg!(target_pointer_width = "32");
+    let five_quarters_tagged = cfg!(target_arch = "x86");
     assert_eq!(
         tagged(-7, 20 * 1024),
         five_quarters_tagged,
@@ -5466,12 +5466,11 @@ fn fast_slots_are_tagged_by_how_full_the_scan_leaves_the_table() {
     assert!(!tagged(1, 10 * 1024), "level 1, 10 KiB: sparse table");
 }
 
-/// A 32-bit target keeps the dfast tables bare below
-/// `DFAST_TAGGED_WINDOW_FLOOR`: its loop spills the three tags a tagged scan
-/// carries. A 64-bit target tags every eligible window, and both tag a window
-/// past the floor.
+/// i686 keeps the dfast tables bare below `DFAST_TAGGED_WINDOW_FLOOR`: its loop
+/// spills the three tags a tagged scan carries. Every other target tags every
+/// eligible window, and all tag a window past the floor.
 #[test]
-fn a_small_dfast_window_is_tagged_only_on_a_64_bit_target() {
+fn a_small_dfast_window_is_tagged_except_on_i686() {
     use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
     let layout = |source: usize| {
         let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
@@ -5488,14 +5487,14 @@ fn a_small_dfast_window_is_tagged_only_on_a_64_bit_target() {
     let (window, tagged) = layout(10 * 1024);
     assert!(
         window < 1 << 18,
-        "fixture: a 10 KiB frame's window is under the 32-bit floor",
+        "fixture: a 10 KiB frame's window is under the i686 floor",
     );
-    assert_eq!(tagged, cfg!(target_pointer_width = "64"));
+    assert_eq!(tagged, !cfg!(target_arch = "x86"));
 
     let (window, tagged) = layout(1 << 20);
     assert!(
         window >= 1 << 18,
-        "fixture: a 1 MiB frame's window is past the 32-bit floor",
+        "fixture: a 1 MiB frame's window is past the i686 floor",
     );
     assert!(tagged, "a window past the floor is tagged on every target");
 }
