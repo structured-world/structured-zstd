@@ -313,7 +313,7 @@ impl MatchGeneratorDriver {
         // match this reset. Restoring it would let the encoder search past the
         // frame header's window (an undecodable match), so on a key mismatch we
         // refuse and the caller re-primes.
-        let Some((params, table_bits, fast_attach, ldm)) = self.reset_shape else {
+        let Some((params, table_bits, fast_attach, fast_tagged, ldm)) = self.reset_shape else {
             return false;
         };
         let key = PrimedKey {
@@ -321,6 +321,7 @@ impl MatchGeneratorDriver {
             params,
             table_bits,
             fast_attach,
+            fast_tagged,
             ldm,
         };
         let Some((snapshot, budget, captured_key)) = &mut self.primed else {
@@ -410,7 +411,7 @@ impl MatchGeneratorDriver {
     pub(super) fn capture_primed_dictionary_impl(&mut self, level: super::super::CompressionLevel) {
         // No resolved shape means `reset` has not run for this frame — nothing
         // valid to key a snapshot on, so skip the capture.
-        let Some((params, table_bits, fast_attach, ldm)) = self.reset_shape else {
+        let Some((params, table_bits, fast_attach, fast_tagged, ldm)) = self.reset_shape else {
             return;
         };
         let key = PrimedKey {
@@ -418,6 +419,7 @@ impl MatchGeneratorDriver {
             params,
             table_bits,
             fast_attach,
+            fast_tagged,
             ldm,
         };
         // CDict-equivalent retained state. A binary-tree level in ATTACH mode

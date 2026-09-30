@@ -159,10 +159,12 @@ pub(crate) enum TableCarry {
     /// full-table memset (upstream zstd `ZSTD_continueCCtx`), provided the
     /// cached dict table is still primed; otherwise empty it.
     AdvanceEpoch,
-    /// A primed snapshot matching this exact shape is copied over the table
-    /// right after the reset (the copy-mode dictionary restore), replacing its
-    /// contents and bias wholesale: leave it.
-    OverwrittenByRestore,
+    /// A primed snapshot of this geometry, its slots `tagged` or bare, is
+    /// copied over the table right after the reset (the copy-mode dictionary
+    /// restore), replacing its contents and bias wholesale: leave it. The
+    /// restore only lands when the reset chooses the same slot format, so a
+    /// reset that chooses the other one empties the table instead.
+    OverwrittenByRestore { tagged: bool },
 }
 
 /// Upstream zstd-shape Fast-strategy matcher state.
@@ -657,7 +659,7 @@ impl FastKernelMatcher {
             // cached dict table goes with it: its absolute positions index a
             // table this one no longer continues.
             self.dict.invalidate();
-        } else if carry == TableCarry::OverwrittenByRestore {
+        } else if carry == (TableCarry::OverwrittenByRestore { tagged }) {
             // Leave the table untouched: the snapshot restore copies the
             // primed contents (and bias) over it immediately after.
         } else if carry == TableCarry::AdvanceEpoch && self.dict.is_primed() {
@@ -2017,7 +2019,6 @@ impl FastKernelMatcher {
     }
 
     /// Whether the main table's slots are tagged.
-    #[cfg(test)]
     pub(crate) fn slots_tagged(&self) -> bool {
         self.hash_table.is_tagged()
     }

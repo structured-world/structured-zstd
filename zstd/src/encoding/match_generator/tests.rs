@@ -3093,6 +3093,43 @@ fn primed_snapshot_not_restored_when_window_hint_differs() {
     );
 }
 
+/// The Fast slot format is chosen per frame from how full the scan will leave
+/// the table, which depends on the input size and not only on the window. Two
+/// hints in one window bucket (17 KiB and 32 KiB at level -7: fills of 1.06
+/// and 2.0) resolve to the same geometry but to opposite formats; a dictionary
+/// snapshot captured at the tagged one must not hand its format to the bare
+/// one, which is what a restore keyed on the geometry alone would do.
+#[test]
+fn primed_snapshot_keeps_the_frames_own_fast_slot_format() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let level = CompressionLevel::Level(-7);
+    let dict: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+
+    driver.set_source_size_hint(32 * 1024);
+    driver.reset(level);
+    assert!(
+        driver.simple_mut().slots_tagged(),
+        "precondition: 32 KiB is tagged"
+    );
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    driver.capture_primed_dictionary(level);
+
+    driver.set_source_size_hint(17 * 1024);
+    driver.reset(level);
+    assert!(
+        !driver.simple_mut().slots_tagged(),
+        "precondition: 17 KiB is bare"
+    );
+    let _ = driver.restore_primed_dictionary(level);
+    assert!(
+        !driver.simple_mut().slots_tagged(),
+        "a restored snapshot must not replace the frame's bare slots with the \
+         tagged ones of the frame it was captured on"
+    );
+}
+
 #[test]
 fn primed_snapshot_restored_for_hints_in_same_window_bucket() {
     // The snapshot key must normalize the source-size hint to the resolved

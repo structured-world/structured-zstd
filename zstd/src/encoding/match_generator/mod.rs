@@ -327,13 +327,14 @@ pub struct MatchGeneratorDriver {
     reset_dict_attach_ok: bool,
     // Hint-resolved matcher shape from the last `reset`: the [`LevelParams`], the
     // active backend's applied Dfast/Row hash-table width (`0` for HC/Fast), the
-    // Fast attach-vs-copy mode, and the active LDM override (#27). Combined with
-    // the frame's level into the [`PrimedKey`] that keys the primed snapshot, so
-    // it is only restored into a reset that resolved the identical matcher AND
-    // LDM configuration. `None` before the first `reset`.
+    // Fast attach-vs-copy mode, the Fast slot format, and the active LDM override
+    // (#27). Combined with the frame's level into the [`PrimedKey`] that keys
+    // the primed snapshot, so it is only restored into a reset that resolved the
+    // identical matcher AND LDM configuration. `None` before the first `reset`.
     reset_shape: Option<(
         LevelParams,
         usize,
+        bool,
         bool,
         Option<super::parameters::LdmOverride>,
     )>,
@@ -412,6 +413,10 @@ struct PrimedKey {
     params: LevelParams,
     table_bits: usize,
     fast_attach: bool,
+    /// Whether the Fast table's slots are tagged. The format is chosen per
+    /// frame from how full the input will leave the table, so two frames of one
+    /// geometry can differ in it; a restore carries the snapshot's format in.
+    fast_tagged: bool,
     /// Fine-grained LDM override (#27) active at capture time. The
     /// snapshot's cloned `storage` carries `BtMatcher::ldm_producer`,
     /// which is configured from this override; restoring a snapshot
@@ -1442,20 +1447,29 @@ impl Matcher for MatchGeneratorDriver {
                 // key components mirror `reset_shape` below: Simple leaves
                 // `resolved_table_bits` 0, never carries an LDM override,
                 // and `fast_attach` is false in copy mode by construction.
-                let table_overwritten_by_restore = dict_hint.is_some()
-                    && !dict_attach_epoch
-                    && self.primed.as_ref().is_some_and(|(_, _, captured)| {
-                        *captured
-                            == PrimedKey {
-                                level,
-                                params,
-                                table_bits: 0,
-                                fast_attach: false,
-                                ldm: None,
-                            }
-                    });
-                let carry = if table_overwritten_by_restore {
-                    TableCarry::OverwrittenByRestore
+                // The slot format is the one component this reset has yet to
+                // choose, so it travels with the carry: the reset leaves the
+                // table only if it chooses the snapshot's format, which is
+                // the only case the restore then accepts.
+                let restored_slot_format = self
+                    .primed
+                    .as_ref()
+                    .filter(|(_, _, captured)| {
+                        dict_hint.is_some()
+                            && !dict_attach_epoch
+                            && *captured
+                                == PrimedKey {
+                                    level,
+                                    params,
+                                    table_bits: 0,
+                                    fast_attach: false,
+                                    fast_tagged: captured.fast_tagged,
+                                    ldm: None,
+                                }
+                    })
+                    .map(|(_, _, captured)| captured.fast_tagged);
+                let carry = if let Some(tagged) = restored_slot_format {
+                    TableCarry::OverwrittenByRestore { tagged }
                 } else if dict_attach_epoch {
                     TableCarry::AdvanceEpoch
                 } else {
@@ -1761,7 +1775,15 @@ impl Matcher for MatchGeneratorDriver {
         } else {
             None
         };
-        self.reset_shape = Some((params, resolved_table_bits, fast_attach, active_ldm));
+        // The Fast slot format this reset chose; only the Simple backend has one.
+        let fast_tagged = matches!(&self.storage, MatcherStorage::Simple(m) if m.slots_tagged());
+        self.reset_shape = Some((
+            params,
+            resolved_table_bits,
+            fast_attach,
+            fast_tagged,
+            active_ldm,
+        ));
         // Everything is laid out in `workspace` now. A driver reset on its own
         // before it joined a context still holds the workspace it used then,
         // which nothing points into any more; on its own the field is empty

@@ -243,12 +243,15 @@ fn reset_keeps_table_when_overwritten_by_restore() {
     // SAFETY: hash 7 < (1 << hash_log = 1024) table entries.
     unsafe { m.hash_table.put(probe_hash, 0xCAFE) };
 
-    // Same shape + restore-pending: contents survive the reset.
+    // This geometry fills its table enough to be tagged.
+    assert!(m.slots_tagged());
+
+    // Same shape + restore-pending in the same slot format: contents survive.
     reset_in(
         &mut m,
         &mut ws,
         (16, 10, 4, 2),
-        TableCarry::OverwrittenByRestore,
+        TableCarry::OverwrittenByRestore { tagged: true },
     );
     // SAFETY: same bounds as the put above.
     assert_eq!(
@@ -256,6 +259,23 @@ fn reset_keeps_table_when_overwritten_by_restore() {
         0xCAFE,
         "restore-pending reset must not clear the table"
     );
+
+    // A snapshot in the other slot format will not be restored (its key
+    // differs), so a reset that claims it anyway must still empty the table.
+    reset_in(
+        &mut m,
+        &mut ws,
+        (16, 10, 4, 2),
+        TableCarry::OverwrittenByRestore { tagged: false },
+    );
+    // SAFETY: same bounds as the put above.
+    assert_eq!(
+        unsafe { m.hash_table.get(probe_hash) },
+        0,
+        "a restore in the other slot format must not leave the table uncleared"
+    );
+    // SAFETY: same bounds as the put above.
+    unsafe { m.hash_table.put(probe_hash, 0xCAFE) };
 
     // Plain same-shape reset: contents are memset back to empty.
     reset_in(&mut m, &mut ws, (16, 10, 4, 2), TableCarry::Clear);
@@ -273,7 +293,7 @@ fn reset_keeps_table_when_overwritten_by_restore() {
         &mut m,
         &mut ws,
         (16, 11, 4, 2),
-        TableCarry::OverwrittenByRestore,
+        TableCarry::OverwrittenByRestore { tagged: true },
     );
     assert_eq!(m.hash_table.hash_log(), 11);
     // SAFETY: hash 7 < (1 << 11) table entries.

@@ -662,6 +662,10 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
         // below `data.len() <= isize::MAX` and `step` below
         // `MAX_STEP_SIZE + data.len() / K_STEP_INCR + 1`, together under
         // `usize::MAX`.
+        debug_assert!(
+            step <= MAX_STEP_SIZE + data.len() / K_STEP_INCR + 1,
+            "scan step {step} past the bound that keeps position sums from wrapping"
+        );
         let mut ip1 = ip0 + 1;
         let mut ip2 = ip0 + step;
         let mut ip3 = ip2 + 1;
@@ -903,6 +907,10 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             // regions.
             if ip2 >= next_step {
                 step += 1;
+                debug_assert!(
+                    step <= MAX_STEP_SIZE + data.len() / K_STEP_INCR + 1,
+                    "scan step {step} past the bound that keeps position sums from wrapping"
+                );
                 // Upstream zstd `zstd_fast.c:344-345`: the widening step jumps
                 // ahead of the lines the scan has pulled in, so warm the next
                 // two. A prefetch never faults, and `wrapping_add` keeps an
