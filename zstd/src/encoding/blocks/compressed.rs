@@ -624,35 +624,30 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
     // Trailing literals, reported after the last sequence; the runs are read
     // back by position, so no sequence may follow them.
     let mut tail = 0usize;
-    state.matcher.start_matching(|seq| match seq {
-        Sequence::Literals { len } => tail += len,
-        Sequence::Triple {
-            literal_len,
-            offset,
-            match_len,
-        } => {
-            // A custom matcher's order is checked in every build: literals out
-            // of order would be copied from the wrong place without an error.
-            assert_eq!(tail, 0, "literals reported before a sequence");
-            // A custom matcher's report is checked before it is narrowed: a
-            // length that lost its high bits could still fit the block and
-            // pass the gather's bounds check. One compare for all three; it
-            // folds away where `usize` is 32 bits.
-            assert!(
-                (literal_len | match_len | offset) <= u32::MAX as usize,
-                "a sequence length exceeds 32 bits"
-            );
-            parts.sequences.push(RawSequence {
-                ll: literal_len as u32,
-                ml: match_len as u32,
-                // The found offset. `fill_wire_offsets` replaces it with its
-                // code once the partition this sequence lands in is about to be
-                // encoded, since the code depends on a history that partition
-                // boundaries can rewind.
-                off_base: offset as u32,
-            });
-        }
-    });
+    let sequences = &mut parts.sequences;
+    if uses_fast_offset_codes(state.strategy_tag) {
+        // The Fast band codes each offset as it is emitted, against the
+        // history the block starts from. Upstream decides the offBase at the
+        // store (`ZSTD_storeSeq` in `zstd_fast.c`); here the derivation is
+        // inlined at each of the kernel's emit sites, where the rep-or-explicit
+        // outcome is nearly fixed per site and predicts, instead of in a later
+        // pass where every sequence waits on the history the previous one
+        // rotated. A block written raw restores `offset_hist`, so the next
+        // block starts from the decoder's history either way.
+        let mut hist = state.offset_hist;
+        state.matcher.start_matching(|seq| {
+            record_sequence::<true>(seq, &mut tail, sequences, &mut hist);
+        });
+        state.offset_hist = hist;
+    } else {
+        // Coded once the partition a sequence lands in is about to be encoded
+        // (`fill_and_count`), since the post-split can rewind the history at a
+        // partition boundary.
+        let mut unused = [0; 3];
+        state.matcher.start_matching(|seq| {
+            record_sequence::<false>(seq, &mut tail, sequences, &mut unused);
+        });
+    }
     let kernel = state.copy_kernel;
     literal_runs::gather_literals(
         kernel,
@@ -661,6 +656,48 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
         tail,
         &mut parts.literals,
     );
+}
+
+/// Record one reported sequence. With `CODE_OFFSETS` the offset is replaced by
+/// its fast-band wire code against `hist`, which it advances; without it the
+/// raw offset is kept for [`fill_and_count`] to code.
+#[inline(always)]
+fn record_sequence<const CODE_OFFSETS: bool>(
+    seq: Sequence,
+    tail: &mut usize,
+    sequences: &mut RegionVec<RawSequence>,
+    hist: &mut [u32; 3],
+) {
+    match seq {
+        Sequence::Literals { len } => *tail += len,
+        Sequence::Triple {
+            literal_len,
+            offset,
+            match_len,
+        } => {
+            // A custom matcher's order is checked in every build: literals out
+            // of order would be copied from the wrong place without an error.
+            assert_eq!(*tail, 0, "literals reported before a sequence");
+            // A custom matcher's report is checked before it is narrowed: a
+            // length that lost its high bits could still fit the block and
+            // pass the gather's bounds check. One compare for all three; it
+            // folds away where `usize` is 32 bits.
+            assert!(
+                (literal_len | match_len | offset) <= u32::MAX as usize,
+                "a sequence length exceeds 32 bits"
+            );
+            let off_base = if CODE_OFFSETS {
+                encode_offset_with_history_fast(offset as u32, literal_len as u32, hist)
+            } else {
+                offset as u32
+            };
+            sequences.push(RawSequence {
+                ll: literal_len as u32,
+                ml: match_len as u32,
+                off_base,
+            });
+        }
+    }
 }
 
 fn encode_block_parts<M: Matcher>(
@@ -1264,18 +1301,11 @@ fn estimate_sequences_section_bytes(
         // Upstream zstd: OF code's value equals its additional-bits width.
         of_bits += of as usize;
     };
-    if uses_fast_offset_codes(strategy) {
-        for seq in sequences {
-            count_offset(encode_offset_with_history_fast(
-                seq.off_base,
-                seq.ll,
-                &mut hist,
-            ));
-        }
-    } else {
-        for seq in sequences {
-            count_offset(encode_offset_with_history(seq.off_base, seq.ll, &mut hist));
-        }
+    // Only post-split strategies are estimated, and the Fast band, whose
+    // sequences arrive already coded, never post-splits.
+    debug_assert!(!uses_fast_offset_codes(strategy));
+    for seq in sequences {
+        count_offset(encode_offset_with_history(seq.off_base, seq.ll, &mut hist));
     }
     *offset_hist = hist;
     let extra_bits = codes.bits + of_bits;
@@ -1752,17 +1782,18 @@ struct SequenceCodeCounts<'a> {
 /// `HIST_countFast_wksp`) because its codes go to three separate byte arrays;
 /// ours are already where they belong.
 ///
-/// `FAST_REPCODE` picks the offBase policy once per block instead of per
-/// sequence. Upstream's fast matcher emits only offBase 1 (`rep[0]` when
-/// litLength > 0, `rep[1]` when litLength == 0 via the secondary-position check)
-/// or an explicit offset, and never 2/3; greedy and above search all three
-/// repeat offsets, which is what the full `encode_offset_with_history` mirrors.
+/// `OFFSETS_CODED` says the sequences already carry their wire codes: the Fast
+/// band codes each offset as it is collected ([`collect_block_parts`]), and
+/// never post-splits, so its block is one partition coded against the history
+/// it started from. Greedy and above keep the raw offset until here and search
+/// all three repeat offsets, which is what the full
+/// `encode_offset_with_history` mirrors.
 ///
 /// Per PARTITION, not per block: the emitter can write a partition raw, and
 /// when it does it restores the history, so the partition after it must be
 /// filled from the restored one. Filling here, just before each partition is
 /// encoded, is what keeps that true.
-fn fill_and_count<const FAST_REPCODE: bool>(
+fn fill_and_count<const OFFSETS_CODED: bool>(
     raw_sequences: &mut [RawSequence],
     offset_hist: &mut [u32; 3],
     counts: SequenceCodeCounts<'_>,
@@ -1786,12 +1817,13 @@ fn fill_and_count<const FAST_REPCODE: bool>(
     // written back once is the same three words, moved once.
     let mut hist = *offset_hist;
     for (i, seq) in raw_sequences.iter_mut().enumerate() {
-        let off_base = if FAST_REPCODE {
-            encode_offset_with_history_fast(seq.off_base, seq.ll, &mut hist)
+        let off_base = if OFFSETS_CODED {
+            seq.off_base
         } else {
-            encode_offset_with_history(seq.off_base, seq.ll, &mut hist)
+            let off_base = encode_offset_with_history(seq.off_base, seq.ll, &mut hist);
+            seq.off_base = off_base;
+            off_base
         };
-        seq.off_base = off_base;
         let (ll_code, _, ll_bits) = encode_literal_length(seq.ll);
         let (ml_code, _, ml_bits) = encode_match_len(seq.ml);
         let (of_code, _, _) = encode_offset(off_base);
@@ -1805,7 +1837,9 @@ fn fill_and_count<const FAST_REPCODE: bool>(
         ml_counts[ml_code as usize] += 1;
         of_counts[of_code as usize] += 1;
     }
-    *offset_hist = hist;
+    if !OFFSETS_CODED {
+        *offset_hist = hist;
+    }
     // SAFETY: the loop wrote every one of the `raw_sequences.len()` slots, all
     // within the capacity asserted above.
     unsafe {

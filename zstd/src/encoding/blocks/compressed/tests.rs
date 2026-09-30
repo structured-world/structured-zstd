@@ -580,6 +580,80 @@ fn code_buffer(ws: &mut Workspace, count: usize) -> RegionVec<u32> {
     ws.buffer(count)
 }
 
+/// The Fast band codes offsets as the sequences are collected. The codes and
+/// the final history must be what the fast derivation gives over the raw
+/// offsets in order, including the explicit offset that equals `rep[0]` (coded
+/// 1) and the litLength-0 match of `rep[1]` (coded 1, rotating); without
+/// coding, the raw offsets are kept and the history is left alone.
+#[test]
+fn collected_fast_band_sequences_carry_the_fast_derivation() {
+    use super::{Sequence, encode_offset_with_history_fast, record_sequence};
+    let reported = [
+        (5usize, 100usize, 9usize),
+        (3, 100, 6),
+        (0, 4, 7),
+        (2, 4, 5),
+        (0, 100, 8),
+        (7, 250, 4),
+        (1, 1, 4),
+    ];
+    let mut expected_hist = [1u32, 4, 8];
+    let expected: Vec<u32> = reported
+        .iter()
+        .map(|&(ll, off, _)| {
+            encode_offset_with_history_fast(off as u32, ll as u32, &mut expected_hist)
+        })
+        .collect();
+    assert!(expected.contains(&1) && expected.iter().any(|&code| code > 3));
+
+    for coded in [true, false] {
+        let mut ws = Workspace::new();
+        ws.begin_layout(
+            region_bytes::<RawSequence>(reported.len()),
+            |bytes| bytes,
+            crate::encoding::workspace::IngestPlan::Stream,
+        );
+        ws.open(0, usize::MAX);
+        let mut sequences: RegionVec<RawSequence> = ws.buffer(reported.len());
+        let mut tail = 0usize;
+        let mut hist = [1u32, 4, 8];
+        for &(literal_len, offset, match_len) in &reported {
+            let seq = Sequence::Triple {
+                literal_len,
+                offset,
+                match_len,
+            };
+            if coded {
+                record_sequence::<true>(seq, &mut tail, &mut sequences, &mut hist);
+            } else {
+                record_sequence::<false>(seq, &mut tail, &mut sequences, &mut hist);
+            }
+        }
+        let trailing = Sequence::Literals { len: 11 };
+        if coded {
+            record_sequence::<true>(trailing, &mut tail, &mut sequences, &mut hist);
+        } else {
+            record_sequence::<false>(trailing, &mut tail, &mut sequences, &mut hist);
+        }
+        assert_eq!(tail, 11);
+        let off_bases: Vec<u32> = sequences.iter().map(|seq| seq.off_base).collect();
+        if coded {
+            assert_eq!(off_bases, expected);
+            assert_eq!(hist, expected_hist);
+        } else {
+            let raw: Vec<u32> = reported.iter().map(|&(_, off, _)| off as u32).collect();
+            assert_eq!(off_bases, raw);
+            assert_eq!(hist, [1, 4, 8]);
+        }
+        let lengths: Vec<(u32, u32)> = sequences.iter().map(|seq| (seq.ll, seq.ml)).collect();
+        let reported_lengths: Vec<(u32, u32)> = reported
+            .iter()
+            .map(|&(ll, _, ml)| (ll as u32, ml as u32))
+            .collect();
+        assert_eq!(lengths, reported_lengths);
+    }
+}
+
 /// The estimator prices a block the splitter is thinking about; the emitter
 /// writes the one it chose. They walk the sequences by different routes: the
 /// emitter derives each offset code, packs it with the extra-bit widths and
@@ -613,7 +687,9 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
         })
         .collect();
 
-    for strat in [StrategyTag::Fast, StrategyTag::Lazy, StrategyTag::BtUltra2] {
+    // Not the Fast band: it never post-splits, so it is never estimated, and
+    // its sequences reach the emitter already coded.
+    for strat in [StrategyTag::Lazy, StrategyTag::BtUltra2] {
         let make_state = || CompressState::<EntropyOnlyMatcher> {
             matcher: EntropyOnlyMatcher,
             copy_kernel: crate::encoding::fastpath::select_kernel(),
