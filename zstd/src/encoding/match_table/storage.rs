@@ -809,6 +809,20 @@ impl MatchTable {
         &mut self.tables[self.hash3_off..]
     }
 
+    /// Base addresses of the hash, chain and hash3 regions, for a search that
+    /// indexes them by masked hashes and tree slots it has already bounded.
+    /// They come from the buffer's own pointer, so they need no bounds check
+    /// and stay usable across the slices other code takes of the tables, until
+    /// the tables are laid out again.
+    #[inline(always)]
+    pub(crate) fn table_bases(&mut self) -> (*mut u32, *mut u32, *mut u32) {
+        debug_assert!(self.chain_off <= self.hash3_off && self.hash3_off <= self.tables.len());
+        let base = self.tables.base_ptr();
+        // SAFETY: both offsets are inside the buffer (asserted above; the
+        // layout that set them sized the buffer to hold every region).
+        unsafe { (base, base.add(self.chain_off), base.add(self.hash3_off)) }
+    }
+
     /// Hash and chain tables at once, for the walkers that read a head and
     /// write a link in the same step.
     #[inline(always)]

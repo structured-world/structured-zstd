@@ -766,14 +766,10 @@ macro_rules! bt_insert_and_collect_matches_body {
         // larger than a 32 KiB L1d: a 4 KiB frame's table stays resident and
         // the request is pure overhead there (+0.8% on 4 KiB logs at level 16,
         // -2.5% on the 1 MiB corpus file at level 19, both layouts aligned).
-        // The hash3 table's base, taken once for the prefetch, the inserts and
-        // the probe below. Nothing between here and the probe reslices the
-        // tables unless the general catch-up runs, which takes it again.
-        let table3_base: *mut u32 = if $use_hash3 {
-            $table.hash3_table_mut().as_mut_ptr()
-        } else {
-            core::ptr::null_mut()
-        };
+        // The three table regions' bases, taken once from the buffer's own
+        // pointer for every access below: no slice, no bounds check, and still
+        // valid after the general catch-up slices the tables for itself.
+        let (hash_ptr, chain_ptr, table3_base) = $table.table_bases();
         #[cfg(all(
             target_feature = "sse",
             any(target_arch = "x86", target_arch = "x86_64")
@@ -850,7 +846,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                 table3
             } else {
                 $table.update_hash3_until($abs_pos);
-                $table.hash3_table_mut().as_mut_ptr()
+                table3_base
             };
             // hash3 short-match probe folded inline (was a separate per-kernel
             // call): table lookup + one common-prefix scan via `$cpl`, reusing
@@ -961,33 +957,14 @@ macro_rules! bt_insert_and_collect_matches_body {
             $table.hash_log,
             $table.search_mls,
         );
-        // Upstream holds `U32* const hashTable = ms->hashTable` for the whole
-        // body (zstd_opt.c:607). Ours re-derived it from the shared table
-        // buffer at every use, and each re-derivation is a bounds-checked
-        // reslice that reloads the buffer's header and the seam offset through
-        // `&mut self`. One raw base, the way `chain_ptr` below does it.
-        //
-        // The BT pointer-pair table's base is hoisted out of `self` once too:
-        // every access below is `chain_table[computed_index]` through `&mut
-        // self`, which the optimizer cannot prove loop-invariant, so it reloads
-        // the Vec's (ptr,len) from the struct AND bounds-checks on every tree
-        // step (the upstream zstd walks a raw `U32* btable`, zstd_opt.c). The raw
-        // base carries no borrow, so the `&self` helper calls in the loop
-        // (`bt_pair_index_for_abs`, `window_low_abs_for_target`,
-        // `relative_position`) coexist — they read other fields, never
-        // `chain_table`. Indices are in bounds by the BT invariants:
-        // `bt_pair_index_for_abs` returns `2*(abs & bt_mask) (+1)` ≤
-        // `chain_table.len()-1`, and the slots only ever hold those values.
-        // Both bases come out of ONE split borrow: taking the second through
-        // its own `&mut` reslice reborrows the whole buffer, which invalidates
-        // a pointer already taken from the first.
+        // Upstream holds `U32* const hashTable = ms->hashTable` and the tree's
+        // `bt` for the whole body (zstd_opt.c:607); the walk below indexes the
+        // bases taken at the top the same way. Its indices are in bounds by the
+        // BT invariants: a pair slot is `2*(abs & bt_mask) (+1)` <
+        // `chain_table.len()`, and the slots only ever hold those values.
         debug_assert_eq!($table.hash_table().len(), 1usize << $table.hash_log);
         debug_assert_eq!($table.chain_table().len(), 2 << $table.bt_log());
         debug_assert!(hash < 1usize << $table.hash_log);
-        let (hash_ptr, chain_ptr) = {
-            let (hash_table, chain_table) = $table.hash_and_chain_mut();
-            (hash_table.as_mut_ptr(), chain_table.as_mut_ptr())
-        };
         // Prefetch the hash bucket now. For the large L16+ hash table over
         // high-entropy input the bucket is L3/DRAM-cold, and unlike upstream's
         // monolithic ZSTD_btGetAllMatches (which overlaps this miss with its
