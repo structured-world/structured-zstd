@@ -759,6 +759,34 @@ macro_rules! bt_insert_and_collect_matches_body {
                 probe!($reps[2] as usize);
             }
         }
+        // The next position's hash3 bucket, requested now: the parser searches
+        // positions in order and the lookup below had nothing to overlap its
+        // miss with. Issued outside the probe's gate because the next search
+        // reads the bucket whether or not this one does, and only for a table
+        // larger than a 32 KiB L1d: a 4 KiB frame's table stays resident and
+        // the request is pure overhead there (+0.8% on 4 KiB logs at level 16,
+        // -2.5% on the 1 MiB corpus file at level 19, both layouts aligned).
+        #[cfg(all(
+            target_feature = "sse",
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
+        if $use_hash3 && $table.hash3_log > 13 && idx + 1 + 4 <= clen {
+            #[cfg(target_arch = "x86")]
+            use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+            #[cfg(target_arch = "x86_64")]
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let hh_next = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                concat,
+                idx + 1,
+                $table.hash3_log,
+                3,
+            );
+            // SAFETY: a prefetch never faults, and `hh_next` is masked to
+            // `hash3_log` bits, so it indexes inside the table anyway.
+            unsafe {
+                _mm_prefetch($table.hash3_table().as_ptr().add(hh_next).cast(), _MM_HINT_T0);
+            }
+        }
         if $use_hash3 && !skip_further_match_search && *$best_len_for_skip < $min_match_len {
             // The parser advances one position at a time, so this catch-up
             // almost always has a single position to insert and the call
