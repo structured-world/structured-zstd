@@ -760,7 +760,11 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         block_scratch: super::CompressedBlockScratch::new(),
         workspace: Workspace::new(),
         offset_hist: [10, 20, 30],
-        strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
+        // A post-split strategy, the only kind whose partitions reach this
+        // emitter, so the offset is coded here and moves the history (offset 20
+        // at litLength 0 is `rep[1]`, which rotates) before the raw fallback
+        // has to put it back.
+        strategy_tag: crate::encoding::strategy::StrategyTag::BtUltra2,
         pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
