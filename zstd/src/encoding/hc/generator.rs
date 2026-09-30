@@ -788,24 +788,62 @@ macro_rules! bt_insert_and_collect_matches_body {
             }
         }
         if $use_hash3 && !skip_further_match_search && *$best_len_for_skip < $min_match_len {
-            // The parser advances one position at a time, so this catch-up
-            // almost always has a single position to insert and the call
-            // boundary around it is the whole cost: two frames per position,
-            // each re-deriving the live history and re-reading the fields this
-            // body already holds. Upstream inlines the same work into the
-            // finder (`ZSTD_insertAndFindFirstIndexHash3`), which is what
-            // passing the pointers we already have amounts to. The general
-            // form stays for the cases the fast one declines.
-            // SAFETY: `concat` is the live history and nothing here
-            // reallocates it.
-            if !unsafe { $table.fill_hash3_from(concat.as_ptr(), concat.len(), $abs_pos) } {
+            // Upstream's `ZSTD_insertAndFindFirstIndexHash3` inserts the
+            // positions since the last search and reads one bucket through a
+            // table pointer it holds. Ours went through a fill that checked the
+            // table again, sliced it and ran a loop unrolled for long catch-ups,
+            // then sliced the table a second time for the read and decoded the
+            // entry into an absolute position. The parser advances one position
+            // at a time, so the catch-up is nearly always one insert: here it
+            // goes in straight through one table pointer the read then reuses,
+            // and the read stays in the table's stored-index space. The general
+            // catch-up keeps what this declines: a cursor below the history, a
+            // position too close to the end to hash, a table not configured.
+            let h3_log = $table.hash3_log;
+            let abs_bias = $table.block_coords.abs_bias;
+            debug_assert_eq!(
+                $table.block_coords,
+                $table.bt_coords(),
+                "block coordinates are stale"
+            );
+            let h3_start = $table.next_to_update3;
+            let h3_ptr: *mut u32 = if h3_log != 0 && h3_start >= hist_start && idx + 4 <= clen {
+                debug_assert_eq!($table.hash3_table().len(), 1usize << h3_log);
+                let table3 = $table.hash3_table_mut().as_mut_ptr();
+                // A cursor at or past this position inserts nothing and is set
+                // back to it, as the general catch-up's fill does.
+                if h3_start < $abs_pos {
+                    let mut cursor = h3_start;
+                    loop {
+                        let hh = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                            concat,
+                            cursor - hist_start,
+                            h3_log,
+                            3,
+                        );
+                        // SAFETY: `cursor < abs_pos`, so its four bytes end
+                        // before `idx + 4 <= clen`; the hash is masked to
+                        // `h3_log` bits and the table holds that many slots.
+                        // `cursor - abs_bias` is the stored index the table
+                        // keeps for it (`position_base - 1 - index_shift` is
+                        // the bias), which the armed block makes representable.
+                        unsafe { *table3.add(hh) = cursor.wrapping_sub(abs_bias) as u32 };
+                        cursor += 1;
+                        if cursor == $abs_pos {
+                            break;
+                        }
+                    }
+                }
+                $table.next_to_update3 = $abs_pos;
+                table3
+            } else {
                 $table.update_hash3_until($abs_pos);
-            }
+                $table.hash3_table_mut().as_mut_ptr()
+            };
             // hash3 short-match probe folded inline (was a separate per-kernel
             // call): table lookup + one common-prefix scan via `$cpl`, reusing
             // the BT collect's `concat` / `idx` / `tail_limit`. Labeled block so
             // the probe's early-outs yield None without returning from the walk.
-            let h3_log = $table.hash3_log;
             let h3_candidate: Option<$crate::encoding::opt::types::MatchCandidate> =
                 if h3_log == 0 || idx + 4 > clen {
                     None
@@ -815,32 +853,35 @@ macro_rules! bt_insert_and_collect_matches_body {
                             $crate::encoding::match_table::storage::MatchTable::hash_position_at(
                                 concat, idx, h3_log, 3,
                             );
-                        // The hash is masked to `h3_log` bits and the table is
-                        // `1 << h3_log` slots wide, so the slot is in range by
-                        // construction and the bounds-checked slice read plus
-                        // its empty-slot fallback were paying for a case that
-                        // cannot arise. Upstream indexes `hashTable3[hash3]`
-                        // directly for the same reason.
-                        debug_assert_eq!($table.hash3_table().len(), 1usize << h3_log);
-                        // SAFETY: `hh < 1 << h3_log == hash3_table().len()`.
-                        let entry = unsafe { *$table.hash3_table().get_unchecked(hh) };
-                        let Some(cand_abs) =
+                        // SAFETY: `hh` is masked to `h3_log` bits, inside the
+                        // table `h3_ptr` points at; upstream indexes
+                        // `hashTable3[hash3]` directly for the same reason.
+                        let entry = unsafe { *h3_ptr.add(hh) };
+                        // In stored-index space: an entry at or below
+                        // `index_shift` is empty or below the representable
+                        // floor, and the distance back from this position must
+                        // land inside the history (`<= idx`), be at least one
+                        // and stay under the hash3 reach. The subtraction wraps
+                        // for an entry ahead of this position, which the one
+                        // unsigned bound then rejects.
+                        if entry as usize <= $table.index_shift {
+                            break 'h3 None;
+                        }
+                        let off = ($abs_pos.wrapping_sub(abs_bias) as u32).wrapping_sub(entry) as usize;
+                        if off.wrapping_sub(1)
+                            >= idx.min($crate::encoding::bt::HC3_MAX_OFFSET - 1)
+                        {
+                            break 'h3 None;
+                        }
+                        let cand_idx = idx - off;
+                        debug_assert_eq!(
+                            Some(hist_start + cand_idx),
                             $crate::encoding::match_table::storage::MatchTable::stored_abs_position_fast(
                                 entry,
                                 $table.position_base,
                                 $table.index_shift,
-                            )
-                        else {
-                            break 'h3 None;
-                        };
-                        if cand_abs < hist_start || cand_abs >= $abs_pos {
-                            break 'h3 None;
-                        }
-                        let off = $abs_pos - cand_abs;
-                        if off >= $crate::encoding::bt::HC3_MAX_OFFSET {
-                            break 'h3 None;
-                        }
-                        let cand_idx = cand_abs - hist_start;
+                            ),
+                        );
                         // The bucket is keyed on three bytes and the shortest
                         // match this parser accepts is three, so three bytes
                         // that differ cannot produce a candidate: check them
