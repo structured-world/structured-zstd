@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.58](https://github.com/structured-world/structured-zstd/compare/v0.0.57...v0.0.58) - 2026-10-01
+
+### Added
+
+- *(dict)* [**breaking**] entropy tables measured from the samples ([#533](https://github.com/structured-world/structured-zstd/pull/533))
+- *(dict)* [**breaking**] upstream COVER and sample-aware trainers ([#532](https://github.com/structured-world/structured-zstd/pull/532))
+- cap the CPU kernel tier (--cpu, set_cpu_ceiling) ([#537](https://github.com/structured-world/structured-zstd/pull/537))
+
+### Performance
+
+- *(encode)* code Fast-band offsets as the sequences are collected ([#547](https://github.com/structured-world/structured-zstd/pull/547))
+- *(encode)* optimal parser speed on small inputs ([#546](https://github.com/structured-world/structured-zstd/pull/546))
+- *(encode)* make the classifier and Fast scans placement-stable ([#544](https://github.com/structured-world/structured-zstd/pull/544))
+- *(decode)* take the wildcopy width from the kernel type ([#540](https://github.com/structured-world/structured-zstd/pull/540))
+- *(encode)* tag Fast and dfast hash slots to skip colliding candidates ([#539](https://github.com/structured-world/structured-zstd/pull/539))
+- *(encode)* [**breaking**] gather literal runs after matching, report sequences by length ([#538](https://github.com/structured-world/structured-zstd/pull/538))
+
 ## [0.0.57](https://github.com/structured-world/structured-zstd/compare/v0.0.56...v0.0.57) - 2026-09-27
 
 ### Added
