@@ -502,7 +502,12 @@ pub struct ScalarKernel;
 /// `cmov` on every field of every sequence. Indexed by a `u8`, and sized for
 /// every `u8`, so the load carries no bounds check either. The widths in use
 /// are small, so the hot part is the first few cache lines of it.
-pub(crate) const BIT_MASK: [u64; 256] = {
+///
+/// A `static`, as upstream zstd's `static const unsigned BIT_mask[]`
+/// (`lib/common/bitstream.h`) is one object. A `const` array is a value
+/// copied at each use; a debug (`-O0`) build copied all 2 KiB of it onto the
+/// stack at every inlined load, 43 KiB of the scalar sequence decoder's frame.
+pub(crate) static BIT_MASK: [u64; 256] = {
     let mut table = [u64::MAX; 256];
     let mut i: usize = 0;
     while i < 64 {

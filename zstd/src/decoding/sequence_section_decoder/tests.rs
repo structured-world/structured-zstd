@@ -396,6 +396,82 @@ mod init_sequence_stream_tests {
         );
     }
 
+    /// Stack for one scalar sequence decode and everything it calls, in a
+    /// debug (`-O0`) build. The portable tier is what a
+    /// `default-features = false` build runs on every target. A 64-page
+    /// (256 KiB) kernel task stack also holds the caller's path down to the
+    /// decoder, so the decoder gets well under half of it. After the fix the
+    /// monolith and the out-of-line executor it calls take about 52 KiB at
+    /// `-O0` (x86_64, `UserSliceBackend`); this leaves room for the thread's own
+    /// start-up frames without letting any backend's monolith grow back.
+    #[cfg(feature = "std")]
+    const SCALAR_DECODE_STACK: usize = 96 * 1024;
+
+    /// Enter the scalar monolith for one backend on a thread whose whole stack
+    /// is [`SCALAR_DECODE_STACK`]. The prologue probes every page of the frame,
+    /// so a frame that does not fit hits the guard page and the process aborts
+    /// with "has overflowed its stack" rather than returning.
+    #[cfg(feature = "std")]
+    fn scalar_decode_on_bounded_stack<B, F>(make_buffer: F)
+    where
+        B: crate::decoding::buffer_backend::BufferBackend,
+        F: FnOnce() -> DecodeBuffer<B>,
+        DecodeBuffer<B>: Send + 'static,
+    {
+        // Everything the harness owns is built here, on the caller's stack, so
+        // the bounded thread spends its stack on the decoder alone. The FSE
+        // tables are ~12 KiB inline; the decoder takes them by reference.
+        let header = predefined_one_sequence_header();
+        let mut fse = alloc::boxed::Box::new(FSEScratch::new());
+        let mut buf = alloc::boxed::Box::new(make_buffer());
+        std::thread::Builder::new()
+            .stack_size(SCALAR_DECODE_STACK)
+            .spawn(move || {
+                let source = [0xFFu8; 8];
+                let lits = [0u8; 32];
+                let mut offset_hist = [1u32, 4, 8];
+                let _ = crate::decoding::seq_decoder_scalar::decode_and_execute_sequences_scalar(
+                    &header,
+                    &source,
+                    &mut fse,
+                    &mut buf,
+                    &mut offset_hist,
+                    &lits,
+                    lits.len() - crate::WILDCOPY_OVERLENGTH,
+                    None,
+                );
+            })
+            .expect("spawn bounded-stack decode thread")
+            .join()
+            .expect("bounded-stack decode thread panicked");
+    }
+
+    /// Debug-build stack regression for the scalar sequence decoder, every
+    /// backend it is instantiated for. At `-O0` LLVM gives each inlined
+    /// temporary its own stack slot, so the frame grew with every
+    /// force-inlined copy: the 2 KiB `BIT_MASK` table was a `const`, copied
+    /// onto the stack at each inlined load, and the per-sequence executor was
+    /// force-inlined at all three of the monolith's call sites. The
+    /// monolith's own frame reached 147,912 B (`UserSliceBackend`), 88,648 B
+    /// (`FlatBuf`) and 83,912 B (`RingBuffer`); the first is larger than this
+    /// whole thread stack on its own. After the fix they are 25,736 B,
+    /// 23,784 B and 23,784 B (x86_64, `panic = "abort"`, no default
+    /// features). `cargo test` builds the crate at
+    /// `-O0`, so it runs the configuration a debug kernel links.
+    #[cfg(feature = "std")]
+    #[test]
+    fn scalar_decode_fits_a_bounded_debug_stack() {
+        use crate::decoding::flat_buf::FlatBuf;
+        use crate::decoding::user_slice_buf::UserSliceBackend;
+
+        scalar_decode_on_bounded_stack(|| DecodeBuffer::<RingBuffer>::new(4 * 1024));
+        scalar_decode_on_bounded_stack(|| DecodeBuffer::<FlatBuf>::new(4 * 1024));
+        scalar_decode_on_bounded_stack(|| {
+            let output: &'static mut [u8] = std::vec![0u8; 4 * 1024].leak();
+            DecodeBuffer::from_backend(UserSliceBackend::from_slice(output), 1 << 20)
+        });
+    }
+
     /// Drive the BMI2 entry's preamble directly. The runtime kernel
     /// selector prefers the avx2 tier on any CPU that has BMI2, so this
     /// tier never runs through the normal dispatch on CI hardware; call it
