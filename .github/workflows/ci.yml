@@ -426,6 +426,22 @@ jobs:
       - name: Clippy (embedded_minimal — kernel-scalar + std)
         working-directory: zstd
         run: cargo clippy -p structured-zstd --no-default-features --features kernel-scalar,std,hash -- -D warnings
+      # The clippy steps above compile for the host, which has SSE2 and a
+      # float unit. A kernel target has neither (x86_64-unknown-none is
+      # -sse,-sse2,...,+soft-float), so a vector type that
+      # reaches codegen there fails only on that target, as an LLVM error
+      # rather than a type error. Build for it directly, with no SIMD tier and
+      # with the x86 tiers enabled (they must stay inert without the target
+      # feature), in both profiles since -O0 and -O3 lower differently.
+      - name: Install bare-metal target
+        run: rustup target add x86_64-unknown-none
+      - name: Build (x86_64-unknown-none)
+        working-directory: zstd
+        run: |
+          for profile in dev release; do
+            cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features hash
+            cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features kernel-avx2,hash
+          done
 
   wasm:
     # #347 / #348: the wasm32 simd128 kernel tier + the npm package
