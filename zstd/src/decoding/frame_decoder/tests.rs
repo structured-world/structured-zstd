@@ -3579,3 +3579,55 @@ fn a_zero_offset_sequence_is_refused_rather_than_executed() {
         .decode_all_to_vec(frame.as_slice(), &mut collected)
         .expect_err("decode_all_to_vec must refuse the frame");
 }
+
+/// A `FrameDecoder` and everything it owns inline must stay small enough to
+/// live in a kernel task's stack frame. With the FSE sequence tables held by
+/// value the decoder was ~14 KiB, and a `panic = "abort"` build (every
+/// `*-none` target) built a second copy of the state inside `decode_all`'s
+/// frame: ~42 KiB of stack between the caller and `decode_all`, which
+/// overflows a 32 KiB kernel stack. `cargo test` runs `panic = "unwind"`,
+/// where LLVM happens to elide the copy, so pin the root cause instead:
+/// the inline size of the types every decode entry point moves around.
+#[test]
+fn frame_decoder_stays_small_enough_for_a_kernel_stack() {
+    use crate::decoding::scratch::DecoderScratch;
+    const BUDGET: usize = 2 * 1024;
+    let decoder = core::mem::size_of::<FrameDecoder>();
+    let state = core::mem::size_of::<super::FrameDecoderState>();
+    let scratch = core::mem::size_of::<DecoderScratch>();
+    std::eprintln!("FrameDecoder={decoder} FrameDecoderState={state} DecoderScratch={scratch}");
+    assert!(decoder <= BUDGET, "FrameDecoder is {decoder} B inline");
+    assert!(state <= BUDGET, "FrameDecoderState is {state} B inline");
+    assert!(scratch <= BUDGET, "DecoderScratch is {scratch} B inline");
+}
+
+/// The boxed FSE tables must show up in the reported context size. They are
+/// ~12 KiB that moved from inline to the heap when `fse` became a `Box`, and
+/// a C caller budgets against this figure, so leaving them uncounted
+/// under-reports the decoder by more than the rest of a fresh scratch
+/// combined. Pins both owners: the decode scratch and a dictionary.
+#[test]
+fn boxed_fse_tables_are_reported_as_heap() {
+    use crate::decoding::Dictionary;
+    use crate::decoding::scratch::{DecoderScratch, FSEScratch};
+
+    let boxed = core::mem::size_of::<FSEScratch>();
+    assert!(
+        boxed > 4 * 1024,
+        "expected the FSE tables to be the bulk of the charge, got {boxed} B"
+    );
+
+    let scratch: DecoderScratch = DecoderScratch::new(1024);
+    assert!(
+        scratch.workspace_bytes() >= boxed,
+        "workspace_bytes() = {} omits the {boxed} B boxed FSE tables",
+        scratch.workspace_bytes()
+    );
+
+    let dict = Dictionary::from_raw_content(1, alloc::vec![0u8; 64]).expect("dictionary");
+    assert!(
+        dict.heap_bytes() >= boxed,
+        "Dictionary::heap_bytes() = {} omits the {boxed} B boxed FSE tables",
+        dict.heap_bytes()
+    );
+}

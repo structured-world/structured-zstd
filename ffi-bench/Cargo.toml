@@ -267,6 +267,10 @@ name = "ffi_loop_dict"
 path = "../zstd/examples/ffi_loop_dict.rs"
 
 [[example]]
+name = "stack_budget"
+path = "../zstd/examples/stack_budget.rs"
+
+[[example]]
 name = "profile_decode"
 path = "../zstd/examples/profile_decode.rs"
 

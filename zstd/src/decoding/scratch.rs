@@ -6,6 +6,7 @@ use super::ringbuffer::RingBuffer;
 use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
 use crate::fse::SeqFSETable;
 use crate::huff0::HuffmanTable;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 
@@ -23,7 +24,14 @@ pub struct DecoderScratch<B: BufferBackend = RingBuffer> {
     /// The decoder used for Huffman blocks.
     pub huf: HuffmanScratch,
     /// The decoder used for FSE blocks.
-    pub fse: FSEScratch,
+    ///
+    /// Boxed so `DecoderScratch` -- and the `FrameDecoder` that holds one
+    /// inline -- stays small on the stack. The three sequence tables are
+    /// ~12 KiB of inline arrays; held by value, a `panic = "abort"` build
+    /// (every `*-none` kernel target) materialises one or two copies of the
+    /// whole state in `FrameDecoder::decode_all`'s frame, ~28 KiB, which
+    /// overflows a 32 KiB kernel task stack before a block is decoded.
+    pub fse: Box<FSEScratch>,
 
     pub buffer: DecodeBuffer<B>,
     pub offset_hist: [u32; 3],
@@ -140,7 +148,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 table: HuffmanTable::new(),
                 table_source: TableSource::Local,
             },
-            fse: FSEScratch {
+            fse: Box::new(FSEScratch {
                 offsets: AlignedFSETable::new(MAX_OFFSET_CODE),
                 literal_lengths: AlignedFSETable::new(MAX_LITERAL_LENGTH_CODE),
                 match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
@@ -149,7 +157,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 ll_source: SeqTableSource::Local,
                 of_source: SeqTableSource::Local,
                 ml_source: SeqTableSource::Local,
-            },
+            }),
             buffer: DecodeBuffer::new(window_size),
             offset_hist: [1, 4, 8],
 
@@ -162,11 +170,16 @@ impl<B: BufferBackend> DecoderScratch<B> {
     /// per-block literal and block-content buffers and the entropy tables. The
     /// window dominates and scales with the frame; the rest are bounded by the
     /// block maximum and the entropy alphabet.
+    ///
+    /// `fse` is a `Box`, so its fixed-size decode arrays are heap bytes rather
+    /// than inline in this struct: charge `size_of` for the boxed value on top
+    /// of the build-scratch vectors `FSEScratch::heap_bytes` sums.
     pub fn workspace_bytes(&self) -> usize {
         self.buffer.capacity()
             + self.literals_buffer.capacity()
             + self.block_content_buffer.capacity()
             + self.huf.heap_bytes()
+            + core::mem::size_of::<FSEScratch>()
             + self.fse.heap_bytes()
     }
 
@@ -463,9 +476,11 @@ pub struct FSEScratch {
 
 impl FSEScratch {
     /// Heap bytes owned by the three locally-built sequence FSE tables
-    /// (LL/ML/OF). The fixed-size decode arrays are inline (counted by
-    /// `size_of`); this sums their build-scratch vectors. `Dict`-sourced
-    /// tables read a shared handle and are not owned here.
+    /// (LL/ML/OF): this sums their build-scratch vectors. The fixed-size
+    /// decode arrays are part of `size_of::<FSEScratch>()` and so are NOT
+    /// counted here; every owner holds this struct in a `Box`, so each
+    /// charges that `size_of` itself. `Dict`-sourced tables read a shared
+    /// handle and are not owned here.
     pub fn heap_bytes(&self) -> usize {
         self.offsets.heap_bytes()
             + self.literal_lengths.heap_bytes()

@@ -353,6 +353,15 @@ jobs:
         # Corpus fixtures resolve from the manifest dir, so no
         # working-directory is needed.
         run: cargo nextest run --profile ci -p ffi-bench --features bench-internals,dict-builder
+      - name: Decode stack budget (32 KiB, panic = abort)
+        # `cargo test` always unwinds, and under unwind LLVM elides a copy of
+        # the frame state that an abort build (every `*-none` target) keeps in
+        # `decode_all`'s frame, so only a non-test binary built with
+        # panic = abort can see that frame grow past a kernel task's stack.
+        if: runner.os == 'Linux'
+        env:
+          CARGO_PROFILE_RELEASE_PANIC: abort
+        run: cargo run --release -p ffi-bench --example stack_budget -- 32
 
   cross-i686:
     needs: lint
