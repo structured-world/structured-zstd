@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790868032269,
+  "lastUpdate": 1791393523423,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -11627,6 +11627,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.129,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2764284225b5cb125eee0c604a33ad8d42938a02",
+          "message": "perf(encode): Fast scan at or below v0.0.57 at level 1 (#549)\n\n## Summary\n\n- Level 1 is at or below v0.0.57 on both rows of #548 again: 10 KiB\nrandom over its 1.25 KiB dictionary, and z000033 1 MiB. Levels -1 and -7\nare faster than both v0.0.57 and main.\n- The Fast scan streams from Broadwell's loop stream detector wherever\nthe linker places it. The old loop sat at that buffer's capacity, so\nidentical machine code ran about 8% apart depending on the function's\naddress.\n- Output is byte-identical to main on every input that keeps its slot\nformat, and to v0.0.57 where tags went off.\n\n## Changes\n\n- The scan carries two cursors instead of four. Upstream's `ip1` and\n`ip3` are always `ip0 + 1` and `ip2 + 1` at an iteration boundary, so\nthey are derived where used rather than rotated through registers.\n- Fast slots are tagged only under the cmov probe (`window_log < 19`,\nupstream zstd's `useCmov` boundary). Under the branch probe the tag's\nextra live values pushed the data base, hash shift and table base to the\nstack (46 instructions per position against 33 at the same probe count).\nThe tagged branch-probe kernels are no longer built.\n- A copy-mode dictionary counts toward the table fill at any length, as\nit did before this PR. Bare slots over a 1.25 KiB dictionary took five\ntimes the branch misses.\n\n## Performance\n\nXeon E5-1650 v4 (x86_64, bare metal), bench profile with\n`target-cpu=x86-64-v3`. Five interleaved rounds of `perf stat -r 3`,\neach started below load 1.5. Values are ms for the whole loop. main is\n16ecdc69.\n\n| input | level | v0.0.57 | main | this PR |\n|---|---|---|---|---|\n| 10 KiB random + 1.25 KiB dictionary | 1 | 78.6-83.4 | 80.8-95.2 |\n79.9-81.8 |\n| z000033, 10 KiB | 1 | 247.7-252.0 | 242.0-273.7 | 226.8-244.9 |\n| z000033, 256 KiB | 1 | 484.5-517.0 | 410.9-412.3 | 402.2-431.2 |\n| z000033, 1 MiB | 1 | 813.5-897.2 | 837.9-868.8 | 791.7-824.8 |\n| z000033, 10 KiB | -1 | 131.7-161.2 | 153.8-161.3 | 124.1-126.9 |\n| z000033, 256 KiB | -7 | 238.1-246.0 | 210.9-219.3 | 202.2-207.1 (one\n240.7) |\n| z000033, 1 MiB | -1 | 629.4-675.2 | 655.8-682.4 | 613.9-639.6 |\n\nCompressed bytes (CLI frames, v0.0.57 / main / this PR / libzstd 1.5.7):\n\n| input | level | bytes |\n|---|---|---|\n| z000033, 1 MiB | 1 | 571128 / 571142 / 571128 / 571529 |\n| z000033, 1 MiB | -1 | 595177 / 595242 / 595177 / 595460 |\n| z000033, 1 MiB | -7 | 699239 / 699017 / 699239 / 699615 |\n\nCLI md5 matches main at levels -7 to 2 on 10 KiB random and z000033 over\n1.25 to 110 KiB dictionaries, and on z000033 at 10 and 256 KiB.\n\nAt 512 KiB and up the Fast levels match v0.0.57 byte for byte. This was\nchecked at levels -7 to 2 on eight inputs:\n- z000033 at 512 KiB and 1 MiB;\n- 1 MiB of source text, logs, random bytes, and records sharing a\nfour-byte prefix;\n- z000033 1 MiB over 1.25 and 110 KiB dictionaries.\n\nAgainst main (tagged there) sizes stay within 0.2%. The exception is the\nshared-prefix records at level 1: 561460 bytes against 567546 (libzstd\n561640).\n\nlibzstd through the same encode-loop harness runs 1.4-1.6x faster on\nthese inputs than both main and this PR. Upstream zstd scans this range\nwithout tags too, so that distance is not the cutoff's.\n\nPlacement: the dictionary row's kernel was placed at each 16-byte phase\nby aligning functions to 16, 32, 64 and 128 bytes.\n- Before the scan change, phases 0 and 48 streamed 283-371M uops from\nthe loop stream detector. Phase 16 streamed 3-7M and ran 85-89 ms.\n- With two cursors, all four phases stream 310-372M uops.\n\ni686 (Xeon E5-2697 v4), previous head against this PR:\n- dictionary row: 169.5-172.0 against 163.5-164.8;\n- z000033 10 KiB at level -1: 264.6-267.0 against 261.0-263.6;\n- z000033 10 and 256 KiB at level 1: within 1.2%, ranges overlapping.\n\naarch64 timing is not included: the M1 was under load during this round.\n\n## Testing\n\nfmt, clippy (library with and without the testing facade, ffi-bench\ntargets), the crate's test suite and doc tests pass on macOS aarch64.\nCLI frame md5 was compared on x86_64 as above.\n\nCloses #548\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Improvements**\n* Updated Fast compression to choose its search strategy based on input\nand dictionary size, with support limited to compatible configurations.\n* Revised the Fast compression search process while preserving its\ncursor and hash-position schedule.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-07T19:36:13+03:00",
+          "tree_id": "86754c1d63bab0fe96363a3ac3477a3cafc6e584",
+          "url": "https://github.com/structured-world/structured-zstd/commit/2764284225b5cb125eee0c604a33ad8d42938a02"
+        },
+        "date": 1791393496154,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.059,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 151.415,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 227.581,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.504,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.114,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.409,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.931,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.438,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.961,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 4.619,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 2.938,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.048,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.098,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 0.761,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.677,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 0.856,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.737,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.074,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.074,
             "unit": "ms"
           }
         ]
