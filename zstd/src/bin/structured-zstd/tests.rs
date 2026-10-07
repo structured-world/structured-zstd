@@ -4074,6 +4074,35 @@ fn plain_input_is_passed_through_or_refused() {
         .to_string();
     assert!(err.contains("unknown header"), "{err}");
 
+    // A skippable frame cut short gets its own message, in front of the first
+    // frame and after one.
+    let mut cut_skippable = 0x184D_2A50u32.to_le_bytes().to_vec();
+    cut_skippable.extend_from_slice(&16u32.to_le_bytes());
+    cut_skippable.extend_from_slice(b"short");
+    let mut cut_after_frame = frame_of(b"framed");
+    cut_after_frame.extend_from_slice(&cut_skippable);
+    for (input, label) in [
+        (cut_skippable.as_slice(), "leading"),
+        (cut_after_frame.as_slice(), "after a frame"),
+    ] {
+        let err = decompress_stream(input, io::sink(), &mut no_dict(), &pass)
+            .expect_err("a truncated skippable frame is refused")
+            .to_string();
+        assert!(
+            err.contains("skippable frame is truncated"),
+            "{label}: {err}"
+        );
+    }
+
+    // A frame magic whose header is invalid (a window larger than any decoder
+    // accepts, RFC 8878 3.1.1.1.2) is a damaged frame, reported with its cause.
+    let mut bad_header = 0xFD2F_B528u32.to_le_bytes().to_vec();
+    bad_header.extend_from_slice(&[0x00, 0xF8]);
+    let err = decompress_stream(bad_header.as_slice(), io::sink(), &mut no_dict(), &pass)
+        .expect_err("a frame with an invalid header is refused")
+        .to_string();
+    assert!(err.contains("invalid zstd frame"), "{err}");
+
     // The default follows the reference command: on when forced and writing
     // to stdout (`zstd -dcf`), off otherwise.
     assert!(DecodeSettings::from_options(&parse(&["-dcf", "f"]).unwrap()).pass_through);

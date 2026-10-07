@@ -3832,6 +3832,39 @@ fn fast_strategy_takes_a_three_byte_min_match_as_four() {
     }
 }
 
+/// Upstream's fast compressor probes by branch, not cmov, once the window
+/// reaches 2^19 (zstd_fast.c, `ZSTD_compressBlock_fast`: `useCmov =
+/// windowLog < 19`). Every min_match the fast strategy hashes runs that probe
+/// over a window that large and round-trips.
+#[test]
+fn fast_strategy_round_trips_every_min_match_under_the_branch_probe() {
+    use crate::encoding::{CompressionParameters, Strategy};
+    let mut payload = noise_bytes(256 * 1024, 9);
+    let repeated = payload[1000..200_000].to_vec();
+    payload.extend_from_slice(&repeated);
+    payload.extend_from_slice(&b"key=value; ".repeat(20_000));
+    for min_match in 4..=7 {
+        let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+            .strategy(Strategy::Fast)
+            .window_log(20)
+            .min_match(min_match)
+            .build()
+            .expect("valid knobs");
+        let mut enc: FrameCompressor = FrameCompressor::new(params.level());
+        enc.set_parameters(&params);
+        let frame = enc.compress_independent_frame(&payload);
+        assert!(
+            frame.len() < payload.len() * 3 / 4,
+            "min_match {min_match}: the repeats are found"
+        );
+        let mut decoded = Vec::with_capacity(payload.len());
+        FrameDecoder::new()
+            .decode_all_to_vec(&frame, &mut decoded)
+            .unwrap();
+        assert!(decoded == payload, "min_match {min_match}: round trip");
+    }
+}
+
 /// The raw-literals gate is recomputed when the dictionary state changes
 /// AFTER `set_parameters`. With a positive `target_length`, the gate turns
 /// on exactly where the frame runs the fast strategy: L2 over a 200 KiB

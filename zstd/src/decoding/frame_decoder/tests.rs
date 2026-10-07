@@ -19,6 +19,17 @@ const _: fn() = || {
     assert_send_sync::<FrameDecoder>();
 };
 
+/// A decoder that has not started a frame has no declared size to miss: the
+/// size check passes, and so does it for a frame still being decoded.
+#[test]
+fn verify_content_size_passes_without_a_finished_frame() {
+    let mut decoder = FrameDecoder::new();
+    decoder.verify_content_size().unwrap();
+    let compressed = crate::encoding::compress_to_vec(&[7u8; 64][..], CompressionLevel::Fastest);
+    decoder.init(compressed.as_slice()).unwrap();
+    decoder.verify_content_size().unwrap();
+}
+
 #[test]
 fn force_dict_installs_active_dictionary_handle() {
     // Regression: `force_dict` arms `Dict`-sourced scratch tables for a

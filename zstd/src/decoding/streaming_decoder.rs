@@ -5,9 +5,7 @@ use core::borrow::BorrowMut;
 use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
 use crate::decoding::{BlockDecodingStrategy, DictionaryHandle, FrameDecoder};
-#[cfg(not(feature = "std"))]
-use crate::io::ErrorKind;
-use crate::io::{Error, Read};
+use crate::io::{Error, ErrorKind, Read};
 
 /// High level Zstandard frame decoder that can be used to decompress a given Zstandard frame.
 ///
@@ -59,53 +57,113 @@ pub struct StreamingDecoder<READ: Read, DEC: BorrowMut<FrameDecoder>> {
     /// frames): every read from here on is the end of the stream, without
     /// asking the source again.
     exhausted: bool,
-    /// What a frame boundary has read so far, kept across a non-blocking
-    /// source's `WouldBlock` so that retrying resumes rather than restarts.
-    boundary: Boundary,
+    /// Source bytes read ahead and not yet decoded.
+    input: Input,
 }
 
-/// The longest frame header (RFC 8878 3.1.1.1): magic, descriptor, window
-/// descriptor, a 4-byte dictionary id and an 8-byte content size.
-const MAX_FRAME_HEADER: usize = 4 + 1 + 1 + 4 + 8;
+/// Room for any block (at most `MAX_BLOCK_SIZE` of content behind a 3-byte
+/// header) with its trailing checksum, twice over, so the source is read in
+/// large chunks.
+const INPUT_SIZE: usize = 2 * MAX_BLOCK_SIZE as usize;
 
-/// A frame boundary in progress: the bytes of the next header read so far, and
-/// the content of a skippable frame still to step over.
-#[derive(Default)]
-struct Boundary {
-    header: [u8; MAX_FRAME_HEADER],
-    have: usize,
+/// Source bytes read ahead of the decoder, the way upstream zstd's
+/// `ZSTD_decompressStream` buffers input until the next step's whole input is
+/// there. A block is decoded only once it is all in hand, a frame header only
+/// once it is complete, so a non-blocking source that returns `WouldBlock`
+/// part-way through either loses nothing: the next read continues from here.
+struct Input {
+    /// Zero-filled once, on the first read; holds the pending bytes at
+    /// `start..end`.
+    buf: alloc::vec::Vec<u8>,
+    start: usize,
+    end: usize,
+    /// Content of a skippable frame still to step over.
     skip_left: u32,
 }
 
-impl Boundary {
-    /// The length of the header whose first `self.have` bytes are in hand, or
-    /// of as much of it as those bytes can tell: the magic decides a
-    /// skippable frame's 8 bytes, a frame's descriptor decides the rest.
-    fn header_len(&self) -> usize {
-        if self.have < 4 {
-            return 4;
+impl Input {
+    const fn new() -> Self {
+        Self {
+            buf: alloc::vec::Vec::new(),
+            start: 0,
+            end: 0,
+            skip_left: 0,
         }
-        let magic = u32::from_le_bytes([
-            self.header[0],
-            self.header[1],
-            self.header[2],
-            self.header[3],
-        ]);
-        if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
-            return 8;
-        }
-        if magic != crate::common::MAGIC_NUM {
-            return 4;
-        }
-        if self.have < 5 {
-            return 5;
-        }
-        let descriptor = crate::decoding::frame::FrameDescriptor(self.header[4]);
-        let window = usize::from(!descriptor.single_segment_flag());
-        let dict = descriptor.dictionary_id_bytes().map_or(0, usize::from);
-        let fcs = descriptor.frame_content_size_bytes().map_or(0, usize::from);
-        5 + window + dict + fcs
     }
+
+    fn pending(&self) -> &[u8] {
+        &self.buf[self.start..self.end]
+    }
+
+    /// The pending bytes as a vector the caller can append the rest of the
+    /// source to; empty, with no allocation, when nothing was read ahead.
+    fn take_pending(&mut self) -> alloc::vec::Vec<u8> {
+        let pending = self.pending().to_vec();
+        self.start = 0;
+        self.end = 0;
+        pending
+    }
+
+    fn consume(&mut self, n: usize) {
+        debug_assert!(n <= self.end - self.start);
+        self.start += n;
+        if self.start == self.end {
+            self.start = 0;
+            self.end = 0;
+        }
+    }
+
+    /// Read more of `source` behind the pending bytes. `Ok(0)` is its end;
+    /// its errors come back as it reported them, `Interrupted` retried.
+    fn fill<R: Read>(&mut self, source: &mut R) -> Result<usize, Error> {
+        if self.buf.is_empty() {
+            self.buf = alloc::vec![0; INPUT_SIZE];
+        }
+        if self.start > 0 {
+            self.buf.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.start = 0;
+        }
+        // A whole block or header always fits with room to spare, and the
+        // decoder takes one as soon as it is whole, so the buffer never fills.
+        // Were it full, the empty read below would return `Ok(0)` and the
+        // end-of-input path would report the stream.
+        debug_assert!(self.end < self.buf.len(), "input full without progress");
+        loop {
+            match source.read(&mut self.buf[self.end..]) {
+                Ok(n) => {
+                    self.end += n;
+                    return Ok(n);
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// How much of a frame header `bytes` says there is to read: 4 for the magic,
+/// 8 for a skippable frame's header, and for a frame its descriptor's fields.
+/// A magic that is neither stops at 4, where the parser rejects it.
+fn header_len(bytes: &[u8]) -> usize {
+    let Some(magic) = bytes.first_chunk::<4>() else {
+        return 4;
+    };
+    let magic = u32::from_le_bytes(*magic);
+    if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
+        return 8;
+    }
+    if magic != crate::common::MAGIC_NUM {
+        return 4;
+    }
+    let Some(&descriptor) = bytes.get(4) else {
+        return 5;
+    };
+    let descriptor = crate::decoding::frame::FrameDescriptor(descriptor);
+    let window = usize::from(!descriptor.single_segment_flag());
+    let dict = descriptor.dictionary_id_bytes().map_or(0, usize::from);
+    let fcs = descriptor.frame_content_size_bytes().map_or(0, usize::from);
+    5 + window + dict + fcs
 }
 
 impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
@@ -119,7 +177,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
             source,
             forced_dictionary: false,
             exhausted: !started,
-            boundary: Boundary::default(),
+            input: Input::new(),
         })
     }
 
@@ -170,7 +228,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
             source,
             forced_dictionary: true,
             exhausted: !started,
-            boundary: Boundary::default(),
+            input: Input::new(),
         })
     }
 }
@@ -186,7 +244,7 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
             source,
             forced_dictionary: false,
             exhausted: !started,
-            boundary: Boundary::default(),
+            input: Input::new(),
         })
     }
 
@@ -268,14 +326,27 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
         self.decoder
     }
 
+    /// The error for a source that ended inside a frame: the leftover input
+    /// handed to the block decoder, which reports how it was cut short as it
+    /// does for any truncated frame. Whole input never reaches here (it would
+    /// have decoded), so that decode fails; were it to pass, the cut is still
+    /// reported, as an early end of input.
+    fn cut_short(&mut self) -> Error {
+        let mut rest = self.input.pending();
+        self.decoder
+            .borrow_mut()
+            .decode_blocks(&mut rest, BlockDecodingStrategy::All)
+            .map_or_else(frame_error, |_| Error::from(ErrorKind::UnexpectedEof))
+    }
+
     /// Start the frame that follows the finished one, skipping skippable
     /// frames, with the constructor's dictionary if it had one. `false` when
     /// the source ends cleanly at the frame boundary; anything else that is
     /// not a frame is an error.
     ///
     /// The source's own errors go back as it reported them, so a non-blocking
-    /// source's `WouldBlock` stays one, and what the boundary had read is kept
-    /// in [`Boundary`]: the header is parsed only once it is whole, so a retry
+    /// source's `WouldBlock` stays one; what the boundary had read stays in
+    /// [`Input`], and the header is parsed only once it is whole, so a retry
     /// resumes where the source stopped.
     fn start_next_frame(&mut self) -> Result<bool, Error> {
         let how = if self.forced_dictionary {
@@ -284,41 +355,40 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
             FrameStart::Plain
         };
         loop {
-            while self.boundary.skip_left > 0 {
-                let mut scratch = [0u8; 512];
-                // In `u32`, as the skippable length is: at most 512 after.
-                let take = self.boundary.skip_left.min(scratch.len() as u32) as usize;
-                match self.source.read(&mut scratch[..take]) {
-                    Ok(0) => return Err(frame_error(FrameDecoderError::FailedToSkipFrame)),
-                    // `n <= take <= skip_left`, so it fits the `u32` it is
-                    // taken from.
-                    Ok(n) => self.boundary.skip_left -= n as u32,
-                    Err(e) if e.kind() == crate::io::ErrorKind::Interrupted => {}
-                    Err(e) => return Err(e),
+            while self.input.skip_left > 0 {
+                if self.input.pending().is_empty() && self.input.fill(&mut self.source)? == 0 {
+                    return Err(frame_error(FrameDecoderError::FailedToSkipFrame));
                 }
+                // Counted in the wire's `u32`; the pending length is at most
+                // `INPUT_SIZE`, which a `u32` holds.
+                let pending = u32::try_from(self.input.pending().len()).unwrap_or(u32::MAX);
+                let take = self.input.skip_left.min(pending);
+                self.input.consume(take as usize);
+                self.input.skip_left -= take;
             }
             loop {
-                let want = self.boundary.header_len();
-                if self.boundary.have >= want {
+                let have = self.input.pending().len();
+                if have >= header_len(self.input.pending()) {
                     break;
                 }
-                let have = self.boundary.have;
-                match self.source.read(&mut self.boundary.header[have..want]) {
-                    Ok(0) if have == 0 => return Ok(false),
+                if self.input.fill(&mut self.source)? == 0 {
+                    if have == 0 {
+                        return Ok(false);
+                    }
                     // The source ended inside a header: let the parser report
                     // it as it reports any header cut short.
-                    Ok(0) => break,
-                    Ok(n) => self.boundary.have += n,
-                    Err(e) if e.kind() == crate::io::ErrorKind::Interrupted => {}
-                    Err(e) => return Err(e),
+                    break;
                 }
             }
-            let have = core::mem::take(&mut self.boundary.have);
-            let started = how.start(self.decoder.borrow_mut(), &self.boundary.header[..have]);
+            let mut header = self.input.pending();
+            let before = header.len();
+            let started = how.start(self.decoder.borrow_mut(), &mut header);
+            let used = before - header.len();
+            self.input.consume(used);
             match started {
                 Ok(()) => return Ok(true),
                 Err(e) => match skippable_frame_length(&e) {
-                    Some(length) => self.boundary.skip_left = length,
+                    Some(length) => self.input.skip_left = length,
                     None => return Err(frame_error(e)),
                 },
             }
@@ -472,15 +542,21 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         if buf.is_empty() || self.exhausted {
             return Ok(0);
         }
+        let mut written = 0;
         loop {
             let decoder = self.decoder.borrow_mut();
             if decoder.is_finished() && decoder.can_collect() == 0 {
-                // Frame fully decoded and fully drained: its length and running
+                // Bytes in hand go back first: the frame's checks and the next
+                // frame's header wait for a call that has nothing to deliver,
+                // so an error never follows delivered bytes (the `Read`
+                // contract) and a source that has not sent the next frame
+                // yet is not waited on.
+                if written > 0 {
+                    return Ok(written);
+                }
+                // Fully decoded and drained: the frame's length and running
                 // digest are final, so a frame shorter or longer than it
-                // declared, or with a bad checksum in `Verify` mode, fails
-                // here. Only reached with nothing written in this call, so the
-                // error never follows delivered bytes, which the `Read`
-                // contract forbids.
+                // declared, or with a bad checksum in `Verify` mode, fails here.
                 verify_finished_frame(decoder)?;
                 if !self.start_next_frame()? {
                     self.exhausted = true;
@@ -488,40 +564,28 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
                 }
                 continue;
             }
-
-            // Interleave bounded decode with draining so the decode window
-            // (`RingBuffer`) stays near `window_size` instead of accumulating
-            // the whole request before a single end-of-call drain.
-            // `read_to_end` hands ever-larger buffers; decoding `buf.len()`
-            // worth into the ring up front grew it far past the window
-            // (repeated `reserve_amortized` alloc+copy). Decode at most one
-            // block worth per step, then drain what is now collectable into
-            // `buf`, mirroring upstream zstd's window-bounded flush loop.
-            let mut written = 0;
-            while written < buf.len() {
-                // Drain whatever is collectable now (retaining `window_size`
-                // until the frame finishes). Reclaims the ring promptly so the
-                // next decode step reuses the same capacity.
-                written += decoder.read(&mut buf[written..])?;
-                if written == buf.len() || decoder.is_finished() {
-                    break;
-                }
-                // Decode one bounded chunk. `UptoBytes` may overshoot a little
-                // but is capped to one block, so the ring's live region stays
-                // within `window_size + MAX_BLOCK_SIZE`.
-                let step = (buf.len() - written).min(MAX_BLOCK_SIZE as usize);
-                decoder
-                    .decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBytes(step))
-                    .map_err(frame_error)?;
+            if written == buf.len() {
+                return Ok(written);
             }
-            // Bytes in hand go back now: the next frame is only started on a
-            // call that has nothing to deliver, so a reader is never held
-            // waiting on a source that has not sent the next frame yet.
+            // Decode the whole blocks the input holds, handing output to `buf`
+            // block by block: the decode window stays one window plus one
+            // block, as upstream's flush loop keeps it.
+            let (consumed, produced) = decoder
+                .decode_available(self.input.pending(), &mut buf[written..])
+                .map_err(frame_error)?;
+            self.input.consume(consumed);
+            written += produced;
+            if consumed > 0 || produced > 0 {
+                continue;
+            }
+            // The next block is not all in hand. Return what this call has
+            // rather than wait on the source for it.
             if written > 0 {
                 return Ok(written);
             }
-            // Nothing written: the frame finished and drained empty, so loop
-            // to the finish point above to check it and move on.
+            if self.input.fill(&mut self.source)? == 0 {
+                return Err(self.cut_short());
+            }
         }
     }
 
@@ -554,7 +618,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         // count.
         let keep_dictionary = self.forced_dictionary;
         if at_start {
-            let mut compressed = alloc::vec::Vec::new();
+            let mut compressed = self.input.take_pending();
             self.source.read_to_end(&mut compressed)?;
             self.decoder
                 .borrow_mut()
@@ -598,7 +662,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         // As in the std path: the decoder's own dictionary, reused in place.
         let keep_dictionary = self.forced_dictionary;
         if at_start {
-            let mut compressed = alloc::vec::Vec::new();
+            let mut compressed = self.input.take_pending();
             self.source.read_to_end(&mut compressed)?;
             self.decoder
                 .borrow_mut()

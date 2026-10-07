@@ -740,6 +740,31 @@ fn copy_mode_dictionary_fill_runs_at_every_hash_width() {
     }
 }
 
+/// A window of 2^19 or more takes the branch probe (upstream zstd_fast.c,
+/// `ZSTD_compressBlock_fast`: `useCmov = windowLog < 19`). Every hash width
+/// runs its own monomorph of it and finds a repeat at least that long.
+#[test]
+fn branch_probe_finds_repeats_at_every_hash_width() {
+    let unit: alloc::vec::Vec<u8> = (0..64u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    let block = unit.repeat(32);
+    for mls in 4u32..=8 {
+        let mut m = FastKernelMatcher::with_params(20, 14, mls, 2);
+        m.commit_input(block.clone());
+        let mut longest = 0;
+        m.start_matching(|seq| {
+            if let Sequence::Triple { match_len, .. } = seq {
+                longest = longest.max(match_len);
+            }
+        });
+        assert!(
+            longest >= mls as usize,
+            "mls {mls}: the repeat must be found, longest {longest}"
+        );
+    }
+}
+
 /// Boundary: pending block too short to hash anything (less than
 /// `HASH_READ_SIZE` bytes). The dict-prime path must early-return
 /// without panicking on the `last_hashable` subtract.

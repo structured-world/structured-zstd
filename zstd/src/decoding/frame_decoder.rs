@@ -785,6 +785,22 @@ impl DecoderScratchKind {
         }
     }
 
+    /// [`Self::decode_block_content`] for a block whose content is already in
+    /// memory: a compressed block is decoded from `source` in place instead of
+    /// being copied into the block buffer first. Advances `source` past it.
+    fn decode_block_content_from_slice(
+        &mut self,
+        decoder: &mut BlockDecoder,
+        header: &crate::blocks::block::BlockHeader,
+        source: &mut &[u8],
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
+    ) -> Result<u64, DecodeBlockContentError> {
+        match self {
+            Self::Ring(s) => decoder.decode_block_content_from_slice(header, s, dict, source),
+            Self::Flat(s) => decoder.decode_block_content_from_slice(header, s, dict, source),
+        }
+    }
+
     #[cfg(feature = "hash")]
     fn hash_finish(&self) -> u64 {
         use core::hash::Hasher;
@@ -2509,6 +2525,27 @@ impl FrameDecoder {
         source: &[u8],
         target: &mut [u8],
     ) -> Result<(usize, usize), FrameDecoderError> {
+        let progress = self.decode_available(source, target)?;
+        // Once the frame is fully decoded and drained, its length and running
+        // digest are final: check the declared size, and the checksum in
+        // `Verify` mode (no-op otherwise).
+        if self.is_finished() && self.can_collect() == 0 {
+            self.verify_content_size()?;
+            #[cfg(feature = "hash")]
+            self.verify_content_checksum()?;
+        }
+        Ok(progress)
+    }
+
+    /// [`Self::decode_from_to`] without its finish-point checks, for a caller
+    /// that must not report an error in the same call that delivered bytes
+    /// (a `Read` adapter) and so runs them itself on a call that delivers
+    /// none.
+    pub(crate) fn decode_available(
+        &mut self,
+        source: &[u8],
+        target: &mut [u8],
+    ) -> Result<(usize, usize), FrameDecoderError> {
         use FrameDecoderError as err;
         let bytes_read_at_start = match &self.state {
             Some(s) => s.bytes_read_counter,
@@ -2635,9 +2672,11 @@ impl FrameDecoder {
                     } else {
                         None
                     };
+                    // The whole block is in `mt_source` (checked above), so
+                    // it decodes from the slice without a copy.
                     let bytes_read_in_block_body = state
                         .decoder_scratch
-                        .decode_block_content(
+                        .decode_block_content_from_slice(
                             &mut block_dec,
                             &block_header,
                             &mut mt_source,
@@ -2676,15 +2715,6 @@ impl FrameDecoder {
             + self
                 .read(&mut target[written..])
                 .map_err(err::FailedToDrainDecodebuffer)?;
-        // Once the frame is fully decoded and drained, its length and running
-        // digest are final: check the declared size, and the checksum in
-        // `Verify` mode (no-op otherwise). Same finish point as the streaming
-        // reader.
-        if self.is_finished() && self.can_collect() == 0 {
-            self.verify_content_size()?;
-            #[cfg(feature = "hash")]
-            self.verify_content_checksum()?;
-        }
         let bytes_read_at_end = match &mut self.state {
             Some(s) => s.bytes_read_counter,
             None => panic!("Bug in library"),

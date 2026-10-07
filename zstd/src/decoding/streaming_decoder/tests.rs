@@ -159,61 +159,252 @@ impl Read for Trickle<'_> {
     }
 }
 
-/// A `WouldBlock` in the middle of a following frame's header, or of a
-/// skippable frame between frames, loses nothing: retrying the read picks
-/// up where the source stopped. Only the boundary is under test: the first
-/// frame is handed over whole, the skippable frame and the next frame's
-/// header trickle, and the next frame's blocks arrive whole again.
+/// A `WouldBlock` anywhere after the first frame's header, inside a block,
+/// a block header, a checksum, a skippable frame or the next frame's header,
+/// loses nothing: retrying the read picks up where the source stopped. The
+/// constructor reads the first header synchronously, so that alone arrives
+/// whole; every byte after it trickles in between `WouldBlock`s.
 #[test]
-fn read_resumes_a_frame_boundary_interrupted_by_would_block() {
-    let first = frame_of(b"first, ");
-    let skippable = skippable_frame(b"metadata between frames");
-    let second = frame_of(b"second");
-    let descriptor = crate::decoding::frame::FrameDescriptor(second[4]);
-    let second_header = 5
+fn read_resumes_wherever_a_would_block_interrupts_it() {
+    let payload: alloc::vec::Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let mut compressor =
+        crate::encoding::FrameCompressor::new(crate::encoding::CompressionLevel::Fastest);
+    compressor.set_content_checksum(true);
+    compressor.set_source(payload.as_slice());
+    let mut stream = alloc::vec::Vec::new();
+    compressor.set_drain(&mut stream);
+    compressor.compress();
+    stream.extend(skippable_frame(b"metadata between frames"));
+    stream.extend(frame_of(b"second"));
+    let descriptor = crate::decoding::frame::FrameDescriptor(stream[4]);
+    let first_header = 5
         + usize::from(!descriptor.single_segment_flag())
         + usize::from(descriptor.dictionary_id_bytes().unwrap())
         + usize::from(descriptor.frame_content_size_bytes().unwrap());
-    let mut boundary = skippable.clone();
-    boundary.extend_from_slice(&second[..second_header]);
 
     struct Staged<'a> {
         head: &'a [u8],
-        boundary: Trickle<'a>,
-        tail: &'a [u8],
+        tail: Trickle<'a>,
     }
     impl Read for Staged<'_> {
         fn read(&mut self, buf: &mut [u8]) -> Result<usize, crate::io::Error> {
-            if !self.head.is_empty() {
-                self.head.read(buf)
-            } else if !self.boundary.data.is_empty() {
-                self.boundary.read(buf)
-            } else {
+            if self.head.is_empty() {
                 self.tail.read(buf)
+            } else {
+                self.head.read(buf)
             }
         }
     }
 
     let staged = Staged {
-        head: &first,
-        boundary: Trickle {
-            data: &boundary,
+        head: &stream[..first_header],
+        tail: Trickle {
+            data: &stream[first_header..],
             block_next: false,
         },
-        tail: &second[second_header..],
     };
     let mut decoder = StreamingDecoder::new(staged).unwrap();
+    #[cfg(feature = "hash")]
+    decoder
+        .decoder_mut()
+        .set_content_checksum(crate::decoding::ContentChecksum::Verify);
     let mut out = alloc::vec::Vec::new();
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; 4096];
     loop {
         match decoder.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => out.extend_from_slice(&buf[..n]),
             Err(e) if e.kind() == crate::io::ErrorKind::WouldBlock => {}
-            Err(e) => panic!("the stream must survive WouldBlock at a boundary: {e:?}"),
+            Err(e) => panic!("the stream must survive WouldBlock: {e:?}"),
         }
     }
-    assert_eq!(out, b"first, second");
+    let mut expected = payload;
+    expected.extend_from_slice(b"second");
+    assert!(out == expected, "decoded {} bytes", out.len());
+}
+
+/// A source that reports `Interrupted` before every read it serves, so each
+/// read path's retry runs: the header reads, the skip of a skippable frame,
+/// the boundary probe and the input fill.
+struct Interrupting<'a> {
+    data: &'a [u8],
+    interrupt_next: bool,
+}
+
+impl Read for Interrupting<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, crate::io::Error> {
+        self.interrupt_next = !self.interrupt_next;
+        if self.interrupt_next {
+            return Err(crate::io::Error::from(crate::io::ErrorKind::Interrupted));
+        }
+        self.data.read(buf)
+    }
+}
+
+/// `Interrupted` is not an error (the `Read` contract): every read path
+/// retries it, whether the source is at a frame header, inside a skippable
+/// frame, at a frame boundary or between blocks.
+#[test]
+fn read_retries_an_interrupted_source_everywhere() {
+    let mut stream = skippable_frame(b"leading");
+    stream.extend(frame_of(b"one "));
+    stream.extend(skippable_frame(b"between"));
+    stream.extend(frame_of(b"two"));
+    let source = Interrupting {
+        data: &stream,
+        interrupt_next: false,
+    };
+    let mut decoder = StreamingDecoder::new(source).unwrap();
+    let mut out = alloc::vec::Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        let n = decoder.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(out, b"one two");
+}
+
+/// A skippable frame that ends before its declared length is a truncated
+/// stream, wherever it stands: in front of the first frame, where the
+/// constructor skips it, and after a frame, where `read` does.
+#[test]
+fn a_truncated_skippable_frame_is_an_error() {
+    let mut leading = skippable_frame(b"metadata");
+    leading.truncate(leading.len() - 3);
+    let err = StreamingDecoder::new(leading.as_slice())
+        .err()
+        .expect("a leading skippable frame cut short must not start the stream");
+    assert!(
+        matches!(
+            err,
+            crate::decoding::errors::FrameDecoderError::FailedToSkipFrame
+        ),
+        "{err:?}"
+    );
+
+    let mut trailing = frame_of(b"payload");
+    let mut skippable = skippable_frame(b"metadata");
+    skippable.truncate(skippable.len() - 3);
+    trailing.extend(skippable);
+    let decoder = StreamingDecoder::new(trailing.as_slice()).unwrap();
+    let err =
+        drain_with_read(decoder).expect_err("a skippable frame cut short must not end cleanly");
+    assert!(
+        alloc::format!("{err:?}").contains("FailedToSkipFrame"),
+        "{err:?}"
+    );
+}
+
+/// A source that fails part-way through a leading skippable frame fails the
+/// constructor with the skip error, and one that fails at the boundary after
+/// it fails with the magic-number read error, not a clean empty stream.
+#[test]
+fn a_source_error_around_a_leading_skippable_frame_fails_the_constructor() {
+    use crate::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+
+    /// Serves `data`, then fails every read with `Other`.
+    struct FailsAfter<'a> {
+        data: &'a [u8],
+    }
+    impl Read for FailsAfter<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, crate::io::Error> {
+            if self.data.is_empty() {
+                return Err(crate::io::Error::from(crate::io::ErrorKind::Other));
+            }
+            self.data.read(buf)
+        }
+    }
+
+    let skippable = skippable_frame(b"metadata");
+    let inside = FailsAfter {
+        data: &skippable[..skippable.len() - 3],
+    };
+    let err = StreamingDecoder::new(inside)
+        .err()
+        .expect("a source error inside a skippable frame must fail");
+    assert!(
+        matches!(err, FrameDecoderError::FailedToSkipFrame),
+        "{err:?}"
+    );
+
+    let at_boundary = FailsAfter { data: &skippable };
+    let err = StreamingDecoder::new(at_boundary)
+        .err()
+        .expect("a source error at the next frame boundary must fail");
+    assert!(
+        matches!(
+            err,
+            FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::MagicNumberReadError(_))
+        ),
+        "{err:?}"
+    );
+}
+
+/// The source ending part-way through the next frame's header is a truncated
+/// stream, not its clean end.
+#[test]
+fn read_rejects_a_stream_cut_inside_the_next_frame_header() {
+    let mut stream = frame_of(b"payload");
+    // Magic and descriptor only: a frame header is longer than five bytes,
+    // since a single-segment frame always carries its content size.
+    let next = frame_of(b"next");
+    stream.extend_from_slice(&next[..5]);
+    let decoder = StreamingDecoder::new(stream.as_slice()).unwrap();
+    assert!(drain_with_read(decoder).is_err());
+}
+
+/// A block whose content does not decode fails the read that reaches it.
+#[test]
+fn read_rejects_a_block_that_does_not_decode() {
+    // Single-segment frame of 16 bytes holding one last compressed block of
+    // four bytes that are no valid literals section.
+    let frame = [
+        0x28, 0xB5, 0x2F, 0xFD, 0x20, 16, 0x25, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+    ];
+    let decoder = StreamingDecoder::new(&frame[..]).unwrap();
+    assert!(drain_with_read(decoder).is_err());
+}
+
+/// `read_to_end` hands the source's own error back as it reported it.
+#[cfg(feature = "std")]
+#[test]
+fn read_to_end_returns_the_source_error() {
+    let frame = frame_of(b"complete frame");
+    let mut decoder = StreamingDecoder::new(OpenPipe { data: &frame }).unwrap();
+    let mut out = alloc::vec::Vec::new();
+    let err = decoder
+        .read_to_end(&mut out)
+        .expect_err("a source that would block cannot be read to its end");
+    assert_eq!(err.kind(), crate::io::ErrorKind::WouldBlock);
+}
+
+/// A frame cut inside its trailing checksum has every block decoded, and
+/// still must not end as if it were whole.
+#[test]
+fn read_rejects_a_frame_cut_inside_its_checksum() {
+    let mut compressor =
+        crate::encoding::FrameCompressor::new(crate::encoding::CompressionLevel::Fastest);
+    compressor.set_content_checksum(true);
+    compressor.set_source(&b"checksummed payload"[..]);
+    let mut frame = alloc::vec::Vec::new();
+    compressor.set_drain(&mut frame);
+    compressor.compress();
+    frame.truncate(frame.len() - 2);
+    let decoder = StreamingDecoder::new(frame.as_slice()).unwrap();
+    assert!(drain_with_read(decoder).is_err());
+}
+
+/// A dictionary constructor still rejects a source that is not a frame.
+#[test]
+fn a_dictionary_constructor_rejects_bytes_that_are_not_a_frame() {
+    use crate::decoding::{Dictionary, DictionaryHandle};
+    let handle = DictionaryHandle::from_dictionary(
+        Dictionary::from_raw_content(7, b"dictionary content".to_vec()).unwrap(),
+    );
+    assert!(StreamingDecoder::new_with_dictionary_handle(&b"not a frame"[..], &handle).is_err());
 }
 
 /// `read` stays a stream: a finished frame's bytes are delivered without
