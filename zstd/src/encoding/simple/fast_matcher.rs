@@ -2421,9 +2421,10 @@ fn run_fast_kernel_block(
     };
     // Dispatch on (mls, use_cmov, tagged) — each triple monomorphises the
     // kernel hot loop independently. A table is tagged only under the cmov
-    // probe (see `reset`), so the tagged branch-probe copies are never built.
-    // `_` is unreachable: `FastHashTable::new` rejects mls outside 4..=8 at
-    // construction.
+    // probe (see `reset`), so the branch probe dispatches to the bare kernel
+    // alone and no tagged branch-probe copy is built; the kernel asserts its
+    // slot format against the table's on entry. `_` is unreachable:
+    // `FastHashTable::new` rejects mls outside 4..=8 at construction.
     let tagged = hash_table.is_tagged();
     macro_rules! run {
         ($mls:literal, $cmov:literal, $tagged:literal) => {
@@ -2439,22 +2440,21 @@ fn run_fast_kernel_block(
         };
     }
     let result = match (mls, use_cmov, tagged) {
-        (4, false, false) => run!(4, false, false),
+        (4, false, _) => run!(4, false, false),
         (4, true, false) => run!(4, true, false),
         (4, true, true) => run!(4, true, true),
-        (5, false, false) => run!(5, false, false),
+        (5, false, _) => run!(5, false, false),
         (5, true, false) => run!(5, true, false),
         (5, true, true) => run!(5, true, true),
-        (6, false, false) => run!(6, false, false),
+        (6, false, _) => run!(6, false, false),
         (6, true, false) => run!(6, true, false),
         (6, true, true) => run!(6, true, true),
-        (7, false, false) => run!(7, false, false),
+        (7, false, _) => run!(7, false, false),
         (7, true, false) => run!(7, true, false),
         (7, true, true) => run!(7, true, true),
-        (8, false, false) => run!(8, false, false),
+        (8, false, _) => run!(8, false, false),
         (8, true, false) => run!(8, true, false),
         (8, true, true) => run!(8, true, true),
-        (_, false, true) => unreachable!("a tagged table under the branch probe"),
         _ => unreachable!(
             "FastHashTable construction rejects mls outside 4..=8 — \
              got mls={mls} which means the table was bypassed",
