@@ -666,10 +666,13 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             step <= MAX_STEP_SIZE + data.len() / K_STEP_INCR + 1,
             "scan step {step} past the bound that keeps position sums from wrapping"
         );
-        let mut ip1 = ip0 + 1;
+        // Upstream zstd's four cursors are two pairs of adjacent positions,
+        // `ip1 == ip0 + 1` and `ip3 == ip2 + 1`, at every iteration boundary,
+        // so the scan carries only `ip0` and `ip2` and derives the others
+        // where they are used: rotating four cursors through registers costs
+        // a move per cursor per half-iteration.
         let mut ip2 = ip0 + step;
-        let mut ip3 = ip2 + 1;
-        if ip3 > ilimit {
+        if ip2 + 1 > ilimit {
             break;
         }
 
@@ -678,15 +681,15 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
         // bytes at each `base + ip*`. MLS ≤ 8 matches hash_ptr's
         // contract.
         let mut hash0 = unsafe { hash_ptr_raw::<MLS>(base.add(ip0), hlog) };
-        let mut hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip1), hlog) };
+        let mut hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip0 + 1), hlog) };
         // The slot word probed for the current ip0, tagged or bare.
         let mut match_idx = unsafe { *table.get_unchecked(slot_index::<TAGGED>(hash0)) };
         ktrace!(
             "OUTER ip0={} ip1={} ip2={} ip3={} step={} hash0={} hash1={} match_idx={} rep1={} rep2={}",
             ip0,
-            ip1,
+            ip0 + 1,
             ip2,
-            ip3,
+            ip2 + 1,
             step,
             hash0,
             hash1,
@@ -780,10 +783,10 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
                 // Safe writeback for hash1 — ip1 is BEFORE ip2 (the
                 // match site), so its position won't conflict with
                 // the match's forward extension. Upstream zstd lines 286-287.
-                ktrace!("PUT hash1={} pos={} (rep-emit post)", hash1, ip1);
+                ktrace!("PUT hash1={} pos={} (rep-emit post)", hash1, ip0 + 1);
                 unsafe {
                     *table.get_unchecked_mut(slot_index::<TAGGED>(hash1)) =
-                        slot_value::<TAGGED>(ip1, hash1)
+                        slot_value::<TAGGED>(ip0 + 1, hash1)
                 };
                 ktrace!(
                     "MATCH rep new_ip={} match0={} m_len={} offset={}",
@@ -816,10 +819,10 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             } {
                 // Safe writeback for hash1 (ip1 = ip0 + 1, before
                 // search resumption). Upstream zstd line 296.
-                ktrace!("PUT hash1={} pos={} (explicit1 post)", hash1, ip1);
+                ktrace!("PUT hash1={} pos={} (explicit1 post)", hash1, ip0 + 1);
                 unsafe {
                     *table.get_unchecked_mut(slot_index::<TAGGED>(hash1)) =
-                        slot_value::<TAGGED>(ip1, hash1)
+                        slot_value::<TAGGED>(ip0 + 1, hash1)
                 };
                 ktrace!(
                     "MATCH explicit1 ip0={} match_idx={} offset={}",
@@ -842,9 +845,9 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             match_idx = unsafe { *table.get_unchecked(slot_index::<TAGGED>(hash1)) };
             hash0 = hash1;
             hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip2), hlog) };
-            ip0 = ip1;
-            ip1 = ip2;
-            ip2 = ip3;
+            // Upstream's `ip0 = ip1; ip1 = ip2; ip2 = ip3`: from here to the
+            // second shift its `ip1` is `ip2` and its `ip2` is `ip2 + 1`.
+            ip0 += 1;
 
             // Writeback for new ip0. Upstream zstd lines 314-315.
             ktrace!("PUT hash0={} pos={} (post-shift1)", hash0, ip0);
@@ -870,10 +873,10 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
                 // (upstream zstd lines 319-324) — otherwise ip1 might fall
                 // past the match start when we resume scanning.
                 if step <= 4 {
-                    ktrace!("PUT hash1={} pos={} (explicit2 post, step<=4)", hash1, ip1);
+                    ktrace!("PUT hash1={} pos={} (explicit2 post, step<=4)", hash1, ip2);
                     unsafe {
                         *table.get_unchecked_mut(slot_index::<TAGGED>(hash1)) =
-                            slot_value::<TAGGED>(ip1, hash1)
+                            slot_value::<TAGGED>(ip2, hash1)
                     };
                 }
                 ktrace!(
@@ -895,12 +898,13 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             // in. Upstream zstd lines 329-339.
             match_idx = unsafe { *table.get_unchecked(slot_index::<TAGGED>(hash1)) };
             hash0 = hash1;
-            hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip2), hlog) };
-            ip0 = ip1;
-            ip1 = ip2;
-            // Cannot wrap, by the bound given at the loop head.
+            hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip2 + 1), hlog) };
+            // Upstream's `ip0 = ip1; ip1 = ip2; ip2 = ip0 + step;
+            // ip3 = ip1 + step`, which leaves `ip1 == ip0 + 1` and
+            // `ip3 == ip2 + 1` again. Cannot wrap, by the bound given at the
+            // loop head.
+            ip0 = ip2;
             ip2 = ip0 + step;
-            ip3 = ip1 + step;
 
             // Step-doubling: upstream zstd lines 342-347. Drives the
             // kSearchStrength-based acceleration on incompressible
@@ -916,13 +920,13 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
                 // two. A prefetch never faults, and `wrapping_add` keeps an
                 // address past the buffer end a plain value, not a pointer
                 // offset out of bounds.
-                crate::decoding::prefetch::prefetch_l1_at(base.wrapping_add(ip1 + 64));
-                crate::decoding::prefetch::prefetch_l1_at(base.wrapping_add(ip1 + 128));
+                crate::decoding::prefetch::prefetch_l1_at(base.wrapping_add(ip0 + 1 + 64));
+                crate::decoding::prefetch::prefetch_l1_at(base.wrapping_add(ip0 + 1 + 128));
                 next_step += K_STEP_INCR;
             }
 
             // do-while termination: if ip3 walks past ilimit, drain.
-            if ip3 > ilimit {
+            if ip2 + 1 > ilimit {
                 break None;
             }
         };
