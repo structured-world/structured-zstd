@@ -34,6 +34,122 @@ fn drain_with_read(
     }
 }
 
+/// One compressed frame of `payload`.
+fn frame_of(payload: &[u8]) -> alloc::vec::Vec<u8> {
+    crate::encoding::compress_to_vec(payload, crate::encoding::CompressionLevel::Fastest)
+}
+
+/// A skippable frame (RFC 8878 3.1.2) carrying `payload`.
+fn skippable_frame(payload: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut f = alloc::vec![0x50, 0x2A, 0x4D, 0x18];
+    f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// RFC 8878 3: a stream is one or more frames. Plain `read`, the path
+/// `io::copy` takes, must deliver every frame's content, not stop at the end
+/// of the first one.
+#[test]
+fn read_continues_into_following_frames() {
+    let mut stream = frame_of(b"first frame, ");
+    stream.extend(frame_of(b"second frame, "));
+    stream.extend(frame_of(b"third"));
+    let decoder = StreamingDecoder::new(stream.as_slice()).unwrap();
+    assert_eq!(
+        drain_with_read(decoder).unwrap(),
+        b"first frame, second frame, third"
+    );
+}
+
+/// Skippable frames carry no content and are skipped wherever they stand,
+/// first in the stream included; a skippable frame last ends the stream
+/// cleanly.
+#[test]
+fn read_skips_skippable_frames_anywhere_in_the_stream() {
+    let mut stream = skippable_frame(b"leading metadata");
+    stream.extend(frame_of(b"one "));
+    stream.extend(skippable_frame(b""));
+    stream.extend(frame_of(b"two"));
+    stream.extend(skippable_frame(b"trailer"));
+    let decoder = StreamingDecoder::new(stream.as_slice()).unwrap();
+    assert_eq!(drain_with_read(decoder).unwrap(), b"one two");
+}
+
+/// A stream of skippable frames alone holds no content: it decodes to
+/// nothing, through `read` and through `read_to_end`, as upstream decodes it.
+#[test]
+fn a_stream_of_only_skippable_frames_decodes_to_nothing() {
+    let mut stream = skippable_frame(b"first");
+    stream.extend(skippable_frame(b"second"));
+    let decoder = StreamingDecoder::new(stream.as_slice()).unwrap();
+    assert!(drain_with_read(decoder).unwrap().is_empty());
+    let mut decoder = StreamingDecoder::new(stream.as_slice()).unwrap();
+    let mut out = alloc::vec::Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    assert!(out.is_empty());
+}
+
+/// Bytes after the last frame that do not form a frame are an error, not a
+/// clean end of stream.
+#[test]
+fn read_rejects_bytes_after_the_last_frame_that_are_not_a_frame() {
+    let mut stream = frame_of(b"payload");
+    stream.extend_from_slice(b"not a frame");
+    let decoder = StreamingDecoder::new(stream.as_slice()).unwrap();
+    assert!(drain_with_read(decoder).is_err());
+}
+
+/// A decoder built with a dictionary applies it to every frame, not just the
+/// first, as `read_to_end` already does.
+#[test]
+fn read_applies_the_constructor_dictionary_to_following_frames() {
+    use crate::decoding::{Dictionary, DictionaryHandle};
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    let content = b"shared words the frames reuse again and again".to_vec();
+    let handle = DictionaryHandle::from_dictionary(
+        Dictionary::from_raw_content(7, content.clone()).unwrap(),
+    );
+    let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor
+        .set_dictionary(Dictionary::from_raw_content(7, content).unwrap())
+        .unwrap();
+    let mut stream = compressor.compress_independent_frame(b"the frames reuse words");
+    stream.extend(compressor.compress_independent_frame(b" and again the shared words"));
+    let decoder = StreamingDecoder::new_with_dictionary_handle(stream.as_slice(), &handle).unwrap();
+    assert_eq!(
+        drain_with_read(decoder).unwrap(),
+        b"the frames reuse words and again the shared words"
+    );
+}
+
+/// A source that hands out its bytes and then reports that nothing more is
+/// available yet, as an open pipe or socket would.
+struct OpenPipe<'a> {
+    data: &'a [u8],
+}
+
+impl Read for OpenPipe<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, crate::io::Error> {
+        if self.data.is_empty() {
+            return Err(crate::io::Error::from(crate::io::ErrorKind::WouldBlock));
+        }
+        self.data.read(buf)
+    }
+}
+
+/// `read` stays a stream: a finished frame's bytes are delivered without
+/// first waiting for the next frame's header from a source that is still
+/// open.
+#[test]
+fn read_delivers_a_finished_frame_before_the_next_frame_arrives() {
+    let frame = frame_of(b"complete frame");
+    let mut decoder = StreamingDecoder::new(OpenPipe { data: &frame }).unwrap();
+    let mut buf = [0u8; 64];
+    let n = decoder.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"complete frame");
+}
+
 /// RFC 8878 3.1.1.1.4: when `Frame_Content_Size` is present the decompressed
 /// data must be exactly that long. A frame that declares 64 MiB and produces
 /// nothing must end the stream with an error, not a clean `Ok(0)` EOF that
