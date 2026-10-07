@@ -56,8 +56,9 @@ jobs:
       rust_core: ${{ steps.filter.outputs.rust_core }}
       # Only a pull request can be docs-only here: pushes of documentation do
       # not start the workflow, and a manual run always builds.
-      # The root README is the crate's rustdoc page (zstd/README.md links to
-      # it) and its code blocks run as doctests, so changing it is code.
+      # The root README is the crate's rustdoc page and its code blocks run as
+      # doctests; zstd/README.md, the symlink to it, is what include_str! and
+      # the packaged crate read. Changing either is code.
       code: ${{ github.event_name != 'pull_request' || steps.code.outputs.code == 'true' || steps.filter.outputs.readme == 'true' }}
     steps:
       - uses: actions/checkout@v7
@@ -95,6 +96,7 @@ jobs:
               - 'rust-toolchain.toml'
             readme:
               - 'README.md'
+              - 'zstd/README.md'
 
   lint:
     # Skipped on a docs-only pull request; every job that needs `lint` is
@@ -342,9 +344,11 @@ jobs:
   test:
     # A skipped matrix job reports one check named `test`, not the
     # `test (<os>)` checks the branch requires. So the job always runs unless
-    # lint failed, and on a docs-only pull request its steps are skipped.
+    # lint failed, and on a docs-only pull request its steps are skipped. It
+    # does not run when path detection failed: an empty `code` output must not
+    # read as docs-only.
     needs: [changes, lint]
-    if: ${{ !cancelled() && needs.lint.result != 'failure' }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.lint.result != 'failure' }}
     timeout-minutes: 15
     strategy:
       # Each OS hits its own runner-image regressions (macos-latest currently
