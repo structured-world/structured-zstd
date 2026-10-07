@@ -11,18 +11,37 @@ cd structured-zstd
 cargo build -p structured-zstd --features hash,std,dict-builder
 ```
 
+Tests run under [cargo-nextest](https://nexte.st/), which is not part of the
+Rust toolchain:
+
+```bash
+cargo install cargo-nextest --locked
+```
+
 Before opening a pull request, run what CI runs:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy -p structured-zstd --features hash,std,dict-builder -- -D warnings
-cargo nextest run -p structured-zstd --features hash,std,dict-builder
+cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder
 cargo test --doc -p structured-zstd --features hash,std,dict-builder
 cargo clippy -p structured-zstd --no-default-features -- -D warnings
+cargo clippy -p structured-zstd --no-default-features --features hash -- -D warnings
 ```
 
-The comparison against the C reference (`ffi-bench`) needs
-`--features bench-internals,dict-builder`.
+The parity and cross-validation tests against the C reference live in
+`ffi-bench`:
+
+```bash
+cargo nextest run --profile ci -p ffi-bench --features bench-internals,dict-builder
+```
+
+The timing comparison against the C reference is built without
+`bench-internals`, so that it measures the same build a user of the crate gets:
+
+```bash
+cargo bench -p ffi-bench --bench compare_ffi
+```
 
 ## Pull requests
 

@@ -48,6 +48,10 @@ jobs:
     # cascade) is skipped on such pushes — see the gate on that job.
     name: Detect changed paths
     runs-on: ubuntu-latest
+    # On a pull request the path filters list its files through the API.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       rust_core: ${{ steps.filter.outputs.rust_core }}
       # Only a pull request can be docs-only here: pushes of documentation do
@@ -735,6 +739,8 @@ jobs:
         # the same input that originally surfaced it.
         working-directory: zstd/fuzz
         run: |
+          # The glob below must see the same entries as the emptiness test.
+          shopt -s dotglob
           for target in $FUZZ_TARGETS; do
             if [ -d "artifacts/$target" ] && [ -n "$(find "artifacts/$target" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
               echo "Replaying $(find "artifacts/$target" -mindepth 1 -maxdepth 1 | wc -l) regression artifacts for $target"
