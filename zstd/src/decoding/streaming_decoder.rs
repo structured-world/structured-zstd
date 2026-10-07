@@ -61,18 +61,17 @@ pub struct StreamingDecoder<READ: Read, DEC: BorrowMut<FrameDecoder>> {
     input: Input,
 }
 
-/// Room for any block (at most `MAX_BLOCK_SIZE` of content behind a 3-byte
-/// header) with its trailing checksum, twice over, so the source is read in
-/// large chunks.
-const INPUT_SIZE: usize = 2 * MAX_BLOCK_SIZE as usize;
+/// The most of a skippable frame's content read in one step.
+const SKIP_CHUNK: u32 = 8 * 1024;
 
-/// Source bytes read ahead of the decoder, the way upstream zstd's
-/// `ZSTD_decompressStream` buffers input until the next step's whole input is
-/// there. A block is decoded only once it is all in hand, a frame header only
-/// once it is complete, so a non-blocking source that returns `WouldBlock`
-/// part-way through either loses nothing: the next read continues from here.
+/// Source bytes of the decoder's next step, gathered the way upstream zstd's
+/// `ZSTD_decompressStream` loads `nextSrcSizeToDecompress` bytes: exactly the
+/// next frame header, block or checksum, and nothing past it. A step is decoded
+/// only once it is all in hand, so a non-blocking source that returns
+/// `WouldBlock` part-way through loses nothing, and the source never stands
+/// beyond what the decoder has taken.
 struct Input {
-    /// Zero-filled once, on the first read; holds the pending bytes at
+    /// Grown to the largest step seen; holds the pending bytes at
     /// `start..end`.
     buf: alloc::vec::Vec<u8>,
     start: usize,
@@ -113,24 +112,25 @@ impl Input {
         }
     }
 
-    /// Read more of `source` behind the pending bytes. `Ok(0)` is its end;
-    /// its errors come back as it reported them, `Interrupted` retried.
-    fn fill<R: Read>(&mut self, source: &mut R) -> Result<usize, Error> {
-        if self.buf.is_empty() {
-            self.buf = alloc::vec![0; INPUT_SIZE];
-        }
+    /// Read more of `source` behind the pending bytes, up to `want` pending in
+    /// all and no further. `Ok(0)` is its end; its errors come back as it
+    /// reported them, `Interrupted` retried.
+    fn fill<R: Read>(&mut self, source: &mut R, want: usize) -> Result<usize, Error> {
+        // Pending bytes are an unfinished step, which reads stop at, so they
+        // are rarely moved; when they are, they are less than one step.
         if self.start > 0 {
             self.buf.copy_within(self.start..self.end, 0);
             self.end -= self.start;
             self.start = 0;
         }
-        // A whole block or header always fits with room to spare, and the
-        // decoder takes one as soon as it is whole, so the buffer never fills.
-        // Were it full, the empty read below would return `Ok(0)` and the
-        // end-of-input path would report the stream.
-        debug_assert!(self.end < self.buf.len(), "input full without progress");
+        debug_assert!(self.end < want, "a fill must ask for more than is pending");
+        if self.buf.len() < want {
+            // Doubling keeps a stream of growing blocks to a few allocations.
+            let len = want.max(2 * self.buf.len());
+            self.buf.resize(len, 0);
+        }
         loop {
-            match source.read(&mut self.buf[self.end..]) {
+            match source.read(&mut self.buf[self.end..want]) {
                 Ok(n) => {
                     self.end += n;
                     return Ok(n);
@@ -144,26 +144,33 @@ impl Input {
 
 /// How much of a frame header `bytes` says there is to read: 4 for the magic,
 /// 8 for a skippable frame's header, and for a frame its descriptor's fields.
-/// A magic that is neither stops at 4, where the parser rejects it.
-fn header_len(bytes: &[u8]) -> usize {
-    let Some(magic) = bytes.first_chunk::<4>() else {
-        return 4;
+/// A magic that is neither stops at 4, where the parser rejects it. A
+/// magicless frame (`ZSTD_f_zstd1_magicless`) starts at its descriptor and
+/// has no skippable form.
+fn header_len(bytes: &[u8], magicless: bool) -> usize {
+    let descriptor_at = if magicless {
+        0
+    } else {
+        let Some(magic) = bytes.first_chunk::<4>() else {
+            return 4;
+        };
+        let magic = u32::from_le_bytes(*magic);
+        if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
+            return 8;
+        }
+        if magic != crate::common::MAGIC_NUM {
+            return 4;
+        }
+        4
     };
-    let magic = u32::from_le_bytes(*magic);
-    if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
-        return 8;
-    }
-    if magic != crate::common::MAGIC_NUM {
-        return 4;
-    }
-    let Some(&descriptor) = bytes.get(4) else {
-        return 5;
+    let Some(&descriptor) = bytes.get(descriptor_at) else {
+        return descriptor_at + 1;
     };
     let descriptor = crate::decoding::frame::FrameDescriptor(descriptor);
     let window = usize::from(!descriptor.single_segment_flag());
     let dict = descriptor.dictionary_id_bytes().map_or(0, usize::from);
     let fcs = descriptor.frame_content_size_bytes().map_or(0, usize::from);
-    5 + window + dict + fcs
+    descriptor_at + 1 + window + dict + fcs
 }
 
 impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
@@ -306,6 +313,10 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
     }
 
     /// Destructures this object into the inner reader.
+    ///
+    /// The decoder reads only what its next step needs, so once a frame's
+    /// content has been delivered the reader stands right after that frame.
+    /// Bytes of a step a `WouldBlock` left unfinished stay with the decoder.
     pub fn into_inner(self) -> READ
     where
         READ: Sized,
@@ -354,13 +365,19 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
         } else {
             FrameStart::Plain
         };
+        let magicless = self.decoder.borrow_mut().is_magicless();
         loop {
             while self.input.skip_left > 0 {
-                if self.input.pending().is_empty() && self.input.fill(&mut self.source)? == 0 {
+                // Counted in the wire's `u32`; a step is at most `SKIP_CHUNK`,
+                // which every `usize` holds.
+                let step = self.input.skip_left.min(SKIP_CHUNK);
+                if self.input.pending().is_empty()
+                    && self.input.fill(&mut self.source, step as usize)? == 0
+                {
                     return Err(frame_error(FrameDecoderError::FailedToSkipFrame));
                 }
-                // Counted in the wire's `u32`; the pending length is at most
-                // `INPUT_SIZE`, which a `u32` holds.
+                // Reads stop at `step`, so what is pending is skippable content;
+                // the minimum is taken in `u32`, the wire's width.
                 let pending = u32::try_from(self.input.pending().len()).unwrap_or(u32::MAX);
                 let take = self.input.skip_left.min(pending);
                 self.input.consume(take as usize);
@@ -368,10 +385,11 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
             }
             loop {
                 let have = self.input.pending().len();
-                if have >= header_len(self.input.pending()) {
+                let want = header_len(self.input.pending(), magicless);
+                if have >= want {
                     break;
                 }
-                if self.input.fill(&mut self.source)? == 0 {
+                if self.input.fill(&mut self.source, want)? == 0 {
                     if have == 0 {
                         return Ok(false);
                     }
@@ -580,12 +598,18 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             if consumed > 0 || produced > 0 {
                 continue;
             }
-            // The next block is not all in hand. Return what this call has
+            // The next step is not all in hand. Return what this call has
             // rather than wait on the source for it.
             if written > 0 {
                 return Ok(written);
             }
-            if self.input.fill(&mut self.source)? == 0 {
+            let want = decoder.input_needed(self.input.pending());
+            // A step whose input is all here yet decodes nothing (a block over
+            // the frame's maximum, say) is a damaged frame: report it.
+            if want <= self.input.pending().len() {
+                return Err(self.cut_short());
+            }
+            if self.input.fill(&mut self.source, want)? == 0 {
                 return Err(self.cut_short());
             }
         }

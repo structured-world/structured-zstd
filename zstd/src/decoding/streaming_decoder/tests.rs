@@ -223,6 +223,98 @@ fn read_resumes_wherever_a_would_block_interrupts_it() {
     assert!(out == expected, "decoded {} bytes", out.len());
 }
 
+/// Magicless frames carry no magic number, so the next frame's header is as
+/// long as its descriptor says from its first byte. A ten-byte magicless
+/// header (window descriptor and an eight-byte content size) handed over a
+/// byte at a time between `WouldBlock`s must still start the frame.
+#[test]
+fn read_continues_into_following_magicless_frames() {
+    let first = frame_declaring(5, false, b"first");
+    let second = frame_declaring(6, false, b"second");
+    let mut stream = first[4..].to_vec();
+    let first_len = stream.len();
+    stream.extend_from_slice(&second[4..]);
+
+    struct Staged<'a> {
+        head: &'a [u8],
+        tail: Trickle<'a>,
+    }
+    impl Read for Staged<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, crate::io::Error> {
+            if self.head.is_empty() {
+                self.tail.read(buf)
+            } else {
+                self.head.read(buf)
+            }
+        }
+    }
+
+    let mut frame_decoder = crate::decoding::FrameDecoder::new();
+    frame_decoder.set_magicless(true);
+    let staged = Staged {
+        head: &stream[..first_len],
+        tail: Trickle {
+            data: &stream[first_len..],
+            block_next: false,
+        },
+    };
+    let mut decoder = StreamingDecoder::new_with_decoder(staged, frame_decoder).unwrap();
+    let mut out = alloc::vec::Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        match decoder.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == crate::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("magicless frames must decode in turn: {e:?}"),
+        }
+    }
+    assert_eq!(out, b"firstsecond");
+}
+
+/// The reader takes from its source only what the next step of the frame
+/// needs, as upstream's `ZSTD_decompressStream` loads only the next step's
+/// input. Once a frame's content is delivered the source stands right after
+/// that frame, so `into_inner` hands back the rest of the stream untouched.
+#[test]
+fn into_inner_after_a_frame_returns_the_rest_of_the_source() {
+    let payload = b"one frame of content";
+    let mut stream = frame_of(payload);
+    stream.extend_from_slice(b"bytes after the frame");
+    let mut decoder = StreamingDecoder::new(stream.as_slice()).unwrap();
+    let mut out = [0u8; 20];
+    decoder.read_exact(&mut out).unwrap();
+    assert_eq!(&out, payload);
+    assert_eq!(decoder.into_inner(), b"bytes after the frame");
+}
+
+/// A small frame is read into a buffer the size of its block, not one sized
+/// for the largest block any frame may hold.
+#[test]
+fn a_small_frame_buffers_no_more_than_its_block() {
+    let payload: alloc::vec::Vec<u8> = (0..1000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    let frame = frame_of(&payload);
+    let mut decoder = StreamingDecoder::new(frame.as_slice()).unwrap();
+    let mut out = alloc::vec::Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let n = decoder.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(out, payload);
+    assert!(
+        decoder.input.buf.len() <= frame.len(),
+        "a {}-byte frame used a {}-byte input buffer",
+        frame.len(),
+        decoder.input.buf.len()
+    );
+}
+
 /// A source that reports `Interrupted` before every read it serves, so each
 /// read path's retry runs: the header reads, the skip of a skippable frame,
 /// the boundary probe and the input fill.

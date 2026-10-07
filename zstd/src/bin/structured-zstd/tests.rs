@@ -4103,6 +4103,27 @@ fn plain_input_is_passed_through_or_refused() {
         .to_string();
     assert!(err.contains("invalid zstd frame"), "{err}");
 
+    // A source that fails where the next frame would start is a read failure,
+    // not a stump of a header: "unknown header" is for input that ends there.
+    struct FailsAfter<'a> {
+        data: &'a [u8],
+    }
+    impl Read for FailsAfter<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.data.is_empty() {
+                return Err(io::Error::other("device went away"));
+            }
+            self.data.read(buf)
+        }
+    }
+    let mut skippable = 0x184D_2A50u32.to_le_bytes().to_vec();
+    skippable.extend_from_slice(&0u32.to_le_bytes());
+    let source = FailsAfter { data: &skippable };
+    let err = decompress_stream(source, io::sink(), &mut no_dict(), &pass)
+        .expect_err("a failing source is refused")
+        .to_string();
+    assert!(err.contains("failed to read the input"), "{err}");
+
     // The default follows the reference command: on when forced and writing
     // to stdout (`zstd -dcf`), off otherwise.
     assert!(DecodeSettings::from_options(&parse(&["-dcf", "f"]).unwrap()).pass_through);

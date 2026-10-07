@@ -1334,6 +1334,48 @@ impl FrameDecoder {
         self.magicless = magicless;
     }
 
+    /// Whether frame headers are read without the magic number.
+    pub(crate) fn is_magicless(&self) -> bool {
+        self.magicless
+    }
+
+    /// How many bytes from the start of `pending` the current frame's next
+    /// step needs in hand: a block header, a whole block, or the trailing
+    /// checksum; 0 once the frame wants no more input. Upstream zstd's
+    /// `ZSTD_nextSrcSizeToDecompress`. A block stating more than the frame's
+    /// block maximum needs only its header, whose decode then reports it.
+    pub(crate) fn input_needed(&self, pending: &[u8]) -> usize {
+        let Some(state) = self.state.as_ref() else {
+            return 0;
+        };
+        if state.frame_finished {
+            let checksum_due =
+                state.frame_header.descriptor.content_checksum_flag() && state.check_sum.is_none();
+            return if checksum_due { 4 } else { 0 };
+        }
+        let Some(&[b0, b1, b2]) = pending.first_chunk::<3>() else {
+            return 3;
+        };
+        // RFC 8878 3.1.1.2: Last_Block (bit 0), Block_Type (bits 1-2),
+        // Block_Size (bits 3-23); an RLE block carries one byte of content.
+        let header = u32::from_le_bytes([b0, b1, b2, 0]);
+        let body = if (header >> 1) & 3 == 1 {
+            1
+        } else {
+            (header >> 3) as usize
+        };
+        // A window wider than the address space cannot bound a block below
+        // the 128 KiB maximum, so it counts as unbounded here.
+        let window = state
+            .frame_header
+            .window_size()
+            .map_or(usize::MAX, |w| usize::try_from(w).unwrap_or(usize::MAX));
+        if body > decoding::block_decoder::block_maximum(window) {
+            return 3;
+        }
+        3 + body
+    }
+
     #[cfg(target_has_atomic = "ptr")]
     fn shared_dict_exists(&self, dict_id: u32) -> bool {
         self.shared_dicts.contains_key(&dict_id)

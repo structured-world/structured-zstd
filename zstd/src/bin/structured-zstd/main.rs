@@ -5230,10 +5230,23 @@ fn decompress_stream<R: Read, W: Write>(
         // what follows either is reported the same way.
         let mut decoder = match built {
             Ok(decoder) => decoder,
-            Err(err) => match after_frame_message(&err) {
-                Some(message) => bail!("{message}"),
-                None => bail!("invalid zstd frame: {err:?}"),
-            },
+            Err(err) => {
+                // A source that fails where a frame would start is a read
+                // failure, whatever the parser was reading at the time.
+                if let FrameDecoderError::ReadFrameHeaderError(
+                    structured_zstd::decoding::errors::ReadFrameHeaderError::MagicNumberReadError(
+                        e,
+                    ),
+                ) = &err
+                    && e.kind() != io::ErrorKind::UnexpectedEof
+                {
+                    bail!("failed to read the input: {e}");
+                }
+                match after_frame_message(&err) {
+                    Some(message) => bail!("{message}"),
+                    None => bail!("invalid zstd frame: {err:?}"),
+                }
+            }
         };
         // The library computes the digest but does not compare it, leaving the
         // decision to the caller. For a command-line tool that decision is
@@ -5269,7 +5282,8 @@ fn decompress_stream<R: Read, W: Write>(
 
 /// The reference command's message for what follows a frame and is not one:
 /// fewer than four bytes, a magic number that is no frame's, or a skippable
-/// frame cut short. `None` for a damaged frame.
+/// frame cut short. `None` for a damaged frame, and for a source that failed
+/// rather than ended.
 fn after_frame_message(
     err: &structured_zstd::decoding::errors::FrameDecoderError,
 ) -> Option<&'static str> {
@@ -5278,7 +5292,9 @@ fn after_frame_message(
         FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(_)) => {
             Some("unsupported format")
         }
-        FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::MagicNumberReadError(_)) => {
+        FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::MagicNumberReadError(e))
+            if e.kind() == io::ErrorKind::UnexpectedEof =>
+        {
             Some("unknown header")
         }
         FrameDecoderError::FailedToSkipFrame => Some("skippable frame is truncated"),
