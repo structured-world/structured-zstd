@@ -569,9 +569,11 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             }
             // Decode the whole blocks the input holds, handing output to `buf`
             // block by block: the decode window stays one window plus one
-            // block, as upstream's flush loop keeps it.
+            // block, as upstream's flush loop keeps it. The buffer takes the
+            // whole window at the first block whatever the frame declares, as
+            // upstream sizes a stream's buffer from the window.
             let (consumed, produced) = decoder
-                .decode_available(self.input.pending(), &mut buf[written..])
+                .decode_available(self.input.pending(), &mut buf[written..], true)
                 .map_err(frame_error)?;
             self.input.consume(consumed);
             written += produced;

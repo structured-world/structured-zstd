@@ -2525,7 +2525,7 @@ impl FrameDecoder {
         source: &[u8],
         target: &mut [u8],
     ) -> Result<(usize, usize), FrameDecoderError> {
-        let progress = self.decode_available(source, target)?;
+        let progress = self.decode_available(source, target, false)?;
         // Once the frame is fully decoded and drained, its length and running
         // digest are final: check the declared size, and the checksum in
         // `Verify` mode (no-op otherwise).
@@ -2540,11 +2540,13 @@ impl FrameDecoder {
     /// [`Self::decode_from_to`] without its finish-point checks, for a caller
     /// that must not report an error in the same call that delivered bytes
     /// (a `Read` adapter) and so runs them itself on a call that delivers
-    /// none.
+    /// none. `reserve_window` sizes the buffer for a frame of unknown size to
+    /// its window at its first block instead of letting it grow.
     pub(crate) fn decode_available(
         &mut self,
         source: &[u8],
         target: &mut [u8],
+        reserve_window: bool,
     ) -> Result<(usize, usize), FrameDecoderError> {
         use FrameDecoderError as err;
         let bytes_read_at_start = match &self.state {
@@ -2655,9 +2657,15 @@ impl FrameDecoder {
                     // and page-fault passes per frame. Not on the header alone,
                     // which would let a header followed by nothing reserve its
                     // whole declared window. The size is content-capped, so a
-                    // small frame gets a small buffer; a frame of unknown size
-                    // keeps growing lazily rather than paying for its window.
-                    if state.block_counter == 0 && state.frame_header.fcs_declared() {
+                    // small frame gets a small buffer. A frame of unknown size
+                    // gets its window only when the caller asked for it: the
+                    // `Read` adapter does, as `decode_blocks` always has, since
+                    // growing a large frame by doubling copies it several times;
+                    // the slice API leaves it to grow, so a small unsized frame
+                    // does not pay for a window it never fills.
+                    if state.block_counter == 0
+                        && (reserve_window || state.frame_header.fcs_declared())
+                    {
                         state.reserve_decoding_buffer();
                     }
 
