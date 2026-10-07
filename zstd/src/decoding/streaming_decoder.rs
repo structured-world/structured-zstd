@@ -59,6 +59,53 @@ pub struct StreamingDecoder<READ: Read, DEC: BorrowMut<FrameDecoder>> {
     /// frames): every read from here on is the end of the stream, without
     /// asking the source again.
     exhausted: bool,
+    /// What a frame boundary has read so far, kept across a non-blocking
+    /// source's `WouldBlock` so that retrying resumes rather than restarts.
+    boundary: Boundary,
+}
+
+/// The longest frame header (RFC 8878 3.1.1.1): magic, descriptor, window
+/// descriptor, a 4-byte dictionary id and an 8-byte content size.
+const MAX_FRAME_HEADER: usize = 4 + 1 + 1 + 4 + 8;
+
+/// A frame boundary in progress: the bytes of the next header read so far, and
+/// the content of a skippable frame still to step over.
+#[derive(Default)]
+struct Boundary {
+    header: [u8; MAX_FRAME_HEADER],
+    have: usize,
+    skip_left: u32,
+}
+
+impl Boundary {
+    /// The length of the header whose first `self.have` bytes are in hand, or
+    /// of as much of it as those bytes can tell: the magic decides a
+    /// skippable frame's 8 bytes, a frame's descriptor decides the rest.
+    fn header_len(&self) -> usize {
+        if self.have < 4 {
+            return 4;
+        }
+        let magic = u32::from_le_bytes([
+            self.header[0],
+            self.header[1],
+            self.header[2],
+            self.header[3],
+        ]);
+        if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
+            return 8;
+        }
+        if magic != crate::common::MAGIC_NUM {
+            return 4;
+        }
+        if self.have < 5 {
+            return 5;
+        }
+        let descriptor = crate::decoding::frame::FrameDescriptor(self.header[4]);
+        let window = usize::from(!descriptor.single_segment_flag());
+        let dict = descriptor.dictionary_id_bytes().map_or(0, usize::from);
+        let fcs = descriptor.frame_content_size_bytes().map_or(0, usize::from);
+        5 + window + dict + fcs
+    }
 }
 
 impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
@@ -72,6 +119,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
             source,
             forced_dictionary: false,
             exhausted: !started,
+            boundary: Boundary::default(),
         })
     }
 
@@ -122,6 +170,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
             source,
             forced_dictionary: true,
             exhausted: !started,
+            boundary: Boundary::default(),
         })
     }
 }
@@ -137,6 +186,7 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
             source,
             forced_dictionary: false,
             exhausted: !started,
+            boundary: Boundary::default(),
         })
     }
 
@@ -222,6 +272,11 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
     /// frames, with the constructor's dictionary if it had one. `false` when
     /// the source ends cleanly at the frame boundary; anything else that is
     /// not a frame is an error.
+    ///
+    /// The source's own errors go back as it reported them, so a non-blocking
+    /// source's `WouldBlock` stays one, and what the boundary had read is kept
+    /// in [`Boundary`]: the header is parsed only once it is whole, so a retry
+    /// resumes where the source stopped.
     fn start_next_frame(&mut self) -> Result<bool, Error> {
         let how = if self.forced_dictionary {
             FrameStart::HeldDictionary
@@ -229,25 +284,41 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
             FrameStart::Plain
         };
         loop {
-            // The probe's own error goes back as the source reported it, so a
-            // non-blocking source's `WouldBlock` stays one.
-            let mut probe = [0u8; 1];
-            if read_at_boundary(&mut self.source, &mut probe)? == 0 {
-                return Ok(false);
+            while self.boundary.skip_left > 0 {
+                let mut scratch = [0u8; 512];
+                // In `u32`, as the skippable length is: at most 512 after.
+                let take = self.boundary.skip_left.min(scratch.len() as u32) as usize;
+                match self.source.read(&mut scratch[..take]) {
+                    Ok(0) => return Err(frame_error(FrameDecoderError::FailedToSkipFrame)),
+                    // `n <= take <= skip_left`, so it fits the `u32` it is
+                    // taken from.
+                    Ok(n) => self.boundary.skip_left -= n as u32,
+                    Err(e) if e.kind() == crate::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
             }
-            let started = how.start(
-                self.decoder.borrow_mut(),
-                Prefixed {
-                    first: Some(probe[0]),
-                    inner: &mut self.source,
-                },
-            );
+            loop {
+                let want = self.boundary.header_len();
+                if self.boundary.have >= want {
+                    break;
+                }
+                let have = self.boundary.have;
+                match self.source.read(&mut self.boundary.header[have..want]) {
+                    Ok(0) if have == 0 => return Ok(false),
+                    // The source ended inside a header: let the parser report
+                    // it as it reports any header cut short.
+                    Ok(0) => break,
+                    Ok(n) => self.boundary.have += n,
+                    Err(e) if e.kind() == crate::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let have = core::mem::take(&mut self.boundary.have);
+            let started = how.start(self.decoder.borrow_mut(), &self.boundary.header[..have]);
             match started {
                 Ok(()) => return Ok(true),
                 Err(e) => match skippable_frame_length(&e) {
-                    Some(length) => {
-                        skip_frame_content(&mut self.source, length).map_err(frame_error)?
-                    }
+                    Some(length) => self.boundary.skip_left = length,
                     None => return Err(frame_error(e)),
                 },
             }
@@ -290,13 +361,17 @@ fn skippable_frame_length(e: &FrameDecoderError) -> Option<u32> {
 
 /// Read past a skippable frame's `length` content bytes.
 fn skip_frame_content<R: Read>(source: &mut R, length: u32) -> Result<(), FrameDecoderError> {
-    let mut left = length as usize;
+    // Counted in the wire's `u32`: a `usize` is 16 bits on some targets, and a
+    // truncated count would leave part of the content to be read as a header.
+    let mut left = length;
     let mut scratch = [0u8; 512];
     while left > 0 {
-        let take = left.min(scratch.len());
+        // The minimum is taken in `u32`, then fits `usize` as at most 512.
+        let take = left.min(scratch.len() as u32) as usize;
         match source.read(&mut scratch[..take]) {
             Ok(0) => return Err(FrameDecoderError::FailedToSkipFrame),
-            Ok(n) => left -= n,
+            // `n <= take <= left`, so it fits the `u32` it is taken from.
+            Ok(n) => left -= n as u32,
             Err(e) if e.kind() == crate::io::ErrorKind::Interrupted => {}
             Err(_) => return Err(FrameDecoderError::FailedToSkipFrame),
         }

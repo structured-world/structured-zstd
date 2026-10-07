@@ -4057,17 +4057,22 @@ fn plain_input_is_passed_through_or_refused() {
         .expect_err("a damaged frame after a good one is refused");
     assert_eq!(out, b"first");
 
-    // A skippable frame is a frame too: plain bytes after one are refused.
+    // A skippable frame is a frame too: plain bytes after one are refused,
+    // with the message they get after any other frame.
     let mut after_skippable = 0x184D_2A50u32.to_le_bytes().to_vec();
     after_skippable.extend_from_slice(&0u32.to_le_bytes());
-    after_skippable.extend_from_slice(b"plain");
-    decompress_stream(
-        after_skippable.as_slice(),
-        io::sink(),
-        &mut no_dict(),
-        &pass,
-    )
-    .expect_err("plain bytes after a skippable frame are refused");
+    let mut plain_after = after_skippable.clone();
+    plain_after.extend_from_slice(b"plain");
+    let err = decompress_stream(plain_after.as_slice(), io::sink(), &mut no_dict(), &pass)
+        .expect_err("plain bytes after a skippable frame are refused")
+        .to_string();
+    assert!(err.contains("unsupported format"), "{err}");
+    let mut stump_after = after_skippable;
+    stump_after.extend_from_slice(b"ab");
+    let err = decompress_stream(stump_after.as_slice(), io::sink(), &mut no_dict(), &pass)
+        .expect_err("a stump after a skippable frame is refused")
+        .to_string();
+    assert!(err.contains("unknown header"), "{err}");
 
     // The default follows the reference command: on when forced and writing
     // to stdout (`zstd -dcf`), off otherwise.

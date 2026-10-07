@@ -138,6 +138,84 @@ impl Read for OpenPipe<'_> {
     }
 }
 
+/// A non-blocking source that hands out one byte per call and reports
+/// `WouldBlock` on every other call, so every frame header, skippable frame
+/// and block arrives in pieces.
+struct Trickle<'a> {
+    data: &'a [u8],
+    block_next: bool,
+}
+
+impl Read for Trickle<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, crate::io::Error> {
+        self.block_next = !self.block_next;
+        if !self.block_next {
+            return Err(crate::io::Error::from(crate::io::ErrorKind::WouldBlock));
+        }
+        let n = buf.len().min(1).min(self.data.len());
+        buf[..n].copy_from_slice(&self.data[..n]);
+        self.data = &self.data[n..];
+        Ok(n)
+    }
+}
+
+/// A `WouldBlock` in the middle of a following frame's header, or of a
+/// skippable frame between frames, loses nothing: retrying the read picks
+/// up where the source stopped. Only the boundary is under test: the first
+/// frame is handed over whole, the skippable frame and the next frame's
+/// header trickle, and the next frame's blocks arrive whole again.
+#[test]
+fn read_resumes_a_frame_boundary_interrupted_by_would_block() {
+    let first = frame_of(b"first, ");
+    let skippable = skippable_frame(b"metadata between frames");
+    let second = frame_of(b"second");
+    let descriptor = crate::decoding::frame::FrameDescriptor(second[4]);
+    let second_header = 5
+        + usize::from(!descriptor.single_segment_flag())
+        + usize::from(descriptor.dictionary_id_bytes().unwrap())
+        + usize::from(descriptor.frame_content_size_bytes().unwrap());
+    let mut boundary = skippable.clone();
+    boundary.extend_from_slice(&second[..second_header]);
+
+    struct Staged<'a> {
+        head: &'a [u8],
+        boundary: Trickle<'a>,
+        tail: &'a [u8],
+    }
+    impl Read for Staged<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, crate::io::Error> {
+            if !self.head.is_empty() {
+                self.head.read(buf)
+            } else if !self.boundary.data.is_empty() {
+                self.boundary.read(buf)
+            } else {
+                self.tail.read(buf)
+            }
+        }
+    }
+
+    let staged = Staged {
+        head: &first,
+        boundary: Trickle {
+            data: &boundary,
+            block_next: false,
+        },
+        tail: &second[second_header..],
+    };
+    let mut decoder = StreamingDecoder::new(staged).unwrap();
+    let mut out = alloc::vec::Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        match decoder.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == crate::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("the stream must survive WouldBlock at a boundary: {e:?}"),
+        }
+    }
+    assert_eq!(out, b"first, second");
+}
+
 /// `read` stays a stream: a finished frame's bytes are delivered without
 /// first waiting for the next frame's header from a source that is still
 /// open.
