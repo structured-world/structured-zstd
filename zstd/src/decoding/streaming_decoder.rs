@@ -585,11 +585,25 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             if written == buf.len() {
                 return Ok(written);
             }
-            // Decode the whole blocks the input holds, handing output to `buf`
-            // block by block: the decode window stays one window plus one
-            // block, as upstream's flush loop keeps it. The buffer takes the
-            // whole window at the first block whatever the frame declares, as
-            // upstream sizes a stream's buffer from the window.
+            // The decoder is entered only with its next step whole, or with
+            // output to hand over: entering it with part of a block only
+            // parses the block header to find the block incomplete.
+            let want = decoder.input_needed(self.input.pending());
+            if want > self.input.pending().len() && decoder.can_collect() == 0 {
+                // Return what this call has rather than wait on the source.
+                if written > 0 {
+                    return Ok(written);
+                }
+                if self.input.fill(&mut self.source, want)? == 0 {
+                    return Err(self.cut_short());
+                }
+                continue;
+            }
+            // Decode the step, handing output to `buf` block by block: the
+            // decode window stays one window plus one block, as upstream's
+            // flush loop keeps it. The buffer takes the whole window at the
+            // first block whatever the frame declares, as upstream sizes a
+            // stream's buffer from the window.
             let (consumed, produced) = decoder
                 .decode_available(self.input.pending(), &mut buf[written..], true)
                 .map_err(frame_error)?;
@@ -598,20 +612,12 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             if consumed > 0 || produced > 0 {
                 continue;
             }
-            // The next step is not all in hand. Return what this call has
-            // rather than wait on the source for it.
             if written > 0 {
                 return Ok(written);
             }
-            let want = decoder.input_needed(self.input.pending());
             // A step whose input is all here yet decodes nothing (a block over
             // the frame's maximum, say) is a damaged frame: report it.
-            if want <= self.input.pending().len() {
-                return Err(self.cut_short());
-            }
-            if self.input.fill(&mut self.source, want)? == 0 {
-                return Err(self.cut_short());
-            }
+            return Err(self.cut_short());
         }
     }
 
