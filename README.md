@@ -414,4 +414,4 @@ USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
 
 ## License
 
-Apache License 2.0. Contributions will be published under the same Apache 2.0 license.
+Apache License 2.0. Contributions are accepted under the [Structured World Contributor License Agreement](https://sw.foundation/cla) and published under the same Apache 2.0 license; see [CONTRIBUTING.md](https://github.com/structured-world/structured-zstd/blob/main/CONTRIBUTING.md).

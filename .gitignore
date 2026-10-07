@@ -21,8 +21,6 @@ zstd/fuzz/corpus
 zstd/fuzz/artifacts/**
 .idea
 /=
-CLAUDE.md
-.claude/
 .local/
 **/__pycache__/
 dhat-heap.json

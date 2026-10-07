@@ -14,14 +14,12 @@ on:
       - 'docs/**'
       - 'LICENSE*'
       - '.gitignore'
+  # Pull requests always start the workflow, so every required check reports:
+  # a docs-only pull request would otherwise never get them and stay blocked.
+  # On such a pull request the `changes` job reports `code=false` and the
+  # code jobs are skipped, which a required check counts as passing.
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - '.github/bench-dashboard/**'
-      - 'docs/**'
-      - 'LICENSE*'
-      - '.gitignore'
   # Manual trigger: lets the wasm dashboard shard (`bench-wasm`) be
   # refreshed on demand for changes the push path doesn't auto-gate on
   # — e.g. a wasm bench-harness / parser edit that moves the published
@@ -50,10 +48,35 @@ jobs:
     # cascade) is skipped on such pushes — see the gate on that job.
     name: Detect changed paths
     runs-on: ubuntu-latest
+    # On a pull request the path filters list its files through the API.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       rust_core: ${{ steps.filter.outputs.rust_core }}
+      # Only a pull request can be docs-only here: pushes of documentation do
+      # not start the workflow, and a manual run always builds.
+      # The root README is the crate's rustdoc page and its code blocks run as
+      # doctests; zstd/README.md, the symlink to it, is what include_str! and
+      # the packaged crate read. Changing either is code.
+      code: ${{ github.event_name != 'pull_request' || steps.code.outputs.code == 'true' || steps.filter.outputs.readme == 'true' }}
     steps:
       - uses: actions/checkout@v7
+      # `code` is false when every changed file is documentation: the same
+      # paths the push trigger ignores.
+      - uses: dorny/paths-filter@v4
+        id: code
+        if: github.event_name == 'pull_request'
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '**'
+              - '!**.md'
+              - '!.github/bench-dashboard/**'
+              - '!docs/**'
+              - '!LICENSE*'
+              - '!.gitignore'
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -71,8 +94,15 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
+            readme:
+              - 'README.md'
+              - 'zstd/README.md'
 
   lint:
+    # Skipped on a docs-only pull request; every job that needs `lint` is
+    # then skipped too and reports under its own name.
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
@@ -312,7 +342,13 @@ jobs:
           echo "musl staticlib OK ($(du -h "$a" | cut -f1))"
 
   test:
-    needs: lint
+    # A skipped matrix job reports one check named `test`, not the
+    # `test (<os>)` checks the branch requires. So the job always runs unless
+    # lint failed, and on a docs-only pull request its steps are skipped. It
+    # does not run when path detection failed: an empty `code` output must not
+    # read as docs-only.
+    needs: [changes, lint]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.lint.result != 'failure' }}
     timeout-minutes: 15
     strategy:
       # Each OS hits its own runner-image regressions (macos-latest currently
@@ -325,9 +361,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        if: needs.changes.outputs.code == 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.code == 'true'
       - name: Prepend toolchain bin to PATH (macos shim workaround)
-        if: runner.os == 'macOS'
+        if: needs.changes.outputs.code == 'true' && runner.os == 'macOS'
         # macos-latest preinstalled rustup ships via Homebrew without the
         # `~/.cargo/bin/{cargo,rustc}` proxy shims. `rustup run stable cargo`
         # works for the outer call but the cargo it launches then invokes
@@ -336,17 +374,22 @@ jobs:
         # real binaries.
         run: |
           TC="$(rustup show active-toolchain | awk '{print $1}')"
-          echo "$HOME/.rustup/toolchains/$TC/bin" >> $GITHUB_PATH
+          echo "$HOME/.rustup/toolchains/$TC/bin" >> "$GITHUB_PATH"
       - uses: taiki-e/install-action@nextest
+        if: needs.changes.outputs.code == 'true'
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.code == 'true'
         with:
           prefix-key: ${{ runner.os }}-cargo
       - name: Test
+        if: needs.changes.outputs.code == 'true'
         working-directory: zstd
         run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder
       - name: Doc tests
+        if: needs.changes.outputs.code == 'true'
         run: cargo test --doc -p structured-zstd --features hash,std,dict-builder
       - name: FFI parity + cross-validation tests
+        if: needs.changes.outputs.code == 'true'
         # The libzstd-linking parity / cross-validation / corpus tests live in
         # `ffi-bench`; `bench-internals` activates the white-box-facade targets
         # gated behind it, and `dict-builder` the trainer parity targets.
@@ -704,9 +747,11 @@ jobs:
         # the same input that originally surfaced it.
         working-directory: zstd/fuzz
         run: |
+          # The glob below must see the same entries as the emptiness test.
+          shopt -s dotglob
           for target in $FUZZ_TARGETS; do
-            if [ -d "artifacts/$target" ] && [ -n "$(ls artifacts/$target 2>/dev/null)" ]; then
-              echo "Replaying $(ls artifacts/$target | wc -l) regression artifacts for $target"
+            if [ -d "artifacts/$target" ] && [ -n "$(find "artifacts/$target" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+              echo "Replaying $(find "artifacts/$target" -mindepth 1 -maxdepth 1 | wc -l) regression artifacts for $target"
               cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" "$target" artifacts/"$target"/*
             else
               echo "No regression artifacts for $target — skipping replay"
