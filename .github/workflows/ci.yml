@@ -56,7 +56,9 @@ jobs:
       rust_core: ${{ steps.filter.outputs.rust_core }}
       # Only a pull request can be docs-only here: pushes of documentation do
       # not start the workflow, and a manual run always builds.
-      code: ${{ github.event_name != 'pull_request' || steps.code.outputs.code == 'true' }}
+      # The root README is the crate's rustdoc page (zstd/README.md links to
+      # it) and its code blocks run as doctests, so changing it is code.
+      code: ${{ github.event_name != 'pull_request' || steps.code.outputs.code == 'true' || steps.filter.outputs.readme == 'true' }}
     steps:
       - uses: actions/checkout@v7
       # `code` is false when every changed file is documentation: the same
@@ -91,6 +93,8 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
+            readme:
+              - 'README.md'
 
   lint:
     # Skipped on a docs-only pull request; every job that needs `lint` is
