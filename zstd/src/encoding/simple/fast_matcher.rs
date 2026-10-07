@@ -146,19 +146,11 @@ fn fast_slots_pay_for_tags(
 ///
 /// Measured on x86_64 (bare against tagged): a fill of 0.31 (10 KiB at levels
 /// 1 and -7) and 1.25 (20 KiB at -7, 10 KiB at -1) ran 3-11% faster bare; 2.0
-/// (32 KiB at -7) and up ran 7-16% faster tagged. Targets without a
-/// measurement of their own take this one.
+/// (32 KiB at -7) and up ran 7-16% faster tagged, and a 10 KiB frame at level 1
+/// over a 110 KiB copy-mode dictionary, whose fill takes the table past it, ran
+/// 4% faster tagged. Targets without a measurement of their own take this one.
 #[cfg(not(target_arch = "x86"))]
 const FAST_TAG_MIN_FILL: (u128, u128) = (3, 2);
-
-/// Dictionary length from which a copy-mode frame's table is tagged. The
-/// dictionary fill alone takes a small frame's table past [`FAST_TAG_MIN_FILL`],
-/// yet on 10 KiB frames at level 1 (x86_64, random and z000033 content) bare
-/// slots ran 2-4.5% faster with dictionaries of 1-32 KiB, the two tied at
-/// 48 KiB, and tags paid 1-3% from 64 KiB to 110 KiB. Upstream zstd strips the
-/// tags from a CDict's table when it copies it into the context
-/// (`ZSTD_copyCDictTableIntoCCtx`), so its copy-mode scan always runs bare.
-const COPY_MODE_DICT_TAG_MIN: usize = 64 * 1024;
 
 /// Table fill, as `(numerator, denominator)`, from which Fast slots are tagged.
 ///
@@ -710,9 +702,11 @@ impl FastKernelMatcher {
         // instructions per position (46 against 33) at the same probe count,
         // and 4-10% slower on z000033 from 512 KiB at levels 1, -1 and -7. The
         // cmov probe is register-bound bare as well, and there the tag's halved
-        // D1 misses pay: 4-17% faster tagged from 32 to 256 KiB.
+        // D1 misses pay: 4-17% faster tagged from 32 to 256 KiB. A copy-mode
+        // dictionary counts toward the fill at any length: on 10 KiB frames at
+        // level 1 with a 1.25 KiB dictionary the bare scan took five times the
+        // branch misses and 9% more time, and from 16 to 110 KiB the two tied.
         let tagged = window_log < 19
-            && (dictionary_len == 0 || dictionary_len >= COPY_MODE_DICT_TAG_MIN)
             && fast_slots_pay_for_tags(expected_input, dictionary_len, step_size, hash_log)
             && carry != TableCarry::AdvanceEpoch
             && hash_log + TAG_BITS <= 32

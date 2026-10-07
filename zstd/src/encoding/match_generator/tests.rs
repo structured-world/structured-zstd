@@ -5479,15 +5479,14 @@ fn fast_slots_are_tagged_by_how_full_the_scan_leaves_the_table() {
     );
 }
 
-/// The two cases a filled table still leaves bare. A window of 2^19 or more
-/// selects the branch probe, where the tag's live values spill the scan's
-/// bases (a 256 KiB frame at level 1 has window 18 and is tagged, a 512 KiB one
-/// has window 19 and is not). A copy-mode dictionary below
-/// `COPY_MODE_DICT_TAG_MIN` fills a small frame's table, yet bare slots ran
-/// faster there (a 1280-byte dictionary, as the dashboard's dictionary row
-/// uses, leaves the frame bare; a 64 KiB one tags it).
+/// A window of 2^19 or more selects the branch probe, where the tag's live
+/// values spill the scan's bases, so a filled table stays bare there (a 256 KiB
+/// frame at level 1 has window 18 and is tagged, a 512 KiB one has window 19
+/// and is not). A copy-mode dictionary of any length counts toward the fill:
+/// a small frame over a 1280-byte dictionary, as the dashboard's dictionary row
+/// uses, is tagged, since bare slots there took five times the branch misses.
 #[test]
-fn fast_slots_stay_bare_under_the_branch_probe_and_small_copy_dictionaries() {
+fn fast_slots_stay_bare_under_the_branch_probe_and_tag_small_copy_dictionaries() {
     use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
     let tagged = |source: usize, dictionary: usize| {
         let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
@@ -5512,12 +5511,12 @@ fn fast_slots_stay_bare_under_the_branch_probe_and_small_copy_dictionaries() {
     );
     assert!(!tagged(1 << 20, 0), "level 1, 1 MiB: branch probe, bare");
     assert!(
-        !tagged(10 * 1024, 1280),
-        "level 1, 10 KiB over a 1280-byte copy-mode dictionary: bare"
+        tagged(10 * 1024, 1280),
+        "level 1, 10 KiB over a 1280-byte copy-mode dictionary: tagged"
     );
     assert!(
-        !tagged(10 * 1024, 32 * 1024),
-        "level 1, 10 KiB over a 32 KiB copy-mode dictionary: bare"
+        tagged(10 * 1024, 32 * 1024),
+        "level 1, 10 KiB over a 32 KiB copy-mode dictionary: tagged"
     );
     assert!(
         tagged(10 * 1024, 64 * 1024),
