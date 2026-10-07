@@ -688,8 +688,11 @@ impl FastKernelMatcher {
         // do not, which a bare slot accepts as a four-byte match. Bare slots
         // take exactly upstream zstd's decisions (its no-dictionary table has
         // no tags), so a frame this gate leaves bare encodes as upstream does.
-        // Measured on levels -7..2 over z000033 prefixes, random input and
-        // records sharing a four-byte prefix: identical sizes bare and tagged.
+        // Measured on 1 MiB inputs at levels -7..2 (z000033, source text, logs,
+        // records sharing a four-byte prefix, random, z000033 over 1.25 and
+        // 110 KiB copy-mode dictionaries): bare and tagged sizes stay within
+        // 0.2% of each other, except the shared-prefix records at level 1,
+        // where bare output is 1.1% smaller.
         let primed_window = (1usize << window_log)
             .checked_add(dictionary_len)
             .map_or(MAX_PRIMED_WINDOW_SIZE, |window| {
@@ -700,7 +703,9 @@ impl FastKernelMatcher {
         // the table base in registers bare; the tag's extra live values push
         // them to the stack, so a tagged branch probe ran about 13 more
         // instructions per position (46 against 33) at the same probe count,
-        // and 4-10% slower on z000033 from 512 KiB at levels 1, -1 and -7. The
+        // and 4-10% slower on z000033 from 512 KiB at levels 1, -1 and -7
+        // (upstream zstd runs this probe bare too: the distance to it there is
+        // the same with or without tags, so it is not this choice's). The
         // cmov probe is register-bound bare as well, and there the tag's halved
         // D1 misses pay: 4-17% faster tagged from 32 to 256 KiB. A copy-mode
         // dictionary counts toward the fill at any length: on 10 KiB frames at
