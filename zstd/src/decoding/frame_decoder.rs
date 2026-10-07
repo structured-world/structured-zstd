@@ -690,13 +690,21 @@ impl DecoderScratchKind {
     }
 
     /// Total decompressed bytes produced so far (the buffer's running output
-    /// counter, unaffected by window drops / drains). Used to stamp a captured
-    /// [`ResumeState`]'s `output_offset`.
-    #[cfg(feature = "lsm")]
+    /// counter, unaffected by window drops / drains): the frame's length once
+    /// its last block is decoded, and a captured resume state's offset.
     fn total_output(&self) -> u64 {
         match self {
             Self::Ring(s) => s.buffer.total_output(),
             Self::Flat(s) => s.buffer.total_output(),
+        }
+    }
+
+    /// Set the output counter to the length of a frame the direct path decoded
+    /// into the caller's slice, which never passes through this buffer.
+    fn set_total_output(&mut self, produced: u64) {
+        match self {
+            Self::Ring(s) => s.buffer.set_total_output(produced),
+            Self::Flat(s) => s.buffer.set_total_output(produced),
         }
     }
 
@@ -1772,6 +1780,45 @@ impl FrameDecoder {
         Some(cksum_64bit as u32)
     }
 
+    /// Check that a finished frame produced exactly the `Frame_Content_Size` its
+    /// header declared (RFC 8878 3.1.1.1.4), returning
+    /// [`FrameDecoderError::FrameContentSizeMismatch`] otherwise. No-op for a
+    /// frame that declares no size or has not decoded its last block yet.
+    ///
+    /// [`decode_all`](Self::decode_all), [`decode_from_to`](Self::decode_from_to)
+    /// and the streaming reader call this automatically. Callers driving
+    /// [`decode_blocks`](Self::decode_blocks) directly invoke it once the
+    /// frame is finished, as upstream zstd checks at its last block.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::decoding::{BlockDecodingStrategy, FrameDecoder};
+    /// use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
+    ///
+    /// let frame = compress_to_vec(&b"declared and delivered"[..], CompressionLevel::Fastest);
+    /// let mut source = frame.as_slice();
+    /// let mut decoder = FrameDecoder::new();
+    /// decoder.init(&mut source).unwrap();
+    /// decoder.decode_blocks(&mut source, BlockDecodingStrategy::All).unwrap();
+    /// assert!(decoder.is_finished());
+    /// decoder.verify_content_size().unwrap();
+    /// assert_eq!(decoder.collect().unwrap(), b"declared and delivered");
+    /// ```
+    pub fn verify_content_size(&self) -> Result<(), FrameDecoderError> {
+        let Some(state) = self.state.as_ref() else {
+            return Ok(());
+        };
+        if !state.frame_finished || !state.frame_header.fcs_declared() {
+            return Ok(());
+        }
+        let declared = state.frame_header.frame_content_size();
+        let produced = state.decoder_scratch.total_output();
+        if produced != declared {
+            return Err(FrameDecoderError::FrameContentSizeMismatch { declared, produced });
+        }
+        Ok(())
+    }
+
     /// Compare the frame's stored content checksum against the digest the
     /// decoder computed, returning [`FrameDecoderError::ChecksumMismatch`] on
     /// disagreement. No-op unless the mode is [`ContentChecksum::Verify`] and
@@ -2629,11 +2676,13 @@ impl FrameDecoder {
             + self
                 .read(&mut target[written..])
                 .map_err(err::FailedToDrainDecodebuffer)?;
-        // Once the frame is fully decoded and drained, the running digest is
-        // final: validate it in `Verify` mode (no-op otherwise). Same finish
-        // point as the streaming reader.
-        #[cfg(feature = "hash")]
+        // Once the frame is fully decoded and drained, its length and running
+        // digest are final: check the declared size, and the checksum in
+        // `Verify` mode (no-op otherwise). Same finish point as the streaming
+        // reader.
         if self.is_finished() && self.can_collect() == 0 {
+            self.verify_content_size()?;
+            #[cfg(feature = "hash")]
             self.verify_content_checksum()?;
         }
         let bytes_read_at_end = match &mut self.state {
@@ -3420,6 +3469,7 @@ impl FrameDecoder {
                         h.write(&output[..n]);
                         self.computed_block_checksums.push(h.finish() as u32);
                     }
+                    state.decoder_scratch.set_total_output(n as u64);
                     state.frame_finished = true;
                     return Ok(n);
                 }
@@ -3679,6 +3729,7 @@ impl FrameDecoder {
         }
 
         let written = produced as usize;
+        state.decoder_scratch.set_total_output(produced);
         state.frame_finished = true;
         // `direct`'s last use is in the decode loop above; NLL therefore
         // releases its `&mut output` borrow before here, freeing `output` for

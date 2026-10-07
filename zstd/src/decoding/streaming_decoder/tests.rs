@@ -1,6 +1,89 @@
 use super::StreamingDecoder;
 use crate::io::Read;
 
+/// A frame with an 8-byte `Frame_Content_Size` of `fcs` followed by one raw
+/// last block carrying `payload`. Multi-segment frames take a 1 KiB window
+/// descriptor; single-segment ones size their window by the FCS.
+fn frame_declaring(fcs: u64, single_segment: bool, payload: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut f = alloc::vec![0x28, 0xB5, 0x2F, 0xFD];
+    if single_segment {
+        f.push(0xE0);
+    } else {
+        f.extend_from_slice(&[0xC0, 0x00]);
+    }
+    f.extend_from_slice(&fcs.to_le_bytes());
+    let header = ((payload.len() as u32) << 3) | 1;
+    f.extend_from_slice(&header.to_le_bytes()[..3]);
+    f.extend_from_slice(payload);
+    f
+}
+
+/// Drain `decoder` through plain `read` calls the way `io::copy` does, up to
+/// the first `Ok(0)` or error.
+fn drain_with_read(
+    mut decoder: StreamingDecoder<&[u8], crate::decoding::FrameDecoder>,
+) -> Result<alloc::vec::Vec<u8>, crate::io::Error> {
+    let mut out = alloc::vec::Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = decoder.read(&mut buf)?;
+        if n == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// RFC 8878 3.1.1.1.4: when `Frame_Content_Size` is present the decompressed
+/// data must be exactly that long. A frame that declares 64 MiB and produces
+/// nothing must end the stream with an error, not a clean `Ok(0)` EOF that
+/// lets `io::copy` report an empty file as decoded. Both window layouts.
+#[test]
+fn read_rejects_a_frame_shorter_than_its_declared_size() {
+    for single_segment in [false, true] {
+        let frame = frame_declaring(64 << 20, single_segment, &[]);
+        let decoder = StreamingDecoder::new(frame.as_slice()).unwrap();
+        let err = drain_with_read(decoder)
+            .expect_err("a frame that produced less than it declared must not end cleanly");
+        assert!(
+            alloc::format!("{err:?}").contains("FrameContentSizeMismatch"),
+            "single_segment={single_segment}: {err:?}"
+        );
+    }
+}
+
+/// `read_to_end` decodes a sized frame on the direct path, straight into the
+/// caller's vector, outside the buffer whose counter the size check reads. A
+/// `read` after it must still see the frame as complete and valid and return
+/// a clean `Ok(0)`, not a size mismatch against a counter left at zero.
+#[cfg(feature = "std")]
+#[test]
+fn read_after_a_direct_read_to_end_ends_cleanly() {
+    use crate::encoding::{CompressionLevel, compress_to_vec};
+    let payload: alloc::vec::Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    let frame = compress_to_vec(payload.as_slice(), CompressionLevel::Fastest);
+    let mut decoder = StreamingDecoder::new(frame.as_slice()).unwrap();
+    let mut out = alloc::vec::Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    assert_eq!(out, payload);
+    let mut buf = [0u8; 16];
+    assert_eq!(decoder.read(&mut buf).unwrap(), 0);
+}
+
+/// The other direction: a frame that produces more than it declares. Its
+/// bytes may be delivered, but the stream must not end as if it were valid.
+#[test]
+fn read_rejects_a_frame_longer_than_its_declared_size() {
+    let frame = frame_declaring(1, false, b"abcd");
+    let decoder = StreamingDecoder::new(frame.as_slice()).unwrap();
+    let err = drain_with_read(decoder)
+        .expect_err("a frame that produced more than it declared must not end cleanly");
+    assert!(
+        alloc::format!("{err:?}").contains("FrameContentSizeMismatch"),
+        "{err:?}"
+    );
+}
+
 /// `Read::read` must not return `Err` after it has already written bytes
 /// into the caller's buffer (the trait mandates that an error implies no
 /// bytes were read). When a single `read` call both drains the final bytes

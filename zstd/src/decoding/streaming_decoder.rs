@@ -209,20 +209,32 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
     }
 }
 
+/// A frame decode error as the `Read` error it surfaces through.
+fn frame_error(e: FrameDecoderError) -> Error {
+    #[cfg(feature = "std")]
+    return Error::other(e);
+    #[cfg(not(feature = "std"))]
+    return Error::new(ErrorKind::Other, alloc::boxed::Box::new(e));
+}
+
+/// The checks a frame can only pass once it is fully decoded and drained: the
+/// declared content size, then the content checksum in `Verify` mode.
+fn verify_finished_frame(decoder: &FrameDecoder) -> Result<(), Error> {
+    decoder.verify_content_size().map_err(frame_error)?;
+    #[cfg(feature = "hash")]
+    decoder.verify_content_checksum().map_err(frame_error)?;
+    Ok(())
+}
+
 impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, DEC> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let decoder = self.decoder.borrow_mut();
         if decoder.is_finished() && decoder.can_collect() == 0 {
-            // Frame fully decoded and fully drained: the running XXH64 digest
-            // is final, so a `Verify`-mode decoder validates the content
-            // checksum at this finish point. No-op in other modes.
-            #[cfg(feature = "hash")]
-            if let Err(e) = decoder.verify_content_checksum() {
-                #[cfg(feature = "std")]
-                return Err(Error::other(e));
-                #[cfg(not(feature = "std"))]
-                return Err(Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)));
-            }
+            // Frame fully decoded and fully drained: its length and running
+            // digest are final, so this finish point is where a frame shorter
+            // or longer than it declared, or with a bad checksum in `Verify`
+            // mode, ends the stream with an error instead of a clean EOF.
+            verify_finished_frame(decoder)?;
             //No more bytes can ever be decoded
             return Ok(0);
         }
@@ -248,37 +260,20 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             // is capped to one block, so the ring's live region stays within
             // `window_size + MAX_BLOCK_SIZE`.
             let step = (buf.len() - written).min(MAX_BLOCK_SIZE as usize);
-            if let Err(e) =
-                decoder.decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBytes(step))
-            {
-                #[cfg(feature = "std")]
-                {
-                    return Err(Error::other(e));
-                }
-                #[cfg(not(feature = "std"))]
-                {
-                    return Err(Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)));
-                }
-            }
+            decoder
+                .decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBytes(step))
+                .map_err(frame_error)?;
         }
 
         // The loop can finish AND fully drain a frame within this same call
         // (decode last block, then drain it into `buf`). Validate here too when
         // the frame is finished and nothing is left to collect, but ONLY when
         // this call wrote no bytes: the `Read` contract forbids returning `Err`
-        // after bytes were delivered, so when `written > 0` the verify is
-        // deferred to the next call, where the top early-return runs it and
+        // after bytes were delivered, so when `written > 0` the checks are
+        // deferred to the next call, where the top early-return runs them and
         // returns `Err` on the zero-byte path. Idempotent with that top check.
-        #[cfg(feature = "hash")]
-        if written == 0
-            && decoder.is_finished()
-            && decoder.can_collect() == 0
-            && let Err(e) = decoder.verify_content_checksum()
-        {
-            #[cfg(feature = "std")]
-            return Err(Error::other(e));
-            #[cfg(not(feature = "std"))]
-            return Err(Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)));
+        if written == 0 && decoder.is_finished() && decoder.can_collect() == 0 {
+            verify_finished_frame(decoder)?;
         }
 
         Ok(written)
