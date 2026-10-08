@@ -599,6 +599,9 @@ pub enum FrameDecoderError {
     FailedToInitialize(FrameHeaderError),
     FailedToDrainDecodebuffer(Error),
     FailedToSkipFrame,
+    /// The source failed, rather than ended, while a skippable frame's
+    /// content was being stepped over; carries the source's own error.
+    FailedToReadSkippableFrame(Error),
     TargetTooSmall,
     /// Decoded block sizes don't sum to the frame's declared
     /// `frame_content_size` (either a block claims to expand past
@@ -757,6 +760,7 @@ impl StdError for FrameDecoderError {
             FrameDecoderError::FailedToReadChecksum(source) => Some(source),
             FrameDecoderError::FailedToInitialize(source) => Some(source),
             FrameDecoderError::FailedToDrainDecodebuffer(source) => Some(source),
+            FrameDecoderError::FailedToReadSkippableFrame(source) => Some(source),
             _ => None,
         }
     }
@@ -831,6 +835,9 @@ impl core::fmt::Display for FrameDecoderError {
                     f,
                     "Failed to skip bytes for the length given in the frame header"
                 )
+            }
+            FrameDecoderError::FailedToReadSkippableFrame(e) => {
+                write!(f, "Failed to read a skippable frame's content: {e}")
             }
             FrameDecoderError::TargetTooSmall => {
                 write!(

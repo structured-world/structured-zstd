@@ -534,7 +534,8 @@ fn skip_frame_content<R: Read>(source: &mut R, length: u32) -> Result<(), FrameD
             // `n <= take <= left`, so it fits the `u32` it is taken from.
             Ok(n) => left -= n as u32,
             Err(e) if e.kind() == crate::io::ErrorKind::Interrupted => {}
-            Err(_) => return Err(FrameDecoderError::FailedToSkipFrame),
+            // A source that fails is not a frame cut short: its error is kept.
+            Err(e) => return Err(FrameDecoderError::FailedToReadSkippableFrame(e)),
         }
     }
     Ok(())
@@ -665,6 +666,9 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
                 }
                 continue;
             }
+            // A full `buf` never strands a checksum: a frame's last window of
+            // output is collectable only once the frame is finished, its
+            // checksum read, so the source already stands past the frame.
             if written == buf.len() {
                 return Ok(written);
             }

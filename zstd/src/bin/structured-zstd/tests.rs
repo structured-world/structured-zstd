@@ -4124,6 +4124,20 @@ fn plain_input_is_passed_through_or_refused() {
         .to_string();
     assert!(err.contains("failed to read the input"), "{err}");
 
+    // The same inside a skippable frame's content: the device failed, the
+    // frame is not truncated.
+    let mut metadata = 0x184D_2A50u32.to_le_bytes().to_vec();
+    metadata.extend_from_slice(&16u32.to_le_bytes());
+    metadata.extend_from_slice(b"partial");
+    let source = FailsAfter { data: &metadata };
+    let err = decompress_stream(source, io::sink(), &mut no_dict(), &pass)
+        .expect_err("a source failing inside a skippable frame is refused")
+        .to_string();
+    assert!(
+        err.contains("failed to read the input") && err.contains("device went away"),
+        "{err}"
+    );
+
     // The default follows the reference command: on when forced and writing
     // to stdout (`zstd -dcf`), off otherwise.
     assert!(DecodeSettings::from_options(&parse(&["-dcf", "f"]).unwrap()).pass_through);

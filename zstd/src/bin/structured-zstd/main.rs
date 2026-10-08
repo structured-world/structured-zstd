@@ -5242,6 +5242,10 @@ fn decompress_stream<R: Read, W: Write>(
                 {
                     bail!("failed to read the input: {e}");
                 }
+                // The same inside a leading skippable frame's content.
+                if let FrameDecoderError::FailedToReadSkippableFrame(e) = &err {
+                    bail!("failed to read the input: {e}");
+                }
                 match after_frame_message(&err) {
                     Some(message) => bail!("{message}"),
                     None => bail!("invalid zstd frame: {err:?}"),

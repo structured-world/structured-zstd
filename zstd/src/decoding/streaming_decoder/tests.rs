@@ -288,6 +288,27 @@ fn into_inner_after_a_frame_returns_the_rest_of_the_source() {
     assert_eq!(decoder.into_inner(), b"bytes after the frame");
 }
 
+/// A checksummed frame read into a buffer of exactly its content size takes
+/// its four-byte checksum with its last block, so the source stands right
+/// after the frame, not at the checksum.
+#[test]
+fn into_inner_after_a_checksummed_frame_returns_the_rest_of_the_source() {
+    let payload = b"one frame of content";
+    let mut compressor =
+        crate::encoding::FrameCompressor::new(crate::encoding::CompressionLevel::Fastest);
+    compressor.set_content_checksum(true);
+    compressor.set_source(&payload[..]);
+    let mut stream = alloc::vec::Vec::new();
+    compressor.set_drain(&mut stream);
+    compressor.compress();
+    stream.extend_from_slice(b"bytes after the frame");
+    let mut decoder = StreamingDecoder::new(stream.as_slice()).unwrap();
+    let mut out = [0u8; 20];
+    decoder.read_exact(&mut out).unwrap();
+    assert_eq!(&out, payload);
+    assert_eq!(decoder.into_inner(), b"bytes after the frame");
+}
+
 /// A small frame is read into a buffer the size of its block, not one sized
 /// for the largest block any frame may hold.
 #[test]
@@ -414,12 +435,15 @@ fn a_source_error_around_a_leading_skippable_frame_fails_the_constructor() {
     let inside = FailsAfter {
         data: &skippable[..skippable.len() - 3],
     };
+    // The source's own error is kept: a failing device is not a skippable
+    // frame cut short.
     let err = StreamingDecoder::new(inside)
         .err()
         .expect("a source error inside a skippable frame must fail");
+    let shown = alloc::format!("{err:?}");
     assert!(
-        matches!(err, FrameDecoderError::FailedToSkipFrame),
-        "{err:?}"
+        shown.contains("FailedToReadSkippableFrame") && shown.contains("Other"),
+        "{shown}"
     );
 
     let at_boundary = FailsAfter { data: &skippable };
