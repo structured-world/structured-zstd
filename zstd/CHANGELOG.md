@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.59](https://github.com/structured-world/structured-zstd/compare/v0.0.58...v0.0.59) - 2026-10-08
+
+### Added
+
+- *(decode)* streaming read walks every frame and checks its size ([#558](https://github.com/structured-world/structured-zstd/pull/558))
+
+### Documentation
+
+- contributor guide, security policy and the organisation CLA ([#554](https://github.com/structured-world/structured-zstd/pull/554))
+
+### Performance
+
+- *(encode)* Fast scan at or below v0.0.57 at level 1 ([#549](https://github.com/structured-world/structured-zstd/pull/549))
+
 ## [0.0.58](https://github.com/structured-world/structured-zstd/compare/v0.0.57...v0.0.58) - 2026-10-01
 
 ### Added
