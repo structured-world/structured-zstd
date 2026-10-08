@@ -820,20 +820,6 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             Err(e) => Err(e),
         }
     }
-
-    fn append_from_read<R: Read>(&mut self, mut read: R, max: usize) -> Result<usize, Error> {
-        let old = self.tail;
-        let new_tail = old + max;
-        if new_tail > self.slice.len() {
-            return Err(Error::other(
-                "UserSliceBackend: raw block exceeds caller-provided output capacity",
-            ));
-        }
-        let n = read.read(&mut self.slice[old..new_tail])?;
-        self.tail = old + n;
-        Ok(n)
-    }
-
     // Keep `#[inline]` (hint, not force). An earlier experiment with
     // `#[inline(always)]` regressed primary bench by +2.96% — body
     // is materially larger than `extend` (assert + readable/writable

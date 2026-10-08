@@ -657,6 +657,45 @@ fn read_rejects_a_frame_cut_inside_a_raw_block() {
     );
 }
 
+/// Per-block checksums asked for on the decoder are taken for every block a
+/// `read` decodes, compressed and Raw alike, in block order: the same digests
+/// `decode_all` reports for the frame.
+#[cfg(all(feature = "lsm", feature = "hash"))]
+#[test]
+fn read_records_per_block_checksums_for_every_block() {
+    let mut payload = b"compressible line of text, again and again\n".repeat(8_000);
+    payload.extend(incompressible(300_000));
+    let frame = crate::encoding::compress_to_vec(
+        payload.as_slice(),
+        crate::encoding::CompressionLevel::Fastest,
+    );
+
+    let mut whole = crate::decoding::FrameDecoder::new();
+    whole.enable_per_block_checksums();
+    let mut out = alloc::vec![0u8; payload.len()];
+    whole.decode_all(&frame, &mut out).unwrap();
+    let expected = whole.computed_block_checksums().to_vec();
+    assert!(expected.len() > 2, "the frame must hold several blocks");
+
+    let mut frame_decoder = crate::decoding::FrameDecoder::new();
+    frame_decoder.enable_per_block_checksums();
+    let mut decoder = StreamingDecoder::new_with_decoder(frame.as_slice(), frame_decoder).unwrap();
+    let mut decoded = alloc::vec::Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = decoder.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        decoded.extend_from_slice(&buf[..n]);
+    }
+    assert!(decoded == payload);
+    assert_eq!(
+        decoder.decoder.computed_block_checksums(),
+        expected.as_slice()
+    );
+}
+
 /// A source that serves `data` up to each of `stops` in turn, reporting
 /// `WouldBlock` once at each, as a socket does between arrivals.
 struct Arrivals<'a> {

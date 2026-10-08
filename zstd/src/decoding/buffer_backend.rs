@@ -539,13 +539,6 @@ pub(crate) trait BufferBackend: Sized {
     /// tail. Backs the Raw block path.
     fn extend_from_reader<R: Read>(&mut self, read: R, fill_length: usize) -> Result<(), Error>;
 
-    /// Append what one `read` call yields, at most `max` bytes, directly into
-    /// the tail, and return how many: the resumable form of
-    /// [`Self::extend_from_reader`] for a source that may stop part-way
-    /// through a Raw block. `Ok(0)` is the source's end; a failed read
-    /// appends nothing.
-    fn append_from_read<R: Read>(&mut self, read: R, max: usize) -> Result<usize, Error>;
-
     /// Copy `len` bytes from logical position `start` (relative to
     /// the live region's head) to the tail. Non-overlapping case.
     ///

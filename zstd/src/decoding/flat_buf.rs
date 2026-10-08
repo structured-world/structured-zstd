@@ -546,24 +546,6 @@ impl BufferBackend for FlatBuf {
         }
     }
 
-    fn append_from_read<R: Read>(&mut self, mut read: R, max: usize) -> Result<usize, Error> {
-        // Initialised before the slice is formed, as in `extend_from_reader`;
-        // the unread part of it is cut off again.
-        let old = self.buf.len();
-        self.reserve(max);
-        self.buf.resize(old + max, 0);
-        match read.read(&mut self.buf[old..old + max]) {
-            Ok(n) => {
-                self.buf.truncate(old + n);
-                Ok(n)
-            }
-            Err(e) => {
-                self.buf.truncate(old);
-                Err(e)
-            }
-        }
-    }
-
     #[inline]
     unsafe fn extend_from_within_unchecked<K: CpuKernel>(&mut self, start: usize, len: usize) {
         let dst_off = self.buf.len();

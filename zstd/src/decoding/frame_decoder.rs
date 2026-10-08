@@ -708,10 +708,16 @@ impl DecoderScratchKind {
         }
     }
 
-    fn buffer_append_from_read(&mut self, source: impl Read, max: usize) -> Result<usize, Error> {
+    /// Append `data` to the buffer, copied under the kernel a literals-only
+    /// block takes: the scalar tier stays portable.
+    fn buffer_push(&mut self, data: &[u8], kernel: crate::cpu_kernel::CpuKernelTag) {
+        use crate::cpu_kernel::{BaselineKernel, CpuKernelTag, ScalarKernel};
+        let scalar = kernel == CpuKernelTag::Scalar;
         match self {
-            Self::Ring(s) => s.buffer.append_from_read(source, max),
-            Self::Flat(s) => s.buffer.append_from_read(source, max),
+            Self::Ring(s) if scalar => s.buffer.push::<ScalarKernel>(data),
+            Self::Ring(s) => s.buffer.push::<BaselineKernel>(data),
+            Self::Flat(s) if scalar => s.buffer.push::<ScalarKernel>(data),
+            Self::Flat(s) => s.buffer.push::<BaselineKernel>(data),
         }
     }
 
@@ -1460,21 +1466,28 @@ impl FrameDecoder {
         )))
     }
 
-    /// Append what one read of `source` yields of the Raw block in progress,
-    /// at most `left` bytes, straight into the decode buffer. `Ok(0)` is the
-    /// source's end.
-    pub(crate) fn raw_block_from_read(
-        &mut self,
-        source: impl Read,
-        left: u32,
-    ) -> Result<usize, Error> {
+    /// Append `content`, the next part of the Raw block in progress, to the
+    /// decode buffer.
+    pub(crate) fn raw_block_push(&mut self, content: &[u8]) {
+        let kernel = self.kernel;
         let state = self
             .state
             .as_mut()
             .expect("a Raw block is started on an initialised frame");
-        state
-            .decoder_scratch
-            .buffer_append_from_read(source, left as usize)
+        state.decoder_scratch.buffer_push(content, kernel);
+    }
+
+    /// Whether [`Self::enable_per_block_checksums`] asked for block digests.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    pub(crate) fn per_block_checksums_enabled(&self) -> bool {
+        self.per_block_checksums_enabled
+    }
+
+    /// Record the digest of a block decoded outside this decoder's own block
+    /// loops, in block order.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    pub(crate) fn record_block_checksum(&mut self, digest: u32) {
+        self.computed_block_checksums.push(digest);
     }
 
     /// The error for a source that ended inside the Raw block of `size` bytes
@@ -2862,6 +2875,10 @@ impl FrameDecoder {
                     } else {
                         None
                     };
+                    #[cfg(all(feature = "lsm", feature = "hash"))]
+                    let len_before_block = self
+                        .per_block_checksums_enabled
+                        .then(|| state.decoder_scratch.buffer_len());
                     // The whole block is in `mt_source` (checked above), so
                     // it decodes from the slice without a copy.
                     let bytes_read_in_block_body = state
@@ -2882,6 +2899,19 @@ impl FrameDecoder {
                             )
                         })?;
                     state.bytes_read_counter += bytes_read_in_block_body;
+                    // The block's digest, as `decode_blocks` takes it: output
+                    // is drained before a block decodes, never during, so the
+                    // whole block is still in the buffer here.
+                    #[cfg(all(feature = "lsm", feature = "hash"))]
+                    if let Some(len_before_block) = len_before_block {
+                        let added = state.decoder_scratch.buffer_len() - len_before_block;
+                        let (s1, s2) = state.decoder_scratch.last_n_as_slices(added);
+                        let mut h = twox_hash::XxHash64::with_seed(0);
+                        use core::hash::Hasher;
+                        h.write(s1);
+                        h.write(s2);
+                        self.computed_block_checksums.push(h.finish() as u32);
+                    }
                     state.block_counter += 1;
 
                     if block_header.last_block {

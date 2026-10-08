@@ -83,15 +83,24 @@ struct Input {
     raw: Option<RawBlock>,
 }
 
-/// A Raw block in progress. Its content is the output itself, so it goes
-/// from the source straight into the decode buffer, read by read, rather than
-/// gathered here first and copied a second time.
-#[derive(Clone, Copy)]
+/// A Raw block in progress. Its content is the output itself, so it is not
+/// gathered whole: each read lands in a [`RAW_CHUNK`] of the input buffer,
+/// still in cache, and goes on to the decode buffer at once.
 struct RawBlock {
     size: u32,
     left: u32,
     last: bool,
+    /// The running digest of the block, when per-block checksums are asked
+    /// for: its content may be handed on before the block ends, so it cannot
+    /// be hashed from the decode buffer at the end as other blocks are.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    digest: Option<twox_hash::XxHash64>,
 }
+
+/// The most of a Raw block read in one step. Every byte of the input buffer
+/// is initialised once, when it first grows, so a source that hands content
+/// over in small pieces costs a copy of each piece and nothing more.
+const RAW_CHUNK: usize = 32 * 1024;
 
 impl Input {
     const fn new() -> Self {
@@ -122,6 +131,28 @@ impl Input {
         let result = source.read_to_end(&mut self.buf);
         self.end = self.buf.len();
         result.map(drop)
+    }
+
+    /// Read the next part of a Raw block, at most `left` bytes and at most
+    /// [`RAW_CHUNK`], into the start of the buffer and return how many. Only
+    /// called while nothing is pending. `Ok(0)` is the source's end;
+    /// `Interrupted` is retried.
+    fn read_raw<R: Read>(&mut self, source: &mut R, left: u32) -> Result<usize, Error> {
+        debug_assert!(
+            self.pending().is_empty(),
+            "a Raw block is read with nothing pending"
+        );
+        // `RAW_CHUNK` fits a `u32`, so the minimum is taken in the wire's width.
+        let chunk = left.min(RAW_CHUNK as u32) as usize;
+        if self.buf.len() < chunk {
+            self.buf.resize(chunk, 0);
+        }
+        loop {
+            match source.read(&mut self.buf[..chunk]) {
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                other => return other,
+            }
+        }
     }
 
     /// Drop the input, buffer and all: after `read_rest` it holds a whole
@@ -576,6 +607,16 @@ fn read_at_boundary<R: Read>(source: &mut R, probe: &mut [u8; 1]) -> Result<usiz
     }
 }
 
+/// Close a Raw block whose content is all in the decode buffer, recording its
+/// digest when per-block checksums are on.
+fn finish_raw_block(decoder: &mut FrameDecoder, raw: RawBlock) {
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    if let Some(digest) = raw.digest {
+        decoder.record_block_checksum(core::hash::Hasher::finish(&digest) as u32);
+    }
+    decoder.finish_raw_block(raw.size, raw.last);
+}
+
 /// A frame decode error as the `Read` error it surfaces through.
 fn frame_error(e: FrameDecoderError) -> Error {
     #[cfg(feature = "std")]
@@ -629,29 +670,31 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             }
             // A Raw block in progress reads on into the decode buffer once
             // the output already there has been handed over.
-            if let Some(raw) = self.input.raw
-                && decoder.can_collect() == 0
-            {
+            if self.input.raw.is_some() && decoder.can_collect() == 0 {
                 // Return what this call has rather than wait on the source.
                 if written > 0 {
                     return Ok(written);
                 }
-                let n = loop {
-                    match decoder.raw_block_from_read(&mut self.source, raw.left) {
-                        Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                        other => break other?,
-                    }
-                };
+                // The block stays recorded until the read has delivered: a
+                // `WouldBlock` returns here with the block still open.
+                let left = self.input.raw.as_ref().map_or(0, |raw| raw.left);
+                let n = self.input.read_raw(&mut self.source, left)?;
+                let mut raw = self.input.raw.take().expect("checked just above");
                 if n == 0 {
                     return Err(frame_error(decoder.raw_block_cut_short(raw.size, raw.last)));
                 }
+                let content = &self.input.buf[..n];
+                decoder.raw_block_push(content);
+                #[cfg(all(feature = "lsm", feature = "hash"))]
+                if let Some(digest) = raw.digest.as_mut() {
+                    core::hash::Hasher::write(digest, content);
+                }
                 // `n <= left`, so it fits the `u32` it is taken from.
-                let left = raw.left - n as u32;
-                if left == 0 {
-                    decoder.finish_raw_block(raw.size, raw.last);
-                    self.input.raw = None;
+                raw.left -= n as u32;
+                if raw.left == 0 {
+                    finish_raw_block(decoder, raw);
                 } else {
-                    self.input.raw = Some(RawBlock { left, ..raw });
+                    self.input.raw = Some(raw);
                 }
                 continue;
             }
@@ -676,14 +719,19 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
                         .map_err(frame_error)?
                 {
                     self.input.consume(3);
+                    let raw = RawBlock {
+                        size,
+                        left: size,
+                        last,
+                        #[cfg(all(feature = "lsm", feature = "hash"))]
+                        digest: decoder
+                            .per_block_checksums_enabled()
+                            .then(|| twox_hash::XxHash64::with_seed(0)),
+                    };
                     if size == 0 {
-                        decoder.finish_raw_block(0, last);
+                        finish_raw_block(decoder, raw);
                     } else {
-                        self.input.raw = Some(RawBlock {
-                            size,
-                            left: size,
-                            last,
-                        });
+                        self.input.raw = Some(raw);
                     }
                     continue;
                 }

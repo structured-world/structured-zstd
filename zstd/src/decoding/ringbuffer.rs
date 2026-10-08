@@ -842,37 +842,6 @@ impl RingBuffer {
         Ok(())
     }
 
-    /// See [`BufferBackend::append_from_read`].
-    pub fn append_from_read<R: Read>(
-        &mut self,
-        mut read: R,
-        max: usize,
-    ) -> Result<usize, crate::io::Error> {
-        if max == 0 {
-            return Ok(0);
-        }
-        self.reserve(max);
-        let ((ptr1, len1), (ptr2, len2)) = self.free_slice_parts();
-        debug_assert!(len1 + len2 >= max);
-        // One read, into the free run at the tail; when that run is empty
-        // the free space starts over at the front.
-        let (ptr, len) = if len1 > 0 {
-            (ptr1, len1.min(max))
-        } else {
-            (ptr2, len2.min(max))
-        };
-        // SAFETY: `ptr` heads a free run of at least `len` writable bytes
-        // (reserved above), initialised here before a slice is formed.
-        let slot = unsafe {
-            ptr.write_bytes(0, len);
-            slice::from_raw_parts_mut(ptr, len)
-        };
-        let n = read.read(slot)?;
-        debug_assert!(n <= len);
-        self.tail = self.wrap(self.tail + n);
-        Ok(n)
-    }
-
     #[allow(dead_code)]
     /// This function is functionally the same as [RingBuffer::extend_from_within_unchecked],
     /// but it does not contain any branching operations.
@@ -1305,14 +1274,6 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         fill_length: usize,
     ) -> Result<(), crate::io::Error> {
         Self::extend_from_reader(self, read, fill_length)
-    }
-    #[inline]
-    fn append_from_read<R: crate::io::Read>(
-        &mut self,
-        read: R,
-        max: usize,
-    ) -> Result<usize, crate::io::Error> {
-        Self::append_from_read(self, read, max)
     }
     #[inline]
     unsafe fn extend_from_within_unchecked<K: CpuKernel>(&mut self, start: usize, len: usize) {
