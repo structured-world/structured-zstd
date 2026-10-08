@@ -1405,8 +1405,8 @@ impl FrameDecoder {
     }
 
     /// Start the Raw block whose 3-byte header is `header`, its content to
-    /// follow straight from the source through [`Self::raw_block_from_read`]
-    /// instead of being gathered first and copied a second time. Returns the
+    /// follow in parts through [`Self::raw_block_push`] as the source delivers
+    /// it, instead of being gathered whole first. Returns the
     /// block's size and whether it is the frame's last; `Ok(None)`, with
     /// nothing consumed, when `header` is not a Raw block's, or the frame
     /// expects no block (its blocks are done and its checksum is next).
