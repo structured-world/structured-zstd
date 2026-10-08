@@ -514,6 +514,19 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         Ok(())
     }
 
+    /// Append what one read of `read` yields, at most `max` bytes, straight
+    /// into the buffer: a Raw block's content for a source that may stop
+    /// part-way through it. Returns the count, `0` at the source's end.
+    pub fn append_from_read<R: Read>(
+        &mut self,
+        read: R,
+        max: usize,
+    ) -> Result<usize, crate::io::Error> {
+        let n = self.buffer.append_from_read(read, max)?;
+        self.total_output_counter += n as u64;
+        Ok(n)
+    }
+
     /// Add `n` to the cumulative produced-byte counter for output produced
     /// outside `push` / `repeat` — namely the inline `exec_sequence_inline`
     /// path, which writes through the backend directly and so bypasses the

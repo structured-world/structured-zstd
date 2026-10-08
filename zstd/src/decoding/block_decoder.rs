@@ -49,7 +49,7 @@ pub(crate) fn block_maximum(window_size: usize) -> usize {
 /// against `blockSizeMax` in `ZSTD_decompressContinue`. A compressed block's
 /// output is only known as it decodes, and is checked there.
 #[inline]
-fn block_fits_the_maximum(
+pub(crate) fn block_fits_the_maximum(
     header: &BlockHeader,
     window_size: usize,
 ) -> Result<(), DecodeBlockContentError> {

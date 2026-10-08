@@ -708,6 +708,13 @@ impl DecoderScratchKind {
         }
     }
 
+    fn buffer_append_from_read(&mut self, source: impl Read, max: usize) -> Result<usize, Error> {
+        match self {
+            Self::Ring(s) => s.buffer.append_from_read(source, max),
+            Self::Flat(s) => s.buffer.append_from_read(source, max),
+        }
+    }
+
     /// Clone the cross-block entropy/repcode state (FSE + Huffman tables +
     /// `offset_hist`) out of the live scratch for a [`ResumeState`] snapshot.
     #[cfg(feature = "lsm")]
@@ -1389,6 +1396,124 @@ impl FrameDecoder {
         // The block header is parsed again by the block decoder. Carrying it
         // across would cost a stored field per block for three byte loads.
         3 + if block_type == 1 { 1 } else { size }
+    }
+
+    /// Start the Raw block whose 3-byte header is `header`, its content to
+    /// follow straight from the source through [`Self::raw_block_from_read`]
+    /// instead of being gathered first and copied a second time. Returns the
+    /// block's size and whether it is the frame's last; `Ok(None)`, with
+    /// nothing consumed, when `header` is not a Raw block's, or the frame
+    /// expects no block (its blocks are done and its checksum is next).
+    /// `reserve_window` is as for [`Self::decode_available`].
+    pub(crate) fn start_raw_block(
+        &mut self,
+        header: &[u8; 3],
+        reserve_window: bool,
+    ) -> Result<Option<(u32, bool)>, FrameDecoderError> {
+        let kernel = self.kernel;
+        #[cfg(feature = "hash")]
+        let checksum_mode = self.content_checksum;
+        let state = self
+            .state
+            .as_mut()
+            .ok_or(FrameDecoderError::NotYetInitialized)?;
+        // RFC 8878 3.1.1.2.2: Block_Type 0 is Raw.
+        if state.frame_finished || (header[0] >> 1) & 3 != 0 {
+            return Ok(None);
+        }
+        // The checksum mode is applied before any of the frame's output is
+        // written, as `decode_available` applies it.
+        #[cfg(feature = "hash")]
+        {
+            let compute_hash = checksum_mode != ContentChecksum::None
+                && state.frame_header.descriptor.content_checksum_flag();
+            state.decoder_scratch.set_compute_hash(compute_hash);
+        }
+        let block_index = state.block_counter as u32;
+        let block_frame_offset = state.bytes_read_counter as u32;
+        let mut block_dec = decoding::block_decoder::with_kernel(kernel);
+        let (block_header, header_size) = block_dec
+            .read_block_header(&header[..])
+            .map_err(|source| block_header_decode_error(source, block_index, block_frame_offset))?;
+        let window = state
+            .frame_header
+            .window_size()
+            .map_or(usize::MAX, |w| usize::try_from(w).unwrap_or(usize::MAX));
+        decoding::block_decoder::block_fits_the_maximum(&block_header, window).map_err(
+            |source| {
+                block_body_decode_error(
+                    source,
+                    block_index,
+                    block_frame_offset,
+                    &block_header,
+                    header_size,
+                )
+            },
+        )?;
+        state.bytes_read_counter += u64::from(header_size);
+        if state.block_counter == 0 && (reserve_window || state.frame_header.fcs_declared()) {
+            state.reserve_decoding_buffer();
+        }
+        Ok(Some((
+            block_header.decompressed_size,
+            block_header.last_block,
+        )))
+    }
+
+    /// Append what one read of `source` yields of the Raw block in progress,
+    /// at most `left` bytes, straight into the decode buffer. `Ok(0)` is the
+    /// source's end.
+    pub(crate) fn raw_block_from_read(
+        &mut self,
+        source: impl Read,
+        left: u32,
+    ) -> Result<usize, Error> {
+        let state = self
+            .state
+            .as_mut()
+            .expect("a Raw block is started on an initialised frame");
+        state
+            .decoder_scratch
+            .buffer_append_from_read(source, left as usize)
+    }
+
+    /// The error for a source that ended inside the Raw block of `size` bytes
+    /// in progress: a body read cut short, as the block decoder reports it.
+    pub(crate) fn raw_block_cut_short(&self, size: u32, last: bool) -> FrameDecoderError {
+        let state = self
+            .state
+            .as_ref()
+            .expect("a Raw block is started on an initialised frame");
+        let header = crate::blocks::block::BlockHeader {
+            last_block: last,
+            block_type: crate::blocks::block::BlockType::Raw,
+            decompressed_size: size,
+            content_size: size,
+        };
+        block_body_decode_error(
+            DecodeBlockContentError::ReadError {
+                step: crate::blocks::block::BlockType::Raw,
+                source: Error::from(crate::io::ErrorKind::UnexpectedEof),
+            },
+            state.block_counter as u32,
+            // The header was counted when the block started.
+            (state.bytes_read_counter - 3) as u32,
+            &header,
+            3,
+        )
+    }
+
+    /// Close the Raw block of `size` bytes whose content is all appended.
+    pub(crate) fn finish_raw_block(&mut self, size: u32, last: bool) {
+        let state = self
+            .state
+            .as_mut()
+            .expect("a Raw block is started on an initialised frame");
+        state.bytes_read_counter += u64::from(size);
+        state.block_counter += 1;
+        if last {
+            state.frame_finished = true;
+        }
     }
 
     #[cfg(target_has_atomic = "ptr")]

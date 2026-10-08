@@ -69,7 +69,8 @@ const SKIP_CHUNK: u32 = 8 * 1024;
 /// next frame header, block or checksum, and nothing past it. A step is decoded
 /// only once it is all in hand, so a non-blocking source that returns
 /// `WouldBlock` part-way through loses nothing, and the source never stands
-/// beyond what the decoder has taken.
+/// beyond what the decoder has taken. A Raw block's content is the exception:
+/// it is read straight into the decoder's buffer, see [`RawBlock`].
 struct Input {
     /// Grown to the largest step seen; holds the pending bytes at
     /// `start..end`.
@@ -78,6 +79,18 @@ struct Input {
     end: usize,
     /// Content of a skippable frame still to step over.
     skip_left: u32,
+    /// The Raw block whose content is being read.
+    raw: Option<RawBlock>,
+}
+
+/// A Raw block in progress. Its content is the output itself, so it goes
+/// from the source straight into the decode buffer, read by read, rather than
+/// gathered here first and copied a second time.
+#[derive(Clone, Copy)]
+struct RawBlock {
+    size: u32,
+    left: u32,
+    last: bool,
 }
 
 impl Input {
@@ -87,6 +100,7 @@ impl Input {
             start: 0,
             end: 0,
             skip_left: 0,
+            raw: None,
         }
     }
 
@@ -613,14 +627,65 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             if written == buf.len() {
                 return Ok(written);
             }
-            // The decoder is entered only with its next step whole, or with
-            // output to hand over: entering it with part of a block only
-            // parses the block header to find the block incomplete.
-            let want = decoder.input_needed(self.input.pending());
-            if want > self.input.pending().len() && decoder.can_collect() == 0 {
+            // A Raw block in progress reads on into the decode buffer once
+            // the output already there has been handed over.
+            if let Some(raw) = self.input.raw
+                && decoder.can_collect() == 0
+            {
                 // Return what this call has rather than wait on the source.
                 if written > 0 {
                     return Ok(written);
+                }
+                let n = loop {
+                    match decoder.raw_block_from_read(&mut self.source, raw.left) {
+                        Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                        other => break other?,
+                    }
+                };
+                if n == 0 {
+                    return Err(frame_error(decoder.raw_block_cut_short(raw.size, raw.last)));
+                }
+                // `n <= left`, so it fits the `u32` it is taken from.
+                let left = raw.left - n as u32;
+                if left == 0 {
+                    decoder.finish_raw_block(raw.size, raw.last);
+                    self.input.raw = None;
+                } else {
+                    self.input.raw = Some(RawBlock { left, ..raw });
+                }
+                continue;
+            }
+            // Otherwise the decoder is entered only with its next step whole,
+            // or with output to hand over: entering it with part of a block
+            // only parses the block header to find the block incomplete.
+            let want = decoder.input_needed(self.input.pending());
+            if self.input.raw.is_none()
+                && want > self.input.pending().len()
+                && decoder.can_collect() == 0
+            {
+                // Return what this call has rather than wait on the source.
+                if written > 0 {
+                    return Ok(written);
+                }
+                // A Raw block's header alone is in hand: its content goes
+                // straight to the decode buffer from here on.
+                if let Some(&header) = self.input.pending().first_chunk::<3>()
+                    && self.input.pending().len() == 3
+                    && let Some((size, last)) = decoder
+                        .start_raw_block(&header, true)
+                        .map_err(frame_error)?
+                {
+                    self.input.consume(3);
+                    if size == 0 {
+                        decoder.finish_raw_block(0, last);
+                    } else {
+                        self.input.raw = Some(RawBlock {
+                            size,
+                            left: size,
+                            last,
+                        });
+                    }
+                    continue;
                 }
                 if self.input.fill(&mut self.source, want)? == 0 {
                     return Err(self.cut_short());
@@ -668,8 +733,9 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             return Ok(0);
         }
         // `new()` already read the frame header, so the fast path applies when
-        // the decoder sits at the start of that frame with nothing decoded yet.
-        let at_start = {
+        // the decoder sits at the start of that frame with nothing decoded yet;
+        // a first Raw block part-read into the decode buffer is not that.
+        let at_start = self.input.raw.is_none() && {
             let d = self.decoder.borrow_mut();
             d.is_at_frame_start() && d.can_collect() == 0
         };
@@ -717,7 +783,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         if self.exhausted {
             return Ok(());
         }
-        let at_start = {
+        let at_start = self.input.raw.is_none() && {
             let d = self.decoder.borrow_mut();
             d.is_at_frame_start() && d.can_collect() == 0
         };

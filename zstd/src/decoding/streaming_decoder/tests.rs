@@ -545,6 +545,118 @@ fn a_leading_skippable_frame_is_skipped_in_large_chunks() {
     );
 }
 
+/// `len` bytes no compressor shrinks, so frames of them hold Raw blocks.
+fn incompressible(len: usize) -> alloc::vec::Vec<u8> {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 32) as u8
+        })
+        .collect()
+}
+
+/// Raw blocks are read straight into the decode buffer, read by read: a
+/// source that hands them over a byte at a time between `WouldBlock`s, with
+/// the content checksum verified, still decodes every byte.
+#[test]
+fn read_resumes_raw_blocks_wherever_a_would_block_interrupts_them() {
+    let payload = incompressible(300_000);
+    let mut compressor =
+        crate::encoding::FrameCompressor::new(crate::encoding::CompressionLevel::Fastest);
+    compressor.set_content_checksum(true);
+    compressor.set_source(payload.as_slice());
+    let mut stream = alloc::vec::Vec::new();
+    compressor.set_drain(&mut stream);
+    compressor.compress();
+    assert!(
+        stream.len() > payload.len(),
+        "the frame must hold Raw blocks"
+    );
+    stream.extend(frame_of(b"next"));
+    let descriptor = crate::decoding::frame::FrameDescriptor(stream[4]);
+    let first_header = 5
+        + usize::from(!descriptor.single_segment_flag())
+        + usize::from(descriptor.dictionary_id_bytes().unwrap())
+        + usize::from(descriptor.frame_content_size_bytes().unwrap());
+    // Every byte after the first frame header arrives on its own, and every
+    // other read would block.
+    let stops: alloc::vec::Vec<usize> = (first_header..stream.len()).collect();
+    let source = Arrivals {
+        data: &stream,
+        served: 0,
+        stops: &stops,
+    };
+    let mut decoder = StreamingDecoder::new(source).unwrap();
+    #[cfg(feature = "hash")]
+    decoder
+        .decoder_mut()
+        .set_content_checksum(crate::decoding::ContentChecksum::Verify);
+    let mut out = alloc::vec::Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match decoder.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == crate::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("Raw blocks must survive WouldBlock: {e:?}"),
+        }
+    }
+    let mut expected = payload;
+    expected.extend_from_slice(b"next");
+    assert!(out == expected, "decoded {} bytes", out.len());
+}
+
+/// `read_to_end` after a `read` that stopped inside the first Raw block must
+/// carry on from the decode buffer, not decode the frame again from the
+/// source as if nothing had been read.
+#[cfg(feature = "std")]
+#[test]
+fn read_to_end_after_a_part_read_raw_block_is_complete() {
+    let payload = incompressible(20_000);
+    let frame = frame_of(&payload);
+    let descriptor = crate::decoding::frame::FrameDescriptor(frame[4]);
+    let header = 5
+        + usize::from(!descriptor.single_segment_flag())
+        + usize::from(descriptor.dictionary_id_bytes().unwrap())
+        + usize::from(descriptor.frame_content_size_bytes().unwrap());
+    let stops = [header + 3 + 100];
+    let source = Arrivals {
+        data: &frame,
+        served: 0,
+        stops: &stops,
+    };
+    let mut decoder = StreamingDecoder::new(source).unwrap();
+    let mut buf = [0u8; 64];
+    // The Raw block's first 100 bytes are taken, then the source blocks.
+    loop {
+        match decoder.read(&mut buf) {
+            Err(e) if e.kind() == crate::io::ErrorKind::WouldBlock => break,
+            Ok(n) => assert_eq!(n, 0, "a frame's window holds its output until it ends"),
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    let mut out = alloc::vec::Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    assert!(out == payload, "decoded {} bytes", out.len());
+}
+
+/// A source that ends inside a Raw block is a truncated block body.
+#[test]
+fn read_rejects_a_frame_cut_inside_a_raw_block() {
+    let payload = incompressible(20_000);
+    let mut frame = frame_of(&payload);
+    frame.truncate(frame.len() - 100);
+    let decoder = StreamingDecoder::new(frame.as_slice()).unwrap();
+    let err = drain_with_read(decoder).expect_err("a cut Raw block must fail");
+    assert!(
+        alloc::format!("{err:?}").contains("UnexpectedEof"),
+        "{err:?}"
+    );
+}
+
 /// A source that serves `data` up to each of `stops` in turn, reporting
 /// `WouldBlock` once at each, as a socket does between arrivals.
 struct Arrivals<'a> {
