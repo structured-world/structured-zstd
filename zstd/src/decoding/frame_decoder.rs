@@ -1367,24 +1367,28 @@ impl FrameDecoder {
             return 3;
         };
         // RFC 8878 3.1.1.2: Last_Block (bit 0), Block_Type (bits 1-2),
-        // Block_Size (bits 3-23); an RLE block carries one byte of content,
-        // and a Reserved one (3.1.1.2.2) is invalid from its header alone.
+        // Block_Size (bits 3-23). A Reserved block (3.1.1.2.2) is invalid
+        // from its header alone. Block_Size is held to the block maximum for
+        // every type: for an RLE block it is the repeat count, while its
+        // content is one byte.
         let header = u32::from_le_bytes([b0, b1, b2, 0]);
-        let body = match (header >> 1) & 3 {
-            1 => 1,
-            3 => return 3,
-            _ => (header >> 3) as usize,
-        };
+        let block_type = (header >> 1) & 3;
+        if block_type == 3 {
+            return 3;
+        }
+        let size = (header >> 3) as usize;
         // A window wider than the address space cannot bound a block below
         // the 128 KiB maximum, so it counts as unbounded here.
         let window = state
             .frame_header
             .window_size()
             .map_or(usize::MAX, |w| usize::try_from(w).unwrap_or(usize::MAX));
-        if body > decoding::block_decoder::block_maximum(window) {
+        if size > decoding::block_decoder::block_maximum(window) {
             return 3;
         }
-        3 + body
+        // The block header is parsed again by the block decoder. Carrying it
+        // across would cost a stored field per block for three byte loads.
+        3 + if block_type == 1 { 1 } else { size }
     }
 
     #[cfg(target_has_atomic = "ptr")]

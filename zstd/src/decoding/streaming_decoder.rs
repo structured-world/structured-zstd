@@ -110,7 +110,10 @@ impl Input {
         result.map(drop)
     }
 
-    fn clear(&mut self) {
+    /// Drop the input, buffer and all: after `read_rest` it holds a whole
+    /// stream, which a decoder kept alive must not pin.
+    fn release(&mut self) {
+        self.buf = alloc::vec::Vec::new();
         self.start = 0;
         self.end = 0;
     }
@@ -470,9 +473,16 @@ fn skip_frame_content<R: Read>(source: &mut R, length: u32) -> Result<(), FrameD
     // Counted in the wire's `u32`: a `usize` is 16 bits on some targets, and a
     // truncated count would leave part of the content to be read as a header.
     let mut left = length;
-    let mut scratch = [0u8; 512];
+    if left == 0 {
+        return Ok(());
+    }
+    // Read in `SKIP_CHUNK`s, as skippable frames after the first frame are,
+    // on the heap and only as large as the content: a stack array that size
+    // would cost a no_std target 8 KiB of stack for every constructor call.
+    let mut scratch = alloc::vec![0u8; left.min(SKIP_CHUNK) as usize];
     while left > 0 {
-        // The minimum is taken in `u32`, then fits `usize` as at most 512.
+        // The minimum is taken in `u32`, then fits `usize` as at most
+        // `SKIP_CHUNK`.
         let take = left.min(scratch.len() as u32) as usize;
         match source.read(&mut scratch[..take]) {
             Ok(0) => return Err(FrameDecoderError::FailedToSkipFrame),
@@ -674,7 +684,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
                 output,
                 keep_dictionary,
             );
-            self.input.clear();
+            self.input.release();
             decoded.map_err(Error::other)?;
             return Ok(output.len() - start_total);
         }
@@ -720,7 +730,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
                 output,
                 keep_dictionary,
             );
-            self.input.clear();
+            self.input.release();
             decoded.map_err(|e| Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)))?;
             return Ok(());
         }

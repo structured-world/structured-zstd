@@ -478,6 +478,73 @@ fn read_rejects_a_reserved_block_without_waiting_for_its_body() {
     assert_ne!(err.kind(), crate::io::ErrorKind::WouldBlock, "{err:?}");
 }
 
+/// An RLE block's size field is its repeat count (RFC 8878 3.1.1.2.3): one
+/// over the frame's block maximum is invalid from the header alone, so the
+/// reader reports it without waiting for the block's one byte of content.
+#[test]
+fn read_rejects_an_oversized_rle_block_without_waiting_for_its_byte() {
+    // Single-segment frame of 16 bytes, then a last RLE block repeating its
+    // byte 100 times, past the frame's 16-byte block maximum.
+    let header = (100u32 << 3) | (1 << 1) | 1;
+    let mut frame = alloc::vec![0x28, 0xB5, 0x2F, 0xFD, 0x20, 16];
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    let mut decoder = StreamingDecoder::new(OpenPipe { data: &frame }).unwrap();
+    let mut buf = [0u8; 64];
+    let err = decoder
+        .read(&mut buf)
+        .expect_err("an RLE block over the block maximum must fail");
+    assert_ne!(err.kind(), crate::io::ErrorKind::WouldBlock, "{err:?}");
+}
+
+/// `read_to_end` gathers the rest of the stream in one buffer; it must not
+/// stay allocated once the stream is decoded, or a decoder kept alive pins a
+/// whole compressed archive.
+#[cfg(feature = "std")]
+#[test]
+fn read_to_end_releases_the_compressed_stream() {
+    let payload: alloc::vec::Vec<u8> = (0..50_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    let stream = frame_of(&payload);
+    let mut decoder = StreamingDecoder::new(stream.as_slice()).unwrap();
+    let mut out = alloc::vec::Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    assert_eq!(out, payload);
+    assert_eq!(decoder.input.buf.capacity(), 0);
+}
+
+/// A source that counts the reads it serves.
+struct Counting<'a> {
+    data: &'a [u8],
+    reads: usize,
+}
+
+impl Read for Counting<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, crate::io::Error> {
+        self.reads += 1;
+        self.data.read(buf)
+    }
+}
+
+/// A large skippable frame in front of the first frame is stepped over in
+/// chunks of `SKIP_CHUNK`, as the ones after it are, not 512 bytes at a time.
+#[test]
+fn a_leading_skippable_frame_is_skipped_in_large_chunks() {
+    let mut stream = skippable_frame(&alloc::vec![0u8; 64 * 1024]);
+    stream.extend(frame_of(b"after the metadata"));
+    let mut source = Counting {
+        data: &stream,
+        reads: 0,
+    };
+    StreamingDecoder::new(&mut source).unwrap();
+    let chunks = 64 * 1024 / super::SKIP_CHUNK as usize;
+    assert!(
+        source.reads <= chunks + 8,
+        "{} reads for a 64 KiB skippable frame",
+        source.reads
+    );
+}
+
 /// A source that serves `data` up to each of `stops` in turn, reporting
 /// `WouldBlock` once at each, as a socket does between arrivals.
 struct Arrivals<'a> {
