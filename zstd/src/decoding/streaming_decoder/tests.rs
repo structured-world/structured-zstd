@@ -460,6 +460,84 @@ fn read_rejects_a_block_that_does_not_decode() {
     assert!(drain_with_read(decoder).is_err());
 }
 
+/// A block header of the reserved type (RFC 8878 3.1.1.2.2) is invalid on its
+/// own: the reader reports it from the header's three bytes instead of waiting
+/// on the source for a body the block does not have.
+#[test]
+fn read_rejects_a_reserved_block_without_waiting_for_its_body() {
+    // Single-segment frame of 16 bytes, then a last block of type 3 stating
+    // 10 bytes of content, within the frame's block maximum, that never follow.
+    let header = (10u32 << 3) | (3 << 1) | 1;
+    let mut frame = alloc::vec![0x28, 0xB5, 0x2F, 0xFD, 0x20, 16];
+    frame.extend_from_slice(&header.to_le_bytes()[..3]);
+    let mut decoder = StreamingDecoder::new(OpenPipe { data: &frame }).unwrap();
+    let mut buf = [0u8; 64];
+    let err = decoder
+        .read(&mut buf)
+        .expect_err("a reserved block type must fail");
+    assert_ne!(err.kind(), crate::io::ErrorKind::WouldBlock, "{err:?}");
+}
+
+/// A source that serves `data` up to each of `stops` in turn, reporting
+/// `WouldBlock` once at each, as a socket does between arrivals.
+struct Arrivals<'a> {
+    data: &'a [u8],
+    served: usize,
+    stops: &'a [usize],
+}
+
+impl Read for Arrivals<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, crate::io::Error> {
+        let limit = match self.stops.first() {
+            Some(&stop) if stop == self.served => {
+                self.stops = &self.stops[1..];
+                return Err(crate::io::Error::from(crate::io::ErrorKind::WouldBlock));
+            }
+            Some(&stop) => stop,
+            None => self.data.len(),
+        };
+        let n = buf.len().min(limit - self.served);
+        buf[..n].copy_from_slice(&self.data[self.served..self.served + n]);
+        self.served += n;
+        Ok(n)
+    }
+}
+
+/// Input a `read` gathered before a `WouldBlock`, and whatever `read_to_end`
+/// takes from the source before it stops again, both stay with the decoder: a
+/// retried `read_to_end` decodes the whole frame.
+#[cfg(feature = "std")]
+#[test]
+fn read_to_end_resumes_after_the_source_would_block() {
+    let payload: alloc::vec::Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    let frame = frame_of(&payload);
+    let descriptor = crate::decoding::frame::FrameDescriptor(frame[4]);
+    let header = 5
+        + usize::from(!descriptor.single_segment_flag())
+        + usize::from(descriptor.dictionary_id_bytes().unwrap())
+        + usize::from(descriptor.frame_content_size_bytes().unwrap());
+    let stops = [header + 10, header + 50];
+    let source = Arrivals {
+        data: &frame,
+        served: 0,
+        stops: &stops,
+    };
+    let mut decoder = StreamingDecoder::new(source).unwrap();
+    let mut buf = [0u8; 64];
+    let err = decoder
+        .read(&mut buf)
+        .expect_err("the first block is not all here");
+    assert_eq!(err.kind(), crate::io::ErrorKind::WouldBlock);
+    let mut out = alloc::vec::Vec::new();
+    let err = decoder
+        .read_to_end(&mut out)
+        .expect_err("the source stops again");
+    assert_eq!(err.kind(), crate::io::ErrorKind::WouldBlock);
+    out.clear();
+    decoder.read_to_end(&mut out).unwrap();
+    assert!(out == payload, "decoded {} bytes", out.len());
+}
+
 /// `read_to_end` hands the source's own error back as it reported it.
 #[cfg(feature = "std")]
 #[test]
@@ -486,7 +564,13 @@ fn read_rejects_a_frame_cut_inside_its_checksum() {
     compressor.compress();
     frame.truncate(frame.len() - 2);
     let decoder = StreamingDecoder::new(frame.as_slice()).unwrap();
-    assert!(drain_with_read(decoder).is_err());
+    // The cut is reported where it is, in the checksum, not as a block header
+    // read out of the checksum's first bytes.
+    let err = drain_with_read(decoder).expect_err("a frame missing checksum bytes must fail");
+    assert!(
+        alloc::format!("{err:?}").contains("FailedToReadChecksum"),
+        "{err:?}"
+    );
 }
 
 /// A dictionary constructor still rejects a source that is not a frame.

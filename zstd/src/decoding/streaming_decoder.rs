@@ -94,13 +94,25 @@ impl Input {
         &self.buf[self.start..self.end]
     }
 
-    /// The pending bytes as a vector the caller can append the rest of the
-    /// source to; empty, with no allocation, when nothing was read ahead.
-    fn take_pending(&mut self) -> alloc::vec::Vec<u8> {
-        let pending = self.pending().to_vec();
+    /// Read the rest of `source` behind the pending bytes. What it reads stays
+    /// pending whatever it returns, so a source that stops part-way through
+    /// is retried from where it stopped, with nothing lost.
+    fn read_rest<R: Read>(&mut self, source: &mut R) -> Result<(), Error> {
+        if self.start > 0 {
+            self.buf.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.start = 0;
+        }
+        self.buf.truncate(self.end);
+        // Both `read_to_end`s keep what they appended when they fail.
+        let result = source.read_to_end(&mut self.buf);
+        self.end = self.buf.len();
+        result.map(drop)
+    }
+
+    fn clear(&mut self) {
         self.start = 0;
         self.end = 0;
-        pending
     }
 
     fn consume(&mut self, n: usize) {
@@ -337,15 +349,21 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
         self.decoder
     }
 
-    /// The error for a source that ended inside a frame: the leftover input
-    /// handed to the block decoder, which reports how it was cut short as it
-    /// does for any truncated frame. Whole input never reaches here (it would
-    /// have decoded), so that decode fails; were it to pass, the cut is still
-    /// reported, as an early end of input.
+    /// The error for a source that ended inside a frame. Cut inside the
+    /// trailing checksum, that is what it reports; cut inside a block, the
+    /// leftover input goes to the block decoder, which reports how it was cut
+    /// short as it does for any truncated frame. Whole input never reaches
+    /// here (it would have decoded), so that decode fails; were it to pass,
+    /// the cut is still reported, as an early end of input.
     fn cut_short(&mut self) -> Error {
+        let decoder = self.decoder.borrow_mut();
+        if decoder.awaits_checksum() {
+            return frame_error(FrameDecoderError::FailedToReadChecksum(Error::from(
+                ErrorKind::UnexpectedEof,
+            )));
+        }
         let mut rest = self.input.pending();
-        self.decoder
-            .borrow_mut()
+        decoder
             .decode_blocks(&mut rest, BlockDecodingStrategy::All)
             .map_or_else(frame_error, |_| Error::from(ErrorKind::UnexpectedEof))
     }
@@ -650,12 +668,14 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         // count.
         let keep_dictionary = self.forced_dictionary;
         if at_start {
-            let mut compressed = self.input.take_pending();
-            self.source.read_to_end(&mut compressed)?;
-            self.decoder
-                .borrow_mut()
-                .decode_current_frame_to_vec(&compressed, output, keep_dictionary)
-                .map_err(Error::other)?;
+            self.input.read_rest(&mut self.source)?;
+            let decoded = self.decoder.borrow_mut().decode_current_frame_to_vec(
+                self.input.pending(),
+                output,
+                keep_dictionary,
+            );
+            self.input.clear();
+            decoded.map_err(Error::other)?;
             return Ok(output.len() - start_total);
         }
         // Mid-frame fallback: drain through the generic path, which carries on
@@ -694,12 +714,14 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         // As in the std path: the decoder's own dictionary, reused in place.
         let keep_dictionary = self.forced_dictionary;
         if at_start {
-            let mut compressed = self.input.take_pending();
-            self.source.read_to_end(&mut compressed)?;
-            self.decoder
-                .borrow_mut()
-                .decode_current_frame_to_vec(&compressed, output, keep_dictionary)
-                .map_err(|e| Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)))?;
+            self.input.read_rest(&mut self.source)?;
+            let decoded = self.decoder.borrow_mut().decode_current_frame_to_vec(
+                self.input.pending(),
+                output,
+                keep_dictionary,
+            );
+            self.input.clear();
+            decoded.map_err(|e| Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)))?;
             return Ok(());
         }
         // Mid-frame fallback: drain through the generic path, which carries on

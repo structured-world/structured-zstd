@@ -1339,6 +1339,16 @@ impl FrameDecoder {
         self.magicless
     }
 
+    /// Whether every block of the frame is decoded and only its trailing
+    /// content checksum is still to be read.
+    pub(crate) fn awaits_checksum(&self) -> bool {
+        self.state.as_ref().is_some_and(|state| {
+            state.frame_finished
+                && state.frame_header.descriptor.content_checksum_flag()
+                && state.check_sum.is_none()
+        })
+    }
+
     /// How many bytes from the start of `pending` the current frame's next
     /// step needs in hand: a block header, a whole block, or the trailing
     /// checksum; 0 once the frame wants no more input. Upstream zstd's
@@ -1357,12 +1367,13 @@ impl FrameDecoder {
             return 3;
         };
         // RFC 8878 3.1.1.2: Last_Block (bit 0), Block_Type (bits 1-2),
-        // Block_Size (bits 3-23); an RLE block carries one byte of content.
+        // Block_Size (bits 3-23); an RLE block carries one byte of content,
+        // and a Reserved one (3.1.1.2.2) is invalid from its header alone.
         let header = u32::from_le_bytes([b0, b1, b2, 0]);
-        let body = if (header >> 1) & 3 == 1 {
-            1
-        } else {
-            (header >> 3) as usize
+        let body = match (header >> 1) & 3 {
+            1 => 1,
+            3 => return 3,
+            _ => (header >> 3) as usize,
         };
         // A window wider than the address space cannot bound a block below
         // the 128 KiB maximum, so it counts as unbounded here.
