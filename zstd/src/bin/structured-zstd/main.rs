@@ -800,19 +800,37 @@ struct ParseFailure {
 }
 
 /// `-p`: hold the window open before exiting, as the reference does at its
-/// common exit (`waitEnter`). Whatever stdin holds, or its end, lets the
+/// common exit (`waitEnter`). Whatever `stdin` holds, or its end, lets the
 /// program go.
-fn wait_for_enter() {
+fn wait_for_enter(stdin: &mut impl Read) {
     eprintln!("Press enter to continue... ");
     let mut byte = [0u8; 1];
     // A failed read ends the wait just as Enter would.
-    drop(io::stdin().read(&mut byte));
+    drop(stdin.read(&mut byte));
 }
 
 fn main() {
     // `args_os`, not `args`: the latter panics on an argument that is not
     // UTF-8, which on Unix is a legitimate filename rather than a mistake.
     let raw: Vec<OsString> = std::env::args_os().collect();
+    std::process::exit(run_command(&raw, &mut io::stdin()));
+}
+
+/// The whole command for `raw` (`argv`, program name first): its exit status,
+/// returned once `-p` has had its wait on `stdin`. The one exit every outcome
+/// passes through, as the reference's `_end` is.
+fn run_command(raw: &[OsString], stdin: &mut impl Read) -> i32 {
+    let mut pause = false;
+    let status = command_status(raw, &mut pause);
+    if pause {
+        wait_for_enter(stdin);
+    }
+    status
+}
+
+/// [`run_command`] up to the exit: the status, with `pause` set when the
+/// command line asked for `-p`.
+fn command_status(raw: &[OsString], pause: &mut bool) -> i32 {
     let prog = raw
         .first()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -824,38 +842,32 @@ fn main() {
     let default_level = level_from_env(std::env::var_os("ZSTD_CLEVEL").as_deref(), DEFAULT_LEVEL);
     check_threads_env(std::env::var_os("ZSTD_NBTHREADS").as_deref(), DEFAULT_LEVEL);
 
-    let options = match parse_args(&raw[1..], &preset, default_level) {
+    let args = raw.get(1..).unwrap_or_default();
+    let options = match parse_args(args, &preset, default_level) {
         Ok(Parsed::Run(options)) => *options,
-        Ok(Parsed::Handled { pause }) => {
-            if pause {
-                wait_for_enter();
-            }
-            return;
+        Ok(Parsed::Handled { pause: asked }) => {
+            *pause = asked;
+            return 0;
         }
         Err(failure) => {
+            *pause = failure.pause;
             display!(failure.verbosity, 1, "zstd: {}", failure.error);
             if failure.verbosity >= DEFAULT_LEVEL {
                 let mut stderr = io::stderr().lock();
                 let _ = write_short_usage(&mut stderr, &preset.name);
             }
-            if failure.pause {
-                wait_for_enter();
-            }
-            std::process::exit(1);
+            return 1;
         }
     };
     let verbosity = options.verbosity;
-    let pause = options.pause;
+    *pause = options.pause;
     // Before anything that compresses or decompresses: the first such call
     // chooses the kernels, and they stay chosen for the process.
     if let Some(level) = options.cpu
         && let Err(err) = structured_zstd::set_cpu_ceiling(level)
     {
         display!(verbosity, 1, "zstd: --cpu={level}: {err}");
-        if pause {
-            wait_for_enter();
-        }
-        std::process::exit(1);
+        return 1;
     }
     display!(
         verbosity,
@@ -866,18 +878,14 @@ fn main() {
     );
     // Status goes to stderr through `display!`, so it never contaminates a
     // `-c` stdout data stream.
-    let status = match run(options) {
+    match run(options) {
         Ok(0) => 0,
         Ok(_failed_inputs) => 1,
         Err(err) => {
             display!(verbosity, 1, "zstd: {err}");
             1
         }
-    };
-    if pause {
-        wait_for_enter();
     }
-    std::process::exit(status);
 }
 
 /// What `argv[0]` presets before any flag is read: the conventional symlink

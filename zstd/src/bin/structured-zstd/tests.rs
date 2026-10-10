@@ -2359,6 +2359,41 @@ fn pause_holds_the_exits_parsing_takes() {
     }
 }
 
+/// The whole command waits on stdin under `-p` at its one exit, whatever the
+/// outcome (printed, refused, run), and only then; the status is the run's.
+#[test]
+fn the_command_pauses_at_its_one_exit() {
+    let command = |args: &[&str]| {
+        let raw: Vec<OsString> = std::iter::once("zstd")
+            .chain(args.iter().copied())
+            .map(OsString::from)
+            .collect();
+        let mut stdin: &[u8] = b"\nleft";
+        let status = run_command(&raw, &mut stdin);
+        (status, stdin == b"left")
+    };
+    assert_eq!(command(&["-p", "-V"]), (0, true));
+    assert_eq!(command(&["-V"]), (0, false));
+    assert_eq!(command(&["-p", "--bogus"]), (1, true));
+    assert_eq!(command(&["--bogus"]), (1, false));
+    assert_eq!(command(&["-p", "-b1", "-i0", "-qq", "-B64K"]), (0, true));
+    assert_eq!(command(&["-b1", "-i0", "-qq", "-B64K"]), (0, false));
+    assert_eq!(
+        command(&["-p", "-qq", "-d", "/nonexistent/input.zst"]),
+        (1, true)
+    );
+    // A run that ends in an error rather than a failed input.
+    assert_eq!(command(&["-p", "-qq", "-b", "-"]), (1, true));
+    // A kernel ceiling from the other instruction-set ladder is refused before
+    // anything runs, and the pause still holds.
+    let foreign = if cfg!(target_arch = "aarch64") {
+        "--cpu=avx2"
+    } else {
+        "--cpu=neon"
+    };
+    assert_eq!(command(&["-p", "-qq", foreign]), (1, true));
+}
+
 /// Long options the reference takes for its own testing and tuning. The ones
 /// that cannot change what this build does are accepted; `--trace` still needs
 /// its file, as it does there.
