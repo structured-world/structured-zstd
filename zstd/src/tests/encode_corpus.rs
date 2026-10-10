@@ -36,8 +36,7 @@ fn test_encode_corpus_files_uncompressed_our_decompressor() {
 
         compressor.compress();
         let mut decompressed_output = Vec::new();
-        let mut decoder =
-            crate::decoding::StreamingDecoder::new(compressed_file.as_slice()).unwrap();
+        let mut decoder = crate::decoding::StreamingDecoder::new(compressed_file.as_slice());
         decoder.read_to_end(&mut decompressed_output).unwrap();
 
         if input != decompressed_output {
@@ -91,8 +90,7 @@ fn test_encode_corpus_files_compressed_our_decompressor() {
 
         compressor.compress();
         let mut decompressed_output = Vec::new();
-        let mut decoder =
-            crate::decoding::StreamingDecoder::new(compressed_file.as_slice()).unwrap();
+        let mut decoder = crate::decoding::StreamingDecoder::new(compressed_file.as_slice());
         decoder.read_to_end(&mut decompressed_output).unwrap();
 
         if input != decompressed_output {

@@ -317,8 +317,7 @@ fn dfast_default_level_roundtrip_with_repetitive_breaks_exercises_fast_loop() {
     // Decompress and assert byte-for-byte parity. A regression
     // that broke the fast-loop helper call would either produce
     // invalid frames (decode error) or wrong bytes (mismatch).
-    let mut decoder = crate::decoding::StreamingDecoder::new(compressed.as_slice())
-        .expect("default-level frame must decode");
+    let mut decoder = crate::decoding::StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::with_capacity(data.len());
     // Under `feature = "std"` (the gate above) `StreamingDecoder`
     // implements `std::io::Read`, so `Read::read_to_end` resolves

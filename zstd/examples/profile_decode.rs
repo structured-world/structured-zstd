@@ -11,7 +11,7 @@ fn main() {
     eprintln!("input {} bytes, iters {}", data.len(), iters);
     let mut total = 0usize;
     for _ in 0..iters {
-        let mut decoder = StreamingDecoder::new(data.as_slice()).expect("ctor");
+        let mut decoder = StreamingDecoder::new(data.as_slice());
         let mut out = Vec::new();
         decoder.read_to_end(&mut out).expect("decode");
         total = total.wrapping_add(out.len());

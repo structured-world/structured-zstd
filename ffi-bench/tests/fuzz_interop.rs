@@ -12,7 +12,7 @@ use structured_zstd::decoding::{BlockDecodingStrategy, FrameDecoder, StreamingDe
 use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
 
 fn decode_szstd(data: &mut dyn Read) -> Vec<u8> {
-    let mut decoder = StreamingDecoder::new(data).unwrap();
+    let mut decoder = StreamingDecoder::new(data);
     let mut result: Vec<u8> = Vec::new();
     decoder.read_to_end(&mut result).expect("Decoding failed");
     result

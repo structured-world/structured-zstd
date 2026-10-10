@@ -29,6 +29,14 @@ use crate::io::{Error, ErrorKind, Read};
 /// To decode a single frame and leave the bytes after it unread, drive a
 /// [FrameDecoder] directly.
 ///
+/// ## When the source is read
+/// Construction reads nothing; the first frame's header is read by the first
+/// `read` or `read_to_end`, and a source that is not a zstd stream fails
+/// there, as upstream's `ZSTD_DStream` reads nothing until it is fed. So
+/// [`into_inner`](Self::into_inner) hands back an untouched source when the
+/// decoder was never read, and the source is not lost when its first frame
+/// turns out to be damaged.
+///
 /// ```no_run
 /// // `File` is std-only; `read_to_end` itself is available under no_std too.
 /// #[cfg(feature = "std")]
@@ -39,7 +47,7 @@ use crate::io::{Error, ErrorKind, Read};
 ///
 ///     // Read a Zstandard archive from the filesystem then decompress it into a vec.
 ///     let mut f: File = todo!("Read a .zstd archive from somewhere");
-///     let mut decoder = StreamingDecoder::new(f).unwrap();
+///     let mut decoder = StreamingDecoder::new(f);
 ///     let mut result = Vec::new();
 ///     Read::read_to_end(&mut decoder, &mut result).unwrap();
 /// }
@@ -48,17 +56,30 @@ pub struct StreamingDecoder<READ: Read, DEC: BorrowMut<FrameDecoder>> {
     pub decoder: DEC,
     source: READ,
     /// Whether the decoder was constructed with a dictionary it applies to
-    /// every frame. The `read_to_end` paths re-initialise FOLLOWING
-    /// concatenated frames with it (a plain re-init resolves dictionaries by
+    /// every frame, the first included (a plain init resolves dictionaries by
     /// frame id only and would lose it for frames omitting the id); the
     /// decoder already holds its handle, so this one keeps none of its own.
     forced_dictionary: bool,
-    /// The source has ended at a frame boundary (or held only skippable
-    /// frames): every read from here on is the end of the stream, without
-    /// asking the source again.
-    exhausted: bool,
+    /// Where the stream stands between frames.
+    position: Position,
     /// Source bytes read ahead and not yet decoded.
     input: Input,
+}
+
+/// Where a [`StreamingDecoder`] stands in its stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Position {
+    /// Nothing read yet: the next step is the first frame's header, and the
+    /// source ending here is an error, as an empty stream holds no frame.
+    BeforeFirstFrame,
+    /// A frame or skippable frame has ended: the next step is the next
+    /// frame's header, and the source ending here is the end of the stream.
+    BetweenFrames,
+    /// Inside a frame whose header has been read.
+    InFrame,
+    /// The source has ended at a frame boundary: every read from here on is
+    /// the end of the stream, without asking the source again.
+    End,
 }
 
 /// The most of a skippable frame's content read in one step.
@@ -234,27 +255,49 @@ fn header_len(bytes: &[u8], magicless: bool) -> usize {
 }
 
 impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
-    pub fn new_with_decoder(
-        mut source: READ,
-        mut decoder: DEC,
-    ) -> Result<StreamingDecoder<READ, DEC>, FrameDecoderError> {
-        let started = start_first_frame(decoder.borrow_mut(), &mut source, FrameStart::Plain)?;
-        Ok(StreamingDecoder {
+    /// [`new`](StreamingDecoder::new) driving a caller-supplied
+    /// [`FrameDecoder`], so its buffers and settings (magicless format,
+    /// registered dictionaries, checksum mode) carry over from stream to
+    /// stream. Nothing is read from `source` until the first read.
+    ///
+    /// # Examples
+    /// ```
+    /// use std::io::Read;
+    /// use structured_zstd::decoding::{FrameDecoder, StreamingDecoder};
+    /// use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
+    ///
+    /// let frame = compress_to_vec(&b"reused decoder"[..], CompressionLevel::Fastest);
+    /// let mut decoder = FrameDecoder::new();
+    /// for _ in 0..2 {
+    ///     let mut stream = StreamingDecoder::new_with_decoder(&frame[..], &mut decoder);
+    ///     let mut decoded = Vec::new();
+    ///     stream.read_to_end(&mut decoded).unwrap();
+    ///     assert_eq!(decoded, b"reused decoder");
+    /// }
+    /// ```
+    pub fn new_with_decoder(source: READ, decoder: DEC) -> StreamingDecoder<READ, DEC> {
+        StreamingDecoder {
             decoder,
             source,
             forced_dictionary: false,
-            exhausted: !started,
+            position: Position::BeforeFirstFrame,
             input: Input::new(),
-        })
+        }
     }
 
     /// [`new_with_decoder`](Self::new_with_decoder) with `dict` applied to
-    /// the frame even when its header omits the dictionary ID, as
+    /// every frame even when its header omits the dictionary ID, as
     /// [`new_with_dictionary_handle`](StreamingDecoder::new_with_dictionary_handle)
     /// applies it (same warning). A decoder reused frame after frame keeps its
     /// buffers and, for the same dictionary, the handle it already holds, so
     /// after the first frame it allocates nothing and touches no reference
     /// count.
+    ///
+    /// # Errors
+    ///
+    /// Only for a dictionary whose content no frame can use. Nothing is read
+    /// from `source` until the first read, which reports a frame that does
+    /// not match the dictionary.
     ///
     /// # Examples
     /// ```
@@ -281,41 +324,51 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
     /// }
     /// ```
     pub fn new_with_decoder_and_dictionary_handle(
-        mut source: READ,
+        source: READ,
         mut decoder: DEC,
         dict: &DictionaryHandle,
     ) -> Result<StreamingDecoder<READ, DEC>, FrameDecoderError> {
-        let started = start_first_frame(
-            decoder.borrow_mut(),
-            &mut source,
-            FrameStart::Dictionary(dict),
-        )?;
+        decoder.borrow_mut().arm_dict(dict)?;
         Ok(StreamingDecoder {
             decoder,
             source,
             forced_dictionary: true,
-            exhausted: !started,
+            position: Position::BeforeFirstFrame,
             input: Input::new(),
         })
     }
 }
 
 impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
-    pub fn new(
-        mut source: READ,
-    ) -> Result<StreamingDecoder<READ, FrameDecoder>, FrameDecoderError> {
-        let mut decoder = FrameDecoder::new();
-        let started = start_first_frame(&mut decoder, &mut source, FrameStart::Plain)?;
-        Ok(StreamingDecoder {
-            decoder,
-            source,
-            forced_dictionary: false,
-            exhausted: !started,
-            input: Input::new(),
-        })
+    /// Create a streaming decoder over `source`.
+    ///
+    /// Nothing is read from `source` here: the first frame's header is read by
+    /// the first `read` or `read_to_end`, which is where a source that is not
+    /// a zstd stream, or is empty, reports its error. Until then
+    /// [`into_inner`](Self::into_inner) hands `source` back untouched, and
+    /// after such an error it hands back whatever the source holds past the
+    /// bytes the decoder took.
+    ///
+    /// # Examples
+    /// ```
+    /// use std::io::Read;
+    /// use structured_zstd::decoding::StreamingDecoder;
+    ///
+    /// let mut decoder = StreamingDecoder::new(&b"not a zstd frame"[..]);
+    /// let mut out = Vec::new();
+    /// assert!(decoder.read_to_end(&mut out).is_err());
+    /// ```
+    pub fn new(source: READ) -> StreamingDecoder<READ, FrameDecoder> {
+        StreamingDecoder::new_with_decoder(source, FrameDecoder::new())
     }
 
     /// Create a streaming decoder using a pre-parsed dictionary handle.
+    ///
+    /// Nothing is read from `source` here, as with [`new`](Self::new).
+    ///
+    /// # Errors
+    ///
+    /// Only for a dictionary whose content no frame can use.
     ///
     /// # Warning
     ///
@@ -366,17 +419,28 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
     /// Exposed for settings that are read as decoding proceeds rather than at
     /// construction — [`FrameDecoder::set_content_checksum`] above all, which a
     /// caller that wants mismatches to fail (rather than merely be computed)
-    /// has to reach after the constructor has chosen and initialised the
-    /// decoder, including on the dictionary paths.
+    /// has to reach after the constructor has chosen the decoder, including
+    /// on the dictionary paths.
     pub fn decoder_mut(&mut self) -> &mut FrameDecoder {
         self.decoder.borrow_mut()
     }
 
     /// Destructures this object into the inner reader.
     ///
-    /// The decoder reads only what its next step needs, so once a frame's
-    /// content has been delivered the reader stands right after that frame.
-    /// Bytes of a step a `WouldBlock` left unfinished stay with the decoder.
+    /// This reads nothing. A decoder that was never read hands the reader back
+    /// untouched. The decoder reads only what its next step needs, so once a
+    /// frame's content has been delivered the reader stands right after that
+    /// frame. Bytes of a step a `WouldBlock` left unfinished stay with the
+    /// decoder.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::decoding::StreamingDecoder;
+    ///
+    /// let data = b"\x28\xb5\x2f\xfd and whatever follows";
+    /// let decoder = StreamingDecoder::new(&data[..]);
+    /// assert_eq!(decoder.into_inner(), &data[..]);
+    /// ```
     pub fn into_inner(self) -> READ
     where
         READ: Sized,
@@ -416,16 +480,17 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
             .map_or_else(frame_error, |_| Error::from(ErrorKind::UnexpectedEof))
     }
 
-    /// Start the frame that follows the finished one, skipping skippable
-    /// frames, with the constructor's dictionary if it had one. `false` when
-    /// the source ends cleanly at the frame boundary; anything else that is
-    /// not a frame is an error.
+    /// Start the next frame of the stream, the first included, skipping
+    /// skippable frames, with the constructor's dictionary if it had one.
+    /// `false` when the source ends cleanly at a frame boundary, which the
+    /// start of the stream is not; anything else that is not a frame is an
+    /// error.
     ///
     /// The source's own errors go back as it reported them, so a non-blocking
     /// source's `WouldBlock` stays one; what the boundary had read stays in
     /// [`Input`], and the header is parsed only once it is whole, so a retry
     /// resumes where the source stopped.
-    fn start_next_frame(&mut self) -> Result<bool, Error> {
+    fn start_frame(&mut self) -> Result<bool, Error> {
         let how = if self.forced_dictionary {
             FrameStart::HeldDictionary
         } else {
@@ -457,6 +522,9 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
                 }
                 if self.input.fill(&mut self.source, want)? == 0 {
                     if have == 0 {
+                        if self.position == Position::BeforeFirstFrame {
+                            return Err(no_frame_error());
+                        }
                         return Ok(false);
                     }
                     // The source ended inside a header: let the parser report
@@ -470,33 +538,19 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
             let used = before - header.len();
             self.input.consume(used);
             match started {
-                Ok(()) => return Ok(true),
+                Ok(()) => {
+                    self.position = Position::InFrame;
+                    return Ok(true);
+                }
                 Err(e) => match skippable_frame_length(&e) {
-                    Some(length) => self.input.skip_left = length,
+                    Some(length) => {
+                        // A stream of skippable frames alone is a stream that
+                        // holds no content, not an empty one.
+                        self.position = Position::BetweenFrames;
+                        self.input.skip_left = length;
+                    }
                     None => return Err(frame_error(e)),
                 },
-            }
-        }
-    }
-}
-
-/// `inner` with one byte already taken from it put back in front, so a frame
-/// boundary can be probed for the end of the stream without losing the byte.
-struct Prefixed<'a, R: Read> {
-    first: Option<u8>,
-    inner: &'a mut R,
-}
-
-impl<R: Read> Read for Prefixed<'_, R> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        match (self.first.take(), buf.first_mut()) {
-            (Some(byte), Some(slot)) => {
-                *slot = byte;
-                Ok(1)
-            }
-            (byte, _) => {
-                self.first = byte;
-                self.inner.read(buf)
             }
         }
     }
@@ -513,45 +567,16 @@ fn skippable_frame_length(e: &FrameDecoderError) -> Option<u32> {
     }
 }
 
-/// Read past a skippable frame's `length` content bytes.
-fn skip_frame_content<R: Read>(source: &mut R, length: u32) -> Result<(), FrameDecoderError> {
-    // Counted in the wire's `u32`: a `usize` is 16 bits on some targets, and a
-    // truncated count would leave part of the content to be read as a header.
-    let mut left = length;
-    if left == 0 {
-        return Ok(());
-    }
-    // Read in `SKIP_CHUNK`s, as skippable frames after the first frame are,
-    // on the heap and only as large as the content: a stack array that size
-    // would cost a no_std target 8 KiB of stack for every constructor call.
-    let mut scratch = alloc::vec![0u8; left.min(SKIP_CHUNK) as usize];
-    while left > 0 {
-        // The minimum is taken in `u32`, then fits `usize` as at most
-        // `SKIP_CHUNK`.
-        let take = left.min(scratch.len() as u32) as usize;
-        match source.read(&mut scratch[..take]) {
-            Ok(0) => return Err(FrameDecoderError::FailedToSkipFrame),
-            // `n <= take <= left`, so it fits the `u32` it is taken from.
-            Ok(n) => left -= n as u32,
-            Err(e) if e.kind() == crate::io::ErrorKind::Interrupted => {}
-            // A source that fails is not a frame cut short: its error is kept.
-            Err(e) => return Err(FrameDecoderError::FailedToReadSkippableFrame(e)),
-        }
-    }
-    Ok(())
-}
-
 /// How a frame's decoder is initialised.
-enum FrameStart<'d> {
+enum FrameStart {
     /// Dictionaries resolved by the frame's dictionary id.
     Plain,
-    /// The supplied dictionary, applied whatever the frame header names.
-    Dictionary(&'d DictionaryHandle),
-    /// The dictionary the decoder already holds, applied the same way.
+    /// The dictionary the decoder holds, applied whatever the frame header
+    /// names.
     HeldDictionary,
 }
 
-impl FrameStart<'_> {
+impl FrameStart {
     fn start(
         &self,
         decoder: &mut FrameDecoder,
@@ -559,51 +584,7 @@ impl FrameStart<'_> {
     ) -> Result<(), FrameDecoderError> {
         match self {
             Self::Plain => decoder.init(source),
-            Self::Dictionary(dict) => decoder.init_with_dict_handle(source, dict),
             Self::HeldDictionary => decoder.reset_with_active_dict(source),
-        }
-    }
-}
-
-/// Start the first content frame of `source`, skipping skippable frames in
-/// front of it. `false` when the source held only skippable frames, which
-/// decode to nothing; an empty source is an error from the header read.
-fn start_first_frame<R: Read>(
-    decoder: &mut FrameDecoder,
-    source: &mut R,
-    how: FrameStart<'_>,
-) -> Result<bool, FrameDecoderError> {
-    let mut started = how.start(decoder, &mut *source);
-    loop {
-        let length = match started {
-            Ok(()) => return Ok(true),
-            Err(e) => skippable_frame_length(&e).ok_or(e)?,
-        };
-        skip_frame_content(source, length)?;
-        let mut probe = [0u8; 1];
-        let n = read_at_boundary(source, &mut probe).map_err(|e| {
-            FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::MagicNumberReadError(e))
-        })?;
-        if n == 0 {
-            return Ok(false);
-        }
-        started = how.start(
-            decoder,
-            Prefixed {
-                first: Some(probe[0]),
-                inner: source,
-            },
-        );
-    }
-}
-
-/// One byte from `source` at a frame boundary, retried on interruption; `0`
-/// is the clean end of the stream.
-fn read_at_boundary<R: Read>(source: &mut R, probe: &mut [u8; 1]) -> Result<usize, Error> {
-    loop {
-        match source.read(probe) {
-            Err(e) if e.kind() == crate::io::ErrorKind::Interrupted => {}
-            other => return other,
         }
     }
 }
@@ -626,6 +607,14 @@ fn frame_error(e: FrameDecoderError) -> Error {
     return Error::new(ErrorKind::Other, alloc::boxed::Box::new(e));
 }
 
+/// The error for a source that ends before its first frame begins: there is no
+/// magic number to read, as there is for any frame header cut short there.
+fn no_frame_error() -> Error {
+    frame_error(FrameDecoderError::ReadFrameHeaderError(
+        ReadFrameHeaderError::MagicNumberReadError(Error::from(ErrorKind::UnexpectedEof)),
+    ))
+}
+
 /// The checks a frame can only pass once it is fully decoded and drained: the
 /// declared content size, then the content checksum in `Verify` mode.
 fn verify_finished_frame(decoder: &FrameDecoder) -> Result<(), Error> {
@@ -641,18 +630,29 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
     /// does. Skippable frames are skipped; the source ending at a frame
     /// boundary is the end of the stream, anything else is an error.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
-        if buf.is_empty() || self.exhausted {
+        if buf.is_empty() || self.position == Position::End {
             return Ok(0);
         }
         let mut written = 0;
         loop {
+            if self.position != Position::InFrame {
+                // Bytes in hand go back first: the next frame's header waits
+                // for a call that has nothing to deliver, so an error never
+                // follows delivered bytes (the `Read` contract) and a source
+                // that has not sent the next frame yet is not waited on.
+                if written > 0 {
+                    return Ok(written);
+                }
+                if !self.start_frame()? {
+                    self.position = Position::End;
+                    return Ok(0);
+                }
+                continue;
+            }
             let decoder = self.decoder.borrow_mut();
             if decoder.is_finished() && decoder.can_collect() == 0 {
-                // Bytes in hand go back first: the frame's checks and the next
-                // frame's header wait for a call that has nothing to deliver,
-                // so an error never follows delivered bytes (the `Read`
-                // contract) and a source that has not sent the next frame
-                // yet is not waited on.
+                // As above: the frame's checks wait for a call with nothing
+                // to deliver.
                 if written > 0 {
                     return Ok(written);
                 }
@@ -660,10 +660,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
                 // digest are final, so a frame shorter or longer than it
                 // declared, or with a bad checksum in `Verify` mode, fails here.
                 verify_finished_frame(decoder)?;
-                if !self.start_next_frame()? {
-                    self.exhausted = true;
-                    return Ok(0);
-                }
+                self.position = Position::BetweenFrames;
                 continue;
             }
             // A full `buf` never strands a checksum: a frame's last window of
@@ -781,76 +778,66 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
     #[cfg(feature = "std")]
     fn read_to_end(&mut self, output: &mut alloc::vec::Vec<u8>) -> Result<usize, Error> {
         let start_total = output.len();
-        if self.exhausted {
-            return Ok(0);
-        }
-        // `new()` already read the frame header, so the fast path applies when
-        // the decoder sits at the start of that frame with nothing decoded yet;
-        // a first Raw block part-read into the decode buffer is not that.
-        let at_start = self.input.raw.is_none() && {
-            let d = self.decoder.borrow_mut();
-            d.is_at_frame_start() && d.can_collect() == 0
-        };
-        // A forced dictionary is the one the decoder already holds; following
-        // frames are re-initialised with it in place, touching no reference
-        // count.
-        let keep_dictionary = self.forced_dictionary;
-        if at_start {
-            self.input.read_rest(&mut self.source)?;
-            let decoded = self.decoder.borrow_mut().decode_current_frame_to_vec(
-                self.input.pending(),
-                output,
-                keep_dictionary,
-            );
-            self.input.release();
-            decoded.map_err(Error::other)?;
-            return Ok(output.len() - start_total);
-        }
-        // Mid-frame fallback: drain through the generic path, which carries on
-        // into the following frames, so the source is consumed to true EOF.
-        loop {
-            let start = output.len();
-            output.resize(start + MAX_BLOCK_SIZE as usize, 0);
-            // On error, drop the just-grown (zeroed) tail before propagating so
-            // the caller never observes bytes that were never decoded.
-            let n = match self.read(&mut output[start..]) {
-                Ok(n) => n,
-                Err(e) => {
-                    output.truncate(start);
-                    return Err(e);
-                }
-            };
-            output.truncate(start + n);
-            if n == 0 {
-                break;
-            }
-        }
+        self.decode_rest_to_vec(output)?;
         Ok(output.len() - start_total)
     }
 
-    /// no_std counterpart of the decode-in-place `read_to_end` fast path above
-    /// (the no_std `Read::read_to_end` returns `()` instead of the byte count).
+    /// no_std counterpart of the decode-in-place `read_to_end` above (the
+    /// no_std `Read::read_to_end` returns `()` instead of the byte count).
     #[cfg(not(feature = "std"))]
     fn read_to_end(&mut self, output: &mut alloc::vec::Vec<u8>) -> Result<(), Error> {
-        if self.exhausted {
-            return Ok(());
-        }
-        let at_start = self.input.raw.is_none() && {
-            let d = self.decoder.borrow_mut();
-            d.is_at_frame_start() && d.can_collect() == 0
-        };
-        // As in the std path: the decoder's own dictionary, reused in place.
+        self.decode_rest_to_vec(output)
+    }
+}
+
+impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
+    /// Body of both `read_to_end`s: decode the rest of the stream, appending
+    /// to `output`.
+    fn decode_rest_to_vec(&mut self, output: &mut alloc::vec::Vec<u8>) -> Result<(), Error> {
+        // A forced dictionary is the one the decoder already holds; every
+        // frame is initialised with it in place, touching no reference count.
         let keep_dictionary = self.forced_dictionary;
-        if at_start {
-            self.input.read_rest(&mut self.source)?;
-            let decoded = self.decoder.borrow_mut().decode_current_frame_to_vec(
-                self.input.pending(),
-                output,
-                keep_dictionary,
-            );
-            self.input.release();
-            decoded.map_err(|e| Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)))?;
-            return Ok(());
+        match self.position {
+            Position::End => return Ok(()),
+            // Nothing decoded yet: the whole stream, first header included,
+            // decodes from one buffer.
+            Position::BeforeFirstFrame => {
+                self.input.read_rest(&mut self.source)?;
+                if self.input.pending().is_empty() {
+                    self.input.release();
+                    return Err(no_frame_error());
+                }
+                let mut rest = self.input.pending();
+                let decoded = self.decoder.borrow_mut().decode_concatenated_frames_to_vec(
+                    &mut rest,
+                    output,
+                    keep_dictionary,
+                );
+                self.input.release();
+                decoded.map_err(frame_error)?;
+                self.position = Position::End;
+                return Ok(());
+            }
+            // A frame whose header a `read` took, with nothing decoded yet;
+            // a first Raw block part-read into the decode buffer is not that.
+            Position::InFrame
+                if self.input.raw.is_none() && {
+                    let d = self.decoder.borrow_mut();
+                    d.is_at_frame_start() && d.can_collect() == 0
+                } =>
+            {
+                self.input.read_rest(&mut self.source)?;
+                let decoded = self.decoder.borrow_mut().decode_current_frame_to_vec(
+                    self.input.pending(),
+                    output,
+                    keep_dictionary,
+                );
+                self.input.release();
+                decoded.map_err(frame_error)?;
+                self.position = Position::End;
+                return Ok(());
+            }
+            Position::InFrame | Position::BetweenFrames => {}
         }
         // Mid-frame fallback: drain through the generic path, which carries on
         // into the following frames, so the source is consumed to true EOF.
@@ -868,10 +855,9 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             };
             output.truncate(start + n);
             if n == 0 {
-                break;
+                return Ok(());
             }
         }
-        Ok(())
     }
 }
 

@@ -58,7 +58,7 @@ fn long_range_repetitive(total_len: usize) -> Vec<u8> {
 }
 
 fn decode(compressed: &[u8]) -> Vec<u8> {
-    let mut decoder = StreamingDecoder::new(compressed).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed);
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).unwrap();
     out

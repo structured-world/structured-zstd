@@ -140,7 +140,7 @@ fn cross_rust_fastest_with_source_hint_ffi_decompress_iteration_23() {
         out
     };
 
-    let mut rust_decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut rust_decoder = StreamingDecoder::new(compressed.as_slice());
     let mut rust_result = Vec::new();
     rust_decoder.read_to_end(&mut rust_result).unwrap();
     assert_eq!(data, rust_result, "rust decoder must accept hinted stream");
@@ -158,7 +158,7 @@ fn cross_ffi_compress_rust_decompress_1000() {
         let data = generate_data(i.wrapping_add(0xBEEF), len);
 
         let compressed = zstd::encode_all(&data[..], 1).unwrap();
-        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice());
         let mut result = Vec::new();
         decoder.read_to_end(&mut result).unwrap();
         assert_eq!(
@@ -199,7 +199,7 @@ fn cross_ffi_compress_rust_decompress_large_blocks() {
         let data = generate_huffman_friendly(i as u64 + 400, size, 48);
 
         let compressed = zstd::encode_all(&data[..], 1).unwrap();
-        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice());
         let mut result = Vec::new();
         decoder.read_to_end(&mut result).unwrap();
         assert_eq!(
@@ -211,7 +211,7 @@ fn cross_ffi_compress_rust_decompress_large_blocks() {
     // Multi-block: 512KB
     let data = generate_huffman_friendly(500, 512 * 1024, 48);
     let compressed = zstd::encode_all(&data[..], 1).unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     assert_eq!(data, result, "ffi→rust multi-block roundtrip failed");
@@ -233,7 +233,7 @@ fn cross_rust_compress_ffi_decompress_huffman_seed100() {
 fn cross_ffi_compress_rust_decompress_huffman_seed100() {
     let data = generate_huffman_friendly(100, 512 * 1024, 48);
     let compressed = zstd::encode_all(&data[..], 1).unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     assert_eq!(data, result, "ffi→rust seed=100 512KB roundtrip failed");
@@ -278,7 +278,7 @@ fn cross_ffi_compress_rust_decompress_repeat_offsets() {
         data.extend_from_slice(pattern);
     }
     let compressed = zstd::encode_all(&data[..], 1).unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     assert_eq!(data, result, "ffi→rust repeat offset roundtrip failed");
@@ -289,7 +289,7 @@ fn cross_ffi_compress_rust_decompress_repeat_offsets() {
     }
     multi_block.truncate(512 * 1024);
     let compressed = zstd::encode_all(&multi_block[..], 1).unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     assert_eq!(
@@ -486,7 +486,7 @@ fn cross_ffi_compress_rust_decompress_rle_mode_tables() {
     for level in [-6i32, -1, 1, 3, 9, 19] {
         for (idx, data) in inputs.iter().enumerate() {
             let compressed = zstd::encode_all(&data[..], level).unwrap();
-            let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+            let mut decoder = StreamingDecoder::new(compressed.as_slice());
             let mut result = Vec::new();
             decoder.read_to_end(&mut result).unwrap();
             // `assert_eq!(*data, result, ...)` borrows both operands
@@ -535,7 +535,7 @@ fn cross_every_level_roundtrips_through_the_c_codec_both_ways() {
             );
 
             let theirs = zstd::encode_all(data, level).unwrap();
-            let mut decoder = StreamingDecoder::new(theirs.as_slice()).unwrap();
+            let mut decoder = StreamingDecoder::new(theirs.as_slice());
             let mut ours_decoded = Vec::with_capacity(data.len());
             decoder
                 .read_to_end(&mut ours_decoded)

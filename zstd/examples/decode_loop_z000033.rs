@@ -199,8 +199,7 @@ fn main() {
             for _ in 0..iters {
                 sink.clear();
                 let mut decoder =
-                    StreamingDecoder::new(std::hint::black_box(compressed.as_slice()))
-                        .expect("StreamingDecoder::new");
+                    StreamingDecoder::new(std::hint::black_box(compressed.as_slice()));
                 decoder.read_to_end(&mut sink).expect("stream decode");
                 total = total.wrapping_add(sink.len());
             }

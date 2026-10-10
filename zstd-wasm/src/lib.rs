@@ -80,8 +80,8 @@ pub fn decompress(data: &[u8], checksum: Option<ContentChecksum>) -> Result<Vec<
     // Stream the frame so the output Vec grows to fit — works for frames with
     // or without a content-size header (the fixed-size `decode_all_to_vec`
     // requires the caller to know the decoded length up front).
-    let mut decoder = StreamingDecoder::new(data)
-        .map_err(|err| JsError::new(&format!("structured-zstd: invalid frame: {err:?}")))?;
+    // The frame header is read by `read_to_end`, which reports a bad frame.
+    let mut decoder = StreamingDecoder::new(data);
     decoder
         .decoder
         .set_content_checksum(core_checksum(checksum));
@@ -125,11 +125,8 @@ pub fn decompress_using_dict(
     dict: &[u8],
     checksum: Option<ContentChecksum>,
 ) -> Result<Vec<u8>, JsError> {
-    let mut decoder = StreamingDecoder::new_with_dictionary_bytes(data, dict).map_err(|err| {
-        JsError::new(&format!(
-            "structured-zstd: dict decode init failed: {err:?}"
-        ))
-    })?;
+    let mut decoder = StreamingDecoder::new_with_dictionary_bytes(data, dict)
+        .map_err(|err| JsError::new(&format!("structured-zstd: invalid dictionary: {err:?}")))?;
     decoder
         .decoder
         .set_content_checksum(core_checksum(checksum));
