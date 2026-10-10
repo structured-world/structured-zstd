@@ -1298,3 +1298,98 @@ fn read_to_end_empty_frame_decodes_to_empty() {
     decoder.read_to_end(&mut out).unwrap();
     assert!(out.is_empty());
 }
+
+/// Read a few bytes at a time, a stream of two frames with a skippable frame
+/// between them reports each frame once, in order, with the bytes it took
+/// from the source and the bytes it decoded to; the skippable frame is not a
+/// frame of output and is not reported.
+#[test]
+fn every_finished_frame_is_reported_once_with_its_sizes() {
+    use super::FinishedFrame;
+    use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+    use alloc::vec::Vec;
+
+    let first_payload = b"the first frame of the stream".repeat(40);
+    let second_payload = b"and the second one".repeat(3);
+    let first = compress_slice_to_vec(&first_payload, CompressionLevel::Level(3));
+    let second = compress_slice_to_vec(&second_payload, CompressionLevel::Level(1));
+    let mut stream = first.clone();
+    stream.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+    stream.extend_from_slice(&3u32.to_le_bytes());
+    stream.extend_from_slice(b"pad");
+    stream.extend_from_slice(&second);
+
+    let mut decoder = StreamingDecoder::new(stream.as_slice());
+    let mut buf = [0u8; 7];
+    let mut finished = Vec::new();
+    let mut decoded = 0usize;
+    loop {
+        let n = decoder
+            .read_reporting_frames(&mut buf, |frame| finished.push(frame))
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        decoded += n;
+    }
+    assert_eq!(decoded, first_payload.len() + second_payload.len());
+    assert_eq!(
+        finished,
+        [
+            FinishedFrame {
+                compressed_size: first.len() as u64,
+                decompressed_size: first_payload.len() as u64,
+            },
+            FinishedFrame {
+                compressed_size: second.len() as u64,
+                decompressed_size: second_payload.len() as u64,
+            },
+        ]
+    );
+    let mut again = Vec::new();
+    let end = decoder
+        .read_reporting_frames(&mut buf, |frame| again.push(frame))
+        .unwrap();
+    assert_eq!((end, again.as_slice()), (0, &[][..]), "reported once");
+}
+
+/// Empty frames deliver no bytes, so one read passes through several of them
+/// on its way to output; each is still a frame of the stream and is reported,
+/// in order, before the frame whose output that read returns.
+#[test]
+fn consecutive_empty_frames_are_each_reported() {
+    use super::FinishedFrame;
+    use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+    use alloc::vec::Vec;
+
+    let empty = compress_slice_to_vec(b"", CompressionLevel::Level(3));
+    let payload = b"after two empty frames";
+    let last = compress_slice_to_vec(payload, CompressionLevel::Level(3));
+    let mut stream = empty.clone();
+    stream.extend_from_slice(&empty);
+    stream.extend_from_slice(&last);
+
+    let mut decoder = StreamingDecoder::new(stream.as_slice());
+    let mut buf = [0u8; 64];
+    let mut finished = Vec::new();
+    while decoder
+        .read_reporting_frames(&mut buf, |frame| finished.push(frame))
+        .unwrap()
+        > 0
+    {}
+    let empty_frame = FinishedFrame {
+        compressed_size: empty.len() as u64,
+        decompressed_size: 0,
+    };
+    assert_eq!(
+        finished,
+        [
+            empty_frame,
+            empty_frame,
+            FinishedFrame {
+                compressed_size: last.len() as u64,
+                decompressed_size: payload.len() as u64,
+            },
+        ]
+    );
+}

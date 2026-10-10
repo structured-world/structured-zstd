@@ -50,7 +50,7 @@ pub use crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE;
 pub use crate::common::MAX_DECODER_WINDOW_SIZE;
 #[cfg(feature = "lsm")]
 pub use frame_decoder::{PartialDecode, ResumeInput, ResumeState};
-pub use streaming_decoder::StreamingDecoder;
+pub use streaming_decoder::{FinishedFrame, StreamingDecoder};
 
 /// Decompressed size a frame declares in its header, as read by
 /// [`read_frame_content_size`] without decoding the frame body.
