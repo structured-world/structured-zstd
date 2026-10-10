@@ -8,6 +8,15 @@
 /// (`benchzstd.c`, `BMK_syntheticTest`).
 pub(crate) const DEFAULT_SIZE: usize = 10_000_000;
 
+/// An empty buffer with room for `size` bytes, or the allocator's refusal:
+/// the size comes from the command line, so running out of memory is an
+/// answer to report, as the reference reports a failed `malloc`.
+fn buffer(size: usize) -> Result<Vec<u8>, std::collections::TryReserveError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(size)?;
+    Ok(out)
+}
+
 /// The rotate-multiply step both generators draw from.
 fn next_state(state: u32) -> u32 {
     (state.wrapping_mul(2_654_435_761) ^ 2_246_822_519).rotate_left(13)
@@ -17,14 +26,18 @@ fn next_state(state: u32) -> u32 {
 /// earlier run of bytes and the rest emit literals from a skewed alphabet
 /// (`RDG_genBuffer` with seed 0). At 100 and above the content is sparse: long
 /// runs of zero bytes, each ended by one literal.
-pub(crate) fn compressible(size: usize, match_percent: u32) -> Vec<u8> {
+pub(crate) fn compressible(
+    size: usize,
+    match_percent: u32,
+) -> Result<Vec<u8>, std::collections::TryReserveError> {
     let match_proba = f64::from(match_percent) / 100.0;
     let literal_proba = match_proba / 4.5;
     let literals = literal_table((literal_proba * 256.0 + 0.001) as u32);
     let mut seed = 0u32;
-    let mut out = vec![0u8; size];
+    let mut out = buffer(size)?;
+    out.resize(size, 0);
     fill_block(&mut out, match_proba, &literals, &mut seed);
-    out
+    Ok(out)
 }
 
 const LITERAL_TABLE_LOG: u32 = 13;
@@ -390,14 +403,14 @@ const WEIGHT_BY_LENGTH: [usize; 6] = [0, 8, 6, 4, 3, 2];
 /// Lorem ipsum text of exactly `size` bytes (`LOREM_genBuffer` with seed 0):
 /// the customary first sentence, then random sentences of the word list in
 /// paragraphs, the last one cut and padded to the size.
-pub(crate) fn lorem(size: usize) -> Vec<u8> {
+pub(crate) fn lorem(size: usize) -> Result<Vec<u8>, std::collections::TryReserveError> {
     let mut words = Vec::with_capacity(650);
     for (id, word) in WORDS.iter().enumerate() {
         let weight = WEIGHT_BY_LENGTH[word.len().min(WEIGHT_BY_LENGTH.len() - 1)];
         words.extend(std::iter::repeat_n(id, weight));
     }
     let mut text = Lorem {
-        out: Vec::with_capacity(size),
+        out: buffer(size)?,
         size,
         state: 0,
         words,
@@ -407,7 +420,7 @@ pub(crate) fn lorem(size: usize) -> Vec<u8> {
         let sentences = text.about(7);
         text.paragraph(sentences);
     }
-    text.out
+    Ok(text.out)
 }
 
 struct Lorem {

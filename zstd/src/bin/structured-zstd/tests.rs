@@ -2331,6 +2331,13 @@ fn n_p_and_capital_p_are_read_as_the_reference_reads_them() {
         parse(&["-b", "-P50"]).unwrap().bench_compressibility,
         Some(50)
     );
+    // `-p` takes a parameter only when a digit follows it (zstdcli.c:1324);
+    // otherwise it is the pause and the cluster goes on, so a suffix letter
+    // there is the next flag, not a multiplier of nothing.
+    let opts = parse(&["-pq", "f"]).unwrap();
+    assert!(opts.pause);
+    assert_eq!(opts.bench_param, None);
+    assert!(parse(&["-pK", "f"]).is_err());
 }
 
 /// `-p` holds every exit, including a command line that fails to parse or
@@ -2470,6 +2477,22 @@ fn a_benchmark_without_inputs_measures_generated_data() {
     ])
     .unwrap();
     assert_eq!(run(opts).unwrap(), 0);
+    // Nor a `--patch-from` reference, which would otherwise ask for a stream
+    // size and resize the window of a benchmark that has no patch to make.
+    let opts = parse(&[
+        "-b1",
+        "-i0",
+        "-qq",
+        "-B64K",
+        "--patch-from",
+        "/nonexistent/reference",
+    ])
+    .unwrap();
+    assert_eq!(run(opts).unwrap(), 0);
+    // A size no allocator can give is an error, not an abort.
+    let opts = parse(&["-b1", "-i0", "-qq", "--block-size=9223372036854775808"]).unwrap();
+    let refused = run(opts).err().unwrap().to_string();
+    assert!(refused.contains("memory"), "{refused}");
 }
 
 /// `--block-size=#` is the long spelling of `-B#`, as in the reference, which

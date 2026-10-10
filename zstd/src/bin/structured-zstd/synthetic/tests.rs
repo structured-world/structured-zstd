@@ -23,11 +23,15 @@ fn lorem_matches_the_reference_generator() {
         (DEFAULT_SIZE, 0x32a1_2e43_3722_227b),
     ];
     for (size, hash) in expected {
-        let text = lorem(size);
+        let text = lorem(size).unwrap();
         assert_eq!(text.len(), size);
         assert_eq!(fnv(&text), hash, "lorem ipsum of {size} bytes");
     }
-    assert!(lorem(64).starts_with(b"Lorem ipsum dolor sit amet, "));
+    assert!(
+        lorem(64)
+            .unwrap()
+            .starts_with(b"Lorem ipsum dolor sit amet, ")
+    );
 }
 
 /// `-P#` data is upstream's `RDG_genBuffer` with seed 0, byte for byte,
@@ -62,9 +66,12 @@ fn compressible_matches_the_reference_generator() {
         (100, 1_000_000, 0xec6d_84ab_0a18_5fc6),
     ];
     for (percent, size, hash) in expected {
-        let data = compressible(size, percent);
+        let data = compressible(size, percent).unwrap();
         assert_eq!(data.len(), size);
         assert_eq!(fnv(&data), hash, "-P{percent} data of {size} bytes");
     }
-    assert!(compressible(0, 50).is_empty());
+    assert!(compressible(0, 50).unwrap().is_empty());
+    // A size no allocator can give is refused, not an abort.
+    assert!(compressible(usize::MAX, 50).is_err());
+    assert!(lorem(usize::MAX).is_err());
 }

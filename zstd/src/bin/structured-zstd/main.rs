@@ -1508,6 +1508,10 @@ fn parse_args_into(
                 // `-b` benchmarks; the digits after it are the level it starts
                 // at, read by the level arm (`-b19`).
                 'b' => opts.bench = true,
+                // `-p` takes a benchmark parameter only when a digit follows;
+                // otherwise it is the pause, and the cluster goes on
+                // (zstdcli.c:1322-1329).
+                'p' if !chars.get(ci + 1).is_some_and(char::is_ascii_digit) => *pause = true,
                 'e' | 'i' | 'p' | 'P' | 'B' | 'T' | 's' => {
                     // A flag with a number attached; the cluster goes on after
                     // the number, so `-b1e10i0` is `-b -1 -e10 -i0`.
@@ -1523,10 +1527,8 @@ fn parse_args_into(
                         }
                         // Per-level benchmark time budget in seconds.
                         'i' => opts.bench_secs = f64::from(value),
-                        // `-p` with digits is a benchmark parameter, without
-                        // them a pause before exiting (zstdcli.c:1322-1329).
-                        'p' if next > ci + 1 => opts.bench_param = Some(value),
-                        'p' => *pause = true,
+                        // `-p` with digits: a benchmark parameter.
+                        'p' => opts.bench_param = Some(value),
                         'P' => opts.bench_compressibility = Some(value),
                         // `-B#` cuts the benchmark's inputs into independent
                         // frames and a training sample into several samples.
@@ -2384,6 +2386,15 @@ fn run_selected(mut opts: Options) -> Result<usize> {
     if opts.mode == Mode::Test {
         opts.remove_source = false;
     }
+    // A benchmark of generated data measures it alone, as the reference's does
+    // (`BMK_syntheticTest` passes no dictionary and no patch reference), so a
+    // `-D` or `--patch-from` there is not read: through either the same
+    // command line would measure another codec path, and the patch setup below
+    // would resize a window for a patch nobody is making.
+    if opts.bench && opts.inputs.is_empty() {
+        opts.dict = None;
+        opts.patch_from = None;
+    }
     if opts.patch_from.is_some() {
         // A patch is one input against one reference: the reference command
         // refuses several, and stdin only with a declared length, since the
@@ -2419,14 +2430,7 @@ fn run_selected(mut opts: Options) -> Result<usize> {
         }
     }
 
-    // A benchmark of generated data measures it alone, as the reference's does
-    // (`BMK_syntheticTest` passes no dictionary), so a `-D` there is not read:
-    // through it the same command line would measure another codec path.
-    let dict_bytes = if opts.bench && opts.inputs.is_empty() {
-        None
-    } else {
-        load_dictionary(&opts)?
-    };
+    let dict_bytes = load_dictionary(&opts)?;
 
     // `-b` benchmarks compression/decompression across levels instead of
     // producing output files; handle it before the streaming flow. It takes the
@@ -3121,6 +3125,9 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
             ),
             None => ("Lorem ipsum".to_string(), synthetic::lorem(size)),
         };
+        let data = data.map_err(|err| {
+            eyre!("-b: not enough memory for {size} bytes of generated data: {err}")
+        })?;
         return benchmark_one(opts, codecs, &label, &data, &sizes);
     }
 
@@ -3306,8 +3313,16 @@ fn benchmark_one(
     let frames_bound = bench_frames_extent(file_sizes, opts.block_size)
         .and_then(|(room, _)| usize::try_from(room).ok())
         .ok_or_else(|| eyre!("-b: {label} is more than this machine can hold compressed"))?;
-    let mut compressed = Vec::with_capacity(frames_bound);
-    let mut decoded = Vec::with_capacity(data.len());
+    // Taken fallibly: their sizes follow the input and `-B`, so a machine that
+    // cannot hold them is answered with an error rather than an abort.
+    let mut compressed = Vec::new();
+    compressed
+        .try_reserve_exact(frames_bound)
+        .map_err(|err| eyre!("-b: not enough memory for the frames of {label}: {err}"))?;
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(data.len())
+        .map_err(|err| eyre!("-b: not enough memory to decode {label}: {err}"))?;
     for level in opts.bench_start..=opts.bench_end {
         validate_level(level)?;
         let settings = FrameSettings {
