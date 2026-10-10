@@ -64,12 +64,10 @@ pub struct StreamingDecoder<READ: Read, DEC: BorrowMut<FrameDecoder>> {
     position: Position,
     /// Source bytes read ahead and not yet decoded.
     input: Input,
-    /// The frame `read` finished last, until [`Self::take_finished_frame`].
-    finished_frame: Option<FinishedFrame>,
 }
 
 /// The sizes of one frame a [`StreamingDecoder`] decoded, as
-/// [`StreamingDecoder::take_finished_frame`] reports it: what the frame took
+/// [`StreamingDecoder::read_reporting_frames`] reports it: what the frame took
 /// from the source and what it decoded to, as upstream's
 /// `ZSTD_trace_decompress_end` reports them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,7 +290,6 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
             forced_dictionary: false,
             position: Position::BeforeFirstFrame,
             input: Input::new(),
-            finished_frame: None,
         }
     }
 
@@ -346,7 +343,6 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
             forced_dictionary: true,
             position: Position::BeforeFirstFrame,
             input: Input::new(),
-            finished_frame: None,
         })
     }
 }
@@ -435,35 +431,6 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
     /// on the dictionary paths.
     pub fn decoder_mut(&mut self) -> &mut FrameDecoder {
         self.decoder.borrow_mut()
-    }
-
-    /// The frame the last `read` finished, if it finished one, taken so the
-    /// next frame's report does not repeat it: call it after each `read` to
-    /// see every frame of the stream, skippable frames excepted. A `read`
-    /// finishes at most one frame, since it hands a frame's output back before
-    /// it starts the next one. `read_to_end` decodes the rest of the stream in
-    /// one pass and reports no frame.
-    ///
-    /// # Examples
-    /// ```
-    /// use std::io::Read;
-    /// use structured_zstd::decoding::StreamingDecoder;
-    /// use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
-    ///
-    /// let frame = compress_to_vec(&b"one frame"[..], CompressionLevel::Fastest);
-    /// let mut decoder = StreamingDecoder::new(&frame[..]);
-    /// let mut buf = [0u8; 64];
-    /// let mut finished = Vec::new();
-    /// while decoder.read(&mut buf).unwrap() > 0 {
-    ///     finished.extend(decoder.take_finished_frame());
-    /// }
-    /// finished.extend(decoder.take_finished_frame());
-    /// assert_eq!(finished.len(), 1);
-    /// assert_eq!(finished[0].compressed_size, frame.len() as u64);
-    /// assert_eq!(finished[0].decompressed_size, 9);
-    /// ```
-    pub fn take_finished_frame(&mut self) -> Option<FinishedFrame> {
-        self.finished_frame.take()
     }
 
     /// Destructures this object into the inner reader.
@@ -665,12 +632,37 @@ fn verify_finished_frame(decoder: &FrameDecoder) -> Result<(), Error> {
     Ok(())
 }
 
-impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, DEC> {
-    /// Decode the stream into `buf`, frame after frame (RFC 8878 3: a stream
-    /// is one or more frames), as upstream zstd's `ZSTD_decompressStream`
-    /// does. Skippable frames are skipped; the source ending at a frame
-    /// boundary is the end of the stream, anything else is an error.
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
+    /// [`read`](Read::read), handing `finished` each frame the call finishes,
+    /// at the moment it is verified and before the next frame is started, as
+    /// upstream's `ZSTD_trace_decompress_end` hook is called. One call can
+    /// finish several frames (empty frames deliver nothing, so it passes on
+    /// to the next), and each is reported in stream order; skippable frames
+    /// are not. `read_to_end` reports none.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::decoding::StreamingDecoder;
+    /// use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
+    ///
+    /// let frame = compress_to_vec(&b"one frame"[..], CompressionLevel::Fastest);
+    /// let mut decoder = StreamingDecoder::new(&frame[..]);
+    /// let mut buf = [0u8; 64];
+    /// let mut finished = Vec::new();
+    /// while decoder
+    ///     .read_reporting_frames(&mut buf, |frame| finished.push(frame))
+    ///     .unwrap()
+    ///     > 0
+    /// {}
+    /// assert_eq!(finished.len(), 1);
+    /// assert_eq!(finished[0].compressed_size, frame.len() as u64);
+    /// assert_eq!(finished[0].decompressed_size, 9);
+    /// ```
+    pub fn read_reporting_frames(
+        &mut self,
+        buf: &mut [u8],
+        mut finished: impl FnMut(FinishedFrame),
+    ) -> Result<usize, Error> {
         if buf.is_empty() || self.position == Position::End {
             return Ok(0);
         }
@@ -701,7 +693,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
                 // digest are final, so a frame shorter or longer than it
                 // declared, or with a bad checksum in `Verify` mode, fails here.
                 verify_finished_frame(decoder)?;
-                self.finished_frame = Some(FinishedFrame {
+                finished(FinishedFrame {
                     compressed_size: decoder.bytes_read_from_source(),
                     decompressed_size: decoder.decoded_size(),
                 });
@@ -809,6 +801,16 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             // the frame's maximum, say) is a damaged frame: report it.
             return Err(self.cut_short());
         }
+    }
+}
+
+impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, DEC> {
+    /// Decode the stream into `buf`, frame after frame (RFC 8878 3: a stream
+    /// is one or more frames), as upstream zstd's `ZSTD_decompressStream`
+    /// does. Skippable frames are skipped; the source ending at a frame
+    /// boundary is the end of the stream, anything else is an error.
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        self.read_reporting_frames(buf, |_| {})
     }
 
     /// Decode-in-place fast path for whole-frame consumption. Instead of the

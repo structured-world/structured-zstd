@@ -2290,10 +2290,19 @@ impl Codecs {
     /// Open `--trace` for this run, if it was asked for. A file that cannot be
     /// opened is reported and the run goes on untraced, as the reference goes
     /// on when its `fopen` fails.
-    fn open_trace(&mut self, opts: &Options, single_pass: bool) {
+    ///
+    /// # Errors
+    ///
+    /// The trace names a file the run reads or writes. Appending to an input
+    /// or the dictionary would change it, and opening an output ahead of its
+    /// own overwrite check would make the run refuse its own output, or with
+    /// `-f` rename the output over the trace. The reference opens the trace
+    /// without asking; refusing first leaves every file as it was.
+    fn open_trace(&mut self, opts: &Options, single_pass: bool) -> Result<()> {
         let Some(path) = &opts.trace else {
-            return;
+            return Ok(());
         };
+        refuse_trace_alias(opts, path)?;
         match trace::Trace::open(path, UPSTREAM_VERSION_NUMBER, single_pass) {
             Ok(trace) => self.trace = Some(trace),
             Err(err) => display!(
@@ -2303,7 +2312,52 @@ impl Codecs {
                 path.display()
             ),
         }
+        Ok(())
     }
+}
+
+/// Refuse a `--trace` path that names a file of the run: an input, the
+/// dictionary, the `-o` output, or an output derived from an input. Compared
+/// as files, as the output checks compare them: another spelling, a symlink
+/// or a hard link is the same file.
+fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
+    let names = |other: &Path| -> Result<bool> {
+        Ok(names_the_same_file(trace, other)?
+            || (trace.exists() && other.exists() && paths_point_to_same_file(trace, other)?))
+    };
+    let refuse = |role: &str, other: &Path| -> Result<()> {
+        if names(other)? {
+            bail!(
+                "--trace {} is also {role} {}",
+                trace.display(),
+                other.display()
+            );
+        }
+        Ok(())
+    };
+    if let Some(dictionary) = dictionary_path(opts) {
+        refuse("the dictionary", dictionary)?;
+    }
+    for input in opts.inputs.iter().filter(|input| *input != Path::new("-")) {
+        refuse("the input", input)?;
+    }
+    // A benchmark and `-t` write nothing, and stdout is no file.
+    if opts.bench || opts.to_stdout || opts.mode == Mode::Test {
+        return Ok(());
+    }
+    if let Some(output) = &opts.output {
+        return refuse("the output", output);
+    }
+    if matches!(opts.mode, Mode::Compress | Mode::Decompress) {
+        for input in opts.inputs.iter().filter(|input| *input != Path::new("-")) {
+            // An input whose output cannot be derived is reported when its
+            // turn comes, and writes nothing.
+            if let Ok(output) = derive_output_path(opts, input) {
+                refuse("the output", &output)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Append `frame` to `trace`, if one is open. A trace that cannot be written
@@ -2573,7 +2627,7 @@ fn run_selected(mut opts: Options) -> Result<usize> {
         compresses(&opts),
         decodes(&opts),
     )?;
-    codecs.open_trace(&opts, false);
+    codecs.open_trace(&opts, false)?;
     // Everything from here on primes from the parsed form, so the blob it was
     // parsed out of is released rather than held for the length of the run
     // beside the thing that replaced it.
@@ -3248,7 +3302,7 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     let codecs = &mut Codecs::prepare(dict.as_deref(), opts.patch_from.is_some(), true, true)?;
     // The reference benchmarks whole buffers in one call each way, which its
     // trace reports as single-pass.
-    codecs.open_trace(opts, true);
+    codecs.open_trace(opts, true)?;
     drop(dict);
 
     if synthetic {
@@ -5749,9 +5803,10 @@ fn decompress_stream<R: Read, W: Write>(
 /// decoder writes into it directly, so its length is the size of each write.
 /// `io::copy` would do the same through an 8 KiB buffer of its own.
 ///
-/// With a `trace` open, each frame the decoder finishes is recorded, timed
-/// from the end of the one before (from the start for the first), against
-/// `dictionary_size`.
+/// With a `trace` open, each frame the decoder finishes is recorded against
+/// `dictionary_size`, timed from the end of the one before (from the start for
+/// the first) to the moment the decoder verifies it, so neither the next
+/// frame's decoding nor the trace line's own write is counted in it.
 fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::FrameDecoder>>(
     decoder: &mut structured_zstd::decoding::StreamingDecoder<R, D>,
     writer: &mut impl Write,
@@ -5762,24 +5817,23 @@ fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::
     let mut since = trace.is_some().then(std::time::Instant::now);
     let mut written = 0u64;
     loop {
-        let read = decoder.read(buffer);
-        if let Some(started) = since.as_mut()
-            && let Some(frame) = decoder.take_finished_frame()
-        {
-            let now = std::time::Instant::now();
-            trace_frame(
-                trace,
-                &trace::Frame {
-                    method: trace::Method::Decompress,
-                    level: 0,
-                    dictionary_size,
-                    uncompressed_size: frame.decompressed_size,
-                    compressed_size: frame.compressed_size,
-                    duration: now - *started,
-                },
-            );
-            *started = now;
-        }
+        let read = decoder.read_reporting_frames(buffer, |frame| {
+            if let Some(started) = since.as_mut() {
+                let duration = started.elapsed();
+                trace_frame(
+                    trace,
+                    &trace::Frame {
+                        method: trace::Method::Decompress,
+                        level: 0,
+                        dictionary_size,
+                        uncompressed_size: frame.decompressed_size,
+                        compressed_size: frame.compressed_size,
+                        duration,
+                    },
+                );
+                *started = std::time::Instant::now();
+            }
+        });
         let n = match read {
             Ok(0) => return Ok(written),
             Ok(n) => n,

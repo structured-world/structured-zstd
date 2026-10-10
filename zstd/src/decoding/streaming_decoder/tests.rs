@@ -1324,8 +1324,9 @@ fn every_finished_frame_is_reported_once_with_its_sizes() {
     let mut finished = Vec::new();
     let mut decoded = 0usize;
     loop {
-        let n = decoder.read(&mut buf).unwrap();
-        finished.extend(decoder.take_finished_frame());
+        let n = decoder
+            .read_reporting_frames(&mut buf, |frame| finished.push(frame))
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -1345,5 +1346,50 @@ fn every_finished_frame_is_reported_once_with_its_sizes() {
             },
         ]
     );
-    assert_eq!(decoder.take_finished_frame(), None, "taken, not repeated");
+    let mut again = Vec::new();
+    let end = decoder
+        .read_reporting_frames(&mut buf, |frame| again.push(frame))
+        .unwrap();
+    assert_eq!((end, again.as_slice()), (0, &[][..]), "reported once");
+}
+
+/// Empty frames deliver no bytes, so one read passes through several of them
+/// on its way to output; each is still a frame of the stream and is reported,
+/// in order, before the frame whose output that read returns.
+#[test]
+fn consecutive_empty_frames_are_each_reported() {
+    use super::FinishedFrame;
+    use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+    use alloc::vec::Vec;
+
+    let empty = compress_slice_to_vec(b"", CompressionLevel::Level(3));
+    let payload = b"after two empty frames";
+    let last = compress_slice_to_vec(payload, CompressionLevel::Level(3));
+    let mut stream = empty.clone();
+    stream.extend_from_slice(&empty);
+    stream.extend_from_slice(&last);
+
+    let mut decoder = StreamingDecoder::new(stream.as_slice());
+    let mut buf = [0u8; 64];
+    let mut finished = Vec::new();
+    while decoder
+        .read_reporting_frames(&mut buf, |frame| finished.push(frame))
+        .unwrap()
+        > 0
+    {}
+    let empty_frame = FinishedFrame {
+        compressed_size: empty.len() as u64,
+        decompressed_size: 0,
+    };
+    assert_eq!(
+        finished,
+        [
+            empty_frame,
+            empty_frame,
+            FinishedFrame {
+                compressed_size: last.len() as u64,
+                decompressed_size: payload.len() as u64,
+            },
+        ]
+    );
 }
