@@ -76,6 +76,7 @@ mod display;
 mod inputs;
 mod interrupt;
 mod progress;
+mod synthetic;
 
 use display::{DEFAULT_LEVEL, HumanSize, Progress, confirm};
 use inputs::Selection;
@@ -109,6 +110,30 @@ enum Mode {
     Train,
 }
 
+/// The standard streams a run treats as terminals whatever they are
+/// (`--fake-stdin-is-console` and its siblings), so the rules that depend on a
+/// terminal can be exercised from a script.
+#[derive(Clone, Copy, Default)]
+struct FakeConsole {
+    stdin: bool,
+    stdout: bool,
+    stderr: bool,
+}
+
+impl FakeConsole {
+    fn stdin(self) -> bool {
+        self.stdin || io::stdin().is_terminal()
+    }
+
+    fn stdout(self) -> bool {
+        self.stdout || io::stdout().is_terminal()
+    }
+
+    fn stderr(self) -> bool {
+        self.stderr || io::stderr().is_terminal()
+    }
+}
+
 /// Parsed command line.
 struct Options {
     mode: Mode,
@@ -133,12 +158,24 @@ struct Options {
     max_dict: usize,
     /// Explicit dictionary ID for `--train` (`--dictID`).
     dict_id: Option<u32>,
-    /// Benchmark mode (`-b`); benchmarks `bench_start..=bench_end`.
+    /// Benchmark mode (`-b`); benchmarks `bench_start..=bench_end`. The start
+    /// is the compression level, as the reference command takes it.
     bench: bool,
     bench_start: i32,
     bench_end: i32,
-    /// Per-level benchmark time budget in seconds (`-i`, default 1).
+    /// Per-level benchmark time budget in seconds (`-i`, default 1). Zero
+    /// measures one pass.
     bench_secs: f64,
+    /// `-p#`: a number the benchmark's `-q` lines carry as `(param=#)`, to
+    /// tell runs of a parameter sweep apart.
+    bench_param: Option<u32>,
+    /// `-P#`: with no input named, benchmark generated data of this
+    /// compressibility in percent instead of lorem ipsum text.
+    bench_compressibility: Option<u32>,
+    /// `-p`: wait for Enter before exiting.
+    pause: bool,
+    /// Which standard streams count as terminals; see [`FakeConsole`].
+    console: FakeConsole,
     /// Measure each input on its own (`-S`) instead of as one stream, so the
     /// reported ratio and throughput describe a file rather than a mixture.
     bench_separately: bool,
@@ -308,61 +345,110 @@ const DEFAULT_LONG_WINDOW_LOG: u32 = 27;
 /// `--long` would be a wider window and nothing else.
 const MIN_LONG_LEVEL: i32 = 16;
 
-/// Parse a size written the way upstream accepts it: a plain count, or one
-/// suffixed `KB`/`MB`/`GB` (also spelled `K`/`M`/`G`, any case). Upstream uses
-/// powers of two for these, despite the decimal-looking names.
-fn parse_size(text: &str) -> Result<u64> {
-    let trimmed = text.trim();
-    let upper = trimmed.to_ascii_uppercase();
-    let (digits, shift) = match upper.as_str() {
-        s if s.ends_with("KB") => (&trimmed[..trimmed.len() - 2], 10),
-        s if s.ends_with("MB") => (&trimmed[..trimmed.len() - 2], 20),
-        s if s.ends_with("GB") => (&trimmed[..trimmed.len() - 2], 30),
-        s if s.ends_with('K') => (&trimmed[..trimmed.len() - 1], 10),
-        s if s.ends_with('M') => (&trimmed[..trimmed.len() - 1], 20),
-        s if s.ends_with('G') => (&trimmed[..trimmed.len() - 1], 30),
-        _ => (trimmed, 0),
-    };
-    let value: u64 = digits
-        .trim()
-        .parse()
-        .map_err(|_| eyre!("expected a size, got `{text}`"))?;
-    // `checked_shl` then `checked_mul` would be the same test twice: a shift
-    // that fits still has to fit as a product. One checked multiply says it.
-    value
-        .checked_mul(1u64 << shift)
-        .ok_or_else(|| eyre!("size `{text}` does not fit in 64 bits"))
+/// Which spellings of a size suffix [`read_leading_number`] reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SuffixCase {
+    /// `K`, `M`, `G` and `B` only, as the reference reads them. Required where
+    /// the number is followed by more text: in `-19k` the `k` is the next flag,
+    /// and in `--fast=3k` a tail the option drops.
+    Upper,
+    /// Lower case as well. Only for a value that must be a number and nothing
+    /// else, where `4kb` cannot mean anything but four kibibytes.
+    Any,
 }
 
-/// Read the leading unsigned number the way upstream's argument reader does
-/// (`readU32FromCharChecked`, zstdcli.c:350-376): a run of decimal digits,
-/// then an optional `K` or `M` multiplier which may be spelled `KiB` / `MB`.
-/// Reading STOPS there and the remainder is handed back — no sign is accepted,
-/// and an empty digit run reads as zero, which every caller treats as invalid.
-fn read_leading_u32(text: &str) -> Result<(u32, &str)> {
+/// Read the leading number of `text` the way upstream's argument readers do
+/// (`readU32FromCharChecked` and `readSizeTFromCharChecked`, zstdcli.c:355-460):
+/// a run of decimal digits, then an optional `K`, `M` or `G` multiplier, which
+/// may be followed by `i` and then `B`. The multipliers are powers of two
+/// whatever the spelling, so `KB`, `K` and `KiB` are all 1024. `max` is the
+/// widest value the destination holds. Reading stops after the suffix and the
+/// rest is handed back; an empty digit run reads as zero.
+fn read_leading_number(text: &str, max: u64, case: SuffixCase) -> Result<(u64, &str)> {
+    let overflow = || {
+        eyre!(
+            "numeric value `{text}` overflows {} bits",
+            64 - max.leading_zeros()
+        )
+    };
     let bytes = text.as_bytes();
     let mut at = 0;
-    let mut value: u32 = 0;
-    while at < bytes.len() && bytes[at].is_ascii_digit() {
+    let mut value: u64 = 0;
+    while let Some(&digit) = bytes.get(at).filter(|b| b.is_ascii_digit()) {
         value = value
             .checked_mul(10)
-            .and_then(|v| v.checked_add(u32::from(bytes[at] - b'0')))
-            .ok_or_else(|| eyre!("numeric value `{text}` overflows 32-bit unsigned int"))?;
+            .and_then(|v| v.checked_add(u64::from(digit - b'0')))
+            .filter(|&v| v <= max)
+            .ok_or_else(overflow)?;
         at += 1;
     }
-    if at < bytes.len() && matches!(bytes[at], b'K' | b'M') {
-        let shifts = if bytes[at] == b'M' { 2 } else { 1 };
-        for _ in 0..shifts {
-            value = value
-                .checked_mul(1024)
-                .ok_or_else(|| eyre!("numeric value `{text}` overflows 32-bit unsigned int"))?;
-        }
-        at += 1;
-        // `KiB` and `KB` are the same multiplier spelled longer.
-        at += usize::from(bytes.get(at) == Some(&b'i'));
-        at += usize::from(bytes.get(at) == Some(&b'B'));
-    }
+    let fold = |byte: &u8| match case {
+        SuffixCase::Upper => *byte,
+        SuffixCase::Any => byte.to_ascii_uppercase(),
+    };
+    let shift = match bytes.get(at).map(fold) {
+        Some(b'K') => 10,
+        Some(b'M') => 20,
+        Some(b'G') => 30,
+        _ => return Ok((value, &text[at..])),
+    };
+    value = value
+        .checked_mul(1 << shift)
+        .filter(|&v| v <= max)
+        .ok_or_else(overflow)?;
+    at += 1;
+    at += usize::from(bytes.get(at) == Some(&b'i'));
+    at += usize::from(bytes.get(at).map(fold) == Some(b'B'));
     Ok((value, &text[at..]))
+}
+
+/// A whole option value that is a number: the leading number and nothing
+/// after it, as upstream's `NEXT_UINT32` / `NEXT_TSIZE` require. An empty value
+/// is refused, where the reference reads it as zero: `--size-hint=$UNSET` is a
+/// script that lost its value, not one asking for nothing.
+fn parse_number(text: &str, max: u64) -> Result<u64> {
+    if !text.starts_with(|c: char| c.is_ascii_digit()) {
+        bail!("`{text}`: expected a number");
+    }
+    let (value, rest) = read_leading_number(text, max, SuffixCase::Any)?;
+    if !rest.is_empty() {
+        bail!(
+            "`{text}`: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB, G, GB, GiB are allowed"
+        );
+    }
+    Ok(value)
+}
+
+/// A size option (`NEXT_TSIZE`): as wide as the platform's `size_t`.
+fn parse_size(text: &str) -> Result<u64> {
+    parse_number(text, usize::MAX as u64)
+}
+
+/// A count option (`NEXT_UINT32`).
+fn parse_u32(text: &str) -> Result<u32> {
+    let value = parse_number(text, u64::from(u32::MAX))?;
+    Ok(u32::try_from(value).expect("parse_number caps the value at u32::MAX"))
+}
+
+/// The number that starts at `chars[at]` inside a short-option cluster
+/// (`-e19`, `-B64K`), suffix included, and the index where the cluster carries
+/// on after it. The reference reads such a number and then goes on with the
+/// cluster (`zstdcli.c:1205-1345`), so `-b1e10i0` is `-b`, `-1`, `-e10`,
+/// `-i0`. No digit there reads as zero, as `readU32FromChar` reads it.
+fn cluster_u32(chars: &[char], at: usize) -> Result<(u32, usize)> {
+    let rest: String = chars[at..].iter().collect();
+    let (value, tail) = read_leading_u32(&rest)?;
+    Ok((value, chars.len() - tail.chars().count()))
+}
+
+/// [`read_leading_number`] into a `u32`, for the short options and the
+/// sub-options that read a number and then look at what follows it.
+fn read_leading_u32(text: &str) -> Result<(u32, &str)> {
+    let (value, rest) = read_leading_number(text, u64::from(u32::MAX), SuffixCase::Upper)?;
+    Ok((
+        u32::try_from(value).expect("read_leading_number caps the value at u32::MAX"),
+        rest,
+    ))
 }
 
 /// Parse a `-M` / `--memory` value into bytes, or `None` for "the default".
@@ -735,6 +821,7 @@ fn main() {
         }
     };
     let verbosity = options.verbosity;
+    let pause = options.pause;
     // Before anything that compresses or decompresses: the first such call
     // chooses the kernels, and they stay chosen for the process.
     if let Some(level) = options.cpu
@@ -760,6 +847,15 @@ fn main() {
             1
         }
     };
+    if pause {
+        // `-p`: hold the window open, whatever the outcome, as the reference
+        // does at its common exit (`waitEnter`). Whatever stdin holds, or its
+        // end, lets the program go.
+        eprintln!("Press enter to continue... ");
+        let mut byte = [0u8; 1];
+        // A failed read ends the wait just as Enter would.
+        drop(io::stdin().read(&mut byte));
+    }
     std::process::exit(status);
 }
 
@@ -980,6 +1076,10 @@ fn parse_args_into(
         bench_start: default_level,
         bench_end: default_level,
         bench_secs: DEFAULT_BENCH_SECONDS,
+        bench_param: None,
+        bench_compressibility: None,
+        pause: false,
+        console: FakeConsole::default(),
         bench_separately: false,
         block_size: None,
         long: false,
@@ -1137,7 +1237,17 @@ fn parse_args_into(
                 | "mmap-dict"
                 | "no-mmap-dict"
                 | "row-match-finder"
-                | "no-row-match-finder" => {}
+                | "no-row-match-finder"
+                // Real-time priority for a benchmark: an operating-system
+                // setting around the measurement, not part of it.
+                | "priority=rt"
+                // Traces the reference implementation's own file-system calls
+                // by their C names; there is nothing of ours that output
+                // would describe.
+                | "trace-file-stat" => {}
+                "fake-stdin-is-console" => opts.console.stdin = true,
+                "fake-stdout-is-console" => opts.console.stdout = true,
+                "fake-stderr-is-console" => opts.console.stderr = true,
                 "compress-literals" => opts.literals = LiteralCompressionMode::Enable,
                 "no-compress-literals" => opts.literals = LiteralCompressionMode::Disable,
                 _ => {
@@ -1164,12 +1274,14 @@ fn parse_args_into(
                     } else if long.starts_with("use-dict=") {
                         opts.dict = Some(attached_path(arg_os, "--use-dict=".len()));
                     } else if let Some(v) = option_text(long, "maxdict", arg_os, &mut iter)? {
-                        opts.max_dict = v.parse::<usize>().wrap_err("invalid --maxdict size")?;
+                        opts.max_dict =
+                            usize::try_from(parse_u32(&v).wrap_err("invalid --maxdict size")?)
+                                .expect("a u32 fits in usize on the platforms this builds for");
                     } else if let Some(v) = option_text(long, "dictID", arg_os, &mut iter)? {
                         // Zero is how the dictionary API spells "choose one for
                         // me", so it selects the default rather than being
                         // carried through as an id the trainer would refuse.
-                        let id = v.parse::<u32>().wrap_err("invalid --dictID")?;
+                        let id = parse_u32(&v).wrap_err("invalid --dictID")?;
                         opts.dict_id = (id != 0).then_some(id);
                     } else if let Some(v) = option_text(long, "stream-size", arg_os, &mut iter)? {
                         // An exact pledge: it goes into the frame header, so a
@@ -1212,12 +1324,18 @@ fn parse_args_into(
                             eyre!("--target-compressed-block-size={v} is too large")
                         })?);
                     } else if let Some(v) = option_text(long, "threads", arg_os, &mut iter)? {
-                        let _ = v.parse::<u32>().wrap_err("invalid --threads")?;
-                    } else if let Some(v) = option_text(long, "block-size", arg_os, &mut iter)? {
-                        // The long spelling of `-B#`: the reference reads both
-                        // into one setting (zstdcli.c, `--block-size` and `-B`),
-                        // which cuts the benchmark's frames and the training
-                        // samples, and is a multi-threaded job size otherwise.
+                        parse_u32(&v).wrap_err("invalid --threads")?;
+                    } else if let Some(v) = first_option_text(
+                        long,
+                        &["block-size", "split", "jobsize"],
+                        arg_os,
+                        &mut iter,
+                    )? {
+                        // The long spellings of `-B#`: the reference reads all
+                        // of them into one setting (zstdcli.c:1108-1110,
+                        // `chunkSize`), which cuts the benchmark's frames and
+                        // the training samples, and is a multi-threaded job
+                        // size otherwise.
                         let size = parse_size(&v).wrap_err("invalid --block-size")?;
                         opts.block_size = (size != 0).then_some(size);
                     } else if let Some(list) = option_value(long, "filelist", arg_os, &mut iter)? {
@@ -1283,6 +1401,23 @@ fn parse_args_into(
                         // reference command unlocks the ultra levels with it.
                         opts.patch_from = Some(reference);
                         ultra = true;
+                    } else if let Some(reference) =
+                        option_value(long, "patch-apply", arg_os, &mut iter)?
+                    {
+                        // Decompression against a `--patch-from` reference. The
+                        // reference command lifts its memory ceiling to the
+                        // largest window here (zstdcli.c:1146), since a patch
+                        // reaches back across the whole reference; the ceiling
+                        // this build enforces is that default.
+                        select_mode(&mut opts, Mode::Decompress);
+                        opts.patch_from = Some(reference);
+                        opts.memory_limit = None;
+                    } else if option_value(long, "trace", arg_os, &mut iter)?.is_some() {
+                        // The file a build with library tracing appends one
+                        // line per frame to. This build has no per-frame
+                        // hook, which is the reference built without one: the
+                        // option and its file are taken and nothing is
+                        // written.
                     } else if long == "rsyncable" {
                         // Synchronisation points are cut between the jobs of a
                         // multi-threaded run, which this build does not have;
@@ -1321,39 +1456,48 @@ fn parse_args_into(
                 'z' => select_mode(&mut opts, Mode::Compress),
                 't' => select_mode(&mut opts, Mode::Test),
                 'l' => select_mode(&mut opts, Mode::List),
-                'b' | 'e' | 'i' => {
-                    // `-b[N]` benchmark (start level), `-e[N]` end level for a
-                    // range, `-i[N]` iteration budget. The number is attached
-                    // (`-b19`), upstream-style; bare `-b` benchmarks the default.
-                    let rest: String = chars[ci + 1..].iter().collect();
-                    let value = if rest.is_empty() {
-                        None
-                    } else {
-                        Some(rest.parse::<i32>().wrap_err("invalid numeric suffix")?)
-                    };
+                // `-b` benchmarks; the digits after it are the level it starts
+                // at, read by the level arm (`-b19`).
+                'b' => opts.bench = true,
+                'e' | 'i' | 'p' | 'P' | 'B' | 'T' | 's' => {
+                    // A flag with a number attached; the cluster goes on after
+                    // the number, so `-b1e10i0` is `-b -1 -e10 -i0`.
+                    let (value, next) = cluster_u32(&chars, ci + 1)
+                        .wrap_err_with(|| format!("invalid -{c} value (in {arg})"))?;
                     match c {
-                        'b' => {
-                            opts.bench = true;
-                            if let Some(v) = value {
-                                opts.bench_start = v;
-                            }
-                        }
+                        // End of the benchmarked level range.
                         'e' => {
-                            if let Some(v) = value {
-                                bench_end = Some(v);
-                            }
+                            bench_end = Some(
+                                i32::try_from(value)
+                                    .wrap_err_with(|| format!("invalid -e level `{value}`"))?,
+                            );
                         }
-                        // `-i[N]`: per-level benchmark time budget in seconds.
-                        'i' => {
-                            if let Some(v) = value {
-                                opts.bench_secs = (v.max(1)) as f64;
-                            }
-                        }
-                        _ => unreachable!(),
+                        // Per-level benchmark time budget in seconds.
+                        'i' => opts.bench_secs = f64::from(value),
+                        // `-p` with digits is a benchmark parameter, without
+                        // them a pause before exiting (zstdcli.c:1322-1329).
+                        'p' if next > ci + 1 => opts.bench_param = Some(value),
+                        'p' => opts.pause = true,
+                        'P' => opts.bench_compressibility = Some(value),
+                        // `-B#` cuts the benchmark's inputs into independent
+                        // frames and a training sample into several samples.
+                        // When compressing it is the job size of a
+                        // multi-threaded run, which this build does not have,
+                        // so it is kept and has no effect there.
+                        'B' => opts.block_size = (value != 0).then_some(u64::from(value)),
+                        // The thread count: single-threaded here, so it steers
+                        // nothing, but it is read like every other number.
+                        'T' => {}
+                        // The legacy trainer's selectivity.
+                        's' => opts.selectivity = value,
+                        _ => unreachable!("every flag of this arm is listed"),
                     }
-                    ci = chars.len();
+                    ci = next;
                     continue;
                 }
+                // Gzip's "do not store the name": nothing is stored to begin
+                // with, so accepted and ignored, as the reference does.
+                'n' => {}
                 'c' => {
                     // Clears `-o`; see the `--stdout` arm for why.
                     opts.to_stdout = true;
@@ -1367,51 +1511,10 @@ fn parse_args_into(
                 'k' => opts.keep = true,
                 // `-S` measures each input on its own.
                 'S' => opts.bench_separately = true,
-                's' => {
-                    // `-s#`: the legacy trainer's selectivity, read like the
-                    // reference reads it (`readU32FromChar`).
-                    let rest: String = chars[ci + 1..].iter().collect();
-                    let (selectivity, tail) =
-                        read_leading_u32(&rest).wrap_err("invalid -s selectivity")?;
-                    if !tail.is_empty() {
-                        bail!("invalid -s selectivity `{rest}`");
-                    }
-                    opts.selectivity = selectivity;
-                    ci = chars.len();
-                    continue;
-                }
                 'q' => *verbosity -= 1,
                 'v' => *verbosity += 1,
                 'C' => opts.checksum = true,
                 'r' => opts.recursive = true,
-                'B' => {
-                    // `-B[N]` cuts the benchmark's inputs into independent
-                    // frames and a training sample into several samples. When
-                    // compressing it is the job size of a multi-threaded run,
-                    // which this build does not have, so it is kept and has no
-                    // effect there. Read as the reference reads it
-                    // (`readU32FromChar`): a count with an optional `K` / `M`.
-                    let rest: String = chars[ci + 1..].iter().collect();
-                    let (size, tail) = read_leading_u32(&rest).wrap_err("invalid -B value")?;
-                    if !tail.is_empty() {
-                        bail!("invalid -B value `{rest}`");
-                    }
-                    opts.block_size = (size != 0).then_some(u64::from(size));
-                    ci = chars.len();
-                    continue;
-                }
-                'T' => {
-                    // `-T[N]` thread count: single-threaded here, so it steers
-                    // nothing, but the value is still parsed the way
-                    // `--threads=` reads it, since a typo is a broken command
-                    // line either way.
-                    let rest: String = chars[ci + 1..].iter().collect();
-                    if !rest.is_empty() {
-                        rest.parse::<u32>().wrap_err("invalid -T thread count")?;
-                    }
-                    ci = chars.len();
-                    continue;
-                }
                 'M' => {
                     // `-M[N]` is a decompression memory ceiling — a safety
                     // promise, so it is checked against the one this build
@@ -1422,12 +1525,14 @@ fn parse_args_into(
                     // next argument stays a filename (`zstd -d -M 8 f.zst`
                     // reads `8` as a file). Erroring here would refuse a
                     // command line the reference tool accepts.
-                    let rest: String = chars[ci + 1..].iter().collect();
-                    if !rest.is_empty() {
+                    let (_, next) = cluster_u32(&chars, ci + 1)
+                        .wrap_err_with(|| format!("invalid -M memory limit (in {arg})"))?;
+                    let number: String = chars[ci + 1..next].iter().collect();
+                    if !number.is_empty() {
                         opts.memory_limit =
-                            parse_memory_limit(&rest).wrap_err("invalid -M memory limit")?;
+                            parse_memory_limit(&number).wrap_err("invalid -M memory limit")?;
                     }
-                    ci = chars.len();
+                    ci = next;
                     continue;
                 }
                 'V' => {
@@ -1468,10 +1573,12 @@ fn parse_args_into(
                     continue;
                 }
                 '0'..='9' => {
-                    // The rest of the cluster is the (possibly multi-digit) level.
-                    let digits: String = chars[ci..].iter().collect();
-                    opts.level = digits.parse::<i32>().wrap_err("invalid level")?;
-                    ci = chars.len();
+                    // The level, and the cluster goes on after it (`-19c`).
+                    let (level, next) = cluster_u32(&chars, ci)
+                        .wrap_err_with(|| format!("invalid level (in {arg})"))?;
+                    opts.level = i32::try_from(level)
+                        .wrap_err_with(|| format!("invalid level `{level}`"))?;
+                    ci = next;
                     continue;
                 }
                 _ => bail!("unknown flag: -{c} (in {arg})"),
@@ -1493,6 +1600,9 @@ fn parse_args_into(
         check_memory_limit(limit, 0, 0)?;
     }
     validate_level(opts.level)?;
+    // The benchmark starts at the compression level, however it was given
+    // (`-b19`, `-19 -b`, `ZSTD_CLEVEL`), as the reference starts at `cLevel`.
+    opts.bench_start = opts.level;
     // An end below the start is raised to it, as upstream raises `cLevelLast`.
     opts.bench_end = bench_end.map_or(opts.bench_start, |end: i32| end.max(opts.bench_start));
     // The levels 20-22 are expensive enough that upstream asks for them by
@@ -2176,6 +2286,12 @@ fn run(mut opts: Options) -> Result<usize> {
         );
         return Ok(skipped);
     }
+    // A benchmark with no input named measures generated data. Inputs that were
+    // named and came to nothing are a different request: measuring lorem ipsum
+    // in their place would report a result for files never read.
+    if files.is_empty() && explicit && opts.bench {
+        bail!("-b requires one or more regular input files to benchmark");
+    }
     opts.inputs = files;
     // The count is exact: at most one per directory walked, each its own input.
     Ok(run_selected(opts)? + skipped)
@@ -2188,10 +2304,10 @@ fn run_selected(mut opts: Options) -> Result<usize> {
         matches!(opts.mode, Mode::Compress | Mode::Decompress | Mode::Test) && !opts.bench;
     // The streaming modes refuse to read stdin from a terminal unless forced,
     // as the reference command does.
-    if streams && reads_stdin(&opts.inputs) && !opts.force_stdin && io::stdin().is_terminal() {
+    if streams && reads_stdin(&opts.inputs) && !opts.force_stdin && opts.console.stdin() {
         bail!("stdin is a console, aborting");
     }
-    refuse_console_stdout(&opts, io::stdout().is_terminal())?;
+    refuse_console_stdout(&opts, opts.console.stdout())?;
     let has_stdout_output = matches!(opts.mode, Mode::Compress | Mode::Decompress)
         && !opts.bench
         && writes_stdout(&opts);
@@ -2201,7 +2317,7 @@ fn run_selected(mut opts: Options) -> Result<usize> {
     }
     // When stderr is not a terminal, do not pollute it with progress updates
     // unless asked.
-    if !io::stderr().is_terminal() && opts.progress != Progress::Always {
+    if !opts.console.stderr() && opts.progress != Progress::Always {
         opts.progress = Progress::Never;
     }
     if has_stdout_output && opts.remove_source {
@@ -2780,14 +2896,15 @@ fn multi_summary(opts: &Options, total: usize, tally: &Tally) {
     }
 }
 
-/// `-b`: benchmark compression + decompression of the input across the
-/// requested level range, reporting ratio and best-of throughput. A simplified
-/// `zstd -b#` (per-level row); honours `-D` so dictionary throughput can be
-/// measured. Time-budgeted per level rather than fixed-iteration.
+/// `-b`: benchmark compression + decompression of the inputs, or of generated
+/// data when none is named, across the requested level range, reporting ratio
+/// and best-of throughput. A simplified `zstd -b#` (per-level row); honours
+/// `-D` so dictionary throughput can be measured. Time-budgeted per level
+/// rather than fixed-iteration.
 fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
-    if opts.inputs.is_empty() {
-        bail!("-b requires one or more regular input files to benchmark");
-    }
+    // With no input named the reference measures data it generates
+    // (`BMK_syntheticTest`): `-B` bytes of it, ten million by default.
+    let synthetic = opts.inputs.is_empty();
     // `-` is stdin everywhere else in this tool, and a benchmark cannot measure
     // it: the whole input is held and read again per pass, which a stream
     // affords neither. Answered before the stat below, or the marker would name
@@ -2807,7 +2924,13 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     // Kept, not just summed: these are the lengths the ceiling below is weighed
     // against, and the read is bounded by the same ones — so what was approved
     // and what is taken cannot be two different figures.
-    let mut sizes = Vec::with_capacity(opts.inputs.len());
+    let mut sizes = Vec::with_capacity(opts.inputs.len().max(1));
+    if synthetic {
+        let size = opts.block_size.unwrap_or(synthetic::DEFAULT_SIZE as u64);
+        sum = size;
+        largest = size;
+        sizes.push(size);
+    }
     for input in &opts.inputs {
         let metadata = fs::metadata(input)
             .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
@@ -2926,6 +3049,19 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     // beside the two forms parsed out of it for the rest of the run.
     let codecs = &mut Codecs::prepare(dict.as_deref(), opts.patch_from.is_some(), true, true)?;
     drop(dict);
+
+    if synthetic {
+        let size = usize::try_from(sizes[0])
+            .map_err(|_| eyre!("-B {} is more than this machine can hold", sizes[0]))?;
+        let (label, data) = match opts.bench_compressibility {
+            Some(percent) => (
+                format!("Synthetic {percent}%"),
+                synthetic::compressible(size, percent),
+            ),
+            None => ("Lorem ipsum".to_string(), synthetic::lorem(size)),
+        };
+        return benchmark_one(opts, codecs, &label, &data, &sizes);
+    }
 
     if opts.bench_separately {
         for (input, size) in opts.inputs.iter().zip(&sizes) {
@@ -3184,7 +3320,7 @@ fn benchmark_one(
         if opts.verbosity >= DEFAULT_LEVEL {
             println!("{}", result.line(&name));
         } else if opts.verbosity == 1 {
-            println!("{}", result.quiet_line(&name));
+            println!("{}", result.quiet_line(&name, opts.bench_param));
         }
     }
     Ok(())
@@ -3226,9 +3362,10 @@ impl BenchResult {
     }
 
     /// The reference command's line under `-q`, which its own speed scripts
-    /// parse: `-%-3i%11i (%5.3f) %6.2f MB/s %6.1f MB/s  %s`.
-    fn quiet_line(&self, name: &str) -> String {
-        format!(
+    /// parse: `-%-3i%11i (%5.3f) %6.2f MB/s %6.1f MB/s  %s`, followed by
+    /// ` (param=%d)` when `-p#` set one.
+    fn quiet_line(&self, name: &str, param: Option<u32>) -> String {
+        let mut line = format!(
             "-{:<3}{:>11} ({:>5.3}) {:>6.2} MB/s {:>6.1} MB/s  {}",
             self.level,
             self.output,
@@ -3236,7 +3373,11 @@ impl BenchResult {
             self.compress_mb_s,
             self.decompress_mb_s,
             name,
-        )
+        );
+        if let Some(param) = param.filter(|&param| param != 0) {
+            line.push_str(&format!(" (param={param})"));
+        }
+        line
     }
 }
 
@@ -4527,9 +4668,7 @@ fn stream_stdin<W: Write>(opts: &Options, codecs: &mut Codecs, sink: W) -> Resul
 /// The counter over `reader` expecting `total` bytes, drawn under the
 /// `--progress` rule every input shares.
 fn progress_monitor<R: Read>(opts: &Options, reader: R, total: Option<u64>) -> ProgressMonitor<R> {
-    let shown = opts
-        .progress
-        .shown(opts.verbosity, io::stderr().is_terminal());
+    let shown = opts.progress.shown(opts.verbosity, opts.console.stderr());
     ProgressMonitor::new(reader, total, shown)
 }
 

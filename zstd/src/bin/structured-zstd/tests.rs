@@ -1760,14 +1760,21 @@ fn fast_flag_maps_to_negative_level() {
 
 #[test]
 fn fast_level_reads_a_digit_run_and_ignores_the_tail() {
-    // upstream zstd (zstdcli.c:1139 -> readU32FromCharChecked, 350-376): the
+    // upstream zstd (zstdcli.c:1174 -> readU32FromCharChecked, 355-388): the
     // acceleration factor is the LEADING digit run; the parser stops at the
-    // first byte that is neither a digit nor a K/M multiplier and `--fast`
+    // first byte that is neither a digit nor a K/M/G multiplier and `--fast`
     // never looks at what is left. `zstd --fast=3.5` compresses at level -3,
     // so refusing it turns a working command line into an error.
     assert_eq!(parse(&["--fast=3.5"]).unwrap().level, -3);
     assert_eq!(parse(&["--fast=3x"]).unwrap().level, -3);
-    assert_eq!(parse(&["--fast=3G"]).unwrap().level, -3);
+    // The multipliers are upper case only there, so a lower-case one is tail.
+    assert_eq!(parse(&["--fast=3k"]).unwrap().level, -3);
+    // `G` multiplies like `K` and `M`, and the factor then clamps to the
+    // fastest level.
+    assert_eq!(
+        parse(&["--fast=3G"]).unwrap().level,
+        CompressionLevel::MIN_LEVEL
+    );
     // A sign is not a digit, so the run is empty and the factor is zero —
     // which upstream rejects. Rust's own integer parser accepts `+3`, and
     // accepting it here would take a level upstream refuses.
@@ -2211,8 +2218,8 @@ fn benchmark_flags_parse_level_range() {
     assert_eq!(opts.bench_end, opts.bench_start);
 }
 
-/// `-B#` is read the way the reference reads it (a count with `K` / `M`), and
-/// zero is no block size at all.
+/// `-B#` is read the way the reference reads it (a count with `K` / `M` /
+/// `G`), and zero is no block size at all.
 #[test]
 fn block_size_is_read_like_the_reference_reads_it() {
     assert_eq!(
@@ -2229,8 +2236,152 @@ fn block_size_is_read_like_the_reference_reads_it() {
     );
     assert_eq!(parse(&["-b", "-B0", "f"]).unwrap().block_size, None);
     assert_eq!(parse(&["-b", "-B", "f"]).unwrap().block_size, None);
-    assert!(parse(&["-b", "-B1G", "f"]).is_err(), "no G multiplier");
+    assert_eq!(
+        parse(&["-b", "-B1G", "f"]).unwrap().block_size,
+        Some(1 << 30)
+    );
+    // Past 32 bits is an overflow, as `readU32FromChar` reports it.
+    assert!(parse(&["-b", "-B4G", "f"]).is_err());
     assert!(parse(&["-b", "-Bx", "f"]).is_err());
+}
+
+/// Every numeric option reads the reference's number grammar (zstdcli.c:355-460
+/// with `NEXT_UINT32` / `NEXT_TSIZE`): digits, a `K` / `M` / `G` multiplier,
+/// then `i` and `B` in either combination, and nothing after. `playTests.sh`
+/// passes `--maxdict=4K`, which a plain integer parse refused.
+#[test]
+fn numeric_options_read_the_reference_suffixes() {
+    assert_eq!(parse(&["--maxdict=4K", "f"]).unwrap().max_dict, 4096);
+    assert_eq!(parse(&["--maxdict", "1KiB", "f"]).unwrap().max_dict, 1024);
+    assert_eq!(parse(&["--dictID=1K", "f"]).unwrap().dict_id, Some(1024));
+    assert_eq!(
+        parse(&["--size-hint=1KiB", "f"]).unwrap().size_hint,
+        Some(1024)
+    );
+    assert_eq!(
+        parse(&["-b", "--block-size=1MiB", "f"]).unwrap().block_size,
+        Some(1 << 20)
+    );
+    // A whole value is unambiguous, so lower case reads too.
+    assert_eq!(parse(&["--maxdict=4kb", "f"]).unwrap().max_dict, 4096);
+    // A 32-bit option overflows past 32 bits, and anything after the suffix
+    // is the reference's error.
+    assert!(parse(&["--maxdict=4G", "f"]).is_err());
+    let tail = parse(&["--maxdict=4K5", "f"]).err().unwrap().to_string();
+    assert!(
+        tail.contains("only numeric values with optional suffixes"),
+        "{tail}"
+    );
+}
+
+/// `--split=#` and `--jobsize=#` are the reference's other spellings of the
+/// chunk size `-B#` sets (zstdcli.c:1108-1110); `playTests.sh` trains with
+/// `--split=2K`.
+#[test]
+fn split_and_jobsize_set_the_block_size() {
+    assert_eq!(
+        parse(&["--train", "--split=2K", "f"]).unwrap().block_size,
+        Some(2048)
+    );
+    assert_eq!(
+        parse(&["--jobsize", "1M", "f"]).unwrap().block_size,
+        Some(1 << 20)
+    );
+}
+
+/// A short flag that takes a number reads it and the cluster goes on, as the
+/// reference's loop does (zstdcli.c:1205-1345): `playTests.sh` runs
+/// `zstd -b1e10i0`, which is `-b -1 -e10 -i0`. The benchmark starts at the
+/// level however it was given.
+#[test]
+fn short_numbers_end_where_the_next_flag_starts() {
+    let opts = parse(&["-b1e10i0", "f"]).unwrap();
+    assert!(opts.bench);
+    assert_eq!((opts.level, opts.bench_start, opts.bench_end), (1, 1, 10));
+    // `-i0` is one pass per level, not a second.
+    assert_eq!(opts.bench_secs, 0.0);
+    // A lower-case letter after a number is the next flag, not a multiplier.
+    let opts = parse(&["-19k", "f"]).unwrap();
+    assert_eq!(opts.level, 19);
+    assert!(opts.keep);
+    let opts = parse(&["-B64Kc", "f"]).unwrap();
+    assert_eq!(opts.block_size, Some(64 << 10));
+    assert!(opts.to_stdout);
+    assert_eq!(parse(&["-5", "-b", "f"]).unwrap().bench_start, 5);
+    // The memory ceiling ends at its number too.
+    let opts = parse(&["-d", "-M512c", "f"]).unwrap();
+    assert_eq!(opts.memory_limit, Some(512 << 20));
+    assert!(opts.to_stdout);
+}
+
+/// The reference's remaining short flags: `-n` is gzip's "no name", which has
+/// nothing to do here; `-p` pauses before exiting, `-p#` tags benchmark lines,
+/// and `-P#` sets the generated data's compressibility.
+#[test]
+fn n_p_and_capital_p_are_read_as_the_reference_reads_them() {
+    assert!(parse(&["-n", "f"]).is_ok());
+    let opts = parse(&["-p", "f"]).unwrap();
+    assert!(opts.pause);
+    assert_eq!(opts.bench_param, None);
+    let opts = parse(&["-b", "-p7", "f"]).unwrap();
+    assert!(!opts.pause);
+    assert_eq!(opts.bench_param, Some(7));
+    assert_eq!(
+        parse(&["-b", "-P50"]).unwrap().bench_compressibility,
+        Some(50)
+    );
+}
+
+/// Long options the reference takes for its own testing and tuning. The ones
+/// that cannot change what this build does are accepted; `--trace` still needs
+/// its file, as it does there.
+#[test]
+fn test_and_tuning_options_are_accepted() {
+    for args in [
+        &["--priority=rt", "-b", "f"][..],
+        &["--trace-file-stat", "f"],
+        &["--trace", "t.csv", "f"],
+        &["--trace=t.csv", "f"],
+    ] {
+        assert!(parse(args).is_ok(), "{args:?}");
+    }
+    assert!(parse(&["--trace"]).is_err());
+    let opts = parse(&[
+        "--fake-stdin-is-console",
+        "--fake-stdout-is-console",
+        "--fake-stderr-is-console",
+    ])
+    .unwrap();
+    assert!(opts.console.stdin());
+    assert!(opts.console.stdout());
+    assert!(opts.console.stderr());
+}
+
+/// `--patch-apply=REF` decompresses against a `--patch-from` reference, with
+/// the memory ceiling lifted to the default as the reference lifts it.
+#[test]
+fn patch_apply_decompresses_against_the_reference() {
+    let opts = parse(&["-M64", "--patch-apply=ref", "f.zst"]).unwrap();
+    assert_eq!(opts.mode, Mode::Decompress);
+    assert_eq!(opts.patch_from, Some(PathBuf::from("ref")));
+    assert_eq!(opts.memory_limit, None);
+    let opts = parse(&["--patch-apply", "ref", "f.zst"]).unwrap();
+    assert_eq!(opts.patch_from, Some(PathBuf::from("ref")));
+}
+
+/// With no input named, `-b` measures generated data as the reference does:
+/// lorem ipsum, or with `-P#` data of that compressibility, `-B` bytes of it.
+/// Inputs named that select nothing are still refused (see
+/// `file_only_modes_refuse_an_empty_selection`).
+#[test]
+fn a_benchmark_without_inputs_measures_generated_data() {
+    for args in [
+        &["-b1", "-i0", "-qq", "-B64K"][..],
+        &["-b1", "-i0", "-qq", "-B64K", "-P50"],
+        &["-b1", "-i0", "-qq", "-B64K", "-P100"],
+    ] {
+        assert_eq!(run(parse(args).unwrap()).unwrap(), 0, "{args:?}");
+    }
 }
 
 /// `--block-size=#` is the long spelling of `-B#`, as in the reference, which
@@ -4248,12 +4399,13 @@ fn attached_short_option_values_are_validated() {
     assert!(parse(&["-Tinvalid", "f"]).is_err());
     assert!(parse(&["-Binvalid", "f"]).is_err());
     assert!(parse(&["-Minvalid", "f"]).is_err());
-    // A thread count is a count. Sizes suffixes belong to `-B`, which is a
-    // size, and `--threads=` already refuses them — the short spelling has to
-    // agree with the long one.
+    // Every number takes the size suffixes, a thread count included, as the
+    // reference reads them all with one reader; the short spelling and the
+    // long one agree.
     assert!(parse(&["-B4K", "f"]).is_ok());
-    assert!(parse(&["-T4K", "f"]).is_err());
-    assert!(parse(&["--threads=4K", "f"]).is_err());
+    assert!(parse(&["-T4K", "f"]).is_ok());
+    assert!(parse(&["--threads=4K", "f"]).is_ok());
+    assert!(parse(&["--threads=4x", "f"]).is_err());
 }
 
 /// Ignoring what `--adapt` does is not a licence to ignore what it says. The
@@ -5225,8 +5377,18 @@ fn benchmark_lines_follow_the_reference_layout() {
         " 3#a.txt            :      7692 ->       255 (x30.16),  123.5 MB/s, 1234.5 MB/s"
     );
     assert_eq!(
-        result.quiet_line("a.txt"),
+        result.quiet_line("a.txt", None),
         "-3          255 (30.165) 123.46 MB/s 1234.5 MB/s  a.txt"
+    );
+    // `-p#` tags the line with its parameter, as `benchzstd.c` does; zero is
+    // the reference's "no parameter".
+    assert_eq!(
+        result.quiet_line("a.txt", Some(7)),
+        "-3          255 (30.165) 123.46 MB/s 1234.5 MB/s  a.txt (param=7)"
+    );
+    assert_eq!(
+        result.quiet_line("a.txt", Some(0)),
+        result.quiet_line("a.txt", None)
     );
     let slow = BenchResult {
         compress_mb_s: 1.5,
