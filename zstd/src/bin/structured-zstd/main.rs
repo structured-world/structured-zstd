@@ -78,6 +78,7 @@ mod interrupt;
 mod priority;
 mod progress;
 mod synthetic;
+mod trace;
 
 use display::{DEFAULT_LEVEL, HumanSize, Progress, confirm};
 use inputs::Selection;
@@ -92,6 +93,10 @@ const DECOMPRESS_SUFFIXES: [(&str, &str); 3] = [("zst", ""), ("zstd", ""), ("tzs
 
 /// The reference command version whose command line this tool follows.
 const UPSTREAM_VERSION: &str = "1.5.7";
+
+/// [`UPSTREAM_VERSION`] as `ZSTD_VERSION_NUMBER` spells it
+/// (`major * 10000 + minor * 100 + release`), the version a trace line carries.
+const UPSTREAM_VERSION_NUMBER: u32 = 10507;
 
 /// How the reference command names stdout in a summary line.
 const STDOUT_MARK: &str = "/*stdout*\\";
@@ -179,6 +184,8 @@ struct Options {
     bench_realtime: bool,
     /// Which standard streams count as terminals; see [`FakeConsole`].
     console: FakeConsole,
+    /// `--trace FILE`: where one CSV line per frame is appended.
+    trace: Option<PathBuf>,
     /// The widest window decoding takes; see [`decode_window_ceiling`]. Set
     /// once the dictionary's size is known.
     decode_window: u64,
@@ -1179,6 +1186,7 @@ fn parse_args_into(
         pause: false,
         bench_realtime: false,
         console: FakeConsole::default(),
+        trace: None,
         decode_window: structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE,
         decode_memory_overhead: decode_memory_overhead(0),
         patch_window_lifted: false,
@@ -1523,15 +1531,11 @@ fn parse_args_into(
                         opts.patch_from = Some(reference);
                         opts.patch_window_lifted = true;
                         opts.memory_limit = None;
-                    } else if option_value(long, "trace", arg_os, &mut iter)?.is_some() {
-                        // The file a build with library tracing appends one
-                        // line per frame to. This build has no per-frame hook
-                        // yet, which is the reference built without one: with
-                        // `ZSTD_TRACE` off (its default on macOS, Windows and
-                        // every non-ELF target, lib/common/zstd_trace.h:24-33)
-                        // it takes the option and its file and writes nothing.
-                        // Refusing instead would fail scripts the reference
-                        // runs, `tests/playTests.sh` among them.
+                    } else if let Some(path) = option_value(long, "trace", arg_os, &mut iter)? {
+                        // The file one CSV line per compressed and decompressed
+                        // frame is appended to, as a reference build with library
+                        // tracing writes it (`programs/zstdcli_trace.c`).
+                        opts.trace = Some(path);
                     } else if long == "rsyncable" {
                         // Synchronisation points are cut between the jobs of a
                         // multi-threaded run, which this build does not have;
@@ -1968,6 +1972,7 @@ Advanced options:
 
   -v, --verbose                 Enable verbose output; pass multiple times to increase verbosity.
   -q, --quiet                   Suppress warnings; pass twice to suppress errors.
+  --trace LOG                   Log tracing information to LOG.
 
   --[no-]progress               Forcibly show/hide the progress counter. NOTE: Any (de)compressed
                                 output to terminal will mix with progress counter text.
@@ -2274,6 +2279,42 @@ struct Codecs {
     /// What the decoder fills before each write, [`IO_CHUNK`] once the first
     /// frame allocates it, and kept for the rest of the run.
     chunk: Vec<u8>,
+    /// Length of the `-D` / `--patch-from` blob, the dictionary size a
+    /// decompression trace line reports (upstream's `ZSTD_DDict_dictSize`).
+    dictionary_size: u64,
+    /// `--trace`: the file every frame is recorded in, once it is open.
+    trace: Option<trace::Trace>,
+}
+
+impl Codecs {
+    /// Open `--trace` for this run, if it was asked for. A file that cannot be
+    /// opened is reported and the run goes on untraced, as the reference goes
+    /// on when its `fopen` fails.
+    fn open_trace(&mut self, opts: &Options, single_pass: bool) {
+        let Some(path) = &opts.trace else {
+            return;
+        };
+        match trace::Trace::open(path, UPSTREAM_VERSION_NUMBER, single_pass) {
+            Ok(trace) => self.trace = Some(trace),
+            Err(err) => display!(
+                opts.verbosity,
+                2,
+                "zstd: --trace {}: {err}; nothing is traced",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Append `frame` to `trace`, if one is open. A trace that cannot be written
+/// is reported once and closed; the work it describes goes on.
+fn trace_frame(trace: &mut Option<trace::Trace>, frame: &trace::Frame) {
+    if let Some(open) = trace.as_mut()
+        && let Err(err) = open.record(frame)
+    {
+        eprintln!("zstd: --trace: {err}; no further frames are traced");
+        *trace = None;
+    }
 }
 
 /// The piece the command reads and writes at a time: one block, the size of
@@ -2305,7 +2346,10 @@ impl Codecs {
         let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
             return Ok(Self::default());
         };
-        let mut prepared = Self::default();
+        let mut prepared = Self {
+            dictionary_size: raw.len() as u64,
+            ..Self::default()
+        };
         if for_compression {
             // Through the constructor that keeps the blob's own length, since
             // that is what the compression-parameter tier is chosen by —
@@ -2529,6 +2573,7 @@ fn run_selected(mut opts: Options) -> Result<usize> {
         compresses(&opts),
         decodes(&opts),
     )?;
+    codecs.open_trace(&opts, false);
     // Everything from here on primes from the parsed form, so the blob it was
     // parsed out of is released rather than held for the length of the run
     // beside the thing that replaced it.
@@ -3201,6 +3246,9 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     // done with: it is released before the measuring starts rather than held
     // beside the two forms parsed out of it for the rest of the run.
     let codecs = &mut Codecs::prepare(dict.as_deref(), opts.patch_from.is_some(), true, true)?;
+    // The reference benchmarks whole buffers in one call each way, which its
+    // trace reports as single-pass.
+    codecs.open_trace(opts, true);
     drop(dict);
 
     if synthetic {
@@ -4911,22 +4959,15 @@ fn stream<R: BufRead, W: Write>(
     mut sink: W,
 ) -> Result<Processed> {
     let written = match opts.mode {
-        Mode::Compress => {
-            let mut counting = CountingWriter {
-                inner: &mut sink,
-                written: 0,
-            };
-            compress_stream(
-                &mut reader,
-                &mut counting,
-                &FrameSettings {
-                    pledged_size: pledged_size.or(opts.pledged_size),
-                    ..FrameSettings::from_options(opts)
-                },
-                codecs,
-            )?;
-            counting.written
-        }
+        Mode::Compress => compress_stream(
+            &mut reader,
+            &mut sink,
+            &FrameSettings {
+                pledged_size: pledged_size.or(opts.pledged_size),
+                ..FrameSettings::from_options(opts)
+            },
+            codecs,
+        )?,
         Mode::Decompress => decompress_stream(&mut reader, &mut sink, codecs, decode)?,
         Mode::Test => decompress_stream(&mut reader, io::sink(), codecs, decode)?,
         Mode::List | Mode::Train => unreachable!("list / train never stream"),
@@ -5457,13 +5498,14 @@ fn new_compressor(
 
 /// Streaming compression core (file or stdout), optionally dictionary-primed.
 /// The encoder takes each piece straight from `reader`'s buffer: a file or
-/// stdin [`IO_CHUNK`] at a time, a slice in one piece.
+/// stdin [`IO_CHUNK`] at a time, a slice in one piece. Returns the bytes of the
+/// frame written, and records the frame in the run's `--trace`.
 fn compress_stream<R: BufRead, W: Write>(
     reader: R,
     writer: W,
     settings: &FrameSettings,
     codecs: &mut Codecs,
-) -> Result<()> {
+) -> Result<u64> {
     let compressed = compress_frame(reader, writer, settings, codecs);
     if compressed.is_err() {
         // A frame that failed part-way leaves the context inside it, or
@@ -5481,8 +5523,16 @@ fn compress_frame<R: BufRead, W: Write>(
     writer: W,
     settings: &FrameSettings,
     codecs: &mut Codecs,
-) -> Result<()> {
-    let mut encoder = StreamingEncoder::with_context(writer, codecs.compressor(settings)?);
+) -> Result<u64> {
+    // Timed from before the context is set up, as the reference starts the
+    // trace in `ZSTD_compressBegin_internal`.
+    let started = codecs.trace.is_some().then(std::time::Instant::now);
+    let counted = CountingWriter {
+        inner: writer,
+        written: 0,
+    };
+    let mut encoder = StreamingEncoder::with_context(counted, codecs.compressor(settings)?);
+    let mut consumed = 0u64;
     if let Some(size) = settings.pledged_size {
         // The size is known exactly (a regular file, or `--stream-size`), so
         // pledge it: the frame records Frame_Content_Size (decoders can
@@ -5507,9 +5557,30 @@ fn compress_frame<R: BufRead, W: Write>(
             .write_all(piece)
             .wrap_err("streaming compression failed")?;
         reader.consume(len);
+        consumed += len as u64;
     }
-    encoder.finish().wrap_err("failed to finalize zstd frame")?;
-    Ok(())
+    let written = encoder
+        .finish()
+        .wrap_err("failed to finalize zstd frame")?
+        .written;
+    if let Some(started) = started {
+        let dictionary_size = codecs
+            .encoder
+            .as_ref()
+            .map_or(0, |dictionary| dictionary.content_size() as u64);
+        trace_frame(
+            &mut codecs.trace,
+            &trace::Frame {
+                method: trace::Method::Compress,
+                level: settings.level,
+                dictionary_size,
+                uncompressed_size: consumed,
+                compressed_size: written,
+                duration: started.elapsed(),
+            },
+        );
+    }
+    Ok(written)
 }
 
 /// The magic number every zstd frame opens with (RFC 8878 §3.1.1).
@@ -5548,8 +5619,16 @@ fn decompress_stream<R: Read, W: Write>(
         decoder: handle,
         decompressor,
         chunk,
+        dictionary_size,
+        trace,
         ..
     } = codecs;
+    // The dictionary every frame here is decoded against, when there is one.
+    let dictionary_size = if handle.is_some() {
+        *dictionary_size
+    } else {
+        0
+    };
     decompressor
         .set_max_window_size(settings.max_window)
         .map_err(|err| eyre!("{err}"))?;
@@ -5635,7 +5714,7 @@ fn decompress_stream<R: Read, W: Write>(
         // reported here. The chunk is taken only now, by input that is a
         // frame: plain or empty input never decodes into it.
         chunk.resize(IO_CHUNK, 0);
-        let err = match drain_decoded(&mut decoder, &mut writer, chunk) {
+        let err = match drain_decoded(&mut decoder, &mut writer, chunk, trace, dictionary_size) {
             Ok(n) => {
                 written += n;
                 continue;
@@ -5669,14 +5748,39 @@ fn decompress_stream<R: Read, W: Write>(
 /// Hand everything `decoder` produces to `writer`, `buffer` at a time: the
 /// decoder writes into it directly, so its length is the size of each write.
 /// `io::copy` would do the same through an 8 KiB buffer of its own.
-fn drain_decoded(
-    decoder: &mut impl Read,
+///
+/// With a `trace` open, each frame the decoder finishes is recorded, timed
+/// from the end of the one before (from the start for the first), against
+/// `dictionary_size`.
+fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::FrameDecoder>>(
+    decoder: &mut structured_zstd::decoding::StreamingDecoder<R, D>,
     writer: &mut impl Write,
     buffer: &mut [u8],
+    trace: &mut Option<trace::Trace>,
+    dictionary_size: u64,
 ) -> io::Result<u64> {
+    let mut since = trace.is_some().then(std::time::Instant::now);
     let mut written = 0u64;
     loop {
-        let n = match decoder.read(buffer) {
+        let read = decoder.read(buffer);
+        if let Some(started) = since.as_mut()
+            && let Some(frame) = decoder.take_finished_frame()
+        {
+            let now = std::time::Instant::now();
+            trace_frame(
+                trace,
+                &trace::Frame {
+                    method: trace::Method::Decompress,
+                    level: 0,
+                    dictionary_size,
+                    uncompressed_size: frame.decompressed_size,
+                    compressed_size: frame.compressed_size,
+                    duration: now - *started,
+                },
+            );
+            *started = now;
+        }
+        let n = match read {
             Ok(0) => return Ok(written),
             Ok(n) => n,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,

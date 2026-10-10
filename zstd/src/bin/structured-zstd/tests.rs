@@ -2608,6 +2608,92 @@ fn a_wide_window_decodes_with_long_or_memory() {
     assert_eq!(fs::read(output).unwrap(), b"abc");
 }
 
+/// `--trace FILE` appends one line per frame in the reference's format:
+/// compressing two files appends two `compress` lines, decompressing and
+/// testing a file of two frames appends two `decompress` lines each, all
+/// `streaming`, and a benchmark's lines are `single-pass`. The header is
+/// written once, when the file is created.
+#[test]
+fn trace_records_every_frame() {
+    let scratch = Scratch::new("trace");
+    let trace = scratch.0.join("t.csv");
+    let trace = trace.to_str().unwrap();
+    let one = scratch.file("one", &b"the first input ".repeat(100));
+    let two = scratch.file("two", b"the second one");
+    let one = one.to_str().unwrap();
+    let two = two.to_str().unwrap();
+    let lines = || {
+        fs::read_to_string(trace)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        run(parse(&["-qq", "-f", "-19", "--trace", trace, one, two]).unwrap()).unwrap(),
+        0
+    );
+    let compressed = lines();
+    assert_eq!(compressed.len(), 3, "{compressed:#?}");
+    assert!(compressed[0].starts_with("Algorithm, Version, Method, Mode, Level"));
+    let one_frame = fs::read(format!("{one}.zst")).unwrap();
+    assert!(
+        compressed[1].starts_with(&format!(
+            "zstd, 10507, compress, streaming, 19, 0, 0, 1600, {}, ",
+            one_frame.len()
+        )),
+        "{}",
+        compressed[1]
+    );
+    assert!(compressed[2].starts_with("zstd, 10507, compress, streaming, 19, 0, 0, 14, "));
+
+    // Two frames back to back decode to both inputs, and each is a line.
+    let mut both = one_frame.clone();
+    both.extend_from_slice(&fs::read(format!("{two}.zst")).unwrap());
+    let both = scratch.file("both.zst", &both);
+    let both = both.to_str().unwrap();
+    let out = scratch.0.join("both");
+    let out = out.to_str().unwrap();
+    assert_eq!(
+        run(parse(&["-qq", "-f", "-d", "--trace", trace, both, "-o", out]).unwrap()).unwrap(),
+        0
+    );
+    assert_eq!(
+        run(parse(&["-qq", "-t", "--trace", trace, both]).unwrap()).unwrap(),
+        0
+    );
+    let decoded = &lines()[3..];
+    assert_eq!(decoded.len(), 4, "{decoded:#?}");
+    for pair in decoded.chunks(2) {
+        assert!(
+            pair[0].starts_with(&format!(
+                "zstd, 10507, decompress, streaming, 0, 0, 0, 1600, {}, ",
+                one_frame.len()
+            )),
+            "{}",
+            pair[0]
+        );
+        assert!(pair[1].starts_with("zstd, 10507, decompress, streaming, 0, 0, 0, 14, "));
+    }
+
+    // A benchmark compresses and decompresses each level once per pass.
+    assert_eq!(
+        run(parse(&["-qq", "-b1", "-i0", "--trace", trace, two]).unwrap()).unwrap(),
+        0
+    );
+    let benched = &lines()[7..];
+    assert!(!benched.is_empty());
+    assert!(
+        benched
+            .iter()
+            .all(|line| line.starts_with("zstd, 10507, ") && line.contains(", single-pass, ")),
+        "{benched:#?}"
+    );
+    assert!(benched.iter().any(|line| line.contains(", compress, ")));
+    assert!(benched.iter().any(|line| line.contains(", decompress, ")));
+}
+
 /// `--patch-apply=REF` decompresses against a `--patch-from` reference, with
 /// the memory ceiling lifted to the default as the reference lifts it.
 #[test]
