@@ -2725,6 +2725,91 @@ fn trace_times_decoding_without_the_writes() {
     assert!(nanos < 50_000_000, "{line}");
 }
 
+/// A trace that cannot be opened, or stops taking writes, costs the run its
+/// trace and nothing else: the frames are still written, the run succeeds,
+/// and a trace that failed a write is closed rather than retried per frame.
+#[test]
+fn a_trace_that_fails_leaves_the_run_untraced() {
+    let scratch = Scratch::new("trace-fails");
+    let input = scratch.file("in", b"compressed whatever the trace does");
+    let input = input.to_str().unwrap();
+    let unreachable = scratch.0.join("no-such-directory").join("t.csv");
+    let unreachable = unreachable.to_str().unwrap();
+    // At the default verbosity, so the report of the trace is made.
+    assert_eq!(
+        run(parse(&["-f", "--trace", unreachable, input]).unwrap()).unwrap(),
+        0
+    );
+    assert!(scratch.0.join("in.zst").exists());
+    assert!(!Path::new(unreachable).exists());
+
+    // Opened for reading only, so the first line written to it fails.
+    let read_only = scratch.file("read-only.csv", b"");
+    let mut trace = Some(trace::Trace::over(
+        fs::File::open(&read_only).unwrap(),
+        10507,
+        false,
+    ));
+    trace_frame(
+        &mut trace,
+        &trace::Frame {
+            method: trace::Method::Compress,
+            level: 3,
+            dictionary_size: 0,
+            uncompressed_size: 8,
+            compressed_size: 4,
+            duration: std::time::Duration::from_nanos(8),
+        },
+    );
+    assert!(trace.is_none(), "a trace that failed a write is closed");
+}
+
+/// The trace is checked against the files a run actually writes: an input
+/// that names no output (decompressing a file without a zstd suffix) and a
+/// mode that writes no file (`--list`) leave nothing to collide with, and the
+/// run goes on with its trace open.
+#[test]
+fn a_trace_beside_no_output_is_opened() {
+    let scratch = Scratch::new("trace-no-output");
+    let payload = b"listed and decoded";
+    let frame = scratch.file("frame.zst", &frame_of(payload));
+    let unsuffixed = scratch.file("unsuffixed", &frame_of(payload));
+    let trace = scratch.0.join("t.csv");
+    let trace = trace.to_str().unwrap();
+    // Refused for its name, which is not the trace's business.
+    assert_ne!(
+        run(parse(&["-qq", "-d", "--trace", trace, unsuffixed.to_str().unwrap()]).unwrap())
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        run(parse(&["-qq", "-l", "--trace", trace, frame.to_str().unwrap()]).unwrap()).unwrap(),
+        0
+    );
+    assert!(
+        fs::read_to_string(trace)
+            .unwrap()
+            .starts_with("Algorithm, Version")
+    );
+}
+
+/// A compression that fails part-way is reported from the stream, not
+/// counted as written: an input shorter than its pledge.
+#[test]
+fn a_failed_compression_is_an_error_of_the_stream() {
+    let opts = parse(&["-3", "f"]).unwrap();
+    let mut out = Vec::new();
+    let failed = stream(
+        &opts,
+        &mut no_dict(),
+        ProgressMonitor::new(&b"short"[..], None, false),
+        Some(64),
+        &DecodeSettings::from_options(&opts),
+        &mut out,
+    );
+    assert!(failed.is_err());
+}
+
 /// A `--trace` file that is also a file the run reads or writes is refused
 /// before anything is opened: appending to an input would change it, and
 /// creating an output ahead of its own overwrite check would make the run

@@ -59,6 +59,18 @@ impl Trace {
         })
     }
 
+    /// A trace over `file` as it was opened, so a test can hand the run one
+    /// that refuses writes.
+    #[cfg(test)]
+    pub fn over(file: File, version: u32, single_pass: bool) -> Self {
+        Self {
+            file,
+            version,
+            single_pass,
+            line: String::new(),
+        }
+    }
+
     /// Append the line for `frame` (`TRACE_log`).
     pub fn record(&mut self, frame: &Frame) -> io::Result<()> {
         self.line.clear();
