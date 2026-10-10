@@ -50,7 +50,7 @@ fn parse_as(preset: &ProgramPreset, default_level: i32, args: &[&str]) -> Result
     let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
     match parse_args(&owned, preset, default_level).map_err(|failure| failure.error)? {
         Parsed::Run(opts) => Ok(*opts),
-        Parsed::Handled => bail!("parse handled (help/version) unexpectedly"),
+        Parsed::Handled { .. } => bail!("parse handled (help/version) unexpectedly"),
     }
 }
 
@@ -122,7 +122,7 @@ fn a_non_utf8_argument_survives_parsing() {
         .expect("parsing must not fail")
     {
         Parsed::Run(opts) => *opts,
-        Parsed::Handled => panic!("unexpected help/version"),
+        Parsed::Handled { .. } => panic!("unexpected help/version"),
     };
     assert_eq!(
         opts.inputs,
@@ -153,7 +153,7 @@ fn attached_path_options_keep_their_bytes() {
             .expect("parsing must not fail")
         {
             Parsed::Run(opts) => *opts,
-            Parsed::Handled => panic!("unexpected help/version"),
+            Parsed::Handled { .. } => panic!("unexpected help/version"),
         }
     };
 
@@ -1760,14 +1760,21 @@ fn fast_flag_maps_to_negative_level() {
 
 #[test]
 fn fast_level_reads_a_digit_run_and_ignores_the_tail() {
-    // upstream zstd (zstdcli.c:1139 -> readU32FromCharChecked, 350-376): the
+    // upstream zstd (zstdcli.c:1174 -> readU32FromCharChecked, 355-388): the
     // acceleration factor is the LEADING digit run; the parser stops at the
-    // first byte that is neither a digit nor a K/M multiplier and `--fast`
+    // first byte that is neither a digit nor a K/M/G multiplier and `--fast`
     // never looks at what is left. `zstd --fast=3.5` compresses at level -3,
     // so refusing it turns a working command line into an error.
     assert_eq!(parse(&["--fast=3.5"]).unwrap().level, -3);
     assert_eq!(parse(&["--fast=3x"]).unwrap().level, -3);
-    assert_eq!(parse(&["--fast=3G"]).unwrap().level, -3);
+    // The multipliers are upper case only there, so a lower-case one is tail.
+    assert_eq!(parse(&["--fast=3k"]).unwrap().level, -3);
+    // `G` multiplies like `K` and `M`, and the factor then clamps to the
+    // fastest level.
+    assert_eq!(
+        parse(&["--fast=3G"]).unwrap().level,
+        CompressionLevel::MIN_LEVEL
+    );
     // A sign is not a digit, so the run is empty and the factor is zero —
     // which upstream rejects. Rust's own integer parser accepts `+3`, and
     // accepting it here would take a level upstream refuses.
@@ -2211,8 +2218,8 @@ fn benchmark_flags_parse_level_range() {
     assert_eq!(opts.bench_end, opts.bench_start);
 }
 
-/// `-B#` is read the way the reference reads it (a count with `K` / `M`), and
-/// zero is no block size at all.
+/// `-B#` is read the way the reference reads it (a count with `K` / `M` /
+/// `G`), and zero is no block size at all.
 #[test]
 fn block_size_is_read_like_the_reference_reads_it() {
     assert_eq!(
@@ -2229,8 +2236,265 @@ fn block_size_is_read_like_the_reference_reads_it() {
     );
     assert_eq!(parse(&["-b", "-B0", "f"]).unwrap().block_size, None);
     assert_eq!(parse(&["-b", "-B", "f"]).unwrap().block_size, None);
-    assert!(parse(&["-b", "-B1G", "f"]).is_err(), "no G multiplier");
+    assert_eq!(
+        parse(&["-b", "-B1G", "f"]).unwrap().block_size,
+        Some(1 << 30)
+    );
+    // Past 32 bits is an overflow, as `readU32FromChar` reports it.
+    assert!(parse(&["-b", "-B4G", "f"]).is_err());
     assert!(parse(&["-b", "-Bx", "f"]).is_err());
+}
+
+/// Every numeric option reads the reference's number grammar (zstdcli.c:355-460
+/// with `NEXT_UINT32` / `NEXT_TSIZE`): digits, a `K` / `M` / `G` multiplier,
+/// then `i` and `B` in either combination, and nothing after. `playTests.sh`
+/// passes `--maxdict=4K`, which a plain integer parse refused.
+#[test]
+fn numeric_options_read_the_reference_suffixes() {
+    assert_eq!(parse(&["--maxdict=4K", "f"]).unwrap().max_dict, 4096);
+    assert_eq!(parse(&["--maxdict", "1KiB", "f"]).unwrap().max_dict, 1024);
+    assert_eq!(parse(&["--dictID=1K", "f"]).unwrap().dict_id, Some(1024));
+    assert_eq!(
+        parse(&["--size-hint=1KiB", "f"]).unwrap().size_hint,
+        Some(1024)
+    );
+    assert_eq!(
+        parse(&["-b", "--block-size=1MiB", "f"]).unwrap().block_size,
+        Some(1 << 20)
+    );
+    // A whole value is unambiguous, so lower case reads too.
+    assert_eq!(parse(&["--maxdict=4kb", "f"]).unwrap().max_dict, 4096);
+    // A 32-bit option overflows past 32 bits, and anything after the suffix
+    // is the reference's error.
+    assert!(parse(&["--maxdict=4G", "f"]).is_err());
+    let tail = parse(&["--maxdict=4K5", "f"]).err().unwrap().to_string();
+    assert!(
+        tail.contains("only numeric values with optional suffixes"),
+        "{tail}"
+    );
+}
+
+/// `--split=#` and `--jobsize=#` are the reference's other spellings of the
+/// chunk size `-B#` sets (zstdcli.c:1108-1110); `playTests.sh` trains with
+/// `--split=2K`.
+#[test]
+fn split_and_jobsize_set_the_block_size() {
+    assert_eq!(
+        parse(&["--train", "--split=2K", "f"]).unwrap().block_size,
+        Some(2048)
+    );
+    assert_eq!(
+        parse(&["--jobsize", "1M", "f"]).unwrap().block_size,
+        Some(1 << 20)
+    );
+    assert!(parse(&["--split"]).is_err(), "the value is required");
+}
+
+/// A short flag that takes a number reads it and the cluster goes on, as the
+/// reference's loop does (zstdcli.c:1205-1345): `playTests.sh` runs
+/// `zstd -b1e10i0`, which is `-b -1 -e10 -i0`. The benchmark starts at the
+/// level however it was given.
+#[test]
+fn short_numbers_end_where_the_next_flag_starts() {
+    let opts = parse(&["-b1e10i0", "f"]).unwrap();
+    assert!(opts.bench);
+    assert_eq!((opts.level, opts.bench_start, opts.bench_end), (1, 1, 10));
+    // `-i0` is one pass per level, not a second.
+    assert_eq!(opts.bench_secs, 0.0);
+    // A lower-case letter after a number is the next flag, not a multiplier.
+    let opts = parse(&["-19k", "f"]).unwrap();
+    assert_eq!(opts.level, 19);
+    assert!(opts.keep);
+    let opts = parse(&["-B64Kc", "f"]).unwrap();
+    assert_eq!(opts.block_size, Some(64 << 10));
+    assert!(opts.to_stdout);
+    assert_eq!(parse(&["-5", "-b", "f"]).unwrap().bench_start, 5);
+    // The memory ceiling ends at its number too.
+    let opts = parse(&["-d", "-M512c", "f"]).unwrap();
+    assert_eq!(opts.memory_limit, Some(512 << 20));
+    assert!(opts.to_stdout);
+}
+
+/// The reference's remaining short flags: `-n` is gzip's "no name", which has
+/// nothing to do here; `-p` pauses before exiting, `-p#` tags benchmark lines,
+/// and `-P#` sets the generated data's compressibility.
+#[test]
+fn n_p_and_capital_p_are_read_as_the_reference_reads_them() {
+    assert!(parse(&["-n", "f"]).is_ok());
+    let opts = parse(&["-p", "f"]).unwrap();
+    assert!(opts.pause);
+    assert_eq!(opts.bench_param, None);
+    let opts = parse(&["-b", "-p7", "f"]).unwrap();
+    assert!(!opts.pause);
+    assert_eq!(opts.bench_param, Some(7));
+    assert_eq!(
+        parse(&["-b", "-P50"]).unwrap().bench_compressibility,
+        Some(50)
+    );
+    // `-p` takes a parameter only when a digit follows it (zstdcli.c:1324);
+    // otherwise it is the pause and the cluster goes on, so a suffix letter
+    // there is the next flag, not a multiplier of nothing.
+    let opts = parse(&["-pq", "f"]).unwrap();
+    assert!(opts.pause);
+    assert_eq!(opts.bench_param, None);
+    assert!(parse(&["-pK", "f"]).is_err());
+}
+
+/// `-p` holds every exit, including a command line that fails to parse or
+/// one that only prints, as the reference's common exit does (zstdcli.c,
+/// `_end` calls `waitEnter`).
+#[test]
+fn pause_holds_the_exits_parsing_takes() {
+    let parse_raw = |args: &[&str]| {
+        let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
+        parse_args(&owned, &plain(), CompressionLevel::DEFAULT_LEVEL)
+    };
+    assert!(parse_raw(&["-p", "--bogus"]).err().unwrap().pause);
+    assert!(!parse_raw(&["--bogus"]).err().unwrap().pause);
+    for handled in ["-V", "-H", "-h", "--version", "--help"] {
+        assert!(
+            matches!(
+                parse_raw(&["-p", handled]),
+                Ok(Parsed::Handled { pause: true })
+            ),
+            "{handled}"
+        );
+        assert!(
+            matches!(parse_raw(&[handled]), Ok(Parsed::Handled { pause: false })),
+            "{handled}"
+        );
+    }
+}
+
+/// The whole command waits on stdin under `-p` at its one exit, whatever the
+/// outcome (printed, refused, run), and only then; the status is the run's.
+#[test]
+fn the_command_pauses_at_its_one_exit() {
+    let command = |args: &[&str]| {
+        let raw: Vec<OsString> = std::iter::once("zstd")
+            .chain(args.iter().copied())
+            .map(OsString::from)
+            .collect();
+        let mut stdin: &[u8] = b"\nleft";
+        let status = run_command(&raw, &mut stdin);
+        (status, stdin == b"left")
+    };
+    assert_eq!(command(&["-p", "-V"]), (0, true));
+    assert_eq!(command(&["-V"]), (0, false));
+    assert_eq!(command(&["-p", "--bogus"]), (1, true));
+    assert_eq!(command(&["--bogus"]), (1, false));
+    assert_eq!(command(&["-p", "-b1", "-i0", "-qq", "-B64K"]), (0, true));
+    assert_eq!(command(&["-b1", "-i0", "-qq", "-B64K"]), (0, false));
+    assert_eq!(
+        command(&["-p", "-qq", "-d", "/nonexistent/input.zst"]),
+        (1, true)
+    );
+    // A run that ends in an error rather than a failed input.
+    assert_eq!(command(&["-p", "-qq", "-b", "-"]), (1, true));
+    // A kernel ceiling from the other instruction-set ladder is refused before
+    // anything runs, and the pause still holds.
+    let foreign = if cfg!(target_arch = "aarch64") {
+        "--cpu=avx2"
+    } else {
+        "--cpu=neon"
+    };
+    assert_eq!(command(&["-p", "-qq", foreign]), (1, true));
+}
+
+/// Long options the reference takes for its own testing and tuning. The ones
+/// that cannot change what this build does are accepted; `--trace` still needs
+/// its file, as it does there.
+#[test]
+fn test_and_tuning_options_are_accepted() {
+    // `--priority=rt` asks the benchmark for real-time scheduling, as the
+    // reference's does before it measures (`benchzstd.c:950`).
+    assert!(parse(&["--priority=rt", "-b", "f"]).unwrap().bench_realtime);
+    assert!(!parse(&["-b", "f"]).unwrap().bench_realtime);
+    // `--trace-file-stat` prints the reference's own C calls by name; there is
+    // nothing of ours it could describe, so it is refused rather than taken
+    // and left silent.
+    let refused = parse(&["--trace-file-stat", "f"])
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(refused.contains("--trace-file-stat"), "{refused}");
+    for args in [&["--trace", "t.csv", "f"][..], &["--trace=t.csv", "f"]] {
+        assert!(parse(args).is_ok(), "{args:?}");
+    }
+    assert!(parse(&["--trace"]).is_err());
+    let opts = parse(&[
+        "--fake-stdin-is-console",
+        "--fake-stdout-is-console",
+        "--fake-stderr-is-console",
+    ])
+    .unwrap();
+    assert!(opts.console.stdin());
+    assert!(opts.console.stdout());
+    assert!(opts.console.stderr());
+}
+
+/// `--patch-apply=REF` decompresses against a `--patch-from` reference, with
+/// the memory ceiling lifted to the default as the reference lifts it.
+#[test]
+fn patch_apply_decompresses_against_the_reference() {
+    let opts = parse(&["-M64", "--patch-apply=ref", "f.zst"]).unwrap();
+    assert_eq!(opts.mode, Mode::Decompress);
+    assert_eq!(opts.patch_from, Some(PathBuf::from("ref")));
+    assert_eq!(opts.memory_limit, None);
+    let opts = parse(&["--patch-apply", "ref", "f.zst"]).unwrap();
+    assert_eq!(opts.patch_from, Some(PathBuf::from("ref")));
+}
+
+/// With no input named, `-b` measures generated data as the reference does:
+/// lorem ipsum, or with `-P#` data of that compressibility, `-B` bytes of it.
+/// Inputs named that select nothing are still refused (see
+/// `file_only_modes_refuse_an_empty_selection`).
+#[test]
+fn a_benchmark_without_inputs_measures_generated_data() {
+    for args in [
+        &["-b1", "-i0", "-qq", "-B64K"][..],
+        &["-b1", "-i0", "-qq", "-B64K", "-P50"],
+        &["-b1", "-i0", "-qq", "-B64K", "-P100"],
+        // `-q` prints the machine-readable lines, a `-p#` sweep's tagged.
+        &["-b1", "-i0", "-q", "-B64K"],
+        &["-b1", "-i0", "-q", "-B64K", "-p7"],
+        // Raising the priority needs a privilege a test does not have; the
+        // refusal is reported and the measurement runs.
+        &["-b1", "-i0", "-qq", "-B64K", "--priority=rt"],
+    ] {
+        assert_eq!(run(parse(args).unwrap()).unwrap(), 0, "{args:?}");
+    }
+    // The generated data is measured alone, as `BMK_syntheticTest` measures
+    // it, so a `-D` there is not even read: measuring through it would report
+    // another codec path under the same command line.
+    let opts = parse(&[
+        "-b1",
+        "-i0",
+        "-qq",
+        "-B64K",
+        "-D",
+        "/nonexistent/dictionary",
+    ])
+    .unwrap();
+    assert_eq!(run(opts).unwrap(), 0);
+    // Nor a `--patch-from` reference, which would otherwise ask for a stream
+    // size and resize the window of a benchmark that has no patch to make.
+    let opts = parse(&[
+        "-b1",
+        "-i0",
+        "-qq",
+        "-B64K",
+        "--patch-from",
+        "/nonexistent/reference",
+    ])
+    .unwrap();
+    assert_eq!(run(opts).unwrap(), 0);
+    // A size no allocator can give is an error, not an abort. `usize::MAX`
+    // parses on every target and is past what any allocation may be.
+    let too_large = format!("--block-size={}", usize::MAX);
+    let opts = parse(&["-b1", "-i0", "-qq", &too_large]).unwrap();
+    let refused = run(opts).err().unwrap().to_string();
+    assert!(refused.contains("memory"), "{refused}");
 }
 
 /// `--block-size=#` is the long spelling of `-B#`, as in the reference, which
@@ -4248,12 +4512,13 @@ fn attached_short_option_values_are_validated() {
     assert!(parse(&["-Tinvalid", "f"]).is_err());
     assert!(parse(&["-Binvalid", "f"]).is_err());
     assert!(parse(&["-Minvalid", "f"]).is_err());
-    // A thread count is a count. Sizes suffixes belong to `-B`, which is a
-    // size, and `--threads=` already refuses them — the short spelling has to
-    // agree with the long one.
+    // Every number takes the size suffixes, a thread count included, as the
+    // reference reads them all with one reader; the short spelling and the
+    // long one agree.
     assert!(parse(&["-B4K", "f"]).is_ok());
-    assert!(parse(&["-T4K", "f"]).is_err());
-    assert!(parse(&["--threads=4K", "f"]).is_err());
+    assert!(parse(&["-T4K", "f"]).is_ok());
+    assert!(parse(&["--threads=4K", "f"]).is_ok());
+    assert!(parse(&["--threads=4x", "f"]).is_err());
 }
 
 /// Ignoring what `--adapt` does is not a licence to ignore what it says. The
@@ -5225,9 +5490,29 @@ fn benchmark_lines_follow_the_reference_layout() {
         " 3#a.txt            :      7692 ->       255 (x30.16),  123.5 MB/s, 1234.5 MB/s"
     );
     assert_eq!(
-        result.quiet_line("a.txt"),
+        result.quiet_line("a.txt", None),
         "-3          255 (30.165) 123.46 MB/s 1234.5 MB/s  a.txt"
     );
+    // `-p#` tags the line with its parameter, as `benchzstd.c` does; zero is
+    // the reference's "no parameter".
+    assert_eq!(
+        result.quiet_line("a.txt", Some(7)),
+        "-3          255 (30.165) 123.46 MB/s 1234.5 MB/s  a.txt (param=7)"
+    );
+    assert_eq!(
+        result.quiet_line("a.txt", Some(0)),
+        result.quiet_line("a.txt", None)
+    );
+    // The `-q` header heads a plain run only: a parameter sweep's lines are
+    // the tagged rows alone (`benchzstd.c:955`).
+    let quiet = |args: &[&str]| bench_quiet_header(&parse(args).unwrap(), 7692);
+    assert_eq!(
+        quiet(&["-b", "-q", "-B64K", "f"]).as_deref(),
+        Some("bench 1.5.7 : input 7692 bytes, 3 seconds, 64 KB blocks")
+    );
+    assert_eq!(quiet(&["-b", "-q", "-p7", "f"]), None);
+    assert!(quiet(&["-b", "-q", "-p0", "f"]).is_some());
+    assert_eq!(quiet(&["-b", "f"]), None);
     let slow = BenchResult {
         compress_mb_s: 1.5,
         output: 7000,
