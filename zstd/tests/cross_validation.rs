@@ -693,6 +693,14 @@ fn reserved_descriptor_bit_is_refused_like_the_reference() {
         structured_zstd::decoding::frame_header_size(&reserved).unwrap(),
         header_size
     );
+    // Both answer from the five-byte prefix alone.
+    let prefix_size =
+        unsafe { zstd_safe::zstd_sys::ZSTD_frameHeaderSize(reserved.as_ptr().cast(), 5) };
+    assert_eq!(prefix_size, 6);
+    assert_eq!(
+        structured_zstd::decoding::frame_header_size(&reserved[..5]).unwrap(),
+        prefix_size
+    );
     assert!(
         structured_zstd::decoding::FrameDecoder::new()
             .decode_all(&reserved, &mut out)

@@ -107,6 +107,50 @@ pub fn read_frame_header_with_format(
     Ok((frame_header, bytes_read as u8))
 }
 
+fn eof() -> crate::io::Error {
+    crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof)
+}
+
+fn take<'a>(input: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+    if input.len() < n {
+        return None;
+    }
+    let (head, tail) = input.split_at(n);
+    *input = tail;
+    Some(head)
+}
+
+/// Take a frame's 4-byte magic number off the front of `*input`, refusing
+/// anything else: a skippable frame (with its length, also taken), another
+/// magic, or fewer than four bytes.
+pub(crate) fn take_magic_from_slice(input: &mut &[u8]) -> Result<(), ReadFrameHeaderError> {
+    use ReadFrameHeaderError as err;
+    let m = take(input, 4).ok_or_else(|| err::MagicNumberReadError(eof()))?;
+    let magic_num = u32::from_le_bytes([m[0], m[1], m[2], m[3]]);
+    if (0x184D2A50..=0x184D2A5F).contains(&magic_num) {
+        let s = take(input, 4).ok_or_else(|| err::FrameDescriptorReadError(eof()))?;
+        let skip_size = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+        return Err(ReadFrameHeaderError::SkipFrame {
+            magic_number: magic_num,
+            length: skip_size,
+        });
+    }
+    if magic_num != MAGIC_NUM {
+        return Err(ReadFrameHeaderError::BadMagicNumber(magic_num));
+    }
+    Ok(())
+}
+
+/// Length of the frame header at the start of `input`, magic number included,
+/// read from the magic and the descriptor byte alone; the fields after them
+/// need not be there yet.
+pub(crate) fn measure_header_from_slice(mut input: &[u8]) -> Result<usize, ReadFrameHeaderError> {
+    take_magic_from_slice(&mut input)?;
+    let d =
+        take(&mut input, 1).ok_or_else(|| ReadFrameHeaderError::FrameDescriptorReadError(eof()))?;
+    Ok(4 + FrameDescriptor(d[0]).header_len())
+}
+
 /// Slice-direct equivalent of [`read_frame_header_with_format`]: parses the
 /// header straight out of `input` with byte indexing + `from_le_bytes`, instead
 /// of per-field `read_exact` calls through the `Read` trait, and advances
@@ -120,34 +164,11 @@ pub(crate) fn read_frame_header_from_slice(
     magicless: bool,
 ) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
     use ReadFrameHeaderError as err;
-    fn eof() -> crate::io::Error {
-        crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof)
-    }
-    fn take<'a>(input: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
-        if input.len() < n {
-            return None;
-        }
-        let (head, tail) = input.split_at(n);
-        *input = tail;
-        Some(head)
-    }
 
     let mut bytes_read: u8 = 0;
     if !magicless {
-        let m = take(input, 4).ok_or_else(|| err::MagicNumberReadError(eof()))?;
-        let magic_num = u32::from_le_bytes([m[0], m[1], m[2], m[3]]);
+        take_magic_from_slice(input)?;
         bytes_read = 4;
-        if (0x184D2A50..=0x184D2A5F).contains(&magic_num) {
-            let s = take(input, 4).ok_or_else(|| err::FrameDescriptorReadError(eof()))?;
-            let skip_size = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-            return Err(ReadFrameHeaderError::SkipFrame {
-                magic_number: magic_num,
-                length: skip_size,
-            });
-        }
-        if magic_num != MAGIC_NUM {
-            return Err(ReadFrameHeaderError::BadMagicNumber(magic_num));
-        }
     }
 
     let d = take(input, 1).ok_or_else(|| err::FrameDescriptorReadError(eof()))?;

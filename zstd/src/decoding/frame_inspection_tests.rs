@@ -273,6 +273,27 @@ fn frame_header_size_measures_a_header_with_the_reserved_bit() {
     );
 }
 
+/// The header's length follows from its descriptor alone, so the size query
+/// answers from the five-byte prefix (magic and descriptor), as upstream's
+/// `ZSTD_frameHeaderSize` does: telling a caller how much more to read is what
+/// it is for. Fewer than five bytes cannot say, and a prefix that is not a
+/// frame's is still refused.
+#[test]
+fn frame_header_size_answers_from_the_five_byte_prefix() {
+    let full = no_fcs_frame();
+    assert_eq!(frame_header_size(&full[..5]).unwrap(), 6);
+    let reserved = no_fcs_frame_with_descriptor_bits(0x08);
+    assert_eq!(frame_header_size(&reserved[..5]).unwrap(), 6);
+    // Single segment, two-byte content size, four-byte dictionary id.
+    let wide = [0x28, 0xB5, 0x2F, 0xFD, 0x63];
+    assert_eq!(frame_header_size(&wide).unwrap(), 4 + 1 + 4 + 2);
+    assert!(frame_header_size(&full[..4]).is_err());
+    assert!(matches!(
+        frame_header_size(&[0xAB; 5]).unwrap_err(),
+        ReadFrameHeaderError::BadMagicNumber(_)
+    ));
+}
+
 /// Bit 4 is the Unused_bit, which a decoder "shall not interpret" (RFC 8878
 /// 3.1.1.1.1): a frame with it set reads like the same frame without it.
 #[test]
