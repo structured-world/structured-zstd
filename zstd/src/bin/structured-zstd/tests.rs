@@ -2694,6 +2694,53 @@ fn trace_records_every_frame() {
     assert!(benched.iter().any(|line| line.contains(", decompress, ")));
 }
 
+/// A `--trace` file that is also a file the run reads or writes is refused
+/// before anything is opened: appending to an input would change it, and
+/// creating an output ahead of its own overwrite check would make the run
+/// refuse it, or rename the output over the trace. Nothing is touched.
+#[test]
+fn trace_naming_a_file_of_the_run_is_refused() {
+    let scratch = Scratch::new("trace-alias");
+    let payload = b"a file the run works on";
+    let input = scratch.file("in", payload);
+    let frame = scratch.file("frame.zst", &frame_of(payload));
+    let dictionary = scratch.file("dict", b"dictionary content, long enough to be used");
+    let input = input.to_str().unwrap();
+    let frame_path = frame.to_str().unwrap();
+    let dictionary_path = dictionary.to_str().unwrap();
+    let derived = scratch.0.join("in.zst");
+    let derived = derived.to_str().unwrap();
+    let named = scratch.0.join("named");
+    let named = named.to_str().unwrap();
+    let frame_bytes = fs::read(&frame).unwrap();
+
+    let refused = |args: &[&str]| run(parse(args).unwrap()).is_err();
+    // The input being decoded.
+    assert!(refused(&[
+        "-qq", "-d", "--trace", frame_path, frame_path, "-o", named
+    ]));
+    // An output derived from an input, and one named with `-o`.
+    assert!(refused(&["-qq", "--trace", derived, input]));
+    assert!(refused(&["-qq", "--trace", named, input, "-o", named]));
+    // The dictionary, and a benchmark's input.
+    assert!(refused(&[
+        "-qq",
+        "-D",
+        dictionary_path,
+        "--trace",
+        dictionary_path,
+        input,
+        "-o",
+        named
+    ]));
+    assert!(refused(&["-qq", "-b1", "-i0", "--trace", input, input]));
+
+    assert_eq!(fs::read(&frame).unwrap(), frame_bytes);
+    assert_eq!(fs::read(scratch.0.join("in")).unwrap(), payload);
+    assert!(!Path::new(derived).exists());
+    assert!(!Path::new(named).exists());
+}
+
 /// `--patch-apply=REF` decompresses against a `--patch-from` reference, with
 /// the memory ceiling lifted to the default as the reference lifts it.
 #[test]
