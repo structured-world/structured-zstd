@@ -5580,20 +5580,26 @@ impl<R: Read> Read for Watched<R> {
 }
 
 /// The reference command's message for a frame whose window is past the
-/// ceiling (fileio.c:2674-2684), with the flag that would let it decode.
+/// ceiling: libzstd's `frameParameter_windowTooLarge` through its decoding-error
+/// line (fileio.c:2720), then the hint (fileio.c:2674-2684) naming the flag that
+/// would let it decode.
 fn window_too_large_message(window: u64, limit: u64) -> String {
     use structured_zstd::decoding::MAX_DECODER_WINDOW_SIZE;
 
+    let head = format!(
+        "Decoding error (36) : Frame requires too much memory for decoding\n\
+         Window size larger than maximum : {window} > {limit}"
+    );
     // The window rounded up to a power of two, and to whole MiB.
     let window_log = window.next_power_of_two().ilog2();
     if window <= MAX_DECODER_WINDOW_SIZE {
         format!(
-            "Window size larger than maximum : {window} > {limit}\nUse --long={window_log} or --memory={}MB",
+            "{head}\nUse --long={window_log} or --memory={}MB",
             window.div_ceil(1 << 20)
         )
     } else {
         format!(
-            "Window size larger than maximum : {window} > {limit}\nWindow log larger than ZSTD_WINDOWLOG_MAX={}; not supported",
+            "{head}\nWindow log larger than ZSTD_WINDOWLOG_MAX={}; not supported",
             MAX_DECODER_WINDOW_SIZE.ilog2()
         )
     }

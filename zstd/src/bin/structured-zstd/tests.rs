@@ -2469,7 +2469,9 @@ fn the_decode_window_follows_the_command_line() {
 fn a_window_past_the_ceiling_names_the_flag_that_decodes_it() {
     assert_eq!(
         window_too_large_message(1 << 28, 1 << 27),
-        "Window size larger than maximum : 268435456 > 134217728\nUse --long=28 or --memory=256MB"
+        "Decoding error (36) : Frame requires too much memory for decoding\n\
+         Window size larger than maximum : 268435456 > 134217728\n\
+         Use --long=28 or --memory=256MB"
     );
     assert!(window_too_large_message(1 << 40, 1 << 27).contains("ZSTD_WINDOWLOG_MAX"));
 }
