@@ -667,6 +667,9 @@ fn apply_advanced_params(text: &str, params: &mut AdvancedParams) -> Result<()> 
         if !tail.is_empty() {
             bail!("--zstd parameter `{key}` has an invalid value `{value}`");
         }
+        // Zero, an empty value (`wlog=`) included, leaves the knob to the
+        // level, as the reference reads it: `readU32FromChar` of nothing is 0,
+        // and 0 is "default" for every compression parameter.
         let set = (number != 0).then_some(number);
         match key {
             "windowLog" | "wlog" => params.window_log = set,
@@ -1525,7 +1528,9 @@ fn parse_args_into(
                                     .wrap_err_with(|| format!("invalid -e level `{value}`"))?,
                             );
                         }
-                        // Per-level benchmark time budget in seconds.
+                        // Per-level benchmark time budget in seconds. A bare
+                        // `-i` is zero, one pass, as the reference reads it
+                        // (`readU32FromChar` of nothing is 0).
                         'i' => opts.bench_secs = f64::from(value),
                         // `-p` with digits: a benchmark parameter.
                         'p' => opts.bench_param = Some(value),
@@ -3269,21 +3274,6 @@ fn benchmark_one(
     if data.is_empty() {
         bail!("-b: {label} is empty");
     }
-    // Raised here, with the subject already read or generated, so only the
-    // measurement runs at that priority, as in the reference
-    // (`BMK_benchCLevels`, called once its buffer is filled).
-    if opts.bench_realtime {
-        display!(opts.verbosity, 2, "Note : switching to real-time priority ");
-        // The reference ignores a refusal too: without the privilege the
-        // measurement still runs, at the ordinary priority.
-        if !priority::raise_to_realtime() {
-            display!(
-                opts.verbosity,
-                3,
-                "Note : real-time priority was refused; measuring at the ordinary priority"
-            );
-        }
-    }
     // Per-level time budget; best (fastest) pass wins, like upstream's -i loop.
     let mb = data.len() as f64 / 1e6;
     let name = bench_display_name(label);
@@ -3323,6 +3313,24 @@ fn benchmark_one(
     decoded
         .try_reserve_exact(data.len())
         .map_err(|err| eyre!("-b: not enough memory to decode {label}: {err}"))?;
+    // Raised for the measurement alone: the subject is read or generated and
+    // the buffers taken by now, and the guard puts the priority back when this
+    // subject is done, before a `-S` run reads the next one. The reference
+    // raises at the same point (`BMK_benchCLevels`) and ignores a refusal too.
+    let _realtime = if opts.bench_realtime {
+        display!(opts.verbosity, 2, "Note : switching to real-time priority ");
+        let raised = priority::raise_to_realtime();
+        if raised.is_none() {
+            display!(
+                opts.verbosity,
+                3,
+                "Note : real-time priority was refused; measuring at the ordinary priority"
+            );
+        }
+        raised
+    } else {
+        None
+    };
     for level in opts.bench_start..=opts.bench_end {
         validate_level(level)?;
         let settings = FrameSettings {

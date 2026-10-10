@@ -2489,8 +2489,10 @@ fn a_benchmark_without_inputs_measures_generated_data() {
     ])
     .unwrap();
     assert_eq!(run(opts).unwrap(), 0);
-    // A size no allocator can give is an error, not an abort.
-    let opts = parse(&["-b1", "-i0", "-qq", "--block-size=9223372036854775808"]).unwrap();
+    // A size no allocator can give is an error, not an abort. `usize::MAX`
+    // parses on every target and is past what any allocation may be.
+    let too_large = format!("--block-size={}", usize::MAX);
+    let opts = parse(&["-b1", "-i0", "-qq", &too_large]).unwrap();
     let refused = run(opts).err().unwrap().to_string();
     assert!(refused.contains("memory"), "{refused}");
 }
