@@ -2204,7 +2204,15 @@ struct Codecs {
     /// The decoder every frame is decoded with, its buffers allocated by the
     /// first frame and reused by the rest.
     decompressor: structured_zstd::decoding::FrameDecoder,
+    /// What the decoder fills before each write, [`IO_CHUNK`] once the first
+    /// stream allocates it, and kept for the rest of the run.
+    decoded: Vec<u8>,
 }
+
+/// The piece the command reads and writes at a time: one block, the size of
+/// upstream's `ZSTD_DStreamOutSize()` and `ZSTD_CStreamInSize()`. Each piece is
+/// one system call, so a smaller one multiplies the calls the data costs.
+const IO_CHUNK: usize = 128 * 1024;
 
 impl Codecs {
     /// Parse the blob into the forms this run will use, and no others: a run
@@ -4749,7 +4757,11 @@ fn stream_opened<W: Write>(
     // pledging that turns a perfectly good stream into a length mismatch.
     let pledged_size = metadata.is_file().then_some(source_size);
     // The same length is the counter's total, and a FIFO's has none to show.
-    let reader = progress_monitor(opts, BufReader::new(source), pledged_size);
+    let reader = progress_monitor(
+        opts,
+        BufReader::with_capacity(IO_CHUNK, source),
+        pledged_size,
+    );
     let decode = DecodeSettings::for_file(opts);
     stream(opts, codecs, reader, pledged_size, &decode, sink)
 }
@@ -5407,8 +5419,10 @@ fn decompress_stream<R: Read, W: Write>(
     let Codecs {
         decoder: handle,
         decompressor,
+        decoded,
         ..
     } = codecs;
+    decoded.resize(IO_CHUNK, 0);
     let mut source = BufReader::new(reader);
     let mut frames = 0u64;
     let mut written = 0u64;
@@ -5489,7 +5503,7 @@ fn decompress_stream<R: Read, W: Write>(
         // The decoder reads every frame and skippable frame of the stream, the
         // first one's header included, so whatever is wrong with the input is
         // reported here.
-        let err = match io::copy(&mut decoder, &mut writer) {
+        let err = match drain_decoded(&mut decoder, &mut writer, decoded) {
             Ok(n) => {
                 written += n;
                 continue;
@@ -5511,6 +5525,27 @@ fn decompress_stream<R: Read, W: Write>(
             },
             None => return Err(err).wrap_err("streaming decompression failed"),
         }
+    }
+}
+
+/// Hand everything `decoder` produces to `writer`, `buffer` at a time: the
+/// decoder writes into it directly, so its length is the size of each write.
+/// `io::copy` would do the same through an 8 KiB buffer of its own.
+fn drain_decoded(
+    decoder: &mut impl Read,
+    writer: &mut impl Write,
+    buffer: &mut [u8],
+) -> io::Result<u64> {
+    let mut written = 0u64;
+    loop {
+        let n = match decoder.read(buffer) {
+            Ok(0) => return Ok(written),
+            Ok(n) => n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        writer.write_all(&buffer[..n])?;
+        written += n as u64;
     }
 }
 
