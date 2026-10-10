@@ -25,14 +25,21 @@ pub const MAX_BLOCK_SIZE: u32 = 128 * 1024;
 /// parameter bounds import it from there.
 pub const MIN_TARGET_BLOCK_SIZE: u32 = 1340;
 
-/// Decoder window-size limit (128 MiB = `1 << 27`), matching upstream zstd's
-/// default `ZSTD_d_windowLogMax` (`ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`). Frames
-/// advertising a larger window are rejected to bound allocation on untrusted
-/// input. The spec permits larger windows, but no standard zstd encoder emits
-/// them by default, so matching the upstream limit keeps the drop-in contract:
-/// every frame a stock zstd decoder accepts, we accept too — and crucially,
-/// every frame OUR encoder emits (up to `window_log 27` at level 22) round-trips
-/// through our own decoder. A non-power-of-two cap below `1 << 27` would reject
-/// our own level-22 / streaming output (whose window header carries the full
-/// 128 MiB). Decompression-bomb protection lives on the OUTPUT path, not here.
+/// The decoder's default window ceiling (128 MiB = `1 << 27`), upstream zstd's
+/// default `ZSTD_d_windowLogMax` (`ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`). On the
+/// paths where the decoder holds the window itself, a frame advertising a
+/// larger one is refused to bound that allocation on untrusted input, until the
+/// caller raises the ceiling (`FrameDecoder::set_max_window_size`). Every frame
+/// our encoder emits by default (up to `window_log 27` at level 22) fits it.
 pub const MAXIMUM_ALLOWED_WINDOW_SIZE: u64 = 1 << 27;
+
+/// The largest window this build decodes on any path, however far the ceiling
+/// is raised: upstream `ZSTD_WINDOWLOG_MAX`, `1 << 31` on 64-bit targets and
+/// `1 << 30` on 32-bit ones, where a larger window could not be addressed.
+#[cfg(target_pointer_width = "64")]
+pub const MAX_DECODER_WINDOW_SIZE: u64 = 1 << 31;
+/// The largest window this build decodes on any path, however far the ceiling
+/// is raised: upstream `ZSTD_WINDOWLOG_MAX`, `1 << 31` on 64-bit targets and
+/// `1 << 30` on 32-bit ones, where a larger window could not be addressed.
+#[cfg(not(target_pointer_width = "64"))]
+pub const MAX_DECODER_WINDOW_SIZE: u64 = 1 << 30;

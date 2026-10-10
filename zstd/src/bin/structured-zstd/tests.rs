@@ -2174,11 +2174,13 @@ fn long_is_refused_at_levels_that_cannot_run_it() {
 #[test]
 fn out_of_range_long_window_log_is_refused() {
     assert!(parse(&["-19", "--long=99", "in.txt"]).is_err());
-    // The encoder would accept up to 30, but this build's decoder refuses any
-    // frame declaring a window above 128 MiB — so those levels only produce
-    // files it cannot read back. Refuse them at the flag instead.
+    // Past the default decoder ceiling is fine: such a frame decodes with
+    // `--long=N` or `--memory`, as the reference command's does. Past what the
+    // encoder writes is not.
     assert!(parse(&["-19", "--long=27", "in.txt"]).is_ok());
-    assert!(parse(&["-19", "--long=28", "in.txt"]).is_err());
+    assert!(parse(&["-19", "--long=28", "in.txt"]).is_ok());
+    let past = format!("--long={}", max_window_log() + 1);
+    assert!(parse(&["-19", &past, "in.txt"]).is_err());
 }
 
 /// A benchmark range is two levels, and both of them run. Checking only the
@@ -2431,6 +2433,179 @@ fn test_and_tuning_options_are_accepted() {
     assert!(opts.console.stdin());
     assert!(opts.console.stdout());
     assert!(opts.console.stderr());
+}
+
+/// The decoder's window ceiling follows the command line as the reference's
+/// does: a patch reaches across its whole reference, `--long=N` and
+/// `--zstd=wlog=N` raise the ceiling to their window (the latter winning, as
+/// it wins when compressing), `-M` gives what its promise leaves after the
+/// other buffers and the dictionary, and nothing named keeps the default.
+/// Nothing lowers it below the default. A `-M` after `--patch-apply` is a
+/// promise the patch keeps too, as the reference's later `-M` replaces the
+/// limit `--patch-apply` lifted.
+#[test]
+fn the_decode_window_follows_the_command_line() {
+    use structured_zstd::decoding::{MAX_DECODER_WINDOW_SIZE, MAXIMUM_ALLOWED_WINDOW_SIZE};
+
+    let ceiling =
+        |args: &[&str], dictionary: u64| decode_window_ceiling(&parse(args).unwrap(), dictionary);
+    assert_eq!(ceiling(&["-d", "f.zst"], 0), MAXIMUM_ALLOWED_WINDOW_SIZE);
+    assert_eq!(ceiling(&["-d", "--long=28", "f.zst"], 0), 1 << 28);
+    assert_eq!(ceiling(&["-d", "--zstd=wlog=29", "f.zst"], 0), 1 << 29);
+    assert_eq!(
+        ceiling(&["-d", "--long=27", "--zstd=wlog=29", "f.zst"], 0),
+        1 << 29
+    );
+    assert_eq!(
+        ceiling(&["-d", "--long=20", "f.zst"], 0),
+        MAXIMUM_ALLOWED_WINDOW_SIZE
+    );
+    assert_eq!(
+        ceiling(&["--patch-apply=ref", "f.zst"], 0),
+        MAX_DECODER_WINDOW_SIZE
+    );
+    assert_eq!(
+        ceiling(&["--patch-apply=ref", "-M512MB", "f.zst"], 1 << 20),
+        (512 << 20) - (1 << 20) - (2 << 20)
+    );
+    // A later `-M0` asks for the default limit again, as zero replaces the
+    // reference command's limit (zstdcli.c:1572-1577); an earlier one is
+    // overridden by the patch like any other `-M`.
+    assert_eq!(
+        ceiling(&["--patch-apply=ref", "-M0", "f.zst"], 0),
+        MAXIMUM_ALLOWED_WINDOW_SIZE
+    );
+    assert_eq!(
+        ceiling(&["--patch-apply=ref", "--long=28", "-M0", "f.zst"], 0),
+        1 << 28
+    );
+    assert_eq!(
+        ceiling(&["-M0", "--patch-apply=ref", "f.zst"], 0),
+        MAX_DECODER_WINDOW_SIZE
+    );
+    assert_eq!(
+        ceiling(&["-d", "-M512MB", "f.zst"], 1 << 20),
+        (512 << 20) - (1 << 20) - (2 << 20)
+    );
+}
+
+/// A benchmark holds its input, frames, decoded copy, encoder and dictionaries
+/// while it decodes, so under `-M` its window may have only what the promise
+/// leaves after them and the decoder's other buffers; without `-M` nothing is
+/// promised and the run's own ceiling stands.
+#[test]
+fn a_benchmark_window_leaves_room_for_what_the_benchmark_holds() {
+    use structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE;
+
+    let mut opts = parse(&["-b19", "-M600MB", "--long=29", "f"]).unwrap();
+    opts.decode_window = decode_window_ceiling(&opts, 0);
+    let held = 400u64 << 20;
+    assert_eq!(
+        bench_decode_settings(&opts, Some(held)).max_window,
+        (600 << 20) - held - DECODER_AUXILIARY_BYTES
+    );
+    // The default window is always left: the limit was checked to cover it.
+    let tight = (600u64 << 20) - MAXIMUM_ALLOWED_WINDOW_SIZE;
+    assert_eq!(
+        bench_decode_settings(&opts, Some(tight)).max_window,
+        MAXIMUM_ALLOWED_WINDOW_SIZE
+    );
+    let mut free = parse(&["-b19", "--long=29", "f"]).unwrap();
+    free.decode_window = decode_window_ceiling(&free, 0);
+    assert_eq!(bench_decode_settings(&free, None).max_window, 1 << 29);
+}
+
+/// Decoding takes the decoder's widest window by `--long=N`, past what the
+/// encoder writes, as the reference command's `-d --long=31` does on a 64-bit
+/// build; compressing still stops at what this build writes.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn decoding_takes_the_decoders_widest_window_log() {
+    use structured_zstd::decoding::MAX_DECODER_WINDOW_SIZE;
+
+    let widest = MAX_DECODER_WINDOW_SIZE.ilog2();
+    assert!(
+        widest > max_window_log(),
+        "the decoder reaches past the encoder"
+    );
+    let long = format!("--long={widest}");
+    let wlog = format!("--zstd=wlog={widest}");
+    for flag in [&long, &wlog] {
+        let opts = parse(&["-d", flag, "f.zst"]).unwrap();
+        assert_eq!(decode_window_ceiling(&opts, 0), MAX_DECODER_WINDOW_SIZE);
+        assert!(parse(&[flag, "f"]).is_err(), "{flag} compressing");
+    }
+    assert!(parse(&["-d", &format!("--long={}", widest + 1), "f.zst"]).is_err());
+}
+
+/// A frame past the ceiling is refused with the reference command's message,
+/// naming the flags that would decode it (fileio.c:2674-2684).
+/// The `--memory` named covers the window and what `-M` counts besides it, the
+/// decoder's other buffers and the dictionary, so it is a limit that decodes
+/// the frame.
+#[test]
+fn a_window_past_the_ceiling_names_the_flag_that_decodes_it() {
+    assert_eq!(
+        window_too_large_message(1 << 28, 1 << 27, Some(DECODER_AUXILIARY_BYTES)),
+        "Decoding error (36) : Frame requires too much memory for decoding\n\
+         Window size larger than maximum : 268435456 > 134217728\n\
+         Use --long=28 or --memory=257MB"
+    );
+    assert!(
+        window_too_large_message(1 << 40, 1 << 27, Some(DECODER_AUXILIARY_BYTES))
+            .contains("ZSTD_WINDOWLOG_MAX")
+    );
+}
+
+/// A frame from `zstd --long=28` does not decode with the default ceiling and
+/// does with `--long=28` or a `-M` large enough, as with the reference command;
+/// the `--memory` the refusal names is one of those.
+#[test]
+fn a_wide_window_decodes_with_long_or_memory() {
+    let scratch = Scratch::new("widewindow");
+    // No declared size, window log 28, one raw block of "abc".
+    let mut frame = 0xFD2F_B528u32.to_le_bytes().to_vec();
+    frame.extend_from_slice(&[0x00, (28 - 10) << 3, 0x19, 0x00, 0x00]);
+    frame.extend_from_slice(b"abc");
+    let input = scratch.file("wide.zst", &frame);
+    let input = input.to_str().unwrap();
+    let output = scratch.0.join("wide");
+    let output = output.to_str().unwrap();
+
+    let refused = run(parse(&["-d", "-qq", "-f", input, "-o", output]).unwrap())
+        .expect_err("the default ceiling refuses a 256 MiB window")
+        .to_string();
+    assert!(refused.contains("Use --long=28"), "{refused}");
+    let named = refused
+        .split_whitespace()
+        .find(|word| word.starts_with("--memory="))
+        .expect("the refusal names a --memory");
+    for flag in ["--long=28", "-M512MB", named] {
+        assert_eq!(
+            run(parse(&["-d", "-qq", "-f", flag, input, "-o", output]).unwrap()).unwrap(),
+            0,
+            "{flag}"
+        );
+        assert_eq!(fs::read(output).unwrap(), b"abc", "{flag}");
+    }
+
+    // A patch reaches across its whole reference, so applying one takes any
+    // window without a flag; this frame copies nothing from the reference.
+    let reference = scratch.file("reference", b"reference");
+    assert_eq!(
+        run(parse(&[
+            "-qq",
+            "-f",
+            &format!("--patch-apply={}", reference.display()),
+            input,
+            "-o",
+            output,
+        ])
+        .unwrap())
+        .unwrap(),
+        0
+    );
+    assert_eq!(fs::read(output).unwrap(), b"abc");
 }
 
 /// `--patch-apply=REF` decompresses against a `--patch-from` reference, with
@@ -4142,7 +4317,7 @@ fn decoding_counts_its_output_and_no_check_ignores_the_checksum() {
         &mut codecs,
         &DecodeSettings {
             verify_checksum: false,
-            pass_through: false,
+            ..DecodeSettings::default()
         },
     )
     .expect("--no-check decodes it regardless");
@@ -4232,8 +4407,8 @@ fn forced_pass_through_follows_each_inputs_destination() {
 #[test]
 fn an_empty_input_passes_through_and_is_refused_otherwise() {
     let pass = DecodeSettings {
-        verify_checksum: true,
         pass_through: true,
+        ..DecodeSettings::default()
     };
     let mut out = Vec::new();
     let written = decompress_stream(&b""[..], &mut out, &mut no_dict(), &pass)
@@ -4262,8 +4437,8 @@ fn an_empty_input_passes_through_and_is_refused_otherwise() {
 #[test]
 fn plain_input_is_passed_through_or_refused() {
     let pass = DecodeSettings {
-        verify_checksum: true,
         pass_through: true,
+        ..DecodeSettings::default()
     };
     let mut out = Vec::new();
     let written = decompress_stream(
@@ -4358,14 +4533,18 @@ fn plain_input_is_passed_through_or_refused() {
         );
     }
 
-    // A frame magic whose header is invalid (a window larger than any decoder
-    // accepts, RFC 8878 3.1.1.1.2) is a damaged frame, reported with its cause.
+    // A frame magic whose header asks for a window larger than any decoder
+    // accepts (RFC 8878 3.1.1.1.2) is refused with the reference command's
+    // message for it (fileio.c:2683).
     let mut bad_header = 0xFD2F_B528u32.to_le_bytes().to_vec();
     bad_header.extend_from_slice(&[0x00, 0xF8]);
     let err = decompress_stream(bad_header.as_slice(), io::sink(), &mut no_dict(), &pass)
         .expect_err("a frame with an invalid header is refused")
         .to_string();
-    assert!(err.contains("invalid zstd frame"), "{err}");
+    assert!(
+        err.contains("Window log larger than ZSTD_WINDOWLOG_MAX"),
+        "{err}"
+    );
 
     // A source that fails where the next frame would start is a read failure,
     // not a stump of a header: "unknown header" is for input that ends there.
@@ -4421,8 +4600,8 @@ fn a_frame_with_the_reserved_descriptor_bit_is_refused() {
     frame[4] |= 0x08;
     for pass_through in [false, true] {
         let settings = DecodeSettings {
-            verify_checksum: true,
             pass_through,
+            ..DecodeSettings::default()
         };
         let mut out = Vec::new();
         let err = decompress_stream(frame.as_slice(), &mut out, &mut no_dict(), &settings)
@@ -4916,8 +5095,9 @@ fn repeated_advanced_parameter_lists_accumulate() {
 }
 
 /// The knobs reach the encoder: a `--zstd=wlog=` window is what the frame
-/// declares, it wins over the window `--long` would set, and a window the
-/// decoder cannot read back is refused at the command line like `--long=N`.
+/// declares, it wins over the window `--long` would set, and a window past
+/// what this build writes and reads back is refused at the command line like
+/// `--long=N`.
 #[test]
 fn advanced_parameters_reach_the_frame() {
     use structured_zstd::decoding::read_frame_header_info;
@@ -4926,8 +5106,12 @@ fn advanced_parameters_reach_the_frame() {
     assert_eq!(opts.advanced.window_log, Some(20));
     assert_eq!(opts.advanced.strategy, Some(Strategy::Btopt));
     assert!(
-        parse(&["--zstd=wlog=28", "f"]).is_err(),
-        "beyond what decodes"
+        parse(&["--zstd=wlog=28", "f"]).is_ok(),
+        "within the encoder"
+    );
+    assert!(
+        parse(&[&format!("--zstd=wlog={}", max_window_log() + 1), "f"]).is_err(),
+        "beyond what this build writes"
     );
     assert!(
         parse(&["--zstd=mml=9", "f"]).is_err(),
@@ -4983,9 +5167,10 @@ fn advanced_parameters_reach_the_frame() {
 }
 
 /// `--max` sets every knob to its hardest end, as the reference's
-/// `setMaxCompression` does, with the window stopped where this build still
-/// decodes. It unlocks the ultra levels and long-distance matching, replaces a
-/// `--zstd=` list given before it, and is adjusted by one given after it.
+/// `setMaxCompression` does, with the window stopped at the widest this build
+/// writes and reads back. It unlocks the ultra levels and long-distance
+/// matching, replaces a `--zstd=` list given before it, and is adjusted by one
+/// given after it.
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn max_sets_every_knob_to_its_hardest_end() {
@@ -4994,7 +5179,7 @@ fn max_sets_every_knob_to_its_hardest_end() {
     assert_eq!(
         opts.advanced,
         AdvancedParams {
-            window_log: Some(27),
+            window_log: Some(max_window_log()),
             chain_log: Some(30),
             hash_log: Some(30),
             search_log: Some(30),
@@ -5462,8 +5647,9 @@ fn a_named_file_sizes_its_patch_window_from_the_file() {
 }
 
 /// The patch window covers the input (`highbit(size) + 1`), is never below the
-/// smallest window the format allows, and stops where the decoder would refuse
-/// the frame.
+/// smallest window the format allows, and stops at the widest window this
+/// build writes and reads back. A patch past the decoder's default 128 MiB is
+/// fine: applying it raises the ceiling, as `--patch-apply` does upstream.
 #[test]
 fn the_patch_window_covers_the_input_within_what_decodes() {
     assert_eq!(patch_window_log(0).unwrap(), 10);
@@ -5471,7 +5657,10 @@ fn the_patch_window_covers_the_input_within_what_decodes() {
     assert_eq!(patch_window_log(2000).unwrap(), 11);
     assert_eq!(patch_window_log(1 << 20).unwrap(), 21);
     assert_eq!(patch_window_log((1 << 27) - 1).unwrap(), 27);
-    assert!(patch_window_log(1 << 27).is_err());
+    assert_eq!(patch_window_log(1 << 27).unwrap(), 28);
+    let upper = max_window_log();
+    assert_eq!(patch_window_log((1 << upper) - 1).unwrap(), upper);
+    assert!(patch_window_log(1 << upper).is_err());
 }
 
 /// `-b` prints its result in the reference command's layout, at the default

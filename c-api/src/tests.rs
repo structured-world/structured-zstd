@@ -1215,6 +1215,55 @@ fn d_window_log_max_rejects_oversized_window() {
     }
 }
 
+/// A frame whose window exceeds the default 128 MiB: the streaming decoder
+/// refuses it until `ZSTD_d_windowLogMax` is raised, then decodes it, as
+/// upstream's does; one-shot `ZSTD_decompress` writes into `dst` and holds no
+/// window, so it takes the frame either way, as upstream's does.
+#[test]
+fn d_window_log_max_raises_the_streaming_ceiling() {
+    // Magic | descriptor (no FCS, not single-segment) | window log 28 |
+    // last raw block of 3 bytes | "abc".
+    let mut frame = 0xFD2F_B528u32.to_le_bytes().to_vec();
+    frame.extend_from_slice(&[0x00, (28 - 10) << 3, 0x19, 0x00, 0x00]);
+    frame.extend_from_slice(b"abc");
+
+    let stream = |window_log_max: Option<core::ffi::c_int>| unsafe {
+        let zds = crate::streaming::ZSTD_createDStream();
+        if let Some(log) = window_log_max {
+            assert_eq!(ZSTD_DCtx_setParameter(zds, 100, log), 0);
+        }
+        let mut outbuf = vec![0u8; 64];
+        let mut inb = ZSTD_inBuffer {
+            src: frame.as_ptr() as *const core::ffi::c_void,
+            size: frame.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_decompressStream(zds, &mut outb, &mut inb);
+        crate::streaming::ZSTD_freeDStream(zds);
+        (rc, outbuf[..outb.pos].to_vec())
+    };
+    let (rc, _) = stream(None);
+    assert_eq!(
+        ZSTD_getErrorCode(rc),
+        ZSTD_ErrorCode::ZSTD_error_frameParameter_windowTooLarge
+    );
+    let (rc, out) = stream(Some(28));
+    assert_eq!(ZSTD_isError(rc), 0, "{}", ZSTD_getErrorCode(rc) as u32);
+    assert_eq!(out, b"abc");
+
+    let mut dst = [0u8; 16];
+    let n = unsafe {
+        crate::simple::ZSTD_decompress(dst.as_mut_ptr(), dst.len(), frame.as_ptr(), frame.len())
+    };
+    assert_eq!(ZSTD_isError(n), 0);
+    assert_eq!(&dst[..n], b"abc");
+}
+
 #[test]
 fn stream_size_hints_match_upstream() {
     assert_eq!(ZSTD_CStreamInSize(), 128 * 1024);

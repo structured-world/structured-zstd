@@ -179,6 +179,15 @@ struct Options {
     bench_realtime: bool,
     /// Which standard streams count as terminals; see [`FakeConsole`].
     console: FakeConsole,
+    /// The widest window decoding takes; see [`decode_window_ceiling`]. Set
+    /// once the dictionary's size is known.
+    decode_window: u64,
+    /// What `-M` counts besides the window; see [`decode_memory_overhead`].
+    /// Set with [`Self::decode_window`].
+    decode_memory_overhead: Option<u64>,
+    /// A patch lifted the decode window to its widest, and no `-M` (`-M0`
+    /// included) came after to set a limit of its own.
+    patch_window_lifted: bool,
     /// Measure each input on its own (`-S`) instead of as one stream, so the
     /// reported ratio and throughput describe a file rather than a mixture.
     bench_separately: bool,
@@ -481,6 +490,59 @@ fn parse_memory_limit(text: &str) -> Result<Option<u64>> {
     Ok((bytes != 0).then_some(bytes))
 }
 
+/// What the decoder holds BESIDES the window, rounded well up: the literal and
+/// block buffers (a block is capped at 128 KiB each), the sequence storage,
+/// the Huffman and FSE tables, and the tool's own I/O buffers. Counted because
+/// `-M` promises total memory, not one allocation: a limit equal to the window
+/// alone is one we would break.
+const DECODER_AUXILIARY_BYTES: u64 = 1 << 20;
+
+/// What `-M` counts besides the window: the decoder's other buffers and the
+/// dictionary (`dictionary_bytes`), held as read and again as parsed. `None`
+/// past `u64`, which no limit covers.
+fn decode_memory_overhead(dictionary_bytes: u64) -> Option<u64> {
+    dictionary_bytes
+        .checked_mul(2)
+        .and_then(|dictionary| dictionary.checked_add(DECODER_AUXILIARY_BYTES))
+}
+
+/// The widest window this run decodes, handed to the decoder as its ceiling.
+///
+/// Under `-M` the window may have what the promise leaves once
+/// [`decode_memory_overhead`] is counted; the limit was already checked to
+/// leave at least the default. `-M` comes first because a patch keeps it too:
+/// `--patch-apply` drops a `-M` given before it, so one still set came after,
+/// and replaces the lifted limit as a later `-M` replaces it in the reference
+/// command. Otherwise a patch whose window no later `-M` (`-M0` included) has
+/// limited again reaches back across its whole reference, so it is decoded
+/// with the widest window any decode takes, as upstream's development branch
+/// raises its limit for `--patch-apply`. Failing both, `--zstd=wlog=N` or
+/// `--long=N` raises it, the former first as it wins when compressing; and
+/// failing those the decoder's default stands. A log below the default does
+/// not lower it: the reference would then refuse frames its own default
+/// accepts, which serves nobody.
+fn decode_window_ceiling(opts: &Options, dictionary_bytes: u64) -> u64 {
+    use structured_zstd::decoding::{MAX_DECODER_WINDOW_SIZE, MAXIMUM_ALLOWED_WINDOW_SIZE};
+
+    if let Some(limit) = opts.memory_limit {
+        return decode_memory_overhead(dictionary_bytes)
+            .and_then(|held| limit.checked_sub(held))
+            .unwrap_or(0)
+            .clamp(MAXIMUM_ALLOWED_WINDOW_SIZE, MAX_DECODER_WINDOW_SIZE);
+    }
+    if opts.patch_window_lifted {
+        return MAX_DECODER_WINDOW_SIZE;
+    }
+    // The reference derives a missing limit from the compression window
+    // whatever set it (zstdcli.c:1572-1577), `--max` included, which sets
+    // `windowLog` to its maximum (zstdcli.c:644): so `-d --max` raises the
+    // ceiling there, and here, rather than being read as compression-only.
+    match opts.advanced.window_log.or(opts.long_window_log) {
+        Some(log) => (1u64 << log).clamp(MAXIMUM_ALLOWED_WINDOW_SIZE, MAX_DECODER_WINDOW_SIZE),
+        None => MAXIMUM_ALLOWED_WINDOW_SIZE,
+    }
+}
+
 /// Check a requested decompression memory ceiling against the one this build
 /// actually enforces.
 ///
@@ -497,14 +559,9 @@ fn parse_memory_limit(text: &str) -> Result<Option<u64>> {
 /// frame and the decompressed copy. Any of them can break the promise alone, so
 /// they are weighed from the file sizes before anything is loaded.
 fn check_memory_limit(requested: u64, whole_file_bytes: u64, copies: u64) -> Result<()> {
-    /// Window ceiling the decoder refuses to exceed.
+    /// Window ceiling the decoder refuses to exceed by default.
     const WINDOW: u64 = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE;
-    /// What the decoder holds BESIDES the window, rounded well up: the literal
-    /// and block buffers (a block is capped at 128 KiB each), the sequence
-    /// storage, the Huffman and FSE tables, and the tool's own I/O buffers.
-    /// Counted because the promise is about total memory, not about one
-    /// allocation: a limit equal to the window alone is one we would break.
-    const AUXILIARY: u64 = 1 << 20;
+    const AUXILIARY: u64 = DECODER_AUXILIARY_BYTES;
     // A size here is what a directory entry claims, not what was allocated, and
     // a sparse file can claim more than memory could ever hold. Arithmetic that
     // leaves the type is therefore a real input, not a theoretical one: a
@@ -550,26 +607,25 @@ fn check_memory_limit(requested: u64, whole_file_bytes: u64, copies: u64) -> Res
     Ok(())
 }
 
-/// Check a `--long=N` window log against what this build can both write and
-/// read back.
-///
-/// The encoder reaches further than the decoder: it accepts window logs up to
-/// 30, while decoding refuses any frame declaring a window above
-/// [`MAXIMUM_ALLOWED_WINDOW_SIZE`](structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE).
-/// The lower of the two is the honest limit, since the values in between only
-/// produce files this tool cannot open. Validated at parse time rather than at
-/// the first frame, so a wrong value is reported before any output is written.
-fn check_window_log(log: u32) -> Result<()> {
+/// Check a `--long=N` or `--zstd=wlog=N` window log once the mode is known:
+/// against what this build both writes and reads back when the run
+/// compresses, against the widest window the decoder takes when it only
+/// decodes. Validated at parse time rather than at the first frame, so a wrong
+/// value is reported before any output is written. A window past the
+/// decoder's default ceiling is fine: decoding such a frame takes `--long=N`
+/// or `--memory`, as it does with the reference command.
+fn check_window_log(log: u32, compressing: bool) -> Result<()> {
     use structured_zstd::encoding::CParameter;
 
     let bounds = CParameter::WindowLog.bounds();
-    let decodable = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE.ilog2();
-    let upper = i64::from(max_window_log());
+    let upper = i64::from(if compressing {
+        max_window_log()
+    } else {
+        structured_zstd::decoding::MAX_DECODER_WINDOW_SIZE.ilog2()
+    });
     if i64::from(log) < bounds.lower_bound || i64::from(log) > upper {
         bail!(
-            "window log {log} is outside the supported range {}..={upper} \
-             (above {decodable} the frame would declare a window this build \
-             refuses to decode)",
+            "window log {log} is outside the supported range {}..={upper}",
             bounds.lower_bound,
         );
     }
@@ -577,20 +633,20 @@ fn check_window_log(log: u32) -> Result<()> {
 }
 
 /// The largest window this build both writes and reads back: the encoder's
-/// ceiling or the decoder's, whichever is lower (see [`check_window_log`]).
+/// ceiling or the largest window any decode accepts, whichever is lower.
 fn max_window_log() -> u32 {
     use structured_zstd::encoding::CParameter;
 
     let encodable = u32::try_from(CParameter::WindowLog.bounds().upper_bound)
         .expect("the window-log bound is a small positive number");
-    let decodable = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE.ilog2();
+    let decodable = structured_zstd::decoding::MAX_DECODER_WINDOW_SIZE.ilog2();
     encodable.min(decodable)
 }
 
 /// Every knob at the end of its range that compresses hardest, as the
 /// reference command's `--max` sets them (`zstdcli.c`, `setMaxCompression`).
 /// One departure: the window stops at [`max_window_log`] rather than at 31,
-/// since a larger one would write frames this build refuses to decode. The
+/// the widest the encoder writes. The
 /// long-distance hash rate is left to derive from the rest, which is what the
 /// reference's 0 there asks for.
 fn max_compression_params() -> AdvancedParams {
@@ -1123,6 +1179,9 @@ fn parse_args_into(
         pause: false,
         bench_realtime: false,
         console: FakeConsole::default(),
+        decode_window: structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE,
+        decode_memory_overhead: decode_memory_overhead(0),
+        patch_window_lifted: false,
         bench_separately: false,
         block_size: None,
         long: false,
@@ -1345,9 +1404,11 @@ fn parse_args_into(
                     )? {
                         // Recorded now, checked once the mode is final: the
                         // ceiling describes decoding, and a later flag can
-                        // still decide this run does none.
+                        // still decide this run does none. Zero included, it
+                        // replaces the window a patch lifted.
                         opts.memory_limit =
                             parse_memory_limit(&v).wrap_err("invalid memory limit")?;
+                        opts.patch_window_lifted = false;
                     } else if let Some(params) = long.strip_prefix("adapt=") {
                         // Parameterised form (`--adapt=min=1,max=9`). We do not
                         // vary the level, so the bounds change nothing, but a
@@ -1446,20 +1507,21 @@ fn parse_args_into(
                         // A patch needs the levels that reach far back, so the
                         // reference command unlocks the ultra levels with it.
                         opts.patch_from = Some(reference);
+                        opts.patch_window_lifted = true;
                         ultra = true;
                     } else if let Some(reference) =
                         option_value(long, "patch-apply", arg_os, &mut iter)?
                     {
                         // Decompression against a `--patch-from` reference. The
-                        // reference command lifts its memory ceiling to the
-                        // largest window here (zstdcli.c:1146), since a patch
+                        // reference command (its development branch; 1.5.7 has
+                        // no such option) lifts its memory ceiling to the
+                        // largest window here, since a patch
                         // reaches back across the whole reference. A `-M` given
-                        // earlier is dropped the same way. The decoder's own
-                        // window ceiling is fixed at 128 MiB for now, so a patch
-                        // with a wider window is refused by the decoder, loudly,
-                        // rather than applied.
+                        // earlier is dropped the same way; one given later
+                        // stands (see `decode_window_ceiling`).
                         select_mode(&mut opts, Mode::Decompress);
                         opts.patch_from = Some(reference);
+                        opts.patch_window_lifted = true;
                         opts.memory_limit = None;
                     } else if option_value(long, "trace", arg_os, &mut iter)?.is_some() {
                         // The file a build with library tracing appends one
@@ -1487,8 +1549,9 @@ fn parse_args_into(
                         // Reject `--long=` / `--long=abc` instead of treating
                         // them as a silent no-op. Exact-match so `--longer` is an
                         // unknown option.
+                        // Checked once the mode is final, as a decode-only run
+                        // takes a wider window than one that compresses.
                         let log: u32 = v.parse().wrap_err("invalid --long window log")?;
-                        check_window_log(log)?;
                         opts.long = true;
                         opts.long_window_log = Some(log);
                     } else {
@@ -1590,6 +1653,7 @@ fn parse_args_into(
                     if !number.is_empty() {
                         opts.memory_limit =
                             parse_memory_limit(&number).wrap_err("invalid -M memory limit")?;
+                        opts.patch_window_lifted = false;
                     }
                     ci = next;
                     continue;
@@ -1718,11 +1782,14 @@ fn parse_args_into(
              matching runs; at level {long_level} it would only widen the window",
         );
     }
-    // `--zstd=` knobs are validated here, before any file is opened: a window
-    // the decoder cannot read back is refused like `--long=N` is, and a knob
-    // out of its range is a broken command line.
-    if let Some(log) = opts.advanced.window_log {
-        check_window_log(log)?;
+    // Window logs are validated here, before any file is opened, against the
+    // mode the whole command line settled on; a knob out of its range is a
+    // broken command line.
+    for log in [opts.long_window_log, opts.advanced.window_log]
+        .into_iter()
+        .flatten()
+    {
+        check_window_log(log, compresses(&opts))?;
     }
     if compresses(&opts) {
         frame_parameters(
@@ -1922,13 +1989,13 @@ Advanced options:
 
 Advanced compression options:
   --ultra                       Enable levels beyond 19, up to 22; requires more memory.
-  --max                         Compress with every parameter at its maximum; the window stops at 27,
-                                the widest this build reads back. Requires a lot of memory.
+  --max                         Compress with every parameter at its maximum; the window stops at 30,
+                                the widest this build writes. Requires a lot of memory.
   --fast[=#]                    Use to very fast compression levels. [Default: 1]
   --long[=#]                    Enable long distance matching with window log #. [Default: 27]
                                 Available from level 16 up (or with --zstd=strat=7..9), where
-                                long-distance matching runs; capped at 27, the window this
-                                build can read back.
+                                long-distance matching runs; up to 30 when compressing. When
+                                decompressing, admits windows up to 2^#.
   --patch-from=REF              Use REF as the reference point for Zstandard's diff engine.
   --zstd=wlog=#,clog=#,hlog=#,slog=#,mml=#,tlen=#,strat=#[,lhlog=#,lmml=#,lblog=#,lhrlog=#]
                                 Override the level's compression parameters knob by knob.
@@ -2081,20 +2148,20 @@ fn dictionary_path(opts: &Options) -> Option<&Path> {
 
 /// The window a `--patch-from` compression runs with: wide enough to reach
 /// back over the whole input (`highbit(size) + 1`, as the reference command
-/// sizes it), within what this build can read back. A larger input cannot be
-/// patched here, since the frame would declare a window the decoder refuses.
+/// sizes it), within what this build both writes and reads back. A larger
+/// input cannot be patched here.
 fn patch_window_log(source_size: u64) -> Result<u32> {
     use structured_zstd::encoding::CParameter;
 
     let file_window_log = u64::BITS - source_size.max(1).leading_zeros();
     let lower = u32::try_from(CParameter::WindowLog.bounds().lower_bound)
         .expect("the window log lower bound is a small positive number");
-    let decodable = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE.ilog2();
-    if file_window_log > decodable {
+    let upper = max_window_log();
+    if file_window_log > upper {
         bail!(
             "Can't handle files larger than {} MiB with --patch-from: the patch would \
-             declare a window this build refuses to decode",
-            structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE >> 20
+             need a window past the largest this build writes and reads back",
+            (1u64 << upper) >> 20
         );
     }
     Ok(file_window_log.max(lower))
@@ -2444,6 +2511,9 @@ fn run_selected(mut opts: Options) -> Result<usize> {
     }
 
     let dict_bytes = load_dictionary(&opts)?;
+    let dictionary_bytes = dict_bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);
+    opts.decode_window = decode_window_ceiling(&opts, dictionary_bytes);
+    opts.decode_memory_overhead = decode_memory_overhead(dictionary_bytes);
 
     // `-b` benchmarks compression/decompression across levels instead of
     // producing output files; handle it before the streaming flow. It takes the
@@ -3023,6 +3093,9 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
 
     // Those whole-file buffers dwarf the decoder's own workspace, so a ceiling
     // that ignored them would be kept in the small and broken in the large.
+    // What they add up to is kept: the decoder's window gets only what the
+    // limit leaves past them (see `bench_decode_settings`).
+    let mut held = None;
     if let Some(limit) = opts.memory_limit {
         // With `-S` only one input is in memory at a time, so the largest file
         // is what has to fit rather than their sum.
@@ -3111,14 +3184,17 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         // while they are built from it. All of it is counted with the buffers
         // rather than on its own, since allocations that each clear the ceiling
         // separately can still exceed it together.
+        let mut total = buffers;
         if let Some(bytes) = &dict {
-            let total = (bytes.len() as u64)
+            total = (bytes.len() as u64)
                 .checked_mul(3)
                 .and_then(|dictionaries| buffers.checked_add(dictionaries))
                 .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
             check_memory_limit(limit, total, 1)?;
         }
+        held = Some(total);
     }
+    let decode = bench_decode_settings(opts, held);
 
     // Both directions are measured in turn, so both forms are wanted — parsed
     // here, once, rather than inside the timed loops below. The blob is then
@@ -3141,7 +3217,7 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         let data = data.map_err(|err| {
             eyre!("-b: not enough memory for {size} bytes of generated data: {err}")
         })?;
-        return benchmark_one(opts, codecs, &label, &data, &sizes);
+        return benchmark_one(opts, codecs, &decode, &label, &data, &sizes);
     }
 
     if opts.bench_separately {
@@ -3151,6 +3227,7 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
             benchmark_one(
                 opts,
                 codecs,
+                &decode,
                 &input.display().to_string(),
                 &data,
                 std::slice::from_ref(size),
@@ -3166,7 +3243,30 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         [only] => only.display().to_string(),
         many => format!(" {} files", many.len()),
     };
-    benchmark_one(opts, codecs, &label, &data, &sizes)
+    benchmark_one(opts, codecs, &decode, &label, &data, &sizes)
+}
+
+/// The settings a benchmark decodes with. `held` is what the benchmark holds
+/// while it decodes (input, frames, decoded copy, encoder, dictionaries), as
+/// weighed against `-M`; the window may have only what the promise leaves after
+/// it and the decoder's other buffers. The limit was checked to leave at least
+/// the default window, which stays the floor.
+fn bench_decode_settings(opts: &Options, held: Option<u64>) -> DecodeSettings {
+    use structured_zstd::decoding::{MAX_DECODER_WINDOW_SIZE, MAXIMUM_ALLOWED_WINDOW_SIZE};
+
+    let settings = DecodeSettings::from_options(opts);
+    let (Some(limit), Some(held)) = (opts.memory_limit, held) else {
+        return settings;
+    };
+    let overhead = held.checked_add(DECODER_AUXILIARY_BYTES);
+    DecodeSettings {
+        max_window: overhead
+            .and_then(|overhead| limit.checked_sub(overhead))
+            .unwrap_or(0)
+            .clamp(MAXIMUM_ALLOWED_WINDOW_SIZE, MAX_DECODER_WINDOW_SIZE),
+        memory_overhead: overhead,
+        ..settings
+    }
 }
 
 /// Read every input into one buffer, taking no more room — and no more bytes —
@@ -3269,10 +3369,12 @@ fn bench_frames_extent(file_sizes: &[u64], block_size: Option<u64>) -> Option<(u
 /// Measure one benchmark subject: every input together, or a single file under
 /// `-S`. Split out so the two modes differ only in what they hand over, not in
 /// how the measurement is taken. `file_sizes` are the lengths of the inputs
-/// `data` holds, in order; each is compressed as frames of its own.
+/// `data` holds, in order; each is compressed as frames of its own. `decode`
+/// is what the frames are decoded with (see [`bench_decode_settings`]).
 fn benchmark_one(
     opts: &Options,
     codecs: &mut Codecs,
+    decode: &DecodeSettings,
     label: &str,
     data: &[u8],
     file_sizes: &[u64],
@@ -3383,12 +3485,7 @@ fn benchmark_one(
         loop {
             decoded.clear();
             let t = Instant::now();
-            decompress_stream(
-                compressed.as_slice(),
-                &mut decoded,
-                codecs,
-                &DecodeSettings::from_options(opts),
-            )?;
+            decompress_stream(compressed.as_slice(), &mut decoded, codecs, decode)?;
             best_decompress = best_decompress.min(t.elapsed().as_secs_f64());
             if start.elapsed().as_secs_f64() >= opts.bench_secs {
                 break;
@@ -5229,8 +5326,8 @@ fn frame_parameters(
         .map_err(|err| eyre!("invalid compression parameters: {err}"))
 }
 
-/// How a stream is decoded: whether a stored checksum is compared, and what
-/// happens to input that is not a zstd stream.
+/// How a stream is decoded: whether a stored checksum is compared, what
+/// happens to input that is not a zstd stream, and the widest window taken.
 #[derive(Clone, Copy)]
 struct DecodeSettings {
     /// Compare the trailing checksum against the data (`--[no-]check`).
@@ -5238,6 +5335,11 @@ struct DecodeSettings {
     /// Copy input that is not a zstd stream through unchanged rather than
     /// failing on it (`--pass-through`).
     pass_through: bool,
+    /// The decoder's window ceiling; see [`decode_window_ceiling`].
+    max_window: u64,
+    /// What `-M` counts besides the window, for the `--memory` a refusal
+    /// names; see [`decode_memory_overhead`].
+    memory_overhead: Option<u64>,
 }
 
 impl Default for DecodeSettings {
@@ -5245,6 +5347,8 @@ impl Default for DecodeSettings {
         Self {
             verify_checksum: true,
             pass_through: false,
+            max_window: structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE,
+            memory_overhead: decode_memory_overhead(0),
         }
     }
 }
@@ -5262,6 +5366,8 @@ impl DecodeSettings {
             verify_checksum: opts.checksum,
             pass_through: opts.mode != Mode::Test
                 && opts.pass_through.unwrap_or(opts.force && to_stdout),
+            max_window: opts.decode_window,
+            memory_overhead: opts.decode_memory_overhead,
         }
     }
 
@@ -5444,6 +5550,9 @@ fn decompress_stream<R: Read, W: Write>(
         chunk,
         ..
     } = codecs;
+    decompressor
+        .set_max_window_size(settings.max_window)
+        .map_err(|err| eyre!("{err}"))?;
     let mut source = BufReader::new(reader);
     let mut frames = 0u64;
     let mut written = 0u64;
@@ -5542,6 +5651,12 @@ fn decompress_stream<R: Read, W: Write>(
             .get_ref()
             .and_then(|e| e.downcast_ref::<FrameDecoderError>())
         {
+            Some(&FrameDecoderError::WindowSizeTooBig {
+                requested, limit, ..
+            }) => bail!(
+                "{}",
+                window_too_large_message(requested, limit, settings.memory_overhead)
+            ),
             Some(frame_err) => match after_frame_message(frame_err) {
                 Some(message) => bail!("{message}"),
                 None => bail!("invalid zstd frame: {frame_err:?}"),
@@ -5588,6 +5703,37 @@ impl<R: Read> Read for Watched<R> {
             self.failed = true;
         }
         result
+    }
+}
+
+/// The reference command's message for a frame whose window is past the
+/// ceiling: libzstd's `frameParameter_windowTooLarge` through its decoding-error
+/// line (fileio.c:2720), then the hint (fileio.c:2674-2684) naming the flag that
+/// would let it decode. The `--memory` named is the window plus
+/// `memory_overhead`, what `-M` counts besides it, so the limit it names does
+/// decode the frame; it is left out when that sum has no value.
+fn window_too_large_message(window: u64, limit: u64, memory_overhead: Option<u64>) -> String {
+    use structured_zstd::decoding::MAX_DECODER_WINDOW_SIZE;
+
+    let head = format!(
+        "Decoding error (36) : Frame requires too much memory for decoding\n\
+         Window size larger than maximum : {window} > {limit}"
+    );
+    // The window rounded up to a power of two, and the memory to whole MiB.
+    let window_log = window.next_power_of_two().ilog2();
+    if window <= MAX_DECODER_WINDOW_SIZE {
+        match memory_overhead.and_then(|overhead| window.checked_add(overhead)) {
+            Some(memory) => format!(
+                "{head}\nUse --long={window_log} or --memory={}MB",
+                memory.div_ceil(1 << 20)
+            ),
+            None => format!("{head}\nUse --long={window_log}"),
+        }
+    } else {
+        format!(
+            "{head}\nWindow log larger than ZSTD_WINDOWLOG_MAX={}; not supported",
+            MAX_DECODER_WINDOW_SIZE.ilog2()
+        )
     }
 }
 

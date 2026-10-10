@@ -561,12 +561,16 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
         }
         use codec::decoding::errors::ReadFrameHeaderError;
         match codec::decoding::read_frame_header_info(&src[inp.pos..], false) {
-            Ok(info) => {
-                // `ZSTD_d_windowLogMax`: refuse oversized windows before any
-                // decode work runs.
-                let limit = 1u64 << dctx.window_log_max;
-                if info.window_size > limit {
-                    return encode(ZSTD_ErrorCode::ZSTD_error_frameParameter_windowTooLarge);
+            Ok(_) => {
+                // `ZSTD_d_windowLogMax` is the decoder's own ceiling; it
+                // refuses a wider window when the header is read below. Set on
+                // every frame start, since the decoder may have been replaced
+                // since the parameter was.
+                if let Err(err) = dctx
+                    .decoder
+                    .set_max_window_size(1u64 << dctx.window_log_max)
+                {
+                    return encode(code_for_decoder_error(&err));
                 }
                 let mut reader = &src[inp.pos..];
                 // Verify the trailing content checksum like

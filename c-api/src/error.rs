@@ -170,6 +170,7 @@ pub fn code_for_decoder_error(err: &FrameDecoderError) -> ZSTD_ErrorCode {
             ZSTD_error_frameParameter_unsupported
         }
         FrameDecoderError::WindowSizeTooBig { .. } => ZSTD_error_frameParameter_windowTooLarge,
+        FrameDecoderError::WindowCeilingOutOfRange { .. } => ZSTD_error_parameter_outOfBound,
         FrameDecoderError::DictionaryDecodeError(_) => ZSTD_error_dictionary_corrupted,
         FrameDecoderError::DictNotProvided { .. }
         | FrameDecoderError::DictIdMismatch { .. }
