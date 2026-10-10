@@ -1,6 +1,13 @@
 use std::time::Duration;
 
-use super::{Frame, HEADER, Method, Trace, line};
+use super::{Frame, HEADER, Method, Trace, write_line};
+
+/// The line `write_line` produces for `frame`.
+fn line(version: u32, single_pass: bool, frame: &Frame) -> String {
+    let mut out = String::new();
+    write_line(&mut out, version, single_pass, frame);
+    out
+}
 
 /// A line carries the reference's fields in its order and formatting:
 /// version, method, mode, level, workers, dictionary, sizes, nanoseconds,
@@ -63,8 +70,20 @@ fn the_header_is_written_only_to_a_new_file() {
         let mut trace = Trace::open(&path, 10507, false).unwrap();
         trace.record(&frame).unwrap();
     }
+    // The line buffer is cleared between records, never carried over.
+    let longer = Frame {
+        uncompressed_size: 123_456_789,
+        ..frame
+    };
+    let mut trace = Trace::open(&path, 10507, false).unwrap();
+    trace.record(&longer).unwrap();
+    trace.record(&frame).unwrap();
     let written = std::fs::read_to_string(&path).unwrap();
     let expected_line = line(10507, false, &frame);
-    assert_eq!(written, format!("{HEADER}{expected_line}{expected_line}"));
+    let longer_line = line(10507, false, &longer);
+    assert_eq!(
+        written,
+        format!("{HEADER}{expected_line}{expected_line}{longer_line}{expected_line}")
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }

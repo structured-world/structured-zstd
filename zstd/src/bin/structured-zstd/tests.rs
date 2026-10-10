@@ -2694,6 +2694,37 @@ fn trace_records_every_frame() {
     assert!(benched.iter().any(|line| line.contains(", decompress, ")));
 }
 
+/// A decompressed frame's traced duration is the decoder's time, not the
+/// sink's: a writer that takes a long time over each write does not appear in
+/// the line, and neither does the write of the frame's last output, which
+/// happens before the decoder is called again to finish the frame.
+#[test]
+fn trace_times_decoding_without_the_writes() {
+    struct Slow;
+    impl Write for Slow {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let scratch = Scratch::new("trace-writes");
+    let path = scratch.0.join("t.csv");
+    let frame = frame_of(b"a small frame, decoded in microseconds");
+    let mut trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(frame.as_slice());
+    let mut buffer = [0u8; 16];
+    drain_decoded(&mut decoder, &mut Slow, &mut buffer, &mut trace, 0).unwrap();
+    drop(trace);
+    let lines = fs::read_to_string(&path).unwrap();
+    let line = lines.lines().nth(1).unwrap();
+    let nanos: u64 = line.split(", ").nth(9).unwrap().parse().unwrap();
+    // Three writes of at least 100 ms each went to the sink.
+    assert!(nanos < 50_000_000, "{line}");
+}
+
 /// A `--trace` file that is also a file the run reads or writes is refused
 /// before anything is opened: appending to an input would change it, and
 /// creating an output ahead of its own overwrite check would make the run
@@ -5044,7 +5075,7 @@ fn a_failed_frame_does_not_reach_the_next_input() {
     let payload = vec![b'x'; 300_000];
     compress_stream(
         payload.as_slice(),
-        &mut Vec::new(),
+        Vec::new(),
         &FrameSettings {
             pledged_size: Some(payload.len() as u64 + 1),
             ..settings
