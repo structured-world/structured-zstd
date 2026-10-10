@@ -1418,7 +1418,12 @@ impl FrameDecoder {
         self.max_window_size = size;
         // Upstream refuses a parameter change mid-frame outright (`stage_wrong`);
         // refusing only the frame the new ceiling forbids keeps a decoder whose
-        // frame was abandoned free to take a new ceiling for the next one.
+        // frame was abandoned free to take a new ceiling for the next one. Such
+        // a frame stays unfinished in `state`: the C ABI's session reset leaves
+        // it there, and so does a command-line run whose previous input was
+        // damaged, and both then set the ceiling for the next frame. The cost of
+        // honouring the change is one branch per decode call (per `read`, per
+        // Raw-block refill), never per block or byte.
         // The header was admitted when the frame started, so its window reads.
         if let Some(state) = self.state.as_mut()
             && !state.frame_finished
