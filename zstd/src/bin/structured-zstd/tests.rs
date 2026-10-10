@@ -2437,9 +2437,12 @@ fn test_and_tuning_options_are_accepted() {
 
 /// The decoder's window ceiling follows the command line as the reference's
 /// does: a patch reaches across its whole reference, `--long=N` and
-/// `--zstd=wlog=N` raise the ceiling to their window, `-M` gives what its
-/// promise leaves after the other buffers and the dictionary, and nothing
-/// named keeps the default. Nothing lowers it below the default.
+/// `--zstd=wlog=N` raise the ceiling to their window (the latter winning, as
+/// it wins when compressing), `-M` gives what its promise leaves after the
+/// other buffers and the dictionary, and nothing named keeps the default.
+/// Nothing lowers it below the default. A `-M` after `--patch-apply` is a
+/// promise the patch keeps too, as the reference's later `-M` replaces the
+/// limit `--patch-apply` lifted.
 #[test]
 fn the_decode_window_follows_the_command_line() {
     use structured_zstd::decoding::{MAX_DECODER_WINDOW_SIZE, MAXIMUM_ALLOWED_WINDOW_SIZE};
@@ -2450,6 +2453,10 @@ fn the_decode_window_follows_the_command_line() {
     assert_eq!(ceiling(&["-d", "--long=28", "f.zst"], 0), 1 << 28);
     assert_eq!(ceiling(&["-d", "--zstd=wlog=29", "f.zst"], 0), 1 << 29);
     assert_eq!(
+        ceiling(&["-d", "--long=27", "--zstd=wlog=29", "f.zst"], 0),
+        1 << 29
+    );
+    assert_eq!(
         ceiling(&["-d", "--long=20", "f.zst"], 0),
         MAXIMUM_ALLOWED_WINDOW_SIZE
     );
@@ -2458,26 +2465,60 @@ fn the_decode_window_follows_the_command_line() {
         MAX_DECODER_WINDOW_SIZE
     );
     assert_eq!(
+        ceiling(&["--patch-apply=ref", "-M512MB", "f.zst"], 1 << 20),
+        (512 << 20) - (1 << 20) - (2 << 20)
+    );
+    assert_eq!(
         ceiling(&["-d", "-M512MB", "f.zst"], 1 << 20),
         (512 << 20) - (1 << 20) - (2 << 20)
     );
 }
 
+/// Decoding takes the decoder's widest window by `--long=N`, past what the
+/// encoder writes, as the reference command's `-d --long=31` does on a 64-bit
+/// build; compressing still stops at what this build writes.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn decoding_takes_the_decoders_widest_window_log() {
+    use structured_zstd::decoding::MAX_DECODER_WINDOW_SIZE;
+
+    let widest = MAX_DECODER_WINDOW_SIZE.ilog2();
+    assert!(
+        widest > max_window_log(),
+        "the decoder reaches past the encoder"
+    );
+    let long = format!("--long={widest}");
+    let wlog = format!("--zstd=wlog={widest}");
+    for flag in [&long, &wlog] {
+        let opts = parse(&["-d", flag, "f.zst"]).unwrap();
+        assert_eq!(decode_window_ceiling(&opts, 0), MAX_DECODER_WINDOW_SIZE);
+        assert!(parse(&[flag, "f"]).is_err(), "{flag} compressing");
+    }
+    assert!(parse(&["-d", &format!("--long={}", widest + 1), "f.zst"]).is_err());
+}
+
 /// A frame past the ceiling is refused with the reference command's message,
 /// naming the flags that would decode it (fileio.c:2674-2684).
+/// The `--memory` named covers the window and what `-M` counts besides it, the
+/// decoder's other buffers and the dictionary, so it is a limit that decodes
+/// the frame.
 #[test]
 fn a_window_past_the_ceiling_names_the_flag_that_decodes_it() {
     assert_eq!(
-        window_too_large_message(1 << 28, 1 << 27),
+        window_too_large_message(1 << 28, 1 << 27, Some(DECODER_AUXILIARY_BYTES)),
         "Decoding error (36) : Frame requires too much memory for decoding\n\
          Window size larger than maximum : 268435456 > 134217728\n\
-         Use --long=28 or --memory=256MB"
+         Use --long=28 or --memory=257MB"
     );
-    assert!(window_too_large_message(1 << 40, 1 << 27).contains("ZSTD_WINDOWLOG_MAX"));
+    assert!(
+        window_too_large_message(1 << 40, 1 << 27, Some(DECODER_AUXILIARY_BYTES))
+            .contains("ZSTD_WINDOWLOG_MAX")
+    );
 }
 
 /// A frame from `zstd --long=28` does not decode with the default ceiling and
-/// does with `--long=28` or a `-M` large enough, as with the reference command.
+/// does with `--long=28` or a `-M` large enough, as with the reference command;
+/// the `--memory` the refusal names is one of those.
 #[test]
 fn a_wide_window_decodes_with_long_or_memory() {
     let scratch = Scratch::new("widewindow");
@@ -2494,7 +2535,11 @@ fn a_wide_window_decodes_with_long_or_memory() {
         .expect_err("the default ceiling refuses a 256 MiB window")
         .to_string();
     assert!(refused.contains("Use --long=28"), "{refused}");
-    for flag in ["--long=28", "-M512MB"] {
+    let named = refused
+        .split_whitespace()
+        .find(|word| word.starts_with("--memory="))
+        .expect("the refusal names a --memory");
+    for flag in ["--long=28", "-M512MB", named] {
         assert_eq!(
             run(parse(&["-d", "-qq", "-f", flag, input, "-o", output]).unwrap()).unwrap(),
             0,
@@ -2502,6 +2547,24 @@ fn a_wide_window_decodes_with_long_or_memory() {
         );
         assert_eq!(fs::read(output).unwrap(), b"abc", "{flag}");
     }
+
+    // A patch reaches across its whole reference, so applying one takes any
+    // window without a flag; this frame copies nothing from the reference.
+    let reference = scratch.file("reference", b"reference");
+    assert_eq!(
+        run(parse(&[
+            "-qq",
+            "-f",
+            &format!("--patch-apply={}", reference.display()),
+            input,
+            "-o",
+            output,
+        ])
+        .unwrap())
+        .unwrap(),
+        0
+    );
+    assert_eq!(fs::read(output).unwrap(), b"abc");
 }
 
 /// `--patch-apply=REF` decompresses against a `--patch-from` reference, with
