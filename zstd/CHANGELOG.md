@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/structured-world/structured-zstd/compare/v0.1.0...v0.1.1) - 2026-10-10
+
+### Added
+
+- *(cli)* read the reference's remaining options ([#565](https://github.com/structured-world/structured-zstd/pull/565))
+
+### Fixed
+
+- *(decode)* reject frames with the reserved descriptor bit set ([#562](https://github.com/structured-world/structured-zstd/pull/562))
+
 ## [0.0.59](https://github.com/structured-world/structured-zstd/compare/v0.0.58...v0.0.59) - 2026-10-08
 
 ### Added
