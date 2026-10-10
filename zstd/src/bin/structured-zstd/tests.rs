@@ -4148,6 +4148,30 @@ fn plain_input_is_passed_through_or_refused() {
     );
 }
 
+/// A frame whose descriptor has the Reserved_bit set is refused with the
+/// reference command's message for that error ("Decoding error (36) :
+/// Unsupported frame parameter"), with or without pass-through.
+#[test]
+fn a_frame_with_the_reserved_descriptor_bit_is_refused() {
+    let mut frame = frame_of(b"payload");
+    frame[4] |= 0x08;
+    for pass_through in [false, true] {
+        let settings = DecodeSettings {
+            verify_checksum: true,
+            pass_through,
+        };
+        let mut out = Vec::new();
+        let err = decompress_stream(frame.as_slice(), &mut out, &mut no_dict(), &settings)
+            .expect_err("the reserved bit must be refused")
+            .to_string();
+        assert!(
+            err.contains("Decoding error (36) : Unsupported frame parameter"),
+            "pass_through={pass_through}: {err}"
+        );
+        assert!(out.is_empty(), "nothing of the frame reaches the output");
+    }
+}
+
 /// Data to stdout silences the result summary and sets `--rm` aside; the
 /// verbosity and the removal flag are what the run computes from the inputs
 /// and destination together.

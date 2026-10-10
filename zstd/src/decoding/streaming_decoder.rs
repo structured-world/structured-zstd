@@ -247,11 +247,7 @@ fn header_len(bytes: &[u8], magicless: bool) -> usize {
     let Some(&descriptor) = bytes.get(descriptor_at) else {
         return descriptor_at + 1;
     };
-    let descriptor = crate::decoding::frame::FrameDescriptor(descriptor);
-    let window = usize::from(!descriptor.single_segment_flag());
-    let dict = descriptor.dictionary_id_bytes().map_or(0, usize::from);
-    let fcs = descriptor.frame_content_size_bytes().map_or(0, usize::from);
-    descriptor_at + 1 + window + dict + fcs
+    descriptor_at + crate::decoding::frame::FrameDescriptor(descriptor).header_len()
 }
 
 impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {

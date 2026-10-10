@@ -306,8 +306,22 @@ pub struct FrameHeaderInfo {
 /// [`ReadFrameHeaderError`](errors::ReadFrameHeaderError) when the header is
 /// too short, has a bad magic number, or is a skippable frame.
 pub fn frame_header_size(src: &[u8]) -> Result<usize, errors::ReadFrameHeaderError> {
-    let (_header, consumed) = frame::read_frame_header_with_format(src, false)?;
-    Ok(consumed as usize)
+    match frame::read_frame_header_with_format(src, false) {
+        Ok((_header, consumed)) => Ok(consumed as usize),
+        // The reserved bit makes the frame undecodable, not its header
+        // unmeasurable: upstream's `ZSTD_frameHeaderSize` reads the length off
+        // the descriptor without looking at the bit. The parser refuses it only
+        // once the whole header is in hand, so the descriptor is at `src[4]`.
+        Err(
+            e @ errors::ReadFrameHeaderError::InvalidFrameDescriptor(
+                errors::FrameDescriptorError::ReservedBitSet,
+            ),
+        ) => match src.get(4) {
+            Some(&descriptor) => Ok(4 + frame::FrameDescriptor(descriptor).header_len()),
+            None => Err(e),
+        },
+        Err(e) => Err(e),
+    }
 }
 
 /// Decode the leading frame header fields of `src` without decoding the body.

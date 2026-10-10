@@ -3831,3 +3831,63 @@ fn drained_stream_output_does_not_pin_its_peak() {
     assert_eq!(decoded, input);
     unsafe { ZSTD_freeCCtx(cctx) };
 }
+
+/// A frame whose descriptor has the Reserved_bit (bit 3) set is refused with
+/// `frameParameter_unsupported`, the code libzstd returns for it
+/// (`zstd_decompress.c:511`), by the header query and by every decode entry
+/// point. `ZSTD_frameHeaderSize` still measures the header, as libzstd's does
+/// without looking at the bit. The `ffi-bench` interop test pins libzstd's
+/// code on the same bytes.
+#[test]
+fn the_reserved_descriptor_bit_is_frame_parameter_unsupported() {
+    use crate::frame::ZSTD_getFrameHeader_advanced;
+    use crate::streaming::{ZSTD_decompressStream, ZSTD_inBuffer, ZSTD_outBuffer};
+
+    // Multi-segment frame, 1 KiB window, one last Raw block of three bytes,
+    // with descriptor bit 3 set.
+    let frame = [
+        0x28, 0xB5, 0x2F, 0xFD, 0x08, 0x00, 0x19, 0x00, 0x00, 0xAA, 0xBB, 0xCC,
+    ];
+    let unsupported = ZSTD_ErrorCode::ZSTD_error_frameParameter_unsupported;
+    let mut header = std::mem::MaybeUninit::<ZSTD_FrameHeader>::uninit();
+
+    let rc = unsafe { ZSTD_getFrameHeader(header.as_mut_ptr(), frame.as_ptr(), frame.len()) };
+    assert_eq!(ZSTD_getErrorCode(rc), unsupported, "ZSTD_getFrameHeader");
+    let rc = unsafe {
+        ZSTD_getFrameHeader_advanced(header.as_mut_ptr(), frame[4..].as_ptr(), frame.len() - 4, 1)
+    };
+    assert_eq!(ZSTD_getErrorCode(rc), unsupported, "magicless header");
+
+    let mut out = [0u8; 16];
+    let rc = unsafe { ZSTD_decompress(out.as_mut_ptr(), out.len(), frame.as_ptr(), frame.len()) };
+    assert_eq!(ZSTD_getErrorCode(rc), unsupported, "ZSTD_decompress");
+    let dctx = ZSTD_createDCtx();
+    let rc = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+        )
+    };
+    assert_eq!(ZSTD_getErrorCode(rc), unsupported, "ZSTD_decompressDCtx");
+    let mut inb = ZSTD_inBuffer {
+        src: frame.as_ptr().cast(),
+        size: frame.len(),
+        pos: 0,
+    };
+    let mut outb = ZSTD_outBuffer {
+        dst: out.as_mut_ptr().cast(),
+        size: out.len(),
+        pos: 0,
+    };
+    let rc = unsafe { ZSTD_decompressStream(dctx, &mut outb, &mut inb) };
+    assert_eq!(ZSTD_getErrorCode(rc), unsupported, "ZSTD_decompressStream");
+    unsafe { ZSTD_freeDCtx(dctx) };
+
+    assert_eq!(
+        unsafe { ZSTD_frameHeaderSize(frame.as_ptr(), frame.len()) },
+        6
+    );
+}

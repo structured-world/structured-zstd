@@ -3590,3 +3590,60 @@ fn a_zero_offset_sequence_is_refused_rather_than_executed() {
         .decode_all_to_vec(frame.as_slice(), &mut collected)
         .expect_err("decode_all_to_vec must refuse the frame");
 }
+
+/// RFC 8878 3.1.1.1.1: a frame whose descriptor has its Reserved_bit (bit 3)
+/// set is refused by every decode entry point, before any block is read, as
+/// upstream's `ZSTD_getFrameHeader_advanced` refuses it. The same frame
+/// without the bit decodes, so the refusal is the bit and nothing else.
+#[test]
+fn every_decode_entry_point_refuses_the_reserved_descriptor_bit() {
+    use crate::decoding::StreamingDecoder;
+    use crate::decoding::errors::{FrameDescriptorError, ReadFrameHeaderError};
+    use crate::io::Read;
+
+    // Multi-segment frame, 1 KiB window, one last Raw block of three bytes.
+    let clean = [
+        0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x19, 0x00, 0x00, 0xAA, 0xBB, 0xCC,
+    ];
+    let mut reserved = clean;
+    reserved[4] |= 0x08;
+
+    let is_reserved_bit = |err: &FrameDecoderError| {
+        matches!(
+            err,
+            FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::InvalidFrameDescriptor(
+                FrameDescriptorError::ReservedBitSet
+            ))
+        )
+    };
+    let mut out = [0u8; 16];
+
+    let err = FrameDecoder::new().init(&reserved[..]).unwrap_err();
+    assert!(is_reserved_bit(&err), "init: {err:?}");
+    let err = FrameDecoder::new()
+        .decode_all(&reserved, &mut out)
+        .unwrap_err();
+    assert!(is_reserved_bit(&err), "decode_all: {err:?}");
+    let err = FrameDecoder::new()
+        .decode_from_to(&reserved, &mut out)
+        .unwrap_err();
+    assert!(is_reserved_bit(&err), "decode_from_to: {err:?}");
+    let mut magicless = FrameDecoder::new();
+    magicless.set_magicless(true);
+    let err = magicless.init(&reserved[4..]).unwrap_err();
+    assert!(is_reserved_bit(&err), "magicless init: {err:?}");
+
+    let err = StreamingDecoder::new(&reserved[..])
+        .err()
+        .expect("StreamingDecoder must refuse the reserved bit");
+    assert!(is_reserved_bit(&err), "StreamingDecoder: {err:?}");
+
+    let written = FrameDecoder::new().decode_all(&clean, &mut out).unwrap();
+    assert_eq!(&out[..written], &[0xAA, 0xBB, 0xCC]);
+    let mut decoded = Vec::new();
+    StreamingDecoder::new(&clean[..])
+        .unwrap()
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, [0xAA, 0xBB, 0xCC]);
+}

@@ -8,7 +8,7 @@
 
 use core::ffi::{CStr, c_char, c_uint};
 
-use codec::decoding::errors::FrameDecoderError;
+use codec::decoding::errors::{FrameDecoderError, FrameDescriptorError, ReadFrameHeaderError};
 
 /// Error codes from `zstd_errors.h` (upstream v1.5.7), numeric values pinned
 /// since zstd v1.3.1. Exposed `#[repr(u32)]` so the discriminants are the
@@ -148,6 +148,11 @@ pub fn code_for_training_error(err: &std::io::Error) -> ZSTD_ErrorCode {
 pub fn code_for_decoder_error(err: &FrameDecoderError) -> ZSTD_ErrorCode {
     use ZSTD_ErrorCode::*;
     match err {
+        // Upstream refuses a set Reserved_bit as an unsupported frame
+        // parameter (`zstd_decompress.c:511`).
+        FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::InvalidFrameDescriptor(
+            FrameDescriptorError::ReservedBitSet,
+        )) => ZSTD_error_frameParameter_unsupported,
         FrameDecoderError::ReadFrameHeaderError(_) => ZSTD_error_prefix_unknown,
         FrameDecoderError::FrameHeaderError(_) | FrameDecoderError::FailedToInitialize(_) => {
             ZSTD_error_frameParameter_unsupported

@@ -4,7 +4,7 @@
 
 use core::ffi::{c_uint, c_ulonglong};
 
-use codec::decoding::errors::ReadFrameHeaderError;
+use codec::decoding::errors::{FrameDescriptorError, ReadFrameHeaderError};
 use codec::decoding::{
     FrameContentSize, find_frame_compressed_size, frame_decompressed_bound, frame_header_size,
     read_frame_content_size, read_frame_header_info,
@@ -141,6 +141,11 @@ unsafe fn fill_frame_header(zfh: *mut ZSTD_FrameHeader, src: &[u8], magicless: b
         }
         Err(ReadFrameHeaderError::BadMagicNumber(_) | ReadFrameHeaderError::SkipFrame { .. }) => {
             encode(ZSTD_ErrorCode::ZSTD_error_prefix_unknown)
+        }
+        // Upstream refuses a set Reserved_bit as an unsupported frame
+        // parameter (`zstd_decompress.c:511`).
+        Err(ReadFrameHeaderError::InvalidFrameDescriptor(FrameDescriptorError::ReservedBitSet)) => {
+            encode(ZSTD_ErrorCode::ZSTD_error_frameParameter_unsupported)
         }
         Err(ReadFrameHeaderError::InvalidFrameDescriptor(_)) => {
             encode(ZSTD_ErrorCode::ZSTD_error_corruption_detected)

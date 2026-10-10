@@ -12,7 +12,12 @@ use std::error::Error as StdError;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FrameDescriptorError {
-    InvalidFrameContentSizeFlag { got: u8 },
+    InvalidFrameContentSizeFlag {
+        got: u8,
+    },
+    /// The descriptor's `Reserved_bit` (bit 3) is set, which a decoder of this
+    /// format version must refuse.
+    ReservedBitSet,
 }
 
 impl fmt::Display for FrameDescriptorError {
@@ -21,6 +26,10 @@ impl fmt::Display for FrameDescriptorError {
             Self::InvalidFrameContentSizeFlag { got } => write!(
                 f,
                 "Invalid Frame_Content_Size_Flag; Is: {got}, Should be one of: 0, 1, 2, 3"
+            ),
+            Self::ReservedBitSet => write!(
+                f,
+                "Reserved_bit of the Frame_Header_Descriptor is set; it must be zero"
             ),
         }
     }

@@ -103,6 +103,7 @@ pub fn read_frame_header_with_format(
         frame_header.frame_content_size = fcs;
     }
 
+    desc.check_reserved_bit()?;
     Ok((frame_header, bytes_read as u8))
 }
 
@@ -191,6 +192,7 @@ pub(crate) fn read_frame_header_from_slice(
         frame_header.frame_content_size = fcs;
     }
 
+    desc.check_reserved_bit()?;
     Ok((frame_header, bytes_read))
 }
 
@@ -337,9 +339,32 @@ impl FrameDescriptor {
 
     /// This bit is reserved for some future feature, a compliant decoder **must ensure**
     /// that this value is set to zero.
-    #[expect(dead_code)]
     pub fn reserved_flag(&self) -> bool {
         ((self.0 >> 3) & 0x1) == 1
+    }
+
+    /// Refuse a descriptor with the `Reserved_bit` set. RFC 8878 3.1.1.1.1: "A
+    /// decoder compliant with this specification version must ensure it is not
+    /// set." The parsers call it once the whole header is in hand, as upstream
+    /// does (`zstd_decompress.c:511`), so a header cut short still reports the
+    /// cut. Bit 4, the `Unused_bit`, is not looked at: the same clause says a
+    /// decoder "shall not interpret" it.
+    pub(crate) fn check_reserved_bit(&self) -> Result<(), FrameDescriptorError> {
+        if self.reserved_flag() {
+            return Err(FrameDescriptorError::ReservedBitSet);
+        }
+        Ok(())
+    }
+
+    /// Length of the frame header from this descriptor byte on: the byte
+    /// itself and the fields it announces, without the magic number. Upstream
+    /// measures a header the same way, from the descriptor alone
+    /// (`ZSTD_frameHeaderSize_internal`, `zstd_decompress.c:416-429`).
+    pub(crate) fn header_len(&self) -> usize {
+        let window = usize::from(!self.single_segment_flag());
+        let dict = self.dictionary_id_bytes().map_or(0, usize::from);
+        let fcs = self.frame_content_size_bytes().map_or(0, usize::from);
+        1 + window + dict + fcs
     }
 
     /// If this flag is set, data must be regenerated within a single continuous memory segment.
