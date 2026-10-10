@@ -2364,9 +2364,12 @@ fn pause_holds_the_exits_parsing_takes() {
 /// its file, as it does there.
 #[test]
 fn test_and_tuning_options_are_accepted() {
+    // `--priority=rt` asks the benchmark for real-time scheduling, as the
+    // reference's does before it measures (`benchzstd.c:950`).
+    assert!(parse(&["--priority=rt", "-b", "f"]).unwrap().bench_realtime);
+    assert!(!parse(&["-b", "f"]).unwrap().bench_realtime);
     for args in [
-        &["--priority=rt", "-b", "f"][..],
-        &["--trace-file-stat", "f"],
+        &["--trace-file-stat", "f"][..],
         &["--trace", "t.csv", "f"],
         &["--trace=t.csv", "f"],
     ] {
@@ -2409,6 +2412,9 @@ fn a_benchmark_without_inputs_measures_generated_data() {
         // `-q` prints the machine-readable lines, a `-p#` sweep's tagged.
         &["-b1", "-i0", "-q", "-B64K"],
         &["-b1", "-i0", "-q", "-B64K", "-p7"],
+        // Raising the priority needs a privilege a test does not have; the
+        // refusal is reported and the measurement runs.
+        &["-b1", "-i0", "-qq", "-B64K", "--priority=rt"],
     ] {
         assert_eq!(run(parse(args).unwrap()).unwrap(), 0, "{args:?}");
     }

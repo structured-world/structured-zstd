@@ -75,6 +75,7 @@ macro_rules! display {
 mod display;
 mod inputs;
 mod interrupt;
+mod priority;
 mod progress;
 mod synthetic;
 
@@ -174,6 +175,8 @@ struct Options {
     bench_compressibility: Option<u32>,
     /// `-p`: wait for Enter before exiting.
     pause: bool,
+    /// `--priority=rt`: the benchmark measures at real-time scheduling.
+    bench_realtime: bool,
     /// Which standard streams count as terminals; see [`FakeConsole`].
     console: FakeConsole,
     /// Measure each input on its own (`-S`) instead of as one stream, so the
@@ -1104,6 +1107,7 @@ fn parse_args_into(
         bench_param: None,
         bench_compressibility: None,
         pause: false,
+        bench_realtime: false,
         console: FakeConsole::default(),
         bench_separately: false,
         block_size: None,
@@ -1263,13 +1267,11 @@ fn parse_args_into(
                 | "no-mmap-dict"
                 | "row-match-finder"
                 | "no-row-match-finder"
-                // Real-time priority for a benchmark: an operating-system
-                // setting around the measurement, not part of it.
-                | "priority=rt"
                 // Traces the reference implementation's own file-system calls
                 // by their C names; there is nothing of ours that output
                 // would describe.
                 | "trace-file-stat" => {}
+                "priority=rt" => opts.bench_realtime = true,
                 "fake-stdin-is-console" => opts.console.stdin = true,
                 "fake-stdout-is-console" => opts.console.stdout = true,
                 "fake-stderr-is-console" => opts.console.stderr = true,
@@ -1432,17 +1434,23 @@ fn parse_args_into(
                         // Decompression against a `--patch-from` reference. The
                         // reference command lifts its memory ceiling to the
                         // largest window here (zstdcli.c:1146), since a patch
-                        // reaches back across the whole reference; the ceiling
-                        // this build enforces is that default.
+                        // reaches back across the whole reference. A `-M` given
+                        // earlier is dropped the same way. The decoder's own
+                        // window ceiling is fixed at 128 MiB for now, so a patch
+                        // with a wider window is refused by the decoder, loudly,
+                        // rather than applied.
                         select_mode(&mut opts, Mode::Decompress);
                         opts.patch_from = Some(reference);
                         opts.memory_limit = None;
                     } else if option_value(long, "trace", arg_os, &mut iter)?.is_some() {
                         // The file a build with library tracing appends one
-                        // line per frame to. This build has no per-frame
-                        // hook, which is the reference built without one: the
-                        // option and its file are taken and nothing is
-                        // written.
+                        // line per frame to. This build has no per-frame hook
+                        // yet, which is the reference built without one: with
+                        // `ZSTD_TRACE` off (its default on macOS, Windows and
+                        // every non-ELF target, lib/common/zstd_trace.h:24-33)
+                        // it takes the option and its file and writes nothing.
+                        // Refusing instead would fail scripts the reference
+                        // runs, `tests/playTests.sh` among them.
                     } else if long == "rsyncable" {
                         // Synchronisation points are cut between the jobs of a
                         // multi-threaded run, which this build does not have;
@@ -3085,6 +3093,19 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     // beside the two forms parsed out of it for the rest of the run.
     let codecs = &mut Codecs::prepare(dict.as_deref(), opts.patch_from.is_some(), true, true)?;
     drop(dict);
+
+    if opts.bench_realtime {
+        display!(opts.verbosity, 2, "Note : switching to real-time priority ");
+        // The reference ignores a refusal too: without the privilege the
+        // measurement still runs, at the ordinary priority.
+        if !priority::raise_to_realtime() {
+            display!(
+                opts.verbosity,
+                3,
+                "Note : real-time priority was refused; measuring at the ordinary priority"
+            );
+        }
+    }
 
     if synthetic {
         // `-B` is read as a `u32` and `--block-size` capped at `usize`, and the
