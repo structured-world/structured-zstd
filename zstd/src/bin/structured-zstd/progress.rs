@@ -162,10 +162,16 @@ impl<R: Read> Read for ProgressMonitor<R> {
 /// once more on its way through; bytes count as read when they are consumed.
 impl<R: BufRead> BufRead for ProgressMonitor<R> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-        // The end is an empty fill, which `read` sees as `Ok(0)`.
+        // The end is an empty fill, which `read` sees as `Ok(0)`; it is handed
+        // back as it is, since asking a buffered reader at its end again reads
+        // the source again.
         if self.reader.fill_buf()?.is_empty() {
             self.update(0);
+            return Ok(&[]);
         }
+        // Asked again only to return the borrow past `update` above: data not
+        // yet consumed is the reader's buffer itself, which `fill_buf` returns
+        // without reading (the `BufRead` contract).
         self.reader.fill_buf()
     }
 
