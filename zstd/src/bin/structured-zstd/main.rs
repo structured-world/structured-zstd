@@ -1975,13 +1975,13 @@ Advanced options:
 
 Advanced compression options:
   --ultra                       Enable levels beyond 19, up to 22; requires more memory.
-  --max                         Compress with every parameter at its maximum; the window stops at 27,
-                                the widest this build reads back. Requires a lot of memory.
+  --max                         Compress with every parameter at its maximum; the window stops at 30,
+                                the widest this build writes. Requires a lot of memory.
   --fast[=#]                    Use to very fast compression levels. [Default: 1]
   --long[=#]                    Enable long distance matching with window log #. [Default: 27]
                                 Available from level 16 up (or with --zstd=strat=7..9), where
-                                long-distance matching runs; capped at 27, the window this
-                                build can read back.
+                                long-distance matching runs; up to 30 when compressing. When
+                                decompressing, admits windows up to 2^#.
   --patch-from=REF              Use REF as the reference point for Zstandard's diff engine.
   --zstd=wlog=#,clog=#,hlog=#,slog=#,mml=#,tlen=#,strat=#[,lhlog=#,lmml=#,lblog=#,lhrlog=#]
                                 Override the level's compression parameters knob by knob.
