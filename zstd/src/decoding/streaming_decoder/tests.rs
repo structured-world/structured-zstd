@@ -1298,3 +1298,52 @@ fn read_to_end_empty_frame_decodes_to_empty() {
     decoder.read_to_end(&mut out).unwrap();
     assert!(out.is_empty());
 }
+
+/// Read a few bytes at a time, a stream of two frames with a skippable frame
+/// between them reports each frame once, in order, with the bytes it took
+/// from the source and the bytes it decoded to; the skippable frame is not a
+/// frame of output and is not reported.
+#[test]
+fn every_finished_frame_is_reported_once_with_its_sizes() {
+    use super::FinishedFrame;
+    use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+    use alloc::vec::Vec;
+
+    let first_payload = b"the first frame of the stream".repeat(40);
+    let second_payload = b"and the second one".repeat(3);
+    let first = compress_slice_to_vec(&first_payload, CompressionLevel::Level(3));
+    let second = compress_slice_to_vec(&second_payload, CompressionLevel::Level(1));
+    let mut stream = first.clone();
+    stream.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+    stream.extend_from_slice(&3u32.to_le_bytes());
+    stream.extend_from_slice(b"pad");
+    stream.extend_from_slice(&second);
+
+    let mut decoder = StreamingDecoder::new(stream.as_slice());
+    let mut buf = [0u8; 7];
+    let mut finished = Vec::new();
+    let mut decoded = 0usize;
+    loop {
+        let n = decoder.read(&mut buf).unwrap();
+        finished.extend(decoder.take_finished_frame());
+        if n == 0 {
+            break;
+        }
+        decoded += n;
+    }
+    assert_eq!(decoded, first_payload.len() + second_payload.len());
+    assert_eq!(
+        finished,
+        [
+            FinishedFrame {
+                compressed_size: first.len() as u64,
+                decompressed_size: first_payload.len() as u64,
+            },
+            FinishedFrame {
+                compressed_size: second.len() as u64,
+                decompressed_size: second_payload.len() as u64,
+            },
+        ]
+    );
+    assert_eq!(decoder.take_finished_frame(), None, "taken, not repeated");
+}
