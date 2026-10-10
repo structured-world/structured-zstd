@@ -508,7 +508,15 @@ pub(crate) struct ExecSeq {
 /// The per-call `buffer.reserve(match_length)` is preserved by that
 /// variant — required for memory safety against malformed inputs whose
 /// `match_length` exceeds the upfront block-maximum headroom.
-#[inline(always)]
+///
+/// Forced inline only in optimized builds. Upstream zstd marks
+/// `ZSTD_execSequence` `HINT_INLINE` and lets the build drop the forced
+/// inline (`ZSTD_NO_INLINE`, `lib/common/compiler.h`). Here a debug build
+/// drops it: at `-O0` every inlined copy keeps its own stack slots, and the
+/// scalar monolith expands this executor at three call sites, which made that
+/// one frame 147,912 B (`UserSliceBackend`, x86_64). Release code is unchanged.
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline)]
 // Grouping the arguments into a struct would push them off the argument
 // registers and onto memory loads, which is the cost this per-sequence
 // boundary exists to avoid.
