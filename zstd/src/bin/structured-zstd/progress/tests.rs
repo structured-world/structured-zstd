@@ -41,6 +41,46 @@ fn an_empty_buffer_read_is_not_the_end_of_the_stream() {
     assert!(monitor.finished, "the reader saying so does");
 }
 
+/// Read through its buffer, the monitor counts what is consumed and finishes on
+/// the empty fill that is the end of the stream, as it does through `read`.
+#[test]
+fn a_buffered_read_counts_what_is_consumed_and_finishes_at_the_end() {
+    use std::io::BufRead;
+
+    let mut monitor = ProgressMonitor::new(&b"payload"[..], Some(7), false);
+    assert_eq!(monitor.fill_buf().unwrap(), b"payload");
+    assert_eq!(monitor.read, 0, "a fill is not a read until it is consumed");
+    monitor.consume(3);
+    assert_eq!(monitor.read, 3);
+    monitor.consume(4);
+    assert!(!monitor.finished, "the total alone does not end the stream");
+    assert!(monitor.fill_buf().unwrap().is_empty());
+    assert!(monitor.finished, "the empty fill does");
+    assert_eq!(monitor.read, 7);
+}
+
+/// The end of the stream costs the source one read: the empty fill is handed
+/// back as it is rather than asked for again, which a buffered reader at its
+/// end would answer with a second read of the source.
+#[test]
+fn the_end_of_a_buffered_read_reads_the_source_once() {
+    use std::io::{BufRead, BufReader};
+
+    struct Counting {
+        reads: usize,
+    }
+    impl Read for Counting {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            Ok(0)
+        }
+    }
+    let mut monitor = ProgressMonitor::new(BufReader::new(Counting { reads: 0 }), None, false);
+    assert!(monitor.fill_buf().unwrap().is_empty());
+    assert!(monitor.finished);
+    assert_eq!(monitor.reader.get_ref().reads, 1);
+}
+
 /// Both directions stream, so a file only has to fit the window, never memory.
 /// Measuring its length in `usize` puts a 4 GiB ceiling on 32-bit targets that
 /// has nothing to do with what the work needs: the progress counter would be
