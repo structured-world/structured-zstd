@@ -777,6 +777,43 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  ci-result:
+    # The one check the `main` ruleset requires for this workflow, so a new
+    # job or a matrix entry never has to be added to the ruleset by hand, and
+    # a docs-only pull request, whose build jobs are skipped, still reports
+    # a result. It needs every job that runs on a pull request. On a pull
+    # request that changes code each of them has to succeed: a job skipped
+    # there is a broken gate, not a pass. On a docs-only one a skip is the
+    # expected outcome. The bench jobs are left out: they never run on pull
+    # requests.
+    name: CI result
+    needs: [changes, lint, c-abi, test, cross-i686, msrv, no-std, wasm, codecov, fuzz]
+    if: ${{ always() }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          CODE_CHANGED: ${{ needs.changes.outputs.code }}
+        run: |
+          set -euo pipefail
+          if [ "$CODE_CHANGED" = "true" ]; then
+            accepted='["success"]'
+          else
+            accepted='["success","skipped"]'
+          fi
+          failed=$(jq -r --argjson ok "$accepted" \
+            'to_entries[] | select(.value.result as $r | $ok | index($r) | not) | "\(.key): \(.value.result)"' \
+            <<<"$NEEDS")
+          if [ -n "$failed" ]; then
+            while IFS= read -r line; do
+              echo "::error::$line"
+            done <<<"$failed"
+            exit 1
+          fi
+          echo "every job passed (code changed: ${CODE_CHANGED:-unknown})"
+
   bench-matrix:
     # Canonical bench target inventory. Every downstream bench job
     # (`bench-build`, `benchmark`, `benchmark-aggregate`,
