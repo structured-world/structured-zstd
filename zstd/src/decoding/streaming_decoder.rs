@@ -636,13 +636,13 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         let mut written = 0;
         loop {
             if self.position != Position::InFrame {
-                // Bytes in hand go back first: the next frame's header waits
-                // for a call that has nothing to deliver, so an error never
-                // follows delivered bytes (the `Read` contract) and a source
-                // that has not sent the next frame yet is not waited on.
-                if written > 0 {
-                    return Ok(written);
-                }
+                // A call reaches a frame boundary with nothing delivered: a
+                // finished frame hands its last bytes back before it is left
+                // (the check below), so the next frame's header is read only
+                // by a call with nothing to deliver, an error never follows
+                // delivered bytes (the `Read` contract), and a source that has
+                // not sent the next frame yet is not waited on.
+                debug_assert_eq!(written, 0, "a frame boundary is reached empty-handed");
                 if !self.start_frame()? {
                     self.position = Position::End;
                     return Ok(0);
@@ -651,8 +651,8 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             }
             let decoder = self.decoder.borrow_mut();
             if decoder.is_finished() && decoder.can_collect() == 0 {
-                // As above: the frame's checks wait for a call with nothing
-                // to deliver.
+                // Bytes in hand go back first: the frame's checks and the
+                // next frame's header wait for a call with nothing to deliver.
                 if written > 0 {
                     return Ok(written);
                 }
@@ -797,29 +797,16 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
         // A forced dictionary is the one the decoder already holds; every
         // frame is initialised with it in place, touching no reference count.
         let keep_dictionary = self.forced_dictionary;
+        // The first header is read the bounded way, a step at a time, so a
+        // source that is not a zstd stream is refused after a header's worth
+        // of bytes instead of after the whole of it is gathered below.
+        if self.position == Position::BeforeFirstFrame && !self.start_frame()? {
+            self.position = Position::End;
+        }
         match self.position {
             Position::End => return Ok(()),
-            // Nothing decoded yet: the whole stream, first header included,
-            // decodes from one buffer.
-            Position::BeforeFirstFrame => {
-                self.input.read_rest(&mut self.source)?;
-                if self.input.pending().is_empty() {
-                    self.input.release();
-                    return Err(no_frame_error());
-                }
-                let mut rest = self.input.pending();
-                let decoded = self.decoder.borrow_mut().decode_concatenated_frames_to_vec(
-                    &mut rest,
-                    output,
-                    keep_dictionary,
-                );
-                self.input.release();
-                decoded.map_err(frame_error)?;
-                self.position = Position::End;
-                return Ok(());
-            }
-            // A frame whose header a `read` took, with nothing decoded yet;
-            // a first Raw block part-read into the decode buffer is not that.
+            // A frame whose header is read, with nothing decoded yet; a first
+            // Raw block part-read into the decode buffer is not that.
             Position::InFrame
                 if self.input.raw.is_none() && {
                     let d = self.decoder.borrow_mut();
@@ -837,7 +824,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
                 self.position = Position::End;
                 return Ok(());
             }
-            Position::InFrame | Position::BetweenFrames => {}
+            Position::BeforeFirstFrame | Position::InFrame | Position::BetweenFrames => {}
         }
         // Mid-frame fallback: drain through the generic path, which carries on
         // into the following frames, so the source is consumed to true EOF.

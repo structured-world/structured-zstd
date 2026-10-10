@@ -616,6 +616,45 @@ fn a_leading_skippable_frame_is_skipped_in_large_chunks() {
     );
 }
 
+/// `read_to_end` on a stream not started yet validates the first frame header
+/// before it gathers the rest of the source: a large input that is not zstd
+/// fails after a header's worth of bytes, not after the whole input was
+/// copied into memory.
+#[cfg(feature = "std")]
+#[test]
+fn read_to_end_rejects_a_non_zstd_source_before_buffering_it() {
+    let not_zstd = alloc::vec![0xABu8; 1 << 20];
+    let mut source = Counting {
+        data: &not_zstd,
+        reads: 0,
+    };
+    let mut out = alloc::vec::Vec::new();
+    let err = StreamingDecoder::new(&mut source)
+        .read_to_end(&mut out)
+        .expect_err("bytes that are not a frame must be refused");
+    assert!(
+        alloc::format!("{err:?}").contains("BadMagicNumber"),
+        "{err:?}"
+    );
+    let taken = not_zstd.len() - source.data.len();
+    assert!(taken <= 18, "{taken} bytes taken to refuse a magic number");
+    assert!(out.is_empty());
+}
+
+/// `read_to_end` at the end of the stream appends nothing and succeeds, as
+/// `read` returns `Ok(0)` there.
+#[cfg(feature = "std")]
+#[test]
+fn read_to_end_after_the_end_of_the_stream_appends_nothing() {
+    let frame = frame_of(b"one frame");
+    let mut decoder = StreamingDecoder::new(frame.as_slice());
+    let mut out = alloc::vec::Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    assert_eq!(out, b"one frame");
+    assert_eq!(decoder.read_to_end(&mut out).unwrap(), 0);
+    assert_eq!(out, b"one frame");
+}
+
 /// `len` bytes no compressor shrinks, so frames of them hold Raw blocks.
 fn incompressible(len: usize) -> alloc::vec::Vec<u8> {
     let mut x = 0x9E37_79B9_7F4A_7C15u64;
