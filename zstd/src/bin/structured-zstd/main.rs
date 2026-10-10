@@ -782,15 +782,28 @@ enum Parsed {
     /// Boxed: the options are a few hundred bytes, and the other variant is
     /// nothing at all.
     Run(Box<Options>),
-    Handled,
+    /// `pause` is whether a `-p` came before the option that was handled.
+    Handled { pause: bool },
 }
 
 /// A command line that could not be parsed, with the display level the
 /// flags before the mistake had reached: `-q --bogus` reports the mistake
-/// alone, where the default level adds the short usage under it.
+/// alone, where the default level adds the short usage under it. `pause` is
+/// likewise whether a `-p` came before it.
 struct ParseFailure {
     error: Error,
     verbosity: i32,
+    pause: bool,
+}
+
+/// `-p`: hold the window open before exiting, as the reference does at its
+/// common exit (`waitEnter`). Whatever stdin holds, or its end, lets the
+/// program go.
+fn wait_for_enter() {
+    eprintln!("Press enter to continue... ");
+    let mut byte = [0u8; 1];
+    // A failed read ends the wait just as Enter would.
+    drop(io::stdin().read(&mut byte));
 }
 
 fn main() {
@@ -810,12 +823,20 @@ fn main() {
 
     let options = match parse_args(&raw[1..], &preset, default_level) {
         Ok(Parsed::Run(options)) => *options,
-        Ok(Parsed::Handled) => return,
+        Ok(Parsed::Handled { pause }) => {
+            if pause {
+                wait_for_enter();
+            }
+            return;
+        }
         Err(failure) => {
             display!(failure.verbosity, 1, "zstd: {}", failure.error);
             if failure.verbosity >= DEFAULT_LEVEL {
                 let mut stderr = io::stderr().lock();
                 let _ = write_short_usage(&mut stderr, &preset.name);
+            }
+            if failure.pause {
+                wait_for_enter();
             }
             std::process::exit(1);
         }
@@ -828,6 +849,9 @@ fn main() {
         && let Err(err) = structured_zstd::set_cpu_ceiling(level)
     {
         display!(verbosity, 1, "zstd: --cpu={level}: {err}");
+        if pause {
+            wait_for_enter();
+        }
         std::process::exit(1);
     }
     display!(
@@ -848,13 +872,7 @@ fn main() {
         }
     };
     if pause {
-        // `-p`: hold the window open, whatever the outcome, as the reference
-        // does at its common exit (`waitEnter`). Whatever stdin holds, or its
-        // end, lets the program go.
-        eprintln!("Press enter to continue... ");
-        let mut byte = [0u8; 1];
-        // A failed read ends the wait just as Enter would.
-        drop(io::stdin().read(&mut byte));
+        wait_for_enter();
     }
     std::process::exit(status);
 }
@@ -1050,8 +1068,14 @@ fn parse_args(
     default_level: i32,
 ) -> Result<Parsed, ParseFailure> {
     let mut verbosity = preset.verbosity;
-    parse_args_into(args, preset, default_level, &mut verbosity)
-        .map_err(|error| ParseFailure { error, verbosity })
+    let mut pause = false;
+    parse_args_into(args, preset, default_level, &mut verbosity, &mut pause).map_err(|error| {
+        ParseFailure {
+            error,
+            verbosity,
+            pause,
+        }
+    })
 }
 
 fn parse_args_into(
@@ -1059,6 +1083,7 @@ fn parse_args_into(
     preset: &ProgramPreset,
     default_level: i32,
     verbosity: &mut i32,
+    pause: &mut bool,
 ) -> Result<Parsed> {
     let mut opts = Options {
         mode: preset.mode,
@@ -1216,11 +1241,11 @@ fn parse_args_into(
                 "no-progress" => opts.progress = Progress::Never,
                 "version" => {
                     print_version(*verbosity);
-                    return Ok(Parsed::Handled);
+                    return Ok(Parsed::Handled { pause: *pause });
                 }
                 "help" => {
                     print_help(*verbosity, &preset.name);
-                    return Ok(Parsed::Handled);
+                    return Ok(Parsed::Handled { pause: *pause });
                 }
                 // Flags that steer HOW the work is done, not what comes out:
                 // thread counts, IO strategy, matcher hints. We are
@@ -1477,7 +1502,7 @@ fn parse_args_into(
                         // `-p` with digits is a benchmark parameter, without
                         // them a pause before exiting (zstdcli.c:1322-1329).
                         'p' if next > ci + 1 => opts.bench_param = Some(value),
-                        'p' => opts.pause = true,
+                        'p' => *pause = true,
                         'P' => opts.bench_compressibility = Some(value),
                         // `-B#` cuts the benchmark's inputs into independent
                         // frames and a training sample into several samples.
@@ -1488,9 +1513,12 @@ fn parse_args_into(
                         // The thread count: single-threaded here, so it steers
                         // nothing, but it is read like every other number.
                         'T' => {}
-                        // The legacy trainer's selectivity.
-                        's' => opts.selectivity = value,
-                        _ => unreachable!("every flag of this arm is listed"),
+                        // `-s#`, the legacy trainer's selectivity: the one flag
+                        // of this arm left.
+                        _ => {
+                            debug_assert_eq!(c, 's');
+                            opts.selectivity = value;
+                        }
                     }
                     ci = next;
                     continue;
@@ -1537,17 +1565,17 @@ fn parse_args_into(
                 }
                 'V' => {
                     print_version(*verbosity);
-                    return Ok(Parsed::Handled);
+                    return Ok(Parsed::Handled { pause: *pause });
                 }
                 'H' => {
                     print_help(*verbosity, &preset.name);
-                    return Ok(Parsed::Handled);
+                    return Ok(Parsed::Handled { pause: *pause });
                 }
                 'h' => {
                     let mut stdout = io::stdout().lock();
                     write_short_usage(&mut stdout, &preset.name)
                         .wrap_err("failed to write usage")?;
-                    return Ok(Parsed::Handled);
+                    return Ok(Parsed::Handled { pause: *pause });
                 }
                 'D' | 'o' => {
                     // Value is the rest of this token, or the next argument.
@@ -1588,6 +1616,7 @@ fn parse_args_into(
         let _ = idx;
     }
     opts.verbosity = *verbosity;
+    opts.pause = *pause;
 
     // `-M` bounds decompression, so it is weighed only on the runs that decode.
     // Compressing, listing or training allocates no decoder, and upstream takes
@@ -2366,7 +2395,14 @@ fn run_selected(mut opts: Options) -> Result<usize> {
         }
     }
 
-    let dict_bytes = load_dictionary(&opts)?;
+    // A benchmark of generated data measures it alone, as the reference's does
+    // (`BMK_syntheticTest` passes no dictionary), so a `-D` there is not read:
+    // through it the same command line would measure another codec path.
+    let dict_bytes = if opts.bench && opts.inputs.is_empty() {
+        None
+    } else {
+        load_dictionary(&opts)?
+    };
 
     // `-b` benchmarks compression/decompression across levels instead of
     // producing output files; handle it before the streaming flow. It takes the
@@ -3051,8 +3087,9 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     drop(dict);
 
     if synthetic {
-        let size = usize::try_from(sizes[0])
-            .map_err(|_| eyre!("-B {} is more than this machine can hold", sizes[0]))?;
+        // `-B` is read as a `u32` and `--block-size` capped at `usize`, and the
+        // default is ten million, so the size always addresses.
+        let size = usize::try_from(sizes[0]).expect("a benchmark block size fits usize");
         let (label, data) = match opts.bench_compressibility {
             Some(percent) => (
                 format!("Synthetic {percent}%"),
@@ -3211,15 +3248,8 @@ fn benchmark_one(
         opts.bench_start,
         opts.bench_end
     );
-    if opts.verbosity == 1 {
-        // The reference command's machine-readable header, for scripts that
-        // drive `-b -q`; the block size is the one asked for, as it prints it.
-        println!(
-            "bench {UPSTREAM_VERSION} : input {} bytes, {} seconds, {} KB blocks",
-            data.len(),
-            opts.bench_secs as u64,
-            opts.block_size.unwrap_or(0) >> 10
-        );
+    if let Some(header) = bench_quiet_header(opts, data.len()) {
+        println!("{header}");
     }
 
     debug_assert_eq!(
@@ -3324,6 +3354,19 @@ fn benchmark_one(
         }
     }
     Ok(())
+}
+
+/// The reference command's machine-readable header for scripts that drive
+/// `-b -q`, the block size printed as asked for. A `-p#` sweep gets none: its
+/// output is the tagged result rows alone (`benchzstd.c:955`).
+fn bench_quiet_header(opts: &Options, input_len: usize) -> Option<String> {
+    (opts.verbosity == 1 && opts.bench_param.is_none_or(|param| param == 0)).then(|| {
+        format!(
+            "bench {UPSTREAM_VERSION} : input {input_len} bytes, {} seconds, {} KB blocks",
+            opts.bench_secs as u64,
+            opts.block_size.unwrap_or(0) >> 10
+        )
+    })
 }
 
 /// What one level of a benchmark measured.

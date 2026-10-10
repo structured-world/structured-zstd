@@ -50,7 +50,7 @@ fn parse_as(preset: &ProgramPreset, default_level: i32, args: &[&str]) -> Result
     let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
     match parse_args(&owned, preset, default_level).map_err(|failure| failure.error)? {
         Parsed::Run(opts) => Ok(*opts),
-        Parsed::Handled => bail!("parse handled (help/version) unexpectedly"),
+        Parsed::Handled { .. } => bail!("parse handled (help/version) unexpectedly"),
     }
 }
 
@@ -122,7 +122,7 @@ fn a_non_utf8_argument_survives_parsing() {
         .expect("parsing must not fail")
     {
         Parsed::Run(opts) => *opts,
-        Parsed::Handled => panic!("unexpected help/version"),
+        Parsed::Handled { .. } => panic!("unexpected help/version"),
     };
     assert_eq!(
         opts.inputs,
@@ -153,7 +153,7 @@ fn attached_path_options_keep_their_bytes() {
             .expect("parsing must not fail")
         {
             Parsed::Run(opts) => *opts,
-            Parsed::Handled => panic!("unexpected help/version"),
+            Parsed::Handled { .. } => panic!("unexpected help/version"),
         }
     };
 
@@ -2287,6 +2287,7 @@ fn split_and_jobsize_set_the_block_size() {
         parse(&["--jobsize", "1M", "f"]).unwrap().block_size,
         Some(1 << 20)
     );
+    assert!(parse(&["--split"]).is_err(), "the value is required");
 }
 
 /// A short flag that takes a number reads it and the cluster goes on, as the
@@ -2330,6 +2331,32 @@ fn n_p_and_capital_p_are_read_as_the_reference_reads_them() {
         parse(&["-b", "-P50"]).unwrap().bench_compressibility,
         Some(50)
     );
+}
+
+/// `-p` holds every exit, including a command line that fails to parse or
+/// one that only prints, as the reference's common exit does (zstdcli.c,
+/// `_end` calls `waitEnter`).
+#[test]
+fn pause_holds_the_exits_parsing_takes() {
+    let parse_raw = |args: &[&str]| {
+        let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
+        parse_args(&owned, &plain(), CompressionLevel::DEFAULT_LEVEL)
+    };
+    assert!(parse_raw(&["-p", "--bogus"]).err().unwrap().pause);
+    assert!(!parse_raw(&["--bogus"]).err().unwrap().pause);
+    for handled in ["-V", "-H", "-h", "--version", "--help"] {
+        assert!(
+            matches!(
+                parse_raw(&["-p", handled]),
+                Ok(Parsed::Handled { pause: true })
+            ),
+            "{handled}"
+        );
+        assert!(
+            matches!(parse_raw(&[handled]), Ok(Parsed::Handled { pause: false })),
+            "{handled}"
+        );
+    }
 }
 
 /// Long options the reference takes for its own testing and tuning. The ones
@@ -2379,9 +2406,25 @@ fn a_benchmark_without_inputs_measures_generated_data() {
         &["-b1", "-i0", "-qq", "-B64K"][..],
         &["-b1", "-i0", "-qq", "-B64K", "-P50"],
         &["-b1", "-i0", "-qq", "-B64K", "-P100"],
+        // `-q` prints the machine-readable lines, a `-p#` sweep's tagged.
+        &["-b1", "-i0", "-q", "-B64K"],
+        &["-b1", "-i0", "-q", "-B64K", "-p7"],
     ] {
         assert_eq!(run(parse(args).unwrap()).unwrap(), 0, "{args:?}");
     }
+    // The generated data is measured alone, as `BMK_syntheticTest` measures
+    // it, so a `-D` there is not even read: measuring through it would report
+    // another codec path under the same command line.
+    let opts = parse(&[
+        "-b1",
+        "-i0",
+        "-qq",
+        "-B64K",
+        "-D",
+        "/nonexistent/dictionary",
+    ])
+    .unwrap();
+    assert_eq!(run(opts).unwrap(), 0);
 }
 
 /// `--block-size=#` is the long spelling of `-B#`, as in the reference, which
@@ -5390,6 +5433,16 @@ fn benchmark_lines_follow_the_reference_layout() {
         result.quiet_line("a.txt", Some(0)),
         result.quiet_line("a.txt", None)
     );
+    // The `-q` header heads a plain run only: a parameter sweep's lines are
+    // the tagged rows alone (`benchzstd.c:955`).
+    let quiet = |args: &[&str]| bench_quiet_header(&parse(args).unwrap(), 7692);
+    assert_eq!(
+        quiet(&["-b", "-q", "-B64K", "f"]).as_deref(),
+        Some("bench 1.5.7 : input 7692 bytes, 3 seconds, 64 KB blocks")
+    );
+    assert_eq!(quiet(&["-b", "-q", "-p7", "f"]), None);
+    assert!(quiet(&["-b", "-q", "-p0", "f"]).is_some());
+    assert_eq!(quiet(&["-b", "f"]), None);
     let slow = BenchResult {
         compress_mb_s: 1.5,
         output: 7000,
