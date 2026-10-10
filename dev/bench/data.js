@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791666041787,
+  "lastUpdate": 1791671297550,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -13259,6 +13259,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.074,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b5b19e3ca5f0e048ced2fefbeae8d35743e817bd",
+          "message": "feat(decoding)!: configurable window ceiling up to 2 GiB (#568)\n\n## Summary\n\nFrames whose window exceeds 128 MiB (upstream `--long=28` and up, to 31)\nnow decode, and the ceiling is the caller's to set, as with upstream's\n`ZSTD_d_windowLogMax`.\n\n- **Codec.**\n- `FrameDecoder::set_max_window_size` sets the ceiling a streaming\ndecode enforces, within 1 KiB..=`MAX_DECODER_WINDOW_SIZE` (2 GiB on\n64-bit, 1 GiB on 32-bit). The default stays 128 MiB.\n- A ceiling lowered below the window of a frame already started binds\nthat frame: its next decode step (`decode_blocks`, the streaming path\nincluding Raw blocks and `read_to_end`, `decode_blocks_partial`) fails\nwith `WindowSizeTooBig`, before any of its window is reserved, until the\nceiling is raised again or the next frame starts.\n- One-shot decoding into the caller's buffer holds no window, so only\n`MAX_DECODER_WINDOW_SIZE` bounds it there, as upstream's\n`ZSTD_decompressDCtx`. A frame declaring more than the buffer holds is\nrefused before anything is decoded, so a one-shot decode never allocates\nwindow-sized memory.\n- **C ABI.** `ZSTD_d_windowLogMax` is passed to the decoder. It replaces\na separate check in the streaming wrapper.\n- **CLI.**\n- Decompression: `--zstd=wlog=N` and `--long=N` raise the ceiling (the\nformer winning, as when compressing), as upstream's do\n(zstdcli.c:1609-1614). A decode-only run takes them up to the decoder's\nwidest window (31 on 64-bit).\n- `-M` lets the window grow into what the limit leaves after the\ndecoder's buffers and the `-D` dictionary. A limit below the default\nwindow is still refused. Under `-b` the window also leaves room for\neverything the benchmark holds.\n- `--patch-apply` takes any window; a `-M` given after it still binds,\nand `-M0` there asks for the default limit again.\n- A refused frame prints upstream's message: `Decoding error (36) :\nFrame requires too much memory for decoding` / `Window size larger than\nmaximum : W > L` / `Use --long=N or --memory=NMB`, where the named\n`--memory` covers the decoder's other buffers and the dictionary too.\n- Compression: `--long`, `--zstd=wlog` and `--patch-from` are no longer\ncapped at 27.\n\nBREAKING CHANGE: `FrameDecoderError::WindowSizeTooBig` now carries the\nceiling it exceeded and is `#[non_exhaustive]`. New variant\n`WindowCeilingOutOfRange`.\n\n## Testing\n\n- Codec:\n- The default ceiling refuses a 256 MiB-window frame; after it is\nraised, the frame decodes.\n- Lowering the ceiling mid-frame refuses that frame on every decode path\n(including a streaming read paused before or inside a Raw block, with no\nwindow reserved, and `read_to_end`); raising it again lets it finish;\nthe next frame starts clean.\n  - The ceiling is bounded at both ends.\n- One-shot decoding accepts any window the target can address and\nrefuses the rest.\n  - An oversized declared content size is refused up front.\n- C ABI: `ZSTD_d_windowLogMax` raises the streaming ceiling; one-shot\n`ZSTD_decompress` decodes the same frame.\n- CLI:\n- The ceiling is derived from `--long`, `--zstd=wlog`, `-M`,\n`--patch-apply` and their combinations, and under `-b -M` from what the\nbenchmark holds.\n- The text of upstream's message is checked, and the `--memory` it names\ndecodes the frame.\n- An end-to-end decode of a 256 MiB-window frame is refused by default\nand succeeds with `--long=28`, with `-M512MB`, and under\n`--patch-apply`.\n- By hand against upstream 1.5.7: a 400 MiB `--long=29` frame both ways\nand a 141 MiB-window patch both ways, byte-identical.\n- Gates: fmt, clippy on the workspace with `-D warnings`, nextest on the\nworkspace with `lsm` (1596 passed, on the branch updated with main),\n`cargo doc -D warnings`.\n\nCloses #567\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Decoders can now accept frames with windows larger than the default\n128 MiB ceiling when a higher limit is configured, up to the supported\nmaximum.\n* The CLI now supports wider-window decoding through `--long`,\n`--zstd=wlog`, `-M`, or patch application, with memory limits accounted\nfor during decoding and benchmarks.\n\n* **Bug Fixes**\n* Decoding now checks window limits consistently across streaming and\npartial reads, and reports clearer guidance for frames that exceed the\nactive limit.\n* Decoding into a caller-provided buffer now detects when the declared\nframe content cannot fit before attempting to decode.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-11T00:48:15+03:00",
+          "tree_id": "d3ab43827650a224a10af7dc488fa9ea31e24168",
+          "url": "https://github.com/structured-world/structured-zstd/commit/b5b19e3ca5f0e048ced2fefbeae8d35743e817bd"
+        },
+        "date": 1791671262726,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.059,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 149.678,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 224.1,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.498,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.375,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.929,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.402,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.957,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.156,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 8.295,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.54,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.086,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.168,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.369,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.182,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.511,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.275,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.187,
             "unit": "ms"
           }
         ]
