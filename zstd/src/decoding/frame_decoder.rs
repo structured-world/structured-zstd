@@ -2470,7 +2470,10 @@ impl FrameDecoder {
     /// # Errors
     ///
     /// Returns [`FrameDecoderError::NotYetInitialized`] if the decoder has not
-    /// been reset, [`FrameDecoderError::InvalidBlockRange`] if the effective
+    /// been reset, [`FrameDecoderError::WindowSizeTooBig`] if the window
+    /// ceiling was lowered below the frame's window after it started (see
+    /// [`set_max_window_size`](Self::set_max_window_size)),
+    /// [`FrameDecoderError::InvalidBlockRange`] if the effective
     /// start exceeds `end_block`, [`FrameDecoderError::ResumeWindowTooShort`]
     /// if `resume`'s `window_prime` is shorter than the match window the resume
     /// block can reach back into (`min(window_size, output_offset)`), and
@@ -2494,6 +2497,7 @@ impl FrameDecoder {
         emit_resume: bool,
     ) -> Result<PartialDecode, FrameDecoderError> {
         use FrameDecoderError as err;
+        self.check_window_still_admitted()?;
         #[cfg(feature = "hash")]
         let checksum_mode = self.content_checksum;
         let magicless = self.magicless;

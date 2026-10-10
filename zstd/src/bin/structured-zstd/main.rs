@@ -185,6 +185,9 @@ struct Options {
     /// What `-M` counts besides the window; see [`decode_memory_overhead`].
     /// Set with [`Self::decode_window`].
     decode_memory_overhead: Option<u64>,
+    /// A patch lifted the decode window to its widest, and no `-M` (`-M0`
+    /// included) came after to set a limit of its own.
+    patch_window_lifted: bool,
     /// Measure each input on its own (`-S`) instead of as one stream, so the
     /// reported ratio and throughput describe a file rather than a mixture.
     bench_separately: bool,
@@ -510,11 +513,11 @@ fn decode_memory_overhead(dictionary_bytes: u64) -> Option<u64> {
 /// leave at least the default. `-M` comes first because a patch keeps it too:
 /// `--patch-apply` drops a `-M` given before it, so one still set came after,
 /// and replaces the lifted limit as a later `-M` replaces it in the reference
-/// command. Otherwise a `--patch-from` reference is reached back across in
-/// full, so a patch is decoded with the widest window any decode takes, as the
-/// reference raises its limit for `--patch-apply` (zstdcli.c:1146). Failing
-/// both, `--zstd=wlog=N` or `--long=N` raises it, as the reference takes them
-/// (zstdcli.c:1609-1614), the former first as it wins when compressing; and
+/// command. Otherwise a patch whose window no later `-M` (`-M0` included) has
+/// limited again reaches back across its whole reference, so it is decoded
+/// with the widest window any decode takes, as upstream's development branch
+/// raises its limit for `--patch-apply`. Failing both, `--zstd=wlog=N` or
+/// `--long=N` raises it, the former first as it wins when compressing; and
 /// failing those the decoder's default stands. A log below the default does
 /// not lower it: the reference would then refuse frames its own default
 /// accepts, which serves nobody.
@@ -527,9 +530,13 @@ fn decode_window_ceiling(opts: &Options, dictionary_bytes: u64) -> u64 {
             .unwrap_or(0)
             .clamp(MAXIMUM_ALLOWED_WINDOW_SIZE, MAX_DECODER_WINDOW_SIZE);
     }
-    if opts.patch_from.is_some() {
+    if opts.patch_window_lifted {
         return MAX_DECODER_WINDOW_SIZE;
     }
+    // The reference derives a missing limit from the compression window
+    // whatever set it (zstdcli.c:1572-1577), `--max` included, which sets
+    // `windowLog` to its maximum (zstdcli.c:644): so `-d --max` raises the
+    // ceiling there, and here, rather than being read as compression-only.
     match opts.advanced.window_log.or(opts.long_window_log) {
         Some(log) => (1u64 << log).clamp(MAXIMUM_ALLOWED_WINDOW_SIZE, MAX_DECODER_WINDOW_SIZE),
         None => MAXIMUM_ALLOWED_WINDOW_SIZE,
@@ -1174,6 +1181,7 @@ fn parse_args_into(
         console: FakeConsole::default(),
         decode_window: structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE,
         decode_memory_overhead: decode_memory_overhead(0),
+        patch_window_lifted: false,
         bench_separately: false,
         block_size: None,
         long: false,
@@ -1396,9 +1404,11 @@ fn parse_args_into(
                     )? {
                         // Recorded now, checked once the mode is final: the
                         // ceiling describes decoding, and a later flag can
-                        // still decide this run does none.
+                        // still decide this run does none. Zero included, it
+                        // replaces the window a patch lifted.
                         opts.memory_limit =
                             parse_memory_limit(&v).wrap_err("invalid memory limit")?;
+                        opts.patch_window_lifted = false;
                     } else if let Some(params) = long.strip_prefix("adapt=") {
                         // Parameterised form (`--adapt=min=1,max=9`). We do not
                         // vary the level, so the bounds change nothing, but a
@@ -1497,18 +1507,21 @@ fn parse_args_into(
                         // A patch needs the levels that reach far back, so the
                         // reference command unlocks the ultra levels with it.
                         opts.patch_from = Some(reference);
+                        opts.patch_window_lifted = true;
                         ultra = true;
                     } else if let Some(reference) =
                         option_value(long, "patch-apply", arg_os, &mut iter)?
                     {
                         // Decompression against a `--patch-from` reference. The
-                        // reference command lifts its memory ceiling to the
-                        // largest window here (zstdcli.c:1146), since a patch
+                        // reference command (its development branch; 1.5.7 has
+                        // no such option) lifts its memory ceiling to the
+                        // largest window here, since a patch
                         // reaches back across the whole reference. A `-M` given
                         // earlier is dropped the same way; one given later
                         // stands (see `decode_window_ceiling`).
                         select_mode(&mut opts, Mode::Decompress);
                         opts.patch_from = Some(reference);
+                        opts.patch_window_lifted = true;
                         opts.memory_limit = None;
                     } else if option_value(long, "trace", arg_os, &mut iter)?.is_some() {
                         // The file a build with library tracing appends one
@@ -1640,6 +1653,7 @@ fn parse_args_into(
                     if !number.is_empty() {
                         opts.memory_limit =
                             parse_memory_limit(&number).wrap_err("invalid -M memory limit")?;
+                        opts.patch_window_lifted = false;
                     }
                     ci = next;
                     continue;

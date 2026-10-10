@@ -2468,6 +2468,21 @@ fn the_decode_window_follows_the_command_line() {
         ceiling(&["--patch-apply=ref", "-M512MB", "f.zst"], 1 << 20),
         (512 << 20) - (1 << 20) - (2 << 20)
     );
+    // A later `-M0` asks for the default limit again, as zero replaces the
+    // reference command's limit (zstdcli.c:1572-1577); an earlier one is
+    // overridden by the patch like any other `-M`.
+    assert_eq!(
+        ceiling(&["--patch-apply=ref", "-M0", "f.zst"], 0),
+        MAXIMUM_ALLOWED_WINDOW_SIZE
+    );
+    assert_eq!(
+        ceiling(&["--patch-apply=ref", "--long=28", "-M0", "f.zst"], 0),
+        1 << 28
+    );
+    assert_eq!(
+        ceiling(&["-M0", "--patch-apply=ref", "f.zst"], 0),
+        MAX_DECODER_WINDOW_SIZE
+    );
     assert_eq!(
         ceiling(&["-d", "-M512MB", "f.zst"], 1 << 20),
         (512 << 20) - (1 << 20) - (2 << 20)

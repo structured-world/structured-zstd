@@ -3711,6 +3711,25 @@ fn lowering_the_ceiling_binds_the_frame_in_progress() {
         .unwrap();
 }
 
+/// The partial decode holds the window too, so a ceiling lowered below the
+/// frame's window after it started refuses it there as well.
+#[cfg(feature = "lsm")]
+#[test]
+fn lowering_the_ceiling_binds_a_partial_decode() {
+    let frame = frame_with_window_log(28);
+    let mut decoder = FrameDecoder::new();
+    decoder.set_max_window_size(1 << 28).unwrap();
+    let mut source = frame.as_slice();
+    decoder.init(&mut source).unwrap();
+    decoder.set_max_window_size(1 << 27).unwrap();
+    match decoder.decode_blocks_partial(&mut source, 0, 0, None, false) {
+        Err(FrameDecoderError::WindowSizeTooBig { requested, limit }) => {
+            assert_eq!((requested, limit), (1 << 28, 1 << 27));
+        }
+        other => panic!("the lowered ceiling must refuse the partial decode: {other:?}"),
+    }
+}
+
 /// The window a decoder accepts on the paths that hold the window itself is
 /// 128 MiB by default, as upstream's `ZSTD_d_windowLogMax` default is, and a
 /// caller raises it the way upstream's `ZSTD_DCtx_setMaxWindowSize` does. A
