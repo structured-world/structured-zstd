@@ -103,7 +103,52 @@ pub fn read_frame_header_with_format(
         frame_header.frame_content_size = fcs;
     }
 
+    desc.check_reserved_bit()?;
     Ok((frame_header, bytes_read as u8))
+}
+
+fn eof() -> crate::io::Error {
+    crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof)
+}
+
+fn take<'a>(input: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+    if input.len() < n {
+        return None;
+    }
+    let (head, tail) = input.split_at(n);
+    *input = tail;
+    Some(head)
+}
+
+/// Take a frame's 4-byte magic number off the front of `*input`, refusing
+/// anything else: a skippable frame (with its length, also taken), another
+/// magic, or fewer than four bytes.
+pub(crate) fn take_magic_from_slice(input: &mut &[u8]) -> Result<(), ReadFrameHeaderError> {
+    use ReadFrameHeaderError as err;
+    let m = take(input, 4).ok_or_else(|| err::MagicNumberReadError(eof()))?;
+    let magic_num = u32::from_le_bytes([m[0], m[1], m[2], m[3]]);
+    if (0x184D2A50..=0x184D2A5F).contains(&magic_num) {
+        let s = take(input, 4).ok_or_else(|| err::FrameDescriptorReadError(eof()))?;
+        let skip_size = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+        return Err(ReadFrameHeaderError::SkipFrame {
+            magic_number: magic_num,
+            length: skip_size,
+        });
+    }
+    if magic_num != MAGIC_NUM {
+        return Err(ReadFrameHeaderError::BadMagicNumber(magic_num));
+    }
+    Ok(())
+}
+
+/// Length of the frame header at the start of `input`, magic number included,
+/// read from the magic and the descriptor byte alone; the fields after them
+/// need not be there yet.
+pub(crate) fn measure_header_from_slice(mut input: &[u8]) -> Result<usize, ReadFrameHeaderError> {
+    take_magic_from_slice(&mut input)?;
+    let d =
+        take(&mut input, 1).ok_or_else(|| ReadFrameHeaderError::FrameDescriptorReadError(eof()))?;
+    Ok(4 + FrameDescriptor(d[0]).header_len())
 }
 
 /// Slice-direct equivalent of [`read_frame_header_with_format`]: parses the
@@ -119,34 +164,11 @@ pub(crate) fn read_frame_header_from_slice(
     magicless: bool,
 ) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
     use ReadFrameHeaderError as err;
-    fn eof() -> crate::io::Error {
-        crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof)
-    }
-    fn take<'a>(input: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
-        if input.len() < n {
-            return None;
-        }
-        let (head, tail) = input.split_at(n);
-        *input = tail;
-        Some(head)
-    }
 
     let mut bytes_read: u8 = 0;
     if !magicless {
-        let m = take(input, 4).ok_or_else(|| err::MagicNumberReadError(eof()))?;
-        let magic_num = u32::from_le_bytes([m[0], m[1], m[2], m[3]]);
+        take_magic_from_slice(input)?;
         bytes_read = 4;
-        if (0x184D2A50..=0x184D2A5F).contains(&magic_num) {
-            let s = take(input, 4).ok_or_else(|| err::FrameDescriptorReadError(eof()))?;
-            let skip_size = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-            return Err(ReadFrameHeaderError::SkipFrame {
-                magic_number: magic_num,
-                length: skip_size,
-            });
-        }
-        if magic_num != MAGIC_NUM {
-            return Err(ReadFrameHeaderError::BadMagicNumber(magic_num));
-        }
     }
 
     let d = take(input, 1).ok_or_else(|| err::FrameDescriptorReadError(eof()))?;
@@ -191,6 +213,7 @@ pub(crate) fn read_frame_header_from_slice(
         frame_header.frame_content_size = fcs;
     }
 
+    desc.check_reserved_bit()?;
     Ok((frame_header, bytes_read))
 }
 
@@ -337,9 +360,32 @@ impl FrameDescriptor {
 
     /// This bit is reserved for some future feature, a compliant decoder **must ensure**
     /// that this value is set to zero.
-    #[expect(dead_code)]
     pub fn reserved_flag(&self) -> bool {
         ((self.0 >> 3) & 0x1) == 1
+    }
+
+    /// Refuse a descriptor with the `Reserved_bit` set. RFC 8878 3.1.1.1.1: "A
+    /// decoder compliant with this specification version must ensure it is not
+    /// set." The parsers call it once the whole header is in hand, as upstream
+    /// does (`zstd_decompress.c:511`), so a header cut short still reports the
+    /// cut. Bit 4, the `Unused_bit`, is not looked at: the same clause says a
+    /// decoder "shall not interpret" it.
+    pub(crate) fn check_reserved_bit(&self) -> Result<(), FrameDescriptorError> {
+        if self.reserved_flag() {
+            return Err(FrameDescriptorError::ReservedBitSet);
+        }
+        Ok(())
+    }
+
+    /// Length of the frame header from this descriptor byte on: the byte
+    /// itself and the fields it announces, without the magic number. Upstream
+    /// measures a header the same way, from the descriptor alone
+    /// (`ZSTD_frameHeaderSize_internal`, `zstd_decompress.c:416-429`).
+    pub(crate) fn header_len(&self) -> usize {
+        let window = usize::from(!self.single_segment_flag());
+        let dict = self.dictionary_id_bytes().map_or(0, usize::from);
+        let fcs = self.frame_content_size_bytes().map_or(0, usize::from);
+        1 + window + dict + fcs
     }
 
     /// If this flag is set, data must be regenerated within a single continuous memory segment.

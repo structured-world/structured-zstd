@@ -2,6 +2,7 @@ use super::{
     FrameContentSize, FrameSizeError, find_frame_compressed_size, frame_decompressed_bound,
     frame_header_size, read_frame_content_size, read_frame_header_info,
 };
+use crate::decoding::errors::{FrameDescriptorError, ReadFrameHeaderError};
 use crate::encoding::{CompressionLevel, compress_slice_to_vec};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -197,4 +198,113 @@ fn frame_decompressed_bound_handles_skippable_frame() {
 #[test]
 fn frame_decompressed_bound_errors_on_garbage_header() {
     assert!(frame_decompressed_bound(&[0xAB; 16]).is_err());
+}
+
+/// [`no_fcs_frame`] with `bits` set in its Frame_Header_Descriptor.
+fn no_fcs_frame_with_descriptor_bits(bits: u8) -> Vec<u8> {
+    let mut f = no_fcs_frame();
+    f[4] |= bits;
+    f
+}
+
+fn is_reserved_bit_error(err: &ReadFrameHeaderError) -> bool {
+    matches!(
+        err,
+        ReadFrameHeaderError::InvalidFrameDescriptor(FrameDescriptorError::ReservedBitSet)
+    )
+}
+
+/// RFC 8878 3.1.1.1.1: a decoder must refuse a frame whose descriptor has its
+/// Reserved_bit (bit 3) set. Both header parsers do, with and without the
+/// magic number, and so does every inspection helper built on them, as
+/// upstream's `ZSTD_getFrameHeader_advanced` does.
+#[test]
+fn header_parsers_reject_the_reserved_descriptor_bit() {
+    use crate::decoding::frame::{read_frame_header_from_slice, read_frame_header_with_format};
+    let f = no_fcs_frame_with_descriptor_bits(0x08);
+    for (bytes, magicless) in [(&f[..], false), (&f[4..], true)] {
+        let err = read_frame_header_with_format(bytes, magicless)
+            .err()
+            .expect("the reserved bit must be refused");
+        assert!(
+            is_reserved_bit_error(&err),
+            "magicless={magicless}: {err:?}"
+        );
+        let mut input = bytes;
+        let err = read_frame_header_from_slice(&mut input, magicless)
+            .err()
+            .expect("the reserved bit must be refused");
+        assert!(
+            is_reserved_bit_error(&err),
+            "magicless={magicless}: {err:?}"
+        );
+        let err = read_frame_header_info(bytes, magicless).unwrap_err();
+        assert!(
+            is_reserved_bit_error(&err),
+            "magicless={magicless}: {err:?}"
+        );
+    }
+    assert!(is_reserved_bit_error(
+        &read_frame_content_size(&f).unwrap_err()
+    ));
+    assert_eq!(
+        alloc::format!("{}", FrameDescriptorError::ReservedBitSet),
+        "Reserved_bit of the Frame_Header_Descriptor is set; it must be zero"
+    );
+    for err in [
+        find_frame_compressed_size(&f).unwrap_err(),
+        frame_decompressed_bound(&f).unwrap_err(),
+    ] {
+        assert!(
+            matches!(&err, FrameSizeError::Header(e) if is_reserved_bit_error(e)),
+            "{err:?}"
+        );
+    }
+}
+
+/// The header's length does not depend on the reserved bit: upstream's
+/// `ZSTD_frameHeaderSize` reads it from the descriptor without checking the
+/// bit, and so does the size query here.
+#[test]
+fn frame_header_size_measures_a_header_with_the_reserved_bit() {
+    assert_eq!(
+        frame_header_size(&no_fcs_frame_with_descriptor_bits(0x08)).unwrap(),
+        6
+    );
+}
+
+/// The header's length follows from its descriptor alone, so the size query
+/// answers from the five-byte prefix (magic and descriptor), as upstream's
+/// `ZSTD_frameHeaderSize` does: telling a caller how much more to read is what
+/// it is for. Fewer than five bytes cannot say, and a prefix that is not a
+/// frame's is still refused.
+#[test]
+fn frame_header_size_answers_from_the_five_byte_prefix() {
+    let full = no_fcs_frame();
+    assert_eq!(frame_header_size(&full[..5]).unwrap(), 6);
+    let reserved = no_fcs_frame_with_descriptor_bits(0x08);
+    assert_eq!(frame_header_size(&reserved[..5]).unwrap(), 6);
+    // Single segment, two-byte content size, four-byte dictionary id.
+    let wide = [0x28, 0xB5, 0x2F, 0xFD, 0x63];
+    assert_eq!(frame_header_size(&wide).unwrap(), 4 + 1 + 4 + 2);
+    assert!(frame_header_size(&full[..4]).is_err());
+    assert!(matches!(
+        frame_header_size(&[0xAB; 5]).unwrap_err(),
+        ReadFrameHeaderError::BadMagicNumber(_)
+    ));
+}
+
+/// Bit 4 is the Unused_bit, which a decoder "shall not interpret" (RFC 8878
+/// 3.1.1.1.1): a frame with it set reads like the same frame without it.
+#[test]
+fn the_unused_descriptor_bit_is_not_interpreted() {
+    let f = no_fcs_frame_with_descriptor_bits(0x10);
+    let info = read_frame_header_info(&f, false).unwrap();
+    assert_eq!(info.window_size, 1024);
+    assert_eq!(find_frame_compressed_size(&f).unwrap(), f.len());
+    let mut out = [0u8; 3];
+    let written = crate::decoding::FrameDecoder::new()
+        .decode_all(&f, &mut out)
+        .unwrap();
+    assert_eq!(&out[..written], &[0xAA, 0xBB, 0xCC]);
 }

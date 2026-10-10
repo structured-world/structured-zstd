@@ -302,12 +302,24 @@ pub struct FrameHeaderInfo {
 /// 4-byte magic number (the offset at which the first block begins). Backs the
 /// C `ZSTD_frameHeaderSize`.
 ///
+/// Only the magic number and the descriptor byte are needed: the length
+/// follows from the descriptor alone, so a caller holding just that five-byte
+/// prefix learns how much of the header is still to read. Upstream's
+/// `ZSTD_frameHeaderSize` measures it the same way
+/// (`zstd_decompress.c:416-429`), without looking at the descriptor's other
+/// bits, so a header this library refuses to decode is still measured.
+///
 /// # Errors
-/// [`ReadFrameHeaderError`](errors::ReadFrameHeaderError) when the header is
-/// too short, has a bad magic number, or is a skippable frame.
+/// [`ReadFrameHeaderError`](errors::ReadFrameHeaderError) when `src` is shorter
+/// than five bytes, has a bad magic number, or is a skippable frame.
+///
+/// ```rust
+/// use structured_zstd::decoding::frame_header_size;
+/// // Magic number and a descriptor announcing a window byte only.
+/// assert_eq!(frame_header_size(&[0x28, 0xB5, 0x2F, 0xFD, 0x00]).unwrap(), 6);
+/// ```
 pub fn frame_header_size(src: &[u8]) -> Result<usize, errors::ReadFrameHeaderError> {
-    let (_header, consumed) = frame::read_frame_header_with_format(src, false)?;
-    Ok(consumed as usize)
+    frame::measure_header_from_slice(src)
 }
 
 /// Decode the leading frame header fields of `src` without decoding the body.

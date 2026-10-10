@@ -652,3 +652,65 @@ fn cross_every_level_with_ldm_and_dictionary_roundtrips_both_ways() {
          this matrix was not exercising anything"
     );
 }
+
+/// A frame whose descriptor has the Reserved_bit (bit 3) set is refused by
+/// libzstd and by this decoder, and the same frame with only the Unused_bit
+/// (bit 4) set is accepted by both. libzstd's code is
+/// `frameParameter_unsupported`, which the C ABI's own test pins for this
+/// library; its header size query answers either way.
+#[test]
+fn reserved_descriptor_bit_is_refused_like_the_reference() {
+    use zstd::zstd_safe;
+    // Multi-segment frame, 1 KiB window, one last Raw block of three bytes.
+    let clean = [
+        0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x19, 0x00, 0x00, 0xAA, 0xBB, 0xCC,
+    ];
+    let mut reserved = clean;
+    reserved[4] |= 0x08;
+    let mut unused = clean;
+    unused[4] |= 0x10;
+
+    let mut out = [0u8; 16];
+    let code = zstd_safe::decompress(&mut out[..], &reserved[..]).unwrap_err();
+    assert_eq!(
+        zstd_safe::get_error_name(code),
+        "Unsupported frame parameter"
+    );
+    let code = zstd_safe::find_frame_compressed_size(&reserved[..]).unwrap_err();
+    assert_eq!(
+        zstd_safe::get_error_name(code),
+        "Unsupported frame parameter",
+        "libzstd's compressed-size query refuses it the same way"
+    );
+    let header_size = unsafe {
+        zstd_safe::zstd_sys::ZSTD_frameHeaderSize(reserved.as_ptr().cast(), reserved.len())
+    };
+    assert_eq!(
+        header_size, 6,
+        "libzstd measures the header regardless of the bit"
+    );
+    assert_eq!(
+        structured_zstd::decoding::frame_header_size(&reserved).unwrap(),
+        header_size
+    );
+    // Both answer from the five-byte prefix alone.
+    let prefix_size =
+        unsafe { zstd_safe::zstd_sys::ZSTD_frameHeaderSize(reserved.as_ptr().cast(), 5) };
+    assert_eq!(prefix_size, 6);
+    assert_eq!(
+        structured_zstd::decoding::frame_header_size(&reserved[..5]).unwrap(),
+        prefix_size
+    );
+    assert!(
+        structured_zstd::decoding::FrameDecoder::new()
+            .decode_all(&reserved, &mut out)
+            .is_err()
+    );
+
+    let written = zstd_safe::decompress(&mut out[..], &unused[..]).unwrap();
+    assert_eq!(&out[..written], &[0xAA, 0xBB, 0xCC]);
+    let written = structured_zstd::decoding::FrameDecoder::new()
+        .decode_all(&unused, &mut out)
+        .unwrap();
+    assert_eq!(&out[..written], &[0xAA, 0xBB, 0xCC]);
+}

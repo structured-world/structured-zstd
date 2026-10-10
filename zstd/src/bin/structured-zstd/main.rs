@@ -5291,13 +5291,20 @@ impl<R: Read> Read for Watched<R> {
 
 /// The reference command's message for what follows a frame and is not one:
 /// fewer than four bytes, a magic number that is no frame's, or a skippable
-/// frame cut short. `None` for a damaged frame, and for a source that failed
-/// rather than ended.
+/// frame cut short; and for a frame header it refuses outright. `None` for a
+/// damaged frame, and for a source that failed rather than ended.
 fn after_frame_message(
     err: &structured_zstd::decoding::errors::FrameDecoderError,
 ) -> Option<&'static str> {
-    use structured_zstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+    use structured_zstd::decoding::errors::{
+        FrameDecoderError, FrameDescriptorError, ReadFrameHeaderError,
+    };
     match err {
+        // The reference command prints libzstd's `frameParameter_unsupported`
+        // through its decoding-error line (fileio.c:2720).
+        FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::InvalidFrameDescriptor(
+            FrameDescriptorError::ReservedBitSet,
+        )) => Some("Decoding error (36) : Unsupported frame parameter"),
         FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(_)) => {
             Some("unsupported format")
         }
