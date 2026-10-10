@@ -682,15 +682,13 @@ fn decode_all_exact_fit_output_decodes_correctly() {
 }
 
 #[test]
-fn decode_all_fallback_validates_fcs_against_total_output() {
+fn decode_all_validates_fcs_against_total_output() {
     // Synthetic single-segment frame: FCS = 20 bytes, but the
-    // last-block flag fires after only 4 bytes of raw payload.
-    // On the direct path this would trip the post-block
-    // `produced > content_size` check; the fallback path
-    // (eligible=false because output is sized exactly to FCS,
-    // no WILDCOPY slack) used to silently return Ok(4). With
-    // the fix it now surfaces `FrameContentSizeMismatch`
-    // matching the direct path.
+    // last-block flag fires after only 4 bytes of raw payload. A
+    // buffer of the declared size takes the direct path, which must
+    // surface `FrameContentSizeMismatch` rather than return Ok(4). A
+    // buffer smaller than the declared size cannot hold the frame and is
+    // refused before anything is decoded or buffered.
     //
     // Frame layout: 4 B magic | 1 B FHD (single_segment=1,
     // FCS_flag=3 → 8-byte FCS) | 8 B FCS=20 | block header
@@ -707,22 +705,17 @@ fn decode_all_fallback_validates_fcs_against_total_output() {
     wire.push(0x00);
     wire.extend_from_slice(&[1u8, 2, 3, 4]);
 
-    let mut dec = FrameDecoder::new();
-    // Size output SMALLER than the declared FCS so direct-decode is
-    // gated out (`output.len() >= content_size` is false) and the
-    // frame takes the legacy fallback drain loop — the path this test
-    // guards. The corrupt frame only produces 4 bytes, so 19 is ample
-    // room; the point is `19 != declared FCS (20)`.
     const DECLARED_FCS: usize = 20;
-    let mut out = alloc::vec![0u8; DECLARED_FCS - 1];
-    assert_ne!(
-        out.len(),
-        DECLARED_FCS,
-        "output must be smaller than FCS to exercise the fallback path",
-    );
-    let err = dec
+    let mut short = alloc::vec![0u8; DECLARED_FCS - 1];
+    assert!(matches!(
+        FrameDecoder::new().decode_all(wire.as_slice(), &mut short),
+        Err(crate::decoding::errors::FrameDecoderError::TargetTooSmall)
+    ));
+
+    let mut out = alloc::vec![0u8; DECLARED_FCS];
+    let err = FrameDecoder::new()
         .decode_all(wire.as_slice(), &mut out)
-        .expect_err("fallback must reject corrupt FCS underflow");
+        .expect_err("a corrupt FCS underflow must be refused");
     match err {
         crate::decoding::errors::FrameDecoderError::FrameContentSizeMismatch {
             declared,
@@ -3665,4 +3658,118 @@ fn every_decode_entry_point_refuses_the_reserved_descriptor_bit() {
         .read_to_end(&mut decoded)
         .unwrap();
     assert_eq!(decoded, [0xAA, 0xBB, 0xCC]);
+}
+
+/// A frame with no declared size whose window descriptor names `1 << log`
+/// bytes, carrying one raw block of `abc`.
+fn frame_with_window_log(log: u8) -> Vec<u8> {
+    let mut frame = alloc::vec![0x28, 0xB5, 0x2F, 0xFD];
+    // Descriptor: no content size, not single-segment, no checksum, no
+    // dictionary; then the window descriptor, exponent `log - 10`.
+    frame.push(0x00);
+    frame.push((log - 10) << 3);
+    // Last raw block of 3 bytes: (3 << 3) | (raw << 1) | last.
+    frame.extend_from_slice(&[0x19, 0x00, 0x00]);
+    frame.extend_from_slice(b"abc");
+    frame
+}
+
+/// The window a decoder accepts on the paths that hold the window itself is
+/// 128 MiB by default, as upstream's `ZSTD_d_windowLogMax` default is, and a
+/// caller raises it the way upstream's `ZSTD_DCtx_setMaxWindowSize` does. A
+/// frame from `zstd --long=28` is refused until the ceiling is raised, then
+/// decodes.
+#[test]
+fn the_window_ceiling_is_the_callers_to_raise() {
+    use crate::decoding::StreamingDecoder;
+    use crate::io::Read;
+
+    let frame = frame_with_window_log(28);
+    let mut refused = FrameDecoder::new();
+    assert_eq!(refused.max_window_size(), 1 << 27);
+    match refused.init(frame.as_slice()) {
+        Err(FrameDecoderError::WindowSizeTooBig { requested, limit }) => {
+            assert_eq!((requested, limit), (1 << 28, 1 << 27));
+        }
+        other => panic!("a 256 MiB window must exceed the default ceiling: {other:?}"),
+    }
+    let mut decoded = Vec::new();
+    assert!(
+        StreamingDecoder::new(frame.as_slice())
+            .read_to_end(&mut decoded)
+            .is_err(),
+        "the streaming decoder holds the window, so the default ceiling binds it"
+    );
+
+    let mut raised = FrameDecoder::new();
+    raised.set_max_window_size(1 << 28).unwrap();
+    assert_eq!(raised.max_window_size(), 1 << 28);
+    decoded.clear();
+    StreamingDecoder::new_with_decoder(frame.as_slice(), raised)
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, b"abc");
+}
+
+/// The ceiling takes what upstream's `ZSTD_dParam_getBounds` allows: from
+/// the smallest window to `ZSTD_WINDOWLOG_MAX`, and nothing outside.
+#[test]
+fn the_window_ceiling_stays_within_the_formats_bounds() {
+    let mut decoder = FrameDecoder::new();
+    assert!(decoder.set_max_window_size(1 << 10).is_ok());
+    assert!(
+        decoder
+            .set_max_window_size(crate::decoding::MAX_DECODER_WINDOW_SIZE)
+            .is_ok()
+    );
+    assert!(decoder.set_max_window_size((1 << 10) - 1).is_err());
+    assert!(
+        decoder
+            .set_max_window_size(crate::decoding::MAX_DECODER_WINDOW_SIZE + 1)
+            .is_err()
+    );
+    // A refused setting leaves the one in force.
+    assert_eq!(
+        decoder.max_window_size(),
+        crate::decoding::MAX_DECODER_WINDOW_SIZE
+    );
+}
+
+/// Decoding into the caller's buffer holds no window of its own, so it is not
+/// bounded by the ceiling, as upstream's `ZSTD_decompressDCtx` is not: the
+/// default decoder takes a `--long=28` frame there. A window past what this
+/// target can address at all is refused everywhere.
+#[test]
+fn decoding_into_the_callers_buffer_takes_any_addressable_window() {
+    let mut out = [0u8; 8];
+    let written = FrameDecoder::new()
+        .decode_all(&frame_with_window_log(28), &mut out)
+        .unwrap();
+    assert_eq!(&out[..written], b"abc");
+
+    let past_max = frame_with_window_log(if cfg!(target_pointer_width = "64") {
+        32
+    } else {
+        31
+    });
+    match FrameDecoder::new().decode_all(&past_max, &mut out) {
+        Err(FrameDecoderError::WindowSizeTooBig { limit, .. }) => {
+            assert_eq!(limit, crate::decoding::MAX_DECODER_WINDOW_SIZE);
+        }
+        other => panic!("a window past the format's limit must be refused: {other:?}"),
+    }
+}
+
+/// A frame that declares more content than the caller's buffer holds cannot
+/// fit it, so decoding into that buffer stops at once instead of buffering the
+/// frame's window first.
+#[test]
+fn a_frame_larger_than_the_callers_buffer_is_refused_up_front() {
+    let content = [3u8; 4096];
+    let compressed = crate::encoding::compress_to_vec(&content[..], CompressionLevel::Fastest);
+    let mut small = [0u8; 100];
+    assert!(matches!(
+        FrameDecoder::new().decode_all(&compressed, &mut small),
+        Err(FrameDecoderError::TargetTooSmall)
+    ));
 }

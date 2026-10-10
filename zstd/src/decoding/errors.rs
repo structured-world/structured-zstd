@@ -597,7 +597,21 @@ impl From<HuffmanTableError> for DictionaryDecodeError {
 pub enum FrameDecoderError {
     ReadFrameHeaderError(ReadFrameHeaderError),
     FrameHeaderError(FrameHeaderError),
+    /// The frame's window exceeds the ceiling in force: the decoder's
+    /// [`FrameDecoder::set_max_window_size`](crate::decoding::FrameDecoder::set_max_window_size)
+    /// setting, or [`MAX_DECODER_WINDOW_SIZE`](crate::decoding::MAX_DECODER_WINDOW_SIZE).
+    #[non_exhaustive]
     WindowSizeTooBig {
+        /// The window the frame declares.
+        requested: u64,
+        /// The ceiling it exceeded.
+        limit: u64,
+    },
+    /// A requested window ceiling lies outside 1 KiB (the smallest window a
+    /// frame declares, RFC 8878 3.1.1.1.2) ..=
+    /// [`MAX_DECODER_WINDOW_SIZE`](crate::decoding::MAX_DECODER_WINDOW_SIZE).
+    WindowCeilingOutOfRange {
+        /// The ceiling asked for.
         requested: u64,
     },
     DictionaryDecodeError(DictionaryDecodeError),
@@ -780,12 +794,18 @@ impl core::fmt::Display for FrameDecoderError {
             FrameDecoderError::FrameHeaderError(e) => {
                 write!(f, "{e:?}")
             }
-            FrameDecoderError::WindowSizeTooBig { requested } => {
+            FrameDecoderError::WindowSizeTooBig { requested, limit } => {
                 write!(
                     f,
-                    "Specified window_size is too big; Requested: {}, Allowed: {}",
-                    requested,
-                    crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE,
+                    "Specified window_size is too big; Requested: {requested}, Allowed: {limit}",
+                )
+            }
+            FrameDecoderError::WindowCeilingOutOfRange { requested } => {
+                write!(
+                    f,
+                    "window ceiling {requested} is outside {}..={}",
+                    crate::common::MIN_WINDOW_SIZE,
+                    crate::common::MAX_DECODER_WINDOW_SIZE,
                 )
             }
             FrameDecoderError::DictionaryDecodeError(e) => {

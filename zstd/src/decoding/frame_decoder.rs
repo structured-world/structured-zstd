@@ -167,6 +167,10 @@ pub struct FrameDecoder {
     /// expect frames without the 4-byte magic number prefix.
     /// Default false (standard zstd format).
     magicless: bool,
+    /// Largest window a frame may declare on the paths where the decoder
+    /// holds the window itself. Default [`MAXIMUM_ALLOWED_WINDOW_SIZE`]; set
+    /// via [`Self::set_max_window_size`].
+    max_window_size: u64,
     /// How the optional content checksum is handled. Default
     /// [`ContentChecksum::EmitOnly`] (compute + expose, no error on
     /// mismatch). Set via [`Self::set_content_checksum`].
@@ -1011,25 +1015,22 @@ impl FrameDecoderState {
     pub(crate) fn new_with_format(
         source: impl Read,
         magicless: bool,
+        max_window: u64,
     ) -> Result<FrameDecoderState, FrameDecoderError> {
         let (frame, header_size) = frame::read_frame_header_with_format(source, magicless)?;
-        Self::new_with_parsed_header(frame, header_size)
+        Self::new_with_parsed_header(frame, header_size, max_window)
     }
 
     /// Build a fresh state from an already-parsed frame header (the non-parsing
     /// tail of [`Self::new_with_format`]). Shared by the `Read` path and the
-    /// slice-direct path ([`FrameDecoder::reset_from_slice`]).
+    /// slice-direct path ([`FrameDecoder::reset_from_slice`]). A window past
+    /// `max_window` is refused.
     pub(crate) fn new_with_parsed_header(
         frame: frame::FrameHeader,
         header_size: u8,
+        max_window: u64,
     ) -> Result<FrameDecoderState, FrameDecoderError> {
-        let window_size = frame.window_size()?;
-
-        if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
-            return Err(FrameDecoderError::WindowSizeTooBig {
-                requested: window_size,
-            });
-        }
+        let window_size = checked_window_size(&frame, max_window)?;
 
         let decoder_scratch = if frame.descriptor.single_segment_flag() {
             DecoderScratchKind::new_flat(window_size as usize)
@@ -1067,27 +1068,24 @@ impl FrameDecoderState {
         &mut self,
         source: impl Read,
         magicless: bool,
+        max_window: u64,
     ) -> Result<(), FrameDecoderError> {
         let (frame_header, header_size) = frame::read_frame_header_with_format(source, magicless)?;
-        self.reset_with_parsed_header(frame_header, header_size)
+        self.reset_with_parsed_header(frame_header, header_size, max_window)
     }
 
     /// Apply an already-parsed frame header to this state (the non-parsing tail
     /// of [`Self::reset_with_format`]). Shared by the `Read` path and the slice-direct
-    /// path ([`FrameDecoder::reset_from_slice`]).
+    /// path ([`FrameDecoder::reset_from_slice`]). A window past `max_window`
+    /// is refused.
     #[inline]
     pub(crate) fn reset_with_parsed_header(
         &mut self,
         frame_header: frame::FrameHeader,
         header_size: u8,
+        max_window: u64,
     ) -> Result<(), FrameDecoderError> {
-        let window_size = frame_header.window_size()?;
-
-        if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
-            return Err(FrameDecoderError::WindowSizeTooBig {
-                requested: window_size,
-            });
-        }
+        let window_size = checked_window_size(&frame_header, max_window)?;
 
         self.decoder_scratch
             .reset(&frame_header, window_size as usize);
@@ -1123,6 +1121,24 @@ impl FrameDecoderState {
     }
 }
 
+/// The window `frame` declares, refused past `max_window`. The ceiling is at
+/// most [`MAX_DECODER_WINDOW_SIZE`](crate::common::MAX_DECODER_WINDOW_SIZE), so
+/// the window a frame is admitted with always fits in `usize`.
+fn checked_window_size(
+    frame: &frame::FrameHeader,
+    max_window: u64,
+) -> Result<u64, FrameDecoderError> {
+    debug_assert!(max_window <= crate::common::MAX_DECODER_WINDOW_SIZE);
+    let window_size = frame.window_size()?;
+    if window_size > max_window {
+        return Err(FrameDecoderError::WindowSizeTooBig {
+            requested: window_size,
+            limit: max_window,
+        });
+    }
+    Ok(window_size)
+}
+
 impl Default for FrameDecoder {
     fn default() -> Self {
         Self::new()
@@ -1144,6 +1160,7 @@ impl FrameDecoder {
             #[cfg(not(target_has_atomic = "ptr"))]
             shared_dicts: (),
             magicless: false,
+            max_window_size: MAXIMUM_ALLOWED_WINDOW_SIZE,
             content_checksum: ContentChecksum::EmitOnly,
             #[cfg(feature = "lsm")]
             expect_dict_id: None,
@@ -1351,6 +1368,49 @@ impl FrameDecoder {
     /// when the entire stream is known to be magicless zstd frames.
     pub fn set_magicless(&mut self, magicless: bool) {
         self.magicless = magicless;
+    }
+
+    /// Set the largest window a frame may declare when this decoder holds the
+    /// window itself: [`Self::init`], [`Self::reset`], [`Self::decode_blocks`]
+    /// and the streaming paths. Upstream zstd's `ZSTD_DCtx_setMaxWindowSize`
+    /// (and `ZSTD_d_windowLogMax`, as `1 << log`). The default,
+    /// [`MAXIMUM_ALLOWED_WINDOW_SIZE`], is upstream's; raise it to decode
+    /// frames from `zstd --long=28` and wider, lower it to cap the memory
+    /// untrusted input may claim. Decoding into a caller's buffer
+    /// ([`Self::decode_all`] and its siblings) holds no window, so only
+    /// [`MAX_DECODER_WINDOW_SIZE`](crate::decoding::MAX_DECODER_WINDOW_SIZE)
+    /// bounds it there, as upstream's `ZSTD_decompressDCtx`.
+    ///
+    /// # Errors
+    ///
+    /// [`FrameDecoderError::WindowCeilingOutOfRange`] when `size` lies
+    /// outside 1 KiB (the smallest window a frame declares) ..=
+    /// [`MAX_DECODER_WINDOW_SIZE`](crate::decoding::MAX_DECODER_WINDOW_SIZE);
+    /// the ceiling in force is kept.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_zstd::decoding::FrameDecoder;
+    ///
+    /// let mut decoder = FrameDecoder::new();
+    /// decoder.set_max_window_size(1 << 30).unwrap();
+    /// assert_eq!(decoder.max_window_size(), 1 << 30);
+    /// assert!(decoder.set_max_window_size(1 << 9).is_err());
+    /// ```
+    pub fn set_max_window_size(&mut self, size: u64) -> Result<(), FrameDecoderError> {
+        if !(crate::common::MIN_WINDOW_SIZE..=crate::common::MAX_DECODER_WINDOW_SIZE)
+            .contains(&size)
+        {
+            return Err(FrameDecoderError::WindowCeilingOutOfRange { requested: size });
+        }
+        self.max_window_size = size;
+        Ok(())
+    }
+
+    /// The window ceiling in force; see [`Self::set_max_window_size`].
+    pub fn max_window_size(&self) -> u64 {
+        self.max_window_size
     }
 
     /// Whether frame headers are read without the magic number.
@@ -1624,13 +1684,16 @@ impl FrameDecoder {
         #[cfg(all(feature = "lsm", feature = "hash"))]
         self.computed_block_checksums.clear();
         let magicless = self.magicless;
+        let max_window = self.max_window_size;
         let dict_id = match &mut self.state {
             Some(s) => {
-                s.reset_with_format(source, magicless)?;
+                s.reset_with_format(source, magicless, max_window)?;
                 s.frame_header.dictionary_id()
             }
             None => {
-                self.state = Some(FrameDecoderState::new_with_format(source, magicless)?);
+                self.state = Some(FrameDecoderState::new_with_format(
+                    source, magicless, max_window,
+                )?);
                 // A frame that resolves its dictionary by ID drops one armed
                 // for a forced-dictionary stream that never started.
                 self.armed_dict = None;
@@ -1680,23 +1743,27 @@ impl FrameDecoder {
     /// per field) and advances `*input` past it, then applies it through the
     /// shared parsed-header path. Behaviour — including skippable-frame and
     /// truncation errors, dictionary-id resolution, and pinned-expectation
-    /// validation — is identical to `reset`; only the header read avoids the
-    /// `io::impls` dispatch.
+    /// validation — is identical to `reset`, except the window ceiling: the
+    /// frame decodes into the caller's buffer and holds no window of its own,
+    /// so only [`MAX_DECODER_WINDOW_SIZE`](crate::common::MAX_DECODER_WINDOW_SIZE)
+    /// bounds it, as upstream `ZSTD_decompressDCtx` takes any window.
     pub(crate) fn reset_from_slice(&mut self, input: &mut &[u8]) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
         #[cfg(all(feature = "lsm", feature = "hash"))]
         self.computed_block_checksums.clear();
         let magicless = self.magicless;
+        let max_window = crate::common::MAX_DECODER_WINDOW_SIZE;
         let (frame_header, header_size) = frame::read_frame_header_from_slice(input, magicless)?;
         let dict_id = match &mut self.state {
             Some(s) => {
-                s.reset_with_parsed_header(frame_header, header_size)?;
+                s.reset_with_parsed_header(frame_header, header_size, max_window)?;
                 s.frame_header.dictionary_id()
             }
             None => {
                 self.state = Some(FrameDecoderState::new_with_parsed_header(
                     frame_header,
                     header_size,
+                    max_window,
                 )?);
                 self.armed_dict = None;
                 self.state
@@ -1826,14 +1893,17 @@ impl FrameDecoder {
         self.computed_block_checksums.clear();
         Self::validate_dictionary_content(dict.as_dict())?;
         let magicless = self.magicless;
+        let max_window = self.max_window_size;
         // Scope the &mut borrow of `self.state` to the header parse
         // alone, so the subsequent `validate_expectations(&self, ...)`
         // call below can take a fresh shared borrow of self without
         // tripping the borrow checker.
         match &mut self.state {
-            Some(s) => s.reset_with_format(source, magicless)?,
+            Some(s) => s.reset_with_format(source, magicless, max_window)?,
             None => {
-                self.state = Some(FrameDecoderState::new_with_format(source, magicless)?);
+                self.state = Some(FrameDecoderState::new_with_format(
+                    source, magicless, max_window,
+                )?);
                 self.armed_dict = None;
             }
         }
@@ -1884,13 +1954,16 @@ impl FrameDecoder {
         self.computed_block_checksums.clear();
         Self::validate_dictionary_content(dict.as_dict())?;
         let magicless = self.magicless;
+        // Into the caller's buffer, like `reset_from_slice`: no window held.
+        let max_window = crate::common::MAX_DECODER_WINDOW_SIZE;
         let (frame_header, header_size) = frame::read_frame_header_from_slice(input, magicless)?;
         match &mut self.state {
-            Some(s) => s.reset_with_parsed_header(frame_header, header_size)?,
+            Some(s) => s.reset_with_parsed_header(frame_header, header_size, max_window)?,
             None => {
                 self.state = Some(FrameDecoderState::new_with_parsed_header(
                     frame_header,
                     header_size,
+                    max_window,
                 )?);
                 self.armed_dict = None;
             }
@@ -3361,10 +3434,14 @@ impl FrameDecoder {
             // reserved the frame's whole declared window for it, which for a
             // streamed producer's small frame is megabytes for kilobytes.
             let declared_size = fcs_declared.then_some(content_size);
-            let direct_eligible = match declared_size {
-                Some(declared) => declared > 0 && (output.len() as u64) >= declared,
-                None => true,
-            };
+            // A frame declaring more than the slice holds cannot fit it: the
+            // declared size is checked once the frame is decoded. Stopping
+            // here is what keeps this path free of a window-sized buffer, as
+            // upstream `ZSTD_decompressDCtx` writes only into `dst`.
+            if declared_size.is_some_and(|declared| declared > output.len() as u64) {
+                return Err(FrameDecoderError::TargetTooSmall);
+            }
+            let direct_eligible = declared_size != Some(0);
             if direct_eligible {
                 let written = self.run_direct_decode(&mut input, output, declared_size)?;
                 output = &mut output[written..];
@@ -3507,10 +3584,11 @@ impl FrameDecoder {
             // reserved the frame's whole declared window for it, which for a
             // streamed producer's small frame is megabytes for kilobytes.
             let declared_size = fcs_declared.then_some(content_size);
-            let direct_eligible = match declared_size {
-                Some(declared) => declared > 0 && (output.len() as u64) >= declared,
-                None => true,
-            };
+            // Refused before any buffer is taken (see the no-lsm path above).
+            if declared_size.is_some_and(|declared| declared > output.len() as u64) {
+                return Err(FrameDecoderError::TargetTooSmall);
+            }
+            let direct_eligible = declared_size != Some(0);
             if direct_eligible {
                 let written = self.run_direct_decode(&mut input, output, declared_size)?;
                 output = &mut output[written..];
