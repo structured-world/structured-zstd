@@ -217,11 +217,17 @@ use structured_zstd::io::Read;
 
 let compressed_data: Vec<u8> = vec![];
 let mut source: &[u8] = &compressed_data;
-let mut decoder = StreamingDecoder::new(&mut source).unwrap();
+let mut decoder = StreamingDecoder::new(&mut source);
 
 let mut result = Vec::new();
 decoder.read_to_end(&mut result).unwrap();
 ```
+
+Creating a `StreamingDecoder` reads nothing from its source. The first read
+reads the first frame header and reports any problem with the input, and
+`into_inner()` hands the source back. A decoder that was never read returns
+the source untouched, so a container format can decide not to decompress an
+entry and copy its raw bytes instead.
 
 ### Dictionaries
 

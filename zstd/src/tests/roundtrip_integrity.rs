@@ -40,7 +40,7 @@ fn generate_compressible(seed: u64, len: usize) -> Vec<u8> {
 /// Roundtrip using compress_to_vec at the given level.
 fn roundtrip_at_level(data: &[u8], level: CompressionLevel) -> Vec<u8> {
     let compressed = compress_to_vec(data, level);
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     result
@@ -66,7 +66,7 @@ fn roundtrip_streaming_at_level(data: &[u8], level: CompressionLevel) -> Vec<u8>
     compressor.set_source(data);
     compressor.set_drain(&mut compressed);
     compressor.compress();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     result
@@ -325,7 +325,7 @@ fn small_repetitive_compresses_on_borrowed_hashchain_band() {
         // assertion below measures, and keeps guarding the borrowed-HC path even
         // if wrapper routing changes.
         let compressed = compress_slice_to_vec(&data[..], CompressionLevel::Level(level));
-        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice());
         let mut roundtrip = Vec::new();
         decoder.read_to_end(&mut roundtrip).unwrap();
         assert_eq!(data, roundtrip, "L{level} borrowed-HC roundtrip mismatch");
@@ -426,7 +426,7 @@ fn roundtrip_reused_frame_compressor_across_frames() {
         compressor.compress();
     }
 
-    let mut decoder = StreamingDecoder::new(first_compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(first_compressed.as_slice());
     let mut first_roundtrip = Vec::new();
     decoder.read_to_end(&mut first_roundtrip).unwrap();
     assert_eq!(
@@ -434,7 +434,7 @@ fn roundtrip_reused_frame_compressor_across_frames() {
         "First reused-frame roundtrip failed"
     );
 
-    let mut decoder = StreamingDecoder::new(second_compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(second_compressed.as_slice());
     let mut second_roundtrip = Vec::new();
     decoder.read_to_end(&mut second_roundtrip).unwrap();
     assert_eq!(
@@ -670,7 +670,7 @@ fn all_22_levels_roundtrip() {
             compressor.compress();
             out
         };
-        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice());
         let mut result = Vec::new();
         decoder.read_to_end(&mut result).unwrap();
         assert_eq!(data, result, "Roundtrip failed for Level({level})");
@@ -698,7 +698,7 @@ fn sampled_levels_roundtrip_validity() {
             !compressed.is_empty(),
             "Level {level} produced empty compressed output"
         );
-        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice());
         let mut result = Vec::new();
         decoder.read_to_end(&mut result).unwrap();
         assert_eq!(
@@ -721,7 +721,7 @@ fn numeric_level_streaming_roundtrip() {
             encoder.write_all(chunk).unwrap();
         }
         let compressed = encoder.finish().unwrap();
-        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice());
         let mut result = Vec::new();
         decoder.read_to_end(&mut result).unwrap();
         assert_eq!(
@@ -758,7 +758,7 @@ fn source_size_hint_small_input_roundtrip() {
         compressor.compress();
         out
     };
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     assert_eq!(data, result, "Small input with size hint must roundtrip");
@@ -792,12 +792,12 @@ fn source_size_hint_reduces_window_for_small_input() {
         .window_size()
         .unwrap();
     // Both must decompress correctly
-    let mut decoder = StreamingDecoder::new(no_hint.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(no_hint.as_slice());
     let mut r = Vec::new();
     decoder.read_to_end(&mut r).unwrap();
     assert_eq!(data, r);
 
-    let mut decoder = StreamingDecoder::new(with_hint.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(with_hint.as_slice());
     let mut r = Vec::new();
     decoder.read_to_end(&mut r).unwrap();
     assert_eq!(data, r);
@@ -839,7 +839,7 @@ fn streaming_pledged_size_uses_source_hint() {
         .window_size()
         .unwrap();
 
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     assert_eq!(data, result, "Pledged-size streaming must roundtrip");
@@ -885,7 +885,7 @@ fn compress_to_vec_default_small_input_uses_source_size_hint() {
         .window_size()
         .unwrap();
 
-    let mut decoder = StreamingDecoder::new(auto_hint.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(auto_hint.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, data);
@@ -912,7 +912,7 @@ fn all_levels_tiny_input_with_hint() {
             compressor.compress();
             out
         };
-        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice());
         let mut result = Vec::new();
         decoder.read_to_end(&mut result).unwrap();
         assert_eq!(
@@ -953,7 +953,7 @@ fn a_reused_borrowed_compressor_rejects_slots_from_a_longer_frame() {
         let second = compressor.compress_independent_frame(&short);
 
         for (frame, source, which) in [(first, &long, "first"), (second, &short, "second")] {
-            let mut decoder = StreamingDecoder::new(frame.as_slice()).unwrap();
+            let mut decoder = StreamingDecoder::new(frame.as_slice());
             let mut decoded = Vec::new();
             decoder.read_to_end(&mut decoded).unwrap();
             assert_eq!(
@@ -1025,7 +1025,7 @@ fn borrowed_oneshot_matches_owned_and_roundtrips() {
                     borrowed, owned,
                     "borrowed one-shot frame differs from owned at {level:?} seed={seed} len={len}",
                 );
-                let mut decoder = StreamingDecoder::new(borrowed.as_slice()).unwrap();
+                let mut decoder = StreamingDecoder::new(borrowed.as_slice());
                 let mut result = Vec::new();
                 decoder.read_to_end(&mut result).unwrap();
                 assert_eq!(

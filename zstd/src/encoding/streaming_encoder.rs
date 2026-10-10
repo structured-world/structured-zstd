@@ -70,7 +70,7 @@ pub struct StreamingEncoder<
 ///     frames.push(frame);
 /// }
 /// use std::io::Read;
-/// let mut decoder = structured_zstd::decoding::StreamingDecoder::new(&frames[1][..]).unwrap();
+/// let mut decoder = structured_zstd::decoding::StreamingDecoder::new(&frames[1][..]);
 /// let mut decoded = Vec::new();
 /// decoder.read_to_end(&mut decoded).unwrap();
 /// assert_eq!(decoded, b"second frame");

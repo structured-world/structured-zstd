@@ -299,7 +299,7 @@ fn test_streaming() {
     use std::io::Read;
 
     let mut content = fs::File::open("./decodecorpus_files/z000088.zst").unwrap();
-    let mut stream = crate::decoding::StreamingDecoder::new(&mut content).unwrap();
+    let mut stream = crate::decoding::StreamingDecoder::new(&mut content);
 
     let mut result = Vec::new();
     Read::read_to_end(&mut stream, &mut result).unwrap();
@@ -340,8 +340,7 @@ fn test_streaming() {
     let mut stream = crate::decoding::StreamingDecoder::new_with_decoder(
         &mut content,
         stream.into_frame_decoder(),
-    )
-    .unwrap();
+    );
 
     let mut result = Vec::new();
     Read::read_to_end(&mut stream, &mut result).unwrap();
@@ -410,7 +409,7 @@ fn test_streaming_no_std() {
 
     let content = include_bytes!("../../decodecorpus_files/z000088.zst");
     let mut content = content.as_slice();
-    let mut stream = crate::decoding::StreamingDecoder::new(&mut content).unwrap();
+    let mut stream = crate::decoding::StreamingDecoder::new(&mut content);
 
     let original = include_bytes!("../../decodecorpus_files/z000088");
     let mut result = vec![0; original.len()];
@@ -450,8 +449,7 @@ fn test_streaming_no_std() {
     let mut stream = crate::decoding::StreamingDecoder::new_with_decoder(
         &mut content,
         stream.into_frame_decoder(),
-    )
-    .unwrap();
+    );
 
     let original = include_bytes!("../../decodecorpus_files/z000068");
     let mut result = vec![0; original.len()];

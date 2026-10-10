@@ -281,7 +281,7 @@ fn a_raw_frame_from_a_reader_carries_a_valid_checksum() {
     compressor.set_drain(&mut output);
     compressor.compress();
 
-    let mut decoder = crate::decoding::StreamingDecoder::new(output.as_slice()).unwrap();
+    let mut decoder = crate::decoding::StreamingDecoder::new(output.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, input);

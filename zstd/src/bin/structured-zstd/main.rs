@@ -5211,10 +5211,12 @@ fn decompress_stream<R: Read, W: Write>(
             bail!("unsupported format");
         }
         frames += 1;
-        let mut stream = io::Cursor::new(magic).chain(&mut source);
-        // Borrowed, not moved: a frame that turns out to be skippable leaves
-        // the reader with us to step over it and carry on.
-        let built = match handle {
+        let mut stream = Watched {
+            inner: io::Cursor::new(magic).chain(&mut source),
+            failed: false,
+        };
+        // Borrowed, not moved: the reader stays with us after the decoder.
+        let mut decoder = match handle {
             // The dictionary constructors FORCE the supplied dictionary, which
             // the registration path does not: a frame may legitimately omit the
             // optional dictionary ID, and then nothing would select it.
@@ -5222,35 +5224,9 @@ fn decompress_stream<R: Read, W: Write>(
                 &mut stream,
                 &mut *decompressor,
                 h,
-            ),
+            )
+            .map_err(|err| eyre!("invalid dictionary: {err}"))?,
             None => StreamingDecoder::new_with_decoder(&mut stream, &mut *decompressor),
-        };
-        // Skippable frames in front of the first frame are stepped over by the
-        // constructor itself, and the ones after it by the decoder's `Read`;
-        // what follows either is reported the same way.
-        let mut decoder = match built {
-            Ok(decoder) => decoder,
-            Err(err) => {
-                // A source that fails where a frame would start is a read
-                // failure, whatever the parser was reading at the time.
-                if let FrameDecoderError::ReadFrameHeaderError(
-                    structured_zstd::decoding::errors::ReadFrameHeaderError::MagicNumberReadError(
-                        e,
-                    ),
-                ) = &err
-                    && e.kind() != io::ErrorKind::UnexpectedEof
-                {
-                    bail!("failed to read the input: {e}");
-                }
-                // The same inside a leading skippable frame's content.
-                if let FrameDecoderError::FailedToReadSkippableFrame(e) = &err {
-                    bail!("failed to read the input: {e}");
-                }
-                match after_frame_message(&err) {
-                    Some(message) => bail!("{message}"),
-                    None => bail!("invalid zstd frame: {err:?}"),
-                }
-            }
         };
         // The library computes the digest but does not compare it, leaving the
         // decision to the caller. For a command-line tool that decision is
@@ -5266,6 +5242,9 @@ fn decompress_stream<R: Read, W: Write>(
             } else {
                 structured_zstd::decoding::ContentChecksum::None
             });
+        // The decoder reads every frame and skippable frame of the stream, the
+        // first one's header included, so whatever is wrong with the input is
+        // reported here.
         let err = match io::copy(&mut decoder, &mut writer) {
             Ok(n) => {
                 written += n;
@@ -5273,14 +5252,40 @@ fn decompress_stream<R: Read, W: Write>(
             }
             Err(err) => err,
         };
+        // A source that fails is a read failure, whatever the decoder was
+        // reading at the time, a frame header or a skippable frame's content.
+        if decoder.get_ref().failed {
+            bail!("failed to read the input: {err}");
+        }
         match err
             .get_ref()
             .and_then(|e| e.downcast_ref::<FrameDecoderError>())
-            .and_then(after_frame_message)
         {
-            Some(message) => bail!("{message}"),
+            Some(frame_err) => match after_frame_message(frame_err) {
+                Some(message) => bail!("{message}"),
+                None => bail!("invalid zstd frame: {frame_err:?}"),
+            },
             None => return Err(err).wrap_err("streaming decompression failed"),
         }
+    }
+}
+
+/// The decoder's source, remembering whether it failed, so a decode error can
+/// be told apart from the input device failing under it.
+struct Watched<R> {
+    inner: R,
+    failed: bool,
+}
+
+impl<R: Read> Read for Watched<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let result = self.inner.read(buf);
+        if let Err(e) = &result
+            && e.kind() != io::ErrorKind::Interrupted
+        {
+            self.failed = true;
+        }
+        result
     }
 }
 

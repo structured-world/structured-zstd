@@ -852,7 +852,7 @@ fn streaming_encoder_roundtrip_multiple_writes() {
     }
     let compressed = encoder.finish().unwrap();
 
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -869,7 +869,7 @@ fn flush_emits_nonempty_partial_output() {
         "flush should emit header+partial block bytes"
     );
     let compressed = encoder.finish().unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, b"partial-block");
@@ -911,7 +911,7 @@ fn finish_consumes_encoder_and_emits_frame() {
     let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
     encoder.write_all(b"abc").unwrap();
     let compressed = encoder.finish().unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, b"abc");
@@ -921,7 +921,7 @@ fn finish_consumes_encoder_and_emits_frame() {
 fn finish_without_writes_emits_empty_frame() {
     let encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
     let compressed = encoder.finish().unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert!(decoded.is_empty());
@@ -942,7 +942,7 @@ fn uncompressed_level_roundtrip() {
         encoder.write_all(chunk).unwrap();
     }
     let compressed = encoder.finish().unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -956,7 +956,7 @@ fn better_level_streaming_roundtrip() {
         encoder.write_all(chunk).unwrap();
     }
     let compressed = encoder.finish().unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -983,7 +983,7 @@ fn best_level_streaming_roundtrip() {
         encoder.write_all(chunk).unwrap();
     }
     let compressed = encoder.finish().unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -1061,7 +1061,7 @@ fn new_with_matcher_and_get_mut_work() {
     encoder.get_mut().extend_from_slice(b"");
     encoder.write_all(b"custom-matcher").unwrap();
     let compressed = encoder.finish().unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, b"custom-matcher");
@@ -1084,7 +1084,7 @@ fn pledged_content_size_written_in_header() {
     assert_eq!(header.frame_content_size(), payload.len() as u64);
 
     // Verify roundtrip
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -1143,7 +1143,7 @@ fn encoded_scratch_capacity_is_reused_across_blocks() {
 
     encoder.write_all(&payload[128..]).unwrap();
     let compressed = encoder.finish().unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -1189,7 +1189,7 @@ fn source_size_hint_directly_reduces_window_header() {
         "source size hint should not increase advertised window"
     );
 
-    let mut decoder = StreamingDecoder::new(with_hint_frame.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(with_hint_frame.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -1298,7 +1298,7 @@ fn level_22_streaming_window_roundtrips_in_our_decoder() {
         crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE,
     );
 
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -1325,7 +1325,7 @@ fn streaming_encoder_set_content_checksum_false_clears_header_flag() {
         "content_checksum(false) must clear the frame header flag",
     );
 
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -1490,7 +1490,7 @@ fn streaming_encoder_strategy_override_survives_frame_start() {
     );
 
     let compressed = encoder.finish().unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -1522,7 +1522,7 @@ fn streaming_encoder_uncompressed_with_dictionary_omits_dict_id() {
     );
 
     // Decodes WITHOUT any dictionary.
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -1607,7 +1607,7 @@ fn set_dictionary_from_bytes_with_an_empty_buffer_clears_the_dictionary() {
 
     // Decodes with no dictionary supplied, which it could not do had the
     // earlier attach survived.
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -1757,7 +1757,7 @@ fn a_block_searched_without_the_classifier_is_found_again() {
             "level {level}: {} bytes from {total}, the copy of the first block was not found",
             compressed.len(),
         );
-        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice());
         let mut decoded = Vec::new();
         decoder.read_to_end(&mut decoded).unwrap();
         assert_eq!(decoded.len(), total);
@@ -1778,7 +1778,7 @@ fn a_streamed_raw_frame_carries_a_valid_checksum() {
     let compressed = encoder.finish().unwrap();
     // Content_Checksum_flag (RFC 8878 3.1.1.1.1.5).
     assert_ne!(compressed[4] & 0b100, 0);
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
@@ -1801,7 +1801,7 @@ fn a_full_last_buffer_is_pre_split_where_its_content_changes() {
     let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(19));
     encoder.write_all(&payload).unwrap();
     let compressed = encoder.finish().unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);

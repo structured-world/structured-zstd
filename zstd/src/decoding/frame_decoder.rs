@@ -208,6 +208,11 @@ pub struct FrameDecoder {
     /// caller-sized target, so detecting there put an atomic read and a branch
     /// on every call; feature detection belongs before the work, not inside it.
     kernel: crate::cpu_kernel::CpuKernelTag,
+    /// A dictionary [`Self::arm_dict`] installed before the decoder had a
+    /// frame state to hold it, taken by the first
+    /// [`Self::reset_with_active_dict`]. Only ever `Some` while `state` is
+    /// `None`: once a state exists the dictionary lives there.
+    armed_dict: Option<DictionaryHandle>,
 }
 
 /// How the decoder treats a frame's optional XXH64 content checksum
@@ -1149,6 +1154,7 @@ impl FrameDecoder {
             #[cfg(all(feature = "lsm", feature = "hash"))]
             computed_block_checksums: alloc::vec::Vec::new(),
             kernel: crate::cpu_kernel::detect_cpu_kernel(),
+            armed_dict: None,
         }
     }
 
@@ -1625,6 +1631,9 @@ impl FrameDecoder {
             }
             None => {
                 self.state = Some(FrameDecoderState::new_with_format(source, magicless)?);
+                // A frame that resolves its dictionary by ID drops one armed
+                // for a forced-dictionary stream that never started.
+                self.armed_dict = None;
                 self.state
                     .as_ref()
                     .and_then(|state| state.frame_header.dictionary_id())
@@ -1689,6 +1698,7 @@ impl FrameDecoder {
                     frame_header,
                     header_size,
                 )?);
+                self.armed_dict = None;
                 self.state
                     .as_ref()
                     .and_then(|state| state.frame_header.dictionary_id())
@@ -1754,26 +1764,48 @@ impl FrameDecoder {
         Ok(())
     }
 
+    /// Install `dict` as the dictionary [`Self::reset_with_active_dict`]
+    /// applies to the next frame, before that frame's header is read, so a
+    /// stream can be set up without touching its source. The dictionary is
+    /// validated here. A decoder already holding this dictionary keeps its
+    /// handle and touches no reference count.
+    pub(crate) fn arm_dict(&mut self, dict: &DictionaryHandle) -> Result<(), FrameDecoderError> {
+        Self::validate_dictionary_content(dict.as_dict())?;
+        match self.state.as_mut() {
+            Some(state) => state.set_active_dict(dict),
+            None => self.armed_dict = Some(dict.clone()),
+        }
+        Ok(())
+    }
+
     /// [`reset_with_dict_handle`](Self::reset_with_dict_handle) with the
-    /// dictionary the decode state already holds, for the frames that follow
-    /// a forced-dictionary frame in one stream. The handle is moved out and
-    /// back rather than passed in, so no reference count is touched.
+    /// dictionary the decoder already holds: the one [`Self::arm_dict`]
+    /// installed, or the one the previous frame of a forced-dictionary stream
+    /// used. The handle is moved out and back rather than passed in, so no
+    /// reference count is touched.
     pub(crate) fn reset_with_active_dict(
         &mut self,
         source: impl Read,
     ) -> Result<(), FrameDecoderError> {
-        let dict = self
+        let dict = match self
             .state
             .as_mut()
             .and_then(|state| state.active_dict.take())
-            .expect("a forced-dictionary stream's decoder holds its dictionary");
+        {
+            Some(dict) => dict,
+            None => self
+                .armed_dict
+                .take()
+                .expect("a forced-dictionary stream's decoder holds its dictionary"),
+        };
         let reset = self.reset_frame_for_dict(source, &dict);
         // Back in place whatever the outcome, so a failed header leaves the
-        // decoder holding its dictionary as before.
-        self.state
-            .as_mut()
-            .expect("the state the dictionary was taken from")
-            .active_dict = Some(dict);
+        // decoder holding its dictionary as before: in the state when there is
+        // one, armed when the first header failed before a state existed.
+        match self.state.as_mut() {
+            Some(state) => state.active_dict = Some(dict),
+            None => self.armed_dict = Some(dict),
+        }
         reset
     }
 
@@ -1802,6 +1834,7 @@ impl FrameDecoder {
             Some(s) => s.reset_with_format(source, magicless)?,
             None => {
                 self.state = Some(FrameDecoderState::new_with_format(source, magicless)?);
+                self.armed_dict = None;
             }
         }
         // Single source of truth: route through the same
@@ -1859,6 +1892,7 @@ impl FrameDecoder {
                     frame_header,
                     header_size,
                 )?);
+                self.armed_dict = None;
             }
         }
         #[cfg(feature = "lsm")]

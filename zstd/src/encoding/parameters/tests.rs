@@ -96,7 +96,6 @@ fn literal_compression_mode_changes_the_frame() {
         let mut source = frame;
         let mut out = alloc::vec::Vec::new();
         StreamingDecoder::new(&mut source)
-            .unwrap()
             .read_to_end(&mut out)
             .unwrap();
         out
