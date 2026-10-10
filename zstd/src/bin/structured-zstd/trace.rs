@@ -38,6 +38,8 @@ pub struct Trace {
     /// Whether frames are (de)compressed from and into whole buffers, as the
     /// benchmark does (`single-pass`), rather than streamed (`streaming`).
     single_pass: bool,
+    /// The line being written, kept so each frame reuses its allocation.
+    line: String,
 }
 
 impl Trace {
@@ -53,20 +55,24 @@ impl Trace {
             file,
             version,
             single_pass,
+            line: String::new(),
         })
     }
 
     /// Append the line for `frame` (`TRACE_log`).
     pub fn record(&mut self, frame: &Frame) -> io::Result<()> {
-        let line = line(self.version, self.single_pass, frame);
-        self.file.write_all(line.as_bytes())
+        self.line.clear();
+        write_line(&mut self.line, self.version, self.single_pass, frame);
+        self.file.write_all(self.line.as_bytes())
     }
 }
 
-/// The trace line for `frame`, in the reference's format: a duration of zero
-/// counts as a tenth of a nanosecond, and the ratio and speed take two
-/// decimals. Speed is bytes per nanosecond times a thousand, decimal MB/s.
-fn line(version: u32, single_pass: bool, frame: &Frame) -> String {
+/// Write the trace line for `frame` to `out`, in the reference's format: a
+/// duration of zero counts as a tenth of a nanosecond, and the ratio and speed
+/// take two decimals. Speed is bytes per nanosecond times a thousand, decimal
+/// MB/s.
+fn write_line(out: &mut String, version: u32, single_pass: bool, frame: &Frame) {
+    use std::fmt::Write as _;
     let method = match frame.method {
         Method::Compress => "compress",
         Method::Decompress => "decompress",
@@ -84,10 +90,12 @@ fn line(version: u32, single_pass: bool, frame: &Frame) -> String {
     let speed = frame.uncompressed_size as f64 * 1000.0 / duration;
     // Workers: this build compresses on the calling thread only, which the
     // reference reports as 0.
-    format!(
-        "zstd, {version}, {method}, {mode}, {}, 0, {}, {}, {}, {nanos}, {ratio:.2}, {speed:.2}\n",
+    writeln!(
+        out,
+        "zstd, {version}, {method}, {mode}, {}, 0, {}, {}, {}, {nanos}, {ratio:.2}, {speed:.2}",
         frame.level, frame.dictionary_size, frame.uncompressed_size, frame.compressed_size,
     )
+    .expect("formatting into a String cannot fail");
 }
 
 #[cfg(test)]

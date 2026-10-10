@@ -4872,6 +4872,31 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
+/// A destination that knows how many bytes it has taken, so a frame's
+/// compressed size is read off it after the frame rather than counted on the
+/// way in: a buffer already knows its length.
+trait BytesWritten {
+    fn bytes_written(&self) -> u64;
+}
+
+impl<W: Write> BytesWritten for CountingWriter<W> {
+    fn bytes_written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl BytesWritten for Vec<u8> {
+    fn bytes_written(&self) -> u64 {
+        self.len() as u64
+    }
+}
+
+impl<T: BytesWritten + ?Sized> BytesWritten for &mut T {
+    fn bytes_written(&self) -> u64 {
+        (**self).bytes_written()
+    }
+}
+
 /// Whether a file type is a named pipe.
 fn is_fifo_type(kind: &fs::FileType) -> bool {
     #[cfg(unix)]
@@ -5015,7 +5040,10 @@ fn stream<R: BufRead, W: Write>(
     let written = match opts.mode {
         Mode::Compress => compress_stream(
             &mut reader,
-            &mut sink,
+            CountingWriter {
+                inner: &mut sink,
+                written: 0,
+            },
             &FrameSettings {
                 pledged_size: pledged_size.or(opts.pledged_size),
                 ..FrameSettings::from_options(opts)
@@ -5554,7 +5582,7 @@ fn new_compressor(
 /// The encoder takes each piece straight from `reader`'s buffer: a file or
 /// stdin [`IO_CHUNK`] at a time, a slice in one piece. Returns the bytes of the
 /// frame written, and records the frame in the run's `--trace`.
-fn compress_stream<R: BufRead, W: Write>(
+fn compress_stream<R: BufRead, W: Write + BytesWritten>(
     reader: R,
     writer: W,
     settings: &FrameSettings,
@@ -5572,7 +5600,7 @@ fn compress_stream<R: BufRead, W: Write>(
 
 /// [`compress_stream`] on the run's context, which it leaves as the frame
 /// left it.
-fn compress_frame<R: BufRead, W: Write>(
+fn compress_frame<R: BufRead, W: Write + BytesWritten>(
     mut reader: R,
     writer: W,
     settings: &FrameSettings,
@@ -5581,11 +5609,8 @@ fn compress_frame<R: BufRead, W: Write>(
     // Timed from before the context is set up, as the reference starts the
     // trace in `ZSTD_compressBegin_internal`.
     let started = codecs.trace.is_some().then(std::time::Instant::now);
-    let counted = CountingWriter {
-        inner: writer,
-        written: 0,
-    };
-    let mut encoder = StreamingEncoder::with_context(counted, codecs.compressor(settings)?);
+    let before = writer.bytes_written();
+    let mut encoder = StreamingEncoder::with_context(writer, codecs.compressor(settings)?);
     let mut consumed = 0u64;
     if let Some(size) = settings.pledged_size {
         // The size is known exactly (a regular file, or `--stream-size`), so
@@ -5613,10 +5638,12 @@ fn compress_frame<R: BufRead, W: Write>(
         reader.consume(len);
         consumed += len as u64;
     }
+    // A writer only takes bytes, so its count has not gone down.
     let written = encoder
         .finish()
         .wrap_err("failed to finalize zstd frame")?
-        .written;
+        .bytes_written()
+        - before;
     if let Some(started) = started {
         let dictionary_size = codecs
             .encoder
@@ -5804,9 +5831,12 @@ fn decompress_stream<R: Read, W: Write>(
 /// `io::copy` would do the same through an 8 KiB buffer of its own.
 ///
 /// With a `trace` open, each frame the decoder finishes is recorded against
-/// `dictionary_size`, timed from the end of the one before (from the start for
-/// the first) to the moment the decoder verifies it, so neither the next
-/// frame's decoding nor the trace line's own write is counted in it.
+/// `dictionary_size`, timed as the decoder's own time on it: the calls into
+/// the decoder from the end of the frame before to the moment this one is
+/// verified. The writes to `writer` and the trace line's own write fall
+/// outside it, so the speed reported is the decoder's, whatever the sink. The
+/// reference times the span between its begin and end hooks instead, which
+/// takes in the caller's writes of every block but the last.
 fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::FrameDecoder>>(
     decoder: &mut structured_zstd::decoding::StreamingDecoder<R, D>,
     writer: &mut impl Write,
@@ -5814,12 +5844,16 @@ fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::
     trace: &mut Option<trace::Trace>,
     dictionary_size: u64,
 ) -> io::Result<u64> {
-    let mut since = trace.is_some().then(std::time::Instant::now);
+    let tracing = trace.is_some();
+    // The decoder's time spent on the frame in progress, over the calls so far.
+    let mut spent = std::time::Duration::ZERO;
     let mut written = 0u64;
     loop {
+        let mut mark = tracing.then(std::time::Instant::now);
         let read = decoder.read_reporting_frames(buffer, |frame| {
-            if let Some(started) = since.as_mut() {
-                let duration = started.elapsed();
+            if let Some(mark) = mark.as_mut() {
+                let duration = spent + mark.elapsed();
+                spent = std::time::Duration::ZERO;
                 trace_frame(
                     trace,
                     &trace::Frame {
@@ -5831,9 +5865,12 @@ fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::
                         duration,
                     },
                 );
-                *started = std::time::Instant::now();
+                *mark = std::time::Instant::now();
             }
         });
+        if let Some(mark) = mark {
+            spent += mark.elapsed();
+        }
         let n = match read {
             Ok(0) => return Ok(written),
             Ok(n) => n,
