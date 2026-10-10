@@ -3633,16 +3633,35 @@ fn every_decode_entry_point_refuses_the_reserved_descriptor_bit() {
     let err = magicless.init(&reserved[4..]).unwrap_err();
     assert!(is_reserved_bit(&err), "magicless init: {err:?}");
 
+    // The streaming decoder reads the first header on its first read; both
+    // read paths report the refusal as the decoder's own error.
+    let decoder_error = |err: crate::io::Error| {
+        let shown = alloc::format!("{err:?}");
+        let inner = err
+            .into_inner()
+            .and_then(|e| e.downcast::<FrameDecoderError>().ok())
+            .unwrap_or_else(|| panic!("not a decode error: {shown}"));
+        *inner
+    };
     let err = StreamingDecoder::new(&reserved[..])
-        .err()
-        .expect("StreamingDecoder must refuse the reserved bit");
-    assert!(is_reserved_bit(&err), "StreamingDecoder: {err:?}");
+        .read(&mut out)
+        .expect_err("StreamingDecoder::read must refuse the reserved bit");
+    let err = decoder_error(err);
+    assert!(is_reserved_bit(&err), "StreamingDecoder::read: {err:?}");
+    let mut decoded = Vec::new();
+    let err = StreamingDecoder::new(&reserved[..])
+        .read_to_end(&mut decoded)
+        .expect_err("StreamingDecoder::read_to_end must refuse the reserved bit");
+    let err = decoder_error(err);
+    assert!(
+        is_reserved_bit(&err),
+        "StreamingDecoder::read_to_end: {err:?}"
+    );
+    assert!(decoded.is_empty());
 
     let written = FrameDecoder::new().decode_all(&clean, &mut out).unwrap();
     assert_eq!(&out[..written], &[0xAA, 0xBB, 0xCC]);
-    let mut decoded = Vec::new();
     StreamingDecoder::new(&clean[..])
-        .unwrap()
         .read_to_end(&mut decoded)
         .unwrap();
     assert_eq!(decoded, [0xAA, 0xBB, 0xCC]);

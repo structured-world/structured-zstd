@@ -247,6 +247,10 @@ fn header_parsers_reject_the_reserved_descriptor_bit() {
     assert!(is_reserved_bit_error(
         &read_frame_content_size(&f).unwrap_err()
     ));
+    assert_eq!(
+        alloc::format!("{}", FrameDescriptorError::ReservedBitSet),
+        "Reserved_bit of the Frame_Header_Descriptor is set; it must be zero"
+    );
     for err in [
         find_frame_compressed_size(&f).unwrap_err(),
         frame_decompressed_bound(&f).unwrap_err(),

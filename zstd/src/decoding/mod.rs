@@ -311,15 +311,11 @@ pub fn frame_header_size(src: &[u8]) -> Result<usize, errors::ReadFrameHeaderErr
         // The reserved bit makes the frame undecodable, not its header
         // unmeasurable: upstream's `ZSTD_frameHeaderSize` reads the length off
         // the descriptor without looking at the bit. The parser refuses it only
-        // once the whole header is in hand, so the descriptor is at `src[4]`.
-        Err(
-            e @ errors::ReadFrameHeaderError::InvalidFrameDescriptor(
-                errors::FrameDescriptorError::ReservedBitSet,
-            ),
-        ) => match src.get(4) {
-            Some(&descriptor) => Ok(4 + frame::FrameDescriptor(descriptor).header_len()),
-            None => Err(e),
-        },
+        // once it has read the whole header, so `src[4]`, the descriptor, is
+        // in bounds.
+        Err(errors::ReadFrameHeaderError::InvalidFrameDescriptor(
+            errors::FrameDescriptorError::ReservedBitSet,
+        )) => Ok(4 + frame::FrameDescriptor(src[4]).header_len()),
         Err(e) => Err(e),
     }
 }
