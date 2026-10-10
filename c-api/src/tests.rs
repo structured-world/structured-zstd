@@ -3886,6 +3886,13 @@ fn the_reserved_descriptor_bit_is_frame_parameter_unsupported() {
     assert_eq!(ZSTD_getErrorCode(rc), unsupported, "ZSTD_decompressStream");
     unsafe { ZSTD_freeDCtx(dctx) };
 
+    let rc = unsafe { ZSTD_findFrameCompressedSize(frame.as_ptr(), frame.len()) };
+    assert_eq!(
+        ZSTD_getErrorCode(rc),
+        unsupported,
+        "ZSTD_findFrameCompressedSize"
+    );
+
     assert_eq!(
         unsafe { ZSTD_frameHeaderSize(frame.as_ptr(), frame.len()) },
         6

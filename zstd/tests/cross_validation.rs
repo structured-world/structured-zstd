@@ -676,6 +676,12 @@ fn reserved_descriptor_bit_is_refused_like_the_reference() {
         zstd_safe::get_error_name(code),
         "Unsupported frame parameter"
     );
+    let code = zstd_safe::find_frame_compressed_size(&reserved[..]).unwrap_err();
+    assert_eq!(
+        zstd_safe::get_error_name(code),
+        "Unsupported frame parameter",
+        "libzstd's compressed-size query refuses it the same way"
+    );
     let header_size = unsafe {
         zstd_safe::zstd_sys::ZSTD_frameHeaderSize(reserved.as_ptr().cast(), reserved.len())
     };

@@ -11,7 +11,7 @@ use codec::decoding::{
 };
 use codec::encoding::{CompressionLevel, FrameCompressor, compress_bound};
 
-use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
+use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, code_for_descriptor_error, encode};
 use crate::ffi::{in_slice, out_slice};
 
 /// `ZSTD_VERSION_NUMBER` for the vendored upstream: MAJOR*10000 + MINOR*100 +
@@ -199,14 +199,13 @@ pub unsafe extern "C" fn ZSTD_findFrameCompressedSize(src: *const u8, src_size: 
     match find_frame_compressed_size(src) {
         Ok(size) => size,
         // A non-zstd prefix (bad magic / skippable) is "unknown prefix", but a
-        // corrupt frame descriptor is a corrupt frame, not an unknown prefix:
-        // map it accordingly instead of hiding it as prefix_unknown. Mirrors
-        // `fill_frame_header`.
+        // refused frame descriptor is a frame, not an unknown prefix: map it
+        // as `fill_frame_header` does instead of hiding it as prefix_unknown.
         Err(FrameSizeError::Header(
             ReadFrameHeaderError::BadMagicNumber(_) | ReadFrameHeaderError::SkipFrame { .. },
         )) => encode(ZSTD_ErrorCode::ZSTD_error_prefix_unknown),
-        Err(FrameSizeError::Header(ReadFrameHeaderError::InvalidFrameDescriptor(_))) => {
-            encode(ZSTD_ErrorCode::ZSTD_error_corruption_detected)
+        Err(FrameSizeError::Header(ReadFrameHeaderError::InvalidFrameDescriptor(descriptor))) => {
+            encode(code_for_descriptor_error(&descriptor))
         }
         Err(FrameSizeError::Header(_)) => encode(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong),
         Err(FrameSizeError::Truncated) => encode(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong),

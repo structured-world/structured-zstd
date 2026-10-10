@@ -4,13 +4,13 @@
 
 use core::ffi::{c_uint, c_ulonglong};
 
-use codec::decoding::errors::{FrameDescriptorError, ReadFrameHeaderError};
+use codec::decoding::errors::ReadFrameHeaderError;
 use codec::decoding::{
     FrameContentSize, find_frame_compressed_size, frame_decompressed_bound, frame_header_size,
     read_frame_content_size, read_frame_header_info,
 };
 
-use crate::error::{ZSTD_ErrorCode, encode};
+use crate::error::{ZSTD_ErrorCode, code_for_descriptor_error, encode};
 use crate::ffi::in_slice;
 
 /// `(0ULL - 1)` — content size could not be determined.
@@ -80,11 +80,11 @@ pub unsafe extern "C" fn ZSTD_frameHeaderSize(src: *const u8, src_size: usize) -
         Err(ReadFrameHeaderError::BadMagicNumber(_)) => {
             encode(ZSTD_ErrorCode::ZSTD_error_prefix_unknown)
         }
-        // A bad frame descriptor is a corrupt frame, not a too-short read:
+        // A bad frame descriptor is a refused frame, not a too-short read:
         // report it as such (mirrors `fill_frame_header`) instead of the
         // retryable `srcSize_wrong`.
-        Err(ReadFrameHeaderError::InvalidFrameDescriptor(_)) => {
-            encode(ZSTD_ErrorCode::ZSTD_error_corruption_detected)
+        Err(ReadFrameHeaderError::InvalidFrameDescriptor(descriptor)) => {
+            encode(code_for_descriptor_error(&descriptor))
         }
         // The remaining variants are genuine short reads.
         Err(_) => encode(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong),
@@ -142,13 +142,8 @@ unsafe fn fill_frame_header(zfh: *mut ZSTD_FrameHeader, src: &[u8], magicless: b
         Err(ReadFrameHeaderError::BadMagicNumber(_) | ReadFrameHeaderError::SkipFrame { .. }) => {
             encode(ZSTD_ErrorCode::ZSTD_error_prefix_unknown)
         }
-        // Upstream refuses a set Reserved_bit as an unsupported frame
-        // parameter (`zstd_decompress.c:511`).
-        Err(ReadFrameHeaderError::InvalidFrameDescriptor(FrameDescriptorError::ReservedBitSet)) => {
-            encode(ZSTD_ErrorCode::ZSTD_error_frameParameter_unsupported)
-        }
-        Err(ReadFrameHeaderError::InvalidFrameDescriptor(_)) => {
-            encode(ZSTD_ErrorCode::ZSTD_error_corruption_detected)
+        Err(ReadFrameHeaderError::InvalidFrameDescriptor(descriptor)) => {
+            encode(code_for_descriptor_error(&descriptor))
         }
         // The remaining variants are short-read failures: ask for more input.
         Err(_) => FRAMEHEADERSIZE_MAX,

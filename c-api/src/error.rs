@@ -141,6 +141,20 @@ pub fn code_for_training_error(err: &std::io::Error) -> ZSTD_ErrorCode {
     }
 }
 
+/// Map a refused frame header descriptor to the code upstream returns. The one
+/// mapping for every entry point that parses a header, so they cannot drift
+/// apart.
+pub fn code_for_descriptor_error(err: &FrameDescriptorError) -> ZSTD_ErrorCode {
+    match err {
+        // Upstream refuses a set Reserved_bit as an unsupported frame
+        // parameter (`zstd_decompress.c:511`).
+        FrameDescriptorError::ReservedBitSet => {
+            ZSTD_ErrorCode::ZSTD_error_frameParameter_unsupported
+        }
+        _ => ZSTD_ErrorCode::ZSTD_error_corruption_detected,
+    }
+}
+
 /// Map a decoder error to the closest stable `ZSTD_ErrorCode`. Conservative:
 /// any variant without an exact upstream analogue (including the
 /// feature-gated and future ones caught by the wildcard) collapses to
@@ -148,11 +162,9 @@ pub fn code_for_training_error(err: &std::io::Error) -> ZSTD_ErrorCode {
 pub fn code_for_decoder_error(err: &FrameDecoderError) -> ZSTD_ErrorCode {
     use ZSTD_ErrorCode::*;
     match err {
-        // Upstream refuses a set Reserved_bit as an unsupported frame
-        // parameter (`zstd_decompress.c:511`).
         FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::InvalidFrameDescriptor(
-            FrameDescriptorError::ReservedBitSet,
-        )) => ZSTD_error_frameParameter_unsupported,
+            descriptor,
+        )) => code_for_descriptor_error(descriptor),
         FrameDecoderError::ReadFrameHeaderError(_) => ZSTD_error_prefix_unknown,
         FrameDecoderError::FrameHeaderError(_) | FrameDecoderError::FailedToInitialize(_) => {
             ZSTD_error_frameParameter_unsupported
