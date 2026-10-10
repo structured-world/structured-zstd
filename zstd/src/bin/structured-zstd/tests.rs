@@ -2474,6 +2474,32 @@ fn the_decode_window_follows_the_command_line() {
     );
 }
 
+/// A benchmark holds its input, frames, decoded copy, encoder and dictionaries
+/// while it decodes, so under `-M` its window may have only what the promise
+/// leaves after them and the decoder's other buffers; without `-M` nothing is
+/// promised and the run's own ceiling stands.
+#[test]
+fn a_benchmark_window_leaves_room_for_what_the_benchmark_holds() {
+    use structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE;
+
+    let mut opts = parse(&["-b19", "-M600MB", "--long=29", "f"]).unwrap();
+    opts.decode_window = decode_window_ceiling(&opts, 0);
+    let held = 400u64 << 20;
+    assert_eq!(
+        bench_decode_settings(&opts, Some(held)).max_window,
+        (600 << 20) - held - DECODER_AUXILIARY_BYTES
+    );
+    // The default window is always left: the limit was checked to cover it.
+    let tight = (600u64 << 20) - MAXIMUM_ALLOWED_WINDOW_SIZE;
+    assert_eq!(
+        bench_decode_settings(&opts, Some(tight)).max_window,
+        MAXIMUM_ALLOWED_WINDOW_SIZE
+    );
+    let mut free = parse(&["-b19", "--long=29", "f"]).unwrap();
+    free.decode_window = decode_window_ceiling(&free, 0);
+    assert_eq!(bench_decode_settings(&free, None).max_window, 1 << 29);
+}
+
 /// Decoding takes the decoder's widest window by `--long=N`, past what the
 /// encoder writes, as the reference command's `-d --long=31` does on a 64-bit
 /// build; compressing still stops at what this build writes.

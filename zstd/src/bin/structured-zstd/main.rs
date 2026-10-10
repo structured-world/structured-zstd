@@ -3071,6 +3071,9 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
 
     // Those whole-file buffers dwarf the decoder's own workspace, so a ceiling
     // that ignored them would be kept in the small and broken in the large.
+    // What they add up to is kept: the decoder's window gets only what the
+    // limit leaves past them (see `bench_decode_settings`).
+    let mut held = None;
     if let Some(limit) = opts.memory_limit {
         // With `-S` only one input is in memory at a time, so the largest file
         // is what has to fit rather than their sum.
@@ -3159,14 +3162,17 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         // while they are built from it. All of it is counted with the buffers
         // rather than on its own, since allocations that each clear the ceiling
         // separately can still exceed it together.
+        let mut total = buffers;
         if let Some(bytes) = &dict {
-            let total = (bytes.len() as u64)
+            total = (bytes.len() as u64)
                 .checked_mul(3)
                 .and_then(|dictionaries| buffers.checked_add(dictionaries))
                 .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
             check_memory_limit(limit, total, 1)?;
         }
+        held = Some(total);
     }
+    let decode = bench_decode_settings(opts, held);
 
     // Both directions are measured in turn, so both forms are wanted — parsed
     // here, once, rather than inside the timed loops below. The blob is then
@@ -3189,7 +3195,7 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         let data = data.map_err(|err| {
             eyre!("-b: not enough memory for {size} bytes of generated data: {err}")
         })?;
-        return benchmark_one(opts, codecs, &label, &data, &sizes);
+        return benchmark_one(opts, codecs, &decode, &label, &data, &sizes);
     }
 
     if opts.bench_separately {
@@ -3199,6 +3205,7 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
             benchmark_one(
                 opts,
                 codecs,
+                &decode,
                 &input.display().to_string(),
                 &data,
                 std::slice::from_ref(size),
@@ -3214,7 +3221,30 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         [only] => only.display().to_string(),
         many => format!(" {} files", many.len()),
     };
-    benchmark_one(opts, codecs, &label, &data, &sizes)
+    benchmark_one(opts, codecs, &decode, &label, &data, &sizes)
+}
+
+/// The settings a benchmark decodes with. `held` is what the benchmark holds
+/// while it decodes (input, frames, decoded copy, encoder, dictionaries), as
+/// weighed against `-M`; the window may have only what the promise leaves after
+/// it and the decoder's other buffers. The limit was checked to leave at least
+/// the default window, which stays the floor.
+fn bench_decode_settings(opts: &Options, held: Option<u64>) -> DecodeSettings {
+    use structured_zstd::decoding::{MAX_DECODER_WINDOW_SIZE, MAXIMUM_ALLOWED_WINDOW_SIZE};
+
+    let settings = DecodeSettings::from_options(opts);
+    let (Some(limit), Some(held)) = (opts.memory_limit, held) else {
+        return settings;
+    };
+    let overhead = held.checked_add(DECODER_AUXILIARY_BYTES);
+    DecodeSettings {
+        max_window: overhead
+            .and_then(|overhead| limit.checked_sub(overhead))
+            .unwrap_or(0)
+            .clamp(MAXIMUM_ALLOWED_WINDOW_SIZE, MAX_DECODER_WINDOW_SIZE),
+        memory_overhead: overhead,
+        ..settings
+    }
 }
 
 /// Read every input into one buffer, taking no more room — and no more bytes —
@@ -3317,10 +3347,12 @@ fn bench_frames_extent(file_sizes: &[u64], block_size: Option<u64>) -> Option<(u
 /// Measure one benchmark subject: every input together, or a single file under
 /// `-S`. Split out so the two modes differ only in what they hand over, not in
 /// how the measurement is taken. `file_sizes` are the lengths of the inputs
-/// `data` holds, in order; each is compressed as frames of its own.
+/// `data` holds, in order; each is compressed as frames of its own. `decode`
+/// is what the frames are decoded with (see [`bench_decode_settings`]).
 fn benchmark_one(
     opts: &Options,
     codecs: &mut Codecs,
+    decode: &DecodeSettings,
     label: &str,
     data: &[u8],
     file_sizes: &[u64],
@@ -3431,12 +3463,7 @@ fn benchmark_one(
         loop {
             decoded.clear();
             let t = Instant::now();
-            decompress_stream(
-                compressed.as_slice(),
-                &mut decoded,
-                codecs,
-                &DecodeSettings::from_options(opts),
-            )?;
+            decompress_stream(compressed.as_slice(), &mut decoded, codecs, decode)?;
             best_decompress = best_decompress.min(t.elapsed().as_secs_f64());
             if start.elapsed().as_secs_f64() >= opts.bench_secs {
                 break;

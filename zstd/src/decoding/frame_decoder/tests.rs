@@ -3674,6 +3674,43 @@ fn frame_with_window_log(log: u8) -> Vec<u8> {
     frame
 }
 
+/// Lowering the ceiling below the window of a frame already started takes
+/// effect on that frame: its next decode step is refused rather than reserving
+/// the window the new ceiling forbids. Raising it again lets the frame go on,
+/// and the next frame starts against the ceiling then in force.
+#[test]
+fn lowering_the_ceiling_binds_the_frame_in_progress() {
+    use crate::decoding::BlockDecodingStrategy;
+
+    let frame = frame_with_window_log(28);
+    let mut decoder = FrameDecoder::new();
+    decoder.set_max_window_size(1 << 28).unwrap();
+    let mut source = frame.as_slice();
+    decoder.init(&mut source).unwrap();
+    decoder.set_max_window_size(1 << 27).unwrap();
+    match decoder.decode_blocks(&mut source, BlockDecodingStrategy::All) {
+        Err(FrameDecoderError::WindowSizeTooBig { requested, limit }) => {
+            assert_eq!((requested, limit), (1 << 28, 1 << 27));
+        }
+        other => panic!("the lowered ceiling must refuse the frame: {other:?}"),
+    }
+    decoder.set_max_window_size(1 << 28).unwrap();
+    decoder
+        .decode_blocks(&mut source, BlockDecodingStrategy::All)
+        .unwrap();
+    let mut decoded = Vec::new();
+    decoder.collect_to_writer(&mut decoded).unwrap();
+    assert_eq!(decoded, b"abc");
+
+    decoder.set_max_window_size(1 << 27).unwrap();
+    let narrow = frame_with_window_log(27);
+    let mut source = narrow.as_slice();
+    decoder.init(&mut source).unwrap();
+    decoder
+        .decode_blocks(&mut source, BlockDecodingStrategy::All)
+        .unwrap();
+}
+
 /// The window a decoder accepts on the paths that hold the window itself is
 /// 128 MiB by default, as upstream's `ZSTD_d_windowLogMax` default is, and a
 /// caller raises it the way upstream's `ZSTD_DCtx_setMaxWindowSize` does. A

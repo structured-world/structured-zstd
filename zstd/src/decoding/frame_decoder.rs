@@ -860,6 +860,10 @@ struct FrameDecoderState {
     /// borrows from this field (disjoint from `decoder_scratch`) with zero
     /// further clones. `None` on the no-dict path. Cleared by `reset`.
     active_dict: Option<DictionaryHandle>,
+    /// A ceiling lowered below this frame's window after the frame started;
+    /// see [`FrameDecoder::set_max_window_size`]. Every decode step of the frame
+    /// is refused while it is set. Cleared when the next frame starts.
+    window_refused_at: Option<u64>,
 }
 
 pub enum BlockDecodingStrategy {
@@ -1046,6 +1050,7 @@ impl FrameDecoderState {
             check_sum: None,
             using_dict: None,
             active_dict: None,
+            window_refused_at: None,
         })
     }
 
@@ -1095,6 +1100,7 @@ impl FrameDecoderState {
         self.bytes_read_counter = u64::from(header_size);
         self.check_sum = None;
         self.using_dict = None;
+        self.window_refused_at = None;
         // `active_dict` is intentionally NOT cleared here: it is only ever READ
         // while a scratch table source is `Dict`, which `init_from_dict` arms
         // on a dict frame and which a no-dict frame leaves `Local` (so a stale
@@ -1381,6 +1387,11 @@ impl FrameDecoder {
     /// [`MAX_DECODER_WINDOW_SIZE`](crate::decoding::MAX_DECODER_WINDOW_SIZE)
     /// bounds it there, as upstream's `ZSTD_decompressDCtx`.
     ///
+    /// A ceiling lowered below the window of a frame already started binds that
+    /// frame too: its next decode step fails with
+    /// [`FrameDecoderError::WindowSizeTooBig`] instead of reserving the window,
+    /// until the ceiling is raised again or the next frame starts.
+    ///
     /// # Errors
     ///
     /// [`FrameDecoderError::WindowCeilingOutOfRange`] when `size` lies
@@ -1405,6 +1416,30 @@ impl FrameDecoder {
             return Err(FrameDecoderError::WindowCeilingOutOfRange { requested: size });
         }
         self.max_window_size = size;
+        // Upstream refuses a parameter change mid-frame outright (`stage_wrong`);
+        // refusing only the frame the new ceiling forbids keeps a decoder whose
+        // frame was abandoned free to take a new ceiling for the next one.
+        // The header was admitted when the frame started, so its window reads.
+        if let Some(state) = self.state.as_mut()
+            && !state.frame_finished
+            && let Ok(window) = state.frame_header.window_size()
+        {
+            state.window_refused_at = (window > size).then_some(size);
+        }
+        Ok(())
+    }
+
+    /// Refuse the frame in progress when the ceiling was lowered below its
+    /// window after it started (see [`Self::set_max_window_size`]).
+    fn check_window_still_admitted(&self) -> Result<(), FrameDecoderError> {
+        if let Some(state) = self.state.as_ref()
+            && let Some(limit) = state.window_refused_at
+        {
+            return Err(FrameDecoderError::WindowSizeTooBig {
+                requested: state.frame_header.window_size()?,
+                limit,
+            });
+        }
         Ok(())
     }
 
@@ -2230,6 +2265,7 @@ impl FrameDecoder {
         strat: BlockDecodingStrategy,
     ) -> Result<bool, FrameDecoderError> {
         use FrameDecoderError as err;
+        self.check_window_still_admitted()?;
         // Apply the content-checksum mode to the streaming drain hash before
         // any block decodes into the ring. Hash only when a digest is both
         // wanted (mode != None) AND present in the frame (content_checksum_flag
@@ -2851,6 +2887,7 @@ impl FrameDecoder {
         reserve_window: bool,
     ) -> Result<(usize, usize), FrameDecoderError> {
         use FrameDecoderError as err;
+        self.check_window_still_admitted()?;
         let bytes_read_at_start = match &self.state {
             Some(s) => s.bytes_read_counter,
             None => 0,
