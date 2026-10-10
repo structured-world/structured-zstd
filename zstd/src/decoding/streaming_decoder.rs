@@ -672,6 +672,9 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
                 if written > 0 {
                     return Ok(written);
                 }
+                // A ceiling lowered while the block was open refuses the rest
+                // of it, as it refuses every other step of the frame.
+                decoder.check_window_still_admitted().map_err(frame_error)?;
                 // The block stays recorded until the read has delivered: a
                 // `WouldBlock` returns here with the block still open.
                 let left = self.input.raw.as_ref().map_or(0, |raw| raw.left);

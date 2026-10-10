@@ -3711,6 +3711,150 @@ fn lowering_the_ceiling_binds_the_frame_in_progress() {
         .unwrap();
 }
 
+/// A streaming read paused between a wide frame's header and its first block,
+/// then resumed after the ceiling was lowered, is refused: the Raw block's
+/// content would otherwise go straight into a window the new ceiling forbids.
+#[test]
+fn lowering_the_ceiling_binds_a_paused_streaming_read() {
+    use crate::decoding::StreamingDecoder;
+    use crate::io::{Error, ErrorKind, Read};
+
+    /// Hands over the first `pause_at` bytes, then blocks once, then the rest.
+    struct PausesAt<'a> {
+        data: &'a [u8],
+        at: usize,
+        pause_at: usize,
+        paused: bool,
+    }
+    impl Read for PausesAt<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+            if self.at == self.pause_at && !self.paused {
+                self.paused = true;
+                return Err(Error::from(ErrorKind::WouldBlock));
+            }
+            let end = if self.at < self.pause_at {
+                self.pause_at
+            } else {
+                self.data.len()
+            };
+            let n = buf.len().min(end - self.at);
+            buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    let frame = frame_with_window_log(28);
+    // After the frame header (6 bytes), and inside the Raw block once its own
+    // header (3 more) is read.
+    for pause_at in [6, 9] {
+        let mut decoder = FrameDecoder::new();
+        decoder.set_max_window_size(1 << 28).unwrap();
+        let source = PausesAt {
+            data: &frame,
+            at: 0,
+            pause_at,
+            paused: false,
+        };
+        let mut stream = StreamingDecoder::new_with_decoder(source, &mut decoder);
+        let mut out = [0u8; 8];
+        let paused = stream.read(&mut out).expect_err("the source blocks");
+        assert_eq!(paused.kind(), ErrorKind::WouldBlock, "pause at {pause_at}");
+        stream.decoder_mut().set_max_window_size(1 << 27).unwrap();
+        let refused = stream
+            .read(&mut out)
+            .expect_err("the lowered ceiling refuses");
+        match refused
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<FrameDecoderError>())
+        {
+            Some(FrameDecoderError::WindowSizeTooBig { requested, limit }) => {
+                assert_eq!((*requested, *limit), (1 << 28, 1 << 27));
+            }
+            other => panic!("pause at {pause_at}: expected WindowSizeTooBig, got {other:?}"),
+        }
+        drop(stream);
+        // Paused before the block began, nothing of the window was reserved
+        // under the old ceiling, and the refusal reserves none under the new.
+        if pause_at == 6 {
+            assert!(
+                ring_capacity(&decoder) < 1 << 27,
+                "the refused frame reserved {} bytes",
+                ring_capacity(&decoder)
+            );
+        }
+    }
+}
+
+/// `read_to_end` on a frame that declares its size decodes straight into the
+/// caller's vector, and a ceiling lowered after the frame started refuses it
+/// there too, as on every other path that decodes a step of the frame.
+#[test]
+fn lowering_the_ceiling_binds_read_to_end() {
+    use crate::decoding::StreamingDecoder;
+    use crate::io::{Error, ErrorKind, Read};
+
+    /// Hands over the frame header, then blocks once, then the rest.
+    struct PausesAfterHeader<'a> {
+        data: &'a [u8],
+        at: usize,
+        paused: bool,
+    }
+    const HEADER: usize = 10;
+    impl Read for PausesAfterHeader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+            if self.at == HEADER && !self.paused {
+                self.paused = true;
+                return Err(Error::from(ErrorKind::WouldBlock));
+            }
+            let end = if self.at < HEADER {
+                HEADER
+            } else {
+                self.data.len()
+            };
+            let n = buf.len().min(end - self.at);
+            buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    // Declared size 3 in a 4-byte field, not single-segment, window 2^28,
+    // then one last raw block of `abc`.
+    let mut frame = alloc::vec![0x28, 0xB5, 0x2F, 0xFD, 0x80, (28 - 10) << 3];
+    frame.extend_from_slice(&3u32.to_le_bytes());
+    frame.extend_from_slice(&[0x19, 0x00, 0x00]);
+    frame.extend_from_slice(b"abc");
+
+    let mut decoder = FrameDecoder::new();
+    decoder.set_max_window_size(1 << 28).unwrap();
+    let source = PausesAfterHeader {
+        data: &frame,
+        at: 0,
+        paused: false,
+    };
+    let mut stream = StreamingDecoder::new_with_decoder(source, &mut decoder);
+    let paused = stream
+        .read(&mut [0u8; 8])
+        .expect_err("the source blocks after the header");
+    assert_eq!(paused.kind(), ErrorKind::WouldBlock);
+    stream.decoder_mut().set_max_window_size(1 << 27).unwrap();
+    let mut out = Vec::new();
+    let refused = stream
+        .read_to_end(&mut out)
+        .expect_err("the lowered ceiling refuses");
+    assert!(
+        matches!(
+            refused
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<FrameDecoderError>()),
+            Some(FrameDecoderError::WindowSizeTooBig { .. })
+        ),
+        "{refused:?}"
+    );
+    assert!(out.is_empty());
+}
+
 /// The partial decode holds the window too, so a ceiling lowered below the
 /// frame's window after it started refuses it there as well.
 #[cfg(feature = "lsm")]

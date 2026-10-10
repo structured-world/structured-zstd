@@ -1430,8 +1430,9 @@ impl FrameDecoder {
     }
 
     /// Refuse the frame in progress when the ceiling was lowered below its
-    /// window after it started (see [`Self::set_max_window_size`]).
-    fn check_window_still_admitted(&self) -> Result<(), FrameDecoderError> {
+    /// window after it started (see [`Self::set_max_window_size`]). Every
+    /// entry that decodes a step of the frame asks first.
+    pub(crate) fn check_window_still_admitted(&self) -> Result<(), FrameDecoderError> {
         if let Some(state) = self.state.as_ref()
             && let Some(limit) = state.window_refused_at
         {
@@ -1517,6 +1518,8 @@ impl FrameDecoder {
         header: &[u8; 3],
         reserve_window: bool,
     ) -> Result<Option<(u32, bool)>, FrameDecoderError> {
+        // Before the window is reserved below.
+        self.check_window_still_admitted()?;
         let kernel = self.kernel;
         #[cfg(feature = "hash")]
         let checksum_mode = self.content_checksum;
@@ -3246,6 +3249,7 @@ impl FrameDecoder {
         output: &mut Vec<u8>,
         keep_dictionary: bool,
     ) -> Result<usize, FrameDecoderError> {
+        self.check_window_still_admitted()?;
         let start_len = output.len();
         // The current frame is already initialised (its header consumed by the
         // caller, WITH the dictionary applied if the decoder was constructed
