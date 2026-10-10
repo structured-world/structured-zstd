@@ -11,7 +11,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, ErrorKind, IsTerminal, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use structured_zstd::encoding::{
@@ -2205,8 +2205,8 @@ struct Codecs {
     /// first frame and reused by the rest.
     decompressor: structured_zstd::decoding::FrameDecoder,
     /// What the decoder fills before each write, [`IO_CHUNK`] once the first
-    /// stream allocates it, and kept for the rest of the run.
-    decoded: Vec<u8>,
+    /// frame allocates it, and kept for the rest of the run.
+    chunk: Vec<u8>,
 }
 
 /// The piece the command reads and writes at a time: one block, the size of
@@ -4791,8 +4791,13 @@ fn progress_monitor<R: Read>(opts: &Options, reader: R, total: Option<u64>) -> P
 
 /// The counter over stdin: drawn like a file's, over the `--stream-size`
 /// pledge when there is one, since stdin has no length of its own to stat.
-fn stdin_monitor<R: Read>(opts: &Options, reader: R) -> ProgressMonitor<R> {
-    progress_monitor(opts, reader, opts.pledged_size)
+/// Read [`IO_CHUNK`] at a time, as a file is.
+fn stdin_monitor<R: Read>(opts: &Options, reader: R) -> ProgressMonitor<BufReader<R>> {
+    progress_monitor(
+        opts,
+        BufReader::with_capacity(IO_CHUNK, reader),
+        opts.pledged_size,
+    )
 }
 
 /// Run the mode's codec from `reader` into `sink` and count both sides.
@@ -4800,7 +4805,7 @@ fn stdin_monitor<R: Read>(opts: &Options, reader: R) -> ProgressMonitor<R> {
 /// `--stream-size` stands in when it does not. `decode` is how THIS input is
 /// decoded, its destination included. `-t` decodes into nothing, whatever sink
 /// it was handed.
-fn stream<R: Read, W: Write>(
+fn stream<R: BufRead, W: Write>(
     opts: &Options,
     codecs: &mut Codecs,
     mut reader: ProgressMonitor<R>,
@@ -5345,7 +5350,9 @@ fn new_compressor(
 }
 
 /// Streaming compression core (file or stdout), optionally dictionary-primed.
-fn compress_stream<R: Read, W: Write>(
+/// The encoder takes each piece straight from `reader`'s buffer: a file or
+/// stdin [`IO_CHUNK`] at a time, a slice in one piece.
+fn compress_stream<R: BufRead, W: Write>(
     reader: R,
     writer: W,
     settings: &FrameSettings,
@@ -5363,7 +5370,7 @@ fn compress_stream<R: Read, W: Write>(
 
 /// [`compress_stream`] on the run's context, which it leaves as the frame
 /// left it.
-fn compress_frame<R: Read, W: Write>(
+fn compress_frame<R: BufRead, W: Write>(
     mut reader: R,
     writer: W,
     settings: &FrameSettings,
@@ -5379,7 +5386,22 @@ fn compress_frame<R: Read, W: Write>(
             .set_pledged_content_size(size)
             .wrap_err("failed to set pledged content size")?;
     }
-    io::copy(&mut reader, &mut encoder).wrap_err("streaming compression failed")?;
+    // `io::copy` would pass the data through an 8 KiB buffer of its own.
+    loop {
+        let piece = match reader.fill_buf() {
+            Ok(piece) => piece,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err).wrap_err("streaming compression failed"),
+        };
+        if piece.is_empty() {
+            break;
+        }
+        let len = piece.len();
+        encoder
+            .write_all(piece)
+            .wrap_err("streaming compression failed")?;
+        reader.consume(len);
+    }
     encoder.finish().wrap_err("failed to finalize zstd frame")?;
     Ok(())
 }
@@ -5419,10 +5441,9 @@ fn decompress_stream<R: Read, W: Write>(
     let Codecs {
         decoder: handle,
         decompressor,
-        decoded,
+        chunk,
         ..
     } = codecs;
-    decoded.resize(IO_CHUNK, 0);
     let mut source = BufReader::new(reader);
     let mut frames = 0u64;
     let mut written = 0u64;
@@ -5502,8 +5523,10 @@ fn decompress_stream<R: Read, W: Write>(
             });
         // The decoder reads every frame and skippable frame of the stream, the
         // first one's header included, so whatever is wrong with the input is
-        // reported here.
-        let err = match drain_decoded(&mut decoder, &mut writer, decoded) {
+        // reported here. The chunk is taken only now, by input that is a
+        // frame: plain or empty input never decodes into it.
+        chunk.resize(IO_CHUNK, 0);
+        let err = match drain_decoded(&mut decoder, &mut writer, chunk) {
             Ok(n) => {
                 written += n;
                 continue;
