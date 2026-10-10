@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791469284260,
+  "lastUpdate": 1791623439387,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -12239,6 +12239,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.166,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "117f597a97e057c6d5b50db9f7052b3cb9d118a9",
+          "message": "feat(decode)!: start the first frame on the first read (#561)\n\n## Summary\n\n`StreamingDecoder` no longer reads from its source when it is\nconstructed. The first frame header, any leading skippable frames and\ntheir errors are handled by the first `read` or `read_to_end`, through\nthe same buffered frame start the following frames already used.\nUpstream works the same way: a `ZSTD_DStream` reads nothing until\n`ZSTD_decompressStream` feeds it.\n\nWhy: a container reader such as `zip` switches between a decompressing\nreader and the raw reader. It needs two things, which the `zstd` crate\nwas asked for in gyscos/zstd-rs#381 and gyscos/zstd-rs#382:\n\n- a decoder that was built but never read hands the source back\nuntouched;\n- a damaged first frame does not drop an owned source.\n\nMeasured on a 10-byte frame followed by trailing bytes:\n\n| Scenario | before | after |\n|---|---|---|\n| `new` then `into_inner()`, nothing read | source at 6 | source at 0 |\n| leading skippable frame, nothing read | source at 18 | source at 0 |\n| payload read exactly, then `into_inner()` | 10 (end of frame) | 10 |\n| corrupt data in an owned source | constructor error, source dropped |\n`read` error, source returned by `into_inner()` |\n\n## Changes\n\n- `StreamingDecoder::new` and `new_with_decoder` return `Self`. The\ndictionary constructors fail only on dictionary content.\n- A forced dictionary is armed in `FrameDecoder` before the first header\n(`arm_dict`). Reusing a decoder for the same dictionary still takes no\nnew handle.\n- An empty source is still an error, reported by the first read. A\nstream made only of skippable frames still decodes to nothing.\n- `FrameDecoderError::FailedToReadSkippableFrame` is removed. A source\nerror inside a leading skippable frame comes back as the source reported\nit, as it already did after the first frame.\n- Both `read_to_end` implementations share one body. The first frame\nheader is read the bounded way, a step at a time, before the rest of the\nsource is gathered for the direct path, so an input that is not zstd is\nrefused after a header's worth of bytes.\n- The decode and interop fuzz targets use the infallible constructor.\n- `structured-zstd` is set to 0.1.0, since on a 0.0.x version\nrelease-plz turns a breaking commit into a patch bump. The `c-api` and\n`ffi-bench` requirements on it move to `0.1`.\n- The CLI reports frame errors from the read. It tells a failing input\ndevice apart from damaged data by watching its source; its messages are\nunchanged.\n- Rustdoc for the constructors and `into_inner`, and the README\ndecompression section, state the new contract.\n\n## Testing\n\n- `read_to_end` on a 1 MiB input that is not zstd takes at most a\nheader's worth of bytes before refusing it; `read_to_end` at the end of\nthe stream appends nothing.\n- New tests: `into_inner` before any read leaves the source unread\n(plain stream, skippable frame first, forced dictionary); a damaged\nfirst frame fails the read and keeps the source; an empty source is an\nerror on both read paths; a reused decoder applies the forced dictionary\nto every first frame. The `WouldBlock` tests now trickle the first frame\nheader too.\n- Fuzz regressions that relied on a constructor succeeding now check the\nheader explicitly with `FrameDecoder::init`.\n- Locally on macOS: `cargo fmt --check`, every clippy configuration from\nCI (including `--no-default-features`), rustdoc with `-D warnings`,\n`cargo nextest run -p structured-zstd` (1412 passed), doctests, `cargo\nnextest run -p ffi-bench -p structured-zstd-c` (132 passed), and `cargo\ncheck` of the fuzz crate.\n\nBREAKING CHANGE: StreamingDecoder::new and new_with_decoder return Self\ninstead of Result, and frame errors move from the constructors to the\nfirst read.\n\nCloses #560",
+          "timestamp": "2026-10-10T08:24:04Z",
+          "tree_id": "f9cea2bd5a691c4b3cfdd09d64806f21a93b441a",
+          "url": "https://github.com/structured-world/structured-zstd/commit/117f597a97e057c6d5b50db9f7052b3cb9d118a9"
+        },
+        "date": 1791623410667,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.059,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 150.013,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 222.184,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.491,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.188,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.377,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.935,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.406,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.963,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 8.398,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.714,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.087,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.211,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.371,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.19,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.515,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.283,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.187,
             "unit": "ms"
           }
         ]
