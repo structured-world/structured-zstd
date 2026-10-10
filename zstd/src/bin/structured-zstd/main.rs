@@ -356,7 +356,10 @@ enum SuffixCase {
     /// and in `--fast=3k` a tail the option drops.
     Upper,
     /// Lower case as well. Only for a value that must be a number and nothing
-    /// else, where `4kb` cannot mean anything but four kibibytes.
+    /// else, where `4kb` cannot mean anything but four kibibytes. The
+    /// reference refuses it; reading it is a superset of its grammar that no
+    /// valid command line changes meaning under, and these options took lower
+    /// case here before they took the reference's other spellings.
     Any,
 }
 
@@ -1274,11 +1277,16 @@ fn parse_args_into(
                 | "mmap-dict"
                 | "no-mmap-dict"
                 | "row-match-finder"
-                | "no-row-match-finder"
-                // Traces the reference implementation's own file-system calls
-                // by their C names; there is nothing of ours that output
-                // would describe.
-                | "trace-file-stat" => {}
+                | "no-row-match-finder" => {}
+                // The reference prints a trace of its own file-system helpers
+                // by their C names (`UTIL_stat`, `UTIL_isLink`, ...). There is
+                // nothing of ours that output would describe, and taking the
+                // option silently would leave a script waiting for a trace
+                // that never comes.
+                "trace-file-stat" => bail!(
+                    "--trace-file-stat traces the reference implementation's own file-system \
+                     calls; this build has none to trace"
+                ),
                 "priority=rt" => opts.bench_realtime = true,
                 "fake-stdin-is-console" => opts.console.stdin = true,
                 "fake-stdout-is-console" => opts.console.stdout = true,
@@ -3102,19 +3110,6 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     let codecs = &mut Codecs::prepare(dict.as_deref(), opts.patch_from.is_some(), true, true)?;
     drop(dict);
 
-    if opts.bench_realtime {
-        display!(opts.verbosity, 2, "Note : switching to real-time priority ");
-        // The reference ignores a refusal too: without the privilege the
-        // measurement still runs, at the ordinary priority.
-        if !priority::raise_to_realtime() {
-            display!(
-                opts.verbosity,
-                3,
-                "Note : real-time priority was refused; measuring at the ordinary priority"
-            );
-        }
-    }
-
     if synthetic {
         // `-B` is read as a `u32` and `--block-size` capped at `usize`, and the
         // default is ten million, so the size always addresses.
@@ -3266,6 +3261,21 @@ fn benchmark_one(
 
     if data.is_empty() {
         bail!("-b: {label} is empty");
+    }
+    // Raised here, with the subject already read or generated, so only the
+    // measurement runs at that priority, as in the reference
+    // (`BMK_benchCLevels`, called once its buffer is filled).
+    if opts.bench_realtime {
+        display!(opts.verbosity, 2, "Note : switching to real-time priority ");
+        // The reference ignores a refusal too: without the privilege the
+        // measurement still runs, at the ordinary priority.
+        if !priority::raise_to_realtime() {
+            display!(
+                opts.verbosity,
+                3,
+                "Note : real-time priority was refused; measuring at the ordinary priority"
+            );
+        }
     }
     // Per-level time budget; best (fastest) pass wins, like upstream's -i loop.
     let mb = data.len() as f64 / 1e6;

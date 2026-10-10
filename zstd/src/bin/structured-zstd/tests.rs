@@ -2403,11 +2403,15 @@ fn test_and_tuning_options_are_accepted() {
     // reference's does before it measures (`benchzstd.c:950`).
     assert!(parse(&["--priority=rt", "-b", "f"]).unwrap().bench_realtime);
     assert!(!parse(&["-b", "f"]).unwrap().bench_realtime);
-    for args in [
-        &["--trace-file-stat", "f"][..],
-        &["--trace", "t.csv", "f"],
-        &["--trace=t.csv", "f"],
-    ] {
+    // `--trace-file-stat` prints the reference's own C calls by name; there is
+    // nothing of ours it could describe, so it is refused rather than taken
+    // and left silent.
+    let refused = parse(&["--trace-file-stat", "f"])
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(refused.contains("--trace-file-stat"), "{refused}");
+    for args in [&["--trace", "t.csv", "f"][..], &["--trace=t.csv", "f"]] {
         assert!(parse(args).is_ok(), "{args:?}");
     }
     assert!(parse(&["--trace"]).is_err());
