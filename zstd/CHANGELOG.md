@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/structured-world/structured-zstd/compare/v0.1.1...v0.2.0) - 2026-10-10
+
+### Added
+
+- *(decoding)* [**breaking**] configurable window ceiling up to 2 GiB ([#568](https://github.com/structured-world/structured-zstd/pull/568))
+
+### Performance
+
+- *(cli)* move data in 128 KiB pieces, not 8 KiB ([#573](https://github.com/structured-world/structured-zstd/pull/573))
+
 ## [0.1.1](https://github.com/structured-world/structured-zstd/compare/v0.1.0...v0.1.1) - 2026-10-10
 
 ### Added
