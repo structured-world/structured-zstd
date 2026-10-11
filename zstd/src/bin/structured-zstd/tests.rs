@@ -2810,6 +2810,64 @@ fn a_failed_compression_is_an_error_of_the_stream() {
     assert!(failed.is_err());
 }
 
+/// The dictionary size a trace line reports is the size of the dictionary as
+/// it was given, header and entropy tables included, both ways: upstream sets
+/// `dictContentSize` to the whole buffer it was handed and traces that, and
+/// decompression reports the whole `ZSTD_DDict`.
+#[test]
+fn trace_reports_the_whole_dictionary() {
+    use structured_zstd::dictionary::{
+        CoverOptions, FastCoverOptions, FinalizeOptions, train_fastcover_dict,
+    };
+    let corpus: Vec<u8> = (0..40_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    let options = FastCoverOptions {
+        cover: CoverOptions {
+            k: 256,
+            ..FastCoverOptions::default().cover
+        },
+        ..FastCoverOptions::default()
+    };
+    let blob = train_fastcover_dict(
+        corpus.as_slice(),
+        &[4_000; 10],
+        8 * 1024,
+        &options,
+        FinalizeOptions::default(),
+    )
+    .expect("training the fixture dictionary must succeed");
+    let scratch = Scratch::new("trace-dictionary");
+    let dictionary = scratch.file("dict", &blob);
+    let dictionary = dictionary.to_str().unwrap();
+    let input = scratch.file("in", &corpus[..4_000]);
+    let input = input.to_str().unwrap();
+    let trace = scratch.0.join("t.csv");
+    let trace = trace.to_str().unwrap();
+    assert_eq!(
+        run(parse(&["-qq", "-f", "-D", dictionary, "--trace", trace, input]).unwrap()).unwrap(),
+        0
+    );
+    let frame = format!("{input}.zst");
+    let out = scratch.0.join("out");
+    let out = out.to_str().unwrap();
+    assert_eq!(
+        run(parse(&[
+            "-qq", "-f", "-d", "-D", dictionary, "--trace", trace, &frame, "-o", out
+        ])
+        .unwrap())
+        .unwrap(),
+        0
+    );
+    let written = fs::read_to_string(trace).unwrap();
+    let sizes: Vec<&str> = written
+        .lines()
+        .skip(1)
+        .map(|line| line.split(", ").nth(6).unwrap())
+        .collect();
+    assert_eq!(sizes, [blob.len().to_string(), blob.len().to_string()]);
+}
+
 /// A `--trace` file that is also a file the run reads or writes is refused
 /// before anything is opened: appending to an input would change it, and
 /// creating an output ahead of its own overwrite check would make the run

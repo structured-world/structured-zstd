@@ -2279,8 +2279,9 @@ struct Codecs {
     /// What the decoder fills before each write, [`IO_CHUNK`] once the first
     /// frame allocates it, and kept for the rest of the run.
     chunk: Vec<u8>,
-    /// Length of the `-D` / `--patch-from` blob, the dictionary size a
-    /// decompression trace line reports (upstream's `ZSTD_DDict_dictSize`).
+    /// Length of the `-D` / `--patch-from` blob, the dictionary size a trace
+    /// line reports either way (upstream's `dictContentSize` and
+    /// `ZSTD_DDict_dictSize`, both the whole buffer).
     dictionary_size: u64,
     /// `--trace`: the file every frame is recorded in, once it is open.
     trace: Option<trace::Trace>,
@@ -5645,10 +5646,14 @@ fn compress_frame<R: BufRead, W: Write + BytesWritten>(
         .bytes_written()
         - before;
     if let Some(started) = started {
+        // The dictionary as it was given, header and entropy tables included:
+        // upstream sets `dictContentSize` to the whole buffer
+        // (`ZSTD_initCDict_internal`, `ZSTD_compressBegin_internal`) and
+        // traces that.
         let dictionary_size = codecs
             .encoder
             .as_ref()
-            .map_or(0, |dictionary| dictionary.content_size() as u64);
+            .map_or(0, |_| codecs.dictionary_size);
         trace_frame(
             &mut codecs.trace,
             &trace::Frame {
