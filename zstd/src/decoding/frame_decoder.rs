@@ -2214,6 +2214,13 @@ impl FrameDecoder {
         Ok(())
     }
 
+    /// Bytes the current frame has decoded to so far.
+    pub(crate) fn decoded_size(&self) -> u64 {
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.decoder_scratch.total_output())
+    }
+
     /// Counter for how many bytes have been consumed while decoding the frame
     pub fn bytes_read_from_source(&self) -> u64 {
         let state = match &self.state {

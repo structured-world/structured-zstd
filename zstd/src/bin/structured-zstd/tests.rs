@@ -2608,6 +2608,541 @@ fn a_wide_window_decodes_with_long_or_memory() {
     assert_eq!(fs::read(output).unwrap(), b"abc");
 }
 
+/// `--trace FILE` appends one line per frame in the reference's format:
+/// compressing two files appends two `compress` lines, decompressing and
+/// testing a file of two frames appends two `decompress` lines each, all
+/// `streaming`, and a benchmark's lines are `single-pass`. The header is
+/// written once, when the file is created.
+#[test]
+fn trace_records_every_frame() {
+    let scratch = Scratch::new("trace");
+    let trace = scratch.0.join("t.csv");
+    let trace = trace.to_str().unwrap();
+    let one = scratch.file("one", &b"the first input ".repeat(100));
+    let two = scratch.file("two", b"the second one");
+    let one = one.to_str().unwrap();
+    let two = two.to_str().unwrap();
+    let lines = || {
+        fs::read_to_string(trace)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        run(parse(&["-qq", "-f", "-19", "--trace", trace, one, two]).unwrap()).unwrap(),
+        0
+    );
+    let compressed = lines();
+    assert_eq!(compressed.len(), 3, "{compressed:#?}");
+    assert!(compressed[0].starts_with("Algorithm, Version, Method, Mode, Level"));
+    let one_frame = fs::read(format!("{one}.zst")).unwrap();
+    assert!(
+        compressed[1].starts_with(&format!(
+            "zstd, 10507, compress, streaming, 19, 0, 0, 1600, {}, ",
+            one_frame.len()
+        )),
+        "{}",
+        compressed[1]
+    );
+    assert!(compressed[2].starts_with("zstd, 10507, compress, streaming, 19, 0, 0, 14, "));
+
+    // Two frames back to back decode to both inputs, and each is a line.
+    let mut both = one_frame.clone();
+    both.extend_from_slice(&fs::read(format!("{two}.zst")).unwrap());
+    let both = scratch.file("both.zst", &both);
+    let both = both.to_str().unwrap();
+    let out = scratch.0.join("both");
+    let out = out.to_str().unwrap();
+    assert_eq!(
+        run(parse(&["-qq", "-f", "-d", "--trace", trace, both, "-o", out]).unwrap()).unwrap(),
+        0
+    );
+    assert_eq!(
+        run(parse(&["-qq", "-t", "--trace", trace, both]).unwrap()).unwrap(),
+        0
+    );
+    let decoded = &lines()[3..];
+    assert_eq!(decoded.len(), 4, "{decoded:#?}");
+    for pair in decoded.chunks(2) {
+        assert!(
+            pair[0].starts_with(&format!(
+                "zstd, 10507, decompress, streaming, 0, 0, 0, 1600, {}, ",
+                one_frame.len()
+            )),
+            "{}",
+            pair[0]
+        );
+        assert!(pair[1].starts_with("zstd, 10507, decompress, streaming, 0, 0, 0, 14, "));
+    }
+
+    // A benchmark compresses and decompresses each level once per pass.
+    assert_eq!(
+        run(parse(&["-qq", "-b1", "-i0", "--trace", trace, two]).unwrap()).unwrap(),
+        0
+    );
+    let benched = &lines()[7..];
+    assert!(!benched.is_empty());
+    assert!(
+        benched
+            .iter()
+            .all(|line| line.starts_with("zstd, 10507, ") && line.contains(", single-pass, ")),
+        "{benched:#?}"
+    );
+    assert!(benched.iter().any(|line| line.contains(", compress, ")));
+    assert!(benched.iter().any(|line| line.contains(", decompress, ")));
+}
+
+/// A decompressed frame's traced duration is the decoder's time, not the
+/// sink's: a writer that takes a long time over each write does not appear in
+/// the line, and neither does the write of the frame's last output, which
+/// happens before the decoder is called again to finish the frame.
+#[test]
+fn trace_times_decoding_without_the_writes() {
+    struct Slow;
+    impl Write for Slow {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let scratch = Scratch::new("trace-writes");
+    let path = scratch.0.join("t.csv");
+    let frame = frame_of(b"a small frame, decoded in microseconds");
+    let mut trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(frame.as_slice());
+    let mut buffer = [0u8; 16];
+    drain_decoded(&mut decoder, &mut Slow, &mut buffer, &mut trace, 0).unwrap();
+    drop(trace);
+    let lines = fs::read_to_string(&path).unwrap();
+    let line = lines.lines().nth(1).unwrap();
+    let nanos: u64 = line.split(", ").nth(9).unwrap().parse().unwrap();
+    // Three writes of at least 100 ms each went to the sink.
+    assert!(nanos < 50_000_000, "{line}");
+}
+
+/// A trace that cannot be opened, or stops taking writes, costs the run its
+/// trace and nothing else: the frames are still written, the run succeeds,
+/// and a trace that failed a write is closed rather than retried per frame.
+#[test]
+fn a_trace_that_fails_leaves_the_run_untraced() {
+    let scratch = Scratch::new("trace-fails");
+    let input = scratch.file("in", b"compressed whatever the trace does");
+    let input = input.to_str().unwrap();
+    let unreachable = scratch.0.join("no-such-directory").join("t.csv");
+    let unreachable = unreachable.to_str().unwrap();
+    // At the default verbosity, so the report of the trace is made.
+    assert_eq!(
+        run(parse(&["-f", "--trace", unreachable, input]).unwrap()).unwrap(),
+        0
+    );
+    assert!(scratch.0.join("in.zst").exists());
+    assert!(!Path::new(unreachable).exists());
+
+    // Opened for reading only, so the first line written to it fails.
+    let read_only = scratch.file("read-only.csv", b"");
+    let mut trace = Some(trace::Trace::over(
+        fs::File::open(&read_only).unwrap(),
+        10507,
+        false,
+    ));
+    trace_frame(
+        &mut trace,
+        &trace::Frame {
+            method: trace::Method::Compress,
+            level: 3,
+            dictionary_size: 0,
+            uncompressed_size: 8,
+            compressed_size: 4,
+            duration: std::time::Duration::from_nanos(8),
+        },
+    );
+    assert!(trace.is_none(), "a trace that failed a write is closed");
+}
+
+/// The trace is checked against the files a run actually writes: an input
+/// that names no output (decompressing a file without a zstd suffix) and a
+/// mode that writes no file (`--list`) leave nothing to collide with, and the
+/// run goes on with its trace open.
+#[test]
+fn a_trace_beside_no_output_is_opened() {
+    let scratch = Scratch::new("trace-no-output");
+    let payload = b"listed and decoded";
+    let frame = scratch.file("frame.zst", &frame_of(payload));
+    let unsuffixed = scratch.file("unsuffixed", &frame_of(payload));
+    let trace = scratch.0.join("t.csv");
+    let trace = trace.to_str().unwrap();
+    // Refused for its name, which is not the trace's business.
+    assert_ne!(
+        run(parse(&["-qq", "-d", "--trace", trace, unsuffixed.to_str().unwrap()]).unwrap())
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        run(parse(&["-qq", "-l", "--trace", trace, frame.to_str().unwrap()]).unwrap()).unwrap(),
+        0
+    );
+    assert!(
+        fs::read_to_string(trace)
+            .unwrap()
+            .starts_with("Algorithm, Version")
+    );
+}
+
+/// A compression that fails part-way is reported from the stream, not
+/// counted as written: an input shorter than its pledge.
+#[test]
+fn a_failed_compression_is_an_error_of_the_stream() {
+    let opts = parse(&["-3", "f"]).unwrap();
+    let mut out = Vec::new();
+    let failed = stream(
+        &opts,
+        &mut no_dict(),
+        ProgressMonitor::new(&b"short"[..], None, false),
+        Some(64),
+        &DecodeSettings::from_options(&opts),
+        &mut out,
+    );
+    assert!(failed.is_err());
+}
+
+/// The dictionary size a trace line reports is the size of the dictionary as
+/// it was given, header and entropy tables included, both ways: upstream sets
+/// `dictContentSize` to the whole buffer it was handed and traces that, and
+/// decompression reports the whole `ZSTD_DDict`.
+#[test]
+fn trace_reports_the_whole_dictionary() {
+    use structured_zstd::dictionary::{
+        CoverOptions, FastCoverOptions, FinalizeOptions, train_fastcover_dict,
+    };
+    let corpus: Vec<u8> = (0..40_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    let options = FastCoverOptions {
+        cover: CoverOptions {
+            k: 256,
+            ..FastCoverOptions::default().cover
+        },
+        ..FastCoverOptions::default()
+    };
+    let blob = train_fastcover_dict(
+        corpus.as_slice(),
+        &[4_000; 10],
+        8 * 1024,
+        &options,
+        FinalizeOptions::default(),
+    )
+    .expect("training the fixture dictionary must succeed");
+    let scratch = Scratch::new("trace-dictionary");
+    let dictionary = scratch.file("dict", &blob);
+    let dictionary = dictionary.to_str().unwrap();
+    let input = scratch.file("in", &corpus[..4_000]);
+    let input = input.to_str().unwrap();
+    let trace = scratch.0.join("t.csv");
+    let trace = trace.to_str().unwrap();
+    assert_eq!(
+        run(parse(&["-qq", "-f", "-D", dictionary, "--trace", trace, input]).unwrap()).unwrap(),
+        0
+    );
+    let frame = format!("{input}.zst");
+    let out = scratch.0.join("out");
+    let out = out.to_str().unwrap();
+    assert_eq!(
+        run(parse(&[
+            "-qq", "-f", "-d", "-D", dictionary, "--trace", trace, &frame, "-o", out
+        ])
+        .unwrap())
+        .unwrap(),
+        0
+    );
+    let written = fs::read_to_string(trace).unwrap();
+    let sizes: Vec<&str> = written
+        .lines()
+        .skip(1)
+        .map(|line| line.split(", ").nth(6).unwrap())
+        .collect();
+    assert_eq!(sizes, [blob.len().to_string(), blob.len().to_string()]);
+}
+
+/// A `--filelist` is read by the run, so a trace of the same name, appended
+/// to, would change it; it is refused like an input.
+#[test]
+fn trace_naming_a_file_list_is_refused() {
+    let scratch = Scratch::new("trace-filelist");
+    let input = scratch.file("in", b"listed");
+    let list = scratch.file("list.txt", input.to_str().unwrap().as_bytes());
+    let list = list.to_str().unwrap();
+    let opts = parse(&["-f", "--filelist", list]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new(list)).is_err());
+}
+
+/// The runs that write to standard output: data under `-c` or from stdin
+/// without `-o`, a benchmark's results unless `-qq` silences them, and
+/// `--list`'s table; not a run with `-o` (`-o -` included) or `-t`.
+#[test]
+fn the_runs_writing_to_stdout_are_known() {
+    assert!(writes_to_stdout(&parse(&["-c", "in"]).unwrap()));
+    assert!(writes_to_stdout(&parse(&["-d", "-"]).unwrap()));
+    assert!(!writes_to_stdout(&parse(&["in", "-o", "out"]).unwrap()));
+    // `-o -` names a file called `-`; only `-c` selects stdout.
+    assert!(!writes_to_stdout(&parse(&["in", "-o", "-"]).unwrap()));
+    assert!(writes_to_stdout(&parse(&["-b1", "in"]).unwrap()));
+    assert!(writes_to_stdout(&parse(&["-q", "-b1", "in"]).unwrap()));
+    assert!(!writes_to_stdout(&parse(&["-qq", "-b1", "in"]).unwrap()));
+    assert!(writes_to_stdout(&parse(&["-l", "in.zst"]).unwrap()));
+    assert!(!writes_to_stdout(&parse(&["-t", "in.zst"]).unwrap()));
+}
+
+/// Every name of a file has its identity, a hard link included, and another
+/// file has another.
+#[test]
+fn every_name_of_a_file_has_its_identity() {
+    let scratch = Scratch::new("file-identity");
+    let file = scratch.file("f", b"x");
+    let other = scratch.file("g", b"y");
+    let linked = scratch.0.join("h");
+    fs::hard_link(&file, &linked).unwrap();
+    let id = identity::of_path(&file);
+    assert!(id.is_some());
+    assert_eq!(identity::of_path(&scratch.0.join(".").join("f")), id);
+    assert_eq!(identity::of_path(&linked), id);
+    assert_ne!(identity::of_path(&other), id);
+}
+
+/// An input that is a dangling symlink names the file opening the trace
+/// would create when the two lead to the same place; the trace is refused
+/// rather than become the input.
+#[cfg(unix)]
+#[test]
+fn trace_where_a_dangling_input_leads_is_refused() {
+    let scratch = Scratch::new("trace-dangling-input");
+    let target = scratch.0.join("target");
+    let input = scratch.0.join("in");
+    std::os::unix::fs::symlink(&target, &input).unwrap();
+    let opts = parse(&["-f", input.to_str().unwrap(), "-o", "/dev/null"]).unwrap();
+    assert!(refuse_trace_alias(&opts, &target).is_err());
+}
+
+/// The names Unix gives standard output and standard input are them,
+/// whatever their identity reads as (a pipe under macOS `/dev/fd` reads as
+/// a node of its own).
+#[cfg(unix)]
+#[test]
+fn the_standard_stream_names_are_recognised() {
+    for name in ["/dev/stdout", "/dev/fd/1"] {
+        assert!(is_stdout(Path::new(name)), "{name}");
+    }
+    let reading_stdin = parse(&["-d", "-", "-o", "/dev/null"]).unwrap();
+    for name in ["/dev/stdin", "/dev/fd/0"] {
+        assert!(
+            refuse_trace_alias(&reading_stdin, Path::new(name)).is_err(),
+            "{name}"
+        );
+    }
+}
+
+/// Errors, summaries and progress go to stderr, so a trace there would
+/// interleave with them; it is refused unless `-qq` silences stderr.
+#[cfg(unix)]
+#[test]
+fn trace_on_stderr_is_refused_unless_silenced() {
+    let scratch = Scratch::new("trace-stderr");
+    let input = scratch.file("in", b"x");
+    let input = input.to_str().unwrap();
+    let speaking = parse(&["-f", input, "-o", "/dev/null"]).unwrap();
+    let silent = parse(&["-qq", "-f", input, "-o", "/dev/null"]).unwrap();
+    for name in ["/dev/stderr", "/dev/fd/2"] {
+        assert!(
+            refuse_trace_alias(&speaking, Path::new(name)).is_err(),
+            "{name}"
+        );
+        assert!(
+            refuse_trace_alias(&silent, Path::new(name)).is_ok(),
+            "{name}"
+        );
+    }
+}
+
+/// An input `--exclude-compressed` skips writes no output, so the output
+/// derived from it is no file of the run, and a trace may take its name.
+#[test]
+fn trace_named_like_a_skipped_input_output_is_opened() {
+    let scratch = Scratch::new("trace-excluded");
+    let input = scratch.file("a.zst", b"already compressed");
+    let input = input.to_str().unwrap();
+    let derived = format!("{input}.zst");
+    let opts = parse(&["--exclude-compressed", input]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new(&derived)).is_ok());
+}
+
+/// A trace that is a hard link to an input is that input, under a name no
+/// canonical path tells apart; it is refused like the input itself.
+#[test]
+fn trace_hard_linked_to_an_input_is_refused() {
+    let scratch = Scratch::new("trace-hard-link");
+    let input = scratch.file("in", b"read by the run");
+    let linked = scratch.0.join("trace.csv");
+    fs::hard_link(&input, &linked).unwrap();
+    let opts = parse(&["-f", input.to_str().unwrap()]).unwrap();
+    assert!(refuse_trace_alias(&opts, &linked).is_err());
+}
+
+/// A `-D` file is checked only where the run reads it: `--list` and
+/// `--train` do not, so a trace may share its name there.
+#[test]
+fn trace_naming_an_unread_dictionary_is_opened() {
+    let scratch = Scratch::new("trace-unread-dictionary");
+    let named = scratch.file("report.csv", b"not a dictionary");
+    let named = named.to_str().unwrap();
+    let listing = parse(&["-l", "-D", named, "archive.zst"]).unwrap();
+    assert!(refuse_trace_alias(&listing, Path::new(named)).is_ok());
+    let compressing = parse(&["-D", named, "in"]).unwrap();
+    assert!(refuse_trace_alias(&compressing, Path::new(named)).is_err());
+}
+
+/// A trace that is the file standard output writes to would interleave its
+/// lines with the frames a run sends there, so it is refused when the run
+/// writes data to stdout; when the data goes to a file, a trace on stdout is
+/// a way to watch it, and is opened. Linux only: there `/dev/fd/1` reaches
+/// the test's stdout whatever it is.
+#[cfg(target_os = "linux")]
+#[test]
+fn trace_on_the_stdout_of_a_run_writing_there_is_refused() {
+    let scratch = Scratch::new("trace-stdout");
+    let input = scratch.file("in", b"to stdout");
+    let input = input.to_str().unwrap();
+    let stdout = Path::new("/dev/fd/1");
+    let to_stdout = parse(&["-c", input]).unwrap();
+    assert!(refuse_trace_alias(&to_stdout, stdout).is_err());
+    let out = scratch.0.join("out.zst");
+    let to_file = parse(&["-f", input, "-o", out.to_str().unwrap()]).unwrap();
+    assert!(refuse_trace_alias(&to_file, stdout).is_ok());
+}
+
+/// `--train` without `-o` writes `dictionary`; a trace of that name would be
+/// created first and then trained over, so it is refused like any output.
+#[test]
+fn trace_naming_the_default_training_output_is_refused() {
+    let opts = parse(&["--train", "sample"]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new("dictionary")).is_err());
+    assert!(refuse_trace_alias(&opts, Path::new("elsewhere.csv")).is_ok());
+}
+
+/// A trace path that is a dangling symlink names the file it points at:
+/// opening it creates that file, so a link to an output still to be written
+/// is refused, and a dangling link to anything else is not.
+#[cfg(unix)]
+#[test]
+fn trace_through_a_dangling_link_to_an_output_is_refused() {
+    let scratch = Scratch::new("trace-dangling");
+    let input = scratch.file("in", b"compressed beside its trace");
+    let opts = parse(&["-f", input.to_str().unwrap()]).unwrap();
+    let to_output = scratch.0.join("to-output");
+    std::os::unix::fs::symlink(scratch.0.join("in.zst"), &to_output).unwrap();
+    assert!(refuse_trace_alias(&opts, &to_output).is_err());
+    // A relative target is read against the link's own directory.
+    let relative = scratch.0.join("relative");
+    std::os::unix::fs::symlink("in.zst", &relative).unwrap();
+    assert!(refuse_trace_alias(&opts, &relative).is_err());
+    let elsewhere = scratch.0.join("elsewhere");
+    std::os::unix::fs::symlink(scratch.0.join("t.csv"), &elsewhere).unwrap();
+    assert!(refuse_trace_alias(&opts, &elsewhere).is_ok());
+}
+
+/// A compressed frame's traced duration is the encoder's time, not the
+/// destination's: a writer that takes a long time over each write, the one
+/// that flushes the whole frame at its end included, does not appear in it.
+#[test]
+fn trace_times_compression_without_the_writes() {
+    struct Slow(u64);
+    impl Write for Slow {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl BytesWritten for Slow {
+        fn bytes_written(&self) -> u64 {
+            self.0
+        }
+    }
+    let scratch = Scratch::new("trace-compress-writes");
+    let path = scratch.0.join("t.csv");
+    let mut codecs = no_dict();
+    codecs.trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    let payload = b"a small frame, compressed in microseconds";
+    compress_stream(
+        &payload[..],
+        Slow(0),
+        &FrameSettings {
+            level: 3,
+            ..FrameSettings::default()
+        },
+        &mut codecs,
+    )
+    .unwrap();
+    drop(codecs);
+    let lines = fs::read_to_string(&path).unwrap();
+    let line = lines.lines().nth(1).unwrap();
+    let nanos: u64 = line.split(", ").nth(9).unwrap().parse().unwrap();
+    assert!(nanos < 50_000_000, "{line}");
+}
+
+/// A `--trace` file that is also a file the run reads or writes is refused
+/// before anything is opened: appending to an input would change it, and
+/// creating an output ahead of its own overwrite check would make the run
+/// refuse it, or rename the output over the trace. Nothing is touched.
+#[test]
+fn trace_naming_a_file_of_the_run_is_refused() {
+    let scratch = Scratch::new("trace-alias");
+    let payload = b"a file the run works on";
+    let input = scratch.file("in", payload);
+    let frame = scratch.file("frame.zst", &frame_of(payload));
+    let dictionary = scratch.file("dict", b"dictionary content, long enough to be used");
+    let input = input.to_str().unwrap();
+    let frame_path = frame.to_str().unwrap();
+    let dictionary_path = dictionary.to_str().unwrap();
+    let derived = scratch.0.join("in.zst");
+    let derived = derived.to_str().unwrap();
+    let named = scratch.0.join("named");
+    let named = named.to_str().unwrap();
+    let frame_bytes = fs::read(&frame).unwrap();
+
+    let refused = |args: &[&str]| run(parse(args).unwrap()).is_err();
+    // The input being decoded.
+    assert!(refused(&[
+        "-qq", "-d", "--trace", frame_path, frame_path, "-o", named
+    ]));
+    // An output derived from an input, and one named with `-o`.
+    assert!(refused(&["-qq", "--trace", derived, input]));
+    assert!(refused(&["-qq", "--trace", named, input, "-o", named]));
+    // The dictionary, and a benchmark's input.
+    assert!(refused(&[
+        "-qq",
+        "-D",
+        dictionary_path,
+        "--trace",
+        dictionary_path,
+        input,
+        "-o",
+        named
+    ]));
+    assert!(refused(&["-qq", "-b1", "-i0", "--trace", input, input]));
+
+    assert_eq!(fs::read(&frame).unwrap(), frame_bytes);
+    assert_eq!(fs::read(scratch.0.join("in")).unwrap(), payload);
+    assert!(!Path::new(derived).exists());
+    assert!(!Path::new(named).exists());
+}
+
 /// `--patch-apply=REF` decompresses against a `--patch-from` reference, with
 /// the memory ceiling lifted to the default as the reference lifts it.
 #[test]
@@ -4911,7 +5446,7 @@ fn a_failed_frame_does_not_reach_the_next_input() {
     let payload = vec![b'x'; 300_000];
     compress_stream(
         payload.as_slice(),
-        &mut Vec::new(),
+        Vec::new(),
         &FrameSettings {
             pledged_size: Some(payload.len() as u64 + 1),
             ..settings
