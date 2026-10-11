@@ -73,6 +73,7 @@ macro_rules! display {
 }
 
 mod display;
+mod identity;
 mod inputs;
 mod interrupt;
 mod priority;
@@ -2172,6 +2173,15 @@ fn patch_window_log(source_size: u64) -> Result<u32> {
     Ok(file_window_log.max(lower))
 }
 
+/// Whether the run reads the `-D` / `--patch-from` file it names. Listing
+/// walks frame headers and training builds a dictionary from its samples;
+/// neither consults that one. Reading it anyway would fail a listing over a
+/// missing file that has nothing to do with it, and spend time and memory on
+/// a large one nothing looks at.
+fn reads_dictionary(opts: &Options) -> bool {
+    opts.bench || !matches!(opts.mode, Mode::List | Mode::Train)
+}
+
 /// Read the `-D` dictionary, if there is one, without breaking `-M` to do it.
 ///
 /// The limit was already weighed against what decoding alone needs; the
@@ -2184,11 +2194,7 @@ fn load_dictionary(opts: &Options) -> Result<Option<Vec<u8>>> {
     let Some(path) = dictionary_path(opts) else {
         return Ok(None);
     };
-    // Listing walks frame headers and training builds a dictionary from its
-    // samples; neither consults the one `-D` names. Reading it anyway would
-    // fail a listing over a missing file that has nothing to do with it, and
-    // spend time and memory on a large one nothing looks at.
-    if !opts.bench && matches!(opts.mode, Mode::List | Mode::Train) {
+    if !reads_dictionary(opts) {
         return Ok(None);
     }
     // Asked of the path first, because opening a FIFO blocks until a writer
@@ -2343,7 +2349,9 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
         }
         Ok(())
     };
-    if let Some(dictionary) = dictionary_path(opts) {
+    if let Some(dictionary) = dictionary_path(opts)
+        && reads_dictionary(opts)
+    {
         refuse("the dictionary", dictionary)?;
     }
     for input in opts.inputs.iter().filter(|input| *input != Path::new("-")) {
@@ -2352,11 +2360,11 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
     for list in &opts.filelists {
         refuse("the file list", list)?;
     }
-    // Frames sent to stdout would interleave with the trace's lines there. A
-    // run writing its data to a file leaves stdout free for the trace.
-    if writes_data_to_stdout(opts) && is_stdout(trace) {
+    // What the run sends to stdout would interleave with the trace's lines
+    // there. A run writing to a file leaves stdout free for the trace.
+    if writes_to_stdout(opts) && is_stdout(trace) {
         bail!(
-            "--trace {} is also standard output, where the data is written",
+            "--trace {} is also standard output, which this run writes to",
             trace.display()
         );
     }
@@ -2382,54 +2390,32 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether the run writes (de)compressed data to standard output: `-c`, or
-/// stdin (named `-` or by no input at all) without `-o`. `-o -` is a file
-/// named `-`, as the output is written everywhere else.
-fn writes_data_to_stdout(opts: &Options) -> bool {
-    matches!(opts.mode, Mode::Compress | Mode::Decompress)
-        && !opts.bench
-        && (opts.to_stdout
-            || (opts.output.is_none()
-                && (opts.inputs.is_empty()
-                    || opts.inputs.iter().any(|input| input == Path::new("-")))))
-}
-
-/// Whether `path` is the file this process's standard output writes to.
-fn is_stdout(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsFd;
-        io::stdout()
-            .as_fd()
-            .try_clone_to_owned()
-            .is_ok_and(|fd| names_open_file(path, &File::from(fd)))
+/// Whether the run writes to standard output: (de)compressed data under `-c`
+/// or from stdin without `-o`, a benchmark's results unless `-qq` silences
+/// them, or `--list`'s table. `-o -` is a file named `-`, as the output is
+/// written everywhere else.
+fn writes_to_stdout(opts: &Options) -> bool {
+    if opts.bench {
+        return opts.verbosity >= 1;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        false
-    }
-}
-
-/// Whether `path` names the file `open` is, compared by device and inode. A
-/// regular file or a Linux pipe compares true through any of its names;
-/// macOS gives a pipe under `/dev/fd` attributes of its own, so there only a
-/// file is recognised. Windows has no identity std can read on stable (see
-/// `paths_point_to_same_file`), so there it answers no.
-fn names_open_file(path: &Path, open: &File) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match (fs::metadata(path), open.metadata()) {
-            (Ok(named), Ok(open)) => named.dev() == open.dev() && named.ino() == open.ino(),
-            _ => false,
+    match opts.mode {
+        Mode::List => true,
+        Mode::Compress | Mode::Decompress => {
+            opts.to_stdout
+                || (opts.output.is_none()
+                    && (opts.inputs.is_empty()
+                        || opts.inputs.iter().any(|input| input == Path::new("-"))))
         }
+        Mode::Test | Mode::Train => false,
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, open);
-        false
-    }
+}
+
+/// Whether `path` is the file this process's standard output writes to. A
+/// file, or a pipe on Linux, is recognised through any of its names; macOS
+/// gives a pipe under `/dev/fd` attributes of its own, so there only a file
+/// is.
+fn is_stdout(path: &Path) -> bool {
+    identity::of_stdout().is_some_and(|stdout| identity::of_path(path) == Some(stdout))
 }
 
 /// Where `--train` writes the dictionary: `-o`, or `dictionary` as the
@@ -6129,32 +6115,12 @@ fn names_the_same_file(left: &Path, right: &Path) -> Result<bool> {
     }
 }
 
-/// Whether two different paths name one file, as a hard link does.
-///
-/// Only answers for the identity the platform lets us read. Unix compares the
-/// device and inode. Windows would need the volume serial and file index, which
-/// std exposes only on nightly (`windows_by_handle`) and which no dependency
-/// here can reach, so hard links go unnoticed there — the caller's canonical
-/// path comparison still catches the same path by another name, which is the
-/// case that actually comes up.
+/// Whether two different paths name one file, as a hard link does: compared
+/// by the identity the filesystem gives the file (see [`identity`]).
 fn paths_point_to_same_file(input: &Path, output: &Path) -> Result<bool> {
-    let input_metadata = fs::metadata(input).wrap_err("failed to inspect input file metadata")?;
-    let output_metadata =
-        fs::metadata(output).wrap_err("failed to inspect existing output file metadata")?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(input_metadata.dev() == output_metadata.dev()
-            && input_metadata.ino() == output_metadata.ino())
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = input_metadata;
-        let _ = output_metadata;
-        Ok(false)
-    }
+    fs::metadata(input).wrap_err("failed to inspect input file metadata")?;
+    fs::metadata(output).wrap_err("failed to inspect existing output file metadata")?;
+    Ok(identity::of_path(input).is_some_and(|input| identity::of_path(output) == Some(input)))
 }
 
 #[cfg(windows)]

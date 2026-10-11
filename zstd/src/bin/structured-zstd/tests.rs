@@ -2880,33 +2880,62 @@ fn trace_naming_a_file_list_is_refused() {
     assert!(refuse_trace_alias(&opts, Path::new(list)).is_err());
 }
 
-/// The runs that write their data to standard output: `-c`, and stdin
-/// without `-o`; not a run with `-o`, a benchmark or `-t`.
+/// The runs that write to standard output: data under `-c` or from stdin
+/// without `-o`, a benchmark's results unless `-qq` silences them, and
+/// `--list`'s table; not a run with `-o` (`-o -` included) or `-t`.
 #[test]
-fn the_runs_writing_data_to_stdout_are_known() {
-    assert!(writes_data_to_stdout(&parse(&["-c", "in"]).unwrap()));
-    assert!(writes_data_to_stdout(&parse(&["-d", "-"]).unwrap()));
-    assert!(!writes_data_to_stdout(
-        &parse(&["in", "-o", "out"]).unwrap()
-    ));
+fn the_runs_writing_to_stdout_are_known() {
+    assert!(writes_to_stdout(&parse(&["-c", "in"]).unwrap()));
+    assert!(writes_to_stdout(&parse(&["-d", "-"]).unwrap()));
+    assert!(!writes_to_stdout(&parse(&["in", "-o", "out"]).unwrap()));
     // `-o -` names a file called `-`; only `-c` selects stdout.
-    assert!(!writes_data_to_stdout(&parse(&["in", "-o", "-"]).unwrap()));
-    assert!(!writes_data_to_stdout(&parse(&["-b1", "in"]).unwrap()));
-    assert!(!writes_data_to_stdout(&parse(&["-t", "in.zst"]).unwrap()));
+    assert!(!writes_to_stdout(&parse(&["in", "-o", "-"]).unwrap()));
+    assert!(writes_to_stdout(&parse(&["-b1", "in"]).unwrap()));
+    assert!(writes_to_stdout(&parse(&["-q", "-b1", "in"]).unwrap()));
+    assert!(!writes_to_stdout(&parse(&["-qq", "-b1", "in"]).unwrap()));
+    assert!(writes_to_stdout(&parse(&["-l", "in.zst"]).unwrap()));
+    assert!(!writes_to_stdout(&parse(&["-t", "in.zst"]).unwrap()));
 }
 
-/// A path names an open file when it reaches the same file, whatever the
-/// spelling, and not when it is another file.
-#[cfg(unix)]
+/// Every name of a file has its identity, a hard link included, and another
+/// file has another.
 #[test]
-fn a_path_names_the_open_file_it_reaches() {
-    let scratch = Scratch::new("names-open-file");
+fn every_name_of_a_file_has_its_identity() {
+    let scratch = Scratch::new("file-identity");
     let file = scratch.file("f", b"x");
     let other = scratch.file("g", b"y");
-    let open = fs::File::open(&file).unwrap();
-    assert!(names_open_file(&file, &open));
-    assert!(names_open_file(&scratch.0.join(".").join("f"), &open));
-    assert!(!names_open_file(&other, &open));
+    let linked = scratch.0.join("h");
+    fs::hard_link(&file, &linked).unwrap();
+    let id = identity::of_path(&file);
+    assert!(id.is_some());
+    assert_eq!(identity::of_path(&scratch.0.join(".").join("f")), id);
+    assert_eq!(identity::of_path(&linked), id);
+    assert_ne!(identity::of_path(&other), id);
+}
+
+/// A trace that is a hard link to an input is that input, under a name no
+/// canonical path tells apart; it is refused like the input itself.
+#[test]
+fn trace_hard_linked_to_an_input_is_refused() {
+    let scratch = Scratch::new("trace-hard-link");
+    let input = scratch.file("in", b"read by the run");
+    let linked = scratch.0.join("trace.csv");
+    fs::hard_link(&input, &linked).unwrap();
+    let opts = parse(&["-f", input.to_str().unwrap()]).unwrap();
+    assert!(refuse_trace_alias(&opts, &linked).is_err());
+}
+
+/// A `-D` file is checked only where the run reads it: `--list` and
+/// `--train` do not, so a trace may share its name there.
+#[test]
+fn trace_naming_an_unread_dictionary_is_opened() {
+    let scratch = Scratch::new("trace-unread-dictionary");
+    let named = scratch.file("report.csv", b"not a dictionary");
+    let named = named.to_str().unwrap();
+    let listing = parse(&["-l", "-D", named, "archive.zst"]).unwrap();
+    assert!(refuse_trace_alias(&listing, Path::new(named)).is_ok());
+    let compressing = parse(&["-D", named, "in"]).unwrap();
+    assert!(refuse_trace_alias(&compressing, Path::new(named)).is_err());
 }
 
 /// A trace that is the file standard output writes to would interleave its
