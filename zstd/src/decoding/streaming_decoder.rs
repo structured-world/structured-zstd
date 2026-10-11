@@ -66,6 +66,70 @@ pub struct StreamingDecoder<READ: Read, DEC: BorrowMut<FrameDecoder>> {
     input: Input,
 }
 
+/// A dictionary a [`StreamingDecoder`] constructor refused, with what the
+/// constructor took by value handed back: the source, unread, since the
+/// dictionary is checked before anything is read, and the decoder where the
+/// caller passed one (`()` where the constructor makes its own).
+///
+/// `Debug` and `Display` show the decoder's error as it is, so an `unwrap`
+/// or a message reads the same as for a [`FrameDecoderError`].
+///
+/// # Examples
+/// ```
+/// use structured_zstd::decoding::StreamingDecoder;
+///
+/// let archive_entry: &[u8] = b"\x28\xb5\x2f\xfd...";
+/// // The dictionary magic with nothing after it.
+/// let blob = 0xEC30_A437u32.to_le_bytes();
+/// let refused = StreamingDecoder::new_with_dictionary_bytes(archive_entry, &blob)
+///     .err()
+///     .expect("a truncated dictionary is refused");
+/// eprintln!("dictionary refused: {refused}");
+/// // The entry is still the caller's, as it was handed over.
+/// assert_eq!(refused.into_source(), archive_entry);
+/// ```
+pub struct DictionaryRefused<READ, DEC = ()> {
+    source: READ,
+    decoder: DEC,
+    error: FrameDecoderError,
+}
+
+impl<READ, DEC> DictionaryRefused<READ, DEC> {
+    /// Why the dictionary was refused.
+    pub fn error(&self) -> &FrameDecoderError {
+        &self.error
+    }
+
+    /// The source, as the constructor was given it.
+    pub fn into_source(self) -> READ {
+        self.source
+    }
+
+    /// The source, the decoder and the error.
+    pub fn into_parts(self) -> (READ, DEC, FrameDecoderError) {
+        (self.source, self.decoder, self.error)
+    }
+}
+
+impl<READ, DEC> core::fmt::Debug for DictionaryRefused<READ, DEC> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&self.error, f)
+    }
+}
+
+impl<READ, DEC> core::fmt::Display for DictionaryRefused<READ, DEC> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<READ, DEC> std::error::Error for DictionaryRefused<READ, DEC> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.error)
+    }
+}
+
 /// Where a [`StreamingDecoder`] stands in its stream.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Position {
@@ -291,9 +355,10 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
     ///
     /// # Errors
     ///
-    /// Only for a dictionary whose content no frame can use. Nothing is read
-    /// from `source` until the first read, which reports a frame that does
-    /// not match the dictionary.
+    /// Only for a dictionary whose content no frame can use, as a
+    /// [`DictionaryRefused`] that hands back `source`, unread, and `decoder`
+    /// as they were given. Nothing is read from `source` until the first
+    /// read, which reports a frame that does not match the dictionary.
     ///
     /// # Examples
     /// ```
@@ -318,13 +383,33 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
     ///     stream.read_to_end(&mut decoded).unwrap();
     ///     assert_eq!(decoded, b"the frames reuse words");
     /// }
+    ///
+    /// // A dictionary no frame can use is refused, and the decoder and the
+    /// // frame come back to be used another way.
+    /// let mut unusable = Dictionary::from_raw_content(1, b"content".to_vec()).unwrap();
+    /// unusable.offset_hist[0] = 0;
+    /// let unusable = DictionaryHandle::from_dictionary(unusable);
+    /// let (source, decoder, _error) =
+    ///     StreamingDecoder::new_with_decoder_and_dictionary_handle(&frame[..], decoder, &unusable)
+    ///         .err()
+    ///         .expect("a zero repeat offset is refused")
+    ///         .into_parts();
+    /// assert_eq!(source, &frame[..]);
+    /// # let _: FrameDecoder = decoder;
     /// ```
     pub fn new_with_decoder_and_dictionary_handle(
         source: READ,
         mut decoder: DEC,
         dict: &DictionaryHandle,
-    ) -> Result<StreamingDecoder<READ, DEC>, FrameDecoderError> {
-        decoder.borrow_mut().arm_dict(dict)?;
+    ) -> Result<StreamingDecoder<READ, DEC>, DictionaryRefused<READ, DEC>> {
+        // A refused dictionary leaves the decoder as it was.
+        if let Err(error) = decoder.borrow_mut().arm_dict(dict) {
+            return Err(DictionaryRefused {
+                source,
+                decoder,
+                error,
+            });
+        }
         Ok(StreamingDecoder {
             decoder,
             source,
@@ -364,7 +449,8 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
     ///
     /// # Errors
     ///
-    /// Only for a dictionary whose content no frame can use.
+    /// Only for a dictionary whose content no frame can use, as a
+    /// [`DictionaryRefused`] that hands `source` back unread.
     ///
     /// # Warning
     ///
@@ -376,11 +462,23 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
     pub fn new_with_dictionary_handle(
         source: READ,
         dict: &DictionaryHandle,
-    ) -> Result<StreamingDecoder<READ, FrameDecoder>, FrameDecoderError> {
-        Self::new_with_decoder_and_dictionary_handle(source, FrameDecoder::new(), dict)
+    ) -> Result<StreamingDecoder<READ, FrameDecoder>, DictionaryRefused<READ>> {
+        Self::new_with_decoder_and_dictionary_handle(source, FrameDecoder::new(), dict).map_err(
+            // The decoder was made here, so only the source goes back.
+            |refused| DictionaryRefused {
+                source: refused.source,
+                decoder: (),
+                error: refused.error,
+            },
+        )
     }
 
     /// Create a streaming decoder using a serialized dictionary blob.
+    ///
+    /// # Errors
+    ///
+    /// A blob that is not a dictionary, or one no frame can use, as a
+    /// [`DictionaryRefused`] that hands `source` back unread.
     ///
     /// # Warning
     ///
@@ -391,9 +489,15 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
     pub fn new_with_dictionary_bytes(
         source: READ,
         raw_dictionary: &[u8],
-    ) -> Result<StreamingDecoder<READ, FrameDecoder>, FrameDecoderError> {
-        let dict = DictionaryHandle::decode_dict(raw_dictionary)?;
-        Self::new_with_dictionary_handle(source, &dict)
+    ) -> Result<StreamingDecoder<READ, FrameDecoder>, DictionaryRefused<READ>> {
+        match DictionaryHandle::decode_dict(raw_dictionary) {
+            Ok(dict) => Self::new_with_dictionary_handle(source, &dict),
+            Err(error) => Err(DictionaryRefused {
+                source,
+                decoder: (),
+                error: FrameDecoderError::from(error),
+            }),
+        }
     }
 }
 

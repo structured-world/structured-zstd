@@ -417,6 +417,57 @@ fn into_inner_before_any_read_returns_the_source_untouched() {
     assert_eq!(decoder.into_inner(), plain.as_slice());
 }
 
+/// A dictionary no frame can use (here a zero repeat offset, which RFC 8878
+/// 5 forbids) is refused before anything is read, and every dictionary
+/// constructor hands the source back unread with the error, and the decoder
+/// too where it was passed by value. A blob that does not parse as a
+/// dictionary is refused the same way.
+#[test]
+fn a_refused_dictionary_hands_the_source_back_unread() {
+    use crate::decoding::{Dictionary, DictionaryHandle, FrameDecoder};
+
+    let mut refused = Dictionary::from_raw_content(7, b"dictionary content".to_vec()).unwrap();
+    refused.offset_hist[0] = 0;
+    let refused = DictionaryHandle::from_dictionary(refused);
+    let plain = frame_of(b"payload");
+    let counting = || Counting {
+        data: plain.as_slice(),
+        reads: 0,
+    };
+    let unread = |source: &Counting<'_>| source.reads == 0 && source.data == plain.as_slice();
+
+    let error = StreamingDecoder::new_with_dictionary_handle(counting(), &refused)
+        .err()
+        .expect("a zero repeat offset is refused");
+    assert!(
+        alloc::format!("{error}").contains("epeat"),
+        "the decoder's error shows through: {error}"
+    );
+    assert!(unread(&error.into_source()));
+
+    let mut decoder = FrameDecoder::new();
+    decoder.set_max_window_size(1 << 20).unwrap();
+    let (source, decoder, error) =
+        StreamingDecoder::new_with_decoder_and_dictionary_handle(counting(), decoder, &refused)
+            .err()
+            .expect("a zero repeat offset is refused")
+            .into_parts();
+    assert!(unread(&source));
+    assert_eq!(
+        decoder.max_window_size(),
+        1 << 20,
+        "the same decoder comes back"
+    );
+    assert!(alloc::format!("{error:?}").contains("ZeroRepeatOffset"));
+
+    // The dictionary magic with nothing after it.
+    let truncated = 0xEC30_A437u32.to_le_bytes();
+    let error = StreamingDecoder::new_with_dictionary_bytes(counting(), &truncated)
+        .err()
+        .expect("a truncated dictionary is refused");
+    assert!(unread(&error.into_source()));
+}
+
 /// A damaged first frame fails the first read, not the constructor, so the
 /// source stays with the caller: `into_inner` hands back what the decoder did
 /// not take, and the bytes after the damaged frame are still there.
