@@ -5,9 +5,9 @@
 use std::path::Path;
 
 /// A file as the filesystem identifies it: device and inode on Unix, volume
-/// serial number and file index on Windows.
+/// serial number and the 128-bit file ID on Windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FileId(u64, u64);
+pub struct FileId(u64, u128);
 
 /// The file `path` names, following symlinks; `None` when there is none, or
 /// the platform reads no identity.
@@ -40,7 +40,7 @@ mod sys {
     use std::path::Path;
 
     fn of(metadata: &fs::Metadata) -> FileId {
-        FileId(metadata.dev(), metadata.ino())
+        FileId(metadata.dev(), u128::from(metadata.ino()))
     }
 
     pub fn of_path(path: &Path) -> Option<FileId> {
@@ -78,41 +78,47 @@ mod sys {
     /// `fs::metadata` answers for any path on Unix.
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
-    /// `BY_HANDLE_FILE_INFORMATION`; each `FILETIME` is two `DWORD`s.
+    /// `FileIdInfo` of `FILE_INFO_BY_HANDLE_CLASS`.
+    const FILE_ID_INFO_CLASS: i32 = 18;
+
+    /// `FILE_ID_INFO`: the volume and the 128-bit file ID. The 64-bit index
+    /// of `BY_HANDLE_FILE_INFORMATION` is not unique on ReFS, which is why
+    /// this one is read.
     #[repr(C)]
     #[derive(Default)]
-    struct ByHandleFileInformation {
-        attributes: u32,
-        creation_time: [u32; 2],
-        last_access_time: [u32; 2],
-        last_write_time: [u32; 2],
-        volume_serial_number: u32,
-        file_size_high: u32,
-        file_size_low: u32,
-        number_of_links: u32,
-        file_index_high: u32,
-        file_index_low: u32,
+    struct FileIdInfo {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
     }
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn GetFileInformationByHandle(
+        fn GetFileInformationByHandleEx(
             file: *mut c_void,
-            information: *mut ByHandleFileInformation,
+            class: i32,
+            information: *mut c_void,
+            size: u32,
         ) -> i32;
     }
 
     fn of_handle(handle: RawHandle) -> Option<FileId> {
-        let mut information = ByHandleFileInformation::default();
+        let mut information = FileIdInfo::default();
         // SAFETY: `handle` is open for the duration of the call (borrowed from
-        // a live `File` or the process's stdout), and `information` is a
-        // writable `BY_HANDLE_FILE_INFORMATION`; zero is the failure.
-        let ok = unsafe { GetFileInformationByHandle(handle.cast(), &mut information) };
+        // a live `File` or one of the process's standard streams), and
+        // `information` is a writable `FILE_ID_INFO` of the size passed; zero
+        // is the failure.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle.cast(),
+                FILE_ID_INFO_CLASS,
+                (&raw mut information).cast(),
+                core::mem::size_of::<FileIdInfo>() as u32,
+            )
+        };
         (ok != 0).then(|| {
             FileId(
-                u64::from(information.volume_serial_number),
-                (u64::from(information.file_index_high) << 32)
-                    | u64::from(information.file_index_low),
+                information.volume_serial_number,
+                u128::from_le_bytes(information.file_id),
             )
         })
     }

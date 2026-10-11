@@ -2366,9 +2366,9 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
     for list in &opts.filelists {
         refuse("the file list", list)?;
     }
-    // Stdin is an input like any other, read through a descriptor rather than
-    // a name. A benchmark reads no stdin.
-    if !opts.bench && reads_stdin(&opts.inputs) && is_stdin(trace) {
+    // Stdin is read through a descriptor rather than a name, and not only by
+    // the codec: a confirmation or `-p` reads it too, so no trace goes there.
+    if is_stdin(trace) {
         bail!(
             "--trace {} is also standard input, which this run reads",
             trace.display()
@@ -2382,8 +2382,9 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
             trace.display()
         );
     }
-    // Errors, summaries and progress go to stderr unless `-qq` silences it.
-    if opts.verbosity >= 1 && is_stderr(trace) {
+    // Errors, summaries and progress go to stderr unless `-qq` silences it;
+    // `--show-default-cparams` and `-p`'s prompt go there whatever it is.
+    if (opts.verbosity >= 1 || opts.show_default_cparams || opts.pause) && is_stderr(trace) {
         bail!(
             "--trace {} is also standard error, which this run writes to",
             trace.display()
@@ -2397,7 +2398,17 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
         return refuse("the dictionary being trained", &training_output(opts));
     }
     if let Some(output) = &opts.output {
-        return refuse("the output", output);
+        // Every input skipped as already compressed leaves `-o` unwritten.
+        let writes_output = opts.inputs.is_empty()
+            || opts
+                .inputs
+                .iter()
+                .any(|input| !skips_as_compressed(opts, input));
+        return if writes_output {
+            refuse("the output", output)
+        } else {
+            Ok(())
+        };
     }
     if matches!(opts.mode, Mode::Compress | Mode::Decompress) {
         for input in opts.inputs.iter().filter(|input| *input != Path::new("-")) {
@@ -2455,11 +2466,14 @@ fn is_stderr(path: &Path) -> bool {
         || identity::of_stderr().is_some_and(|stderr| identity::of_path(path) == Some(stderr))
 }
 
-/// Whether `path` is the file this process's standard input reads, as
-/// [`is_stdout`] tells standard output.
+/// Whether `path` is the file this process's standard input reads: by one
+/// of its Unix names, or by identity when it is a regular file, the one kind
+/// a trace appended to would change (`/dev/null` as stdin and as a trace is
+/// two discards, not a collision).
 fn is_stdin(path: &Path) -> bool {
     names_stream(path, &["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"])
-        || identity::of_stdin().is_some_and(|stdin| identity::of_path(path) == Some(stdin))
+        || (fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+            && identity::of_stdin().is_some_and(|stdin| identity::of_path(path) == Some(stdin)))
 }
 
 /// Whether `path` is spelled as one of a standard stream's Unix `names`.
@@ -2483,10 +2497,10 @@ fn training_output(opts: &Options) -> PathBuf {
 fn dangling_link_target(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
     for _ in 0..40 {
-        let is_link = fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.is_symlink());
-        if !is_link || current.exists() {
+        if current.exists() {
             break;
         }
+        // A path that is not there and is no link reads no link either.
         let Ok(target) = fs::read_link(&current) else {
             break;
         };
@@ -5775,7 +5789,14 @@ fn compress_frame<R: BufRead, W: Write + BytesWritten>(
         &mut codecs.trace,
         &trace::Frame {
             method: trace::Method::Compress,
-            level: settings.level,
+            // Level 0 asks for the default, and the frame is compressed at
+            // it; the reference stores 0 as `ZSTD_CLEVEL_DEFAULT` and traces
+            // that (`ZSTD_CCtxParams_setParameter`).
+            level: if settings.level == 0 {
+                structured_zstd::encoding::CompressionLevel::DEFAULT_LEVEL
+            } else {
+                settings.level
+            },
             dictionary_size,
             uncompressed_size: consumed,
             compressed_size: written,

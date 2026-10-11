@@ -2967,6 +2967,115 @@ fn trace_on_stderr_is_refused_unless_silenced() {
     }
 }
 
+/// Standard input is never a place for a trace: besides the codec, a
+/// confirmation or `-p` may read it, so it is refused even when the inputs
+/// are named files.
+#[cfg(unix)]
+#[test]
+fn trace_on_stdin_is_refused_whatever_the_inputs() {
+    let scratch = Scratch::new("trace-stdin-named");
+    let out = scratch.0.join("out.zst");
+    let opts = parse(&["-f", "in", "-o", out.to_str().unwrap()]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new("/dev/stdin")).is_err());
+}
+
+/// `--show-default-cparams` and `-p` write to stderr whatever the
+/// verbosity, so under `-qq` they still keep a trace off it.
+#[cfg(unix)]
+#[test]
+fn trace_on_stderr_is_refused_while_anything_writes_there() {
+    let stderr = Path::new("/dev/stderr");
+    for args in [
+        &["-qq", "--show-default-cparams", "in", "-o", "/dev/null"][..],
+        &["-qq", "-p", "in", "-o", "/dev/null"][..],
+    ] {
+        let opts = parse(args).unwrap();
+        assert!(refuse_trace_alias(&opts, stderr).is_err(), "{args:?}");
+    }
+}
+
+/// When `--exclude-compressed` skips every input, the `-o` output is never
+/// written, and a trace may take its name.
+#[test]
+fn trace_named_like_an_unwritten_output_is_opened() {
+    let scratch = Scratch::new("trace-unwritten-output");
+    let input = scratch.file("a.zst", b"already compressed");
+    let out = scratch.0.join("out");
+    let opts = parse(&[
+        "--exclude-compressed",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(refuse_trace_alias(&opts, &out).is_ok());
+}
+
+/// Standard input has an identity to compare a regular file against, and a
+/// regular file that is not stdin is not taken for it.
+#[test]
+fn a_regular_file_is_not_taken_for_stdin() {
+    let scratch = Scratch::new("stdin-identity");
+    let file = scratch.file("f", b"x");
+    assert!(!is_stdin(&file));
+}
+
+/// Without a trace, decoding drains through plain reads: a source that is
+/// interrupted is read again, and a damaged frame is an error.
+#[test]
+fn the_untraced_drain_retries_interrupts_and_reports_errors() {
+    struct InterruptedOnce<'a> {
+        data: &'a [u8],
+        interrupted: bool,
+    }
+    impl Read for InterruptedOnce<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.data.read(buf)
+        }
+    }
+    let frame = frame_of(b"drained without a trace");
+    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(InterruptedOnce {
+        data: &frame,
+        interrupted: false,
+    });
+    let mut out = Vec::new();
+    let mut buffer = [0u8; 8];
+    let written = drain_decoded(&mut decoder, &mut out, &mut buffer, &mut None, 0).unwrap();
+    assert_eq!(out, b"drained without a trace");
+    assert_eq!(written, out.len() as u64);
+
+    let mut damaged = structured_zstd::decoding::StreamingDecoder::new(&frame[..frame.len() - 2]);
+    assert!(drain_decoded(&mut damaged, &mut Vec::new(), &mut buffer, &mut None, 0).is_err());
+}
+
+/// Level 0 asks for the default level; the trace records the level the
+/// frame was compressed at, as the reference stores 0 as the default.
+#[test]
+fn trace_records_level_zero_as_the_default() {
+    let scratch = Scratch::new("trace-level-zero");
+    let path = scratch.0.join("t.csv");
+    let mut codecs = no_dict();
+    codecs.trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    compress_stream(
+        &b"level zero"[..],
+        Vec::new(),
+        &FrameSettings {
+            level: 0,
+            ..FrameSettings::default()
+        },
+        &mut codecs,
+    )
+    .unwrap();
+    drop(codecs);
+    let lines = fs::read_to_string(&path).unwrap();
+    let level = lines.lines().nth(1).unwrap().split(", ").nth(4).unwrap();
+    assert_eq!(level, "3");
+}
+
 /// An input `--exclude-compressed` skips writes no output, so the output
 /// derived from it is no file of the run, and a trace may take its name.
 #[test]
