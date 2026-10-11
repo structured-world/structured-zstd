@@ -21,6 +21,11 @@ pub fn of_stdout() -> Option<FileId> {
     sys::of_stdout()
 }
 
+/// The file standard input reads, as [`of_stdout`] tells standard output.
+pub fn of_stdin() -> Option<FileId> {
+    sys::of_stdin()
+}
+
 #[cfg(unix)]
 mod sys {
     use super::FileId;
@@ -37,9 +42,17 @@ mod sys {
         fs::metadata(path).ok().as_ref().map(of)
     }
 
-    pub fn of_stdout() -> Option<FileId> {
-        let fd = std::io::stdout().as_fd().try_clone_to_owned().ok()?;
+    fn of_stream(stream: impl AsFd) -> Option<FileId> {
+        let fd = stream.as_fd().try_clone_to_owned().ok()?;
         File::from(fd).metadata().ok().as_ref().map(of)
+    }
+
+    pub fn of_stdout() -> Option<FileId> {
+        of_stream(std::io::stdout())
+    }
+
+    pub fn of_stdin() -> Option<FileId> {
+        of_stream(std::io::stdin())
     }
 }
 
@@ -110,6 +123,10 @@ mod sys {
     pub fn of_stdout() -> Option<FileId> {
         of_handle(std::io::stdout().as_raw_handle())
     }
+
+    pub fn of_stdin() -> Option<FileId> {
+        of_handle(std::io::stdin().as_raw_handle())
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -122,6 +139,10 @@ mod sys {
     }
 
     pub fn of_stdout() -> Option<FileId> {
+        None
+    }
+
+    pub fn of_stdin() -> Option<FileId> {
         None
     }
 }

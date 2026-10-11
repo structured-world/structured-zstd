@@ -2336,6 +2336,9 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
     // the one compared.
     let trace = &dangling_link_target(trace);
     let names = |other: &Path| -> Result<bool> {
+        // A dangling link among the run's files leads to the file opening it
+        // would create as well, which opening the trace may create first.
+        let other = &dangling_link_target(other);
         Ok(names_the_same_file(trace, other)?
             || (trace.exists() && other.exists() && paths_point_to_same_file(trace, other)?))
     };
@@ -2360,6 +2363,14 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
     for list in &opts.filelists {
         refuse("the file list", list)?;
     }
+    // Stdin is an input like any other, read through a descriptor rather than
+    // a name. A benchmark reads no stdin.
+    if !opts.bench && reads_stdin(&opts.inputs) && is_stdin(trace) {
+        bail!(
+            "--trace {} is also standard input, which this run reads",
+            trace.display()
+        );
+    }
     // What the run sends to stdout would interleave with the trace's lines
     // there. A run writing to a file leaves stdout free for the trace.
     if writes_to_stdout(opts) && is_stdout(trace) {
@@ -2380,8 +2391,11 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
     }
     if matches!(opts.mode, Mode::Compress | Mode::Decompress) {
         for input in opts.inputs.iter().filter(|input| *input != Path::new("-")) {
-            // An input whose output cannot be derived is reported when its
-            // turn comes, and writes nothing.
+            // An input skipped as already compressed, or whose output cannot
+            // be derived, writes nothing.
+            if skips_as_compressed(opts, input) {
+                continue;
+            }
             if let Ok(output) = derive_output_path(opts, input) {
                 refuse("the output", &output)?;
             }
@@ -2410,12 +2424,30 @@ fn writes_to_stdout(opts: &Options) -> bool {
     }
 }
 
-/// Whether `path` is the file this process's standard output writes to. A
-/// file, or a pipe on Linux, is recognised through any of its names; macOS
-/// gives a pipe under `/dev/fd` attributes of its own, so there only a file
-/// is.
+/// Whether `input` is one `--exclude-compressed` leaves alone: compression
+/// skips a name with a compressed extension, and writes nothing for it.
+fn skips_as_compressed(opts: &Options, input: &Path) -> bool {
+    compresses(opts) && opts.exclude_compressed && inputs::has_compressed_extension(input)
+}
+
+/// Whether `path` is the file this process's standard output writes to: by
+/// identity, or by one of the names Unix gives it, which reach it whatever
+/// it is (macOS gives a pipe under `/dev/fd` an identity of its own).
 fn is_stdout(path: &Path) -> bool {
-    identity::of_stdout().is_some_and(|stdout| identity::of_path(path) == Some(stdout))
+    names_stream(path, &["/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"])
+        || identity::of_stdout().is_some_and(|stdout| identity::of_path(path) == Some(stdout))
+}
+
+/// Whether `path` is the file this process's standard input reads, as
+/// [`is_stdout`] tells standard output.
+fn is_stdin(path: &Path) -> bool {
+    names_stream(path, &["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"])
+        || identity::of_stdin().is_some_and(|stdin| identity::of_path(path) == Some(stdin))
+}
+
+/// Whether `path` is spelled as one of a standard stream's Unix `names`.
+fn names_stream(path: &Path, names: &[&str]) -> bool {
+    cfg!(unix) && names.iter().any(|name| path == Path::new(name))
 }
 
 /// Where `--train` writes the dictionary: `-o`, or `dictionary` as the
@@ -5033,7 +5065,7 @@ fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata
     if !admissible(&named.file_type()) {
         bail!("{} is not a regular file -- ignored", input.display());
     }
-    if compresses(opts) && opts.exclude_compressed && inputs::has_compressed_extension(input) {
+    if skips_as_compressed(opts, input) {
         display!(
             opts.verbosity,
             4,
@@ -5724,6 +5756,8 @@ fn compress_frame<R: BufRead, W: Write + BytesWritten>(
             .write_all(piece)
             .wrap_err("streaming compression failed")?;
         reader.consume(len);
+        // Counted whether or not a trace reads it: one add per piece read is
+        // cheaper than the branch that would skip it.
         consumed += len as u64;
     }
     // A writer only takes bytes, so its count has not gone down.

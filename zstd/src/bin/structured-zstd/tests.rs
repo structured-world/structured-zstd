@@ -2913,6 +2913,50 @@ fn every_name_of_a_file_has_its_identity() {
     assert_ne!(identity::of_path(&other), id);
 }
 
+/// An input that is a dangling symlink names the file opening the trace
+/// would create when the two lead to the same place; the trace is refused
+/// rather than become the input.
+#[cfg(unix)]
+#[test]
+fn trace_where_a_dangling_input_leads_is_refused() {
+    let scratch = Scratch::new("trace-dangling-input");
+    let target = scratch.0.join("target");
+    let input = scratch.0.join("in");
+    std::os::unix::fs::symlink(&target, &input).unwrap();
+    let opts = parse(&["-f", input.to_str().unwrap(), "-o", "/dev/null"]).unwrap();
+    assert!(refuse_trace_alias(&opts, &target).is_err());
+}
+
+/// The names Unix gives standard output and standard input are them,
+/// whatever their identity reads as (a pipe under macOS `/dev/fd` reads as
+/// a node of its own).
+#[cfg(unix)]
+#[test]
+fn the_standard_stream_names_are_recognised() {
+    for name in ["/dev/stdout", "/dev/fd/1"] {
+        assert!(is_stdout(Path::new(name)), "{name}");
+    }
+    let reading_stdin = parse(&["-d", "-", "-o", "/dev/null"]).unwrap();
+    for name in ["/dev/stdin", "/dev/fd/0"] {
+        assert!(
+            refuse_trace_alias(&reading_stdin, Path::new(name)).is_err(),
+            "{name}"
+        );
+    }
+}
+
+/// An input `--exclude-compressed` skips writes no output, so the output
+/// derived from it is no file of the run, and a trace may take its name.
+#[test]
+fn trace_named_like_a_skipped_input_output_is_opened() {
+    let scratch = Scratch::new("trace-excluded");
+    let input = scratch.file("a.zst", b"already compressed");
+    let input = input.to_str().unwrap();
+    let derived = format!("{input}.zst");
+    let opts = parse(&["--exclude-compressed", input]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new(&derived)).is_ok());
+}
+
 /// A trace that is a hard link to an input is that input, under a name no
 /// canonical path tells apart; it is refused like the input itself.
 #[test]
