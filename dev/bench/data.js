@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791721282220,
+  "lastUpdate": 1791739267483,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -13667,6 +13667,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.187,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f2f1f750e5e1c2712ee45b0900992531749172e4",
+          "message": "feat(cli): --trace writes one CSV line per frame (#579)\n\nReplaces #578 (which replaced #575), squashed into one commit on top of\n`main`.\n\n## Summary\n\n`zstd --trace FILE` appends one CSV line per compressed and decompressed\nframe, as a reference build with library tracing does\n(`programs/zstdcli_trace.c`). Until now the option was taken and nothing\nwas written.\n\n- **Decoding.** `StreamingDecoder::read_reporting_frames(buf, finished)`\nis `read` that hands `finished` each frame the call finishes, at the\nmoment the frame is verified and before the next one starts, as\nupstream's `ZSTD_trace_decompress_end` hook is called: the bytes the\nframe took from the source (header and checksum included) and the bytes\nit decoded to. One call can finish several frames (empty frames deliver\nnothing, so it passes on to the next), and each is reported in stream\norder; skippable frames are not, and `read_to_end` reports none.\n`Read::read` is the same call with a callback that does nothing, so the\ndecoder carries no state for it.\n- **CLI.**\n- The file is opened for appending; the header is written only when it\nwas not a regular file. Lines are gathered and written 8 KiB at a time,\nas the reference's `FILE*` writes them, and the rest when the trace\ncloses, so a benchmark does not time a write per frame.\n- Each line carries `zstd, 10507, compress|decompress,\nstreaming|single-pass, level, workers, dictionary size, uncompressed,\ncompressed, duration ns, ratio, MB/s`, ratio and speed to two decimals,\na zero duration counted as 0.1 ns, as the reference's `TRACE_log` does.\n- Level 0 is recorded as the default level it compresses at, as the\nreference stores it.\n- Compression, `-d`, `-t` and `-b` are traced. The benchmark's lines are\n`single-pass`, the others `streaming`. Workers is 0: this build\ncompresses on the calling thread.\n- The dictionary size is the dictionary as it was given, header and\nentropy tables included, both ways, as the reference reports it\n(`dictContentSize` and `ZSTD_DDict_dictSize` are both the whole buffer).\n- A frame is timed as the codec's own time on it. Decompression: the\ncalls into the decoder from the end of the frame before to the moment\nthis one is verified. Compression: from before the context is set up to\nthe end of the frame. Both leave out the time the source took over its\nreads (and consumes, where a progress display updates) and the\ndestination over its writes, and the trace line's own write, so the\nspeed column is the codec's whatever the devices. The reference times\nthe span between its begin and end hooks, which takes in the caller's\nI/O of every block but the last.\n- A trace that cannot be opened is reported, and the run goes on\nuntraced, as the reference goes on when its `fopen` fails. A trace that\nfails a write is closed, and reported unless `-qq`; the rest of the run\nis untraced, with no timing left running.\n- A trace path that names a file of the run is refused before the trace\nis opened: an input, standard input (always: a confirmation or `-p`\nreads it too; by identity when a regular file or a named pipe is behind\nit), a `--filelist`, the dictionary where the mode reads one, the `-o`\noutput (not under `--list`, which ignores it) and an output derived from\nan input (unless `--exclude-compressed` skips what would write it), with\nany directory the run has to create on the way to it\n(`--output-dir-mirror`), the dictionary `--train` writes, standard\noutput when the run writes there (data under `-c` or from stdin, a\nbenchmark's results, `--list`'s table), and standard error unless `-qq`\nsilences it and none of `--show-default-cparams`, `-p` or `--progress`\nwrites there. Compared as files: canonical path, then the identity the\nfilesystem gives the file (device and inode on Unix, volume serial and\n128-bit file ID on Windows), so a hard link or a redirected stream is\ncaught; the Unix names of the standard streams (`/dev/stdout`,\n`/dev/fd/1`, ...) count as them whatever their identity reads as; a\ndangling symlink, on either side, is compared as the file opening it\nwould create. Names of files still to be created are compared as\nspelled, not by a filesystem's case rules. The reference opens the trace\nwithout asking, which appends to an input, or creates an output ahead of\nits own overwrite check. A run writing to a file leaves stdout free, so\n`--trace /dev/stdout` there is opened.\n  - `--help` lists `--trace LOG`.\n- The Windows file identity also lets the existing output-over-input\ncheck see a hard link there, which it could not before.\n- `compress_stream` returns the frame's compressed size, read off the\ndestination after the frame (a counting writer's count, a buffer's\nlength), which the summary takes instead of counting a second time.\nWithout a trace, the benchmark writes straight into its buffer and\ndecoding drains through plain reads, so an untraced run pays nothing for\ntracing.\n\nChecked against the reference 1.5.7 on Linux (a Fedora build, where\ntracing is on): the header, field order, version and number formatting\nmatch. One difference: the reference reports small `-d`/`-t` frames as\n`single-pass`, because `ZSTD_decompressStream` takes its one-pass\nshortcut when the declared size fits the output buffer; this decoder\nstreams every frame and says so.\n\n## Testing\n\n- Codec: two frames with a skippable frame between them, read a few\nbytes at a time, report each frame once with its sizes; two empty frames\nbefore a third are each reported, in order.\n- Trace file: a line in the reference's format; a zero duration; the\nheader written once across reopening; the reused line buffer carries\nnothing over; a slow source or sink appears in neither a compressed nor\na decompressed frame's duration.\n- CLI end to end: compressing two files, decompressing and testing a\nfile of two frames, and a benchmark, each with the expected lines; a\ntrained dictionary reported at its full size both ways; a trace that\ncannot be opened or written leaves the run untraced; each alias above is\nrefused and leaves every file as it was, and the cases that are not\naliases (a skipped input's output, an unread dictionary, stdout beside a\nfile output, stderr under `-qq`) are opened.\n- Gates: `cargo nextest run --workspace --features\nhash,std,dict-builder,ldm,lsm` (1635 passed; the stdout case also on\nLinux, where it runs; the Windows identity path is exercised by the\nhard-link tests on the Windows CI job), doctests, `cargo fmt --check`,\nclippy on the workspace with `-D warnings`, `cargo doc -D warnings`,\nno-std check on `thumbv7em-none-eabihf`.\n\nCloses #566",
+          "timestamp": "2026-10-11T16:38:08Z",
+          "tree_id": "ca20e2d787911105456fe8123ac72eea83536a84",
+          "url": "https://github.com/structured-world/structured-zstd/commit/f2f1f750e5e1c2712ee45b0900992531749172e4"
+        },
+        "date": 1791739248063,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.06,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.083,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 165.174,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 200.909,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.534,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.369,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.482,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.51,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.055,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.173,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.173,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 4.712,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 3.051,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.05,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.099,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 0.776,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.682,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 0.866,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.742,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.076,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.074,
             "unit": "ms"
           }
         ]
