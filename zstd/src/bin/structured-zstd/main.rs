@@ -225,7 +225,7 @@ struct Options {
     /// and table sizing only; being wrong costs ratio, never correctness, so
     /// it must NOT reach the header.
     size_hint: Option<u64>,
-    /// Display level: `-v` raises it, `-q` lowers it (see [`display`]).
+    /// Display level: `-v` raises it, `-q` lowers it (see [`display!`]).
     verbosity: i32,
     /// Whether frames carry a content checksum (`-C` / `--[no-]check`), and
     /// whether decoding verifies one. On by default, as the reference
@@ -5955,9 +5955,6 @@ fn decompress_stream<R: Read, W: Write>(
     codecs: &mut Codecs,
     settings: &DecodeSettings,
 ) -> Result<u64> {
-    use structured_zstd::decoding::StreamingDecoder;
-    use structured_zstd::decoding::errors::FrameDecoderError;
-
     // Parsed once for the whole run rather than per stream or per frame, and
     // decoded against by one decoder: the decoder keeps its buffers and, for
     // this one dictionary, the handle it took on the first frame.
@@ -6024,80 +6021,132 @@ fn decompress_stream<R: Read, W: Write>(
             bail!("unsupported format");
         }
         frames += 1;
-        // Kept only while a trace times the decoder.
-        let read_time = core::cell::Cell::new(trace.is_some().then_some(std::time::Duration::ZERO));
-        let mut stream = Watched {
-            inner: io::Cursor::new(magic).chain(&mut source),
-            failed: false,
-            read_time: &read_time,
-        };
-        // Borrowed, not moved: the reader stays with us after the decoder.
-        let mut decoder = match handle {
-            // The dictionary constructors FORCE the supplied dictionary, which
-            // the registration path does not: a frame may legitimately omit the
-            // optional dictionary ID, and then nothing would select it.
-            Some(h) => StreamingDecoder::new_with_decoder_and_dictionary_handle(
-                &mut stream,
-                &mut *decompressor,
-                h,
-            )
-            .map_err(|err| eyre!("invalid dictionary: {err}"))?,
-            None => StreamingDecoder::new_with_decoder(&mut stream, &mut *decompressor),
-        };
-        // The library computes the digest but does not compare it, leaving the
-        // decision to the caller. For a command-line tool that decision is
-        // made: the reference command validates by default, and `-t` exists to
-        // answer exactly this question, so a frame whose stored checksum
-        // disagrees with its data has to fail rather than decode quietly.
-        // `--no-check` asks for the opposite. Read at the end of the frame, so
-        // setting it after construction is in time.
-        decoder
-            .decoder_mut()
-            .set_content_checksum(if settings.verify_checksum {
-                structured_zstd::decoding::ContentChecksum::Verify
-            } else {
-                structured_zstd::decoding::ContentChecksum::None
-            });
-        // The decoder reads every frame and skippable frame of the stream, the
-        // first one's header included, so whatever is wrong with the input is
-        // reported here. The chunk is taken only now, by input that is a
-        // frame: plain or empty input never decodes into it.
-        chunk.resize(IO_CHUNK, 0);
-        let err = match drain_decoded(
-            &mut decoder,
-            &mut writer,
+        let stream = Frames {
+            magic,
+            source: &mut source,
+            handle: handle.as_ref(),
+            decompressor,
             chunk,
             trace,
-            &read_time,
             dictionary_size,
-        ) {
-            Ok(n) => {
-                written += n;
-                continue;
-            }
-            Err(err) => err,
+            settings,
         };
-        // A source that fails is a read failure, whatever the decoder was
-        // reading at the time, a frame header or a skippable frame's content.
-        if decoder.get_ref().failed {
-            bail!("failed to read the input: {err}");
-        }
-        match err
-            .get_ref()
-            .and_then(|e| e.downcast_ref::<FrameDecoderError>())
-        {
-            Some(&FrameDecoderError::WindowSizeTooBig {
-                requested, limit, ..
-            }) => bail!(
-                "{}",
-                window_too_large_message(requested, limit, settings.memory_overhead)
-            ),
-            Some(frame_err) => match after_frame_message(frame_err) {
-                Some(message) => bail!("{message}"),
-                None => bail!("invalid zstd frame: {frame_err:?}"),
-            },
-            None => return Err(err).wrap_err("streaming decompression failed"),
-        }
+        // The clock is chosen once per stream, so an untraced one decodes
+        // through bare reads.
+        written += if stream.trace.is_some() {
+            decode_frames(
+                stream,
+                &mut writer,
+                &core::cell::Cell::new(Some(std::time::Duration::ZERO)),
+            )?
+        } else {
+            decode_frames(stream, &mut writer, &Untimed)?
+        };
+    }
+}
+
+/// What [`decode_frames`] decodes: the stream from its first frame's magic
+/// on, and the run's decoder state.
+struct Frames<'a, R> {
+    magic: [u8; 4],
+    source: &'a mut R,
+    handle: Option<&'a structured_zstd::decoding::DictionaryHandle>,
+    decompressor: &'a mut structured_zstd::decoding::FrameDecoder,
+    chunk: &'a mut Vec<u8>,
+    trace: &'a mut Option<trace::Trace>,
+    dictionary_size: u64,
+    settings: &'a DecodeSettings,
+}
+
+/// Decode every frame from `frames.magic` on into `writer`, the source's
+/// reads timed on `read_time`, until the stream ends or what follows is no
+/// frame. Returns the number of bytes written.
+fn decode_frames<R: Read, W: Write, C: ReadClock>(
+    frames: Frames<'_, R>,
+    writer: &mut W,
+    read_time: &C,
+) -> Result<u64> {
+    use structured_zstd::decoding::StreamingDecoder;
+    use structured_zstd::decoding::errors::FrameDecoderError;
+
+    let Frames {
+        magic,
+        source,
+        handle,
+        decompressor,
+        chunk,
+        trace,
+        dictionary_size,
+        settings,
+    } = frames;
+    let mut stream = Watched {
+        inner: io::Cursor::new(magic).chain(source),
+        failed: false,
+        read_time,
+    };
+    // Borrowed, not moved: the reader stays with the caller after the decoder.
+    let mut decoder = match handle {
+        // The dictionary constructors FORCE the supplied dictionary, which
+        // the registration path does not: a frame may legitimately omit the
+        // optional dictionary ID, and then nothing would select it.
+        Some(h) => StreamingDecoder::new_with_decoder_and_dictionary_handle(
+            &mut stream,
+            &mut *decompressor,
+            h,
+        )
+        .map_err(|err| eyre!("invalid dictionary: {err}"))?,
+        None => StreamingDecoder::new_with_decoder(&mut stream, &mut *decompressor),
+    };
+    // The library computes the digest but does not compare it, leaving the
+    // decision to the caller. For a command-line tool that decision is
+    // made: the reference command validates by default, and `-t` exists to
+    // answer exactly this question, so a frame whose stored checksum
+    // disagrees with its data has to fail rather than decode quietly.
+    // `--no-check` asks for the opposite. Read at the end of the frame, so
+    // setting it after construction is in time.
+    decoder
+        .decoder_mut()
+        .set_content_checksum(if settings.verify_checksum {
+            structured_zstd::decoding::ContentChecksum::Verify
+        } else {
+            structured_zstd::decoding::ContentChecksum::None
+        });
+    // The decoder reads every frame and skippable frame of the stream, the
+    // first one's header included, so whatever is wrong with the input is
+    // reported here. The chunk is taken only now, by input that is a
+    // frame: plain or empty input never decodes into it.
+    chunk.resize(IO_CHUNK, 0);
+    let err = match drain_decoded(
+        &mut decoder,
+        writer,
+        chunk,
+        trace,
+        read_time,
+        dictionary_size,
+    ) {
+        Ok(n) => return Ok(n),
+        Err(err) => err,
+    };
+    // A source that fails is a read failure, whatever the decoder was
+    // reading at the time, a frame header or a skippable frame's content.
+    if decoder.get_ref().failed {
+        bail!("failed to read the input: {err}");
+    }
+    match err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<FrameDecoderError>())
+    {
+        Some(&FrameDecoderError::WindowSizeTooBig {
+            requested, limit, ..
+        }) => bail!(
+            "{}",
+            window_too_large_message(requested, limit, settings.memory_overhead)
+        ),
+        Some(frame_err) => match after_frame_message(frame_err) {
+            Some(message) => bail!("{message}"),
+            None => bail!("invalid zstd frame: {frame_err:?}"),
+        },
+        None => Err(err).wrap_err("streaming decompression failed"),
     }
 }
 
@@ -6109,25 +6158,27 @@ fn decompress_stream<R: Read, W: Write>(
 /// `dictionary_size`, timed as the decoder's own time on it: the calls into
 /// the decoder from the end of the frame before to the moment this one is
 /// verified, less the time its source took over the reads, which the source
-/// adds to `read_time` while it holds a sum. The writes to `writer` and the
-/// trace line's own write fall outside it, so the speed reported is the
-/// decoder's, whatever the source and sink. The reference times the span
-/// between its begin and end hooks instead, which takes in the caller's I/O
-/// of every block but the last. When the trace closes, `read_time` is
-/// cleared, and the source stops timing its reads.
-fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::FrameDecoder>>(
+/// times on `read_time`. The writes to `writer` and the trace line's own
+/// write fall outside it, so the speed reported is the decoder's, whatever
+/// the source and sink. The reference times the span between its begin and
+/// end hooks instead, which takes in the caller's I/O of every block but the
+/// last. When the trace closes, `read_time` stops, and so does the timing.
+fn drain_decoded<
+    R: Read,
+    D: core::borrow::BorrowMut<structured_zstd::decoding::FrameDecoder>,
+    C: ReadClock,
+>(
     decoder: &mut structured_zstd::decoding::StreamingDecoder<R, D>,
     writer: &mut impl Write,
     buffer: &mut [u8],
     trace: &mut Option<trace::Trace>,
-    read_time: &core::cell::Cell<Option<std::time::Duration>>,
+    read_time: &C,
     dictionary_size: u64,
 ) -> io::Result<u64> {
     // The decoder's time spent on the frame in progress, over the calls so far.
     let mut spent = std::time::Duration::ZERO;
     let mut written = 0u64;
-    // The source's reads so far; a source that is not timed has taken none.
-    let read_sum = || read_time.get().unwrap_or_default();
+    let read_sum = || read_time.spent();
     // The decoder's time since `mark`: the clock's, less the source's reads
     // in that span, which lie inside it.
     let since = |mark: std::time::Instant, read_at_mark: std::time::Duration| {
@@ -6165,7 +6216,7 @@ fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::
         writer.write_all(&buffer[..n])?;
         written += n as u64;
     }
-    read_time.set(None);
+    read_time.stop();
     loop {
         let n = match decoder.read(buffer) {
             Ok(0) => return Ok(written),
@@ -6178,29 +6229,72 @@ fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::
     }
 }
 
-/// The decoder's source, remembering whether it failed, so a decode error can
-/// be told apart from the input device failing under it. While `read_time`
-/// holds a sum, it adds the time each read takes, so a trace can leave the
-/// source's time out of the decoder's; the decoder owns the source, so the
-/// sum is kept where the drain can read it, and clear, while the decoder is
-/// borrowed.
-struct Watched<'a, R> {
-    inner: R,
-    failed: bool,
-    read_time: &'a core::cell::Cell<Option<std::time::Duration>>,
+/// How the decoder's source accounts for the time its reads take, so a trace
+/// can leave it out of the decoder's. Chosen once per stream: an untraced one
+/// decodes through [`Untimed`], which compiles to the bare read.
+trait ReadClock {
+    /// Make one read, adding its time to the sum while timing.
+    fn time<T>(&self, read: impl FnOnce() -> T) -> T;
+    /// The reads' time so far.
+    fn spent(&self) -> std::time::Duration;
+    /// Stop timing: the trace that would read the sum has closed.
+    fn stop(&self);
 }
 
-impl<R: Read> Read for Watched<'_, R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let result = match self.read_time.get() {
+/// The clock of a stream no trace times: no reads timed, no time spent.
+struct Untimed;
+
+impl ReadClock for Untimed {
+    #[inline(always)]
+    fn time<T>(&self, read: impl FnOnce() -> T) -> T {
+        read()
+    }
+
+    fn spent(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
+    fn stop(&self) {}
+}
+
+/// The clock of a traced stream: the sum while the trace is open, `None` once
+/// it has closed. Shared with the drain, which reads it while the decoder
+/// owns the source.
+impl ReadClock for core::cell::Cell<Option<std::time::Duration>> {
+    fn time<T>(&self, read: impl FnOnce() -> T) -> T {
+        match self.get() {
             Some(sum) => {
                 let started = std::time::Instant::now();
-                let result = self.inner.read(buf);
-                self.read_time.set(Some(sum + started.elapsed()));
+                let result = read();
+                self.set(Some(sum + started.elapsed()));
                 result
             }
-            None => self.inner.read(buf),
-        };
+            None => read(),
+        }
+    }
+
+    fn spent(&self) -> std::time::Duration {
+        self.get().unwrap_or_default()
+    }
+
+    fn stop(&self) {
+        self.set(None);
+    }
+}
+
+/// The decoder's source, remembering whether it failed, so a decode error can
+/// be told apart from the input device failing under it, and timing its reads
+/// on `read_time`.
+struct Watched<'a, R, C> {
+    inner: R,
+    failed: bool,
+    read_time: &'a C,
+}
+
+impl<R: Read, C: ReadClock> Read for Watched<'_, R, C> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let inner = &mut self.inner;
+        let result = self.read_time.time(|| inner.read(buf));
         if let Err(e) = &result
             && e.kind() != io::ErrorKind::Interrupted
         {
