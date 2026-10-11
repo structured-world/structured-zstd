@@ -2322,6 +2322,9 @@ impl Codecs {
 /// as files, as the output checks compare them: another spelling, a symlink
 /// or a hard link is the same file.
 fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
+    // Opening a dangling link creates the file it points at, so that file is
+    // the one compared.
+    let trace = &dangling_link_target(trace);
     let names = |other: &Path| -> Result<bool> {
         Ok(names_the_same_file(trace, other)?
             || (trace.exists() && other.exists() && paths_point_to_same_file(trace, other)?))
@@ -2346,6 +2349,9 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
     if opts.bench || opts.to_stdout || opts.mode == Mode::Test {
         return Ok(());
     }
+    if opts.mode == Mode::Train {
+        return refuse("the dictionary being trained", &training_output(opts));
+    }
     if let Some(output) = &opts.output {
         return refuse("the output", output);
     }
@@ -2359,6 +2365,37 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Where `--train` writes the dictionary: `-o`, or `dictionary` as the
+/// reference command names it.
+fn training_output(opts: &Options) -> PathBuf {
+    opts.output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("dictionary"))
+}
+
+/// The file a dangling symlink at `path` would create when opened for
+/// writing, following a chain of them; `path` itself when it is not one. A
+/// relative target is read against the link's own directory. The chain is
+/// cut at 40 links, as the kernel cuts it (`SYMLOOP_MAX` on Linux), and the
+/// path reached there is returned.
+fn dangling_link_target(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        let is_link = fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.is_symlink());
+        if !is_link || current.exists() {
+            break;
+        }
+        let Ok(target) = fs::read_link(&current) else {
+            break;
+        };
+        current = match current.parent() {
+            Some(parent) if target.is_relative() => parent.join(target),
+            _ => target,
+        };
+    }
+    current
 }
 
 /// Append `frame` to `trace`, if one is open. A trace that cannot be written
@@ -3776,10 +3813,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         Plan::Legacy => Ok(()),
     };
     tuning_fits.map_err(|err| eyre!("dictionary training failed: {err}"))?;
-    let output = opts
-        .output
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("dictionary"));
+    let output = training_output(opts);
     // Settled before the corpus is read: whether this run may write at all is
     // knowable now, and a command that is going to be refused should not first
     // load every sample and spend minutes training a dictionary to throw away.
@@ -5849,12 +5883,12 @@ fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::
     trace: &mut Option<trace::Trace>,
     dictionary_size: u64,
 ) -> io::Result<u64> {
-    let tracing = trace.is_some();
     // The decoder's time spent on the frame in progress, over the calls so far.
     let mut spent = std::time::Duration::ZERO;
     let mut written = 0u64;
     loop {
-        let mut mark = tracing.then(std::time::Instant::now);
+        // Asked per call: a trace closed by a failed write stops the timing.
+        let mut mark = trace.is_some().then(std::time::Instant::now);
         let read = decoder.read_reporting_frames(buffer, |frame| {
             if let Some(mark) = mark.as_mut() {
                 let duration = spent + mark.elapsed();

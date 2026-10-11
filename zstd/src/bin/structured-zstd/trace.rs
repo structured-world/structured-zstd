@@ -80,9 +80,10 @@ impl Trace {
 }
 
 /// Write the trace line for `frame` to `out`, in the reference's format: a
-/// duration of zero counts as a tenth of a nanosecond, and the ratio and speed
-/// take two decimals. Speed is bytes per nanosecond times a thousand, decimal
-/// MB/s.
+/// duration of zero counts as a tenth of a nanosecond for the speed, as
+/// upstream's `TRACE_log` does (`duration ? (double)duration : .1`), and the
+/// ratio and speed take two decimals. Speed is bytes per nanosecond times a
+/// thousand, decimal MB/s.
 fn write_line(out: &mut String, version: u32, single_pass: bool, frame: &Frame) {
     use std::fmt::Write as _;
     let method = match frame.method {

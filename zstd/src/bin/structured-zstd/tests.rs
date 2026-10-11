@@ -2868,6 +2868,36 @@ fn trace_reports_the_whole_dictionary() {
     assert_eq!(sizes, [blob.len().to_string(), blob.len().to_string()]);
 }
 
+/// `--train` without `-o` writes `dictionary`; a trace of that name would be
+/// created first and then trained over, so it is refused like any output.
+#[test]
+fn trace_naming_the_default_training_output_is_refused() {
+    let opts = parse(&["--train", "sample"]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new("dictionary")).is_err());
+    assert!(refuse_trace_alias(&opts, Path::new("elsewhere.csv")).is_ok());
+}
+
+/// A trace path that is a dangling symlink names the file it points at:
+/// opening it creates that file, so a link to an output still to be written
+/// is refused, and a dangling link to anything else is not.
+#[cfg(unix)]
+#[test]
+fn trace_through_a_dangling_link_to_an_output_is_refused() {
+    let scratch = Scratch::new("trace-dangling");
+    let input = scratch.file("in", b"compressed beside its trace");
+    let opts = parse(&["-f", input.to_str().unwrap()]).unwrap();
+    let to_output = scratch.0.join("to-output");
+    std::os::unix::fs::symlink(scratch.0.join("in.zst"), &to_output).unwrap();
+    assert!(refuse_trace_alias(&opts, &to_output).is_err());
+    // A relative target is read against the link's own directory.
+    let relative = scratch.0.join("relative");
+    std::os::unix::fs::symlink("in.zst", &relative).unwrap();
+    assert!(refuse_trace_alias(&opts, &relative).is_err());
+    let elsewhere = scratch.0.join("elsewhere");
+    std::os::unix::fs::symlink(scratch.0.join("t.csv"), &elsewhere).unwrap();
+    assert!(refuse_trace_alias(&opts, &elsewhere).is_ok());
+}
+
 /// A `--trace` file that is also a file the run reads or writes is refused
 /// before anything is opened: appending to an input would change it, and
 /// creating an output ahead of its own overwrite check would make the run
