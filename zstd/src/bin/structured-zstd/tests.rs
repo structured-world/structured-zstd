@@ -2716,7 +2716,7 @@ fn trace_times_decoding_without_the_writes() {
     let mut trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
     let mut decoder = structured_zstd::decoding::StreamingDecoder::new(frame.as_slice());
     let mut buffer = [0u8; 16];
-    let no_reads = core::cell::Cell::new(std::time::Duration::ZERO);
+    let no_reads = core::cell::Cell::new(None);
     drain_decoded(
         &mut decoder,
         &mut Slow,
@@ -3004,6 +3004,70 @@ fn trace_on_stderr_is_refused_while_anything_writes_there() {
     }
 }
 
+/// `--list` writes its table to stdout and ignores `-o`, so a trace may take
+/// that name.
+#[test]
+fn trace_named_like_a_listing_output_is_opened() {
+    let scratch = Scratch::new("trace-list-output");
+    let report = scratch.0.join("report.csv");
+    let report = report.to_str().unwrap();
+    let opts = parse(&["-qq", "-l", "-o", report, "archive.zst"]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new(report)).is_ok());
+}
+
+/// A mirror root the run has yet to create must become a directory, so a
+/// trace there, created first as a file, would fail every input.
+#[test]
+fn trace_where_a_mirrored_directory_goes_is_refused() {
+    let scratch = Scratch::new("trace-mirror-root");
+    let input = scratch.file("in", b"mirrored");
+    let root = scratch.0.join("results");
+    let opts = parse(&[
+        "-f",
+        "--output-dir-mirror",
+        root.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(refuse_trace_alias(&opts, &root).is_err());
+    assert!(!root.exists());
+}
+
+/// When the trace closes on a failed write, the source stops timing its
+/// reads: the rest of the stream decodes as an untraced one does.
+#[test]
+fn a_closed_trace_stops_timing_the_source() {
+    let scratch = Scratch::new("trace-closed-timing");
+    let read_only = scratch.file("read-only.csv", b"");
+    let mut trace = Some(trace::Trace::over(
+        fs::File::open(&read_only).unwrap(),
+        10507,
+        false,
+    ));
+    let mut both = frame_of(b"the first frame");
+    both.extend_from_slice(&frame_of(b"the second frame"));
+    let read_time = core::cell::Cell::new(Some(std::time::Duration::ZERO));
+    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(Watched {
+        inner: both.as_slice(),
+        failed: false,
+        read_time: &read_time,
+    });
+    let mut out = Vec::new();
+    let mut buffer = [0u8; 8];
+    drain_decoded(
+        &mut decoder,
+        &mut out,
+        &mut buffer,
+        &mut trace,
+        &read_time,
+        0,
+    )
+    .unwrap();
+    assert_eq!(out, b"the first framethe second frame");
+    assert!(trace.is_none());
+    assert_eq!(read_time.get(), None);
+}
+
 /// When `--exclude-compressed` skips every input, the `-o` output is never
 /// written, and a trace may take its name.
 #[test]
@@ -3058,7 +3122,7 @@ fn the_drain_retries_interrupts_and_reports_errors() {
         });
         let mut out = Vec::new();
         let mut buffer = [0u8; 8];
-        let no_reads = core::cell::Cell::new(std::time::Duration::ZERO);
+        let no_reads = core::cell::Cell::new(None);
         let written = drain_decoded(
             &mut decoder,
             &mut out,
@@ -3259,11 +3323,11 @@ fn trace_times_decoding_without_the_reads() {
     let path = scratch.0.join("t.csv");
     let frame = frame_of(b"a small frame, read slowly");
     let mut trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
-    let read_time = core::cell::Cell::new(std::time::Duration::ZERO);
+    let read_time = core::cell::Cell::new(Some(std::time::Duration::ZERO));
     let mut decoder = structured_zstd::decoding::StreamingDecoder::new(Watched {
         inner: Slow(&frame),
         failed: false,
-        read_time: Some(&read_time),
+        read_time: &read_time,
     });
     let mut buffer = [0u8; 64];
     drain_decoded(

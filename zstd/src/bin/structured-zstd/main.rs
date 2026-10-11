@@ -2396,8 +2396,9 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
             trace.display()
         );
     }
-    // A benchmark and `-t` write nothing, and stdout is no file.
-    if opts.bench || opts.to_stdout || opts.mode == Mode::Test {
+    // A benchmark and `-t` write nothing, `--list` writes its table to stdout
+    // whatever `-o` says, and stdout is no file.
+    if opts.bench || opts.to_stdout || matches!(opts.mode, Mode::Test | Mode::List) {
         return Ok(());
     }
     if opts.mode == Mode::Train {
@@ -2425,6 +2426,15 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
             }
             if let Ok(output) = derive_output_path(opts, input) {
                 refuse("the output", &output)?;
+                // A directory the run has to create on the way to it, as
+                // `--output-dir-mirror` does: a trace opened there first
+                // would be a file where the directory has to go.
+                for directory in output.ancestors().skip(1) {
+                    if directory.as_os_str().is_empty() || directory.exists() {
+                        break;
+                    }
+                    refuse("the output directory", directory)?;
+                }
             }
         }
     }
@@ -6015,11 +6025,11 @@ fn decompress_stream<R: Read, W: Write>(
         }
         frames += 1;
         // Kept only while a trace times the decoder.
-        let read_time = core::cell::Cell::new(std::time::Duration::ZERO);
+        let read_time = core::cell::Cell::new(trace.is_some().then_some(std::time::Duration::ZERO));
         let mut stream = Watched {
             inner: io::Cursor::new(magic).chain(&mut source),
             failed: false,
-            read_time: trace.is_some().then_some(&read_time),
+            read_time: &read_time,
         };
         // Borrowed, not moved: the reader stays with us after the decoder.
         let mut decoder = match handle {
@@ -6099,32 +6109,35 @@ fn decompress_stream<R: Read, W: Write>(
 /// `dictionary_size`, timed as the decoder's own time on it: the calls into
 /// the decoder from the end of the frame before to the moment this one is
 /// verified, less the time its source took over the reads, which the source
-/// adds to `read_time`. The writes to `writer` and the trace line's own write
-/// fall outside it, so the speed reported is the decoder's, whatever the
-/// source and sink. The reference times the span between its begin and end
-/// hooks instead, which takes in the caller's I/O of every block but the
-/// last.
+/// adds to `read_time` while it holds a sum. The writes to `writer` and the
+/// trace line's own write fall outside it, so the speed reported is the
+/// decoder's, whatever the source and sink. The reference times the span
+/// between its begin and end hooks instead, which takes in the caller's I/O
+/// of every block but the last. When the trace closes, `read_time` is
+/// cleared, and the source stops timing its reads.
 fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::FrameDecoder>>(
     decoder: &mut structured_zstd::decoding::StreamingDecoder<R, D>,
     writer: &mut impl Write,
     buffer: &mut [u8],
     trace: &mut Option<trace::Trace>,
-    read_time: &core::cell::Cell<std::time::Duration>,
+    read_time: &core::cell::Cell<Option<std::time::Duration>>,
     dictionary_size: u64,
 ) -> io::Result<u64> {
     // The decoder's time spent on the frame in progress, over the calls so far.
     let mut spent = std::time::Duration::ZERO;
     let mut written = 0u64;
+    // The source's reads so far; a source that is not timed has taken none.
+    let read_sum = || read_time.get().unwrap_or_default();
     // The decoder's time since `mark`: the clock's, less the source's reads
     // in that span, which lie inside it.
     let since = |mark: std::time::Instant, read_at_mark: std::time::Duration| {
-        mark.elapsed() - (read_time.get() - read_at_mark)
+        mark.elapsed() - (read_sum() - read_at_mark)
     };
     // While the trace is open; a failed write closes it, and the plain drain
     // below takes the rest without timing or reporting anything.
     while trace.is_some() {
         let mut mark = std::time::Instant::now();
-        let mut read_at_mark = read_time.get();
+        let mut read_at_mark = read_sum();
         let read = decoder.read_reporting_frames(buffer, |frame| {
             let duration = spent + since(mark, read_at_mark);
             spent = std::time::Duration::ZERO;
@@ -6140,7 +6153,7 @@ fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::
                 },
             );
             mark = std::time::Instant::now();
-            read_at_mark = read_time.get();
+            read_at_mark = read_sum();
         });
         spent += since(mark, read_at_mark);
         let n = match read {
@@ -6152,6 +6165,7 @@ fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::
         writer.write_all(&buffer[..n])?;
         written += n as u64;
     }
+    read_time.set(None);
     loop {
         let n = match decoder.read(buffer) {
             Ok(0) => return Ok(written),
@@ -6165,23 +6179,24 @@ fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::
 }
 
 /// The decoder's source, remembering whether it failed, so a decode error can
-/// be told apart from the input device failing under it. With `read_time`, it
-/// adds the time each read takes, so a trace can leave the source's time out
-/// of the decoder's; the decoder owns the source, so the sum is kept where
-/// the drain can read it while the decoder is borrowed.
+/// be told apart from the input device failing under it. While `read_time`
+/// holds a sum, it adds the time each read takes, so a trace can leave the
+/// source's time out of the decoder's; the decoder owns the source, so the
+/// sum is kept where the drain can read it, and clear, while the decoder is
+/// borrowed.
 struct Watched<'a, R> {
     inner: R,
     failed: bool,
-    read_time: Option<&'a core::cell::Cell<std::time::Duration>>,
+    read_time: &'a core::cell::Cell<Option<std::time::Duration>>,
 }
 
 impl<R: Read> Read for Watched<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let result = match self.read_time {
-            Some(read_time) => {
+        let result = match self.read_time.get() {
+            Some(sum) => {
                 let started = std::time::Instant::now();
                 let result = self.inner.read(buf);
-                read_time.set(read_time.get() + started.elapsed());
+                self.read_time.set(Some(sum + started.elapsed()));
                 result
             }
             None => self.inner.read(buf),
