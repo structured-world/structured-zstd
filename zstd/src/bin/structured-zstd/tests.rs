@@ -2716,7 +2716,16 @@ fn trace_times_decoding_without_the_writes() {
     let mut trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
     let mut decoder = structured_zstd::decoding::StreamingDecoder::new(frame.as_slice());
     let mut buffer = [0u8; 16];
-    drain_decoded(&mut decoder, &mut Slow, &mut buffer, &mut trace, 0).unwrap();
+    let no_reads = core::cell::Cell::new(std::time::Duration::ZERO);
+    drain_decoded(
+        &mut decoder,
+        &mut Slow,
+        &mut buffer,
+        &mut trace,
+        &no_reads,
+        0,
+    )
+    .unwrap();
     drop(trace);
     let lines = fs::read_to_string(&path).unwrap();
     let line = lines.lines().nth(1).unwrap();
@@ -3048,14 +3057,31 @@ fn the_drain_retries_interrupts_and_reports_errors() {
         });
         let mut out = Vec::new();
         let mut buffer = [0u8; 8];
-        let written = drain_decoded(&mut decoder, &mut out, &mut buffer, &mut trace, 0).unwrap();
+        let no_reads = core::cell::Cell::new(std::time::Duration::ZERO);
+        let written = drain_decoded(
+            &mut decoder,
+            &mut out,
+            &mut buffer,
+            &mut trace,
+            &no_reads,
+            0,
+        )
+        .unwrap();
         assert_eq!(out, b"drained with or without a trace", "traced: {traced}");
         assert_eq!(written, out.len() as u64);
 
         let mut damaged =
             structured_zstd::decoding::StreamingDecoder::new(&frame[..frame.len() - 2]);
         assert!(
-            drain_decoded(&mut damaged, &mut Vec::new(), &mut buffer, &mut trace, 0).is_err(),
+            drain_decoded(
+                &mut damaged,
+                &mut Vec::new(),
+                &mut buffer,
+                &mut trace,
+                &no_reads,
+                0
+            )
+            .is_err(),
             "traced: {traced}"
         );
     }
@@ -3202,6 +3228,79 @@ fn trace_times_compression_without_the_writes() {
     compress_stream(
         &payload[..],
         Slow(0),
+        &FrameSettings {
+            level: 3,
+            ..FrameSettings::default()
+        },
+        &mut codecs,
+    )
+    .unwrap();
+    drop(codecs);
+    let lines = fs::read_to_string(&path).unwrap();
+    let line = lines.lines().nth(1).unwrap();
+    let nanos: u64 = line.split(", ").nth(9).unwrap().parse().unwrap();
+    assert!(nanos < 50_000_000, "{line}");
+}
+
+/// A decompressed frame's traced duration leaves out the source's time as it
+/// leaves out the sink's: a source that takes a long time over each read does
+/// not appear in it.
+#[test]
+fn trace_times_decoding_without_the_reads() {
+    struct Slow<'a>(&'a [u8]);
+    impl Read for Slow<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.0.read(buf)
+        }
+    }
+    let scratch = Scratch::new("trace-decode-reads");
+    let path = scratch.0.join("t.csv");
+    let frame = frame_of(b"a small frame, read slowly");
+    let mut trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    let read_time = core::cell::Cell::new(std::time::Duration::ZERO);
+    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(Watched {
+        inner: Slow(&frame),
+        failed: false,
+        read_time: Some(&read_time),
+    });
+    let mut buffer = [0u8; 64];
+    drain_decoded(
+        &mut decoder,
+        &mut Vec::new(),
+        &mut buffer,
+        &mut trace,
+        &read_time,
+        0,
+    )
+    .unwrap();
+    drop(trace);
+    let lines = fs::read_to_string(&path).unwrap();
+    let line = lines.lines().nth(1).unwrap();
+    let nanos: u64 = line.split(", ").nth(9).unwrap().parse().unwrap();
+    assert!(nanos < 50_000_000, "{line}");
+}
+
+/// A compressed frame's traced duration leaves out the source's time as it
+/// leaves out the destination's: a reader that takes a long time over each
+/// read does not appear in it.
+#[test]
+fn trace_times_compression_without_the_reads() {
+    struct Slow<'a>(&'a [u8]);
+    impl Read for Slow<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.0.read(buf)
+        }
+    }
+    let scratch = Scratch::new("trace-compress-reads");
+    let path = scratch.0.join("t.csv");
+    let mut codecs = no_dict();
+    codecs.trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    let payload = b"a small frame, read slowly";
+    compress_stream(
+        io::BufReader::with_capacity(8, Slow(payload)),
+        Vec::new(),
         &FrameSettings {
             level: 3,
             ..FrameSettings::default()

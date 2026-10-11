@@ -2467,12 +2467,14 @@ fn is_stderr(path: &Path) -> bool {
 }
 
 /// Whether `path` is the file this process's standard input reads: by one
-/// of its Unix names, or by identity when it is a regular file, the one kind
-/// a trace appended to would change (`/dev/null` as stdin and as a trace is
-/// two discards, not a collision).
+/// of its Unix names, or by identity when it is a regular file or a named
+/// pipe, the kinds a trace written to would feed into the input. A device is
+/// left out: `/dev/null` as stdin and as a trace is two discards, not a
+/// collision.
 fn is_stdin(path: &Path) -> bool {
     names_stream(path, &["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"])
-        || (fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+        || (fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() || is_fifo_type(&metadata.file_type()))
             && identity::of_stdin().is_some_and(|stdin| identity::of_path(path) == Some(stdin)))
 }
 
@@ -5753,8 +5755,9 @@ fn compress_stream<R: BufRead, W: Write + BytesWritten>(
 /// left it. With a trace open, the frame is recorded, timed as the encoder's
 /// own time: from before the context is set up, as the reference starts the
 /// trace in `ZSTD_compressBegin_internal`, to the end of the frame, less the
-/// time `writer` took over the bytes handed to it, so the speed reported is
-/// the encoder's whatever the destination.
+/// time `reader` took to deliver the input and `writer` took over the output,
+/// so the speed reported is the encoder's whatever the source and
+/// destination.
 fn compress_frame<R: BufRead, W: Write + BytesWritten>(
     reader: R,
     writer: W,
@@ -5768,14 +5771,18 @@ fn compress_frame<R: BufRead, W: Write + BytesWritten>(
         return Ok(writer.bytes_written() - before);
     }
     let started = std::time::Instant::now();
+    let mut source = TimedReader {
+        inner: reader,
+        spent: std::time::Duration::ZERO,
+    };
     let timed = TimedWriter {
         inner: writer,
         spent: std::time::Duration::ZERO,
     };
-    let (timed, consumed) = encode_frame(reader, timed, settings, codecs)?;
-    // `spent` sums spans of the monotonic clock inside this one, so it is
-    // never the larger.
-    let duration = started.elapsed() - timed.spent;
+    let (timed, consumed) = encode_frame(&mut source, timed, settings, codecs)?;
+    // Both sums are spans of the monotonic clock inside this one, apart from
+    // each other, so together they are never the larger.
+    let duration = started.elapsed() - timed.spent - source.spent;
     let written = timed.bytes_written() - before;
     // The dictionary as it was given, header and entropy tables included:
     // upstream sets `dictContentSize` to the whole buffer
@@ -5832,6 +5839,35 @@ impl<W: Write> Write for TimedWriter<W> {
 impl<W: BytesWritten> BytesWritten for TimedWriter<W> {
     fn bytes_written(&self) -> u64 {
         self.inner.bytes_written()
+    }
+}
+
+/// A buffered reader that keeps the time it spends reading its source, so a
+/// trace can leave the source's time out of the encoder's.
+struct TimedReader<R> {
+    inner: R,
+    spent: std::time::Duration,
+}
+
+impl<R: Read> Read for TimedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let started = std::time::Instant::now();
+        let read = self.inner.read(buf);
+        self.spent += started.elapsed();
+        read
+    }
+}
+
+impl<R: BufRead> BufRead for TimedReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        let started = std::time::Instant::now();
+        let filled = self.inner.fill_buf();
+        self.spent += started.elapsed();
+        filled
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.inner.consume(amount);
     }
 }
 
@@ -5972,9 +6008,12 @@ fn decompress_stream<R: Read, W: Write>(
             bail!("unsupported format");
         }
         frames += 1;
+        // Kept only while a trace times the decoder.
+        let read_time = core::cell::Cell::new(std::time::Duration::ZERO);
         let mut stream = Watched {
             inner: io::Cursor::new(magic).chain(&mut source),
             failed: false,
+            read_time: trace.is_some().then_some(&read_time),
         };
         // Borrowed, not moved: the reader stays with us after the decoder.
         let mut decoder = match handle {
@@ -6008,7 +6047,14 @@ fn decompress_stream<R: Read, W: Write>(
         // reported here. The chunk is taken only now, by input that is a
         // frame: plain or empty input never decodes into it.
         chunk.resize(IO_CHUNK, 0);
-        let err = match drain_decoded(&mut decoder, &mut writer, chunk, trace, dictionary_size) {
+        let err = match drain_decoded(
+            &mut decoder,
+            &mut writer,
+            chunk,
+            trace,
+            &read_time,
+            dictionary_size,
+        ) {
             Ok(n) => {
                 written += n;
                 continue;
@@ -6046,26 +6092,35 @@ fn decompress_stream<R: Read, W: Write>(
 /// With a `trace` open, each frame the decoder finishes is recorded against
 /// `dictionary_size`, timed as the decoder's own time on it: the calls into
 /// the decoder from the end of the frame before to the moment this one is
-/// verified. The writes to `writer` and the trace line's own write fall
-/// outside it, so the speed reported is the decoder's, whatever the sink. The
-/// reference times the span between its begin and end hooks instead, which
-/// takes in the caller's writes of every block but the last.
+/// verified, less the time its source took over the reads, which the source
+/// adds to `read_time`. The writes to `writer` and the trace line's own write
+/// fall outside it, so the speed reported is the decoder's, whatever the
+/// source and sink. The reference times the span between its begin and end
+/// hooks instead, which takes in the caller's I/O of every block but the
+/// last.
 fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::FrameDecoder>>(
     decoder: &mut structured_zstd::decoding::StreamingDecoder<R, D>,
     writer: &mut impl Write,
     buffer: &mut [u8],
     trace: &mut Option<trace::Trace>,
+    read_time: &core::cell::Cell<std::time::Duration>,
     dictionary_size: u64,
 ) -> io::Result<u64> {
     // The decoder's time spent on the frame in progress, over the calls so far.
     let mut spent = std::time::Duration::ZERO;
     let mut written = 0u64;
+    // The decoder's time since `mark`: the clock's, less the source's reads
+    // in that span, which lie inside it.
+    let since = |mark: std::time::Instant, read_at_mark: std::time::Duration| {
+        mark.elapsed() - (read_time.get() - read_at_mark)
+    };
     // While the trace is open; a failed write closes it, and the plain drain
     // below takes the rest without timing or reporting anything.
     while trace.is_some() {
         let mut mark = std::time::Instant::now();
+        let mut read_at_mark = read_time.get();
         let read = decoder.read_reporting_frames(buffer, |frame| {
-            let duration = spent + mark.elapsed();
+            let duration = spent + since(mark, read_at_mark);
             spent = std::time::Duration::ZERO;
             trace_frame(
                 trace,
@@ -6079,8 +6134,9 @@ fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::
                 },
             );
             mark = std::time::Instant::now();
+            read_at_mark = read_time.get();
         });
-        spent += mark.elapsed();
+        spent += since(mark, read_at_mark);
         let n = match read {
             Ok(0) => return Ok(written),
             Ok(n) => n,
@@ -6103,15 +6159,27 @@ fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::
 }
 
 /// The decoder's source, remembering whether it failed, so a decode error can
-/// be told apart from the input device failing under it.
-struct Watched<R> {
+/// be told apart from the input device failing under it. With `read_time`, it
+/// adds the time each read takes, so a trace can leave the source's time out
+/// of the decoder's; the decoder owns the source, so the sum is kept where
+/// the drain can read it while the decoder is borrowed.
+struct Watched<'a, R> {
     inner: R,
     failed: bool,
+    read_time: Option<&'a core::cell::Cell<std::time::Duration>>,
 }
 
-impl<R: Read> Read for Watched<R> {
+impl<R: Read> Read for Watched<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let result = self.inner.read(buf);
+        let result = match self.read_time {
+            Some(read_time) => {
+                let started = std::time::Instant::now();
+                let result = self.inner.read(buf);
+                read_time.set(read_time.get() + started.elapsed());
+                result
+            }
+            None => self.inner.read(buf),
+        };
         if let Err(e) = &result
             && e.kind() != io::ErrorKind::Interrupted
         {
