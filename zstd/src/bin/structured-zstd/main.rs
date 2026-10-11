@@ -2317,8 +2317,9 @@ impl Codecs {
     }
 }
 
-/// Refuse a `--trace` path that names a file of the run: an input, the
-/// dictionary, the `-o` output, or an output derived from an input. Compared
+/// Refuse a `--trace` path that names a file of the run: an input, a file
+/// list, the dictionary, the `-o` output, an output derived from an input, or
+/// the file standard output is when the run writes its data there. Compared
 /// as files, as the output checks compare them: another spelling, a symlink
 /// or a hard link is the same file.
 fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
@@ -2345,6 +2346,17 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
     for input in opts.inputs.iter().filter(|input| *input != Path::new("-")) {
         refuse("the input", input)?;
     }
+    for list in &opts.filelists {
+        refuse("the file list", list)?;
+    }
+    // Frames sent to stdout would interleave with the trace's lines there. A
+    // run writing its data to a file leaves stdout free for the trace.
+    if writes_data_to_stdout(opts) && is_stdout(trace) {
+        bail!(
+            "--trace {} is also standard output, where the data is written",
+            trace.display()
+        );
+    }
     // A benchmark and `-t` write nothing, and stdout is no file.
     if opts.bench || opts.to_stdout || opts.mode == Mode::Test {
         return Ok(());
@@ -2365,6 +2377,56 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether the run writes (de)compressed data to standard output: `-c`, or
+/// stdin (named `-` or by no input at all) without `-o`.
+fn writes_data_to_stdout(opts: &Options) -> bool {
+    matches!(opts.mode, Mode::Compress | Mode::Decompress)
+        && !opts.bench
+        && (opts.to_stdout
+            || opts.output.as_deref() == Some(Path::new("-"))
+            || (opts.output.is_none()
+                && (opts.inputs.is_empty()
+                    || opts.inputs.iter().any(|input| input == Path::new("-")))))
+}
+
+/// Whether `path` is the file this process's standard output writes to.
+fn is_stdout(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+        io::stdout()
+            .as_fd()
+            .try_clone_to_owned()
+            .is_ok_and(|fd| names_open_file(path, &File::from(fd)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Whether `path` names the file `open` is, compared by device and inode. A
+/// regular file or a Linux pipe compares true through any of its names;
+/// macOS gives a pipe under `/dev/fd` attributes of its own, so there only a
+/// file is recognised. Windows has no identity std can read on stable (see
+/// `paths_point_to_same_file`), so there it answers no.
+fn names_open_file(path: &Path, open: &File) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(path), open.metadata()) {
+            (Ok(named), Ok(open)) => named.dev() == open.dev() && named.ino() == open.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, open);
+        false
+    }
 }
 
 /// Where `--train` writes the dictionary: `-o`, or `dictionary` as the

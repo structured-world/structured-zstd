@@ -2868,6 +2868,64 @@ fn trace_reports_the_whole_dictionary() {
     assert_eq!(sizes, [blob.len().to_string(), blob.len().to_string()]);
 }
 
+/// A `--filelist` is read by the run, so a trace of the same name, appended
+/// to, would change it; it is refused like an input.
+#[test]
+fn trace_naming_a_file_list_is_refused() {
+    let scratch = Scratch::new("trace-filelist");
+    let input = scratch.file("in", b"listed");
+    let list = scratch.file("list.txt", input.to_str().unwrap().as_bytes());
+    let list = list.to_str().unwrap();
+    let opts = parse(&["-f", "--filelist", list]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new(list)).is_err());
+}
+
+/// The runs that write their data to standard output: `-c`, and stdin
+/// without `-o`; not a run with `-o`, a benchmark or `-t`.
+#[test]
+fn the_runs_writing_data_to_stdout_are_known() {
+    assert!(writes_data_to_stdout(&parse(&["-c", "in"]).unwrap()));
+    assert!(writes_data_to_stdout(&parse(&["-d", "-"]).unwrap()));
+    assert!(!writes_data_to_stdout(
+        &parse(&["in", "-o", "out"]).unwrap()
+    ));
+    assert!(!writes_data_to_stdout(&parse(&["-b1", "in"]).unwrap()));
+    assert!(!writes_data_to_stdout(&parse(&["-t", "in.zst"]).unwrap()));
+}
+
+/// A path names an open file when it reaches the same file, whatever the
+/// spelling, and not when it is another file.
+#[cfg(unix)]
+#[test]
+fn a_path_names_the_open_file_it_reaches() {
+    let scratch = Scratch::new("names-open-file");
+    let file = scratch.file("f", b"x");
+    let other = scratch.file("g", b"y");
+    let open = fs::File::open(&file).unwrap();
+    assert!(names_open_file(&file, &open));
+    assert!(names_open_file(&scratch.0.join(".").join("f"), &open));
+    assert!(!names_open_file(&other, &open));
+}
+
+/// A trace that is the file standard output writes to would interleave its
+/// lines with the frames a run sends there, so it is refused when the run
+/// writes data to stdout; when the data goes to a file, a trace on stdout is
+/// a way to watch it, and is opened. Linux only: there `/dev/fd/1` reaches
+/// the test's stdout whatever it is.
+#[cfg(target_os = "linux")]
+#[test]
+fn trace_on_the_stdout_of_a_run_writing_there_is_refused() {
+    let scratch = Scratch::new("trace-stdout");
+    let input = scratch.file("in", b"to stdout");
+    let input = input.to_str().unwrap();
+    let stdout = Path::new("/dev/fd/1");
+    let to_stdout = parse(&["-c", input]).unwrap();
+    assert!(refuse_trace_alias(&to_stdout, stdout).is_err());
+    let out = scratch.0.join("out.zst");
+    let to_file = parse(&["-f", input, "-o", out.to_str().unwrap()]).unwrap();
+    assert!(refuse_trace_alias(&to_file, stdout).is_ok());
+}
+
 /// `--train` without `-o` writes `dictionary`; a trace of that name would be
 /// created first and then trained over, so it is refused like any output.
 #[test]
