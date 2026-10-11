@@ -3004,6 +3004,40 @@ fn trace_on_stderr_is_refused_while_anything_writes_there() {
     }
 }
 
+/// A trace that closes on a stream of empty frames, which the decoder walks
+/// within one read, stops timing the source even though the read then ends
+/// the stream.
+#[test]
+fn a_trace_closed_on_empty_frames_stops_timing() {
+    let scratch = Scratch::new("trace-closed-empty");
+    let read_only = scratch.file("read-only.csv", b"");
+    let mut trace = Some(trace::Trace::over(
+        fs::File::open(&read_only).unwrap(),
+        10507,
+        false,
+    ));
+    let mut empties = frame_of(b"");
+    empties.extend_from_slice(&frame_of(b""));
+    let read_time = core::cell::Cell::new(Some(std::time::Duration::ZERO));
+    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(Watched {
+        inner: empties.as_slice(),
+        failed: false,
+        read_time: &read_time,
+    });
+    let mut buffer = [0u8; 64];
+    drain_decoded(
+        &mut decoder,
+        &mut Vec::new(),
+        &mut buffer,
+        &mut trace,
+        &read_time,
+        0,
+    )
+    .unwrap();
+    assert!(trace.is_none());
+    assert_eq!(read_time.get(), None);
+}
+
 /// `--list` writes its table to stdout and ignores `-o`, so a trace may take
 /// that name.
 #[test]
@@ -3377,6 +3411,50 @@ fn trace_times_compression_without_the_reads() {
     let lines = fs::read_to_string(&path).unwrap();
     let line = lines.lines().nth(1).unwrap();
     let nanos: u64 = line.split(", ").nth(9).unwrap().parse().unwrap();
+    assert!(nanos < 50_000_000, "{line}");
+}
+
+/// A source whose `consume` takes long, as a progress display writing to a
+/// slow stderr does, is the caller's time too, and stays out of the frame's;
+/// the uncompressed size is still every byte consumed.
+#[test]
+fn trace_times_compression_without_the_consumes() {
+    struct SlowConsume<'a>(&'a [u8]);
+    impl Read for SlowConsume<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+    impl BufRead for SlowConsume<'_> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Ok(&self.0[..self.0.len().min(8)])
+        }
+        fn consume(&mut self, amount: usize) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.0 = &self.0[amount..];
+        }
+    }
+    let scratch = Scratch::new("trace-compress-consumes");
+    let path = scratch.0.join("t.csv");
+    let mut codecs = no_dict();
+    codecs.trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    let payload = b"a small frame, consumed slowly";
+    compress_stream(
+        SlowConsume(payload),
+        Vec::new(),
+        &FrameSettings {
+            level: 3,
+            ..FrameSettings::default()
+        },
+        &mut codecs,
+    )
+    .unwrap();
+    drop(codecs);
+    let lines = fs::read_to_string(&path).unwrap();
+    let line = lines.lines().nth(1).unwrap();
+    let fields: Vec<&str> = line.split(", ").collect();
+    assert_eq!(fields[7], payload.len().to_string(), "{line}");
+    let nanos: u64 = fields[9].parse().unwrap();
     assert!(nanos < 50_000_000, "{line}");
 }
 

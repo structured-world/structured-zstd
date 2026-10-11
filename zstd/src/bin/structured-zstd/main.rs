@@ -5782,7 +5782,7 @@ fn compress_frame<R: BufRead, W: Write + BytesWritten>(
 ) -> Result<u64> {
     let before = writer.bytes_written();
     if codecs.trace.is_none() {
-        let (writer, _) = encode_frame(reader, writer, settings, codecs)?;
+        let writer = encode_frame(reader, writer, settings, codecs)?;
         // A writer only takes bytes, so its count has not gone down.
         return Ok(writer.bytes_written() - before);
     }
@@ -5790,12 +5790,14 @@ fn compress_frame<R: BufRead, W: Write + BytesWritten>(
     let mut source = TimedReader {
         inner: reader,
         spent: std::time::Duration::ZERO,
+        consumed: 0,
     };
     let timed = TimedWriter {
         inner: writer,
         spent: std::time::Duration::ZERO,
     };
-    let (timed, consumed) = encode_frame(&mut source, timed, settings, codecs)?;
+    let timed = encode_frame(&mut source, timed, settings, codecs)?;
+    let consumed = source.consumed;
     // Both sums are spans of the monotonic clock inside this one, apart from
     // each other, so together they are never the larger.
     let duration = started.elapsed() - timed.spent - source.spent;
@@ -5858,11 +5860,14 @@ impl<W: BytesWritten> BytesWritten for TimedWriter<W> {
     }
 }
 
-/// A buffered reader that keeps the time it spends reading its source, so a
-/// trace can leave the source's time out of the encoder's.
+/// A buffered reader that keeps the time it spends in its source, reading and
+/// consuming (a progress display updates on `consume`), so a trace can leave
+/// the source's time out of the encoder's, and the bytes taken from it, the
+/// frame's uncompressed size.
 struct TimedReader<R> {
     inner: R,
     spent: std::time::Duration,
+    consumed: u64,
 }
 
 impl<R: Read> Read for TimedReader<R> {
@@ -5870,6 +5875,9 @@ impl<R: Read> Read for TimedReader<R> {
         let started = std::time::Instant::now();
         let read = self.inner.read(buf);
         self.spent += started.elapsed();
+        if let Ok(n) = read {
+            self.consumed += n as u64;
+        }
         read
     }
 }
@@ -5883,20 +5891,21 @@ impl<R: BufRead> BufRead for TimedReader<R> {
     }
 
     fn consume(&mut self, amount: usize) {
+        let started = std::time::Instant::now();
         self.inner.consume(amount);
+        self.spent += started.elapsed();
+        self.consumed += amount as u64;
     }
 }
 
-/// One frame of `reader` into `writer` on the run's context: the writer back,
-/// and the bytes of input the frame took.
+/// One frame of `reader` into `writer` on the run's context: the writer back.
 fn encode_frame<R: BufRead, W: Write>(
     mut reader: R,
     writer: W,
     settings: &FrameSettings,
     codecs: &mut Codecs,
-) -> Result<(W, u64)> {
+) -> Result<W> {
     let mut encoder = StreamingEncoder::with_context(writer, codecs.compressor(settings)?);
-    let mut consumed = 0u64;
     if let Some(size) = settings.pledged_size {
         // The size is known exactly (a regular file, or `--stream-size`), so
         // pledge it: the frame records Frame_Content_Size (decoders can
@@ -5921,12 +5930,8 @@ fn encode_frame<R: BufRead, W: Write>(
             .write_all(piece)
             .wrap_err("streaming compression failed")?;
         reader.consume(len);
-        // Counted whether or not a trace reads it: one add per piece read is
-        // cheaper than the branch that would skip it.
-        consumed += len as u64;
     }
-    let writer = encoder.finish().wrap_err("failed to finalize zstd frame")?;
-    Ok((writer, consumed))
+    encoder.finish().wrap_err("failed to finalize zstd frame")
 }
 
 /// The magic number every zstd frame opens with (RFC 8878 §3.1.1).
@@ -6203,6 +6208,11 @@ fn drain_decoded<
                     duration,
                 },
             );
+            // A failed write closed the trace: the reads left in this call,
+            // through any number of empty or skippable frames, go untimed.
+            if trace.is_none() {
+                read_time.stop();
+            }
             mark = std::time::Instant::now();
             read_at_mark = read_sum();
         });

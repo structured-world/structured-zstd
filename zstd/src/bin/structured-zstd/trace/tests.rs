@@ -70,7 +70,7 @@ fn the_header_is_written_only_to_a_new_file() {
         let mut trace = Trace::open(&path, 10507, false).unwrap();
         trace.record(&frame).unwrap();
     }
-    // The line buffer is cleared between records, never carried over.
+    // The lines are written in the order they were recorded.
     let longer = Frame {
         uncompressed_size: 123_456_789,
         ..frame
@@ -78,12 +78,45 @@ fn the_header_is_written_only_to_a_new_file() {
     let mut trace = Trace::open(&path, 10507, false).unwrap();
     trace.record(&longer).unwrap();
     trace.record(&frame).unwrap();
+    drop(trace);
     let written = std::fs::read_to_string(&path).unwrap();
     let expected_line = line(10507, false, &frame);
     let longer_line = line(10507, false, &longer);
     assert_eq!(
         written,
         format!("{HEADER}{expected_line}{expected_line}{longer_line}{expected_line}")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Lines are buffered, as the reference's `FILE*` buffers them, so a frame
+/// costs no write of its own: a benchmark times its frames with the trace
+/// open, and a write per frame would be timed with them. They reach the file
+/// when the trace closes.
+#[test]
+fn lines_reach_the_file_when_the_trace_closes() {
+    let dir = std::env::temp_dir().join(format!(
+        "structured-zstd-trace-buffered-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.csv");
+    let _ = std::fs::remove_file(&path);
+    let frame = Frame {
+        method: Method::Compress,
+        level: 3,
+        dictionary_size: 0,
+        uncompressed_size: 8,
+        compressed_size: 4,
+        duration: Duration::from_nanos(8),
+    };
+    let mut trace = Trace::open(&path, 10507, false).unwrap();
+    trace.record(&frame).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    drop(trace);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{HEADER}{}", line(10507, false, &frame))
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }

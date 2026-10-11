@@ -30,7 +30,14 @@ pub struct Frame {
     pub duration: Duration,
 }
 
-/// The open trace file, and what every line of this run shares.
+/// How many bytes of lines are gathered before they are written, as a `FILE*`
+/// gathers them.
+const BUFFERED: usize = 8 * 1024;
+
+/// The open trace file, and what every line of this run shares. Lines are
+/// gathered and written in pieces, as the reference's `FILE*` writes them: a
+/// benchmark times its frames with the trace open, and a write per frame
+/// would be timed with them. Closing the trace writes what is left.
 pub struct Trace {
     file: File,
     /// The reference command's version number (`ZSTD_VERSION_NUMBER`).
@@ -38,8 +45,10 @@ pub struct Trace {
     /// Whether frames are (de)compressed from and into whole buffers, as the
     /// benchmark does (`single-pass`), rather than streamed (`streaming`).
     single_pass: bool,
-    /// The line being written, kept so each frame reuses its allocation.
-    line: String,
+    /// The lines not yet written, kept so each piece reuses its allocation.
+    lines: String,
+    /// The length of `lines` that is written at once.
+    buffered: usize,
     /// Whether a write that fails is reported on stderr: the run's
     /// verbosity carries errors (`-qq` silences them).
     pub reports_failures: bool,
@@ -50,37 +59,59 @@ impl Trace {
     /// regular file, as the reference does (`TRACE_enable`).
     pub fn open(path: &Path, version: u32, single_pass: bool) -> io::Result<Self> {
         let write_header = !fs::metadata(path).is_ok_and(|metadata| metadata.is_file());
-        let mut file = OpenOptions::new().append(true).create(true).open(path)?;
+        let file = OpenOptions::new().append(true).create(true).open(path)?;
+        let mut lines = String::with_capacity(BUFFERED + HEADER.len());
         if write_header {
-            file.write_all(HEADER.as_bytes())?;
+            lines.push_str(HEADER);
         }
         Ok(Self {
             file,
             version,
             single_pass,
-            line: String::new(),
+            lines,
+            buffered: BUFFERED,
             reports_failures: true,
         })
     }
 
     /// A trace over `file` as it was opened, so a test can hand the run one
-    /// that refuses writes.
+    /// that refuses writes. Unbuffered, so the first line meets the refusal.
     #[cfg(test)]
     pub fn over(file: File, version: u32, single_pass: bool) -> Self {
         Self {
             file,
             version,
             single_pass,
-            line: String::new(),
+            lines: String::new(),
+            buffered: 0,
             reports_failures: true,
         }
     }
 
-    /// Append the line for `frame` (`TRACE_log`).
+    /// Append the line for `frame` (`TRACE_log`). The lines gathered are
+    /// dropped when their write fails, so closing the trace does not retry
+    /// it.
     pub fn record(&mut self, frame: &Frame) -> io::Result<()> {
-        self.line.clear();
-        write_line(&mut self.line, self.version, self.single_pass, frame);
-        self.file.write_all(self.line.as_bytes())
+        write_line(&mut self.lines, self.version, self.single_pass, frame);
+        if self.lines.len() < self.buffered {
+            return Ok(());
+        }
+        let written = self.file.write_all(self.lines.as_bytes());
+        self.lines.clear();
+        written
+    }
+}
+
+impl Drop for Trace {
+    /// Write the lines still gathered, reporting a failure as a failed line
+    /// is reported.
+    fn drop(&mut self) {
+        if !self.lines.is_empty()
+            && let Err(err) = self.file.write_all(self.lines.as_bytes())
+            && self.reports_failures
+        {
+            eprintln!("zstd: --trace: {err}; the last frames are not traced");
+        }
     }
 }
 
