@@ -3020,10 +3020,10 @@ fn a_regular_file_is_not_taken_for_stdin() {
     assert!(!is_stdin(&file));
 }
 
-/// Without a trace, decoding drains through plain reads: a source that is
-/// interrupted is read again, and a damaged frame is an error.
+/// Decoding drains the same way with a trace open or without one: a source
+/// that is interrupted is read again, and a damaged frame is an error.
 #[test]
-fn the_untraced_drain_retries_interrupts_and_reports_errors() {
+fn the_drain_retries_interrupts_and_reports_errors() {
     struct InterruptedOnce<'a> {
         data: &'a [u8],
         interrupted: bool,
@@ -3037,19 +3037,28 @@ fn the_untraced_drain_retries_interrupts_and_reports_errors() {
             self.data.read(buf)
         }
     }
-    let frame = frame_of(b"drained without a trace");
-    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(InterruptedOnce {
-        data: &frame,
-        interrupted: false,
-    });
-    let mut out = Vec::new();
-    let mut buffer = [0u8; 8];
-    let written = drain_decoded(&mut decoder, &mut out, &mut buffer, &mut None, 0).unwrap();
-    assert_eq!(out, b"drained without a trace");
-    assert_eq!(written, out.len() as u64);
+    let scratch = Scratch::new("drain-paths");
+    let path = scratch.0.join("t.csv");
+    let frame = frame_of(b"drained with or without a trace");
+    for traced in [false, true] {
+        let mut trace = traced.then(|| trace::Trace::open(&path, 10507, false).unwrap());
+        let mut decoder = structured_zstd::decoding::StreamingDecoder::new(InterruptedOnce {
+            data: &frame,
+            interrupted: false,
+        });
+        let mut out = Vec::new();
+        let mut buffer = [0u8; 8];
+        let written = drain_decoded(&mut decoder, &mut out, &mut buffer, &mut trace, 0).unwrap();
+        assert_eq!(out, b"drained with or without a trace", "traced: {traced}");
+        assert_eq!(written, out.len() as u64);
 
-    let mut damaged = structured_zstd::decoding::StreamingDecoder::new(&frame[..frame.len() - 2]);
-    assert!(drain_decoded(&mut damaged, &mut Vec::new(), &mut buffer, &mut None, 0).is_err());
+        let mut damaged =
+            structured_zstd::decoding::StreamingDecoder::new(&frame[..frame.len() - 2]);
+        assert!(
+            drain_decoded(&mut damaged, &mut Vec::new(), &mut buffer, &mut trace, 0).is_err(),
+            "traced: {traced}"
+        );
+    }
 }
 
 /// Level 0 asks for the default level; the trace records the level the
@@ -3128,7 +3137,9 @@ fn trace_on_the_stdout_of_a_run_writing_there_is_refused() {
     let to_stdout = parse(&["-c", input]).unwrap();
     assert!(refuse_trace_alias(&to_stdout, stdout).is_err());
     let out = scratch.0.join("out.zst");
-    let to_file = parse(&["-f", input, "-o", out.to_str().unwrap()]).unwrap();
+    // `-qq` keeps the stderr check out: a runner that sends both streams to
+    // one file would make `/dev/fd/1` stderr as well.
+    let to_file = parse(&["-qq", "-f", input, "-o", out.to_str().unwrap()]).unwrap();
     assert!(refuse_trace_alias(&to_file, stdout).is_ok());
 }
 
