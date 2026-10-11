@@ -2889,6 +2889,8 @@ fn the_runs_writing_data_to_stdout_are_known() {
     assert!(!writes_data_to_stdout(
         &parse(&["in", "-o", "out"]).unwrap()
     ));
+    // `-o -` names a file called `-`; only `-c` selects stdout.
+    assert!(!writes_data_to_stdout(&parse(&["in", "-o", "-"]).unwrap()));
     assert!(!writes_data_to_stdout(&parse(&["-b1", "in"]).unwrap()));
     assert!(!writes_data_to_stdout(&parse(&["-t", "in.zst"]).unwrap()));
 }

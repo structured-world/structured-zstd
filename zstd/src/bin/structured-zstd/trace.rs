@@ -40,6 +40,9 @@ pub struct Trace {
     single_pass: bool,
     /// The line being written, kept so each frame reuses its allocation.
     line: String,
+    /// Whether a write that fails is reported on stderr: the run's
+    /// verbosity carries errors (`-qq` silences them).
+    pub reports_failures: bool,
 }
 
 impl Trace {
@@ -56,6 +59,7 @@ impl Trace {
             version,
             single_pass,
             line: String::new(),
+            reports_failures: true,
         })
     }
 
@@ -68,6 +72,7 @@ impl Trace {
             version,
             single_pass,
             line: String::new(),
+            reports_failures: true,
         }
     }
 

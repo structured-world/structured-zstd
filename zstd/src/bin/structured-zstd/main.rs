@@ -2305,7 +2305,10 @@ impl Codecs {
         };
         refuse_trace_alias(opts, path)?;
         match trace::Trace::open(path, UPSTREAM_VERSION_NUMBER, single_pass) {
-            Ok(trace) => self.trace = Some(trace),
+            Ok(mut trace) => {
+                trace.reports_failures = opts.verbosity >= 1;
+                self.trace = Some(trace);
+            }
             Err(err) => display!(
                 opts.verbosity,
                 2,
@@ -2380,12 +2383,12 @@ fn refuse_trace_alias(opts: &Options, trace: &Path) -> Result<()> {
 }
 
 /// Whether the run writes (de)compressed data to standard output: `-c`, or
-/// stdin (named `-` or by no input at all) without `-o`.
+/// stdin (named `-` or by no input at all) without `-o`. `-o -` is a file
+/// named `-`, as the output is written everywhere else.
 fn writes_data_to_stdout(opts: &Options) -> bool {
     matches!(opts.mode, Mode::Compress | Mode::Decompress)
         && !opts.bench
         && (opts.to_stdout
-            || opts.output.as_deref() == Some(Path::new("-"))
             || (opts.output.is_none()
                 && (opts.inputs.is_empty()
                     || opts.inputs.iter().any(|input| input == Path::new("-")))))
@@ -2466,7 +2469,9 @@ fn trace_frame(trace: &mut Option<trace::Trace>, frame: &trace::Frame) {
     if let Some(open) = trace.as_mut()
         && let Err(err) = open.record(frame)
     {
-        eprintln!("zstd: --trace: {err}; no further frames are traced");
+        if open.reports_failures {
+            eprintln!("zstd: --trace: {err}; no further frames are traced");
+        }
         *trace = None;
     }
 }
@@ -5948,31 +5953,38 @@ fn drain_decoded<R: Read, D: core::borrow::BorrowMut<structured_zstd::decoding::
     // The decoder's time spent on the frame in progress, over the calls so far.
     let mut spent = std::time::Duration::ZERO;
     let mut written = 0u64;
-    loop {
-        // Asked per call: a trace closed by a failed write stops the timing.
-        let mut mark = trace.is_some().then(std::time::Instant::now);
+    // While the trace is open; a failed write closes it, and the plain drain
+    // below takes the rest without timing or reporting anything.
+    while trace.is_some() {
+        let mut mark = std::time::Instant::now();
         let read = decoder.read_reporting_frames(buffer, |frame| {
-            if let Some(mark) = mark.as_mut() {
-                let duration = spent + mark.elapsed();
-                spent = std::time::Duration::ZERO;
-                trace_frame(
-                    trace,
-                    &trace::Frame {
-                        method: trace::Method::Decompress,
-                        level: 0,
-                        dictionary_size,
-                        uncompressed_size: frame.decompressed_size,
-                        compressed_size: frame.compressed_size,
-                        duration,
-                    },
-                );
-                *mark = std::time::Instant::now();
-            }
+            let duration = spent + mark.elapsed();
+            spent = std::time::Duration::ZERO;
+            trace_frame(
+                trace,
+                &trace::Frame {
+                    method: trace::Method::Decompress,
+                    level: 0,
+                    dictionary_size,
+                    uncompressed_size: frame.decompressed_size,
+                    compressed_size: frame.compressed_size,
+                    duration,
+                },
+            );
+            mark = std::time::Instant::now();
         });
-        if let Some(mark) = mark {
-            spent += mark.elapsed();
-        }
+        spent += mark.elapsed();
         let n = match read {
+            Ok(0) => return Ok(written),
+            Ok(n) => n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        writer.write_all(&buffer[..n])?;
+        written += n as u64;
+    }
+    loop {
+        let n = match decoder.read(buffer) {
             Ok(0) => return Ok(written),
             Ok(n) => n,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
