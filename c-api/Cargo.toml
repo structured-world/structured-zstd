@@ -47,4 +47,4 @@ crate-type = ["cdylib", "staticlib"]
 # this manifest (release-plz packages the workspace; a bare `path` dependency
 # fails its "all dependencies must have a version requirement" check even for
 # publish = false members).
-codec = { path = "../zstd", version = "0.1", package = "structured-zstd", features = ["dict-builder"] }
+codec = { path = "../zstd", version = "0.2", package = "structured-zstd", features = ["dict-builder"] }
