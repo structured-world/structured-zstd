@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/structured-world/structured-zstd/compare/v0.1.1...v0.2.0) - 2026-10-12
+
+### Added
+
+- *(cli)* --trace writes one CSV line per frame ([#579](https://github.com/structured-world/structured-zstd/pull/579))
+- *(decoding)* [**breaking**] hand the source back from a refused dictionary ([#577](https://github.com/structured-world/structured-zstd/pull/577))
+- *(decoding)* [**breaking**] configurable window ceiling up to 2 GiB ([#568](https://github.com/structured-world/structured-zstd/pull/568))
+
+### Fixed
+
+- *(decoding)* box the FSE sequence tables so decode fits a 32 KiB stack ([#550](https://github.com/structured-world/structured-zstd/pull/550))
+- *(decoding)* keep the scalar sequence decoder's debug frame off a kernel stack ([#551](https://github.com/structured-world/structured-zstd/pull/551))
+
+### Performance
+
+- *(cli)* move data in 128 KiB pieces, not 8 KiB ([#573](https://github.com/structured-world/structured-zstd/pull/573))
+
 ## [0.1.1](https://github.com/structured-world/structured-zstd/compare/v0.1.0...v0.1.1) - 2026-10-10
 
 ### Added
