@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 #[cfg(not(target_has_atomic = "ptr"))]
 use alloc::rc::Rc;
 #[cfg(target_has_atomic = "ptr")]
@@ -26,8 +27,10 @@ pub struct Dictionary {
     /// therefore still requires a non-zero one.
     pub id: u32,
     /// A dictionary can contain an entropy table, either FSE or
-    /// Huffman.
-    pub fse: FSEScratch,
+    /// Huffman. Boxed for the same reason as `DecoderScratch::fse`: the
+    /// ~12 KiB of inline tables must not ride the stack through
+    /// construction.
+    pub fse: Box<FSEScratch>,
     /// A dictionary can contain an entropy table, either FSE or
     /// Huffman.
     pub huf: HuffmanScratch,
@@ -70,10 +73,15 @@ pub const MAGIC_NUM: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 
 impl Dictionary {
     /// Heap bytes owned by this dictionary: the content plus the parsed
-    /// entropy tables' heap (the fixed-size FSE decode arrays are inline,
-    /// counted by `size_of::<Dictionary>()`).
+    /// entropy tables' heap. `fse` is a `Box`, so the fixed-size FSE decode
+    /// arrays are heap bytes rather than inline in `size_of::<Dictionary>()`;
+    /// charge that `size_of` here so a caller budgeting against the reported
+    /// figure sees them.
     pub fn heap_bytes(&self) -> usize {
-        self.dict_content.capacity() + self.fse.heap_bytes() + self.huf.heap_bytes()
+        self.dict_content.capacity()
+            + core::mem::size_of::<FSEScratch>()
+            + self.fse.heap_bytes()
+            + self.huf.heap_bytes()
     }
 
     /// Build a dictionary from raw content bytes (without entropy table sections).
@@ -98,7 +106,7 @@ impl Dictionary {
 
         Ok(Dictionary {
             id,
-            fse: FSEScratch::new(),
+            fse: Box::new(FSEScratch::new()),
             huf: HuffmanScratch::new(),
             dict_content,
             offset_hist: [1, 4, 8],
@@ -131,7 +139,7 @@ impl Dictionary {
             // caller asking for a dictionary that cannot exist.
             Ok(Dictionary {
                 id: 0,
-                fse: FSEScratch::new(),
+                fse: Box::new(FSEScratch::new()),
                 huf: HuffmanScratch::new(),
                 dict_content: Vec::new(),
                 offset_hist: [1, 4, 8],
@@ -186,7 +194,7 @@ impl Dictionary {
 
         let mut new_dict = Dictionary {
             id: 0,
-            fse: FSEScratch::new(),
+            fse: Box::new(FSEScratch::new()),
             huf: HuffmanScratch::new(),
             dict_content: Vec::new(),
             offset_hist: [1, 4, 8],

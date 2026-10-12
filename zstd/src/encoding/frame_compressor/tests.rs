@@ -1391,7 +1391,7 @@ fn set_dictionary_from_bytes_matches_full_decode_byte_for_byte() {
 fn set_dictionary_accepts_a_dictionary_without_an_id() {
     let raw_content = crate::decoding::Dictionary {
         id: 0,
-        fse: crate::decoding::scratch::FSEScratch::new(),
+        fse: alloc::boxed::Box::new(crate::decoding::scratch::FSEScratch::new()),
         huf: crate::decoding::scratch::HuffmanScratch::new(),
         dict_content: vec![1, 2, 3],
         offset_hist: [1, 4, 8],
@@ -1409,7 +1409,7 @@ fn set_dictionary_accepts_a_dictionary_without_an_id() {
     let mut decoder = crate::decoding::FrameDecoder::new();
     let registered = decoder.add_dict(crate::decoding::Dictionary {
         id: 0,
-        fse: crate::decoding::scratch::FSEScratch::new(),
+        fse: alloc::boxed::Box::new(crate::decoding::scratch::FSEScratch::new()),
         huf: crate::decoding::scratch::HuffmanScratch::new(),
         dict_content: vec![1, 2, 3],
         offset_hist: [1, 4, 8],
@@ -1552,7 +1552,7 @@ fn set_dictionary_from_bytes_rejects_a_corrupt_serialized_dictionary() {
 fn set_dictionary_rejects_zero_repeat_offsets() {
     let invalid = crate::decoding::Dictionary {
         id: 1,
-        fse: crate::decoding::scratch::FSEScratch::new(),
+        fse: alloc::boxed::Box::new(crate::decoding::scratch::FSEScratch::new()),
         huf: crate::decoding::scratch::HuffmanScratch::new(),
         dict_content: vec![1, 2, 3],
         offset_hist: [0, 4, 8],
