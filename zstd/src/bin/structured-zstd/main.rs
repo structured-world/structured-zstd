@@ -1707,42 +1707,31 @@ fn parse_args_into(
     {
         check_memory_limit(limit, 0, 0)?;
     }
-    validate_level(opts.level)?;
     // The benchmark starts at the compression level, however it was given
     // (`-b19`, `-19 -b`, `ZSTD_CLEVEL`), as the reference starts at `cLevel`.
-    opts.bench_start = opts.level;
+    // Both ends are bounded by the scale alone (upstream zstdcli.c:1456-1458).
+    opts.bench_start = clamp_level(opts.level);
     // An end below the start is raised to it, as upstream raises `cLevelLast`.
-    opts.bench_end = bench_end.map_or(opts.bench_start, |end: i32| end.max(opts.bench_start));
-    // The levels 20-22 are expensive enough that upstream asks for them by
-    // name. Benchmarking compresses the range `-b`/`-e` give rather than the
-    // level `-N` set, so the gate reads the range's top when there is one —
-    // `-b20` reaches an ultra level as surely as `-20` does.
-    let (lowest_level, highest_level) = if opts.bench {
-        (
-            opts.bench_start.min(opts.bench_end),
-            opts.bench_start.max(opts.bench_end),
-        )
-    } else {
-        (opts.level, opts.level)
-    };
-    // Both ends run, so both are checked here rather than at the level that
-    // reaches them: a range starting below the scale would otherwise stat and
-    // read every input before the first pass refused it.
-    validate_level(lowest_level)?;
-    validate_level(highest_level)?;
+    opts.bench_end = bench_end.map_or(opts.bench_start, |end: i32| {
+        clamp_level(end).max(opts.bench_start)
+    });
     // Unnamed, an ultra level is not refused but reduced, with a warning, the
-    // way upstream reduces it — a script that runs `zstd -22` compresses at 19
-    // rather than failing, and refusing here is what would break it.
-    if !ultra && highest_level > CLI_MAX_LEVEL_WITHOUT_ULTRA {
+    // way upstream reduces it (zstdcli.c:1557-1566): a script that runs
+    // `zstd -22` compresses at 19 rather than failing. The benchmark has left
+    // before that gate there, so it is not reduced here either.
+    let level_cap = if ultra {
+        CompressionLevel::MAX_LEVEL
+    } else {
+        CLI_MAX_LEVEL_WITHOUT_ULTRA
+    };
+    if !opts.bench && opts.level > level_cap {
         display!(
             *verbosity,
             2,
-            "Warning : compression level higher than max, reduced to {CLI_MAX_LEVEL_WITHOUT_ULTRA}"
+            "Warning : compression level higher than max, reduced to {level_cap}"
         );
-        opts.level = opts.level.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
-        opts.bench_start = opts.bench_start.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
-        opts.bench_end = opts.bench_end.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
     }
+    opts.level = clamp_level(opts.level).min(level_cap);
     // Window logs are validated here, before any file is opened, against the
     // mode the whole command line settled on; a knob out of its range is a
     // broken command line.
@@ -1810,12 +1799,10 @@ fn compresses(opts: &Options) -> bool {
     opts.bench || matches!(opts.mode, Mode::Compress)
 }
 
-fn validate_level(level: i32) -> Result<()> {
-    let (min, max) = (CompressionLevel::MIN_LEVEL, CompressionLevel::MAX_LEVEL);
-    if !(min..=max).contains(&level) {
-        bail!("compression level {level} out of range [{min}, {max}]");
-    }
-    Ok(())
+/// `level` brought onto the scale, as the library brings it (upstream
+/// zstd_compress.c:8294-8304): past either end it compresses at that end.
+fn clamp_level(level: i32) -> i32 {
+    level.clamp(CompressionLevel::MIN_LEVEL, CompressionLevel::MAX_LEVEL)
 }
 
 /// `--version`: the reference command version this tool follows, and this
@@ -3709,7 +3696,11 @@ fn benchmark_one(
         None
     };
     for level in opts.bench_start..=opts.bench_end {
-        validate_level(level)?;
+        debug_assert_eq!(
+            level,
+            clamp_level(level),
+            "the range was clamped at parse time"
+        );
         let settings = FrameSettings {
             level,
             size_hint: None,

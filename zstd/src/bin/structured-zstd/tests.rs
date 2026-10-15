@@ -1733,19 +1733,34 @@ fn levels_above_19_without_ultra_fall_back_to_19() {
     assert_eq!(parse(&["-20", "in.txt"]).unwrap().level, 19);
     // Named, they run as asked.
     assert_eq!(parse(&["--ultra", "-22", "in.txt"]).unwrap().level, 22);
-    // Benchmarking compresses the range `-b`/`-e` name rather than the level
-    // `-N` sets, so the range is what gets clamped: `-b20` reaches an ultra
-    // level as surely as `-20` does.
-    let opts = parse(&["-b20", "in.txt"]).unwrap();
-    assert_eq!((opts.bench_start, opts.bench_end), (19, 19));
-    let opts = parse(&["-b3", "-e22", "in.txt"]).unwrap();
-    assert_eq!((opts.bench_start, opts.bench_end), (3, 19));
-    assert_eq!(
-        parse(&["--ultra", "-b20", "in.txt"]).unwrap().bench_start,
-        20
-    );
     // Below the ultra band nothing moves.
     assert_eq!(parse(&["-19", "in.txt"]).unwrap().level, 19);
+}
+
+/// A level past the scale is not refused either (upstream zstdcli.c:1557-1566):
+/// `zstd -99` warns and compresses at 19, or at 22 under `--ultra`, as the
+/// reference's own test suite expects ("too large compression level =>
+/// auto-fix"). A level below the scale compresses at the fastest one, as the
+/// library clamps it (zstd_compress.c:8303).
+#[test]
+fn levels_past_the_scale_are_reduced_to_it() {
+    assert_eq!(parse(&["-99", "in.txt"]).unwrap().level, 19);
+    assert_eq!(parse(&["--ultra", "-99", "in.txt"]).unwrap().level, 22);
+    let min = CompressionLevel::MIN_LEVEL;
+    assert_eq!(parse_as(&plain(), min - 5, &["in.txt"]).unwrap().level, min);
+    // The digit run still has to fit 32 bits.
+    assert!(parse(&["-5000000000", "in.txt"]).is_err());
+}
+
+/// Benchmarking leaves before the `--ultra` gate (upstream zstdcli.c:1456-1484,
+/// `goto _end`), so `-b20` measures level 20 without `--ultra`; only the top
+/// of the scale bounds the range.
+#[test]
+fn benchmark_range_is_bounded_by_the_scale_alone() {
+    let opts = parse(&["-b20", "in.txt"]).unwrap();
+    assert_eq!((opts.bench_start, opts.bench_end), (20, 20));
+    let opts = parse(&["-b3", "-e99", "in.txt"]).unwrap();
+    assert_eq!((opts.bench_start, opts.bench_end), (3, 22));
 }
 
 #[test]
@@ -2307,14 +2322,14 @@ fn out_of_range_long_window_log_is_refused() {
     assert!(parse(&["-19", &past, "in.txt"]).is_err());
 }
 
-/// A benchmark range is two levels, and both of them run. Checking only the
-/// top lets `-b-200000` through parsing, so the files are stat'd and read whole
-/// before the first level is rejected — work for a command that was never going
-/// to run.
+/// A benchmark range is two levels, and both of them run. A sign inside the
+/// cluster is not a level, so `-b-200000` is a broken command line; an end past
+/// the scale is bounded by it (upstream zstdcli.c:1457).
 #[test]
 fn a_benchmark_range_is_validated_at_both_ends() {
     assert!(parse(&["-b-200000", "in.txt"]).is_err());
-    assert!(parse(&["-b3", "-e200000", "in.txt"]).is_err());
+    let opts = parse(&["-b3", "-e200000", "in.txt"]).unwrap();
+    assert_eq!((opts.bench_start, opts.bench_end), (3, 22));
     assert!(parse(&["-b1", "-e19", "in.txt"]).is_ok());
 }
 
