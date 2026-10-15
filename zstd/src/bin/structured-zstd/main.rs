@@ -3047,13 +3047,12 @@ fn process_concatenated(
 /// fails is reported and the rest are still processed, as the reference
 /// command does; the count that failed decides the exit status.
 fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Result<usize> {
-    // The inputs are processed one after another, so an output derived from an
-    // early one can land on a file still waiting its turn: `-f foo foo.zst`
-    // would replace `foo.zst` before it is ever read. The `-D` dictionary is a
-    // file this run needs too, and the one a frame will need to be read back,
-    // so writing over it destroys the key to what was just produced. `-f`
-    // permits overwriting the output, not destroying either, so everything the
-    // run reads is checked before the first byte is written.
+    // The `-D` dictionary is a file this run needs, and the one a frame will
+    // need to be read back, so writing over it destroys the key to what was
+    // just produced; it is checked before the first byte is written. Another
+    // input is not: under `-f` an output derived from an early input replaces
+    // a later one of that name, as the reference command does
+    // (`-f foo foo.zst` writes `foo.zst`, then compresses it in turn).
     //
     // Only for the modes that write one. Testing decodes into a sink and names
     // no destination, so asking what it would produce has no answer. An input
@@ -3099,15 +3098,6 @@ fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Resu
                     input.display(),
                     dict.display(),
                 );
-            }
-            for other in &opts.inputs {
-                if other != Path::new("-") && names_the_same_file(&output, other)? {
-                    bail!(
-                        "{} would be written over {}, which is also an input",
-                        input.display(),
-                        other.display(),
-                    );
-                }
             }
         }
     }

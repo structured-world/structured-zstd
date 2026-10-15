@@ -376,36 +376,31 @@ fn target_block_size_reaches_the_encoder() {
     );
 }
 
-/// Inputs are processed one after another, so an output derived from an early
-/// one can land on a file still waiting its turn: `-f foo foo.zst` replaces
-/// `foo.zst` before it is ever read, and the original is gone. `-f` says
-/// overwrite the output, not destroy another input.
+/// Inputs are processed one after another, and under `-f` an output derived
+/// from an early one replaces a later input of that name before it is read, as
+/// the reference command does (its own suite runs `zstd -f tmp*` over `tmp`
+/// and `tmp.zst`): `-f foo foo.zst` writes `foo.zst` from `foo`, then
+/// compresses that into `foo.zst.zst`.
 #[test]
-fn an_output_may_not_land_on_another_input() {
-    let dir = std::env::temp_dir();
-    let plain = dir.join(format!("szstd-alias-{}", std::process::id()));
-    let archive = PathBuf::from(format!("{}.zst", plain.display()));
-    fs::write(&plain, b"first input").unwrap();
-    fs::write(&archive, b"second input, would be destroyed").unwrap();
+fn an_output_may_land_on_a_later_input_under_force() {
+    let scratch = Scratch::new("alias");
+    let plain = scratch.file("data", b"first input");
+    let archive = scratch.file("data.zst", b"second input, overwritten");
 
-    let mut opts = parse(&["-f", "a", "b"]).unwrap();
-    opts.inputs = vec![plain.clone(), archive.clone()];
-    let refused = run(opts);
+    let mut opts = parse(&["-q", "-f", "a", "b"]).unwrap();
+    opts.inputs = vec![plain, archive.clone()];
+    assert_eq!(run(opts).expect("the run goes ahead"), 0, "no input failed");
 
-    let survived = fs::read(&archive).unwrap_or_default();
-    let _ = fs::remove_file(&plain);
-    let _ = fs::remove_file(&archive);
-    let err = refused
-        .expect_err("an output that is also an input must be refused")
-        .to_string();
-    assert!(
-        err.contains("input"),
-        "the refusal must name the collision: {err}"
-    );
-    assert_eq!(
-        survived, b"second input, would be destroyed",
-        "the second input must still be there"
-    );
+    let decode = |frame: &[u8]| {
+        let mut out = Vec::new();
+        structured_zstd::decoding::StreamingDecoder::new(frame)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    };
+    assert_eq!(decode(&fs::read(&archive).unwrap()), b"first input");
+    let twice = fs::read(scratch.path().join("data.zst.zst")).unwrap();
+    assert_eq!(decode(&decode(&twice)), b"first input");
 }
 
 /// `--rm` deletes an input once its output is safely written, but an input that
@@ -826,39 +821,6 @@ fn an_output_may_not_land_on_the_dictionary() {
         "the refusal must name the collision: {err}"
     );
     assert_eq!(survived.len(), 4096, "the dictionary must still be there");
-}
-
-/// The same file can be named many ways — `foo.zst`, `./foo.zst`,
-/// `dir/../dir/foo.zst` — and a guard that compares the spelling rather than
-/// the file lets every one of those through. The second input is destroyed just
-/// the same.
-#[test]
-fn an_output_may_not_land_on_another_input_spelled_differently() {
-    let dir = std::env::temp_dir();
-    let plain = dir.join(format!("szstd-spelling-{}", std::process::id()));
-    let archive = PathBuf::from(format!("{}.zst", plain.display()));
-    fs::write(&plain, b"first input").unwrap();
-    fs::write(&archive, b"second input, would be destroyed").unwrap();
-
-    // The same archive, reached through the directory rather than named
-    // directly: a different string for one file.
-    let indirect = dir
-        .join("..")
-        .join(dir.file_name().expect("a temp dir has a name"))
-        .join(archive.file_name().expect("the archive has a name"));
-
-    let mut opts = parse(&["-f", "a", "b"]).unwrap();
-    opts.inputs = vec![plain.clone(), indirect];
-    let refused = run(opts);
-
-    let survived = fs::read(&archive).unwrap_or_default();
-    let _ = fs::remove_file(&plain);
-    let _ = fs::remove_file(&archive);
-    refused.expect_err("the collision is the file, not the spelling");
-    assert_eq!(
-        survived, b"second input, would be destroyed",
-        "the second input must still be there"
-    );
 }
 
 /// Training reads every sample whole, so a sample has to be a file with an end:
