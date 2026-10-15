@@ -801,9 +801,9 @@ fn encode_block_parts<M: Matcher>(
         // passes; folded into one loop here saves the per-element
         // closure overhead (profile #220 round 3: `Map::fold` +
         // `call_mut` accounted for ~5% of total bench CPU).
-        let mut ll_counts = [0usize; 256];
-        let mut ml_counts = [0usize; 256];
-        let mut of_counts = [0usize; 256];
+        let mut ll_counts: SequenceHistogram = [0; SEQUENCE_CODE_SLOTS];
+        let mut ml_counts: SequenceHistogram = [0; SEQUENCE_CODE_SLOTS];
+        let mut of_counts: SequenceHistogram = [0; SEQUENCE_CODE_SLOTS];
         // The offset codes are derived in this same pass rather than by a
         // walk of their own ahead of the literals section: both passes read
         // every sequence, and the second one was reading back what the first
@@ -920,9 +920,9 @@ fn encode_block_parts<M: Matcher>(
 /// allocates. Counts are zeroed at the top of every probe.
 struct EstimatorWorkspace {
     lit_counts: Box<[usize; 256]>,
-    ll_counts: Box<[usize; 256]>,
-    ml_counts: Box<[usize; 256]>,
-    of_counts: Box<[usize; 256]>,
+    ll_counts: Box<SequenceHistogram>,
+    ml_counts: Box<SequenceHistogram>,
+    of_counts: Box<SequenceHistogram>,
     /// FSE table handles no probe state holds any more, for the next probe to
     /// build into. Every one is unique, so a build writes it in place.
     spare_fse: Vec<SharedFseTable>,
@@ -937,7 +937,8 @@ impl EstimatorWorkspace {
     /// the pooled tables with their reference counts, and the room kept for
     /// the probes' Huffman tables.
     fn heap_size(&self) -> usize {
-        4 * core::mem::size_of::<[usize; 256]>()
+        core::mem::size_of::<[usize; 256]>()
+            + 3 * core::mem::size_of::<SequenceHistogram>()
             + self.built_huff.capacity() * core::mem::size_of::<huff0_encoder::HuffmanTable>()
             + self.spare_fse.capacity() * core::mem::size_of::<SharedFseTable>()
             + self.spare_fse.len()
@@ -965,9 +966,9 @@ impl Default for EstimatorWorkspace {
     fn default() -> Self {
         Self {
             lit_counts: Box::new([0; 256]),
-            ll_counts: Box::new([0; 256]),
-            ml_counts: Box::new([0; 256]),
-            of_counts: Box::new([0; 256]),
+            ll_counts: Box::new([0; SEQUENCE_CODE_SLOTS]),
+            ml_counts: Box::new([0; SEQUENCE_CODE_SLOTS]),
+            of_counts: Box::new([0; SEQUENCE_CODE_SLOTS]),
             spare_fse: Vec::new(),
             built_huff: Vec::new(),
         }
@@ -1281,7 +1282,7 @@ fn estimate_sequences_section_bytes(
     } = workspace;
     let (ll_counts, ml_counts, of_counts) = (&mut **ll_counts, &mut **ml_counts, &mut **of_counts);
     debug_assert_eq!(codes.ll.len(), sequences.len());
-    let histogram = |codes: &[u8], counts: &mut [usize; 256]| {
+    let histogram = |codes: &[u8], counts: &mut SequenceHistogram| {
         counts.fill(0);
         let mut max = 0u8;
         for &code in codes {
@@ -1412,7 +1413,7 @@ fn estimate_sequences_section_bytes(
 /// `encode_sequences` would emit: FSE state transitions + final state flush.
 fn fse_section_bits_for_mode(
     mode: &FseTableMode<'_>,
-    counts: &[usize; 256],
+    counts: &SequenceHistogram,
     default: &FSETable,
 ) -> usize {
     let max_symbol = counts.iter().rposition(|&c| c > 0).unwrap_or_default();
@@ -1764,12 +1765,22 @@ impl SequenceCode {
     }
 }
 
+/// Slots in a sequence-code histogram: enough for the widest of the three
+/// alphabets, the 53 match-length codes (RFC 8878 3.1.1.3.2.1.1). Upstream's
+/// `HIST_countFast_wksp` likewise clears and counts only up to the last code;
+/// a byte-wide histogram here zeroed 6 KiB a block for three streams that use
+/// under 128 slots between them.
+const SEQUENCE_CODE_SLOTS: usize = 64;
+
+/// Occurrences of each code of one sequence stream.
+type SequenceHistogram = [usize; SEQUENCE_CODE_SLOTS];
+
 /// The three sequence-code histograms, passed as one argument so the pass that
 /// fills them stays under the register-pressure of six.
 struct SequenceCodeCounts<'a> {
-    ll: &'a mut [usize; 256],
-    ml: &'a mut [usize; 256],
-    of: &'a mut [usize; 256],
+    ll: &'a mut SequenceHistogram,
+    ml: &'a mut SequenceHistogram,
+    of: &'a mut SequenceHistogram,
 }
 
 /// Fill each sequence's wire offset code in place, advancing the repeat-offset
@@ -1883,7 +1894,7 @@ fn fill_and_count<const OFFSETS_CODED: bool>(
 /// scan starts at its own alphabet's last code (`MAX_CODE`: 35, 52 or 31),
 /// where upstream's `HIST_count_simple` starts its own, so nothing past the
 /// alphabet is read.
-fn highest_used_code<const MAX_CODE: usize>(counts: &[usize; 256]) -> usize {
+fn highest_used_code<const MAX_CODE: usize>(counts: &SequenceHistogram) -> usize {
     debug_assert!(
         counts[MAX_CODE + 1..].iter().all(|&count| count == 0),
         "a code past the alphabet's last ({MAX_CODE}) was counted",
@@ -2219,7 +2230,7 @@ impl FseTableMode<'_> {
     }
 }
 
-fn entropy_cost(counts: &[usize; 256], max_symbol: usize, total: usize) -> usize {
+fn entropy_cost(counts: &SequenceHistogram, max_symbol: usize, total: usize) -> usize {
     let mut cost = 0usize;
     for &count in counts.iter().take(max_symbol + 1) {
         if count == 0 {
@@ -2234,7 +2245,11 @@ fn entropy_cost(counts: &[usize; 256], max_symbol: usize, total: usize) -> usize
     cost >> 8
 }
 
-fn cross_entropy_cost(counts: &[usize; 256], max_symbol: usize, table: &FSETable) -> Option<usize> {
+fn cross_entropy_cost(
+    counts: &SequenceHistogram,
+    max_symbol: usize,
+    table: &FSETable,
+) -> Option<usize> {
     let acc_log = table.acc_log();
     if acc_log > 8 {
         return None;
@@ -2259,7 +2274,7 @@ fn cross_entropy_cost(counts: &[usize; 256], max_symbol: usize, table: &FSETable
     Some(cost >> 8)
 }
 
-fn fse_bit_cost(counts: &[usize; 256], max_symbol: usize, table: &FSETable) -> Option<usize> {
+fn fse_bit_cost(counts: &SequenceHistogram, max_symbol: usize, table: &FSETable) -> Option<usize> {
     let table_log = table.acc_log() as usize;
     let table_size = 1usize << table_log;
     let mut cost = 0usize;
@@ -2316,7 +2331,7 @@ fn choose_table_from_counts<'a>(
     // last symbol in place for its normalize, and restore it (see
     // `build_seq_ctable`) — no per-table copy. Every selection-time read
     // re-borrows it immutably; the value is unchanged on return.
-    counts: &mut [usize; 256],
+    counts: &mut SequenceHistogram,
     total: usize,
     // The highest symbol code with a non-zero count, tracked by the caller as it
     // builds `counts`. The sequence-code alphabets are tiny (LL <= 35, ML <= 52,

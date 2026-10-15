@@ -1,7 +1,8 @@
 use super::{
-    FseTableMode, LastUsedTable, RawSequence, choose_table_from_counts, emit_single_sequence_block,
-    encode_literal_length, encode_match_len, encode_offset_with_history, min_gain,
-    min_literals_to_compress, previous_table, remember_last_used_tables,
+    FseTableMode, LastUsedTable, RawSequence, SEQUENCE_CODE_SLOTS, SequenceHistogram,
+    choose_table_from_counts, emit_single_sequence_block, encode_literal_length, encode_match_len,
+    encode_offset_with_history, min_gain, min_literals_to_compress, previous_table,
+    remember_last_used_tables,
 };
 use crate::encoding::frame_compressor::{
     CompressState, FseTables, PreviousFseTable, SharedFseTable,
@@ -22,7 +23,7 @@ fn choose_table<'a>(
     strategy: StrategyTag,
     next: &'a mut Option<SharedFseTable>,
 ) -> FseTableMode<'a> {
-    let mut counts = [0usize; 256];
+    let mut counts: SequenceHistogram = [0; SEQUENCE_CODE_SLOTS];
     let mut total = 0usize;
     let mut max_symbol = 0usize;
     for symbol in data {
@@ -989,7 +990,7 @@ fn fast_band_strategies_prefer_repeat_fse_table() {
         PreviousFseTable::Custom(crate::encoding::frame_compressor::SharedFseTable::new(prev));
     let fse_tables = FseTables::new();
     // Distribution over symbols {0,1}, both covered by `previous`.
-    let mut counts = [0usize; 256];
+    let mut counts: SequenceHistogram = [0; SEQUENCE_CODE_SLOTS];
     counts[0] = 4;
     counts[1] = 6;
     let total = 10;
