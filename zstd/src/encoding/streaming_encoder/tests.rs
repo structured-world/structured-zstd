@@ -410,26 +410,12 @@ fn the_reported_footprint_covers_what_compressing_retained() {
     assert_eq!(enc.heap_size(), after, "restoring must undo the removal");
 
     // The entropy state kept between blocks is the other half of the figure:
-    // the FSE tables each axis holds in its two slots, and the Huffman tables
-    // the emit paths copy into before a block that may turn out raw. All of it
-    // survives the frame, so a caller sizing a context has to be told about it.
-    // Checked by removal rather than by comparison: the match-finder's share
-    // alone exceeds it, so any "total is at least the parts" assertion would
-    // pass with the term missing entirely.
-    let entropy = enc.context.state.fse_tables.heap_size()
-        + enc
-            .context
-            .state
-            .huff_rollback
-            .as_ref()
-            .map_or(0, |table| table.heap_size())
-        + enc
-            .context
-            .state
-            .block_scratch
-            .huff_rollback
-            .as_ref()
-            .map_or(0, |table| table.heap_size());
+    // the FSE tables each axis holds in its two slots. It survives the frame,
+    // so a caller sizing a context has to be told about it. Checked by removal
+    // rather than by comparison: the match-finder's share alone exceeds it, so
+    // any "total is at least the parts" assertion would pass with the term
+    // missing entirely.
+    let entropy = enc.context.state.fse_tables.heap_size();
     assert!(
         entropy > 0,
         "compressing should have left entropy state retained",
@@ -439,16 +425,12 @@ fn the_reported_footprint_covers_what_compressing_retained() {
         &mut enc.context.state.fse_tables,
         crate::encoding::frame_compressor::FseTables::new(),
     );
-    let saved_rollback = enc.context.state.huff_rollback.take();
-    let saved_scratch_rollback = enc.context.state.block_scratch.huff_rollback.take();
     assert_eq!(
         with_entropy - enc.heap_size(),
         entropy,
         "the entropy state is retained but not counted in the reported footprint",
     );
     enc.context.state.fse_tables = saved_tables;
-    enc.context.state.huff_rollback = saved_rollback;
-    enc.context.state.block_scratch.huff_rollback = saved_scratch_rollback;
     assert_eq!(enc.heap_size(), with_entropy, "restoring must undo removal");
 }
 use crate::io::{Error, ErrorKind, Read, Write};

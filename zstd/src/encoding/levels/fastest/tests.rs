@@ -72,7 +72,6 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,
-        huff_rollback: None,
         huff_weights: Default::default(),
         seen_content: Default::default(),
         fse_tables: FseTables::new(),

@@ -165,11 +165,6 @@ pub(crate) struct CompressedBlockScratch {
     /// first block-split). The estimator uses `EntropyOnlyMatcher` and
     /// never re-splits, so this nesting is one level deep.
     estimator_inner: Option<Box<CompressedBlockScratch>>,
-    /// Persistent slot for `compress_block_encoded`'s pre-block entropy
-    /// rollback snapshot. `clone_from` into this slot reuses its `Vec`
-    /// buffers across blocks; a fresh `.clone()` per block paid a
-    /// malloc + free pair on both Huffman code containers every block.
-    pub(crate) huff_rollback: Option<huff0_encoder::HuffmanTable>,
 }
 
 impl CompressedBlockScratch {
@@ -192,10 +187,6 @@ impl CompressedBlockScratch {
                 .estimator_workspace
                 .as_ref()
                 .map_or(0, EstimatorWorkspace::heap_size)
-            + self
-                .huff_rollback
-                .as_ref()
-                .map_or(0, |table| table.heap_size())
             + self.estimator_inner.as_ref().map_or(0, |inner| {
                 core::mem::size_of::<CompressedBlockScratch>() + inner.retained_heap_size()
             })
@@ -395,21 +386,25 @@ impl Matcher for EntropyOnlyMatcher {
     }
 }
 
-/// A block of [`crate::blocks::block::BlockType::Compressed`]
-pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
+/// A block of [`crate::blocks::block::BlockType::Compressed`]. Its tables are
+/// returned for the caller to [`commit_block_tables`] if it keeps the block,
+/// or [`discard_block_tables`] if it writes the block raw instead.
+#[must_use = "the block's tables have to be committed or discarded"]
+pub(crate) fn compress_block<M: Matcher>(
+    state: &mut CompressState<M>,
+    output: &mut Vec<u8>,
+) -> BlockTables {
     let mut scratch = core::mem::take(&mut state.block_scratch);
     collect_block_parts(state, &mut scratch.parts);
-    let decisions = encode_block_parts(
+    let tables = encode_block_parts(
         state,
         &scratch.parts.literals,
         &mut scratch.parts.sequences,
         &mut scratch.sequence_codes,
         output,
     );
-    // This path writes the block it just encoded, so the tables it chose are
-    // what the next block reads.
-    remember_last_used_tables(&mut state.fse_tables, decisions);
     state.block_scratch = scratch;
+    tables
 }
 
 pub(crate) fn compress_block_with_post_split<M: Matcher>(
@@ -500,7 +495,6 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             // `built_huff`; this slot stays empty.
             last_huff_table: None,
             huff_table_spare: None,
-            huff_rollback: None,
             // Lent, not created: the estimator builds a table per split
             // candidate, and a fresh scratch here would take its buffers again
             // on every post-split block and drop them at the end of it. Handed
@@ -710,9 +704,9 @@ fn encode_block_parts<M: Matcher>(
     // allocated once rather than per block.
     codes: &mut RegionVec<u32>,
     output: &mut Vec<u8>,
-    // What each axis decided, for the caller to apply once it knows the block
-    // is kept. LL, ML, OF.
-) -> [LastUsedTable; 3] {
+    // What the block decided for its tables, for the caller to commit once it
+    // knows the block is kept.
+) -> BlockTables {
     // A block with no sequences writes no tables, so every axis keeps what it
     // had whatever the caller decides.
     let mut decisions = [LastUsedTable::Keep; 3];
@@ -754,7 +748,10 @@ fn encode_block_parts<M: Matcher>(
     // small-input framing economy (single-segment header, store-raw fallback
     // for non-shrinking blocks) lives in `append_frame_header` /
     // `compress_block_encoded`, not in this literals path.
-    if state.literal_compression_disabled {
+    // What the section does to the Huffman table is returned, not applied: the
+    // table the block started from stays in place until the caller keeps the
+    // block, so a block that loses to a raw one has nothing to put back.
+    let huff = if state.literal_compression_disabled {
         // Upstream zstd `ZSTD_literalsCompressionIsDisabled` (auto mode:
         // `strategy == ZSTD_fast && targetLength > 0`, i.e. the negative levels):
         // emit RAW literals, skipping the Huffman pass entirely
@@ -762,10 +759,10 @@ fn encode_block_parts<M: Matcher>(
         // C's negative-band frames byte-for-byte (the literals section there is
         // Raw, not Compressed/RLE).
         raw_literals(literals_vec, &mut writer);
-        state.clear_huff_table();
+        HuffOutcome::Clear
     } else if !literals_vec.is_empty() && all_bytes_identical(literals_vec) {
         rle_literals(literals_vec, &mut writer);
-        state.clear_huff_table();
+        HuffOutcome::Clear
     } else if literals_vec.len() >= min_lits {
         match compress_literals(
             literals_vec,
@@ -776,18 +773,14 @@ fn encode_block_parts<M: Matcher>(
             &mut state.huff_weights,
             literals_suspected_incompressible(literals_vec.len(), raw_sequences.len()),
         ) {
-            HuffmanTableUpdate::New(table) => {
-                state.replace_huff_table(table);
-            }
-            HuffmanTableUpdate::Reused => {}
-            HuffmanTableUpdate::Cleared => {
-                state.clear_huff_table();
-            }
+            HuffmanTableUpdate::New(table) => HuffOutcome::New(table),
+            HuffmanTableUpdate::Reused => HuffOutcome::Keep,
+            HuffmanTableUpdate::Cleared => HuffOutcome::Clear,
         }
     } else {
         raw_literals(literals_vec, &mut writer);
-        state.clear_huff_table();
-    }
+        HuffOutcome::Clear
+    };
 
     // sequences section
 
@@ -913,7 +906,40 @@ fn encode_block_parts<M: Matcher>(
         ];
     }
     writer.flush();
-    decisions
+    BlockTables {
+        fse: decisions,
+        huff,
+    }
+}
+
+/// What a block decided for the tables the next block may repeat, held until
+/// the caller knows whether the block is kept. Upstream builds into
+/// `nextCBlock` and makes it the previous state only on confirmation
+/// (`ZSTD_blockState_confirmRepcodesAndEntropyTables`); a block that goes out
+/// raw is simply not confirmed, so nothing the block started from is ever
+/// copied to be put back.
+pub(crate) struct BlockTables {
+    fse: [LastUsedTable; 3],
+    huff: HuffOutcome,
+}
+
+/// Make a kept block's tables the ones the next block reads.
+pub(crate) fn commit_block_tables<M: Matcher>(state: &mut CompressState<M>, tables: BlockTables) {
+    remember_last_used_tables(&mut state.fse_tables, tables.fse);
+    match tables.huff {
+        HuffOutcome::Keep => {}
+        HuffOutcome::Clear => state.clear_huff_table(),
+        HuffOutcome::New(table) => state.replace_huff_table(table),
+    }
+}
+
+/// Drop a discarded block's tables, keeping a Huffman table it built as a
+/// buffer for the next build; the FSE tables it built stay in their `*_next`
+/// slots for the same reason.
+pub(crate) fn discard_block_tables<M: Matcher>(state: &mut CompressState<M>, tables: BlockTables) {
+    if let HuffOutcome::New(table) = tables.huff {
+        state.park_huff_table(table);
+    }
 }
 
 /// Workspace shared across estimator probes so per-probe cost computation never
@@ -1634,24 +1660,10 @@ fn emit_single_sequence_block<M: Matcher>(
     buffers: &mut SingleSequenceEmitBuffers<'_>,
 ) -> bool {
     let saved_offset_hist = state.offset_hist;
-    // Copy into the rollback slot rather than a fresh `Option`: the slot keeps
-    // its buffers between blocks, so this reuses them instead of taking two
-    // `Vec`s per block. `had_huff_table` carries what an `Option` copy would
-    // have carried, without discarding the buffer when there is nothing to
-    // copy.
-    let had_huff_table = state.last_huff_table.is_some();
-    if let Some(src) = &state.last_huff_table {
-        match &mut state.huff_rollback {
-            Some(dst) => dst.clone_from(src),
-            slot => *slot = Some(src.clone()),
-        }
-    }
-    // The FSE tables need no copy: the block builds into the `*_next` slots and
-    // the previous ones are only read, so rolling back is simply not applying
-    // the decisions below. Copying them was also what kept the built table's
-    // handle shared, which forced a fresh one per block.
+    // The tables are only read here and the block's decisions come back to be
+    // committed, so writing the partition raw leaves nothing to restore.
     buffers.compressed.clear();
-    let fse_decisions = encode_block_parts(
+    let tables = encode_block_parts(
         state,
         literals,
         sequences,
@@ -1661,27 +1673,7 @@ fn emit_single_sequence_block<M: Matcher>(
     let min_gain = (source_len >> 8) + 2;
     if buffers.compressed.len() >= source_len.saturating_sub(min_gain) {
         state.offset_hist = saved_offset_hist;
-        if had_huff_table {
-            // Swap, not assign: the table this block built goes back into the
-            // rollback slot and becomes the next block's copy buffer.
-            core::mem::swap(&mut state.last_huff_table, &mut state.huff_rollback);
-        } else {
-            // Nothing was carried in, so whatever this block built is dropped
-            // from the state; park it for the next build rather than freeing.
-            state.clear_huff_table();
-        }
-        // A partition that built a table and then chose raw or RLE literals
-        // parked it on the way there, so the swap above had nothing to give
-        // back: the slot would go into the next partition empty, which is the
-        // allocation of both code buffers it exists to avoid — on exactly the
-        // run of partitions that keeps failing the size test. Take the parked
-        // table; the slot is asked for one per partition, the spare's other
-        // reader once per frame.
-        if state.huff_rollback.is_none() {
-            state.huff_rollback = state.huff_table_spare.take();
-        }
-        // The FSE decisions are simply not applied, so the previous tables are
-        // whatever the last kept block left.
+        discard_block_tables(state, tables);
         let header = BlockHeader {
             last_block,
             block_type: BlockType::Raw,
@@ -1692,7 +1684,7 @@ fn emit_single_sequence_block<M: Matcher>(
     } else {
         // The block is kept, so its tables become what the next one reads.
         // Upstream's confirm step, at the same point in the decision.
-        remember_last_used_tables(&mut state.fse_tables, fse_decisions);
+        commit_block_tables(state, tables);
         let header = BlockHeader {
             last_block,
             block_type: BlockType::Compressed,

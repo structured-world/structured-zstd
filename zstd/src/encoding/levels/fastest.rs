@@ -4,7 +4,10 @@ use crate::{
     encoding::{
         CompressionLevel, Matcher,
         block_header::BlockHeader,
-        blocks::{compress_block, compress_block_with_post_split},
+        blocks::{
+            commit_block_tables, compress_block, compress_block_with_post_split,
+            discard_block_tables,
+        },
         frame_compressor::CompressState,
         incompressible::{
             block_looks_incompressible, block_looks_incompressible_strict,
@@ -223,37 +226,17 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             sink.push(precomputed_checksum.expect("checksum is hashed whenever a sink exists"));
         }
 
-        // Keep rollback snapshots for the oversize fallback path below:
-        // `compress_block` can mutate entropy/history state before we know
-        // whether the compressed payload fits `MAX_BLOCK_SIZE`.
+        // The offset history is the only state `compress_block` advances in
+        // place; its tables come back to be committed once the size test below
+        // keeps the block, so a raw fallback has no entropy state to restore.
         let saved_offset_hist = state.offset_hist;
-        // Snapshot the Huffman table into the scratch's persistent rollback
-        // slot: `clone_from` reuses the slot's buffers across blocks (a
-        // fresh `.clone()` paid a malloc + free pair on both code containers
-        // every block). FSE previous tables are `SharedFseTable` handles —
-        // their clone is a refcount bump, no slot needed.
-        let mut saved_huff_table = core::mem::take(&mut state.block_scratch.huff_rollback);
-        // Only when there IS a table to snapshot. `Option::clone_from` from a
-        // `None` source drops what the slot holds, which is every buffer this
-        // persistent slot exists to keep: a run of blocks that build a table and
-        // then lose the size test would free and rebuild it every time.
-        let had_prior_huff_table = state.last_huff_table.is_some();
-        if let Some(prior) = state.last_huff_table.as_ref() {
-            match saved_huff_table.as_mut() {
-                Some(slot) => slot.clone_from(prior),
-                None => saved_huff_table = Some(prior.clone()),
-            }
-        }
-        let saved_ll_previous = state.fse_tables.ll_previous.clone();
-        let saved_ml_previous = state.fse_tables.ml_previous.clone();
-        let saved_of_previous = state.fse_tables.of_previous.clone();
         // Compress directly into `output`: reserve the fixed 3-byte block
         // header, append the payload after it, then backfill the header in
         // place once its length is known — no temp `Vec`, no extend-copy.
         let hdr_off = output.len();
         output.extend_from_slice(&[0u8; 3]);
         let payload_off = output.len();
-        compress_block(state, output);
+        let tables = compress_block(state, output);
         let payload_len = output.len() - payload_off;
         // Fall back to a raw block when the compressed payload is not
         // smaller than the source (`payload >= block_size`) or exceeds the
@@ -266,34 +249,11 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         // already look incompressible, so small inputs that slip past it but
         // fail to shrink still need this post-hoc store-raw.
         if payload_len >= MAX_BLOCK_SIZE as usize || payload_len >= block_size as usize {
-            // Roll back the payload + reserved header and the entropy state.
+            // Drop the payload + reserved header; the block's tables are not
+            // committed, so the next block reads the ones this one started from.
             output.truncate(hdr_off);
             state.offset_hist = saved_offset_hist;
-            // Swap (not move) so the slot keeps owning a reusable table
-            // allocation for the next block's snapshot. With no prior table
-            // there is nothing to restore, and the table this block built goes
-            // into the slot rather than being dropped.
-            if had_prior_huff_table {
-                core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
-            } else if let Some(built) = state.last_huff_table.take() {
-                saved_huff_table = Some(built);
-            }
-            // A block that built a table and then chose raw or RLE literals
-            // parked it on its way there, so the swap above had nothing to give
-            // back and the slot would go into the next block empty — which is
-            // the per-block allocation of both code buffers this slot exists to
-            // avoid, on exactly the run of blocks that keeps failing the size
-            // test. Take the parked table instead: the slot is asked for one
-            // per block, the spare's other reader once per frame.
-            if saved_huff_table.is_none() {
-                saved_huff_table = state.huff_table_spare.take();
-            }
-            state.fse_tables.roll_back_confirmation([
-                saved_ll_previous,
-                saved_ml_previous,
-                saved_of_previous,
-            ]);
-            state.block_scratch.huff_rollback = saved_huff_table;
+            discard_block_tables(state, tables);
             let header = BlockHeader {
                 last_block,
                 block_type: BlockType::Raw,
@@ -304,9 +264,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             output.extend_from_slice(state.matcher.get_last_space());
             BlockType::Raw
         } else {
-            // Return the snapshot to its slot so the next block's
-            // `clone_from` reuses the allocation.
-            state.block_scratch.huff_rollback = saved_huff_table;
+            commit_block_tables(state, tables);
             let header = BlockHeader {
                 last_block,
                 block_type: BlockType::Compressed,
@@ -462,24 +420,9 @@ pub(crate) fn compress_block_encoded_borrowed(
             // below, so hashing `block` is both correct and order-safe.
             sink.push(crate::encoding::frame_compressor::xxh64_block_low32(block));
         }
+        // As in the owned path: only the offset history is restored by hand;
+        // the block's tables are committed once it is kept.
         let saved_offset_hist = state.offset_hist;
-        // Persistent rollback slot — same allocation-reuse rationale as the
-        // owned `compress_block_encoded` snapshot above.
-        let mut saved_huff_table = core::mem::take(&mut state.block_scratch.huff_rollback);
-        // Only when there IS a table to snapshot. `Option::clone_from` from a
-        // `None` source drops what the slot holds, which is every buffer this
-        // persistent slot exists to keep: a run of blocks that build a table and
-        // then lose the size test would free and rebuild it every time.
-        let had_prior_huff_table = state.last_huff_table.is_some();
-        if let Some(prior) = state.last_huff_table.as_ref() {
-            match saved_huff_table.as_mut() {
-                Some(slot) => slot.clone_from(prior),
-                None => saved_huff_table = Some(prior.clone()),
-            }
-        }
-        let saved_ll_previous = state.fse_tables.ll_previous.clone();
-        let saved_ml_previous = state.fse_tables.ml_previous.clone();
-        let saved_of_previous = state.fse_tables.of_previous.clone();
         // Compress directly into `output`: reserve the fixed 3-byte block
         // header, append the payload after it, then backfill the header in
         // place once its length is known. Avoids the per-block temp `Vec`
@@ -488,42 +431,18 @@ pub(crate) fn compress_block_encoded_borrowed(
         let hdr_off = output.len();
         output.extend_from_slice(&[0u8; 3]);
         let payload_off = output.len();
-        compress_block(state, output);
+        let tables = compress_block(state, output);
         let payload_len = output.len() - payload_off;
         if payload_len >= MAX_BLOCK_SIZE as usize || payload_len >= block_size as usize {
             // Incompressible (compressed payload not smaller than the source,
-            // or over the max block size): roll back the payload + reserved
-            // header and the entropy state, then emit a stored Raw block. A
+            // or over the max block size): drop the payload + reserved header
+            // and the block's tables, then emit a stored Raw block. A
             // non-shrinking compressed block wastes bytes and can reference
             // past a single-segment frame's window (== content size); storing
             // raw matches the upstream post-hoc fallback.
             output.truncate(hdr_off);
             state.offset_hist = saved_offset_hist;
-            // Swap (not move) so the slot keeps owning a reusable table
-            // allocation for the next block's snapshot. With no prior table
-            // there is nothing to restore, and the table this block built goes
-            // into the slot rather than being dropped.
-            if had_prior_huff_table {
-                core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
-            } else if let Some(built) = state.last_huff_table.take() {
-                saved_huff_table = Some(built);
-            }
-            // A block that built a table and then chose raw or RLE literals
-            // parked it on its way there, so the swap above had nothing to give
-            // back and the slot would go into the next block empty — which is
-            // the per-block allocation of both code buffers this slot exists to
-            // avoid, on exactly the run of blocks that keeps failing the size
-            // test. Take the parked table instead: the slot is asked for one
-            // per block, the spare's other reader once per frame.
-            if saved_huff_table.is_none() {
-                saved_huff_table = state.huff_table_spare.take();
-            }
-            state.fse_tables.roll_back_confirmation([
-                saved_ll_previous,
-                saved_ml_previous,
-                saved_of_previous,
-            ]);
-            state.block_scratch.huff_rollback = saved_huff_table;
+            discard_block_tables(state, tables);
             let header = BlockHeader {
                 last_block,
                 block_type: BlockType::Raw,
@@ -533,9 +452,7 @@ pub(crate) fn compress_block_encoded_borrowed(
             output.extend_from_slice(block);
             BlockType::Raw
         } else {
-            // Return the snapshot to its slot so the next block's
-            // `clone_from` reuses the allocation.
-            state.block_scratch.huff_rollback = saved_huff_table;
+            commit_block_tables(state, tables);
             let header = BlockHeader {
                 last_block,
                 block_type: BlockType::Compressed,
