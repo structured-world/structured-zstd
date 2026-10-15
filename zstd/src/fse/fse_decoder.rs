@@ -622,14 +622,12 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     /// allocation for the symbol counter (stack-allocated since the
     /// max symbol count is bounded by `u8::MAX + 1 = 256`).
     ///
-    /// Wraps `build_decoding_table_inner` so the `symbol_spread_buffer`
-    /// scratch is unconditionally restored to `self` on every exit
-    /// path (success OR error) — otherwise an early `Err` from the
-    /// inner pass would drop the taken buffer and force a fresh
-    /// allocation on the next build.
+    /// Wraps `build_decoding_table_inner`, which borrows the table's fields
+    /// one by one so the spread scratch is lent in place rather than moved
+    /// out and back.
     ///
-    /// On `Err` the table is also fully `reset()` after the buffer
-    /// restore: the inner pass mutates `self.decode` (partial push)
+    /// On `Err` the table is fully `reset()`: the inner pass mutates
+    /// `self.decode` (partial push)
     /// while `self.accuracy_log` / `self.symbol_probabilities` were
     /// already set by the caller (`build_from_probabilities`); leaving
     /// that inconsistency in place would let a subsequent `init_state`
@@ -642,26 +640,38 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     }
 
     fn build_decoding_table_meta(&mut self, meta: SeqMeta<'_>) -> Result<(), FSETableError> {
-        let mut spread = core::mem::take(&mut self.symbol_spread_buffer);
-        let result = self.build_decoding_table_inner(&mut spread, meta);
-        self.symbol_spread_buffer = spread;
+        let result = Self::build_decoding_table_inner(
+            &mut self.decode,
+            &mut self.decode_len,
+            &mut self.symbol_spread_buffer,
+            &self.symbol_probabilities,
+            self.max_symbol,
+            self.accuracy_log,
+            meta,
+        );
         if result.is_err() {
             self.reset();
         }
         result
     }
 
+    // The table's fields, borrowed one by one; see `build_decoding_table_meta`.
+    #[allow(clippy::too_many_arguments)]
     fn build_decoding_table_inner(
-        &mut self,
+        decode: &mut [core::mem::MaybeUninit<E>; CAP],
+        decode_len: &mut usize,
         spread: &mut SpreadBuf,
+        symbol_probabilities: &ProbabilityBuf,
+        max_symbol: u8,
+        accuracy_log: u8,
         meta: SeqMeta<'_>,
     ) -> Result<(), FSETableError> {
-        let nb_symbols = self.symbol_probabilities.len();
-        if nb_symbols > self.max_symbol as usize + 1 {
+        let nb_symbols = symbol_probabilities.len();
+        if nb_symbols > max_symbol as usize + 1 {
             return Err(FSETableError::TooManySymbols { got: nb_symbols });
         }
 
-        let table_size = 1 << self.accuracy_log;
+        let table_size = 1 << accuracy_log;
         // The decode array is `[E; CAP]` and the fast-spread scratch is a fixed
         // `FSE_FAST_SPREAD_BUF`; a `table_size` above CAP would overrun both.
         // The wire path never exceeds CAP (sequence acc_log <= 9, HUF <= 6), but
@@ -670,7 +680,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // oversized table as a typed error instead of panic-overrunning.
         if table_size > CAP {
             return Err(FSETableError::AccLogTooBig {
-                got: self.accuracy_log,
+                got: accuracy_log,
                 max: CAP.trailing_zeros() as u8,
             });
         }
@@ -708,7 +718,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // a tighter scalar loop without the Iterator::next state
         // machine. The enumerate+take iterator chain was visible as
         // ~1.8% combined self-time on the decode flamegraph.
-        let probs = self.symbol_probabilities.as_slice();
+        let probs = symbol_probabilities.as_slice();
         let mut negative_idx = table_size;
         for symbol in 0..nb_symbols {
             let prob = probs[symbol];
@@ -799,7 +809,6 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // so `nextState == 1`, `high_bit == 1`, `nbBits ==
         // accuracy_log`, `newState == 0` — exactly the -1 entry
         // shape.
-        let accuracy_log = self.accuracy_log;
         let table_size_u32 = table_size as u32;
         // Write the `table_size` live entries directly into the inline,
         // value-initialised `decode` array (no `MaybeUninit` / `set_len`
@@ -814,7 +823,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             table_size <= CAP,
             "FSE table_size {table_size} exceeds monomorphized CAP {CAP}",
         );
-        self.decode_len = 0;
+        *decode_len = 0;
 
         // Slice index instead of `spread.iter().take(table_size)`:
         // if `spread.len() < table_size` (a future refactor breaking
@@ -865,7 +874,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 // is dropped here harmlessly (`MaybeUninit<E>` has no
                 // Drop).
                 return Err(FSETableError::TableInvariantViolation {
-                    prob: self.symbol_probabilities[symbol as usize],
+                    prob: symbol_probabilities[symbol as usize],
                     symbol,
                     num_bits: nb,
                     accuracy_log,
@@ -887,7 +896,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             // instead of re-walking the finished table. `from_raw`
             // zero-inits the meta fields, so the no-meta arms match
             // the post-pass results exactly.
-            self.decode[state_idx] = core::mem::MaybeUninit::new(match meta {
+            decode[state_idx] = core::mem::MaybeUninit::new(match meta {
                 SeqMeta::None => entry,
                 SeqMeta::Packed(packed) => {
                     let m = packed.get(symbol as usize).copied().unwrap_or(0);
@@ -905,7 +914,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
 
         // Commit the live span. The loop wrote every `state_idx ∈
         // [0, table_size)`; an Err above returns with `decode_len` still 0.
-        self.decode_len = table_size;
+        *decode_len = table_size;
 
         Ok(())
     }
