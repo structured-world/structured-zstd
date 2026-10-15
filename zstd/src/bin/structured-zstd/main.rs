@@ -3225,6 +3225,7 @@ fn file_summary(
         return;
     }
     let verbose = opts.verbosity > 3;
+    let level = opts.progress.summary_level();
     match opts.mode {
         Mode::Compress => {
             let read = HumanSize::new(processed.read, verbose);
@@ -3232,20 +3233,25 @@ fn file_summary(
             if processed.read == 0 {
                 display!(
                     opts.verbosity,
-                    2,
+                    level,
                     "{name:<20} :  ({read:>6} => {written:>6}, {destination})"
                 );
             } else {
                 display!(
                     opts.verbosity,
-                    2,
+                    level,
                     "{name:<20} :{:>6.2}%   ({read:>6} => {written:>6}, {destination})",
                     processed.written as f64 / processed.read as f64 * 100.0
                 );
             }
         }
         Mode::Decompress | Mode::Test => {
-            display!(opts.verbosity, 2, "{name:<20}: {} bytes", processed.written);
+            display!(
+                opts.verbosity,
+                level,
+                "{name:<20}: {} bytes",
+                processed.written
+            );
         }
         Mode::List | Mode::Train => {}
     }
@@ -3258,6 +3264,7 @@ fn multi_summary(opts: &Options, total: usize, tally: &Tally) {
         return;
     }
     let verbose = opts.verbosity > 3;
+    let level = opts.progress.summary_level();
     match opts.mode {
         Mode::Compress => {
             let read = HumanSize::new(tally.read, verbose);
@@ -3265,7 +3272,7 @@ fn multi_summary(opts: &Options, total: usize, tally: &Tally) {
             if tally.read == 0 {
                 display!(
                     opts.verbosity,
-                    2,
+                    level,
                     "{:>3} files compressed : ({} => {})",
                     tally.processed,
                     read.columns(6),
@@ -3274,7 +3281,7 @@ fn multi_summary(opts: &Options, total: usize, tally: &Tally) {
             } else {
                 display!(
                     opts.verbosity,
-                    2,
+                    level,
                     "{:>3} files compressed : {:.2}% ({} => {})",
                     tally.processed,
                     tally.written as f64 / tally.read as f64 * 100.0,
@@ -3286,7 +3293,7 @@ fn multi_summary(opts: &Options, total: usize, tally: &Tally) {
         Mode::Decompress | Mode::Test => {
             display!(
                 opts.verbosity,
-                2,
+                level,
                 "{} files decompressed : {:>6} bytes total",
                 tally.processed,
                 tally.written

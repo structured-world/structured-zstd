@@ -31,6 +31,15 @@ impl Progress {
             Self::Auto => verbosity >= DEFAULT_LEVEL && stderr_is_terminal,
         }
     }
+
+    /// The level from which a result summary is printed: forcing progress
+    /// keeps it under `-q` (upstream fileio_common.h `DISPLAY_SUMMARY`).
+    pub fn summary_level(self) -> i32 {
+        match self {
+            Self::Always => 1,
+            Self::Auto | Self::Never => DEFAULT_LEVEL,
+        }
+    }
 }
 
 /// A byte count scaled to the unit the reference command prints it in.

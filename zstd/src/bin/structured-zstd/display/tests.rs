@@ -1,5 +1,15 @@
 use super::{DEFAULT_LEVEL, HumanSize, Progress, confirm};
 
+/// `--progress` keeps the result summary under `-q` (upstream fileio_common.h
+/// `DISPLAY_SUMMARY`: shown at level 2, or at level 1 when progress is forced),
+/// while `-qq` silences it like everything else.
+#[test]
+fn forced_progress_keeps_the_summary_under_quiet() {
+    assert_eq!(Progress::Always.summary_level(), 1);
+    assert_eq!(Progress::Auto.summary_level(), DEFAULT_LEVEL);
+    assert_eq!(Progress::Never.summary_level(), DEFAULT_LEVEL);
+}
+
 /// The reference command scales sizes in powers of two and picks the number
 /// of decimals from the scaled value, so `-l` columns and result summaries
 /// line up with what its own output shows. A whole number of units drops the
