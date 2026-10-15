@@ -490,7 +490,9 @@ macro_rules! row_find_best_match {
         } else {
             (1u64 << row_entries) - 1
         };
-        let mut buf = [0u32; 64];
+        // Filled up to `n` before it is read, so it is left uninitialised, as
+        // upstream's `matchBuffer` is: zeroing it cost 256 bytes per search.
+        let mut buf = [core::mem::MaybeUninit::<u32>::uninit(); 64];
         let mut n = 0usize;
         {
             #[allow(unused_mut)]
@@ -561,7 +563,7 @@ macro_rules! row_find_best_match {
                     }
                 }
                 // SAFETY: `n < attempts_at_entry <= row_entries <= 64`.
-                unsafe { *buf.get_unchecked_mut(n) = raw };
+                unsafe { buf.get_unchecked_mut(n).write(raw) };
                 n += 1;
                 attempts -= 1;
             }
@@ -570,7 +572,9 @@ macro_rules! row_find_best_match {
         // are gated at the match head (`MEM_read32(match) == MEM_read32(ip)`)
         // instead of at the current best length.
         let prefix_start = $ctx.prefix_start;
-        for &raw in &buf[..n] {
+        for slot in &buf[..n] {
+            // SAFETY: the first `n` entries were written above.
+            let raw = unsafe { slot.assume_init() };
             let cand_idx = raw as usize - hist_start;
             // SAFETY: `cand_idx < cur_idx`; the gate reads 4 bytes at
             // `+ ml - 3` where `ml + 1 <= limit` (the count breaks out of the
