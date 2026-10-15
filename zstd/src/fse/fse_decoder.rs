@@ -546,6 +546,11 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 max: ENTRY_MAX_ACCURACY_LOG,
             });
         }
+        // Refused before anything is stored: the probability store is bounded
+        // by the alphabet, and this also bounds the sum below.
+        if probs.len() > self.max_symbol as usize + 1 {
+            return Err(FSETableError::TooManySymbols { got: probs.len() });
+        }
         // Probability sum check: `build_decoding_table` assumes the
         // sum of positive probabilities plus the count of `-1`
         // entries (each contributing one slot at the top of the

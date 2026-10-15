@@ -548,7 +548,7 @@ jobs:
       # and its zero-allocation test run as wasm too, under wasmtime (the WASI
       # target supplies the test harness's std).
       - name: Install wasmtime
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: wasmtime,cargo-nextest
       - name: Workspace decoder tests (wasm32-wasip1)
@@ -559,7 +559,7 @@ jobs:
           cargo nextest run --profile ci -p structured-zstd --target wasm32-wasip1 --no-default-features --features caller-workspace,hash,std --lib -E 'test(/decoding::workspace::tests/)'
           cargo nextest run --profile ci -p structured-zstd --target wasm32-wasip1 --no-default-features --features caller-workspace,hash,std --test workspace_no_alloc
       - name: Install wasm-pack
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: wasm-pack
       - uses: actions/setup-node@v7
@@ -625,7 +625,7 @@ jobs:
         with:
           prefix-key: wasm-bench
       - name: Install wasm-pack
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: wasm-pack
       - uses: actions/setup-node@v7
@@ -794,7 +794,7 @@ jobs:
           prefix-key: fuzz
           workspaces: zstd/fuzz
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-fuzz
       - name: Replay regression corpus

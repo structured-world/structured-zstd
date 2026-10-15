@@ -105,6 +105,21 @@ fn build_from_probabilities_accepts_exact_sum() {
     assert!(result.is_ok(), "expected Ok for exact sum, got {result:?}");
 }
 
+/// More probabilities than the table's alphabet holds are refused before they
+/// are stored: the store is bounded by the alphabet under `caller-workspace`,
+/// so copying them first would panic instead of returning the typed error.
+#[test]
+fn build_from_probabilities_rejects_more_symbols_than_the_alphabet() {
+    let mut t = FSETable::new(255);
+    let mut probs = [0i32; 300];
+    probs[0] = 16;
+    let result = t.build_from_probabilities(4, &probs);
+    assert!(
+        matches!(result, Err(FSETableError::TooManySymbols { got: 300 })),
+        "expected TooManySymbols {{ got: 300 }}, got {result:?}",
+    );
+}
+
 /// A table description whose zero-probability run outgrows the alphabet is
 /// refused as soon as it does, as upstream's `FSE_readNCount` stops at
 /// `charnum > maxSV1`, rather than collecting zeros until the input runs out.

@@ -7,7 +7,7 @@
 //!   frames. The typical choice for application code.
 //! * [`FrameDecoder`] — single-frame interface; use when the caller manages
 //!   the input buffer manually (zero-copy slices, network framing, etc).
-//! * [`workspace::WorkspaceDecoder`] (feature `caller-workspace`): streaming
+//! * `workspace::WorkspaceDecoder` (feature `caller-workspace`): streaming
 //!   decoder over a byte slice the caller sizes and owns, with no allocation
 //!   and limits on window, output and work. For consumers that account their
 //!   memory themselves, such as browser bundles verifying a download.

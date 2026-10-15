@@ -676,6 +676,12 @@ pub struct WorkspaceDecoder<'w> {
     failed: bool,
 }
 
+// SAFETY: `region` points into the `&'w mut [u8]` workspace this decoder
+// borrows exclusively for `'w` (`_region` records that borrow), and every other
+// field is `Send`. Moving the decoder moves that exclusive borrow with it, as
+// moving the `&mut [u8]` itself would.
+unsafe impl Send for WorkspaceDecoder<'_> {}
+
 impl<'w> WorkspaceDecoder<'w> {
     /// Build a decoder in `workspace`, which must hold at least
     /// [`workspace_bytes`]`(limits.max_window_size)` bytes. Nothing is

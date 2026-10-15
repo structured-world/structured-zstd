@@ -4040,9 +4040,42 @@ fn a_compressed_block_past_the_block_maximum_is_refused() {
         0x15, 0x00, 0x00, // last, Compressed, Block_Size 2
         0x00, 0x00, // raw literals of 0 bytes, 0 sequences
     ];
+    // Pin the cause, not only the refusal: any other error here would mean the
+    // block was refused for a reason this check does not own.
+    let expect_past_maximum = |err: &FrameDecoderError| {
+        let source = match err {
+            FrameDecoderError::FailedToReadBlockBody(source) => source,
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::FailedToReadBlockBodyAt { source, .. } => source,
+            other => panic!("expected a block-body refusal, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                source,
+                DecodeBlockContentError::DecompressBlockError(
+                    DecompressBlockError::ContentPastBlockMaximum {
+                        size: 2,
+                        maximum: 0
+                    }
+                ),
+            ),
+            "expected the block-maximum refusal, got {err:?}",
+        );
+    };
     let mut out = [0u8; 16];
-    assert!(FrameDecoder::new().decode_all(&frame, &mut out).is_err());
+    let err = FrameDecoder::new()
+        .decode_all(&frame, &mut out)
+        .expect_err("decode_all must refuse the block");
+    expect_past_maximum(&err);
     let mut decoded = Vec::new();
     let mut streaming = crate::decoding::StreamingDecoder::new(&frame[..]);
-    assert!(crate::io::Read::read_to_end(&mut streaming, &mut decoded).is_err());
+    let err = crate::io::Read::read_to_end(&mut streaming, &mut decoded)
+        .expect_err("the streaming decoder must refuse the block");
+    match err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<FrameDecoderError>())
+    {
+        Some(err) => expect_past_maximum(err),
+        None => panic!("expected a FrameDecoderError, got {err:?}"),
+    }
 }

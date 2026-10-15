@@ -517,6 +517,14 @@ fn failure_is_terminal_until_reset() {
     assert_eq!(run(&mut decoder, valid, 64, 64, &mut work).unwrap(), data);
 }
 
+/// The decoder can move to another thread with its workspace, as the
+/// `&mut [u8]` it borrows can; the raw window pointer must not take that away.
+#[test]
+fn decoder_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<WorkspaceDecoder<'static>>();
+}
+
 /// Corrupting any byte of a frame is accepted or refused exactly as the
 /// one-shot decoder decides, with the same output when accepted, and never
 /// panics or stalls.
