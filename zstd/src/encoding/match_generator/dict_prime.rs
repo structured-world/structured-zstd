@@ -184,11 +184,25 @@ impl MatchGeneratorDriver {
             | super::super::strategy::BackendTag::Row
             | super::super::strategy::BackendTag::HashChain => 4,
         };
-        while start < dict_content.len() {
-            let end = (start + self.slice_size).min(dict_content.len());
-            if end - start < min_primed_tail {
-                break;
+        // A dictionary too short to hash at all is left out whole: no match can
+        // reach it, so offsets stay right. A longer one goes in whole, since the
+        // decoder places every byte of it before the frame and a byte missing
+        // here shifts every offset into it. A last piece too short to hash is
+        // avoided by ending the piece before it that much earlier, or, when
+        // that would leave this piece too short instead, by running it to the
+        // end.
+        let hashable = dict_content.len() >= min_primed_tail;
+        while hashable && start < dict_content.len() {
+            let mut end = (start + self.slice_size).min(dict_content.len());
+            if end != dict_content.len() && dict_content.len() - end < min_primed_tail {
+                let shortened = dict_content.len() - min_primed_tail;
+                end = if shortened - start >= min_primed_tail {
+                    shortened
+                } else {
+                    dict_content.len()
+                };
             }
+            debug_assert!(end - start >= min_primed_tail);
             // The chunk goes straight into the history, as a block of input
             // does.
             let chunk = &dict_content[start..end];

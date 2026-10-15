@@ -653,6 +653,48 @@ fn cross_every_level_with_ldm_and_dictionary_roundtrips_both_ways() {
     );
 }
 
+/// A raw-content dictionary whose start the input repeats, so the input's
+/// matches reach the dictionary's first byte, compressed with its size pledged
+/// (as `zstd -D dict file` does). The pledge shrinks the window, so the
+/// dictionary is taken in window-sized pieces, and a length one to three bytes
+/// past a whole number of them leaves a last piece too short to hash: those
+/// bytes still belong to the history, or every offset into the dictionary
+/// lands that many bytes off. The frame has to decode through the C decoder at
+/// every level and every tail length.
+#[test]
+fn cross_dictionary_with_a_short_last_piece_roundtrips_at_every_level() {
+    let mut failed = Vec::new();
+    for tail in 0..=3usize {
+        let dict_raw = generate_huffman_friendly(0xD1C7, 65_536 + tail, 40);
+        let data = &dict_raw[..11_000];
+        let dictionary =
+            structured_zstd::encoding::EncoderDictionary::from_serialized_or_raw_content(&dict_raw)
+                .expect("any bytes are a raw-content dictionary");
+        for level in 1i32..=22 {
+            let mut context = structured_zstd::encoding::CompressionContext::new(
+                CompressionLevel::from_level(level),
+            );
+            context.set_content_checksum(true).unwrap();
+            context.set_encoder_dictionary(dictionary.clone()).unwrap();
+            let mut encoder =
+                structured_zstd::encoding::StreamingEncoder::with_context(Vec::new(), &mut context);
+            encoder.set_pledged_content_size(data.len() as u64).unwrap();
+            std::io::Write::write_all(&mut encoder, data).unwrap();
+            let ours = encoder.finish().unwrap();
+
+            let mut c_dec = zstd::bulk::Decompressor::with_dictionary(&dict_raw).unwrap();
+            match c_dec.decompress(ours.as_slice(), data.len()) {
+                Ok(decoded) if decoded == data => {}
+                other => failed.push((tail, level, other.err().map(|e| e.to_string()))),
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "(tail, level) whose frame does not decode: {failed:?}"
+    );
+}
+
 /// A frame whose descriptor has the Reserved_bit (bit 3) set is refused by
 /// libzstd and by this decoder, and the same frame with only the Unused_bit
 /// (bit 4) set is accepted by both. libzstd's code is
