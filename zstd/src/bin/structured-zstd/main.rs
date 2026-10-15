@@ -2056,9 +2056,36 @@ fn write_default_cparams(
     writeln!(out, " - strategy      : {strategy} ({ordinal})")
 }
 
-/// Print `--show-default-cparams` for every input of a compressing run, on
-/// stderr and whatever the verbosity, as the reference command does.
-fn show_default_cparams(opts: &Options) -> Result<()> {
+/// Write the parameters `level` and the `--zstd=` knobs compress an input of
+/// `size` with, as the `--zstd=` option that reproduces them (upstream
+/// zstdcli.c `printActualCParams`). A knob of zero leaves the level's value.
+fn write_actual_cparams(
+    out: &mut impl Write,
+    size: Option<u64>,
+    dictionary_size: usize,
+    level: i32,
+    advanced: &AdvancedParams,
+) -> io::Result<()> {
+    let params =
+        LevelParameters::for_level(level, size.filter(|&bytes| bytes != 0), dictionary_size);
+    let knob = |set: Option<u32>, own: u32| set.filter(|&value| value != 0).unwrap_or(own);
+    writeln!(
+        out,
+        "--zstd=wlog={},clog={},hlog={},slog={},mml={},tlen={},strat={}",
+        knob(advanced.window_log, params.window_log),
+        knob(advanced.chain_log, params.chain_log),
+        knob(advanced.hash_log, params.hash_log),
+        knob(advanced.search_log, params.search_log),
+        knob(advanced.min_match, params.min_match),
+        knob(advanced.target_length, params.target_length),
+        advanced.strategy.unwrap_or(params.strategy).ordinal(),
+    )
+}
+
+/// Print, for every input of a compressing run, the default parameters when
+/// `--show-default-cparams` asked for them and the actual ones at `-vv`, on
+/// stderr, as the reference command does (zstdcli.c:1649-1657).
+fn show_cparams(opts: &Options) -> Result<()> {
     let dictionary_size = match dictionary_path(opts) {
         Some(path) => fs::metadata(path)
             .wrap_err_with(|| format!("failed to inspect dictionary file {}", path.display()))?
@@ -2084,8 +2111,14 @@ fn show_default_cparams(opts: &Options) -> Result<()> {
                 .map(|metadata| metadata.len());
             (input.display().to_string(), size)
         };
-        write_default_cparams(&mut err, &name, size, dictionary_size, opts.level)
-            .wrap_err("failed to write the default parameters")?;
+        if opts.show_default_cparams {
+            write_default_cparams(&mut err, &name, size, dictionary_size, opts.level)
+                .wrap_err("failed to write the default parameters")?;
+        }
+        if opts.verbosity >= 4 {
+            write_actual_cparams(&mut err, size, dictionary_size, opts.level, &opts.advanced)
+                .wrap_err("failed to write the compression parameters")?;
+        }
     }
     Ok(())
 }
@@ -2805,13 +2838,11 @@ fn run_selected(mut opts: Options) -> Result<usize> {
     // Decompression has no parameters to show; testing is not decompression
     // there, so it is not refused, and prints nothing since it compresses
     // nothing.
-    if opts.show_default_cparams {
-        if opts.mode == Mode::Decompress {
-            bail!("error : can't use --show-default-cparams in decompression mode");
-        }
-        if opts.mode == Mode::Compress {
-            show_default_cparams(&opts)?;
-        }
+    if opts.show_default_cparams && opts.mode == Mode::Decompress {
+        bail!("error : can't use --show-default-cparams in decompression mode");
+    }
+    if opts.mode == Mode::Compress && (opts.show_default_cparams || opts.verbosity >= 4) {
+        show_cparams(&opts)?;
     }
 
     // A destination named outright belongs to the whole run, whatever it reads:

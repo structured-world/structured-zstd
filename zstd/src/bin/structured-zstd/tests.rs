@@ -5301,6 +5301,33 @@ fn show_default_cparams_sizes_an_empty_file_as_unknown() {
     assert!(small.contains(" - windowLog     : 12\n"), "{small}");
 }
 
+/// At `-vv` the parameters a file compresses with are printed as the
+/// `--zstd=` option that reproduces them (upstream zstdcli.c
+/// `printActualCParams`): the level's row, with every knob `--zstd=` set in
+/// its place and a zero knob meaning the level's own value.
+#[test]
+fn actual_cparams_print_as_the_zstd_option() {
+    let mut out = Vec::new();
+    write_actual_cparams(&mut out, None, 0, 3, &AdvancedParams::default()).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "--zstd=wlog=21,clog=16,hlog=17,slog=1,mml=5,tlen=0,strat=2\n"
+    );
+
+    let advanced = AdvancedParams {
+        window_log: Some(23),
+        search_log: Some(0),
+        strategy: Some(Strategy::Btopt),
+        ..AdvancedParams::default()
+    };
+    let mut out = Vec::new();
+    write_actual_cparams(&mut out, None, 0, 3, &advanced).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "--zstd=wlog=23,clog=16,hlog=17,slog=1,mml=5,tlen=0,strat=7\n"
+    );
+}
+
 /// Decompression has no parameters to show, so the flag is refused there, as
 /// the reference command refuses it.
 #[test]
