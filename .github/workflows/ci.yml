@@ -117,6 +117,10 @@ jobs:
         run: cargo clippy -p structured-zstd --features hash,std,dict-builder -- -D warnings
       - name: Clippy (testing facade)
         run: cargo clippy -p structured-zstd --features hash,std,dict-builder,bench-internals -- -D warnings
+      - name: Clippy (caller-workspace, all targets)
+        # The feature swaps the entropy tables' build scratch for inline
+        # storage and adds the workspace decoder; lint both with their tests.
+        run: cargo clippy -p structured-zstd --all-targets --features hash,std,dict-builder,lsm,caller-workspace -- -D warnings
       - name: Clippy (ffi-bench targets)
         # The libzstd-linking benches/tests/examples live in `ffi-bench`.
         # Lint them with the features their `required-features` gate on so the
@@ -130,8 +134,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc -p structured-zstd --no-deps --features std,hash,ldm,dict-builder,lsm
-          cargo doc -p structured-zstd --no-deps --document-private-items --features std,hash,ldm,dict-builder,lsm
+          cargo doc -p structured-zstd --no-deps --features std,hash,ldm,dict-builder,lsm,caller-workspace
+          cargo doc -p structured-zstd --no-deps --document-private-items --features std,hash,ldm,dict-builder,lsm,caller-workspace
           cargo doc -p structured-zstd-c -p structured-zstd-wasm --no-deps --document-private-items
       - name: Gate — compare_ffi/memory must not pull bench-internals
         # Rationale: both `compare_ffi` (timing) and `compare_ffi_memory`
@@ -385,9 +389,16 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         working-directory: zstd
         run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder
+      - name: Test (caller-workspace)
+        # The whole suite again with the feature on: the shared decode core
+        # then runs on inline table storage, and the workspace decoder's own
+        # tests and its zero-allocation test join in.
+        if: needs.changes.outputs.code == 'true'
+        working-directory: zstd
+        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder,caller-workspace
       - name: Doc tests
         if: needs.changes.outputs.code == 'true'
-        run: cargo test --doc -p structured-zstd --features hash,std,dict-builder
+        run: cargo test --doc -p structured-zstd --features hash,std,dict-builder,caller-workspace
       - name: FFI parity + cross-validation tests
         if: needs.changes.outputs.code == 'true'
         # The libzstd-linking parity / cross-validation / corpus tests live in
@@ -478,6 +489,9 @@ jobs:
       - name: Clippy (embedded_minimal — kernel-scalar + std)
         working-directory: zstd
         run: cargo clippy -p structured-zstd --no-default-features --features kernel-scalar,std,hash -- -D warnings
+      - name: Clippy (no_std + caller-workspace)
+        working-directory: zstd
+        run: cargo clippy -p structured-zstd --no-default-features --features caller-workspace,hash -- -D warnings
       # The clippy steps above compile for the host, which has SSE2 and a
       # float unit. A kernel target has neither (x86_64-unknown-none is
       # -sse,-sse2,...,+soft-float), so a vector type that
@@ -493,6 +507,7 @@ jobs:
           for profile in dev release; do
             cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features hash
             cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features kernel-avx2,hash
+            cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features caller-workspace,hash
           done
 
   wasm:
@@ -527,6 +542,22 @@ jobs:
       # where a missing cargo-feature gate would go unnoticed, so keep it built.
       - name: Clippy (wasm32 simd128 feature without +simd128)
         run: cargo clippy -p structured-zstd -p structured-zstd-wasm --target wasm32-unknown-unknown --no-default-features --features kernel-simd128 -- -D warnings
+      - name: Clippy (wasm32 caller-workspace)
+        run: cargo clippy -p structured-zstd --target wasm32-unknown-unknown --no-default-features --features caller-workspace,hash,kernel-simd128 --config 'target.wasm32-unknown-unknown.rustflags=["-C","target-feature=+simd128"]' -- -D warnings
+      # The caller-workspace decoder is built for browser bundles, so its tests
+      # and its zero-allocation test run as wasm too, under wasmtime (the WASI
+      # target supplies the test harness's std).
+      - name: Install wasmtime
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasmtime,cargo-nextest
+      - name: Workspace decoder tests (wasm32-wasip1)
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
+        run: |
+          rustup target add wasm32-wasip1
+          cargo nextest run --profile ci -p structured-zstd --target wasm32-wasip1 --no-default-features --features caller-workspace,hash,std --lib -E 'test(/decoding::workspace::tests/)'
+          cargo nextest run --profile ci -p structured-zstd --target wasm32-wasip1 --no-default-features --features caller-workspace,hash,std --test workspace_no_alloc
       - name: Install wasm-pack
         uses: taiki-e/install-action@v2
         with:
@@ -793,6 +824,11 @@ jobs:
             cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" "$target" -- -max_total_time=90 -timeout=30
             echo "::endgroup::"
           done
+      - name: Fuzz decode_workspace (90s, caller-workspace build)
+        # Its own step: the target needs the library's caller-workspace
+        # feature, which the targets above must not get.
+        working-directory: zstd/fuzz
+        run: cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" --features workspace decode_workspace -- -max_total_time=90 -timeout=30
       - name: Upload new crash artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v7

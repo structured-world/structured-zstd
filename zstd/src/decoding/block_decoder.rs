@@ -63,6 +63,23 @@ pub(crate) fn block_fits_the_maximum(
     Ok(())
 }
 
+/// A compressed block's content is held to the frame's block maximum too
+/// (RFC 8878 3.1.1.2.4), as upstream's `ZSTD_decompressBlock_internal` refuses
+/// `srcSize > blockSizeMax`. Checked before the block body runs, whatever the
+/// content would decode to.
+#[inline]
+fn compressed_content_fits(
+    header: &BlockHeader,
+    window_size: usize,
+) -> Result<(), DecompressBlockError> {
+    let size = header.content_size as usize;
+    let maximum = block_maximum(window_size);
+    if size > maximum {
+        return Err(DecompressBlockError::ContentPastBlockMaximum { size, maximum });
+    }
+    Ok(())
+}
+
 /// A block with no sequences: its literals ARE its output. Out of line, so the
 /// per-block body keeps the shape the sequence executor is laid out around.
 ///
@@ -233,6 +250,7 @@ impl BlockDecoder {
                 panic!("Reserved-type block should be rejected during header parsing");
             }
             BlockType::Compressed => {
+                compressed_content_fits(header, workspace.split().buffer.window_size)?;
                 let n = header.content_size as usize;
                 if source.len() < n {
                     return Err(DecodeBlockContentError::ReadError {
@@ -311,6 +329,7 @@ impl BlockDecoder {
             }
 
             BlockType::Compressed => {
+                compressed_content_fits(header, workspace.split().buffer.window_size)?;
                 self.decompress_block(header, workspace, dict, source)?;
 
                 self.internal_state = DecoderState::ReadyToDecodeNextHeader;
@@ -332,6 +351,7 @@ impl BlockDecoder {
         // decode path (`decode_all`) skips this copy by passing
         // a borrowed slice of the input straight to
         // `decompress_block_inplace_with_parts`.
+        use crate::decoding::scratch::ByteScratch;
         let parts = workspace.split();
         parts
             .block_content_buffer
@@ -404,14 +424,18 @@ impl BlockDecoder {
     /// lifetime-widening trick is gone — disjoint-field borrows
     /// type-check naturally.
     #[allow(clippy::too_many_arguments)]
-    fn decompress_block_inplace_with_parts<'d, B: super::buffer_backend::BufferBackend>(
+    fn decompress_block_inplace_with_parts<
+        'd,
+        B: super::buffer_backend::BufferBackend,
+        L: crate::decoding::scratch::ByteScratch,
+    >(
         &mut self,
         header: &BlockHeader,
         huf: &mut crate::decoding::scratch::HuffmanScratch,
         fse: &'d mut crate::decoding::scratch::FSEScratch,
         buffer: &mut crate::decoding::decode_buffer::DecodeBuffer<B>,
         offset_hist: &mut [u32; 3],
-        literals_buffer: &mut alloc::vec::Vec<u8>,
+        literals_buffer: &mut L,
         raw: &[u8],
         dict: Option<&'d crate::decoding::dictionary::Dictionary>,
     ) -> Result<(), DecompressBlockError> {

@@ -43,3 +43,6 @@ pub const MAX_DECODER_WINDOW_SIZE: u64 = 1 << 31;
 /// `1 << 30` on 32-bit ones, where a larger window could not be addressed.
 #[cfg(not(target_pointer_width = "64"))]
 pub const MAX_DECODER_WINDOW_SIZE: u64 = 1 << 30;
+
+#[cfg(feature = "caller-workspace")]
+pub(crate) mod inline_vec;

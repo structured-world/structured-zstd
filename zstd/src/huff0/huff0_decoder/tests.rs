@@ -1,21 +1,21 @@
 use super::*;
-use alloc::vec;
 
 fn test_table() -> HuffmanTable {
     // Packed `num_bits | (symbol << 8)` per state index (upstream zstd `HUF_DEltX1`).
-    let packed_decode = vec![
+    let mut packed_decode = DecodeTableBuf::new();
+    packed_decode.extend_from_slice(&[
         1u16 | (u16::from(b'A') << 8),
         2u16 | (u16::from(b'B') << 8),
         1u16 | (u16::from(b'C') << 8),
         2u16 | (u16::from(b'D') << 8),
-    ];
+    ]);
 
     HuffmanTable {
         packed_decode,
-        weights: Vec::new(),
+        weights: SymbolBuf::new(),
         max_num_bits: 2,
         state_mask: 0b11,
-        bits: Vec::new(),
+        bits: SymbolBuf::new(),
         bit_ranks: [0; (MAX_MAX_NUM_BITS as usize) + 1],
         weight_sum: 0,
         weight_rank_count: [0; (MAX_MAX_NUM_BITS as usize) + 1],

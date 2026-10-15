@@ -47,6 +47,10 @@ pub struct RingBuffer {
     /// not doubled for one block. A need beyond it still grows as before.
     /// `usize::MAX` (the default) leaves the doubling alone.
     growth_limit: usize,
+    /// `buf` is caller-owned memory ([`Self::from_borrowed`]): never grown,
+    /// never freed.
+    #[cfg(feature = "caller-workspace")]
+    borrowed: bool,
 }
 
 // SAFETY: RingBuffer does not hold any thread specific values -> it can be sent to another thread -> RingBuffer is Send
@@ -66,6 +70,31 @@ impl RingBuffer {
             tail: 0,
             max_capacity: usize::MAX,
             growth_limit: usize::MAX,
+            #[cfg(feature = "caller-workspace")]
+            borrowed: false,
+        }
+    }
+
+    /// A ring over caller-owned memory of `cap + WILDCOPY_OVERLENGTH` bytes,
+    /// `cap` of them indexed by the ring and the rest the copiers' overshoot
+    /// slack. It never grows: the caller sizes `cap` for the most the decode
+    /// can hold at once.
+    ///
+    /// # Safety
+    /// `buf` is valid for reads and writes of `cap + WILDCOPY_OVERLENGTH`
+    /// initialised bytes for as long as the ring is used, and nothing else
+    /// accesses that memory meanwhile. `cap >= 1`.
+    #[cfg(feature = "caller-workspace")]
+    pub(crate) unsafe fn from_borrowed(buf: NonNull<u8>, cap: usize) -> Self {
+        debug_assert!(cap >= 1);
+        RingBuffer {
+            buf,
+            cap,
+            head: 0,
+            tail: 0,
+            max_capacity: usize::MAX,
+            growth_limit: usize::MAX,
+            borrowed: true,
         }
     }
 
@@ -252,6 +281,15 @@ impl RingBuffer {
     #[inline(never)]
     #[cold]
     fn reserve_amortized(&mut self, amount: usize) {
+        // A borrowed ring is sized for the window plus two block maxima (see
+        // `decoding::workspace`), which covers every write a block can issue
+        // before the per-block ceiling refuses it, so growth is unreachable.
+        // Growing would free memory this ring does not own.
+        #[cfg(feature = "caller-workspace")]
+        assert!(
+            !self.borrowed,
+            "a caller-owned ring cannot grow; its capacity bounds every block"
+        );
         // SAFETY: if we were successfully able to construct this layout when we allocated then it's also valid do so now
         let current_layout =
             unsafe { Layout::array::<u8>(self.cap + WILDCOPY_OVERLENGTH).unwrap_unchecked() };
@@ -1302,6 +1340,10 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
 impl Drop for RingBuffer {
     fn drop(&mut self) {
         if self.cap == 0 {
+            return;
+        }
+        #[cfg(feature = "caller-workspace")]
+        if self.borrowed {
             return;
         }
 

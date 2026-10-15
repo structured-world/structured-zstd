@@ -22,7 +22,13 @@ use crate::blocks::sequence_section::{
 /// #132.
 pub struct DecoderScratch<B: BufferBackend = RingBuffer> {
     /// The decoder used for Huffman blocks.
+    #[cfg(not(feature = "caller-workspace"))]
     pub huf: HuffmanScratch,
+    /// The decoder used for Huffman blocks. Boxed, like `fse`, because
+    /// `caller-workspace` stores the decode table inline (~6 KiB), which would
+    /// otherwise grow every owned decoder's stack frame.
+    #[cfg(feature = "caller-workspace")]
+    pub huf: Box<HuffmanScratch>,
     /// The decoder used for FSE blocks.
     ///
     /// Boxed so `DecoderScratch` -- and the `FrameDecoder` that holds one
@@ -52,13 +58,83 @@ pub struct DecoderScratch<B: BufferBackend = RingBuffer> {
 /// The lifetime `'a` is the shorter-of (a) the underlying owner's
 /// lifetime and (b) the active borrow. The backend type `B` flows
 /// through to [`super::decode_buffer::DecodeBuffer<B>`].
-pub struct WorkspaceRef<'a, B: BufferBackend> {
+pub struct WorkspaceRef<'a, B: BufferBackend, L: ByteScratch = Vec<u8>> {
     pub huf: &'a mut HuffmanScratch,
     pub fse: &'a mut FSEScratch,
     pub buffer: &'a mut DecodeBuffer<B>,
     pub offset_hist: &'a mut [u32; 3],
-    pub literals_buffer: &'a mut Vec<u8>,
-    pub block_content_buffer: &'a mut Vec<u8>,
+    pub literals_buffer: &'a mut L,
+    pub block_content_buffer: &'a mut L,
+}
+
+/// Per-block byte scratch the literals and block-content stages write into:
+/// the `Vec<u8>` the owned decoders keep, or (under `caller-workspace`) a
+/// fixed region of caller memory. The methods are the `Vec` subset those
+/// stages use, so the `Vec` monomorph compiles to the same code as before.
+pub(crate) trait ByteScratch {
+    fn len(&self) -> usize;
+    fn clear(&mut self);
+    fn truncate(&mut self, len: usize);
+    /// Room for `additional` more bytes past `len`.
+    fn reserve(&mut self, additional: usize);
+    fn push(&mut self, byte: u8);
+    fn resize(&mut self, new_len: usize, value: u8);
+    fn extend_from_slice(&mut self, bytes: &[u8]);
+    fn as_mut_ptr(&mut self) -> *mut u8;
+    /// # Safety
+    /// Every byte below `new_len` is initialised and lies within the reserved
+    /// capacity.
+    unsafe fn set_len(&mut self, new_len: usize);
+    fn as_slice(&self) -> &[u8];
+    fn as_mut_slice(&mut self) -> &mut [u8];
+}
+
+impl ByteScratch for Vec<u8> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    #[inline(always)]
+    fn clear(&mut self) {
+        Vec::clear(self)
+    }
+    #[inline(always)]
+    fn truncate(&mut self, len: usize) {
+        Vec::truncate(self, len)
+    }
+    #[inline(always)]
+    fn reserve(&mut self, additional: usize) {
+        Vec::reserve(self, additional)
+    }
+    #[inline(always)]
+    fn push(&mut self, byte: u8) {
+        Vec::push(self, byte)
+    }
+    #[inline(always)]
+    fn resize(&mut self, new_len: usize, value: u8) {
+        Vec::resize(self, new_len, value)
+    }
+    #[inline(always)]
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        Vec::extend_from_slice(self, bytes)
+    }
+    #[inline(always)]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        Vec::as_mut_ptr(self)
+    }
+    #[inline(always)]
+    unsafe fn set_len(&mut self, new_len: usize) {
+        // SAFETY: forwarded to the caller of this method.
+        unsafe { Vec::set_len(self, new_len) }
+    }
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        Vec::as_slice(self)
+    }
+    #[inline(always)]
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        Vec::as_mut_slice(self)
+    }
 }
 
 /// Polymorphic accessor for the decoder's per-call scratch state.
@@ -76,11 +152,13 @@ pub struct WorkspaceRef<'a, B: BufferBackend> {
 /// `&mut huf` and `&mut literals_buffer` simultaneously.
 pub(crate) trait Workspace {
     type Backend: BufferBackend;
-    fn split(&mut self) -> WorkspaceRef<'_, Self::Backend>;
+    type Bytes: ByteScratch;
+    fn split(&mut self) -> WorkspaceRef<'_, Self::Backend, Self::Bytes>;
 }
 
 impl<B: BufferBackend> Workspace for DecoderScratch<B> {
     type Backend = B;
+    type Bytes = Vec<u8>;
     fn split(&mut self) -> WorkspaceRef<'_, B> {
         WorkspaceRef {
             huf: &mut self.huf,
@@ -124,6 +202,7 @@ pub struct DirectScratch<'o, 'p> {
 
 impl<'o, 'p> Workspace for DirectScratch<'o, 'p> {
     type Backend = super::user_slice_buf::UserSliceBackend<'o>;
+    type Bytes = Vec<u8>;
     fn split(&mut self) -> WorkspaceRef<'_, Self::Backend> {
         // Reborrow the `&'p mut` fields to `&'_ mut` so the returned
         // WorkspaceRef's lifetime is tied to the `&mut self` of this
@@ -144,10 +223,13 @@ impl<'o, 'p> Workspace for DirectScratch<'o, 'p> {
 impl<B: BufferBackend> DecoderScratch<B> {
     pub fn new(window_size: usize) -> DecoderScratch<B> {
         DecoderScratch {
+            #[cfg(not(feature = "caller-workspace"))]
             huf: HuffmanScratch {
                 table: HuffmanTable::new(),
                 table_source: TableSource::Local,
             },
+            #[cfg(feature = "caller-workspace")]
+            huf: Box::new(HuffmanScratch::new()),
             fse: Box::new(FSEScratch {
                 offsets: AlignedFSETable::new(MAX_OFFSET_CODE),
                 literal_lengths: AlignedFSETable::new(MAX_LITERAL_LENGTH_CODE),
@@ -175,10 +257,17 @@ impl<B: BufferBackend> DecoderScratch<B> {
     /// than inline in this struct: charge `size_of` for the boxed value on top
     /// of the build-scratch vectors `FSEScratch::heap_bytes` sums.
     pub fn workspace_bytes(&self) -> usize {
+        // Under `caller-workspace` the Huffman scratch is boxed too.
+        let boxed_huf = if cfg!(feature = "caller-workspace") {
+            core::mem::size_of::<HuffmanScratch>()
+        } else {
+            0
+        };
         self.buffer.capacity()
             + self.literals_buffer.capacity()
             + self.block_content_buffer.capacity()
             + self.huf.heap_bytes()
+            + boxed_huf
             + core::mem::size_of::<FSEScratch>()
             + self.fse.heap_bytes()
     }
@@ -234,54 +323,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
         }
 
         self.buffer.reset(window_size);
-
-        // Mirror upstream zstd's `ZSTD_decompressBegin`: it never clears the
-        // entropy tables per frame (marks them invalid by flag, rebuilds lazily).
-        // Resetting an already-empty table is a no-op on the observable state
-        // (`accuracy_log`/`max_num_bits` stay 0, the buffers stay empty), so a
-        // RAW / RLE / zero-sequence frame — which never builds a table — skips
-        // the clears (and the Huffman `[0; 13]` rank-count memset) entirely.
-        // Byte-identical: the table is cleared exactly when it was built.
-        if self.fse.literal_lengths.is_populated() {
-            self.fse.literal_lengths.reset();
-        }
-        if self.fse.match_lengths.is_populated() {
-            self.fse.match_lengths.reset();
-        }
-        if self.fse.offsets.is_populated() {
-            self.fse.offsets.reset();
-        }
-        // Reset the cached pipeline-gate signal alongside the FSE
-        // table reset — otherwise scratch reuse across frames could
-        // engage the long pipeline on a new frame's Repeat-mode
-        // header based on the previous frame's offset distribution
-        // (or vice versa: skip the pipeline when the new frame
-        // actually has long offsets).
-        self.fse.offsets_long_share = 0;
-        // Revert any dictionary copy-on-write attachment: a scratch
-        // reused from a dict-attached frame must not read the previous
-        // dictionary's tables on the next (possibly dict-less) frame.
-        self.fse.detach_dict();
-        // Pair the one-shot cold-dict flag with `reset`: a scratch
-        // reused from a dictionary-attached frame whose blocks never
-        // entered sequence decoding (raw-/RLE-only blocks, zero-seq
-        // compressed blocks) would otherwise carry the flag into the
-        // next frame and mis-apply the cold-dict gate there. Cleared
-        // alongside `offsets_long_share` so the no-dict path keeps
-        // the documented "no behaviour change" property.
-        self.fse.ddict_is_cold = false;
-
-        // Same lazy-entropy skip as the FSE tables above: a Huffman table that
-        // was never built this round (`max_num_bits == 0`) is already in its
-        // reset state, so re-running `reset` (clearing 6 buffers + the
-        // `[0; 13]` rank-count memset) is wasted no-op work on RAW / RLE / raw-
-        // literal frames. Byte-identical.
-        if self.huf.table.max_num_bits != 0 {
-            self.huf.table.reset();
-        }
-        // Mirror the FSE detach: a reused workspace must not read a
-        // previous frame's dictionary Huffman table.
-        self.huf.detach_dict();
+        reset_entropy(&mut self.huf, &mut self.fse);
     }
 
     pub fn init_from_dict(&mut self, dict: &DictionaryHandle) {
@@ -306,6 +348,58 @@ impl<B: BufferBackend> DecoderScratch<B> {
     }
 }
 
+/// Per-frame entropy reset shared by every decoder that owns a set of tables.
+#[inline(always)]
+pub(crate) fn reset_entropy(huf: &mut HuffmanScratch, fse: &mut FSEScratch) {
+    // Mirror upstream zstd's `ZSTD_decompressBegin`: it never clears the
+    // entropy tables per frame (marks them invalid by flag, rebuilds lazily).
+    // Resetting an already-empty table is a no-op on the observable state
+    // (`accuracy_log`/`max_num_bits` stay 0, the buffers stay empty), so a
+    // RAW / RLE / zero-sequence frame, which never builds a table, skips
+    // the clears (and the Huffman `[0; 13]` rank-count memset) entirely.
+    // Byte-identical: the table is cleared exactly when it was built.
+    if fse.literal_lengths.is_populated() {
+        fse.literal_lengths.reset();
+    }
+    if fse.match_lengths.is_populated() {
+        fse.match_lengths.reset();
+    }
+    if fse.offsets.is_populated() {
+        fse.offsets.reset();
+    }
+    // Reset the cached pipeline-gate signal alongside the FSE
+    // table reset; otherwise scratch reuse across frames could
+    // engage the long pipeline on a new frame's Repeat-mode
+    // header based on the previous frame's offset distribution
+    // (or vice versa: skip the pipeline when the new frame
+    // actually has long offsets).
+    fse.offsets_long_share = 0;
+    // Revert any dictionary copy-on-write attachment: a scratch
+    // reused from a dict-attached frame must not read the previous
+    // dictionary's tables on the next (possibly dict-less) frame.
+    fse.detach_dict();
+    // Pair the one-shot cold-dict flag with `reset`: a scratch
+    // reused from a dictionary-attached frame whose blocks never
+    // entered sequence decoding (raw-/RLE-only blocks, zero-seq
+    // compressed blocks) would otherwise carry the flag into the
+    // next frame and mis-apply the cold-dict gate there. Cleared
+    // alongside `offsets_long_share` so the no-dict path keeps
+    // the documented "no behaviour change" property.
+    fse.ddict_is_cold = false;
+
+    // Same lazy-entropy skip as the FSE tables above: a Huffman table that
+    // was never built this round (`max_num_bits == 0`) is already in its
+    // reset state, so re-running `reset` (clearing 6 buffers + the
+    // `[0; 13]` rank-count memset) is wasted no-op work on RAW / RLE / raw-
+    // literal frames. Byte-identical.
+    if huf.table.max_num_bits != 0 {
+        huf.table.reset();
+    }
+    // Mirror the FSE detach: a reused workspace must not read a
+    // previous frame's dictionary Huffman table.
+    huf.detach_dict();
+}
+
 #[derive(Clone)]
 pub struct HuffmanScratch {
     pub table: HuffmanTable,
@@ -327,6 +421,20 @@ impl HuffmanScratch {
         HuffmanScratch {
             table: HuffmanTable::new(),
             table_source: TableSource::Local,
+        }
+    }
+
+    /// Initialise an empty scratch in place, in caller-owned memory.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes and aligned for `Self`.
+    #[cfg(feature = "caller-workspace")]
+    pub(crate) unsafe fn init_in_place(this: *mut Self) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: forwarded from the caller; every field is written.
+        unsafe {
+            HuffmanTable::init_in_place(addr_of_mut!((*this).table));
+            addr_of_mut!((*this).table_source).write(TableSource::Local);
         }
     }
 
@@ -497,6 +605,34 @@ impl FSEScratch {
             ll_source: SeqTableSource::Local,
             of_source: SeqTableSource::Local,
             ml_source: SeqTableSource::Local,
+        }
+    }
+
+    /// Initialise an empty scratch in place, in caller-owned memory, without
+    /// materialising the ~12 KiB of tables on the stack.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes and aligned for `Self`.
+    #[cfg(feature = "caller-workspace")]
+    pub(crate) unsafe fn init_in_place(this: *mut Self) {
+        use crate::fse::SeqFSETable;
+        use core::ptr::addr_of_mut;
+        // SAFETY: forwarded from the caller; every field is written.
+        unsafe {
+            SeqFSETable::init_in_place(addr_of_mut!((*this).offsets.0), MAX_OFFSET_CODE);
+            SeqFSETable::init_in_place(
+                addr_of_mut!((*this).literal_lengths.0),
+                MAX_LITERAL_LENGTH_CODE,
+            );
+            SeqFSETable::init_in_place(
+                addr_of_mut!((*this).match_lengths.0),
+                MAX_MATCH_LENGTH_CODE,
+            );
+            addr_of_mut!((*this).offsets_long_share).write(0);
+            addr_of_mut!((*this).ddict_is_cold).write(false);
+            addr_of_mut!((*this).ll_source).write(SeqTableSource::Local);
+            addr_of_mut!((*this).of_source).write(SeqTableSource::Local);
+            addr_of_mut!((*this).ml_source).write(SeqTableSource::Local);
         }
     }
 

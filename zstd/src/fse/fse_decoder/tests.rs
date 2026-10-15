@@ -117,7 +117,8 @@ fn to_encoder_table_rejects_accuracy_log_above_nine() {
     // A table with accuracy_log 10 (1 << 10 = 1024 entries) and a plausible
     // probability distribution summing to 1024.
     t.accuracy_log = 10;
-    t.symbol_probabilities = alloc::vec![512, 512];
+    t.symbol_probabilities.clear();
+    t.symbol_probabilities.extend_from_slice(&[512, 512]);
     assert!(
         t.to_encoder_table().is_none(),
         "accuracy_log > 9 must not be reusable as an encoder table"

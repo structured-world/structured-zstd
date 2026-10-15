@@ -3,7 +3,7 @@
 
 use super::super::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
 use super::buffer_backend::WILDCOPY_OVERLENGTH;
-use super::scratch::HuffmanScratch;
+use super::scratch::{ByteScratch, HuffmanScratch};
 use crate::bit_io::BitReaderReversed;
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 use crate::cpu_kernel::Avx2Kernel;
@@ -28,6 +28,7 @@ use crate::cpu_kernel::{CpuKernel, CpuKernelTag, ScalarKernel};
 use crate::decoding::dictionary::Dictionary;
 use crate::decoding::errors::DecompressLiteralsError;
 use crate::huff0::HuffmanDecoder;
+#[cfg(test)]
 use alloc::vec::Vec;
 
 /// Decode and decompress the provided literals section into `target`, returning the number of bytes read.
@@ -107,14 +108,14 @@ pub struct LiteralsView<'a> {
 // The block's literals inputs, each a borrow or a scalar the caller already
 // holds; a struct here would marshal a record per block to satisfy the lint.
 #[allow(clippy::too_many_arguments)]
-pub fn decode_literals_zerocopy<'a>(
+pub fn decode_literals_zerocopy<'a, L: ByteScratch>(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
     dict: Option<&Dictionary>,
     source: &'a [u8],
     payload_len: usize,
     needs_slack: bool,
-    target: &'a mut Vec<u8>,
+    target: &'a mut L,
     kernel: CpuKernelTag,
 ) -> Result<LiteralsView<'a>, DecompressLiteralsError> {
     // Snapshot `target.len()` before any decode work — the returned
@@ -188,8 +189,8 @@ fn bytes_used_raw(section: &LiteralsSection) -> u32 {
 /// view over both. The slack is written, not merely reserved: the copiers read
 /// it, and reading uninitialised memory is undefined behaviour here even though
 /// the bytes are discarded.
-fn pad_with_slack(
-    target: &mut Vec<u8>,
+fn pad_with_slack<L: ByteScratch>(
+    target: &mut L,
     base: usize,
     n: usize,
     bytes_used: u32,
@@ -199,7 +200,7 @@ fn pad_with_slack(
         target.resize(base + n + WILDCOPY_OVERLENGTH, 0);
     }
     Ok(LiteralsView {
-        data: &target[base..],
+        data: &target.as_slice()[base..],
         len: n,
         bytes_used,
     })
@@ -209,12 +210,12 @@ fn pad_with_slack(
 /// This function is used when the literals section is `Compressed` or `Treeless`
 ///
 /// Returns the number of bytes read.
-fn decompress_literals(
+fn decompress_literals<L: ByteScratch>(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
     dict: Option<&Dictionary>,
     source: &[u8],
-    target: &mut Vec<u8>,
+    target: &mut L,
     kernel: CpuKernelTag,
 ) -> Result<u32, DecompressLiteralsError> {
     // `kernel` was resolved once, before the first block, by whoever owns the
@@ -257,7 +258,7 @@ fn decompress_literals(
         // past.
         #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
         CpuKernelTag::Neon => {
-            decompress_literals_impl::<NeonKernel>(section, scratch, dict, source, target)
+            decompress_literals_impl::<NeonKernel, L>(section, scratch, dict, source, target)
         }
         #[cfg(all(
             target_arch = "aarch64",
@@ -265,22 +266,22 @@ fn decompress_literals(
             any(feature = "std", target_feature = "sve"),
         ))]
         CpuKernelTag::Sve => {
-            decompress_literals_impl::<SveKernel>(section, scratch, dict, source, target)
+            decompress_literals_impl::<SveKernel, L>(section, scratch, dict, source, target)
         }
-        _ => decompress_literals_impl::<ScalarKernel>(section, scratch, dict, source, target),
+        _ => decompress_literals_impl::<ScalarKernel, L>(section, scratch, dict, source, target),
     }
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 #[target_feature(enable = "bmi2,avx2")]
-unsafe fn decompress_literals_avx2(
+unsafe fn decompress_literals_avx2<L: ByteScratch>(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
     dict: Option<&Dictionary>,
     source: &[u8],
-    target: &mut Vec<u8>,
+    target: &mut L,
 ) -> Result<u32, DecompressLiteralsError> {
-    decompress_literals_impl::<Avx2Kernel>(section, scratch, dict, source, target)
+    decompress_literals_impl::<Avx2Kernel, L>(section, scratch, dict, source, target)
 }
 
 #[cfg(all(
@@ -288,34 +289,34 @@ unsafe fn decompress_literals_avx2(
     feature = "kernel-bmi2"
 ))]
 #[target_feature(enable = "bmi2")]
-unsafe fn decompress_literals_bmi2(
+unsafe fn decompress_literals_bmi2<L: ByteScratch>(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
     dict: Option<&Dictionary>,
     source: &[u8],
-    target: &mut Vec<u8>,
+    target: &mut L,
 ) -> Result<u32, DecompressLiteralsError> {
-    decompress_literals_impl::<Bmi2Kernel>(section, scratch, dict, source, target)
+    decompress_literals_impl::<Bmi2Kernel, L>(section, scratch, dict, source, target)
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
 #[target_feature(enable = "avx512vbmi2,avx512f,avx512vl,avx512bw,bmi2,avx2")]
-unsafe fn decompress_literals_vbmi2(
+unsafe fn decompress_literals_vbmi2<L: ByteScratch>(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
     dict: Option<&Dictionary>,
     source: &[u8],
-    target: &mut Vec<u8>,
+    target: &mut L,
 ) -> Result<u32, DecompressLiteralsError> {
-    decompress_literals_impl::<Vbmi2Kernel>(section, scratch, dict, source, target)
+    decompress_literals_impl::<Vbmi2Kernel, L>(section, scratch, dict, source, target)
 }
 
-fn decompress_literals_impl<K: CpuKernel>(
+fn decompress_literals_impl<K: CpuKernel, L: ByteScratch>(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
     dict: Option<&Dictionary>,
     source: &[u8],
-    target: &mut Vec<u8>,
+    target: &mut L,
 ) -> Result<u32, DecompressLiteralsError> {
     use DecompressLiteralsError as err;
 

@@ -3,6 +3,22 @@ use crate::cpu_kernel::CpuKernel;
 use crate::decoding::errors::{FSEDecoderError, FSETableError};
 use alloc::vec::Vec;
 
+/// Build-time probability list: at most 256 symbols (`u8` alphabet).
+#[cfg(not(feature = "caller-workspace"))]
+type ProbabilityBuf = Vec<i32>;
+/// Build-time probability list: at most 256 symbols (`u8` alphabet), inline so
+/// a table can live in caller-owned memory.
+#[cfg(feature = "caller-workspace")]
+type ProbabilityBuf = crate::common::inline_vec::InlineVec<i32, 256>;
+
+/// Symbol-spread scratch: one byte per state of the largest table (`1 << 9`).
+#[cfg(not(feature = "caller-workspace"))]
+type SpreadBuf = Vec<u8>;
+/// Symbol-spread scratch: one byte per state of the largest table (`1 << 9`),
+/// inline so a table can live in caller-owned memory.
+#[cfg(feature = "caller-workspace")]
+type SpreadBuf = crate::common::inline_vec::InlineVec<u8, 512>;
+
 // Visibility = `pub` so the `pub type FSEDecoder` / `pub type
 // SeqFSEDecoder` aliases below don't expose a more-private struct
 // (compiler `private_interfaces` warning). External reachability is
@@ -263,7 +279,7 @@ pub struct FSETableImpl<E: FseEntry, const CAP: usize> {
     /// Number of live entries in `decode` (`1 << accuracy_log`).
     decode_len: usize,
     /// Reused scratch buffer for symbol spreading to avoid per-build allocations.
-    symbol_spread_buffer: Vec<u8>,
+    symbol_spread_buffer: SpreadBuf,
     /// The size of the table is stored in logarithm base 2 format,
     /// with the **size of the table** being equal to `(1 << accuracy_log)`.
     /// This value is used so that the decoder knows how many bits to read from the bitstream.
@@ -278,7 +294,11 @@ pub struct FSETableImpl<E: FseEntry, const CAP: usize> {
     ///
     /// If a symbol probability is set to `-1`, it means that the probability of a symbol
     /// occurring in the data is less than one.
+    #[cfg(not(feature = "caller-workspace"))]
     pub symbol_probabilities: Vec<i32>, //used while building the decode Vector
+    /// See the `Vec` form of this field; stored inline under `caller-workspace`.
+    #[cfg(feature = "caller-workspace")]
+    pub(crate) symbol_probabilities: ProbabilityBuf,
 }
 
 /// Type alias preserved for HUF-weight-stream callers and existing
@@ -313,8 +333,8 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             // i32 here was a heap allocation paid per fresh table (3 seq + the
             // HUF weight table per `DecoderScratch`), part of the per-frame fixed
             // cost that dominates tiny-frame decode.
-            symbol_probabilities: Vec::new(),
-            symbol_spread_buffer: Vec::new(),
+            symbol_probabilities: ProbabilityBuf::new(),
+            symbol_spread_buffer: SpreadBuf::new(),
             // Uninitialised — no `CAP`-entry memset; the build fills the live
             // span before any read (see the field doc).
             decode: [const { core::mem::MaybeUninit::uninit() }; CAP],
@@ -326,9 +346,36 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     /// Heap bytes owned by this table. The `decode` table is a fixed inline
     /// array (counted by `size_of`, not here); only the build-scratch vectors
     /// are heap-allocated.
+    #[cfg(not(feature = "caller-workspace"))]
     pub fn heap_bytes(&self) -> usize {
         self.symbol_spread_buffer.capacity()
             + self.symbol_probabilities.capacity() * core::mem::size_of::<i32>()
+    }
+
+    /// Heap bytes owned by this table: none, the build scratch is inline.
+    #[cfg(feature = "caller-workspace")]
+    pub fn heap_bytes(&self) -> usize {
+        0
+    }
+
+    /// Initialise an empty table in place, without building it on the stack:
+    /// the decode array and the build scratch are left uninitialised, as `new`
+    /// leaves them.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes and aligned for `Self`.
+    #[cfg(feature = "caller-workspace")]
+    pub(crate) unsafe fn init_in_place(this: *mut Self, max_symbol: u8) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: the caller guarantees `this` is writable and aligned; every
+        // field that is not `MaybeUninit` storage is written here.
+        unsafe {
+            addr_of_mut!((*this).max_symbol).write(max_symbol);
+            addr_of_mut!((*this).decode_len).write(0);
+            addr_of_mut!((*this).accuracy_log).write(0);
+            SpreadBuf::init_in_place(addr_of_mut!((*this).symbol_spread_buffer));
+            ProbabilityBuf::init_in_place(addr_of_mut!((*this).symbol_probabilities));
+        }
     }
 
     /// Live decode entries (`decode[..decode_len]`).
@@ -559,7 +606,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             return Err(FSETableError::ProbabilityCounterMismatch {
                 got: probability_sum,
                 expected_sum: table_size,
-                symbol_probabilities: probs.to_vec(),
+                symbol_probabilities: mismatch_diagnostic(probs),
             });
         }
         self.symbol_probabilities.clear();
@@ -606,7 +653,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
 
     fn build_decoding_table_inner(
         &mut self,
-        spread: &mut Vec<u8>,
+        spread: &mut SpreadBuf,
         meta: SeqMeta<'_>,
     ) -> Result<(), FSETableError> {
         let nb_symbols = self.symbol_probabilities.len();
@@ -975,7 +1022,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             return Err(FSETableError::ProbabilityCounterMismatch {
                 got: probability_counter,
                 expected_sum: probability_sum,
-                symbol_probabilities: self.symbol_probabilities.clone(),
+                symbol_probabilities: mismatch_diagnostic(&self.symbol_probabilities),
             });
         }
         if self.symbol_probabilities.len() > self.max_symbol as usize + 1 {
@@ -1230,6 +1277,19 @@ const ENTRY_MAX_ACCURACY_LOG: u8 = 16;
 fn highest_bit_set(x: u32) -> u32 {
     assert!(x > 0);
     u32::BITS - x.leading_zeros()
+}
+
+/// The probabilities a sum-mismatch error carries for diagnosis.
+#[cfg(not(feature = "caller-workspace"))]
+fn mismatch_diagnostic(probs: &[i32]) -> Vec<i32> {
+    probs.to_vec()
+}
+
+/// Empty under `caller-workspace`: copying the list would allocate on
+/// malformed input, which that decoder promises never to do.
+#[cfg(feature = "caller-workspace")]
+fn mismatch_diagnostic(_probs: &[i32]) -> Vec<i32> {
+    Vec::new()
 }
 
 //utility functions for building the decoding table from probabilities
