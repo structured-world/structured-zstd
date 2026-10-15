@@ -1683,8 +1683,10 @@ fn parse_args_into(
                     // The level, and the cluster goes on after it (`-19c`).
                     let (level, next) = cluster_u32(&chars, ci)
                         .wrap_err_with(|| format!("invalid level (in {arg})"))?;
-                    opts.level = i32::try_from(level)
-                        .wrap_err_with(|| format!("invalid level `{level}`"))?;
+                    // The reference reads an unsigned value and takes it as an
+                    // `int` (zstdcli.c:1210), so the top of the 32-bit range
+                    // wraps to the negative levels it names there.
+                    opts.level = level.cast_signed();
                     ci = next;
                     continue;
                 }

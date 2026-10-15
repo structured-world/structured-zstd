@@ -1750,6 +1750,10 @@ fn levels_past_the_scale_are_reduced_to_it() {
     assert_eq!(parse_as(&plain(), min - 5, &["in.txt"]).unwrap().level, min);
     // The digit run still has to fit 32 bits.
     assert!(parse(&["-5000000000", "in.txt"]).is_err());
+    // Within 32 bits it is the reference's unsigned read taken as an `int`
+    // (zstdcli.c:1210): the largest value is level -1, which its test suite
+    // compresses at ("max allowed numeric value is 4294967295").
+    assert_eq!(parse(&["-4294967295", "in.txt"]).unwrap().level, -1);
 }
 
 /// Benchmarking leaves before the `--ultra` gate (upstream zstdcli.c:1456-1484,
