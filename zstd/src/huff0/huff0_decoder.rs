@@ -8,6 +8,22 @@ use alloc::vec::Vec;
 /// The Zstandard specification limits the maximum length of a code to 11 bits.
 pub(crate) const MAX_MAX_NUM_BITS: u8 = 11;
 
+/// Decode lookup table, `1 << max_num_bits` packed entries.
+#[cfg(not(feature = "caller-workspace"))]
+type DecodeTableBuf = Vec<u16>;
+/// Decode lookup table, at most `1 << 11` packed entries, inline so the table
+/// can live in caller-owned memory.
+#[cfg(feature = "caller-workspace")]
+type DecodeTableBuf = crate::common::inline_vec::InlineVec<u16, { 1 << MAX_MAX_NUM_BITS as usize }>;
+
+/// Per-symbol weights or code lengths: at most 256 symbols.
+#[cfg(not(feature = "caller-workspace"))]
+type SymbolBuf = Vec<u8>;
+/// Per-symbol weights or code lengths: at most 256 symbols, inline so the
+/// table can live in caller-owned memory.
+#[cfg(feature = "caller-workspace")]
+type SymbolBuf = crate::common::inline_vec::InlineVec<u8, 256>;
+
 pub struct HuffmanDecoder<'table> {
     table: &'table HuffmanTable,
     /// State is used to index into the table.
@@ -139,19 +155,19 @@ pub struct HuffmanTable {
     /// in the low byte lets the 4-stream decoder shift directly by the entry
     /// (modulo 64), without extracting it on the dependent bitstream path.
     /// Entries remain two bytes: at most 4 KiB for the 11-bit table.
-    pub(crate) packed_decode: Vec<u16>,
+    pub(crate) packed_decode: DecodeTableBuf,
     /// The weight of a symbol is the number of occurrences in a table.
     /// This value is used in constructing a binary tree referred to as
     /// a Huffman tree. Once this tree is constructed, it can be used to build the
     /// lookup table
-    weights: Vec<u8>,
+    weights: SymbolBuf,
     /// The maximum size in bits a prefix code in the encoded data can be.
     /// This value is used so that the decoder knows how many bits
     /// to read from the bitstream before checking the table. This
     /// value must be 11 or lower.
     pub max_num_bits: u8,
     state_mask: u64,
-    bits: Vec<u8>,
+    bits: SymbolBuf,
     bit_ranks: [u32; (MAX_MAX_NUM_BITS as usize) + 1],
     /// Running `sum(1 << (w - 1))` accumulated WHILE weights decode
     /// (upstream zstd `HUF_readStats` keeps the same running stats), replacing a
@@ -171,6 +187,7 @@ pub struct HuffmanTable {
 impl HuffmanTable {
     /// Heap bytes owned by this table (decode lookup table plus the
     /// weight-decoding scratch vectors and the weight-stream FSE table).
+    #[cfg(not(feature = "caller-workspace"))]
     pub fn heap_bytes(&self) -> usize {
         self.packed_decode.capacity() * core::mem::size_of::<u16>()
             + self.weights.capacity()
@@ -178,15 +195,44 @@ impl HuffmanTable {
             + self.fse_table.heap_bytes()
     }
 
+    /// Heap bytes owned by this table: none, every buffer is inline.
+    #[cfg(feature = "caller-workspace")]
+    pub fn heap_bytes(&self) -> usize {
+        0
+    }
+
+    /// Initialise an empty table in place, without building it on the stack.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes and aligned for `Self`.
+    #[cfg(feature = "caller-workspace")]
+    pub(crate) unsafe fn init_in_place(this: *mut Self) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: the caller guarantees `this` is writable and aligned; every
+        // field that is not `MaybeUninit` storage is written here.
+        unsafe {
+            DecodeTableBuf::init_in_place(addr_of_mut!((*this).packed_decode));
+            SymbolBuf::init_in_place(addr_of_mut!((*this).weights));
+            addr_of_mut!((*this).max_num_bits).write(0);
+            addr_of_mut!((*this).state_mask).write(0);
+            SymbolBuf::init_in_place(addr_of_mut!((*this).bits));
+            addr_of_mut!((*this).bit_ranks).write([0; (MAX_MAX_NUM_BITS as usize) + 1]);
+            addr_of_mut!((*this).weight_sum).write(0);
+            addr_of_mut!((*this).weight_rank_count).write([0; (MAX_MAX_NUM_BITS as usize) + 1]);
+            addr_of_mut!((*this).last_weight).write(0);
+            FSETable::init_in_place(addr_of_mut!((*this).fse_table), 255);
+        }
+    }
+
     /// Create a new, empty table.
     pub fn new() -> HuffmanTable {
         HuffmanTable {
-            packed_decode: Vec::new(),
+            packed_decode: DecodeTableBuf::new(),
 
-            weights: Vec::with_capacity(256),
+            weights: SymbolBuf::with_capacity(256),
             max_num_bits: 0,
             state_mask: 0,
-            bits: Vec::with_capacity(256),
+            bits: SymbolBuf::with_capacity(256),
             bit_ranks: [0; (MAX_MAX_NUM_BITS as usize) + 1],
             weight_sum: 0,
             weight_rank_count: [0; (MAX_MAX_NUM_BITS as usize) + 1],
@@ -456,7 +502,7 @@ impl HuffmanTable {
                 // the per-index parity branch defeated unrolling and read
                 // every byte twice. The running stats accumulate alongside
                 // (upstream zstd `HUF_readStats` shape).
-                let mut push_weight = |w: u8, weights: &mut Vec<u8>| -> Result<(), err> {
+                let mut push_weight = |w: u8, weights: &mut SymbolBuf| -> Result<(), err> {
                     if w > MAX_MAX_NUM_BITS {
                         return Err(err::WeightBiggerThanMaxNumBits { got: w });
                     }

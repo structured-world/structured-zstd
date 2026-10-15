@@ -282,6 +282,13 @@ pub enum DecompressBlockError {
         size: usize,
         maximum: usize,
     },
+    /// A compressed block's content is `size` bytes, past the block maximum
+    /// (RFC 8878 3.1.1.2.4, `Block_Maximum_Size`) of `maximum`, the smaller of
+    /// the frame's window and 128 KiB, whatever it would decode to.
+    ContentPastBlockMaximum {
+        size: usize,
+        maximum: usize,
+    },
     /// A block with no sequences whose literals do not fit a fixed-capacity
     /// backend: `requested` bytes at `tail` against `capacity`. The block is
     /// within the block maximum, so this says the caller's slice is short, and
@@ -333,6 +340,10 @@ impl core::fmt::Display for DecompressBlockError {
             DecompressBlockError::ExpandsPastBlockMaximum { size, maximum } => write!(
                 f,
                 "Block expands to {size} bytes, past this frame's maximum of {maximum}"
+            ),
+            DecompressBlockError::ContentPastBlockMaximum { size, maximum } => write!(
+                f,
+                "Compressed block of {size} bytes, past this frame's maximum of {maximum}"
             ),
             DecompressBlockError::LiteralsOutputOverflow {
                 tail,

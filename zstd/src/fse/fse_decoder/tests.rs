@@ -105,6 +105,37 @@ fn build_from_probabilities_accepts_exact_sum() {
     assert!(result.is_ok(), "expected Ok for exact sum, got {result:?}");
 }
 
+/// More probabilities than the table's alphabet holds are refused before they
+/// are stored: the store is bounded by the alphabet under `caller-workspace`,
+/// so copying them first would panic instead of returning the typed error.
+#[test]
+fn build_from_probabilities_rejects_more_symbols_than_the_alphabet() {
+    let mut t = FSETable::new(255);
+    let mut probs = [0i32; 300];
+    probs[0] = 16;
+    let result = t.build_from_probabilities(4, &probs);
+    assert!(
+        matches!(result, Err(FSETableError::TooManySymbols { got: 300 })),
+        "expected TooManySymbols {{ got: 300 }}, got {result:?}",
+    );
+}
+
+/// A table description whose zero-probability run outgrows the alphabet is
+/// refused as soon as it does, as upstream's `FSE_readNCount` stops at
+/// `charnum > maxSV1`, rather than collecting zeros until the input runs out.
+/// Accuracy log 5, one zero probability, then 2-bit "three more zeros" fields
+/// for the rest of the input.
+#[test]
+fn zero_run_past_the_alphabet_is_refused_early() {
+    let mut source = alloc::vec![0x10u8, 0xFE];
+    source.extend(core::iter::repeat_n(0xFF, 200));
+    let mut table = SeqFSETable::new(35);
+    match table.build_decoder(&source, 9) {
+        Err(FSETableError::TooManySymbols { got }) => assert!(got > 36 && got <= 39),
+        other => panic!("expected TooManySymbols, got {other:?}"),
+    }
+}
+
 /// The decoder accepts tables with `accuracy_log` up to
 /// `ENTRY_MAX_ACCURACY_LOG = 16`, but the encoder table builder indexes a
 /// fixed 512-entry (`1 << 9`) scratch. A decoder table with `accuracy_log >
@@ -117,7 +148,8 @@ fn to_encoder_table_rejects_accuracy_log_above_nine() {
     // A table with accuracy_log 10 (1 << 10 = 1024 entries) and a plausible
     // probability distribution summing to 1024.
     t.accuracy_log = 10;
-    t.symbol_probabilities = alloc::vec![512, 512];
+    t.symbol_probabilities.clear();
+    t.symbol_probabilities.extend_from_slice(&[512, 512]);
     assert!(
         t.to_encoder_table().is_none(),
         "accuracy_log > 9 must not be reusable as an encoder table"

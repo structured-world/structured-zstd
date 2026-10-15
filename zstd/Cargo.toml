@@ -69,7 +69,7 @@ required-features = ["std", "dict-builder", "ldm"]
 # `#[cfg_attr(docsrs, doc(cfg(...)))]` annotations that render feature
 # badges on each item.
 [package.metadata.docs.rs]
-features = ["std", "hash", "ldm", "dict-builder", "lsm"]
+features = ["std", "hash", "ldm", "dict-builder", "lsm", "caller-workspace"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -182,6 +182,11 @@ ldm = ["hash"]
 # targets with atomic pointer support this feature is a no-op.
 critical-section = ["dep:critical-section"]
 std = []
+# Allocation-free streaming decoder over caller-owned workspace memory
+# (`decoding::workspace`). Also stores the entropy tables' build scratch
+# inline instead of in `Vec`s, which the workspace decoder needs; with the
+# feature off the other decoders build exactly as before.
+caller-workspace = []
 
 # ---------------------------------------------------------------------------
 # Internal features. NOT part of the public API: they widen the crate's
@@ -228,6 +233,23 @@ lsm = []
 # Internal feature, only used when building as part of libstd, not part of the
 # stable interface of this crate.
 rustc-dep-of-std = ["dep:compiler_builtins", "dep:core", "dep:alloc"]
+
+[[test]]
+name = "workspace_no_alloc"
+path = "tests/workspace_no_alloc.rs"
+required-features = ["caller-workspace", "std"]
+
+# Pure-Rust examples of the caller-workspace decoder; unlike the examples the
+# `ffi-bench` crate builds, they link no C code.
+[[example]]
+name = "workspace_stream_verify"
+path = "examples/workspace_stream_verify.rs"
+required-features = ["caller-workspace", "std"]
+
+[[example]]
+name = "workspace_decode_loop"
+path = "examples/workspace_decode_loop.rs"
+required-features = ["caller-workspace", "std"]
 
 # All benches, integration tests, and FFI diagnostic examples are targets of
 # the non-published `ffi-bench` crate (they link the C `zstd` bindings); their

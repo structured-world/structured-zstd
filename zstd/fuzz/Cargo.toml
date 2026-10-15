@@ -18,6 +18,11 @@ features = ["fuzz-exports"]
 [dependencies.libfuzzer-sys]
 git = "https://github.com/rust-fuzz/libfuzzer-sys.git"
 
+# Builds the library with its caller-workspace storage; kept off for the other
+# targets so they keep fuzzing the default build.
+[features]
+workspace = ["structured-zstd/caller-workspace"]
+
 # Prevent this from interfering with workspaces
 [workspace]
 members = ["."]
@@ -45,3 +50,8 @@ path = "fuzz_targets/huff0.rs"
 [[bin]]
 name = "fse"
 path = "fuzz_targets/fse.rs"
+
+[[bin]]
+name = "decode_workspace"
+path = "fuzz_targets/decode_workspace.rs"
+required-features = ["workspace"]

@@ -3,6 +3,22 @@ use crate::cpu_kernel::CpuKernel;
 use crate::decoding::errors::{FSEDecoderError, FSETableError};
 use alloc::vec::Vec;
 
+/// Build-time probability list: at most 256 symbols (`u8` alphabet).
+#[cfg(not(feature = "caller-workspace"))]
+type ProbabilityBuf = Vec<i32>;
+/// Build-time probability list: at most 256 symbols (`u8` alphabet), inline so
+/// a table can live in caller-owned memory.
+#[cfg(feature = "caller-workspace")]
+type ProbabilityBuf = crate::common::inline_vec::InlineVec<i32, 256>;
+
+/// Symbol-spread scratch: one byte per state of the largest table (`1 << 9`).
+#[cfg(not(feature = "caller-workspace"))]
+type SpreadBuf = Vec<u8>;
+/// Symbol-spread scratch: one byte per state of the largest table (`1 << 9`),
+/// inline so a table can live in caller-owned memory.
+#[cfg(feature = "caller-workspace")]
+type SpreadBuf = crate::common::inline_vec::InlineVec<u8, 512>;
+
 // Visibility = `pub` so the `pub type FSEDecoder` / `pub type
 // SeqFSEDecoder` aliases below don't expose a more-private struct
 // (compiler `private_interfaces` warning). External reachability is
@@ -263,7 +279,7 @@ pub struct FSETableImpl<E: FseEntry, const CAP: usize> {
     /// Number of live entries in `decode` (`1 << accuracy_log`).
     decode_len: usize,
     /// Reused scratch buffer for symbol spreading to avoid per-build allocations.
-    symbol_spread_buffer: Vec<u8>,
+    symbol_spread_buffer: SpreadBuf,
     /// The size of the table is stored in logarithm base 2 format,
     /// with the **size of the table** being equal to `(1 << accuracy_log)`.
     /// This value is used so that the decoder knows how many bits to read from the bitstream.
@@ -278,7 +294,11 @@ pub struct FSETableImpl<E: FseEntry, const CAP: usize> {
     ///
     /// If a symbol probability is set to `-1`, it means that the probability of a symbol
     /// occurring in the data is less than one.
+    #[cfg(not(feature = "caller-workspace"))]
     pub symbol_probabilities: Vec<i32>, //used while building the decode Vector
+    /// See the `Vec` form of this field; stored inline under `caller-workspace`.
+    #[cfg(feature = "caller-workspace")]
+    pub(crate) symbol_probabilities: ProbabilityBuf,
 }
 
 /// Type alias preserved for HUF-weight-stream callers and existing
@@ -313,8 +333,8 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             // i32 here was a heap allocation paid per fresh table (3 seq + the
             // HUF weight table per `DecoderScratch`), part of the per-frame fixed
             // cost that dominates tiny-frame decode.
-            symbol_probabilities: Vec::new(),
-            symbol_spread_buffer: Vec::new(),
+            symbol_probabilities: ProbabilityBuf::new(),
+            symbol_spread_buffer: SpreadBuf::new(),
             // Uninitialised — no `CAP`-entry memset; the build fills the live
             // span before any read (see the field doc).
             decode: [const { core::mem::MaybeUninit::uninit() }; CAP],
@@ -326,9 +346,36 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     /// Heap bytes owned by this table. The `decode` table is a fixed inline
     /// array (counted by `size_of`, not here); only the build-scratch vectors
     /// are heap-allocated.
+    #[cfg(not(feature = "caller-workspace"))]
     pub fn heap_bytes(&self) -> usize {
         self.symbol_spread_buffer.capacity()
             + self.symbol_probabilities.capacity() * core::mem::size_of::<i32>()
+    }
+
+    /// Heap bytes owned by this table: none, the build scratch is inline.
+    #[cfg(feature = "caller-workspace")]
+    pub fn heap_bytes(&self) -> usize {
+        0
+    }
+
+    /// Initialise an empty table in place, without building it on the stack:
+    /// the decode array and the build scratch are left uninitialised, as `new`
+    /// leaves them.
+    ///
+    /// # Safety
+    /// `this` must be valid for writes and aligned for `Self`.
+    #[cfg(feature = "caller-workspace")]
+    pub(crate) unsafe fn init_in_place(this: *mut Self, max_symbol: u8) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: the caller guarantees `this` is writable and aligned; every
+        // field that is not `MaybeUninit` storage is written here.
+        unsafe {
+            addr_of_mut!((*this).max_symbol).write(max_symbol);
+            addr_of_mut!((*this).decode_len).write(0);
+            addr_of_mut!((*this).accuracy_log).write(0);
+            SpreadBuf::init_in_place(addr_of_mut!((*this).symbol_spread_buffer));
+            ProbabilityBuf::init_in_place(addr_of_mut!((*this).symbol_probabilities));
+        }
     }
 
     /// Live decode entries (`decode[..decode_len]`).
@@ -499,6 +546,11 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 max: ENTRY_MAX_ACCURACY_LOG,
             });
         }
+        // Refused before anything is stored: the probability store is bounded
+        // by the alphabet, and this also bounds the sum below.
+        if probs.len() > self.max_symbol as usize + 1 {
+            return Err(FSETableError::TooManySymbols { got: probs.len() });
+        }
         // Probability sum check: `build_decoding_table` assumes the
         // sum of positive probabilities plus the count of `-1`
         // entries (each contributing one slot at the top of the
@@ -559,7 +611,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             return Err(FSETableError::ProbabilityCounterMismatch {
                 got: probability_sum,
                 expected_sum: table_size,
-                symbol_probabilities: probs.to_vec(),
+                symbol_probabilities: mismatch_diagnostic(probs),
             });
         }
         self.symbol_probabilities.clear();
@@ -575,14 +627,12 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     /// allocation for the symbol counter (stack-allocated since the
     /// max symbol count is bounded by `u8::MAX + 1 = 256`).
     ///
-    /// Wraps `build_decoding_table_inner` so the `symbol_spread_buffer`
-    /// scratch is unconditionally restored to `self` on every exit
-    /// path (success OR error) — otherwise an early `Err` from the
-    /// inner pass would drop the taken buffer and force a fresh
-    /// allocation on the next build.
+    /// Wraps `build_decoding_table_inner`, which borrows the table's fields
+    /// one by one so the spread scratch is lent in place rather than moved
+    /// out and back.
     ///
-    /// On `Err` the table is also fully `reset()` after the buffer
-    /// restore: the inner pass mutates `self.decode` (partial push)
+    /// On `Err` the table is fully `reset()`: the inner pass mutates
+    /// `self.decode` (partial push)
     /// while `self.accuracy_log` / `self.symbol_probabilities` were
     /// already set by the caller (`build_from_probabilities`); leaving
     /// that inconsistency in place would let a subsequent `init_state`
@@ -595,26 +645,38 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     }
 
     fn build_decoding_table_meta(&mut self, meta: SeqMeta<'_>) -> Result<(), FSETableError> {
-        let mut spread = core::mem::take(&mut self.symbol_spread_buffer);
-        let result = self.build_decoding_table_inner(&mut spread, meta);
-        self.symbol_spread_buffer = spread;
+        let result = Self::build_decoding_table_inner(
+            &mut self.decode,
+            &mut self.decode_len,
+            &mut self.symbol_spread_buffer,
+            &self.symbol_probabilities,
+            self.max_symbol,
+            self.accuracy_log,
+            meta,
+        );
         if result.is_err() {
             self.reset();
         }
         result
     }
 
+    // The table's fields, borrowed one by one; see `build_decoding_table_meta`.
+    #[allow(clippy::too_many_arguments)]
     fn build_decoding_table_inner(
-        &mut self,
-        spread: &mut Vec<u8>,
+        decode: &mut [core::mem::MaybeUninit<E>; CAP],
+        decode_len: &mut usize,
+        spread: &mut SpreadBuf,
+        symbol_probabilities: &ProbabilityBuf,
+        max_symbol: u8,
+        accuracy_log: u8,
         meta: SeqMeta<'_>,
     ) -> Result<(), FSETableError> {
-        let nb_symbols = self.symbol_probabilities.len();
-        if nb_symbols > self.max_symbol as usize + 1 {
+        let nb_symbols = symbol_probabilities.len();
+        if nb_symbols > max_symbol as usize + 1 {
             return Err(FSETableError::TooManySymbols { got: nb_symbols });
         }
 
-        let table_size = 1 << self.accuracy_log;
+        let table_size = 1 << accuracy_log;
         // The decode array is `[E; CAP]` and the fast-spread scratch is a fixed
         // `FSE_FAST_SPREAD_BUF`; a `table_size` above CAP would overrun both.
         // The wire path never exceeds CAP (sequence acc_log <= 9, HUF <= 6), but
@@ -623,7 +685,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // oversized table as a typed error instead of panic-overrunning.
         if table_size > CAP {
             return Err(FSETableError::AccLogTooBig {
-                got: self.accuracy_log,
+                got: accuracy_log,
                 max: CAP.trailing_zeros() as u8,
             });
         }
@@ -661,7 +723,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // a tighter scalar loop without the Iterator::next state
         // machine. The enumerate+take iterator chain was visible as
         // ~1.8% combined self-time on the decode flamegraph.
-        let probs = self.symbol_probabilities.as_slice();
+        let probs = symbol_probabilities.as_slice();
         let mut negative_idx = table_size;
         for symbol in 0..nb_symbols {
             let prob = probs[symbol];
@@ -752,7 +814,6 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // so `nextState == 1`, `high_bit == 1`, `nbBits ==
         // accuracy_log`, `newState == 0` — exactly the -1 entry
         // shape.
-        let accuracy_log = self.accuracy_log;
         let table_size_u32 = table_size as u32;
         // Write the `table_size` live entries directly into the inline,
         // value-initialised `decode` array (no `MaybeUninit` / `set_len`
@@ -767,7 +828,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             table_size <= CAP,
             "FSE table_size {table_size} exceeds monomorphized CAP {CAP}",
         );
-        self.decode_len = 0;
+        *decode_len = 0;
 
         // Slice index instead of `spread.iter().take(table_size)`:
         // if `spread.len() < table_size` (a future refactor breaking
@@ -818,7 +879,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 // is dropped here harmlessly (`MaybeUninit<E>` has no
                 // Drop).
                 return Err(FSETableError::TableInvariantViolation {
-                    prob: self.symbol_probabilities[symbol as usize],
+                    prob: symbol_probabilities[symbol as usize],
                     symbol,
                     num_bits: nb,
                     accuracy_log,
@@ -840,7 +901,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             // instead of re-walking the finished table. `from_raw`
             // zero-inits the meta fields, so the no-meta arms match
             // the post-pass results exactly.
-            self.decode[state_idx] = core::mem::MaybeUninit::new(match meta {
+            decode[state_idx] = core::mem::MaybeUninit::new(match meta {
                 SeqMeta::None => entry,
                 SeqMeta::Packed(packed) => {
                     let m = packed.get(symbol as usize).copied().unwrap_or(0);
@@ -858,7 +919,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
 
         // Commit the live span. The loop wrote every `state_idx ∈
         // [0, table_size)`; an Err above returns with `decode_len` still 0.
-        self.decode_len = table_size;
+        *decode_len = table_size;
 
         Ok(())
     }
@@ -948,6 +1009,15 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
 
             let prob = (value as i32) - 1;
 
+            // Stop as soon as the list outgrows the alphabet, as upstream's
+            // `FSE_readNCount` stops at `charnum > maxSV1`, instead of letting
+            // a malformed run of zero probabilities grow it without bound.
+            let max_symbols = self.max_symbol as usize + 1;
+            if self.symbol_probabilities.len() >= max_symbols {
+                return Err(FSETableError::TooManySymbols {
+                    got: self.symbol_probabilities.len() + 1,
+                });
+            }
             self.symbol_probabilities.push(prob);
             if prob != 0 {
                 if prob > 0 {
@@ -962,8 +1032,11 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 loop {
                     let skip_amount = read_bits!(2) as usize;
 
-                    self.symbol_probabilities
-                        .resize(self.symbol_probabilities.len() + skip_amount, 0);
+                    let new_len = self.symbol_probabilities.len() + skip_amount;
+                    if new_len > max_symbols {
+                        return Err(FSETableError::TooManySymbols { got: new_len });
+                    }
+                    self.symbol_probabilities.resize(new_len, 0);
                     if skip_amount != 3 {
                         break;
                     }
@@ -975,14 +1048,11 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             return Err(FSETableError::ProbabilityCounterMismatch {
                 got: probability_counter,
                 expected_sum: probability_sum,
-                symbol_probabilities: self.symbol_probabilities.clone(),
+                symbol_probabilities: mismatch_diagnostic(&self.symbol_probabilities),
             });
         }
-        if self.symbol_probabilities.len() > self.max_symbol as usize + 1 {
-            return Err(FSETableError::TooManySymbols {
-                got: self.symbol_probabilities.len(),
-            });
-        }
+        // Held inside the loop, before every append.
+        debug_assert!(self.symbol_probabilities.len() <= self.max_symbol as usize + 1);
 
         let bytes_read = if bit_pos.is_multiple_of(8) {
             bit_pos / 8
@@ -1230,6 +1300,19 @@ const ENTRY_MAX_ACCURACY_LOG: u8 = 16;
 fn highest_bit_set(x: u32) -> u32 {
     assert!(x > 0);
     u32::BITS - x.leading_zeros()
+}
+
+/// The probabilities a sum-mismatch error carries for diagnosis.
+#[cfg(not(feature = "caller-workspace"))]
+fn mismatch_diagnostic(probs: &[i32]) -> Vec<i32> {
+    probs.to_vec()
+}
+
+/// Empty under `caller-workspace`: copying the list would allocate on
+/// malformed input, which that decoder promises never to do.
+#[cfg(feature = "caller-workspace")]
+fn mismatch_diagnostic(_probs: &[i32]) -> Vec<i32> {
+    Vec::new()
 }
 
 //utility functions for building the decoding table from probabilities

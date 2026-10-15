@@ -1,13 +1,16 @@
 //! RFC 8878 Zstandard decoder.
 //!
-//! Three entry points are exposed, each with progressively lower-level
-//! control:
+//! The entry points:
 //!
 //! * [`StreamingDecoder`] — implements [`crate::io::Read`] over a compressed
 //!   byte stream, transparently parsing the frame header and concatenated
 //!   frames. The typical choice for application code.
 //! * [`FrameDecoder`] — single-frame interface; use when the caller manages
 //!   the input buffer manually (zero-copy slices, network framing, etc).
+//! * `workspace::WorkspaceDecoder` (feature `caller-workspace`): streaming
+//!   decoder over a byte slice the caller sizes and owns, with no allocation
+//!   and limits on window, output and work. For consumers that account their
+//!   memory themselves, such as browser bundles verifying a download.
 //! * [`DictionaryHandle`] — pre-parsed dictionary handle. Parse the
 //!   dictionary bytes once with [`DictionaryHandle::decode_dict`] and reuse
 //!   the handle across every subsequent decode; saves the per-frame
@@ -32,6 +35,9 @@
 pub mod errors;
 mod frame_decoder;
 mod streaming_decoder;
+#[cfg(feature = "caller-workspace")]
+#[cfg_attr(docsrs, doc(cfg(feature = "caller-workspace")))]
+pub mod workspace;
 
 pub use dictionary::{Dictionary, DictionaryHandle, MAGIC_NUM as DICTIONARY_MAGIC};
 pub use frame_decoder::{BlockDecodingStrategy, ContentChecksum, FrameDecoder};

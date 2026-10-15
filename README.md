@@ -231,6 +231,19 @@ reads the first frame header and reports any problem with the input, and
 the source untouched, so a container format can decide not to decompress an
 entry and copy its raw bytes instead.
 
+### Decoding in caller-owned memory
+
+Behind the `caller-workspace` feature, `decoding::workspace::WorkspaceDecoder`
+decodes a stream chunk by chunk inside one byte slice the caller supplies,
+and never allocates. `workspace_bytes(max_window)` says how large the slice
+must be, so a consumer that accounts its own memory (a browser bundle
+verifying a download, say) admits it before decoding starts. Each step is
+bounded by the window a frame may declare, the total output, and a work
+budget charged before the work it pays for; a refusal is reported apart from
+malformed or truncated input. It works in `no_std` builds and in WebAssembly,
+and decodes through the same code as the other decoders. Frames that need a
+dictionary are refused.
+
 ### Dictionaries
 
 ```rust,no_run
@@ -294,6 +307,7 @@ in pure Rust:
 | `kernel-scalar` | ✅ | Marker for the always-compiled scalar fallback |
 | `dict-builder` | ❌ | Pure-Rust COVER / FastCOVER / legacy dictionary training |
 | `lsm` | ❌ | [Storage-format extensions](#storage-format-extensions) |
+| `caller-workspace` | ❌ | [Decoding in caller-owned memory](#decoding-in-caller-owned-memory) |
 
 Each flag gates its tier wherever that tier exists. `kernel-sse`,
 `kernel-bmi2`, `kernel-avx2`, `kernel-neon` and `kernel-simd128` cover both

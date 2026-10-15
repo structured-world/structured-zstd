@@ -4025,3 +4025,57 @@ fn a_frame_larger_than_the_callers_buffer_is_refused_up_front() {
         Err(FrameDecoderError::TargetTooSmall)
     ));
 }
+
+/// A compressed block whose content is larger than the frame's block maximum
+/// is malformed (RFC 8878 3.1.1.2.4), as upstream's `ZSTD_decompressBlock_internal`
+/// refuses `srcSize > blockSizeMax`, even when it would produce no output. Here
+/// a single-segment frame declaring 0 bytes (window and block maximum 0)
+/// carries a 2-byte compressed block holding an empty literals section and no
+/// sequences.
+#[test]
+fn a_compressed_block_past_the_block_maximum_is_refused() {
+    let frame = [
+        0x28, 0xB5, 0x2F, 0xFD, // magic
+        0x20, 0x00, // single segment, Frame_Content_Size 0
+        0x15, 0x00, 0x00, // last, Compressed, Block_Size 2
+        0x00, 0x00, // raw literals of 0 bytes, 0 sequences
+    ];
+    // Pin the cause, not only the refusal: any other error here would mean the
+    // block was refused for a reason this check does not own.
+    let expect_past_maximum = |err: &FrameDecoderError| {
+        let source = match err {
+            FrameDecoderError::FailedToReadBlockBody(source) => source,
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::FailedToReadBlockBodyAt { source, .. } => source,
+            other => panic!("expected a block-body refusal, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                source,
+                DecodeBlockContentError::DecompressBlockError(
+                    DecompressBlockError::ContentPastBlockMaximum {
+                        size: 2,
+                        maximum: 0
+                    }
+                ),
+            ),
+            "expected the block-maximum refusal, got {err:?}",
+        );
+    };
+    let mut out = [0u8; 16];
+    let err = FrameDecoder::new()
+        .decode_all(&frame, &mut out)
+        .expect_err("decode_all must refuse the block");
+    expect_past_maximum(&err);
+    let mut decoded = Vec::new();
+    let mut streaming = crate::decoding::StreamingDecoder::new(&frame[..]);
+    let err = crate::io::Read::read_to_end(&mut streaming, &mut decoded)
+        .expect_err("the streaming decoder must refuse the block");
+    match err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<FrameDecoderError>())
+    {
+        Some(err) => expect_past_maximum(err),
+        None => panic!("expected a FrameDecoderError, got {err:?}"),
+    }
+}

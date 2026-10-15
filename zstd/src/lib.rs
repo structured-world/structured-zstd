@@ -10,6 +10,9 @@
 //!   compression levels ([`encoding::CompressionLevel`]).
 //! * [`dictionary`] (feature `dict-builder`) — COVER / FastCOVER training
 //!   plus raw-to-finalized dictionary helpers.
+//! * `decoding::workspace` (feature `caller-workspace`): streaming decoder
+//!   that runs entirely in caller-owned memory, never allocating, with
+//!   caller-set limits on window, output and work.
 //!
 //! No FFI, no cmake, no system zstd. `no_std` builds are supported by
 //! disabling the default `std` feature.
