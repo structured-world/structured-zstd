@@ -1312,7 +1312,9 @@ fn estimate_sequences_section_bytes(
         counts.fill(0);
         let mut max = 0u8;
         for &code in codes {
-            counts[code as usize] += 1;
+            debug_assert!(usize::from(code) < SEQUENCE_CODE_SLOTS);
+            // SAFETY: a length code is at most 52, under the histogram's slots.
+            unsafe { *counts.get_unchecked_mut(usize::from(code)) += 1 };
             max = max.max(code);
         }
         max as usize
@@ -1325,7 +1327,9 @@ fn estimate_sequences_section_bytes(
     let mut hist = *offset_hist;
     let mut count_offset = |off_base: u32| {
         let (of, _, _) = encode_offset(off_base);
-        of_counts[of as usize] += 1;
+        debug_assert!(usize::from(of) < SEQUENCE_CODE_SLOTS);
+        // SAFETY: an offset code is at most 31, under the histogram's slots.
+        unsafe { *of_counts.get_unchecked_mut(usize::from(of)) += 1 };
         of_max = of_max.max(of as usize);
         // Upstream zstd: OF code's value equals its additional-bits width.
         of_bits += of as usize;
@@ -1838,9 +1842,18 @@ fn fill_and_count<const OFFSETS_CODED: bool>(
                 ll_code, ml_code, of_code, ll_bits, ml_bits,
             ));
         }
-        ll_counts[ll_code as usize] += 1;
-        ml_counts[ml_code as usize] += 1;
-        of_counts[of_code as usize] += 1;
+        debug_assert!(
+            usize::from(ll_code.max(ml_code).max(of_code)) < SEQUENCE_CODE_SLOTS,
+            "the code functions stay inside their alphabets",
+        );
+        // SAFETY: the codes are at most 35 (LL), 52 (ML) and 31 (OF), under the
+        // histogram's `SEQUENCE_CODE_SLOTS`; a byte-wide index would otherwise
+        // be bounds-checked three times a sequence.
+        unsafe {
+            *ll_counts.get_unchecked_mut(usize::from(ll_code)) += 1;
+            *ml_counts.get_unchecked_mut(usize::from(ml_code)) += 1;
+            *of_counts.get_unchecked_mut(usize::from(of_code)) += 1;
+        }
     }
     if !OFFSETS_CODED {
         *offset_hist = hist;
