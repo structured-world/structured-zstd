@@ -7,17 +7,12 @@ use core::ops::{Deref, DerefMut};
 
 /// A `Vec`-shaped buffer of at most `N` elements stored inline.
 ///
-/// Writes past `N` are discarded while the length keeps counting, so a
-/// builder that appends until its input runs out still reports how much it
-/// tried to store, and its own length check (`TooManySymbols`,
-/// `DecodedLiteralCountMismatch`, ...) rejects the input exactly as it would
-/// with a growable `Vec`. Only the stored prefix is ever readable.
+/// Every user is bounded by the format below `N` and checks its input against
+/// that bound before appending (the Huffman weight count, the FSE alphabet), so
+/// growing past `N` is a broken invariant: the bounds-checked write panics
+/// rather than leaving the buffer.
 pub(crate) struct InlineVec<T: Copy, const N: usize> {
-    /// Elements appended, counted past `N`.
     len: usize,
-    /// Elements actually held, `min(len, N)`, kept apart so a read is one
-    /// load as with a `Vec`.
-    stored: usize,
     buf: [MaybeUninit<T>; N],
 }
 
@@ -25,7 +20,6 @@ impl<T: Copy, const N: usize> InlineVec<T, N> {
     pub(crate) const fn new() -> Self {
         Self {
             len: 0,
-            stored: 0,
             buf: [const { MaybeUninit::uninit() }; N],
         }
     }
@@ -42,14 +36,9 @@ impl<T: Copy, const N: usize> InlineVec<T, N> {
     pub(crate) unsafe fn init_in_place(this: *mut Self) {
         // SAFETY: the caller guarantees `this` is writable and aligned; the
         // element array is `MaybeUninit` and needs no initialisation.
-        unsafe {
-            core::ptr::addr_of_mut!((*this).len).write(0);
-            core::ptr::addr_of_mut!((*this).stored).write(0);
-        }
+        unsafe { core::ptr::addr_of_mut!((*this).len).write(0) };
     }
 
-    /// Number of elements appended, which can exceed `N` after a discarded
-    /// write; see the type documentation.
     #[inline(always)]
     pub(crate) fn len(&self) -> usize {
         self.len
@@ -63,53 +52,41 @@ impl<T: Copy, const N: usize> InlineVec<T, N> {
     #[inline(always)]
     pub(crate) fn clear(&mut self) {
         self.len = 0;
-        self.stored = 0;
     }
 
     /// No-op: the storage is fixed. Callers size their requests below `N`.
     #[inline(always)]
     pub(crate) fn reserve(&mut self, additional: usize) {
-        debug_assert!(self.len.saturating_add(additional) <= N);
+        debug_assert!(self.len + additional <= N);
     }
 
     #[inline(always)]
     pub(crate) fn push(&mut self, value: T) {
-        // `stored < N` only while nothing has been discarded, so a held
-        // element always sits at its own index.
-        if self.stored < N {
-            self.buf[self.stored] = MaybeUninit::new(value);
-            self.stored += 1;
-        }
+        self.buf[self.len] = MaybeUninit::new(value);
         self.len += 1;
     }
 
     pub(crate) fn resize(&mut self, new_len: usize, value: T) {
-        let fill_end = new_len.min(N);
-        if fill_end > self.stored {
-            for slot in &mut self.buf[self.stored..fill_end] {
+        if new_len > self.len {
+            for slot in &mut self.buf[self.len..new_len] {
                 *slot = MaybeUninit::new(value);
             }
         }
-        self.stored = fill_end;
         self.len = new_len;
     }
 
     pub(crate) fn extend_from_slice(&mut self, values: &[T]) {
-        let copied = values.len().min(N - self.stored);
-        for (slot, &value) in self.buf[self.stored..self.stored + copied]
-            .iter_mut()
-            .zip(values)
-        {
+        let end = self.len + values.len();
+        for (slot, &value) in self.buf[self.len..end].iter_mut().zip(values) {
             *slot = MaybeUninit::new(value);
         }
-        self.stored += copied;
-        self.len += values.len();
+        self.len = end;
     }
 
-    /// The writable tail past the stored prefix.
+    /// The writable tail past the live prefix.
     #[inline(always)]
     pub(crate) fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
-        &mut self.buf[self.stored..]
+        &mut self.buf[self.len..]
     }
 
     /// # Safety
@@ -118,7 +95,6 @@ impl<T: Copy, const N: usize> InlineVec<T, N> {
     pub(crate) unsafe fn set_len(&mut self, new_len: usize) {
         assert!(new_len <= N, "InlineVec::set_len past its capacity");
         self.len = new_len;
-        self.stored = new_len;
     }
 
     #[inline(always)]
@@ -132,18 +108,21 @@ impl<T: Copy, const N: usize> Deref for InlineVec<T, N> {
 
     #[inline(always)]
     fn deref(&self) -> &[T] {
-        // SAFETY: every element below `stored <= N` was written by `push`,
+        debug_assert!(self.len <= N);
+        // SAFETY: every element below `len <= N` was written by `push`,
         // `resize`, `extend_from_slice` or a `set_len` whose caller initialised
-        // it; `MaybeUninit<T>` has `T`'s layout.
-        unsafe { core::slice::from_raw_parts(self.buf.as_ptr().cast::<T>(), self.stored) }
+        // it, each of which bounds `len` by `N`; `MaybeUninit<T>` has `T`'s
+        // layout.
+        unsafe { core::slice::from_raw_parts(self.buf.as_ptr().cast::<T>(), self.len) }
     }
 }
 
 impl<T: Copy, const N: usize> DerefMut for InlineVec<T, N> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut [T] {
+        debug_assert!(self.len <= N);
         // SAFETY: as for `deref`.
-        unsafe { core::slice::from_raw_parts_mut(self.buf.as_mut_ptr().cast::<T>(), self.stored) }
+        unsafe { core::slice::from_raw_parts_mut(self.buf.as_mut_ptr().cast::<T>(), self.len) }
     }
 }
 
@@ -151,7 +130,6 @@ impl<T: Copy, const N: usize> Clone for InlineVec<T, N> {
     fn clone(&self) -> Self {
         let mut out = Self::new();
         out.extend_from_slice(self);
-        out.len = self.len;
         out
     }
 }

@@ -1004,6 +1004,15 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
 
             let prob = (value as i32) - 1;
 
+            // Stop as soon as the list outgrows the alphabet, as upstream's
+            // `FSE_readNCount` stops at `charnum > maxSV1`, instead of letting
+            // a malformed run of zero probabilities grow it without bound.
+            let max_symbols = self.max_symbol as usize + 1;
+            if self.symbol_probabilities.len() >= max_symbols {
+                return Err(FSETableError::TooManySymbols {
+                    got: self.symbol_probabilities.len() + 1,
+                });
+            }
             self.symbol_probabilities.push(prob);
             if prob != 0 {
                 if prob > 0 {
@@ -1018,8 +1027,11 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 loop {
                     let skip_amount = read_bits!(2) as usize;
 
-                    self.symbol_probabilities
-                        .resize(self.symbol_probabilities.len() + skip_amount, 0);
+                    let new_len = self.symbol_probabilities.len() + skip_amount;
+                    if new_len > max_symbols {
+                        return Err(FSETableError::TooManySymbols { got: new_len });
+                    }
+                    self.symbol_probabilities.resize(new_len, 0);
                     if skip_amount != 3 {
                         break;
                     }
@@ -1034,11 +1046,8 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 symbol_probabilities: mismatch_diagnostic(&self.symbol_probabilities),
             });
         }
-        if self.symbol_probabilities.len() > self.max_symbol as usize + 1 {
-            return Err(FSETableError::TooManySymbols {
-                got: self.symbol_probabilities.len(),
-            });
-        }
+        // Held inside the loop, before every append.
+        debug_assert!(self.symbol_probabilities.len() <= self.max_symbol as usize + 1);
 
         let bytes_read = if bit_pos.is_multiple_of(8) {
             bit_pos / 8

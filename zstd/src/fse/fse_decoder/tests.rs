@@ -105,6 +105,22 @@ fn build_from_probabilities_accepts_exact_sum() {
     assert!(result.is_ok(), "expected Ok for exact sum, got {result:?}");
 }
 
+/// A table description whose zero-probability run outgrows the alphabet is
+/// refused as soon as it does, as upstream's `FSE_readNCount` stops at
+/// `charnum > maxSV1`, rather than collecting zeros until the input runs out.
+/// Accuracy log 5, one zero probability, then 2-bit "three more zeros" fields
+/// for the rest of the input.
+#[test]
+fn zero_run_past_the_alphabet_is_refused_early() {
+    let mut source = alloc::vec![0x10u8, 0xFE];
+    source.extend(core::iter::repeat_n(0xFF, 200));
+    let mut table = SeqFSETable::new(35);
+    match table.build_decoder(&source, 9) {
+        Err(FSETableError::TooManySymbols { got }) => assert!(got > 36 && got <= 39),
+        other => panic!("expected TooManySymbols, got {other:?}"),
+    }
+}
+
 /// The decoder accepts tables with `accuracy_log` up to
 /// `ENTRY_MAX_ACCURACY_LOG = 16`, but the encoder table builder indexes a
 /// fixed 512-entry (`1 << 9`) scratch. A decoder table with `accuracy_log >

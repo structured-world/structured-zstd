@@ -10,44 +10,37 @@ fn push_resize_extend_within_capacity_read_back() {
     assert_eq!(v.as_slice(), &[1, 2, 3, 9, 9]);
     v.resize(2, 0);
     assert_eq!(v.as_slice(), &[1, 2]);
+    v.resize(8, 4);
+    assert_eq!(v.len(), 8);
     v.clear();
     assert!(v.is_empty());
 }
 
-/// Writes past the capacity are dropped but counted, so a builder's own
-/// length check sees the overflow; only the stored prefix is readable.
+/// A clone holds the same elements.
 #[test]
-fn overflow_is_counted_not_stored() {
-    let mut v: InlineVec<u8, 4> = InlineVec::new();
-    for b in 0..6 {
-        v.push(b);
-    }
-    assert_eq!(v.len(), 6);
-    assert_eq!(&*v, &[0, 1, 2, 3]);
-
-    let mut w: InlineVec<i32, 3> = InlineVec::new();
-    w.resize(10, 0);
-    assert_eq!(w.len(), 10);
-    assert_eq!(&*w, &[0, 0, 0]);
-    w.extend_from_slice(&[7, 7]);
-    assert_eq!(w.len(), 12);
-
-    // Shrinking back below the capacity restores a fully readable buffer.
-    w.resize(1, 0);
-    assert_eq!(&*w, &[0]);
-}
-
-/// A clone keeps both the stored prefix and the counted length.
-#[test]
-fn clone_preserves_counted_length() {
-    let mut v: InlineVec<u16, 2> = InlineVec::new();
+fn clone_copies_the_elements() {
+    let mut v: InlineVec<u16, 4> = InlineVec::new();
     v.extend_from_slice(&[5, 6, 7]);
-    let c = v.clone();
-    assert_eq!(c.len(), 3);
-    assert_eq!(&*c, &[5, 6]);
+    assert_eq!(&*v.clone(), &[5, 6, 7]);
 }
 
-/// `set_len` past the capacity would expose memory that does not exist.
+/// Appending past the capacity is a broken invariant and must stop at the
+/// buffer's edge rather than write beyond it.
+#[test]
+#[should_panic]
+fn push_past_capacity_panics() {
+    let mut v: InlineVec<u8, 2> = InlineVec::new();
+    v.extend_from_slice(&[1, 2]);
+    v.push(3);
+}
+
+#[test]
+#[should_panic]
+fn resize_past_capacity_panics() {
+    let mut v: InlineVec<i32, 3> = InlineVec::new();
+    v.resize(4, 0);
+}
+
 #[test]
 #[should_panic(expected = "past its capacity")]
 fn set_len_past_capacity_panics() {
