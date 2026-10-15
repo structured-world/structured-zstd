@@ -995,6 +995,39 @@ fn a_new_output_inherits_the_source_permissions() {
     );
 }
 
+/// The output of a regular file carries the file's modification time, both
+/// ways, as the reference command sets it (fileio.c:2140 and 3122,
+/// `UTIL_utime`): a round trip leaves the restored file dated as the original.
+#[test]
+fn an_output_keeps_the_source_modification_time() {
+    let scratch = Scratch::new("mtime");
+    let input = scratch.file("dated.txt", b"payload with a date");
+    let dated = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(946_677_600);
+    File::options()
+        .write(true)
+        .open(&input)
+        .unwrap()
+        .set_modified(dated)
+        .unwrap();
+    let mtime = |path: &Path| fs::metadata(path).unwrap().modified().unwrap();
+
+    let mut opts = parse(&["-3", "-q", "f"]).unwrap();
+    opts.inputs = vec![input.clone()];
+    process_file(&opts, &input, &mut no_dict(), 1).expect("compressing must succeed");
+    let archive = scratch.path().join("dated.txt.zst");
+    assert_eq!(mtime(&archive), dated, "the archive is dated as its source");
+
+    fs::remove_file(&input).unwrap();
+    let mut opts = parse(&["-d", "-q", "f"]).unwrap();
+    opts.inputs = vec![archive.clone()];
+    process_file(&opts, &archive, &mut no_dict(), 1).expect("decompressing must succeed");
+    assert_eq!(
+        mtime(&input),
+        dated,
+        "the restored file is dated as the archive"
+    );
+}
+
 /// A dictionary carries stretches of its corpus verbatim — that is what makes
 /// it a dictionary — so training on private samples and leaving the result at
 /// whatever the umask allows publishes fragments of them. It is the same rule

@@ -5365,6 +5365,16 @@ fn write_output_file_if<T>(
         let mut sink = temp_file;
         let value = fill(&mut sink)?;
         sink.flush().wrap_err("failed to flush output")?;
+        // The output of a regular file is dated as the file (upstream
+        // fileio.c:2140, 3122, `UTIL_utime`); stamped on the temporary, so the
+        // rename below carries it into place.
+        if let Some(metadata) = source.filter(|metadata| metadata.is_file()) {
+            let modified = metadata
+                .modified()
+                .wrap_err("failed to read the source's modification time")?;
+            sink.set_modified(modified)
+                .wrap_err("failed to apply the source's modification time to the output")?;
+        }
         Ok(value)
     })();
     let value = match result {
