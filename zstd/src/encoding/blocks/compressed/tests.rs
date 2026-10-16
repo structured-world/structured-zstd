@@ -565,6 +565,76 @@ fn retained_heap_size_counts_the_block_buffers() {
     );
 }
 
+/// The splitter's workspace survives the block that created it, so its count
+/// tables are retained allocation the context must report.
+#[test]
+fn retained_heap_size_counts_the_estimator_workspace() {
+    let mut scratch = super::CompressedBlockScratch::new();
+    let before = scratch.retained_heap_size();
+    scratch.estimator_workspace = Some(Default::default());
+    let tables =
+        core::mem::size_of::<[usize; 256]>() + 3 * core::mem::size_of::<SequenceHistogram>();
+    assert!(
+        scratch.retained_heap_size() - before >= tables,
+        "the estimator's {tables} bytes of count tables went unreported",
+    );
+}
+
+/// A block written raw is not confirmed: the tables the next block repeats stay
+/// those it started from, and a Huffman table it built is kept as a buffer
+/// rather than becoming the carried table.
+#[test]
+fn discarded_block_keeps_the_entry_tables() {
+    let mut state = CompressState {
+        matcher: super::EntropyOnlyMatcher,
+        copy_kernel: crate::encoding::fastpath::select_kernel(),
+        last_huff_table: Some(huff0_encoder::HuffmanTable::build_from_data(b"aaaabbc")),
+        huff_table_spare: None,
+        huff_weights: Default::default(),
+        seen_content: Default::default(),
+        fse_tables: FseTables::new(),
+        block_scratch: super::CompressedBlockScratch::new(),
+        workspace: Workspace::new(),
+        offset_hist: [1, 4, 8],
+        strategy_tag: StrategyTag::Fast,
+        pre_split: None,
+        huf_optimal_search: true,
+        literal_compression_disabled: false,
+        post_split_allowed: true,
+    };
+    let entry_codes = state
+        .last_huff_table
+        .as_ref()
+        .unwrap()
+        .packed_codes()
+        .to_vec();
+    let built = huff0_encoder::HuffmanTable::build_from_data(b"xyzzzzzzzzzz");
+    let built_codes = built.packed_codes().to_vec();
+    assert_ne!(entry_codes, built_codes);
+    super::discard_block_tables(
+        &mut state,
+        super::BlockTables {
+            fse: [
+                LastUsedTable::Default,
+                LastUsedTable::Rle(3),
+                LastUsedTable::Encoded,
+            ],
+            huff: super::HuffOutcome::New(built),
+        },
+    );
+    assert_eq!(
+        state.last_huff_table.as_ref().unwrap().packed_codes(),
+        entry_codes
+    );
+    assert_eq!(
+        state.huff_table_spare.as_ref().unwrap().packed_codes(),
+        built_codes
+    );
+    assert!(state.fse_tables.ll_previous.is_none());
+    assert!(state.fse_tables.ml_previous.is_none());
+    assert!(state.fse_tables.of_previous.is_none());
+}
+
 /// A buffer for `count` sequence codes, carved from `ws`, which must outlive it.
 fn code_buffer(ws: &mut Workspace, count: usize) -> RegionVec<u32> {
     // The block target stands for the trailing part's size in bytes.

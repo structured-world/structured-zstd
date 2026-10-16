@@ -3736,7 +3736,8 @@ impl RowMatchGenerator {
     /// Upstream zstd `ZSTD_hash4/5/6` of the `mls`-byte key at `base[idx..]`
     /// with `salt` XORed into the product, reduced to the top `bits`:
     /// `ZSTD_hashPtrSalted` for the row tables, `ZSTD_hashPtr` (salt 0) for
-    /// the hash chain.
+    /// the hash chain. The salt only spreads bucket indices between tables
+    /// and protects no secret, so a constant one is not a cryptographic value.
     ///
     /// # Safety
     /// `idx + ROW_HASH_KEY_LEN <= len` and `base` must point to `len` bytes.
