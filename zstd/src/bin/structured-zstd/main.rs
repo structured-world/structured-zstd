@@ -2131,17 +2131,26 @@ fn patch_window_log(source_size: u64) -> Result<u32> {
 
 /// Whether a `--patch-from` compression of `source_size` bytes against a
 /// `reference_size`-byte reference needs long-distance matching to reach the
-/// reference: when the file's window outgrows what the level's match finder
-/// cycles through, as the reference command decides it
-/// (`FIO_adjustParamsForPatchFromMode`, `fileWindowLog > ZSTD_cycleLog(chainLog,
-/// strategy)` on the level's parameters for those sizes, the binary-tree
-/// strategies cycling one log short of their chain).
-fn patch_needs_long_distance(level: i32, source_size: u64, reference_size: u64) -> bool {
+/// reference: when the file's window outgrows what the match finder cycles
+/// through, by the reference command's rule (`FIO_adjustParamsForPatchFromMode`,
+/// `fileWindowLog > ZSTD_cycleLog(chainLog, strategy)`, the binary-tree
+/// strategies cycling one log short of their chain). The chain and strategy
+/// are the ones the frame runs, the level's for those sizes under any
+/// `--zstd=` override; the reference command reads the bare level's and
+/// leaves an overridden short chain without long mode.
+fn patch_needs_long_distance(
+    level: i32,
+    advanced: &AdvancedParams,
+    source_size: u64,
+    reference_size: u64,
+) -> bool {
     let file_window_log = u64::BITS - source_size.max(1).leading_zeros();
     // A reference past the address space cannot have been read to get here.
     let reference_size = usize::try_from(reference_size).unwrap_or(usize::MAX);
     let params = LevelParameters::for_level(level, Some(source_size), reference_size);
-    let cycle_log = params.chain_log - u32::from(params.strategy >= Strategy::Btlazy2);
+    let chain_log = advanced.chain_log.unwrap_or(params.chain_log);
+    let strategy = advanced.strategy.unwrap_or(params.strategy);
+    let cycle_log = chain_log - u32::from(strategy >= Strategy::Btlazy2);
     file_window_log > cycle_log
 }
 
@@ -2742,7 +2751,7 @@ fn run_selected(mut opts: Options) -> Result<usize> {
             let reference_size = fs::metadata(reference)
                 .map_err(|err| eyre!("can't stat {} : {err}", reference.display()))?
                 .len();
-            if patch_needs_long_distance(opts.level, source_size, reference_size) {
+            if patch_needs_long_distance(opts.level, &opts.advanced, source_size, reference_size) {
                 if !opts.long {
                     display!(opts.verbosity, 2, "long mode automatically triggered");
                 }

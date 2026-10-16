@@ -2214,10 +2214,16 @@ fn long_finds_a_far_repeat_at_a_low_level() {
 /// log short of their chain).
 #[test]
 fn patch_from_needs_long_mode_where_the_matcher_cannot_cycle_the_input() {
+    let level_only = AdvancedParams::default();
     // Level 3 on 61 MiB against 60 MiB: dfast, chainLog 16, file window log 26.
-    assert!(patch_needs_long_distance(3, 61 << 20, 60 << 20));
+    assert!(patch_needs_long_distance(
+        3,
+        &level_only,
+        61 << 20,
+        60 << 20
+    ));
     // A small patch fits the chain the level already has.
-    assert!(!patch_needs_long_distance(3, 2000, 4000));
+    assert!(!patch_needs_long_distance(3, &level_only, 2000, 4000));
     // The binary tree cycles one log short: a file window equal to the chain
     // log is past it at btlazy2 (level 13), within it at lazy2 (level 12).
     let reference = 1u64 << 20;
@@ -2229,11 +2235,43 @@ fn patch_from_needs_long_mode_where_the_matcher_cannot_cycle_the_input() {
         assert_eq!(params.chain_log, chain_log, "level {level}: one size tier");
         assert_eq!(params.strategy >= Strategy::Btlazy2, binary_tree);
         assert_eq!(
-            patch_needs_long_distance(level, size, reference),
+            patch_needs_long_distance(level, &level_only, size, reference),
             binary_tree,
             "level {level}"
         );
     }
+}
+
+/// The rule reads the matcher that will run: a `--zstd=` chain or strategy
+/// override that leaves the reference out of the level's cycle turns long mode
+/// on, and one that brings it in keeps it off. The reference command reads the
+/// bare level and so writes a patch of literals for the first case.
+#[test]
+fn patch_from_long_mode_follows_the_overridden_matcher() {
+    let reference = 1u64 << 20;
+    let size = 4u64 << 20;
+    let params = LevelParameters::for_level(19, Some(size), reference as usize);
+    let file_window_log = u64::BITS - size.leading_zeros();
+    assert!(
+        params.chain_log > file_window_log,
+        "level 19 cycles the input by itself"
+    );
+    let level_only = AdvancedParams::default();
+    assert!(!patch_needs_long_distance(19, &level_only, size, reference));
+    let short_chain = AdvancedParams {
+        chain_log: Some(16),
+        ..AdvancedParams::default()
+    };
+    assert!(patch_needs_long_distance(19, &short_chain, size, reference));
+    // Level 1 runs fast with a short chain; a binary tree with a long one
+    // cycles the input.
+    assert!(patch_needs_long_distance(1, &level_only, size, reference));
+    let long_tree = AdvancedParams {
+        chain_log: Some(file_window_log + 1),
+        strategy: Some(Strategy::Btopt),
+        ..AdvancedParams::default()
+    };
+    assert!(!patch_needs_long_distance(1, &long_tree, size, reference));
 }
 
 /// The window log has a supported range; a value outside it has to fail rather
