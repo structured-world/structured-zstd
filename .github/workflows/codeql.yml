@@ -41,6 +41,12 @@ jobs:
           languages: ${{ matrix.language }}
           # Match Default setup without running contributor-controlled builds.
           build-mode: none
+          # The codec's hash salts are fixed mixing constants, not secrets, and
+          # nothing here is cryptographic, so this query only reports them.
+          config: |
+            query-filters:
+              - exclude:
+                  id: rust/hard-coded-cryptographic-value
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@f3c49fd1ef3281abc41069b3dd22807a60c963f6 # v4
         with:
