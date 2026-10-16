@@ -47,6 +47,7 @@ use super::opt::ldm::HcRawSeq;
 pub(crate) mod gear_hash;
 pub(crate) mod params;
 pub(crate) mod search;
+pub(crate) mod store;
 pub(crate) mod table;
 
 use gear_hash::{GearHashState, LDM_BATCH_SIZE};

@@ -321,6 +321,42 @@ fn ldm_finds_far_repeat_under_every_strategy() {
     }
 }
 
+/// The block splitter does not cut inside a long-distance match: a repeat of
+/// random data is one match per block, and a cut through it would only buy a
+/// block whose single sequence carries the same match on. Both frame loops
+/// ask, the one-shot one and the stream's.
+#[cfg(feature = "ldm")]
+#[test]
+fn ldm_matches_are_not_cut_by_the_block_splitter() {
+    use crate::encoding::StreamingEncoder;
+    use crate::io::Write;
+
+    let half = generate_data(0xC07_0569, 1 << 20);
+    let mut data = half.clone();
+    data.extend_from_slice(&half);
+    let params = CompressionParameters::builder(CompressionLevel::Level(3))
+        .window_log(22)
+        .enable_long_distance_matching(true)
+        .build()
+        .unwrap();
+    let one_shot = compress_with_parameters(&data, &params);
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(3));
+    encoder.set_parameters(&params).unwrap();
+    encoder.write_all(&data).unwrap();
+    let streamed = encoder.finish().unwrap();
+    for (path, frame) in [("one-shot", &one_shot), ("stream", &streamed)] {
+        // The first copy goes out raw; the second is eight blocks of one
+        // sequence each, where a cut at every splitter boundary would make it
+        // about a hundred.
+        assert!(
+            frame.len() < half.len() + 512,
+            "{path}: the repeat cost {} bytes",
+            frame.len() - half.len()
+        );
+        assert_eq!(decode(frame), data, "{path}: round-trip");
+    }
+}
+
 /// Long-distance matching reaches into a dictionary, under every strategy:
 /// the dictionary is indexed into its table when it is loaded (upstream
 /// `ZSTD_ldm_fillHashTable` from `ZSTD_loadDictionaryContent`), so a source

@@ -620,6 +620,16 @@ pub trait Matcher {
     fn matches_beyond_window_tables(&self) -> bool {
         false
     }
+    /// Where to cut the next block, given the cut the block splitter
+    /// proposes `cut` bytes into the `window` bytes of
+    /// [`uncommitted_input`](Self::uncommitted_input) it looked at. A matcher
+    /// that already knows a match crossing the cut moves it out of the match,
+    /// at most to `window`; cutting inside one only makes the next block
+    /// start by repeating it. Defaults to `cut`.
+    fn settle_block_cut(&mut self, window: usize, cut: usize) -> usize {
+        let _ = window;
+        cut
+    }
     /// Heap bytes this matcher's allocations hold (tables, history, scratch),
     /// excluding the inline struct itself. Lets a context report its true
     /// footprint via `ZSTD_sizeof_CCtx`. Defaults to `0` for custom matchers.

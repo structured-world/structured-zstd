@@ -4022,6 +4022,12 @@ impl RowMatchGenerator {
         self.dict_index_floor = floor;
     }
 
+    /// The committed window followed by the input read but not yet committed.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn window_with_pending(&self) -> &[u8] {
+        &self.history[self.history_start..]
+    }
+
     /// Hand the last committed block of `len` bytes back to the uncommitted
     /// input, undoing only the bookkeeping of [`Self::commit_block`]: what it
     /// evicted stays evicted, so committing the same bytes again in pieces

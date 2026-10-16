@@ -161,6 +161,10 @@ use super::hc::generator::HcMatchGenerator;
 // can reach the driver's private `primed` / `reset_shape` state directly; the
 // `Matcher` trait's dict entry points forward to its inherent `*_impl` helpers.
 mod dict_prime;
+// Long-distance matching: the search ahead of the blocks and the blocks
+// matched around its matches. A child module for the same private access.
+#[cfg(feature = "ldm")]
+mod long_distance;
 
 // `Strategy` and `StrategyTag` live in `crate::encoding::strategy`.
 // The driver carries a `StrategyTag` field set at `reset()` and
@@ -257,6 +261,17 @@ impl MatcherStorage {
             Self::Dfast(m) => m.live_history(),
             Self::Row(m) => m.live_history(),
             Self::HashChain(m) => m.table.live_history(),
+        }
+    }
+
+    /// The committed window followed by the input read but not committed.
+    #[cfg(feature = "ldm")]
+    fn window_with_pending(&self) -> &[u8] {
+        match self {
+            Self::Simple(m) => m.window_with_pending(),
+            Self::Dfast(m) => m.window_with_pending(),
+            Self::Row(m) => m.window_with_pending(),
+            Self::HashChain(m) => m.table.window_with_pending(),
         }
     }
 
@@ -450,9 +465,15 @@ pub struct MatchGeneratorDriver {
     /// `ldmState` beside the match state: every strategy reads the same one.
     #[cfg(feature = "ldm")]
     ldm: Option<super::ldm::LdmProducer>,
-    /// The long-distance sequences found for the block being matched.
+    /// The long-distance matches searched ahead of the blocks.
     #[cfg(feature = "ldm")]
-    ldm_sequences: Vec<super::opt::ldm::HcRawSeq>,
+    ldm_store: super::ldm::store::LdmSequenceStore,
+    /// What the last search found, before the store takes it.
+    #[cfg(feature = "ldm")]
+    ldm_found: Vec<super::opt::ldm::HcRawSeq>,
+    /// The long-distance sequences of the block being matched.
+    #[cfg(feature = "ldm")]
+    ldm_block: Vec<super::opt::ldm::HcRawSeq>,
     /// Stream position of the committed end, in the coordinates the
     /// long-distance matcher keeps its table in: the frame's first byte
     /// (its dictionary's, when it has one) is `0`.
@@ -748,7 +769,11 @@ impl MatchGeneratorDriver {
             #[cfg(feature = "ldm")]
             ldm: None,
             #[cfg(feature = "ldm")]
-            ldm_sequences: Vec::new(),
+            ldm_store: Default::default(),
+            #[cfg(feature = "ldm")]
+            ldm_found: Vec::new(),
+            #[cfg(feature = "ldm")]
+            ldm_block: Vec::new(),
             #[cfg(feature = "ldm")]
             ldm_committed_end: 0,
             #[cfg(feature = "ldm")]
@@ -1230,7 +1255,9 @@ impl Matcher for MatchGeneratorDriver {
         #[cfg(feature = "ldm")]
         let ldm = self.ldm.as_ref().map_or(0, |p| p.heap_size())
             + self.primed_ldm.as_ref().map_or(0, |p| p.heap_size())
-            + self.ldm_sequences.capacity() * core::mem::size_of::<super::opt::ldm::HcRawSeq>();
+            + self.ldm_store.heap_size()
+            + (self.ldm_found.capacity() + self.ldm_block.capacity())
+                * core::mem::size_of::<super::opt::ldm::HcRawSeq>();
         #[cfg(not(feature = "ldm"))]
         let ldm = 0;
         self.storage.heap_size() + snapshot + self.own_workspace.heap_bytes() + ldm
@@ -1982,6 +2009,16 @@ impl Matcher for MatchGeneratorDriver {
         false
     }
 
+    fn settle_block_cut(&mut self, window: usize, cut: usize) -> usize {
+        #[cfg(feature = "ldm")]
+        return self.settle_long_distance_cut(window, cut);
+        #[cfg(not(feature = "ldm"))]
+        {
+            let _ = window;
+            cut
+        }
+    }
+
     fn get_last_space(&mut self) -> &[u8] {
         // A block matched in pieces is still one block to the encoder.
         #[cfg(feature = "ldm")]
@@ -2124,14 +2161,11 @@ impl Matcher for MatchGeneratorDriver {
             // below it they are taken outright (upstream
             // `ZSTD_ldm_blockCompress`, `zstd_ldm.c:685-749`).
             if matches!(self.search, super::strategy::SearchMethod::BinaryTree) {
-                self.generate_long_distance_sequences();
+                self.take_long_distance_block();
                 let MatcherStorage::HashChain(hc) = &mut self.storage else {
                     unreachable!("the optimal parser runs on the hash-chain backend");
                 };
-                core::mem::swap(
-                    &mut self.ldm_sequences,
-                    &mut hc.backend.bt_mut().ldm_sequences,
-                );
+                core::mem::swap(&mut self.ldm_block, &mut hc.backend.bt_mut().ldm_sequences);
             } else if self.start_matching_long_distance(&mut handle_sequence) {
                 return;
             }
@@ -2168,6 +2202,13 @@ impl Matcher for MatchGeneratorDriver {
                     .skip_matching_borrowed(block_start, block_end, incompressible_hint),
             }
             return;
+        }
+        // A block written out unsearched is still searched for long matches,
+        // as upstream searches every block it compresses, and its matches are
+        // taken past.
+        #[cfg(feature = "ldm")]
+        if self.ldm.is_some() {
+            self.take_long_distance_block();
         }
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
@@ -2230,88 +2271,6 @@ impl MatchGeneratorDriver {
                 ),
             },
         }
-    }
-
-    /// Find the long-distance sequences of the last committed block into
-    /// [`Self::ldm_sequences`], and return the block's length.
-    ///
-    /// What a match may reach is fixed against the block's END, as upstream
-    /// enforces the distance once per chunk before generating
-    /// (`ZSTD_window_enforceMaxDist` on `chunkEnd`, `zstd_ldm.c:585`): one
-    /// window back from it, or the whole dictionary while the window has not
-    /// yet passed the dictionary's end. Every sequence then holds an offset
-    /// valid at its last byte, wherever in the block it lies.
-    #[cfg(feature = "ldm")]
-    fn generate_long_distance_sequences(&mut self) -> usize {
-        let block_len = self.storage.last_block_len();
-        self.ldm_sequences.clear();
-        let Some(producer) = self.ldm.as_mut() else {
-            return block_len;
-        };
-        let block_end = self.ldm_committed_end;
-        let window = self.reported_window_size;
-        let reach_floor = if self.ldm_dict_end != 0 && block_end <= window + self.ldm_dict_end {
-            0
-        } else {
-            block_end.saturating_sub(window)
-        };
-        let live = self.storage.committed_window();
-        let live_start = block_end - live.len();
-        let floor = reach_floor.max(live_start);
-        producer.generate_into(
-            &live[floor - live_start..],
-            floor,
-            block_end - block_len,
-            block_end,
-            &mut self.ldm_sequences,
-        );
-        block_len
-    }
-
-    /// Take the block's long-distance matches outright and match only the
-    /// literals between them with the frame's backend (upstream
-    /// `ZSTD_ldm_blockCompress` below btopt). The block is handed back to the
-    /// uncommitted input and committed again in pieces, so each gap is the
-    /// backend's whole block and each match body is indexed without being
-    /// searched. Returns `false` when the block has no long-distance match,
-    /// leaving it committed for the ordinary search.
-    #[cfg(feature = "ldm")]
-    fn start_matching_long_distance(&mut self, handle_sequence: &mut impl FnMut(Sequence)) -> bool {
-        let block_len = self.generate_long_distance_sequences();
-        if self.ldm_sequences.is_empty() {
-            return false;
-        }
-        let sequences = core::mem::take(&mut self.ldm_sequences);
-        self.storage.uncommit_block(block_len);
-        let mut consumed = 0usize;
-        for seq in &sequences {
-            // The gap's trailing literals become the long match's own.
-            let mut gap_literals = 0usize;
-            if seq.lit_length != 0 {
-                self.storage.commit_piece(seq.lit_length);
-                self.start_matching_owned(&mut |sequence| match sequence {
-                    Sequence::Literals { len } => gap_literals = len,
-                    triple => handle_sequence(triple),
-                });
-            }
-            self.storage.commit_piece(seq.match_length);
-            self.storage.skip_long_match();
-            handle_sequence(Sequence::Triple {
-                literal_len: gap_literals,
-                offset: seq.offset,
-                match_len: seq.match_length,
-            });
-            self.storage.note_long_match(seq.offset, gap_literals);
-            consumed += seq.lit_length + seq.match_length;
-        }
-        let tail = block_len - consumed;
-        if tail != 0 {
-            self.storage.commit_piece(tail);
-            self.start_matching_owned(handle_sequence);
-        }
-        self.ldm_sequences = sequences;
-        self.ldm_split_block = Some(block_len);
-        true
     }
 }
 

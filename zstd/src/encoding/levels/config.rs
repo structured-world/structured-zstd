@@ -256,6 +256,22 @@ impl LevelParams {
         };
         (hash_log + 3).max(chain_log + 1).min(31) as u32
     }
+
+    /// The level's upstream `cParams.minMatch`: the shortest match its search
+    /// accepts, and so the shortest piece of a long-distance match a block cut
+    /// leaves worth keeping (`maybeSplitSequence`, `zstd_ldm.c:644`).
+    #[cfg(feature = "ldm")]
+    pub(crate) fn min_match(&self) -> usize {
+        use crate::encoding::strategy::SearchMethod;
+        let configured = match self.search {
+            SearchMethod::Fast => self.fast.map(|fast| fast.mls as usize),
+            SearchMethod::DoubleFast => Some(crate::encoding::match_generator::DFAST_MIN_MATCH_LEN),
+            SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => self.row.map(|row| row.mls),
+            SearchMethod::HashChain => Some(crate::encoding::hc::HC_MIN_MATCH_LEN),
+            SearchMethod::BinaryTree => self.hc.map(|hc| hc.search_mls),
+        };
+        configured.unwrap_or(crate::encoding::cost_model::HC_FORMAT_MINMATCH)
+    }
 }
 
 /// The pre-splitter level for an effective strategy (the tag plus, for the

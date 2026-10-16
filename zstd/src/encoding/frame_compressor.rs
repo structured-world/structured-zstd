@@ -2741,6 +2741,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     block_capacity,
                     savings,
                 );
+                // The splitter sees byte statistics only; a cut it proposes
+                // inside a match the matcher already knows of is moved out.
+                let split_at = if split_at < available {
+                    self.state.matcher.settle_block_cut(available, split_at)
+                } else {
+                    split_at
+                };
                 if split_at < available {
                     block_len = split_at;
                     last_block = false;
