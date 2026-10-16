@@ -613,6 +613,13 @@ pub trait Matcher {
     fn block_samples_match_dict(&self, _block: &[u8]) -> bool {
         false
     }
+    /// Whether this matcher finds matches beyond what its regular tables
+    /// reach (long-distance matching). A block that looks incompressible can
+    /// then still be a repeat from far back, so the encoder searches every
+    /// block instead of writing one off on a sample. Defaults to `false`.
+    fn matches_beyond_window_tables(&self) -> bool {
+        false
+    }
     /// Heap bytes this matcher's allocations hold (tables, history, scratch),
     /// excluding the inline struct itself. Lets a context report its true
     /// footprint via `ZSTD_sizeof_CCtx`. Defaults to `0` for custom matchers.

@@ -2401,6 +2401,48 @@ impl MatchTable {
         self.next_to_update3 = self.next_to_update3.max(committed_end);
     }
 
+    /// Hand the last committed block of `len` bytes back to the uncommitted
+    /// input, undoing only the bookkeeping of [`Self::commit_block`]: what it
+    /// evicted stays evicted, so committing the same bytes again in pieces
+    /// evicts nothing more.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn uncommit_block(&mut self, len: usize) {
+        assert_eq!(self.chunk_lens.pop_back(), Some(len));
+        self.window_size -= len;
+        self.uncommitted_len += len;
+    }
+
+    /// Index the last committed block as the body of a long-distance match on
+    /// the lazy chain: only its tail, which is what upstream's lazy search
+    /// catches up on after one (`ZSTD_ldm_limitTableUpdate` moves
+    /// `nextToUpdate` to it), since the match itself is never searched.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn skip_long_match(&mut self) {
+        debug_assert!(
+            !self.uses_bt,
+            "the optimal parser takes LDM matches as candidates"
+        );
+        self.ensure_tables();
+        let (start, len) = self.current_block_range();
+        let end = start + len;
+        self.backfill_boundary_positions(start, end);
+        self.insert_positions(
+            end - len.min(crate::encoding::ldm::LONG_MATCH_INDEXED_TAIL),
+            end,
+        );
+    }
+
+    /// Carry a long-distance match the driver emitted into the repeat
+    /// offsets, as the encoder will code it.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn note_long_match(&mut self, offset: usize, literal_len: usize) {
+        let _ = crate::encoding::blocks::encode_offset_with_history(
+            offset as u32,
+            literal_len as u32,
+            &mut self.offset_hist,
+        );
+    }
+
     pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
         self.ensure_tables();
         let (current_abs_start, current_len) = self.current_block_range();

@@ -4012,6 +4012,42 @@ impl RowMatchGenerator {
         crate::encoding::fastpath::scalar::common_prefix_len_ptr
     );
 
+    /// Hand the last committed block of `len` bytes back to the uncommitted
+    /// input, undoing only the bookkeeping of [`Self::commit_block`]: what it
+    /// evicted stays evicted, so committing the same bytes again in pieces
+    /// evicts nothing more.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn uncommit_block(&mut self, len: usize) {
+        assert_eq!(self.chunk_lens.pop_back(), Some(len));
+        self.window_size -= len;
+        self.uncommitted_len += len;
+    }
+
+    /// Take the last committed block as the body of a long-distance match:
+    /// nothing in it is indexed now, and the next block resumes indexing its
+    /// tail, as upstream's `ZSTD_ldm_limitTableUpdate` leaves `nextToUpdate`.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn skip_long_match(&mut self) {
+        let (start, len) = self.current_block_range();
+        self.skip_matching_with_hint(None);
+        let end = start + len;
+        self.lazy_next_to_update = end - len.min(crate::encoding::ldm::LONG_MATCH_INDEXED_TAIL);
+    }
+
+    /// Carry a long-distance match the driver emitted into the repeat offsets:
+    /// the lazy parse's carried pair takes it as the newest (upstream
+    /// `ZSTD_ldm_blockCompress` shifts `rep`), the encoder-side history as the
+    /// encoder will code it.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn note_long_match(&mut self, offset: usize, literal_len: usize) {
+        let newest = self
+            .lazy_reps
+            .map_or(self.offset_hist[0] as usize, |reps| reps[0]);
+        self.lazy_reps = Some([offset, newest]);
+        let _ =
+            encode_offset_with_history(offset as u32, literal_len as u32, &mut self.offset_hist);
+    }
+
     pub(crate) fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
         match self.row_log {
             4 => self.skip_matching_with_hint_rl::<4>(incompressible_hint),

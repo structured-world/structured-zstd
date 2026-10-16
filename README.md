@@ -99,9 +99,9 @@ does, with the window stopped at 30 (the widest this build writes), and
 upstream's layout.
 `--target-compressed-block-size` does take effect: it bounds what goes into a
 block, so blocks flush sooner. `--long` means `--long=27`, as upstream
-documents. It needs level 16 or above, where long-distance matching actually
-runs — below that it is refused rather than accepted as a wider window and
-nothing else. A window is never declared larger than the source can fill, so a
+documents, and runs long-distance matching at every level. `--patch-from`
+turns it on itself when the input outgrows what the level's match finder
+reaches, by upstream's rule. A window is never declared larger than the source can fill, so a
 small file compressed with `--long` does not ask its decoders to reserve
 128 MiB. Decoding takes windows up to 128 MiB by default; a wider frame (from
 `--long=28` and up) is refused with upstream's message, and decodes with

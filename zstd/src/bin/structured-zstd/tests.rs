@@ -2139,33 +2139,101 @@ fn an_explicit_window_is_capped_by_a_known_source_size() {
     );
 }
 
-/// Long-distance matching lives on the optimal parser here, so the levels below
-/// it can widen the window and still never run the matcher the flag names.
-/// Taking `--long` at those levels would report success for work that did not
-/// happen, and hand back a file compressed the ordinary way.
+/// `--long` runs long-distance matching at every level, as upstream's does: its
+/// own tests compress with `--long` at levels 1 and 3 (`tests/playTests.sh`).
 #[test]
-fn long_is_refused_at_levels_that_cannot_run_it() {
-    assert!(parse(&["-3", "--long", "in.txt"]).is_err());
-    assert!(parse(&["--long", "-15", "in.txt"]).is_err());
-    // From the optimal parser up, the matcher is there to run.
-    assert!(parse(&["-16", "--long", "in.txt"]).is_ok());
+fn long_is_taken_at_every_level() {
+    for level in 1..=19 {
+        let flag = format!("-{level}");
+        assert!(
+            parse(&[&flag, "--long", "in.txt"]).unwrap().long,
+            "level {level}"
+        );
+    }
+    assert!(parse(&["--fast=3", "--long", "in.txt"]).unwrap().long);
     assert!(parse(&["--ultra", "-22", "--long=27", "in.txt"]).is_ok());
-    // Decompression takes the flag as the window hint it is; nothing to run.
     assert!(parse(&["-d", "--long", "in.txt.zst"]).is_ok());
-    // Benchmarking compresses the levels `-b`/`-e` name, not the one `-N` set,
-    // so those are the levels the flag has to be true of.
-    assert!(parse(&["-b16", "--long", "in.txt"]).is_ok());
-    assert!(parse(&["-b16", "-e19", "--long", "in.txt"]).is_ok());
-    assert!(parse(&["-b3", "--long", "in.txt"]).is_err());
-    // The whole range runs with the flag, so a range that starts below the
-    // matcher is refused even when it ends above it.
-    assert!(parse(&["-b3", "-e19", "--long", "in.txt"]).is_err());
-    // And a benchmark range is what counts, not a level that was also typed.
-    assert!(parse(&["-16", "-b3", "--long", "in.txt"]).is_err());
-    // Benchmarking compresses whatever mode was asked for, so `-d` does not
-    // excuse the flag from naming levels that can run it.
-    assert!(parse(&["-d", "-b3", "--long", "in.txt"]).is_err());
-    assert!(parse(&["-d", "-b16", "--long", "in.txt"]).is_ok());
+    assert!(parse(&["-b3", "-e19", "--long", "in.txt"]).is_ok());
+    assert!(parse(&["-3", "--long", "--zstd=strat=6", "in.txt"]).is_ok());
+}
+
+/// Past the window a level keeps, `--long` is what finds a repeat: a copy laid
+/// out in shuffled pieces up to 4 MiB behind, beyond level 3's 2 MiB window,
+/// costs next to nothing with the flag and nearly its whole size without it.
+#[test]
+fn long_finds_a_far_repeat_at_a_low_level() {
+    const PIECE: usize = 4096;
+    let mut state = 0x5EED_0569u64;
+    // Six-bit symbols: compressible enough that no block is written off, and
+    // short local matches stay rare.
+    let half: Vec<u8> = (0..4 << 20)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) & 63) as u8
+        })
+        .collect();
+    let pieces = half.len() / PIECE;
+    let mut data = half.clone();
+    for i in 0..pieces {
+        let piece = (i * 37) % pieces;
+        data.extend_from_slice(&half[piece * PIECE..(piece + 1) * PIECE]);
+    }
+    let compress = |long: bool| {
+        let mut frame = Vec::new();
+        compress_stream(
+            data.as_slice(),
+            &mut frame,
+            &FrameSettings {
+                level: 3,
+                long,
+                long_window_log: long.then_some(DEFAULT_LONG_WINDOW_LOG),
+                ..FrameSettings::default()
+            },
+            &mut no_dict(),
+        )
+        .expect("compressing succeeds");
+        frame
+    };
+    let without = compress(false);
+    let with = compress(true);
+    assert!(
+        with.len() * 3 < without.len() * 2,
+        "--long at level 3: {} bytes against {} without it",
+        with.len(),
+        without.len()
+    );
+    assert_eq!(decoded(&with).unwrap(), data);
+}
+
+/// `--patch-from` turns long mode on itself when the input outgrows what the
+/// level's match finder cycles through, by upstream's rule
+/// (`FIO_adjustParamsForPatchFromMode`: `fileWindowLog >
+/// ZSTD_cycleLog(chainLog, strategy)`, the binary-tree strategies cycling one
+/// log short of their chain).
+#[test]
+fn patch_from_needs_long_mode_where_the_matcher_cannot_cycle_the_input() {
+    // Level 3 on 61 MiB against 60 MiB: dfast, chainLog 16, file window log 26.
+    assert!(patch_needs_long_distance(3, 61 << 20, 60 << 20));
+    // A small patch fits the chain the level already has.
+    assert!(!patch_needs_long_distance(3, 2000, 4000));
+    // The binary tree cycles one log short: a file window equal to the chain
+    // log is past it at btlazy2 (level 13), within it at lazy2 (level 12).
+    let reference = 1u64 << 20;
+    for (level, binary_tree) in [(12, false), (13, true)] {
+        let chain_log =
+            LevelParameters::for_level(level, Some(1 << 30), reference as usize).chain_log;
+        let size = 1u64 << (chain_log - 1);
+        let params = LevelParameters::for_level(level, Some(size), reference as usize);
+        assert_eq!(params.chain_log, chain_log, "level {level}: one size tier");
+        assert_eq!(params.strategy >= Strategy::Btlazy2, binary_tree);
+        assert_eq!(
+            patch_needs_long_distance(level, size, reference),
+            binary_tree,
+            "level {level}"
+        );
+    }
 }
 
 /// The window log has a supported range; a value outside it has to fail rather
@@ -6152,16 +6220,6 @@ fn max_is_refused_on_a_32_bit_target() {
         panic!("--max must be refused on a 32-bit target");
     };
     assert!(err.to_string().contains("32-bit"), "{err}");
-}
-
-/// `--long` below level 16 is refused because the matcher does not run there,
-/// unless `--zstd=strat=` moves the level onto a parser where it does.
-#[test]
-fn a_strategy_override_onto_the_optimal_parser_admits_long() {
-    assert!(parse(&["-3", "--long", "f"]).is_err());
-    assert!(parse(&["-3", "--long", "--zstd=strat=7", "f"]).is_ok());
-    assert!(parse(&["-3", "--long", "--zstd=strat=9", "f"]).is_ok());
-    assert!(parse(&["-3", "--long", "--zstd=strat=6", "f"]).is_err());
 }
 
 /// `--[no-]compress-literals` decides whether literal sections are

@@ -902,6 +902,38 @@ impl DfastMatchGenerator {
         self.insert_positions(current_abs_start, current_abs_end);
     }
 
+    /// Hand the last committed block of `len` bytes back to the uncommitted
+    /// input, undoing only the bookkeeping of [`Self::commit_block`]: what it
+    /// evicted stays evicted, so committing the same bytes again in pieces
+    /// evicts nothing more.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn uncommit_block(&mut self, len: usize) {
+        assert_eq!(self.window_blocks.pop_back(), Some(len));
+        self.window_size -= len;
+        self.uncommitted_len += len;
+    }
+
+    /// Index the last committed block as the body of a long-distance match:
+    /// only its tail, as upstream fills the fast tables after one
+    /// (`ZSTD_ldm_limitTableUpdate` + `ZSTD_ldm_fillFastTables`), since the
+    /// match itself is never searched.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn skip_long_match(&mut self) {
+        self.ensure_hash_tables();
+        let current_len = self.window_blocks.back().copied().unwrap_or(0);
+        let end = self.history_abs_start + self.window_size;
+        let from = end - current_len.min(crate::encoding::ldm::LONG_MATCH_INDEXED_TAIL);
+        self.insert_positions(from, end);
+    }
+
+    /// Carry a long-distance match the driver emitted into the repeat
+    /// offsets, as the encoder will code it.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn note_long_match(&mut self, offset: usize, literal_len: usize) {
+        let _ =
+            encode_offset_with_history(offset as u32, literal_len as u32, &mut self.offset_hist);
+    }
+
     /// Upstream zstd `ZSTD_dictMatchState` attach (dfast): hash the dictionary block at
     /// the front of history into the SEPARATE immutable [`Self::dict`] tables
     /// (long+short), once, instead of re-priming the live tables every frame

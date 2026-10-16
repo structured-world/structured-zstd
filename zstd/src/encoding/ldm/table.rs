@@ -91,7 +91,6 @@ const REBASE_GUARD_BAND: u32 = 1u32 << 30;
 /// [`LdmHashTable::insert_absolute`] / [`LdmHashTable::resolve`]
 /// helpers so absolute-position support extends past `u32::MAX`
 /// transparently — same pattern as `MatchTable`'s chain rebase.
-#[derive(Clone)]
 pub(crate) struct LdmHashTable {
     entries: Vec<LdmEntry>,
     bucket_offsets: Vec<u8>,
@@ -108,6 +107,29 @@ pub(crate) struct LdmHashTable {
     /// store a position beyond the `u32` window — upstream zstd
     /// `ZSTD_ldm_reduceTable` (`zstd_ldm.c:520`).
     position_base: usize,
+}
+
+impl Clone for LdmHashTable {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            bucket_offsets: self.bucket_offsets.clone(),
+            effective_bucket_log: self.effective_bucket_log,
+            bucket_mask: self.bucket_mask,
+            position_base: self.position_base,
+        }
+    }
+
+    /// Into the buffers already held: a restored dictionary snapshot copies
+    /// the table every frame, and allocating it again each time would cost
+    /// more than the copy.
+    fn clone_from(&mut self, source: &Self) {
+        self.entries.clone_from(&source.entries);
+        self.bucket_offsets.clone_from(&source.bucket_offsets);
+        self.effective_bucket_log = source.effective_bucket_log;
+        self.bucket_mask = source.bucket_mask;
+        self.position_base = source.position_base;
+    }
 }
 
 impl LdmHashTable {
@@ -288,6 +310,7 @@ impl LdmHashTable {
     /// Absolute stream position that corresponds to the +1
     /// relative-offset bias — i.e. an entry with `offset == 1`
     /// refers to absolute byte `position_base`.
+    #[cfg(test)]
     pub(crate) const fn position_base(&self) -> usize {
         self.position_base
     }

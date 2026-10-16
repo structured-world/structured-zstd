@@ -40,9 +40,9 @@
 //! never enables LDM — even at level 22. It is activated either by
 //! [`CompressionParametersBuilder::enable_long_distance_matching`] or by any of
 //! the `ldm_*` setters, which each imply `enable_long_distance_matching(true)`.
-//! When enabled, the LDM producer attaches to the optimal (`btopt` / `btultra`
-//! / `btultra2`) match-finder; pair it with an optimal [`Strategy`] (or a level
-//! ≥ 16) for it to take effect.
+//! It works under every [`Strategy`]: the optimal parsers weigh its matches as
+//! candidates, the others take them outright and search only the bytes between
+//! them, as upstream does. A dictionary loaded under it is indexed for it too.
 
 use crate::encoding::CompressionLevel;
 

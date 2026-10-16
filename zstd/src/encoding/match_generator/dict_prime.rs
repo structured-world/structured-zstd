@@ -101,6 +101,8 @@ impl MatchGeneratorDriver {
         if dict_content.is_empty() {
             return;
         }
+        #[cfg(feature = "ldm")]
+        let ldm_dict_start = self.ldm_committed_end;
 
         // Dictionary bytes should stay addressable until produced frame output
         // itself exceeds the live window size. We bump `max_window_size`
@@ -214,6 +216,24 @@ impl MatchGeneratorDriver {
             self.skip_matching_for_dictionary_priming(dict_content.len());
             committed_dict_budget += end - start;
             start = end;
+        }
+        // The long-distance matcher indexes the dictionary as upstream does when
+        // it loads one (`ZSTD_ldm_fillHashTable` from
+        // `ZSTD_loadDictionaryContent`), so a frame can reach it from as far as
+        // the window allows.
+        #[cfg(feature = "ldm")]
+        {
+            self.ldm_dict_end = self.ldm_committed_end;
+            if let Some(producer) = self.ldm.as_mut() {
+                let window = self.storage.committed_window();
+                let window_start = self.ldm_committed_end - window.len();
+                producer.fill_table(
+                    window,
+                    window_start,
+                    ldm_dict_start.max(window_start),
+                    self.ldm_committed_end,
+                );
+            }
         }
 
         // Derive `granted_retained_budget` directly from the two real
@@ -395,20 +415,12 @@ impl MatchGeneratorDriver {
                 if tree_in_snapshot {
                     tables.clone_from(&snapshot_tables);
                 }
-                // The snapshot does not retain the LDM producer (it holds no
-                // dict state; see `capture_primed_dictionary`). Carry over the
-                // frame's freshly-reset producer, built this frame by `reset`
-                // with the same params the snapshot key pins.
-                #[cfg(feature = "ldm")]
-                let fresh_ldm = live.take_ldm_producer();
                 *live = snap.clone();
                 live.table.tables = tables;
                 live.table.history = history;
                 if !tree_in_snapshot {
                     live.table.ensure_tables();
                 }
-                #[cfg(feature = "ldm")]
-                live.set_ldm_producer(fresh_ldm);
                 snap.table.tables = snapshot_tables;
                 snap.table.history = snapshot_history;
             }
@@ -419,6 +431,16 @@ impl MatchGeneratorDriver {
             }
         }
         self.dictionary_retained_budget = budget;
+        // The restored window is the dictionary, the frame's first bytes, and
+        // the long-distance matcher's table holds it as priming left it.
+        #[cfg(feature = "ldm")]
+        {
+            self.ldm_committed_end = self.storage.committed_window().len();
+            self.ldm_dict_end = self.ldm_committed_end;
+            if let (Some(live), Some(snapshot)) = (self.ldm.as_mut(), self.primed_ldm.as_ref()) {
+                live.clone_from(snapshot);
+            }
+        }
         true
     }
 
@@ -436,6 +458,13 @@ impl MatchGeneratorDriver {
             fast_tagged,
             ldm,
         };
+        // The key pins the parameters, so a restore copies into a table of the
+        // same shape.
+        #[cfg(feature = "ldm")]
+        match (self.primed_ldm.as_mut(), self.ldm.as_ref()) {
+            (Some(snapshot), Some(live)) => snapshot.clone_from(live),
+            (_, live) => self.primed_ldm = live.cloned(),
+        }
         // CDict-equivalent retained state. A binary-tree level in ATTACH mode
         // decouples the dictionary into `dms` (the upstream zstd `dictMatchState`); its
         // live hash / chain / hash3 tables carry NO dict entries
@@ -468,24 +497,15 @@ impl MatchGeneratorDriver {
             let tables = core::mem::take(&mut hc.table.tables);
             let chain_off = core::mem::take(&mut hc.table.chain_off);
             let hash3_off = core::mem::take(&mut hc.table.hash3_off);
-            // The LDM producer carries no dictionary state (LDM is not
-            // dict-primed; its hash table is empty at capture), so it is not
-            // retained either — `restore` reinstates the frame's freshly-reset
-            // producer. Take it out so the clone does not duplicate its table.
-            #[cfg(feature = "ldm")]
-            let ldm_producer = hc.take_ldm_producer();
-            // Clone the dict-state-only storage (live tables now empty Vecs,
-            // LDM producer detached).
+            // Clone the dict-state-only storage (live tables now empty Vecs).
             let snapshot = self.storage.clone();
-            // Move the live tables (and LDM producer) back into the working storage.
+            // Move the live tables back into the working storage.
             let MatcherStorage::HashChain(hc) = &mut self.storage else {
                 unreachable!("storage variant is stable across the take/put");
             };
             hc.table.tables = tables;
             hc.table.chain_off = chain_off;
             hc.table.hash3_off = hash3_off;
-            #[cfg(feature = "ldm")]
-            hc.set_ldm_producer(ldm_producer);
             self.primed = Some((snapshot, self.dictionary_retained_budget, key));
         } else {
             self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, key));
@@ -494,6 +514,7 @@ impl MatchGeneratorDriver {
 
     pub(super) fn invalidate_primed_dictionary_impl(&mut self) {
         self.primed = None;
+        self.primed_ldm = Default::default();
         // Drop the Fast-backend CDict-equivalent table cache too: it is keyed
         // to the dictionary being removed / replaced. Left in place, the next
         // same-params `reset` would retain it and the kernel would probe a

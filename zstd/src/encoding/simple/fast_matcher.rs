@@ -1653,6 +1653,49 @@ impl FastKernelMatcher {
         }
     }
 
+    /// The committed window, oldest byte first.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn committed_window(&self) -> &[u8] {
+        self.history_bytes()
+    }
+
+    /// Hand the staged block of `len` bytes back to the uncommitted input,
+    /// undoing only the bookkeeping of [`Self::commit_block`]: what it evicted
+    /// stays evicted, so committing the same bytes again in pieces evicts
+    /// nothing more.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn uncommit_block(&mut self, len: usize) {
+        assert_eq!(self.staged_block.take(), Some(len));
+        self.uncommitted_len += len;
+    }
+
+    /// Index the staged block as the body of a long-distance match: only its
+    /// tail, the way upstream fills the fast table after one
+    /// (`ZSTD_ldm_limitTableUpdate` + `ZSTD_fillHashTable`, every third
+    /// position), since the match itself is never searched.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn skip_long_match(&mut self) {
+        const FILL_STEP: usize = 3;
+        let block_start = self.take_staged_block();
+        let end = self.committed_len();
+        let from = end - (end - block_start).min(crate::encoding::ldm::LONG_MATCH_INDEXED_TAIL);
+        self.prime_hash_table_for_range_stepped(from, FILL_STEP);
+    }
+
+    /// Carry a long-distance match the driver emitted into the repeat
+    /// offsets: the kernel's pair shifts it in as the newest (upstream
+    /// `ZSTD_ldm_blockCompress`), the encoder-side history takes it as the
+    /// encoder will code it.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn note_long_match(&mut self, offset: usize, literal_len: usize) {
+        self.rep = [offset as u32, self.rep[0]];
+        let _ = crate::encoding::blocks::encode_offset_with_history(
+            offset as u32,
+            literal_len as u32,
+            &mut self.offset_hist,
+        );
+    }
+
     /// Commit one slice of a COPY-mode dictionary: append it to history, index
     /// it into the LIVE table with upstream's dictionary fill, and carry the
     /// dictionary boundary.

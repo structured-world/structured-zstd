@@ -15,32 +15,19 @@
 //!    `strategy` (`ZSTD_ldm_adjustParameters` parity).
 //!
 //! Aggregate [`LdmProducer`] holds the rolling-hash state, the
-//! bucket table, and the per-call scratch buffers. The downstream
-//! consumer (`bt::ldm_sequences`) was plumbed during Phase 1
-//! (#119) — Phase 5 swaps the `prepare_ldm_candidates` no-op stub
-//! for a real producer that fills that buffer.
+//! bucket table, and the per-call scratch buffers. The match driver owns
+//! one per frame, as upstream keeps `ldmState` in the context: the optimal
+//! parser takes its sequences as candidates, every other strategy takes them
+//! outright and searches only the literals between them
+//! (`ZSTD_ldm_blockCompress`).
 //!
-//! # Activation policy (distro-grade parity)
+//! # Activation policy
 //!
-//! `LdmProducer` is **never activated automatically by a
-//! [`super::CompressionLevel`] preset.** This mirrors upstream
-//! `libzstd.so.1` behaviour: `ZSTD_compress(..., level)` keeps
-//! LDM off at every standard level (1..22). Activation is an
-//! explicit user opt-in:
-//!
-//! * upstream — `ZSTD_CCtx_setParameter(cctx,
-//!   ZSTD_c_enableLongDistanceMatching, ZSTD_ps_enable)`;
-//! * `zstd` CLI — `zstd --long[=N]`;
-//! * Rust port (this crate) — the Phase-5 surface ships an
-//!   `ldm_producer: Option<LdmProducer>` field on `BtMatcher` that
-//!   stays `None` by default. The forthcoming parameter-API issue
-//!   (#27) plugs into that field; the C ABI work in #126 / #127
-//!   wires `ZSTD_c_enableLongDistanceMatching` through the same
-//!   surface.
-//!
-//! Therefore the `level22_sequences_match_upstream zstd_on_corpus_proxy`
-//! ratio gate continues to compare two LDM-OFF outputs (ours vs
-//! upstream `ZSTD_compress(..., 22)`) — byte-parity invariant.
+//! No [`super::CompressionLevel`] preset turns it on, as upstream
+//! `ZSTD_compress(..., level)` keeps LDM off at every level. It is an
+//! explicit opt-in: the parameter API
+//! (`enable_long_distance_matching`), `ZSTD_c_enableLongDistanceMatching`
+//! through the C ABI, and `zstd --long[=N]`.
 //!
 //! Upstream zstd parity anchors:
 //! * `lib/compress/zstd_ldm.c` v1.5.7
@@ -48,19 +35,6 @@
 //! * `lib/compress/zstd_ldm_geartab.h` — the 256 × `u64` permutation
 //!   table reproduced verbatim in [`gear_hash::GEAR_TAB`] to preserve
 //!   byte-for-byte split-point compatibility.
-
-// Phase 5 of #111 ships the full LDM producer (gear hash + params
-// + bucket table + verify/extend search + aggregate driver) in
-// two commits. By distro-parity design (see the module docs
-// above), no `CompressionLevel` preset activates the producer —
-// `BtMatcher::ldm_producer` stays `None` until #27 (Rust
-// parameter API) or #126/#127 (C ABI) plug the user opt-in.
-// Several `pub(crate)` accessors (`LDM_HASHLOG_MIN/MAX`,
-// `params::bounded`, `bucket_mask`) are therefore reachable only
-// via the unit test suite until the parameter API lands; the
-// `#![allow(dead_code)]` matches the same transitional marker in
-// `bt/mod.rs` introduced during Phase 1.
-#![allow(dead_code)]
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -84,6 +58,12 @@ use table::LdmHashTable;
 /// (`zstd_ldm.c:315`: `XXH64(split, minMatchLength, 0)`).
 const LDM_XXH64_SEED: u64 = 0;
 
+/// How much of a long-distance match's body the strategy's own tables index:
+/// the match is taken without being searched, and upstream catches its tables
+/// up on no more than this much of it (`ZSTD_ldm_limitTableUpdate`,
+/// `zstd_ldm.c:335`, brings `nextToUpdate` to within 512 of the match end).
+pub(crate) const LONG_MATCH_INDEXED_TAIL: usize = 512;
+
 /// LDM sequence producer — owns the rolling-hash state, bucket
 /// table, and scratch buffers needed to scan an input block and
 /// emit a stream of [`HcRawSeq`] candidates consumed by the
@@ -95,7 +75,6 @@ const LDM_XXH64_SEED: u64 = 0;
 /// [`Self::clear`] only when starting a new frame (so the
 /// long-range history accumulated across blocks is preserved
 /// within a frame, mirroring upstream zstd's `ldmState_t` lifecycle).
-#[derive(Clone)]
 pub(crate) struct LdmProducer {
     /// Parameter set this producer was built with. Used by the
     /// split walker (next commit) to honour `min_match_length` /
@@ -110,6 +89,26 @@ pub(crate) struct LdmProducer {
     /// entries per upstream zstd pre-condition). Kept in the producer so
     /// hot calls don't re-allocate.
     splits_scratch: Vec<usize>,
+}
+
+impl Clone for LdmProducer {
+    fn clone(&self) -> Self {
+        Self {
+            params: self.params,
+            hash_state: self.hash_state,
+            hash_table: self.hash_table.clone(),
+            splits_scratch: self.splits_scratch.clone(),
+        }
+    }
+
+    /// Into the table already held (see [`LdmHashTable`]'s `clone_from`); the
+    /// split scratch is per call, so its contents are not carried.
+    fn clone_from(&mut self, source: &Self) {
+        self.params = source.params;
+        self.hash_state = source.hash_state;
+        self.hash_table.clone_from(&source.hash_table);
+        self.splits_scratch.resize(source.splits_scratch.len(), 0);
+    }
 }
 
 impl LdmProducer {
@@ -132,12 +131,6 @@ impl LdmProducer {
         }
     }
 
-    /// Re-derive parameters from a `(window_log, strategy)` pair
-    /// using [`LdmParams::adjust_for`]. Convenience wrapper.
-    pub(crate) fn with_window_and_strategy(window_log: u32, strategy: u32) -> Self {
-        Self::new(LdmParams::adjust_for(window_log, strategy))
-    }
-
     /// Heap bytes this producer owns: the LDM hash table and the split-scratch.
     pub(crate) fn heap_size(&self) -> usize {
         self.hash_table.heap_size() + self.splits_scratch.capacity() * core::mem::size_of::<usize>()
@@ -151,6 +144,51 @@ impl LdmProducer {
             self.params.min_match_length as usize,
             self.params.hash_rate_log,
         );
+    }
+
+    /// Index `[start_abs, end_abs)` of `live_history` (whose first byte sits
+    /// at `history_abs_start`) without searching it: a dictionary loaded under
+    /// long-distance matching (upstream zstd `ZSTD_ldm_fillHashTable`,
+    /// `zstd_ldm.c:289-327`). Leaves the rolling hash for the next
+    /// [`Self::generate_into`], which re-seeds it anyway.
+    pub(crate) fn fill_table(
+        &mut self,
+        live_history: &[u8],
+        history_abs_start: usize,
+        start_abs: usize,
+        end_abs: usize,
+    ) {
+        debug_assert!(history_abs_start <= start_abs && start_abs <= end_abs);
+        debug_assert!(end_abs <= history_abs_start + live_history.len());
+        let min_match = self.params.min_match_length as usize;
+        let hash_id_mask = self.hash_table.bucket_mask();
+        let mut hash_state = GearHashState::new(min_match, self.params.hash_rate_log);
+        let mut ip_abs = start_abs;
+        while ip_abs < end_abs {
+            let chunk = &live_history[ip_abs - history_abs_start..end_abs - history_abs_start];
+            let (hashed, num_splits) =
+                gear_hash::feed(&mut hash_state, chunk, &mut self.splits_scratch);
+            for &split in &self.splits_scratch[..num_splits] {
+                // A split closes a `min_match`-byte window; one that would open
+                // before the range is not a window of it.
+                if ip_abs + split < start_abs + min_match {
+                    continue;
+                }
+                let split_abs = ip_abs + split - min_match;
+                let split_idx = split_abs - history_abs_start;
+                let mut hasher = XxHash64::with_seed(LDM_XXH64_SEED);
+                hasher.write(&live_history[split_idx..split_idx + min_match]);
+                let xxhash = hasher.finish();
+                self.hash_table.ensure_room_for(split_abs);
+                self.hash_table.insert_absolute(
+                    (xxhash as u32) & hash_id_mask,
+                    split_abs,
+                    (xxhash >> 32) as u32,
+                );
+            }
+            // `feed` consumes at least one byte of a non-empty chunk.
+            ip_abs += hashed.max(1);
+        }
     }
 
     /// Read-only view of the parameter set for diagnostics / tests.

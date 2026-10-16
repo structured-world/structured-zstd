@@ -360,11 +360,6 @@ const MIN_BENCH_BLOCK_SIZE: u64 = 32;
 /// Window log a bare `--long` selects, as upstream documents (128 MiB).
 const DEFAULT_LONG_WINDOW_LOG: u32 = 27;
 
-/// Lowest level whose matcher actually runs long-distance matching. Below it
-/// the encoder uses a strategy that carries no long-distance producer, so
-/// `--long` would be a wider window and nothing else.
-const MIN_LONG_LEVEL: i32 = 16;
-
 /// Which spellings of a size suffix [`read_leading_number`] reads.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SuffixCase {
@@ -1764,29 +1759,6 @@ fn parse_args_into(
         opts.bench_start = opts.bench_start.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
         opts.bench_end = opts.bench_end.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
     }
-    // Long-distance matching runs on the optimal parser here, so below it the
-    // flag would widen the window and never run the matcher it names. Settled
-    // after the whole command line, since the level may follow the flag — and
-    // read from the benchmark range when there is one, because those are the
-    // levels that will actually compress. The whole range runs with the flag,
-    // so its lowest level is the one that has to carry the matcher.
-    let long_level = if opts.bench {
-        opts.bench_start.min(opts.bench_end)
-    } else {
-        opts.level
-    };
-    // A `--zstd=strat=` override onto the optimal parser carries the matcher
-    // whatever the level says.
-    let optimal_strategy = opts
-        .advanced
-        .strategy
-        .is_some_and(|strategy| strategy >= Strategy::Btopt);
-    if opts.long && compresses(&opts) && long_level < MIN_LONG_LEVEL && !optimal_strategy {
-        bail!(
-            "--long needs level {MIN_LONG_LEVEL} or above, where long-distance \
-             matching runs; at level {long_level} it would only widen the window",
-        );
-    }
     // Window logs are validated here, before any file is opened, against the
     // mode the whole command line settled on; a knob out of its range is a
     // broken command line.
@@ -2171,6 +2143,22 @@ fn patch_window_log(source_size: u64) -> Result<u32> {
         );
     }
     Ok(file_window_log.max(lower))
+}
+
+/// Whether a `--patch-from` compression of `source_size` bytes against a
+/// `reference_size`-byte reference needs long-distance matching to reach the
+/// reference: when the file's window outgrows what the level's match finder
+/// cycles through, as the reference command decides it
+/// (`FIO_adjustParamsForPatchFromMode`, `fileWindowLog > ZSTD_cycleLog(chainLog,
+/// strategy)` on the level's parameters for those sizes, the binary-tree
+/// strategies cycling one log short of their chain).
+fn patch_needs_long_distance(level: i32, source_size: u64, reference_size: u64) -> bool {
+    let file_window_log = u64::BITS - source_size.max(1).leading_zeros();
+    // A reference past the address space cannot have been read to get here.
+    let reference_size = usize::try_from(reference_size).unwrap_or(usize::MAX);
+    let params = LevelParameters::for_level(level, Some(source_size), reference_size);
+    let cycle_log = params.chain_log - u32::from(params.strategy >= Strategy::Btlazy2);
+    file_window_log > cycle_log
 }
 
 /// Whether the run reads the `-D` / `--patch-from` file it names. Listing
@@ -2766,15 +2754,14 @@ fn run_selected(mut opts: Options) -> Result<usize> {
                 _ => bail!("Using --patch-from with stdin requires --stream-size"),
             };
             opts.advanced.window_log = Some(patch_window_log(source_size)?);
-            // Long-distance matching is what finds the reference across a
-            // window this wide; it runs on the optimal parser here, so it is
-            // switched on where that parser runs.
-            let optimal = opts.level >= MIN_LONG_LEVEL
-                || opts
-                    .advanced
-                    .strategy
-                    .is_some_and(|strategy| strategy >= Strategy::Btopt);
-            if optimal {
+            let reference = opts.patch_from.as_deref().expect("set in this branch");
+            let reference_size = fs::metadata(reference)
+                .map_err(|err| eyre!("can't stat {} : {err}", reference.display()))?
+                .len();
+            if patch_needs_long_distance(opts.level, source_size, reference_size) {
+                if !opts.long {
+                    display!(opts.verbosity, 2, "long mode automatically triggered");
+                }
                 opts.long = true;
             }
         }
