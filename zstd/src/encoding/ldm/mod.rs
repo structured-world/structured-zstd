@@ -65,6 +65,21 @@ const LDM_XXH64_SEED: u64 = 0;
 /// `zstd_ldm.c:335`, brings `nextToUpdate` to within 512 of the match end).
 pub(crate) const LONG_MATCH_INDEXED_TAIL: usize = 512;
 
+/// Bytes a frame's long-distance matching holds under `params`: its table and
+/// the sequence vectors around it. Each vector keeps at most a block's matches
+/// at `min_match_length` apiece (upstream's `ZSTD_ldm_getMaxNbSeq`), and five
+/// are retained: what a search found, the store, which keeps the matches a
+/// block took until they are half of it, the block's own, and the optimal
+/// parser's copy of those.
+pub(crate) fn estimated_workspace_bytes(params: &LdmParams) -> usize {
+    const RETAINED_SEQUENCE_VECTORS: usize = 5;
+    let block = crate::common::MAX_BLOCK_SIZE as usize;
+    let sequences = block / params.min_match_length.max(1) as usize + 1;
+    let vectors = sequences * core::mem::size_of::<HcRawSeq>() * RETAINED_SEQUENCE_VECTORS;
+    LdmHashTable::estimated_workspace_bytes(params.hash_log, params.bucket_size_log)
+        .saturating_add(vectors)
+}
+
 /// LDM sequence producer — owns the rolling-hash state, bucket
 /// table, and scratch buffers needed to scan an input block and
 /// emit a stream of [`HcRawSeq`] candidates consumed by the

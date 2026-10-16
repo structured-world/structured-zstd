@@ -296,6 +296,66 @@ fn a_strategy_override_counts_only_the_backend_it_selects() {
     assert_eq!(estimate(&as_fast), estimate(&level_one));
 }
 
+/// Long-distance matching holds its found sequences besides its table, a
+/// block's worth at the matcher's minimum match apiece in each of the vectors
+/// it keeps (upstream budgets one such store, `ZSTD_ldm_getMaxNbSeq`). The
+/// shortest minimum match multiplies them, and both estimates count it.
+#[cfg(feature = "ldm")]
+#[test]
+fn long_distance_estimates_count_the_sequence_storage() {
+    use crate::encoding::CompressionParameters;
+    let with_min_match = |min_match: u32| {
+        CompressionParameters::builder(CompressionLevel::Level(3))
+            .enable_long_distance_matching(true)
+            .ldm_min_match(min_match)
+            .build()
+            .unwrap()
+    };
+    let short =
+        super::estimated_compression_workspace_bytes_for_parameters(&with_min_match(4), None, None);
+    let long = super::estimated_compression_workspace_bytes_for_parameters(
+        &with_min_match(64),
+        None,
+        None,
+    );
+    // One vector of a block at four bytes a match, the least the extra
+    // storage can be.
+    let one_store = (128 * 1024 / 4) * core::mem::size_of::<crate::encoding::opt::ldm::HcRawSeq>();
+    assert!(
+        short >= long + one_store,
+        "minMatch 4 budgets {short} bytes, minMatch 64 {long}"
+    );
+    let off = super::estimated_compression_workspace_bytes_for_run(
+        CompressionLevel::Level(3),
+        None,
+        None,
+        false,
+        None,
+    );
+    let on = super::estimated_compression_workspace_bytes_for_run(
+        CompressionLevel::Level(3),
+        None,
+        None,
+        true,
+        None,
+    );
+    let table_only = {
+        let params = super::resolve_level_params(CompressionLevel::Level(3), None);
+        let ldm = crate::encoding::ldm::params::LdmParams::adjust_for(
+            u32::from(params.window_log),
+            super::ldm_strategy_ordinal(params.strategy_tag, params.lazy_depth),
+        );
+        crate::encoding::ldm::table::LdmHashTable::estimated_workspace_bytes(
+            ldm.hash_log,
+            ldm.bucket_size_log,
+        )
+    };
+    assert!(
+        on > off + table_only,
+        "the run estimate counts the table alone: {on} with, {off} without"
+    );
+}
+
 /// The parameters the encoder actually runs for a (level, source size) pair
 /// are upstream's `ZSTD_getCParams(level, size, 0)` for that pair: strategy,
 /// window / hash / chain widths, search depth, minMatch and targetLength, on

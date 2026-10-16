@@ -993,13 +993,11 @@ pub fn estimated_compression_workspace_bytes_for_run(
     #[cfg(feature = "ldm")]
     let ldm = if long_distance_matching {
         let strategy = ldm_strategy_ordinal(params.strategy_tag, params.lazy_depth);
-        let ldm_params = crate::encoding::ldm::params::LdmParams::adjust_for(
-            u32::from(params.window_log),
-            strategy,
-        );
-        crate::encoding::ldm::table::LdmHashTable::estimated_workspace_bytes(
-            ldm_params.hash_log,
-            ldm_params.bucket_size_log,
+        crate::encoding::ldm::estimated_workspace_bytes(
+            &crate::encoding::ldm::params::LdmParams::adjust_for(
+                u32::from(params.window_log),
+                strategy,
+            ),
         )
     } else {
         0
@@ -1058,11 +1056,7 @@ pub fn estimated_compression_workspace_bytes_for_parameters(
     apply_frame_overrides(&mut params, &overrides, dictionary.is_some(), src_size_hint);
     #[cfg(feature = "ldm")]
     let ldm = overrides.ldm.map_or(0, |ldm| {
-        let ldm_params = frame_ldm_params(&params, &ldm);
-        crate::encoding::ldm::table::LdmHashTable::estimated_workspace_bytes(
-            ldm_params.hash_log,
-            ldm_params.bucket_size_log,
-        )
+        crate::encoding::ldm::estimated_workspace_bytes(&frame_ldm_params(&params, &ldm))
     });
     #[cfg(not(feature = "ldm"))]
     let ldm = 0;
