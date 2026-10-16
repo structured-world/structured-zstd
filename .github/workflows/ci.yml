@@ -353,7 +353,9 @@ jobs:
     # read as docs-only.
     needs: [changes, lint]
     if: ${{ !cancelled() && needs.changes.result == 'success' && needs.lint.result != 'failure' }}
-    timeout-minutes: 15
+    # The lazy search is monomorphised per (row log, key width) and SIMD tier,
+    # so the crate's test build is serial-bound; Windows builds it three times.
+    timeout-minutes: 25
     strategy:
       # Each OS hits its own runner-image regressions (macos-latest currently
       # ships Homebrew rustup without `cargo`/`rustc` shims under
