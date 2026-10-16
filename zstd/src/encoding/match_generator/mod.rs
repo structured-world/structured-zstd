@@ -2204,9 +2204,23 @@ fn owned_sink<'a, F: FnMut(Sequence)>(
     gap_literals: &'a mut Option<usize>,
 ) -> impl FnMut(Sequence) + 'a {
     // The guard is read only for the block's last report, never per triple.
+    // Each arm rebuilds the report from its fields: forwarding the matched
+    // value whole copies it as one 32-byte block out of the separate stores
+    // that wrote it, and that copy stalls on every triple.
     move |sequence| match sequence {
-        Sequence::Literals { len } if gap_literals.is_some() => *gap_literals = Some(len),
-        sequence => handle_sequence(sequence),
+        Sequence::Triple {
+            literal_len,
+            offset,
+            match_len,
+        } => handle_sequence(Sequence::Triple {
+            literal_len,
+            offset,
+            match_len,
+        }),
+        Sequence::Literals { len } => match gap_literals {
+            Some(gap) => *gap = len,
+            None => handle_sequence(Sequence::Literals { len }),
+        },
     }
 }
 
