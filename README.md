@@ -420,9 +420,9 @@ upstream `main`, so the link target is correct for forks too —
 fork consumers should point readers at the upstream registry
 rather than maintain divergent copies. -->
 
-## Project relationship
+## Origins
 
-Maintained fork of [KillingSpark/zstd-rs](https://github.com/KillingSpark/zstd-rs) (ruzstd) by [Dmitry Prudnikov](https://github.com/polaz). We sync periodically with upstream but maintain an independent development trajectory focused on the [CoordiNode](https://github.com/structured-world/coordinode) database engine's per-label dictionary needs.
+structured-zstd is an independent project by [Dmitry Prudnikov](https://github.com/polaz), developed for the [CoordiNode](https://github.com/structured-world/coordinode) database engine and its per-label dictionary workloads. It started from the code base of [ruzstd](https://github.com/KillingSpark/zstd-rs) by Moritz Borcherding; that code is used under the MIT License, whose notice is kept in [NOTICE](https://github.com/structured-world/structured-zstd/blob/main/NOTICE).
 
 ## Support the project
 
