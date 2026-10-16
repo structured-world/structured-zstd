@@ -131,6 +131,81 @@ fn parse_search_matrix_decoupled_roundtrips() {
     assert_eq!(got, data, "lazy-on-rowhash diverged");
 }
 
+/// Long-distance matches are taken outright on the lazy hash-chain search as
+/// on every other non-optimal one: a repeat beyond the chain's reach is
+/// matched, the stream rebuilds, and the chain carries on around the matches.
+#[cfg(feature = "ldm")]
+#[test]
+fn hash_chain_lazy_takes_long_distance_matches() {
+    use super::super::parameters::CompressionParameters;
+    use super::super::strategy::{ParseMode, SearchMethod};
+
+    // Six-bit symbols from an LCG's high bits: no repeat the chain finds.
+    let mut state = 0x0569_C4A1u32;
+    let half: Vec<u8> = (0..256 * 1024)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 26) as u8
+        })
+        .collect();
+    // The copy in shuffled pieces, so one hit cannot carry the rest.
+    const PIECE: usize = 4096;
+    let pieces = half.len() / PIECE;
+    let mut data = half.clone();
+    for i in 0..pieces {
+        let piece = (i * 37) % pieces;
+        data.extend_from_slice(&half[piece * PIECE..(piece + 1) * PIECE]);
+    }
+    // Literal bytes the parse leaves, after checking the stream rebuilds.
+    let literals = |long: bool| {
+        let overrides = CompressionParameters::builder(CompressionLevel::Level(5))
+            .window_log(22)
+            .hash_log(12)
+            .chain_log(12)
+            .enable_long_distance_matching(long)
+            .build()
+            .unwrap()
+            .overrides();
+        let mut driver = MatchGeneratorDriver::new(1 << 17, 8);
+        driver.set_param_overrides(Some(overrides));
+        driver.set_config_override(SearchMethod::HashChain, ParseMode::Lazy2);
+        driver.reset(CompressionLevel::Level(5));
+        assert_eq!(driver.search, SearchMethod::HashChain);
+        let mut out = Vec::with_capacity(data.len());
+        let mut literals = 0usize;
+        let mut consumed = 0usize;
+        while consumed < data.len() {
+            let take = (data.len() - consumed).min(driver.slice_size);
+            let block = &data[consumed..consumed + take];
+            driver.commit_input(block);
+            consumed += take;
+            let mut replay = BlockReplay::new(block);
+            driver.start_matching(|seq| {
+                literals += match seq {
+                    Sequence::Triple { literal_len, .. } => literal_len,
+                    Sequence::Literals { len } => len,
+                };
+                replay.apply(&mut out, seq);
+            });
+        }
+        assert_eq!(
+            out, data,
+            "long-distance matching {long}: the stream does not rebuild"
+        );
+        literals
+    };
+    let without = literals(false);
+    let with = literals(true);
+    assert!(
+        without > half.len() * 3 / 2,
+        "the chain reached the repeat by itself: {without} literal bytes"
+    );
+    assert!(
+        with < half.len() + half.len() / 8,
+        "the repeat was not matched: {with} literal bytes, {without} without"
+    );
+}
+
 /// The row `mls` knob (C-like `minMatch`) is respected: every accepted
 /// match (regular row + repcode, on the lazy parse) is at least `mls`
 /// bytes, and the stream still round-trips for the whole 4..=7 range. The
