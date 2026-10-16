@@ -226,6 +226,36 @@ impl LevelParams {
     pub(crate) fn pre_split(&self) -> Option<u8> {
         Some(pre_split_for(self.strategy_tag, self.lazy_depth))
     }
+
+    /// `log2` of how much of a dictionary's end the match-finder tables index
+    /// when it is loaded: a longer dictionary is indexed only that far from its
+    /// end, since tables this size could not keep more of it anyway (upstream
+    /// `ZSTD_loadDictionaryContent`, `zstd_compress.c:4987`:
+    /// `MIN(MAX(hashLog + 3, chainLog + 1), 31)`). Every byte of it stays in
+    /// the window.
+    pub(crate) fn dictionary_reach_log(&self) -> u32 {
+        use crate::encoding::strategy::SearchMethod;
+        // The active backend's config: an override may leave the level row's
+        // own beside it.
+        let logs = match self.search {
+            SearchMethod::Fast => self.fast.map(|fast| (fast.hash_log as usize, 0)),
+            SearchMethod::DoubleFast => self
+                .dfast
+                .map(|dfast| (dfast.long_hash_log as usize, dfast.short_hash_log as usize)),
+            SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => {
+                self.row.map(|row| (row.hash_bits, row.chain_log))
+            }
+            SearchMethod::HashChain | SearchMethod::BinaryTree => {
+                self.hc.map(|hc| (hc.hash_log, hc.chain_log))
+            }
+        };
+        // The reset synthesises the active config when a row lacks it, so a
+        // missing one only means a table-less level: nothing to index.
+        let Some((hash_log, chain_log)) = logs else {
+            return 0;
+        };
+        (hash_log + 3).max(chain_log + 1).min(31) as u32
+    }
 }
 
 /// The pre-splitter level for an effective strategy (the tag plus, for the

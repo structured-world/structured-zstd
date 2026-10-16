@@ -96,6 +96,9 @@ pub(crate) struct DfastMatchGenerator {
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
     pub(crate) offset_hist: [u32; 3],
+    /// While a dictionary is primed: how far into it the tables start
+    /// indexing, `0` for all of it (see [`Self::set_dictionary_index_floor`]).
+    dict_index_floor: usize,
     // Storage: single `u32` per bucket — upstream zstd-parity overwrite-on-
     // collision. Each slot holds a +1-biased relative position
     // (`(abs_pos - position_base + 1) as u32`); `DFAST_EMPTY_SLOT = 0`
@@ -304,6 +307,7 @@ impl DfastMatchGenerator {
             history_start: 0,
             history_abs_start: 0,
             offset_hist: [1, 4, 8],
+            dict_index_floor: 0,
             tables: Table::empty(),
             tables_fresh: false,
             tagged: false,
@@ -883,6 +887,12 @@ impl DfastMatchGenerator {
         }
     }
 
+    /// Index a dictionary being primed only from `floor` bytes into it, `0`
+    /// for all of it; the driver sets it for the prime and clears it after.
+    pub(crate) fn set_dictionary_index_floor(&mut self, floor: usize) {
+        self.dict_index_floor = floor;
+    }
+
     pub(crate) fn skip_matching_dense(&mut self) {
         self.ensure_hash_tables();
         let current_len = self.window_blocks.back().copied().unwrap_or(0);
@@ -891,11 +901,15 @@ impl DfastMatchGenerator {
             // committed yet, so none to seed.
             return;
         }
-        let current_abs_start = self.history_abs_start + self.window_size - current_len;
-        let current_abs_end = current_abs_start + current_len;
+        let current_abs_end = self.history_abs_start + self.window_size;
+        // A dictionary being primed sits at the front of the history, so its
+        // index floor counts from there.
+        let floor = self.history_abs_start + self.dict_index_floor;
+        let current_abs_start = (current_abs_end - current_len).max(floor.min(current_abs_end));
         let backfill_start = current_abs_start
             .saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN)
-            .max(self.history_abs_start);
+            .max(self.history_abs_start)
+            .max(floor);
         if backfill_start < current_abs_start {
             self.insert_positions(backfill_start, current_abs_start);
         }
@@ -1055,7 +1069,13 @@ impl DfastMatchGenerator {
         // or `7+1` dict chunking), so gate the early return on `backfill_floor`,
         // not `start_concat` — otherwise those seam inserts are dropped and the
         // attached dict tables stay incomplete.
-        let backfill_floor = start_concat.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+        // Nothing below the index floor is indexed, seam included: the chunk
+        // before it was not.
+        let floor = self.dict_index_floor.min(end_concat);
+        let backfill_floor = start_concat
+            .max(floor)
+            .saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN)
+            .max(floor);
         if backfill_floor >= short_safe_end {
             return;
         }

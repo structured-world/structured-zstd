@@ -103,6 +103,15 @@ impl MatchGeneratorDriver {
         }
         #[cfg(feature = "ldm")]
         let ldm_dict_start = self.ldm_committed_end;
+        // The match-finder tables index only as much of the dictionary's end as
+        // they can hold (upstream `ZSTD_loadDictionaryContent`,
+        // `zstd_compress.c:4987`); the whole of it is committed all the same,
+        // so every byte stays in reach of an offset.
+        let reach_log = self
+            .reset_shape
+            .map_or(31, |(params, ..)| params.dictionary_reach_log());
+        self.storage
+            .set_dictionary_index_floor(dict_content.len().saturating_sub(1usize << reach_log));
 
         // Dictionary bytes should stay addressable until produced frame output
         // itself exceeds the live window size. We bump `max_window_size`
@@ -331,6 +340,8 @@ impl MatchGeneratorDriver {
             super::super::strategy::BackendTag::Row => self.row_matcher_mut().mark_dict_primed(),
             _ => {}
         }
+        // The dictionary is indexed; later inserts are the input's own.
+        self.storage.set_dictionary_index_floor(0);
     }
 
     pub(super) fn restore_primed_dictionary_impl(

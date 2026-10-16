@@ -239,6 +239,16 @@ impl MatcherStorage {
         }
     }
 
+    /// See the backends' `set_dictionary_index_floor`.
+    fn set_dictionary_index_floor(&mut self, floor: usize) {
+        match self {
+            Self::Simple(m) => m.set_dictionary_index_floor(floor),
+            Self::Dfast(m) => m.set_dictionary_index_floor(floor),
+            Self::Row(m) => m.set_dictionary_index_floor(floor),
+            Self::HashChain(m) => m.table.set_dictionary_index_floor(floor),
+        }
+    }
+
     /// The committed window of the owned history, oldest byte first.
     #[cfg(feature = "ldm")]
     fn committed_window(&self) -> &[u8] {

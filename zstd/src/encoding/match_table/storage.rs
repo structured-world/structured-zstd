@@ -261,6 +261,9 @@ pub(crate) struct MatchTable {
     pub(crate) hash3_log: usize,
     pub(crate) next_to_update3: usize,
     pub(crate) skip_insert_until_abs: usize,
+    /// While a dictionary is primed: how far into it the tables start
+    /// indexing, `0` for all of it (see [`Self::set_dictionary_index_floor`]).
+    pub(crate) dict_index_floor: usize,
     pub(crate) dictionary_limit_abs: Option<usize>,
     pub(crate) dictionary_primed_for_frame: bool,
     /// Sticky across resets: set once a dictionary is primed into this table
@@ -360,6 +363,7 @@ impl Clone for MatchTable {
             hash3_log: self.hash3_log,
             next_to_update3: self.next_to_update3,
             skip_insert_until_abs: self.skip_insert_until_abs,
+            dict_index_floor: self.dict_index_floor,
             dictionary_limit_abs: self.dictionary_limit_abs,
             dictionary_primed_for_frame: self.dictionary_primed_for_frame,
             dictionary_active: self.dictionary_active,
@@ -407,6 +411,7 @@ impl Clone for MatchTable {
         self.hash3_log = source.hash3_log;
         self.next_to_update3 = source.next_to_update3;
         self.skip_insert_until_abs = source.skip_insert_until_abs;
+        self.dict_index_floor = source.dict_index_floor;
         self.dictionary_limit_abs = source.dictionary_limit_abs;
         self.dictionary_primed_for_frame = source.dictionary_primed_for_frame;
         self.dictionary_active = source.dictionary_active;
@@ -541,6 +546,7 @@ impl MatchTable {
             hash3_log: HC3_HASH_LOG,
             next_to_update3: 0,
             skip_insert_until_abs: 0,
+            dict_index_floor: 0,
             dictionary_limit_abs: None,
             dictionary_primed_for_frame: false,
             dictionary_active: false,
@@ -984,6 +990,7 @@ impl MatchTable {
         // generous fixed depth keeps the tree well-ordered without the live
         // searchLog cap. Mirrors upstream zstd `ZSTD_insertBt1` nbCompares.
         const DMS_BUILD_DEPTH: usize = 1 << 9;
+        let floor = self.dict_index_floor;
         // 2 children per dict position: [smaller, larger].
         build_dms!(
             self,
@@ -993,7 +1000,7 @@ impl MatchTable {
             read,
             2,
             |concat, hash_table, chain_table, dms_hash_log, region| {
-                let mut current = 0usize;
+                let mut current = floor;
                 while current + read <= region {
                     let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
                     // Insert `current` as the new root; splay the old tree into
@@ -1061,6 +1068,7 @@ impl MatchTable {
     /// chain. Cached across frames via `DictAttach::is_primed`.
     pub(crate) fn prime_dms_hc(&mut self, region_len: usize) {
         let mls = HC_MIN_MATCH_LEN;
+        let floor = self.dict_index_floor;
         // Single `next` link per dict position (HC4 chain, not the BT's 2/pos).
         build_dms!(
             self,
@@ -1070,7 +1078,7 @@ impl MatchTable {
             mls,
             1,
             |concat, hash_table, chain_table, dms_hash_log, region| {
-                let mut current = 0usize;
+                let mut current = floor;
                 while current + mls <= region {
                     let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
                     // Prepend `current` to its bucket chain (upstream zstd
@@ -2401,6 +2409,19 @@ impl MatchTable {
         self.next_to_update3 = self.next_to_update3.max(committed_end);
     }
 
+    /// Index a dictionary being primed only from `floor` bytes into it, `0`
+    /// for all of it; the driver sets it for the prime and clears it after.
+    /// The tree's insertion cursors start from the floor too, since a copied
+    /// dictionary is threaded through them.
+    pub(crate) fn set_dictionary_index_floor(&mut self, floor: usize) {
+        self.dict_index_floor = floor;
+        if floor != 0 {
+            let floor_abs = self.history_abs_start + floor;
+            self.skip_insert_until_abs = self.skip_insert_until_abs.max(floor_abs);
+            self.next_to_update3 = self.next_to_update3.max(floor_abs);
+        }
+    }
+
     /// Hand the last committed block of `len` bytes back to the uncommitted
     /// input, undoing only the bookkeeping of [`Self::commit_block`]: what it
     /// evicted stays evicted, so committing the same bytes again in pieces
@@ -2447,6 +2468,10 @@ impl MatchTable {
         self.ensure_tables();
         let (current_abs_start, current_len) = self.current_block_range();
         let current_abs_end = current_abs_start + current_len;
+        // A dictionary being primed sits at the front of the history and is
+        // indexed only from its floor on.
+        let floor = (self.history_abs_start + self.dict_index_floor).min(current_abs_end);
+        let current_abs_start = current_abs_start.max(floor);
         self.backfill_boundary_positions(current_abs_start, current_abs_end);
         if self.uses_bt {
             if incompressible_hint == Some(true) {

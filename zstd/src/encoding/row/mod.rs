@@ -2419,6 +2419,9 @@ pub(crate) struct RowMatchGenerator {
     /// stores it raw and rotates, so the encoder-side history and
     /// upstream's parse-side reps legitimately differ.
     lazy_reps: Option<[usize; 2]>,
+    /// While a dictionary is primed: how far into it the tables start
+    /// indexing, `0` for all of it (see [`Self::set_dictionary_index_floor`]).
+    dict_index_floor: usize,
     pub(crate) lazy_depth: u8,
     /// Cached fastpath kernel for the per-candidate `common_prefix_len`
     /// compare, resolved once per matcher so the rep probe skips the
@@ -2547,6 +2550,7 @@ impl RowMatchGenerator {
             row_hash_mls: ROW_MIN_MATCH_LEN.clamp(4, 6) as u32,
             lazy_next_to_update: 0,
             lazy_reps: None,
+            dict_index_floor: 0,
             lazy_depth: 1,
             cpl_kernel: crate::encoding::fastpath::select_kernel(),
             rows_len: 0,
@@ -4012,6 +4016,12 @@ impl RowMatchGenerator {
         crate::encoding::fastpath::scalar::common_prefix_len_ptr
     );
 
+    /// Index a dictionary being primed only from `floor` bytes into it, `0`
+    /// for all of it; the driver sets it for the prime and clears it after.
+    pub(crate) fn set_dictionary_index_floor(&mut self, floor: usize) {
+        self.dict_index_floor = floor;
+    }
+
     /// Hand the last committed block of `len` bytes back to the uncommitted
     /// input, undoing only the bookkeeping of [`Self::commit_block`]: what it
     /// evicted stays evicted, so committing the same bytes again in pieces
@@ -4474,6 +4484,7 @@ impl RowMatchGenerator {
         bt: &mut [u32],
         content: *const u8,
         concat_len: usize,
+        start: usize,
         index_base: usize,
         hash_log: usize,
         chain_log: usize,
@@ -4481,7 +4492,7 @@ impl RowMatchGenerator {
         mls: u32,
     ) {
         let target = concat_len.saturating_sub(8);
-        let mut idx = 0usize;
+        let mut idx = start;
         while idx < target {
             // SAFETY: `idx + 8 <= concat_len`; the tree holds only earlier
             // dictionary positions (this loop's own inserts).
@@ -4526,6 +4537,7 @@ impl RowMatchGenerator {
                 hc_chain,
                 base.add(history_start),
                 concat_len,
+                self.dict_index_floor,
                 index_base,
                 hash_log,
                 chain_log,
@@ -4557,6 +4569,7 @@ impl RowMatchGenerator {
         }
         let base = self.history.as_ptr();
         let history_start = self.history_start;
+        let floor = self.dict_index_floor;
         let dict = self.dict.table_mut_or_init(|| RowDictTables {
             heads: Vec::new(),
             positions: Vec::new(),
@@ -4581,6 +4594,7 @@ impl RowMatchGenerator {
                 &mut dict.hc_chain,
                 base.add(history_start),
                 concat_len,
+                floor,
                 BT_IDX_BASE,
                 hash_log,
                 chain_log,
@@ -4644,7 +4658,8 @@ impl RowMatchGenerator {
             // tables. The index cursor carries across the dictionary's
             // slices; `mark_dict_primed` moves it to the dictionary end.
             self.dict.set_region_len(concat_len);
-            let from = self.lazy_next_to_update.max(hist_start) - hist_start;
+            let from =
+                (self.lazy_next_to_update.max(hist_start) - hist_start).max(self.dict_index_floor);
             if from < indexable_end {
                 let scan = self.scan_ctx();
                 if self.finder == LazyFinder::Chain {
@@ -4709,7 +4724,7 @@ impl RowMatchGenerator {
         if self.dict.is_primed() {
             return;
         }
-        let from = self.dict.next_to_update();
+        let from = self.dict.next_to_update().max(self.dict_index_floor);
         if from >= indexable_end {
             return;
         }
