@@ -2154,6 +2154,21 @@ fn patch_needs_long_distance(
     file_window_log > cycle_log
 }
 
+/// Whether a level this run compresses at needs long-distance matching for the
+/// patch (see [`patch_needs_long_distance`]). A benchmark compresses every
+/// level of its `-b`/`-e` range under one setting, so one level that cannot
+/// cycle the input turns it on for all.
+fn patch_run_needs_long_distance(opts: &Options, source_size: u64, reference_size: u64) -> bool {
+    let levels = if opts.bench {
+        opts.bench_start..=opts.bench_end
+    } else {
+        opts.level..=opts.level
+    };
+    levels
+        .into_iter()
+        .any(|level| patch_needs_long_distance(level, &opts.advanced, source_size, reference_size))
+}
+
 /// Whether the run reads the `-D` / `--patch-from` file it names. Listing
 /// walks frame headers and training builds a dictionary from its samples;
 /// neither consults that one. Reading it anyway would fail a listing over a
@@ -2751,7 +2766,7 @@ fn run_selected(mut opts: Options) -> Result<usize> {
             let reference_size = fs::metadata(reference)
                 .map_err(|err| eyre!("can't stat {} : {err}", reference.display()))?
                 .len();
-            if patch_needs_long_distance(opts.level, &opts.advanced, source_size, reference_size) {
+            if patch_run_needs_long_distance(&opts, source_size, reference_size) {
                 if !opts.long {
                     display!(opts.verbosity, 2, "long mode automatically triggered");
                 }

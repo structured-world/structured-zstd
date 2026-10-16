@@ -2242,6 +2242,24 @@ fn patch_from_needs_long_mode_where_the_matcher_cannot_cycle_the_input() {
     }
 }
 
+/// A benchmark compresses its whole level range, so a patch needs long mode
+/// when any level of it does: lazy2 (level 12) cycles a file window equal to
+/// the chain log that btlazy2 (level 13) does not, and `-b12 -e13` measures
+/// both.
+#[test]
+fn patch_from_long_mode_covers_every_benchmarked_level() {
+    let reference = 1u64 << 20;
+    let chain_log = LevelParameters::for_level(13, Some(1 << 30), reference as usize).chain_log;
+    let size = 1u64 << (chain_log - 1);
+    let level_only = AdvancedParams::default();
+    assert!(!patch_needs_long_distance(12, &level_only, size, reference));
+    assert!(patch_needs_long_distance(13, &level_only, size, reference));
+    let range = parse(&["-b12", "-e13", "--patch-from=ref", "in"]).unwrap();
+    assert!(patch_run_needs_long_distance(&range, size, reference));
+    let single = parse(&["-12", "--patch-from=ref", "in"]).unwrap();
+    assert!(!patch_run_needs_long_distance(&single, size, reference));
+}
+
 /// The rule reads the matcher that will run: a `--zstd=` chain or strategy
 /// override that leaves the reference out of the level's cycle turns long mode
 /// on, and one that brings it in keeps it off. The reference command reads the
