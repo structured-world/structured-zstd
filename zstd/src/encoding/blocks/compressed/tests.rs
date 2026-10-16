@@ -602,6 +602,10 @@ fn discarded_block_keeps_the_entry_tables() {
         literal_compression_disabled: false,
         post_split_allowed: true,
     };
+    let entry_fse = [(); 3].map(|()| SharedFseTable::new(FSETable::blank()));
+    state.fse_tables.ll_previous = Some(PreviousFseTable::Custom(entry_fse[0].clone()));
+    state.fse_tables.ml_previous = Some(PreviousFseTable::Custom(entry_fse[1].clone()));
+    state.fse_tables.of_previous = Some(PreviousFseTable::Custom(entry_fse[2].clone()));
     let entry_codes = state
         .last_huff_table
         .as_ref()
@@ -617,7 +621,7 @@ fn discarded_block_keeps_the_entry_tables() {
             fse: [
                 LastUsedTable::Default,
                 LastUsedTable::Rle(3),
-                LastUsedTable::Encoded,
+                LastUsedTable::Default,
             ],
             huff: super::HuffOutcome::New(built),
         },
@@ -630,9 +634,17 @@ fn discarded_block_keeps_the_entry_tables() {
         state.huff_table_spare.as_ref().unwrap().packed_codes(),
         built_codes
     );
-    assert!(state.fse_tables.ll_previous.is_none());
-    assert!(state.fse_tables.ml_previous.is_none());
-    assert!(state.fse_tables.of_previous.is_none());
+    let previous = [
+        &state.fse_tables.ll_previous,
+        &state.fse_tables.ml_previous,
+        &state.fse_tables.of_previous,
+    ];
+    for (slot, entry) in previous.into_iter().zip(&entry_fse) {
+        assert!(
+            matches!(slot, Some(PreviousFseTable::Custom(t)) if SharedFseTable::ptr_eq(t, entry)),
+            "a discarded block replaced the FSE table the next block repeats",
+        );
+    }
 }
 
 /// A buffer for `count` sequence codes, carved from `ws`, which must outlive it.
