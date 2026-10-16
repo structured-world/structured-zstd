@@ -109,29 +109,6 @@ pub(crate) struct LdmHashTable {
     position_base: usize,
 }
 
-impl Clone for LdmHashTable {
-    fn clone(&self) -> Self {
-        Self {
-            entries: self.entries.clone(),
-            bucket_offsets: self.bucket_offsets.clone(),
-            effective_bucket_log: self.effective_bucket_log,
-            bucket_mask: self.bucket_mask,
-            position_base: self.position_base,
-        }
-    }
-
-    /// Into the buffers already held: a restored dictionary snapshot copies
-    /// the table every frame, and allocating it again each time would cost
-    /// more than the copy.
-    fn clone_from(&mut self, source: &Self) {
-        self.entries.clone_from(&source.entries);
-        self.bucket_offsets.clone_from(&source.bucket_offsets);
-        self.effective_bucket_log = source.effective_bucket_log;
-        self.bucket_mask = source.bucket_mask;
-        self.position_base = source.position_base;
-    }
-}
-
 impl LdmHashTable {
     /// Allocate a fresh table for the given parameters.
     ///

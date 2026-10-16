@@ -92,26 +92,6 @@ pub(crate) struct LdmProducer {
     splits_scratch: Vec<usize>,
 }
 
-impl Clone for LdmProducer {
-    fn clone(&self) -> Self {
-        Self {
-            params: self.params,
-            hash_state: self.hash_state,
-            hash_table: self.hash_table.clone(),
-            splits_scratch: self.splits_scratch.clone(),
-        }
-    }
-
-    /// Into the table already held (see [`LdmHashTable`]'s `clone_from`); the
-    /// split scratch is per call, so its contents are not carried.
-    fn clone_from(&mut self, source: &Self) {
-        self.params = source.params;
-        self.hash_state = source.hash_state;
-        self.hash_table.clone_from(&source.hash_table);
-        self.splits_scratch.resize(source.splits_scratch.len(), 0);
-    }
-}
-
 impl LdmProducer {
     /// Build a fresh producer for the given parameter set.
     ///

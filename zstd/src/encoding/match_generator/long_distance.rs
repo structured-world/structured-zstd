@@ -5,7 +5,7 @@
 //! A child module so it reaches the driver's private long-distance state and
 //! storage directly.
 
-use super::{MatchGeneratorDriver, Sequence};
+use super::{MatchGeneratorDriver, Sequence, owned_sink};
 
 impl MatchGeneratorDriver {
     /// Search the input from where the last search stopped up to `to`, a
@@ -103,14 +103,12 @@ impl MatchGeneratorDriver {
         let mut consumed = 0usize;
         for seq in &sequences {
             // The gap's trailing literals become the long match's own.
-            let mut gap_literals = 0usize;
+            let mut gap = Some(0usize);
             if seq.lit_length != 0 {
                 self.storage.commit_piece(seq.lit_length);
-                self.start_matching_owned(&mut |sequence| match sequence {
-                    Sequence::Literals { len } => gap_literals = len,
-                    triple => handle_sequence(triple),
-                });
+                self.start_matching_owned(&mut owned_sink(handle_sequence, &mut gap));
             }
+            let gap_literals = gap.expect("the gap sink only ever writes Some");
             self.storage.commit_piece(seq.match_length);
             self.storage.skip_long_match();
             handle_sequence(Sequence::Triple {
@@ -124,7 +122,8 @@ impl MatchGeneratorDriver {
         let tail = block_len - consumed;
         if tail != 0 {
             self.storage.commit_piece(tail);
-            self.start_matching_owned(handle_sequence);
+            let mut forward = None;
+            self.start_matching_owned(&mut owned_sink(handle_sequence, &mut forward));
         }
         self.ldm_block = sequences;
         self.ldm_split_block = Some(block_len);

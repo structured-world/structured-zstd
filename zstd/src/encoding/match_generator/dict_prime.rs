@@ -60,6 +60,10 @@ impl MatchGeneratorDriver {
             }
         };
         self.dictionary_retained_budget = inflated.saturating_sub(base);
+        // The reset kept the dictionary's bytes and index but cleared the
+        // long-distance table, which a freshly primed frame would hold filled.
+        #[cfg(feature = "ldm")]
+        self.index_dictionary_in_place();
     }
 
     pub(super) fn prime_with_dictionary_impl(
@@ -358,7 +362,7 @@ impl MatchGeneratorDriver {
         // match this reset. Restoring it would let the encoder search past the
         // frame header's window (an undecodable match), so on a key mismatch we
         // refuse and the caller re-primes.
-        let Some((params, table_bits, fast_attach, fast_tagged, ldm)) = self.reset_shape else {
+        let Some((params, table_bits, fast_attach, fast_tagged)) = self.reset_shape else {
             return false;
         };
         let key = PrimedKey {
@@ -367,7 +371,6 @@ impl MatchGeneratorDriver {
             table_bits,
             fast_attach,
             fast_tagged,
-            ldm,
         };
         let Some((snapshot, budget, captured_key)) = &mut self.primed else {
             return false;
@@ -442,23 +445,32 @@ impl MatchGeneratorDriver {
             }
         }
         self.dictionary_retained_budget = budget;
-        // The restored window is the dictionary, the frame's first bytes, and
-        // the long-distance matcher's table holds it as priming left it.
         #[cfg(feature = "ldm")]
-        {
-            self.ldm_committed_end = self.storage.committed_window().len();
-            self.ldm_dict_end = self.ldm_committed_end;
-            if let (Some(live), Some(snapshot)) = (self.ldm.as_mut(), self.primed_ldm.as_ref()) {
-                live.clone_from(snapshot);
-            }
-        }
+        self.index_dictionary_in_place();
         true
+    }
+
+    /// Index the dictionary the reset left in the window into the
+    /// long-distance matcher's cleared table, as priming it would. Upstream
+    /// re-indexes per frame as well: a CDict carries no long-distance table,
+    /// and a frame that loads the dictionary fills one
+    /// (`ZSTD_ldm_fillHashTable` from `ZSTD_loadDictionaryContent`). Keeping a
+    /// copy of the filled table instead would hold a second table, the
+    /// largest the frame has, and copying it costs more than the fill.
+    #[cfg(feature = "ldm")]
+    fn index_dictionary_in_place(&mut self) {
+        self.ldm_committed_end = self.storage.committed_window().len();
+        self.ldm_dict_end = self.ldm_committed_end;
+        if let Some(producer) = self.ldm.as_mut() {
+            let window = self.storage.committed_window();
+            producer.fill_table(window, 0, 0, window.len());
+        }
     }
 
     pub(super) fn capture_primed_dictionary_impl(&mut self, level: super::super::CompressionLevel) {
         // No resolved shape means `reset` has not run for this frame — nothing
         // valid to key a snapshot on, so skip the capture.
-        let Some((params, table_bits, fast_attach, fast_tagged, ldm)) = self.reset_shape else {
+        let Some((params, table_bits, fast_attach, fast_tagged)) = self.reset_shape else {
             return;
         };
         let key = PrimedKey {
@@ -467,15 +479,7 @@ impl MatchGeneratorDriver {
             table_bits,
             fast_attach,
             fast_tagged,
-            ldm,
         };
-        // The key pins the parameters, so a restore copies into a table of the
-        // same shape.
-        #[cfg(feature = "ldm")]
-        match (self.primed_ldm.as_mut(), self.ldm.as_ref()) {
-            (Some(snapshot), Some(live)) => snapshot.clone_from(live),
-            (_, live) => self.primed_ldm = live.cloned(),
-        }
         // CDict-equivalent retained state. A binary-tree level in ATTACH mode
         // decouples the dictionary into `dms` (the upstream zstd `dictMatchState`); its
         // live hash / chain / hash3 tables carry NO dict entries
@@ -525,7 +529,6 @@ impl MatchGeneratorDriver {
 
     pub(super) fn invalidate_primed_dictionary_impl(&mut self) {
         self.primed = None;
-        self.primed_ldm = Default::default();
         // Drop the Fast-backend CDict-equivalent table cache too: it is keyed
         // to the dictionary being removed / replaced. Left in place, the next
         // same-params `reset` would retain it and the kernel would probe a

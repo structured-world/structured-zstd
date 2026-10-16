@@ -423,12 +423,11 @@ pub struct MatchGeneratorDriver {
     reset_dict_attach_ok: bool,
     // Hint-resolved matcher shape from the last `reset`: the [`LevelParams`], the
     // active backend's applied Dfast/Row hash-table width (`0` for HC/Fast), the
-    // Fast attach-vs-copy mode, the Fast slot format and the long-distance
-    // matcher's parameters. Combined with the frame's level into the
-    // [`PrimedKey`] that keys the primed snapshot, so it is only restored into a
-    // reset that resolved the identical matcher. `None` before the first
-    // `reset`.
-    reset_shape: Option<(LevelParams, usize, bool, bool, LdmShape)>,
+    // Fast attach-vs-copy mode and the Fast slot format. Combined with the
+    // frame's level into the [`PrimedKey`] that keys the primed snapshot, so it
+    // is only restored into a reset that resolved the identical matcher. `None`
+    // before the first `reset`.
+    reset_shape: Option<(LevelParams, usize, bool, bool)>,
     // One-shot borrowed block range `[start, end)` staged by the borrowed
     // Fast frame path (`set_borrowed_block`) for the NEXT
     // `start_matching` / `skip_matching_with_hint`. `Some` routes that
@@ -448,10 +447,6 @@ pub struct MatchGeneratorDriver {
     /// is only restored into a reset that produces the same matcher — see
     /// `restore_primed_dictionary`.
     primed: Option<(MatcherStorage, usize, PrimedKey)>,
-    /// The long-distance matcher as `prime_with_dictionary` left it, with the
-    /// dictionary indexed, captured and restored together with
-    /// [`Self::primed`]; its parameters are in the key.
-    primed_ldm: LdmSnapshot,
     /// Where the tables live when the driver is reset on its own through
     /// [`Matcher::reset`]; inside a compression context they live in the
     /// context's workspace instead and this stays empty.
@@ -539,23 +534,7 @@ struct PrimedKey {
     /// frame from how full the input will leave the table, so two frames of one
     /// geometry can differ in it; a restore carries the snapshot's format in.
     fast_tagged: bool,
-    /// The long-distance matcher's parameters, `None` without one. A primed
-    /// snapshot carries its table with the dictionary indexed in it, which a
-    /// frame with other parameters could not use.
-    ldm: LdmShape,
 }
-
-/// [`PrimedKey::ldm`]: nothing to key on in a build without the matcher.
-#[cfg(feature = "ldm")]
-type LdmShape = Option<super::ldm::params::LdmParams>;
-#[cfg(not(feature = "ldm"))]
-type LdmShape = ();
-
-/// The long-distance matcher as a primed snapshot keeps it.
-#[cfg(feature = "ldm")]
-type LdmSnapshot = Option<super::ldm::LdmProducer>;
-#[cfg(not(feature = "ldm"))]
-type LdmSnapshot = ();
 
 /// Whether a configured HashChain matcher attaches the dictionary for a frame
 /// of `size_log` (see [`MatchGeneratorDriver::hc_dict_attach_mode`]).
@@ -763,7 +742,6 @@ impl MatchGeneratorDriver {
             dictionary_size_hint: None,
             borrowed_pending: None,
             primed: None,
-            primed_ldm: Default::default(),
             own_workspace: crate::encoding::workspace::Workspace::new(),
             frame_in_place: false,
             #[cfg(feature = "ldm")]
@@ -1254,7 +1232,6 @@ impl Matcher for MatchGeneratorDriver {
             .map_or(0, |(storage, _, _)| storage.heap_size());
         #[cfg(feature = "ldm")]
         let ldm = self.ldm.as_ref().map_or(0, |p| p.heap_size())
-            + self.primed_ldm.as_ref().map_or(0, |p| p.heap_size())
             + self.ldm_store.heap_size()
             + (self.ldm_found.capacity() + self.ldm_block.capacity())
                 * core::mem::size_of::<super::opt::ldm::HcRawSeq>();
@@ -1401,12 +1378,10 @@ impl Matcher for MatchGeneratorDriver {
         }
         // The long-distance matcher's parameters for the frame, `None` without one.
         #[cfg(feature = "ldm")]
-        let frame_ldm: LdmShape = self
+        let frame_ldm = self
             .param_overrides
             .and_then(|ov| ov.ldm)
             .map(|ldm_ov| crate::encoding::levels::config::frame_ldm_params(&params, &ldm_ov));
-        #[cfg(not(feature = "ldm"))]
-        let frame_ldm: LdmShape = ();
         // A dictionary frame's hash-chain / binary-tree widths are the CDict's
         // (`resolve_level_params_with_dict`): verbatim when the dictionary is
         // copied into the live tables (`ZSTD_resetCCtx_byCopyingCDict` builds
@@ -1636,7 +1611,6 @@ impl Matcher for MatchGeneratorDriver {
                                     table_bits: 0,
                                     fast_attach: false,
                                     fast_tagged: captured.fast_tagged,
-                                    ldm: frame_ldm,
                                 }
                     })
                     .map(|(_, _, captured)| captured.fast_tagged);
@@ -1916,18 +1890,9 @@ impl Matcher for MatchGeneratorDriver {
         // resolved matcher geometry instead, so folding the Fast bit into their
         // key would over-key identical resolved shapes. `fast_attach` is the
         // decision `prime_with_dictionary` makes from the same `reset_size_log`.
-        // The long-distance matcher's parameters are part of it on every
-        // backend: the snapshot keeps the matcher's table with the dictionary
-        // indexed, so a restored frame writes what a freshly primed one does.
         // The Fast slot format this reset chose; only the Simple backend has one.
         let fast_tagged = matches!(&self.storage, MatcherStorage::Simple(m) if m.slots_tagged());
-        self.reset_shape = Some((
-            params,
-            resolved_table_bits,
-            fast_attach,
-            fast_tagged,
-            frame_ldm,
-        ));
+        self.reset_shape = Some((params, resolved_table_bits, fast_attach, fast_tagged));
         // Everything is laid out in `workspace` now. A driver reset on its own
         // before it joined a context still holds the workspace it used then,
         // which nothing points into any more; on its own the field is empty
@@ -2113,6 +2078,10 @@ impl Matcher for MatchGeneratorDriver {
         // the Simple backend is instrumented (the gate guarantees it),
         // and the stage is consumed so the next block re-stages.
         if let Some((block_start, block_end)) = self.borrowed_pending.take() {
+            // The borrowed scans share their kernels with the owned ones, so
+            // they report through the same sink type.
+            let mut forward = None;
+            let mut sink = owned_sink(&mut handle_sequence, &mut forward);
             match self.active_backend() {
                 super::strategy::BackendTag::Simple => {
                     let m = self.simple_mut();
@@ -2120,18 +2089,14 @@ impl Matcher for MatchGeneratorDriver {
                         // Dict-attach borrowed scan: live matches read the
                         // borrowed input in place, dict matches read the
                         // committed dict prefix via the 2-segment counter.
-                        m.start_matching_borrowed_dict(
-                            block_start,
-                            block_end,
-                            &mut handle_sequence,
-                        );
+                        m.start_matching_borrowed_dict(block_start, block_end, &mut sink);
                     } else {
-                        m.start_matching_borrowed(block_start, block_end, &mut handle_sequence);
+                        m.start_matching_borrowed(block_start, block_end, &mut sink);
                     }
                 }
                 super::strategy::BackendTag::Dfast => self
                     .dfast_matcher_mut()
-                    .start_matching_borrowed(block_start, block_end, &mut handle_sequence),
+                    .start_matching_borrowed(block_start, block_end, &mut sink),
                 super::strategy::BackendTag::Row => {
                     // Same greedy/lazy parse split as the owned RowHash arm.
                     let greedy = self.parse == super::strategy::ParseMode::Greedy;
@@ -2139,13 +2104,13 @@ impl Matcher for MatchGeneratorDriver {
                         block_start,
                         block_end,
                         greedy,
-                        &mut handle_sequence,
+                        &mut sink,
                     );
                 }
                 super::strategy::BackendTag::HashChain => match self.search {
                     super::strategy::SearchMethod::HashChain => self
                         .hc_matcher_mut()
-                        .start_matching_lazy_borrowed(block_start, block_end, &mut handle_sequence),
+                        .start_matching_lazy_borrowed(block_start, block_end, &mut sink),
                     // `borrowed_supported()` keeps the optimal parsers on the
                     // owned path and `set_borrowed_block` asserts it.
                     other => {
@@ -2170,7 +2135,8 @@ impl Matcher for MatchGeneratorDriver {
                 return;
             }
         }
-        self.start_matching_owned(&mut handle_sequence);
+        let mut gap_literals = None;
+        self.start_matching_owned(&mut owned_sink(&mut handle_sequence, &mut gap_literals));
     }
 
     fn skip_matching(&mut self) {
@@ -2225,6 +2191,22 @@ impl Matcher for MatchGeneratorDriver {
                 self.hc_matcher_mut().skip_matching(incompressible_hint)
             }
         }
+    }
+}
+
+/// The sink every owned match runs against: `handle_sequence`, except that a
+/// block's trailing literals go to `gap_literals` when it is `Some`, as the
+/// gap before a long-distance match needs them. One sink type for the plain
+/// block and for those gaps compiles each backend's scan once per caller sink
+/// instead of twice.
+fn owned_sink<'a, F: FnMut(Sequence)>(
+    handle_sequence: &'a mut F,
+    gap_literals: &'a mut Option<usize>,
+) -> impl FnMut(Sequence) + 'a {
+    // The guard is read only for the block's last report, never per triple.
+    move |sequence| match sequence {
+        Sequence::Literals { len } if gap_literals.is_some() => *gap_literals = Some(len),
+        sequence => handle_sequence(sequence),
     }
 }
 
