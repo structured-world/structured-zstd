@@ -131,8 +131,12 @@ enum LazyFinder {
 /// start, hoisted ONCE per block so the hot loops read no `Option` branch
 /// and no `Vec` header per access. Valid for the whole parse: the history
 /// buffer is never reallocated while a block is being scanned.
+///
+/// `MLS` is the row key width (upstream's `mls` template argument), bound by
+/// the per-tier parse monoliths so the hot loops hash with a constant width;
+/// `0` reads it from `mls` instead, for the cold callers.
 #[derive(Clone, Copy)]
-struct RowScan {
+struct RowScan<const MLS: u32 = 0> {
     base: *const u8,
     len: usize,
     hist_start: usize,
@@ -150,9 +154,17 @@ struct RowScan {
     prefix_start: usize,
     dict_frame: bool,
     attached: bool,
+    /// The row key width, for an unbound (`MLS == 0`) view.
+    mls: u32,
 }
 
-impl RowScan {
+impl<const MLS: u32> RowScan<MLS> {
+    /// The row key width: the bound constant, or the stored one when unbound.
+    #[inline(always)]
+    fn key_mls(&self) -> u32 {
+        if MLS == 0 { self.mls } else { MLS }
+    }
+
     /// Upstream `ZSTD_getLowestMatchIndex`: the whole history down to
     /// `lowLimit` while a dictionary is valid, else at most `maxDist` back.
     #[inline(always)]
@@ -490,7 +502,9 @@ macro_rules! row_find_best_match {
         } else {
             (1u64 << row_entries) - 1
         };
-        let mut buf = [0u32; 64];
+        // Filled up to `n` before it is read, so it is left uninitialised, as
+        // upstream's `matchBuffer` is: zeroing it cost 256 bytes per search.
+        let mut buf = [core::mem::MaybeUninit::<u32>::uninit(); 64];
         let mut n = 0usize;
         {
             #[allow(unused_mut)]
@@ -561,7 +575,7 @@ macro_rules! row_find_best_match {
                     }
                 }
                 // SAFETY: `n < attempts_at_entry <= row_entries <= 64`.
-                unsafe { *buf.get_unchecked_mut(n) = raw };
+                unsafe { buf.get_unchecked_mut(n).write(raw) };
                 n += 1;
                 attempts -= 1;
             }
@@ -570,7 +584,9 @@ macro_rules! row_find_best_match {
         // are gated at the match head (`MEM_read32(match) == MEM_read32(ip)`)
         // instead of at the current best length.
         let prefix_start = $ctx.prefix_start;
-        for &raw in &buf[..n] {
+        for slot in &buf[..n] {
+            // SAFETY: the first `n` entries were written above.
+            let raw = unsafe { slot.assume_init() };
             let cand_idx = raw as usize - hist_start;
             // SAFETY: `cand_idx < cur_idx`; the gate reads 4 bytes at
             // `+ ml - 3` where `ml + 1 <= limit` (the count breaks out of the
@@ -617,7 +633,7 @@ macro_rules! row_find_best_match {
                     $ctx.base,
                     $ctx.len,
                     cur_idx,
-                    $m.row_hash_mls,
+                    $ctx.key_mls(),
                     dict_row_hash_log + ROW_TAG_BITS,
                     0,
                 )
@@ -839,7 +855,7 @@ macro_rules! hc_find_best_match {
                     $ctx.base,
                     $ctx.len,
                     cur_idx,
-                    $m.row_hash_mls,
+                    $ctx.key_mls(),
                     dict.hash_log,
                     0,
                 )
@@ -1175,7 +1191,7 @@ macro_rules! dubt_find_best_match {
                         $ctx.base,
                         $ctx.len,
                         cur_idx,
-                        $m.row_hash_mls,
+                        $ctx.key_mls(),
                         dict.hash_log,
                         0,
                     )
@@ -1297,7 +1313,7 @@ macro_rules! row_cache_insert_range {
 /// chosen match only, immediate-repcode loop after every stored sequence,
 /// `>> 8` miss acceleration with lazy skipping past step 8.
 macro_rules! lazy_parse_body {
-    ($m:expr, $handle:expr, $rl:expr, $finder:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+    ($m:expr, $handle:expr, $rl:expr, $finder:expr, $mls:ident, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         #[allow(unused_labels)]
         'parse: {
             debug_assert!($finder != FINDER_ROWS || $rl == $m.row_log);
@@ -1317,7 +1333,7 @@ macro_rules! lazy_parse_body {
             }
             let block_end = current_abs_start + current_len;
             $m.enter_block(current_abs_start, block_end);
-            let scan = $m.scan_ctx();
+            let scan = $m.scan_ctx_with::<$mls>();
             let hist_start = scan.hist_start;
             let depth = $m.lazy_depth;
             // Upstream `ilimit`: `iend - 8 - ZSTD_ROW_HASH_CACHE_SIZE` for the
@@ -1703,29 +1719,39 @@ macro_rules! gen_lazy_monolith {
             allow(dead_code)
         )]
         #[allow(unused_unsafe)]
-        unsafe fn $name<K: RowTags, const ROW_LOG: usize, const FINDER: u8>(
+        unsafe fn $name<K: RowTags, const ROW_LOG: usize, const FINDER: u8, const MLS: u32>(
             &mut self,
             mut handle_sequence: impl FnMut(Sequence),
         ) {
-            lazy_parse_body!(self, handle_sequence, ROW_LOG, FINDER, $use_mask, $maskmac, $cpl)
+            lazy_parse_body!(self, handle_sequence, ROW_LOG, FINDER, MLS, $use_mask, $maskmac, $cpl)
         }
     };
 }
 
-/// Bind the runtime finder and (for rows) `row_log` to the const parameters
-/// of a lazy monolith: rows per `ROW_LOG` 4..=6, the chain and the tree
-/// once each (they ignore `ROW_LOG`). Cold, once per block.
+/// Bind the runtime finder, (for rows) `row_log` and the key width to the
+/// const parameters of a lazy monolith: rows per `ROW_LOG` 4..=6, the chain
+/// and the tree once each (they ignore `ROW_LOG`), each per `MLS` 4..=6, as
+/// upstream instantiates its searches per `(rowLog, mls)`. Cold, once per
+/// block.
 macro_rules! dispatch_lazy {
     ($self:ident . $m:ident :: <$k:ty> ( $($arg:expr),* )) => {
+        match $self.row_hash_mls {
+            4 => dispatch_lazy!(@finder $self . $m :: <$k, 4> ( $($arg),* )),
+            5 => dispatch_lazy!(@finder $self . $m :: <$k, 5> ( $($arg),* )),
+            6 => dispatch_lazy!(@finder $self . $m :: <$k, 6> ( $($arg),* )),
+            _ => unreachable!("row_hash_mls is clamped to 4..=6 in configure()"),
+        }
+    };
+    (@finder $self:ident . $m:ident :: <$k:ty, $mls:literal> ( $($arg:expr),* )) => {
         match $self.finder {
             LazyFinder::Rows => match $self.row_log {
-                4 => $self.$m::<$k, 4, FINDER_ROWS>($($arg),*),
-                5 => $self.$m::<$k, 5, FINDER_ROWS>($($arg),*),
-                6 => $self.$m::<$k, 6, FINDER_ROWS>($($arg),*),
+                4 => $self.$m::<$k, 4, FINDER_ROWS, $mls>($($arg),*),
+                5 => $self.$m::<$k, 5, FINDER_ROWS, $mls>($($arg),*),
+                6 => $self.$m::<$k, 6, FINDER_ROWS, $mls>($($arg),*),
                 _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
             },
-            LazyFinder::Chain => $self.$m::<$k, 4, FINDER_CHAIN>($($arg),*),
-            LazyFinder::Tree => $self.$m::<$k, 4, FINDER_TREE>($($arg),*),
+            LazyFinder::Chain => $self.$m::<$k, 4, FINDER_CHAIN, $mls>($($arg),*),
+            LazyFinder::Tree => $self.$m::<$k, 4, FINDER_TREE, $mls>($($arg),*),
         }
     };
 }
@@ -3710,7 +3736,8 @@ impl RowMatchGenerator {
     /// Upstream zstd `ZSTD_hash4/5/6` of the `mls`-byte key at `base[idx..]`
     /// with `salt` XORed into the product, reduced to the top `bits`:
     /// `ZSTD_hashPtrSalted` for the row tables, `ZSTD_hashPtr` (salt 0) for
-    /// the hash chain.
+    /// the hash chain. The salt only spreads bucket indices between tables
+    /// and protects no secret, so a constant one is not a cryptographic value.
     ///
     /// # Safety
     /// `idx + ROW_HASH_KEY_LEN <= len` and `base` must point to `len` bytes.
@@ -3745,17 +3772,26 @@ impl RowMatchGenerator {
     /// Hash-chain bucket of `abs_pos` (upstream `ZSTD_hashPtr(p, hashLog, mls)`).
     /// Callers pass positions at least `ROW_HASH_KEY_LEN` bytes before the end.
     #[inline(always)]
-    fn hc_hash_at(&self, ctx: RowScan, abs_pos: usize) -> usize {
+    fn hc_hash_at<const MLS: u32>(&self, ctx: RowScan<MLS>, abs_pos: usize) -> usize {
         let idx = abs_pos - ctx.hist_start;
         debug_assert!(idx + ROW_HASH_KEY_LEN <= ctx.len);
         let bits = self.row_hash_log + self.row_log;
         // SAFETY: caller contract, `ctx` views the live history.
-        unsafe { Self::key_hash_raw(ctx.base, ctx.len, idx, self.row_hash_mls, bits, 0) as usize }
+        unsafe { Self::key_hash_raw(ctx.base, ctx.len, idx, ctx.key_mls(), bits, 0) as usize }
     }
 
-    /// The live history as a [`RowScan`] for one parse.
+    /// The live history as a [`RowScan`] for one parse, its key width read at
+    /// run time.
     #[inline(always)]
     fn scan_ctx(&self) -> RowScan {
+        self.scan_ctx_with::<0>()
+    }
+
+    /// The live history as a [`RowScan`] whose key width is the constant
+    /// `MLS` (`0`: read at run time), which must be this matcher's.
+    #[inline(always)]
+    fn scan_ctx_with<const MLS: u32>(&self) -> RowScan<MLS> {
+        debug_assert!(MLS == 0 || MLS == self.row_hash_mls);
         let history = self.live_history();
         let dict_frame = self.loaded_dict_end != 0;
         RowScan {
@@ -3768,13 +3804,18 @@ impl RowMatchGenerator {
             prefix_start: self.prefix_low,
             dict_frame,
             attached: dict_frame && self.dict_plan.is_some_and(|p| p.attach),
+            mls: self.row_hash_mls,
         }
     }
 
     /// `(row, tag)` of `abs_pos` through a hoisted [`RowScan`]; `None` when
     /// fewer than `ROW_HASH_KEY_LEN` bytes follow the position.
     #[inline(always)]
-    fn row_hash_at(&self, ctx: RowScan, abs_pos: usize) -> Option<(usize, u8)> {
+    fn row_hash_at<const MLS: u32>(
+        &self,
+        ctx: RowScan<MLS>,
+        abs_pos: usize,
+    ) -> Option<(usize, u8)> {
         let idx = abs_pos - ctx.hist_start;
         if idx + ROW_HASH_KEY_LEN > ctx.len {
             return None;
@@ -3782,14 +3823,7 @@ impl RowMatchGenerator {
         let total_bits = self.row_hash_log + ROW_TAG_BITS;
         // SAFETY: `idx + ROW_HASH_KEY_LEN <= ctx.len`, `ctx` views the live history.
         let combined = unsafe {
-            Self::key_hash_raw(
-                ctx.base,
-                ctx.len,
-                idx,
-                self.row_hash_mls,
-                total_bits,
-                ctx.salt,
-            )
+            Self::key_hash_raw(ctx.base, ctx.len, idx, ctx.key_mls(), total_bits, ctx.salt)
         };
         let row_mask = (1usize << self.row_hash_log) - 1;
         let row = ((combined >> ROW_TAG_BITS) as usize) & row_mask;

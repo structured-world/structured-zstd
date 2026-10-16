@@ -396,7 +396,6 @@ impl<M: Matcher> CompressionContext<M> {
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huff_table_spare: None,
-                huff_rollback: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),
                 fse_tables: FseTables::new(),

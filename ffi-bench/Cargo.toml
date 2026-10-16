@@ -136,6 +136,10 @@ path = "tests/dictionary_ffi.rs"
 required-features = ["bench-internals", "dict-builder"]
 
 [[test]]
+name = "dictionary_interop"
+path = "tests/dictionary_interop.rs"
+
+[[test]]
 name = "legacy_trainer_ffi"
 path = "tests/legacy_trainer_ffi.rs"
 required-features = ["bench-internals", "dict-builder"]

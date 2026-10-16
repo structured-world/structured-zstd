@@ -1,7 +1,8 @@
 use super::{
-    FseTableMode, LastUsedTable, RawSequence, choose_table_from_counts, emit_single_sequence_block,
-    encode_literal_length, encode_match_len, encode_offset_with_history, min_gain,
-    min_literals_to_compress, previous_table, remember_last_used_tables,
+    FseTableMode, LastUsedTable, RawSequence, SEQUENCE_CODE_SLOTS, SequenceHistogram,
+    choose_table_from_counts, emit_single_sequence_block, encode_literal_length, encode_match_len,
+    encode_offset_with_history, min_gain, min_literals_to_compress, previous_table,
+    remember_last_used_tables,
 };
 use crate::encoding::frame_compressor::{
     CompressState, FseTables, PreviousFseTable, SharedFseTable,
@@ -22,7 +23,7 @@ fn choose_table<'a>(
     strategy: StrategyTag,
     next: &'a mut Option<SharedFseTable>,
 ) -> FseTableMode<'a> {
-    let mut counts = [0usize; 256];
+    let mut counts: SequenceHistogram = [0; SEQUENCE_CODE_SLOTS];
     let mut total = 0usize;
     let mut max_symbol = 0usize;
     for symbol in data {
@@ -388,7 +389,6 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: seed_table.clone(),
                 huff_table_spare: None,
-                huff_rollback: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),
                 fse_tables: FseTables::new(),
@@ -406,7 +406,6 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: seed_table,
                 huff_table_spare: None,
-                huff_rollback: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),
                 fse_tables: FseTables::new(),
@@ -472,7 +471,6 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,
-        huff_rollback: None,
         huff_weights: Default::default(),
         seen_content: Default::default(),
         fse_tables: FseTables::new(),
@@ -538,7 +536,6 @@ fn retained_heap_size_counts_the_block_buffers() {
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,
-        huff_rollback: None,
         huff_weights: Default::default(),
         seen_content: Default::default(),
         fse_tables: FseTables::new(),
@@ -566,6 +563,88 @@ fn retained_heap_size_counts_the_block_buffers() {
         "laying out {needed} bytes of block buffers grew the reported retained size by only {} bytes",
         after - before,
     );
+}
+
+/// The splitter's workspace survives the block that created it, so its count
+/// tables are retained allocation the context must report.
+#[test]
+fn retained_heap_size_counts_the_estimator_workspace() {
+    let mut scratch = super::CompressedBlockScratch::new();
+    let before = scratch.retained_heap_size();
+    scratch.estimator_workspace = Some(Default::default());
+    let tables =
+        core::mem::size_of::<[usize; 256]>() + 3 * core::mem::size_of::<SequenceHistogram>();
+    assert!(
+        scratch.retained_heap_size() - before >= tables,
+        "the estimator's {tables} bytes of count tables went unreported",
+    );
+}
+
+/// A block written raw is not confirmed: the tables the next block repeats stay
+/// those it started from, and a Huffman table it built is kept as a buffer
+/// rather than becoming the carried table.
+#[test]
+fn discarded_block_keeps_the_entry_tables() {
+    let mut state = CompressState {
+        matcher: super::EntropyOnlyMatcher,
+        copy_kernel: crate::encoding::fastpath::select_kernel(),
+        last_huff_table: Some(huff0_encoder::HuffmanTable::build_from_data(b"aaaabbc")),
+        huff_table_spare: None,
+        huff_weights: Default::default(),
+        seen_content: Default::default(),
+        fse_tables: FseTables::new(),
+        block_scratch: super::CompressedBlockScratch::new(),
+        workspace: Workspace::new(),
+        offset_hist: [1, 4, 8],
+        strategy_tag: StrategyTag::Fast,
+        pre_split: None,
+        huf_optimal_search: true,
+        literal_compression_disabled: false,
+        post_split_allowed: true,
+    };
+    let entry_fse = [(); 3].map(|()| SharedFseTable::new(FSETable::blank()));
+    state.fse_tables.ll_previous = Some(PreviousFseTable::Custom(entry_fse[0].clone()));
+    state.fse_tables.ml_previous = Some(PreviousFseTable::Custom(entry_fse[1].clone()));
+    state.fse_tables.of_previous = Some(PreviousFseTable::Custom(entry_fse[2].clone()));
+    let entry_codes = state
+        .last_huff_table
+        .as_ref()
+        .unwrap()
+        .packed_codes()
+        .to_vec();
+    let built = huff0_encoder::HuffmanTable::build_from_data(b"xyzzzzzzzzzz");
+    let built_codes = built.packed_codes().to_vec();
+    assert_ne!(entry_codes, built_codes);
+    super::discard_block_tables(
+        &mut state,
+        super::BlockTables {
+            fse: [
+                LastUsedTable::Default,
+                LastUsedTable::Rle(3),
+                LastUsedTable::Default,
+            ],
+            huff: super::HuffOutcome::New(built),
+        },
+    );
+    assert_eq!(
+        state.last_huff_table.as_ref().unwrap().packed_codes(),
+        entry_codes
+    );
+    assert_eq!(
+        state.huff_table_spare.as_ref().unwrap().packed_codes(),
+        built_codes
+    );
+    let previous = [
+        &state.fse_tables.ll_previous,
+        &state.fse_tables.ml_previous,
+        &state.fse_tables.of_previous,
+    ];
+    for (slot, entry) in previous.into_iter().zip(&entry_fse) {
+        assert!(
+            matches!(slot, Some(PreviousFseTable::Custom(t)) if SharedFseTable::ptr_eq(t, entry)),
+            "a discarded block replaced the FSE table the next block repeats",
+        );
+    }
 }
 
 /// A buffer for `count` sequence codes, carved from `ws`, which must outlive it.
@@ -688,7 +767,6 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
             copy_kernel: crate::encoding::fastpath::select_kernel(),
             last_huff_table: None,
             huff_table_spare: None,
-            huff_rollback: None,
             huff_weights: Default::default(),
             seen_content: Default::default(),
             fse_tables: FseTables::new(),
@@ -753,7 +831,6 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,
-        huff_rollback: None,
         huff_weights: Default::default(),
         seen_content: Default::default(),
         fse_tables: FseTables::new(),
@@ -834,51 +911,6 @@ fn a_predefined_or_rle_block_parks_the_custom_table_it_replaces() {
             "{decision:?}: the displaced custom table is the next block's buffer",
         );
     }
-}
-
-/// A block that loses to a raw one must leave the axis exactly as it found
-/// it: the restored table unique, and a buffer free to build into.
-///
-/// The caller holds a CLONE of what `previous` was, so restoring only that
-/// leaves the same table in both slots — `previous` restored and `next` where
-/// confirmation displaced it — and the next block finds its buffer shared and
-/// allocates a fresh eleven-kilobyte table. On a run of blocks that keep
-/// falling back to raw that is a per-axis allocation per block, which is the
-/// cost this pair of slots exists to remove.
-#[test]
-fn a_block_that_falls_back_to_raw_leaves_its_axis_reusable() {
-    use crate::encoding::frame_compressor::SharedFseTable;
-    use crate::fse::fse_encoder::FSETable;
-
-    let mut fse_tables = FseTables::new();
-    let before = SharedFseTable::new(FSETable::blank());
-    fse_tables.ll_previous = Some(PreviousFseTable::Custom(before));
-    // What the caller keeps across the attempt.
-    let saved = fse_tables.ll_previous.clone();
-
-    // The attempt builds into the axis's spare slot, then confirms it, which
-    // displaces the old table into that slot.
-    fse_tables.ll_next = Some(SharedFseTable::new(FSETable::blank()));
-    super::commit_last_used_table(
-        &mut fse_tables.ll_previous,
-        &mut fse_tables.ll_next,
-        LastUsedTable::Encoded,
-    );
-
-    fse_tables.roll_back_confirmation([saved, None, None]);
-
-    let Some(PreviousFseTable::Custom(restored)) = fse_tables.ll_previous.as_ref() else {
-        panic!("the restored table must be the custom one the axis started with");
-    };
-    assert_eq!(
-        SharedFseTable::strong_count(restored),
-        1,
-        "the restored table must be unique, or the next block cannot build into its slot",
-    );
-    assert!(
-        fse_tables.ll_next.is_some(),
-        "the discarded table is exactly the buffer the next block wants",
-    );
 }
 
 /// A frame start replaces the previous slots, and the table that was there is
@@ -989,7 +1021,7 @@ fn fast_band_strategies_prefer_repeat_fse_table() {
         PreviousFseTable::Custom(crate::encoding::frame_compressor::SharedFseTable::new(prev));
     let fse_tables = FseTables::new();
     // Distribution over symbols {0,1}, both covered by `previous`.
-    let mut counts = [0usize; 256];
+    let mut counts: SequenceHistogram = [0; SEQUENCE_CODE_SLOTS];
     counts[0] = 4;
     counts[1] = 6;
     let total = 10;

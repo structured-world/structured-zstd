@@ -3396,19 +3396,21 @@ fn primed_snapshot_fast_attach_does_not_over_key_non_simple_backends() {
     );
 }
 
+/// A dictionary one byte past a whole slice is committed whole: the decoder
+/// places every byte of it before the frame, so a byte left out would shift
+/// every offset into it. The retention budget grows by all of it.
 #[test]
-fn prime_with_dictionary_counts_only_committed_tail_budget() {
+fn prime_with_dictionary_commits_a_short_last_piece() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Fastest);
 
     let before = driver.simple_mut().max_window_size;
-    // One full slice plus a 1-byte tail that cannot be committed.
     driver.prime_with_dictionary(b"abcdefghi", [1, 4, 8]);
 
     assert_eq!(
         driver.simple_mut().max_window_size,
-        before + 8,
-        "retention budget must account only for dictionary bytes actually committed to history"
+        before + 9,
+        "every dictionary byte is in the history and in the budget"
     );
 }
 
@@ -3465,20 +3467,19 @@ fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
     );
 }
 
+/// The Row backend takes a dictionary one byte past a whole slice whole too.
 #[test]
-fn row_prime_with_dictionary_subtracts_uncommitted_tail_budget() {
+fn row_prime_with_dictionary_commits_a_short_last_piece() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Level(5));
 
     let base_window = driver.row_matcher().max_window_size;
-    // Slice size is 8. The trailing byte cannot be committed (<4 tail),
-    // so it must be subtracted from retained budget.
     driver.prime_with_dictionary(b"abcdefghi", [1, 4, 8]);
 
     assert_eq!(
         driver.row_matcher().max_window_size,
-        base_window + 8,
-        "row retained window must exclude uncommitted 1-byte tail"
+        base_window + 9,
+        "every dictionary byte is in the history and in the budget"
     );
 }
 

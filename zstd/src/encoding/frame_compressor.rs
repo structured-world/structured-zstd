@@ -509,65 +509,6 @@ pub(crate) struct FseTables {
 }
 
 impl FseTables {
-    /// Undo a block's table confirmation, keeping the tables it built as the
-    /// next block's buffers.
-    ///
-    /// A block that loses to a raw one has already had its tables confirmed
-    /// into the previous slots, and the caller holds a clone of what they
-    /// were. Restoring only that clone leaves the axis holding the SAME table
-    /// in both slots — the restored one in `previous` and the one confirmation
-    /// displaced into `next` — so the next block finds its buffer shared and
-    /// allocates eleven kilobytes instead of writing into it, on every block
-    /// of a run that keeps falling back.
-    ///
-    /// Handing the discarded table to `next` fixes both halves at once: the
-    /// restored table is unique again, and the buffer the block just filled is
-    /// exactly what the next one wants to build into.
-    pub(crate) fn roll_back_confirmation(&mut self, saved: [Option<PreviousFseTable>; 3]) {
-        let [saved_ll, saved_ml, saved_of] = saved;
-        for (previous, next, restored) in [
-            (&mut self.ll_previous, &mut self.ll_next, saved_ll),
-            (&mut self.ml_previous, &mut self.ml_next, saved_ml),
-            (&mut self.of_previous, &mut self.of_next, saved_of),
-        ] {
-            let discarded = core::mem::replace(previous, restored);
-            // The table the block built, and it is not the one just restored:
-            // whatever `next` held was the outgoing previous, which is what was
-            // restored, so it is a duplicate and this one is free and unique.
-            //
-            // The exception is `RepeatLast`, where confirmation never replaced
-            // `previous` at all — the discarded handle IS the restored one.
-            // Parking it in `next` then leaves the two sharing a handle, and the
-            // next custom build cannot write into a table `previous` still
-            // holds, so it allocates another one.
-            let built = match discarded {
-                Some(PreviousFseTable::Custom(built))
-                    if !matches!(previous.as_ref(), Some(PreviousFseTable::Custom(back))
-                        if SharedFseTable::ptr_eq(&built, back)) =>
-                {
-                    Some(built)
-                }
-                _ => None,
-            };
-            match built {
-                Some(built) => *next = Some(built),
-                // Nothing new to park. The block settled on a predefined or RLE
-                // table, or repeated the last one, so confirmation may have
-                // parked the outgoing custom table here — and if that is the
-                // table now back in `previous`, holding it here too is what
-                // keeps the next build from writing into it.
-                None => {
-                    if let (Some(spare), Some(PreviousFseTable::Custom(back))) =
-                        (next.as_ref(), previous.as_ref())
-                        && SharedFseTable::ptr_eq(spare, back)
-                    {
-                        *next = None;
-                    }
-                }
-            }
-        }
-    }
-
     /// Keep the frame's tables as buffers before the next frame overwrites
     /// them.
     ///
@@ -1345,14 +1286,6 @@ pub(crate) struct CompressState<M: Matcher> {
     /// allocations. Without this, every dict-seeded frame whose last block
     /// ended raw/RLE paid a fresh two-Vec table clone per frame.
     pub(crate) huff_table_spare: Option<crate::huff0::huff0_encoder::HuffmanTable>,
-    /// Where a block copies `last_huff_table` before encoding, so it can be put
-    /// back if the compressed form loses to a raw block.
-    ///
-    /// A slot rather than a local because the copy is per block: cloning into a
-    /// fresh `Option` took two `Vec`s every time, while cloning into one that
-    /// already holds a table reuses them. Restoring is a swap, which also hands
-    /// the discarded table back here as the next block's buffer.
-    pub(crate) huff_rollback: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     /// The Huffman weight builder's three buffers, kept across blocks and
     /// frames. The cheap build path takes a tree and two weight buffers per
     /// call, and it runs once per block plus once per split candidate wherever
@@ -1489,19 +1422,14 @@ impl<M: Matcher> CompressState<M> {
     }
 
     /// Heap bytes the compressor keeps between blocks and frames beyond the
-    /// match finder: the FSE tables both slots of each axis hold, the rollback
-    /// slot the emit paths copy a Huffman table into before a block that may not
-    /// be kept, the block scratch with everything it holds (the splitter's
-    /// workspace and the nested estimator scratch), and the context workspace
-    /// the literal and sequence buffers are carved from.
+    /// match finder: the FSE tables both slots of each axis hold, the block
+    /// scratch with everything it holds (the splitter's workspace and the
+    /// nested estimator scratch), and the context workspace the literal and
+    /// sequence buffers are carved from.
     ///
     /// All of it survives a frame, so a caller sizing a context has to see it.
     pub(crate) fn retained_scratch_heap_size(&self) -> usize {
         self.fse_tables.heap_size()
-            + self
-                .huff_rollback
-                .as_ref()
-                .map_or(0, |table| table.heap_size())
             + self.block_scratch.retained_heap_size()
             + self.workspace.heap_bytes()
     }
@@ -1531,7 +1459,7 @@ impl<M: Matcher> CompressState<M> {
     /// dropped the previous table on every block, so the builds that followed
     /// allocated their buffers again.
     #[inline]
-    fn park_huff_table(&mut self, table: crate::huff0::huff0_encoder::HuffmanTable) {
+    pub(crate) fn park_huff_table(&mut self, table: crate::huff0::huff0_encoder::HuffmanTable) {
         if self.huff_table_spare.is_none() {
             self.huff_table_spare = Some(table);
         } else {
@@ -1772,7 +1700,6 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huff_table_spare: None,
-                huff_rollback: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),
                 fse_tables: FseTables::new(),
@@ -2212,7 +2139,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huff_table_spare: None,
-                huff_rollback: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),
                 fse_tables: FseTables::new(),
