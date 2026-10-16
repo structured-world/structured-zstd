@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/structured-world/structured-zstd/compare/v0.2.0...v0.2.1) - 2026-10-16
+
+### Added
+
+- *(decoding)* add caller-owned streaming workspace decoder ([#583](https://github.com/structured-world/structured-zstd/pull/583))
+
+### Fixed
+
+- *(encoding)* commit a dictionary's short last chunk into the history ([#586](https://github.com/structured-world/structured-zstd/pull/586))
+
 ## [0.2.0](https://github.com/structured-world/structured-zstd/compare/v0.1.1...v0.2.0) - 2026-10-12
 
 ### Added
