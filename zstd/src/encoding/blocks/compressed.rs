@@ -1847,8 +1847,11 @@ fn fill_and_count<const OFFSETS_CODED: bool>(
             "the code functions stay inside their alphabets",
         );
         // SAFETY: the codes are at most 35 (LL), 52 (ML) and 31 (OF), under the
-        // histogram's `SEQUENCE_CODE_SLOTS`; a byte-wide index would otherwise
-        // be bounds-checked three times a sequence.
+        // histogram's `SEQUENCE_CODE_SLOTS`. The LL and ML bounds hold in release
+        // because `encode_literal_length` and `encode_match_len` index
+        // `LL_EXTRA_BITS` (36 entries) and `ML_EXTRA_BITS` (53) with a bounds
+        // check, so a larger code panics there before reaching this write; the
+        // OF code is `ilog2` of a `u32`. Those lookups must stay checked.
         unsafe {
             *ll_counts.get_unchecked_mut(usize::from(ll_code)) += 1;
             *ml_counts.get_unchecked_mut(usize::from(ml_code)) += 1;
