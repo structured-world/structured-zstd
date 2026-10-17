@@ -11,39 +11,40 @@ fn forced_progress_keeps_the_summary_under_quiet() {
 }
 
 /// The reference command scales sizes in powers of two and picks the number
-/// of decimals from the scaled value, so `-l` columns and result summaries
-/// line up with what its own output shows. A whole number of units drops the
-/// decimals entirely; anything else keeps three significant figures.
+/// of decimals from the scaled value (`util.c` `UTIL_makeHumanReadableSize`),
+/// so `-l` columns and result summaries read as its output does: none for a
+/// count of bytes or a value of a hundred units and up, one from ten, two
+/// above one, three at exactly one unit.
 #[test]
 fn sizes_scale_and_round_the_way_the_reference_prints_them() {
     assert_eq!(HumanSize::new(0, false).to_string(), "0 B");
     assert_eq!(HumanSize::new(100, false).to_string(), "100 B");
     assert_eq!(HumanSize::new(1023, false).to_string(), "1023 B");
-    assert_eq!(HumanSize::new(1024, false).to_string(), "1 KiB");
+    assert_eq!(HumanSize::new(1024, false).to_string(), "1.000 KiB");
     assert_eq!(HumanSize::new(1025, false).to_string(), "1.00 KiB");
     assert_eq!(HumanSize::new(1536, false).to_string(), "1.50 KiB");
     assert_eq!(
         HumanSize::new(10 * 1024 + 512, false).to_string(),
         "10.5 KiB"
     );
-    assert_eq!(HumanSize::new(12 * 1024, false).to_string(), "12 KiB");
-    assert_eq!(HumanSize::new(7 << 20, false).to_string(), "7 MiB");
+    assert_eq!(HumanSize::new(12 * 1024, false).to_string(), "12.0 KiB");
+    assert_eq!(HumanSize::new(7 << 20, false).to_string(), "7.00 MiB");
+    assert_eq!(HumanSize::new(8 << 20, false).to_string(), "8.00 MiB");
+    assert_eq!(HumanSize::new(1 << 30, false).to_string(), "1.000 GiB");
     assert_eq!(HumanSize::new(123 << 30, false).to_string(), "123 GiB");
     assert_eq!(HumanSize::new(150 << 30, false).to_string(), "150 GiB");
-    assert_eq!(HumanSize::new(1 << 40, false).to_string(), "1 TiB");
+    assert_eq!(HumanSize::new(1 << 40, false).to_string(), "1.000 TiB");
 }
 
 /// A value just over a whole unit keeps two decimals: a file a byte over a
-/// kibibyte would otherwise print as `1 KiB`, which it is not.
+/// kibibyte prints as `1.00 KiB`, and exactly one as `1.000 KiB`.
 #[test]
 fn a_value_just_over_a_unit_keeps_two_decimals() {
     let size = HumanSize::new((1 << 20) + 1, false);
     assert_eq!(size.precision(), 2);
     let just_over_a_unit = HumanSize::new(1024 + 1, false);
     assert_eq!(just_over_a_unit.to_string(), "1.00 KiB");
-    // Only values strictly above one unit reach the two-decimal branch; a
-    // value scaled to exactly one unit is whole and prints without decimals.
-    assert_eq!(HumanSize::new(1 << 30, false).precision(), 0);
+    assert_eq!(HumanSize::new(1 << 30, false).precision(), 3);
 }
 
 /// `-vv` keeps the raw byte count: a summary being pasted into a report wants

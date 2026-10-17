@@ -45,8 +45,8 @@ impl Progress {
 /// A byte count scaled to the unit the reference command prints it in.
 ///
 /// Scaled in powers of two, with the precision chosen from the magnitude of
-/// the scaled value: two decimals below ten, one below a hundred, none above
-/// that or when the value is a whole number of units.
+/// the scaled value: three decimals at exactly one unit, two below ten, one
+/// below a hundred, none above that or for a count of bytes.
 /// `verbose` keeps the raw byte count instead, as `-vv` does.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct HumanSize {
@@ -89,15 +89,18 @@ impl HumanSize {
             .map_or((bytes as f64, " B"), |(shift, suffix)| {
                 (bytes as f64 / (1u64 << shift) as f64, *suffix)
             });
-        // A scaled value is at least one unit, and an unscaled one is a whole
-        // number of bytes, so a fraction here is always above one.
-        let precision = if value >= 100.0 || value as u64 as f64 == value {
+        // As `UTIL_makeHumanReadableSize` chooses it (`util.c:585-593`): no
+        // decimals for an unscaled count (its `(U64)value == size`) or from a
+        // hundred units, then one from ten, two above one, and three for a
+        // value of exactly one unit.
+        let precision = if value >= 100.0 || suffix == " B" {
             0
         } else if value >= 10.0 {
             1
-        } else {
-            debug_assert!(value > 1.0);
+        } else if value > 1.0 {
             2
+        } else {
+            3
         };
         Self {
             value,

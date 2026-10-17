@@ -4491,6 +4491,17 @@ fn multi_threaded_modes_are_refused_only_beside_a_single_thread() {
     }
 }
 
+/// The parameters `-vv` shows carry the window `--long` set, unless `--zstd=`
+/// named one, as the reference's `printActualCParams` shows them.
+#[test]
+fn shown_parameters_carry_the_long_window() {
+    let shown = |args: &[&str]| shown_advanced_params(&parse(args).unwrap()).window_log;
+    assert_eq!(shown(&["-19", "f"]), None);
+    assert_eq!(shown(&["-19", "--long", "f"]), Some(27));
+    assert_eq!(shown(&["--long=30", "f"]), Some(30));
+    assert_eq!(shown(&["--zstd=wlog=20", "--long", "f"]), Some(20));
+}
+
 /// Training on no samples, or fewer than the trainer needs, ends with the
 /// reference trainer's status 14 (`dibio.c` `EXM_THROW(14, "nb of samples too
 /// low")`) rather than the generic 1.

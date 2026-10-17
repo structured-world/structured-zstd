@@ -2432,11 +2432,26 @@ fn show_cparams(opts: &Options) -> Result<()> {
                 .wrap_err("failed to write the default parameters")?;
         }
         if opts.verbosity >= 4 {
-            write_actual_cparams(&mut err, size, dictionary_size, opts.level, &opts.advanced)
-                .wrap_err("failed to write the compression parameters")?;
+            write_actual_cparams(
+                &mut err,
+                size,
+                dictionary_size,
+                opts.level,
+                &shown_advanced_params(opts),
+            )
+            .wrap_err("failed to write the compression parameters")?;
         }
     }
     Ok(())
+}
+
+/// The `--zstd=` knobs `-vv` shows: `--long=N` sets the window when `--zstd=`
+/// has not (`zstdcli.c:1127-1129`).
+fn shown_advanced_params(opts: &Options) -> AdvancedParams {
+    AdvancedParams {
+        window_log: opts.advanced.window_log.or(opts.long_window_log),
+        ..opts.advanced
+    }
 }
 
 /// The file the run's dictionary comes from: `-D`, or the `--patch-from`
@@ -5510,7 +5525,10 @@ fn list_file(path: &Path, verbose: bool, verbosity: i32) -> Result<ArchiveSummar
         .decompressed
         .map(|decompressed| decompressed as f64 / summary.compressed as f64);
     let check = if summary.check { "XXH64" } else { "None" };
-    let compressed = HumanSize::new(summary.compressed, false);
+    // `-vv` prints sizes as exact byte counts, as the reference's one display
+    // level governs its size formatting too (`g_utilDisplayLevel`).
+    let raw = verbosity > 3;
+    let compressed = HumanSize::new(summary.compressed, raw);
     if !verbose {
         match (summary.decompressed, ratio) {
             (Some(decompressed), Some(ratio)) => println!(
@@ -5518,7 +5536,7 @@ fn list_file(path: &Path, verbose: bool, verbosity: i32) -> Result<ArchiveSummar
                 summary.frames,
                 summary.skips,
                 compressed.columns(6),
-                HumanSize::new(decompressed, false).columns(8),
+                HumanSize::new(decompressed, raw).columns(8),
                 path.display()
             ),
             _ => println!(
@@ -5540,14 +5558,14 @@ fn list_file(path: &Path, verbose: bool, verbosity: i32) -> Result<ArchiveSummar
     println!("DictID: {}", summary.dict_id.unwrap_or(0));
     println!(
         "Window Size: {} ({} B)",
-        HumanSize::new(summary.window_size, false),
+        HumanSize::new(summary.window_size, raw),
         summary.window_size
     );
     println!("Compressed Size: {compressed} ({} B)", summary.compressed);
     if let (Some(decompressed), Some(ratio)) = (summary.decompressed, ratio) {
         println!(
             "Decompressed Size: {} ({decompressed} B)",
-            HumanSize::new(decompressed, false)
+            HumanSize::new(decompressed, raw)
         );
         println!("Ratio: {ratio:.4}");
     }
