@@ -1815,6 +1815,81 @@ fn decoding_names_the_foreign_format_it_cannot_read() {
     assert!(decode_stream_message(b"some data").contains("unsupported format"));
 }
 
+/// A decoding failure is reported against the input, in the reference
+/// command's two shapes (`fileio.c` 2463, 2748-2796): `zstd: NAME: message`
+/// for input that is not a frame, and `NAME : Decoding error (36) : <libzstd's
+/// message>` for a frame that fails, every line of a multi-line report named.
+#[test]
+fn decode_failures_name_the_input_like_the_reference() {
+    let failure = |bytes: &[u8], settings: &DecodeSettings| {
+        let err = decompress_stream(bytes, io::sink(), &mut no_dict(), settings)
+            .expect_err("the input is refused");
+        named(err, "in.zst").to_string()
+    };
+    assert_eq!(
+        failure(b"plain text", &DecodeSettings::default()),
+        "zstd: in.zst: unsupported format "
+    );
+    assert_eq!(
+        failure(b"", &DecodeSettings::default()),
+        "zstd: in.zst: unexpected end of file "
+    );
+    // A dictionary frame decoded without its dictionary.
+    let dictionary_frame = include_bytes!("../../../dict_tests/files/ModemManager.service.zst");
+    assert_eq!(
+        failure(dictionary_frame, &DecodeSettings::default()),
+        "in.zst : Decoding error (36) : Dictionary mismatch "
+    );
+    let narrow = DecodeSettings {
+        max_window: 1 << 10,
+        ..DecodeSettings::default()
+    };
+    let report = failure(&frame_of(&[7u8; 1 << 16]), &narrow);
+    assert!(
+        report.starts_with("in.zst : Decoding error (36) : Frame requires too much memory"),
+        "{report}"
+    );
+    assert!(
+        report.lines().all(|line| line.starts_with("in.zst : ")),
+        "every line is named: {report}"
+    );
+    // Anything else keeps its own text.
+    let other = named(eyre!("can't stat x"), "in.zst").to_string();
+    assert_eq!(other, "can't stat x");
+}
+
+/// A passed-through input is told apart from a decoded one, so it gets no
+/// result line: the reference prints none for it (`FIO_passThrough` returns
+/// ahead of the summary).
+#[test]
+fn a_passed_through_input_is_told_apart_from_a_decoded_one() {
+    let pass = DecodeSettings {
+        pass_through: true,
+        ..DecodeSettings::default()
+    };
+    let decode = |bytes: &[u8]| decode_or_pass(bytes, io::sink(), &mut no_dict(), &pass).unwrap();
+    assert_eq!(decode(b"some data"), Decoded::PassedThrough(9));
+    assert_eq!(decode(b""), Decoded::PassedThrough(0));
+    assert_eq!(decode(&frame_of(b"framed")), Decoded::Frames(6));
+}
+
+/// One input that fails to decode does not end a run over several: the
+/// reference command reports it and goes on to the next (`FIO_decompressMultipleFilenames`),
+/// so the inputs after it are still written and the exit status counts the
+/// failure.
+#[test]
+fn a_failed_input_does_not_end_a_concatenated_decode() {
+    let scratch = Scratch::new("deccont");
+    let bad = scratch.file("bad", b"plain text");
+    let good = scratch.file("good.zst", &frame_of(b"after the bad one"));
+    let output = scratch.path().join("out");
+    let mut opts = parse(&["-d", "-qq", "-f", "-o", "x", "a", "b"]).unwrap();
+    opts.inputs = vec![bad, good];
+    opts.output = Some(output.clone());
+    assert_eq!(run(opts).expect("a failed input is counted"), 1);
+    assert_eq!(fs::read(&output).unwrap(), b"after the bad one");
+}
+
 /// The preset is the starting point, not the last word: `zstdcat -v` still
 /// raises the level, and `--no-pass-through` still turns pass-through off.
 #[test]

@@ -940,7 +940,7 @@ fn command_status(raw: &[OsString], pause: &mut bool) -> i32 {
         Ok(0) => 0,
         Ok(_failed_inputs) => 1,
         Err(err) => {
-            display!(verbosity, 1, "zstd: {err}");
+            report(verbosity, &err);
             exit_status(&err)
         }
     }
@@ -1075,6 +1075,87 @@ impl std::error::Error for Fatal {}
 /// The exit status an error ends the run with.
 fn exit_status(err: &Error) -> i32 {
     err.downcast_ref::<Fatal>().map_or(1, |fatal| fatal.status)
+}
+
+/// A decoding failure, still to be named after the input it came from (see
+/// [`named`]): input that is not a frame at all, or the lines about a frame
+/// that failed to decode.
+#[derive(Debug)]
+struct DecodeFailure {
+    in_frame: bool,
+    lines: Vec<String>,
+}
+
+impl DecodeFailure {
+    /// The input is not a frame: `zstd: NAME: message`.
+    fn not_a_frame(message: impl Into<String>) -> Error {
+        Box::new(DecodeFailure {
+            in_frame: false,
+            lines: vec![message.into()],
+        })
+    }
+
+    /// A frame failed to decode: `NAME : line` for every line of `report`.
+    fn in_frame(report: &str) -> Error {
+        Box::new(DecodeFailure {
+            in_frame: true,
+            lines: report.lines().map(str::to_string).collect(),
+        })
+    }
+}
+
+impl core::fmt::Display for DecodeFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.lines.join("\n"))
+    }
+}
+
+impl std::error::Error for DecodeFailure {}
+
+/// An error whose text is complete, the input's name included, and is printed
+/// as it stands.
+#[derive(Debug)]
+struct Reported(String);
+
+impl core::fmt::Display for Reported {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Reported {}
+
+/// `err` with the input's `name` written in, the way the reference command
+/// names it (`fileio.c` 2463, 2748-2796); any other error is returned as it
+/// is.
+fn named(err: Error, name: &str) -> Error {
+    match err.downcast::<DecodeFailure>() {
+        Ok(failure) => {
+            let lines: Vec<String> = failure
+                .lines
+                .iter()
+                // Every one of these reference lines ends in a space.
+                .map(|line| {
+                    if failure.in_frame {
+                        format!("{name} : {line} ")
+                    } else {
+                        format!("zstd: {name}: {line} ")
+                    }
+                })
+                .collect();
+            Box::new(Reported(lines.join("\n")))
+        }
+        Err(err) => err,
+    }
+}
+
+/// Print an error that ends an input or the run: a [`Reported`] one as it
+/// stands, anything else after the tool's name.
+fn report(verbosity: i32, err: &Error) {
+    match err.downcast_ref::<Reported>() {
+        Some(reported) => display!(verbosity, 1, "{reported}"),
+        None => display!(verbosity, 1, "zstd: {err}"),
+    }
 }
 
 /// The default compression level, from `ZSTD_CLEVEL` when it is set.
@@ -3151,7 +3232,8 @@ fn process_concatenated(
                             sink,
                         ),
                         None => stream_stdin(opts, codecs, sink),
-                    })?;
+                    })
+                    .map_err(|err| named(err, &name))?;
                 match written {
                     Some((processed, placement)) => {
                         file_summary(
@@ -3284,7 +3366,7 @@ fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Resu
             match process_file(opts, input, codecs, total) {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    display!(opts.verbosity, 1, "zstd: {err}");
+                    report(opts.verbosity, &named(err, &input.display().to_string()));
                     Outcome::Refused
                 }
             }
@@ -3341,6 +3423,9 @@ enum Outcome {
 struct Processed {
     read: u64,
     written: u64,
+    /// The input was not zstd and went through unchanged: it has no result
+    /// line of its own.
+    passed_through: bool,
 }
 
 /// The run's running totals, for the multi-file summary and the exit status.
@@ -3375,7 +3460,7 @@ fn file_summary(
     destination: &str,
     processed: &Processed,
 ) {
-    if total > 1 && opts.verbosity < 3 {
+    if (total > 1 && opts.verbosity < 3) || processed.passed_through {
         return;
     }
     let verbose = opts.verbosity > 3;
@@ -3388,13 +3473,15 @@ fn file_summary(
                 display!(
                     opts.verbosity,
                     level,
-                    "{name:<20} :  ({read:>6} => {written:>6}, {destination})"
+                    // The trailing space is the reference's line, byte for
+                    // byte (`fileio.c:1793-1799`), as are those below.
+                    "{name:<20} :  ({read:>6} => {written:>6}, {destination}) "
                 );
             } else {
                 display!(
                     opts.verbosity,
                     level,
-                    "{name:<20} :{:>6.2}%   ({read:>6} => {written:>6}, {destination})",
+                    "{name:<20} :{:>6.2}%   ({read:>6} => {written:>6}, {destination}) ",
                     processed.written as f64 / processed.read as f64 * 100.0
                 );
             }
@@ -3403,7 +3490,7 @@ fn file_summary(
             display!(
                 opts.verbosity,
                 level,
-                "{name:<20}: {} bytes",
+                "{name:<20}: {} bytes ",
                 processed.written
             );
         }
@@ -3448,7 +3535,8 @@ fn multi_summary(opts: &Options, total: usize, tally: &Tally) {
             display!(
                 opts.verbosity,
                 level,
-                "{} files decompressed : {:>6} bytes total",
+                // `fileio.c:3138`, trailing space included.
+                "{} files decompressed : {:>6} bytes total ",
                 tally.processed,
                 tally.written
             );
@@ -5553,15 +5641,17 @@ fn stream<R: BufRead, W: Write>(
                 ..FrameSettings::from_options(opts)
             },
             codecs,
-        )?,
-        Mode::Decompress => decompress_stream(&mut reader, &mut sink, codecs, decode)?,
-        Mode::Test => decompress_stream(&mut reader, io::sink(), codecs, decode)?,
+        )
+        .map(Decoded::Frames)?,
+        Mode::Decompress => decode_or_pass(&mut reader, &mut sink, codecs, decode)?,
+        Mode::Test => decode_or_pass(&mut reader, io::sink(), codecs, decode)?,
         Mode::List | Mode::Train => unreachable!("list / train never stream"),
     };
     sink.flush().wrap_err("failed to flush output")?;
     Ok(Processed {
         read: reader.read,
-        written,
+        written: written.bytes(),
+        passed_through: matches!(written, Decoded::PassedThrough(_)),
     })
 }
 
@@ -5577,16 +5667,16 @@ fn stream_input_to<W: Write>(
     destination: &str,
     total: usize,
 ) -> Result<Outcome> {
-    let (name, processed) = if input == Path::new("-") {
+    let (name, streamed) = if input == Path::new("-") {
         (
             STDIN_MARK.to_string(),
-            stream_stdin(opts, codecs, &mut sink)?,
+            stream_stdin(opts, codecs, &mut sink),
         )
     } else {
         match open_input(opts, input) {
             Ok(Some((source, metadata))) => (
                 input.display().to_string(),
-                stream_opened(opts, codecs, source, &metadata, &mut sink)?,
+                stream_opened(opts, codecs, source, &metadata, &mut sink),
             ),
             Ok(None) => return Ok(Outcome::Skipped),
             Err(err) => {
@@ -5594,6 +5684,19 @@ fn stream_input_to<W: Write>(
                 return Ok(Outcome::Refused);
             }
         }
+    };
+    let processed = match streamed {
+        Ok(processed) => processed,
+        // A decoded input that fails is reported and the next one decoded, as
+        // the reference command goes on (`FIO_decompressMultipleFilenames`):
+        // what each input decodes to stands on its own in the output. A
+        // compressed input that fails ends the run instead, since the frame
+        // it left half-written would corrupt every frame after it.
+        Err(err) if opts.mode != Mode::Compress => {
+            report(opts.verbosity, &named(err, &name));
+            return Ok(Outcome::Refused);
+        }
+        Err(err) => return Err(named(err, &name)),
     };
     file_summary(opts, total, &name, destination, &processed);
     Ok(Outcome::Done(processed))
@@ -6302,10 +6405,38 @@ const SKIPPABLE_MAGIC_BASE: u32 = 0x184D_2A50;
 /// refused either way, with the reference command's message.
 fn decompress_stream<R: Read, W: Write>(
     reader: R,
-    mut writer: W,
+    writer: W,
     codecs: &mut Codecs,
     settings: &DecodeSettings,
 ) -> Result<u64> {
+    decode_or_pass(reader, writer, codecs, settings).map(Decoded::bytes)
+}
+
+/// What [`decode_or_pass`] wrote: the content of the frames, or the input
+/// itself passed through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decoded {
+    Frames(u64),
+    PassedThrough(u64),
+}
+
+impl Decoded {
+    fn bytes(self) -> u64 {
+        match self {
+            Decoded::Frames(bytes) | Decoded::PassedThrough(bytes) => bytes,
+        }
+    }
+}
+
+/// [`decompress_stream`], saying whether the input was decoded or passed
+/// through: the reference reports no result for a passed-through input
+/// (`FIO_passThrough` returns ahead of the summary).
+fn decode_or_pass<R: Read, W: Write>(
+    reader: R,
+    mut writer: W,
+    codecs: &mut Codecs,
+    settings: &DecodeSettings,
+) -> Result<Decoded> {
     // Parsed once for the whole run rather than per stream or per frame, and
     // decoded against by one decoder: the decoder keeps its buffers and, for
     // this one dictionary, the handle it took on the first frame.
@@ -6342,10 +6473,11 @@ fn decompress_stream<R: Read, W: Write>(
             // other, and passes through as the empty output (the reference
             // command refuses it there too; `cat`, `zcat -f` and `xzcat -f`
             // pass it).
-            if frames == 0 && !settings.pass_through {
-                bail!("unexpected end of file");
-            }
-            return Ok(written);
+            return match frames {
+                0 if settings.pass_through => Ok(Decoded::PassedThrough(0)),
+                0 => Err(DecodeFailure::not_a_frame("unexpected end of file")),
+                _ => Ok(Decoded::Frames(written)),
+            };
         }
         let is_frame = read == 4 && {
             let magic = u32::from_le_bytes(magic);
@@ -6355,7 +6487,9 @@ fn decompress_stream<R: Read, W: Write>(
         // not, in the order the reference checks it (`FIO_decompressFrames`):
         // copying it through would hand on compressed bytes as content.
         if let Some(format) = foreign_format(&magic[..read]) {
-            bail!("{format} file cannot be uncompressed (this build reads zstd only) -- ignored");
+            return Err(DecodeFailure::not_a_frame(format!(
+                "{format} file cannot be uncompressed (this build reads zstd only) -- ignored"
+            )));
         }
         if !is_frame {
             // Only input that is not zstd from its first byte is passed
@@ -6370,12 +6504,12 @@ fn decompress_stream<R: Read, W: Write>(
                 written += read as u64;
                 written += io::copy(&mut source, &mut writer)
                     .wrap_err("failed to pass the input through")?;
-                return Ok(written);
+                return Ok(Decoded::PassedThrough(written));
             }
             if read < 4 {
-                bail!("unknown header");
+                return Err(DecodeFailure::not_a_frame("unknown header"));
             }
-            bail!("unsupported format");
+            return Err(DecodeFailure::not_a_frame("unsupported format"));
         }
         frames += 1;
         let stream = Frames {
@@ -6495,13 +6629,22 @@ fn decode_frames<R: Read, W: Write, C: ReadClock>(
     {
         Some(&FrameDecoderError::WindowSizeTooBig {
             requested, limit, ..
-        }) => bail!(
-            "{}",
-            window_too_large_message(requested, limit, settings.memory_overhead)
-        ),
+        }) => Err(DecodeFailure::in_frame(&window_too_large_message(
+            requested,
+            limit,
+            settings.memory_overhead,
+        ))),
         Some(frame_err) => match after_frame_message(frame_err) {
-            Some(message) => bail!("{message}"),
-            None => bail!("invalid zstd frame: {frame_err:?}"),
+            Some(message) if message.starts_with("Decoding error") => {
+                Err(DecodeFailure::in_frame(message))
+            }
+            Some(message) => Err(DecodeFailure::not_a_frame(message)),
+            // libzstd's message for the failure's class through the decoding
+            // error line (`fileio.c:2463`).
+            None => Err(DecodeFailure::in_frame(&format!(
+                "Decoding error (36) : {}",
+                frame_err.code().message()
+            ))),
         },
         None => Err(err).wrap_err("streaming decompression failed"),
     }

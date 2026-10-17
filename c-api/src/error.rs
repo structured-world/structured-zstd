@@ -8,7 +8,7 @@
 
 use core::ffi::{CStr, c_char, c_uint};
 
-use codec::decoding::errors::{FrameDecoderError, FrameDescriptorError, ReadFrameHeaderError};
+use codec::decoding::errors::{ErrorCode, FrameDecoderError, FrameDescriptorError};
 
 /// Error codes from `zstd_errors.h` (upstream v1.5.7), numeric values pinned
 /// since zstd v1.3.1. Exposed `#[repr(u32)]` so the discriminants are the
@@ -141,55 +141,39 @@ pub fn code_for_training_error(err: &std::io::Error) -> ZSTD_ErrorCode {
     }
 }
 
-/// Map a refused frame header descriptor to the code upstream returns. The one
-/// mapping for every entry point that parses a header, so they cannot drift
-/// apart.
-pub fn code_for_descriptor_error(err: &FrameDescriptorError) -> ZSTD_ErrorCode {
-    match err {
-        // Upstream refuses a set Reserved_bit as an unsupported frame
-        // parameter (`zstd_decompress.c:511`).
-        FrameDescriptorError::ReservedBitSet => {
-            ZSTD_ErrorCode::ZSTD_error_frameParameter_unsupported
-        }
-        _ => ZSTD_ErrorCode::ZSTD_error_corruption_detected,
-    }
-}
-
-/// Map a decoder error to the closest stable `ZSTD_ErrorCode`. Conservative:
-/// any variant without an exact upstream analogue (including the
-/// feature-gated and future ones caught by the wildcard) collapses to
-/// `corruption_detected`, the code upstream uses for a malformed frame.
-pub fn code_for_decoder_error(err: &FrameDecoderError) -> ZSTD_ErrorCode {
+/// The `ZSTD_ErrorCode` for the codec's classification of a failure; the
+/// classification itself is the codec's ([`ErrorCode`]).
+pub fn code_for(code: ErrorCode) -> ZSTD_ErrorCode {
     use ZSTD_ErrorCode::*;
-    match err {
-        FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::InvalidFrameDescriptor(
-            descriptor,
-        )) => code_for_descriptor_error(descriptor),
-        FrameDecoderError::ReadFrameHeaderError(_) => ZSTD_error_prefix_unknown,
-        FrameDecoderError::FrameHeaderError(_) | FrameDecoderError::FailedToInitialize(_) => {
-            ZSTD_error_frameParameter_unsupported
-        }
-        FrameDecoderError::WindowSizeTooBig { .. } => ZSTD_error_frameParameter_windowTooLarge,
-        FrameDecoderError::WindowCeilingOutOfRange { .. } => ZSTD_error_parameter_outOfBound,
-        FrameDecoderError::DictionaryDecodeError(_) => ZSTD_error_dictionary_corrupted,
-        FrameDecoderError::DictNotProvided { .. }
-        | FrameDecoderError::DictIdMismatch { .. }
-        | FrameDecoderError::DictAlreadyRegistered { .. } => ZSTD_error_dictionary_wrong,
-        FrameDecoderError::TargetTooSmall => ZSTD_error_dstSize_tooSmall,
-        FrameDecoderError::FrameContentSizeMismatch { .. } => ZSTD_error_corruption_detected,
-        FrameDecoderError::NotYetInitialized => ZSTD_error_init_missing,
-        // Trailing content checksum disagreed with the decoded output — upstream
-        // reports this distinctly from generic corruption.
-        FrameDecoderError::ChecksumMismatch { .. } => ZSTD_error_checksum_wrong,
-        // Block-body / drain / skip failures and any feature-gated or future
-        // variant: a malformed or unparseable frame.
+    match code {
+        ErrorCode::PrefixUnknown => ZSTD_error_prefix_unknown,
+        ErrorCode::FrameParameterUnsupported => ZSTD_error_frameParameter_unsupported,
+        ErrorCode::FrameParameterWindowTooLarge => ZSTD_error_frameParameter_windowTooLarge,
+        ErrorCode::ParameterOutOfBound => ZSTD_error_parameter_outOfBound,
+        ErrorCode::DictionaryCorrupted => ZSTD_error_dictionary_corrupted,
+        ErrorCode::DictionaryWrong => ZSTD_error_dictionary_wrong,
+        ErrorCode::DstSizeTooSmall => ZSTD_error_dstSize_tooSmall,
+        ErrorCode::InitMissing => ZSTD_error_init_missing,
+        ErrorCode::ChecksumWrong => ZSTD_error_checksum_wrong,
+        // `ErrorCode` is non-exhaustive: a class added later that this layer
+        // does not know yet is a malformed frame here.
         _ => ZSTD_error_corruption_detected,
     }
 }
 
+/// The code upstream returns for a refused frame header descriptor.
+pub fn code_for_descriptor_error(err: &FrameDescriptorError) -> ZSTD_ErrorCode {
+    code_for(err.code())
+}
+
+/// The code upstream returns for a decoder error.
+pub fn code_for_decoder_error(err: &FrameDecoderError) -> ZSTD_ErrorCode {
+    code_for(err.code())
+}
+
 /// Static, NUL-terminated message for a code (the strings upstream's
 /// `ZSTD_getErrorString` returns for the stable codes).
-fn message(code: ZSTD_ErrorCode) -> &'static CStr {
+pub(crate) fn message(code: ZSTD_ErrorCode) -> &'static CStr {
     use ZSTD_ErrorCode::*;
     match code {
         ZSTD_error_no_error => c"No error detected",
