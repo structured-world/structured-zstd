@@ -256,9 +256,43 @@ pub fn write_skippable_frame<W: Write>(
     payload: &[u8],
     writer: &mut W,
 ) -> Result<usize, SkippableFrameError> {
-    validate_magic_variant(magic_variant)?;
+    // Size before variant, the order upstream reports them in.
     validate_payload_size(payload.len())?;
+    validate_magic_variant(magic_variant)?;
     write_skippable_frame_to(magic_variant, payload, writer).map_err(SkippableFrameError::Io)
+}
+
+/// Borrow the magic variant and payload of the skippable frame `src` starts
+/// with, without copying. Backs the C `ZSTD_readSkippableFrame`; bytes after
+/// the frame are ignored.
+///
+/// # Errors
+/// [`SkippableSliceError::Truncated`] when `src` ends before the header or the
+/// declared payload does, [`SkippableSliceError::BadMagicNumber`] when it does
+/// not start with a skippable-frame magic.
+///
+/// ```rust
+/// use structured_zstd::skippable::{parse_skippable_frame, write_skippable_frame};
+/// let mut frame = Vec::new();
+/// write_skippable_frame(7, b"metadata", &mut frame).unwrap();
+/// assert_eq!(parse_skippable_frame(&frame).unwrap(), (7, &b"metadata"[..]));
+/// ```
+pub fn parse_skippable_frame(src: &[u8]) -> Result<(u8, &[u8]), SkippableSliceError> {
+    let header = src
+        .get(..SKIPPABLE_HEADER_SIZE)
+        .ok_or(SkippableSliceError::Truncated)?;
+    let magic_number = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let variant = magic_number.wrapping_sub(SKIPPABLE_MAGIC_START);
+    if variant > u32::from(SKIPPABLE_MAGIC_MAX_VARIANT) {
+        return Err(SkippableSliceError::BadMagicNumber(magic_number));
+    }
+    let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    let payload = usize::try_from(length)
+        .ok()
+        .and_then(|length| SKIPPABLE_HEADER_SIZE.checked_add(length))
+        .and_then(|end| src.get(SKIPPABLE_HEADER_SIZE..end))
+        .ok_or(SkippableSliceError::Truncated)?;
+    Ok((variant as u8, payload))
 }
 
 /// Internal raw writer. Skips validation (caller must have validated
@@ -324,6 +358,32 @@ pub enum SkippableFrameError {
     /// Underlying I/O error from the writer.
     Io(Error),
 }
+
+/// Errors surfaced by [`parse_skippable_frame`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SkippableSliceError {
+    /// The buffer ends before the 8-byte header or the declared payload.
+    Truncated,
+    /// The first 4 bytes are not a skippable-frame magic in the
+    /// `0x184D2A50..=0x184D2A5F` range.
+    BadMagicNumber(u32),
+}
+
+impl core::fmt::Display for SkippableSliceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Truncated => f.write_str("skippable frame is truncated"),
+            Self::BadMagicNumber(m) => write!(
+                f,
+                "magic 0x{m:08X} is not in the skippable range 0x184D2A50..=0x184D2A5F"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SkippableSliceError {}
 
 /// Errors surfaced when reading a [`SkippableFrame`] from a stream.
 #[derive(Debug)]

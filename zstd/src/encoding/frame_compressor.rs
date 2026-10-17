@@ -152,15 +152,44 @@ impl EncoderDictionary {
     /// assert!(dictionary.heap_size() >= b"raw content, no header".len());
     /// ```
     pub fn heap_size(&self) -> usize {
-        // `Arc` and `Rc` both place two word-sized counts ahead of the value,
-        // padded to its alignment.
-        let shared = core::alloc::Layout::new::<[usize; 2]>()
+        Self::shared_allocation_size()
+            + self.inner.dictionary.heap_bytes()
+            + self.inner.entropy.heap_size()
+    }
+
+    /// Upper bound on [`Self::heap_size`] for a dictionary prepared from a
+    /// `serialized_len`-byte blob, before preparing it: for budgeting memory
+    /// ahead of time, as the C `ZSTD_estimateCDictSize` does.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::EncoderDictionary;
+    ///
+    /// let blob = b"raw content, no header";
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(blob).unwrap();
+    /// assert!(dictionary.heap_size() <= EncoderDictionary::estimated_heap_size(blob.len()));
+    /// ```
+    pub fn estimated_heap_size(serialized_len: usize) -> usize {
+        // The content is at most the blob. The tables are bounded by their
+        // largest form: every FSE table and the Huffman table at their maximum
+        // accuracy, as a dictionary's entropy section can declare them.
+        const PREPARED_TABLES_HEAP: usize = 64 * 1024;
+        // Saturating on purpose: `usize::MAX` still bounds what no allocation
+        // can exceed, where a wrapped sum would under-report.
+        Self::shared_allocation_size()
+            .saturating_add(serialized_len)
+            .saturating_add(PREPARED_TABLES_HEAP)
+    }
+
+    /// Bytes of the shared allocation itself: `Arc` and `Rc` both place two
+    /// word-sized counts ahead of the value, padded to its alignment.
+    fn shared_allocation_size() -> usize {
+        core::alloc::Layout::new::<[usize; 2]>()
             .extend(core::alloc::Layout::new::<EncoderDictionaryParts>())
             .expect("a fixed-size layout extends")
             .0
             .pad_to_align()
-            .size();
-        shared + self.inner.dictionary.heap_bytes() + self.inner.entropy.heap_size()
+            .size()
     }
 
     /// Heap bytes that `handles` alone keep alive: each distinct dictionary

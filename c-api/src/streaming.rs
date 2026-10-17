@@ -560,16 +560,13 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
             return 0;
         }
         use codec::decoding::errors::ReadFrameHeaderError;
-        match codec::decoding::read_frame_header_info(&src[inp.pos..], false) {
+        match codec::decoding::read_frame_header_info(&src[inp.pos..], dctx.magicless) {
             Ok(_) => {
-                // `ZSTD_d_windowLogMax` is the decoder's own ceiling; it
-                // refuses a wider window when the header is read below. Set on
-                // every frame start, since the decoder may have been replaced
-                // since the parameter was.
-                if let Err(err) = dctx
-                    .decoder
-                    .set_max_window_size(1u64 << dctx.window_log_max)
-                {
+                // The window ceiling is the decoder's own; it refuses a wider
+                // window when the header is read below. Set on every frame
+                // start, since the decoder may have been replaced since the
+                // parameter was.
+                if let Err(err) = dctx.decoder.set_max_window_size(dctx.max_window_size) {
                     return encode(code_for_decoder_error(&err));
                 }
                 let mut reader = &src[inp.pos..];
@@ -596,8 +593,7 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
                     }
                     Ok(Err(err)) => return encode(code_for_decoder_error(&err)),
                     Err(_) => {
-                        dctx.decoder = codec::decoding::FrameDecoder::new();
-                        dctx.ddict_serial = 0;
+                        dctx.replace_decoder();
                         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
                     }
                 }
@@ -658,8 +654,7 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
         }
         Ok(Err(err)) => encode(code_for_decoder_error(&err)),
         Err(_) => {
-            dctx.decoder = codec::decoding::FrameDecoder::new();
-            dctx.ddict_serial = 0;
+            dctx.replace_decoder();
             dctx.stream_frame_done = true;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }

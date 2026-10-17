@@ -128,9 +128,13 @@ pub(crate) fn set_frame_parameters(
 #[allow(non_camel_case_types)]
 pub struct ZSTD_DCtx {
     pub(crate) decoder: FrameDecoder,
-    /// `ZSTD_d_windowLogMax`: streaming window-size acceptance ceiling
-    /// (log2). Defaults to `ZSTD_WINDOWLOG_LIMIT_DEFAULT`.
-    pub(crate) window_log_max: core::ffi::c_int,
+    /// Streaming window-size acceptance ceiling in bytes, set as a log by
+    /// `ZSTD_d_windowLogMax` or exactly by `ZSTD_DCtx_setMaxWindowSize`.
+    /// Defaults to `1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT`.
+    pub(crate) max_window_size: u64,
+    /// `ZSTD_d_format`: frames carry no magic number. Kept here as well as in
+    /// `decoder` so a replacement decoder starts with it.
+    pub(crate) magicless: bool,
     /// Whether the streaming decoder sits at a frame boundary (the next
     /// `ZSTD_decompressStream` input starts a new frame). `true` initially.
     pub(crate) stream_frame_done: bool,
@@ -425,7 +429,8 @@ pub unsafe extern "C" fn ZSTD_compress2(
 pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
     try_box(ZSTD_DCtx {
         decoder: FrameDecoder::new(),
-        window_log_max: crate::params::WINDOW_LOG_LIMIT_DEFAULT,
+        max_window_size: crate::params::MAX_WINDOW_SIZE_DEFAULT,
+        magicless: false,
         stream_frame_done: true,
         attached_ddict: crate::attach::DCtxDictAttach::None,
         ddict_serial: 0,
@@ -447,15 +452,23 @@ impl ZSTD_DCtx {
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
     /// dictionary references.
     pub(crate) fn reset_parameters(&mut self) {
-        self.window_log_max = crate::params::WINDOW_LOG_LIMIT_DEFAULT;
+        self.max_window_size = crate::params::MAX_WINDOW_SIZE_DEFAULT;
+        self.magicless = false;
         // Replace the decoder to drop any loaded dictionaries; the
         // workspace re-grows on the next frame. The fresh decoder sits at
         // a frame boundary, so the streaming flag must say so too.
-        self.decoder = FrameDecoder::new();
+        self.replace_decoder();
         self.stream_frame_done = true;
-        self.ddict_serial = 0;
         self.ddict_handle = None;
         self.attached_ddict = crate::attach::DCtxDictAttach::None;
+    }
+
+    /// Start over with a fresh decoder, as after a panic that may have torn the
+    /// old one: the frame format carries over, the loaded dictionaries do not.
+    pub(crate) fn replace_decoder(&mut self) {
+        self.decoder = FrameDecoder::new();
+        self.decoder.set_magicless(self.magicless);
+        self.ddict_serial = 0;
     }
 }
 
@@ -583,9 +596,8 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
             // longer holds any previously-loaded dictionary, so clear the DDict
             // cache key too — otherwise the next ZSTD_decompress_usingDDict with
             // the same handle would skip re-loading it and decode without it.
-            dctx.decoder = FrameDecoder::new();
+            dctx.replace_decoder();
             dctx.stream_frame_done = true;
-            dctx.ddict_serial = 0;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
     }
