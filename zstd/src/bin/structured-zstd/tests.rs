@@ -2084,6 +2084,45 @@ fn training_samples_are_loaded_the_way_the_reference_loads_them() {
     assert_eq!(limited.sizes.len(), 2, "-M bounds what is loaded");
 }
 
+/// The trainer says what the reference's says about its load (dibio.c,
+/// `DiB_trainFromFiles`): a `-M` limit as a warning, in whole megabytes, and
+/// that samples past the budget are trained on in part. Under the budget
+/// only the warning is said, and without `-M` nothing.
+#[test]
+fn training_reports_the_memory_limit_and_a_partial_load() {
+    let dir = Scratch::new("training-notices");
+    let mut many = Vec::new();
+    for i in 0..12 {
+        many.push(dir.file(&format!("chunked{i}"), &vec![b'z'; 1 << 20]));
+    }
+    let limited = load_training_samples(&many, Some(2 << 10), Some(5 << 20), |_| Ok(())).unwrap();
+    assert_eq!(
+        training_load_notices(&limited, Some(5 << 20)),
+        vec![
+            (
+                2,
+                "!  Warning : setting manual memory limit for dictionary training data at 5 MB"
+                    .to_string()
+            ),
+            (
+                1,
+                "Training samples set too large (12 MB); training on 5 MB only...".to_string()
+            ),
+        ]
+    );
+    let roomy = load_training_samples(&many, Some(2 << 10), Some(64 << 20), |_| Ok(())).unwrap();
+    assert_eq!(
+        training_load_notices(&roomy, Some(64 << 20)),
+        vec![(
+            2,
+            "!  Warning : setting manual memory limit for dictionary training data at 64 MB"
+                .to_string()
+        )]
+    );
+    let unlimited = load_training_samples(&many, Some(2 << 10), None, |_| Ok(())).unwrap();
+    assert!(training_load_notices(&unlimited, None).is_empty());
+}
+
 /// The files are taken in the reference's shuffled order (`DiB_shuffle`), so
 /// the same file list lays the corpus out the same way; the legacy dictionary
 /// trained from a fixed list then carries the reference's content byte for

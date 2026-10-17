@@ -4032,6 +4032,9 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     let set = load_training_samples(&opts.inputs, opts.block_size, opts.memory_limit, |count| {
         enough_samples(count).map_err(failed)
     })?;
+    for (level, line) in training_load_notices(&set, opts.memory_limit) {
+        display!(opts.verbosity, level, "{line}");
+    }
     let dict = match plan {
         Plan::Legacy => {
             let mut dict = Vec::new();
@@ -4134,6 +4137,38 @@ struct TrainingSet {
     sizes: Vec<usize>,
     /// What each file read was, taken from the open file.
     sources: Vec<fs::Metadata>,
+    /// Bytes the samples hold before any budget (`dibio.c`, `totalSizeToLoad`).
+    requested: u64,
+    /// Most bytes loaded: [`TRAINING_DATA_MAX`], or `-M` when smaller.
+    budget: u64,
+}
+
+/// What the reference's trainer says about the samples it loads, as
+/// `(level, line)` (dibio.c, `DiB_trainFromFiles`): the `-M` limit as a warning,
+/// and that the samples outgrew the budget.
+fn training_load_notices(set: &TrainingSet, memory_limit: Option<u64>) -> Vec<(i32, String)> {
+    const MB: u64 = 1 << 20;
+    let mut notices = Vec::new();
+    if let Some(limit) = memory_limit {
+        notices.push((
+            2,
+            format!(
+                "!  Warning : setting manual memory limit for dictionary training data at {} MB",
+                limit / MB
+            ),
+        ));
+    }
+    if set.budget < set.requested {
+        notices.push((
+            1,
+            format!(
+                "Training samples set too large ({} MB); training on {} MB only...",
+                set.requested / MB,
+                set.budget / MB
+            ),
+        ));
+    }
+    notices
 }
 
 /// Reorder the sample files the way the reference does before loading
@@ -4254,6 +4289,13 @@ fn load_training_samples(
         );
     }
     let budget = TRAINING_DATA_MAX.min(memory_limit.unwrap_or(u64::MAX));
+    let requested = file_sizes
+        .iter()
+        .map(|&size| match block_size {
+            Some(_) => size,
+            None => size.min(TRAINING_SAMPLE_MAX),
+        })
+        .sum();
     let (plan, bytes) = plan_training_load(&file_sizes, block_size, budget, samples);
     // What the budget keeps, not what the files hold, is what the trainer gets.
     // The five-sample floor above is on the files, as upstream's is
@@ -4273,6 +4315,8 @@ fn load_training_samples(
         corpus: Vec::with_capacity(corpus_room),
         sizes: Vec::with_capacity(entries),
         sources: Vec::new(),
+        requested,
+        budget,
     };
     for ((input, &size), &pieces) in order.into_iter().zip(&file_sizes).zip(&plan) {
         if pieces == 0 {
