@@ -764,23 +764,38 @@ pub(crate) fn adjust_params_for_source_size(mut params: LevelParams, src_size: u
             .map_or((0, 0), |r| (r.hash_bits as u32, r.chain_log as u32)),
         BackendTag::Dfast => (0, 0),
     };
-    // The chain cap (`ZSTD_cycleLog`) reads only `strategy >= btlazy2(6)`, so a
-    // coarse 6/3 split is exact for it; `adjust_cparams`'s other strategy use
-    // (`cdict_indices_are_tagged`) is gated on `create_cdict = false` here.
-    let strategy = if matches!(
-        params.strategy_tag,
-        StrategyTag::Btlazy2 | StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
-    ) {
-        6
-    } else {
-        3
+    // `adjust_cparams` reads the strategy for the chain cap (`ZSTD_cycleLog`,
+    // btlazy2 and up) and for the row-hash cap (greedy to lazy2, with the
+    // search log as the row log), so it gets the real class and search log;
+    // `Lazy` stands for lazy and lazy2, which both caps treat alike.
+    let strategy = match params.strategy_tag {
+        StrategyTag::Fast => 1,
+        StrategyTag::Dfast => 2,
+        StrategyTag::Greedy => 3,
+        StrategyTag::Lazy => 4,
+        StrategyTag::Btlazy2 => 6,
+        StrategyTag::BtOpt => 7,
+        StrategyTag::BtUltra => 8,
+        StrategyTag::BtUltra2 => 9,
+    };
+    // `search_depth` is `1 << searchLog` on both backends that search.
+    let search_log = match backend {
+        BackendTag::HashChain => params
+            .hc
+            .as_ref()
+            .map_or(1, |h| h.search_depth.trailing_zeros()),
+        BackendTag::Row => params
+            .row
+            .as_ref()
+            .map_or(1, |r| r.search_depth.trailing_zeros()),
+        BackendTag::Simple | BackendTag::Dfast => 1,
     };
     let adj = adjust_cparams(
         CParams {
             window_log: u32::from(params.window_log),
             chain_log,
             hash_log,
-            search_log: 1,
+            search_log,
             min_match: 4,
             target_length: 0,
             strategy,

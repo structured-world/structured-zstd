@@ -1499,6 +1499,14 @@ impl<M: Matcher> CompressState<M> {
             + self.workspace.heap_bytes()
     }
 
+    /// Heap bytes of the parse recorded while capture is on, held until taken.
+    pub(crate) fn captured_parse_heap_size(&self) -> usize {
+        self.sequence_capture.as_ref().map_or(0, |capture| {
+            capture.capacity()
+                * core::mem::size_of::<crate::encoding::sequences::ExternalSequence>()
+        })
+    }
+
     /// Clears `last_huff_table`, parking the table's buffers in
     /// `huff_table_spare` for reuse instead of dropping them.
     #[inline]
@@ -2363,8 +2371,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Record the parse every block takes, from the next one on, until turned
     /// off: its sequences with plain offsets, each block closed by a delimiter
     /// carrying its trailing literals, and a block written out unsearched as a
-    /// delimiter alone (C `ZSTD_generateSequences`). The frames themselves are
-    /// unchanged.
+    /// delimiter alone (C `ZSTD_generateSequences`). An empty input records
+    /// nothing, as upstream's does. The frames themselves are unchanged.
     ///
     /// ```
     /// use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
@@ -2509,6 +2517,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         total += self.state.huff_weights.heap_size();
         total += self.state.retained_scratch_heap_size();
         total += self.state.seen_content.heap_size();
+        total += self.state.captured_parse_heap_size();
         total += self
             .dictionary
             .as_ref()
@@ -3043,6 +3052,16 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 block_size: block_len as u32,
             };
             out[header_at..payload_at].copy_from_slice(&header.to_le_bytes());
+            // A stored block is a delimiter alone in a captured parse. The
+            // empty block of an empty input records none, as upstream's
+            // block loop never runs for one (zstd_compress.c:4610).
+            if block_len > 0
+                && let Some(capture) = self.state.sequence_capture.as_mut()
+            {
+                capture.push(crate::encoding::sequences::ExternalSequence::delimiter(
+                    block_len as u32,
+                ));
+            }
             #[cfg(feature = "hash")]
             if self.content_checksum {
                 self.hasher.write(&out[payload_at..]);

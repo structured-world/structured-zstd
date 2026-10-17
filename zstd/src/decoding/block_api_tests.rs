@@ -183,6 +183,52 @@ fn block_decode_refusals() {
     ));
 }
 
+/// A block refused before it is decoded (content of the wrong length) leaves
+/// the frame as it was, so the right content still decodes, as upstream's
+/// size check precedes any state change; a block whose content fails to
+/// decode ends the frame, and the next block is refused rather than decoded
+/// against what the failure left behind.
+#[test]
+fn a_block_that_fails_to_decode_ends_the_frame() {
+    let input = text(4_000);
+    let frame = blocky_frame(&input);
+    let begin = |decoder: &mut FrameDecoder| {
+        let mut source = frame.as_slice();
+        decoder.reset(&mut source).unwrap();
+        source
+    };
+    let mut decoder = FrameDecoder::new();
+    let rest = begin(&mut decoder);
+    let (header, body) = rest.split_first_chunk::<3>().unwrap();
+    let (len, _) = decoder.block_content_len(*header).unwrap();
+    let mut target = vec![0u8; 2048];
+    assert!(
+        decoder
+            .decode_block(*header, &body[..len - 1], &mut target)
+            .is_err()
+    );
+    assert!(
+        decoder
+            .decode_block(*header, &body[..len], &mut target)
+            .is_ok()
+    );
+
+    let mut decoder = FrameDecoder::new();
+    let rest = begin(&mut decoder);
+    let (header, body) = rest.split_first_chunk::<3>().unwrap();
+    let (len, _) = decoder.block_content_len(*header).unwrap();
+    let corrupt = vec![0xFFu8; len];
+    assert!(
+        decoder
+            .decode_block(*header, &corrupt, &mut target)
+            .is_err()
+    );
+    assert!(matches!(
+        decoder.decode_block(*header, &body[..len], &mut target),
+        Err(FrameDecoderError::NotYetInitialized)
+    ));
+}
+
 /// Encode the RFC 8878 3.1.1.2 header of a compressed block of `len` bytes.
 fn compressed_header(len: usize) -> [u8; 3] {
     let raw = ((len as u32) << 3 | 2 << 1).to_le_bytes();
@@ -227,6 +273,46 @@ fn a_run_of_blocks_decodes_against_its_history() {
             }
         }
     }
+}
+
+/// A stored block far larger than the window goes into the history a block
+/// at a time, so the history never holds more than the window and a block,
+/// whatever the caller hands over; the window's worth it keeps is the end of
+/// the block.
+#[test]
+fn inserting_a_huge_block_keeps_only_the_window() {
+    let mut decoder = FrameDecoder::new();
+    decoder.set_max_window_size(1 << 10).unwrap();
+    decoder.begin_blocks(None).unwrap();
+    let huge = noise(1 << 20, 5);
+    let tail_start = huge.len() - 500;
+    decoder.insert_block(&huge).unwrap();
+    assert!(
+        decoder.workspace_size() < 512 << 10,
+        "{} bytes held after a 1 MiB insert into a 1 KiB window",
+        decoder.workspace_size()
+    );
+    // The last window of the block is the history the next block reads: an
+    // encoder that stored only that tail compresses a block repeating it,
+    // and the block decodes against the decoder's history.
+    let params = CompressionParameters::builder(CompressionLevel::Default)
+        .window_log(10)
+        .build()
+        .unwrap();
+    let mut context = CompressionContext::new(CompressionLevel::Default);
+    context.set_parameters(&params).unwrap();
+    context.start_frame(&mut Vec::new()).unwrap();
+    let tail = &huge[tail_start..];
+    assert!(!context.compress_block(tail, &mut Vec::new()).unwrap());
+    let mut repeat = tail.to_vec();
+    repeat.extend_from_slice(tail);
+    let mut payload = Vec::new();
+    assert!(context.compress_block(&repeat, &mut payload).unwrap());
+    let mut target = vec![0u8; 4096];
+    let n = decoder
+        .decode_block(compressed_header(payload.len()), &payload, &mut target)
+        .unwrap();
+    assert_eq!(&target[..n], &repeat[..]);
 }
 
 #[test]

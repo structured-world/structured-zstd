@@ -707,6 +707,7 @@ impl<M: Matcher> CompressionContext<M> {
         total += self.state.huff_weights.heap_size();
         total += self.state.retained_scratch_heap_size();
         total += self.state.seen_content.heap_size();
+        total += self.state.captured_parse_heap_size();
         total += self.encoded_scratch.capacity();
         total += self
             .dictionary

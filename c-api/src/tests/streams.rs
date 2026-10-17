@@ -438,6 +438,64 @@ fn stream_inits_take_a_dictionary_under_eight_bytes() {
     }
 }
 
+/// A serialized dictionary given as a prefix with the auto or fullDict
+/// selector is a full dictionary for its one frame, as upstream keeps the
+/// selector with the prefix (zstd_compress.c:1351, zstd_decompress.c:1725):
+/// the frame names it, and the decoding side reads it the same way.
+#[test]
+fn a_serialized_prefix_is_a_full_dictionary() {
+    let input = dict_sample();
+    let id = unsafe { crate::attach::ZSTD_getDictID_fromDict(DICT.as_ptr(), DICT.len()) };
+    assert_ne!(id, 0);
+    for content_type in [0, 2] {
+        unsafe {
+            let cctx = crate::context::ZSTD_createCCtx();
+            let rc = crate::attach::ZSTD_CCtx_refPrefix_advanced(
+                cctx,
+                DICT.as_ptr(),
+                DICT.len(),
+                content_type,
+            );
+            assert_eq!(rc, 0, "{content_type}: {:?}", code(rc));
+            let mut frame = vec![0u8; input.len() + 1024];
+            let n = crate::context::ZSTD_compress2(
+                cctx,
+                frame.as_mut_ptr(),
+                frame.len(),
+                input.as_ptr(),
+                input.len(),
+            );
+            assert_eq!(ZSTD_isError(n), 0, "{content_type}: {:?}", code(n));
+            assert_eq!(
+                ZSTD_getDictID_fromFrame(frame.as_ptr(), n),
+                id,
+                "{content_type}"
+            );
+            ZSTD_freeCCtx(cctx);
+
+            let dctx = crate::context::ZSTD_createDCtx();
+            let rc = crate::attach::ZSTD_DCtx_refPrefix_advanced(
+                dctx,
+                DICT.as_ptr(),
+                DICT.len(),
+                content_type,
+            );
+            assert_eq!(rc, 0, "{content_type}: {:?}", code(rc));
+            let mut out = vec![0u8; input.len()];
+            let m = crate::context::ZSTD_decompressDCtx(
+                dctx,
+                out.as_mut_ptr(),
+                out.len(),
+                frame.as_ptr(),
+                n,
+            );
+            assert_eq!(m, input.len(), "{content_type}: {:?}", code(m));
+            assert_eq!(out, input);
+            ZSTD_freeDCtx(dctx);
+        }
+    }
+}
+
 /// A dictionary under eight bytes takes no part in compression, as zstd.h
 /// states for every dictionary entry point: the frame is the one compressed
 /// without it, and decodes without it, even when the input starts with it.

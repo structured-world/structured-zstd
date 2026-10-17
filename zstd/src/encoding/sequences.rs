@@ -254,9 +254,9 @@ pub fn validate_parse(
 /// a decoder would (C `ZSTD_compressSequencesAndLiterals` takes the literals
 /// rather than the input). Matches reaching before the start read from
 /// `dict`; literals past the last sequence are the trailing ones. Only the
-/// last `window` bytes (or as far back as the parse's farthest match, when
-/// that is further) are held for the matches to copy from, so a frame is
-/// built from it without the whole input in memory.
+/// last `window` bytes are held for the matches to copy from (more only
+/// while a match reaching further, into the dictionary, is being copied), so
+/// a frame is built from it without the whole input in memory.
 ///
 /// ```
 /// use structured_zstd::encoding::sequences::{ExternalSequence, RebuiltSource};
@@ -275,10 +275,7 @@ pub struct RebuiltSource<'a> {
     sequences: core::slice::Iter<'a, ExternalSequence>,
     literals: &'a [u8],
     dict: &'a [u8],
-    /// Bytes of output held back for the matches: the window, or the
-    /// parse's farthest offset when a match reaches into the dictionary
-    /// from further back than that.
-    keep: usize,
+    window: usize,
     /// Literals handed out so far.
     lit_at: usize,
     /// Literals of the sequence in hand still to come.
@@ -288,7 +285,8 @@ pub struct RebuiltSource<'a> {
     offset: usize,
     /// Bytes rebuilt so far.
     produced: usize,
-    /// The bytes most recently rebuilt: at least the last `keep` of them.
+    /// The bytes most recently rebuilt: at least the last `window` of them,
+    /// and as far back as the match in hand reaches.
     history: Vec<u8>,
     len: usize,
 }
@@ -312,7 +310,6 @@ impl<'a> RebuiltSource<'a> {
     ) -> Result<Self, SequenceError> {
         let mut position = 0usize;
         let mut lits = 0usize;
-        let mut keep = window;
         for (index, sequence) in sequences.iter().enumerate() {
             let lit_len = sequence.lit_len as usize;
             lits = lits
@@ -342,7 +339,6 @@ impl<'a> RebuiltSource<'a> {
             if past_reach {
                 return Err(SequenceError::OffsetTooFar { index });
             }
-            keep = keep.max(offset);
             position = position
                 .checked_add(sequence.match_len as usize)
                 .ok_or(SequenceError::LengthMismatch)?;
@@ -354,7 +350,7 @@ impl<'a> RebuiltSource<'a> {
             sequences: sequences.iter(),
             literals,
             dict,
-            keep,
+            window,
             lit_at: 0,
             lit_left: 0,
             match_left: 0,
@@ -389,9 +385,10 @@ impl<'a> RebuiltSource<'a> {
                     .extend_from_slice(&self.dict[from..from + take]);
                 take
             } else {
-                // `history` holds the last `keep` bytes at least, and no
-                // offset is further back. An overlapping match repeats its
-                // first `offset` bytes.
+                // `history` holds the last `window` bytes, and as far back as
+                // this match reaches (a match past the window starts while the
+                // output is within it, when nothing has been let go yet). An
+                // overlapping match repeats its first `offset` bytes.
                 let from = self.history.len() - self.offset;
                 let take = left.min(self.offset);
                 self.history.extend_from_within(from..from + take);
@@ -434,15 +431,21 @@ impl crate::io::Read for RebuiltSource<'_> {
             buf[filled..filled + n].copy_from_slice(&self.history[start..]);
             filled += n;
         }
-        // Keep what the matches still to come can reach, dropping the rest a
-        // `keep`'s worth at a time so the drain is paid once per that many
-        // bytes. A `keep` past half of `usize` never fills twice over.
-        if self
-            .keep
+        // Keep what the matches still to come can reach: the window, and the
+        // match in hand's reach while it lasts (later matches stay within the
+        // window, as `new` checked). The rest goes a `keep`'s worth at a time,
+        // so the drain is paid once per that many bytes; a `keep` past half
+        // of `usize` never fills twice over.
+        let keep = if self.match_left > 0 {
+            self.window.max(self.offset)
+        } else {
+            self.window
+        };
+        if keep
             .checked_mul(2)
             .is_some_and(|limit| self.history.len() > limit)
         {
-            let drop = self.history.len() - self.keep;
+            let drop = self.history.len() - keep;
             self.history.drain(..drop);
         }
         Ok(filled)

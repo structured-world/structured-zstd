@@ -517,12 +517,25 @@ impl DecoderScratchKind {
 
     /// Take `content` into the history as output the caller already holds:
     /// appended, never handed out, and let go of once past the window.
+    ///
+    /// Taken a piece at a time, no piece longer than a block or the window,
+    /// and trimmed after each: a block far past the window then never makes
+    /// the history hold more than the window and one piece. Upstream keeps a
+    /// pointer to the caller's bytes instead (`ZSTD_insertBlock`), which a
+    /// decoder owning its history cannot.
     fn buffer_insert(&mut self, content: &[u8], kernel: crate::cpu_kernel::CpuKernelTag) {
-        self.buffer_push(content, kernel);
-        match self {
-            Self::Ring(s) => s.buffer.drop_to_window_size(),
-            Self::Flat(s) => s.buffer.drop_to_window_size(),
+        let window = match self {
+            Self::Ring(s) => s.buffer.window_size,
+            Self::Flat(s) => s.buffer.window_size,
         };
+        let piece = window.clamp(1, crate::common::MAX_BLOCK_SIZE as usize);
+        for chunk in content.chunks(piece) {
+            self.buffer_push(chunk, kernel);
+            match self {
+                Self::Ring(s) => s.buffer.drop_to_window_size(),
+                Self::Flat(s) => s.buffer.drop_to_window_size(),
+            };
+        }
     }
 
     fn workspace_bytes(&self) -> usize {
@@ -1686,7 +1699,11 @@ impl FrameDecoder {
     /// As a block [`Self::decode_from_to`] decodes, plus
     /// [`FrameDecoderError::TargetTooSmall`] when `target` cannot take the
     /// block's output, and [`FrameDecoderError::NotYetInitialized`] when no
-    /// frame is waiting for a block. A failed block ends the frame.
+    /// frame is waiting for a block. A block refused before it is decoded (a
+    /// bad header, a block past the maximum, content of the wrong length)
+    /// leaves the frame as it was, as upstream checks the size before it
+    /// changes any state; one that fails while decoding, or whose output
+    /// `target` cannot take, ends the frame.
     ///
     /// ```
     /// use structured_zstd::decoding::FrameDecoder;
@@ -1763,10 +1780,20 @@ impl FrameDecoder {
         };
         let before = state.decoder_scratch.buffer_len();
         let mut source = content;
-        let read = state
-            .decoder_scratch
-            .decode_block_content_from_slice(&mut block_dec, &block_header, &mut source, dict_ref)
-            .map_err(body_error)?;
+        let read = match state.decoder_scratch.decode_block_content_from_slice(
+            &mut block_dec,
+            &block_header,
+            &mut source,
+            dict_ref,
+        ) {
+            Ok(read) => read,
+            Err(source) => {
+                // The frame's counters and history have moved: no later block
+                // can be decoded against them.
+                state.frame_finished = true;
+                return Err(body_error(source));
+            }
+        };
         state.bytes_read_counter += read;
         state.block_counter += 1;
         if block_header.last_block {

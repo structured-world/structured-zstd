@@ -266,10 +266,21 @@ fn get_frame_header_short_input_asks_for_more() {
         _reserved1: 0,
         _reserved2: 0,
     };
-    // Only 2 bytes: too short for even the magic; expect a positive size hint.
-    let r = unsafe { ZSTD_getFrameHeader(&mut zfh, frame.as_ptr(), 2) };
-    assert_eq!(ZSTD_isError(r), 0);
-    assert!(r > 0 && r <= 18);
+    // The hint is what upstream asks for (zstd_decompress.c:458-498): the
+    // five bytes that hold the descriptor, then the header's own length, and
+    // eight for a skippable frame; bytes that start no known magic number
+    // are refused at once.
+    let mut ask = |src: &[u8]| unsafe { ZSTD_getFrameHeader(&mut zfh, src.as_ptr(), src.len()) };
+    assert_eq!(ask(&frame[..2]), 5);
+    // Magic number and a descriptor announcing only a window byte.
+    let six = [0x28, 0xB5, 0x2F, 0xFD, 0x00];
+    assert_eq!(ask(&six), 6);
+    assert_eq!(ask(&[0x50, 0x2A, 0x4D, 0x18, 0]), 8);
+    assert_eq!(ask(&[0x50, 0x2A]), 5);
+    assert_eq!(
+        crate::tests::experimental::code(ask(&[0x00, 0x01])),
+        crate::error::ZSTD_ErrorCode::ZSTD_error_prefix_unknown
+    );
 }
 
 #[test]

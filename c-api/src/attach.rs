@@ -59,10 +59,11 @@ pub(crate) enum CCtxDictAttach {
         cdict: *const ZSTD_CDict,
         serial: u64,
     },
-    /// `ZSTD_CCtx_refPrefix*`: single-use raw-content dictionary for the
-    /// next frame only.
+    /// `ZSTD_CCtx_refPrefix*`: single-use dictionary for the next frame only,
+    /// raw content unless the selector made it a serialized one.
     Prefix {
         dict: EncoderDictionary,
+        raw_content: bool,
         serial: u64,
     },
 }
@@ -305,8 +306,8 @@ impl ZSTD_CCtx {
     /// must never reach the wire, regardless of `ZSTD_c_dictIDFlag`).
     pub(crate) fn attach_suppresses_dict_id(&self) -> bool {
         match &self.attached_dict {
-            CCtxDictAttach::Load { raw_content, .. } => *raw_content,
-            CCtxDictAttach::Prefix { .. } => true,
+            CCtxDictAttach::Load { raw_content, .. }
+            | CCtxDictAttach::Prefix { raw_content, .. } => *raw_content,
             // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
             CCtxDictAttach::RefCDict { cdict, .. } => unsafe { &**cdict }.raw_content,
             CCtxDictAttach::None => false,
@@ -476,17 +477,19 @@ unsafe fn cctx_ref_prefix(
         cctx.replace_attached_dict(CCtxDictAttach::None);
         return 0;
     }
-    // A prefix is raw content by definition: only the auto / rawContent
-    // selectors are meaningful; everything else (fullDict, out-of-range
-    // discriminants) is rejected.
-    if !matches!(content_type, ZSTD_DCT_AUTO | ZSTD_DCT_RAW_CONTENT) {
-        return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
-    }
-    let Some(prepared) = prepare_compression_dictionary(prefix, true) else {
+    // The selector is kept with the prefix and read as a loaded dictionary's
+    // is, as upstream does (zstd_compress.c:1351): auto with the magic number
+    // and fullDict make it a serialized dictionary for its frame.
+    let raw_content = match encode_raw_content(prefix, content_type) {
+        Ok(v) => v,
+        Err(code) => return encode(code),
+    };
+    let Some(prepared) = prepare_compression_dictionary(prefix, raw_content) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted);
     };
     cctx.replace_attached_dict(CCtxDictAttach::Prefix {
         dict: prepared,
+        raw_content,
         serial: next_dict_serial(),
     });
     0
@@ -506,8 +509,8 @@ pub unsafe extern "C" fn ZSTD_CCtx_refPrefix(
     unsafe { cctx_ref_prefix(cctx, prefix, prefix_size, ZSTD_DCT_RAW_CONTENT) }
 }
 
-/// `ZSTD_CCtx_refPrefix_advanced` — explicit content type (`fullDict` is
-/// rejected; a prefix is raw content).
+/// `ZSTD_CCtx_refPrefix_advanced` — explicit content type, read as
+/// `ZSTD_CCtx_loadDictionary_advanced` reads it.
 ///
 /// # Safety
 /// Same as [`ZSTD_CCtx_refPrefix`].
@@ -657,6 +660,22 @@ pub unsafe extern "C" fn ZSTD_DCtx_refPrefix(
     prefix: *const u8,
     prefix_size: usize,
 ) -> usize {
+    unsafe { dctx_ref_prefix(dctx, prefix, prefix_size, ZSTD_DCT_RAW_CONTENT) }
+}
+
+/// Shared body of `ZSTD_DCtx_refPrefix*`: the selector is read as a loaded
+/// dictionary's is, as upstream's prefix is a dictionary loaded for one
+/// frame (zstd_decompress.c:1725).
+///
+/// # Safety
+/// `prefix` valid for `prefix_size` bytes (or `NULL` + 0); `dctx` live or
+/// `NULL`.
+unsafe fn dctx_ref_prefix(
+    dctx: *mut ZSTD_DCtx,
+    prefix: *const u8,
+    prefix_size: usize,
+    content_type: c_int,
+) -> usize {
     if dctx.is_null() {
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
@@ -669,9 +688,7 @@ pub unsafe extern "C" fn ZSTD_DCtx_refPrefix(
         dctx.attached_ddict = DCtxDictAttach::None;
         return 0;
     }
-    let parsed = catch_unwind(AssertUnwindSafe(|| {
-        parse_decode_dict(prefix, ZSTD_DCT_RAW_CONTENT)
-    }));
+    let parsed = catch_unwind(AssertUnwindSafe(|| parse_decode_dict(prefix, content_type)));
     match parsed {
         Ok(Ok(handle)) => {
             dctx.attached_ddict = DCtxDictAttach::Prefix { handle };
@@ -682,8 +699,9 @@ pub unsafe extern "C" fn ZSTD_DCtx_refPrefix(
     }
 }
 
-/// `ZSTD_DCtx_refPrefix_advanced` — explicit content type (`fullDict` is
-/// rejected; a prefix is raw content).
+/// `ZSTD_DCtx_refPrefix_advanced` — explicit content type, read as
+/// `ZSTD_DCtx_loadDictionary_advanced` reads it. `NULL` / empty clears
+/// whatever the selector.
 ///
 /// # Safety
 /// Same as [`ZSTD_DCtx_refPrefix`].
@@ -694,12 +712,7 @@ pub unsafe extern "C" fn ZSTD_DCtx_refPrefix_advanced(
     prefix_size: usize,
     content_type: c_int,
 ) -> usize {
-    // NULL/empty is the clear signal and wins over selector validation
-    // (the delegate runs its own null/stage checks and then clears).
-    if prefix_size > 0 && !matches!(content_type, ZSTD_DCT_AUTO | ZSTD_DCT_RAW_CONTENT) {
-        return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
-    }
-    unsafe { ZSTD_DCtx_refPrefix(dctx, prefix, prefix_size) }
+    unsafe { dctx_ref_prefix(dctx, prefix, prefix_size, content_type) }
 }
 
 /// `size_t ZSTD_compress_usingDict(ZSTD_CCtx* ctx, void* dst, size_t

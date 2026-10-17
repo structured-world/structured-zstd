@@ -254,6 +254,38 @@ fn rebuild_reads_dictionary_overlaps_and_tail() {
     ));
 }
 
+/// A match reaching deep into the dictionary early on holds more than the
+/// window only while it lasts: the long run of literals after it is held to
+/// the window again.
+#[test]
+fn rebuild_lets_a_deep_match_go_after_it_ends() {
+    let dict: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
+    let literals: Vec<u8> = (0..10_000u32).map(|i| (i * 13 + 1) as u8).collect();
+    let parse = [seq(900, 0, 20)];
+    let mut expected = dict[100..120].to_vec();
+    expected.extend_from_slice(&literals);
+    assert_eq!(rebuild(&parse, &literals, &dict, 16, 8).unwrap(), expected);
+
+    // While it lasts the match keeps its whole reach, even once it copies
+    // from its own output and the history is trimmed under it.
+    let parse = [seq(50, 0, 200)];
+    let mut expected = dict[950..].to_vec();
+    for i in 50..200 {
+        expected.push(expected[i - 50]);
+    }
+    let mut source = RebuiltSource::new(&parse, &[], &dict, 16).unwrap();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8];
+    loop {
+        let n = crate::io::Read::read(&mut source, &mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(out, expected);
+}
+
 /// An input many windows long rebuilds whole while only about a window of it
 /// is held: the frame `ZSTD_compressSequencesAndLiterals` builds needs no
 /// copy of the whole input.
@@ -477,6 +509,99 @@ fn heap_size_counts_the_producer_parse() {
         "{} vs {} + {held}",
         large.heap_size(),
         small.heap_size()
+    );
+}
+
+/// An uncompressed frame's blocks are captured as delimiters alone, so the
+/// parse still covers the input; an empty input captures nothing, as upstream
+/// `ZSTD_generateSequences` returns no sequence for it (its block loop never
+/// runs, zstd_compress.c:4610).
+#[test]
+fn capture_covers_an_uncompressed_frame() {
+    let input = b"stored as it is ".repeat(300);
+    let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Uncompressed);
+    compressor.set_max_block_size(Some(1024));
+    compressor.set_sequence_capture(true);
+    let frame = compressor.compress_independent_frame(&input);
+    let parse = compressor.take_captured_sequences();
+    assert!(parse.iter().all(ExternalSequence::is_delimiter));
+    let covered: usize = parse.iter().map(|s| s.lit_len as usize).sum();
+    assert_eq!(covered, input.len());
+    assert_eq!(parse.len(), block_count(&frame));
+
+    let _ = compressor.compress_independent_frame(&[]);
+    assert!(compressor.take_captured_sequences().is_empty());
+}
+
+/// A producer installed mid-frame at an optimal level with long-distance
+/// matching on: the blocks before it left their long matches with the
+/// optimal parser, and a piece between long matches that the producer fails
+/// on is matched without them, so the frame still decodes to its input.
+#[cfg(feature = "ldm")]
+#[test]
+fn producer_fallback_ignores_long_matches_of_earlier_blocks() {
+    let mut state = 0x1357_9BDFu32;
+    let mut noise = |len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    };
+    let base = noise(300_000);
+    let params = crate::encoding::CompressionParameters::builder(CompressionLevel::Level(19))
+        .window_log(21)
+        .enable_long_distance_matching(true)
+        .build()
+        .unwrap();
+    let mut context = crate::encoding::CompressionContext::new(CompressionLevel::Level(19));
+    context.set_parameters(&params).unwrap();
+    let mut frame = Vec::new();
+    let mut input = Vec::new();
+    let mut feed = |context: &mut crate::encoding::CompressionContext, data: &[u8]| {
+        let mut rest = data;
+        while !rest.is_empty() {
+            let n = context.write(&mut frame, rest).unwrap();
+            rest = &rest[n..];
+        }
+        input.extend_from_slice(data);
+    };
+    feed(&mut context, &base);
+    feed(&mut context, &base);
+    context.set_sequence_producer(Some(alloc::boxed::Box::new(AlwaysFails)), true);
+    let mut spliced = Vec::new();
+    for (index, piece) in base.chunks(10_000).enumerate() {
+        spliced.extend_from_slice(piece);
+        spliced.extend(noise(97 + index));
+    }
+    feed(&mut context, &spliced);
+    context.finish_frame(&mut frame).unwrap();
+    let mut decoded = Vec::with_capacity(input.len());
+    FrameDecoder::new()
+        .decode_all_to_vec(&frame, &mut decoded)
+        .expect("the frame decodes");
+    assert!(decoded == input, "the frame decodes to other bytes");
+}
+
+/// The captured parse the compressor holds counts in its footprint.
+#[test]
+fn heap_size_counts_the_captured_parse() {
+    let input = b"captured sequences take room ".repeat(400);
+    let mut plain = default_compressor();
+    let _ = plain.compress_independent_frame(&input);
+    let mut capturing = default_compressor();
+    capturing.set_sequence_capture(true);
+    let _ = capturing.compress_independent_frame(&input);
+    let holding = capturing.heap_size();
+    let held = capturing.take_captured_sequences().len() * core::mem::size_of::<ExternalSequence>();
+    assert!(held > 0);
+    assert!(
+        holding >= plain.heap_size() + held,
+        "{holding} vs {} + {held}",
+        plain.heap_size()
     );
 }
 

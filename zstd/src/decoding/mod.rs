@@ -474,6 +474,32 @@ pub fn frame_header_size_in_format(
     frame::measure_header_with_format(src, magicless)
 }
 
+/// How many bytes from its start the frame header beginning `src` takes to
+/// read whole, judged from what `src` holds of it: the bytes that hold the
+/// descriptor until they are all here (five, or one without the magic
+/// number), then the header's own length, and eight for a skippable frame.
+/// A caller reading a header in pieces asks this before
+/// [`read_frame_header_info`]; upstream's `ZSTD_getFrameHeader_advanced`
+/// returns the same counts.
+///
+/// ```rust
+/// use structured_zstd::decoding::frame_header_input_needed;
+/// assert_eq!(frame_header_input_needed(&[0x28, 0xB5], false).unwrap(), 5);
+/// // Magic number and a descriptor announcing a window byte only.
+/// assert_eq!(frame_header_input_needed(&[0x28, 0xB5, 0x2F, 0xFD, 0x00], false).unwrap(), 6);
+/// assert!(frame_header_input_needed(&[0x00, 0x01], false).is_err());
+/// ```
+///
+/// # Errors
+/// [`ReadFrameHeaderError::BadMagicNumber`](errors::ReadFrameHeaderError::BadMagicNumber)
+/// when the bytes start no known magic number.
+pub fn frame_header_input_needed(
+    src: &[u8],
+    magicless: bool,
+) -> Result<usize, errors::ReadFrameHeaderError> {
+    frame::header_input_needed(src, magicless)
+}
+
 /// Decode the leading frame header fields of `src` without decoding the body.
 ///
 /// Backs the C `ZSTD_getFrameHeader`. When `magicless` is `true` the 4-byte

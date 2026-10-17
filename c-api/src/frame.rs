@@ -21,9 +21,6 @@ use crate::ffi::{in_slice, out_slice};
 const CONTENTSIZE_UNKNOWN: c_ulonglong = u64::MAX;
 /// `(0ULL - 2)` — an error occurred.
 const CONTENTSIZE_ERROR: c_ulonglong = u64::MAX - 1;
-/// `ZSTD_FRAMEHEADERSIZE_MAX` — the "need at most this many bytes" hint
-/// `ZSTD_getFrameHeader` returns when `src` is too short.
-const FRAMEHEADERSIZE_MAX: usize = 18;
 /// `ZSTD_BLOCKSIZE_MAX`: the codec's block maximum, named rather than
 /// re-declared.
 const BLOCKSIZE_MAX: u64 = codec::MAX_BLOCK_SIZE as u64;
@@ -149,8 +146,12 @@ unsafe fn fill_frame_header(zfh: *mut ZSTD_FrameHeader, src: &[u8], magicless: b
         Err(ReadFrameHeaderError::InvalidFrameDescriptor(descriptor)) => {
             encode(code_for_descriptor_error(&descriptor))
         }
-        // The remaining variants are short-read failures: ask for more input.
-        Err(_) => FRAMEHEADERSIZE_MAX,
+        // The remaining variants are short-read failures: ask for as much as
+        // the header still needs, as upstream does.
+        Err(_) => match codec::decoding::frame_header_input_needed(src, magicless) {
+            Ok(needed) => needed,
+            Err(_) => encode(ZSTD_ErrorCode::ZSTD_error_prefix_unknown),
+        },
     }
 }
 

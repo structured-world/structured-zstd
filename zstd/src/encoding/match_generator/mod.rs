@@ -2248,6 +2248,17 @@ impl Matcher for MatchGeneratorDriver {
             // limitations); taking both loses neither.
             #[cfg(feature = "ldm")]
             if self.ldm.is_some() {
+                // Where the producer fails with fallback, the backend matches
+                // what is left without long-match candidates: this block's are
+                // taken outright, and the optimal parser still holds the last
+                // block's, whose block-relative positions would name the wrong
+                // bytes here (its candidates are trusted, not re-checked).
+                if matches!(self.search, super::strategy::SearchMethod::BinaryTree) {
+                    let MatcherStorage::HashChain(hc) = &mut self.storage else {
+                        unreachable!("the optimal parser runs on the hash-chain backend");
+                    };
+                    hc.backend.bt_mut().ldm_sequences.clear();
+                }
                 if self.start_matching_long_distance(&mut handle_sequence, true) {
                     return;
                 }
@@ -2256,12 +2267,6 @@ impl Matcher for MatchGeneratorDriver {
                 }
                 // The producer failed with fallback on a block with no long
                 // match, which is already taken: the backend matches it.
-                if matches!(self.search, super::strategy::SearchMethod::BinaryTree) {
-                    let MatcherStorage::HashChain(hc) = &mut self.storage else {
-                        unreachable!("the optimal parser runs on the hash-chain backend");
-                    };
-                    core::mem::swap(&mut self.ldm_block, &mut hc.backend.bt_mut().ldm_sequences);
-                }
                 let mut gap_literals = None;
                 self.start_matching_owned(&mut owned_sink(&mut handle_sequence, &mut gap_literals));
                 return;
