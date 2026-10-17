@@ -394,6 +394,9 @@ pub fn min_decoding_buffer_size(
     frame_content_size: Option<u64>,
 ) -> Option<usize> {
     const WILDCOPY_OVERLENGTH: u64 = 32;
+    // Both block terms are the largest block the frame can hold, and no block
+    // exceeds the window: RFC 8878 3.1.1.2.4, Block_Maximum_Size =
+    // min(Window_Size, 128 KiB); upstream zstd_decompress.c:1972 likewise.
     let block_size = window_size.min(crate::common::MAX_BLOCK_SIZE as u64);
     let needed = window_size.checked_add(2 * block_size + 2 * WILDCOPY_OVERLENGTH);
     let size = match (frame_content_size, needed) {

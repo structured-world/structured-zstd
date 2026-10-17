@@ -608,9 +608,9 @@ impl<M: Matcher> CompressionContext<M> {
 
     /// Attach a dictionary blob to each frame (upstream zstd
     /// `ZSTD_CCtx_loadDictionary` on a streaming context, which loads in
-    /// `ZSTD_dct_auto` mode): a blob prefixed with
-    /// [`DICTIONARY_MAGIC`](crate::decoding::DICTIONARY_MAGIC) is a serialized
-    /// dictionary, anything else is raw content. The dictionary primes the
+    /// `ZSTD_dct_auto` mode): a
+    /// [serialized](crate::decoding::Dictionary::is_serialized) dictionary,
+    /// or raw content. The dictionary primes the
     /// match-finder and seeds the first block's entropy tables + repeat
     /// offsets; a serialized one's ID is written into the frame header, while
     /// raw content has none to write, so the decoder must be given the same
@@ -926,8 +926,13 @@ impl<M: Matcher> CompressionContext<M> {
         }
         self.buffer_input(block);
         let start = payload.len();
-        self.encode_block(payload, block.len(), false)
-            .map_err(|err| self.fail(err))?;
+        // One block in, one block out: the caller writes its single header,
+        // so the post-split, which would emit several physical blocks, stays
+        // off (upstream `ZSTD_compressBlock` never splits either).
+        let post_split = core::mem::replace(&mut self.state.post_split_allowed, false);
+        let encoded = self.encode_block(payload, block.len(), false);
+        self.state.post_split_allowed = post_split;
+        encoded.map_err(|err| self.fail(err))?;
         self.bytes_consumed += block.len() as u64;
         // RFC 8878 3.1.1.2.2: Block_Type 2 is Compressed. A Raw or RLE block
         // changes no entropy table and no repeat offset, exactly as a block

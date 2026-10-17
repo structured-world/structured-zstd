@@ -630,6 +630,13 @@ pub trait Matcher {
         let _ = window;
         cut
     }
+    /// The length the next block must take when this matcher lays the blocks
+    /// out itself (a replayed parse with block delimiters), or `None` to leave
+    /// the cut to the encoder. A block so laid out is written as one physical
+    /// block, held to the block size. Defaults to `None`.
+    fn fixed_block_len(&self) -> Option<usize> {
+        None
+    }
     /// Heap bytes this matcher's allocations hold (tables, history, scratch),
     /// excluding the inline struct itself. Lets a context report its true
     /// footprint via `ZSTD_sizeof_CCtx`. Defaults to `0` for custom matchers.

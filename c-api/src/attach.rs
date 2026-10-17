@@ -30,11 +30,6 @@ pub(crate) const ZSTD_DCT_AUTO: c_int = 0;
 pub(crate) const ZSTD_DCT_RAW_CONTENT: c_int = 1;
 pub(crate) const ZSTD_DCT_FULL_DICT: c_int = 2;
 
-/// `ZSTD_dictMagicNumber` little-endian prefix of a serialized dictionary,
-/// read off the codec's own magic rather than re-declared, so the two cannot
-/// disagree about what a dictionary looks like.
-const DICT_MAGIC: u32 = u32::from_le_bytes(codec::decoding::DICTIONARY_MAGIC);
-
 /// Synthetic non-zero ID for raw-content dictionaries. The encoder attach
 /// path requires a non-zero ID, but raw-content frames never put it on the
 /// wire (the ID flag is suppressed); the decoder side uses the same constant
@@ -142,11 +137,7 @@ pub(crate) fn parse_decode_dict(
     dict: &[u8],
     content_type: c_int,
 ) -> Result<DictionaryHandle, ZSTD_ErrorCode> {
-    // The magic is 4 bytes; classify on those alone (a magic-prefixed blob
-    // shorter than a full header then fails the parse as corrupted instead
-    // of silently degrading to raw content).
-    let has_magic =
-        dict.len() >= 4 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
+    let has_magic = Dictionary::is_serialized(dict);
     let full = match content_type {
         ZSTD_DCT_AUTO => has_magic,
         ZSTD_DCT_RAW_CONTENT => false,
@@ -170,8 +161,7 @@ pub(crate) fn parse_decode_dict(
 
 /// Whether `dict` selects raw-content modelling on the encode side.
 pub(crate) fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<bool, ZSTD_ErrorCode> {
-    let has_magic =
-        dict.len() >= 4 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
+    let has_magic = Dictionary::is_serialized(dict);
     match content_type {
         ZSTD_DCT_AUTO => Ok(!has_magic),
         ZSTD_DCT_RAW_CONTENT => Ok(true),
@@ -768,6 +758,7 @@ pub(crate) fn compress_with_dict_bytes(
     dict: &[u8],
     frame: &OneShotFrame,
 ) -> usize {
+    cctx.begin_simple_one_shot();
     let compression_level = frame.level;
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
         // Bytes handed in per call have no identity to recognise them by, so

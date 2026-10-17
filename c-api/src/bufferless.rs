@@ -517,15 +517,6 @@ impl BufferlessDecode {
             dictionary: None,
         }
     }
-
-    /// A copy: every field but the dictionary handle is plain data, and the
-    /// handle is shared.
-    fn copy(&self) -> Self {
-        Self {
-            dictionary: self.dictionary.clone(),
-            ..*self
-        }
-    }
 }
 
 /// The first read of a frame: enough to learn its header's length (magic
@@ -916,8 +907,10 @@ pub unsafe extern "C" fn ZSTD_copyDCtx(dctx: *mut ZSTD_DCtx, prepared_dctx: *con
     dst.decoder.set_magicless(src.magicless);
     dst.attached_ddict = src.attached_ddict.clone();
     let dictionary = src.bufferless.dictionary.clone();
-    // A copy cannot fail, so a begin the copy cannot repeat leaves `dst` as
-    // a context with the settings and no run.
-    let _ = begin_decode(dst, dictionary);
-    dst.bufferless = src.bufferless.copy();
+    // `begin_decode` leaves `dst` at the start of a run with the same
+    // dictionary, the documented copy. A copy cannot fail, so a begin that
+    // fails leaves `dst` with the settings and no run.
+    if crate::error::result_is_error(begin_decode(dst, dictionary)) {
+        dst.bufferless = BufferlessDecode::new(dst.magicless);
+    }
 }

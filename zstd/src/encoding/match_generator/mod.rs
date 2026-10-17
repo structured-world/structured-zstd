@@ -948,10 +948,12 @@ impl MatchGeneratorDriver {
     /// path. Checked AFTER priming, so `is_attached()` reflects the resolved
     /// attach-vs-copy decision.
     pub(crate) fn borrowed_dict_supported(&self) -> bool {
-        matches!(
-            &self.storage,
-            MatcherStorage::Simple(m) if m.dict_is_attached()
-        )
+        // As in `borrowed_supported`: a producer reads the committed block.
+        self.producer.is_none()
+            && matches!(
+                &self.storage,
+                MatcherStorage::Simple(m) if m.dict_is_attached()
+            )
     }
 
     fn simple_mut(&mut self) -> &mut FastKernelMatcher {
@@ -1342,7 +1344,11 @@ impl Matcher for MatchGeneratorDriver {
                 * core::mem::size_of::<super::opt::ldm::HcRawSeq>();
         #[cfg(not(feature = "ldm"))]
         let ldm = 0;
-        self.storage.heap_size() + snapshot + self.own_workspace.heap_bytes() + ldm
+        // The producer's parse buffer is kept from block to block.
+        let produced = self.producer.as_ref().map_or(0, |slot| {
+            slot.parse.capacity() * core::mem::size_of::<ExternalSequence>()
+        });
+        self.storage.heap_size() + snapshot + self.own_workspace.heap_bytes() + ldm + produced
     }
 
     fn clear_param_overrides(&mut self) {

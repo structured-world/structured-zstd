@@ -3,6 +3,42 @@ use crate::encoding::{
     CompressionContext, CompressionLevel, EncoderDictionary, Matcher, Sequence, StreamingEncoder,
 };
 
+/// `compress_block` hands back ONE block's content even at the optimal
+/// levels, whose frames split a block of text then noise into several
+/// physical blocks: the caller writes one header for it.
+#[test]
+fn compress_block_returns_one_block_at_splitting_levels() {
+    let mut block = Vec::new();
+    let mut i = 0u32;
+    while block.len() < 64 * 1024 {
+        block.extend_from_slice(alloc::format!("record {i} status=shipped region=eu\n").as_bytes());
+        i += 1;
+    }
+    block.truncate(64 * 1024);
+    let mut state = 0x2545_F491u32;
+    while block.len() < 128 * 1024 {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        block.push(state as u8);
+    }
+    let mut context = CompressionContext::new(CompressionLevel::Level(19));
+    context.start_frame(&mut alloc::vec::Vec::new()).unwrap();
+    assert_eq!(context.frame_block_size(), Some(block.len()));
+    let mut payload = alloc::vec::Vec::new();
+    assert!(context.compress_block(&block, &mut payload).unwrap());
+
+    let mut decoder = crate::decoding::FrameDecoder::new();
+    decoder.begin_blocks(None).unwrap();
+    // RFC 8878 3.1.1.2: Last_Block 0, Block_Type 2 (Compressed), Block_Size.
+    let header = ((payload.len() as u32) << 3 | 2 << 1).to_le_bytes();
+    let mut out = alloc::vec![0u8; block.len()];
+    let n = decoder
+        .decode_block([header[0], header[1], header[2]], &payload, &mut out)
+        .unwrap();
+    assert_eq!(&out[..n], &block[..]);
+}
+
 /// A context reused frame after frame writes exactly the frames a fresh
 /// encoder writes for each, at every band of levels, with a dictionary and
 /// without, pledged and not, small and past the dictionary attach cutoff:

@@ -1,5 +1,21 @@
 use super::*;
 
+/// A raw frame's window is the one the encoder writes for it, not a panic:
+/// the builder accepts `Uncompressed`, so the query must answer for it.
+#[test]
+fn window_log_for_raw_frames_is_the_encoders() {
+    let raw = CompressionParameters::builder(CompressionLevel::Uncompressed)
+        .build()
+        .unwrap();
+    assert_eq!(raw.window_log_for(None, 0), 17);
+    assert_eq!(raw.window_log_for(Some(1000), 0), 17);
+    let wide = CompressionParameters::builder(CompressionLevel::Uncompressed)
+        .window_log(20)
+        .build()
+        .unwrap();
+    assert_eq!(wide.window_log_for(None, 0), 20);
+}
+
 #[test]
 fn strategy_ordinals_round_trip() {
     for ordinal in 1..=9 {

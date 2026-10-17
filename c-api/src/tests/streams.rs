@@ -330,6 +330,84 @@ fn frame_progression_follows_the_stream() {
     }
 }
 
+/// The one-shot entry points that predate the advanced parameters start their
+/// frame afresh, as upstream's reset the session: a streamed frame left open
+/// is abandoned, and the progression describes the one-shot frame.
+#[test]
+fn simple_one_shots_abandon_an_open_stream() {
+    let buffered = b"buffered and never ended ".repeat(4000);
+    let small = b"0123456789";
+    let zcs = ZSTD_createCStream();
+    let mut out = vec![0u8; 1 << 17];
+    unsafe {
+        let mut inb = ZSTD_inBuffer {
+            src: buffered.as_ptr().cast(),
+            size: buffered.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: out.as_mut_ptr().cast(),
+            size: out.len(),
+            pos: 0,
+        };
+        assert_eq!(
+            ZSTD_isError(ZSTD_compressStream2(zcs, &mut outb, &mut inb, 0)),
+            0
+        );
+        let mut dst = vec![0u8; 256];
+        let n = crate::context::ZSTD_compressCCtx(
+            zcs,
+            dst.as_mut_ptr(),
+            dst.len(),
+            small.as_ptr(),
+            small.len(),
+            3,
+        );
+        assert_eq!(ZSTD_isError(n), 0);
+        let progress = ZSTD_getFrameProgression(zcs);
+        assert_eq!((progress.ingested, progress.consumed), (10, 10));
+        // Nothing is mid-frame any more: parameters may change again.
+        assert_eq!(
+            crate::params::ZSTD_CCtx_setParameter(zcs, crate::params::ZSTD_C_COMPRESSION_LEVEL, 5),
+            0
+        );
+        ZSTD_freeCCtx(zcs);
+    }
+}
+
+/// A dictionary under eight bytes is content, not a truncated serialized one,
+/// even when it is the magic number alone: both stream inits take it, as
+/// upstream does.
+#[test]
+fn stream_inits_take_a_dictionary_under_eight_bytes() {
+    let magic_only = [0x37u8, 0xA4, 0x30, 0xEC];
+    let input = b"short dictionaries are content".repeat(20);
+    unsafe {
+        let zcs = ZSTD_createCStream();
+        let rc = ZSTD_initCStream_usingDict(zcs, magic_only.as_ptr().cast(), 4, 3);
+        assert_eq!(rc, 0, "{:?}", code(rc));
+        let frame = end_frame(zcs, &input).expect("the frame compresses");
+        ZSTD_freeCCtx(zcs);
+
+        let zds = ZSTD_createDStream();
+        let rc = ZSTD_initDStream_usingDict(zds, magic_only.as_ptr().cast(), 4);
+        assert_eq!(rc, 5, "{:?}", code(rc));
+        let mut out = vec![0u8; input.len()];
+        let n = ZSTD_decompress_usingDict(
+            zds,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+            magic_only.as_ptr(),
+            4,
+        );
+        assert_eq!(n, input.len(), "{:?}", code(n));
+        assert_eq!(out, input);
+        ZSTD_freeDCtx(zds);
+    }
+}
+
 /// The decoding inits report the first read size and set up the dictionary:
 /// the plain one drops a referenced DDict, the others load or reference one.
 #[test]

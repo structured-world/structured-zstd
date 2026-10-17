@@ -232,6 +232,23 @@ fn read_skippable_frame_payload_and_errors() {
     }
 }
 
+/// A `NULL` destination with room claimed only measures the payload, as
+/// upstream copies only into a non-`NULL` one.
+#[test]
+fn read_skippable_frame_into_null_measures_the_payload() {
+    let skippable = &FRAMES[SKIPPABLE_AT..];
+    let n = unsafe {
+        ZSTD_readSkippableFrame(
+            core::ptr::null_mut(),
+            8,
+            core::ptr::null_mut(),
+            skippable.as_ptr(),
+            skippable.len(),
+        )
+    };
+    assert_eq!(n, 5);
+}
+
 #[test]
 fn write_skippable_frame_layout_and_errors() {
     let mut out = [0u8; 16];

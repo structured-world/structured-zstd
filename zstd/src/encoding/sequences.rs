@@ -319,7 +319,8 @@ pub fn rebuild_source(
 /// `ZSTD_compressSequences`). The parse is consumed as blocks are cut:
 /// wherever the encoder ends a block, a sequence running across the cut is
 /// split there, and a match piece shorter than [`MIN_MATCH`] goes out as
-/// literals. Block delimiters, if any, only hand their literals on.
+/// literals. Block delimiters, if any, end blocks: each delimited region is
+/// a block of its own, cut further only where it exceeds the block size.
 ///
 /// The parse should pass [`validate_parse`]: offsets are taken as given.
 ///
@@ -350,6 +351,8 @@ pub struct SequenceReplay<'s> {
     input: BlockInput,
     window_size: u64,
     dictionary_priming: bool,
+    /// The parse holds block delimiters, which then lay the blocks out.
+    delimited: bool,
 }
 
 impl<'s> SequenceReplay<'s> {
@@ -364,6 +367,7 @@ impl<'s> SequenceReplay<'s> {
             input: BlockInput::default(),
             window_size,
             dictionary_priming: false,
+            delimited: sequences.iter().any(ExternalSequence::is_delimiter),
         }
     }
 
@@ -474,6 +478,25 @@ impl Matcher for SequenceReplay<'_> {
 
     fn window_size(&self) -> u64 {
         self.window_size
+    }
+
+    /// The rest of the region up to the next block delimiter, skipping
+    /// regions with nothing in them.
+    fn fixed_block_len(&self) -> Option<usize> {
+        if !self.delimited {
+            return None;
+        }
+        let mut len = 0u64;
+        let (mut lit_taken, mut match_taken) = (self.lit_taken, self.match_taken);
+        for sequence in &self.sequences[self.next..] {
+            len += u64::from(sequence.lit_len - lit_taken)
+                + u64::from(sequence.match_len - match_taken);
+            (lit_taken, match_taken) = (0, 0);
+            if sequence.is_delimiter() && len > 0 {
+                return usize::try_from(len).ok();
+            }
+        }
+        None
     }
 }
 

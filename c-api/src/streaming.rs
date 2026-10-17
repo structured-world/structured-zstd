@@ -247,6 +247,7 @@ impl CStreamState {
         }
         context.set_content_size_flag(params.content_size_flag)?;
         context.set_dictionary_id_flag(params.dict_id_flag && !setup.suppress_id)?;
+        // Next to an attached dictionary too; see `compress_sticky_frame`.
         let (producer, fallback) = params.sequence_producer();
         context.set_sequence_producer(producer, fallback);
         Ok(())
@@ -733,6 +734,9 @@ pub unsafe extern "C" fn ZSTD_getFrameProgression(cctx: *const ZSTD_CCtx) -> ZST
         .filter(|stream| stream.open)
         .map_or(0, |stream| stream.context.buffered_input_len() as u64);
     report.ingested = cctx.progress.ingested;
+    // While a stream is open `progress` is its own: every one-shot entry
+    // point either refuses to run or ends the stream first, so the input
+    // still buffered is part of what it ingested.
     report.consumed = cctx.progress.ingested - buffered;
     report.produced = cctx.progress.produced;
     report.flushed = cctx.progress.flushed;
@@ -878,11 +882,13 @@ pub unsafe extern "C" fn ZSTD_initDStream_usingDict(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     };
     dctx.reset_session();
+    // Loading a dictionary leaves the frame format as it is.
+    let first_read = starting_input_length(dctx);
     let rc = unsafe { crate::attach::ZSTD_DCtx_loadDictionary(zds, dict, dict_size) };
     if crate::error::result_is_error(rc) {
         return rc;
     }
-    starting_input_length(unsafe { &*zds })
+    first_read
 }
 
 /// `size_t ZSTD_initDStream_usingDDict(ZSTD_DStream* zds, const ZSTD_DDict*
@@ -900,11 +906,13 @@ pub unsafe extern "C" fn ZSTD_initDStream_usingDDict(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     };
     dctx.reset_session();
+    // Referencing a dictionary leaves the frame format as it is.
+    let first_read = starting_input_length(dctx);
     let rc = unsafe { crate::attach::ZSTD_DCtx_refDDict(zds, ddict) };
     if crate::error::result_is_error(rc) {
         return rc;
     }
-    starting_input_length(unsafe { &*zds })
+    first_read
 }
 
 /// `size_t ZSTD_resetDStream(ZSTD_DStream* zds)` — abandon any frame in

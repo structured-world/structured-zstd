@@ -284,7 +284,8 @@ pub unsafe extern "C" fn ZSTD_readSkippableFrame(
     if payload.len() > dst_capacity {
         return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
     }
-    if !payload.is_empty() {
+    // Upstream copies only into a non-NULL destination; NULL just measures.
+    if !payload.is_empty() && !dst.is_null() {
         let dst = unsafe { out_slice(dst, dst_capacity) };
         dst[..payload.len()].copy_from_slice(payload);
     }

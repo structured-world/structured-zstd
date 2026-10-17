@@ -242,6 +242,15 @@ impl ZSTD_CCtx {
         self.params.pledged_src_size = crate::params::CONTENTSIZE_UNKNOWN;
     }
 
+    /// Start a frame of a one-shot entry point that predates the advanced
+    /// parameters (`ZSTD_compressCCtx`, the `*_usingDict` and `*_usingCDict`
+    /// calls): upstream begins those with a reset of the session
+    /// (`ZSTD_compressBegin_internal`), which abandons a streamed or
+    /// buffer-less frame left open and its pledge.
+    pub(crate) fn begin_simple_one_shot(&mut self) {
+        self.reset_session();
+    }
+
     /// Start a one-shot frame over `src_len` bytes: refused while a streamed
     /// frame is unfinished, whose pledge it would otherwise take. The pledge is
     /// single-use, consumed here whatever the outcome; with all the input in
@@ -360,6 +369,7 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let cctx = unsafe { &mut *cctx };
+    cctx.begin_simple_one_shot();
     let src = unsafe { in_slice(src, src_size) };
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
         let ZSTD_CCtx {
@@ -440,6 +450,10 @@ pub(crate) fn compress_sticky_frame(
         enc.set_target_block_size(params.target_block_size());
         enc.set_max_block_size(params.max_block_size());
         enc.set_magicless(params.magicless);
+        // An attached dictionary stays attached next to a producer: the frame
+        // names it and its entropy seeds the first block, as upstream 1.5.7
+        // writes the dictionary ID in that case too. The producer itself sees
+        // no history, which is what "no effect" means in the zstd.h notes.
         let (producer, fallback) = params.sequence_producer();
         enc.set_sequence_producer(producer, fallback);
         enc.set_sequence_capture(capture.is_some());

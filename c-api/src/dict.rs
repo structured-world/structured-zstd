@@ -12,11 +12,6 @@ use codec::dictionary::{CoverOptions, FastCoverOptions, FinalizeOptions};
 use crate::error::{ZSTD_ErrorCode, encode};
 use crate::ffi::in_slice;
 
-/// Little-endian `ZSTD_MAGIC_DICTIONARY` that prefixes a valid zstd dictionary
-/// (the 4 bytes after it are the dictionary ID). Read off the codec's own magic
-/// rather than re-declared, so the two cannot disagree.
-const DICT_MAGIC: u32 = u32::from_le_bytes(codec::decoding::DICTIONARY_MAGIC);
-
 /// `ZDICT_params_t` — finalize parameters, ABI-identical to `zdict.h`.
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -601,14 +596,7 @@ pub unsafe extern "C" fn ZDICT_trainFromBuffer_legacy(
 /// `dictBuffer` must be valid for `dictSize` bytes (or NULL with `dictSize == 0`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZDICT_getDictID(dict_buffer: *const u8, dict_size: usize) -> c_uint {
-    let dict = unsafe { in_slice(dict_buffer, dict_size) };
-    if dict.len() < 8 {
-        return 0;
-    }
-    if u32::from_le_bytes(dict[..4].try_into().expect("4 bytes")) != DICT_MAGIC {
-        return 0;
-    }
-    u32::from_le_bytes(dict[4..8].try_into().expect("4 bytes"))
+    crate::cdict::dict_id_from_bytes(unsafe { in_slice(dict_buffer, dict_size) })
 }
 
 /// `size_t ZDICT_getDictHeaderSize(const void* dictBuffer, size_t dictSize)` —

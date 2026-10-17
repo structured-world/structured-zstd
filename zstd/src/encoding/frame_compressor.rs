@@ -129,7 +129,7 @@ impl EncoderDictionary {
         // serialized blob through the full parser builds those tables for
         // nothing. The emitted frame is identical either way — only the wasted
         // build is dropped (see `Dictionary::decode_dict_for_encoding`).
-        if raw_dictionary.starts_with(&crate::decoding::DICTIONARY_MAGIC) {
+        if crate::decoding::Dictionary::is_serialized(raw_dictionary) {
             return Self::from_bytes(raw_dictionary);
         }
         Ok(Self::prepared(
@@ -2867,7 +2867,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // shorten it; the remainder stays uncommitted and heads the next
             // block.
             let mut block_len = available;
-            if available == block_capacity {
+            let fixed_len = self.state.matcher.fixed_block_len();
+            if let Some(len) = fixed_len {
+                if len < available {
+                    block_len = len;
+                    last_block = false;
+                }
+            } else if available == block_capacity {
                 let split_at = optimal_block_size_with(
                     self.pre_split_level(),
                     self.state.matcher.uncommitted_input(),
@@ -2961,6 +2967,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // for it.
             let dict_active =
                 self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
+            // A block the matcher laid out stays one physical block.
+            let post_split = self.state.post_split_allowed;
+            self.state.post_split_allowed = post_split && fixed_len.is_none();
             compress_block_encoded(
                 &mut self.state,
                 self.compression_level,
@@ -2973,6 +2982,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 #[cfg(all(feature = "lsm", feature = "hash"))]
                 self.block_checksums.as_mut(),
             );
+            self.state.post_split_allowed = post_split;
             savings += block_len as i64 - (out.len() - before_len) as i64;
             // A block is last only when it took everything read, so nothing
             // uncommitted is left behind it.
@@ -3407,9 +3417,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     }
 
     /// Parse and attach a dictionary blob, in either of the two forms upstream
-    /// `ZSTD_CCtx_loadDictionary` takes (`ZSTD_dct_auto`): a blob prefixed with
-    /// [`DICTIONARY_MAGIC`](crate::decoding::DICTIONARY_MAGIC) is a serialized
-    /// dictionary, and anything else is raw content, which is why any file can
+    /// `ZSTD_CCtx_loadDictionary` takes (`ZSTD_dct_auto`): a
+    /// [serialized](crate::decoding::Dictionary::is_serialized) dictionary,
+    /// and anything else is raw content, which is why any file can
     /// be handed to `zstd -D`. Raw content has no id, so the frame records none
     /// and the decoder must be given the same bytes explicitly.
     ///

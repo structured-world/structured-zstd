@@ -348,3 +348,100 @@ fn producer_failure_falls_back_or_reports() {
     // Literals alone only entropy-code the text; the matcher collapses it.
     assert!(matched_frame.len() * 20 < literal_frame.len());
 }
+
+/// A producer next to an attached dictionary at a Fast level keeps the frame
+/// on the path that asks the producer: the in-place dictionary scan never
+/// would, and refuses to run with one installed.
+#[test]
+fn producer_with_an_attached_dictionary_at_a_fast_level() {
+    let dict_bytes = b"tenant=demo table=orders region=eu status=shipped\n".repeat(20);
+    let dict =
+        crate::encoding::EncoderDictionary::from_serialized_or_raw_content(&dict_bytes).unwrap();
+    let mut input = vec![9u8; 1500];
+    input.extend_from_slice(&dict_bytes[..500]);
+    let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Fastest);
+    compressor.set_encoder_dictionary(dict).unwrap();
+    compressor.set_sequence_producer(Some(alloc::boxed::Box::new(LeadingRun)), false);
+    let frame = compressor.compress_independent_frame(&input);
+    let raw = crate::decoding::Dictionary::from_raw_content(0, dict_bytes.clone()).unwrap();
+    let handle = crate::decoding::DictionaryHandle::from_dictionary(raw);
+    let mut out = vec![0u8; input.len()];
+    let n = FrameDecoder::new()
+        .decode_all_with_dict_handle(&frame, &mut out, &handle)
+        .expect("frame decodes with the dictionary");
+    assert_eq!(&out[..n], &input[..]);
+    assert!(frame.len() < 700, "the run went to the producer's match");
+}
+
+/// Reserves room for `0` sequences in the parse buffer, then parses the
+/// block as literals.
+struct Reserving(usize);
+
+impl SequenceProducer for Reserving {
+    fn produce(
+        &mut self,
+        block: &[u8],
+        _window_size: u64,
+        out: &mut Vec<ExternalSequence>,
+    ) -> Result<(), SequenceProducerError> {
+        out.reserve(self.0);
+        out.push(ExternalSequence::delimiter(block.len() as u32));
+        Ok(())
+    }
+}
+
+/// The parse buffer a producer leaves behind is held for the next block, so
+/// the compressor's footprint counts it.
+#[test]
+fn heap_size_counts_the_producer_parse() {
+    let input = b"some input for one block".repeat(40);
+    let mut small = default_compressor();
+    small.set_sequence_producer(Some(alloc::boxed::Box::new(Reserving(0))), false);
+    let _ = small.compress_independent_frame(&input);
+    let mut large = default_compressor();
+    large.set_sequence_producer(Some(alloc::boxed::Box::new(Reserving(100_000))), false);
+    let _ = large.compress_independent_frame(&input);
+    // Less the handful of sequences the other compressor's buffer holds.
+    let held = (100_000 - 16) * core::mem::size_of::<ExternalSequence>();
+    assert!(
+        large.heap_size() >= small.heap_size() + held,
+        "{} vs {} + {held}",
+        large.heap_size(),
+        small.heap_size()
+    );
+}
+
+/// Count the blocks of a frame by walking their headers.
+fn block_count(frame: &[u8]) -> usize {
+    let mut at = crate::decoding::frame_header_size(frame).unwrap();
+    let mut blocks = 0;
+    loop {
+        let header =
+            u32::from(frame[at]) | u32::from(frame[at + 1]) << 8 | u32::from(frame[at + 2]) << 16;
+        // RFC 8878 3.1.1.2: Last_Block, Block_Type, Block_Size; an RLE block
+        // carries one byte.
+        let size = (header >> 3) as usize;
+        let body = if (header >> 1) & 3 == 1 { 1 } else { size };
+        at += 3 + body;
+        blocks += 1;
+        if header & 1 == 1 {
+            return blocks;
+        }
+    }
+}
+
+/// With block delimiters, each delimited region is a block of its own, the
+/// layout the caller laid down (upstream `ZSTD_sf_explicitBlockDelimiters`).
+#[test]
+fn replay_keeps_delimited_blocks() {
+    let (input, _) = periodic_input_and_parse(17_000, 13);
+    let regions = [3_000u32, 5_000, 9_000];
+    let mut parse = Vec::new();
+    for len in regions {
+        parse.push(seq(13, 13, len - 14));
+        parse.push(ExternalSequence::delimiter(1));
+    }
+    let frame = replay_frame(&input, &parse, None);
+    assert_eq!(decode(&frame), input);
+    assert_eq!(block_count(&frame), regions.len());
+}

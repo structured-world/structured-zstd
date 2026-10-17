@@ -39,17 +39,10 @@ pub(crate) fn next_dict_serial() -> u64 {
     DICT_SERIAL.fetch_add(1, Ordering::Relaxed)
 }
 
-/// `ZSTD_dictMagicNumber` (`zstd.h`): a serialized zstd dictionary begins with
-/// this little-endian magic and bytes `[4..8]` hold the dictionary ID, while
-/// raw-content dictionaries carry no magic and report ID 0. Read off the
-/// codec's own magic rather than re-declared, so the two cannot disagree.
-const DICT_MAGIC: u32 = u32::from_le_bytes(codec::decoding::DICTIONARY_MAGIC);
-
-/// Parse the dictionary ID from a serialized dictionary header, or `0` for a
-/// raw-content dictionary (no magic) / too-short buffer. Matches
-/// `ZSTD_getDictID_fromDict` semantics.
+/// Parse the dictionary ID from a serialized dictionary header, or `0` for
+/// raw content. Matches `ZSTD_getDictID_fromDict` semantics.
 pub(crate) fn dict_id_from_bytes(dict: &[u8]) -> u32 {
-    if dict.len() < 8 || u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) != DICT_MAGIC {
+    if !codec::decoding::Dictionary::is_serialized(dict) {
         return 0;
     }
     u32::from_le_bytes([dict[4], dict[5], dict[6], dict[7]])
@@ -125,13 +118,9 @@ pub unsafe extern "C" fn ZSTD_createCDict(
     if dict.is_empty() {
         return core::ptr::null_mut();
     }
-    // Auto content type (upstream createCDict): a magic-prefixed blob must
+    // Auto content type (upstream createCDict): a serialized dictionary must
     // parse for encoding, anything else is a raw-content dictionary.
-    // Classify on the 4-byte magic alone; a truncated magic-prefixed blob
-    // then fails the encoder parse below as corrupted (upstream parity)
-    // instead of silently degrading to raw content.
-    let raw_content =
-        dict.len() < 4 || u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) != DICT_MAGIC;
+    let raw_content = !codec::decoding::Dictionary::is_serialized(dict);
     let Some(prepared) = prepare_compression_dictionary(dict, raw_content) else {
         return core::ptr::null_mut();
     };
@@ -289,13 +278,8 @@ pub(crate) fn create_cdict_with_params(
     if dict.is_empty() {
         return core::ptr::null_mut();
     }
-    let has_magic =
-        dict.len() >= 4 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
-    let raw_content = match dict_content_type {
-        crate::attach::ZSTD_DCT_AUTO => !has_magic,
-        crate::attach::ZSTD_DCT_RAW_CONTENT => true,
-        crate::attach::ZSTD_DCT_FULL_DICT if has_magic => false,
-        _ => return core::ptr::null_mut(),
+    let Ok(raw_content) = crate::attach::encode_raw_content(dict, dict_content_type) else {
+        return core::ptr::null_mut();
     };
     let Some(resolved) = params.resolve() else {
         return core::ptr::null_mut();
@@ -343,11 +327,9 @@ pub unsafe extern "C" fn ZSTD_createDDict_advanced(
     // FULL_DICT requires the dictionary magic up front: failing here mirrors
     // the CDict creator and the loadDictionary paths, instead of handing out
     // a handle that only fails later at decompression time.
-    let has_magic =
-        dict.len() >= 4 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
     match dict_content_type {
         crate::attach::ZSTD_DCT_AUTO | crate::attach::ZSTD_DCT_RAW_CONTENT => {}
-        crate::attach::ZSTD_DCT_FULL_DICT if has_magic => {}
+        crate::attach::ZSTD_DCT_FULL_DICT if codec::decoding::Dictionary::is_serialized(dict) => {}
         _ => return core::ptr::null_mut(),
     }
     let id = if dict_content_type == crate::attach::ZSTD_DCT_RAW_CONTENT {
@@ -423,6 +405,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let cctx = unsafe { &mut *cctx };
+    cctx.begin_simple_one_shot();
     let cdict_ref = unsafe { &*cdict };
     let src = unsafe { in_slice(src, src_size) };
     let key = cdict_ref.serial;
@@ -492,6 +475,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict_advanced(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let cctx = unsafe { &mut *cctx };
+    cctx.begin_simple_one_shot();
     let cdict_ref = unsafe { &*cdict };
     let src = unsafe { in_slice(src, src_size) };
     let key = cdict_ref.serial;

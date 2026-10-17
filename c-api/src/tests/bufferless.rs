@@ -81,6 +81,51 @@ fn decode_bufferless(
     Ok(output)
 }
 
+/// A context copied from one part-way through a frame starts a frame of its
+/// own: the copy carries the settings and the dictionary, not a stage its
+/// decoder never reached.
+#[test]
+fn copy_dctx_mid_frame_starts_afresh() {
+    let frame: &[u8] = &[
+        0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x18, 0, 0, b'a', b'b', b'c', 0x11, 0, 0, b'd', b'e',
+    ];
+    let src = ZSTD_createDCtx();
+    let dst = ZSTD_createDCtx();
+    let mut out = [0u8; 64];
+    unsafe {
+        assert_eq!(ZSTD_decompressBegin(src), 0);
+        // Through the frame header: `src` now waits for a block header.
+        let mut pos = 0;
+        for _ in 0..2 {
+            pos += step(src, &frame[pos..], &mut out).1;
+        }
+        assert_eq!(ZSTD_nextSrcSizeToDecompress(src), 3);
+        ZSTD_copyDCtx(dst, src);
+        assert_eq!(ZSTD_nextSrcSizeToDecompress(dst), 5);
+        let mut decoded = Vec::new();
+        let mut at = 0;
+        loop {
+            let want = ZSTD_nextSrcSizeToDecompress(dst);
+            if want == 0 {
+                break;
+            }
+            let rc = ZSTD_decompressContinue(
+                dst,
+                out.as_mut_ptr(),
+                out.len(),
+                frame[at..].as_ptr(),
+                want,
+            );
+            assert_eq!(ZSTD_isError(rc), 0, "{:?}", code(rc));
+            decoded.extend_from_slice(&out[..rc]);
+            at += want;
+        }
+        assert_eq!(decoded, b"abcde");
+        ZSTD_freeDCtx(dst);
+        ZSTD_freeDCtx(src);
+    }
+}
+
 /// The decoder asks for the parts of a frame in upstream's order and sizes,
 /// and hands each block's output back at once.
 #[test]
