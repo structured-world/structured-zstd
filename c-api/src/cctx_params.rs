@@ -347,13 +347,15 @@ impl CCtxParams {
     }
 
     /// Put explicit compression and frame parameters in place, every knob
-    /// set (`ZSTD_CCtxParams_init_advanced`): the level no longer chooses any.
-    fn set_explicit(
+    /// set, the others left as they are (upstream `ZSTD_CCtxParams_setZstdParams`):
+    /// the level, recorded as 0, no longer chooses any.
+    pub(crate) fn set_explicit(
         &mut self,
         cparams: &ZSTD_compressionParameters,
         fparams: &crate::cdict::ZSTD_frameParameters,
     ) {
         let opt = |v: u32| (v != 0).then_some(v);
+        self.level = 0;
         self.window_log = opt(cparams.windowLog);
         self.chain_log = opt(cparams.chainLog);
         self.hash_log = opt(cparams.hashLog);

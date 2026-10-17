@@ -808,6 +808,7 @@ pub(crate) fn compress_with_dict_bytes(
         return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
     }
     dst[..len].copy_from_slice(&cctx.scratch);
+    cctx.progress = crate::context::FrameProgress::one_shot(src.len(), len);
     len
 }
 

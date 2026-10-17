@@ -200,6 +200,13 @@ pub struct ZSTD_customMem {
     pub opaque: *const core::ffi::c_void,
 }
 
+impl ZSTD_customMem {
+    /// Whether this is `ZSTD_defaultCMem`, the only allocator accepted.
+    pub(crate) fn is_default(&self) -> bool {
+        self.customAlloc.is_null() && self.customFree.is_null() && self.opaque.is_null()
+    }
+}
+
 /// Representative compression level for an explicit strategy ordinal: feeds
 /// the level-derived defaults for the knobs `cParams` leaves at 0. `None`
 /// for ordinals outside `ZSTD_strategy`'s 1..=9 (invalid input, not a tier).
@@ -276,10 +283,7 @@ pub(crate) fn create_cdict_with_params(
     params: &crate::cctx_params::CCtxParams,
     custom_mem: &ZSTD_customMem,
 ) -> *mut ZSTD_CDict {
-    if !custom_mem.customAlloc.is_null()
-        || !custom_mem.customFree.is_null()
-        || !custom_mem.opaque.is_null()
-    {
+    if !custom_mem.is_default() {
         return core::ptr::null_mut();
     }
     if dict.is_empty() {
@@ -329,10 +333,7 @@ pub unsafe extern "C" fn ZSTD_createDDict_advanced(
     dict_content_type: c_int,
     custom_mem: ZSTD_customMem,
 ) -> *mut ZSTD_DDict {
-    if !custom_mem.customAlloc.is_null()
-        || !custom_mem.customFree.is_null()
-        || !custom_mem.opaque.is_null()
-    {
+    if !custom_mem.is_default() {
         return core::ptr::null_mut();
     }
     let dict = unsafe { in_slice(dict_buffer, dict_size) };
@@ -466,6 +467,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
     }
     let dst = unsafe { out_slice(dst, dst_capacity) };
     dst[..len].copy_from_slice(&cctx.scratch);
+    cctx.progress = crate::context::FrameProgress::one_shot(src.len(), len);
     len
 }
 
@@ -526,6 +528,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict_advanced(
     }
     let dst = unsafe { out_slice(dst, dst_capacity) };
     dst[..len].copy_from_slice(&cctx.scratch);
+    cctx.progress = crate::context::FrameProgress::one_shot(src.len(), len);
     len
 }
 
