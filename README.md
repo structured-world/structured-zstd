@@ -99,9 +99,9 @@ does, with the window stopped at 30 (the widest this build writes), and
 upstream's layout.
 `--target-compressed-block-size` does take effect: it bounds what goes into a
 block, so blocks flush sooner. `--long` means `--long=27`, as upstream
-documents. It needs level 16 or above, where long-distance matching actually
-runs — below that it is refused rather than accepted as a wider window and
-nothing else. A window is never declared larger than the source can fill, so a
+documents, and runs long-distance matching at every level. `--patch-from`
+turns it on itself when the input outgrows what the level's match finder
+reaches, by upstream's rule. A window is never declared larger than the source can fill, so a
 small file compressed with `--long` does not ask its decoders to reserve
 128 MiB. Decoding takes windows up to 128 MiB by default; a wider frame (from
 `--long=28` and up) is refused with upstream's message, and decodes with
@@ -420,9 +420,9 @@ upstream `main`, so the link target is correct for forks too —
 fork consumers should point readers at the upstream registry
 rather than maintain divergent copies. -->
 
-## Project relationship
+## Origins
 
-Maintained fork of [KillingSpark/zstd-rs](https://github.com/KillingSpark/zstd-rs) (ruzstd) by [Dmitry Prudnikov](https://github.com/polaz). We sync periodically with upstream but maintain an independent development trajectory focused on the [CoordiNode](https://github.com/structured-world/coordinode) database engine's per-label dictionary needs.
+structured-zstd is an independent project by [Dmitry Prudnikov](https://github.com/polaz), developed for the [CoordiNode](https://github.com/structured-world/coordinode) database engine and its per-label dictionary workloads. It started from the code base of [ruzstd](https://github.com/KillingSpark/zstd-rs) by Moritz Borcherding; that code is used under the MIT License, whose notice is kept in [NOTICE](https://github.com/structured-world/structured-zstd/blob/main/NOTICE).
 
 ## Support the project
 

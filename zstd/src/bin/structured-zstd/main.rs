@@ -188,11 +188,8 @@ struct Options {
     /// `--trace FILE`: where one CSV line per frame is appended.
     trace: Option<PathBuf>,
     /// The widest window decoding takes; see [`decode_window_ceiling`]. Set
-    /// once the dictionary's size is known.
+    /// once the command line is settled.
     decode_window: u64,
-    /// What `-M` counts besides the window; see [`decode_memory_overhead`].
-    /// Set with [`Self::decode_window`].
-    decode_memory_overhead: Option<u64>,
     /// A patch lifted the decode window to its widest, and no `-M` (`-M0`
     /// included) came after to set a limit of its own.
     patch_window_lifted: bool,
@@ -360,11 +357,6 @@ const MIN_BENCH_BLOCK_SIZE: u64 = 32;
 /// Window log a bare `--long` selects, as upstream documents (128 MiB).
 const DEFAULT_LONG_WINDOW_LOG: u32 = 27;
 
-/// Lowest level whose matcher actually runs long-distance matching. Below it
-/// the encoder uses a strategy that carries no long-distance producer, so
-/// `--long` would be a wider window and nothing else.
-const MIN_LONG_LEVEL: i32 = 16;
-
 /// Which spellings of a size suffix [`read_leading_number`] reads.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SuffixCase {
@@ -500,26 +492,17 @@ fn parse_memory_limit(text: &str) -> Result<Option<u64>> {
 
 /// What the decoder holds BESIDES the window, rounded well up: the literal and
 /// block buffers (a block is capped at 128 KiB each), the sequence storage,
-/// the Huffman and FSE tables, and the tool's own I/O buffers. Counted because
-/// `-M` promises total memory, not one allocation: a limit equal to the window
-/// alone is one we would break.
+/// the Huffman and FSE tables, and the tool's own I/O buffers. A limit that
+/// cannot cover these and the default window together is refused up front.
 const DECODER_AUXILIARY_BYTES: u64 = 1 << 20;
-
-/// What `-M` counts besides the window: the decoder's other buffers and the
-/// dictionary (`dictionary_bytes`), held as read and again as parsed. `None`
-/// past `u64`, which no limit covers.
-fn decode_memory_overhead(dictionary_bytes: u64) -> Option<u64> {
-    dictionary_bytes
-        .checked_mul(2)
-        .and_then(|dictionary| dictionary.checked_add(DECODER_AUXILIARY_BYTES))
-}
 
 /// The widest window this run decodes, handed to the decoder as its ceiling.
 ///
-/// Under `-M` the window may have what the promise leaves once
-/// [`decode_memory_overhead`] is counted; the limit was already checked to
-/// leave at least the default. `-M` comes first because a patch keeps it too:
-/// `--patch-apply` drops a `-M` given before it, so one still set came after,
+/// Under `-M` the window is the limit, as the reference sets it
+/// (`ZSTD_DCtx_setMaxWindowSize(dctx, memLimit)`, fileio.c): scripts written
+/// for it decode a 2^29 window under `--memory=512MB`, which a limit counting
+/// the other buffers too would refuse. `-M` comes first because a patch keeps
+/// it too: `--patch-apply` drops a `-M` given before it, so one still set came after,
 /// and replaces the lifted limit as a later `-M` replaces it in the reference
 /// command. Otherwise a patch whose window no later `-M` (`-M0` included) has
 /// limited again reaches back across its whole reference, so it is decoded
@@ -529,14 +512,11 @@ fn decode_memory_overhead(dictionary_bytes: u64) -> Option<u64> {
 /// failing those the decoder's default stands. A log below the default does
 /// not lower it: the reference would then refuse frames its own default
 /// accepts, which serves nobody.
-fn decode_window_ceiling(opts: &Options, dictionary_bytes: u64) -> u64 {
+fn decode_window_ceiling(opts: &Options) -> u64 {
     use structured_zstd::decoding::{MAX_DECODER_WINDOW_SIZE, MAXIMUM_ALLOWED_WINDOW_SIZE};
 
     if let Some(limit) = opts.memory_limit {
-        return decode_memory_overhead(dictionary_bytes)
-            .and_then(|held| limit.checked_sub(held))
-            .unwrap_or(0)
-            .clamp(MAXIMUM_ALLOWED_WINDOW_SIZE, MAX_DECODER_WINDOW_SIZE);
+        return limit.clamp(MAXIMUM_ALLOWED_WINDOW_SIZE, MAX_DECODER_WINDOW_SIZE);
     }
     if opts.patch_window_lifted {
         return MAX_DECODER_WINDOW_SIZE;
@@ -1189,7 +1169,6 @@ fn parse_args_into(
         console: FakeConsole::default(),
         trace: None,
         decode_window: structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE,
-        decode_memory_overhead: decode_memory_overhead(0),
         patch_window_lifted: false,
         bench_separately: false,
         block_size: None,
@@ -1764,29 +1743,6 @@ fn parse_args_into(
         opts.bench_start = opts.bench_start.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
         opts.bench_end = opts.bench_end.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
     }
-    // Long-distance matching runs on the optimal parser here, so below it the
-    // flag would widen the window and never run the matcher it names. Settled
-    // after the whole command line, since the level may follow the flag — and
-    // read from the benchmark range when there is one, because those are the
-    // levels that will actually compress. The whole range runs with the flag,
-    // so its lowest level is the one that has to carry the matcher.
-    let long_level = if opts.bench {
-        opts.bench_start.min(opts.bench_end)
-    } else {
-        opts.level
-    };
-    // A `--zstd=strat=` override onto the optimal parser carries the matcher
-    // whatever the level says.
-    let optimal_strategy = opts
-        .advanced
-        .strategy
-        .is_some_and(|strategy| strategy >= Strategy::Btopt);
-    if opts.long && compresses(&opts) && long_level < MIN_LONG_LEVEL && !optimal_strategy {
-        bail!(
-            "--long needs level {MIN_LONG_LEVEL} or above, where long-distance \
-             matching runs; at level {long_level} it would only widen the window",
-        );
-    }
     // Window logs are validated here, before any file is opened, against the
     // mode the whole command line settled on; a knob out of its range is a
     // broken command line.
@@ -2171,6 +2127,46 @@ fn patch_window_log(source_size: u64) -> Result<u32> {
         );
     }
     Ok(file_window_log.max(lower))
+}
+
+/// Whether a `--patch-from` compression of `source_size` bytes against a
+/// `reference_size`-byte reference needs long-distance matching to reach the
+/// reference: when the file's window outgrows what the match finder cycles
+/// through, by the reference command's rule (`FIO_adjustParamsForPatchFromMode`,
+/// `fileWindowLog > ZSTD_cycleLog(chainLog, strategy)`, the binary-tree
+/// strategies cycling one log short of their chain). The chain and strategy
+/// are the ones the frame runs, the level's for those sizes under any
+/// `--zstd=` override; the reference command reads the bare level's and
+/// leaves an overridden short chain without long mode.
+fn patch_needs_long_distance(
+    level: i32,
+    advanced: &AdvancedParams,
+    source_size: u64,
+    reference_size: u64,
+) -> bool {
+    let file_window_log = u64::BITS - source_size.max(1).leading_zeros();
+    // A reference past the address space cannot have been read to get here.
+    let reference_size = usize::try_from(reference_size).unwrap_or(usize::MAX);
+    let params = LevelParameters::for_level(level, Some(source_size), reference_size);
+    let chain_log = advanced.chain_log.unwrap_or(params.chain_log);
+    let strategy = advanced.strategy.unwrap_or(params.strategy);
+    let cycle_log = chain_log - u32::from(strategy >= Strategy::Btlazy2);
+    file_window_log > cycle_log
+}
+
+/// Whether a level this run compresses at needs long-distance matching for the
+/// patch (see [`patch_needs_long_distance`]). A benchmark compresses every
+/// level of its `-b`/`-e` range under one setting, so one level that cannot
+/// cycle the input turns it on for all.
+fn patch_run_needs_long_distance(opts: &Options, source_size: u64, reference_size: u64) -> bool {
+    let levels = if opts.bench {
+        opts.bench_start..=opts.bench_end
+    } else {
+        opts.level..=opts.level
+    };
+    levels
+        .into_iter()
+        .any(|level| patch_needs_long_distance(level, &opts.advanced, source_size, reference_size))
 }
 
 /// Whether the run reads the `-D` / `--patch-from` file it names. Listing
@@ -2766,24 +2762,21 @@ fn run_selected(mut opts: Options) -> Result<usize> {
                 _ => bail!("Using --patch-from with stdin requires --stream-size"),
             };
             opts.advanced.window_log = Some(patch_window_log(source_size)?);
-            // Long-distance matching is what finds the reference across a
-            // window this wide; it runs on the optimal parser here, so it is
-            // switched on where that parser runs.
-            let optimal = opts.level >= MIN_LONG_LEVEL
-                || opts
-                    .advanced
-                    .strategy
-                    .is_some_and(|strategy| strategy >= Strategy::Btopt);
-            if optimal {
+            let reference = opts.patch_from.as_deref().expect("set in this branch");
+            let reference_size = fs::metadata(reference)
+                .map_err(|err| eyre!("can't stat {} : {err}", reference.display()))?
+                .len();
+            if patch_run_needs_long_distance(&opts, source_size, reference_size) {
+                if !opts.long {
+                    display!(opts.verbosity, 2, "long mode automatically triggered");
+                }
                 opts.long = true;
             }
         }
     }
 
     let dict_bytes = load_dictionary(&opts)?;
-    let dictionary_bytes = dict_bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);
-    opts.decode_window = decode_window_ceiling(&opts, dictionary_bytes);
-    opts.decode_memory_overhead = decode_memory_overhead(dictionary_bytes);
+    opts.decode_window = decode_window_ceiling(&opts);
 
     // `-b` benchmarks compression/decompression across levels instead of
     // producing output files; handle it before the streaming flow. It takes the
@@ -5629,8 +5622,9 @@ struct DecodeSettings {
     pass_through: bool,
     /// The decoder's window ceiling; see [`decode_window_ceiling`].
     max_window: u64,
-    /// What `-M` counts besides the window, for the `--memory` a refusal
-    /// names; see [`decode_memory_overhead`].
+    /// What the `--memory` a refusal names adds to the window: nothing for a
+    /// plain decode, whose `-M` is the window, and what a benchmark holds
+    /// besides it for one (see [`bench_decode_settings`]).
     memory_overhead: Option<u64>,
 }
 
@@ -5640,7 +5634,7 @@ impl Default for DecodeSettings {
             verify_checksum: true,
             pass_through: false,
             max_window: structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE,
-            memory_overhead: decode_memory_overhead(0),
+            memory_overhead: Some(0),
         }
     }
 }
@@ -5659,7 +5653,7 @@ impl DecodeSettings {
             pass_through: opts.mode != Mode::Test
                 && opts.pass_through.unwrap_or(opts.force && to_stdout),
             max_window: opts.decode_window,
-            memory_overhead: opts.decode_memory_overhead,
+            memory_overhead: Some(0),
         }
     }
 

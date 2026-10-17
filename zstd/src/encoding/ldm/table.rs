@@ -91,7 +91,6 @@ const REBASE_GUARD_BAND: u32 = 1u32 << 30;
 /// [`LdmHashTable::insert_absolute`] / [`LdmHashTable::resolve`]
 /// helpers so absolute-position support extends past `u32::MAX`
 /// transparently — same pattern as `MatchTable`'s chain rebase.
-#[derive(Clone)]
 pub(crate) struct LdmHashTable {
     entries: Vec<LdmEntry>,
     bucket_offsets: Vec<u8>,
@@ -288,6 +287,7 @@ impl LdmHashTable {
     /// Absolute stream position that corresponds to the +1
     /// relative-offset bias — i.e. an entry with `offset == 1`
     /// refers to absolute byte `position_base`.
+    #[cfg(test)]
     pub(crate) const fn position_base(&self) -> usize {
         self.position_base
     }

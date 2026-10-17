@@ -145,11 +145,13 @@ impl LdmParams {
     }
 
     /// Hash-table size in entries: `1 << hash_log`.
+    #[cfg(test)]
     pub(crate) const fn hash_table_entries(&self) -> usize {
         1usize << self.hash_log
     }
 
     /// Per-bucket slot count: `1 << bucket_size_log`.
+    #[cfg(test)]
     pub(crate) const fn bucket_slots(&self) -> usize {
         1usize << self.bucket_size_log
     }

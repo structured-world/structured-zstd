@@ -226,6 +226,52 @@ impl LevelParams {
     pub(crate) fn pre_split(&self) -> Option<u8> {
         Some(pre_split_for(self.strategy_tag, self.lazy_depth))
     }
+
+    /// `log2` of how much of a dictionary's end the match-finder tables index
+    /// when it is loaded: a longer dictionary is indexed only that far from its
+    /// end, since tables this size could not keep more of it anyway (upstream
+    /// `ZSTD_loadDictionaryContent`, `zstd_compress.c:4987`:
+    /// `MIN(MAX(hashLog + 3, chainLog + 1), 31)`). Every byte of it stays in
+    /// the window.
+    pub(crate) fn dictionary_reach_log(&self) -> u32 {
+        use crate::encoding::strategy::SearchMethod;
+        // The active backend's config: an override may leave the level row's
+        // own beside it.
+        let logs = match self.search {
+            SearchMethod::Fast => self.fast.map(|fast| (fast.hash_log as usize, 0)),
+            SearchMethod::DoubleFast => self
+                .dfast
+                .map(|dfast| (dfast.long_hash_log as usize, dfast.short_hash_log as usize)),
+            SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => {
+                self.row.map(|row| (row.hash_bits, row.chain_log))
+            }
+            SearchMethod::HashChain | SearchMethod::BinaryTree => {
+                self.hc.map(|hc| (hc.hash_log, hc.chain_log))
+            }
+        };
+        // The reset synthesises the active config when a row lacks it, so a
+        // missing one only means a table-less level: nothing to index.
+        let Some((hash_log, chain_log)) = logs else {
+            return 0;
+        };
+        (hash_log + 3).max(chain_log + 1).min(31) as u32
+    }
+
+    /// The level's upstream `cParams.minMatch`: the shortest match its search
+    /// accepts, and so the shortest piece of a long-distance match a block cut
+    /// leaves worth keeping (`maybeSplitSequence`, `zstd_ldm.c:644`).
+    #[cfg(feature = "ldm")]
+    pub(crate) fn min_match(&self) -> usize {
+        use crate::encoding::strategy::SearchMethod;
+        let configured = match self.search {
+            SearchMethod::Fast => self.fast.map(|fast| fast.mls as usize),
+            SearchMethod::DoubleFast => Some(crate::encoding::match_generator::DFAST_MIN_MATCH_LEN),
+            SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => self.row.map(|row| row.mls),
+            SearchMethod::HashChain => Some(crate::encoding::hc::HC_MIN_MATCH_LEN),
+            SearchMethod::BinaryTree => self.hc.map(|hc| hc.search_mls),
+        };
+        configured.unwrap_or(crate::encoding::cost_model::HC_FORMAT_MINMATCH)
+    }
 }
 
 /// The pre-splitter level for an effective strategy (the tag plus, for the
@@ -947,13 +993,11 @@ pub fn estimated_compression_workspace_bytes_for_run(
     #[cfg(feature = "ldm")]
     let ldm = if long_distance_matching {
         let strategy = ldm_strategy_ordinal(params.strategy_tag, params.lazy_depth);
-        let ldm_params = crate::encoding::ldm::params::LdmParams::adjust_for(
-            u32::from(params.window_log),
-            strategy,
-        );
-        crate::encoding::ldm::table::LdmHashTable::estimated_workspace_bytes(
-            ldm_params.hash_log,
-            ldm_params.bucket_size_log,
+        crate::encoding::ldm::estimated_workspace_bytes(
+            &crate::encoding::ldm::params::LdmParams::adjust_for(
+                u32::from(params.window_log),
+                strategy,
+            ),
         )
     } else {
         0
@@ -1012,11 +1056,7 @@ pub fn estimated_compression_workspace_bytes_for_parameters(
     apply_frame_overrides(&mut params, &overrides, dictionary.is_some(), src_size_hint);
     #[cfg(feature = "ldm")]
     let ldm = overrides.ldm.map_or(0, |ldm| {
-        let ldm_params = frame_ldm_params(&params, &ldm);
-        crate::encoding::ldm::table::LdmHashTable::estimated_workspace_bytes(
-            ldm_params.hash_log,
-            ldm_params.bucket_size_log,
-        )
+        crate::encoding::ldm::estimated_workspace_bytes(&frame_ldm_params(&params, &ldm))
     });
     #[cfg(not(feature = "ldm"))]
     let ldm = 0;

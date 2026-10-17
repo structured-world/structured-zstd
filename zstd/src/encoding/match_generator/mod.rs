@@ -5,7 +5,7 @@
 //!
 //! The task here is to efficiently find matches in the already encoded data for the current suffix of the not yet encoded data.
 
-#[cfg(feature = "bench-internals")]
+#[cfg(any(feature = "bench-internals", feature = "ldm"))]
 use alloc::vec::Vec;
 // SIMD/CRC intrinsics now live in `crate::encoding::fastpath::*` where they
 // sit under per-CPU `#[target_feature]` umbrellas; no architecture-specific
@@ -161,6 +161,10 @@ use super::hc::generator::HcMatchGenerator;
 // can reach the driver's private `primed` / `reset_shape` state directly; the
 // `Matcher` trait's dict entry points forward to its inherent `*_impl` helpers.
 mod dict_prime;
+// Long-distance matching: the search ahead of the blocks and the blocks
+// matched around its matches. A child module for the same private access.
+#[cfg(feature = "ldm")]
+mod long_distance;
 
 // `Strategy` and `StrategyTag` live in `crate::encoding::strategy`.
 // The driver carries a `StrategyTag` field set at `reset()` and
@@ -236,6 +240,98 @@ impl MatcherStorage {
             Self::Dfast(m) => m.history.capacity(),
             Self::Row(m) => m.history.capacity(),
             Self::HashChain(m) => m.table.history.capacity(),
+        }
+    }
+
+    /// See the backends' `set_dictionary_index_floor`.
+    fn set_dictionary_index_floor(&mut self, floor: usize) {
+        match self {
+            Self::Simple(m) => m.set_dictionary_index_floor(floor),
+            Self::Dfast(m) => m.set_dictionary_index_floor(floor),
+            Self::Row(m) => m.set_dictionary_index_floor(floor),
+            Self::HashChain(m) => m.table.set_dictionary_index_floor(floor),
+        }
+    }
+
+    /// The committed window of the owned history, oldest byte first.
+    #[cfg(feature = "ldm")]
+    fn committed_window(&self) -> &[u8] {
+        match self {
+            Self::Simple(m) => m.committed_window(),
+            Self::Dfast(m) => m.live_history(),
+            Self::Row(m) => m.live_history(),
+            Self::HashChain(m) => m.table.live_history(),
+        }
+    }
+
+    /// The committed window followed by the input read but not committed.
+    #[cfg(feature = "ldm")]
+    fn window_with_pending(&self) -> &[u8] {
+        match self {
+            Self::Simple(m) => m.window_with_pending(),
+            Self::Dfast(m) => m.window_with_pending(),
+            Self::Row(m) => m.window_with_pending(),
+            Self::HashChain(m) => m.table.window_with_pending(),
+        }
+    }
+
+    /// Length of the last committed block.
+    #[cfg(feature = "ldm")]
+    fn last_block_len(&self) -> usize {
+        match self {
+            Self::Simple(m) => m.last_committed_space().len(),
+            Self::Dfast(m) => m.get_last_space().len(),
+            Self::Row(m) => m.get_last_space().len(),
+            Self::HashChain(m) => m.table.get_last_space().len(),
+        }
+    }
+
+    /// See the backends' `uncommit_block`.
+    #[cfg(feature = "ldm")]
+    fn uncommit_block(&mut self, len: usize) {
+        match self {
+            Self::Simple(m) => m.uncommit_block(len),
+            Self::Dfast(m) => m.uncommit_block(len),
+            Self::Row(m) => m.uncommit_block(len),
+            Self::HashChain(m) => m.table.uncommit_block(len),
+        }
+    }
+
+    /// Commit `len` bytes of a block handed back by [`Self::uncommit_block`].
+    /// The whole block fit the window when it was first committed, so a piece
+    /// of it evicts nothing.
+    #[cfg(feature = "ldm")]
+    fn commit_piece(&mut self, len: usize) {
+        match self {
+            Self::Simple(m) => {
+                let evicted = m.commit_block(len);
+                debug_assert_eq!(evicted, 0, "a recommitted piece evicted window bytes");
+            }
+            Self::Dfast(m) => m.commit_block(len),
+            Self::Row(m) => m.commit_block(len),
+            Self::HashChain(m) => m.table.commit_block(len),
+        }
+    }
+
+    /// See the backends' `skip_long_match`.
+    #[cfg(feature = "ldm")]
+    fn skip_long_match(&mut self) {
+        match self {
+            Self::Simple(m) => m.skip_long_match(),
+            Self::Dfast(m) => m.skip_long_match(),
+            Self::Row(m) => m.skip_long_match(),
+            Self::HashChain(m) => m.table.skip_long_match(),
+        }
+    }
+
+    /// See the backends' `note_long_match`.
+    #[cfg(feature = "ldm")]
+    fn note_long_match(&mut self, offset: usize, literal_len: usize) {
+        match self {
+            Self::Simple(m) => m.note_long_match(offset, literal_len),
+            Self::Dfast(m) => m.note_long_match(offset, literal_len),
+            Self::Row(m) => m.note_long_match(offset, literal_len),
+            Self::HashChain(m) => m.table.note_long_match(offset, literal_len),
         }
     }
 
@@ -327,17 +423,11 @@ pub struct MatchGeneratorDriver {
     reset_dict_attach_ok: bool,
     // Hint-resolved matcher shape from the last `reset`: the [`LevelParams`], the
     // active backend's applied Dfast/Row hash-table width (`0` for HC/Fast), the
-    // Fast attach-vs-copy mode, the Fast slot format, and the active LDM override
-    // (#27). Combined with the frame's level into the [`PrimedKey`] that keys
-    // the primed snapshot, so it is only restored into a reset that resolved the
-    // identical matcher AND LDM configuration. `None` before the first `reset`.
-    reset_shape: Option<(
-        LevelParams,
-        usize,
-        bool,
-        bool,
-        Option<super::parameters::LdmOverride>,
-    )>,
+    // Fast attach-vs-copy mode and the Fast slot format. Combined with the
+    // frame's level into the [`PrimedKey`] that keys the primed snapshot, so it
+    // is only restored into a reset that resolved the identical matcher. `None`
+    // before the first `reset`.
+    reset_shape: Option<(LevelParams, usize, bool, bool)>,
     // One-shot borrowed block range `[start, end)` staged by the borrowed
     // Fast frame path (`set_borrowed_block`) for the NEXT
     // `start_matching` / `skip_matching_with_hint`. `Some` routes that
@@ -365,6 +455,33 @@ pub struct MatchGeneratorDriver {
     /// place rather than copied into the history. Decided at the reset,
     /// because it decides how large the history is laid out.
     frame_in_place: bool,
+    /// Long-distance matcher, `Some` while the frame runs with it on. It
+    /// belongs to the driver rather than to a backend, as upstream keeps
+    /// `ldmState` beside the match state: every strategy reads the same one.
+    #[cfg(feature = "ldm")]
+    ldm: Option<super::ldm::LdmProducer>,
+    /// The long-distance matches searched ahead of the blocks.
+    #[cfg(feature = "ldm")]
+    ldm_store: super::ldm::store::LdmSequenceStore,
+    /// What the last search found, before the store takes it.
+    #[cfg(feature = "ldm")]
+    ldm_found: Vec<super::opt::ldm::HcRawSeq>,
+    /// The long-distance sequences of the block being matched.
+    #[cfg(feature = "ldm")]
+    ldm_block: Vec<super::opt::ldm::HcRawSeq>,
+    /// Stream position of the committed end, in the coordinates the
+    /// long-distance matcher keeps its table in: the frame's first byte
+    /// (its dictionary's, when it has one) is `0`.
+    #[cfg(feature = "ldm")]
+    ldm_committed_end: usize,
+    /// Where the frame's dictionary ends in those coordinates, `0` without
+    /// one: what a match may still reach while the window has not passed it.
+    #[cfg(feature = "ldm")]
+    ldm_dict_end: usize,
+    /// Length of a block the long-distance matcher recommitted in pieces, so
+    /// [`Matcher::get_last_space`] reports the whole block, not its last piece.
+    #[cfg(feature = "ldm")]
+    ldm_split_block: Option<usize>,
 }
 
 /// Identity of the matcher configuration a primed snapshot was captured under:
@@ -417,15 +534,6 @@ struct PrimedKey {
     /// frame from how full the input will leave the table, so two frames of one
     /// geometry can differ in it; a restore carries the snapshot's format in.
     fast_tagged: bool,
-    /// Fine-grained LDM override (#27) active at capture time. The
-    /// snapshot's cloned `storage` carries `BtMatcher::ldm_producer`,
-    /// which is configured from this override; restoring a snapshot
-    /// captured under a different LDM configuration (enable flip or
-    /// changed knobs) would reinstate a stale producer. `params` already
-    /// pins `window_log` / `strategy_tag` (the rest of the producer's
-    /// identity), so folding the override completes the LDM identity.
-    /// `None` = LDM off, matching `ParamOverrides::ldm`.
-    ldm: Option<super::parameters::LdmOverride>,
 }
 
 /// Whether a configured HashChain matcher attaches the dictionary for a frame
@@ -636,6 +744,20 @@ impl MatchGeneratorDriver {
             primed: None,
             own_workspace: crate::encoding::workspace::Workspace::new(),
             frame_in_place: false,
+            #[cfg(feature = "ldm")]
+            ldm: None,
+            #[cfg(feature = "ldm")]
+            ldm_store: Default::default(),
+            #[cfg(feature = "ldm")]
+            ldm_found: Vec::new(),
+            #[cfg(feature = "ldm")]
+            ldm_block: Vec::new(),
+            #[cfg(feature = "ldm")]
+            ldm_committed_end: 0,
+            #[cfg(feature = "ldm")]
+            ldm_dict_end: 0,
+            #[cfg(feature = "ldm")]
+            ldm_split_block: None,
         }
     }
 
@@ -1108,7 +1230,14 @@ impl Matcher for MatchGeneratorDriver {
             .primed
             .as_ref()
             .map_or(0, |(storage, _, _)| storage.heap_size());
-        self.storage.heap_size() + snapshot + self.own_workspace.heap_bytes()
+        #[cfg(feature = "ldm")]
+        let ldm = self.ldm.as_ref().map_or(0, |p| p.heap_size())
+            + self.ldm_store.heap_size()
+            + (self.ldm_found.capacity() + self.ldm_block.capacity())
+                * core::mem::size_of::<super::opt::ldm::HcRawSeq>();
+        #[cfg(not(feature = "ldm"))]
+        let ldm = 0;
+        self.storage.heap_size() + snapshot + self.own_workspace.heap_bytes() + ldm
     }
 
     fn clear_param_overrides(&mut self) {
@@ -1247,6 +1376,12 @@ impl Matcher for MatchGeneratorDriver {
                 hint,
             );
         }
+        // The long-distance matcher's parameters for the frame, `None` without one.
+        #[cfg(feature = "ldm")]
+        let frame_ldm = self
+            .param_overrides
+            .and_then(|ov| ov.ldm)
+            .map(|ldm_ov| crate::encoding::levels::config::frame_ldm_params(&params, &ldm_ov));
         // A dictionary frame's hash-chain / binary-tree widths are the CDict's
         // (`resolve_level_params_with_dict`): verbatim when the dictionary is
         // copied into the live tables (`ZSTD_resetCCtx_byCopyingCDict` builds
@@ -1392,9 +1527,16 @@ impl Matcher for MatchGeneratorDriver {
         // taking it again. The kernels keep positions in `u32`, counting a
         // dictionary ahead of the slice, so a longer one is copied.
         let dict_len = dict_hint.map_or(0, |sizes| sizes.content);
+        // The long-distance matcher splits a block into pieces through the
+        // owned history, so its frames keep the input there.
+        #[cfg(feature = "ldm")]
+        let long_distance = self.param_overrides.is_some_and(|ov| ov.ldm.is_some());
+        #[cfg(not(feature = "ldm"))]
+        let long_distance = false;
         self.frame_in_place = match workspace.ingest() {
             crate::encoding::workspace::IngestPlan::Slice(len) => {
                 (dict_hint.is_none() || fast_attach)
+                    && !long_distance
                     && self.borrowed_supported()
                     && len
                         .checked_add(dict_len)
@@ -1447,8 +1589,8 @@ impl Matcher for MatchGeneratorDriver {
                 // the table contents and bias wholesale, so the reset's
                 // full-table memset would be thrown away. The
                 // key components mirror `reset_shape` below: Simple leaves
-                // `resolved_table_bits` 0, never carries an LDM override,
-                // and `fast_attach` is false in copy mode by construction.
+                // `resolved_table_bits` 0, and `fast_attach` is false in copy
+                // mode by construction.
                 // The slot format is the one component this reset has yet to
                 // choose, so it travels with the carry: the reset leaves the
                 // table only if it chooses the snapshot's format, which is
@@ -1469,7 +1611,6 @@ impl Matcher for MatchGeneratorDriver {
                                     table_bits: 0,
                                     fast_attach: false,
                                     fast_tagged: captured.fast_tagged,
-                                    ldm: None,
                                 }
                     })
                     .map(|(_, _, captured)| captured.fast_tagged);
@@ -1722,41 +1863,22 @@ impl Matcher for MatchGeneratorDriver {
                 hc.reset();
             }
         }
-        // LDM wiring (#27): attach (or clear) the long-distance-match
-        // producer on the optimal (BT) backend. LDM is the only
-        // back-reference path that crosses the regular window, so it
-        // only has a home on the `BtMatcher`; non-BT strategies drop the
-        // producer. Built AFTER `hc.reset()` because `BtMatcher::reset`
-        // clears an existing producer's table but does not null the
-        // slot — installing here gives the new frame a fresh producer.
+        // The long-distance matcher for the frame, whichever strategy runs it.
+        // The same parameters keep the table allocation and only clear it, as
+        // upstream reuses its `ldmState_t`.
         #[cfg(feature = "ldm")]
         {
-            // Resolve the derived LDM params first (immutable borrow of the
-            // overrides), then reuse the existing producer's allocation below.
-            let derived_ldm = self
-                .param_overrides
-                .as_ref()
-                .and_then(|ov| ov.ldm)
-                .map(|ldm_ov| crate::encoding::levels::config::frame_ldm_params(&params, &ldm_ov));
-            if let MatcherStorage::HashChain(hc) = &mut self.storage {
-                // Reuse the existing producer's hash-table allocation when the
-                // derived params are unchanged: only `clear()` (re-zero the
-                // table + re-seed the rolling hash, no allocation) is needed for
-                // the new frame. A params change (or the first frame) forces a
-                // fresh `LdmProducer::new`. On the reused-encoder compress-dict
-                // path this avoids re-allocating the LDM hash table (large at
-                // btultra2) every frame — upstream zstd reuses its `ldmState_t`
-                // the same way. `clear()` is mandatory here for correctness
-                // regardless of what `BtMatcher::reset` did to the old table.
-                let producer = derived_ldm.map(|p| match hc.take_ldm_producer() {
-                    Some(mut existing) if existing.params() == p => {
-                        existing.clear();
-                        existing
-                    }
-                    _ => super::ldm::LdmProducer::new(p),
-                });
-                hc.set_ldm_producer(producer);
-            }
+            self.ldm = frame_ldm.map(|p| match self.ldm.take() {
+                Some(mut existing) if existing.params() == p => {
+                    existing.clear();
+                    existing
+                }
+                _ => super::ldm::LdmProducer::new(p),
+            });
+            // A dictionary the reset kept in place is the frame's first bytes.
+            self.ldm_committed_end = self.storage.committed_window().len();
+            self.ldm_dict_end = self.ldm_committed_end;
+            self.ldm_split_block = None;
         }
         // Record the resolved matcher shape for the primed-snapshot key. Captured
         // here (post-resolution, after the test-only param override) so the key
@@ -1768,28 +1890,9 @@ impl Matcher for MatchGeneratorDriver {
         // resolved matcher geometry instead, so folding the Fast bit into their
         // key would over-key identical resolved shapes. `fast_attach` is the
         // decision `prime_with_dictionary` makes from the same `reset_size_log`.
-        // The LDM override is part of the snapshot identity ONLY on the
-        // optimal (BinaryTree) path: that is the only backend whose cloned
-        // `storage` carries a `BtMatcher::ldm_producer`. On Fast / Dfast /
-        // Row and lazy-HashChain resets the producer slot does not exist,
-        // so folding the override there would over-key the snapshot and
-        // force needless re-primes when LDM is toggled. Gated like
-        // `fast_attach` (a key bit only participates where it changes the
-        // cloned matcher shape).
-        let active_ldm = if matches!(params.search, super::strategy::SearchMethod::BinaryTree) {
-            self.param_overrides.and_then(|ov| ov.ldm)
-        } else {
-            None
-        };
         // The Fast slot format this reset chose; only the Simple backend has one.
         let fast_tagged = matches!(&self.storage, MatcherStorage::Simple(m) if m.slots_tagged());
-        self.reset_shape = Some((
-            params,
-            resolved_table_bits,
-            fast_attach,
-            fast_tagged,
-            active_ldm,
-        ));
+        self.reset_shape = Some((params, resolved_table_bits, fast_attach, fast_tagged));
         // Everything is laid out in `workspace` now. A driver reset on its own
         // before it joined a context still holds the workspace it used then,
         // which nothing points into any more; on its own the field is empty
@@ -1864,7 +1967,30 @@ impl Matcher for MatchGeneratorDriver {
         self.reported_window_size as u64
     }
 
+    fn matches_beyond_window_tables(&self) -> bool {
+        #[cfg(feature = "ldm")]
+        return self.ldm.is_some();
+        #[cfg(not(feature = "ldm"))]
+        false
+    }
+
+    fn settle_block_cut(&mut self, window: usize, cut: usize) -> usize {
+        #[cfg(feature = "ldm")]
+        return self.settle_long_distance_cut(window, cut);
+        #[cfg(not(feature = "ldm"))]
+        {
+            let _ = window;
+            cut
+        }
+    }
+
     fn get_last_space(&mut self) -> &[u8] {
+        // A block matched in pieces is still one block to the encoder.
+        #[cfg(feature = "ldm")]
+        if let Some(len) = self.ldm_split_block {
+            let window = self.storage.committed_window();
+            return &window[window.len() - len..];
+        }
         match &self.storage {
             MatcherStorage::Simple(m) => m.last_committed_space(),
             MatcherStorage::Dfast(m) => m.get_last_space(),
@@ -1909,6 +2035,11 @@ impl Matcher for MatchGeneratorDriver {
     /// matches older than the window the frame header reports, which encodes
     /// an offset no decoder can resolve.
     fn commit_filled(&mut self, len: usize) {
+        #[cfg(feature = "ldm")]
+        {
+            self.ldm_committed_end += len;
+            self.ldm_split_block = None;
+        }
         // The window backends evict whole blocks inside `commit_block`,
         // subtracting each evicted block from `window_size` and then adding
         // `len`, so `pre + len - post` is exactly what was evicted and never
@@ -1941,13 +2072,16 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
-        use super::strategy::{self, StrategyTag};
         // Borrowed one-shot Fast path: if the frame driver staged a
         // block range via `set_borrowed_block`, scan it in place against
         // the borrowed window instead of the owned committed block. Only
         // the Simple backend is instrumented (the gate guarantees it),
         // and the stage is consumed so the next block re-stages.
         if let Some((block_start, block_end)) = self.borrowed_pending.take() {
+            // The borrowed scans share their kernels with the owned ones, so
+            // they report through the same sink type.
+            let mut forward = None;
+            let mut sink = owned_sink(&mut handle_sequence, &mut forward);
             match self.active_backend() {
                 super::strategy::BackendTag::Simple => {
                     let m = self.simple_mut();
@@ -1955,18 +2089,14 @@ impl Matcher for MatchGeneratorDriver {
                         // Dict-attach borrowed scan: live matches read the
                         // borrowed input in place, dict matches read the
                         // committed dict prefix via the 2-segment counter.
-                        m.start_matching_borrowed_dict(
-                            block_start,
-                            block_end,
-                            &mut handle_sequence,
-                        );
+                        m.start_matching_borrowed_dict(block_start, block_end, &mut sink);
                     } else {
-                        m.start_matching_borrowed(block_start, block_end, &mut handle_sequence);
+                        m.start_matching_borrowed(block_start, block_end, &mut sink);
                     }
                 }
                 super::strategy::BackendTag::Dfast => self
                     .dfast_matcher_mut()
-                    .start_matching_borrowed(block_start, block_end, &mut handle_sequence),
+                    .start_matching_borrowed(block_start, block_end, &mut sink),
                 super::strategy::BackendTag::Row => {
                     // Same greedy/lazy parse split as the owned RowHash arm.
                     let greedy = self.parse == super::strategy::ParseMode::Greedy;
@@ -1974,13 +2104,13 @@ impl Matcher for MatchGeneratorDriver {
                         block_start,
                         block_end,
                         greedy,
-                        &mut handle_sequence,
+                        &mut sink,
                     );
                 }
                 super::strategy::BackendTag::HashChain => match self.search {
                     super::strategy::SearchMethod::HashChain => self
                         .hc_matcher_mut()
-                        .start_matching_lazy_borrowed(block_start, block_end, &mut handle_sequence),
+                        .start_matching_lazy_borrowed(block_start, block_end, &mut sink),
                     // `borrowed_supported()` keeps the optimal parsers on the
                     // owned path and `set_borrowed_block` asserts it.
                     other => {
@@ -1990,50 +2120,23 @@ impl Matcher for MatchGeneratorDriver {
             }
             return;
         }
-        // Decoupled parse×search dispatch (fires once per block). The
-        // search axis (`self.search`) picks the candidate-finding backend;
-        // the parse axis (greedy vs lazy depth) is carried by the
-        // backend's runtime `lazy_depth`, set per level at `reset()`.
-        // The two are independent, so any parse can run on any search
-        // backend. The `BinaryTree` arm still selects the opt `Strategy`
-        // ZST off `strategy_tag` so `compress_block::<S>` keeps its
-        // const-folded optimal-parser monomorphisation.
-        use super::strategy::SearchMethod;
-        match self.search {
-            SearchMethod::Fast => {
-                self.simple_mut().start_matching(&mut handle_sequence);
+        #[cfg(feature = "ldm")]
+        if self.ldm.is_some() {
+            // The optimal parser weighs long-distance matches as candidates;
+            // below it they are taken outright (upstream
+            // `ZSTD_ldm_blockCompress`, `zstd_ldm.c:685-749`).
+            if matches!(self.search, super::strategy::SearchMethod::BinaryTree) {
+                self.take_long_distance_block();
+                let MatcherStorage::HashChain(hc) = &mut self.storage else {
+                    unreachable!("the optimal parser runs on the hash-chain backend");
+                };
+                core::mem::swap(&mut self.ldm_block, &mut hc.backend.bt_mut().ldm_sequences);
+            } else if self.start_matching_long_distance(&mut handle_sequence) {
+                return;
             }
-            SearchMethod::DoubleFast => {
-                self.dfast_matcher_mut()
-                    .start_matching(&mut handle_sequence);
-            }
-            SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => {
-                // One upstream `lazy_generic` body for greedy (depth 0: a
-                // repcode hit is stored without a search, no lookahead), lazy
-                // / lazy2 (`lazy_depth` 1 / 2) and btlazy2 (depth 2 over the
-                // binary-tree finder); the finder (rows / chain / tree) was
-                // resolved at `configure`.
-                self.row_matcher_mut().start_matching(&mut handle_sequence);
-            }
-            SearchMethod::HashChain => {
-                // Greedy/lazy/lazy2 all flow through the lazy parser; it
-                // reads `hc.lazy_depth` (0 = greedy commit).
-                self.hc_matcher_mut()
-                    .start_matching_lazy(&mut handle_sequence);
-            }
-            SearchMethod::BinaryTree => match self.strategy_tag {
-                StrategyTag::BtOpt => self.compress_block::<strategy::BtOpt>(&mut handle_sequence),
-                StrategyTag::BtUltra => {
-                    self.compress_block::<strategy::BtUltra>(&mut handle_sequence)
-                }
-                StrategyTag::BtUltra2 => {
-                    self.compress_block::<strategy::BtUltra2>(&mut handle_sequence)
-                }
-                _ => unreachable!(
-                    "SearchMethod::BinaryTree requires an optimal strategy tag (BtOpt/BtUltra/BtUltra2)"
-                ),
-            },
         }
+        let mut gap_literals = None;
+        self.start_matching_owned(&mut owned_sink(&mut handle_sequence, &mut gap_literals));
     }
 
     fn skip_matching(&mut self) {
@@ -2066,6 +2169,13 @@ impl Matcher for MatchGeneratorDriver {
             }
             return;
         }
+        // A block written out unsearched is still searched for long matches,
+        // as upstream searches every block it compresses, and its matches are
+        // taken past.
+        #[cfg(feature = "ldm")]
+        if self.ldm.is_some() {
+            self.take_long_distance_block();
+        }
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
                 self.simple_mut()
@@ -2080,6 +2190,82 @@ impl Matcher for MatchGeneratorDriver {
             super::strategy::BackendTag::HashChain => {
                 self.hc_matcher_mut().skip_matching(incompressible_hint)
             }
+        }
+    }
+}
+
+/// The sink every owned match runs against: `handle_sequence`, except that a
+/// block's trailing literals go to `gap_literals` when it is `Some`, as the
+/// gap before a long-distance match needs them. One sink type for the plain
+/// block and for those gaps compiles each backend's scan once per caller sink
+/// instead of twice.
+fn owned_sink<'a, F: FnMut(Sequence)>(
+    handle_sequence: &'a mut F,
+    gap_literals: &'a mut Option<usize>,
+) -> impl FnMut(Sequence) + 'a {
+    // The guard is read only for the block's last report, never per triple.
+    // Each arm rebuilds the report from its fields: forwarding the matched
+    // value whole copies it as one 32-byte block out of the separate stores
+    // that wrote it, and that copy stalls on every triple.
+    move |sequence| match sequence {
+        Sequence::Triple {
+            literal_len,
+            offset,
+            match_len,
+        } => handle_sequence(Sequence::Triple {
+            literal_len,
+            offset,
+            match_len,
+        }),
+        Sequence::Literals { len } => match gap_literals {
+            Some(gap) => *gap = len,
+            None => handle_sequence(Sequence::Literals { len }),
+        },
+    }
+}
+
+impl MatchGeneratorDriver {
+    /// Match the last committed block of the owned history with the frame's
+    /// backend.
+    fn start_matching_owned(&mut self, handle_sequence: &mut impl FnMut(Sequence)) {
+        use super::strategy::{self, StrategyTag};
+        // Decoupled parse×search dispatch (fires once per block). The
+        // search axis (`self.search`) picks the candidate-finding backend;
+        // the parse axis (greedy vs lazy depth) is carried by the
+        // backend's runtime `lazy_depth`, set per level at `reset()`.
+        // The two are independent, so any parse can run on any search
+        // backend. The `BinaryTree` arm still selects the opt `Strategy`
+        // ZST off `strategy_tag` so `compress_block::<S>` keeps its
+        // const-folded optimal-parser monomorphisation.
+        use super::strategy::SearchMethod;
+        match self.search {
+            SearchMethod::Fast => {
+                self.simple_mut().start_matching(handle_sequence);
+            }
+            SearchMethod::DoubleFast => {
+                self.dfast_matcher_mut().start_matching(handle_sequence);
+            }
+            SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => {
+                // One upstream `lazy_generic` body for greedy (depth 0: a
+                // repcode hit is stored without a search, no lookahead), lazy
+                // / lazy2 (`lazy_depth` 1 / 2) and btlazy2 (depth 2 over the
+                // binary-tree finder); the finder (rows / chain / tree) was
+                // resolved at `configure`.
+                self.row_matcher_mut().start_matching(handle_sequence);
+            }
+            SearchMethod::HashChain => {
+                // Greedy/lazy/lazy2 all flow through the lazy parser; it
+                // reads `hc.lazy_depth` (0 = greedy commit).
+                self.hc_matcher_mut().start_matching_lazy(handle_sequence);
+            }
+            SearchMethod::BinaryTree => match self.strategy_tag {
+                StrategyTag::BtOpt => self.compress_block::<strategy::BtOpt>(handle_sequence),
+                StrategyTag::BtUltra => self.compress_block::<strategy::BtUltra>(handle_sequence),
+                StrategyTag::BtUltra2 => self.compress_block::<strategy::BtUltra2>(handle_sequence),
+                _ => unreachable!(
+                    "SearchMethod::BinaryTree requires an optimal strategy tag (BtOpt/BtUltra/BtUltra2)"
+                ),
+            },
         }
     }
 }

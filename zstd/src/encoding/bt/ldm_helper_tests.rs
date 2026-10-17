@@ -32,65 +32,6 @@ fn store(size: usize) -> HcRawSeqStore {
     }
 }
 
-/// Regression test for PR #139 Copilot review — threads #1/#2:
-/// `prepare_ldm_candidates` must translate the absolute
-/// `current_abs_start` (`history_abs_start + window_size -
-/// current_len`) into a slice index inside the supplied
-/// `history` slice. Before the fix, the code passed
-/// `current_abs_start` directly as `block_start` to
-/// `LdmProducer::generate_into`, which would index out of
-/// bounds (or into the wrong byte range) as soon as
-/// `history_abs_start != 0` after window eviction.
-///
-/// We construct a `BtMatcher` with an active `LdmProducer`
-/// whose table starts empty, hand it a small `history` slice,
-/// and call `prepare_ldm_candidates` with absolute coordinates
-/// shifted by a non-zero `history_abs_start`. The call must
-/// complete without panic — under the pre-fix code it would
-/// panic on the `history[block_start..block_end]` slice access
-/// inside `generate_into`.
-#[test]
-#[cfg(feature = "ldm")]
-fn prepare_ldm_candidates_translates_absolute_positions_to_slice_indices() {
-    use crate::encoding::ldm::{LdmProducer, params::LdmParams};
-
-    let mut bt = BtMatcher::new();
-    // Activate the producer with hand-tuned small params —
-    // the upstream zstd btultra2 defaults (`with_window_and_strategy(27, 9)`)
-    // would allocate `1 << 23 = 8M` entries × 8 bytes = 64 MiB
-    // for a table this test never actually populates beyond a
-    // handful of entries. Build a 10-bit hash log instead so
-    // the table is ~8 KiB — keeps the suite stable under
-    // parallel nextest on 32-bit / memory-tight CI shards.
-    bt.ldm_producer = Some(LdmProducer::new(LdmParams {
-        window_log: 27,
-        hash_log: 10,
-        hash_rate_log: 4,
-        min_match_length: 32,
-        bucket_size_log: 4,
-    }));
-
-    // 256 bytes of arbitrary content — enough for the gear
-    // hash to make progress against the upstream zstd btultra2
-    // `min_match_length = 32`.
-    let history: alloc::vec::Vec<u8> = (0u8..=255).collect();
-
-    // Simulate a frame whose window has already evicted some
-    // bytes: `history_abs_start = 1024`, and the current block
-    // covers absolute `[1024, 1280)` which maps to slice
-    // `[0, 256)` inside `history`.
-    let history_abs_start = 1024usize;
-    let current_abs_start = 1024usize;
-    let current_len = history.len();
-
-    // Pre-fix: would panic with `slice index out of bounds`
-    // on `history[1024..1280]`. Post-fix: translates to
-    // `[0..256]` and runs cleanly.
-    bt.prepare_ldm_candidates(&history, history_abs_start, current_abs_start, current_len);
-    // Cross-block fixture isn't engineered to emit a match —
-    // the assertion is simply that the call succeeded.
-}
-
 #[test]
 fn ldm_skip_raw_seq_store_bytes_walks_whole_sequences() {
     let bt = bt_with_seqs(vec![raw(2, 3, 100), raw(4, 1, 200), raw(0, 5, 50)]);

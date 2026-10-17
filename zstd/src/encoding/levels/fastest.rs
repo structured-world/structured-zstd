@@ -88,7 +88,10 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // the dictionary. The classifier's own sample is safe in a way this one is
     // not — it measures the block against itself, and a repeat is what the grid
     // then catches.
-    let dict_rejects_raw = dict_active;
+    //
+    // Long-distance matches are external to the block in the same way, and no
+    // sample sees them either: upstream searches every block for them.
+    let dict_rejects_raw = dict_active || state.matcher.matches_beyond_window_tables();
     // The level and the window decide this for the whole frame, so it also says
     // whether the grid is worth keeping at all: nothing it records can be acted
     // on where no block may go out raw, and recording there would take its

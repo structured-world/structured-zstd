@@ -1103,19 +1103,27 @@ impl<M: Matcher> CompressionContext<M> {
     /// `remaining` is the input still to come as far as the splitter knows:
     /// a full block again while writes continue, the buffered bytes at the
     /// end of the frame.
-    fn pre_split_len(&self, block_capacity: usize, remaining: usize) -> usize {
+    fn pre_split_len(&mut self, block_capacity: usize, remaining: usize) -> usize {
         if matches!(self.compression_level, CompressionLevel::Uncompressed) {
             return self.pending_len();
         }
         let pending = self.state.matcher.uncommitted_input();
-        crate::encoding::frame_compressor::optimal_block_size_with(
+        let window = pending.len();
+        let cut = crate::encoding::frame_compressor::optimal_block_size_with(
             self.state.pre_split.map(usize::from),
             pending,
             remaining,
             block_capacity,
             self.savings,
         )
-        .min(pending.len())
+        .min(window);
+        // The splitter sees byte statistics only; a cut it proposes inside a
+        // match the matcher already knows of is moved out.
+        if cut < window {
+            self.state.matcher.settle_block_cut(window, cut)
+        } else {
+            cut
+        }
     }
 
     /// Emit the pending block once it is full, cut where the pre-splitter

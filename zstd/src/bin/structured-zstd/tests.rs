@@ -2139,33 +2139,157 @@ fn an_explicit_window_is_capped_by_a_known_source_size() {
     );
 }
 
-/// Long-distance matching lives on the optimal parser here, so the levels below
-/// it can widen the window and still never run the matcher the flag names.
-/// Taking `--long` at those levels would report success for work that did not
-/// happen, and hand back a file compressed the ordinary way.
+/// `--long` runs long-distance matching at every level, as upstream's does: its
+/// own tests compress with `--long` at levels 1 and 3 (`tests/playTests.sh`).
 #[test]
-fn long_is_refused_at_levels_that_cannot_run_it() {
-    assert!(parse(&["-3", "--long", "in.txt"]).is_err());
-    assert!(parse(&["--long", "-15", "in.txt"]).is_err());
-    // From the optimal parser up, the matcher is there to run.
-    assert!(parse(&["-16", "--long", "in.txt"]).is_ok());
+fn long_is_taken_at_every_level() {
+    for level in 1..=19 {
+        let flag = format!("-{level}");
+        assert!(
+            parse(&[&flag, "--long", "in.txt"]).unwrap().long,
+            "level {level}"
+        );
+    }
+    assert!(parse(&["--fast=3", "--long", "in.txt"]).unwrap().long);
     assert!(parse(&["--ultra", "-22", "--long=27", "in.txt"]).is_ok());
-    // Decompression takes the flag as the window hint it is; nothing to run.
     assert!(parse(&["-d", "--long", "in.txt.zst"]).is_ok());
-    // Benchmarking compresses the levels `-b`/`-e` name, not the one `-N` set,
-    // so those are the levels the flag has to be true of.
-    assert!(parse(&["-b16", "--long", "in.txt"]).is_ok());
-    assert!(parse(&["-b16", "-e19", "--long", "in.txt"]).is_ok());
-    assert!(parse(&["-b3", "--long", "in.txt"]).is_err());
-    // The whole range runs with the flag, so a range that starts below the
-    // matcher is refused even when it ends above it.
-    assert!(parse(&["-b3", "-e19", "--long", "in.txt"]).is_err());
-    // And a benchmark range is what counts, not a level that was also typed.
-    assert!(parse(&["-16", "-b3", "--long", "in.txt"]).is_err());
-    // Benchmarking compresses whatever mode was asked for, so `-d` does not
-    // excuse the flag from naming levels that can run it.
-    assert!(parse(&["-d", "-b3", "--long", "in.txt"]).is_err());
-    assert!(parse(&["-d", "-b16", "--long", "in.txt"]).is_ok());
+    assert!(parse(&["-b3", "-e19", "--long", "in.txt"]).is_ok());
+    assert!(parse(&["-3", "--long", "--zstd=strat=6", "in.txt"]).is_ok());
+}
+
+/// Past the window a level keeps, `--long` is what finds a repeat: a copy laid
+/// out in shuffled pieces up to 4 MiB behind, beyond level 3's 2 MiB window,
+/// costs next to nothing with the flag and nearly its whole size without it.
+#[test]
+fn long_finds_a_far_repeat_at_a_low_level() {
+    const PIECE: usize = 4096;
+    let mut state = 0x5EED_0569u64;
+    // Six-bit symbols: compressible enough that no block is written off, and
+    // short local matches stay rare.
+    let half: Vec<u8> = (0..4 << 20)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) & 63) as u8
+        })
+        .collect();
+    let pieces = half.len() / PIECE;
+    let mut data = half.clone();
+    for i in 0..pieces {
+        let piece = (i * 37) % pieces;
+        data.extend_from_slice(&half[piece * PIECE..(piece + 1) * PIECE]);
+    }
+    let compress = |long: bool| {
+        let mut frame = Vec::new();
+        compress_stream(
+            data.as_slice(),
+            &mut frame,
+            &FrameSettings {
+                level: 3,
+                long,
+                long_window_log: long.then_some(DEFAULT_LONG_WINDOW_LOG),
+                ..FrameSettings::default()
+            },
+            &mut no_dict(),
+        )
+        .expect("compressing succeeds");
+        frame
+    };
+    let without = compress(false);
+    let with = compress(true);
+    assert!(
+        with.len() * 3 < without.len() * 2,
+        "--long at level 3: {} bytes against {} without it",
+        with.len(),
+        without.len()
+    );
+    assert_eq!(decoded(&with).unwrap(), data);
+}
+
+/// `--patch-from` turns long mode on itself when the input outgrows what the
+/// level's match finder cycles through, by upstream's rule
+/// (`FIO_adjustParamsForPatchFromMode`: `fileWindowLog >
+/// ZSTD_cycleLog(chainLog, strategy)`, the binary-tree strategies cycling one
+/// log short of their chain).
+#[test]
+fn patch_from_needs_long_mode_where_the_matcher_cannot_cycle_the_input() {
+    let level_only = AdvancedParams::default();
+    // Level 3 on 61 MiB against 60 MiB: dfast, chainLog 16, file window log 26.
+    assert!(patch_needs_long_distance(
+        3,
+        &level_only,
+        61 << 20,
+        60 << 20
+    ));
+    // A small patch fits the chain the level already has.
+    assert!(!patch_needs_long_distance(3, &level_only, 2000, 4000));
+    // The binary tree cycles one log short: a file window equal to the chain
+    // log is past it at btlazy2 (level 13), within it at lazy2 (level 12).
+    let reference = 1u64 << 20;
+    for (level, binary_tree) in [(12, false), (13, true)] {
+        let chain_log =
+            LevelParameters::for_level(level, Some(1 << 30), reference as usize).chain_log;
+        let size = 1u64 << (chain_log - 1);
+        let params = LevelParameters::for_level(level, Some(size), reference as usize);
+        assert_eq!(params.chain_log, chain_log, "level {level}: one size tier");
+        assert_eq!(params.strategy >= Strategy::Btlazy2, binary_tree);
+        assert_eq!(
+            patch_needs_long_distance(level, &level_only, size, reference),
+            binary_tree,
+            "level {level}"
+        );
+    }
+}
+
+/// A benchmark compresses its whole level range, so a patch needs long mode
+/// when any level of it does: lazy2 (level 12) cycles a file window equal to
+/// the chain log that btlazy2 (level 13) does not, and `-b12 -e13` measures
+/// both.
+#[test]
+fn patch_from_long_mode_covers_every_benchmarked_level() {
+    let reference = 1u64 << 20;
+    let chain_log = LevelParameters::for_level(13, Some(1 << 30), reference as usize).chain_log;
+    let size = 1u64 << (chain_log - 1);
+    let level_only = AdvancedParams::default();
+    assert!(!patch_needs_long_distance(12, &level_only, size, reference));
+    assert!(patch_needs_long_distance(13, &level_only, size, reference));
+    let range = parse(&["-b12", "-e13", "--patch-from=ref", "in"]).unwrap();
+    assert!(patch_run_needs_long_distance(&range, size, reference));
+    let single = parse(&["-12", "--patch-from=ref", "in"]).unwrap();
+    assert!(!patch_run_needs_long_distance(&single, size, reference));
+}
+
+/// The rule reads the matcher that will run: a `--zstd=` chain or strategy
+/// override that leaves the reference out of the level's cycle turns long mode
+/// on, and one that brings it in keeps it off. The reference command reads the
+/// bare level and so writes a patch of literals for the first case.
+#[test]
+fn patch_from_long_mode_follows_the_overridden_matcher() {
+    let reference = 1u64 << 20;
+    let size = 4u64 << 20;
+    let params = LevelParameters::for_level(19, Some(size), reference as usize);
+    let file_window_log = u64::BITS - size.leading_zeros();
+    assert!(
+        params.chain_log > file_window_log,
+        "level 19 cycles the input by itself"
+    );
+    let level_only = AdvancedParams::default();
+    assert!(!patch_needs_long_distance(19, &level_only, size, reference));
+    let short_chain = AdvancedParams {
+        chain_log: Some(16),
+        ..AdvancedParams::default()
+    };
+    assert!(patch_needs_long_distance(19, &short_chain, size, reference));
+    // Level 1 runs fast with a short chain; a binary tree with a long one
+    // cycles the input.
+    assert!(patch_needs_long_distance(1, &level_only, size, reference));
+    let long_tree = AdvancedParams {
+        chain_log: Some(file_window_log + 1),
+        strategy: Some(Strategy::Btopt),
+        ..AdvancedParams::default()
+    };
+    assert!(!patch_needs_long_distance(1, &long_tree, size, reference));
 }
 
 /// The window log has a supported range; a value outside it has to fail rather
@@ -2438,8 +2562,10 @@ fn test_and_tuning_options_are_accepted() {
 /// The decoder's window ceiling follows the command line as the reference's
 /// does: a patch reaches across its whole reference, `--long=N` and
 /// `--zstd=wlog=N` raise the ceiling to their window (the latter winning, as
-/// it wins when compressing), `-M` gives what its promise leaves after the
-/// other buffers and the dictionary, and nothing named keeps the default.
+/// it wins when compressing), `-M` is the window itself as the reference
+/// takes it (`ZSTD_DCtx_setMaxWindowSize(dctx, memLimit)`, so its own tests
+/// decode a 2^29 window under `--memory=512MB`), and nothing named keeps the
+/// default.
 /// Nothing lowers it below the default. A `-M` after `--patch-apply` is a
 /// promise the patch keeps too, as the reference's later `-M` replaces the
 /// limit `--patch-apply` lifted.
@@ -2447,46 +2573,43 @@ fn test_and_tuning_options_are_accepted() {
 fn the_decode_window_follows_the_command_line() {
     use structured_zstd::decoding::{MAX_DECODER_WINDOW_SIZE, MAXIMUM_ALLOWED_WINDOW_SIZE};
 
-    let ceiling =
-        |args: &[&str], dictionary: u64| decode_window_ceiling(&parse(args).unwrap(), dictionary);
-    assert_eq!(ceiling(&["-d", "f.zst"], 0), MAXIMUM_ALLOWED_WINDOW_SIZE);
-    assert_eq!(ceiling(&["-d", "--long=28", "f.zst"], 0), 1 << 28);
-    assert_eq!(ceiling(&["-d", "--zstd=wlog=29", "f.zst"], 0), 1 << 29);
+    let ceiling = |args: &[&str]| decode_window_ceiling(&parse(args).unwrap());
+    assert_eq!(ceiling(&["-d", "f.zst"]), MAXIMUM_ALLOWED_WINDOW_SIZE);
+    assert_eq!(ceiling(&["-d", "--long=28", "f.zst"]), 1 << 28);
+    assert_eq!(ceiling(&["-d", "--zstd=wlog=29", "f.zst"]), 1 << 29);
     assert_eq!(
-        ceiling(&["-d", "--long=27", "--zstd=wlog=29", "f.zst"], 0),
+        ceiling(&["-d", "--long=27", "--zstd=wlog=29", "f.zst"]),
         1 << 29
     );
     assert_eq!(
-        ceiling(&["-d", "--long=20", "f.zst"], 0),
+        ceiling(&["-d", "--long=20", "f.zst"]),
         MAXIMUM_ALLOWED_WINDOW_SIZE
     );
     assert_eq!(
-        ceiling(&["--patch-apply=ref", "f.zst"], 0),
+        ceiling(&["--patch-apply=ref", "f.zst"]),
         MAX_DECODER_WINDOW_SIZE
     );
     assert_eq!(
-        ceiling(&["--patch-apply=ref", "-M512MB", "f.zst"], 1 << 20),
-        (512 << 20) - (1 << 20) - (2 << 20)
+        ceiling(&["--patch-apply=ref", "-M512MB", "f.zst"]),
+        512 << 20
     );
     // A later `-M0` asks for the default limit again, as zero replaces the
     // reference command's limit (zstdcli.c:1572-1577); an earlier one is
     // overridden by the patch like any other `-M`.
     assert_eq!(
-        ceiling(&["--patch-apply=ref", "-M0", "f.zst"], 0),
+        ceiling(&["--patch-apply=ref", "-M0", "f.zst"]),
         MAXIMUM_ALLOWED_WINDOW_SIZE
     );
     assert_eq!(
-        ceiling(&["--patch-apply=ref", "--long=28", "-M0", "f.zst"], 0),
+        ceiling(&["--patch-apply=ref", "--long=28", "-M0", "f.zst"]),
         1 << 28
     );
     assert_eq!(
-        ceiling(&["-M0", "--patch-apply=ref", "f.zst"], 0),
+        ceiling(&["-M0", "--patch-apply=ref", "f.zst"]),
         MAX_DECODER_WINDOW_SIZE
     );
-    assert_eq!(
-        ceiling(&["-d", "-M512MB", "f.zst"], 1 << 20),
-        (512 << 20) - (1 << 20) - (2 << 20)
-    );
+    assert_eq!(ceiling(&["-d", "-M512MB", "f.zst"]), 512 << 20);
+    assert_eq!(ceiling(&["-d", "--memory=1GB", "f.zst"]), 1 << 30);
 }
 
 /// A benchmark holds its input, frames, decoded copy, encoder and dictionaries
@@ -2498,7 +2621,7 @@ fn a_benchmark_window_leaves_room_for_what_the_benchmark_holds() {
     use structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE;
 
     let mut opts = parse(&["-b19", "-M600MB", "--long=29", "f"]).unwrap();
-    opts.decode_window = decode_window_ceiling(&opts, 0);
+    opts.decode_window = decode_window_ceiling(&opts);
     let held = 400u64 << 20;
     assert_eq!(
         bench_decode_settings(&opts, Some(held)).max_window,
@@ -2511,7 +2634,7 @@ fn a_benchmark_window_leaves_room_for_what_the_benchmark_holds() {
         MAXIMUM_ALLOWED_WINDOW_SIZE
     );
     let mut free = parse(&["-b19", "--long=29", "f"]).unwrap();
-    free.decode_window = decode_window_ceiling(&free, 0);
+    free.decode_window = decode_window_ceiling(&free);
     assert_eq!(bench_decode_settings(&free, None).max_window, 1 << 29);
 }
 
@@ -2532,29 +2655,24 @@ fn decoding_takes_the_decoders_widest_window_log() {
     let wlog = format!("--zstd=wlog={widest}");
     for flag in [&long, &wlog] {
         let opts = parse(&["-d", flag, "f.zst"]).unwrap();
-        assert_eq!(decode_window_ceiling(&opts, 0), MAX_DECODER_WINDOW_SIZE);
+        assert_eq!(decode_window_ceiling(&opts), MAX_DECODER_WINDOW_SIZE);
         assert!(parse(&[flag, "f"]).is_err(), "{flag} compressing");
     }
     assert!(parse(&["-d", &format!("--long={}", widest + 1), "f.zst"]).is_err());
 }
 
 /// A frame past the ceiling is refused with the reference command's message,
-/// naming the flags that would decode it (fileio.c:2674-2684).
-/// The `--memory` named covers the window and what `-M` counts besides it, the
-/// decoder's other buffers and the dictionary, so it is a limit that decodes
-/// the frame.
+/// naming the flags that would decode it (fileio.c:2674-2684): the `--memory`
+/// is the window in whole MiB, which is the limit that decodes it.
 #[test]
 fn a_window_past_the_ceiling_names_the_flag_that_decodes_it() {
     assert_eq!(
-        window_too_large_message(1 << 28, 1 << 27, Some(DECODER_AUXILIARY_BYTES)),
+        window_too_large_message(1 << 28, 1 << 27, Some(0)),
         "Decoding error (36) : Frame requires too much memory for decoding\n\
          Window size larger than maximum : 268435456 > 134217728\n\
-         Use --long=28 or --memory=257MB"
+         Use --long=28 or --memory=256MB"
     );
-    assert!(
-        window_too_large_message(1 << 40, 1 << 27, Some(DECODER_AUXILIARY_BYTES))
-            .contains("ZSTD_WINDOWLOG_MAX")
-    );
+    assert!(window_too_large_message(1 << 40, 1 << 27, Some(0)).contains("ZSTD_WINDOWLOG_MAX"));
 }
 
 /// A frame from `zstd --long=28` does not decode with the default ceiling and
@@ -2580,6 +2698,8 @@ fn a_wide_window_decodes_with_long_or_memory() {
         .split_whitespace()
         .find(|word| word.starts_with("--memory="))
         .expect("the refusal names a --memory");
+    // The window itself, as upstream names and takes it.
+    assert_eq!(named, "--memory=256MB");
     for flag in ["--long=28", "-M512MB", named] {
         assert_eq!(
             run(parse(&["-d", "-qq", "-f", flag, input, "-o", output]).unwrap()).unwrap(),
@@ -6152,16 +6272,6 @@ fn max_is_refused_on_a_32_bit_target() {
         panic!("--max must be refused on a 32-bit target");
     };
     assert!(err.to_string().contains("32-bit"), "{err}");
-}
-
-/// `--long` below level 16 is refused because the matcher does not run there,
-/// unless `--zstd=strat=` moves the level onto a parser where it does.
-#[test]
-fn a_strategy_override_onto_the_optimal_parser_admits_long() {
-    assert!(parse(&["-3", "--long", "f"]).is_err());
-    assert!(parse(&["-3", "--long", "--zstd=strat=7", "f"]).is_ok());
-    assert!(parse(&["-3", "--long", "--zstd=strat=9", "f"]).is_ok());
-    assert!(parse(&["-3", "--long", "--zstd=strat=6", "f"]).is_err());
 }
 
 /// `--[no-]compress-literals` decides whether literal sections are

@@ -251,6 +251,329 @@ fn ldm_custom_knobs_round_trip() {
     assert_eq!(decode(&compress_with_parameters(&data, &params)), data);
 }
 
+/// Long-distance matching runs under every strategy, not only the optimal
+/// ones: a random half repeated at a distance the strategy's own tables
+/// cannot reach is found by LDM alone, so the second copy costs next to
+/// nothing. Upstream applies LDM below btopt through `ZSTD_ldm_blockCompress`.
+/// Six-bit symbols keep every block searched (a full-entropy block would be
+/// written off by the raw skip, whose repeat grid could find the copy instead)
+/// while leaving short local matches rare. The copy is laid out in shuffled
+/// 4 KiB pieces, so each piece sits at an offset of its own and one lucky hit
+/// cannot carry the rest through the repeat code.
+#[cfg(feature = "ldm")]
+#[test]
+fn ldm_finds_far_repeat_under_every_strategy() {
+    const PIECE: usize = 4096;
+    let half: Vec<u8> = generate_data(0x5EED_0569, 512 * 1024)
+        .into_iter()
+        .map(|byte| byte & 63)
+        .collect();
+    let pieces = half.len() / PIECE;
+    let mut data = half.clone();
+    for i in 0..pieces {
+        // 37 is coprime with the piece count, so this visits every piece once.
+        let piece = (i * 37) % pieces;
+        data.extend_from_slice(&half[piece * PIECE..(piece + 1) * PIECE]);
+    }
+    for strategy in [
+        Strategy::Fast,
+        Strategy::Dfast,
+        Strategy::Greedy,
+        Strategy::Lazy,
+        Strategy::Lazy2,
+        Strategy::Btlazy2,
+        Strategy::Btopt,
+    ] {
+        // Tables far smaller than the distance, so nothing but LDM reaches the
+        // first copy.
+        let builder = || {
+            CompressionParameters::builder(CompressionLevel::Level(3))
+                .strategy(strategy)
+                .window_log(22)
+                .hash_log(12)
+                .chain_log(12)
+        };
+        let off = compress_with_parameters(&data, &builder().build().unwrap());
+        let on = compress_with_parameters(
+            &data,
+            &builder()
+                .enable_long_distance_matching(true)
+                .build()
+                .unwrap(),
+        );
+        // Each copy costs about three quarters of its size in literals; the
+        // second one costs nearly that again without LDM (a few pieces are
+        // still found by chance) and almost nothing with it.
+        assert!(
+            off.len() > data.len() * 13 / 20,
+            "{strategy:?}: the regular finder already reached the repeat ({} of {})",
+            off.len(),
+            data.len(),
+        );
+        assert!(
+            on.len() < half.len() * 8 / 10,
+            "{strategy:?}: LDM did not find the repeat ({} of {}, {} without LDM)",
+            on.len(),
+            data.len(),
+            off.len(),
+        );
+        assert_eq!(decode(&on), data, "{strategy:?}: LDM frame round-trip");
+    }
+}
+
+/// The block splitter does not cut inside a long-distance match: a repeat of
+/// random data is one match per block, and a cut through it would only buy a
+/// block whose single sequence carries the same match on. Both frame loops
+/// ask, the one-shot one and the stream's.
+#[cfg(feature = "ldm")]
+#[test]
+fn ldm_matches_are_not_cut_by_the_block_splitter() {
+    use crate::encoding::StreamingEncoder;
+    use crate::io::Write;
+
+    let half = generate_data(0xC07_0569, 1 << 20);
+    let mut data = half.clone();
+    data.extend_from_slice(&half);
+    let params = CompressionParameters::builder(CompressionLevel::Level(3))
+        .window_log(22)
+        .enable_long_distance_matching(true)
+        .build()
+        .unwrap();
+    let one_shot = compress_with_parameters(&data, &params);
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(3));
+    encoder.set_parameters(&params).unwrap();
+    encoder.write_all(&data).unwrap();
+    let streamed = encoder.finish().unwrap();
+    for (path, frame) in [("one-shot", &one_shot), ("stream", &streamed)] {
+        // The first copy goes out raw; the second is eight blocks of one
+        // sequence each, where a cut at every splitter boundary would make it
+        // about a hundred.
+        assert!(
+            frame.len() < half.len() + 512,
+            "{path}: the repeat cost {} bytes",
+            frame.len() - half.len()
+        );
+        assert_eq!(decode(frame), data, "{path}: round-trip");
+    }
+}
+
+/// Long-distance matching reaches into a dictionary, under every strategy:
+/// the dictionary is indexed into its table when it is loaded (upstream
+/// `ZSTD_ldm_fillHashTable` from `ZSTD_loadDictionaryContent`), so a source
+/// made of shuffled pieces of a large dictionary costs next to nothing. A
+/// second frame on the same compressor restores the primed dictionary and must
+/// write what a freshly primed compressor writes.
+#[cfg(feature = "ldm")]
+#[test]
+fn ldm_reaches_into_the_dictionary_under_every_strategy() {
+    use crate::decoding::{Dictionary, FrameDecoder};
+
+    const PIECE: usize = 4096;
+    const DICT_ID: u32 = 0x0569_D1C7;
+    let dict: Vec<u8> = generate_data(0xD1C7_0569, 256 * 1024)
+        .into_iter()
+        .map(|byte| byte & 63)
+        .collect();
+    let pieces = dict.len() / PIECE;
+    let mut source = Vec::new();
+    for i in 0..pieces {
+        let piece = (i * 37) % pieces;
+        source.extend_from_slice(&dict[piece * PIECE..(piece + 1) * PIECE]);
+    }
+    for strategy in [
+        Strategy::Fast,
+        Strategy::Dfast,
+        Strategy::Greedy,
+        Strategy::Lazy2,
+        Strategy::Btlazy2,
+        Strategy::Btopt,
+    ] {
+        let params = CompressionParameters::builder(CompressionLevel::Level(3))
+            .strategy(strategy)
+            .window_log(22)
+            .hash_log(12)
+            .chain_log(12)
+            .enable_long_distance_matching(true)
+            .build()
+            .unwrap();
+        let compressor = || {
+            let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+            compressor.set_parameters(&params);
+            compressor
+                .set_dictionary(Dictionary::from_raw_content(DICT_ID, dict.clone()).unwrap())
+                .unwrap();
+            compressor
+        };
+        let mut warm = compressor();
+        let first = warm.compress_independent_frame(source.as_slice());
+        let restored = warm.compress_independent_frame(source.as_slice());
+        let fresh = compressor().compress_independent_frame(source.as_slice());
+        assert!(
+            first.len() < source.len() / 10,
+            "{strategy:?}: LDM did not reach into the dictionary ({} of {})",
+            first.len(),
+            source.len(),
+        );
+        assert_eq!(
+            first, fresh,
+            "{strategy:?}: a fresh compressor wrote another frame"
+        );
+        assert_eq!(
+            restored, fresh,
+            "{strategy:?}: the restored dictionary wrote another frame"
+        );
+        let mut decoder = FrameDecoder::new();
+        decoder
+            .add_dict(Dictionary::from_raw_content(DICT_ID, dict.clone()).unwrap())
+            .unwrap();
+        let mut decoded = Vec::with_capacity(source.len());
+        decoder.decode_all_to_vec(&restored, &mut decoded).unwrap();
+        assert_eq!(decoded, source, "{strategy:?}: round-trip");
+    }
+}
+
+/// The primed dictionary snapshot carries no long-distance state, so it is
+/// restored whether the next frame turns long-distance matching on or off,
+/// and the frame matches what a freshly primed compressor writes either way.
+#[cfg(feature = "ldm")]
+#[test]
+fn a_primed_dictionary_restores_across_a_long_distance_switch() {
+    use crate::decoding::Dictionary;
+
+    const PIECE: usize = 4096;
+    const DICT_ID: u32 = 0x0569_D1C8;
+    let dict: Vec<u8> = generate_data(0xD1C7_0571, 256 * 1024)
+        .into_iter()
+        .map(|byte| byte & 63)
+        .collect();
+    let pieces = dict.len() / PIECE;
+    let mut source = Vec::new();
+    for i in 0..pieces {
+        let piece = (i * 37) % pieces;
+        source.extend_from_slice(&dict[piece * PIECE..(piece + 1) * PIECE]);
+    }
+    for strategy in [Strategy::Fast, Strategy::Lazy2, Strategy::Btopt] {
+        let params = |long: bool| {
+            CompressionParameters::builder(CompressionLevel::Level(3))
+                .strategy(strategy)
+                .window_log(22)
+                .hash_log(12)
+                .chain_log(12)
+                .enable_long_distance_matching(long)
+                .build()
+                .unwrap()
+        };
+        let compressor = |long: bool| {
+            let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+            compressor.set_parameters(&params(long));
+            compressor
+                .set_dictionary(Dictionary::from_raw_content(DICT_ID, dict.clone()).unwrap())
+                .unwrap();
+            compressor
+        };
+        for first in [false, true] {
+            let mut warm = compressor(first);
+            warm.compress_independent_frame(source.as_slice());
+            warm.set_parameters(&params(!first));
+            let restored = warm.compress_independent_frame(source.as_slice());
+            let fresh = compressor(!first).compress_independent_frame(source.as_slice());
+            assert!(
+                restored == fresh,
+                "{strategy:?}: long-distance matching {} after {}: {} bytes, fresh {}",
+                !first,
+                first,
+                restored.len(),
+                fresh.len(),
+            );
+        }
+    }
+}
+
+/// A dictionary a reused context keeps resident between unsized frames stays
+/// in reach of long-distance matching: every frame on the context writes what
+/// a fresh encoder writes, the first one included. The pieces come from the
+/// dictionary's start, which the regular tables leave unindexed.
+#[cfg(feature = "ldm")]
+#[test]
+fn ldm_reaches_into_a_resident_dictionary_frame_after_frame() {
+    use crate::encoding::{CompressionContext, EncoderDictionary, StreamingEncoder};
+    use crate::io::Write;
+
+    const PIECE: usize = 4096;
+    let dict: Vec<u8> = generate_data(0xD1C7_0570, 256 * 1024)
+        .into_iter()
+        .map(|byte| byte & 63)
+        .collect();
+    let mut source = Vec::new();
+    for piece in [3, 17, 9] {
+        source.extend_from_slice(&dict[piece * PIECE..(piece + 1) * PIECE]);
+    }
+    let dictionary = EncoderDictionary::from_serialized_or_raw_content(&dict).unwrap();
+    for strategy in [
+        Strategy::Fast,
+        Strategy::Dfast,
+        Strategy::Greedy,
+        Strategy::Lazy2,
+        Strategy::Btlazy2,
+        Strategy::Btopt,
+    ] {
+        let params = CompressionParameters::builder(CompressionLevel::Level(3))
+            .strategy(strategy)
+            .window_log(22)
+            .hash_log(12)
+            .chain_log(12)
+            .enable_long_distance_matching(true)
+            .build()
+            .unwrap();
+        let mut fresh = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(3));
+        fresh.set_parameters(&params).unwrap();
+        fresh.set_encoder_dictionary(dictionary.clone()).unwrap();
+        fresh.write_all(&source).unwrap();
+        let expected = fresh.finish().unwrap();
+        let mut without = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(3));
+        without
+            .set_parameters(
+                &CompressionParameters::builder(CompressionLevel::Level(3))
+                    .strategy(strategy)
+                    .window_log(22)
+                    .hash_log(12)
+                    .chain_log(12)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        without.set_encoder_dictionary(dictionary.clone()).unwrap();
+        without.write_all(&source).unwrap();
+        let without = without.finish().unwrap();
+        // The optimal parser weighs the long matches as candidates rather than
+        // taking them outright, so it is held to a gain, not to a size.
+        assert!(
+            expected.len() < without.len() / 2,
+            "{strategy:?}: LDM did not reach into the dictionary ({} bytes, {} without)",
+            expected.len(),
+            without.len(),
+        );
+        let mut context = CompressionContext::new(CompressionLevel::Level(3));
+        context.set_parameters(&params).unwrap();
+        context.set_encoder_dictionary(dictionary.clone()).unwrap();
+        for frame_index in 0..3 {
+            let mut frame = Vec::new();
+            let mut rest = source.as_slice();
+            while !rest.is_empty() {
+                let taken = context.write(&mut frame, rest).unwrap();
+                rest = &rest[taken..];
+            }
+            context.finish_frame(&mut frame).unwrap();
+            assert!(
+                frame == expected,
+                "{strategy:?}: frame {frame_index} on the reused context wrote {} bytes, a fresh encoder {}",
+                frame.len(),
+                expected.len(),
+            );
+        }
+    }
+}
+
 /// `FrameCompressor::set_parameters` on the streaming path reuses one
 /// compressor across frames and produces decodable output.
 #[test]
