@@ -53,6 +53,26 @@ pub(crate) unsafe fn free_boxed<T>(ptr: *mut T) {
     }
 }
 
+/// Bytes the current or last frame of a context has taken in, produced and
+/// handed out; reset when a frame starts.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct FrameProgress {
+    pub(crate) ingested: u64,
+    pub(crate) produced: u64,
+    pub(crate) flushed: u64,
+}
+
+impl FrameProgress {
+    /// A one-shot frame: all of `src_len` taken, all of `frame_len` handed out.
+    pub(crate) fn one_shot(src_len: usize, frame_len: usize) -> Self {
+        Self {
+            ingested: src_len as u64,
+            produced: frame_len as u64,
+            flushed: frame_len as u64,
+        }
+    }
+}
+
 /// Opaque compression context: what upstream keeps in a `ZSTD_CCtx`, kept
 /// here the same way, from one call to the next.
 ///
@@ -75,6 +95,8 @@ pub struct ZSTD_CCtx {
     /// The one-shot compressor and the serial of the dictionary it holds
     /// (`0` = none); `None` before the first one-shot call.
     pub(crate) compressor: Option<(u64, FrameCompressor)>,
+    /// How far the current or last frame got (`ZSTD_getFrameProgression`).
+    pub(crate) progress: FrameProgress,
     /// Context-attached dictionary (`ZSTD_CCtx_loadDictionary` /
     /// `ZSTD_CCtx_refCDict` / `ZSTD_CCtx_refPrefix`), applied at every frame
     /// start by `ZSTD_compress2` / `ZSTD_compressStream2`.
@@ -171,8 +193,22 @@ pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
         params: crate::cctx_params::CCtxParams::default(),
         stream: None,
         compressor: None,
+        progress: FrameProgress::default(),
         attached_dict: crate::attach::CCtxDictAttach::None,
     })
+}
+
+/// `ZSTD_CCtx* ZSTD_createCCtx_advanced(ZSTD_customMem customMem)` —
+/// [`ZSTD_createCCtx`]; custom allocators are not supported, so anything but
+/// `ZSTD_defaultCMem` returns `NULL`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_createCCtx_advanced(
+    custom_mem: crate::cdict::ZSTD_customMem,
+) -> *mut ZSTD_CCtx {
+    if !custom_mem.is_default() {
+        return core::ptr::null_mut();
+    }
+    ZSTD_createCCtx()
 }
 
 impl ZSTD_CCtx {
@@ -329,6 +365,7 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
     }
     let dst = unsafe { out_slice(dst, dst_capacity) };
     dst[..len].copy_from_slice(&cctx.scratch);
+    cctx.progress = FrameProgress::one_shot(src.len(), len);
     len
 }
 
@@ -429,6 +466,7 @@ pub unsafe extern "C" fn ZSTD_compress2(
     // reached the caller: a dstSize_tooSmall failure above must leave it
     // armed for the retry with a bigger buffer.
     cctx.consume_prefix();
+    cctx.progress = FrameProgress::one_shot(src.len(), len);
     len
 }
 
@@ -445,6 +483,19 @@ pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
         ddict_serial: 0,
         ddict_handle: None,
     })
+}
+
+/// `ZSTD_DCtx* ZSTD_createDCtx_advanced(ZSTD_customMem customMem)` —
+/// [`ZSTD_createDCtx`]; custom allocators are not supported, so anything but
+/// `ZSTD_defaultCMem` returns `NULL`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_createDCtx_advanced(
+    custom_mem: crate::cdict::ZSTD_customMem,
+) -> *mut ZSTD_DCtx {
+    if !custom_mem.is_default() {
+        return core::ptr::null_mut();
+    }
+    ZSTD_createDCtx()
 }
 
 impl ZSTD_DCtx {

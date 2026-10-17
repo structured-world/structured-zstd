@@ -5,6 +5,7 @@
 
 mod cctx_params;
 mod experimental;
+mod streams;
 
 use crate::cdict::{
     ZSTD_compress_usingCDict, ZSTD_createCDict, ZSTD_createDDict, ZSTD_decompress_usingDDict,

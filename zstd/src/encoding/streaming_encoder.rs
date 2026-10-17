@@ -842,6 +842,24 @@ impl<M: Matcher> CompressionContext<M> {
         self.encoded_scratch.clear();
     }
 
+    /// Input written to the open frame that no block has compressed yet: it
+    /// waits for its block to fill, or for a flush. Zero between frames.
+    /// Backs the progress the C `ZSTD_getFrameProgression` reports.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel};
+    ///
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// let mut frame = Vec::new();
+    /// context.write(&mut frame, b"less than a block").unwrap();
+    /// assert_eq!(context.buffered_input_len(), 17);
+    /// context.flush(&mut frame).unwrap();
+    /// assert_eq!(context.buffered_input_len(), 0);
+    /// ```
+    pub fn buffered_input_len(&self) -> usize {
+        self.pending_len()
+    }
+
     fn ensure_open(&self) -> Result<(), Error> {
         if self.errored {
             return Err(self.sticky_error());
