@@ -120,14 +120,28 @@ impl Dictionary {
         Self::decode_dict_inner(raw, true)
     }
 
+    /// Whether `raw` is a serialized dictionary rather than raw content: it
+    /// starts with [`MAGIC_NUM`] and has room for the ID after it. A shorter
+    /// blob is raw content whatever it starts with, as upstream zstd reads it
+    /// (zstd_ddict.c:97, zstd_compress.c:5206).
+    ///
+    /// ```
+    /// use structured_zstd::decoding::{Dictionary, DICTIONARY_MAGIC};
+    /// assert!(!Dictionary::is_serialized(&DICTIONARY_MAGIC));
+    /// assert!(Dictionary::is_serialized(&[0x37, 0xA4, 0x30, 0xEC, 7, 0, 0, 0]));
+    /// ```
+    pub fn is_serialized(raw: &[u8]) -> bool {
+        raw.len() >= 8 && raw.starts_with(&MAGIC_NUM)
+    }
+
     /// Loads whichever kind of dictionary `raw` holds, the way `zstd -D` does:
-    /// a blob starting with [`MAGIC_NUM`] is a serialized dictionary with
-    /// entropy tables and an ID, and anything else is taken as raw content,
+    /// a [serialized](Self::is_serialized) dictionary with entropy tables and
+    /// an ID, and anything else is taken as raw content,
     /// which is why any file can be handed to `-D`. A raw-content dictionary
     /// has no ID, so it must be supplied explicitly on both sides — see
     /// [`Self::from_raw_content`].
     pub fn from_serialized_or_raw_content(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
-        if raw.starts_with(&MAGIC_NUM) {
+        if Self::is_serialized(raw) {
             Self::decode_dict(raw)
         } else if raw.is_empty() {
             // A zero-sized buffer is a dictionary with nothing in it rather
@@ -337,8 +351,8 @@ impl DictionaryHandle {
     }
 
     /// Load whichever kind of dictionary `raw` holds, as `ZSTD_createDDict`
-    /// does: a blob starting with [`MAGIC_NUM`] is a serialized dictionary,
-    /// anything else is raw content. See
+    /// does: a [serialized](Dictionary::is_serialized) dictionary, or raw
+    /// content. See
     /// [`Dictionary::from_serialized_or_raw_content`].
     pub fn from_serialized_or_raw_content(raw: &[u8]) -> Result<Self, DictionaryDecodeError> {
         Dictionary::from_serialized_or_raw_content(raw).map(Self::from_dictionary)

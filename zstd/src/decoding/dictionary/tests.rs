@@ -123,6 +123,25 @@ fn dictionary_handle_takes_serialized_or_raw_content() {
     assert_eq!(handle.as_dict().dict_content.as_slice(), raw.as_slice());
 }
 
+/// Under eight bytes there is no room for the magic and an id, so even a
+/// magic-prefixed blob is raw content, as upstream reads it
+/// (zstd_ddict.c:97, zstd_decompress.c:1541); from eight bytes on the magic
+/// names a serialized dictionary.
+#[test]
+fn a_blob_under_eight_bytes_is_raw_content() {
+    assert!(!Dictionary::is_serialized(&MAGIC_NUM));
+    assert!(Dictionary::is_serialized(&[
+        0x37, 0xA4, 0x30, 0xEC, 1, 0, 0, 0
+    ]));
+    assert!(!Dictionary::is_serialized(b"raw content of any length"));
+    let magic_only = Dictionary::from_serialized_or_raw_content(&MAGIC_NUM)
+        .expect("too short to be serialized, so raw content");
+    assert_eq!(magic_only.dict_content.as_slice(), &MAGIC_NUM[..]);
+    let encoder = crate::encoding::EncoderDictionary::from_serialized_or_raw_content(&MAGIC_NUM)
+        .expect("the encoder reads it the same way");
+    assert_eq!(encoder.content(), &MAGIC_NUM[..]);
+}
+
 /// A zero-sized buffer is a dictionary with nothing in it, not a malformed
 /// one: `ZSTD_createDDict(NULL, 0)` builds a usable `DDict` that references no
 /// content (zstd_ddict.c:123-140), and a caller handed an empty file gets the

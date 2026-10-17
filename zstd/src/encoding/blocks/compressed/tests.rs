@@ -386,6 +386,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             };
             let mut est_state = CompressState::<EntropyOnlyMatcher> {
                 matcher: EntropyOnlyMatcher,
+                sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: seed_table.clone(),
                 huff_table_spare: None,
@@ -403,6 +404,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             };
             let mut emit_state = CompressState::<EntropyOnlyMatcher> {
                 matcher: EntropyOnlyMatcher,
+                sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: seed_table,
                 huff_table_spare: None,
@@ -468,6 +470,7 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
 
     let make_state = || CompressState::<EntropyOnlyMatcher> {
         matcher: EntropyOnlyMatcher,
+        sequence_capture: None,
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,
@@ -533,6 +536,7 @@ fn encode_match_len_uses_correct_upper_range_base() {
 fn retained_heap_size_counts_the_block_buffers() {
     let mut state = CompressState {
         matcher: super::EntropyOnlyMatcher,
+        sequence_capture: None,
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,
@@ -587,6 +591,7 @@ fn retained_heap_size_counts_the_estimator_workspace() {
 fn discarded_block_keeps_the_entry_tables() {
     let mut state = CompressState {
         matcher: super::EntropyOnlyMatcher,
+        sequence_capture: None,
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: Some(huff0_encoder::HuffmanTable::build_from_data(b"aaaabbc")),
         huff_table_spare: None,
@@ -764,6 +769,7 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
     for strat in [StrategyTag::Lazy, StrategyTag::BtUltra2] {
         let make_state = || CompressState::<EntropyOnlyMatcher> {
             matcher: EntropyOnlyMatcher,
+            sequence_capture: None,
             copy_kernel: crate::encoding::fastpath::select_kernel(),
             last_huff_table: None,
             huff_table_spare: None,
@@ -828,6 +834,7 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
 fn raw_partition_fallback_restores_repeat_offset_history() {
     let mut state = CompressState {
         matcher: super::EntropyOnlyMatcher,
+        sequence_capture: None,
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,

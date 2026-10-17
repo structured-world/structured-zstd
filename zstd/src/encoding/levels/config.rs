@@ -1010,6 +1010,26 @@ pub fn estimated_compression_workspace_bytes_for_run(
     workspace_bytes(&params, ldm)
 }
 
+/// The level params a frame resolves to under `parameters`, for a source of
+/// `src_size_hint` bytes and an optional dictionary: the level (or the
+/// dictionary's tier), then the caller's overrides, as the matcher's reset
+/// resolves them.
+pub(crate) fn frame_level_params(
+    parameters: &crate::encoding::CompressionParameters,
+    src_size_hint: Option<u64>,
+    dictionary: Option<crate::encoding::DictionarySizes>,
+) -> LevelParams {
+    let level = parameters.level();
+    let overrides = parameters.overrides();
+    let dictionary = dictionary.filter(|sizes| sizes.content != 0);
+    let mut params = match dictionary {
+        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes, &overrides).0,
+        None => resolve_level_params(level, src_size_hint),
+    };
+    apply_frame_overrides(&mut params, &overrides, dictionary.is_some(), src_size_hint);
+    params
+}
+
 /// The workspace estimate for a frame run under `parameters`: the level, every
 /// knob that overrides it, the source size and the dictionary, resolved the way
 /// the encoder resolves them at frame start.
@@ -1046,16 +1066,9 @@ pub fn estimated_compression_workspace_bytes_for_parameters(
     src_size_hint: Option<u64>,
     dictionary: Option<crate::encoding::DictionarySizes>,
 ) -> usize {
-    let level = parameters.level();
-    let overrides = parameters.overrides();
-    let dictionary = dictionary.filter(|sizes| sizes.content != 0);
-    let mut params = match dictionary {
-        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes, &overrides).0,
-        None => resolve_level_params(level, src_size_hint),
-    };
-    apply_frame_overrides(&mut params, &overrides, dictionary.is_some(), src_size_hint);
+    let params = frame_level_params(parameters, src_size_hint, dictionary);
     #[cfg(feature = "ldm")]
-    let ldm = overrides.ldm.map_or(0, |ldm| {
+    let ldm = parameters.overrides().ldm.map_or(0, |ldm| {
         crate::encoding::ldm::estimated_workspace_bytes(&frame_ldm_params(&params, &ldm))
     });
     #[cfg(not(feature = "ldm"))]
@@ -1308,7 +1321,8 @@ pub(crate) fn resolve_level_params_with_dict(
         uses_row_match_finder,
     };
     let base = resolve_level_params(level, source_size);
-    if sizes.content == 0 {
+    // A raw frame searches nothing, so a dictionary has no tier to give it.
+    if sizes.content == 0 || matches!(level, CompressionLevel::Uncompressed) {
         return (base, None);
     }
     // The CDict's cParams decide the frame's strategy REGARDLESS of the

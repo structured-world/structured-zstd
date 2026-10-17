@@ -1,14 +1,14 @@
 use super::*;
 use crate::encoding::{
     HistoryBuf, Matcher, Sequence,
+    block_input::BlockInput,
     frame_compressor::{CompressState, FseTables},
-    test_input::TestInput,
 };
 use alloc::vec;
 
 #[derive(Default)]
 struct HintProbeMatcher {
-    input: TestInput,
+    input: BlockInput,
     skip_hints: Vec<Option<bool>>,
 }
 
@@ -69,6 +69,7 @@ fn custom_matcher_dict_probe_defaults_to_false() {
 fn rle_branch_passes_compressible_hint_to_skip_matching() {
     let mut state = CompressState {
         matcher: HintProbeMatcher::default(),
+        sequence_capture: None,
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,

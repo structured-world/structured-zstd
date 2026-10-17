@@ -3,6 +3,13 @@
 //! real symbol behaviour; the C-consumer link test in `tests/` is added
 //! separately and verifies a real `#include <zstd.h>` consumer.
 
+mod bufferless;
+mod cctx_params;
+mod experimental;
+mod provided;
+mod sequences;
+mod streams;
+
 use crate::cdict::{
     ZSTD_compress_usingCDict, ZSTD_createCDict, ZSTD_createDDict, ZSTD_decompress_usingDDict,
     ZSTD_freeCDict, ZSTD_freeDDict, ZSTD_getDictID_fromCDict, ZSTD_getDictID_fromDDict,
@@ -3802,12 +3809,12 @@ fn a_dictionary_the_context_moved_on_from_is_not_kept() {
     unsafe { ZSTD_freeCDict(cdict) };
 }
 
-/// Output that piled up on the context (a whole incompressible input
-/// consumed into a 64-byte output buffer) is let go once it has been copied
-/// out: the context keeps the output room of one block for the frames after
-/// it, not the largest frame it ever held.
+/// A large incompressible input against a 64-byte output buffer: each call
+/// takes only as much input as the output it can hand back, so the output
+/// waiting on the context stays near one block however large the input, and
+/// `input.pos` tells the caller what is still to come.
 #[test]
-fn drained_stream_output_does_not_pin_its_peak() {
+fn stream_output_waits_for_the_caller() {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let input: Vec<u8> = (0..4 << 20)
         .map(|_| {
@@ -3823,45 +3830,39 @@ fn drained_stream_output_does_not_pin_its_peak() {
         size: input.len(),
         pos: 0,
     };
-    let mut small = [0u8; 64];
-    let mut outb = ZSTD_outBuffer {
-        dst: small.as_mut_ptr().cast(),
-        size: small.len(),
-        pos: 0,
-    };
-    let rc = unsafe { ZSTD_compressStream2(cctx, &mut outb, &mut inb, 2) };
-    assert_eq!(ZSTD_isError(rc), 0);
-    assert_eq!(inb.pos, inb.size, "the input is consumed in full");
     let pending_capacity = |cctx: *mut crate::context::ZSTD_CCtx| {
         unsafe { cctx.as_ref() }
             .and_then(|context| context.stream.as_ref())
             .expect("the context streams")
             .pending_capacity()
     };
-    assert!(
-        pending_capacity(cctx) >= input.len(),
-        "fixture precondition: the whole frame waits on the context"
-    );
-    let mut frame = small[..outb.pos].to_vec();
-    let mut room = vec![0u8; ZSTD_CStreamOutSize()];
-    let mut empty = ZSTD_inBuffer {
-        src: core::ptr::null(),
-        size: 0,
-        pos: 0,
-    };
+    let mut small = [0u8; 64];
+    let mut frame = Vec::new();
+    let mut first = true;
     loop {
         let mut outb = ZSTD_outBuffer {
-            dst: room.as_mut_ptr().cast(),
-            size: room.len(),
+            dst: small.as_mut_ptr().cast(),
+            size: small.len(),
             pos: 0,
         };
-        let rc = unsafe { ZSTD_compressStream2(cctx, &mut outb, &mut empty, 2) };
+        let rc = unsafe { ZSTD_compressStream2(cctx, &mut outb, &mut inb, 2) };
         assert_eq!(ZSTD_isError(rc), 0);
-        frame.extend_from_slice(&room[..outb.pos]);
+        if first {
+            assert!(inb.pos < inb.size, "the first call took all the input");
+            first = false;
+        }
+        assert!(
+            pending_capacity(cctx) <= 2 * ZSTD_CStreamOutSize(),
+            "{} bytes of output wait on the context at input {}",
+            pending_capacity(cctx),
+            inb.pos
+        );
+        frame.extend_from_slice(&small[..outb.pos]);
         if rc == 0 {
             break;
         }
     }
+    assert_eq!(inb.pos, inb.size);
     assert!(
         pending_capacity(cctx) <= ZSTD_CStreamOutSize(),
         "{} bytes of output room kept after the frame was copied out",

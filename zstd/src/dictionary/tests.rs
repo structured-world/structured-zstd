@@ -5,6 +5,39 @@ use std::io::Cursor;
 use std::string::ToString;
 use std::vec;
 
+/// The original trainer names why it refused: a corpus too small first (as
+/// upstream checks it first), then a dictionary under the minimum; a corpus
+/// that repeats too little is refused with no cause of its own.
+#[test]
+fn the_original_trainer_names_its_refusals() {
+    let finalize = FinalizeOptions::default();
+    let mut out = Vec::new();
+    let err =
+        create_legacy_dict_from_slice(&[7u8; 100], &[100], &mut out, 100, 0, finalize).unwrap_err();
+    assert_eq!(TrainingError::of(&err), Some(TrainingError::Samples));
+
+    let (samples, sizes) = training_samples();
+    let err =
+        create_legacy_dict_from_slice(&samples, &sizes, &mut out, 100, 0, finalize).unwrap_err();
+    assert_eq!(
+        TrainingError::of(&err),
+        Some(TrainingError::DictionaryTooSmall)
+    );
+
+    let mut state = 0x9E37_79B9u32;
+    let noise: Vec<u8> = (0..4096)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let err =
+        create_legacy_dict_from_slice(&noise, &[4096], &mut out, 4096, 0, finalize).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(TrainingError::of(&err), None);
+    assert!(out.is_empty());
+}
+
 fn training_data() -> Vec<u8> {
     training_samples().0
 }

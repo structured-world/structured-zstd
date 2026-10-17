@@ -80,15 +80,15 @@ pub(crate) mod lazy_parse;
 // `prepare_ldm_candidates` unconditionally because the gating is internal to
 // the method body (without the feature it shrinks to an
 // `ldm_sequences.clear()` stub).
+pub(crate) mod block_input;
 #[cfg(feature = "ldm")]
 pub(crate) mod ldm;
 pub(crate) mod match_table;
 pub(crate) mod opt;
 pub(crate) mod row;
+pub mod sequences;
 pub(crate) mod simple;
 pub(crate) mod strategy;
-#[cfg(test)]
-pub(crate) mod test_input;
 pub(crate) mod workspace;
 
 pub(crate) mod frame_compressor;
@@ -629,6 +629,13 @@ pub trait Matcher {
     fn settle_block_cut(&mut self, window: usize, cut: usize) -> usize {
         let _ = window;
         cut
+    }
+    /// The length the next block must take when this matcher lays the blocks
+    /// out itself (a replayed parse with block delimiters), or `None` to leave
+    /// the cut to the encoder. A block so laid out is written as one physical
+    /// block, held to the block size. Defaults to `None`.
+    fn fixed_block_len(&self) -> Option<usize> {
+        None
     }
     /// Heap bytes this matcher's allocations hold (tables, history, scratch),
     /// excluding the inline struct itself. Lets a context report its true

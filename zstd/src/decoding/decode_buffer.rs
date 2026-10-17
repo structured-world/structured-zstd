@@ -391,6 +391,34 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
+    /// Copy the newest `n` bytes, the block just decoded, into `target` as the
+    /// frame's output, hashing them as a drain would, and let go of what lies
+    /// past the window: it was handed out when it was decoded, and no match
+    /// reaches back that far. For a caller taking each block's output as soon
+    /// as it is decoded, whose history therefore stays here undrained.
+    ///
+    /// `n` must be `<= self.len()` and `<= target.len()`.
+    pub(crate) fn deliver_newest(&mut self, n: usize, target: &mut [u8]) {
+        let (s1, s2) = self.buffer.as_slices();
+        let total = s1.len() + s2.len();
+        debug_assert!(n <= total && n <= target.len());
+        let start = total - n;
+        let (head, tail) = if start >= s1.len() {
+            (&[][..], &s2[start - s1.len()..])
+        } else {
+            (&s1[start..], s2)
+        };
+        target[..head.len()].copy_from_slice(head);
+        target[head.len()..n].copy_from_slice(tail);
+        #[cfg(feature = "hash")]
+        if self.compute_hash {
+            self.hash.write(head);
+            self.hash.write(tail);
+            self.hash_dirty = true;
+        }
+        self.drop_to_window_size();
+    }
+
     /// Capture a rollback point covering the buffer's write cursor and the
     /// total-output counter. Pair with [`Self::try_restore_checkpoint`] to undo
     /// speculative pushes/repeats made after the capture — used by the fused

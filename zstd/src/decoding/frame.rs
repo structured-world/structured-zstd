@@ -144,11 +144,25 @@ pub(crate) fn take_magic_from_slice(input: &mut &[u8]) -> Result<(), ReadFrameHe
 /// Length of the frame header at the start of `input`, magic number included,
 /// read from the magic and the descriptor byte alone; the fields after them
 /// need not be there yet.
-pub(crate) fn measure_header_from_slice(mut input: &[u8]) -> Result<usize, ReadFrameHeaderError> {
-    take_magic_from_slice(&mut input)?;
+pub(crate) fn measure_header_from_slice(input: &[u8]) -> Result<usize, ReadFrameHeaderError> {
+    measure_header_with_format(input, false)
+}
+
+/// [`measure_header_from_slice`] in either format: a magicless header starts
+/// at its descriptor byte and has no magic number to count.
+pub(crate) fn measure_header_with_format(
+    mut input: &[u8],
+    magicless: bool,
+) -> Result<usize, ReadFrameHeaderError> {
+    let magic_len = if magicless {
+        0
+    } else {
+        take_magic_from_slice(&mut input)?;
+        4
+    };
     let d =
         take(&mut input, 1).ok_or_else(|| ReadFrameHeaderError::FrameDescriptorReadError(eof()))?;
-    Ok(4 + FrameDescriptor(d[0]).header_len())
+    Ok(magic_len + FrameDescriptor(d[0]).header_len())
 }
 
 /// Slice-direct equivalent of [`read_frame_header_with_format`]: parses the

@@ -485,6 +485,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         built_huff,
         scratch_state: CompressState {
             matcher: EntropyOnlyMatcher,
+            sequence_capture: None,
             // The splitter's scratch state never reaches the raw-skip, which
             // is decided one level up on the whole block.
             seen_content: Default::default(),
@@ -636,12 +637,26 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
     // every matcher's scan, where two would compile each backend twice, and the
     // flag is fixed for the block, so its test at each emit site predicts.
     let code_offsets = uses_fast_offset_codes(state.strategy_tag);
+    let block_start_hist = state.offset_hist;
     let mut hist = state.offset_hist;
     state.matcher.start_matching(|seq| {
         record_sequence(seq, &mut tail, sequences, code_offsets, &mut hist);
     });
     if code_offsets {
         state.offset_hist = hist;
+    }
+    // Once per block, after the match loop: the loop itself is the same
+    // whether or not anyone records it. One delimiter per matched block is
+    // one per written block, as `compress_block_encoded` keeps the post-split
+    // off while a parse is recorded.
+    if let Some(capture) = state.sequence_capture.as_mut() {
+        record_block_parse(
+            capture,
+            &parts.sequences,
+            tail,
+            code_offsets,
+            block_start_hist,
+        );
     }
     let kernel = state.copy_kernel;
     literal_runs::gather_literals(
@@ -651,6 +666,41 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
         tail,
         &mut parts.literals,
     );
+}
+
+/// Append a block's parse to `capture` as external sequences with plain
+/// offsets and their repeat-offset numbers, against the `history` the block
+/// started from, closed by a delimiter carrying the `tail` literals. With
+/// `code_offsets` the block's offsets are wire codes, otherwise plain.
+#[cold]
+fn record_block_parse(
+    capture: &mut Vec<crate::encoding::sequences::ExternalSequence>,
+    sequences: &[RawSequence],
+    tail: usize,
+    code_offsets: bool,
+    mut history: [u32; 3],
+) {
+    use crate::encoding::sequences::ExternalSequence;
+    for sequence in sequences {
+        let (offset, code) = if code_offsets {
+            let code = sequence.off_base;
+            let offset = crate::encoding::sequences::plain_offset(code, sequence.ll, &mut history);
+            (offset, code)
+        } else {
+            let offset = sequence.off_base;
+            let code = encode_offset_with_history(offset, sequence.ll, &mut history);
+            (offset, code)
+        };
+        capture.push(ExternalSequence {
+            offset,
+            lit_len: sequence.ll,
+            match_len: sequence.ml,
+            // Codes 1..=3 are the repeat offsets (RFC 8878 3.1.1.5).
+            rep: if code <= 3 { code } else { 0 },
+        });
+    }
+    // A block is at most 128 KiB.
+    capture.push(ExternalSequence::delimiter(tail as u32));
 }
 
 /// Record one reported sequence. With `code_offsets` the offset is replaced by
