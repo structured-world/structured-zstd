@@ -5,13 +5,16 @@ use crate::decoding::errors::HuffmanTableError;
 use crate::fse::{FSEDecoder, FSETable};
 use alloc::vec::Vec;
 
-/// The Zstandard specification limits the maximum length of a code to 11 bits.
-pub(crate) const MAX_MAX_NUM_BITS: u8 = 11;
+/// The longest code a Huffman table may hold: upstream zstd `HUF_TABLELOG_MAX`
+/// (`huf.h`), the bound `HUF_readStats_body` enforces on weights and on the
+/// table log. RFC 8878 §4.2.1 names 11, but reference dictionaries carry
+/// 12-bit tables and its decoder reads them.
+pub(crate) const MAX_MAX_NUM_BITS: u8 = 12;
 
 /// Decode lookup table, `1 << max_num_bits` packed entries.
 #[cfg(not(feature = "caller-workspace"))]
 type DecodeTableBuf = Vec<u16>;
-/// Decode lookup table, at most `1 << 11` packed entries, inline so the table
+/// Decode lookup table, at most `1 << 12` packed entries, inline so the table
 /// can live in caller-owned memory.
 #[cfg(feature = "caller-workspace")]
 type DecodeTableBuf = crate::common::inline_vec::InlineVec<u16, { 1 << MAX_MAX_NUM_BITS as usize }>;
@@ -154,7 +157,7 @@ pub struct HuffmanTable {
     /// Packed `num_bits | (symbol << 8)` per state. Keeping the bit count
     /// in the low byte lets the 4-stream decoder shift directly by the entry
     /// (modulo 64), without extracting it on the dependent bitstream path.
-    /// Entries remain two bytes: at most 4 KiB for the 11-bit table.
+    /// Entries remain two bytes: at most 8 KiB for the 12-bit table.
     pub(crate) packed_decode: DecodeTableBuf,
     /// The weight of a symbol is the number of occurrences in a table.
     /// This value is used in constructing a binary tree referred to as
@@ -164,7 +167,7 @@ pub struct HuffmanTable {
     /// The maximum size in bits a prefix code in the encoded data can be.
     /// This value is used so that the decoder knows how many bits
     /// to read from the bitstream before checking the table. This
-    /// value must be 11 or lower.
+    /// value is 12 or lower.
     pub max_num_bits: u8,
     state_mask: u64,
     bits: SymbolBuf,
@@ -608,7 +611,7 @@ impl HuffmanTable {
         // Starting offset for each code-length rank, in a fixed local
         // sized 16 so the fill loop below indexes it with a masked code
         // length and the optimizer drops the bounds check (code lengths
-        // cap at MAX_MAX_NUM_BITS = 11). Same descending prefix walk as
+        // cap at MAX_MAX_NUM_BITS = 12). Same descending prefix walk as
         // the previous heap-allocated form.
         let mut rank_start = [0usize; 16];
         for bits in (1..=max_bits).rev() {
@@ -656,7 +659,7 @@ impl HuffmanTable {
         let mut sym_off = [0usize; 16];
         let mut acc = 0usize;
         // Prefix sum of the per-code-length counts: `sym_off[l]` is the start
-        // index of the length-`l` run in `sorted`. `bit_ranks` has 12 entries; counts above `max_bits` are zero.
+        // index of the length-`l` run in `sorted`. `bit_ranks` has 13 entries; counts above `max_bits` are zero.
         for (off, &rank) in sym_off.iter_mut().zip(self.bit_ranks.iter()) {
             *off = acc;
             acc += rank as usize;
@@ -664,7 +667,7 @@ impl HuffmanTable {
         {
             let mut cursor = sym_off;
             for (symbol, &len) in self.bits.iter().enumerate() {
-                // `len <= max_bits <= 11`; the mask proves the 16-slot index in
+                // `len <= max_bits <= 12`; the mask proves the 16-slot index in
                 // range. At most 256 symbols (weights capped at 255 + the
                 // inferred last), so every cursor stays < 256 and `symbol` fits u8.
                 let g = (len & 0xF) as usize;

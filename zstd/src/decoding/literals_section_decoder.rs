@@ -871,7 +871,7 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
             let entry = unsafe { *packed.get_unchecked(idx) };
             unsafe { target_ptr.add($c).write((entry >> 8) as u8) };
             $c += 1;
-            // The low byte is <=11 bits; wrapping_shl discards the symbol
+            // The low byte is <=12 bits; wrapping_shl discards the symbol
             // byte while keeping the bit count on the dependent path.
             $b = $b.wrapping_shl(u32::from(entry));
         }};
