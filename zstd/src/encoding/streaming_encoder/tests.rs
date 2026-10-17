@@ -438,7 +438,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 struct TinyMatcher {
-    input: crate::encoding::test_input::TestInput,
+    input: crate::encoding::block_input::BlockInput,
     window_size: u64,
 }
 

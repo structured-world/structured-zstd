@@ -211,6 +211,33 @@ let compressed = compress_with_parameters(data, &params);
 Each parameter's valid range is queryable via `CParameter::bounds()` (the
 analogue of `ZSTD_cParam_getBounds`); the builder validates every set knob.
 
+### Sequences
+
+`encoding::sequences` hands a parse of the input in or out as literal runs and
+matches, laid out as C zstd's `ZSTD_Sequence`. `FrameCompressor::set_sequence_capture`
+records the parse the encoder chose; `SequenceReplay` builds a frame from a
+given parse; a `SequenceProducer` installed with `set_sequence_producer` is
+asked for each block's parse in place of the built-in matchers:
+
+```rust
+use structured_zstd::encoding::sequences::{validate_parse, SequenceReplay};
+use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+
+let input = b"one parse, then the same parse, then the same parse".repeat(20);
+let mut encoder: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+encoder.set_sequence_capture(true);
+let _frame = encoder.compress_independent_frame(&input);
+let parse = encoder.take_captured_sequences();
+validate_parse(&parse, input.len(), 1 << 20, 0, true, 1 << 17).expect("a parse of the input");
+
+let mut replayed = Vec::new();
+let mut compressor =
+    FrameCompressor::new_with_matcher(SequenceReplay::new(&parse, 1 << 20), CompressionLevel::Default);
+compressor.set_source(input.as_slice());
+compressor.set_drain(&mut replayed);
+compressor.compress();
+```
+
 ### Decompression
 
 ```rust,no_run

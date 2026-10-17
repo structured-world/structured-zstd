@@ -109,6 +109,8 @@ pub(crate) struct CCtxParams {
     /// Consumed by the next frame start, then reset to unknown. Belongs to
     /// the context's session, not to the parameter set.
     pub(crate) pledged_src_size: u64,
+    /// `ZSTD_registerSequenceProducer`: asked for each block's parse.
+    pub(crate) producer: Option<crate::sequences::CSequenceProducer>,
 }
 
 impl Default for CCtxParams {
@@ -144,7 +146,29 @@ impl CCtxParams {
             src_size_hint: 0,
             advisory: [0; ADVISORY.len()],
             pledged_src_size: CONTENTSIZE_UNKNOWN,
+            producer: None,
         }
+    }
+
+    /// The registered producer, boxed for the encoder, and whether a block
+    /// it fails on falls back to the built-in matchers
+    /// (`ZSTD_c_enableSeqProducerFallback`).
+    pub(crate) fn sequence_producer(
+        &self,
+    ) -> (
+        Option<Box<dyn codec::encoding::sequences::SequenceProducer>>,
+        bool,
+    ) {
+        let fallback = self
+            .get(ZSTD_C_ENABLE_SEQ_PRODUCER_FALLBACK)
+            .is_ok_and(|v| v != 0);
+        let producer = self.producer.map(|p| {
+            Box::new(crate::sequences::CProducerCall {
+                producer: p,
+                level: self.level,
+            }) as Box<dyn codec::encoding::sequences::SequenceProducer>
+        });
+        (producer, fallback)
     }
 
     /// Resolve the knob set into the codec's validated

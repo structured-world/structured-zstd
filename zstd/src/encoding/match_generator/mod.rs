@@ -5,7 +5,6 @@
 //!
 //! The task here is to efficiently find matches in the already encoded data for the current suffix of the not yet encoded data.
 
-#[cfg(any(feature = "bench-internals", feature = "ldm"))]
 use alloc::vec::Vec;
 // SIMD/CRC intrinsics now live in `crate::encoding::fastpath::*` where they
 // sit under per-CPU `#[target_feature]` umbrellas; no architecture-specific
@@ -27,6 +26,7 @@ use super::dfast::DfastMatchGenerator;
 use super::hc::HC_MIN_MATCH_LEN;
 #[cfg(test)]
 use super::match_table::storage::HC3_HASH_LOG;
+use super::sequences::{ExternalSequence, SequenceProducer};
 // FAST_HASH_FILL_STEP test-only re-export was tied to the legacy
 // SuffixStore MatchGenerator's interleaved hash-fill stride. The
 // upstream zstd-shape Fast kernel walks ip0 with kSearchStrength step-skip
@@ -482,6 +482,21 @@ pub struct MatchGeneratorDriver {
     /// [`Matcher::get_last_space`] reports the whole block, not its last piece.
     #[cfg(feature = "ldm")]
     ldm_split_block: Option<usize>,
+    /// A parser asked for each block in place of the backends, when one is
+    /// installed (C `ZSTD_registerSequenceProducer`).
+    producer: Option<ProducerSlot>,
+}
+
+/// A [`SequenceProducer`] and what to do when it gives no parse.
+struct ProducerSlot {
+    producer: alloc::boxed::Box<dyn SequenceProducer>,
+    /// Match the block with the backend instead when the producer fails;
+    /// otherwise the block goes out as literals and the failure is recorded.
+    fallback: bool,
+    /// A block the producer failed on went out without a fallback.
+    failed: bool,
+    /// The producer's parse of the block in hand, kept for its allocation.
+    parse: Vec<ExternalSequence>,
 }
 
 /// Identity of the matcher configuration a primed snapshot was captured under:
@@ -758,7 +773,92 @@ impl MatchGeneratorDriver {
             ldm_dict_end: 0,
             #[cfg(feature = "ldm")]
             ldm_split_block: None,
+            producer: None,
         }
+    }
+
+    /// Ask `producer` for each block's parse from the next block on, in place
+    /// of the backends; `None` removes it. With `fallback` a block it fails on
+    /// is matched by the backend instead; without, it goes out as literals
+    /// and [`Self::take_producer_failure`] reports it.
+    pub(crate) fn set_sequence_producer(
+        &mut self,
+        producer: Option<alloc::boxed::Box<dyn SequenceProducer>>,
+        fallback: bool,
+    ) {
+        self.producer = producer.map(|producer| ProducerSlot {
+            producer,
+            fallback,
+            failed: false,
+            parse: Vec::new(),
+        });
+    }
+
+    /// Whether a block went out as literals because the producer failed on
+    /// it with no fallback, since this was last asked.
+    pub(crate) fn take_producer_failure(&mut self) -> bool {
+        self.producer
+            .as_mut()
+            .is_some_and(|slot| core::mem::take(&mut slot.failed))
+    }
+
+    /// Report the producer's parse of the last committed block, committing the
+    /// block as an unsearched one does. Returns `false`, having done nothing,
+    /// when the producer failed and the backend is to match the block.
+    fn start_matching_produced(&mut self, handle_sequence: &mut impl FnMut(Sequence)) -> bool {
+        let mut slot = self
+            .producer
+            .take()
+            .expect("called with a producer installed");
+        slot.parse.clear();
+        let window = self.window_size();
+        let block = self.get_last_space();
+        let block_len = block.len();
+        // The parse must cover the block exactly, with matches inside it: the
+        // producer sees no history (as upstream hands it none).
+        let produced = slot
+            .producer
+            .produce(block, window, &mut slot.parse)
+            .is_ok()
+            && crate::encoding::sequences::validate_parse(
+                &slot.parse,
+                block_len,
+                window,
+                0,
+                true,
+                block_len,
+            )
+            .is_ok();
+        if !produced && slot.fallback {
+            self.producer = Some(slot);
+            return false;
+        }
+        self.skip_matching_with_hint(None);
+        if produced {
+            let mut literals = 0usize;
+            for sequence in &slot.parse {
+                literals += sequence.lit_len as usize;
+                if sequence.match_len == 0 {
+                    continue;
+                }
+                handle_sequence(Sequence::Triple {
+                    literal_len: literals,
+                    offset: sequence.offset as usize,
+                    match_len: sequence.match_len as usize,
+                });
+                literals = 0;
+            }
+            if literals > 0 {
+                handle_sequence(Sequence::Literals { len: literals });
+            }
+        } else {
+            slot.failed = true;
+            if block_len > 0 {
+                handle_sequence(Sequence::Literals { len: block_len });
+            }
+        }
+        self.producer = Some(slot);
+        true
     }
 
     fn level_params(level: CompressionLevel, source_size: Option<u64>) -> LevelParams {
@@ -789,6 +889,11 @@ impl MatchGeneratorDriver {
     /// so far, so BT/optimal stay on the owned path.
     pub(crate) fn borrowed_supported(&self) -> bool {
         use super::strategy::{BackendTag, SearchMethod};
+        // A producer reads the committed block, which the in-place scan never
+        // commits.
+        if self.producer.is_some() {
+            return false;
+        }
         match self.active_backend() {
             BackendTag::Simple | BackendTag::Dfast | BackendTag::Row => true,
             // The HashChain backend covers two searches: the lazy CHAIN parser
@@ -2118,6 +2223,9 @@ impl Matcher for MatchGeneratorDriver {
                     }
                 },
             }
+            return;
+        }
+        if self.producer.is_some() && self.start_matching_produced(&mut handle_sequence) {
             return;
         }
         #[cfg(feature = "ldm")]

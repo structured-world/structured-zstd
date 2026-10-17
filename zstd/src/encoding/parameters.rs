@@ -501,6 +501,29 @@ impl CompressionParameters {
         self.overrides.literal_compression
     }
 
+    /// The window, `log2`, a frame of `source_size` bytes (`None` = unknown)
+    /// with a `dictionary_size`-byte dictionary takes under these parameters:
+    /// the level's, or the one set, fitted to the source as C zstd fits it.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionLevel, CompressionParameters};
+    ///
+    /// let params = CompressionParameters::builder(CompressionLevel::Level(19))
+    ///     .window_log(23)
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq!(params.window_log_for(None, 0), 23);
+    /// assert_eq!(params.window_log_for(Some(1000), 0), 10);
+    /// ```
+    pub fn window_log_for(&self, source_size: Option<u64>, dictionary_size: usize) -> u32 {
+        let level = crate::encoding::levels::config::numeric_level(self.level);
+        let mut chosen = LevelParameters::for_level(level, source_size, dictionary_size);
+        if let Some(window_log) = self.overrides.window_log {
+            chosen.window_log = u32::from(window_log);
+        }
+        chosen.adjusted(source_size, dictionary_size).window_log
+    }
+
     pub(crate) fn overrides(&self) -> ParamOverrides {
         self.overrides
     }

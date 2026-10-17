@@ -390,6 +390,24 @@ impl CompressionContext<MatchGeneratorDriver> {
         self.state.matcher.set_param_overrides(Some(overrides));
         Ok(())
     }
+
+    /// Ask `producer` for each block's parse in place of the built-in
+    /// matchers; `None` removes it. With `fallback` a block the producer fails
+    /// on is matched as usual; without, it goes out uncompressed and
+    /// [`Self::take_sequence_producer_failure`] reports it.
+    pub fn set_sequence_producer(
+        &mut self,
+        producer: Option<alloc::boxed::Box<dyn crate::encoding::sequences::SequenceProducer>>,
+        fallback: bool,
+    ) {
+        self.state.matcher.set_sequence_producer(producer, fallback);
+    }
+
+    /// Whether a block went out uncompressed because the producer failed on it
+    /// with no fallback, since this was last asked.
+    pub fn take_sequence_producer_failure(&mut self) -> bool {
+        self.state.matcher.take_producer_failure()
+    }
 }
 
 impl<M: Matcher> CompressionContext<M> {
@@ -402,6 +420,7 @@ impl<M: Matcher> CompressionContext<M> {
             compression_level,
             state: CompressState {
                 matcher,
+                sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huff_table_spare: None,

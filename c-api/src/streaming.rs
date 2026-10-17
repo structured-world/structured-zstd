@@ -247,6 +247,8 @@ impl CStreamState {
         }
         context.set_content_size_flag(params.content_size_flag)?;
         context.set_dictionary_id_flag(params.dict_id_flag && !setup.suppress_id)?;
+        let (producer, fallback) = params.sequence_producer();
+        context.set_sequence_producer(producer, fallback);
         Ok(())
     }
 }
@@ -444,6 +446,11 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
             }
             _ => {}
         }
+        // Without fallback a producer failure fails the frame, as upstream's
+        // `ZSTD_buildSeqStore` returns it (zstd_compress.c:3396).
+        if stream.context.take_sequence_producer_failure() {
+            return Err(ZSTD_ErrorCode::ZSTD_error_sequenceProducer_failed);
+        }
         // Nothing drains `pending` before `copy_out`, so what it grew by is
         // what this call produced.
         progress.ingested += (inp.pos - input_before) as u64;
@@ -455,6 +462,12 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
     }));
     match outcome {
         Ok(Ok(remaining)) => remaining,
+        Ok(Err(ZSTD_ErrorCode::ZSTD_error_sequenceProducer_failed)) => {
+            // The frame is lost: the next call starts a new one, as after the
+            // reset upstream requires.
+            cctx.stream = None;
+            encode(ZSTD_ErrorCode::ZSTD_error_sequenceProducer_failed)
+        }
         Ok(Err(code)) => encode(code),
         Err(_) => {
             // A panic mid-stream leaves the encoder state undefined; drop it
