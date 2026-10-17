@@ -692,6 +692,57 @@ fn test_force_dict_accepts_shared_handle_after_initialization() {
         .expect("force_dict should accept registered shared handle");
 }
 
+/// The fixture dictionary carries a Huffman table whose longest code is 12
+/// bits, which upstream zstd's dictionary builder emits when the samples miss
+/// symbols. The frame was compressed with it by the reference CLI, so its
+/// literals are encoded with that table.
+#[test]
+fn twelve_bit_dictionary_table_decodes_a_reference_frame() {
+    use crate::decoding::FrameDecoder;
+    use alloc::vec;
+
+    let dict_raw = include_bytes!("../../dict_tests/huf12/dictionary");
+    let content = include_bytes!("../../dict_tests/huf12/content");
+    let frame = include_bytes!("../../dict_tests/huf12/content.zst");
+
+    let mut output = vec![0u8; content.len()];
+    let written = FrameDecoder::new()
+        .decode_all_with_dict_bytes(frame.as_slice(), &mut output, dict_raw)
+        .expect("a 12-bit dictionary table is within the format's limit");
+    assert_eq!(&output[..written], content.as_slice());
+}
+
+/// Compressing with the same dictionary reuses its 12-bit table for literals,
+/// on every level and so through every matcher backend.
+#[test]
+fn twelve_bit_dictionary_table_round_trips_every_level() {
+    use crate::decoding::FrameDecoder;
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    let dict_raw = include_bytes!("../../dict_tests/huf12/dictionary");
+    let content = include_bytes!("../../dict_tests/huf12/content");
+
+    for level in 1..=22 {
+        let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>> =
+            FrameCompressor::new(CompressionLevel::from_level(level));
+        compressor
+            .set_dictionary_from_bytes(dict_raw)
+            .expect("a 12-bit dictionary table is within the format's limit");
+        let mut compressed = Vec::new();
+        compressor.set_source(content.as_slice());
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let mut output = vec![0u8; content.len()];
+        let written = FrameDecoder::new()
+            .decode_all_with_dict_bytes(compressed.as_slice(), &mut output, dict_raw)
+            .unwrap_or_else(|e| panic!("level {level} frame failed to decode: {e:?}"));
+        assert_eq!(&output[..written], content.as_slice(), "level {level}");
+    }
+}
+
 #[cfg(test)]
 fn load_sample_dict_frame(expected_dict_id: u32) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
     extern crate std;

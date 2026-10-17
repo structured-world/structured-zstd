@@ -653,6 +653,54 @@ fn cross_every_level_with_ldm_and_dictionary_roundtrips_both_ways() {
     );
 }
 
+/// A dictionary whose Huffman table has a 12-bit longest code, the largest the
+/// format allows: the reference decoder must read the literals we encode with
+/// it, and we must read what the reference encodes with it, at every level.
+#[test]
+fn cross_twelve_bit_dictionary_table_roundtrips_both_ways() {
+    let dict_raw = include_bytes!("../dict_tests/huf12/dictionary");
+    let content = include_bytes!("../dict_tests/huf12/content");
+
+    for level in 1i32..=22 {
+        let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>> =
+            FrameCompressor::new(CompressionLevel::from_level(level));
+        compressor
+            .set_dictionary_from_bytes(dict_raw)
+            .expect("a 12-bit dictionary table is within the format's limit");
+        let mut ours = Vec::new();
+        compressor.set_source(content.as_slice());
+        compressor.set_drain(&mut ours);
+        compressor.compress();
+        let theirs_decoded = zstd::bulk::Decompressor::with_dictionary(dict_raw)
+            .unwrap()
+            .decompress(ours.as_slice(), content.len())
+            .unwrap_or_else(|e| panic!("C decoder rejected our level {level} frame: {e}"));
+        assert_eq!(
+            content.as_slice(),
+            theirs_decoded,
+            "rust→ffi at level {level}"
+        );
+
+        let theirs = zstd::bulk::Compressor::with_dictionary(level, dict_raw)
+            .unwrap()
+            .compress(content.as_slice())
+            .unwrap();
+        let mut ours_decoded = Vec::with_capacity(content.len());
+        let mut decoder = structured_zstd::decoding::FrameDecoder::new();
+        decoder
+            .add_dict(structured_zstd::decoding::Dictionary::decode_dict(dict_raw).unwrap())
+            .unwrap();
+        decoder
+            .decode_all_to_vec(theirs.as_slice(), &mut ours_decoded)
+            .unwrap_or_else(|e| panic!("our decoder rejected C level {level} frame: {e:?}"));
+        assert_eq!(
+            content.as_slice(),
+            ours_decoded,
+            "ffi→rust at level {level}"
+        );
+    }
+}
+
 /// A raw-content dictionary whose start the input repeats, so the input's
 /// matches reach the dictionary's first byte, compressed with its size pledged
 /// (as `zstd -D dict file` does). The pledge shrinks the window, so the

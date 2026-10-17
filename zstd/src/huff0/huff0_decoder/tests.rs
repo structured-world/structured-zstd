@@ -68,6 +68,56 @@ fn build_decoder_rejects_fse_streams_with_256_explicit_weights() {
     );
 }
 
+/// A direct-weights description (header `127 + n`, two 4-bit weights a byte).
+fn direct_weights(weights: &[u8]) -> Vec<u8> {
+    let mut description = alloc::vec![127 + weights.len() as u8];
+    for pair in weights.chunks(2) {
+        description.push((pair[0] << 4) | pair.get(1).copied().unwrap_or(0));
+    }
+    description
+}
+
+/// Upstream zstd accepts a weight and a table log of up to `HUF_TABLELOG_MAX`
+/// = 12 (`huf.h`; checked in `HUF_readStats_body`), and its dictionary builder
+/// can emit such a table. Weights 12, 11, ..., 1 sum to 4095, so the inferred
+/// last weight is 1 and the longest code is 12 bits.
+#[test]
+fn build_decoder_accepts_a_twelve_bit_table() {
+    let weights: Vec<u8> = (1..=12).rev().collect();
+    let mut table = HuffmanTable::new();
+    table
+        .build_decoder(&direct_weights(&weights))
+        .expect("a 12-bit table is within the format's limit");
+    assert_eq!(table.max_num_bits, 12);
+    assert_eq!(table.packed_decode.len(), 1 << 12);
+    // Symbol 0 holds weight 12, the 1-bit code: half the states decode it.
+    let ones = table
+        .packed_decode
+        .iter()
+        .filter(|&&entry| entry == 1)
+        .count();
+    assert_eq!(ones, 1 << 11);
+}
+
+/// One bit past the limit is refused, both as a weight and as a table log
+/// reached through weights that are each within it.
+#[test]
+fn build_decoder_refuses_a_thirteen_bit_table() {
+    let weights: Vec<u8> = (1..=13).rev().collect();
+    let mut table = HuffmanTable::new();
+    assert!(matches!(
+        table.build_decoder(&direct_weights(&weights)),
+        Err(HuffmanTableError::WeightBiggerThanMaxNumBits { got: 13 })
+    ));
+
+    // 3 * 2^11 = 6144: the table log is 13 and the inferred last weight 12.
+    let mut table = HuffmanTable::new();
+    assert!(matches!(
+        table.build_decoder(&direct_weights(&[12, 12, 12])),
+        Err(HuffmanTableError::MaxBitsTooHigh { got: 13 })
+    ));
+}
+
 #[test]
 fn decode_symbol_and_advance_scalar_matches_manual_transition() {
     let table = test_table();
