@@ -8,7 +8,7 @@ use alloc::vec;
 use super::FrameCompressor;
 use crate::common::{MAGIC_NUM, MAX_BLOCK_SIZE};
 use crate::decoding::FrameDecoder;
-use crate::encoding::test_input::TestInput;
+use crate::encoding::block_input::BlockInput;
 use crate::encoding::{HistoryBuf, Matcher, Sequence};
 use alloc::vec::Vec;
 
@@ -29,14 +29,14 @@ fn generate_data(seed: u64, len: usize) -> Vec<u8> {
 // library crate never links libzstd.
 
 struct NoDictionaryMatcher {
-    input: TestInput,
+    input: BlockInput,
     window_size: u64,
 }
 
 impl NoDictionaryMatcher {
     fn new(window_size: u64) -> Self {
         Self {
-            input: TestInput::default(),
+            input: BlockInput::default(),
             window_size,
         }
     }
@@ -85,7 +85,7 @@ impl Matcher for NoDictionaryMatcher {
 /// of 4, and the rest of the block as trailing literals.
 #[cfg(target_pointer_width = "64")]
 struct OversizedLiteralsMatcher {
-    input: TestInput,
+    input: BlockInput,
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -141,7 +141,7 @@ fn a_sequence_length_past_32_bits_is_refused() {
     let data: Vec<u8> = (0..100u8).collect();
     let mut compressor = FrameCompressor::new_with_matcher(
         OversizedLiteralsMatcher {
-            input: TestInput::default(),
+            input: BlockInput::default(),
         },
         super::CompressionLevel::Default,
     );
@@ -155,7 +155,7 @@ fn a_sequence_length_past_32_bits_is_refused() {
 /// position: literals before a sequence, or sequences and trailing literals
 /// four bytes short of the block.
 struct MisreportingMatcher {
-    input: TestInput,
+    input: BlockInput,
     literals_first: bool,
 }
 
@@ -215,7 +215,7 @@ fn compress_with_misreporting_matcher(literals_first: bool) {
     let data: Vec<u8> = (0..100u8).collect();
     let mut compressor = FrameCompressor::new_with_matcher(
         MisreportingMatcher {
-            input: TestInput::default(),
+            input: BlockInput::default(),
             literals_first,
         },
         super::CompressionLevel::Default,
@@ -4444,4 +4444,27 @@ fn a_prepared_dictionary_reports_everything_it_holds() {
         "{} < {floor}",
         prepared.heap_size()
     );
+}
+
+/// The estimate taken before preparing bounds what the prepared dictionary
+/// then holds, however it was parsed: a budget sized by it must not be
+/// overrun by the allocation it was made for.
+#[test]
+fn estimated_heap_size_bounds_every_prepared_form() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let estimate = super::EncoderDictionary::estimated_heap_size(dict_raw.len());
+    let forms = [
+        super::EncoderDictionary::from_bytes(dict_raw).unwrap(),
+        super::EncoderDictionary::from_dictionary(
+            crate::decoding::Dictionary::decode_dict(dict_raw).unwrap(),
+        ),
+        super::EncoderDictionary::from_serialized_or_raw_content(&dict_raw[8..]).unwrap(),
+    ];
+    for prepared in forms {
+        assert!(
+            prepared.heap_size() <= estimate,
+            "{} > {estimate}",
+            prepared.heap_size()
+        );
+    }
 }

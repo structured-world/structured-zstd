@@ -53,6 +53,26 @@ pub(crate) unsafe fn free_boxed<T>(ptr: *mut T) {
     }
 }
 
+/// Bytes the current or last frame of a context has taken in, produced and
+/// handed out; reset when a frame starts.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct FrameProgress {
+    pub(crate) ingested: u64,
+    pub(crate) produced: u64,
+    pub(crate) flushed: u64,
+}
+
+impl FrameProgress {
+    /// A one-shot frame: all of `src_len` taken, all of `frame_len` handed out.
+    pub(crate) fn one_shot(src_len: usize, frame_len: usize) -> Self {
+        Self {
+            ingested: src_len as u64,
+            produced: frame_len as u64,
+            flushed: frame_len as u64,
+        }
+    }
+}
+
 /// Opaque compression context: what upstream keeps in a `ZSTD_CCtx`, kept
 /// here the same way, from one call to the next.
 ///
@@ -68,13 +88,18 @@ pub(crate) unsafe fn free_boxed<T>(ptr: *mut T) {
 pub struct ZSTD_CCtx {
     pub(crate) scratch: Vec<u8>,
     /// Sticky advanced parameters (`ZSTD_CCtx_setParameter` family).
-    pub(crate) params: crate::params::CCtxParams,
+    pub(crate) params: crate::cctx_params::CCtxParams,
     /// Streaming state (`ZSTD_compressStream2`), kept between frames; `None`
     /// before the first streamed frame.
     pub(crate) stream: Option<crate::streaming::CStreamState>,
     /// The one-shot compressor and the serial of the dictionary it holds
     /// (`0` = none); `None` before the first one-shot call.
     pub(crate) compressor: Option<(u64, FrameCompressor)>,
+    /// How far the current or last frame got (`ZSTD_getFrameProgression`).
+    pub(crate) progress: FrameProgress,
+    /// The buffer-less frame begun by `ZSTD_compressBegin*`, compressed on
+    /// the streaming context; `None` outside one.
+    pub(crate) bufferless: Option<crate::bufferless::BufferlessFrame>,
     /// Context-attached dictionary (`ZSTD_CCtx_loadDictionary` /
     /// `ZSTD_CCtx_refCDict` / `ZSTD_CCtx_refPrefix`), applied at every frame
     /// start by `ZSTD_compress2` / `ZSTD_compressStream2`.
@@ -123,14 +148,33 @@ pub(crate) fn set_frame_parameters(
     }
 }
 
+/// Put the block limits, the magic number and the matchers back to a plain
+/// frame's: the compressor is shared with `ZSTD_compress2`, whose sticky
+/// parameters may have set them, and the one-shot entry points do not read
+/// those (upstream runs them on `simpleApiParams`, without a sequence
+/// producer).
+pub(crate) fn plain_frame_shape(compressor: &mut FrameCompressor) {
+    compressor.set_target_block_size(None);
+    compressor.set_max_block_size(None);
+    compressor.set_magicless(false);
+    compressor.set_sequence_producer(None, false);
+}
+
 /// Opaque decompression context. Wraps a reusable [`FrameDecoder`] so its
 /// internal buffers persist across `ZSTD_decompressDCtx` calls.
 #[allow(non_camel_case_types)]
 pub struct ZSTD_DCtx {
     pub(crate) decoder: FrameDecoder,
-    /// `ZSTD_d_windowLogMax`: streaming window-size acceptance ceiling
-    /// (log2). Defaults to `ZSTD_WINDOWLOG_LIMIT_DEFAULT`.
-    pub(crate) window_log_max: core::ffi::c_int,
+    /// Streaming window-size acceptance ceiling in bytes, set as a log by
+    /// `ZSTD_d_windowLogMax` or exactly by `ZSTD_DCtx_setMaxWindowSize`.
+    /// Defaults to `1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT`.
+    pub(crate) max_window_size: u64,
+    /// `ZSTD_d_format`: frames carry no magic number. Kept here as well as in
+    /// `decoder` so a replacement decoder starts with it.
+    pub(crate) magicless: bool,
+    /// Where the buffer-less decode (`ZSTD_decompressBegin*` /
+    /// `ZSTD_decompressContinue`) stands.
+    pub(crate) bufferless: crate::bufferless::BufferlessDecode,
     /// Whether the streaming decoder sits at a frame boundary (the next
     /// `ZSTD_decompressStream` input starts a new frame). `true` initially.
     pub(crate) stream_frame_done: bool,
@@ -155,11 +199,26 @@ pub struct ZSTD_DCtx {
 pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
     try_box(ZSTD_CCtx {
         scratch: Vec::new(),
-        params: crate::params::CCtxParams::default(),
+        params: crate::cctx_params::CCtxParams::default(),
         stream: None,
         compressor: None,
+        progress: FrameProgress::default(),
+        bufferless: None,
         attached_dict: crate::attach::CCtxDictAttach::None,
     })
+}
+
+/// `ZSTD_CCtx* ZSTD_createCCtx_advanced(ZSTD_customMem customMem)` —
+/// [`ZSTD_createCCtx`]; custom allocators are not supported, so anything but
+/// `ZSTD_defaultCMem` returns `NULL`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_createCCtx_advanced(
+    custom_mem: crate::cdict::ZSTD_customMem,
+) -> *mut ZSTD_CCtx {
+    if !custom_mem.is_default() {
+        return core::ptr::null_mut();
+    }
+    ZSTD_createCCtx()
 }
 
 impl ZSTD_CCtx {
@@ -179,13 +238,33 @@ impl ZSTD_CCtx {
         if self.stream_in_progress() {
             self.stream = None;
         }
+        self.bufferless = None;
         self.params.pledged_src_size = crate::params::CONTENTSIZE_UNKNOWN;
+    }
+
+    /// Start a one-shot frame over `src_len` bytes: refused while a streamed
+    /// frame is unfinished, whose pledge it would otherwise take. The pledge is
+    /// single-use, consumed here whatever the outcome; with all the input in
+    /// hand the real size drives the header, but a pledge that disagrees is a
+    /// contract violation (upstream `srcSize_wrong`).
+    pub(crate) fn begin_one_shot(&mut self, src_len: usize) -> Result<(), ZSTD_ErrorCode> {
+        if self.stream_in_progress() {
+            return Err(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
+        }
+        let pledged = core::mem::replace(
+            &mut self.params.pledged_src_size,
+            crate::params::CONTENTSIZE_UNKNOWN,
+        );
+        if pledged != crate::params::CONTENTSIZE_UNKNOWN && pledged != src_len as u64 {
+            return Err(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
+        }
+        Ok(())
     }
 
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
     /// dictionary references, including the ones the kept compressors hold.
     pub(crate) fn reset_parameters(&mut self) {
-        self.params = crate::params::CCtxParams::default();
+        self.params = crate::cctx_params::CCtxParams::default();
         self.replace_attached_dict(crate::attach::CCtxDictAttach::None);
         // A `*_usingCDict` call's dictionary is not an attachment, and goes too.
         if let Some((held, compressor)) = &mut self.compressor
@@ -295,7 +374,7 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
         // Upstream ZSTD_compressCCtx defaults ZSTD_c_checksumFlag = 0; match it.
         enc.set_content_checksum(false);
         enc.set_content_size_flag(true);
-        enc.set_target_block_size(None);
+        plain_frame_shape(enc);
         scratch.clear();
         enc.compress_independent_frame_into(src, scratch);
         Ok(())
@@ -316,46 +395,19 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
     }
     let dst = unsafe { out_slice(dst, dst_capacity) };
     dst[..len].copy_from_slice(&cctx.scratch);
+    cctx.progress = FrameProgress::one_shot(src.len(), len);
     len
 }
 
-/// `size_t ZSTD_compress2(ZSTD_CCtx* cctx, void* dst, size_t dstCapacity,
-/// const void* src, size_t srcSize)` — one-shot compression driven entirely
-/// by the sticky advanced parameters (`ZSTD_CCtx_set*`); always starts a new
-/// frame.
-///
-/// # Safety
-/// `cctx` must be live; `dst`/`src` valid for their lengths (or `NULL`+0).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ZSTD_compress2(
-    cctx: *mut ZSTD_CCtx,
-    dst: *mut u8,
-    dst_capacity: usize,
-    src: *const u8,
-    src_size: usize,
-) -> usize {
-    if cctx.is_null() {
-        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
-    }
-    let cctx = unsafe { &mut *cctx };
-    if cctx.stream_in_progress() {
-        // A one-shot frame would interleave with the unfinished streaming
-        // frame on this context (and consume its pledge); the stream must
-        // be ended or the session reset first.
-        return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
-    }
-    let src = unsafe { in_slice(src, src_size) };
-    // The pledge is single-use: consumed by this frame regardless of
-    // outcome. With all input present in one call the actual srcSize drives
-    // the header, but a mismatching explicit pledge is a contract violation
-    // (upstream `srcSizeWrong`).
-    let pledged = core::mem::replace(
-        &mut cctx.params.pledged_src_size,
-        crate::params::CONTENTSIZE_UNKNOWN,
-    );
-    if pledged != crate::params::CONTENTSIZE_UNKNOWN && pledged != src_size as u64 {
-        return encode(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
-    }
+/// Compress `src` into `cctx.scratch` as one frame under the sticky
+/// parameters and the attached dictionary (the frame of `ZSTD_compress2`),
+/// recording the parse it takes into `capture` when one is given.
+pub(crate) fn compress_sticky_frame(
+    cctx: &mut ZSTD_CCtx,
+    src: &[u8],
+    capture: Option<&mut Vec<codec::encoding::sequences::ExternalSequence>>,
+) -> Result<(), ZSTD_ErrorCode> {
+    cctx.begin_one_shot(src.len())?;
     // A referenced CDict's compression parameters are authoritative
     // (upstream rule), so the sticky knobs are resolved — and can reject —
     // only when they will actually drive the frame; an unsupported sticky
@@ -363,10 +415,7 @@ pub unsafe extern "C" fn ZSTD_compress2(
     // All the input is here, so the frame's size is known and decides whether a
     // referenced CDict's parameters still describe it.
     let src_size = Some(src.len() as u64);
-    let frame_params = match cctx.frame_parameters(src_size) {
-        Ok(frame_params) => frame_params,
-        Err(code) => return encode(code),
-    };
+    let frame_params = cctx.frame_parameters(src_size)?;
     let params = cctx.params;
     let level = cctx.attach_level(src_size);
     let serial = cctx.attach_serial();
@@ -388,23 +437,58 @@ pub unsafe extern "C" fn ZSTD_compress2(
         // The kept compressor outlives parameter changes: clear the cap
         // explicitly when the sticky knob is back at 0 (auto), or a cap set
         // by an earlier call would silently survive.
-        enc.set_target_block_size(
-            (params.target_cblock_size > 0).then_some(params.target_cblock_size as u32),
-        );
+        enc.set_target_block_size(params.target_block_size());
+        enc.set_max_block_size(params.max_block_size());
+        enc.set_magicless(params.magicless);
+        let (producer, fallback) = params.sequence_producer();
+        enc.set_sequence_producer(producer, fallback);
+        enc.set_sequence_capture(capture.is_some());
         scratch.clear();
         enc.compress_independent_frame_into(src, scratch);
+        if let Some(capture) = capture {
+            *capture = enc.take_captured_sequences();
+            enc.set_sequence_capture(false);
+        }
+        // Without fallback a producer failure fails the frame, as upstream's
+        // `ZSTD_buildSeqStore` returns it (zstd_compress.c:3396).
+        if enc.take_sequence_producer_failure() {
+            return Err(ZSTD_ErrorCode::ZSTD_error_sequenceProducer_failed);
+        }
         Ok(())
     }));
     match outcome {
-        Ok(Ok(())) => {}
-        // A refused dictionary leaves the kept compressor as it was.
-        Ok(Err(code)) => return encode(code),
+        Ok(result) => result,
         Err(_) => {
             // A panic can leave the kept compressor torn; the next call
             // builds a new one.
             cctx.compressor = None;
-            return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+            Err(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
+    }
+}
+
+/// `size_t ZSTD_compress2(ZSTD_CCtx* cctx, void* dst, size_t dstCapacity,
+/// const void* src, size_t srcSize)` — one-shot compression driven entirely
+/// by the sticky advanced parameters (`ZSTD_CCtx_set*`); always starts a new
+/// frame.
+///
+/// # Safety
+/// `cctx` must be live; `dst`/`src` valid for their lengths (or `NULL`+0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_compress2(
+    cctx: *mut ZSTD_CCtx,
+    dst: *mut u8,
+    dst_capacity: usize,
+    src: *const u8,
+    src_size: usize,
+) -> usize {
+    if cctx.is_null() {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    }
+    let cctx = unsafe { &mut *cctx };
+    let src = unsafe { in_slice(src, src_size) };
+    if let Err(code) = compress_sticky_frame(cctx, src, None) {
+        return encode(code);
     }
     let len = cctx.scratch.len();
     if len > dst_capacity {
@@ -416,6 +500,7 @@ pub unsafe extern "C" fn ZSTD_compress2(
     // reached the caller: a dstSize_tooSmall failure above must leave it
     // armed for the retry with a bigger buffer.
     cctx.consume_prefix();
+    cctx.progress = FrameProgress::one_shot(src.len(), len);
     len
 }
 
@@ -425,12 +510,27 @@ pub unsafe extern "C" fn ZSTD_compress2(
 pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
     try_box(ZSTD_DCtx {
         decoder: FrameDecoder::new(),
-        window_log_max: crate::params::WINDOW_LOG_LIMIT_DEFAULT,
+        max_window_size: crate::params::MAX_WINDOW_SIZE_DEFAULT,
+        magicless: false,
+        bufferless: crate::bufferless::BufferlessDecode::new(false),
         stream_frame_done: true,
         attached_ddict: crate::attach::DCtxDictAttach::None,
         ddict_serial: 0,
         ddict_handle: None,
     })
+}
+
+/// `ZSTD_DCtx* ZSTD_createDCtx_advanced(ZSTD_customMem customMem)` —
+/// [`ZSTD_createDCtx`]; custom allocators are not supported, so anything but
+/// `ZSTD_defaultCMem` returns `NULL`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_createDCtx_advanced(
+    custom_mem: crate::cdict::ZSTD_customMem,
+) -> *mut ZSTD_DCtx {
+    if !custom_mem.is_default() {
+        return core::ptr::null_mut();
+    }
+    ZSTD_createDCtx()
 }
 
 impl ZSTD_DCtx {
@@ -447,15 +547,24 @@ impl ZSTD_DCtx {
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
     /// dictionary references.
     pub(crate) fn reset_parameters(&mut self) {
-        self.window_log_max = crate::params::WINDOW_LOG_LIMIT_DEFAULT;
+        self.max_window_size = crate::params::MAX_WINDOW_SIZE_DEFAULT;
+        self.magicless = false;
+        self.bufferless = crate::bufferless::BufferlessDecode::new(false);
         // Replace the decoder to drop any loaded dictionaries; the
         // workspace re-grows on the next frame. The fresh decoder sits at
         // a frame boundary, so the streaming flag must say so too.
-        self.decoder = FrameDecoder::new();
+        self.replace_decoder();
         self.stream_frame_done = true;
-        self.ddict_serial = 0;
         self.ddict_handle = None;
         self.attached_ddict = crate::attach::DCtxDictAttach::None;
+    }
+
+    /// Start over with a fresh decoder, as after a panic that may have torn the
+    /// old one: the frame format carries over, the loaded dictionaries do not.
+    pub(crate) fn replace_decoder(&mut self) {
+        self.decoder = FrameDecoder::new();
+        self.decoder.set_magicless(self.magicless);
+        self.ddict_serial = 0;
     }
 }
 
@@ -583,9 +692,8 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
             // longer holds any previously-loaded dictionary, so clear the DDict
             // cache key too — otherwise the next ZSTD_decompress_usingDDict with
             // the same handle would skip re-loading it and decode without it.
-            dctx.decoder = FrameDecoder::new();
+            dctx.replace_decoder();
             dctx.stream_frame_done = true;
-            dctx.ddict_serial = 0;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
     }

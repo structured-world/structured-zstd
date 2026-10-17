@@ -3,6 +3,13 @@
 //! real symbol behaviour; the C-consumer link test in `tests/` is added
 //! separately and verifies a real `#include <zstd.h>` consumer.
 
+mod bufferless;
+mod cctx_params;
+mod experimental;
+mod provided;
+mod sequences;
+mod streams;
+
 use crate::cdict::{
     ZSTD_compress_usingCDict, ZSTD_createCDict, ZSTD_createDDict, ZSTD_decompress_usingDDict,
     ZSTD_freeCDict, ZSTD_freeDDict, ZSTD_getDictID_fromCDict, ZSTD_getDictID_fromDDict,

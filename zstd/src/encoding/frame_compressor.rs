@@ -152,15 +152,44 @@ impl EncoderDictionary {
     /// assert!(dictionary.heap_size() >= b"raw content, no header".len());
     /// ```
     pub fn heap_size(&self) -> usize {
-        // `Arc` and `Rc` both place two word-sized counts ahead of the value,
-        // padded to its alignment.
-        let shared = core::alloc::Layout::new::<[usize; 2]>()
+        Self::shared_allocation_size()
+            + self.inner.dictionary.heap_bytes()
+            + self.inner.entropy.heap_size()
+    }
+
+    /// Upper bound on [`Self::heap_size`] for a dictionary prepared from a
+    /// `serialized_len`-byte blob, before preparing it: for budgeting memory
+    /// ahead of time, as the C `ZSTD_estimateCDictSize` does.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::EncoderDictionary;
+    ///
+    /// let blob = b"raw content, no header";
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(blob).unwrap();
+    /// assert!(dictionary.heap_size() <= EncoderDictionary::estimated_heap_size(blob.len()));
+    /// ```
+    pub fn estimated_heap_size(serialized_len: usize) -> usize {
+        // The content is at most the blob. The tables are bounded by their
+        // largest form: every FSE table and the Huffman table at their maximum
+        // accuracy, as a dictionary's entropy section can declare them.
+        const PREPARED_TABLES_HEAP: usize = 64 * 1024;
+        // Saturating on purpose: `usize::MAX` still bounds what no allocation
+        // can exceed, where a wrapped sum would under-report.
+        Self::shared_allocation_size()
+            .saturating_add(serialized_len)
+            .saturating_add(PREPARED_TABLES_HEAP)
+    }
+
+    /// Bytes of the shared allocation itself: `Arc` and `Rc` both place two
+    /// word-sized counts ahead of the value, padded to its alignment.
+    fn shared_allocation_size() -> usize {
+        core::alloc::Layout::new::<[usize; 2]>()
             .extend(core::alloc::Layout::new::<EncoderDictionaryParts>())
             .expect("a fixed-size layout extends")
             .0
             .pad_to_align()
-            .size();
-        shared + self.inner.dictionary.heap_bytes() + self.inner.entropy.heap_size()
+            .size()
     }
 
     /// Heap bytes that `handles` alone keep alive: each distinct dictionary
@@ -231,6 +260,18 @@ impl EncoderDictionary {
     /// ```
     pub fn content_size(&self) -> usize {
         self.inner.dict_content.len()
+    }
+
+    /// The dictionary content a frame's matches can reach back into.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::EncoderDictionary;
+    ///
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(b"history").unwrap();
+    /// assert_eq!(dictionary.content(), b"history");
+    /// ```
+    pub fn content(&self) -> &[u8] {
+        &self.inner.dict_content
     }
 
     /// The dictionary id.
@@ -313,6 +354,9 @@ pub struct FrameCompressor<
     /// `target + 3` header bytes on the wire. `None` = no target (full
     /// 128 KiB blocks). Set via [`Self::set_target_block_size`].
     target_block_size: Option<u32>,
+    /// Largest block the frame may carry (upstream `ZSTD_c_maxBlockSize`),
+    /// below the format's 128 KiB. Set via [`Self::set_max_block_size`].
+    max_block_size: Option<u32>,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
     /// Block-layout introspection populated at the end of every
@@ -1272,6 +1316,9 @@ pub(crate) fn resolve_frame_params(
 
 pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
+    /// The parse every block took, recorded while this is `Some`, each block
+    /// closed by a delimiter carrying its trailing literals.
+    pub(crate) sequence_capture: Option<Vec<crate::encoding::sequences::ExternalSequence>>,
     /// Grid fingerprints of the frame's blocks, which is what tells the
     /// raw-skip that a block duplicating an earlier one is not the noise it
     /// looks like. See [`SeenContentGrid`](crate::encoding::incompressible::SeenContentGrid).
@@ -1511,6 +1558,17 @@ fn initial_all_blocks_cap(initial_size_hint: Option<u64>, block_capacity: usize)
     }
 }
 
+/// The block ceiling a target block size and a maximum block size leave
+/// together: the smaller one that is set, or the format's 128 KiB.
+pub(crate) fn block_ceiling(target: Option<u32>, max: Option<u32>) -> usize {
+    let ceiling = match (target, max) {
+        (Some(target), Some(max)) => target.min(max),
+        (Some(size), None) | (None, Some(size)) => size,
+        (None, None) => crate::common::MAX_BLOCK_SIZE,
+    };
+    ceiling as usize
+}
+
 /// Per-block feeder for `run_owned_block_loop`.
 ///
 /// `fill_block` appends source bytes to `buf` (which already holds any
@@ -1696,6 +1754,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             source_size_hint: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
+                sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huff_table_spare: None,
@@ -1723,6 +1782,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             content_size_flag: true,
             dict_id_flag: true,
             target_block_size: None,
+            max_block_size: None,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -1735,6 +1795,24 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             block_decompressed_sizes: alloc::vec::Vec::new(),
             tuning: FrameTuning::default(),
         }
+    }
+
+    /// Ask `producer` for each block's parse in place of the built-in
+    /// matchers; `None` removes it. With `fallback` a block the producer fails
+    /// on is matched as usual; without, it goes out uncompressed and
+    /// [`Self::take_sequence_producer_failure`] reports it.
+    pub fn set_sequence_producer(
+        &mut self,
+        producer: Option<alloc::boxed::Box<dyn crate::encoding::sequences::SequenceProducer>>,
+        fallback: bool,
+    ) {
+        self.state.matcher.set_sequence_producer(producer, fallback);
+    }
+
+    /// Whether a block went out uncompressed because the producer failed on it
+    /// with no fallback, since this was last asked.
+    pub fn take_sequence_producer_failure(&mut self) -> bool {
+        self.state.matcher.take_producer_failure()
     }
 
     /// Configure fine-grained compression parameters.
@@ -2135,6 +2213,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             source_size_hint: None,
             state: CompressState {
                 matcher,
+                sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huff_table_spare: None,
@@ -2163,6 +2242,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             content_size_flag: true,
             dict_id_flag: true,
             target_block_size: None,
+            max_block_size: None,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -2235,12 +2315,71 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         });
     }
 
-    /// The active block-size cap: the configured target, or the format's
-    /// 128 KiB block ceiling.
+    /// Cap every block of the frame at `size` bytes (semantics of upstream
+    /// `ZSTD_c_maxBlockSize`), for a decoder that holds only that much of a
+    /// block at a time. Clamped to `[MIN_MAX_BLOCK_SIZE, MAX_BLOCK_SIZE]`;
+    /// `None` restores the format's 128 KiB. Combines with
+    /// [`Self::set_target_block_size`]: the smaller of the two applies.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+    ///
+    /// let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    /// compressor.set_max_block_size(Some(1024));
+    /// let mut frame = Vec::new();
+    /// compressor.set_source(&[7u8; 4096][..]);
+    /// compressor.set_drain(&mut frame);
+    /// compressor.compress();
+    /// ```
+    pub fn set_max_block_size(&mut self, size: Option<u32>) {
+        self.max_block_size = size.map(|s| {
+            s.clamp(
+                crate::common::MIN_MAX_BLOCK_SIZE,
+                crate::common::MAX_BLOCK_SIZE,
+            )
+        });
+    }
+
+    /// Record the parse every block takes, from the next one on, until turned
+    /// off: its sequences with plain offsets, each block closed by a delimiter
+    /// carrying its trailing literals, and a block written out unsearched as a
+    /// delimiter alone (C `ZSTD_generateSequences`). The frames themselves are
+    /// unchanged.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+    ///
+    /// let input = b"capture capture capture capture".repeat(10);
+    /// let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    /// compressor.set_sequence_capture(true);
+    /// compressor.compress_independent_frame(&input);
+    /// let parse = compressor.take_captured_sequences();
+    /// let covered: usize = parse.iter().map(|s| (s.lit_len + s.match_len) as usize).sum();
+    /// assert_eq!(covered, input.len());
+    /// ```
+    pub fn set_sequence_capture(&mut self, capture: bool) {
+        self.state.sequence_capture = capture.then(Vec::new);
+    }
+
+    /// The parse recorded since [`Self::set_sequence_capture`] turned it on,
+    /// or since it was last taken; empty when nothing records it.
+    pub fn take_captured_sequences(&mut self) -> Vec<crate::encoding::sequences::ExternalSequence> {
+        self.state
+            .sequence_capture
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// The configured block ceiling before the window is considered: the
+    /// smaller of the target and the maximum, or the format's 128 KiB.
+    fn block_ceiling(&self) -> usize {
+        block_ceiling(self.target_block_size, self.max_block_size)
+    }
+
+    /// The active block-size cap: the configured ceiling, held to the window.
     fn block_capacity(&self) -> usize {
-        let requested = self
-            .target_block_size
-            .map_or(crate::common::MAX_BLOCK_SIZE as usize, |t| t as usize);
+        let requested = self.block_ceiling();
         // Upstream zstd sizes a block as `MIN(maxBlockSize, windowSize)`
         // (`ZSTD_compress.c`). A block wider than the window can never be
         // held by the matcher, which asserts on it, so a small `window_log`
@@ -2503,9 +2642,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             self.state.matcher.set_dictionary_size_hint(dict.sizes());
         }
         // Clearing buffers to allow re-using of the compressor
-        let block_target = self
-            .target_block_size
-            .map_or(crate::common::MAX_BLOCK_SIZE as usize, |t| t as usize);
+        let block_target = self.block_ceiling();
         // Raw frames emit straight from the staged buffer and never consult
         // the match finder, so they keep no history.
         let ingest = if matches!(self.compression_level, CompressionLevel::Uncompressed) {

@@ -166,6 +166,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         }
         state.matcher.commit_filled(block_len);
         state.matcher.skip_matching_with_hint(Some(false));
+        record_unsearched_block(state, block_size);
         let header = BlockHeader {
             last_block,
             block_type: BlockType::RLE,
@@ -186,6 +187,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         }
         state.matcher.commit_filled(block_len);
         state.matcher.skip_matching_with_hint(Some(true));
+        record_unsearched_block(state, block_size);
         let header = BlockHeader {
             last_block,
             block_type: BlockType::Raw,
@@ -277,6 +279,17 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             output[hdr_off..hdr_off + 3].copy_from_slice(&header.to_le_bytes());
             BlockType::Compressed
         }
+    }
+}
+
+/// A block written out unsearched parses as literals alone: one delimiter
+/// carrying all of it, when the parse is being recorded.
+#[inline]
+fn record_unsearched_block<M: Matcher>(state: &mut CompressState<M>, block_size: u32) {
+    if let Some(capture) = state.sequence_capture.as_mut() {
+        capture.push(crate::encoding::sequences::ExternalSequence::delimiter(
+            block_size,
+        ));
     }
 }
 
@@ -375,6 +388,7 @@ pub(crate) fn compress_block_encoded_borrowed(
         }
         state.matcher.set_borrowed_block(block_start, block_end);
         state.matcher.skip_matching_with_hint(Some(false));
+        record_unsearched_block(state, block_size);
         let header = BlockHeader {
             last_block,
             block_type: BlockType::RLE,
@@ -394,6 +408,7 @@ pub(crate) fn compress_block_encoded_borrowed(
         }
         state.matcher.set_borrowed_block(block_start, block_end);
         state.matcher.skip_matching_with_hint(Some(true));
+        record_unsearched_block(state, block_size);
         let header = BlockHeader {
             last_block,
             block_type: BlockType::Raw,

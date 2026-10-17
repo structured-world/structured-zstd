@@ -80,15 +80,15 @@ pub(crate) mod lazy_parse;
 // `prepare_ldm_candidates` unconditionally because the gating is internal to
 // the method body (without the feature it shrinks to an
 // `ldm_sequences.clear()` stub).
+pub(crate) mod block_input;
 #[cfg(feature = "ldm")]
 pub(crate) mod ldm;
 pub(crate) mod match_table;
 pub(crate) mod opt;
 pub(crate) mod row;
+pub mod sequences;
 pub(crate) mod simple;
 pub(crate) mod strategy;
-#[cfg(test)]
-pub(crate) mod test_input;
 pub(crate) mod workspace;
 
 pub(crate) mod frame_compressor;

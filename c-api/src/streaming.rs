@@ -50,17 +50,17 @@ const ZSTD_E_END: c_int = 2;
 /// context's match-finder tables, buffers and dictionary are built once.
 pub(crate) struct CStreamState {
     /// Compresses every streamed frame, writing straight into `pending`.
-    context: CompressionContext,
+    pub(crate) context: CompressionContext,
     /// Serial of the dictionary attached to `context` (`0` = none), so the
     /// same dictionary on the next frame is not attached again.
     dictionary: u64,
     /// Whether a frame is taking input: from its first call until
     /// `ZSTD_e_end` closes it.
-    open: bool,
+    pub(crate) open: bool,
     /// Frame bytes produced but not yet copied out to the caller.
-    pending: Vec<u8>,
+    pub(crate) pending: Vec<u8>,
     /// Read offset into `pending`.
-    pending_pos: usize,
+    pub(crate) pending_pos: usize,
 }
 
 impl CStreamState {
@@ -91,6 +91,11 @@ impl CStreamState {
     /// it still to be copied out.
     pub(crate) fn in_frame(&self) -> bool {
         self.open || self.pending_remaining() > 0
+    }
+
+    /// Identity of the dictionary the kept context holds (`0` = none).
+    pub(crate) fn dictionary_serial(&self) -> u64 {
+        self.dictionary
     }
 
     /// Detach the dictionary `serial` names from the context, if that is the
@@ -160,49 +165,90 @@ impl ZSTD_CCtx {
             attached_dict,
             ..
         } = self;
-        let state =
-            stream.get_or_insert_with(|| CStreamState::new(CompressionLevel::from_level(level)));
-        let mut setup = || -> Result<(), codec::io::Error> {
-            let context = &mut state.context;
-            // The attached dictionary goes onto the kept context only when it
-            // is not the one already there.
-            if state.dictionary != serial {
-                match attached_dict.prepared() {
-                    Some(dictionary) => context.set_encoder_dictionary(dictionary.clone())?,
-                    None => context.set_dictionary_from_bytes(&[])?,
-                }
-                state.dictionary = serial;
-            }
-            match &frame_params {
-                Some(frame_params) => context.set_parameters(frame_params)?,
-                None => context.set_compression_level(CompressionLevel::from_level(level))?,
-            }
-            context.set_content_checksum(params.checksum_flag)?;
-            context.set_target_block_size(
-                (params.target_cblock_size > 0).then_some(params.target_cblock_size as u32),
-            )?;
-            // The pledge is single-use (consumed by this frame). It is
-            // always enforced against the bytes actually written; the
-            // content-size flag only controls whether the header carries
-            // the FCS field (upstream validates the pledge at frame end
-            // regardless of the flag).
-            if params.pledged_src_size != CONTENTSIZE_UNKNOWN {
-                context.set_pledged_content_size(params.pledged_src_size)?;
-            }
-            context.set_content_size_flag(params.content_size_flag)?;
-            // A raw-content dictionary's synthetic ID never reaches the wire.
-            context.set_dictionary_id_flag(params.dict_id_flag && !suppress_id)?;
-            Ok(())
+        let setup = FrameSetup {
+            params: &params,
+            frame_params: frame_params.as_ref(),
+            level,
+            dictionary: attached_dict.prepared(),
+            serial,
+            suppress_id,
         };
-        if setup().is_err() {
-            // A context that refuses its settings is not trusted with the
-            // next frame either.
+        CStreamState::open_frame(stream, &setup)?;
+        self.progress = crate::context::FrameProgress::default();
+        self.params.pledged_src_size = CONTENTSIZE_UNKNOWN;
+        self.consume_prefix();
+        Ok(())
+    }
+}
+
+/// What the next frame on the kept streaming context runs under.
+pub(crate) struct FrameSetup<'a> {
+    /// Flags, block limits, format, hint and pledge.
+    pub(crate) params: &'a crate::cctx_params::CCtxParams,
+    /// Explicit parameters, or `None` for `level`'s own tuning.
+    pub(crate) frame_params: Option<&'a codec::encoding::CompressionParameters>,
+    pub(crate) level: c_int,
+    pub(crate) dictionary: Option<&'a codec::encoding::EncoderDictionary>,
+    /// Identity of `dictionary` (`0` = none), so the same one is not attached
+    /// to the kept context twice.
+    pub(crate) serial: u64,
+    /// A raw-content dictionary's synthetic ID never reaches the wire.
+    pub(crate) suppress_id: bool,
+}
+
+impl CStreamState {
+    /// Put the context in `stream`, made at `setup.level` when there is none,
+    /// on `setup` and open its next frame. A context that refuses a setting is
+    /// dropped: it is not trusted with the next frame either.
+    pub(crate) fn open_frame<'s>(
+        stream: &'s mut Option<CStreamState>,
+        setup: &FrameSetup<'_>,
+    ) -> Result<&'s mut CStreamState, ZSTD_ErrorCode> {
+        let state = stream
+            .get_or_insert_with(|| CStreamState::new(CompressionLevel::from_level(setup.level)));
+        if state.configure(setup).is_err() {
             *stream = None;
             return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC);
         }
+        let state = stream.as_mut().expect("configured just above");
         state.open = true;
-        self.params.pledged_src_size = CONTENTSIZE_UNKNOWN;
-        self.consume_prefix();
+        Ok(state)
+    }
+
+    fn configure(&mut self, setup: &FrameSetup<'_>) -> Result<(), codec::io::Error> {
+        let params = setup.params;
+        let context = &mut self.context;
+        if self.dictionary != setup.serial {
+            match setup.dictionary {
+                Some(dictionary) => context.set_encoder_dictionary(dictionary.clone())?,
+                None => context.set_dictionary_from_bytes(&[])?,
+            }
+            self.dictionary = setup.serial;
+        }
+        match setup.frame_params {
+            Some(frame_params) => context.set_parameters(frame_params)?,
+            None => context.set_compression_level(CompressionLevel::from_level(setup.level))?,
+        }
+        context.set_content_checksum(params.checksum_flag)?;
+        context.set_target_block_size(params.target_block_size())?;
+        context.set_max_block_size(params.max_block_size())?;
+        context.set_magicless(params.magicless)?;
+        // The hint is a parameter: it stays for every frame until changed.
+        match params.src_size_hint {
+            0 => context.clear_source_size_hint()?,
+            hint => context.set_source_size_hint(hint as u64)?,
+        }
+        // The pledge is single-use (consumed by this frame). It is always
+        // enforced against the bytes actually written; the content-size flag
+        // only controls whether the header carries the FCS field (upstream
+        // validates the pledge at frame end regardless of the flag).
+        if params.pledged_src_size != CONTENTSIZE_UNKNOWN {
+            context.set_pledged_content_size(params.pledged_src_size)?;
+        }
+        context.set_content_size_flag(params.content_size_flag)?;
+        context.set_dictionary_id_flag(params.dict_id_flag && !setup.suppress_id)?;
+        let (producer, fallback) = params.sequence_producer();
+        context.set_sequence_producer(producer, fallback);
         Ok(())
     }
 }
@@ -211,6 +257,24 @@ impl ZSTD_CCtx {
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_createCStream() -> *mut ZSTD_CCtx {
     crate::context::ZSTD_createCCtx()
+}
+
+/// `ZSTD_CStream* ZSTD_createCStream_advanced(ZSTD_customMem customMem)` —
+/// same object as a `ZSTD_CCtx`, see `ZSTD_createCCtx_advanced`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_createCStream_advanced(
+    custom_mem: crate::cdict::ZSTD_customMem,
+) -> *mut ZSTD_CCtx {
+    crate::context::ZSTD_createCCtx_advanced(custom_mem)
+}
+
+/// `ZSTD_DStream* ZSTD_createDStream_advanced(ZSTD_customMem customMem)` —
+/// same object as a `ZSTD_DCtx`, see `ZSTD_createDCtx_advanced`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_createDStream_advanced(
+    custom_mem: crate::cdict::ZSTD_customMem,
+) -> *mut ZSTD_DCtx {
+    crate::context::ZSTD_createDCtx_advanced(custom_mem)
 }
 
 /// `size_t ZSTD_freeCStream(ZSTD_CStream* zcs)` — `NULL` is a no-op.
@@ -320,6 +384,9 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
     let attached = cctx.attach_serial();
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<usize, ZSTD_ErrorCode> {
         let stream = cctx.stream.as_mut().expect("ensure_stream installed state");
+        let progress = &mut cctx.progress;
+        let pending_before = stream.pending.len();
+        let input_before = inp.pos;
         // Consume ALL remaining input: the in-memory output has no
         // backpressure, so a write never short-counts on its account.
         if inp.pos < inp.size {
@@ -379,11 +446,28 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
             }
             _ => {}
         }
+        // Without fallback a producer failure fails the frame, as upstream's
+        // `ZSTD_buildSeqStore` returns it (zstd_compress.c:3396).
+        if stream.context.take_sequence_producer_failure() {
+            return Err(ZSTD_ErrorCode::ZSTD_error_sequenceProducer_failed);
+        }
+        // Nothing drains `pending` before `copy_out`, so what it grew by is
+        // what this call produced.
+        progress.ingested += (inp.pos - input_before) as u64;
+        progress.produced += (stream.pending.len() - pending_before) as u64;
+        let flushed_before = out.pos;
         stream.copy_out(out, dst);
+        progress.flushed += (out.pos - flushed_before) as u64;
         Ok(stream.pending_remaining())
     }));
     match outcome {
         Ok(Ok(remaining)) => remaining,
+        Ok(Err(ZSTD_ErrorCode::ZSTD_error_sequenceProducer_failed)) => {
+            // The frame is lost: the next call starts a new one, as after the
+            // reset upstream requires.
+            cctx.stream = None;
+            encode(ZSTD_ErrorCode::ZSTD_error_sequenceProducer_failed)
+        }
         Ok(Err(code)) => encode(code),
         Err(_) => {
             // A panic mid-stream leaves the encoder state undefined; drop it
@@ -407,15 +491,265 @@ pub unsafe extern "C" fn ZSTD_initCStream(zcs: *mut ZSTD_CCtx, compression_level
     }
     let cctx = unsafe { &mut *zcs };
     cctx.reset_session();
-    // Legacy init clears any previously loaded dictionary, in the kept
+    // This init clears any previously loaded dictionary, in the kept
     // compressors too.
     cctx.replace_attached_dict(crate::attach::CCtxDictAttach::None);
-    cctx.params.level = if compression_level == 0 {
-        3
+    set_level(cctx, compression_level)
+}
+
+/// Store `level` as `ZSTD_CCtx_setParameter(ZSTD_c_compressionLevel)` would.
+fn set_level(cctx: &mut ZSTD_CCtx, level: c_int) -> usize {
+    match cctx
+        .params
+        .set(crate::params::ZSTD_C_COMPRESSION_LEVEL, level)
+    {
+        Ok(()) => 0,
+        Err(code) => encode(code),
+    }
+}
+
+/// The pledged-size argument of the older init functions, where `0` still
+/// means "unknown".
+fn pledge_from(pledged_src_size: u64) -> u64 {
+    if pledged_src_size == 0 {
+        CONTENTSIZE_UNKNOWN
     } else {
-        compression_level
+        pledged_src_size
+    }
+}
+
+/// `size_t ZSTD_initCStream_srcSize(ZSTD_CStream* zcs, int compressionLevel,
+/// unsigned long long pledgedSrcSize)` — [`ZSTD_initCStream`] with the size of
+/// the next frame pledged (`0` = unknown).
+///
+/// # Safety
+/// `zcs` must be a live pointer from `ZSTD_createCStream`, or `NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_initCStream_srcSize(
+    zcs: *mut ZSTD_CCtx,
+    compression_level: c_int,
+    pledged_src_size: u64,
+) -> usize {
+    let rc = unsafe { ZSTD_initCStream(zcs, compression_level) };
+    if crate::error::result_is_error(rc) {
+        return rc;
+    }
+    unsafe { crate::params::ZSTD_CCtx_setPledgedSrcSize(zcs, pledge_from(pledged_src_size)) }
+}
+
+/// `size_t ZSTD_initCStream_usingDict(ZSTD_CStream* zcs, const void* dict,
+/// size_t dictSize, int compressionLevel)` — start a session at
+/// `compressionLevel` with `dict` loaded (none when empty).
+///
+/// # Safety
+/// `zcs` must be live or `NULL`; `dict` valid for `dict_size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_initCStream_usingDict(
+    zcs: *mut ZSTD_CCtx,
+    dict: *const u8,
+    dict_size: usize,
+    compression_level: c_int,
+) -> usize {
+    let Some(cctx) = (unsafe { zcs.as_mut() }) else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     };
+    cctx.reset_session();
+    let rc = set_level(cctx, compression_level);
+    if crate::error::result_is_error(rc) {
+        return rc;
+    }
+    unsafe { crate::attach::ZSTD_CCtx_loadDictionary(zcs, dict, dict_size) }
+}
+
+/// `size_t ZSTD_initCStream_advanced(ZSTD_CStream* zcs, const void* dict,
+/// size_t dictSize, ZSTD_parameters params, unsigned long long
+/// pledgedSrcSize)` — start a session under explicit compression and frame
+/// parameters with `dict` loaded. A `0` pledge means "unknown" only when the
+/// frame parameters leave the content size out.
+///
+/// # Safety
+/// `zcs` must be live or `NULL`; `dict` valid for `dict_size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_initCStream_advanced(
+    zcs: *mut ZSTD_CCtx,
+    dict: *const u8,
+    dict_size: usize,
+    params: crate::params::ZSTD_parameters,
+    pledged_src_size: u64,
+) -> usize {
+    let Some(cctx) = (unsafe { zcs.as_mut() }) else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    };
+    let pledged = if pledged_src_size == 0 && params.fParams.contentSizeFlag == 0 {
+        CONTENTSIZE_UNKNOWN
+    } else {
+        pledged_src_size
+    };
+    cctx.reset_session();
+    cctx.params.pledged_src_size = pledged;
+    let checked = crate::params::ZSTD_checkCParams(params.cParams);
+    if crate::error::result_is_error(checked) {
+        return checked;
+    }
+    cctx.params.set_explicit(&params.cParams, &params.fParams);
+    unsafe { crate::attach::ZSTD_CCtx_loadDictionary(zcs, dict, dict_size) }
+}
+
+/// `size_t ZSTD_initCStream_usingCDict(ZSTD_CStream* zcs, const ZSTD_CDict*
+/// cdict)` — start a session referencing `cdict` (none when `NULL`).
+///
+/// # Safety
+/// `zcs` must be live or `NULL`; `cdict` live or `NULL`, outliving the session.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_initCStream_usingCDict(
+    zcs: *mut ZSTD_CCtx,
+    cdict: *const crate::cdict::ZSTD_CDict,
+) -> usize {
+    let Some(cctx) = (unsafe { zcs.as_mut() }) else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    };
+    cctx.reset_session();
+    unsafe { crate::attach::ZSTD_CCtx_refCDict(zcs, cdict) }
+}
+
+/// `size_t ZSTD_initCStream_usingCDict_advanced(ZSTD_CStream* zcs, const
+/// ZSTD_CDict* cdict, ZSTD_frameParameters fParams, unsigned long long
+/// pledgedSrcSize)` — [`ZSTD_initCStream_usingCDict`] with frame parameters
+/// and the next frame's size.
+///
+/// # Safety
+/// As [`ZSTD_initCStream_usingCDict`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_initCStream_usingCDict_advanced(
+    zcs: *mut ZSTD_CCtx,
+    cdict: *const crate::cdict::ZSTD_CDict,
+    fparams: crate::cdict::ZSTD_frameParameters,
+    pledged_src_size: u64,
+) -> usize {
+    let Some(cctx) = (unsafe { zcs.as_mut() }) else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    };
+    cctx.reset_session();
+    cctx.params.pledged_src_size = pledged_src_size;
+    cctx.params.content_size_flag = fparams.contentSizeFlag != 0;
+    cctx.params.checksum_flag = fparams.checksumFlag != 0;
+    cctx.params.dict_id_flag = fparams.noDictIDFlag == 0;
+    unsafe { crate::attach::ZSTD_CCtx_refCDict(zcs, cdict) }
+}
+
+/// `size_t ZSTD_resetCStream(ZSTD_CStream* zcs, unsigned long long
+/// pledgedSrcSize)` — abandon any frame in flight and pledge the next one's
+/// size (`0` = unknown); parameters and dictionary stay.
+///
+/// # Safety
+/// `zcs` must be a live pointer from `ZSTD_createCStream`, or `NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_resetCStream(zcs: *mut ZSTD_CCtx, pledged_src_size: u64) -> usize {
+    let Some(cctx) = (unsafe { zcs.as_mut() }) else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    };
+    cctx.reset_session();
+    cctx.params.pledged_src_size = pledge_from(pledged_src_size);
     0
+}
+
+/// `size_t ZSTD_compressStream2_simpleArgs(ZSTD_CCtx* cctx, void* dst, size_t
+/// dstCapacity, size_t* dstPos, const void* src, size_t srcSize, size_t*
+/// srcPos, ZSTD_EndDirective endOp)` — [`ZSTD_compressStream2`] with the
+/// buffer structs spelled out as arguments.
+///
+/// # Safety
+/// As [`ZSTD_compressStream2`]; `dst_pos` / `src_pos` must be valid.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)] // the C signature
+pub unsafe extern "C" fn ZSTD_compressStream2_simpleArgs(
+    cctx: *mut ZSTD_CCtx,
+    dst: *mut c_void,
+    dst_capacity: usize,
+    dst_pos: *mut usize,
+    src: *const c_void,
+    src_size: usize,
+    src_pos: *mut usize,
+    end_op: c_int,
+) -> usize {
+    if dst_pos.is_null() || src_pos.is_null() {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    }
+    let mut output = ZSTD_outBuffer {
+        dst,
+        size: dst_capacity,
+        pos: unsafe { *dst_pos },
+    };
+    let mut input = ZSTD_inBuffer {
+        src,
+        size: src_size,
+        pos: unsafe { *src_pos },
+    };
+    let rc = unsafe { ZSTD_compressStream2(cctx, &mut output, &mut input, end_op) };
+    unsafe {
+        *dst_pos = output.pos;
+        *src_pos = input.pos;
+    }
+    rc
+}
+
+/// `ZSTD_frameProgression` — ABI mirror: bytes taken in, compressed, produced
+/// and handed out for the current frame, plus the worker fields a
+/// single-threaded context leaves at 0.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[allow(non_camel_case_types, non_snake_case)]
+pub struct ZSTD_frameProgression {
+    pub ingested: u64,
+    pub consumed: u64,
+    pub produced: u64,
+    pub flushed: u64,
+    pub currentJobID: core::ffi::c_uint,
+    pub nbActiveWorkers: core::ffi::c_uint,
+}
+
+/// `ZSTD_frameProgression ZSTD_getFrameProgression(const ZSTD_CCtx* cctx)` —
+/// how far the frame in progress, or the last one, has got. Input waiting for
+/// its block to fill counts as ingested but not yet consumed.
+///
+/// # Safety
+/// `cctx` must be a live pointer from `ZSTD_createCCtx`, or `NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_getFrameProgression(cctx: *const ZSTD_CCtx) -> ZSTD_frameProgression {
+    let mut report = ZSTD_frameProgression {
+        ingested: 0,
+        consumed: 0,
+        produced: 0,
+        flushed: 0,
+        currentJobID: 0,
+        nbActiveWorkers: 0,
+    };
+    let Some(cctx) = (unsafe { cctx.as_ref() }) else {
+        return report;
+    };
+    let buffered = cctx
+        .stream
+        .as_ref()
+        .filter(|stream| stream.open)
+        .map_or(0, |stream| stream.context.buffered_input_len() as u64);
+    report.ingested = cctx.progress.ingested;
+    report.consumed = cctx.progress.ingested - buffered;
+    report.produced = cctx.progress.produced;
+    report.flushed = cctx.progress.flushed;
+    report
+}
+
+/// `size_t ZSTD_toFlushNow(ZSTD_CCtx* cctx)` — compressed bytes ready to be
+/// copied out right now: what the last call produced and the output buffer
+/// could not take.
+///
+/// # Safety
+/// `cctx` must be a live pointer from `ZSTD_createCCtx`, or `NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_toFlushNow(cctx: *mut ZSTD_CCtx) -> usize {
+    unsafe { cctx.as_ref() }
+        .and_then(|cctx| cctx.stream.as_ref())
+        .map_or(0, CStreamState::pending_remaining)
 }
 
 /// `size_t ZSTD_compressStream(ZSTD_CStream* zcs, ZSTD_outBuffer* output,
@@ -511,19 +845,119 @@ pub extern "C" fn ZSTD_DStreamOutSize() -> usize {
     BLOCK_SIZE_MAX
 }
 
-/// `size_t ZSTD_initDStream(ZSTD_DStream* zds)` — legacy session reset;
-/// returns the recommended first input size.
+/// The first read a fresh decoding session asks for: enough to learn the
+/// frame header's length (magic number and descriptor, upstream
+/// `ZSTD_startingInputLength`).
+fn starting_input_length(dctx: &ZSTD_DCtx) -> usize {
+    if dctx.magicless { 1 } else { 5 }
+}
+
+/// `size_t ZSTD_initDStream(ZSTD_DStream* zds)` — start a decoding session
+/// without a dictionary; returns the first read size.
 ///
 /// # Safety
 /// `zds` must be a live pointer from `ZSTD_createDStream`, or `NULL`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_initDStream(zds: *mut ZSTD_DCtx) -> usize {
-    if zds.is_null() {
+    unsafe { ZSTD_initDStream_usingDDict(zds, core::ptr::null()) }
+}
+
+/// `size_t ZSTD_initDStream_usingDict(ZSTD_DStream* zds, const void* dict,
+/// size_t dictSize)` — start a decoding session with `dict` loaded (none when
+/// empty); returns the first read size.
+///
+/// # Safety
+/// `zds` must be live or `NULL`; `dict` valid for `dict_size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_initDStream_usingDict(
+    zds: *mut ZSTD_DCtx,
+    dict: *const u8,
+    dict_size: usize,
+) -> usize {
+    let Some(dctx) = (unsafe { zds.as_mut() }) else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    };
+    dctx.reset_session();
+    let rc = unsafe { crate::attach::ZSTD_DCtx_loadDictionary(zds, dict, dict_size) };
+    if crate::error::result_is_error(rc) {
+        return rc;
+    }
+    starting_input_length(unsafe { &*zds })
+}
+
+/// `size_t ZSTD_initDStream_usingDDict(ZSTD_DStream* zds, const ZSTD_DDict*
+/// ddict)` — start a decoding session referencing `ddict` (none when `NULL`);
+/// returns the first read size.
+///
+/// # Safety
+/// `zds` must be live or `NULL`; `ddict` live or `NULL`, outliving the session.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_initDStream_usingDDict(
+    zds: *mut ZSTD_DCtx,
+    ddict: *const crate::cdict::ZSTD_DDict,
+) -> usize {
+    let Some(dctx) = (unsafe { zds.as_mut() }) else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    };
+    dctx.reset_session();
+    let rc = unsafe { crate::attach::ZSTD_DCtx_refDDict(zds, ddict) };
+    if crate::error::result_is_error(rc) {
+        return rc;
+    }
+    starting_input_length(unsafe { &*zds })
+}
+
+/// `size_t ZSTD_resetDStream(ZSTD_DStream* zds)` — abandon any frame in
+/// flight, keeping the dictionary and parameters; returns the first read
+/// size.
+///
+/// # Safety
+/// `zds` must be a live pointer from `ZSTD_createDStream`, or `NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_resetDStream(zds: *mut ZSTD_DCtx) -> usize {
+    let Some(dctx) = (unsafe { zds.as_mut() }) else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    };
+    dctx.reset_session();
+    starting_input_length(dctx)
+}
+
+/// `size_t ZSTD_decompressStream_simpleArgs(ZSTD_DCtx* dctx, void* dst,
+/// size_t dstCapacity, size_t* dstPos, const void* src, size_t srcSize,
+/// size_t* srcPos)` — [`ZSTD_decompressStream`] with the buffer structs
+/// spelled out as arguments.
+///
+/// # Safety
+/// As [`ZSTD_decompressStream`]; `dst_pos` / `src_pos` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_decompressStream_simpleArgs(
+    dctx: *mut ZSTD_DCtx,
+    dst: *mut c_void,
+    dst_capacity: usize,
+    dst_pos: *mut usize,
+    src: *const c_void,
+    src_size: usize,
+    src_pos: *mut usize,
+) -> usize {
+    if dst_pos.is_null() || src_pos.is_null() {
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
-    let dctx = unsafe { &mut *zds };
-    dctx.reset_session();
-    ZSTD_DStreamInSize()
+    let mut output = ZSTD_outBuffer {
+        dst,
+        size: dst_capacity,
+        pos: unsafe { *dst_pos },
+    };
+    let mut input = ZSTD_inBuffer {
+        src,
+        size: src_size,
+        pos: unsafe { *src_pos },
+    };
+    let rc = unsafe { ZSTD_decompressStream(dctx, &mut output, &mut input) };
+    unsafe {
+        *dst_pos = output.pos;
+        *src_pos = input.pos;
+    }
+    rc
 }
 
 /// `size_t ZSTD_decompressStream(ZSTD_DStream* zds, ZSTD_outBuffer* output,
@@ -560,16 +994,13 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
             return 0;
         }
         use codec::decoding::errors::ReadFrameHeaderError;
-        match codec::decoding::read_frame_header_info(&src[inp.pos..], false) {
+        match codec::decoding::read_frame_header_info(&src[inp.pos..], dctx.magicless) {
             Ok(_) => {
-                // `ZSTD_d_windowLogMax` is the decoder's own ceiling; it
-                // refuses a wider window when the header is read below. Set on
-                // every frame start, since the decoder may have been replaced
-                // since the parameter was.
-                if let Err(err) = dctx
-                    .decoder
-                    .set_max_window_size(1u64 << dctx.window_log_max)
-                {
+                // The window ceiling is the decoder's own; it refuses a wider
+                // window when the header is read below. Set on every frame
+                // start, since the decoder may have been replaced since the
+                // parameter was.
+                if let Err(err) = dctx.decoder.set_max_window_size(dctx.max_window_size) {
                     return encode(code_for_decoder_error(&err));
                 }
                 let mut reader = &src[inp.pos..];
@@ -596,8 +1027,7 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
                     }
                     Ok(Err(err)) => return encode(code_for_decoder_error(&err)),
                     Err(_) => {
-                        dctx.decoder = codec::decoding::FrameDecoder::new();
-                        dctx.ddict_serial = 0;
+                        dctx.replace_decoder();
                         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
                     }
                 }
@@ -658,8 +1088,7 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
         }
         Ok(Err(err)) => encode(code_for_decoder_error(&err)),
         Err(_) => {
-            dctx.decoder = codec::decoding::FrameDecoder::new();
-            dctx.ddict_serial = 0;
+            dctx.replace_decoder();
             dctx.stream_frame_done = true;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
