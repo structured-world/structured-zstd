@@ -1938,42 +1938,46 @@ fn long_window_log_reaches_the_encoder() {
     );
 }
 
-/// Training writes a file like any other output, so it answers to `-f` like any
-/// other output. Without the gate `--train -o existing` replaces the file with
-/// no warning, and naming a sample as the destination destroys the sample.
+/// `--train -o existing` replaces the file without `-f`, as the reference's
+/// trainer does (`DiB_saveDict` opens the output with `fopen("wb")`): scripts
+/// written for it retrain into the same path, upstream's own test suite among
+/// them.
 #[test]
-fn training_refuses_to_overwrite_without_force() {
+fn training_replaces_an_existing_output() {
     let dir = std::env::temp_dir();
-    let sample = dir.join(format!("szstd-train-sample-{}.bin", std::process::id()));
     let existing = dir.join(format!("szstd-train-out-{}.bin", std::process::id()));
-    fs::write(&sample, vec![7u8; 4096]).unwrap();
-    fs::write(&existing, b"precious").unwrap();
+    fs::write(&existing, b"an older dictionary").unwrap();
+    let samples: Vec<PathBuf> = (0..8)
+        .map(|i| {
+            let sample = dir.join(format!("szstd-train-sample-{}-{i}.bin", std::process::id()));
+            let text: Vec<u8> = (0..400u32)
+                .flat_map(|j| format!("sample {i} row {} key {}\n", j % 31, j % 7).into_bytes())
+                .collect();
+            fs::write(&sample, text).unwrap();
+            sample
+        })
+        .collect();
 
-    // Unreadable, so the answer says which step ran first: a command that
-    // cannot write its result should be refused before it spends the memory
-    // and minutes of building one.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&sample, fs::Permissions::from_mode(0o000)).unwrap();
-    }
-
-    let mut opts = parse(&["--train", "s"]).unwrap();
-    opts.inputs = vec![sample.clone()];
+    let mut opts = parse(&["--train", "-q", "s"]).unwrap();
+    opts.inputs = samples.clone();
     opts.output = Some(existing.clone());
-    let refused = train_dictionary(&opts);
+    let trained = train_dictionary(&opts);
 
-    let survived = fs::read(&existing).unwrap_or_default();
-    let _ = fs::remove_file(&sample);
+    let written = fs::read(&existing).unwrap_or_default();
+    for sample in &samples {
+        let _ = fs::remove_file(sample);
+    }
     let _ = fs::remove_file(&existing);
-    let err = refused
-        .expect_err("an existing dictionary must not be replaced without -f")
-        .to_string();
-    assert!(
-        err.contains("already exists"),
-        "the refusal must be the destination, before any sample is read: {err}"
+    trained.expect("training into an existing output succeeds without -f");
+    assert_ne!(
+        written, b"an older dictionary",
+        "the output was not replaced"
     );
-    assert_eq!(survived, b"precious", "the existing file must be untouched");
+    assert_eq!(
+        written.get(..4),
+        Some(&[0x37, 0xA4, 0x30, 0xEC][..]),
+        "the output holds a trained dictionary"
+    );
 }
 
 /// The trainer flags name algorithms, and the algorithm decides what the

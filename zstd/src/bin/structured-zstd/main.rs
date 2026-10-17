@@ -3965,13 +3965,12 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // Settled before the corpus is read: whether this run may write at all is
     // knowable now, and a command that is going to be refused should not first
     // load every sample and spend minutes training a dictionary to throw away.
-    // A device or pipe is written in place, as for any other output.
+    // A device or pipe is written in place, as for any other output. An
+    // existing file is replaced without `-f`, as the reference's trainer
+    // replaces it (`DiB_saveDict`, `fopen(dictFileName, "wb")`).
     let in_place = writes_in_place(&output)?;
     if !in_place {
         ensure_regular_output_destination(&output)?;
-        if output.exists() && !opts.force {
-            bail!("{} already exists; use -f to overwrite", output.display());
-        }
     }
     // The default destination is a plain `dictionary`, which a sample can
     // easily be named: the run would read that file and then replace it with
