@@ -6,10 +6,13 @@
 //! directive. `ZSTD_compress2` and the streaming entry points consume the
 //! stored set when a frame starts.
 
-use core::ffi::c_int;
+use core::ffi::{c_int, c_uint};
 
-use codec::encoding::{CParameter, CompressionLevel, CompressionParameters, Strategy};
+use codec::encoding::{
+    CParameter, CompressionLevel, CompressionParameters, LevelParameters, Strategy,
+};
 
+use crate::cdict::{ZSTD_compressionParameters, ZSTD_frameParameters};
 use crate::context::{ZSTD_CCtx, ZSTD_DCtx};
 use crate::error::{ZSTD_ErrorCode, encode};
 
@@ -42,6 +45,11 @@ pub(crate) const ZSTD_C_OVERLAP_LOG: c_int = 402;
 
 // `ZSTD_dParameter` discriminants.
 pub(crate) const ZSTD_D_WINDOW_LOG_MAX: c_int = 100;
+pub(crate) const ZSTD_D_FORMAT: c_int = 1000;
+
+// `ZSTD_format_e` values.
+const ZSTD_F_ZSTD1: c_int = 0;
+const ZSTD_F_ZSTD1_MAGICLESS: c_int = 1;
 
 // `ZSTD_ResetDirective` discriminants.
 pub(crate) const ZSTD_RESET_SESSION_ONLY: c_int = 1;
@@ -54,8 +62,10 @@ const TARGET_CBLOCK_SIZE_MIN: c_int = codec::MIN_TARGET_BLOCK_SIZE as c_int;
 const TARGET_CBLOCK_SIZE_MAX: c_int = codec::MAX_BLOCK_SIZE as c_int;
 
 /// Upstream `ZSTD_WINDOWLOG_LIMIT_DEFAULT`: the streaming decoder's default
-/// window-size acceptance ceiling, `1 << 27` bytes.
-pub(crate) const WINDOW_LOG_LIMIT_DEFAULT: c_int = 27;
+/// window-size acceptance ceiling is `1 << 27` bytes.
+const WINDOW_LOG_LIMIT_DEFAULT: c_int = 27;
+/// That default as a byte count.
+pub(crate) const MAX_WINDOW_SIZE_DEFAULT: u64 = 1 << WINDOW_LOG_LIMIT_DEFAULT;
 /// Decoder-side window-log bounds (`ZSTD_WINDOWLOG_ABSOLUTEMIN` ..
 /// `ZSTD_WINDOWLOG_MAX`). The ceiling is pointer-width dependent upstream
 /// (`ZSTD_WINDOWLOG_MAX_32` = 30, `ZSTD_WINDOWLOG_MAX_64` = 31 via
@@ -255,8 +265,134 @@ pub extern "C" fn ZSTD_cParam_getBounds(param: c_int) -> ZSTD_bounds {
 pub extern "C" fn ZSTD_dParam_getBounds(param: c_int) -> ZSTD_bounds {
     match param {
         ZSTD_D_WINDOW_LOG_MAX => ZSTD_bounds::ok(D_WINDOW_LOG_MIN, D_WINDOW_LOG_MAX),
+        ZSTD_D_FORMAT => ZSTD_bounds::ok(ZSTD_F_ZSTD1, ZSTD_F_ZSTD1_MAGICLESS),
         _ => ZSTD_bounds::err(ZSTD_ErrorCode::ZSTD_error_parameter_unsupported),
     }
+}
+
+/// `ZSTD_parameters` — ABI mirror of the upstream struct: compression
+/// parameters followed by frame parameters.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[allow(non_camel_case_types, non_snake_case)]
+pub struct ZSTD_parameters {
+    pub cParams: ZSTD_compressionParameters,
+    pub fParams: ZSTD_frameParameters,
+}
+
+impl From<LevelParameters> for ZSTD_compressionParameters {
+    fn from(p: LevelParameters) -> Self {
+        Self {
+            windowLog: p.window_log,
+            chainLog: p.chain_log,
+            hashLog: p.hash_log,
+            searchLog: p.search_log,
+            minMatch: p.min_match,
+            targetLength: p.target_length,
+            strategy: p.strategy.ordinal(),
+        }
+    }
+}
+
+/// `ZSTD_getCParams` / `ZSTD_adjustCParams` spell an unknown source size as
+/// `0`, as well as `ZSTD_CONTENTSIZE_UNKNOWN`.
+fn known_source_size(size: u64) -> Option<u64> {
+    (size != 0 && size != CONTENTSIZE_UNKNOWN).then_some(size)
+}
+
+/// `ZSTD_compressionParameters ZSTD_getCParams(int compressionLevel, unsigned
+/// long long estimatedSrcSize, size_t dictSize)` — the parameters
+/// `compressionLevel` selects for a source of that size (`0` = unknown) and
+/// dictionary.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_getCParams(
+    compression_level: c_int,
+    estimated_src_size: u64,
+    dict_size: usize,
+) -> ZSTD_compressionParameters {
+    LevelParameters::for_level(
+        compression_level,
+        known_source_size(estimated_src_size),
+        dict_size,
+    )
+    .into()
+}
+
+/// `ZSTD_parameters ZSTD_getParams(int compressionLevel, unsigned long long
+/// estimatedSrcSize, size_t dictSize)` — [`ZSTD_getCParams`] with the default
+/// frame parameters (content size written, no checksum, dictionary ID written).
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_getParams(
+    compression_level: c_int,
+    estimated_src_size: u64,
+    dict_size: usize,
+) -> ZSTD_parameters {
+    ZSTD_parameters {
+        cParams: ZSTD_getCParams(compression_level, estimated_src_size, dict_size),
+        // Upstream leaves `noDictIDFlag` 0, which writes the ID.
+        fParams: ZSTD_frameParameters {
+            contentSizeFlag: 1,
+            checksumFlag: 0,
+            noDictIDFlag: 0,
+        },
+    }
+}
+
+/// The seven compression-parameter fields with the codec knob each one sets.
+fn cparam_fields(cparams: &ZSTD_compressionParameters) -> [(CParameter, c_uint); 7] {
+    [
+        (CParameter::WindowLog, cparams.windowLog),
+        (CParameter::ChainLog, cparams.chainLog),
+        (CParameter::HashLog, cparams.hashLog),
+        (CParameter::SearchLog, cparams.searchLog),
+        (CParameter::MinMatch, cparams.minMatch),
+        (CParameter::TargetLength, cparams.targetLength),
+        (CParameter::Strategy, cparams.strategy),
+    ]
+}
+
+/// `size_t ZSTD_checkCParams(ZSTD_compressionParameters params)` — 0 when every
+/// field lies within its bounds, else `parameter_outOfBound`. Unlike
+/// `ZSTD_CCtx_setParameter`, `0` is a value here, not "auto".
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_checkCParams(cparams: ZSTD_compressionParameters) -> usize {
+    let in_bounds = cparam_fields(&cparams)
+        .iter()
+        .all(|&(parameter, value)| parameter.bounds().contains(i64::from(value)));
+    if in_bounds {
+        0
+    } else {
+        encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound)
+    }
+}
+
+/// `ZSTD_compressionParameters ZSTD_adjustCParams(ZSTD_compressionParameters
+/// cPar, unsigned long long srcSize, size_t dictSize)` — `cPar` with each field
+/// brought within its bounds, then fitted to a source of `srcSize` bytes
+/// (`0` = unknown) and a `dictSize`-byte dictionary.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_adjustCParams(
+    cparams: ZSTD_compressionParameters,
+    src_size: u64,
+    dict_size: usize,
+) -> ZSTD_compressionParameters {
+    let [window, chain, hash, search, min_match, target, strategy] =
+        cparam_fields(&cparams).map(|(parameter, value)| {
+            // Every bound fits `u32`, so the clamped value does too.
+            parameter.bounds().clamp(i64::from(value)) as u32
+        });
+    let clamped = LevelParameters {
+        window_log: window,
+        chain_log: chain,
+        hash_log: hash,
+        search_log: search,
+        min_match,
+        target_length: target,
+        strategy: Strategy::from_ordinal(strategy).expect("clamped into 1..=9"),
+    };
+    clamped
+        .adjusted(known_source_size(src_size), dict_size)
+        .into()
 }
 
 /// Validate `value` against the parameter's bounds. `0` is the universal
@@ -486,15 +622,63 @@ pub unsafe extern "C" fn ZSTD_DCtx_setParameter(
             if value != 0 && !(D_WINDOW_LOG_MIN..=D_WINDOW_LOG_MAX).contains(&value) {
                 return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
             }
-            dctx.window_log_max = if value == 0 {
-                WINDOW_LOG_LIMIT_DEFAULT
+            dctx.max_window_size = if value == 0 {
+                MAX_WINDOW_SIZE_DEFAULT
             } else {
-                value
+                1 << value
             };
+            0
+        }
+        ZSTD_D_FORMAT => {
+            let magicless = match value {
+                ZSTD_F_ZSTD1 => false,
+                ZSTD_F_ZSTD1_MAGICLESS => true,
+                _ => return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound),
+            };
+            dctx.magicless = magicless;
+            dctx.decoder.set_magicless(magicless);
             0
         }
         _ => encode(ZSTD_ErrorCode::ZSTD_error_parameter_unsupported),
     }
+}
+
+/// `size_t ZSTD_DCtx_setFormat(ZSTD_DCtx* dctx, ZSTD_format_e format)` —
+/// [`ZSTD_DCtx_setParameter`] with `ZSTD_d_format`: whether frames carry the
+/// magic number (`ZSTD_f_zstd1`) or start at the frame header
+/// (`ZSTD_f_zstd1_magicless`).
+///
+/// # Safety
+/// `dctx` must be a live pointer from `ZSTD_createDCtx`, or `NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_DCtx_setFormat(dctx: *mut ZSTD_DCtx, format: c_int) -> usize {
+    unsafe { ZSTD_DCtx_setParameter(dctx, ZSTD_D_FORMAT, format) }
+}
+
+/// `size_t ZSTD_DCtx_setMaxWindowSize(ZSTD_DCtx* dctx, size_t maxWindowSize)` —
+/// the largest window a streamed frame may declare, in bytes rather than the
+/// power of two `ZSTD_d_windowLogMax` takes.
+///
+/// # Safety
+/// `dctx` must be a live pointer from `ZSTD_createDCtx`, or `NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_DCtx_setMaxWindowSize(
+    dctx: *mut ZSTD_DCtx,
+    max_window_size: usize,
+) -> usize {
+    if dctx.is_null() {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    }
+    let dctx = unsafe { &mut *dctx };
+    if !dctx.stream_frame_done {
+        return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
+    }
+    let size = max_window_size as u64;
+    if !(1 << D_WINDOW_LOG_MIN..=1 << D_WINDOW_LOG_MAX).contains(&size) {
+        return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
+    }
+    dctx.max_window_size = size;
+    0
 }
 
 /// `size_t ZSTD_DCtx_getParameter(const ZSTD_DCtx* dctx, ZSTD_dParameter param, int* value)`.
@@ -510,13 +694,22 @@ pub unsafe extern "C" fn ZSTD_DCtx_getParameter(
     if dctx.is_null() || value.is_null() {
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
-    match param {
-        ZSTD_D_WINDOW_LOG_MAX => {
-            unsafe { value.write((*dctx).window_log_max) };
-            0
+    let dctx = unsafe { &*dctx };
+    let out = match param {
+        // The power of two at or below the ceiling, which is the ceiling
+        // itself unless `ZSTD_DCtx_setMaxWindowSize` set one between powers.
+        ZSTD_D_WINDOW_LOG_MAX => dctx.max_window_size.ilog2() as c_int,
+        ZSTD_D_FORMAT => {
+            if dctx.magicless {
+                ZSTD_F_ZSTD1_MAGICLESS
+            } else {
+                ZSTD_F_ZSTD1
+            }
         }
-        _ => encode(ZSTD_ErrorCode::ZSTD_error_parameter_unsupported),
-    }
+        _ => return encode(ZSTD_ErrorCode::ZSTD_error_parameter_unsupported),
+    };
+    unsafe { value.write(out) };
+    0
 }
 
 /// `size_t ZSTD_DCtx_reset(ZSTD_DCtx* dctx, ZSTD_ResetDirective reset)`.

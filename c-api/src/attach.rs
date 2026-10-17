@@ -831,9 +831,8 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
             encode(code)
         }
         Err(_) => {
-            dctx.decoder = codec::decoding::FrameDecoder::new();
+            dctx.replace_decoder();
             dctx.stream_frame_done = true;
-            dctx.ddict_serial = 0;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
     }

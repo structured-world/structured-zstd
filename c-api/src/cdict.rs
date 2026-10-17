@@ -666,9 +666,8 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
             encode(code_for_decoder_error(&err))
         }
         Err(_) => {
-            dctx.decoder = codec::decoding::FrameDecoder::new();
+            dctx.replace_decoder();
             dctx.stream_frame_done = true;
-            dctx.ddict_serial = 0;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
     }

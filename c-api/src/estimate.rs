@@ -141,3 +141,73 @@ pub extern "C" fn ZSTD_estimateDStreamSize(max_window_size: usize) -> usize {
     }
     ZSTD_estimateDCtxSize() + max_window_size + BLOCK_SIZE_MAX
 }
+
+/// `size_t ZSTD_estimateDStreamSize_fromFrame(const void* src, size_t
+/// srcSize)` — [`ZSTD_estimateDStreamSize`] for the window the frame header
+/// at `src` declares, or an error code.
+///
+/// # Safety
+/// `src` must be valid for `src_size` bytes (or `NULL` with `src_size == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_estimateDStreamSize_fromFrame(
+    src: *const u8,
+    src_size: usize,
+) -> usize {
+    use codec::decoding::errors::ReadFrameHeaderError;
+    let src = unsafe { crate::ffi::in_slice(src, src_size) };
+    let window_size = match codec::decoding::read_frame_header_info(src, false) {
+        Ok(info) => info.window_size,
+        // A skippable frame needs no window.
+        Err(ReadFrameHeaderError::SkipFrame { .. }) => 0,
+        Err(ReadFrameHeaderError::BadMagicNumber(_)) => {
+            return crate::error::encode(crate::error::ZSTD_ErrorCode::ZSTD_error_prefix_unknown);
+        }
+        Err(ReadFrameHeaderError::InvalidFrameDescriptor(descriptor)) => {
+            return crate::error::encode(crate::error::code_for_descriptor_error(&descriptor));
+        }
+        Err(_) => {
+            return crate::error::encode(crate::error::ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
+        }
+    };
+    if window_size > 1u64 << WINDOW_LOG_MAX {
+        return crate::error::encode(
+            crate::error::ZSTD_ErrorCode::ZSTD_error_frameParameter_windowTooLarge,
+        );
+    }
+    // Bounded by `1 << WINDOW_LOG_MAX` just above, which fits `usize`.
+    ZSTD_estimateDStreamSize(window_size as usize)
+}
+
+/// `size_t ZSTD_estimateCDictSize(size_t dictSize, int compressionLevel)` —
+/// budget for a `ZSTD_CDict` made from a `dictSize`-byte dictionary. The
+/// dictionary keeps its content and entropy tables; the match-finder tables
+/// are built in the compressing context, so the level does not change it.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_estimateCDictSize(dict_size: usize, _compression_level: c_int) -> usize {
+    // An upper bound saturates: `usize::MAX` still bounds any allocation.
+    core::mem::size_of::<crate::cdict::ZSTD_CDict>().saturating_add(
+        codec::encoding::EncoderDictionary::estimated_heap_size(dict_size),
+    )
+}
+
+/// `size_t ZSTD_estimateCDictSize_advanced(size_t dictSize,
+/// ZSTD_compressionParameters cParams, ZSTD_dictLoadMethod_e dictLoadMethod)`
+/// — as [`ZSTD_estimateCDictSize`]. The content is always copied, so the load
+/// method does not change it, and neither do the parameters.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_estimateCDictSize_advanced(
+    dict_size: usize,
+    _cparams: ZSTD_compressionParameters,
+    _dict_load_method: c_int,
+) -> usize {
+    ZSTD_estimateCDictSize(dict_size, 0)
+}
+
+/// `size_t ZSTD_estimateDDictSize(size_t dictSize, ZSTD_dictLoadMethod_e
+/// dictLoadMethod)` — budget for a `ZSTD_DDict` made from a `dictSize`-byte
+/// dictionary, which always keeps its own copy of the bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_estimateDDictSize(dict_size: usize, _dict_load_method: c_int) -> usize {
+    // An upper bound saturates: `usize::MAX` still bounds any allocation.
+    core::mem::size_of::<crate::cdict::ZSTD_DDict>().saturating_add(dict_size)
+}

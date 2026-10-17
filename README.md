@@ -396,10 +396,12 @@ see the
 
 ## Storage-format extensions
 
+Every build carries a typed skippable-frame API (`structured_zstd::skippable`)
+for interleaving application metadata with zstd data.
+
 Behind the `lsm` feature (default **off**), the crate adds building blocks for
 storage-format authors:
 
-- **Skippable frames** — a typed `SkippableFrame` API (`structured_zstd::skippable`) for interleaving application metadata with zstd data.
 - **Block-subset partial decode** — `FrameDecoder::decode_blocks_partial` decodes only the inner blocks covering a requested range (skipping the trailing ones) and preserves the clean prefix on a corrupt block.
 - **Block-to-byte-range lookup** — `FrameEmitInfo::decompressed_byte_range(block_index)` maps a block to its decompressed byte range, so a range query can locate which blocks cover a target byte window.
 - **Resumable decoding** — request a `ResumeState` (cross-block entropy tables + repcode history + next-block coordinates) from a partial decode, then feed it back to continue from a later block, even across a dropped decoder. The state does not carry the match window: the resuming call also supplies the tail of the already-decompressed output (the last `min(window_size, resume_offset)` bytes) via `ResumeInput::window_prime`.
