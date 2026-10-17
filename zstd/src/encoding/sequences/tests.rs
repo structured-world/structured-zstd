@@ -229,8 +229,19 @@ fn rebuild_reads_dictionary_overlaps_and_tail() {
         rebuild(&[seq(20, 2, 4)], b"ab", dict, 1 << 10, 8),
         Err(SequenceError::OffsetTooFar { index: 0 })
     ));
+    // While the output is within the window a match reaches into the whole
+    // dictionary, as `validate_parse` lets it; past the window, only the
+    // window.
+    assert_eq!(
+        rebuild(&[seq(5, 2, 4)], b"ab", dict, 4, 8).unwrap(),
+        b"ab789a"
+    );
+    assert_eq!(
+        validate_parse(&[seq(5, 2, 4)], 6, 4, dict.len(), false, 1 << 17),
+        Ok(())
+    );
     assert!(matches!(
-        rebuild(&[seq(5, 2, 4)], b"ab", dict, 4, 8),
+        rebuild(&[seq(5, 6, 4)], b"abcdef", dict, 4, 8),
         Err(SequenceError::OffsetTooFar { index: 0 })
     ));
     assert!(matches!(

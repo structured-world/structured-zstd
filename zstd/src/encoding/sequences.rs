@@ -254,7 +254,8 @@ pub fn validate_parse(
 /// a decoder would (C `ZSTD_compressSequencesAndLiterals` takes the literals
 /// rather than the input). Matches reaching before the start read from
 /// `dict`; literals past the last sequence are the trailing ones. Only the
-/// last `window` bytes are held for the matches to copy from, so a frame is
+/// last `window` bytes (or as far back as the parse's farthest match, when
+/// that is further) are held for the matches to copy from, so a frame is
 /// built from it without the whole input in memory.
 ///
 /// ```
@@ -274,7 +275,10 @@ pub struct RebuiltSource<'a> {
     sequences: core::slice::Iter<'a, ExternalSequence>,
     literals: &'a [u8],
     dict: &'a [u8],
-    window: usize,
+    /// Bytes of output held back for the matches: the window, or the
+    /// parse's farthest offset when a match reaches into the dictionary
+    /// from further back than that.
+    keep: usize,
     /// Literals handed out so far.
     lit_at: usize,
     /// Literals of the sequence in hand still to come.
@@ -284,21 +288,22 @@ pub struct RebuiltSource<'a> {
     offset: usize,
     /// Bytes rebuilt so far.
     produced: usize,
-    /// The bytes most recently rebuilt: at least the last `window` of them.
+    /// The bytes most recently rebuilt: at least the last `keep` of them.
     history: Vec<u8>,
     len: usize,
 }
 
 impl<'a> RebuiltSource<'a> {
     /// Check that `sequences` and `literals` rebuild to a whole input with
-    /// every match within `window` and within the output so far plus `dict`,
-    /// and set up to read it.
+    /// every match within the output so far plus `dict` while the output is
+    /// within `window`, and within `window` after (as [`validate_parse`]
+    /// checks), and set up to read it.
     ///
     /// # Errors
     /// [`SequenceError::LengthMismatch`] when the sequences need more literals
-    /// than there are, [`SequenceError::OffsetTooFar`] when a match reaches past
-    /// the output and `dict` or past `window`, [`SequenceError::ZeroOffset`]
-    /// for a match at offset 0.
+    /// than there are, [`SequenceError::OffsetTooFar`] when a match reaches
+    /// further back than that, [`SequenceError::ZeroOffset`] for a match at
+    /// offset 0.
     pub fn new(
         sequences: &'a [ExternalSequence],
         literals: &'a [u8],
@@ -307,6 +312,7 @@ impl<'a> RebuiltSource<'a> {
     ) -> Result<Self, SequenceError> {
         let mut position = 0usize;
         let mut lits = 0usize;
+        let mut keep = window;
         for (index, sequence) in sequences.iter().enumerate() {
             let lit_len = sequence.lit_len as usize;
             lits = lits
@@ -322,13 +328,21 @@ impl<'a> RebuiltSource<'a> {
             if offset == 0 {
                 return Err(SequenceError::ZeroOffset { index });
             }
-            // A reach past `usize` holds any offset.
-            let past_reach = position
-                .checked_add(dict.len())
-                .is_some_and(|reach| offset > reach);
-            if offset > window || past_reach {
+            // RFC 8878 3.1.1.1.2 / 3.1.1.5, as `validate_parse` reads them:
+            // while the output is within the window a match may reach into
+            // the dictionary; past it, only the window. A reach past `usize`
+            // holds any offset.
+            let past_reach = if position > window {
+                offset > window
+            } else {
+                position
+                    .checked_add(dict.len())
+                    .is_some_and(|reach| offset > reach)
+            };
+            if past_reach {
                 return Err(SequenceError::OffsetTooFar { index });
             }
+            keep = keep.max(offset);
             position = position
                 .checked_add(sequence.match_len as usize)
                 .ok_or(SequenceError::LengthMismatch)?;
@@ -340,7 +354,7 @@ impl<'a> RebuiltSource<'a> {
             sequences: sequences.iter(),
             literals,
             dict,
-            window,
+            keep,
             lit_at: 0,
             lit_left: 0,
             match_left: 0,
@@ -375,9 +389,9 @@ impl<'a> RebuiltSource<'a> {
                     .extend_from_slice(&self.dict[from..from + take]);
                 take
             } else {
-                // `history` holds the last `window` bytes at least, and the
-                // offset is within the window. An overlapping match repeats
-                // its first `offset` bytes.
+                // `history` holds the last `keep` bytes at least, and no
+                // offset is further back. An overlapping match repeats its
+                // first `offset` bytes.
                 let from = self.history.len() - self.offset;
                 let take = left.min(self.offset);
                 self.history.extend_from_within(from..from + take);
@@ -421,14 +435,14 @@ impl crate::io::Read for RebuiltSource<'_> {
             filled += n;
         }
         // Keep what the matches still to come can reach, dropping the rest a
-        // window's worth at a time so the drain is paid once per window. A
-        // window past half of `usize` never fills twice over.
+        // `keep`'s worth at a time so the drain is paid once per that many
+        // bytes. A `keep` past half of `usize` never fills twice over.
         if self
-            .window
+            .keep
             .checked_mul(2)
             .is_some_and(|limit| self.history.len() > limit)
         {
-            let drop = self.history.len() - self.window;
+            let drop = self.history.len() - self.keep;
             self.history.drain(..drop);
         }
         Ok(filled)

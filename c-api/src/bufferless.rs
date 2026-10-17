@@ -462,29 +462,36 @@ pub unsafe extern "C" fn ZSTD_copyCCtx(
     src_cctx: *const ZSTD_CCtx,
     pledged_src_size: u64,
 ) -> usize {
-    let (Some(dst), Some(src)) = (unsafe { dst_cctx.as_mut() }, unsafe { src_cctx.as_ref() })
-    else {
+    if dst_cctx.is_null() {
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    }
+    // The source is read, and its borrow ended, before the destination is
+    // borrowed mutably: the two may be the same context.
+    let begin = {
+        let Some(src) = (unsafe { src_cctx.as_ref() }) else {
+            return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+        };
+        let Some(frame) = src.bufferless.as_ref().filter(|frame| frame.fresh) else {
+            return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
+        };
+        // 0 is unknown here, whatever the note beside the declaration in
+        // zstd.h suggests: upstream converts it (zstd_compress.c:2596) and its
+        // own callers rely on that, copying with 0 and then compressing input
+        // (tests/fuzzer.c:2450, 4885). Reading it as an empty frame would
+        // refuse what every upstream build accepts.
+        let pledged = if pledged_src_size == 0 {
+            CONTENTSIZE_UNKNOWN
+        } else {
+            pledged_src_size
+        };
+        let mut begin = frame.begin.clone();
+        begin.params.pledged_src_size = pledged;
+        begin.params.content_size_flag = pledged != CONTENTSIZE_UNKNOWN;
+        begin.params.checksum_flag = false;
+        begin.params.dict_id_flag = true;
+        begin
     };
-    let Some(frame) = src.bufferless.as_ref().filter(|frame| frame.fresh) else {
-        return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
-    };
-    // 0 is unknown here, whatever the note beside the declaration in zstd.h
-    // suggests: upstream converts it (zstd_compress.c:2596) and its own
-    // callers rely on that, copying with 0 and then compressing input
-    // (tests/fuzzer.c:2450, 4885). Reading it as an empty frame would refuse
-    // what every upstream build accepts.
-    let pledged = if pledged_src_size == 0 {
-        CONTENTSIZE_UNKNOWN
-    } else {
-        pledged_src_size
-    };
-    let mut begin = frame.begin.clone();
-    begin.params.pledged_src_size = pledged;
-    begin.params.content_size_flag = pledged != CONTENTSIZE_UNKNOWN;
-    begin.params.checksum_flag = false;
-    begin.params.dict_id_flag = true;
-    begin_frame(dst, begin)
+    begin_frame(unsafe { &mut *dst_cctx }, begin)
 }
 
 /// Where a buffer-less decode stands: which part of the frame the next
@@ -912,13 +919,15 @@ pub unsafe extern "C" fn ZSTD_insertBlock(
 /// Both contexts live or `NULL`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_copyDCtx(dctx: *mut ZSTD_DCtx, prepared_dctx: *const ZSTD_DCtx) {
+    // Compared as pointers before any reference exists: a `&mut` and a `&` to
+    // one context would alias.
+    if core::ptr::eq(dctx.cast_const(), prepared_dctx) {
+        return;
+    }
     let (Some(dst), Some(src)) = (unsafe { dctx.as_mut() }, unsafe { prepared_dctx.as_ref() })
     else {
         return;
     };
-    if core::ptr::eq(dst, src) {
-        return;
-    }
     dst.max_window_size = src.max_window_size;
     dst.magicless = src.magicless;
     dst.decoder.set_magicless(src.magicless);

@@ -103,6 +103,29 @@ fn copy_cctx_reads_zero_as_unknown() {
     }
 }
 
+/// A context copied onto itself begins its own frame again, and one copied
+/// onto itself on the decoding side is left as it is.
+#[test]
+fn copy_onto_itself() {
+    let cctx = ZSTD_createCCtx();
+    let dctx = ZSTD_createDCtx();
+    let mut out = [0u8; 64];
+    unsafe {
+        assert_eq!(ZSTD_compressBegin(cctx, 3), 0);
+        assert_eq!(ZSTD_copyCCtx(cctx, cctx, 5), 0);
+        let n = ZSTD_compressEnd(cctx, out.as_mut_ptr(), out.len(), b"bytes".as_ptr(), 5);
+        assert_eq!(ZSTD_isError(n), 0, "{:?}", code(n));
+        assert_eq!(crate::simple::ZSTD_getFrameContentSize(out.as_ptr(), n), 5);
+
+        assert_eq!(ZSTD_decompressBegin(dctx), 0);
+        ZSTD_copyDCtx(dctx, dctx);
+        let decoded = decode_bufferless(dctx, &out[..n], |d| ZSTD_decompressBegin(d)).unwrap();
+        assert_eq!(decoded, b"bytes");
+        ZSTD_freeDCtx(dctx);
+        ZSTD_freeCCtx(cctx);
+    }
+}
+
 /// A run of blocks has no frame window, so the streaming ceiling does not
 /// bind it: a block may match an inserted one further back than the
 /// ceiling, as upstream's block API allows.

@@ -663,7 +663,9 @@ impl<M: Matcher> CompressionContext<M> {
         // The match finder's primed snapshot and resident copy belong to the
         // dictionary being replaced; the next frame primes the new one.
         self.state.matcher.invalidate_primed_dictionary();
-        self.dictionary = Some(dict);
+        // One under 8 bytes is attached as none; see
+        // `EncoderDictionary::is_used_for_compression`.
+        self.dictionary = dict.is_used_for_compression().then_some(dict);
         Ok(())
     }
 

@@ -1632,57 +1632,46 @@ fn uncompressed_mode_does_not_require_dictionary() {
     assert_eq!(decoded, payload);
 }
 
+/// A raw dictionary under 8 bytes takes no part in compression, as zstd.h
+/// states for every dictionary entry point and upstream applies when it
+/// inserts one: attaching it attaches none, through every attach path, and
+/// the frame names no dictionary and decodes without one, even when the
+/// payload starts with the dictionary's bytes.
 #[test]
-fn default_level_tiny_raw_dict_compresses_cleanly() {
-    // Coverage for the dfast dict-attach fast path with a
-    // sub-min-match raw-content dictionary: the dict-table probe in
-    // `start_matching_fast_loop` is gated on the dict table actually
-    // existing (`table().is_some()`), not merely on `is_attached()`,
-    // so a dictionary whose hashable region is shorter than the
-    // short-hash lookahead (where `prime_dict_tables_for_range`
-    // returns before allocating the tables) never dereferences a
-    // null dict pointer. Compressing at the default (dfast) level
-    // with such a dict must succeed.
+fn a_raw_dictionary_under_eight_bytes_attaches_as_none() {
     let dict_id = 0xABCD_0009;
-    let dict = crate::decoding::Dictionary::from_raw_content(dict_id, b"abc".to_vec())
-        .expect("raw dictionary should be valid");
-    let payload = b"the quick brown fox jumps over the lazy dog, repeatedly and at length";
-    let mut output = Vec::new();
-    let mut compressor = FrameCompressor::new(super::CompressionLevel::Default);
+    let payload = b"abcdefg, the quick brown fox jumps over the lazy dog, at length";
+    let tiny = || {
+        crate::decoding::Dictionary::from_raw_content(dict_id, b"abcdefg".to_vec())
+            .expect("raw dictionary should be valid")
+    };
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Default);
     compressor
-        .set_dictionary(dict)
-        .expect("tiny raw dictionary should attach");
-    compressor.set_source(payload.as_slice());
-    compressor.set_drain(&mut output);
-    compressor.compress();
-    assert!(!output.is_empty(), "compression should produce a frame");
+        .set_dictionary(tiny())
+        .expect("attaching succeeds");
+    assert!(compressor.dictionary().is_none());
+    compressor.set_dictionary_from_bytes(b"abcdefg").unwrap();
+    assert!(compressor.dictionary().is_none());
+    compressor
+        .set_encoder_dictionary(super::EncoderDictionary::from_dictionary(tiny()))
+        .unwrap();
+    assert!(compressor.dictionary().is_none());
 
-    // The emitted frame must advertise the attached dictionary id, proving
-    // the tiny-dict path stayed active (the payload round-trips either way,
-    // so without this the test would also pass on a silent no-dict frame).
-    let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
+    let frame = compressor.compress_independent_frame(payload);
+    let (frame_header, _) = crate::decoding::frame::read_frame_header(frame.as_slice())
         .expect("encoded frame should have a readable header");
-    assert_eq!(
-        frame_header.dictionary_id(),
-        Some(dict_id),
-        "tiny raw dict frame should still advertise its dictionary id",
-    );
-
-    // Full roundtrip: decode the dict-compressed frame with the SAME
-    // dictionary attached and confirm byte-exact recovery — proves the
-    // tiny-dict fast path produces a correct frame, not just a non-empty
-    // one.
-    let decode_dict = crate::decoding::Dictionary::from_raw_content(dict_id, b"abc".to_vec())
-        .expect("raw dictionary should be valid");
-    let mut decoder = FrameDecoder::new();
-    decoder
-        .add_dict(decode_dict)
-        .expect("decoder dict should attach");
+    assert_eq!(frame_header.dictionary_id(), None);
     let mut decoded = Vec::with_capacity(payload.len());
-    decoder
-        .decode_all_to_vec(&output, &mut decoded)
-        .expect("dict roundtrip should decode");
-    assert_eq!(decoded, payload, "tiny-dict roundtrip mismatch");
+    FrameDecoder::new()
+        .decode_all_to_vec(&frame, &mut decoded)
+        .expect("the frame decodes without a dictionary");
+    assert_eq!(decoded, payload);
+
+    let mut context = crate::encoding::CompressionContext::new(super::CompressionLevel::Default);
+    context
+        .set_encoder_dictionary(super::EncoderDictionary::from_dictionary(tiny()))
+        .unwrap();
+    assert!(context.dictionary().is_none());
 }
 
 /// Exercises the dictionary dual-probe (live + immutable dict tables)
@@ -1690,8 +1679,7 @@ fn default_level_tiny_raw_dict_compresses_cleanly() {
 /// the payload actually reuses, so each backend's dict long/short
 /// probe (and the dfast `ip+1` dict-long retry) is reached and the
 /// dict-compressed frame round-trips through a decoder primed with the
-/// same dict. The 3-byte-dict test above only proves the null-table
-/// guard; this proves the full attach path produces correct frames.
+/// same dict: the full attach path produces correct frames.
 #[test]
 fn dict_attach_roundtrips_across_backends_with_matching_payload() {
     let dict_id = 0xD1C7_0001;

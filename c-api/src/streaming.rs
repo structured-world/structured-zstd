@@ -909,6 +909,10 @@ pub unsafe extern "C" fn ZSTD_initDStream_usingDict(
     dctx.reset_session();
     // Loading a dictionary leaves the frame format as it is.
     let first_read = starting_input_length(dctx);
+    // A dictionary under 8 bytes is loaded as content here, as upstream's
+    // decoder does (`zstd_decompress.c:1541`) whatever zstd.h's note says:
+    // no compressor uses one, so no frame needs it absent, while a frame from
+    // an encoder that did use it decodes.
     let rc = unsafe { crate::attach::ZSTD_DCtx_loadDictionary(zds, dict, dict_size) };
     if crate::error::result_is_error(rc) {
         return rc;
@@ -1011,17 +1015,25 @@ pub(crate) enum StreamEntry {
     Skip(u64),
 }
 
+/// How far one call got into the next frame.
+enum FrameEntry {
+    /// The header is read and the decoder started on the frame.
+    Started,
+    /// Everything given was taken and more is wanted.
+    WantsInput,
+    /// A skippable frame ended here: a frame is finished.
+    Skipped,
+}
+
 /// Take in what `src` holds of the next frame's start: a header, which may
 /// arrive in pieces, or a skippable frame, passed over across however many
 /// calls it spans, as upstream stages a header and skips a payload
-/// (`zstd_decompress.c`, `zdss_loadHeader` and `ZSTDds_skipFrame`). `Ok(true)`
-/// once a header is read and the decoder started on its frame; `Ok(false)`
-/// when everything given was taken and more is wanted.
+/// (`zstd_decompress.c`, `zdss_loadHeader` and `ZSTDds_skipFrame`).
 fn enter_stream_frame(
     dctx: &mut ZSTD_DCtx,
     inp: &mut ZSTD_inBuffer,
     src: &[u8],
-) -> Result<bool, ZSTD_ErrorCode> {
+) -> Result<FrameEntry, ZSTD_ErrorCode> {
     use codec::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
     loop {
         let available = &src[inp.pos..];
@@ -1032,15 +1044,17 @@ fn enter_stream_frame(
                     .min(available.len());
                 inp.pos += n;
                 let left = left - n as u64;
-                // Through the payload, the stream is back at a boundary and
-                // the caller's loop re-enters for whatever follows.
-                dctx.stream_frame_done = left == 0;
-                dctx.stream_entry = if left == 0 {
-                    StreamEntry::Entered
-                } else {
-                    StreamEntry::Skip(left)
-                };
-                return Ok(false);
+                if left > 0 {
+                    dctx.stream_entry = StreamEntry::Skip(left);
+                    return Ok(FrameEntry::WantsInput);
+                }
+                // Through the payload, the stream is back at a boundary with
+                // a frame finished, as upstream's skip leaves nothing expected
+                // (zstd_decompress.c:1423-1426); what follows waits for the
+                // caller's next call.
+                dctx.stream_entry = StreamEntry::Entered;
+                dctx.stream_frame_done = true;
+                return Ok(FrameEntry::Skipped);
             }
             StreamEntry::Header { bytes, len } => (bytes, len),
             StreamEntry::Entered => ([0; FRAME_HEADER_MAX], 0),
@@ -1052,7 +1066,7 @@ fn enter_stream_frame(
         match codec::decoding::read_frame_header_info(view, dctx.magicless) {
             Ok(_) => {
                 start_stream_frame(dctx, inp, src, &held[..held_len])?;
-                return Ok(true);
+                return Ok(FrameEntry::Started);
             }
             // The skippable header is 8 bytes: what is held and the rest of
             // them from the input. The payload follows on the next pass.
@@ -1079,7 +1093,7 @@ fn enter_stream_frame(
                     len: view.len(),
                 };
                 dctx.stream_frame_done = false;
-                return Ok(false);
+                return Ok(FrameEntry::WantsInput);
             }
             // A malformed header (bad magic, invalid descriptor, ...) is a
             // decode error: the need-more-input hint with nothing consumed
@@ -1232,15 +1246,18 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
     if dctx.stream_frame_done || !matches!(dctx.stream_entry, StreamEntry::Entered) {
         if dctx.stream_frame_done {
             if inp.pos == inp.size {
-                // No active frame and nothing to read: frame-done signal.
-                return 0;
+                // Nothing to read at a boundary finishes nothing, so this
+                // asks for the next frame's start rather than return `0`,
+                // which only the call that finishes a frame returns (upstream
+                // reaches `zdss_loadHeader` and returns its size hint).
+                return starting_input_length(dctx);
             }
             dctx.stream_entry = StreamEntry::Entered;
         }
         match enter_stream_frame(dctx, inp, src) {
-            Ok(true) => {}
-            // Everything given was taken; more input is wanted.
-            Ok(false) => return 1,
+            Ok(FrameEntry::Started) => {}
+            Ok(FrameEntry::WantsInput) => return 1,
+            Ok(FrameEntry::Skipped) => return 0,
             Err(code) => return encode(code),
         }
     }

@@ -244,6 +244,24 @@ impl EncoderDictionary {
         }
     }
 
+    /// Whether frames compress against this dictionary: one prepared from a
+    /// blob under 8 bytes takes no part, as zstd.h states for every dictionary
+    /// entry point and upstream zstd applies when it inserts one
+    /// (`zstd_compress.c:5206`). Attaching such a dictionary attaches none. A
+    /// decoder still reads that blob as content, as upstream's does.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::EncoderDictionary;
+    ///
+    /// let tiny = EncoderDictionary::from_serialized_or_raw_content(b"tiny").unwrap();
+    /// assert!(!tiny.is_used_for_compression());
+    /// let history = EncoderDictionary::from_serialized_or_raw_content(b"some history").unwrap();
+    /// assert!(history.is_used_for_compression());
+    /// ```
+    pub fn is_used_for_compression(&self) -> bool {
+        self.serialized_len >= 8
+    }
+
     /// Bytes of dictionary content, the part a frame can reference.
     ///
     /// This is the extent a caller weighs a source against when deciding
@@ -3511,6 +3529,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // dictionary; drop it so the first frame with the new dictionary
         // re-primes (and re-captures) instead of restoring stale tables.
         self.state.matcher.invalidate_primed_dictionary();
+        if !enc.is_used_for_compression() {
+            return Ok(self.dictionary.take());
+        }
         Ok(self.dictionary.replace(enc))
     }
 }

@@ -247,7 +247,11 @@ fn compress_parse(
         attached_dict,
         ..
     } = cctx;
-    let dictionary = attached_dict.prepared();
+    // A dictionary the compressor would attach as none gives the parse no
+    // history to reach into either.
+    let dictionary = attached_dict
+        .prepared()
+        .filter(|dictionary| dictionary.is_used_for_compression());
     let dict_len = dictionary.map_or(0, codec::encoding::EncoderDictionary::content_size);
     let window = frame_window(frame_params.as_ref(), level, src_len, dict_len);
     // A block is held to the window as well as to its own limit.

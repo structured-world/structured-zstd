@@ -438,6 +438,63 @@ fn stream_inits_take_a_dictionary_under_eight_bytes() {
     }
 }
 
+/// A dictionary under eight bytes takes no part in compression, as zstd.h
+/// states for every dictionary entry point: the frame is the one compressed
+/// without it, and decodes without it, even when the input starts with it.
+#[test]
+fn a_dictionary_under_eight_bytes_is_no_dictionary_when_compressing() {
+    let tiny = b"short d";
+    let input = b"short dictionaries take no part ".repeat(20);
+    let plain = |level| {
+        let mut frame = vec![0u8; input.len() + 64];
+        let n = unsafe {
+            crate::simple::ZSTD_compress(
+                frame.as_mut_ptr(),
+                frame.len(),
+                input.as_ptr(),
+                input.len(),
+                level,
+            )
+        };
+        assert_eq!(ZSTD_isError(n), 0);
+        frame.truncate(n);
+        frame
+    };
+    let decodes_alone = |frame: &[u8]| {
+        let mut out = vec![0u8; input.len()];
+        let n = unsafe {
+            crate::simple::ZSTD_decompress(out.as_mut_ptr(), out.len(), frame.as_ptr(), frame.len())
+        };
+        assert_eq!(n, input.len(), "{:?}", code(n));
+        assert_eq!(out, input);
+    };
+    unsafe {
+        let zcs = ZSTD_createCStream();
+        assert_eq!(
+            ZSTD_initCStream_usingDict(zcs, tiny.as_ptr().cast(), tiny.len(), 3),
+            0
+        );
+        let streamed = end_frame(zcs, &input).expect("the frame compresses");
+        decodes_alone(&streamed);
+
+        let mut frame = vec![0u8; input.len() + 64];
+        let n = crate::attach::ZSTD_compress_usingDict(
+            zcs,
+            frame.as_mut_ptr(),
+            frame.len(),
+            input.as_ptr(),
+            input.len(),
+            tiny.as_ptr(),
+            tiny.len(),
+            3,
+        );
+        assert_eq!(ZSTD_isError(n), 0, "{:?}", code(n));
+        assert_eq!(&frame[..n], &plain(3)[..]);
+        decodes_alone(&frame[..n]);
+        ZSTD_freeCCtx(zcs);
+    }
+}
+
 /// The decoding inits report the first read size and set up the dictionary:
 /// the plain one drops a referenced DDict, the others load or reference one.
 #[test]
@@ -620,6 +677,54 @@ fn decompress_stream_takes_a_header_in_pieces() {
     checked.truncate(n);
     assert_eq!(decode_through_window(zds, &checked, 7), large);
     unsafe { ZSTD_freeCCtx(cctx) };
+    unsafe { ZSTD_freeDCtx(zds) };
+}
+
+/// `0` means a frame was just finished, as upstream returns it: a call that
+/// reaches the end of a skippable frame returns it, and a call with no input
+/// at a frame boundary, a fresh one or one after a frame, asks for input
+/// instead.
+#[test]
+fn decompress_stream_returns_zero_only_for_a_finished_frame() {
+    let call = |zds: *mut ZSTD_DCtx, src: &[u8]| {
+        let mut inb = ZSTD_inBuffer {
+            src: src.as_ptr().cast(),
+            size: src.len(),
+            pos: 0,
+        };
+        let mut out = [0u8; 256];
+        let mut outb = ZSTD_outBuffer {
+            dst: out.as_mut_ptr().cast(),
+            size: out.len(),
+            pos: 0,
+        };
+        let rc = unsafe { crate::streaming::ZSTD_decompressStream(zds, &mut outb, &mut inb) };
+        assert_eq!(ZSTD_isError(rc), 0, "{:?}", code(rc));
+        (rc, inb.pos)
+    };
+    let zds = ZSTD_createDStream();
+    assert_ne!(call(zds, &[]).0, 0, "a fresh stream has finished nothing");
+
+    let mut skippable = [0u8; 8 + 16];
+    let n = unsafe {
+        crate::frame::ZSTD_writeSkippableFrame(
+            skippable.as_mut_ptr(),
+            skippable.len(),
+            [1u8; 16].as_ptr(),
+            16,
+            0,
+        )
+    };
+    assert_eq!(n, skippable.len());
+    assert_eq!(call(zds, &skippable), (0, skippable.len()));
+    assert_ne!(call(zds, &[]).0, 0, "nothing new was finished");
+
+    let mut frame = [0u8; 64];
+    let n = unsafe {
+        crate::simple::ZSTD_compress(frame.as_mut_ptr(), frame.len(), b"bytes".as_ptr(), 5, 3)
+    };
+    assert_eq!(call(zds, &frame[..n]), (0, n));
+    assert_ne!(call(zds, &[]).0, 0, "nothing new was finished");
     unsafe { ZSTD_freeDCtx(zds) };
 }
 
