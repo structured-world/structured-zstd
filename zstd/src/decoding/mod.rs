@@ -593,4 +593,6 @@ pub(crate) mod user_slice_buf;
 pub(crate) use self::simd_copy::copy_bytes_overshooting_for_bench;
 
 #[cfg(test)]
+mod block_api_tests;
+#[cfg(test)]
 mod frame_inspection_tests;

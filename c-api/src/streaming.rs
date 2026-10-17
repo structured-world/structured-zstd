@@ -248,7 +248,7 @@ impl CStreamState {
         context.set_content_size_flag(params.content_size_flag)?;
         context.set_dictionary_id_flag(params.dict_id_flag && !setup.suppress_id)?;
         // Next to an attached dictionary too; see `compress_sticky_frame`.
-        let (producer, fallback) = params.sequence_producer();
+        let (producer, fallback) = params.sequence_producer(setup.level);
         context.set_sequence_producer(producer, fallback);
         Ok(())
     }
@@ -387,7 +387,6 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
         let stream = cctx.stream.as_mut().expect("ensure_stream installed state");
         let progress = &mut cctx.progress;
         let pending_before = stream.pending.len();
-        let input_before = inp.pos;
         // Consume ALL remaining input: the in-memory output has no
         // backpressure, so a write never short-counts on its account.
         if inp.pos < inp.size {
@@ -404,7 +403,12 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
             while inp.pos < inp.size {
                 match stream.context.write(&mut stream.pending, &src[inp.pos..]) {
                     Ok(0) => return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC),
-                    Ok(n) => inp.pos += n,
+                    // Credited as it is taken: it is in the frame from here
+                    // on, whatever ending the frame later says.
+                    Ok(n) => {
+                        inp.pos += n;
+                        progress.ingested += n as u64;
+                    }
                     // The context reports pledge violations as InvalidInput
                     // (the only InvalidInput reachable from `write` on the
                     // in-memory output); upstream's error for input past the
@@ -454,7 +458,6 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
         }
         // Nothing drains `pending` before `copy_out`, so what it grew by is
         // what this call produced.
-        progress.ingested += (inp.pos - input_before) as u64;
         progress.produced += (stream.pending.len() - pending_before) as u64;
         let flushed_before = out.pos;
         stream.copy_out(out, dst);

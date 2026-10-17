@@ -375,6 +375,36 @@ fn simple_one_shots_abandon_an_open_stream() {
     }
 }
 
+/// Input the stream took counts as ingested even when ending the frame then
+/// fails on a pledge it falls short of: it sits buffered in the open frame,
+/// and the progression must not subtract it from less.
+#[test]
+fn ingested_counts_input_before_a_failed_end() {
+    let input = b"fifty bytes of input that fall short of the pledge";
+    let zcs = ZSTD_createCStream();
+    let mut out = vec![0u8; 1024];
+    unsafe {
+        crate::params::ZSTD_CCtx_setPledgedSrcSize(zcs, 100);
+        let mut inb = ZSTD_inBuffer {
+            src: input.as_ptr().cast(),
+            size: input.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: out.as_mut_ptr().cast(),
+            size: out.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 2);
+        assert_eq!(code(rc), ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
+        assert_eq!(inb.pos, input.len());
+        let progress = ZSTD_getFrameProgression(zcs);
+        assert_eq!(progress.ingested, input.len() as u64);
+        assert!(progress.consumed <= progress.ingested);
+        ZSTD_freeCCtx(zcs);
+    }
+}
+
 /// A dictionary under eight bytes is content, not a truncated serialized one,
 /// even when it is the magic number alone: both stream inits take it, as
 /// upstream does.

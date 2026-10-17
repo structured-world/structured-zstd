@@ -315,6 +315,47 @@ unsafe extern "C" fn literal_producer(
     1
 }
 
+/// Records the compression level it is asked at in the `c_int` its state
+/// points at, and parses each block as literals.
+unsafe extern "C" fn level_recorder(
+    state: *mut c_void,
+    out: *mut ZSTD_Sequence,
+    _capacity: usize,
+    _src: *const c_void,
+    src_size: usize,
+    _dict: *const c_void,
+    _dict_size: usize,
+    level: c_int,
+    _window: usize,
+) -> usize {
+    unsafe {
+        *state.cast::<c_int>() = level;
+        out.write(ZSTD_Sequence::delimiter(src_size as u32));
+    }
+    1
+}
+
+/// A producer is told the level the frame runs at: a referenced CDict's on
+/// a small source, not the context's own.
+#[test]
+fn producer_hears_the_frames_level() {
+    let input = fox(2_000);
+    let dict = b"some dictionary content for the cdict".repeat(8);
+    let cctx = ZSTD_createCCtx();
+    let cdict = unsafe { crate::cdict::ZSTD_createCDict(dict.as_ptr(), dict.len(), 10) };
+    let mut level: c_int = -1;
+    unsafe {
+        crate::attach::ZSTD_CCtx_refCDict(cctx, cdict);
+        ZSTD_registerSequenceProducer(cctx, (&raw mut level).cast(), Some(level_recorder));
+    }
+    compress2(cctx, &input).unwrap();
+    assert_eq!(level, 10);
+    unsafe {
+        ZSTD_freeCCtx(cctx);
+        crate::cdict::ZSTD_freeCDict(cdict);
+    }
+}
+
 /// A producer that fails fails the frame (upstream `sequenceProducer_failed`)
 /// unless fallback is on; a working one is asked once per block; `NULL`
 /// removes it. Unlike upstream, long-distance matching may stay on beside it.

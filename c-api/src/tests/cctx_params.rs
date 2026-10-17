@@ -52,6 +52,35 @@ const NO_CUSTOM_MEM: ZSTD_customMem = ZSTD_customMem {
     opaque: core::ptr::null(),
 };
 
+/// The on/off flags take any non-zero value as on and read back as 1, as
+/// upstream coerces them (zstd_compress.c:835-846), on a context and on a
+/// parameter set alike.
+#[test]
+fn on_off_flags_coerce_non_zero_values() {
+    let cctx = ZSTD_createCCtx();
+    let params = ZSTD_createCCtxParams();
+    for flag in [200, CHECKSUM, DICT_ID] {
+        for value in [2, -1, 7] {
+            unsafe {
+                assert_eq!(ZSTD_CCtx_setParameter(cctx, flag, value), 0);
+                let mut read = -7;
+                assert_eq!(ZSTD_CCtx_getParameter(cctx, flag, &mut read), 0);
+                assert_eq!(read, 1, "flag {flag} = {value}");
+                assert_eq!(ZSTD_CCtxParams_setParameter(params, flag, value), 0);
+            }
+            assert_eq!(get(params, flag), Ok(1));
+        }
+        unsafe { assert_eq!(ZSTD_CCtx_setParameter(cctx, flag, 0), 0) };
+        let mut read = -7;
+        unsafe { ZSTD_CCtx_getParameter(cctx, flag, &mut read) };
+        assert_eq!(read, 0);
+    }
+    unsafe {
+        ZSTD_freeCCtxParams(params);
+        ZSTD_freeCCtx(cctx);
+    }
+}
+
 fn get(params: *const ZSTD_CCtx_params, param: c_int) -> Result<c_int, ZSTD_ErrorCode> {
     let mut value = -7;
     let rc = unsafe { ZSTD_CCtxParams_getParameter(params, param, &mut value) };

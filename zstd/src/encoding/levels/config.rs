@@ -1321,7 +1321,8 @@ pub(crate) fn resolve_level_params_with_dict(
         uses_row_match_finder,
     };
     let base = resolve_level_params(level, source_size);
-    if sizes.content == 0 {
+    // A raw frame searches nothing, so a dictionary has no tier to give it.
+    if sizes.content == 0 || matches!(level, CompressionLevel::Uncompressed) {
         return (base, None);
     }
     // The CDict's cParams decide the frame's strategy REGARDLESS of the

@@ -454,7 +454,7 @@ pub(crate) fn compress_sticky_frame(
         // names it and its entropy seeds the first block, as upstream 1.5.7
         // writes the dictionary ID in that case too. The producer itself sees
         // no history, which is what "no effect" means in the zstd.h notes.
-        let (producer, fallback) = params.sequence_producer();
+        let (producer, fallback) = params.sequence_producer(level);
         enc.set_sequence_producer(producer, fallback);
         enc.set_sequence_capture(capture.is_some());
         scratch.clear();

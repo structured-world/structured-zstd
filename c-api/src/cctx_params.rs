@@ -150,11 +150,12 @@ impl CCtxParams {
         }
     }
 
-    /// The registered producer, boxed for the encoder, and whether a block
-    /// it fails on falls back to the built-in matchers
-    /// (`ZSTD_c_enableSeqProducerFallback`).
+    /// The registered producer, boxed for the encoder and told the frame
+    /// runs at `level`, and whether a block it fails on falls back to the
+    /// built-in matchers (`ZSTD_c_enableSeqProducerFallback`).
     pub(crate) fn sequence_producer(
         &self,
+        level: c_int,
     ) -> (
         Option<Box<dyn codec::encoding::sequences::SequenceProducer>>,
         bool,
@@ -163,10 +164,8 @@ impl CCtxParams {
             .get(ZSTD_C_ENABLE_SEQ_PRODUCER_FALLBACK)
             .is_ok_and(|v| v != 0);
         let producer = self.producer.map(|p| {
-            Box::new(crate::sequences::CProducerCall {
-                producer: p,
-                level: self.level,
-            }) as Box<dyn codec::encoding::sequences::SequenceProducer>
+            Box::new(crate::sequences::CProducerCall { producer: p, level })
+                as Box<dyn codec::encoding::sequences::SequenceProducer>
         });
         (producer, fallback)
     }
@@ -228,7 +227,8 @@ impl CCtxParams {
 
     /// Store one parameter, the way upstream `ZSTD_CCtxParams_setParameter`
     /// does: `0` is "auto" for the tunables, the level is clamped into range,
-    /// everything else outside its bounds is refused.
+    /// the on/off flags take any non-zero value as on, and everything else
+    /// outside its bounds is refused.
     pub(crate) fn set(&mut self, param: c_int, value: c_int) -> Result<(), ZSTD_ErrorCode> {
         let Some((lower, upper)) = c_param_bounds(param) else {
             return Err(ZSTD_ErrorCode::ZSTD_error_parameter_unsupported);
@@ -272,6 +272,8 @@ impl CCtxParams {
             ZSTD_C_LDM_MIN_MATCH => self.ldm_min_match = tunable(value)?,
             ZSTD_C_LDM_BUCKET_SIZE_LOG => self.ldm_bucket_size_log = tunable(value)?,
             ZSTD_C_LDM_HASH_RATE_LOG => self.ldm_hash_rate_log = tunable(value)?,
+            // Any non-zero value is on, read back as 1: upstream coerces these
+            // (zstd_compress.c:835-846) and callers pass truthy values to it.
             ZSTD_C_CONTENT_SIZE_FLAG => self.content_size_flag = value != 0,
             ZSTD_C_CHECKSUM_FLAG => self.checksum_flag = value != 0,
             ZSTD_C_DICT_ID_FLAG => self.dict_id_flag = value != 0,

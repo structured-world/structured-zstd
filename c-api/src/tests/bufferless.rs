@@ -81,6 +81,59 @@ fn decode_bufferless(
     Ok(output)
 }
 
+/// A context copied with a pledge of 0 takes input of any size and leaves
+/// the content size out, as upstream reads 0 there and its own callers rely
+/// on (tests/fuzzer.c:2450, 4885).
+#[test]
+fn copy_cctx_reads_zero_as_unknown() {
+    let src = ZSTD_createCCtx();
+    let dst = ZSTD_createCCtx();
+    let mut out = [0u8; 64];
+    unsafe {
+        assert_eq!(ZSTD_compressBegin(src, 3), 0);
+        assert_eq!(ZSTD_copyCCtx(dst, src, 0), 0);
+        let n = ZSTD_compressEnd(dst, out.as_mut_ptr(), out.len(), b"bytes".as_ptr(), 5);
+        assert_eq!(ZSTD_isError(n), 0, "{:?}", code(n));
+        assert_eq!(
+            crate::simple::ZSTD_getFrameContentSize(out.as_ptr(), n),
+            crate::params::CONTENTSIZE_UNKNOWN
+        );
+        ZSTD_freeCCtx(dst);
+        ZSTD_freeCCtx(src);
+    }
+}
+
+/// A block that compressed but did not fit `dst` is already history the next
+/// block could match against; the session ends, so a retry cannot emit a
+/// block that refers to one the caller never received.
+#[test]
+fn compress_block_into_too_small_dst_ends_the_session() {
+    let block = fox(4096);
+    let cctx = ZSTD_createCCtx();
+    let mut small = [0u8; 8];
+    let mut big = vec![0u8; 8192];
+    unsafe {
+        assert_eq!(ZSTD_compressBegin(cctx, 3), 0);
+        let rc = ZSTD_compressBlock(
+            cctx,
+            small.as_mut_ptr(),
+            small.len(),
+            block.as_ptr(),
+            block.len(),
+        );
+        assert_eq!(code(rc), ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
+        let rc = ZSTD_compressBlock(
+            cctx,
+            big.as_mut_ptr(),
+            big.len(),
+            block.as_ptr(),
+            block.len(),
+        );
+        assert_eq!(code(rc), ZSTD_ErrorCode::ZSTD_error_stage_wrong);
+        ZSTD_freeCCtx(cctx);
+    }
+}
+
 /// A context copied from one part-way through a frame starts a frame of its
 /// own: the copy carries the settings and the dictionary, not a stage its
 /// decoder never reached.

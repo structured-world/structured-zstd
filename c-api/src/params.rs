@@ -325,8 +325,10 @@ pub extern "C" fn ZSTD_adjustCParams(
 ///
 /// Stores one sticky compression parameter. Rejected with
 /// `parameter_outOfBound` / `parameter_unsupported` outside the advertised
-/// bounds; `0` means "back to auto" for the tunables, and the level is
-/// clamped into range rather than refused.
+/// bounds; `0` means "back to auto" for the tunables, the level is clamped
+/// into range rather than refused, and the on/off flags (content size,
+/// checksum, dictionary ID, force max window, dedicated dictionary search)
+/// take any non-zero value as on, as upstream does.
 ///
 /// # Safety
 /// `cctx` must be a live pointer from `ZSTD_createCCtx`, or `NULL`.

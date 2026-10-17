@@ -430,6 +430,110 @@ fn block_count(frame: &[u8]) -> usize {
     }
 }
 
+/// A captured parse closes every block the frame holds with a delimiter,
+/// even at the optimal levels that split a block of text then noise into
+/// several: the parse describes the blocks as written.
+#[test]
+fn captured_parse_delimits_every_written_block() {
+    let mut input = Vec::new();
+    let mut state = 0x2545_F491u32;
+    for _ in 0..2 {
+        let mut i = 0u32;
+        let start = input.len();
+        while input.len() - start < 64 * 1024 {
+            input.extend_from_slice(
+                alloc::format!("record {i} status=shipped region=eu\n").as_bytes(),
+            );
+            i += 1;
+        }
+        input.truncate(start + 64 * 1024);
+        for _ in 0..64 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            input.push(state as u8);
+        }
+    }
+    let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(19));
+    compressor.set_sequence_capture(true);
+    let frame = compressor.compress_independent_frame(&input);
+    let parse = compressor.take_captured_sequences();
+    let delimiters = parse.iter().filter(|s| s.is_delimiter()).count();
+    assert_eq!(delimiters, block_count(&frame));
+}
+
+/// At the Fast level the parse is recorded from wire codes, and a block
+/// written as RLE or raw without a search is a delimiter alone: through the
+/// in-place one-shot path and through the reader path alike.
+#[test]
+fn fast_level_capture_covers_unsearched_blocks() {
+    let mut input = vec![5u8; 2048];
+    let mut state = 0x7F4A_7C15u32;
+    input.extend((0..4096).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state as u8
+    }));
+    input.extend(b"fast level text fast level text ".repeat(64));
+
+    let check = |parse: &[ExternalSequence], frame: &[u8]| {
+        let covered: usize = parse
+            .iter()
+            .map(|s| (s.lit_len + s.match_len) as usize)
+            .sum();
+        assert_eq!(covered, input.len());
+        assert_eq!(
+            parse.iter().filter(|s| s.is_delimiter()).count(),
+            block_count(frame)
+        );
+        let mut literals = Vec::new();
+        let mut at = 0;
+        for s in parse {
+            literals.extend_from_slice(&input[at..at + s.lit_len as usize]);
+            at += (s.lit_len + s.match_len) as usize;
+        }
+        let mut rebuilt = Vec::new();
+        rebuild_source(parse, &literals, &[], &mut rebuilt).unwrap();
+        assert_eq!(rebuilt, input);
+    };
+
+    let mut one_shot: FrameCompressor = FrameCompressor::new(CompressionLevel::Fastest);
+    one_shot.set_max_block_size(Some(2048));
+    one_shot.set_sequence_capture(true);
+    let frame = one_shot.compress_independent_frame(&input);
+    check(&one_shot.take_captured_sequences(), &frame);
+
+    let mut frame = Vec::new();
+    let mut reader: FrameCompressor<&[u8], &mut Vec<u8>> =
+        FrameCompressor::new(CompressionLevel::Fastest);
+    reader.set_max_block_size(Some(2048));
+    reader.set_sequence_capture(true);
+    reader.set_source(&input);
+    reader.set_drain(&mut frame);
+    reader.compress();
+    let parse = reader.take_captured_sequences();
+    drop(reader);
+    check(&parse, &frame);
+}
+
+#[test]
+fn sequence_errors_read_as_what_went_wrong() {
+    let cases = [
+        (SequenceError::LengthMismatch, "cover"),
+        (SequenceError::MatchTooShort { index: 3 }, "sequence 3"),
+        (SequenceError::OffsetTooFar { index: 4 }, "too far"),
+        (SequenceError::ZeroOffset { index: 5 }, "offset 0"),
+        (SequenceError::BlockTooLarge, "block size"),
+    ];
+    for (error, text) in cases {
+        assert!(alloc::format!("{error}").contains(text), "{error}");
+    }
+    let boxed: alloc::boxed::Box<dyn std::error::Error> =
+        alloc::boxed::Box::new(SequenceError::BlockTooLarge);
+    assert!(!alloc::format!("{boxed}").is_empty());
+}
+
 /// With block delimiters, each delimited region is a block of its own, the
 /// layout the caller laid down (upstream `ZSTD_sf_explicitBlockDelimiters`).
 #[test]

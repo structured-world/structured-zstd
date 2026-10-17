@@ -419,7 +419,10 @@ pub unsafe extern "C" fn ZSTD_compressBlock(
     }
     let len = state.pending.len();
     if len > dst_capacity {
-        state.pending.clear();
+        // The block is already history a next block could refer to, and the
+        // caller never received it: the session ends rather than go on.
+        *stream = None;
+        *bufferless = None;
         return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
     }
     let dst = unsafe { out_slice(dst, dst_capacity) };
@@ -448,7 +451,8 @@ pub unsafe extern "C" fn ZSTD_getBlockSize(cctx: *const ZSTD_CCtx) -> usize {
 /// `size_t ZSTD_copyCCtx(ZSTD_CCtx* dstCCtx, const ZSTD_CCtx* srcCCtx,
 /// unsigned long long pledgedSrcSize)` — begin on `dstCCtx` the buffer-less
 /// frame `srcCCtx` was begun with, before anything was compressed into it,
-/// with its own pledge (`0` = unknown) and the default frame flags.
+/// with its own pledge (`0` or `ZSTD_CONTENTSIZE_UNKNOWN` = unknown, as
+/// upstream reads it) and the default frame flags.
 ///
 /// # Safety
 /// Both contexts live or `NULL`.
@@ -465,6 +469,11 @@ pub unsafe extern "C" fn ZSTD_copyCCtx(
     let Some(frame) = src.bufferless.as_ref().filter(|frame| frame.fresh) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
     };
+    // 0 is unknown here, whatever the note beside the declaration in zstd.h
+    // suggests: upstream converts it (zstd_compress.c:2596) and its own
+    // callers rely on that, copying with 0 and then compressing input
+    // (tests/fuzzer.c:2450, 4885). Reading it as an empty frame would refuse
+    // what every upstream build accepts.
     let pledged = if pledged_src_size == 0 {
         CONTENTSIZE_UNKNOWN
     } else {

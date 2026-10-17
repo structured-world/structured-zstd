@@ -144,8 +144,11 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // consume it: when no sink collects checksums (the common case), and when
     // the block is headed for the post-split helper, which emits several
     // physical blocks and records a checksum per partition of its own.
-    let post_split =
-        state.post_split_allowed && post_split_enabled(state.strategy_tag, window_size);
+    // A captured parse is recorded per matched block, before any split, so
+    // capturing keeps each block whole and its delimiter true.
+    let post_split = state.post_split_allowed
+        && state.sequence_capture.is_none()
+        && post_split_enabled(state.strategy_tag, window_size);
     #[cfg(all(feature = "lsm", feature = "hash"))]
     let post_split_path = rle_byte_opt.is_none() && !raw_fast_path && post_split;
     #[cfg(all(feature = "lsm", feature = "hash"))]
