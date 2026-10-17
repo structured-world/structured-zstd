@@ -2121,17 +2121,17 @@ fn clamp_level(level: i32) -> i32 {
     level.clamp(CompressionLevel::MIN_LEVEL, CompressionLevel::MAX_LEVEL)
 }
 
-/// `--version`: the reference command version this tool follows, and this
-/// build's own. Below the default display level (`-qV`) only the bare
-/// version number is printed, for a script to read; at `-vV` the supported
-/// formats follow, as they do there.
+/// `--version`: this tool's name, version and maker. Below the default display
+/// level (`-qV`) only the bare format version it implements is printed, the
+/// number scripts compare to decide which zstd features they can use; at
+/// `-vV` the supported formats follow.
 fn print_version(verbosity: i32) {
     if verbosity < DEFAULT_LEVEL {
         println!("{UPSTREAM_VERSION}");
         return;
     }
     println!(
-        "zstd version {UPSTREAM_VERSION} (structured-zstd v{})",
+        "structured-zstd v{} by Structured World",
         env!("CARGO_PKG_VERSION")
     );
     if verbosity >= 3 {

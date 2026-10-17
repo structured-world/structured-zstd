@@ -70,7 +70,11 @@ CLI_TESTS="$UPSTREAM/tests/cli-tests"
 # compression/adapt.sh, compression/multi-threaded.sh: they need a
 #   multi-threaded build (adaptive levels, the `-T` decompression warning);
 #   upstream's own single-threaded build fails them the same way.
-rm -rf "$CLI_TESTS/file-stat"
+# basic/version.sh, progress/: they expect the reference's own banner
+#   (`*** Zstandard CLI ... by Yann Collet ***`) and progress wording; this
+#   command names itself and draws its own progress.
+rm -rf "$CLI_TESTS/file-stat" "$CLI_TESTS/progress"
+rm -f "$CLI_TESTS/basic/version.sh"*
 rm -f "$CLI_TESTS/compression/adapt.sh"* "$CLI_TESTS/compression/multi-threaded.sh"*
 python3 "$CLI_TESTS/run.py" --zstd "$ZSTD_BIN" --datagen "$DATAGEN_BIN"
 
