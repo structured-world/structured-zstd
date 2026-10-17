@@ -397,6 +397,43 @@ jobs:
           CARGO_PROFILE_RELEASE_PANIC: abort
         run: cargo run --release -p ffi-bench --example stack_budget -- 32
 
+  conformance:
+    # Upstream zstd's own command-line suites (tests/playTests.sh and
+    # tests/cli-tests from the pinned release) against the release CLI. The
+    # script holds the pin, the digest and the cases left out with their
+    # reasons, so a local run and this job run the same thing.
+    needs: [changes, lint]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.lint.result != 'failure' }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        if: needs.changes.outputs.code == 'true'
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.code == 'true'
+      - name: Prepend toolchain bin to PATH (macos shim workaround)
+        # Same Homebrew rustup gap as the `test` job.
+        if: needs.changes.outputs.code == 'true' && runner.os == 'macOS'
+        run: |
+          TC="$(rustup show active-toolchain | awk '{print $1}')"
+          echo "$HOME/.rustup/toolchains/$TC/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.code == 'true'
+        with:
+          prefix-key: ${{ runner.os }}-conformance
+      - name: Build the CLI
+        if: needs.changes.outputs.code == 'true'
+        run: cargo build --release -p structured-zstd --bin structured-zstd
+      - name: Upstream suites
+        if: needs.changes.outputs.code == 'true'
+        run: scripts/upstream-conformance.sh target/release/structured-zstd
+
   cross-i686:
     needs: lint
     timeout-minutes: 15
@@ -850,7 +887,7 @@ jobs:
     # expected outcome. The bench jobs are left out: they never run on pull
     # requests.
     name: CI result
-    needs: [changes, lint, c-abi, test, cross-i686, msrv, no-std, wasm, codecov, miri, fuzz]
+    needs: [changes, lint, c-abi, test, conformance, cross-i686, msrv, no-std, wasm, codecov, miri, fuzz]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
