@@ -262,6 +262,18 @@ impl EncoderDictionary {
         self.inner.dict_content.len()
     }
 
+    /// The dictionary content a frame's matches can reach back into.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::EncoderDictionary;
+    ///
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(b"history").unwrap();
+    /// assert_eq!(dictionary.content(), b"history");
+    /// ```
+    pub fn content(&self) -> &[u8] {
+        &self.inner.dict_content
+    }
+
     /// The dictionary id.
     ///
     /// Zero is a raw-content dictionary, which has no header to carry an id.
@@ -1304,6 +1316,9 @@ pub(crate) fn resolve_frame_params(
 
 pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
+    /// The parse every block took, recorded while this is `Some`, each block
+    /// closed by a delimiter carrying its trailing literals.
+    pub(crate) sequence_capture: Option<Vec<crate::encoding::sequences::ExternalSequence>>,
     /// Grid fingerprints of the frame's blocks, which is what tells the
     /// raw-skip that a block duplicating an earlier one is not the noise it
     /// looks like. See [`SeenContentGrid`](crate::encoding::incompressible::SeenContentGrid).
@@ -1739,6 +1754,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             source_size_hint: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
+                sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huff_table_spare: None,
@@ -1779,6 +1795,24 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             block_decompressed_sizes: alloc::vec::Vec::new(),
             tuning: FrameTuning::default(),
         }
+    }
+
+    /// Ask `producer` for each block's parse in place of the built-in
+    /// matchers; `None` removes it. With `fallback` a block the producer fails
+    /// on is matched as usual; without, it goes out uncompressed and
+    /// [`Self::take_sequence_producer_failure`] reports it.
+    pub fn set_sequence_producer(
+        &mut self,
+        producer: Option<alloc::boxed::Box<dyn crate::encoding::sequences::SequenceProducer>>,
+        fallback: bool,
+    ) {
+        self.state.matcher.set_sequence_producer(producer, fallback);
+    }
+
+    /// Whether a block went out uncompressed because the producer failed on it
+    /// with no fallback, since this was last asked.
+    pub fn take_sequence_producer_failure(&mut self) -> bool {
+        self.state.matcher.take_producer_failure()
     }
 
     /// Configure fine-grained compression parameters.
@@ -2179,6 +2213,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             source_size_hint: None,
             state: CompressState {
                 matcher,
+                sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huff_table_spare: None,
@@ -2303,6 +2338,37 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 crate::common::MAX_BLOCK_SIZE,
             )
         });
+    }
+
+    /// Record the parse every block takes, from the next one on, until turned
+    /// off: its sequences with plain offsets, each block closed by a delimiter
+    /// carrying its trailing literals, and a block written out unsearched as a
+    /// delimiter alone (C `ZSTD_generateSequences`). The frames themselves are
+    /// unchanged.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+    ///
+    /// let input = b"capture capture capture capture".repeat(10);
+    /// let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    /// compressor.set_sequence_capture(true);
+    /// compressor.compress_independent_frame(&input);
+    /// let parse = compressor.take_captured_sequences();
+    /// let covered: usize = parse.iter().map(|s| (s.lit_len + s.match_len) as usize).sum();
+    /// assert_eq!(covered, input.len());
+    /// ```
+    pub fn set_sequence_capture(&mut self, capture: bool) {
+        self.state.sequence_capture = capture.then(Vec::new);
+    }
+
+    /// The parse recorded since [`Self::set_sequence_capture`] turned it on,
+    /// or since it was last taken; empty when nothing records it.
+    pub fn take_captured_sequences(&mut self) -> Vec<crate::encoding::sequences::ExternalSequence> {
+        self.state
+            .sequence_capture
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
     }
 
     /// The configured block ceiling before the window is considered: the

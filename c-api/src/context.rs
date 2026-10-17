@@ -148,13 +148,16 @@ pub(crate) fn set_frame_parameters(
     }
 }
 
-/// Put the block limits and the magic number back to a plain frame's: the
-/// compressor is shared with `ZSTD_compress2`, whose sticky parameters may
-/// have set them, and the one-shot entry points do not read those.
+/// Put the block limits, the magic number and the matchers back to a plain
+/// frame's: the compressor is shared with `ZSTD_compress2`, whose sticky
+/// parameters may have set them, and the one-shot entry points do not read
+/// those (upstream runs them on `simpleApiParams`, without a sequence
+/// producer).
 pub(crate) fn plain_frame_shape(compressor: &mut FrameCompressor) {
     compressor.set_target_block_size(None);
     compressor.set_max_block_size(None);
     compressor.set_magicless(false);
+    compressor.set_sequence_producer(None, false);
 }
 
 /// Opaque decompression context. Wraps a reusable [`FrameDecoder`] so its
@@ -237,6 +240,25 @@ impl ZSTD_CCtx {
         }
         self.bufferless = None;
         self.params.pledged_src_size = crate::params::CONTENTSIZE_UNKNOWN;
+    }
+
+    /// Start a one-shot frame over `src_len` bytes: refused while a streamed
+    /// frame is unfinished, whose pledge it would otherwise take. The pledge is
+    /// single-use, consumed here whatever the outcome; with all the input in
+    /// hand the real size drives the header, but a pledge that disagrees is a
+    /// contract violation (upstream `srcSize_wrong`).
+    pub(crate) fn begin_one_shot(&mut self, src_len: usize) -> Result<(), ZSTD_ErrorCode> {
+        if self.stream_in_progress() {
+            return Err(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
+        }
+        let pledged = core::mem::replace(
+            &mut self.params.pledged_src_size,
+            crate::params::CONTENTSIZE_UNKNOWN,
+        );
+        if pledged != crate::params::CONTENTSIZE_UNKNOWN && pledged != src_len as u64 {
+            return Err(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
+        }
+        Ok(())
     }
 
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
@@ -377,43 +399,15 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
     len
 }
 
-/// `size_t ZSTD_compress2(ZSTD_CCtx* cctx, void* dst, size_t dstCapacity,
-/// const void* src, size_t srcSize)` — one-shot compression driven entirely
-/// by the sticky advanced parameters (`ZSTD_CCtx_set*`); always starts a new
-/// frame.
-///
-/// # Safety
-/// `cctx` must be live; `dst`/`src` valid for their lengths (or `NULL`+0).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ZSTD_compress2(
-    cctx: *mut ZSTD_CCtx,
-    dst: *mut u8,
-    dst_capacity: usize,
-    src: *const u8,
-    src_size: usize,
-) -> usize {
-    if cctx.is_null() {
-        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
-    }
-    let cctx = unsafe { &mut *cctx };
-    if cctx.stream_in_progress() {
-        // A one-shot frame would interleave with the unfinished streaming
-        // frame on this context (and consume its pledge); the stream must
-        // be ended or the session reset first.
-        return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
-    }
-    let src = unsafe { in_slice(src, src_size) };
-    // The pledge is single-use: consumed by this frame regardless of
-    // outcome. With all input present in one call the actual srcSize drives
-    // the header, but a mismatching explicit pledge is a contract violation
-    // (upstream `srcSizeWrong`).
-    let pledged = core::mem::replace(
-        &mut cctx.params.pledged_src_size,
-        crate::params::CONTENTSIZE_UNKNOWN,
-    );
-    if pledged != crate::params::CONTENTSIZE_UNKNOWN && pledged != src_size as u64 {
-        return encode(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
-    }
+/// Compress `src` into `cctx.scratch` as one frame under the sticky
+/// parameters and the attached dictionary (the frame of `ZSTD_compress2`),
+/// recording the parse it takes into `capture` when one is given.
+pub(crate) fn compress_sticky_frame(
+    cctx: &mut ZSTD_CCtx,
+    src: &[u8],
+    capture: Option<&mut Vec<codec::encoding::sequences::ExternalSequence>>,
+) -> Result<(), ZSTD_ErrorCode> {
+    cctx.begin_one_shot(src.len())?;
     // A referenced CDict's compression parameters are authoritative
     // (upstream rule), so the sticky knobs are resolved — and can reject —
     // only when they will actually drive the frame; an unsupported sticky
@@ -421,10 +415,7 @@ pub unsafe extern "C" fn ZSTD_compress2(
     // All the input is here, so the frame's size is known and decides whether a
     // referenced CDict's parameters still describe it.
     let src_size = Some(src.len() as u64);
-    let frame_params = match cctx.frame_parameters(src_size) {
-        Ok(frame_params) => frame_params,
-        Err(code) => return encode(code),
-    };
+    let frame_params = cctx.frame_parameters(src_size)?;
     let params = cctx.params;
     let level = cctx.attach_level(src_size);
     let serial = cctx.attach_serial();
@@ -449,20 +440,55 @@ pub unsafe extern "C" fn ZSTD_compress2(
         enc.set_target_block_size(params.target_block_size());
         enc.set_max_block_size(params.max_block_size());
         enc.set_magicless(params.magicless);
+        let (producer, fallback) = params.sequence_producer();
+        enc.set_sequence_producer(producer, fallback);
+        enc.set_sequence_capture(capture.is_some());
         scratch.clear();
         enc.compress_independent_frame_into(src, scratch);
+        if let Some(capture) = capture {
+            *capture = enc.take_captured_sequences();
+            enc.set_sequence_capture(false);
+        }
+        // Without fallback a producer failure fails the frame, as upstream's
+        // `ZSTD_buildSeqStore` returns it (zstd_compress.c:3396).
+        if enc.take_sequence_producer_failure() {
+            return Err(ZSTD_ErrorCode::ZSTD_error_sequenceProducer_failed);
+        }
         Ok(())
     }));
     match outcome {
-        Ok(Ok(())) => {}
-        // A refused dictionary leaves the kept compressor as it was.
-        Ok(Err(code)) => return encode(code),
+        Ok(result) => result,
         Err(_) => {
             // A panic can leave the kept compressor torn; the next call
             // builds a new one.
             cctx.compressor = None;
-            return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+            Err(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
+    }
+}
+
+/// `size_t ZSTD_compress2(ZSTD_CCtx* cctx, void* dst, size_t dstCapacity,
+/// const void* src, size_t srcSize)` — one-shot compression driven entirely
+/// by the sticky advanced parameters (`ZSTD_CCtx_set*`); always starts a new
+/// frame.
+///
+/// # Safety
+/// `cctx` must be live; `dst`/`src` valid for their lengths (or `NULL`+0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_compress2(
+    cctx: *mut ZSTD_CCtx,
+    dst: *mut u8,
+    dst_capacity: usize,
+    src: *const u8,
+    src_size: usize,
+) -> usize {
+    if cctx.is_null() {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    }
+    let cctx = unsafe { &mut *cctx };
+    let src = unsafe { in_slice(src, src_size) };
+    if let Err(code) = compress_sticky_frame(cctx, src, None) {
+        return encode(code);
     }
     let len = cctx.scratch.len();
     if len > dst_capacity {

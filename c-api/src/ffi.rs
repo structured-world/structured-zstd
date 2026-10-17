@@ -3,12 +3,12 @@
 //! All upstream entry points tolerate a `(NULL, 0)` buffer pair, so a zero
 //! length never dereferences the pointer.
 
-/// Build a shared slice from a C `(ptr, len)` pair.
+/// Build a shared slice from a C `(ptr, len)` pair of `len` elements.
 ///
 /// # Safety
-/// When `len > 0`, `ptr` must be non-null and valid for reads of `len` bytes
-/// for the slice's lifetime.
-pub(crate) unsafe fn in_slice<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
+/// When `len > 0`, `ptr` must be non-null, aligned and valid for reads of
+/// `len` elements for the slice's lifetime.
+pub(crate) unsafe fn in_slice<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
     if len == 0 {
         &[]
     } else {
@@ -20,9 +20,9 @@ pub(crate) unsafe fn in_slice<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
 /// NULL tolerance as [`in_slice`].
 ///
 /// # Safety
-/// When `len > 0`, `ptr` must be non-null, valid for reads and writes of
-/// `len` bytes, and unaliased for the slice's lifetime.
-pub(crate) unsafe fn out_slice<'a>(ptr: *mut u8, len: usize) -> &'a mut [u8] {
+/// When `len > 0`, `ptr` must be non-null, aligned, valid for reads and
+/// writes of `len` elements, and unaliased for the slice's lifetime.
+pub(crate) unsafe fn out_slice<'a, T>(ptr: *mut T, len: usize) -> &'a mut [T] {
     if len == 0 {
         &mut []
     } else {

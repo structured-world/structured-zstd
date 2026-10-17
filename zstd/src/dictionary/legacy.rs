@@ -282,11 +282,13 @@ pub(crate) fn train_legacy_raw(
 ) -> Result<Vec<u8>, TooSmall> {
     let total: usize = sample_sizes.iter().sum();
     debug_assert_eq!(total, samples.len(), "the sizes describe the corpus");
-    if dict_size < DICT_SIZE_MIN {
-        return Err(TooSmall::Dictionary);
-    }
+    // The corpus first, as upstream checks it before anything else
+    // (zdict.c, `ZDICT_trainFromBuffer_legacy`).
     if total < MIN_SAMPLES_SIZE {
         return Err(TooSmall::Corpus);
+    }
+    if dict_size < DICT_SIZE_MIN {
+        return Err(TooSmall::Dictionary);
     }
     let selectivity = if selectivity == 0 {
         DEFAULT_SELECTIVITY
