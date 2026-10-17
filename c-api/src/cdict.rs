@@ -223,10 +223,10 @@ fn level_for_strategy(strategy: c_uint) -> Option<c_int> {
 /// `None` when the strategy ordinal is outside `ZSTD_strategy`'s range.
 fn cctx_params_from_cparams(
     cparams: &ZSTD_compressionParameters,
-) -> Option<crate::params::CCtxParams> {
+) -> Option<crate::cctx_params::CCtxParams> {
     use codec::encoding::Strategy;
     let opt = |v: c_uint| if v == 0 { None } else { Some(v) };
-    Some(crate::params::CCtxParams {
+    Some(crate::cctx_params::CCtxParams {
         level: level_for_strategy(cparams.strategy)?,
         window_log: opt(cparams.windowLog),
         hash_log: opt(cparams.hashLog),
@@ -235,7 +235,7 @@ fn cctx_params_from_cparams(
         min_match: opt(cparams.minMatch),
         target_length: opt(cparams.targetLength),
         strategy: Strategy::from_ordinal(cparams.strategy),
-        ..crate::params::CCtxParams::default()
+        ..crate::cctx_params::CCtxParams::default()
     })
 }
 
@@ -257,13 +257,31 @@ pub unsafe extern "C" fn ZSTD_createCDict_advanced(
     cparams: ZSTD_compressionParameters,
     custom_mem: ZSTD_customMem,
 ) -> *mut ZSTD_CDict {
+    // Validate the explicit parameters up front: an invalid strategy ordinal
+    // or an unsupported combination must fail creation (NULL) rather than
+    // silently skip them at attach time.
+    let Some(params) = cctx_params_from_cparams(&cparams) else {
+        return core::ptr::null_mut();
+    };
+    let dict = unsafe { in_slice(dict_buffer, dict_size) };
+    create_cdict_with_params(dict, dict_content_type, &params, &custom_mem)
+}
+
+/// The body of `ZSTD_createCDict_advanced` and `_advanced2`: a CDict that
+/// compresses under the explicit `params`, `NULL` when the dictionary, the
+/// content type, the parameters or the allocator are refused.
+pub(crate) fn create_cdict_with_params(
+    dict: &[u8],
+    dict_content_type: c_int,
+    params: &crate::cctx_params::CCtxParams,
+    custom_mem: &ZSTD_customMem,
+) -> *mut ZSTD_CDict {
     if !custom_mem.customAlloc.is_null()
         || !custom_mem.customFree.is_null()
         || !custom_mem.opaque.is_null()
     {
         return core::ptr::null_mut();
     }
-    let dict = unsafe { in_slice(dict_buffer, dict_size) };
     if dict.is_empty() {
         return core::ptr::null_mut();
     }
@@ -274,12 +292,6 @@ pub unsafe extern "C" fn ZSTD_createCDict_advanced(
         crate::attach::ZSTD_DCT_RAW_CONTENT => true,
         crate::attach::ZSTD_DCT_FULL_DICT if has_magic => false,
         _ => return core::ptr::null_mut(),
-    };
-    // Validate the explicit parameters up front: an invalid strategy ordinal
-    // or an unsupported combination must fail creation (NULL) rather than
-    // silently skip them at attach time.
-    let Some(params) = cctx_params_from_cparams(&cparams) else {
-        return core::ptr::null_mut();
     };
     let Some(resolved) = params.resolve() else {
         return core::ptr::null_mut();
@@ -433,7 +445,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
         enc.set_content_checksum(false);
         enc.set_content_size_flag(true);
         enc.set_dictionary_id_flag(!cdict_ref.raw_content);
-        enc.set_target_block_size(None);
+        crate::context::plain_frame_shape(enc);
         scratch.clear();
         enc.compress_independent_frame_into(src, scratch);
         Ok(())
@@ -495,7 +507,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict_advanced(
         // Raw-content dictionaries never emit their synthetic ID regardless
         // of the flag.
         enc.set_dictionary_id_flag(fparams.noDictIDFlag == 0 && !cdict_ref.raw_content);
-        enc.set_target_block_size(None);
+        crate::context::plain_frame_shape(enc);
         scratch.clear();
         enc.compress_independent_frame_into(src, scratch);
         Ok(())
