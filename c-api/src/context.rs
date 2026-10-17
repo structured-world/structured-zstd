@@ -97,6 +97,9 @@ pub struct ZSTD_CCtx {
     pub(crate) compressor: Option<(u64, FrameCompressor)>,
     /// How far the current or last frame got (`ZSTD_getFrameProgression`).
     pub(crate) progress: FrameProgress,
+    /// The buffer-less frame begun by `ZSTD_compressBegin*`, compressed on
+    /// the streaming context; `None` outside one.
+    pub(crate) bufferless: Option<crate::bufferless::BufferlessFrame>,
     /// Context-attached dictionary (`ZSTD_CCtx_loadDictionary` /
     /// `ZSTD_CCtx_refCDict` / `ZSTD_CCtx_refPrefix`), applied at every frame
     /// start by `ZSTD_compress2` / `ZSTD_compressStream2`.
@@ -166,6 +169,9 @@ pub struct ZSTD_DCtx {
     /// `ZSTD_d_format`: frames carry no magic number. Kept here as well as in
     /// `decoder` so a replacement decoder starts with it.
     pub(crate) magicless: bool,
+    /// Where the buffer-less decode (`ZSTD_decompressBegin*` /
+    /// `ZSTD_decompressContinue`) stands.
+    pub(crate) bufferless: crate::bufferless::BufferlessDecode,
     /// Whether the streaming decoder sits at a frame boundary (the next
     /// `ZSTD_decompressStream` input starts a new frame). `true` initially.
     pub(crate) stream_frame_done: bool,
@@ -194,6 +200,7 @@ pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
         stream: None,
         compressor: None,
         progress: FrameProgress::default(),
+        bufferless: None,
         attached_dict: crate::attach::CCtxDictAttach::None,
     })
 }
@@ -228,6 +235,7 @@ impl ZSTD_CCtx {
         if self.stream_in_progress() {
             self.stream = None;
         }
+        self.bufferless = None;
         self.params.pledged_src_size = crate::params::CONTENTSIZE_UNKNOWN;
     }
 
@@ -478,6 +486,7 @@ pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
         decoder: FrameDecoder::new(),
         max_window_size: crate::params::MAX_WINDOW_SIZE_DEFAULT,
         magicless: false,
+        bufferless: crate::bufferless::BufferlessDecode::new(false),
         stream_frame_done: true,
         attached_ddict: crate::attach::DCtxDictAttach::None,
         ddict_serial: 0,
@@ -514,6 +523,7 @@ impl ZSTD_DCtx {
     pub(crate) fn reset_parameters(&mut self) {
         self.max_window_size = crate::params::MAX_WINDOW_SIZE_DEFAULT;
         self.magicless = false;
+        self.bufferless = crate::bufferless::BufferlessDecode::new(false);
         // Replace the decoder to drop any loaded dictionaries; the
         // workspace re-grows on the next frame. The fresh decoder sits at
         // a frame boundary, so the streaming flag must say so too.

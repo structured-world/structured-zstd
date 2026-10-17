@@ -842,6 +842,86 @@ impl<M: Matcher> CompressionContext<M> {
         self.encoded_scratch.clear();
     }
 
+    /// Start the next frame now, writing its header to `drain`, rather than at
+    /// its first [`write`](Self::write). Settings are fixed from here on, as
+    /// after a write; a frame already open is left as it is.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel};
+    ///
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// let mut frame = Vec::new();
+    /// context.start_frame(&mut frame).unwrap();
+    /// assert!(!frame.is_empty());
+    /// assert!(context.frame_block_size().is_some());
+    /// ```
+    pub fn start_frame<D: Write + ?Sized>(&mut self, drain: &mut D) -> Result<(), Error> {
+        self.ensure_open()?;
+        self.ensure_frame_started(drain)
+    }
+
+    /// The largest block the open frame cuts: the block size limits held to
+    /// the window (upstream `ZSTD_getBlockSize`). `None` between frames.
+    pub fn frame_block_size(&self) -> Option<usize> {
+        self.frame_started.then(|| self.block_capacity())
+    }
+
+    /// Compress `block` as one block of the open frame and append its content,
+    /// without the block header, to `payload` (upstream `ZSTD_compressBlock`).
+    /// Returns whether it compressed: `false` appends nothing, and the caller
+    /// stores the block raw, as a decoder then takes it into its history.
+    /// Either way the block joins the history later blocks match against.
+    ///
+    /// The frame must be open ([`start_frame`](Self::start_frame)), hold no
+    /// input still waiting for its block, and `block` must fit
+    /// [`frame_block_size`](Self::frame_block_size).
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel};
+    ///
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// context.start_frame(&mut Vec::new()).unwrap();
+    /// let mut payload = Vec::new();
+    /// let compressed = context.compress_block(&b"blocks".repeat(100), &mut payload).unwrap();
+    /// assert!(compressed && payload.len() < 600);
+    /// ```
+    pub fn compress_block(&mut self, block: &[u8], payload: &mut Vec<u8>) -> Result<bool, Error> {
+        self.ensure_open()?;
+        if !self.frame_started {
+            return Err(invalid_input_error(
+                "the frame must be started before a block of it is compressed",
+            ));
+        }
+        if self.pending_len() != 0 {
+            return Err(invalid_input_error(
+                "a block cannot follow input still waiting for its block",
+            ));
+        }
+        if block.len() > self.block_capacity() {
+            return Err(invalid_input_error(
+                "the block is larger than the frame's block size",
+            ));
+        }
+        if block.is_empty() {
+            return Ok(false);
+        }
+        self.buffer_input(block);
+        let start = payload.len();
+        self.encode_block(payload, block.len(), false)
+            .map_err(|err| self.fail(err))?;
+        self.bytes_consumed += block.len() as u64;
+        // RFC 8878 3.1.1.2.2: Block_Type 2 is Compressed. A Raw or RLE block
+        // changes no entropy table and no repeat offset, exactly as a block
+        // the caller stores raw does on the decoding side.
+        let compressed = (payload[start] >> 1) & 3 == 2;
+        if compressed {
+            payload.drain(start..start + BLOCK_HEADER_LEN);
+        } else {
+            payload.truncate(start);
+        }
+        Ok(compressed)
+    }
+
     /// Input written to the open frame that no block has compressed yet: it
     /// waits for its block to fill, or for a flush. Zero between frames.
     /// Backs the progress the C `ZSTD_getFrameProgression` reports.

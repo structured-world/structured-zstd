@@ -50,17 +50,17 @@ const ZSTD_E_END: c_int = 2;
 /// context's match-finder tables, buffers and dictionary are built once.
 pub(crate) struct CStreamState {
     /// Compresses every streamed frame, writing straight into `pending`.
-    context: CompressionContext,
+    pub(crate) context: CompressionContext,
     /// Serial of the dictionary attached to `context` (`0` = none), so the
     /// same dictionary on the next frame is not attached again.
     dictionary: u64,
     /// Whether a frame is taking input: from its first call until
     /// `ZSTD_e_end` closes it.
-    open: bool,
+    pub(crate) open: bool,
     /// Frame bytes produced but not yet copied out to the caller.
-    pending: Vec<u8>,
+    pub(crate) pending: Vec<u8>,
     /// Read offset into `pending`.
-    pending_pos: usize,
+    pub(crate) pending_pos: usize,
 }
 
 impl CStreamState {
@@ -91,6 +91,11 @@ impl CStreamState {
     /// it still to be copied out.
     pub(crate) fn in_frame(&self) -> bool {
         self.open || self.pending_remaining() > 0
+    }
+
+    /// Identity of the dictionary the kept context holds (`0` = none).
+    pub(crate) fn dictionary_serial(&self) -> u64 {
+        self.dictionary
     }
 
     /// Detach the dictionary `serial` names from the context, if that is the
@@ -160,55 +165,88 @@ impl ZSTD_CCtx {
             attached_dict,
             ..
         } = self;
-        let state =
-            stream.get_or_insert_with(|| CStreamState::new(CompressionLevel::from_level(level)));
-        let mut setup = || -> Result<(), codec::io::Error> {
-            let context = &mut state.context;
-            // The attached dictionary goes onto the kept context only when it
-            // is not the one already there.
-            if state.dictionary != serial {
-                match attached_dict.prepared() {
-                    Some(dictionary) => context.set_encoder_dictionary(dictionary.clone())?,
-                    None => context.set_dictionary_from_bytes(&[])?,
-                }
-                state.dictionary = serial;
-            }
-            match &frame_params {
-                Some(frame_params) => context.set_parameters(frame_params)?,
-                None => context.set_compression_level(CompressionLevel::from_level(level))?,
-            }
-            context.set_content_checksum(params.checksum_flag)?;
-            context.set_target_block_size(params.target_block_size())?;
-            context.set_max_block_size(params.max_block_size())?;
-            context.set_magicless(params.magicless)?;
-            // The hint is a parameter: it stays for every frame until changed.
-            match params.src_size_hint {
-                0 => context.clear_source_size_hint()?,
-                hint => context.set_source_size_hint(hint as u64)?,
-            }
-            // The pledge is single-use (consumed by this frame). It is
-            // always enforced against the bytes actually written; the
-            // content-size flag only controls whether the header carries
-            // the FCS field (upstream validates the pledge at frame end
-            // regardless of the flag).
-            if params.pledged_src_size != CONTENTSIZE_UNKNOWN {
-                context.set_pledged_content_size(params.pledged_src_size)?;
-            }
-            context.set_content_size_flag(params.content_size_flag)?;
-            // A raw-content dictionary's synthetic ID never reaches the wire.
-            context.set_dictionary_id_flag(params.dict_id_flag && !suppress_id)?;
-            Ok(())
+        let setup = FrameSetup {
+            params: &params,
+            frame_params: frame_params.as_ref(),
+            level,
+            dictionary: attached_dict.prepared(),
+            serial,
+            suppress_id,
         };
-        if setup().is_err() {
-            // A context that refuses its settings is not trusted with the
-            // next frame either.
-            *stream = None;
-            return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC);
-        }
-        state.open = true;
+        CStreamState::open_frame(stream, &setup)?;
         self.progress = crate::context::FrameProgress::default();
         self.params.pledged_src_size = CONTENTSIZE_UNKNOWN;
         self.consume_prefix();
+        Ok(())
+    }
+}
+
+/// What the next frame on the kept streaming context runs under.
+pub(crate) struct FrameSetup<'a> {
+    /// Flags, block limits, format, hint and pledge.
+    pub(crate) params: &'a crate::cctx_params::CCtxParams,
+    /// Explicit parameters, or `None` for `level`'s own tuning.
+    pub(crate) frame_params: Option<&'a codec::encoding::CompressionParameters>,
+    pub(crate) level: c_int,
+    pub(crate) dictionary: Option<&'a codec::encoding::EncoderDictionary>,
+    /// Identity of `dictionary` (`0` = none), so the same one is not attached
+    /// to the kept context twice.
+    pub(crate) serial: u64,
+    /// A raw-content dictionary's synthetic ID never reaches the wire.
+    pub(crate) suppress_id: bool,
+}
+
+impl CStreamState {
+    /// Put the context in `stream`, made at `setup.level` when there is none,
+    /// on `setup` and open its next frame. A context that refuses a setting is
+    /// dropped: it is not trusted with the next frame either.
+    pub(crate) fn open_frame<'s>(
+        stream: &'s mut Option<CStreamState>,
+        setup: &FrameSetup<'_>,
+    ) -> Result<&'s mut CStreamState, ZSTD_ErrorCode> {
+        let state = stream
+            .get_or_insert_with(|| CStreamState::new(CompressionLevel::from_level(setup.level)));
+        if state.configure(setup).is_err() {
+            *stream = None;
+            return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+        }
+        let state = stream.as_mut().expect("configured just above");
+        state.open = true;
+        Ok(state)
+    }
+
+    fn configure(&mut self, setup: &FrameSetup<'_>) -> Result<(), codec::io::Error> {
+        let params = setup.params;
+        let context = &mut self.context;
+        if self.dictionary != setup.serial {
+            match setup.dictionary {
+                Some(dictionary) => context.set_encoder_dictionary(dictionary.clone())?,
+                None => context.set_dictionary_from_bytes(&[])?,
+            }
+            self.dictionary = setup.serial;
+        }
+        match setup.frame_params {
+            Some(frame_params) => context.set_parameters(frame_params)?,
+            None => context.set_compression_level(CompressionLevel::from_level(setup.level))?,
+        }
+        context.set_content_checksum(params.checksum_flag)?;
+        context.set_target_block_size(params.target_block_size())?;
+        context.set_max_block_size(params.max_block_size())?;
+        context.set_magicless(params.magicless)?;
+        // The hint is a parameter: it stays for every frame until changed.
+        match params.src_size_hint {
+            0 => context.clear_source_size_hint()?,
+            hint => context.set_source_size_hint(hint as u64)?,
+        }
+        // The pledge is single-use (consumed by this frame). It is always
+        // enforced against the bytes actually written; the content-size flag
+        // only controls whether the header carries the FCS field (upstream
+        // validates the pledge at frame end regardless of the flag).
+        if params.pledged_src_size != CONTENTSIZE_UNKNOWN {
+            context.set_pledged_content_size(params.pledged_src_size)?;
+        }
+        context.set_content_size_flag(params.content_size_flag)?;
+        context.set_dictionary_id_flag(params.dict_id_flag && !setup.suppress_id)?;
         Ok(())
     }
 }

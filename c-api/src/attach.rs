@@ -98,6 +98,7 @@ impl CCtxDictAttach {
 /// Dictionary state attached to a decompression context. All variants hold
 /// the dictionary pre-parsed as a [`DictionaryHandle`] (`Arc`-shared), so the
 /// per-frame application is a refcount bump.
+#[derive(Clone)]
 pub(crate) enum DCtxDictAttach {
     None,
     /// `ZSTD_DCtx_loadDictionary*`: sticky.
@@ -168,7 +169,7 @@ pub(crate) fn parse_decode_dict(
 }
 
 /// Whether `dict` selects raw-content modelling on the encode side.
-fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<bool, ZSTD_ErrorCode> {
+pub(crate) fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<bool, ZSTD_ErrorCode> {
     let has_magic =
         dict.len() >= 4 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
     match content_type {
