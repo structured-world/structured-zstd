@@ -523,8 +523,8 @@ pub unsafe extern "C" fn ZSTD_CCtxParams_getParameter(
 
 /// `size_t ZSTD_CCtx_setParametersUsingCCtxParams(ZSTD_CCtx* cctx, const
 /// ZSTD_CCtx_params* params)` — replace the context's parameters with
-/// `params`. Only between frames, and not while a `CDict` is referenced,
-/// whose parameters the frame inherits.
+/// `params` from the next frame on (a frame under way keeps its own), and not
+/// while a `CDict` is referenced, whose parameters the frame inherits.
 ///
 /// # Safety
 /// `cctx` and `params` must be live, or `NULL`.
@@ -536,7 +536,11 @@ pub unsafe extern "C" fn ZSTD_CCtx_setParametersUsingCCtxParams(
     let (Some(cctx), Some(source)) = (unsafe { cctx.as_mut() }, unsafe { params.as_ref() }) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     };
-    if cctx.stream_in_progress() || cctx.references_cdict() {
+    // A set applied while a frame streams waits for the next frame, as zstd.h
+    // promises for a single-threaded context: the open frame was configured
+    // when it began and reads none of these again. Upstream's own build
+    // refuses it (zstd_compress.c:1182); nothing depends on that refusal.
+    if cctx.references_cdict() {
         return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
     }
     // The pledge belongs to the session, which the parameters do not replace.

@@ -103,6 +103,61 @@ fn copy_cctx_reads_zero_as_unknown() {
     }
 }
 
+/// A run of blocks has no frame window, so the streaming ceiling does not
+/// bind it: a block may match an inserted one further back than the
+/// ceiling, as upstream's block API allows.
+#[test]
+fn block_runs_ignore_the_streaming_window_ceiling() {
+    // Sixteen symbols: compressible, with no long repeats inside the block,
+    // so its copy matches the first one 3000 bytes back.
+    let mut state = 0x2468_ACE1u32;
+    let stored: Vec<u8> = (0..3000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            b'a' + (state % 16) as u8
+        })
+        .collect();
+    let cctx = ZSTD_createCCtx();
+    let dctx = ZSTD_createDCtx();
+    let mut block = vec![0u8; 8192];
+    let mut out = vec![0u8; 8192];
+    unsafe {
+        assert_eq!(ZSTD_compressBegin(cctx, 3), 0);
+        // The decoder takes this first block as stored bytes: the same
+        // history, through `ZSTD_insertBlock`.
+        let n = ZSTD_compressBlock(
+            cctx,
+            block.as_mut_ptr(),
+            block.len(),
+            stored.as_ptr(),
+            stored.len(),
+        );
+        assert_eq!(ZSTD_isError(n), 0);
+        let n = ZSTD_compressBlock(
+            cctx,
+            block.as_mut_ptr(),
+            block.len(),
+            stored.as_ptr(),
+            stored.len(),
+        );
+        assert!(n > 0 && ZSTD_isError(n) == 0, "{:?}", code(n));
+
+        assert_eq!(crate::params::ZSTD_DCtx_setMaxWindowSize(dctx, 2048), 0);
+        assert_eq!(ZSTD_decompressBegin(dctx), 0);
+        assert_eq!(
+            ZSTD_insertBlock(dctx, stored.as_ptr(), stored.len()),
+            stored.len()
+        );
+        let m = ZSTD_decompressBlock(dctx, out.as_mut_ptr(), out.len(), block.as_ptr(), n);
+        assert_eq!(m, stored.len(), "{:?}", code(m));
+        assert_eq!(&out[..m], &stored[..]);
+        ZSTD_freeDCtx(dctx);
+        ZSTD_freeCCtx(cctx);
+    }
+}
+
 /// A block that compressed but did not fit `dst` is already history the next
 /// block could match against; the session ends, so a retry cannot emit a
 /// block that refers to one the caller never received.

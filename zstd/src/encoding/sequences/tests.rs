@@ -517,6 +517,38 @@ fn fast_level_capture_covers_unsearched_blocks() {
     check(&parse, &frame);
 }
 
+/// A sequence with no match carries no offset either: only a delimiter
+/// (offset 0) may end a parse in literals (zstd.h, `ZSTD_Sequence`).
+#[test]
+fn a_final_literal_run_must_have_no_offset() {
+    assert_eq!(
+        validate_parse(&[seq(1, 12, 0)], 12, 1 << 20, 0, false, 1 << 17),
+        Err(SequenceError::MatchTooShort { index: 0 })
+    );
+    assert_eq!(
+        validate_parse(
+            &[seq(3, 3, 6), seq(9, 3, 0)],
+            12,
+            1 << 20,
+            0,
+            false,
+            1 << 17
+        ),
+        Err(SequenceError::MatchTooShort { index: 1 })
+    );
+    assert_eq!(
+        validate_parse(
+            &[ExternalSequence::delimiter(12)],
+            12,
+            1 << 20,
+            0,
+            true,
+            1 << 17
+        ),
+        Ok(())
+    );
+}
+
 #[test]
 fn sequence_errors_read_as_what_went_wrong() {
     let cases = [

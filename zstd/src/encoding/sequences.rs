@@ -139,8 +139,8 @@ pub enum SequenceError {
     /// The parse covers more bytes than the input holds, or, with explicit
     /// block delimiters, not exactly the input.
     LengthMismatch,
-    /// Sequence `index` matches fewer than [`MIN_MATCH`] bytes without being
-    /// the final one.
+    /// Sequence `index` has an offset but matches fewer than [`MIN_MATCH`]
+    /// bytes; a run of literals alone is a delimiter, with offset 0.
     MatchTooShort {
         /// Index of the sequence.
         index: usize,
@@ -176,7 +176,8 @@ impl core::fmt::Display for SequenceError {
 impl std::error::Error for SequenceError {}
 
 /// Check that `sequences` is a parse of `src_len` bytes a decoder can follow:
-/// every match at least [`MIN_MATCH`] bytes but a final one of none, every
+/// every match at least [`MIN_MATCH`] bytes (literals with no match are a
+/// delimiter, offset 0), every
 /// offset within what is decoded so far plus `dict_len` bytes of dictionary
 /// while that fits the window, and within `window` after. With
 /// `explicit_delimiters` the parse must cover the input exactly and each
@@ -203,7 +204,6 @@ pub fn validate_parse(
 ) -> Result<(), SequenceError> {
     let mut position: u64 = 0;
     let mut block_start: u64 = 0;
-    let last = sequences.len().saturating_sub(1);
     for (index, sequence) in sequences.iter().enumerate() {
         position += u64::from(sequence.lit_len);
         if sequence.is_delimiter() {
@@ -218,7 +218,10 @@ pub fn validate_parse(
         if sequence.offset == 0 {
             return Err(SequenceError::ZeroOffset { index });
         }
-        if sequence.match_len < MIN_MATCH && !(index == last && sequence.match_len == 0) {
+        // A run of literals that ends the parse is a delimiter, handled above:
+        // with an offset it would be a match of no length (zstd.h,
+        // `ZSTD_Sequence`: offset 0 when matchLength is 0).
+        if sequence.match_len < MIN_MATCH {
             return Err(SequenceError::MatchTooShort { index });
         }
         // RFC 8878 3.1.1.1.2 / 3.1.1.5: while the output is within the window

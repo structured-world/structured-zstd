@@ -52,6 +52,54 @@ const NO_CUSTOM_MEM: ZSTD_customMem = ZSTD_customMem {
     opaque: core::ptr::null(),
 };
 
+/// A parameter set applied while a frame streams waits for the next frame,
+/// as zstd.h promises: the frame under way keeps the settings it began with.
+#[test]
+fn parameter_sets_queue_behind_a_streaming_frame() {
+    let cctx = ZSTD_createCCtx();
+    let params = ZSTD_createCCtxParams();
+    let input = b"queued parameters ".repeat(50);
+    let mut first = vec![0u8; 4096];
+    unsafe {
+        ZSTD_CCtxParams_setParameter(params, CHECKSUM, 1);
+        let mut out = ZSTD_outBuffer {
+            dst: first.as_mut_ptr().cast(),
+            size: first.len(),
+            pos: 0,
+        };
+        let mut inp = ZSTD_inBuffer {
+            src: input.as_ptr().cast(),
+            size: input.len(),
+            pos: 0,
+        };
+        assert_eq!(
+            ZSTD_isError(ZSTD_compressStream2(cctx, &mut out, &mut inp, 0)),
+            0
+        );
+        assert_eq!(ZSTD_CCtx_setParametersUsingCCtxParams(cctx, params), 0);
+        assert_eq!(ZSTD_compressStream2(cctx, &mut out, &mut inp, 2), 0);
+        first.truncate(out.pos);
+    }
+    // RFC 8878 3.1.1.1.1: Content_Checksum_Flag is bit 2 of the descriptor.
+    assert_eq!(first[4] >> 2 & 1, 0, "the open frame keeps its settings");
+    let mut second = vec![0u8; 4096];
+    let n = unsafe {
+        ZSTD_compress2(
+            cctx,
+            second.as_mut_ptr(),
+            second.len(),
+            input.as_ptr(),
+            input.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(n), 0);
+    assert_eq!(second[4] >> 2 & 1, 1, "the next frame takes the queued set");
+    unsafe {
+        ZSTD_freeCCtxParams(params);
+        ZSTD_freeCCtx(cctx);
+    }
+}
+
 /// The on/off flags take any non-zero value as on and read back as 1, as
 /// upstream coerces them (zstd_compress.c:835-846), on a context and on a
 /// parameter set alike.

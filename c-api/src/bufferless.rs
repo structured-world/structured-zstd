@@ -538,8 +538,13 @@ pub(crate) fn starting_input_length(magicless: bool) -> usize {
 /// `ZSTD_decompressContinue` and a block run for `ZSTD_decompressBlock`.
 fn begin_decode(dctx: &mut ZSTD_DCtx, dictionary: Option<DictionaryHandle>) -> usize {
     let mut run = BufferlessDecode::new(dctx.magicless);
+    // A run of blocks has no frame window: upstream's block API matches as far
+    // back as the history the caller kept, and its window ceiling binds the
+    // streaming decoder alone (zstd_decompress.c:2231). Each frame of the run
+    // is held to the ceiling again when its header arrives.
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        dctx.decoder.set_max_window_size(dctx.max_window_size)?;
+        dctx.decoder
+            .set_max_window_size(codec::decoding::MAX_DECODER_WINDOW_SIZE)?;
         dctx.decoder.begin_blocks(dictionary.as_ref())
     }));
     match outcome {
@@ -743,6 +748,9 @@ fn decompress_step(
             run.header_len = end;
             dctx.decoder
                 .set_content_checksum(codec::decoding::ContentChecksum::Verify);
+            dctx.decoder
+                .set_max_window_size(dctx.max_window_size)
+                .map_err(failed)?;
             let mut header = &run.header[..end];
             match run.dictionary.as_ref() {
                 Some(dictionary) => dctx.decoder.reset_with_dict_handle(&mut header, dictionary),
