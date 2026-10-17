@@ -3,6 +3,7 @@
 //! real symbol behaviour; the C-consumer link test in `tests/` is added
 //! separately and verifies a real `#include <zstd.h>` consumer.
 
+mod bufferless;
 mod cctx_params;
 mod experimental;
 mod streams;

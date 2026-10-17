@@ -451,6 +451,26 @@ pub fn frame_header_size(src: &[u8]) -> Result<usize, errors::ReadFrameHeaderErr
     frame::measure_header_from_slice(src)
 }
 
+/// [`frame_header_size`] for a frame in either format: with `magicless` the
+/// header starts at its descriptor byte and its length counts no magic
+/// number.
+///
+/// ```rust
+/// use structured_zstd::decoding::frame_header_size_in_format;
+/// // A descriptor announcing a window byte only.
+/// assert_eq!(frame_header_size_in_format(&[0x00], true).unwrap(), 2);
+/// assert_eq!(frame_header_size_in_format(&[0x28, 0xB5, 0x2F, 0xFD, 0x00], false).unwrap(), 6);
+/// ```
+///
+/// # Errors
+/// As [`frame_header_size`]; a magicless input fails only when it is empty.
+pub fn frame_header_size_in_format(
+    src: &[u8],
+    magicless: bool,
+) -> Result<usize, errors::ReadFrameHeaderError> {
+    frame::measure_header_with_format(src, magicless)
+}
+
 /// Decode the leading frame header fields of `src` without decoding the body.
 ///
 /// Backs the C `ZSTD_getFrameHeader`. When `magicless` is `true` the 4-byte
