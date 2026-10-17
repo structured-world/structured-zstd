@@ -51,15 +51,77 @@ trait WrapErr<T> {
     fn wrap_err_with<D: core::fmt::Display, F: FnOnce() -> D>(self, msg: F) -> Result<T>;
 }
 
-impl<T, E: core::fmt::Display> WrapErr<T> for core::result::Result<T, E> {
+impl<T, E: Into<Error>> WrapErr<T> for core::result::Result<T, E> {
     fn wrap_err(self, msg: impl core::fmt::Display) -> Result<T> {
-        self.map_err(|source| eyre!("{msg}: {source}"))
+        self.map_err(|source| with_context(source.into(), || msg.to_string()))
     }
 
     fn wrap_err_with<D: core::fmt::Display, F: FnOnce() -> D>(self, msg: F) -> Result<T> {
-        self.map_err(|source| eyre!("{}: {source}", msg()))
+        self.map_err(|source| with_context(source.into(), || msg().to_string()))
     }
 }
+
+/// `source` after `context`, unless its text is already the reference
+/// command's own line, which carries no context there either.
+fn with_context(source: Error, context: impl FnOnce() -> String) -> Error {
+    if source.is::<Usage>() || source.is::<DecodeFailure>() || source.is::<Fatal>() {
+        return source;
+    }
+    eyre!("{}: {source}", context())
+}
+
+/// A command-line error printed as the reference command prints it: the line
+/// as it stands, and the usage after it for a parameter it does not accept
+/// (`zstdcli.c` `badUsage`, `errorOut`).
+#[derive(Debug)]
+struct Usage {
+    message: String,
+    show_usage: bool,
+}
+
+impl Usage {
+    /// An argument the command does not accept (`badUsage`).
+    fn incorrect(parameter: impl core::fmt::Display) -> Error {
+        Box::new(Usage {
+            message: format!("Incorrect parameter: {parameter} "),
+            show_usage: true,
+        })
+    }
+
+    /// A line that ends the run on its own (`errorOut`, and the reference's
+    /// other one-line refusals).
+    fn plain(message: impl Into<String>) -> Error {
+        Box::new(Usage {
+            message: message.into(),
+            show_usage: false,
+        })
+    }
+}
+
+impl core::fmt::Display for Usage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Usage {}
+
+/// `err` from parsing the value of `argument`, as the reference reports a
+/// value it cannot read: the whole argument named as an incorrect parameter.
+/// A number the value held that does not fit keeps its own line, which the
+/// reference prints instead (`readU32FromChar`).
+fn incorrect_unless_usage(err: Error, argument: &str) -> Error {
+    if err.is::<Usage>() {
+        err
+    } else {
+        Usage::incorrect(argument)
+    }
+}
+
+/// The reference's refusal of `--output-dir-flat=` / `--output-dir-mirror=`
+/// with nothing after the `=` (`zstdcli.c:1086`).
+const EMPTY_OUTPUT_DIR: &str =
+    "error: output dir cannot be empty string (did you mean to pass '.' instead?)";
 /// Say something on stderr when `$verbosity` reaches `$level`: `1` carries
 /// errors, `2` results and warnings, `3` progress, `4` detail. A tool this
 /// size does not need a tracing subscriber; a macro keeps every call site a
@@ -172,6 +234,10 @@ struct Options {
     /// The worker count `-T#` / `--threads=#` asked for, `0` from
     /// `--single-thread`; `None` when never given.
     threads: Option<u32>,
+    /// `--rsyncable` and `--adapt`: multi-threaded modes that change nothing
+    /// in this build, refused only beside an explicit single thread.
+    rsyncable: bool,
+    adapt: bool,
     bench: bool,
     /// `-d` alongside `-b`: the inputs are frames, and only decoding them is
     /// measured (the reference's `BMK_decodeOnly`).
@@ -388,11 +454,14 @@ enum SuffixCase {
 /// widest value the destination holds. Reading stops after the suffix and the
 /// rest is handed back; an empty digit run reads as zero.
 fn read_leading_number(text: &str, max: u64, case: SuffixCase) -> Result<(u64, &str)> {
+    // The reference's lines, by the width it read into (`readU32FromChar`,
+    // `readSizeTFromChar`).
     let overflow = || {
-        eyre!(
-            "numeric value `{text}` overflows {} bits",
-            64 - max.leading_zeros()
-        )
+        Usage::plain(if max == u64::from(u32::MAX) {
+            "error: numeric value overflows 32-bit unsigned int "
+        } else {
+            "error: numeric value overflows size_t "
+        })
     };
     let bytes = text.as_bytes();
     let mut at = 0;
@@ -430,14 +499,19 @@ fn read_leading_number(text: &str, max: u64, case: SuffixCase) -> Result<(u64, &
 /// is refused, where the reference reads it as zero: `--size-hint=$UNSET` is a
 /// script that lost its value, not one asking for nothing.
 fn parse_number(text: &str, max: u64) -> Result<u64> {
+    // The reference's line for anything but a number (`NEXT_UINT32`); the
+    // `G` suffixes read here as well are an extension it does not list.
+    let not_a_number = || {
+        Usage::plain(
+            "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed ",
+        )
+    };
     if !text.starts_with(|c: char| c.is_ascii_digit()) {
-        bail!("`{text}`: expected a number");
+        return Err(not_a_number());
     }
     let (value, rest) = read_leading_number(text, max, SuffixCase::Any)?;
     if !rest.is_empty() {
-        bail!(
-            "`{text}`: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB, G, GB, GiB are allowed"
-        );
+        return Err(not_a_number());
     }
     Ok(value)
 }
@@ -909,12 +983,24 @@ fn command_status(raw: &[OsString], pause: &mut bool) -> i32 {
         }
         Err(failure) => {
             *pause = failure.pause;
-            display!(failure.verbosity, 1, "zstd: {}", failure.error);
-            if failure.verbosity >= DEFAULT_LEVEL {
+            // The reference's own lines stand as they are and bring the usage
+            // only for a parameter it does not take (`badUsage`); a refusal of
+            // ours is named after the tool and shows the usage too.
+            let show_usage = match failure.error.downcast_ref::<Usage>() {
+                Some(usage) => {
+                    display!(failure.verbosity, 1, "{usage}");
+                    usage.show_usage
+                }
+                None => {
+                    display!(failure.verbosity, 1, "zstd: {}", failure.error);
+                    true
+                }
+            };
+            if show_usage && failure.verbosity >= DEFAULT_LEVEL {
                 let mut stderr = io::stderr().lock();
                 let _ = write_short_usage(&mut stderr, &preset.name);
             }
-            return 1;
+            return exit_status(&failure.error);
         }
     };
     let verbosity = options.verbosity;
@@ -1074,7 +1160,11 @@ impl std::error::Error for Fatal {}
 
 /// The exit status an error ends the run with.
 fn exit_status(err: &Error) -> i32 {
-    err.downcast_ref::<Fatal>().map_or(1, |fatal| fatal.status)
+    if let Some(fatal) = err.downcast_ref::<Fatal>() {
+        return fatal.status;
+    }
+    err.downcast_ref::<Reported>()
+        .map_or(1, |reported| reported.status)
 }
 
 /// A decoding failure, still to be named after the input it came from (see
@@ -1113,13 +1203,16 @@ impl core::fmt::Display for DecodeFailure {
 impl std::error::Error for DecodeFailure {}
 
 /// An error whose text is complete, the input's name included, and is printed
-/// as it stands.
+/// as it stands; the run ends with `status`.
 #[derive(Debug)]
-struct Reported(String);
+struct Reported {
+    text: String,
+    status: i32,
+}
 
 impl core::fmt::Display for Reported {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.text)
     }
 }
 
@@ -1143,7 +1236,10 @@ fn named(err: Error, name: &str) -> Error {
                     }
                 })
                 .collect();
-            Box::new(Reported(lines.join("\n")))
+            Box::new(Reported {
+                text: lines.join("\n"),
+                status: 1,
+            })
         }
         Err(err) => err,
     }
@@ -1189,7 +1285,7 @@ fn level_from_env(value: Option<&OsStr>, verbosity: i32) -> i32 {
                 display!(
                     verbosity,
                     2,
-                    "Ignore environment variable setting ZSTD_CLEVEL={text}: numeric value too large"
+                    "Ignore environment variable setting ZSTD_CLEVEL={text}: numeric value too large "
                 );
                 return CompressionLevel::DEFAULT_LEVEL;
             }
@@ -1199,7 +1295,8 @@ fn level_from_env(value: Option<&OsStr>, verbosity: i32) -> i32 {
     display!(
         verbosity,
         2,
-        "Ignore environment variable setting ZSTD_CLEVEL={text}: not a valid integer value"
+        // The reference's lines, trailing space included (`zstdcli.c:763-789`).
+        "Ignore environment variable setting ZSTD_CLEVEL={text}: not a valid integer value "
     );
     CompressionLevel::DEFAULT_LEVEL
 }
@@ -1220,7 +1317,7 @@ fn check_threads_env(value: Option<&OsStr>, verbosity: i32) {
                 display!(
                     verbosity,
                     2,
-                    "Ignore environment variable setting ZSTD_NBTHREADS={text}: numeric value too large"
+                    "Ignore environment variable setting ZSTD_NBTHREADS={text}: numeric value too large "
                 );
                 return;
             }
@@ -1230,7 +1327,7 @@ fn check_threads_env(value: Option<&OsStr>, verbosity: i32) {
     display!(
         verbosity,
         2,
-        "Ignore environment variable setting ZSTD_NBTHREADS={text}: not a valid unsigned value"
+        "Ignore environment variable setting ZSTD_NBTHREADS={text}: not a valid unsigned value "
     );
 }
 
@@ -1335,6 +1432,8 @@ fn parse_args_into(
         max_dict: DEFAULT_MAX_DICT,
         dict_id: None,
         threads: None,
+        rsyncable: false,
+        adapt: false,
         bench: false,
         bench_decode_only: false,
         bench_start: default_level,
@@ -1497,8 +1596,9 @@ fn parse_args_into(
                 // script that passes them must not fail here: that is the
                 // whole drop-in contract.
                 "single-thread" => opts.threads = Some(0),
-                "adapt"
-                | "sparse"
+                "adapt" => opts.adapt = true,
+                "rsyncable" => opts.rsyncable = true,
+                "sparse"
                 | "no-sparse"
                 | "asyncio"
                 | "no-asyncio"
@@ -1581,7 +1681,9 @@ fn parse_args_into(
                         // misspelled key or a non-numeric bound is still a
                         // broken command line, and the contract is that ignored
                         // options validate what they are given.
-                        parse_adapt_params(params)?;
+                        parse_adapt_params(params)
+                            .map_err(|err| incorrect_unless_usage(err, &format!("--{long}")))?;
+                        opts.adapt = true;
                     } else if let Some(v) = option_text(long, "auto-threads", arg_os, &mut iter)? {
                         // Single-threaded: the choice has no effect, but a bad
                         // value is still a bad command line.
@@ -1617,18 +1719,14 @@ fn parse_args_into(
                         option_value(long, "output-dir-flat", arg_os, &mut iter)?
                     {
                         if dir.as_os_str().is_empty() {
-                            bail!(
-                                "error: output dir cannot be empty string (did you mean to pass '.' instead?)"
-                            );
+                            return Err(Usage::plain(EMPTY_OUTPUT_DIR));
                         }
                         opts.output_dir = Some(dir);
                     } else if let Some(dir) =
                         option_value(long, "output-dir-mirror", arg_os, &mut iter)?
                     {
                         if dir.as_os_str().is_empty() {
-                            bail!(
-                                "error: output dir cannot be empty string (did you mean to pass '.' instead?)"
-                            );
+                            return Err(Usage::plain(EMPTY_OUTPUT_DIR));
                         }
                         opts.output_dir_mirror = Some(dir);
                     } else if let Some(v) = long.strip_prefix("format=") {
@@ -1639,32 +1737,33 @@ fn parse_args_into(
                             bail!("--format={v} is not supported; this build only writes zstd");
                         }
                     } else if let Some(v) = long.strip_prefix("zstd=") {
-                        apply_advanced_params(v, &mut opts.advanced)?;
+                        apply_advanced_params(v, &mut opts.advanced)
+                            .map_err(|err| incorrect_unless_usage(err, &format!("--{long}")))?;
                     } else if let Some(v) = long.strip_prefix("cpu=") {
                         opts.cpu = Some(v.parse().map_err(|err| eyre!("--cpu={v}: {err}"))?);
                     } else if let Some(v) = long.strip_prefix("train-cover=") {
                         select_mode(&mut opts, Mode::Train);
                         opts.trainer = Trainer::Cover;
-                        opts.trainer_params = parse_trainer_params(v, false)?;
+                        opts.trainer_params = parse_trainer_params(v, false)
+                            .map_err(|err| incorrect_unless_usage(err, &format!("--{long}")))?;
                     } else if let Some(v) = long.strip_prefix("train-fastcover=") {
                         select_mode(&mut opts, Mode::Train);
                         opts.trainer = Trainer::FastCover;
-                        opts.trainer_params = parse_trainer_params(v, true)?;
+                        opts.trainer_params = parse_trainer_params(v, true)
+                            .map_err(|err| incorrect_unless_usage(err, &format!("--{long}")))?;
                     } else if let Some(v) = long.strip_prefix("train-legacy=") {
                         // `s=#` or `selectivity=#`, as `parseLegacyParameters`
                         // reads it.
                         select_mode(&mut opts, Mode::Train);
                         opts.trainer = Trainer::Legacy;
+                        let incorrect = || Usage::incorrect(format!("--{long}"));
                         let value = v
                             .strip_prefix("selectivity=")
                             .or_else(|| v.strip_prefix("s="))
-                            .ok_or_else(|| {
-                                eyre!("--train-legacy takes `s=#` or `selectivity=#`, got `{v}`")
-                            })?;
-                        let (selectivity, tail) = read_leading_u32(value)
-                            .wrap_err("invalid --train-legacy selectivity")?;
+                            .ok_or_else(incorrect)?;
+                        let (selectivity, tail) = read_leading_u32(value)?;
                         if !tail.is_empty() {
-                            bail!("invalid --train-legacy selectivity `{value}`");
+                            return Err(incorrect());
                         }
                         opts.selectivity = selectivity;
                     } else if let Some(reference) =
@@ -1694,11 +1793,6 @@ fn parse_args_into(
                         // frame is appended to, as a reference build with library
                         // tracing writes it (`programs/zstdcli_trace.c`).
                         opts.trace = Some(path);
-                    } else if long == "rsyncable" {
-                        // Synchronisation points are cut between the jobs of a
-                        // multi-threaded run, which this build does not have;
-                        // the reference command refuses the pair too.
-                        bail!("--rsyncable is not compatible with single-thread mode");
                     } else if long == "long" {
                         // Bare `--long` is `--long=27` upstream. The window is
                         // the point of the flag, so leaving the level's own one
@@ -1717,7 +1811,7 @@ fn parse_args_into(
                         opts.long = true;
                         opts.long_window_log = Some(log);
                     } else {
-                        bail!("unknown option: --{long}");
+                        return Err(Usage::incorrect(format!("--{long}")));
                     }
                 }
             }
@@ -1876,7 +1970,8 @@ fn parse_args_into(
                     ci = next;
                     continue;
                 }
-                _ => bail!("unknown flag: -{c} (in {arg})"),
+                // The reference names the one flag it did not take.
+                _ => return Err(Usage::incorrect(format!("-{c}"))),
             }
             ci += 1;
         }
@@ -1978,7 +2073,32 @@ fn select_mode(opts: &mut Options, mode: Mode) {
 /// above zero, `-T1` included. Scripts read it to tell a single-threaded build.
 fn multithreading_note(opts: &Options) -> Option<&'static str> {
     (opts.mode == Mode::Compress && !opts.bench && opts.threads.is_some_and(|count| count > 0))
-        .then_some("Note : multi-threading is disabled")
+        // The trailing space is the reference's line (`fileio.c:371`).
+        .then_some("Note : multi-threading is disabled ")
+}
+
+/// The refusal of a multi-threaded mode beside an explicit single thread, as
+/// the reference built without threads gives it when compressing
+/// (`FIO_setAdaptiveMode`, `FIO_setRsyncable`): `--single-thread`, `-T0`.
+/// Without one they are taken and change nothing, as there.
+fn single_thread_refusal(opts: &Options) -> Option<Error> {
+    if opts.mode != Mode::Compress || opts.bench || opts.threads != Some(0) {
+        return None;
+    }
+    let mode = if opts.adapt {
+        "Adaptive"
+    } else if opts.rsyncable {
+        "Rsyncable"
+    } else {
+        return None;
+    };
+    Some(
+        Fatal {
+            status: 1,
+            message: format!("{mode} mode is not compatible with single thread mode "),
+        }
+        .into(),
+    )
 }
 
 /// Whether this run will decode anything, and so whether `-M` binds it.
@@ -2037,7 +2157,9 @@ fn write_short_usage(out: &mut impl Write, program: &str) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  -k, --keep                    Preserve INPUT file(s). [Default]"
+        // The usage is the reference's text as it prints it (`zstdcli.c:144-174`),
+        // trailing space and wording included.
+        "  -k, --keep                    Preserve INPUT file(s). [Default] "
     )?;
     writeln!(
         out,
@@ -2078,7 +2200,7 @@ fn write_short_usage(out: &mut impl Write, program: &str) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "                                passed through as-is.\n"
+        "                                passed-through through as-is.\n"
     )?;
     writeln!(
         out,
@@ -2928,6 +3050,9 @@ fn run_selected(mut opts: Options) -> Result<usize> {
     // Only zstd is written. The reference command built without a codec stops
     // the whole run at the first input it would compress to it
     // (`fileio.c` `EXM_THROW(20, ...)`), before writing or removing anything.
+    if let Some(refusal) = single_thread_refusal(&opts) {
+        return Err(refusal);
+    }
     if opts.mode == Mode::Compress && !opts.bench && opts.format != OutputFormat::Zstd {
         let first = match opts.inputs.first() {
             Some(input) if input != Path::new("-") => input.display().to_string(),
@@ -4263,7 +4388,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         bail!("--train cannot read stdin; name the sample files (`./-` for one called `-`)");
     }
     if opts.inputs.is_empty() {
-        bail!("--train requires one or more sample files");
+        return Err(too_few_samples(opts.verbosity));
     }
     // `-c` and `-o` clear one another, so this pair leaves no destination and
     // the default below would stand in: the run would write a file nobody
@@ -4382,6 +4507,13 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     };
     let set = load_training_samples(&opts.inputs, opts.block_size, opts.memory_limit, |count| {
         enough_samples(count).map_err(failed)
+    })
+    .map_err(|err| {
+        if err.is::<TooFewSamples>() {
+            too_few_samples(opts.verbosity)
+        } else {
+            err
+        }
     })?;
     for (level, line) in training_load_notices(&set, opts.memory_limit) {
         display!(opts.verbosity, level, "{line}");
@@ -4478,6 +4610,40 @@ const TRAINING_DATA_MAX: u64 = 2 << 30;
 
 /// Fewest samples a trainer is given (`dibio.c`: "nb of samples too low").
 const TRAINING_SAMPLES_MIN: usize = 5;
+
+/// Fewer than [`TRAINING_SAMPLES_MIN`] samples were found; reported through
+/// [`too_few_samples`] where the display level is known.
+#[derive(Debug)]
+struct TooFewSamples;
+
+impl core::fmt::Display for TooFewSamples {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("nb of samples too low")
+    }
+}
+
+impl std::error::Error for TooFewSamples {}
+
+/// The refusal of fewer than [`TRAINING_SAMPLES_MIN`] samples, none included,
+/// as the reference's trainer gives it (`dibio.c:364-368`): the advice as
+/// warnings, then its error line, status 14.
+fn too_few_samples(verbosity: i32) -> Error {
+    display!(
+        verbosity,
+        2,
+        "!  Warning : nb of samples too low for proper processing ! "
+    );
+    display!(verbosity, 2, "!  Please provide _one file per sample_. ");
+    display!(
+        verbosity,
+        2,
+        "!  Alternatively, split files into fixed-size blocks representative of samples, with -B# "
+    );
+    Box::new(Reported {
+        text: "Error 14 : nb of samples too low".to_string(),
+        status: 14,
+    })
+}
 
 /// The samples a trainer is handed, loaded the way the reference's command
 /// loads them (`dibio.c`, `DiB_trainFromFiles`).
@@ -4634,10 +4800,7 @@ fn load_training_samples(
     }
     let samples = training_extent(&file_sizes, block_size);
     if samples < TRAINING_SAMPLES_MIN as u128 {
-        bail!(
-            "{samples} training sample(s) is too few; provide one file per sample, or \
-             split files into fixed-size samples with -B#"
-        );
+        return Err(Box::new(TooFewSamples));
     }
     let budget = TRAINING_DATA_MAX.min(memory_limit.unwrap_or(u64::MAX));
     let requested = file_sizes
@@ -5511,10 +5674,17 @@ fn is_block_device_type(kind: &fs::FileType) -> bool {
 /// path is only a name, and can be made to name something else between the
 /// look and the open.
 fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata)>> {
-    let named = fs::metadata(input)
-        .map_err(|err| eyre!("can't stat {} : {err} -- ignored", input.display()))?;
+    // The reference's lines, trailing space included (`fileio.c:555-564`,
+    // 2040).
+    let named = fs::metadata(input).map_err(|err| {
+        eyre!(
+            "can't stat {} : {} -- ignored ",
+            input.display(),
+            os_error_text(&err)
+        )
+    })?;
     if named.is_dir() {
-        bail!("{} is a directory -- ignored", input.display());
+        bail!("{} is a directory -- ignored ", input.display());
     }
     // The file a frame is compressed against is not also its content, as the
     // reference refuses it per input (fileio.c `FIO_compressFilename_srcFile`,
@@ -5535,7 +5705,7 @@ fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata
         kind.is_file() || is_fifo_type(kind) || (opts.force && is_block_device_type(kind))
     };
     if !admissible(&named.file_type()) {
-        bail!("{} is not a regular file -- ignored", input.display());
+        bail!("{} is not a regular file -- ignored ", input.display());
     }
     if skips_as_compressed(opts, input) {
         display!(
@@ -5551,9 +5721,21 @@ fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata
         .metadata()
         .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
     if metadata.is_dir() || !admissible(&metadata.file_type()) {
-        bail!("{} is not a regular file -- ignored", input.display());
+        bail!("{} is not a regular file -- ignored ", input.display());
     }
     Ok(Some((source, metadata)))
+}
+
+/// The system's description of `err`, as `strerror` gives it: without the
+/// ` (os error N)` the standard library appends.
+fn os_error_text(err: &io::Error) -> String {
+    let text = err.to_string();
+    match err.raw_os_error() {
+        Some(code) => text
+            .strip_suffix(&format!(" (os error {code})"))
+            .map_or(text.clone(), str::to_string),
+        None => text,
+    }
 }
 
 /// Stream one opened input through the codec into `sink`.

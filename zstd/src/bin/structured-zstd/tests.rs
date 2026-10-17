@@ -4450,16 +4450,127 @@ fn size_arguments_parse_upstream_spellings() {
 /// a zstd frame, or a patch built against no reference at all.
 #[test]
 fn unimplemented_output_changing_flags_are_rejected() {
-    for args in [
-        &["--format=gzip", "f"][..],
-        &["--format=xz", "f"][..],
-        &["--rsyncable", "f"][..],
-    ] {
+    for args in [&["--format=gzip", "f"][..], &["--format=xz", "f"][..]] {
         assert!(
             parse(args).is_err(),
             "{args:?} changes the output and is not implemented; it must not be silently accepted"
         );
     }
+}
+
+/// `--rsyncable` and `--adapt` act on the jobs of a multi-threaded run. The
+/// reference built without threads takes them and changes nothing, refusing
+/// them only beside an explicit single thread when it compresses
+/// (`FIO_setAdaptiveMode`, `FIO_setRsyncable`: `nbWorkers == 0`), with
+/// status 1.
+#[test]
+fn multi_threaded_modes_are_refused_only_beside_a_single_thread() {
+    for args in [
+        &["--rsyncable", "f"][..],
+        &["--adapt", "f"],
+        &["--adapt=min=1,max=9", "f"],
+        &["-T2", "--rsyncable", "f"],
+        &["-d", "-T0", "--rsyncable", "f.zst"],
+    ] {
+        let opts = parse(args).unwrap();
+        assert!(single_thread_refusal(&opts).is_none(), "{args:?}");
+    }
+    for (args, mode) in [
+        (&["--single-thread", "--rsyncable", "f"][..], "Rsyncable"),
+        (&["-T0", "--adapt", "f"], "Adaptive"),
+        (&["-T0", "--adapt", "--rsyncable", "f"], "Adaptive"),
+    ] {
+        let opts = parse(args).unwrap();
+        let refusal = single_thread_refusal(&opts).expect("refused");
+        assert_eq!(exit_status(&refusal), 1, "{args:?}");
+        assert_eq!(
+            refusal.to_string(),
+            format!("error 1 : {mode} mode is not compatible with single thread mode "),
+            "{args:?}"
+        );
+    }
+}
+
+/// Training on no samples, or fewer than the trainer needs, ends with the
+/// reference trainer's status 14 (`dibio.c` `EXM_THROW(14, "nb of samples too
+/// low")`) rather than the generic 1.
+#[test]
+fn training_on_too_few_samples_exits_with_status_14() {
+    let none: Vec<OsString> = vec!["zstd".into(), "--train".into(), "-qq".into()];
+    assert_eq!(run_command(&none, &mut io::empty()), 14);
+    let scratch = Scratch::new("trainfew");
+    let one = scratch.file("one", b"a single sample");
+    let raw: Vec<OsString> = vec![
+        "zstd".into(),
+        "--train".into(),
+        "-qq".into(),
+        one.into_os_string(),
+        "-o".into(),
+        scratch.path().join("dict").into_os_string(),
+    ];
+    assert_eq!(run_command(&raw, &mut io::empty()), 14);
+}
+
+/// Command-line errors read as the reference prints them (`zstdcli.c`
+/// `badUsage`, `errorOut`): an argument it does not take is named whole as an
+/// incorrect parameter, followed by the usage; a number that overflows or is
+/// not a number gets its one line and no usage.
+#[test]
+fn command_line_errors_read_as_the_reference_prints_them() {
+    let usage = |args: &[&str]| {
+        let Err(err) = parse(args) else {
+            panic!("{args:?} is refused");
+        };
+        let usage = err.downcast_ref::<Usage>().expect("a reference line");
+        (usage.message.clone(), usage.show_usage)
+    };
+    assert_eq!(
+        usage(&["--blah"]),
+        ("Incorrect parameter: --blah ".to_string(), true)
+    );
+    assert_eq!(
+        usage(&["-xz"]),
+        ("Incorrect parameter: -x ".to_string(), true)
+    );
+    assert_eq!(
+        usage(&["--adapt=min=1,maxx=2", "f"]),
+        (
+            "Incorrect parameter: --adapt=min=1,maxx=2 ".to_string(),
+            true
+        )
+    );
+    assert_eq!(
+        usage(&["--train-cover=k=48,d=8,steps32", "f"]),
+        (
+            "Incorrect parameter: --train-cover=k=48,d=8,steps32 ".to_string(),
+            true
+        )
+    );
+    assert_eq!(
+        usage(&["--zstd=wlog=x", "f"]),
+        ("Incorrect parameter: --zstd=wlog=x ".to_string(), true)
+    );
+    let overflow = (
+        "error: numeric value overflows 32-bit unsigned int ".to_string(),
+        false,
+    );
+    assert_eq!(usage(&["-5000000000", "f"]), overflow);
+    assert_eq!(usage(&["--fast=5000000000", "f"]), overflow);
+    let not_a_number = (
+        "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed "
+            .to_string(),
+        false,
+    );
+    assert_eq!(usage(&["--memory=32LB", "f"]), not_a_number);
+    assert_eq!(usage(&["--memory=hello", "f"]), not_a_number);
+    assert_eq!(
+        usage(&["--output-dir-flat=", "f"]),
+        (
+            "error: output dir cannot be empty string (did you mean to pass '.' instead?)"
+                .to_string(),
+            false
+        )
+    );
 }
 
 /// `--format=zstd` is the default and names what we actually produce.
@@ -5233,7 +5344,8 @@ fn the_dictionary_is_not_an_input_to_compress_with_itself() {
 /// do not compress say nothing.
 #[test]
 fn asking_for_threads_notes_that_there_are_none() {
-    const NOTE: &str = "Note : multi-threading is disabled";
+    // The reference's line, trailing space included.
+    const NOTE: &str = "Note : multi-threading is disabled ";
     for args in [
         &["-T2", "f"][..],
         &["-T1", "f"],
