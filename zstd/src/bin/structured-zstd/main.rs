@@ -5121,6 +5121,21 @@ fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata
     if named.is_dir() {
         bail!("{} is a directory -- ignored", input.display());
     }
+    // The file a frame is compressed against is not also its content, as the
+    // reference refuses it per input (fileio.c `FIO_compressFilename_srcFile`,
+    // compared by file identity like its `UTIL_isSameFileStat`).
+    if compresses(opts)
+        && let Some(input_id) = identity::of_path(input)
+        && [&opts.dict, &opts.patch_from]
+            .into_iter()
+            .flatten()
+            .any(|dict| identity::of_path(dict) == Some(input_id))
+    {
+        bail!(
+            "cannot use {} as an input file and dictionary",
+            input.display()
+        );
+    }
     let admissible = |kind: &fs::FileType| {
         kind.is_file() || is_fifo_type(kind) || (opts.force && is_block_device_type(kind))
     };

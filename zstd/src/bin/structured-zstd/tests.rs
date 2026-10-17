@@ -4948,6 +4948,47 @@ fn already_compressed_inputs_are_skipped_and_directories_refused() {
     assert!(err.contains("can't stat"), "{err}");
 }
 
+/// Compressing the dictionary file with itself is refused for that input, as
+/// the reference refuses it (`zstd: cannot use %s as an input file and
+/// dictionary`, fileio.c `FIO_compressFilename_srcFile`), whether the file is
+/// the `-D` dictionary or the `--patch-from` reference and however the path is
+/// spelled. Other inputs of the run still compress, and decompressing is not
+/// affected.
+#[test]
+fn the_dictionary_is_not_an_input_to_compress_with_itself() {
+    let scratch = Scratch::new("dict-input");
+    let dict = scratch.file("dict", &vec![b'd'; 4096]);
+    let other = scratch.file("other", b"another input");
+    let respelled = scratch.path().join(".").join("dict");
+    for flag in ["-D", "--patch-from"] {
+        let mut opts = parse(&["-q", flag, "dict", "f"]).unwrap();
+        if flag == "-D" {
+            opts.dict = Some(dict.clone());
+        } else {
+            opts.patch_from = Some(dict.clone());
+        }
+        for spelling in [&dict, &respelled] {
+            let err = open_input(&opts, spelling)
+                .expect_err("the dictionary is refused as an input")
+                .to_string();
+            assert!(
+                err.contains("cannot use") && err.contains("as an input file and dictionary"),
+                "{flag}: {err}"
+            );
+        }
+        assert!(
+            open_input(&opts, &other).unwrap().is_some(),
+            "{flag}: another input opens"
+        );
+    }
+    let mut decoding = parse(&["-d", "-q", "-D", "dict", "f"]).unwrap();
+    decoding.dict = Some(dict.clone());
+    assert!(
+        open_input(&decoding, &dict).unwrap().is_some(),
+        "decoding opens it"
+    );
+}
+
 /// One failing input does not end the run: the rest are processed and the
 /// failure count comes back to become the exit status, as the reference
 /// command's does.
