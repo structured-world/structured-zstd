@@ -646,7 +646,9 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
         state.offset_hist = hist;
     }
     // Once per block, after the match loop: the loop itself is the same
-    // whether or not anyone records it.
+    // whether or not anyone records it. One delimiter per matched block is
+    // one per written block, as `compress_block_encoded` keeps the post-split
+    // off while a parse is recorded.
     if let Some(capture) = state.sequence_capture.as_mut() {
         record_block_parse(
             capture,
