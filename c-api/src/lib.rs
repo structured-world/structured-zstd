@@ -30,6 +30,7 @@
 //! on; consumers wanting an embedded build link `codec` directly.
 
 mod attach;
+mod cctx_params;
 mod cdict;
 mod context;
 mod dict;

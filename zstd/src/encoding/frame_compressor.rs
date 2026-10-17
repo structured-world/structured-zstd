@@ -342,6 +342,9 @@ pub struct FrameCompressor<
     /// `target + 3` header bytes on the wire. `None` = no target (full
     /// 128 KiB blocks). Set via [`Self::set_target_block_size`].
     target_block_size: Option<u32>,
+    /// Largest block the frame may carry (upstream `ZSTD_c_maxBlockSize`),
+    /// below the format's 128 KiB. Set via [`Self::set_max_block_size`].
+    max_block_size: Option<u32>,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
     /// Block-layout introspection populated at the end of every
@@ -1540,6 +1543,17 @@ fn initial_all_blocks_cap(initial_size_hint: Option<u64>, block_capacity: usize)
     }
 }
 
+/// The block ceiling a target block size and a maximum block size leave
+/// together: the smaller one that is set, or the format's 128 KiB.
+pub(crate) fn block_ceiling(target: Option<u32>, max: Option<u32>) -> usize {
+    let ceiling = match (target, max) {
+        (Some(target), Some(max)) => target.min(max),
+        (Some(size), None) | (None, Some(size)) => size,
+        (None, None) => crate::common::MAX_BLOCK_SIZE,
+    };
+    ceiling as usize
+}
+
 /// Per-block feeder for `run_owned_block_loop`.
 ///
 /// `fill_block` appends source bytes to `buf` (which already holds any
@@ -1752,6 +1766,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             content_size_flag: true,
             dict_id_flag: true,
             target_block_size: None,
+            max_block_size: None,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -2192,6 +2207,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             content_size_flag: true,
             dict_id_flag: true,
             target_block_size: None,
+            max_block_size: None,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -2264,12 +2280,40 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         });
     }
 
-    /// The active block-size cap: the configured target, or the format's
-    /// 128 KiB block ceiling.
+    /// Cap every block of the frame at `size` bytes (semantics of upstream
+    /// `ZSTD_c_maxBlockSize`), for a decoder that holds only that much of a
+    /// block at a time. Clamped to `[MIN_MAX_BLOCK_SIZE, MAX_BLOCK_SIZE]`;
+    /// `None` restores the format's 128 KiB. Combines with
+    /// [`Self::set_target_block_size`]: the smaller of the two applies.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+    ///
+    /// let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    /// compressor.set_max_block_size(Some(1024));
+    /// let mut frame = Vec::new();
+    /// compressor.set_source(&[7u8; 4096][..]);
+    /// compressor.set_drain(&mut frame);
+    /// compressor.compress();
+    /// ```
+    pub fn set_max_block_size(&mut self, size: Option<u32>) {
+        self.max_block_size = size.map(|s| {
+            s.clamp(
+                crate::common::MIN_MAX_BLOCK_SIZE,
+                crate::common::MAX_BLOCK_SIZE,
+            )
+        });
+    }
+
+    /// The configured block ceiling before the window is considered: the
+    /// smaller of the target and the maximum, or the format's 128 KiB.
+    fn block_ceiling(&self) -> usize {
+        block_ceiling(self.target_block_size, self.max_block_size)
+    }
+
+    /// The active block-size cap: the configured ceiling, held to the window.
     fn block_capacity(&self) -> usize {
-        let requested = self
-            .target_block_size
-            .map_or(crate::common::MAX_BLOCK_SIZE as usize, |t| t as usize);
+        let requested = self.block_ceiling();
         // Upstream zstd sizes a block as `MIN(maxBlockSize, windowSize)`
         // (`ZSTD_compress.c`). A block wider than the window can never be
         // held by the matcher, which asserts on it, so a small `window_log`
@@ -2532,9 +2576,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             self.state.matcher.set_dictionary_size_hint(dict.sizes());
         }
         // Clearing buffers to allow re-using of the compressor
-        let block_target = self
-            .target_block_size
-            .map_or(crate::common::MAX_BLOCK_SIZE as usize, |t| t as usize);
+        let block_target = self.block_ceiling();
         // Raw frames emit straight from the staged buffer and never consult
         // the match finder, so they keep no history.
         let ingest = if matches!(self.compression_level, CompressionLevel::Uncompressed) {

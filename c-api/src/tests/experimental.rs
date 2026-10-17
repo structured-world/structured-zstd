@@ -33,11 +33,11 @@ const FRAMES: [u8; 34] = [
 /// Where the skippable frame starts in [`FRAMES`].
 const SKIPPABLE_AT: usize = 21;
 
-fn code(rc: usize) -> ZSTD_ErrorCode {
+pub(super) fn code(rc: usize) -> ZSTD_ErrorCode {
     ZSTD_getErrorCode(rc)
 }
 
-fn cparams(p: [u32; 7]) -> ZSTD_compressionParameters {
+pub(super) fn cparams(p: [u32; 7]) -> ZSTD_compressionParameters {
     ZSTD_compressionParameters {
         windowLog: p[0],
         chainLog: p[1],
@@ -345,7 +345,7 @@ fn dictionary_estimates_bound_the_created_objects() {
     }
 }
 
-fn compressed(input: &[u8]) -> Vec<u8> {
+pub(super) fn compressed(input: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; ZSTD_compressBound(input.len())];
     let n = unsafe { ZSTD_compress(out.as_mut_ptr(), out.len(), input.as_ptr(), input.len(), 3) };
     assert_eq!(ZSTD_isError(n), 0);
@@ -353,7 +353,10 @@ fn compressed(input: &[u8]) -> Vec<u8> {
     out
 }
 
-fn stream_decode(dctx: *mut crate::context::ZSTD_DCtx, src: &[u8]) -> Result<Vec<u8>, usize> {
+pub(super) fn stream_decode(
+    dctx: *mut crate::context::ZSTD_DCtx,
+    src: &[u8],
+) -> Result<Vec<u8>, usize> {
     let mut out = vec![0u8; 1 << 16];
     let mut inb = ZSTD_inBuffer {
         src: src.as_ptr().cast(),

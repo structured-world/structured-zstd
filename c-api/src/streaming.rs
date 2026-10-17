@@ -178,9 +178,14 @@ impl ZSTD_CCtx {
                 None => context.set_compression_level(CompressionLevel::from_level(level))?,
             }
             context.set_content_checksum(params.checksum_flag)?;
-            context.set_target_block_size(
-                (params.target_cblock_size > 0).then_some(params.target_cblock_size as u32),
-            )?;
+            context.set_target_block_size(params.target_block_size())?;
+            context.set_max_block_size(params.max_block_size())?;
+            context.set_magicless(params.magicless)?;
+            // The hint is a parameter: it stays for every frame until changed.
+            match params.src_size_hint {
+                0 => context.clear_source_size_hint()?,
+                hint => context.set_source_size_hint(hint as u64)?,
+            }
             // The pledge is single-use (consumed by this frame). It is
             // always enforced against the bytes actually written; the
             // content-size flag only controls whether the header carries

@@ -91,6 +91,9 @@ pub struct CompressionContext<M: Matcher = MatchGeneratorDriver> {
     /// semantics; see `FrameCompressor::set_target_block_size`). `None` =
     /// the format's 128 KiB ceiling.
     target_block_size: Option<u32>,
+    /// Largest block a frame may carry (upstream `ZSTD_c_maxBlockSize`); see
+    /// [`Self::set_max_block_size`].
+    max_block_size: Option<u32>,
     /// The pledged size of the frame in progress; cleared when it ends.
     pledged_content_size: Option<u64>,
     /// Advisory source-size hint from [`set_source_size_hint`](Self::set_source_size_hint).
@@ -201,6 +204,12 @@ impl<W: Write, M: Matcher, C: BorrowMut<CompressionContext<M>>> StreamingEncoder
     /// first write.
     pub fn set_target_block_size(&mut self, target: Option<u32>) -> Result<(), Error> {
         self.context.borrow_mut().set_target_block_size(target)
+    }
+
+    /// Cap each block's size; see [`CompressionContext::set_max_block_size`].
+    /// Must be set before the first write.
+    pub fn set_max_block_size(&mut self, size: Option<u32>) -> Result<(), Error> {
+        self.context.borrow_mut().set_max_block_size(size)
     }
 
     /// Enable or disable the trailing XXH64 content checksum; see
@@ -420,6 +429,7 @@ impl<M: Matcher> CompressionContext<M> {
             last_error_message: None,
             frame_started: false,
             target_block_size: None,
+            max_block_size: None,
             pledged_content_size: None,
             source_size_hint: None,
             content_size_flag: true,
@@ -472,6 +482,21 @@ impl<M: Matcher> CompressionContext<M> {
         self.target_block_size = target.map(|t| {
             t.clamp(
                 crate::common::MIN_TARGET_BLOCK_SIZE,
+                crate::common::MAX_BLOCK_SIZE,
+            )
+        });
+        Ok(())
+    }
+
+    /// Cap every block at `size` bytes (upstream `ZSTD_c_maxBlockSize`),
+    /// clamped to `[MIN_MAX_BLOCK_SIZE, MAX_BLOCK_SIZE]`; mirrors
+    /// `FrameCompressor::set_max_block_size`. Must be set before the frame's
+    /// first write.
+    pub fn set_max_block_size(&mut self, size: Option<u32>) -> Result<(), Error> {
+        self.ensure_settable("the maximum block size must be set before the first write")?;
+        self.max_block_size = size.map(|s| {
+            s.clamp(
+                crate::common::MIN_MAX_BLOCK_SIZE,
                 crate::common::MAX_BLOCK_SIZE,
             )
         });
@@ -550,6 +575,15 @@ impl<M: Matcher> CompressionContext<M> {
         // (`ensure_frame_started`), so a small advisory size also lifts Fast
         // streams off the expensive optimal-HUF search.
         self.source_size_hint = Some(size);
+        Ok(())
+    }
+
+    /// Drop the hint [`set_source_size_hint`](Self::set_source_size_hint)
+    /// set, so later frames are sized by their pledge alone. Must be called
+    /// before the frame's first [`write`](Self::write).
+    pub fn clear_source_size_hint(&mut self) -> Result<(), Error> {
+        self.ensure_settable("source size hint must be cleared before the first write")?;
+        self.source_size_hint = None;
         Ok(())
     }
 
@@ -880,9 +914,10 @@ impl<M: Matcher> CompressionContext<M> {
         if let Some(size) = self.pledged_content_size.or(self.source_size_hint) {
             self.state.matcher.set_source_size_hint(size);
         }
-        let block_target = self
-            .target_block_size
-            .map_or(MAX_BLOCK_SIZE as usize, |t| t as usize);
+        let block_target = crate::encoding::frame_compressor::block_ceiling(
+            self.target_block_size,
+            self.max_block_size,
+        );
         // Raw frames keep no history; everything else is read block by block,
         // and a pledge makes its length exact. One past what the address space
         // holds is laid out as a stream, which sizes to the window anyway.
@@ -1048,9 +1083,10 @@ impl<M: Matcher> CompressionContext<M> {
 
     fn block_capacity(&self) -> usize {
         let matcher_window = self.state.matcher.window_size() as usize;
-        let ceiling = self
-            .target_block_size
-            .map_or(MAX_BLOCK_SIZE as usize, |t| t as usize);
+        let ceiling = crate::encoding::frame_compressor::block_ceiling(
+            self.target_block_size,
+            self.max_block_size,
+        );
         core::cmp::max(1, core::cmp::min(matcher_window, ceiling))
     }
 

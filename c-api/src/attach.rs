@@ -18,7 +18,7 @@ use core::ffi::{c_int, c_uint};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use codec::decoding::{ContentChecksum, Dictionary, DictionaryHandle};
-use codec::encoding::{CompressionLevel, CompressionParameters, EncoderDictionary};
+use codec::encoding::{CompressionParameters, EncoderDictionary};
 
 use crate::cdict::{ZSTD_CDict, ZSTD_DDict, next_dict_serial, prepare_compression_dictionary};
 use crate::context::{ZSTD_CCtx, ZSTD_DCtx, kept_compressor};
@@ -303,6 +303,11 @@ impl ZSTD_CCtx {
         if let Some(stream) = &mut self.stream {
             stream.release_dictionary(replaced);
         }
+    }
+
+    /// Whether a `CDict` is referenced, whose parameters a frame inherits.
+    pub(crate) fn references_cdict(&self) -> bool {
+        matches!(self.attached_dict, CCtxDictAttach::RefCDict { .. })
     }
 
     /// Whether the attach models raw content (synthetic dictionary ID that
@@ -726,12 +731,43 @@ pub unsafe extern "C" fn ZSTD_compress_usingDict(
     dict_size: usize,
     compression_level: c_int,
 ) -> usize {
-    if ctx.is_null() {
+    let Some(cctx) = (unsafe { ctx.as_mut() }) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
-    }
-    let cctx = unsafe { &mut *ctx };
+    };
     let src = unsafe { in_slice(src, src_size) };
     let dict = unsafe { in_slice(dict, dict_size) };
+    let frame = OneShotFrame {
+        level: compression_level,
+        params: None,
+        checksum: false,
+        content_size: true,
+        dict_id: true,
+    };
+    let dst = unsafe { out_slice(dst, dst_capacity) };
+    compress_with_dict_bytes(cctx, dst, src, dict, &frame)
+}
+
+/// How a one-shot frame that ignores the context's sticky parameters is
+/// compressed: at `level`, or under explicit `params`, with these flags.
+pub(crate) struct OneShotFrame {
+    pub(crate) level: c_int,
+    pub(crate) params: Option<CompressionParameters>,
+    pub(crate) checksum: bool,
+    pub(crate) content_size: bool,
+    pub(crate) dict_id: bool,
+}
+
+/// Compress `src` into `dst` with one-off dictionary bytes (none when empty),
+/// on the context's kept compressor: the body of `ZSTD_compress_usingDict`
+/// and `ZSTD_compress_advanced`.
+pub(crate) fn compress_with_dict_bytes(
+    cctx: &mut ZSTD_CCtx,
+    dst: &mut [u8],
+    src: &[u8],
+    dict: &[u8],
+    frame: &OneShotFrame,
+) -> usize {
+    let compression_level = frame.level;
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
         // Bytes handed in per call have no identity to recognise them by, so
         // they are prepared every time (as upstream loads them every time);
@@ -750,11 +786,11 @@ pub unsafe extern "C" fn ZSTD_compress_usingDict(
             ..
         } = cctx;
         let enc = kept_compressor(compressor, serial, prepared.as_ref(), compression_level)?;
-        enc.set_compression_level(CompressionLevel::from_level(compression_level));
-        enc.set_content_checksum(false);
-        enc.set_content_size_flag(true);
-        enc.set_dictionary_id_flag(!raw_content);
-        enc.set_target_block_size(None);
+        crate::context::set_frame_parameters(enc, frame.params.as_ref(), compression_level);
+        enc.set_content_checksum(frame.checksum);
+        enc.set_content_size_flag(frame.content_size);
+        enc.set_dictionary_id_flag(frame.dict_id && !raw_content);
+        crate::context::plain_frame_shape(enc);
         scratch.clear();
         enc.compress_independent_frame_into(src, scratch);
         Ok(())
@@ -768,10 +804,9 @@ pub unsafe extern "C" fn ZSTD_compress_usingDict(
         }
     }
     let len = cctx.scratch.len();
-    if len > dst_capacity {
+    if len > dst.len() {
         return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
     }
-    let dst = unsafe { out_slice(dst, dst_capacity) };
     dst[..len].copy_from_slice(&cctx.scratch);
     len
 }

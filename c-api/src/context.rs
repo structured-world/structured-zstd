@@ -68,7 +68,7 @@ pub(crate) unsafe fn free_boxed<T>(ptr: *mut T) {
 pub struct ZSTD_CCtx {
     pub(crate) scratch: Vec<u8>,
     /// Sticky advanced parameters (`ZSTD_CCtx_setParameter` family).
-    pub(crate) params: crate::params::CCtxParams,
+    pub(crate) params: crate::cctx_params::CCtxParams,
     /// Streaming state (`ZSTD_compressStream2`), kept between frames; `None`
     /// before the first streamed frame.
     pub(crate) stream: Option<crate::streaming::CStreamState>,
@@ -123,6 +123,15 @@ pub(crate) fn set_frame_parameters(
     }
 }
 
+/// Put the block limits and the magic number back to a plain frame's: the
+/// compressor is shared with `ZSTD_compress2`, whose sticky parameters may
+/// have set them, and the one-shot entry points do not read those.
+pub(crate) fn plain_frame_shape(compressor: &mut FrameCompressor) {
+    compressor.set_target_block_size(None);
+    compressor.set_max_block_size(None);
+    compressor.set_magicless(false);
+}
+
 /// Opaque decompression context. Wraps a reusable [`FrameDecoder`] so its
 /// internal buffers persist across `ZSTD_decompressDCtx` calls.
 #[allow(non_camel_case_types)]
@@ -159,7 +168,7 @@ pub struct ZSTD_DCtx {
 pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
     try_box(ZSTD_CCtx {
         scratch: Vec::new(),
-        params: crate::params::CCtxParams::default(),
+        params: crate::cctx_params::CCtxParams::default(),
         stream: None,
         compressor: None,
         attached_dict: crate::attach::CCtxDictAttach::None,
@@ -189,7 +198,7 @@ impl ZSTD_CCtx {
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
     /// dictionary references, including the ones the kept compressors hold.
     pub(crate) fn reset_parameters(&mut self) {
-        self.params = crate::params::CCtxParams::default();
+        self.params = crate::cctx_params::CCtxParams::default();
         self.replace_attached_dict(crate::attach::CCtxDictAttach::None);
         // A `*_usingCDict` call's dictionary is not an attachment, and goes too.
         if let Some((held, compressor)) = &mut self.compressor
@@ -299,7 +308,7 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
         // Upstream ZSTD_compressCCtx defaults ZSTD_c_checksumFlag = 0; match it.
         enc.set_content_checksum(false);
         enc.set_content_size_flag(true);
-        enc.set_target_block_size(None);
+        plain_frame_shape(enc);
         scratch.clear();
         enc.compress_independent_frame_into(src, scratch);
         Ok(())
@@ -392,9 +401,9 @@ pub unsafe extern "C" fn ZSTD_compress2(
         // The kept compressor outlives parameter changes: clear the cap
         // explicitly when the sticky knob is back at 0 (auto), or a cap set
         // by an earlier call would silently survive.
-        enc.set_target_block_size(
-            (params.target_cblock_size > 0).then_some(params.target_cblock_size as u32),
-        );
+        enc.set_target_block_size(params.target_block_size());
+        enc.set_max_block_size(params.max_block_size());
+        enc.set_magicless(params.magicless);
         scratch.clear();
         enc.compress_independent_frame_into(src, scratch);
         Ok(())
