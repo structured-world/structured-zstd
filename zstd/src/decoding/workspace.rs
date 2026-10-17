@@ -70,9 +70,12 @@ use core::ptr::NonNull;
 
 /// Work units charged before a compressed block decodes, on top of its input
 /// bytes and its output bound: the most its entropy-table builds can cost
-/// (one Huffman table of `1 << 11` entries and three sequence tables of
-/// `1 << 9`, rounded up).
-pub const COMPRESSED_BLOCK_UNITS: u64 = 4096;
+/// (one Huffman table of `1 << 12` entries and the literal-length,
+/// match-length and offset tables at `1 << 9`, `1 << 9` and `1 << 8`).
+pub const COMPRESSED_BLOCK_UNITS: u64 = (1 << crate::huff0::MAX_MAX_NUM_BITS)
+    + (1 << super::sequence_section_decoder::LL_MAX_LOG)
+    + (1 << super::sequence_section_decoder::ML_MAX_LOG)
+    + (1 << super::sequence_section_decoder::OF_MAX_LOG);
 
 /// Largest frame header: magic, descriptor, window byte, 4-byte dictionary id
 /// and 8-byte content size (RFC 8878 3.1.1.1).

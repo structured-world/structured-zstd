@@ -7,6 +7,22 @@ use alloc::vec::Vec;
 
 const UNLIMITED: u64 = u64::MAX;
 
+/// The per-block charge must cover the largest tables a block can make the
+/// decoder build: a Huffman table at the longest code the decoder accepts and
+/// the three sequence tables at their accuracy-log limits.
+#[test]
+fn compressed_block_charge_covers_the_largest_table_builds() {
+    use crate::decoding::sequence_section_decoder::{LL_MAX_LOG, ML_MAX_LOG, OF_MAX_LOG};
+    let largest_builds = (1u64 << crate::huff0::MAX_MAX_NUM_BITS)
+        + (1u64 << LL_MAX_LOG)
+        + (1u64 << ML_MAX_LOG)
+        + (1u64 << OF_MAX_LOG);
+    assert!(
+        COMPRESSED_BLOCK_UNITS >= largest_builds,
+        "charge {COMPRESSED_BLOCK_UNITS} < {largest_builds} table entries"
+    );
+}
+
 fn text(len: usize) -> Vec<u8> {
     let words = [
         "alpha ",
