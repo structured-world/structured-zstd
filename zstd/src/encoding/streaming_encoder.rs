@@ -859,10 +859,10 @@ impl<M: Matcher> CompressionContext<M> {
         // A dictionary is only active when it can actually be primed: the level
         // compresses (not `Uncompressed`) AND the matcher supports priming AND a
         // dictionary is attached. Mirrors `FrameCompressor`'s `use_dictionary_state`
-        // so a streaming frame never advertises a `Dictionary_ID`, disables
-        // single-segment, or seeds dict entropy/offsets unless the dictionary is
-        // genuinely in play (otherwise it would emit frames that needlessly
-        // require a dictionary at decode time).
+        // so a streaming frame never advertises a `Dictionary_ID` or seeds dict
+        // entropy/offsets unless the dictionary is genuinely in play (otherwise
+        // it would emit frames that needlessly require a dictionary at decode
+        // time).
         let use_dictionary_state =
             !matches!(self.compression_level, CompressionLevel::Uncompressed)
                 && self.state.matcher.supports_dictionary_priming()
@@ -1001,27 +1001,12 @@ impl<M: Matcher> CompressionContext<M> {
             ));
         }
 
-        // Single-segment is incompatible with a dictionary (the dictionary
-        // pushes referenceable history before the content, so the frame needs
-        // an explicit window descriptor); gate it off when a dict is attached,
-        // mirroring `FrameCompressor`'s `!use_dictionary_state` guard.
-        // Single-segment also requires the FCS field to be present
-        // (`content_size_flag`): the layout drops the window descriptor,
-        // so the header must carry the content size for decoders to size
-        // their window.
-        let single_segment = self.content_size_flag
-            && !use_dictionary_state
-            && self
-                .pledged_content_size
-                .map(|size| (512..=(1 << 14)).contains(&size) && size <= window_size)
-                .unwrap_or(false);
+        let frame_content_size = self.pledged_content_size.filter(|_| self.content_size_flag);
+        let single_segment =
+            crate::encoding::frame_header::single_segment(frame_content_size, window_size);
 
         let header = FrameHeader {
-            frame_content_size: if self.content_size_flag {
-                self.pledged_content_size
-            } else {
-                None
-            },
+            frame_content_size,
             single_segment,
             content_checksum: cfg!(feature = "hash") && self.content_checksum,
             dictionary_id: if use_dictionary_state && self.dictionary_id_flag {

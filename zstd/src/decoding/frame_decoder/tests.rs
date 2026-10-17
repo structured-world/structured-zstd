@@ -172,9 +172,10 @@ fn decode_all_multi_segment_frame_decodes_correctly() {
     // FlatBuf/Ring-backed path.
     //
     // Make the payload structured so multi-segment behavior
-    // actually kicks in: 2 MiB of repeating + random-ish bytes
-    // forces window_size lower than content_size at the encoder.
-    let mut payload: Vec<u8> = Vec::with_capacity(2 * 1024 * 1024);
+    // actually kicks in: 64 KiB past the default level's 2 MiB
+    // window keeps window_size below content_size, so the frame
+    // cannot be single-segment.
+    let mut payload: Vec<u8> = Vec::with_capacity(2 * 1024 * 1024 + 64 * 1024);
     for i in 0..payload.capacity() {
         payload.push((i.wrapping_mul(2_654_435_761) & 0xFF) as u8);
     }

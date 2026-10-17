@@ -119,6 +119,68 @@ fn fcs_header_written_and_c_zstd_compatible() {
     }
 }
 
+/// Frames of a known size take the layout the reference takes for them, with
+/// a dictionary and without, from both encoders: single-segment whenever the
+/// window covers the content (`ZSTD_writeFrameHeader`), so a decoder reserves
+/// the content rather than the power of two above it. Each frame decodes
+/// through the C library.
+#[test]
+fn known_size_frames_choose_the_reference_header_layout() {
+    use std::io::Write;
+    use structured_zstd::encoding::{EncoderDictionary, StreamingEncoder};
+
+    let text: Vec<u8> = (0..60_000u32)
+        .flat_map(|i| format!("row {} key {} val {}\n", i % 97, i % 13, i % 7).into_bytes())
+        .collect();
+    let dictionary = &text[..8_192];
+    for size in [100usize, 600, 16 * 1024 + 1, 64 * 1024, 1 << 20] {
+        let data = &text[..size];
+        for with_dictionary in [false, true] {
+            let reference = if with_dictionary {
+                zstd::bulk::Compressor::with_dictionary(3, dictionary)
+                    .and_then(|mut c| c.compress(data))
+            } else {
+                zstd::bulk::compress(data, 3)
+            }
+            .expect("C compress");
+            let (reference_single, reference_fcs, _) = frame_header_info(&reference);
+
+            let mut streaming = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(3));
+            let mut one_shot: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(3));
+            if with_dictionary {
+                let encoder_dictionary =
+                    EncoderDictionary::from_serialized_or_raw_content(dictionary).unwrap();
+                streaming
+                    .set_encoder_dictionary(encoder_dictionary.clone())
+                    .unwrap();
+                one_shot.set_encoder_dictionary(encoder_dictionary).unwrap();
+            }
+            streaming.set_pledged_content_size(size as u64).unwrap();
+            streaming.write_all(data).unwrap();
+            let streamed = streaming.finish().unwrap();
+            one_shot.set_source_size_hint(size as u64);
+            let one_shot_frame = one_shot.compress_independent_frame(data);
+
+            for (path, frame) in [("stream", &streamed), ("one-shot", &one_shot_frame)] {
+                let (single, fcs, _) = frame_header_info(frame);
+                assert_eq!(
+                    (single, fcs),
+                    (reference_single, reference_fcs),
+                    "{path}, {size} bytes, dictionary {with_dictionary}: header layout"
+                );
+                let decoded = if with_dictionary {
+                    zstd::bulk::Decompressor::with_dictionary(dictionary)
+                        .and_then(|mut d| d.decompress(frame, size))
+                } else {
+                    zstd::bulk::decompress(frame, size)
+                }
+                .expect("C decode");
+                assert_eq!(decoded, data, "{path}, {size} bytes: C roundtrip");
+            }
+        }
+    }
+}
+
 #[test]
 fn source_size_hint_fastest_remains_ffi_compatible_small_input() {
     let data = vec![0xAB; 2047];
