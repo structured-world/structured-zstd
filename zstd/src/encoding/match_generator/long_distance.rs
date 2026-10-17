@@ -90,7 +90,9 @@ impl MatchGeneratorDriver {
     /// committed again in pieces, so each gap is the backend's whole block and
     /// each match body is indexed without being searched. Returns `false` when
     /// the block has no long-distance match, leaving it committed for the
-    /// ordinary search.
+    /// ordinary search. With `produced`, the caller has emptied the optimal
+    /// parser's candidates first, so a piece the producer fails on is never
+    /// matched against an earlier block's long matches.
     pub(super) fn start_matching_long_distance(
         &mut self,
         handle_sequence: &mut impl FnMut(Sequence),

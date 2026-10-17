@@ -230,7 +230,9 @@ pub(crate) fn adjust_cparams(
     // The row finder hashes `hashLog - rowLog` row bits plus an 8-bit tag, all
     // from one 32-bit hash, so the table may not outgrow it. Upstream assumes
     // rows for greedy / lazy / lazy2 at this point, whatever the window, since
-    // the switch to rows is only decided later.
+    // the switch to rows is only decided later. Callers pass the frame's real
+    // strategy and search log: a placeholder would cap tables that have no
+    // rows, or rows of the wrong width.
     if (3..=5).contains(&cp.strategy) {
         let row_log = cp.search_log.clamp(4, 6);
         let max_hash_log = 32 - ROW_HASH_TAG_BITS + row_log;
