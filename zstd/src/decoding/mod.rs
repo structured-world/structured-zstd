@@ -160,6 +160,54 @@ pub fn find_frame_compressed_size(src: &[u8]) -> Result<usize, FrameSizeError> {
     }
 }
 
+/// Error from [`find_decompressed_size`].
+#[derive(Debug)]
+pub enum DecompressedSizeError {
+    /// A frame header could not be parsed.
+    Header(errors::ReadFrameHeaderError),
+    /// A frame's blocks could not be walked to the start of the next one.
+    Frame(FrameSizeError),
+    /// The declared sizes add up past `u64::MAX`.
+    Overflow,
+}
+
+/// Total decompressed size the frames in `src` declare, without decoding any
+/// of them: [`FrameContentSize::Known`] with the sum, skippable frames counting
+/// zero, or [`FrameContentSize::Unknown`] as soon as one frame does not declare
+/// its size. Backs the C `ZSTD_findDecompressedSize` entry point.
+///
+/// # Errors
+/// [`DecompressedSizeError`] when a frame is malformed or truncated, or the
+/// sizes overflow `u64`.
+///
+/// ```rust
+/// use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
+/// use structured_zstd::decoding::{find_decompressed_size, FrameContentSize};
+/// let mut frames = compress_slice_to_vec(&[1u8; 300], CompressionLevel::Default);
+/// frames.extend(compress_slice_to_vec(&[2u8; 200], CompressionLevel::Default));
+/// assert_eq!(find_decompressed_size(&frames).unwrap(), FrameContentSize::Known(500));
+/// ```
+pub fn find_decompressed_size(src: &[u8]) -> Result<FrameContentSize, DecompressedSizeError> {
+    let mut rest = src;
+    let mut total: u64 = 0;
+    while !rest.is_empty() {
+        match read_frame_content_size(rest) {
+            Ok(FrameContentSize::Known(size)) => {
+                total = total
+                    .checked_add(size)
+                    .ok_or(DecompressedSizeError::Overflow)?;
+            }
+            Ok(FrameContentSize::Unknown) => return Ok(FrameContentSize::Unknown),
+            // A skippable frame regenerates nothing.
+            Err(errors::ReadFrameHeaderError::SkipFrame { .. }) => {}
+            Err(err) => return Err(DecompressedSizeError::Header(err)),
+        }
+        let consumed = find_frame_compressed_size(rest).map_err(DecompressedSizeError::Frame)?;
+        rest = &rest[consumed..];
+    }
+    Ok(FrameContentSize::Known(total))
+}
+
 /// Result of walking the block sequence of one frame (between the header and
 /// the optional trailing checksum).
 struct BlockWalk {

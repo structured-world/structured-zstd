@@ -5028,6 +5028,48 @@ fn the_dictionary_is_not_an_input_to_compress_with_itself() {
     );
 }
 
+/// `-d` makes a benchmark a decoding one in either order, as the reference
+/// reads it (zstdcli.c:1191-1196): the inputs are frames and only decoding is
+/// measured. Frames whose sizes are not declared, and input that is not frames,
+/// are refused with the reference's messages; alone, `-d` still decompresses.
+#[test]
+fn bench_with_d_measures_decoding_of_frames() {
+    use structured_zstd::encoding::{CompressionLevel, StreamingEncoder, compress_to_vec};
+
+    for args in [["-b", "-d"], ["-d", "-b"]] {
+        let opts = parse(&[args[0], args[1], "-i0", "f.zst"]).unwrap();
+        assert!(opts.bench && opts.bench_decode_only, "{args:?}");
+    }
+    let plain = parse(&["-d", "f.zst"]).unwrap();
+    assert!(!plain.bench && plain.mode == Mode::Decompress);
+
+    let scratch = Scratch::new("bench-decode");
+    let text: Vec<u8> = (0..2_000u32)
+        .flat_map(|i| format!("line {} of {}\n", i % 37, i % 11).into_bytes())
+        .collect();
+    let framed = scratch.file(
+        "framed.zst",
+        &compress_to_vec(text.as_slice(), CompressionLevel::Default),
+    );
+    let raw = scratch.file("raw", &text);
+    let mut streamed = StreamingEncoder::new(Vec::new(), CompressionLevel::Default);
+    std::io::Write::write_all(&mut streamed, &text).unwrap();
+    let undeclared = scratch.file("undeclared.zst", &streamed.finish().unwrap());
+
+    let run = |input: &Path| {
+        let mut opts = parse(&["-b", "-d", "-i0", "-q", "x"]).unwrap();
+        opts.inputs = vec![input.to_path_buf()];
+        run_benchmark(&opts, None)
+    };
+    run(&framed).expect("frames with declared sizes are measured");
+    let err = run(&raw).expect_err("raw input is not frames").to_string();
+    assert!(err.contains("data may be invalid"), "{err}");
+    let err = run(&undeclared)
+        .expect_err("an undeclared size cannot be measured")
+        .to_string();
+    assert!(err.contains("cannot be determined"), "{err}");
+}
+
 /// One failing input does not end the run: the rest are processed and the
 /// failure count comes back to become the exit status, as the reference
 /// command's does.

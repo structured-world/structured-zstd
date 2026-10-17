@@ -168,6 +168,9 @@ struct Options {
     /// Benchmark mode (`-b`); benchmarks `bench_start..=bench_end`. The start
     /// is the compression level, as the reference command takes it.
     bench: bool,
+    /// `-d` alongside `-b`: the inputs are frames, and only decoding them is
+    /// measured (the reference's `BMK_decodeOnly`).
+    bench_decode_only: bool,
     bench_start: i32,
     bench_end: i32,
     /// Per-level benchmark time budget in seconds (`-i`, default 1). Zero
@@ -1159,6 +1162,7 @@ fn parse_args_into(
         max_dict: DEFAULT_MAX_DICT,
         dict_id: None,
         bench: false,
+        bench_decode_only: false,
         bench_start: default_level,
         bench_end: default_level,
         bench_secs: DEFAULT_BENCH_SECONDS,
@@ -1551,7 +1555,15 @@ fn parse_args_into(
         while ci < chars.len() {
             let c = chars[ci];
             match c {
-                'd' => select_mode(&mut opts, Mode::Decompress),
+                // `-d` also makes any benchmark a decoding one, whichever of
+                // `-b` and `-d` comes first, and within one it stays a
+                // benchmark (zstdcli.c:1191-1196).
+                'd' => {
+                    opts.bench_decode_only = true;
+                    if !opts.bench {
+                        select_mode(&mut opts, Mode::Decompress);
+                    }
+                }
                 'z' => select_mode(&mut opts, Mode::Compress),
                 't' => select_mode(&mut opts, Mode::Test),
                 'l' => select_mode(&mut opts, Mode::List),
@@ -3330,6 +3342,9 @@ fn multi_summary(opts: &Options, total: usize, tally: &Tally) {
 /// `-D` so dictionary throughput can be measured. Time-budgeted per level
 /// rather than fixed-iteration.
 fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
+    if opts.bench_decode_only {
+        return benchmark_decoding(opts, dict);
+    }
     // With no input named the reference measures data it generates
     // (`BMK_syntheticTest`): `-B` bytes of it, ten million by default.
     let synthetic = opts.inputs.is_empty();
@@ -3528,6 +3543,133 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         many => format!(" {} files", many.len()),
     };
     benchmark_one(opts, codecs, &decode, &label, &data, &sizes)
+}
+
+/// `-b -d`: the inputs are frames, and only decoding them is measured, each
+/// file whole, at the size its frames declare (`benchzstd.c`, `BMK_decodeOnly`).
+/// Every input together is one measurement, or each on its own under `-S`.
+fn benchmark_decoding(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
+    if opts.inputs.is_empty() {
+        // The reference generates text and then cannot read a size from it.
+        bail!("Error while trying to assess decompressed size: data may be invalid");
+    }
+    if opts.inputs.iter().any(|input| input == Path::new("-")) {
+        bail!("-b cannot benchmark stdin; name a file (`./-` for one called `-`)");
+    }
+    let mut sizes = Vec::with_capacity(opts.inputs.len());
+    for input in &opts.inputs {
+        let metadata = fs::metadata(input)
+            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
+        if !metadata.is_file() {
+            bail!("-b needs regular files: {} is not one", input.display());
+        }
+        sizes.push(metadata.len());
+    }
+    let codecs = &mut Codecs::prepare(dict.as_deref(), opts.patch_from.is_some(), false, true)?;
+    codecs.open_trace(opts, true)?;
+    drop(dict);
+    if opts.bench_separately {
+        for (input, size) in opts.inputs.iter().zip(&sizes) {
+            let data =
+                read_inputs_bounded(std::slice::from_ref(input), std::slice::from_ref(size))?;
+            benchmark_decoding_one(
+                opts,
+                codecs,
+                &input.display().to_string(),
+                &data,
+                std::slice::from_ref(size),
+            )?;
+        }
+        return Ok(());
+    }
+    let data = read_inputs_bounded(&opts.inputs, &sizes)?;
+    let label = match opts.inputs.as_slice() {
+        [only] => only.display().to_string(),
+        many => format!(" {} files", many.len()),
+    };
+    benchmark_decoding_one(opts, codecs, &label, &data, &sizes)
+}
+
+/// Measure decoding one subject of [`benchmark_decoding`]: `data` holds the
+/// files of `file_sizes`, each a run of frames whose declared sizes give what
+/// it decodes to.
+fn benchmark_decoding_one(
+    opts: &Options,
+    codecs: &mut Codecs,
+    label: &str,
+    data: &[u8],
+    file_sizes: &[u64],
+) -> Result<()> {
+    use std::time::Instant;
+    use structured_zstd::decoding::{FrameContentSize, find_decompressed_size};
+
+    let mut decoded_size = 0u64;
+    let mut at = 0usize;
+    for &size in file_sizes {
+        let file = &data[at..at + size as usize];
+        at += size as usize;
+        match find_decompressed_size(file) {
+            Ok(FrameContentSize::Known(size)) => {
+                decoded_size = decoded_size
+                    .checked_add(size)
+                    .ok_or_else(|| eyre!("decompressed size is too large for local system"))?;
+            }
+            Ok(FrameContentSize::Unknown) => {
+                bail!("Decompressed size cannot be determined: cannot benchmark")
+            }
+            Err(_) => bail!("Error while trying to assess decompressed size: data may be invalid"),
+        }
+    }
+    // The input and its decoded copy are what the run holds.
+    let held = (data.len() as u64)
+        .checked_add(decoded_size)
+        .ok_or_else(|| eyre!("decompressed size is too large for local system"))?;
+    if let Some(limit) = opts.memory_limit {
+        check_memory_limit(limit, held, 1)?;
+    }
+    let decode = bench_decode_settings(opts, Some(held));
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(
+            usize::try_from(decoded_size)
+                .map_err(|_| eyre!("decompressed size is too large for local system"))?,
+        )
+        .map_err(|err| eyre!("-b: not enough memory to decode {label}: {err}"))?;
+    if let Some(header) = bench_quiet_header(opts, data.len()) {
+        println!("{header}");
+    }
+    let mut best = f64::MAX;
+    let start = Instant::now();
+    loop {
+        decoded.clear();
+        let t = Instant::now();
+        decompress_stream(data, &mut decoded, codecs, &decode)?;
+        best = best.min(t.elapsed().as_secs_f64());
+        if start.elapsed().as_secs_f64() >= opts.bench_secs {
+            break;
+        }
+    }
+    if decoded.len() as u64 != decoded_size {
+        bail!("-b: {label} decoded to a size its frames do not declare");
+    }
+    let result = BenchResult {
+        level: 0,
+        input: decoded_size,
+        output: data.len() as u64,
+        compress_mb_s: 0.0,
+        decompress_mb_s: if best > 0.0 {
+            decoded_size as f64 / 1e6 / best
+        } else {
+            f64::INFINITY
+        },
+    };
+    let name = bench_display_name(label);
+    if opts.verbosity >= DEFAULT_LEVEL {
+        println!("{}", result.line(&name));
+    } else if opts.verbosity == 1 {
+        println!("{}", result.quiet_line(&name, opts.bench_param));
+    }
+    Ok(())
 }
 
 /// The settings a benchmark decodes with. `held` is what the benchmark holds
