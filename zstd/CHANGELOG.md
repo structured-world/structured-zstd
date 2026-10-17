@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/structured-world/structured-zstd/compare/v0.2.1...v0.2.2) - 2026-10-17
+
+### Added
+
+- *(encoding)* long-distance matching for every strategy ([#589](https://github.com/structured-world/structured-zstd/pull/589))
+
+### Fixed
+
+- *(huff0)* accept 12-bit Huffman tables as upstream does ([#593](https://github.com/structured-world/structured-zstd/pull/593))
+- *(encoding)* single-segment frames whenever the window covers the content ([#591](https://github.com/structured-world/structured-zstd/pull/591))
+
 ## [0.2.1](https://github.com/structured-world/structured-zstd/compare/v0.2.0...v0.2.1) - 2026-10-16
 
 ### Added
