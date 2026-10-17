@@ -158,6 +158,8 @@ struct Options {
     /// by upstream's default when not `-k`/stdout, but we keep the input unless
     /// `--rm` is given — safer default for a young tool).
     remove_source: bool,
+    /// The format compression writes, from the name the tool was run by.
+    format: OutputFormat,
     /// Positional inputs; empty or a lone `-` means stdin. Held as paths
     /// rather than text: a filename is bytes and need not be UTF-8.
     inputs: Vec<PathBuf>,
@@ -939,16 +941,42 @@ fn command_status(raw: &[OsString], pause: &mut bool) -> i32 {
         Ok(_failed_inputs) => 1,
         Err(err) => {
             display!(verbosity, 1, "zstd: {err}");
-            1
+            exit_status(&err)
+        }
+    }
+}
+
+/// The format compression writes. Only zstd is built in; the others are what
+/// the names of other compressors ask for, and compressing to them is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputFormat {
+    Zstd,
+    Gzip,
+    Xz,
+    Lzma,
+    Lz4,
+}
+
+impl OutputFormat {
+    /// How the reference command names the format in its refusal.
+    fn label(self) -> &'static str {
+        match self {
+            OutputFormat::Zstd => "zstd",
+            OutputFormat::Gzip => "gzip",
+            OutputFormat::Xz | OutputFormat::Lzma => "xz/lzma",
+            OutputFormat::Lz4 => "lz4",
         }
     }
 }
 
 /// What `argv[0]` presets before any flag is read: the conventional symlink
-/// dispatch. `unzstd` decompresses; `zstdcat` and `zcat` decompress to
-/// stdout, overwriting, passing non-zstd input through, and quietly, as the
-/// reference command sets them up; `zstdmt` compresses like `zstd` (its
-/// worker count has no effect here).
+/// dispatch of the reference command (`zstdcli.c` "preset behaviors").
+/// `unzstd` decompresses; `zstdcat`, `zcat` and `gzcat` decompress to stdout,
+/// overwriting, passing non-zstd input through, and quietly; `gunzip`,
+/// `unxz`, `unlzma` and `unlz4` decompress, and all but `unlz4` remove the
+/// source as the tool they stand in for does; `gzip`, `xz`, `lzma` and `lz4`
+/// select that tool's format; `zstdmt` compresses like `zstd` (its worker
+/// count has no effect here).
 struct ProgramPreset {
     /// The name the tool was invoked by, as the usage text shows it.
     name: String,
@@ -957,6 +985,10 @@ struct ProgramPreset {
     force: bool,
     pass_through: Option<bool>,
     verbosity: i32,
+    remove_source: bool,
+    format: OutputFormat,
+    /// A default level of the tool's own (gzip's 6), ahead of `ZSTD_CLEVEL`.
+    level: Option<i32>,
 }
 
 fn program_preset(prog: &str) -> ProgramPreset {
@@ -964,32 +996,85 @@ fn program_preset(prog: &str) -> ProgramPreset {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(prog);
-    // Strip a trailing `.exe` for Windows symlink names.
-    let stem = name.strip_suffix(".exe").unwrap_or(name);
-    let plain = ProgramPreset {
+    // The reference's `exeNameMatch`: the name, then nothing or an extension.
+    let is = |tool: &str| {
+        name.strip_prefix(tool)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    };
+    let decompress = |remove_source| ProgramPreset {
+        mode: Mode::Decompress,
+        remove_source,
+        ..plain_like(name)
+    };
+    let compress_as = |format, remove_source, level| ProgramPreset {
+        format,
+        remove_source,
+        level,
+        ..plain_like(name)
+    };
+    if is("unzstd") {
+        decompress(false)
+    } else if is("zstdcat") || is("zcat") || is("gzcat") {
+        ProgramPreset {
+            mode: Mode::Decompress,
+            to_stdout: true,
+            force: true,
+            pass_through: Some(true),
+            verbosity: 1,
+            ..plain_like(name)
+        }
+    } else if is("gunzip") || is("unxz") || is("unlzma") {
+        decompress(true)
+    } else if is("unlz4") {
+        decompress(false)
+    } else if is("gzip") {
+        compress_as(OutputFormat::Gzip, true, Some(6))
+    } else if is("xz") {
+        compress_as(OutputFormat::Xz, true, None)
+    } else if is("lzma") {
+        compress_as(OutputFormat::Lzma, true, None)
+    } else if is("lz4") {
+        compress_as(OutputFormat::Lz4, false, None)
+    } else {
+        // "zstd", "zstdmt", anything else: compress by default.
+        plain_like(name)
+    }
+}
+
+/// The preset for a name with no behaviour of its own.
+fn plain_like(name: &str) -> ProgramPreset {
+    ProgramPreset {
         name: name.to_string(),
         mode: Mode::Compress,
         to_stdout: false,
         force: false,
         pass_through: None,
         verbosity: DEFAULT_LEVEL,
-    };
-    match stem {
-        "unzstd" => ProgramPreset {
-            mode: Mode::Decompress,
-            ..plain
-        },
-        "zstdcat" | "zcat" => ProgramPreset {
-            mode: Mode::Decompress,
-            to_stdout: true,
-            force: true,
-            pass_through: Some(true),
-            verbosity: 1,
-            ..plain
-        },
-        // "zstd", "zstdmt", anything else: compress by default.
-        _ => plain,
+        remove_source: false,
+        format: OutputFormat::Zstd,
+        level: None,
     }
+}
+
+/// An error that ends the run with an exit status of its own, as the
+/// reference command's `EXM_THROW` does, instead of the generic 1.
+#[derive(Debug)]
+struct Fatal {
+    status: i32,
+    message: String,
+}
+
+impl core::fmt::Display for Fatal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "error {} : {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for Fatal {}
+
+/// The exit status an error ends the run with.
+fn exit_status(err: &Error) -> i32 {
+    err.downcast_ref::<Fatal>().map_or(1, |fatal| fatal.status)
 }
 
 /// The default compression level, from `ZSTD_CLEVEL` when it is set.
@@ -1152,6 +1237,9 @@ fn parse_args_into(
     verbosity: &mut i32,
     pause: &mut bool,
 ) -> Result<Parsed> {
+    // A tool's own default (gzip's 6) wins over `ZSTD_CLEVEL`, as the
+    // reference's preset sets it after reading the environment.
+    let default_level = preset.level.unwrap_or(default_level);
     let mut opts = Options {
         mode: preset.mode,
         level: default_level,
@@ -1160,7 +1248,8 @@ fn parse_args_into(
         output: None,
         force: preset.force,
         keep: false,
-        remove_source: false,
+        remove_source: preset.remove_source,
+        format: preset.format,
         inputs: Vec::new(),
         max_dict: DEFAULT_MAX_DICT,
         dict_id: None,
@@ -2755,6 +2844,23 @@ fn run_selected(mut opts: Options) -> Result<usize> {
         bail!("stdin is a console, aborting");
     }
     refuse_console_stdout(&opts, opts.console.stdout())?;
+    // Only zstd is written. The reference command built without a codec stops
+    // the whole run at the first input it would compress to it
+    // (`fileio.c` `EXM_THROW(20, ...)`), before writing or removing anything.
+    if opts.mode == Mode::Compress && !opts.bench && opts.format != OutputFormat::Zstd {
+        let first = match opts.inputs.first() {
+            Some(input) if input != Path::new("-") => input.display().to_string(),
+            _ => STDIN_MARK.to_string(),
+        };
+        return Err(Fatal {
+            status: 20,
+            message: format!(
+                "zstd: {first}: file cannot be compressed as {} (this build writes zstd only) -- ignored",
+                opts.format.label()
+            ),
+        }
+        .into());
+    }
     let has_stdout_output = matches!(opts.mode, Mode::Compress | Mode::Decompress)
         && !opts.bench
         && writes_stdout(&opts);
@@ -6245,6 +6351,12 @@ fn decompress_stream<R: Read, W: Write>(
             let magic = u32::from_le_bytes(magic);
             magic == FRAME_MAGIC || magic & 0xFFFF_FFF0 == SKIPPABLE_MAGIC_BASE
         };
+        // Another compressor's stream is named and refused, pass-through or
+        // not, in the order the reference checks it (`FIO_decompressFrames`):
+        // copying it through would hand on compressed bytes as content.
+        if let Some(format) = foreign_format(&magic[..read]) {
+            bail!("{format} file cannot be uncompressed (this build reads zstd only) -- ignored");
+        }
         if !is_frame {
             // Only input that is not zstd from its first byte is passed
             // through. What follows a frame and is not one is a damaged or
@@ -6582,6 +6694,18 @@ fn window_too_large_message(window: u64, limit: u64, memory_overhead: Option<u64
             "{head}\nWindow log larger than ZSTD_WINDOWLOG_MAX={}; not supported",
             MAX_DECODER_WINDOW_SIZE.ilog2()
         )
+    }
+}
+
+/// The other compressor whose stream starts with `head`, by the magic numbers
+/// the reference command recognises (`fileio.c` `FIO_decompressFrames`):
+/// gzip `1F 8B`, xz `FD 37`, lzma's headerless `5D 00`, and lz4's frame magic.
+fn foreign_format(head: &[u8]) -> Option<&'static str> {
+    match head {
+        [0x1F, 0x8B, ..] => Some("gzip"),
+        [0xFD, 0x37, ..] | [0x5D, 0x00, ..] => Some("xz/lzma"),
+        [0x04, 0x22, 0x4D, 0x18] => Some("lz4"),
+        _ => None,
     }
 }
 

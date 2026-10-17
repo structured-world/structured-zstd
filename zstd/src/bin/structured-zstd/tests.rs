@@ -1692,6 +1692,129 @@ fn argv0_zstdcat_decompresses_to_stdout_passing_plain_input_through() {
     assert_eq!(program_preset("zstdmt").mode, Mode::Compress);
 }
 
+/// The other names the reference command answers to (`zstdcli.c` "preset
+/// behaviors"): `gzcat` is another `zcat`; the `un*` names decompress, and all
+/// but `unlz4` remove the source like the tool they stand in for; the
+/// compressor names select that tool's format, remove the source the same way
+/// and, for `gzip`, take gzip's default level. A trailing `.anything` is
+/// ignored, as `exeNameMatch` ignores it.
+#[test]
+fn argv0_names_of_other_tools_take_their_presets() {
+    let gzcat = program_preset("gzcat");
+    assert_eq!(gzcat.mode, Mode::Decompress);
+    assert!(gzcat.to_stdout && gzcat.force);
+    assert_eq!(gzcat.pass_through, Some(true));
+    assert_eq!(gzcat.verbosity, 1);
+
+    for (name, removes) in [
+        ("gunzip", true),
+        ("unxz", true),
+        ("unlzma", true),
+        ("unlz4", false),
+    ] {
+        let preset = program_preset(name);
+        assert_eq!(preset.mode, Mode::Decompress, "{name}");
+        assert_eq!(preset.remove_source, removes, "{name}");
+        assert_eq!(
+            preset.format,
+            OutputFormat::Zstd,
+            "{name} writes plain output"
+        );
+    }
+
+    for (name, format, removes, level) in [
+        ("gzip", OutputFormat::Gzip, true, Some(6)),
+        ("xz", OutputFormat::Xz, true, None),
+        ("lzma", OutputFormat::Lzma, true, None),
+        ("lz4", OutputFormat::Lz4, false, None),
+    ] {
+        let preset = program_preset(name);
+        assert_eq!(preset.mode, Mode::Compress, "{name}");
+        assert_eq!(preset.format, format, "{name}");
+        assert_eq!(preset.remove_source, removes, "{name}");
+        assert_eq!(preset.level, level, "{name}");
+    }
+
+    assert_eq!(program_preset("gzip.exe").format, OutputFormat::Gzip);
+    assert_eq!(program_preset("unxz.1").mode, Mode::Decompress);
+    // A longer name that merely starts with one is not that tool.
+    assert_eq!(program_preset("gzipper").format, OutputFormat::Zstd);
+    assert_eq!(program_preset("zstd").format, OutputFormat::Zstd);
+}
+
+/// This build writes zstd only. Compressing under a name that selects another
+/// format fails the whole run the way the reference command built without that
+/// codec does (`fileio.c` `EXM_THROW(20, ...)`): status 20, and the source
+/// left in place even though the name implies removing it.
+#[test]
+fn compressing_to_a_format_this_build_cannot_write_fails_with_status_20() {
+    let scratch = Scratch::new("argv0gz");
+    let input = scratch.file("plain", b"some data");
+    for name in ["gzip", "xz", "lzma", "lz4"] {
+        let raw: Vec<OsString> = vec![name.into(), input.clone().into_os_string(), "-q".into()];
+        assert_eq!(run_command(&raw, &mut io::empty()), 20, "{name}");
+        assert!(input.exists(), "{name} keeps the source");
+    }
+    let leftovers: Vec<_> = fs::read_dir(scratch.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(leftovers, ["plain"], "nothing was written");
+}
+
+/// Decoding recognises the other formats by their magic and says which one it
+/// cannot read, as the reference command built without their codecs does,
+/// instead of calling them an unsupported format. Pass-through does not copy
+/// them either: the reference checks these magics before it passes input
+/// through (`FIO_decompressFrames`), so `zcat` on a gzip file fails rather than
+/// printing the compressed bytes.
+#[test]
+fn decoding_names_the_foreign_format_it_cannot_read() {
+    let pass = DecodeSettings {
+        pass_through: true,
+        ..DecodeSettings::default()
+    };
+    let decode_stream_message = |bytes: &[u8]| {
+        let refused = decompress_stream(
+            bytes,
+            io::sink(),
+            &mut no_dict(),
+            &DecodeSettings::default(),
+        )
+        .expect_err("a foreign format is refused")
+        .to_string();
+        if !refused.contains("unsupported format") {
+            let passed = decompress_stream(bytes, io::sink(), &mut no_dict(), &pass)
+                .expect_err("pass-through refuses it too")
+                .to_string();
+            assert_eq!(passed, refused, "{bytes:02x?}");
+        }
+        refused
+    };
+    for (bytes, message) in [
+        (
+            &[0x1F, 0x8B, 8, 0, 0][..],
+            "gzip file cannot be uncompressed",
+        ),
+        (
+            &[0xFD, 0x37, 0x7A, 0x58, 0x5A][..],
+            "xz/lzma file cannot be uncompressed",
+        ),
+        (
+            &[0x5D, 0x00, 0x00, 0x80, 0x00][..],
+            "xz/lzma file cannot be uncompressed",
+        ),
+        (
+            &[0x04, 0x22, 0x4D, 0x18, 0x00][..],
+            "lz4 file cannot be uncompressed",
+        ),
+    ] {
+        let err = decode_stream_message(bytes);
+        assert!(err.contains(message), "{bytes:02x?}: {err}");
+    }
+    assert!(decode_stream_message(b"some data").contains("unsupported format"));
+}
+
 /// The preset is the starting point, not the last word: `zstdcat -v` still
 /// raises the level, and `--no-pass-through` still turns pass-through off.
 #[test]
