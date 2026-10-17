@@ -857,7 +857,9 @@ fn streaming_pledged_size_uses_source_hint() {
 }
 
 /// One-shot `compress_to_vec` should propagate source-size hint for Default
-/// so tiny payloads avoid oversized dfast window/table sizing.
+/// so tiny payloads avoid oversized dfast window/table sizing: it writes the
+/// frame an explicitly hinted compressor writes, and that frame advertises the
+/// content as its window.
 #[test]
 fn compress_to_vec_default_small_input_uses_source_size_hint() {
     let data = generate_compressible(9604, 4 * 1024); // 4 KiB
@@ -870,31 +872,29 @@ fn compress_to_vec_default_small_input_uses_source_size_hint() {
         .window_size()
         .unwrap();
 
-    // Manual compressor path without hint (legacy behavior baseline).
-    let no_hint = {
+    let hinted = {
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source_size_hint(data.len() as u64);
         compressor.set_source(data.as_slice());
         let mut out = Vec::new();
         compressor.set_drain(&mut out);
         compressor.compress();
         out
     };
-    let no_hint_window = crate::decoding::frame::read_frame_header(no_hint.as_slice())
-        .unwrap()
-        .0
-        .window_size()
-        .unwrap();
 
     let mut decoder = StreamingDecoder::new(auto_hint.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, data);
 
-    assert!(
-        auto_hint_window < no_hint_window,
-        "compress_to_vec(default) should advertise a smaller window on tiny payloads: auto_hint={} no_hint={}",
+    assert_eq!(
+        auto_hint, hinted,
+        "compress_to_vec(default) should write the hinted frame"
+    );
+    assert_eq!(
         auto_hint_window,
-        no_hint_window
+        data.len() as u64,
+        "a tiny payload should advertise its content as the window"
     );
 }
 

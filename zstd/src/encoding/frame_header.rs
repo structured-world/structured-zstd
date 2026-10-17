@@ -140,6 +140,17 @@ impl FrameHeader {
     }
 }
 
+/// Whether a frame whose header writes `content_size` (`None` when it leaves
+/// the size out) under a window of `window_size` bytes is single-segment:
+/// whenever the size is written and the window covers it, with a dictionary or
+/// without, as upstream decides it (`ZSTD_writeFrameHeader`,
+/// `zstd_compress.c:4728`). The decoder's window is then the content size
+/// (RFC 8878 3.1.1.1.2) rather than the power of two above it, and a
+/// dictionary stays referenceable before the content.
+pub(crate) fn single_segment(content_size: Option<u64>, window_size: u64) -> bool {
+    content_size.is_some_and(|size| size <= window_size)
+}
+
 /// Serialize a `Frame_Content_Size` value into `field_size` bytes.
 ///
 /// For 1, 4, and 8-byte fields the value is stored directly.

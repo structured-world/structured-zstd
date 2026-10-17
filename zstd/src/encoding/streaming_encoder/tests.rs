@@ -1177,6 +1177,38 @@ fn source_size_hint_directly_reduces_window_header() {
     assert_eq!(decoded, payload);
 }
 
+/// A frame whose pledged size the window covers is single-segment at any size
+/// and with a dictionary, as upstream writes it (`ZSTD_writeFrameHeader`):
+/// the decoder then reserves the content, not the next power of two above it.
+#[test]
+fn a_pledged_frame_the_window_covers_is_single_segment() {
+    let text: Vec<u8> = (0..60_000u32)
+        .flat_map(|i| alloc::format!("row {} key {} val {}\n", i % 97, i % 13, i % 7).into_bytes())
+        .collect();
+    let dictionary = EncoderDictionary::from_serialized_or_raw_content(&text[..8_192])
+        .expect("raw content is a dictionary");
+    for size in [100usize, 600, 16 * 1024 + 1, 64 * 1024, 1 << 20] {
+        let payload = &text[..size];
+        for with_dictionary in [false, true] {
+            let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(3));
+            if with_dictionary {
+                encoder.set_encoder_dictionary(dictionary.clone()).unwrap();
+            }
+            encoder.set_pledged_content_size(size as u64).unwrap();
+            encoder.write_all(payload).unwrap();
+            let frame = encoder.finish().unwrap();
+            let header = crate::decoding::frame::read_frame_header(frame.as_slice())
+                .unwrap()
+                .0;
+            assert!(
+                header.descriptor.single_segment_flag(),
+                "{size} bytes, dictionary {with_dictionary}: windowed frame"
+            );
+            assert_eq!(header.frame_content_size(), size as u64);
+        }
+    }
+}
+
 #[test]
 fn single_segment_requires_pledged_to_fit_matcher_window() {
     let payload = b"streaming-window-gate-".repeat(60); // 1320 bytes

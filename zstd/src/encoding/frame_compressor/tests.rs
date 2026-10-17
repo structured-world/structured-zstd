@@ -629,6 +629,34 @@ fn compressible_stream_output_capacity_stays_at_output_scale() {
     assert_eq!(decoded, input);
 }
 
+// The header goes out after the content, so its size is written and the
+// single-segment rule applies even when no size was hinted before the frame:
+// a frame the window covers declares the content as its window.
+#[test]
+fn unhinted_frame_the_window_covers_is_single_segment() {
+    let payload = b"unhinted payload, written once the content is known ".repeat(200);
+    let mut compressor = super::FrameCompressor::new(super::CompressionLevel::Default);
+    compressor.set_source(payload.as_slice());
+    compressor.set_drain(Vec::<u8>::new());
+    compressor.compress();
+    let frame = compressor.take_drain().expect("the drain was set");
+    let parsed = crate::decoding::frame::read_frame_header(frame.as_slice())
+        .expect("frame header must parse")
+        .0;
+    assert!(
+        parsed.descriptor.single_segment_flag(),
+        "a frame of {} bytes under a larger window is windowed",
+        payload.len()
+    );
+    assert_eq!(parsed.frame_content_size(), payload.len() as u64);
+    let mut decoder = crate::decoding::FrameDecoder::new();
+    let mut decoded = Vec::with_capacity(payload.len());
+    decoder
+        .decode_all_to_vec(&frame, &mut decoded)
+        .expect("our frame decodes");
+    assert_eq!(decoded, payload);
+}
+
 // A dictionary frame with a known content size that fits the window
 // must take the single-segment layout (reference parity): the
 // dictionary is decoder setup state, not part of the regenerated
