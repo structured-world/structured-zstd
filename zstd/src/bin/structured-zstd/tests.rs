@@ -5028,6 +5028,36 @@ fn the_dictionary_is_not_an_input_to_compress_with_itself() {
     );
 }
 
+/// A compression run asked for worker threads says that this build has none,
+/// as the reference built without threads says it, for any count above zero;
+/// upstream's playTests.sh decides from that line whether to run its
+/// multi-threaded scenarios. No count, a zero, `--single-thread`, and runs that
+/// do not compress say nothing.
+#[test]
+fn asking_for_threads_notes_that_there_are_none() {
+    const NOTE: &str = "Note : multi-threading is disabled";
+    for args in [
+        &["-T2", "f"][..],
+        &["-T1", "f"],
+        &["--threads=4", "f"],
+        &["-v", "-T2", "-"],
+    ] {
+        let opts = parse(args).unwrap();
+        assert_eq!(multithreading_note(&opts), Some(NOTE), "{args:?}");
+    }
+    for args in [
+        &["f"][..],
+        &["-T0", "f"],
+        &["--single-thread", "f"],
+        &["-T4", "--single-thread", "f"],
+        &["-d", "-T2", "f.zst"],
+        &["-b", "-T2", "f"],
+    ] {
+        let opts = parse(args).unwrap();
+        assert_eq!(multithreading_note(&opts), None, "{args:?}");
+    }
+}
+
 /// `-d` makes a benchmark a decoding one in either order, as the reference
 /// reads it (zstdcli.c:1191-1196): the inputs are frames and only decoding is
 /// measured. Frames whose sizes are not declared, and input that is not frames,

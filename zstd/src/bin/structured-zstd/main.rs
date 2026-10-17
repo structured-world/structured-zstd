@@ -167,6 +167,9 @@ struct Options {
     dict_id: Option<u32>,
     /// Benchmark mode (`-b`); benchmarks `bench_start..=bench_end`. The start
     /// is the compression level, as the reference command takes it.
+    /// The worker count `-T#` / `--threads=#` asked for, `0` from
+    /// `--single-thread`; `None` when never given.
+    threads: Option<u32>,
     bench: bool,
     /// `-d` alongside `-b`: the inputs are frames, and only decoding them is
     /// measured (the reference's `BMK_decodeOnly`).
@@ -1161,6 +1164,7 @@ fn parse_args_into(
         inputs: Vec::new(),
         max_dict: DEFAULT_MAX_DICT,
         dict_id: None,
+        threads: None,
         bench: false,
         bench_decode_only: false,
         bench_start: default_level,
@@ -1322,8 +1326,8 @@ fn parse_args_into(
                 // yields the same valid stream. Upstream takes them, so a
                 // script that passes them must not fail here: that is the
                 // whole drop-in contract.
-                "single-thread"
-                | "adapt"
+                "single-thread" => opts.threads = Some(0),
+                "adapt"
                 | "sparse"
                 | "no-sparse"
                 | "asyncio"
@@ -1423,7 +1427,7 @@ fn parse_args_into(
                             eyre!("--target-compressed-block-size={v} is too large")
                         })?);
                     } else if let Some(v) = option_text(long, "threads", arg_os, &mut iter)? {
-                        parse_u32(&v).wrap_err("invalid --threads")?;
+                        opts.threads = Some(parse_u32(&v).wrap_err("invalid --threads")?);
                     } else if let Some(v) = first_option_text(
                         long,
                         &["block-size", "split", "jobsize"],
@@ -1601,8 +1605,8 @@ fn parse_args_into(
                         // so it is kept and has no effect there.
                         'B' => opts.block_size = (value != 0).then_some(u64::from(value)),
                         // The thread count: single-threaded here, so it steers
-                        // nothing, but it is read like every other number.
-                        'T' => {}
+                        // nothing but the note that says so.
+                        'T' => opts.threads = Some(value),
                         // `-s#`, the legacy trainer's selectivity: the one flag
                         // of this arm left.
                         _ => {
@@ -1797,6 +1801,14 @@ fn attached_path(arg: &std::ffi::OsStr, at: usize) -> PathBuf {
 fn select_mode(opts: &mut Options, mode: Mode) {
     opts.mode = mode;
     opts.bench = false;
+}
+
+/// The note a compression run asked for worker threads gets, as the reference
+/// built without threads gives it (fileio.c `FIO_setNbWorkers`): any count
+/// above zero, `-T1` included. Scripts read it to tell a single-threaded build.
+fn multithreading_note(opts: &Options) -> Option<&'static str> {
+    (opts.mode == Mode::Compress && !opts.bench && opts.threads.is_some_and(|count| count > 0))
+        .then_some("Note : multi-threading is disabled")
 }
 
 /// Whether this run will decode anything, and so whether `-M` binds it.
@@ -2819,6 +2831,9 @@ fn run_selected(mut opts: Options) -> Result<usize> {
     if opts.bench {
         run_benchmark(&opts, dict_bytes)?;
         return Ok(0);
+    }
+    if let Some(note) = multithreading_note(&opts) {
+        display!(opts.verbosity, 2, "{note}");
     }
     let mut codecs = Codecs::prepare(
         dict_bytes.as_deref(),
