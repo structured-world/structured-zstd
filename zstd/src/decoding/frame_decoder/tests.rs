@@ -2238,11 +2238,12 @@ mod expect_validation {
 
     #[test]
     fn expect_window_descriptor_mismatch_fails_before_decode() {
-        // Compress a payload large enough to force a
-        // multi-segment frame (window_descriptor on wire).
-        // Default compression at >256 KiB produces multi-
-        // segment frames with a real window_descriptor byte.
-        let payload = alloc::vec![0xABu8; 512 * 1024];
+        // With the content size known the window is fitted to the input and
+        // the frame goes single-segment, without a window descriptor, as
+        // upstream zstd does (zstd_compress.c, ZSTD_adjustCParams_internal and
+        // ZSTD_writeFrameHeader's singleSegment). Only an input past the
+        // default level's largest window (log 21, 2 MiB) carries one.
+        let payload = alloc::vec![0xABu8; 3 * 1024 * 1024];
         let compressed = compress(&payload);
 
         // Read the actual window_descriptor by decoding once
