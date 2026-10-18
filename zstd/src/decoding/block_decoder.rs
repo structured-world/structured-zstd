@@ -45,16 +45,15 @@ pub(crate) fn block_maximum(window_size: usize) -> usize {
 }
 
 /// A Raw or RLE block states its output in its header, so it is held to the
-/// frame's block maximum before anything is written, as upstream checks `rSize`
-/// against `blockSizeMax` in `ZSTD_decompressContinue`. A compressed block's
-/// output is only known as it decodes, and is checked there.
+/// frame's block `maximum` before anything is written, as upstream checks
+/// `rSize` against `blockSizeMax` in `ZSTD_decompressContinue`. A compressed
+/// block's output is only known as it decodes, and is checked there.
 #[inline]
 pub(crate) fn block_fits_the_maximum(
     header: &BlockHeader,
-    window_size: usize,
+    maximum: usize,
 ) -> Result<(), DecodeBlockContentError> {
     let size = header.decompressed_size as usize;
-    let maximum = block_maximum(window_size);
     if size > maximum {
         return Err(DecodeBlockContentError::DecompressBlockError(
             DecompressBlockError::ExpandsPastBlockMaximum { size, maximum },
@@ -70,10 +69,9 @@ pub(crate) fn block_fits_the_maximum(
 #[inline]
 fn compressed_content_fits(
     header: &BlockHeader,
-    window_size: usize,
+    maximum: usize,
 ) -> Result<(), DecompressBlockError> {
     let size = header.content_size as usize;
-    let maximum = block_maximum(window_size);
     if size > maximum {
         return Err(DecompressBlockError::ContentPastBlockMaximum { size, maximum });
     }
@@ -205,7 +203,7 @@ impl BlockDecoder {
                 // the Raw arm's split_at-then-try_push-then-advance shape.
                 let fill = source[0];
                 let parts = workspace.split();
-                block_fits_the_maximum(header, parts.buffer.window_size)?;
+                block_fits_the_maximum(header, parts.buffer.block_maximum())?;
                 parts
                     .buffer
                     .try_extend_and_fill(fill, header.decompressed_size as usize)
@@ -232,7 +230,7 @@ impl BlockDecoder {
                 // past the caller's output slice. Growable backends
                 // grow on demand and always succeed.
                 let parts = workspace.split();
-                block_fits_the_maximum(header, parts.buffer.window_size)?;
+                block_fits_the_maximum(header, parts.buffer.block_maximum())?;
                 // One copy per block, under the kernel a literals-only block
                 // takes: the scalar tier stays portable.
                 let pushed = if self.kernel == CpuKernelTag::Scalar {
@@ -250,7 +248,7 @@ impl BlockDecoder {
                 panic!("Reserved-type block should be rejected during header parsing");
             }
             BlockType::Compressed => {
-                compressed_content_fits(header, workspace.split().buffer.window_size)?;
+                compressed_content_fits(header, workspace.split().buffer.block_maximum())?;
                 let n = header.content_size as usize;
                 if source.len() < n {
                     return Err(DecodeBlockContentError::ReadError {
@@ -293,7 +291,7 @@ impl BlockDecoder {
                     }
                 })?;
                 let parts = workspace.split();
-                block_fits_the_maximum(header, parts.buffer.window_size)?;
+                block_fits_the_maximum(header, parts.buffer.block_maximum())?;
                 parts
                     .buffer
                     .extend_and_fill(buf[0], header.decompressed_size as usize);
@@ -309,7 +307,7 @@ impl BlockDecoder {
                 // blanket `Read for &mut T`, so `&mut source` would also
                 // compile; the by-value form is just cleaner here.)
                 let parts = workspace.split();
-                block_fits_the_maximum(header, parts.buffer.window_size)?;
+                block_fits_the_maximum(header, parts.buffer.block_maximum())?;
                 parts
                     .buffer
                     .extend_from_reader(source, header.decompressed_size as usize)
@@ -329,7 +327,7 @@ impl BlockDecoder {
             }
 
             BlockType::Compressed => {
-                compressed_content_fits(header, workspace.split().buffer.window_size)?;
+                compressed_content_fits(header, workspace.split().buffer.block_maximum())?;
                 self.decompress_block(header, workspace, dict, source)?;
 
                 self.internal_state = DecoderState::ReadyToDecodeNextHeader;
@@ -441,15 +439,16 @@ impl BlockDecoder {
     ) -> Result<(), DecompressBlockError> {
         // A block produces at most its frame's block maximum, its literals and
         // its matches together: the smaller of the window and 128 KiB (RFC 8878
-        // 3.1.1.2.4), as upstream derives it once per frame
-        // (`zstd_decompress.c`: `blockSizeMax = MIN(windowSize,
-        // ZSTD_BLOCKSIZE_MAX)`). Upstream bounds both halves by the same
+        // 3.1.1.2.4), or the decoder's lower block limit, as upstream derives
+        // it once per frame (`zstd_decompress.c`: `blockSizeMax =
+        // MIN(windowSize, ZSTD_BLOCKSIZE_MAX)`, then `ZSTD_d_maxBlockSize`).
+        // Upstream bounds both halves by the same
         // `oend`: the literals up front (`litSize > blockSizeMax` is corruption
         // in `ZSTD_decodeLiteralsBlock`) and every write after. Sequence writes
         // stop at the per-block ceiling; the literals are checked here and the
         // whole block after it decodes, which catches literals left over after
         // the last sequence.
-        let block_maximum = block_maximum(buffer.window_size);
+        let block_maximum = buffer.block_maximum();
         let len_before = buffer.len();
         let mut section = LiteralsSection::new();
         let bytes_in_literals_header = section.parse_from_header(raw)?;

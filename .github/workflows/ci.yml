@@ -220,10 +220,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: c-abi
+      - uses: taiki-e/install-action@nextest
       - name: Clippy (c-api)
         run: cargo clippy -p structured-zstd-c --all-targets -- -D warnings
       - name: Unit + ABI tests
-        run: cargo test -p structured-zstd-c
+        run: cargo nextest run --profile ci -p structured-zstd-c
       - name: 32-bit toolchain (i686)
         # Upstream libzstd ships on 32-bit platforms; the drop-in C ABI must
         # keep building and passing there too (size_t error encoding, struct
@@ -235,7 +236,7 @@ jobs:
       - name: Clippy (c-api, i686)
         run: cargo clippy -p structured-zstd-c --all-targets --target i686-unknown-linux-gnu -- -D warnings
       - name: Unit + ABI tests (i686)
-        run: cargo test -p structured-zstd-c --target i686-unknown-linux-gnu
+        run: cargo nextest run --profile ci -p structured-zstd-c --target i686-unknown-linux-gnu
       - name: Vendored headers match upstream verbatim
         # The headers are copied byte-for-byte from the pinned upstream tag; a
         # diff means someone edited a vendored header (forbidden) or the pin
@@ -260,51 +261,28 @@ jobs:
           soname=$(readelf -d "$so" | sed -n 's/.*SONAME.*\[\(.*\)\]/\1/p')
           echo "SONAME=$soname"
           test "$soname" = "libzstd.so.1"
-      - name: All declared symbols are exported
+      - name: Every upstream export is exported
+        # The library is a superset of upstream's: build libzstd at the pinned
+        # tag and require every symbol its shared object exports, the
+        # static-linking-only sections included, to be exported here too.
         run: |
           set -euo pipefail
-          so=target/debug/libstructured_zstd.so
-          exported=$(nm -D --defined-only "$so" | awk '{print $NF}')
-          missing=0
-          for sym in \
-            ZSTD_compress ZSTD_decompress ZSTD_compressBound \
-            ZSTD_getFrameContentSize ZSTD_findFrameCompressedSize \
-            ZSTD_isError ZSTD_getErrorCode ZSTD_getErrorName ZSTD_getErrorString \
-            ZSTD_minCLevel ZSTD_maxCLevel ZSTD_defaultCLevel \
-            ZSTD_versionNumber ZSTD_versionString \
-            ZSTD_createCCtx ZSTD_freeCCtx ZSTD_createDCtx ZSTD_freeDCtx \
-            ZSTD_compressCCtx ZSTD_decompressDCtx ZSTD_sizeof_CCtx ZSTD_sizeof_DCtx \
-            ZSTD_frameHeaderSize ZSTD_getFrameHeader ZSTD_getFrameHeader_advanced \
-            ZSTD_findDecompressedSize ZSTD_decompressBound \
-            ZDICT_trainFromBuffer ZDICT_finalizeDictionary ZDICT_getDictID \
-            ZDICT_getDictHeaderSize ZDICT_isError ZDICT_getErrorName \
-            ZSTD_CCtx_loadDictionary ZSTD_CCtx_loadDictionary_byReference \
-            ZSTD_CCtx_loadDictionary_advanced ZSTD_CCtx_refCDict \
-            ZSTD_CCtx_refPrefix ZSTD_CCtx_refPrefix_advanced \
-            ZSTD_DCtx_loadDictionary ZSTD_DCtx_loadDictionary_byReference \
-            ZSTD_DCtx_loadDictionary_advanced ZSTD_DCtx_refDDict ZSTD_DCtx_refPrefix \
-            ZSTD_DCtx_refPrefix_advanced \
-            ZSTD_compress_usingCDict ZSTD_decompress_usingDDict \
-            ZSTD_createCDict ZSTD_createCDict_byReference ZSTD_freeCDict \
-            ZSTD_createDDict ZSTD_createDDict_byReference ZSTD_freeDDict \
-            ZSTD_sizeof_CDict ZSTD_sizeof_DDict \
-            ZSTD_getDictID_fromCDict ZSTD_getDictID_fromDDict \
-            ZSTD_compress_usingDict ZSTD_decompress_usingDict \
-            ZSTD_createCDict_advanced ZSTD_createDDict_advanced \
-            ZSTD_compress_usingCDict_advanced \
-            ZSTD_getDictID_fromDict ZSTD_getDictID_fromFrame \
-            ZSTD_estimateCCtxSize ZSTD_estimateCCtxSize_usingCParams \
-            ZSTD_estimateCStreamSize_usingCParams \
-            ZSTD_estimateDCtxSize ZSTD_estimateCStreamSize ZSTD_estimateDStreamSize \
-            ZSTD_getDecompressedSize ZSTD_sizeof_CStream ZSTD_sizeof_DStream \
-            ZDICT_trainFromBuffer_fastCover ZDICT_optimizeTrainFromBuffer_fastCover \
-            ZDICT_trainFromBuffer_cover ZDICT_optimizeTrainFromBuffer_cover; do
-            if ! grep -qx "$sym" <<<"$exported"; then
-              echo "::error::symbol $sym not exported from $so"
-              missing=1
-            fi
-          done
-          test "$missing" -eq 0
+          curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL \
+            "https://github.com/facebook/zstd/archive/refs/tags/${UPSTREAM_TAG}.tar.gz" \
+            -o /tmp/zstd-upstream.tar.gz
+          mkdir -p /tmp/zstd-upstream
+          tar -xzf /tmp/zstd-upstream.tar.gz -C /tmp/zstd-upstream --strip-components=1
+          make -C /tmp/zstd-upstream/lib -j"$(nproc)" libzstd
+          nm -D --defined-only /tmp/zstd-upstream/lib/libzstd.so | awk '{print $NF}' | sort -u > /tmp/upstream.syms
+          nm -D --defined-only target/debug/libstructured_zstd.so | awk '{print $NF}' | sort -u > /tmp/ours.syms
+          missing=$(comm -23 /tmp/upstream.syms /tmp/ours.syms)
+          if [ -n "$missing" ]; then
+            for sym in $missing; do
+              echo "::error::upstream ${UPSTREAM_TAG} exports $sym, this library does not"
+            done
+            exit 1
+          fi
+          echo "all $(wc -l < /tmp/upstream.syms) upstream exports present"
       - name: pkg-config reports upstream version
         run: |
           set -euo pipefail

@@ -53,6 +53,10 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     /// above are read per sequence, and moving them would shift the layout the
     /// decode monolith is built around.
     declared_content: Option<u64>,
+    /// The most one block may hold whatever the window, see
+    /// [`Self::block_maximum`]. Persists across `reset`: it mirrors a decoder
+    /// setting, which the frame layer applies as each frame starts.
+    block_limit: usize,
 }
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
@@ -123,6 +127,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             buffer,
             window_size,
             declared_content: None,
+            block_limit: crate::common::MAX_BLOCK_SIZE as usize,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -152,6 +157,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             buffer,
             window_size,
             declared_content: None,
+            block_limit: crate::common::MAX_BLOCK_SIZE as usize,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -212,6 +218,23 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // tripping the debug overflow check at its cause.
         let ceiling = self.buffer.len() + max_block_output;
         self.buffer.set_max_capacity(ceiling);
+    }
+
+    /// The most one block of the frame may hold: the smaller of the window
+    /// and the block limit (RFC 8878 3.1.1.2.4 caps it at 128 KiB; a decoder
+    /// told every block is smaller caps it lower, as upstream's
+    /// `ZSTD_d_maxBlockSize` lowers `blockSizeMax`). A single-segment frame's
+    /// window is its content size, so its blocks are bounded by that too.
+    #[inline]
+    pub(crate) fn block_maximum(&self) -> usize {
+        self.window_size.min(self.block_limit)
+    }
+
+    /// Lower the block limit [`Self::block_maximum`] applies, never above
+    /// 128 KiB.
+    #[inline]
+    pub(crate) fn set_block_limit(&mut self, limit: usize) {
+        self.block_limit = limit.min(crate::common::MAX_BLOCK_SIZE as usize);
     }
 
     /// What the frame says it will produce in total, when it says so. The
@@ -389,6 +412,34 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         } else {
             (&s1[start..], s2)
         }
+    }
+
+    /// Copy the newest `n` bytes, the block just decoded, into `target` as the
+    /// frame's output, hashing them as a drain would, and let go of what lies
+    /// past the window: it was handed out when it was decoded, and no match
+    /// reaches back that far. For a caller taking each block's output as soon
+    /// as it is decoded, whose history therefore stays here undrained.
+    ///
+    /// `n` must be `<= self.len()` and `<= target.len()`.
+    pub(crate) fn deliver_newest(&mut self, n: usize, target: &mut [u8]) {
+        let (s1, s2) = self.buffer.as_slices();
+        let total = s1.len() + s2.len();
+        debug_assert!(n <= total && n <= target.len());
+        let start = total - n;
+        let (head, tail) = if start >= s1.len() {
+            (&[][..], &s2[start - s1.len()..])
+        } else {
+            (&s1[start..], s2)
+        };
+        target[..head.len()].copy_from_slice(head);
+        target[head.len()..n].copy_from_slice(tail);
+        #[cfg(feature = "hash")]
+        if self.compute_hash {
+            self.hash.write(head);
+            self.hash.write(tail);
+            self.hash_dirty = true;
+        }
+        self.drop_to_window_size();
     }
 
     /// Capture a rollback point covering the buffer's write cursor and the

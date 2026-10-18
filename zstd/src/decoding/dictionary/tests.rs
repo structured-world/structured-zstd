@@ -123,6 +123,25 @@ fn dictionary_handle_takes_serialized_or_raw_content() {
     assert_eq!(handle.as_dict().dict_content.as_slice(), raw.as_slice());
 }
 
+/// Under eight bytes there is no room for the magic and an id, so even a
+/// magic-prefixed blob is raw content, as upstream reads it
+/// (zstd_ddict.c:97, zstd_decompress.c:1541); from eight bytes on the magic
+/// names a serialized dictionary.
+#[test]
+fn a_blob_under_eight_bytes_is_raw_content() {
+    assert!(!Dictionary::is_serialized(&MAGIC_NUM));
+    assert!(Dictionary::is_serialized(&[
+        0x37, 0xA4, 0x30, 0xEC, 1, 0, 0, 0
+    ]));
+    assert!(!Dictionary::is_serialized(b"raw content of any length"));
+    let magic_only = Dictionary::from_serialized_or_raw_content(&MAGIC_NUM)
+        .expect("too short to be serialized, so raw content");
+    assert_eq!(magic_only.dict_content.as_slice(), &MAGIC_NUM[..]);
+    let encoder = crate::encoding::EncoderDictionary::from_serialized_or_raw_content(&MAGIC_NUM)
+        .expect("the encoder reads it the same way");
+    assert_eq!(encoder.content(), &MAGIC_NUM[..]);
+}
+
 /// A zero-sized buffer is a dictionary with nothing in it, not a malformed
 /// one: `ZSTD_createDDict(NULL, 0)` builds a usable `DDict` that references no
 /// content (zstd_ddict.c:123-140), and a caller handed an empty file gets the
@@ -143,6 +162,40 @@ fn an_empty_buffer_is_a_dictionary_with_no_content() {
     // The constructor that names raw content still refuses it: there its
     // emptiness is the caller asking for a dictionary that cannot exist.
     assert!(Dictionary::from_raw_content(1, Vec::new()).is_err());
+}
+
+/// A handle reports the shared allocation with the dictionary, stays within
+/// the bound callers budget by before parsing, and a set of handles counts a
+/// dictionary once and only when nothing outside the set holds it.
+#[test]
+fn a_handle_accounts_for_what_it_keeps() {
+    let raw = include_bytes!("../../../dict_tests/dictionary");
+    let parsed = DictionaryHandle::decode_dict(raw).unwrap();
+    // The two counts ahead of the value are heap too.
+    let shared = 2 * core::mem::size_of::<usize>() + core::mem::size_of::<Dictionary>();
+    assert!(parsed.heap_size() >= shared + parsed.as_dict().heap_bytes());
+    assert!(parsed.heap_size() <= DictionaryHandle::max_heap_size(raw.len()));
+    assert!(parsed.as_dict().heap_bytes() <= Dictionary::max_heap_bytes(raw.len()));
+
+    let raw_content = DictionaryHandle::from_dictionary(
+        Dictionary::from_raw_content(0, vec![7u8; 4096]).unwrap(),
+    );
+    assert!(raw_content.heap_size() <= DictionaryHandle::max_heap_size(4096));
+
+    let copy = parsed.clone();
+    // Both handles in the set, and the same one twice: counted once.
+    assert_eq!(
+        DictionaryHandle::exclusive_heap_size([&parsed, &copy, &parsed]),
+        parsed.heap_size()
+    );
+    // `copy` is held outside the set: nothing is the set's alone.
+    assert_eq!(DictionaryHandle::exclusive_heap_size([&parsed]), 0);
+    // Two different dictionaries, each held only here.
+    assert_eq!(
+        DictionaryHandle::exclusive_heap_size([&copy, &raw_content, &parsed]),
+        parsed.heap_size() + raw_content.heap_size()
+    );
+    assert_eq!(DictionaryHandle::exclusive_heap_size([]), 0);
 }
 
 #[test]

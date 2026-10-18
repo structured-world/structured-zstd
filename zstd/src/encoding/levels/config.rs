@@ -764,23 +764,38 @@ pub(crate) fn adjust_params_for_source_size(mut params: LevelParams, src_size: u
             .map_or((0, 0), |r| (r.hash_bits as u32, r.chain_log as u32)),
         BackendTag::Dfast => (0, 0),
     };
-    // The chain cap (`ZSTD_cycleLog`) reads only `strategy >= btlazy2(6)`, so a
-    // coarse 6/3 split is exact for it; `adjust_cparams`'s other strategy use
-    // (`cdict_indices_are_tagged`) is gated on `create_cdict = false` here.
-    let strategy = if matches!(
-        params.strategy_tag,
-        StrategyTag::Btlazy2 | StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
-    ) {
-        6
-    } else {
-        3
+    // `adjust_cparams` reads the strategy for the chain cap (`ZSTD_cycleLog`,
+    // btlazy2 and up) and for the row-hash cap (greedy to lazy2, with the
+    // search log as the row log), so it gets the real class and search log;
+    // `Lazy` stands for lazy and lazy2, which both caps treat alike.
+    let strategy = match params.strategy_tag {
+        StrategyTag::Fast => 1,
+        StrategyTag::Dfast => 2,
+        StrategyTag::Greedy => 3,
+        StrategyTag::Lazy => 4,
+        StrategyTag::Btlazy2 => 6,
+        StrategyTag::BtOpt => 7,
+        StrategyTag::BtUltra => 8,
+        StrategyTag::BtUltra2 => 9,
+    };
+    // `search_depth` is `1 << searchLog` on both backends that search.
+    let search_log = match backend {
+        BackendTag::HashChain => params
+            .hc
+            .as_ref()
+            .map_or(1, |h| h.search_depth.trailing_zeros()),
+        BackendTag::Row => params
+            .row
+            .as_ref()
+            .map_or(1, |r| r.search_depth.trailing_zeros()),
+        BackendTag::Simple | BackendTag::Dfast => 1,
     };
     let adj = adjust_cparams(
         CParams {
             window_log: u32::from(params.window_log),
             chain_log,
             hash_log,
-            search_log: 1,
+            search_log,
             min_match: 4,
             target_length: 0,
             strategy,
@@ -1010,6 +1025,26 @@ pub fn estimated_compression_workspace_bytes_for_run(
     workspace_bytes(&params, ldm)
 }
 
+/// The level params a frame resolves to under `parameters`, for a source of
+/// `src_size_hint` bytes and an optional dictionary: the level (or the
+/// dictionary's tier), then the caller's overrides, as the matcher's reset
+/// resolves them.
+pub(crate) fn frame_level_params(
+    parameters: &crate::encoding::CompressionParameters,
+    src_size_hint: Option<u64>,
+    dictionary: Option<crate::encoding::DictionarySizes>,
+) -> LevelParams {
+    let level = parameters.level();
+    let overrides = parameters.overrides();
+    let dictionary = dictionary.filter(|sizes| sizes.content != 0);
+    let mut params = match dictionary {
+        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes, &overrides).0,
+        None => resolve_level_params(level, src_size_hint),
+    };
+    apply_frame_overrides(&mut params, &overrides, dictionary.is_some(), src_size_hint);
+    params
+}
+
 /// The workspace estimate for a frame run under `parameters`: the level, every
 /// knob that overrides it, the source size and the dictionary, resolved the way
 /// the encoder resolves them at frame start.
@@ -1046,16 +1081,9 @@ pub fn estimated_compression_workspace_bytes_for_parameters(
     src_size_hint: Option<u64>,
     dictionary: Option<crate::encoding::DictionarySizes>,
 ) -> usize {
-    let level = parameters.level();
-    let overrides = parameters.overrides();
-    let dictionary = dictionary.filter(|sizes| sizes.content != 0);
-    let mut params = match dictionary {
-        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes, &overrides).0,
-        None => resolve_level_params(level, src_size_hint),
-    };
-    apply_frame_overrides(&mut params, &overrides, dictionary.is_some(), src_size_hint);
+    let params = frame_level_params(parameters, src_size_hint, dictionary);
     #[cfg(feature = "ldm")]
-    let ldm = overrides.ldm.map_or(0, |ldm| {
+    let ldm = parameters.overrides().ldm.map_or(0, |ldm| {
         crate::encoding::ldm::estimated_workspace_bytes(&frame_ldm_params(&params, &ldm))
     });
     #[cfg(not(feature = "ldm"))]
@@ -1074,16 +1102,23 @@ fn table_bytes(entry: usize, log: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// Window, match-finder tables, optimal-parser scratch and block staging for a
-/// frame resolved to `params`, plus `ldm` bytes of long-distance table.
+/// Everything a compressor keeps for a frame resolved to `params`, plus `ldm`
+/// bytes of long-distance table: the workspace (history, match-finder tables
+/// and block buffers, laid out by the same functions the reset uses), and
+/// what lives beside it (optimal-parser scratch, entropy tables, the block
+/// splitter's state, the window's block deque).
 fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
     use crate::encoding::strategy::{SearchMethod, StrategyTag};
+    use crate::encoding::workspace::{ALIGN, region_bytes};
     // A 30-bit window is a gibibyte, which a 32-bit `usize` cannot count: the
     // widest window is more memory than such a machine has, so the figure is
     // pinned rather than wrapped.
     let window = 1usize
         .checked_shl(u32::from(params.window_log))
         .unwrap_or(usize::MAX);
+    let block = (crate::common::MAX_BLOCK_SIZE as usize).min(window);
+    let backend = params.backend();
+    let history = crate::encoding::match_generator::history_ceiling(backend, window, 0, block);
     // Mirror `configure()`: the HC3 short-match side table exists only on
     // the btultra/btultra2 tags (minMatch 3), capped by the window log; the
     // BT pointer-pair layout fits inside the `4 << chain_log` chain term
@@ -1143,16 +1178,36 @@ fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
     } else {
         0
     };
-    // Block staging: literal + sequence buffers plus the compressed-block
-    // scratch, each bounded by the 128 KiB block size.
-    let staging = 3 * (128 * 1024);
+    // One allocation: each table region and the history rounded to `ALIGN`,
+    // the block buffers behind them, and the padding that aligns its start.
+    let laid_out = tables
+        .saturating_add(3 * ALIGN)
+        .saturating_add(region_bytes::<u8>(history))
+        .saturating_add(crate::encoding::blocks::CompressedBlockScratch::workspace_bytes(block))
+        .saturating_add(ALIGN - 1);
+    // The backends that slide their window by blocks keep one length per
+    // block in it, in a deque that grows by doubling. Plain arithmetic here
+    // and in `beside`: `history / block` is at most the window over the
+    // smallest block plus a few, and every term of `beside` is a constant or
+    // bounded by the 128 KiB block, so neither comes near `usize::MAX`.
+    let block_deque = if matches!(backend, crate::encoding::strategy::BackendTag::Simple) {
+        0
+    } else {
+        2 * (history / block + 2) * core::mem::size_of::<usize>()
+    };
+    let splits =
+        crate::encoding::levels::fastest::post_split_enabled(params.strategy_tag, window as u64);
+    let beside = crate::encoding::frame_compressor::FseTables::max_heap_size()
+        + crate::encoding::blocks::CompressedBlockScratch::max_retained_heap_size(block, splits)
+        + 2 * crate::huff0::huff0_encoder::HuffmanTable::max_heap_size()
+        + crate::huff0::huff0_encoder::WeightScratch::max_heap_size();
     // Saturating: the parts are each bounded, but their sum at the widest
     // window is more than a 32-bit `usize` counts, and a total that wrapped
     // would report a run as fitting a limit it cannot.
-    window
-        .saturating_add(tables)
+    laid_out
         .saturating_add(bt)
-        .saturating_add(staging)
+        .saturating_add(block_deque)
+        .saturating_add(beside)
         .saturating_add(ldm)
 }
 
@@ -1308,7 +1363,8 @@ pub(crate) fn resolve_level_params_with_dict(
         uses_row_match_finder,
     };
     let base = resolve_level_params(level, source_size);
-    if sizes.content == 0 {
+    // A raw frame searches nothing, so a dictionary has no tier to give it.
+    if sizes.content == 0 || matches!(level, CompressionLevel::Uncompressed) {
         return (base, None);
     }
     // The CDict's cParams decide the frame's strategy REGARDLESS of the

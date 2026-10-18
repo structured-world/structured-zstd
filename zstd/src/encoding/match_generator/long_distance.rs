@@ -85,14 +85,18 @@ impl MatchGeneratorDriver {
 
     /// Take the block's long-distance matches outright and match only the
     /// literals between them with the frame's backend (upstream
-    /// `ZSTD_ldm_blockCompress` below btopt). The block is handed back to the
-    /// uncommitted input and committed again in pieces, so each gap is the
-    /// backend's whole block and each match body is indexed without being
-    /// searched. Returns `false` when the block has no long-distance match,
-    /// leaving it committed for the ordinary search.
+    /// `ZSTD_ldm_blockCompress` below btopt), or with the installed producer
+    /// when `produced`. The block is handed back to the uncommitted input and
+    /// committed again in pieces, so each gap is the backend's whole block and
+    /// each match body is indexed without being searched. Returns `false` when
+    /// the block has no long-distance match, leaving it committed for the
+    /// ordinary search. With `produced`, the caller has emptied the optimal
+    /// parser's candidates first, so a piece the producer fails on is never
+    /// matched against an earlier block's long matches.
     pub(super) fn start_matching_long_distance(
         &mut self,
         handle_sequence: &mut impl FnMut(Sequence),
+        produced: bool,
     ) -> bool {
         let block_len = self.take_long_distance_block();
         if self.ldm_block.is_empty() {
@@ -106,7 +110,7 @@ impl MatchGeneratorDriver {
             let mut gap = Some(0usize);
             if seq.lit_length != 0 {
                 self.storage.commit_piece(seq.lit_length);
-                self.start_matching_owned(&mut owned_sink(handle_sequence, &mut gap));
+                self.match_gap(produced, &mut owned_sink(handle_sequence, &mut gap));
             }
             let gap_literals = gap.expect("the gap sink only ever writes Some");
             self.storage.commit_piece(seq.match_length);
@@ -123,10 +127,19 @@ impl MatchGeneratorDriver {
         if tail != 0 {
             self.storage.commit_piece(tail);
             let mut forward = None;
-            self.start_matching_owned(&mut owned_sink(handle_sequence, &mut forward));
+            self.match_gap(produced, &mut owned_sink(handle_sequence, &mut forward));
         }
         self.ldm_block = sequences;
         self.ldm_split_block = Some(block_len);
         true
+    }
+
+    /// Match the piece just committed between long matches: by the producer
+    /// when `produced` and it gives a parse, by the backend otherwise.
+    fn match_gap(&mut self, produced: bool, sink: &mut impl FnMut(Sequence)) {
+        if produced && self.match_produced(sink) {
+            return;
+        }
+        self.start_matching_owned(sink);
     }
 }

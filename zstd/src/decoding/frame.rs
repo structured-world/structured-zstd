@@ -144,11 +144,66 @@ pub(crate) fn take_magic_from_slice(input: &mut &[u8]) -> Result<(), ReadFrameHe
 /// Length of the frame header at the start of `input`, magic number included,
 /// read from the magic and the descriptor byte alone; the fields after them
 /// need not be there yet.
-pub(crate) fn measure_header_from_slice(mut input: &[u8]) -> Result<usize, ReadFrameHeaderError> {
-    take_magic_from_slice(&mut input)?;
+pub(crate) fn measure_header_from_slice(input: &[u8]) -> Result<usize, ReadFrameHeaderError> {
+    measure_header_with_format(input, false)
+}
+
+/// [`measure_header_from_slice`] in either format: a magicless header starts
+/// at its descriptor byte and has no magic number to count.
+pub(crate) fn measure_header_with_format(
+    mut input: &[u8],
+    magicless: bool,
+) -> Result<usize, ReadFrameHeaderError> {
+    let magic_len = if magicless {
+        0
+    } else {
+        take_magic_from_slice(&mut input)?;
+        4
+    };
     let d =
         take(&mut input, 1).ok_or_else(|| ReadFrameHeaderError::FrameDescriptorReadError(eof()))?;
-    Ok(4 + FrameDescriptor(d[0]).header_len())
+    Ok(magic_len + FrameDescriptor(d[0]).header_len())
+}
+
+/// The lowest skippable magic number, and the mask that maps all sixteen to
+/// it (RFC 8878 3.1.2: `0x184D2A5?`).
+const SKIPPABLE_MAGIC_START: u32 = 0x184D_2A50;
+const SKIPPABLE_MAGIC_MASK: u32 = 0xFFFF_FFF0;
+
+/// How many bytes from its start the header beginning `input` takes to read
+/// whole, from what `input` holds of it: the bytes that hold the descriptor
+/// until they are all here, then the header's length, and eight for a
+/// skippable frame. Bytes that start no known magic number are refused at
+/// once (upstream `ZSTD_getFrameHeader_advanced`, zstd_decompress.c:458-498).
+pub(crate) fn header_input_needed(
+    input: &[u8],
+    magicless: bool,
+) -> Result<usize, ReadFrameHeaderError> {
+    let start = if magicless { 1 } else { 5 };
+    let mut skippable = false;
+    if !magicless && !input.is_empty() {
+        // The bytes that are here, laid over each magic number: a prefix of
+        // one of them is all a short input can be checked for.
+        let n = input.len().min(4);
+        let mut zstd = MAGIC_NUM.to_le_bytes();
+        zstd[..n].copy_from_slice(&input[..n]);
+        let mut skip = SKIPPABLE_MAGIC_START.to_le_bytes();
+        skip[..n].copy_from_slice(&input[..n]);
+        let read = u32::from_le_bytes(zstd);
+        if read != MAGIC_NUM {
+            if u32::from_le_bytes(skip) & SKIPPABLE_MAGIC_MASK != SKIPPABLE_MAGIC_START {
+                return Err(ReadFrameHeaderError::BadMagicNumber(read));
+            }
+            skippable = input.len() >= 4;
+        }
+    }
+    if input.len() < start {
+        return Ok(start);
+    }
+    if skippable {
+        return Ok(8);
+    }
+    measure_header_with_format(input, magicless)
 }
 
 /// Slice-direct equivalent of [`read_frame_header_with_format`]: parses the

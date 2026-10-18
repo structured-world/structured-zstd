@@ -198,6 +198,24 @@ impl HuffmanTable {
             + self.fse_table.heap_bytes()
     }
 
+    /// Most [`heap_bytes`](Self::heap_bytes) can report: each `Vec` holds
+    /// under twice its longest length (see [`FSETable::max_heap_bytes`]), the
+    /// decode table `1 << 12` entries and the code lengths one past the
+    /// 256-symbol alphabet.
+    #[cfg(not(feature = "caller-workspace"))]
+    pub const fn max_heap_bytes() -> usize {
+        2 * (1 << MAX_MAX_NUM_BITS as usize) * core::mem::size_of::<u16>()
+            + 2 * 256
+            + 2 * (256 + 1)
+            + FSETable::max_heap_bytes()
+    }
+
+    /// Most [`heap_bytes`](Self::heap_bytes) can report: none.
+    #[cfg(feature = "caller-workspace")]
+    pub const fn max_heap_bytes() -> usize {
+        0
+    }
+
     /// Heap bytes owned by this table: none, every buffer is inline.
     #[cfg(feature = "caller-workspace")]
     pub fn heap_bytes(&self) -> usize {

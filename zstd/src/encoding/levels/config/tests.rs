@@ -42,6 +42,44 @@ fn a_dictionary_lends_its_shape_whatever_the_source_size() {
     );
 }
 
+/// The estimate for a source is a budget the compressor that ran it stays
+/// within, at every band and size: the history, the match-finder tables, the
+/// block staging and the entropy tables it keeps between frames.
+#[test]
+fn a_compressor_stays_within_its_source_estimate() {
+    let mut state = 0x2545_F491u32;
+    let phrase = b"tenant=demo table=orders op=put key=";
+    let input: Vec<u8> = (0..1usize << 20)
+        .map(|i| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            // Text with a noisy byte in eight: literals and matches both.
+            if i % 8 == 0 {
+                state as u8
+            } else {
+                phrase[i % phrase.len()]
+            }
+        })
+        .collect();
+    let mut over = Vec::new();
+    for level in [-5, 1, 3, 5, 6, 9, 12, 13, 16, 19, 22] {
+        for size in [4 << 10, 64 << 10, 256 << 10, 1 << 20] {
+            let level = CompressionLevel::Level(level);
+            let mut compressor: crate::encoding::FrameCompressor =
+                crate::encoding::FrameCompressor::new(level);
+            let _ = compressor.compress_independent_frame(&input[..size]);
+            let held = compressor.heap_size();
+            let budget =
+                super::estimated_compression_workspace_bytes_for_source(level, Some(size as u64));
+            if held > budget {
+                over.push(format!("{level:?} {size}: {held} > {budget}"));
+            }
+        }
+    }
+    assert!(over.is_empty(), "over budget:\n{}", over.join("\n"));
+}
+
 /// The estimate is a budget figure, so it answers for whatever it is asked —
 /// including a window log no encoder would accept. Shifting by one is undefined
 /// past the width of the type, so an unbounded value turns a question about

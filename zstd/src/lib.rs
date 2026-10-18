@@ -84,6 +84,9 @@ mod common;
 /// source of truth for every surface that has to name it, the C ABI included.
 /// A frame's own maximum is the smaller of this and its window.
 pub use common::MAX_BLOCK_SIZE;
+/// Smallest accepted maximum block size (the `ZSTD_BLOCKSIZE_MAX_MIN` bound),
+/// shared by `set_max_block_size` and the C ABI parameter surface.
+pub use common::MIN_MAX_BLOCK_SIZE;
 /// Smallest accepted block-size target (the `ZSTD_TARGETCBLOCKSIZE_MIN`
 /// bound): the single source of truth shared by the Rust setters
 /// (`set_target_block_size`) and the C ABI parameter surface.
@@ -96,8 +99,6 @@ pub mod dictionary;
 pub mod encoding;
 mod histogram;
 
-#[cfg(feature = "lsm")]
-#[cfg_attr(docsrs, doc(cfg(feature = "lsm")))]
 pub mod skippable;
 
 pub(crate) mod blocks;

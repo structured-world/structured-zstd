@@ -17,8 +17,8 @@
 use core::ffi::{c_int, c_uint};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use codec::decoding::{ContentChecksum, Dictionary, DictionaryHandle};
-use codec::encoding::{CompressionLevel, CompressionParameters, EncoderDictionary};
+use codec::decoding::{Dictionary, DictionaryHandle};
+use codec::encoding::{CompressionParameters, EncoderDictionary};
 
 use crate::cdict::{ZSTD_CDict, ZSTD_DDict, next_dict_serial, prepare_compression_dictionary};
 use crate::context::{ZSTD_CCtx, ZSTD_DCtx, kept_compressor};
@@ -29,11 +29,6 @@ use crate::ffi::{in_slice, out_slice};
 pub(crate) const ZSTD_DCT_AUTO: c_int = 0;
 pub(crate) const ZSTD_DCT_RAW_CONTENT: c_int = 1;
 pub(crate) const ZSTD_DCT_FULL_DICT: c_int = 2;
-
-/// `ZSTD_dictMagicNumber` little-endian prefix of a serialized dictionary,
-/// read off the codec's own magic rather than re-declared, so the two cannot
-/// disagree about what a dictionary looks like.
-const DICT_MAGIC: u32 = u32::from_le_bytes(codec::decoding::DICTIONARY_MAGIC);
 
 /// Synthetic non-zero ID for raw-content dictionaries. The encoder attach
 /// path requires a non-zero ID, but raw-content frames never put it on the
@@ -64,10 +59,11 @@ pub(crate) enum CCtxDictAttach {
         cdict: *const ZSTD_CDict,
         serial: u64,
     },
-    /// `ZSTD_CCtx_refPrefix*`: single-use raw-content dictionary for the
-    /// next frame only.
+    /// `ZSTD_CCtx_refPrefix*`: single-use dictionary for the next frame only,
+    /// raw content unless the selector made it a serialized one.
     Prefix {
         dict: EncoderDictionary,
+        raw_content: bool,
         serial: u64,
     },
 }
@@ -90,7 +86,7 @@ impl CCtxDictAttach {
             CCtxDictAttach::Load { dict, .. } | CCtxDictAttach::Prefix { dict, .. } => Some(dict),
             // SAFETY: C contract — the CDict outlives every context that
             // references it (`ZSTD_CCtx_refCDict` lifetime rule).
-            CCtxDictAttach::RefCDict { cdict, .. } => Some(&unsafe { &**cdict }.dict),
+            CCtxDictAttach::RefCDict { cdict, .. } => unsafe { &**cdict }.dict.as_ref(),
         }
     }
 }
@@ -98,41 +94,28 @@ impl CCtxDictAttach {
 /// Dictionary state attached to a decompression context. All variants hold
 /// the dictionary pre-parsed as a [`DictionaryHandle`] (`Arc`-shared), so the
 /// per-frame application is a refcount bump.
+#[derive(Clone)]
 pub(crate) enum DCtxDictAttach {
     None,
     /// `ZSTD_DCtx_loadDictionary*`: sticky.
     Load {
         handle: DictionaryHandle,
     },
-    /// `ZSTD_DCtx_refDDict`: sticky reference; the parse of the DDict's bytes
-    /// is cached here keyed by its serial.
+    /// `ZSTD_DCtx_refDDict`: sticky reference sharing the DDict's prepared
+    /// dictionary.
     RefDDict {
-        serial: u64,
         handle: DictionaryHandle,
+    },
+    /// `ZSTD_DCtx_refDDict` under `ZSTD_d_refMultipleDDicts`: every DDict
+    /// referenced, most recent last, one per dictionary ID. A frame decodes
+    /// with the one its header names, or with the most recent.
+    RefDDicts {
+        handles: Vec<DictionaryHandle>,
     },
     /// `ZSTD_DCtx_refPrefix`: single-use raw-content dictionary.
     Prefix {
         handle: DictionaryHandle,
     },
-}
-
-impl DCtxDictAttach {
-    /// Heap bytes owned by the attach state: the parsed dictionary behind
-    /// `loadDictionary` / `refPrefix` is context-owned (counted); a
-    /// referenced `DDict`'s parse is cached here but its bytes belong to
-    /// the caller's handle, so only the parsed copy is reported.
-    pub(crate) fn heap_size(&self) -> usize {
-        match self {
-            DCtxDictAttach::None => 0,
-            DCtxDictAttach::Load { handle }
-            | DCtxDictAttach::RefDDict { handle, .. }
-            | DCtxDictAttach::Prefix { handle } => {
-                // Content plus the parsed entropy tables' heap; the inline
-                // FSE decode arrays are covered by the struct size term.
-                handle.as_dict().heap_bytes() + core::mem::size_of::<codec::decoding::Dictionary>()
-            }
-        }
-    }
 }
 
 /// Parse caller bytes into a decode-side [`DictionaryHandle`] honouring the
@@ -141,11 +124,7 @@ pub(crate) fn parse_decode_dict(
     dict: &[u8],
     content_type: c_int,
 ) -> Result<DictionaryHandle, ZSTD_ErrorCode> {
-    // The magic is 4 bytes; classify on those alone (a magic-prefixed blob
-    // shorter than a full header then fails the parse as corrupted instead
-    // of silently degrading to raw content).
-    let has_magic =
-        dict.len() >= 4 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
+    let has_magic = Dictionary::is_serialized(dict);
     let full = match content_type {
         ZSTD_DCT_AUTO => has_magic,
         ZSTD_DCT_RAW_CONTENT => false,
@@ -168,9 +147,8 @@ pub(crate) fn parse_decode_dict(
 }
 
 /// Whether `dict` selects raw-content modelling on the encode side.
-fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<bool, ZSTD_ErrorCode> {
-    let has_magic =
-        dict.len() >= 4 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
+pub(crate) fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<bool, ZSTD_ErrorCode> {
+    let has_magic = Dictionary::is_serialized(dict);
     match content_type {
         ZSTD_DCT_AUTO => Ok(!has_magic),
         ZSTD_DCT_RAW_CONTENT => Ok(true),
@@ -201,7 +179,13 @@ fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<bool, ZSTD_Err
 /// and reads it back at :5254 and :5837).
 pub(crate) fn cdict_params_describe_frame(cdict: &ZSTD_CDict, src_size: Option<u64>) -> bool {
     cdict.params.is_some()
-        || codec::encoding::dictionary_describes_frame(cdict.dict.content_size(), src_size)
+        || codec::encoding::dictionary_describes_frame(
+            cdict
+                .dict
+                .as_ref()
+                .map_or(0, codec::encoding::EncoderDictionary::content_size),
+            src_size,
+        )
 }
 
 impl ZSTD_CCtx {
@@ -305,12 +289,17 @@ impl ZSTD_CCtx {
         }
     }
 
+    /// Whether a `CDict` is referenced, whose parameters a frame inherits.
+    pub(crate) fn references_cdict(&self) -> bool {
+        matches!(self.attached_dict, CCtxDictAttach::RefCDict { .. })
+    }
+
     /// Whether the attach models raw content (synthetic dictionary ID that
     /// must never reach the wire, regardless of `ZSTD_c_dictIDFlag`).
     pub(crate) fn attach_suppresses_dict_id(&self) -> bool {
         match &self.attached_dict {
-            CCtxDictAttach::Load { raw_content, .. } => *raw_content,
-            CCtxDictAttach::Prefix { .. } => true,
+            CCtxDictAttach::Load { raw_content, .. }
+            | CCtxDictAttach::Prefix { raw_content, .. } => *raw_content,
             // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
             CCtxDictAttach::RefCDict { cdict, .. } => unsafe { &**cdict }.raw_content,
             CCtxDictAttach::None => false,
@@ -319,15 +308,16 @@ impl ZSTD_CCtx {
 }
 
 impl DCtxDictAttach {
-    /// The dictionary the next frame must decode with, if any. Borrowed: the
-    /// decoder takes it by reference and keeps its own handle only when it
-    /// is a different dictionary than the last frame's.
-    pub(crate) fn handle(&self) -> Option<&DictionaryHandle> {
+    /// The dictionaries the next frame chooses from, none for no dictionary.
+    /// Borrowed: the decoder takes them by reference and keeps its own handle
+    /// only when the frame's is a different dictionary than the last frame's.
+    pub(crate) fn handles(&self) -> &[DictionaryHandle] {
         match self {
-            DCtxDictAttach::None => None,
+            DCtxDictAttach::None => &[],
             DCtxDictAttach::Load { handle }
             | DCtxDictAttach::RefDDict { handle, .. }
-            | DCtxDictAttach::Prefix { handle } => Some(handle),
+            | DCtxDictAttach::Prefix { handle } => core::slice::from_ref(handle),
+            DCtxDictAttach::RefDDicts { handles } => handles,
         }
     }
 }
@@ -480,17 +470,19 @@ unsafe fn cctx_ref_prefix(
         cctx.replace_attached_dict(CCtxDictAttach::None);
         return 0;
     }
-    // A prefix is raw content by definition: only the auto / rawContent
-    // selectors are meaningful; everything else (fullDict, out-of-range
-    // discriminants) is rejected.
-    if !matches!(content_type, ZSTD_DCT_AUTO | ZSTD_DCT_RAW_CONTENT) {
-        return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
-    }
-    let Some(prepared) = prepare_compression_dictionary(prefix, true) else {
+    // The selector is kept with the prefix and read as a loaded dictionary's
+    // is, as upstream does (zstd_compress.c:1351): auto with the magic number
+    // and fullDict make it a serialized dictionary for its frame.
+    let raw_content = match encode_raw_content(prefix, content_type) {
+        Ok(v) => v,
+        Err(code) => return encode(code),
+    };
+    let Some(prepared) = prepare_compression_dictionary(prefix, raw_content) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted);
     };
     cctx.replace_attached_dict(CCtxDictAttach::Prefix {
         dict: prepared,
+        raw_content,
         serial: next_dict_serial(),
     });
     0
@@ -510,8 +502,8 @@ pub unsafe extern "C" fn ZSTD_CCtx_refPrefix(
     unsafe { cctx_ref_prefix(cctx, prefix, prefix_size, ZSTD_DCT_RAW_CONTENT) }
 }
 
-/// `ZSTD_CCtx_refPrefix_advanced` — explicit content type (`fullDict` is
-/// rejected; a prefix is raw content).
+/// `ZSTD_CCtx_refPrefix_advanced` — explicit content type, read as
+/// `ZSTD_CCtx_loadDictionary_advanced` reads it.
 ///
 /// # Safety
 /// Same as [`ZSTD_CCtx_refPrefix`].
@@ -625,29 +617,29 @@ pub unsafe extern "C" fn ZSTD_DCtx_refDDict(
         dctx.attached_ddict = DCtxDictAttach::None;
         return 0;
     }
-    let ddict = unsafe { &*ddict };
-    if let DCtxDictAttach::RefDDict { serial, .. } = &dctx.attached_ddict
-        && *serial == ddict.serial
-    {
+    // The DDict was prepared at creation; an empty one references nothing.
+    let Some(handle) = &unsafe { &*ddict }.prepared else {
+        dctx.attached_ddict = DCtxDictAttach::None;
+        return 0;
+    };
+    if !dctx.ref_multiple_ddicts {
+        dctx.attached_ddict = DCtxDictAttach::RefDDict {
+            handle: handle.clone(),
+        };
         return 0;
     }
-    // Honour the DDict's creation-time content-type selection (same as
-    // ZSTD_decompress_usingDDict): an explicit rawContent DDict must not be
-    // re-classified on the magic at use time.
-    let parsed = catch_unwind(AssertUnwindSafe(|| {
-        parse_decode_dict(&ddict.raw, ddict.content_type)
-    }));
-    match parsed {
-        Ok(Ok(handle)) => {
-            dctx.attached_ddict = DCtxDictAttach::RefDDict {
-                serial: ddict.serial,
-                handle,
-            };
-            0
-        }
-        Ok(Err(code)) => encode(code),
-        Err(_) => encode(ZSTD_ErrorCode::ZSTD_error_GENERIC),
-    }
+    // Added to the DDicts referenced so far, replacing one of the same ID as
+    // upstream's set does (zstd_decompress.c:105); a loaded dictionary or a
+    // prefix is not a DDict reference and is replaced.
+    let mut handles = match core::mem::replace(&mut dctx.attached_ddict, DCtxDictAttach::None) {
+        DCtxDictAttach::RefDDicts { handles } => handles,
+        DCtxDictAttach::RefDDict { handle } => vec![handle],
+        _ => Vec::new(),
+    };
+    handles.retain(|held| held.id() != handle.id());
+    handles.push(handle.clone());
+    dctx.attached_ddict = DCtxDictAttach::RefDDicts { handles };
+    0
 }
 
 /// `size_t ZSTD_DCtx_refPrefix(ZSTD_DCtx* dctx, const void* prefix, size_t
@@ -661,6 +653,22 @@ pub unsafe extern "C" fn ZSTD_DCtx_refPrefix(
     prefix: *const u8,
     prefix_size: usize,
 ) -> usize {
+    unsafe { dctx_ref_prefix(dctx, prefix, prefix_size, ZSTD_DCT_RAW_CONTENT) }
+}
+
+/// Shared body of `ZSTD_DCtx_refPrefix*`: the selector is read as a loaded
+/// dictionary's is, as upstream's prefix is a dictionary loaded for one
+/// frame (zstd_decompress.c:1725).
+///
+/// # Safety
+/// `prefix` valid for `prefix_size` bytes (or `NULL` + 0); `dctx` live or
+/// `NULL`.
+unsafe fn dctx_ref_prefix(
+    dctx: *mut ZSTD_DCtx,
+    prefix: *const u8,
+    prefix_size: usize,
+    content_type: c_int,
+) -> usize {
     if dctx.is_null() {
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
@@ -673,9 +681,7 @@ pub unsafe extern "C" fn ZSTD_DCtx_refPrefix(
         dctx.attached_ddict = DCtxDictAttach::None;
         return 0;
     }
-    let parsed = catch_unwind(AssertUnwindSafe(|| {
-        parse_decode_dict(prefix, ZSTD_DCT_RAW_CONTENT)
-    }));
+    let parsed = catch_unwind(AssertUnwindSafe(|| parse_decode_dict(prefix, content_type)));
     match parsed {
         Ok(Ok(handle)) => {
             dctx.attached_ddict = DCtxDictAttach::Prefix { handle };
@@ -686,8 +692,9 @@ pub unsafe extern "C" fn ZSTD_DCtx_refPrefix(
     }
 }
 
-/// `ZSTD_DCtx_refPrefix_advanced` — explicit content type (`fullDict` is
-/// rejected; a prefix is raw content).
+/// `ZSTD_DCtx_refPrefix_advanced` — explicit content type, read as
+/// `ZSTD_DCtx_loadDictionary_advanced` reads it. `NULL` / empty clears
+/// whatever the selector.
 ///
 /// # Safety
 /// Same as [`ZSTD_DCtx_refPrefix`].
@@ -698,12 +705,7 @@ pub unsafe extern "C" fn ZSTD_DCtx_refPrefix_advanced(
     prefix_size: usize,
     content_type: c_int,
 ) -> usize {
-    // NULL/empty is the clear signal and wins over selector validation
-    // (the delegate runs its own null/stage checks and then clears).
-    if prefix_size > 0 && !matches!(content_type, ZSTD_DCT_AUTO | ZSTD_DCT_RAW_CONTENT) {
-        return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
-    }
-    unsafe { ZSTD_DCtx_refPrefix(dctx, prefix, prefix_size) }
+    unsafe { dctx_ref_prefix(dctx, prefix, prefix_size, content_type) }
 }
 
 /// `size_t ZSTD_compress_usingDict(ZSTD_CCtx* ctx, void* dst, size_t
@@ -726,12 +728,44 @@ pub unsafe extern "C" fn ZSTD_compress_usingDict(
     dict_size: usize,
     compression_level: c_int,
 ) -> usize {
-    if ctx.is_null() {
+    let Some(cctx) = (unsafe { ctx.as_mut() }) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
-    }
-    let cctx = unsafe { &mut *ctx };
+    };
     let src = unsafe { in_slice(src, src_size) };
     let dict = unsafe { in_slice(dict, dict_size) };
+    let frame = OneShotFrame {
+        level: compression_level,
+        params: None,
+        checksum: false,
+        content_size: true,
+        dict_id: true,
+    };
+    let dst = unsafe { out_slice(dst, dst_capacity) };
+    compress_with_dict_bytes(cctx, dst, src, dict, &frame)
+}
+
+/// How a one-shot frame that ignores the context's sticky parameters is
+/// compressed: at `level`, or under explicit `params`, with these flags.
+pub(crate) struct OneShotFrame {
+    pub(crate) level: c_int,
+    pub(crate) params: Option<CompressionParameters>,
+    pub(crate) checksum: bool,
+    pub(crate) content_size: bool,
+    pub(crate) dict_id: bool,
+}
+
+/// Compress `src` into `dst` with one-off dictionary bytes (none when empty),
+/// on the context's kept compressor: the body of `ZSTD_compress_usingDict`
+/// and `ZSTD_compress_advanced`.
+pub(crate) fn compress_with_dict_bytes(
+    cctx: &mut ZSTD_CCtx,
+    dst: &mut [u8],
+    src: &[u8],
+    dict: &[u8],
+    frame: &OneShotFrame,
+) -> usize {
+    cctx.begin_one_shot();
+    let compression_level = frame.level;
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
         // Bytes handed in per call have no identity to recognise them by, so
         // they are prepared every time (as upstream loads them every time);
@@ -750,11 +784,11 @@ pub unsafe extern "C" fn ZSTD_compress_usingDict(
             ..
         } = cctx;
         let enc = kept_compressor(compressor, serial, prepared.as_ref(), compression_level)?;
-        enc.set_compression_level(CompressionLevel::from_level(compression_level));
-        enc.set_content_checksum(false);
-        enc.set_content_size_flag(true);
-        enc.set_dictionary_id_flag(!raw_content);
-        enc.set_target_block_size(None);
+        crate::context::set_frame_parameters(enc, frame.params.as_ref(), compression_level);
+        enc.set_content_checksum(frame.checksum);
+        enc.set_content_size_flag(frame.content_size);
+        enc.set_dictionary_id_flag(frame.dict_id && !raw_content);
+        crate::context::plain_frame_shape(enc);
         scratch.clear();
         enc.compress_independent_frame_into(src, scratch);
         Ok(())
@@ -767,12 +801,11 @@ pub unsafe extern "C" fn ZSTD_compress_usingDict(
             return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
         }
     }
-    let len = cctx.scratch.len();
-    if len > dst_capacity {
-        return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
-    }
-    let dst = unsafe { out_slice(dst, dst_capacity) };
-    dst[..len].copy_from_slice(&cctx.scratch);
+    let len = match cctx.hand_out_frame(dst) {
+        Ok(len) => len,
+        Err(code) => return encode(code),
+    };
+    cctx.progress = crate::context::FrameProgress::one_shot(src.len(), len);
     len
 }
 
@@ -797,7 +830,11 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let dctx = unsafe { &mut *dctx };
-    let src = unsafe { in_slice(src, src_size) };
+    let src = match unsafe { crate::ffi::decode_input(src, src_size, dst, dst_capacity) } {
+        Ok(src) => src,
+        Err(code) => return encode(code),
+    };
+    let src = &*src;
     let dst = unsafe { out_slice(dst, dst_capacity) };
     let dict = unsafe { in_slice(dict, dict_size) };
     // Deliberately NO `stream_frame_done` guard here: the stage_wrong check
@@ -809,7 +846,7 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
     // covered by the decompress_stream_recovers_after_oneshot_on_midframe_context
     // regression test; every exit path below restores the frame boundary.
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<usize, ZSTD_ErrorCode> {
-        dctx.decoder.set_content_checksum(ContentChecksum::Verify);
+        dctx.decoder.set_content_checksum(dctx.content_checksum);
         if dict.is_empty() {
             dctx.decoder
                 .decode_all(src, dst)
@@ -831,9 +868,8 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
             encode(code)
         }
         Err(_) => {
-            dctx.decoder = codec::decoding::FrameDecoder::new();
+            dctx.replace_decoder();
             dctx.stream_frame_done = true;
-            dctx.ddict_serial = 0;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
     }

@@ -780,6 +780,45 @@ fn build_from_counts_gated_rejects_an_alphabet_wider_than_a_huffman_table() {
     let _ = HuffmanTable::build_from_counts_gated(&counts, false);
 }
 
+/// A compressor reuses one scratch and one table across blocks whose literal
+/// alphabets differ, and a buffer grown by `Vec`'s amortised doubling can end
+/// up far past the longest length it held. The maximums the memory estimates
+/// are built from must still bound what the reused buffers hold, even when the
+/// alphabet widens by one symbol per block, the shape that doubles every time.
+#[test]
+fn reused_buffers_stay_within_their_maximums() {
+    let mut scratch = WeightScratch::default();
+    // A snapshot the compressor restores block by block, as rollbacks and
+    // dictionary seeds copy a table into one it keeps.
+    let mut snapshot = HuffmanTable::build_from_counts_gated(&[1, 2, 3], false);
+    for width in 3..=256usize {
+        let counts: alloc::vec::Vec<usize> =
+            (0..width).map(|i| 1 + (i * 7 % 13) * (i % 5 + 1)).collect();
+        let mut table = HuffmanTable::build_from_counts_gated_with(&counts, false, &mut scratch);
+        let mut fse_table = fse_encoder::FSETable::blank();
+        let _ = table.try_table_description_size(&mut fse_table);
+        assert!(
+            table.heap_size() <= HuffmanTable::max_heap_size(),
+            "table holds {} at width {width}, bound {}",
+            table.heap_size(),
+            HuffmanTable::max_heap_size()
+        );
+        snapshot.clone_from(&table);
+        assert!(
+            snapshot.heap_size() <= HuffmanTable::max_heap_size(),
+            "snapshot holds {} at width {width}",
+            snapshot.heap_size()
+        );
+        scratch.recycle(table);
+        assert!(
+            scratch.heap_size() <= WeightScratch::max_heap_size(),
+            "scratch holds {} at width {width}, bound {}",
+            scratch.heap_size(),
+            WeightScratch::max_heap_size()
+        );
+    }
+}
+
 /// The bound is on the SUM, and the largest histogram the encoder can produce
 /// has to stay well inside it: a full 128 KiB literals section over one symbol.
 #[test]

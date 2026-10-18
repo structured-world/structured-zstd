@@ -1,16 +1,16 @@
-//! Input bookkeeping for the test matchers, which search nothing: the bytes
+//! Input bookkeeping for a matcher that searches nothing itself: the bytes
 //! read in, the block last committed, and what is still uncommitted.
 
 use super::HistoryBuf;
 
 #[derive(Default)]
-pub(crate) struct TestInput {
+pub(crate) struct BlockInput {
     history: HistoryBuf,
     /// End of the last committed block, which starts the history.
     committed: usize,
 }
 
-impl TestInput {
+impl BlockInput {
     /// [`Matcher::fill_in_place`](super::Matcher::fill_in_place).
     pub(crate) fn fill(
         &mut self,

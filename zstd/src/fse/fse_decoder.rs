@@ -3,13 +3,18 @@ use crate::cpu_kernel::CpuKernel;
 use crate::decoding::errors::{FSEDecoderError, FSETableError};
 use alloc::vec::Vec;
 
+/// Most probabilities a table description lists: the `u8` alphabet.
+const MAX_PROBABILITIES: usize = 256;
+/// Most states a table spreads: the largest table, `1 << 9`.
+const MAX_SPREAD: usize = 1 << 9;
+
 /// Build-time probability list: at most 256 symbols (`u8` alphabet).
 #[cfg(not(feature = "caller-workspace"))]
 type ProbabilityBuf = Vec<i32>;
 /// Build-time probability list: at most 256 symbols (`u8` alphabet), inline so
 /// a table can live in caller-owned memory.
 #[cfg(feature = "caller-workspace")]
-type ProbabilityBuf = crate::common::inline_vec::InlineVec<i32, 256>;
+type ProbabilityBuf = crate::common::inline_vec::InlineVec<i32, MAX_PROBABILITIES>;
 
 /// Symbol-spread scratch: one byte per state of the largest table (`1 << 9`).
 #[cfg(not(feature = "caller-workspace"))]
@@ -17,7 +22,7 @@ type SpreadBuf = Vec<u8>;
 /// Symbol-spread scratch: one byte per state of the largest table (`1 << 9`),
 /// inline so a table can live in caller-owned memory.
 #[cfg(feature = "caller-workspace")]
-type SpreadBuf = crate::common::inline_vec::InlineVec<u8, 512>;
+type SpreadBuf = crate::common::inline_vec::InlineVec<u8, MAX_SPREAD>;
 
 // Visibility = `pub` so the `pub type FSEDecoder` / `pub type
 // SeqFSEDecoder` aliases below don't expose a more-private struct
@@ -350,6 +355,20 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     pub fn heap_bytes(&self) -> usize {
         self.symbol_spread_buffer.capacity()
             + self.symbol_probabilities.capacity() * core::mem::size_of::<i32>()
+    }
+
+    /// Most [`heap_bytes`](Self::heap_bytes) can report: a `Vec` that grows
+    /// past its capacity takes the larger of double that capacity and the new
+    /// length, so it never holds twice the longest length it has held.
+    #[cfg(not(feature = "caller-workspace"))]
+    pub const fn max_heap_bytes() -> usize {
+        2 * MAX_SPREAD + 2 * MAX_PROBABILITIES * core::mem::size_of::<i32>()
+    }
+
+    /// Most [`heap_bytes`](Self::heap_bytes) can report: none.
+    #[cfg(feature = "caller-workspace")]
+    pub const fn max_heap_bytes() -> usize {
+        0
     }
 
     /// Heap bytes owned by this table: none, the build scratch is inline.
