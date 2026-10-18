@@ -5,17 +5,14 @@
 //! `include/`), bottomed on the pure-Rust [`codec`] public API. It
 //! builds as both a `cdylib` (SONAME `libzstd.so.1`) and a `staticlib`.
 //!
-//! Current scope: the simple one-shot API, the synchronous context API,
-//! error-code mapping, frame content inspection, the stable
-//! dictionary-builder API (`ZDICT_*` from `zdict.h`), dictionary contexts
-//! (`ZSTD_CDict` / `ZSTD_DDict`), the streaming API
-//! (`ZSTD_compressStream2` / `ZSTD_decompressStream` and the legacy
-//! `ZSTD_*Stream` entry points), the advanced-parameter surface
-//! (`ZSTD_CCtx_setParameter` and friends), the dictionary attach/ref
-//! family (`ZSTD_CCtx_loadDictionary` / `refCDict` / `refPrefix` and the
-//! `ZSTD_DCtx` mirror, plus the `*_usingDict` one-shots), and the
-//! `ZSTD_estimate*` budget queries. The experimental
-//! `ZDICT_STATIC_LINKING_ONLY` trainers land in later phases.
+//! Scope: every function `zstd.h`, `zdict.h` and `zstd_errors.h` declare,
+//! their `*_STATIC_LINKING_ONLY` sections included: the simple and context
+//! APIs, streaming, dictionaries and the dictionary builders, the advanced
+//! and experimental parameters, parameter sets, the buffer-less and block
+//! APIs, sequences and sequence producers, frame inspection and the
+//! `ZSTD_estimate*` budget queries. Thread pools are accepted without
+//! effect, as in upstream's single-threaded build, and `ZSTD_initStatic*`
+//! answer `NULL`: a context cannot live in a caller's workspace.
 //!
 //! Every wrapper here is `unsafe extern "C"`; the safety contracts mirror the
 //! upstream documentation (valid `(ptr, len)` buffers, live context handles).
@@ -30,6 +27,8 @@
 //! on; consumers wanting an embedded build link `codec` directly.
 
 mod attach;
+mod bufferless;
+mod cctx_params;
 mod cdict;
 mod context;
 mod dict;
@@ -38,6 +37,8 @@ mod estimate;
 mod ffi;
 mod frame;
 mod params;
+mod provided;
+mod sequences;
 mod simple;
 mod streaming;
 
@@ -48,8 +49,10 @@ mod tests;
 // re-export the public types so rustdoc and in-crate tests can name them.
 pub use cdict::{ZSTD_CDict, ZSTD_DDict};
 pub use context::{ZSTD_CCtx, ZSTD_DCtx};
-pub use dict::ZDICT_params_t;
+pub use dict::{ZDICT_legacy_params_t, ZDICT_params_t};
 pub use error::ZSTD_ErrorCode;
 pub use frame::{ZSTD_FrameHeader, ZSTD_FrameType_e, ZSTD_format_e};
 pub use params::ZSTD_bounds;
+pub use provided::ZSTD_threadPool;
+pub use sequences::{ZSTD_Sequence, ZSTD_sequenceProducer_F};
 pub use streaming::{ZSTD_inBuffer, ZSTD_outBuffer};

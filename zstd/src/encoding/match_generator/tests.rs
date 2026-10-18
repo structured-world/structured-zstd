@@ -3588,6 +3588,35 @@ fn adjust_params_for_zero_source_size_clamps_window_to_absolute_min() {
     assert_eq!(adjusted.window_log, MIN_WINDOW_LOG);
 }
 
+/// The row-hash cap reads the frame's real strategy and search log, as
+/// upstream's `ZSTD_adjustCParams_internal` does (zstd_compress.c:1597-1606):
+/// a Fast table is never held to it, and a row table of 64-entry rows may
+/// reach `32 - 8 + 6` bits.
+#[test]
+fn source_size_adjustment_caps_row_hashes_by_the_real_strategy() {
+    use super::super::strategy::BackendTag;
+    let big_source = 1u64 << 40;
+
+    let mut fast = resolve_level_params(CompressionLevel::Level(1), None);
+    assert_eq!(fast.backend(), BackendTag::Simple);
+    fast.window_log = 30;
+    fast.fast.as_mut().unwrap().hash_log = 30;
+    let adjusted = adjust_params_for_source_size(fast, big_source);
+    assert_eq!(adjusted.fast.as_ref().unwrap().hash_log, 30);
+
+    let mut row = (3..=12)
+        .map(|level| resolve_level_params(CompressionLevel::Level(level), None))
+        .find(|params| params.backend() == BackendTag::Row)
+        .expect("a level runs the row backend");
+    row.window_log = 30;
+    let config = row.row.as_mut().unwrap();
+    config.hash_bits = 30;
+    config.row_log = 6;
+    config.search_depth = 1 << 6;
+    let adjusted = adjust_params_for_source_size(row, big_source);
+    assert_eq!(adjusted.row.as_ref().unwrap().hash_bits, 30);
+}
+
 #[test]
 fn common_prefix_len_matches_scalar_reference_across_offsets() {
     fn scalar_reference(a: &[u8], b: &[u8]) -> usize {

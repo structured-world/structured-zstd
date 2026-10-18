@@ -3,6 +3,13 @@
 //! real symbol behaviour; the C-consumer link test in `tests/` is added
 //! separately and verifies a real `#include <zstd.h>` consumer.
 
+mod bufferless;
+mod cctx_params;
+mod experimental;
+mod provided;
+mod sequences;
+mod streams;
+
 use crate::cdict::{
     ZSTD_compress_usingCDict, ZSTD_createCDict, ZSTD_createDDict, ZSTD_decompress_usingDDict,
     ZSTD_freeCDict, ZSTD_freeDDict, ZSTD_getDictID_fromCDict, ZSTD_getDictID_fromDDict,
@@ -259,10 +266,21 @@ fn get_frame_header_short_input_asks_for_more() {
         _reserved1: 0,
         _reserved2: 0,
     };
-    // Only 2 bytes: too short for even the magic; expect a positive size hint.
-    let r = unsafe { ZSTD_getFrameHeader(&mut zfh, frame.as_ptr(), 2) };
-    assert_eq!(ZSTD_isError(r), 0);
-    assert!(r > 0 && r <= 18);
+    // The hint is what upstream asks for (zstd_decompress.c:458-498): the
+    // five bytes that hold the descriptor, then the header's own length, and
+    // eight for a skippable frame; bytes that start no known magic number
+    // are refused at once.
+    let mut ask = |src: &[u8]| unsafe { ZSTD_getFrameHeader(&mut zfh, src.as_ptr(), src.len()) };
+    assert_eq!(ask(&frame[..2]), 5);
+    // Magic number and a descriptor announcing only a window byte.
+    let six = [0x28, 0xB5, 0x2F, 0xFD, 0x00];
+    assert_eq!(ask(&six), 6);
+    assert_eq!(ask(&[0x50, 0x2A, 0x4D, 0x18, 0]), 8);
+    assert_eq!(ask(&[0x50, 0x2A]), 5);
+    assert_eq!(
+        crate::tests::experimental::code(ask(&[0x00, 0x01])),
+        crate::error::ZSTD_ErrorCode::ZSTD_error_prefix_unknown
+    );
 }
 
 #[test]
@@ -744,15 +762,97 @@ fn create_cdict_treats_unmagicked_bytes_as_raw_content() {
     assert_eq!(unsafe { ZSTD_getDictID_fromCDict(cdict) }, 0);
     unsafe { ZSTD_freeCDict(cdict) };
 
-    // An empty dictionary is a creation failure.
+    // An empty dictionary makes a CDict of parameters alone, ID 0, as
+    // upstream's does (zstd_compress.c:5562-5598).
     let cdict = unsafe { ZSTD_createCDict(core::ptr::null(), 0, 3) };
-    assert!(cdict.is_null(), "empty createCDict must fail");
+    assert!(!cdict.is_null(), "empty createCDict must succeed");
+    assert_eq!(unsafe { ZSTD_getDictID_fromCDict(cdict) }, 0);
+    unsafe { ZSTD_freeCDict(cdict) };
 
     // A magic-prefixed blob whose tables don't parse is corrupt.
     let mut corrupt = vec![0x37u8, 0xA4, 0x30, 0xEC];
     corrupt.extend_from_slice(&[0xFF; 60]);
     let cdict = unsafe { ZSTD_createCDict(corrupt.as_ptr(), corrupt.len(), 3) };
     assert!(cdict.is_null(), "corrupt full dict must fail");
+}
+
+/// A DDict is prepared when it is created, as upstream loads its entropy then
+/// (`ZSTD_loadEntropy_intoDDict`): a serialized dictionary whose tables do not
+/// parse is refused there, an empty one is a valid no-dictionary handle, and
+/// fullDict over nothing is refused.
+#[test]
+fn ddicts_are_prepared_when_created() {
+    const FULL_DICT: c_int = 2;
+    let default_mem = crate::cdict::ZSTD_customMem {
+        customAlloc: core::ptr::null(),
+        customFree: core::ptr::null(),
+        opaque: core::ptr::null(),
+    };
+    // The magic and an ID, and no tables.
+    let truncated = [0x37u8, 0xA4, 0x30, 0xEC, 1, 0, 0, 0];
+    unsafe {
+        assert!(ZSTD_createDDict(truncated.as_ptr(), truncated.len()).is_null());
+        assert!(
+            crate::cdict::ZSTD_createDDict_advanced(
+                truncated.as_ptr(),
+                truncated.len(),
+                0,
+                FULL_DICT,
+                default_mem
+            )
+            .is_null()
+        );
+        assert!(
+            crate::cdict::ZSTD_createDDict_advanced(
+                core::ptr::null(),
+                0,
+                0,
+                FULL_DICT,
+                default_mem
+            )
+            .is_null()
+        );
+
+        let empty = ZSTD_createDDict(core::ptr::null(), 0);
+        assert!(!empty.is_null(), "an empty DDict is a no-dictionary handle");
+        let input = b"decoded through an empty ddict ".repeat(40);
+        let mut frame = vec![0u8; input.len() + 64];
+        let n = ZSTD_compress(
+            frame.as_mut_ptr(),
+            frame.len(),
+            input.as_ptr(),
+            input.len(),
+            3,
+        );
+        assert_eq!(ZSTD_isError(n), 0);
+        let dctx = ZSTD_createDCtx();
+        let mut out = vec![0u8; input.len()];
+        let m = crate::cdict::ZSTD_decompress_usingDDict(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            n,
+            empty,
+        );
+        assert_eq!(m, input.len());
+        assert_eq!(out, input);
+        // No DDict at all decodes without a dictionary too, as upstream's
+        // ZSTD_decompressMultiFrame does with a NULL ddict.
+        out.fill(0);
+        let m = crate::cdict::ZSTD_decompress_usingDDict(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            n,
+            core::ptr::null(),
+        );
+        assert_eq!(m, input.len());
+        assert_eq!(out, input);
+        ZSTD_freeDCtx(dctx);
+        ZSTD_freeDDict(empty);
+    }
 }
 
 /// The two sides report a `ZSTD_dct_fullDict` selector over bytes that are not
@@ -2267,10 +2367,11 @@ fn ref_prefix_is_single_use_and_roundtrips() {
 }
 
 #[test]
-fn cctx_ref_prefix_survives_a_too_small_destination() {
-    // A prefix is single-use, but "use" means a frame was actually
-    // DELIVERED: a dstSize_tooSmall failure must leave the prefix armed so
-    // the caller's retry with a bigger buffer still compresses against it.
+fn cctx_ref_prefix_is_spent_by_a_too_small_destination() {
+    // A prefix is single-use, and upstream spends it when the frame starts
+    // (ZSTD_CCtx_init_compressStream2, zstd_compress.c:6356), before any byte
+    // reaches dst: after a dstSize_tooSmall failure the retry compresses with
+    // no prefix, and a caller written against libzstd decodes it without one.
     let prefix = dict_payload();
     let mut payload = prefix[..2048].to_vec();
     payload.extend_from_slice(b"unique suffix after prefix material 0123456789");
@@ -2305,29 +2406,18 @@ fn cctx_ref_prefix_survives_a_too_small_destination() {
     assert_eq!(ZSTD_isError(written), 0);
     frame.truncate(written);
 
-    // The retried frame must still depend on the prefix: bare decode fails,
-    // prefixed decode roundtrips.
+    // The retried frame stands alone: a bare decode roundtrips.
     let bare = ZSTD_createDCtx();
     let mut out = vec![0u8; payload.len() + 64];
     let read =
         unsafe { ZSTD_decompressDCtx(bare, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
-    assert_ne!(
-        ZSTD_isError(read),
-        0,
-        "the retry must still compress against the prefix"
-    );
-    unsafe { ZSTD_freeDCtx(bare) };
-
-    let dctx = ZSTD_createDCtx();
     assert_eq!(
-        ZSTD_isError(unsafe { ZSTD_DCtx_refPrefix(dctx, prefix.as_ptr(), prefix.len()) }),
-        0
+        read,
+        payload.len(),
+        "the retry must not reference the prefix"
     );
-    let read =
-        unsafe { ZSTD_decompressDCtx(dctx, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
-    assert_eq!(ZSTD_isError(read), 0);
     assert_eq!(&out[..read], payload.as_slice());
-    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeDCtx(bare) };
     unsafe { ZSTD_freeCCtx(cctx) };
 }
 
@@ -3190,9 +3280,10 @@ fn ref_ddict_honours_raw_content_selection_for_magic_prefixed_bytes() {
 
 #[test]
 fn cdict_advanced_rejects_invalid_strategy_ordinal() {
-    // ZSTD_strategy spans 1 (fast) … 9 (btultra2); 0 and out-of-range
-    // ordinals are invalid input and must fail creation, not silently map
-    // onto the strongest tier.
+    // ZSTD_strategy spans 1 (fast) … 9 (btultra2); out-of-range ordinals are
+    // invalid input and must fail creation, not silently map onto the
+    // strongest tier. 0 is "the default level's", as for every other field
+    // (ZSTD_overrideCParams leaves a 0 field to the level).
     let raw = [0xABu8; 256];
     let no_mem = ZSTD_customMem {
         customAlloc: core::ptr::null(),
@@ -3208,7 +3299,7 @@ fn cdict_advanced_rejects_invalid_strategy_ordinal() {
         targetLength: 0,
         strategy: 0,
     };
-    for bad in [0u32, 10, 42] {
+    for bad in [10u32, 42] {
         let cparams = ZSTD_compressionParameters {
             strategy: bad,
             ..base
@@ -3219,6 +3310,45 @@ fn cdict_advanced_rejects_invalid_strategy_ordinal() {
             cdict.is_null(),
             "strategy ordinal {bad} must fail CDict creation"
         );
+    }
+    let cdict = unsafe { ZSTD_createCDict_advanced(raw.as_ptr(), raw.len(), 0, 1, base, no_mem) };
+    assert!(
+        !cdict.is_null(),
+        "all-zero parameters are the default level's"
+    );
+    let payload = b"default strategy through an all-zero cParams ".repeat(30);
+    let cctx = ZSTD_createCCtx();
+    let mut frame = vec![0u8; ZSTD_compressBound(payload.len())];
+    let written = unsafe {
+        ZSTD_compress_usingCDict(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+            cdict,
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    let dctx = ZSTD_createDCtx();
+    let mut out = vec![0u8; payload.len()];
+    let read = unsafe {
+        crate::attach::ZSTD_decompress_usingDict(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            written,
+            raw.as_ptr(),
+            raw.len(),
+        )
+    };
+    assert_eq!(read, payload.len());
+    assert_eq!(out, payload);
+    unsafe {
+        ZSTD_freeDCtx(dctx);
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeCDict(cdict);
     }
 }
 
@@ -3802,12 +3932,12 @@ fn a_dictionary_the_context_moved_on_from_is_not_kept() {
     unsafe { ZSTD_freeCDict(cdict) };
 }
 
-/// Output that piled up on the context (a whole incompressible input
-/// consumed into a 64-byte output buffer) is let go once it has been copied
-/// out: the context keeps the output room of one block for the frames after
-/// it, not the largest frame it ever held.
+/// A large incompressible input against a 64-byte output buffer: each call
+/// takes only as much input as the output it can hand back, so the output
+/// waiting on the context stays near one block however large the input, and
+/// `input.pos` tells the caller what is still to come.
 #[test]
-fn drained_stream_output_does_not_pin_its_peak() {
+fn stream_output_waits_for_the_caller() {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let input: Vec<u8> = (0..4 << 20)
         .map(|_| {
@@ -3823,45 +3953,39 @@ fn drained_stream_output_does_not_pin_its_peak() {
         size: input.len(),
         pos: 0,
     };
-    let mut small = [0u8; 64];
-    let mut outb = ZSTD_outBuffer {
-        dst: small.as_mut_ptr().cast(),
-        size: small.len(),
-        pos: 0,
-    };
-    let rc = unsafe { ZSTD_compressStream2(cctx, &mut outb, &mut inb, 2) };
-    assert_eq!(ZSTD_isError(rc), 0);
-    assert_eq!(inb.pos, inb.size, "the input is consumed in full");
     let pending_capacity = |cctx: *mut crate::context::ZSTD_CCtx| {
         unsafe { cctx.as_ref() }
             .and_then(|context| context.stream.as_ref())
             .expect("the context streams")
             .pending_capacity()
     };
-    assert!(
-        pending_capacity(cctx) >= input.len(),
-        "fixture precondition: the whole frame waits on the context"
-    );
-    let mut frame = small[..outb.pos].to_vec();
-    let mut room = vec![0u8; ZSTD_CStreamOutSize()];
-    let mut empty = ZSTD_inBuffer {
-        src: core::ptr::null(),
-        size: 0,
-        pos: 0,
-    };
+    let mut small = [0u8; 64];
+    let mut frame = Vec::new();
+    let mut first = true;
     loop {
         let mut outb = ZSTD_outBuffer {
-            dst: room.as_mut_ptr().cast(),
-            size: room.len(),
+            dst: small.as_mut_ptr().cast(),
+            size: small.len(),
             pos: 0,
         };
-        let rc = unsafe { ZSTD_compressStream2(cctx, &mut outb, &mut empty, 2) };
+        let rc = unsafe { ZSTD_compressStream2(cctx, &mut outb, &mut inb, 2) };
         assert_eq!(ZSTD_isError(rc), 0);
-        frame.extend_from_slice(&room[..outb.pos]);
+        if first {
+            assert!(inb.pos < inb.size, "the first call took all the input");
+            first = false;
+        }
+        assert!(
+            pending_capacity(cctx) <= 2 * ZSTD_CStreamOutSize(),
+            "{} bytes of output wait on the context at input {}",
+            pending_capacity(cctx),
+            inb.pos
+        );
+        frame.extend_from_slice(&small[..outb.pos]);
         if rc == 0 {
             break;
         }
     }
+    assert_eq!(inb.pos, inb.size);
     assert!(
         pending_capacity(cctx) <= ZSTD_CStreamOutSize(),
         "{} bytes of output room kept after the frame was copied out",

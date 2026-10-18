@@ -508,6 +508,36 @@ impl DecoderScratchKind {
         }
     }
 
+    fn buffer_deliver_newest(&mut self, n: usize, target: &mut [u8]) {
+        match self {
+            Self::Ring(s) => s.buffer.deliver_newest(n, target),
+            Self::Flat(s) => s.buffer.deliver_newest(n, target),
+        }
+    }
+
+    /// Take `content` into the history as output the caller already holds:
+    /// appended, never handed out, and let go of once past the window.
+    ///
+    /// Taken a piece at a time, no piece longer than a block or the window,
+    /// and trimmed after each: a block far past the window then never makes
+    /// the history hold more than the window and one piece. Upstream keeps a
+    /// pointer to the caller's bytes instead (`ZSTD_insertBlock`), which a
+    /// decoder owning its history cannot.
+    fn buffer_insert(&mut self, content: &[u8], kernel: crate::cpu_kernel::CpuKernelTag) {
+        let window = match self {
+            Self::Ring(s) => s.buffer.window_size,
+            Self::Flat(s) => s.buffer.window_size,
+        };
+        let piece = window.clamp(1, crate::common::MAX_BLOCK_SIZE as usize);
+        for chunk in content.chunks(piece) {
+            self.buffer_push(chunk, kernel);
+            match self {
+                Self::Ring(s) => s.buffer.drop_to_window_size(),
+                Self::Flat(s) => s.buffer.drop_to_window_size(),
+            };
+        }
+    }
+
     fn workspace_bytes(&self) -> usize {
         match self {
             Self::Ring(s) => s.workspace_bytes(),
@@ -1460,8 +1490,9 @@ impl FrameDecoder {
     }
 
     /// Whether every block of the frame is decoded and only its trailing
-    /// content checksum is still to be read.
-    pub(crate) fn awaits_checksum(&self) -> bool {
+    /// content checksum is still to be read, as
+    /// [`Self::read_content_checksum`] takes it.
+    pub fn awaits_checksum(&self) -> bool {
         self.state.as_ref().is_some_and(|state| {
             state.frame_finished
                 && state.frame_header.descriptor.content_checksum_flag()
@@ -1474,7 +1505,23 @@ impl FrameDecoder {
     /// checksum; 0 once the frame wants no more input. Upstream zstd's
     /// `ZSTD_nextSrcSizeToDecompress`. A block stating more than the frame's
     /// block maximum needs only its header, whose decode then reports it.
-    pub(crate) fn input_needed(&self, pending: &[u8]) -> usize {
+    ///
+    /// A caller whose input arrives in pieces holds them until this many are
+    /// in hand, since [`Self::decode_from_to`] moves only on whole steps.
+    ///
+    /// ```
+    /// use structured_zstd::decoding::FrameDecoder;
+    /// use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
+    /// let frame = compress_slice_to_vec(&[7u8; 64], CompressionLevel::Default);
+    /// let mut source = frame.as_slice();
+    /// let mut decoder = FrameDecoder::new();
+    /// decoder.reset(&mut source).unwrap();
+    /// // One byte of a block header: the header itself is the next step.
+    /// assert_eq!(decoder.input_needed(&source[..1]), 3);
+    /// // The rest of the frame holds the whole first block.
+    /// assert!(decoder.input_needed(source) <= source.len());
+    /// ```
+    pub fn input_needed(&self, pending: &[u8]) -> usize {
         let Some(state) = self.state.as_ref() else {
             return 0;
         };
@@ -1636,6 +1683,253 @@ impl FrameDecoder {
         if last {
             state.frame_finished = true;
         }
+    }
+
+    /// Decode one block of the frame begun by [`Self::reset`], its 3-byte
+    /// header and its content given apart, and hand all of its output to
+    /// `target` at once (upstream `ZSTD_decompressContinue` on a block). The
+    /// output also stays in the window for the blocks after it, so `target`
+    /// may be reused for the next one. Returns the bytes written.
+    ///
+    /// A frame whose last block is decoded takes no more blocks: its checksum,
+    /// when it has one, goes to [`Self::read_content_checksum`], and the next
+    /// frame starts with [`Self::reset`].
+    ///
+    /// # Errors
+    /// As a block [`Self::decode_from_to`] decodes, plus
+    /// [`FrameDecoderError::TargetTooSmall`] when `target` cannot take the
+    /// block's output, and [`FrameDecoderError::NotYetInitialized`] when no
+    /// frame is waiting for a block. A block refused before it is decoded (a
+    /// bad header, a block past the maximum, content of the wrong length)
+    /// leaves the frame as it was, as upstream checks the size before it
+    /// changes any state; one that fails while decoding, or whose output
+    /// `target` cannot take, ends the frame.
+    ///
+    /// ```
+    /// use structured_zstd::decoding::FrameDecoder;
+    /// use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
+    ///
+    /// let frame = compress_to_vec(&b"one block at a time"[..], CompressionLevel::Fastest);
+    /// let mut source = frame.as_slice();
+    /// let mut decoder = FrameDecoder::new();
+    /// decoder.reset(&mut source).unwrap();
+    /// let (header, rest) = source.split_first_chunk::<3>().unwrap();
+    /// let mut out = [0u8; 64];
+    /// let n = decoder.decode_block(*header, rest, &mut out).unwrap();
+    /// assert_eq!(&out[..n], b"one block at a time");
+    /// assert!(decoder.is_finished());
+    /// ```
+    pub fn decode_block(
+        &mut self,
+        header: [u8; 3],
+        content: &[u8],
+        target: &mut [u8],
+    ) -> Result<usize, FrameDecoderError> {
+        self.check_window_still_admitted()?;
+        let kernel = self.kernel;
+        #[cfg(feature = "hash")]
+        let checksum_mode = self.content_checksum;
+        let state = self
+            .state
+            .as_mut()
+            .filter(|state| !state.frame_finished)
+            .ok_or(FrameDecoderError::NotYetInitialized)?;
+        #[cfg(feature = "hash")]
+        {
+            let compute_hash = checksum_mode != ContentChecksum::None
+                && state.frame_header.descriptor.content_checksum_flag();
+            state.decoder_scratch.set_compute_hash(compute_hash);
+        }
+        let block_index = state.block_counter as u32;
+        let block_frame_offset = state.bytes_read_counter as u32;
+        let mut block_dec = decoding::block_decoder::with_kernel(kernel);
+        let (block_header, header_size) = block_dec
+            .read_block_header(&header[..])
+            .map_err(|source| block_header_decode_error(source, block_index, block_frame_offset))?;
+        let body_error = |source| {
+            block_body_decode_error(
+                source,
+                block_index,
+                block_frame_offset,
+                &block_header,
+                header_size,
+            )
+        };
+        let window = state
+            .frame_header
+            .window_size()
+            .map_or(usize::MAX, |w| usize::try_from(w).unwrap_or(usize::MAX));
+        decoding::block_decoder::block_fits_the_maximum(&block_header, window)
+            .map_err(body_error)?;
+        if content.len() != block_header.content_size as usize {
+            return Err(body_error(DecodeBlockContentError::ReadError {
+                step: block_header.block_type,
+                source: Error::from(crate::io::ErrorKind::UnexpectedEof),
+            }));
+        }
+        state.bytes_read_counter += u64::from(header_size);
+        if state.block_counter == 0 && state.frame_header.fcs_declared() {
+            state.reserve_decoding_buffer();
+        }
+        // The held dictionary is exposed only while this frame uses it, as in
+        // `decode_available`.
+        let dict_ref = if state.using_dict.is_some() {
+            state.active_dict.as_ref().map(|h| h.as_dict())
+        } else {
+            None
+        };
+        let before = state.decoder_scratch.buffer_len();
+        let mut source = content;
+        let read = match state.decoder_scratch.decode_block_content_from_slice(
+            &mut block_dec,
+            &block_header,
+            &mut source,
+            dict_ref,
+        ) {
+            Ok(read) => read,
+            Err(source) => {
+                // The frame's counters and history have moved: no later block
+                // can be decoded against them.
+                state.frame_finished = true;
+                return Err(body_error(source));
+            }
+        };
+        state.bytes_read_counter += read;
+        state.block_counter += 1;
+        if block_header.last_block {
+            state.frame_finished = true;
+        }
+        // Nothing drains the buffer while a block decodes, so it grew by the
+        // block's output exactly.
+        let produced = state.decoder_scratch.buffer_len() - before;
+        if produced > target.len() {
+            state.frame_finished = true;
+            return Err(FrameDecoderError::TargetTooSmall);
+        }
+        state
+            .decoder_scratch
+            .buffer_deliver_newest(produced, target);
+        self.verify_content_size()?;
+        Ok(produced)
+    }
+
+    /// How many content bytes follow the block header `header` of the current
+    /// frame (its size, or one byte for an RLE block), and whether it is the
+    /// frame's last block; the header is checked against the frame's block
+    /// maximum (upstream `ZSTD_getcBlockSize`). What [`Self::decode_block`]
+    /// wants alongside it.
+    ///
+    /// # Errors
+    /// A reserved block type or a block past the maximum, as
+    /// [`Self::decode_block`] reports them; [`FrameDecoderError::NotYetInitialized`]
+    /// when no frame is waiting for a block.
+    pub fn block_content_len(&self, header: [u8; 3]) -> Result<(usize, bool), FrameDecoderError> {
+        let state = self
+            .state
+            .as_ref()
+            .filter(|state| !state.frame_finished)
+            .ok_or(FrameDecoderError::NotYetInitialized)?;
+        let block_index = state.block_counter as u32;
+        let block_frame_offset = state.bytes_read_counter as u32;
+        let mut block_dec = decoding::block_decoder::with_kernel(self.kernel);
+        let (block_header, header_size) = block_dec
+            .read_block_header(&header[..])
+            .map_err(|source| block_header_decode_error(source, block_index, block_frame_offset))?;
+        let window = state
+            .frame_header
+            .window_size()
+            .map_or(usize::MAX, |w| usize::try_from(w).unwrap_or(usize::MAX));
+        decoding::block_decoder::block_fits_the_maximum(&block_header, window).map_err(
+            |source| {
+                block_body_decode_error(
+                    source,
+                    block_index,
+                    block_frame_offset,
+                    &block_header,
+                    header_size,
+                )
+            },
+        )?;
+        Ok((block_header.content_size as usize, block_header.last_block))
+    }
+
+    /// Take the 4-byte content checksum that ends the frame whose blocks
+    /// [`Self::decode_block`] decoded, and check it in
+    /// [`ContentChecksum::Verify`] mode.
+    ///
+    /// # Errors
+    /// [`FrameDecoderError::ChecksumMismatch`] when it disagrees with the
+    /// output; [`FrameDecoderError::NotYetInitialized`] when the frame is not
+    /// waiting for its checksum.
+    pub fn read_content_checksum(&mut self, checksum: [u8; 4]) -> Result<(), FrameDecoderError> {
+        if !self.awaits_checksum() {
+            return Err(FrameDecoderError::NotYetInitialized);
+        }
+        let state = self
+            .state
+            .as_mut()
+            .expect("a frame awaiting its checksum has a state");
+        state.check_sum = Some(u32::from_le_bytes(checksum));
+        state.bytes_read_counter += 4;
+        #[cfg(feature = "hash")]
+        self.verify_content_checksum()?;
+        Ok(())
+    }
+
+    /// Start a run of blocks outside any frame (upstream
+    /// `ZSTD_decompressBegin` before `ZSTD_decompressBlock` and
+    /// `ZSTD_insertBlock`): each block decodes against the output before it,
+    /// as far back as the window ceiling, and against `dict` when given.
+    /// Compressed blocks go to [`Self::decode_block`] with a header saying
+    /// so, and output the caller already holds to [`Self::insert_block`].
+    ///
+    /// ```
+    /// use structured_zstd::decoding::FrameDecoder;
+    ///
+    /// let mut decoder = FrameDecoder::new();
+    /// decoder.begin_blocks(None).unwrap();
+    /// decoder.insert_block(b"history the next block can match").unwrap();
+    /// ```
+    pub fn begin_blocks(
+        &mut self,
+        dict: Option<&DictionaryHandle>,
+    ) -> Result<(), FrameDecoderError> {
+        // The largest power-of-two window under the ceiling, which is at
+        // least 1 KiB.
+        let window_log = 63 - self.max_window_size.leading_zeros();
+        let mut header = [0u8; 6];
+        let mut len = 0;
+        if !self.magicless {
+            header[..4].copy_from_slice(&crate::common::MAGIC_NUM.to_le_bytes());
+            len = 4;
+        }
+        // RFC 8878 3.1.1.1.1: no content size, no checksum, no dictionary ID,
+        // a window descriptor follows; 3.1.1.1.2: exponent `log - 10`, no
+        // mantissa.
+        header[len] = 0;
+        header[len + 1] = ((window_log - 10) << 3) as u8;
+        let mut source = &header[..len + 2];
+        match dict {
+            Some(dict) => self.reset_with_dict_handle(&mut source, dict),
+            None => self.reset(&mut source),
+        }
+    }
+
+    /// Take `content`, output the caller already holds, into the history of
+    /// the run [`Self::begin_blocks`] started (upstream `ZSTD_insertBlock`),
+    /// for a block the encoder could not compress and the caller stored as is.
+    ///
+    /// # Errors
+    /// [`FrameDecoderError::NotYetInitialized`] when no run of blocks is open.
+    pub fn insert_block(&mut self, content: &[u8]) -> Result<(), FrameDecoderError> {
+        let kernel = self.kernel;
+        let state = self
+            .state
+            .as_mut()
+            .filter(|state| !state.frame_finished)
+            .ok_or(FrameDecoderError::NotYetInitialized)?;
+        state.decoder_scratch.buffer_insert(content, kernel);
+        Ok(())
     }
 
     #[cfg(target_has_atomic = "ptr")]
@@ -2244,6 +2538,22 @@ impl FrameDecoder {
     #[cfg(test)]
     pub(crate) fn active_dict_installed(&self) -> bool {
         self.state.as_ref().is_some_and(|s| s.active_dict.is_some())
+    }
+
+    /// The dictionary the decoder keeps from the last frame it started with
+    /// one, which [`Self::workspace_size`] leaves out because the handle is
+    /// shared: an owner adding up its footprint counts it with the other
+    /// handles it holds (see [`DictionaryHandle::exclusive_heap_size`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_zstd::decoding::FrameDecoder;
+    ///
+    /// assert!(FrameDecoder::new().dictionary().is_none());
+    /// ```
+    pub fn dictionary(&self) -> Option<&DictionaryHandle> {
+        self.state.as_ref().and_then(|s| s.active_dict.as_ref())
     }
 
     /// Whether the current frames last block has been decoded yet

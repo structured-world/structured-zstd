@@ -1015,9 +1015,11 @@ fn run_fastcover(
 ///
 /// # Errors
 ///
-/// `InvalidInput` when `dict_size` is below 256 bytes, when the corpus is under
-/// 512 bytes, when it repeats too little to yield 128 bytes of content, or when
-/// `sample_sizes` does not add up to `samples.len()`.
+/// `InvalidInput` when the corpus is under 512 bytes (carrying
+/// [`TrainingError::Samples`]), when `dict_size` is below 256 bytes (carrying
+/// [`TrainingError::DictionaryTooSmall`]), when it repeats too little to yield
+/// 128 bytes of content, or when `sample_sizes` does not add up to
+/// `samples.len()`.
 ///
 /// # Examples
 ///
@@ -1055,21 +1057,27 @@ pub fn create_legacy_dict_from_slice<W: io::Write>(
     }
     let content =
         legacy::train_legacy_raw(samples, sample_sizes, dict_size, selectivity).map_err(|err| {
-            let reason = match err {
-                legacy::TooSmall::Dictionary => format!(
-                    "a legacy dictionary must be at least {} bytes",
-                    legacy::DICT_SIZE_MIN
+            match err {
+                legacy::TooSmall::Dictionary => refuse(
+                    TrainingError::DictionaryTooSmall,
+                    &format!(
+                        "a legacy dictionary must be at least {} bytes",
+                        legacy::DICT_SIZE_MIN
+                    ),
                 ),
-                legacy::TooSmall::Corpus => format!(
-                    "the samples total {} bytes; the legacy trainer needs at least {}",
-                    samples.len(),
-                    legacy::MIN_SAMPLES_SIZE
+                legacy::TooSmall::Corpus => refuse(
+                    TrainingError::Samples,
+                    &format!(
+                        "the samples total {} bytes; the legacy trainer needs at least {}",
+                        samples.len(),
+                        legacy::MIN_SAMPLES_SIZE
+                    ),
                 ),
-                legacy::TooSmall::Content => {
-                    "the samples repeat too little to yield dictionary content".into()
-                }
-            };
-            io::Error::new(io::ErrorKind::InvalidInput, reason)
+                legacy::TooSmall::Content => io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the samples repeat too little to yield dictionary content",
+                ),
+            }
         })?;
     // Every sample, not only those the content search kept: the reference cuts
     // the corpus to its size limit inside the search alone, for its suffix

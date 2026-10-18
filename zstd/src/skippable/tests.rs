@@ -1,5 +1,39 @@
 use super::*;
 
+/// Parsing borrows the variant and payload of the frame a buffer starts
+/// with, ignores what follows, and tells a short buffer from a wrong magic.
+#[test]
+fn parse_skippable_frame_borrows_or_refuses() {
+    let mut frame = Vec::new();
+    write_skippable_frame(9, b"payload", &mut frame).unwrap();
+    frame.extend_from_slice(b"next frame");
+    assert_eq!(parse_skippable_frame(&frame).unwrap(), (9, &b"payload"[..]));
+
+    assert_eq!(
+        parse_skippable_frame(&frame[..7]),
+        Err(SkippableSliceError::Truncated)
+    );
+    assert_eq!(
+        parse_skippable_frame(&frame[..SKIPPABLE_HEADER_SIZE + 3]),
+        Err(SkippableSliceError::Truncated)
+    );
+    let zstd = [0x28, 0xB5, 0x2F, 0xFD, 0, 0, 0, 0];
+    assert_eq!(
+        parse_skippable_frame(&zstd),
+        Err(SkippableSliceError::BadMagicNumber(0xFD2F_B528))
+    );
+    let above = [0x60, 0x2A, 0x4D, 0x18, 0, 0, 0, 0];
+    assert!(matches!(
+        parse_skippable_frame(&above),
+        Err(SkippableSliceError::BadMagicNumber(_))
+    ));
+    assert!(alloc::format!("{}", SkippableSliceError::Truncated).contains("truncated"));
+    assert!(
+        alloc::format!("{}", SkippableSliceError::BadMagicNumber(0x1234_5678))
+            .contains("0x12345678")
+    );
+}
+
 fn build_expected_skippable(magic_variant: u8, payload: &[u8]) -> Vec<u8> {
     // Upstream zstd `ZSTD_writeSkippableFrame` (zstd v1.5.7
     // `lib/compress/zstd_compress.c:4751-4763`) emits exactly

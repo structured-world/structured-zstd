@@ -5,7 +5,6 @@
 //!
 //! The task here is to efficiently find matches in the already encoded data for the current suffix of the not yet encoded data.
 
-#[cfg(any(feature = "bench-internals", feature = "ldm"))]
 use alloc::vec::Vec;
 // SIMD/CRC intrinsics now live in `crate::encoding::fastpath::*` where they
 // sit under per-CPU `#[target_feature]` umbrellas; no architecture-specific
@@ -27,6 +26,7 @@ use super::dfast::DfastMatchGenerator;
 use super::hc::HC_MIN_MATCH_LEN;
 #[cfg(test)]
 use super::match_table::storage::HC3_HASH_LOG;
+use super::sequences::{ExternalSequence, SequenceProducer};
 // FAST_HASH_FILL_STEP test-only re-export was tied to the legacy
 // SuffixStore MatchGenerator's interleaved hash-fill stride. The
 // upstream zstd-shape Fast kernel walks ip0 with kSearchStrength step-skip
@@ -482,6 +482,21 @@ pub struct MatchGeneratorDriver {
     /// [`Matcher::get_last_space`] reports the whole block, not its last piece.
     #[cfg(feature = "ldm")]
     ldm_split_block: Option<usize>,
+    /// A parser asked for each block in place of the backends, when one is
+    /// installed (C `ZSTD_registerSequenceProducer`).
+    producer: Option<ProducerSlot>,
+}
+
+/// A [`SequenceProducer`] and what to do when it gives no parse.
+struct ProducerSlot {
+    producer: alloc::boxed::Box<dyn SequenceProducer>,
+    /// Match the block with the backend instead when the producer fails;
+    /// otherwise the block goes out as literals and the failure is recorded.
+    fallback: bool,
+    /// A block the producer failed on went out without a fallback.
+    failed: bool,
+    /// The producer's parse of the block in hand, kept for its allocation.
+    parse: Vec<ExternalSequence>,
 }
 
 /// Identity of the matcher configuration a primed snapshot was captured under:
@@ -573,6 +588,29 @@ fn hc_attaches_dictionary(hc: &HcMatchGenerator, size_log: Option<u8>) -> bool {
 /// reaches is never written, so it is never resident: a one-byte stream through
 /// the CLI at levels 3, 19 and 22 peaks at the same RSS as a history grown by
 /// reading, and growing it instead measured no faster.
+/// The most history `backend` keeps for a `window`-byte window with
+/// `dict_len` bytes of dictionary and blocks of up to `block` bytes: the
+/// window, the slack it slides in, and the block being read.
+pub(crate) fn history_ceiling(
+    backend: super::strategy::BackendTag,
+    window: usize,
+    dict_len: usize,
+    block: usize,
+) -> usize {
+    use super::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
+    // `MAX_PRIMED_WINDOW_SIZE` is `(u32::MAX - MAX_BLOCK_SIZE) / 2`, so the
+    // ceiling stays inside `usize` on a 32-bit target; a sum past `usize` is
+    // past it too.
+    let window = window
+        .checked_add(dict_len)
+        .map_or(MAX_PRIMED_WINDOW_SIZE, |w| w.min(MAX_PRIMED_WINDOW_SIZE));
+    let slack = match backend {
+        super::strategy::BackendTag::Simple => window,
+        _ => window >> 2,
+    };
+    window + slack + block
+}
+
 fn frame_history_bytes(
     backend: super::strategy::BackendTag,
     workspace: &crate::encoding::workspace::Workspace,
@@ -582,19 +620,9 @@ fn frame_history_bytes(
     max_window_size: usize,
     level: CompressionLevel,
 ) -> usize {
-    use super::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
     use crate::encoding::workspace::IngestPlan;
     let block = workspace.block_for_window(max_window_size);
-    // `MAX_PRIMED_WINDOW_SIZE` is `(u32::MAX - MAX_BLOCK_SIZE) / 2`, so either
-    // ceiling stays inside `usize` on a 32-bit target.
-    let window = max_window_size
-        .checked_add(dict_len)
-        .map_or(MAX_PRIMED_WINDOW_SIZE, |w| w.min(MAX_PRIMED_WINDOW_SIZE));
-    let slack = match backend {
-        super::strategy::BackendTag::Simple => window,
-        _ => window >> 2,
-    };
-    let ceiling = window + slack + block;
+    let ceiling = history_ceiling(backend, max_window_size, dict_len, block);
     // A size past `usize` is past the ceiling too.
     let bytes = hint.map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX));
     // The input and the room past it its last read may ask for.
@@ -758,7 +786,101 @@ impl MatchGeneratorDriver {
             ldm_dict_end: 0,
             #[cfg(feature = "ldm")]
             ldm_split_block: None,
+            producer: None,
         }
+    }
+
+    /// Ask `producer` for each block's parse from the next block on, in place
+    /// of the backends; `None` removes it. With `fallback` a block it fails on
+    /// is matched by the backend instead; without, it goes out as literals
+    /// and [`Self::take_producer_failure`] reports it.
+    pub(crate) fn set_sequence_producer(
+        &mut self,
+        producer: Option<alloc::boxed::Box<dyn SequenceProducer>>,
+        fallback: bool,
+    ) {
+        // Callers install the producer before every frame: the parse buffer
+        // the last one grew stays for the next.
+        let parse = self
+            .producer
+            .take()
+            .map(|slot| slot.parse)
+            .unwrap_or_default();
+        self.producer = producer.map(|producer| ProducerSlot {
+            producer,
+            fallback,
+            failed: false,
+            parse,
+        });
+    }
+
+    /// Whether a block went out as literals because the producer failed on
+    /// it with no fallback, since this was last asked.
+    pub(crate) fn take_producer_failure(&mut self) -> bool {
+        self.producer
+            .as_mut()
+            .is_some_and(|slot| core::mem::take(&mut slot.failed))
+    }
+
+    /// Report the producer's parse of the last committed block, or of the
+    /// piece of one between long matches, indexing it as an unsearched one.
+    /// Returns `false`, having done nothing, when the producer failed and the
+    /// backend is to match it.
+    fn match_produced(&mut self, handle_sequence: &mut impl FnMut(Sequence)) -> bool {
+        let mut slot = self
+            .producer
+            .take()
+            .expect("called with a producer installed");
+        slot.parse.clear();
+        let window = self.window_size();
+        let block = self.get_last_space();
+        let block_len = block.len();
+        // The parse must cover the block exactly, with matches inside it: the
+        // producer sees no history (as upstream hands it none).
+        let produced = slot
+            .producer
+            .produce(block, window, &mut slot.parse)
+            .is_ok()
+            && crate::encoding::sequences::validate_parse(
+                &slot.parse,
+                block_len,
+                window,
+                0,
+                true,
+                block_len,
+            )
+            .is_ok();
+        if !produced && slot.fallback {
+            self.producer = Some(slot);
+            return false;
+        }
+        // The block's long matches, if any, were taken before it got here.
+        self.skip_backend(None);
+        if produced {
+            let mut literals = 0usize;
+            for sequence in &slot.parse {
+                literals += sequence.lit_len as usize;
+                if sequence.match_len == 0 {
+                    continue;
+                }
+                handle_sequence(Sequence::Triple {
+                    literal_len: literals,
+                    offset: sequence.offset as usize,
+                    match_len: sequence.match_len as usize,
+                });
+                literals = 0;
+            }
+            if literals > 0 {
+                handle_sequence(Sequence::Literals { len: literals });
+            }
+        } else {
+            slot.failed = true;
+            if block_len > 0 {
+                handle_sequence(Sequence::Literals { len: block_len });
+            }
+        }
+        self.producer = Some(slot);
+        true
     }
 
     fn level_params(level: CompressionLevel, source_size: Option<u64>) -> LevelParams {
@@ -789,6 +911,11 @@ impl MatchGeneratorDriver {
     /// so far, so BT/optimal stay on the owned path.
     pub(crate) fn borrowed_supported(&self) -> bool {
         use super::strategy::{BackendTag, SearchMethod};
+        // A producer reads the committed block, which the in-place scan never
+        // commits.
+        if self.producer.is_some() {
+            return false;
+        }
         match self.active_backend() {
             BackendTag::Simple | BackendTag::Dfast | BackendTag::Row => true,
             // The HashChain backend covers two searches: the lazy CHAIN parser
@@ -843,10 +970,12 @@ impl MatchGeneratorDriver {
     /// path. Checked AFTER priming, so `is_attached()` reflects the resolved
     /// attach-vs-copy decision.
     pub(crate) fn borrowed_dict_supported(&self) -> bool {
-        matches!(
-            &self.storage,
-            MatcherStorage::Simple(m) if m.dict_is_attached()
-        )
+        // As in `borrowed_supported`: a producer reads the committed block.
+        self.producer.is_none()
+            && matches!(
+                &self.storage,
+                MatcherStorage::Simple(m) if m.dict_is_attached()
+            )
     }
 
     fn simple_mut(&mut self) -> &mut FastKernelMatcher {
@@ -1237,7 +1366,11 @@ impl Matcher for MatchGeneratorDriver {
                 * core::mem::size_of::<super::opt::ldm::HcRawSeq>();
         #[cfg(not(feature = "ldm"))]
         let ldm = 0;
-        self.storage.heap_size() + snapshot + self.own_workspace.heap_bytes() + ldm
+        // The producer's parse buffer is kept from block to block.
+        let produced = self.producer.as_ref().map_or(0, |slot| {
+            slot.parse.capacity() * core::mem::size_of::<ExternalSequence>()
+        });
+        self.storage.heap_size() + snapshot + self.own_workspace.heap_bytes() + ldm + produced
     }
 
     fn clear_param_overrides(&mut self) {
@@ -2120,6 +2253,41 @@ impl Matcher for MatchGeneratorDriver {
             }
             return;
         }
+        if self.producer.is_some() {
+            // A producer stands in for every parser, the optimal one too, so
+            // its block's long matches are taken outright at any strategy and
+            // the producer parses the literals between them. Upstream refuses
+            // the pair instead (zstd.h, block-level sequence producer
+            // limitations); taking both loses neither.
+            #[cfg(feature = "ldm")]
+            if self.ldm.is_some() {
+                // Where the producer fails with fallback, the backend matches
+                // what is left without long-match candidates: this block's are
+                // taken outright, and the optimal parser still holds the last
+                // block's, whose block-relative positions would name the wrong
+                // bytes here (its candidates are trusted, not re-checked).
+                if matches!(self.search, super::strategy::SearchMethod::BinaryTree) {
+                    let MatcherStorage::HashChain(hc) = &mut self.storage else {
+                        unreachable!("the optimal parser runs on the hash-chain backend");
+                    };
+                    hc.backend.bt_mut().ldm_sequences.clear();
+                }
+                if self.start_matching_long_distance(&mut handle_sequence, true) {
+                    return;
+                }
+                if self.match_produced(&mut handle_sequence) {
+                    return;
+                }
+                // The producer failed with fallback on a block with no long
+                // match, which is already taken: the backend matches it.
+                let mut gap_literals = None;
+                self.start_matching_owned(&mut owned_sink(&mut handle_sequence, &mut gap_literals));
+                return;
+            }
+            if self.match_produced(&mut handle_sequence) {
+                return;
+            }
+        }
         #[cfg(feature = "ldm")]
         if self.ldm.is_some() {
             // The optimal parser weighs long-distance matches as candidates;
@@ -2131,7 +2299,7 @@ impl Matcher for MatchGeneratorDriver {
                     unreachable!("the optimal parser runs on the hash-chain backend");
                 };
                 core::mem::swap(&mut self.ldm_block, &mut hc.backend.bt_mut().ldm_sequences);
-            } else if self.start_matching_long_distance(&mut handle_sequence) {
+            } else if self.start_matching_long_distance(&mut handle_sequence, false) {
                 return;
             }
         }
@@ -2176,6 +2344,14 @@ impl Matcher for MatchGeneratorDriver {
         if self.ldm.is_some() {
             self.take_long_distance_block();
         }
+        self.skip_backend(incompressible_hint);
+    }
+}
+
+impl MatchGeneratorDriver {
+    /// Index the last committed block (or piece of one) in the backend
+    /// without searching it, leaving the long-distance state alone.
+    fn skip_backend(&mut self, incompressible_hint: Option<bool>) {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
                 self.simple_mut()

@@ -135,14 +135,17 @@ pub unsafe extern "C" fn ZSTD_decompress(
     src: *const u8,
     compressed_size: usize,
 ) -> usize {
-    let src = unsafe { in_slice(src, compressed_size) };
+    let src = match unsafe { crate::ffi::decode_input(src, compressed_size, dst, dst_capacity) } {
+        Ok(src) => src,
+        Err(code) => return encode(code),
+    };
     let dst = unsafe { out_slice(dst, dst_capacity) };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let mut decoder = FrameDecoder::new();
         // Verify the trailing content checksum (when the frame carries one), as
         // upstream ZSTD_decompress does: a mismatch surfaces as ChecksumMismatch.
         decoder.set_content_checksum(ContentChecksum::Verify);
-        decoder.decode_all(src, dst)
+        decoder.decode_all(&src, dst)
     }));
     match outcome {
         Ok(Ok(written)) => written,
