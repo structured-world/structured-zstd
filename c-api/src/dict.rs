@@ -12,11 +12,6 @@ use codec::dictionary::{CoverOptions, FastCoverOptions, FinalizeOptions};
 use crate::error::{ZSTD_ErrorCode, encode};
 use crate::ffi::in_slice;
 
-/// Little-endian `ZSTD_MAGIC_DICTIONARY` that prefixes a valid zstd dictionary
-/// (the 4 bytes after it are the dictionary ID). Read off the codec's own magic
-/// rather than re-declared, so the two cannot disagree.
-const DICT_MAGIC: u32 = u32::from_le_bytes(codec::decoding::DICTIONARY_MAGIC);
-
 /// `ZDICT_params_t` — finalize parameters, ABI-identical to `zdict.h`.
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -487,6 +482,112 @@ pub unsafe extern "C" fn ZDICT_finalizeDictionary(
     }
 }
 
+/// `size_t ZDICT_addEntropyTablesFromBuffer(void* dictBuffer, size_t
+/// dictContentSize, size_t dictBufferCapacity, const void* samplesBuffer, const
+/// size_t* samplesSizes, unsigned nbSamples)` — turn the `dictContentSize`
+/// bytes of content at the END of `dictBuffer` into a full dictionary in
+/// place, as [`ZDICT_finalizeDictionary`] at the default level does, content
+/// that does not fit after the header cut from its front.
+///
+/// # Safety
+/// `dictBuffer` valid for `dictBufferCapacity` bytes, the last
+/// `dictContentSize` of them the content; the sample buffers as for
+/// [`ZDICT_trainFromBuffer`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZDICT_addEntropyTablesFromBuffer(
+    dict_buffer: *mut u8,
+    dict_content_size: usize,
+    dict_buffer_capacity: usize,
+    samples_buffer: *const u8,
+    samples_sizes: *const usize,
+    nb_samples: c_uint,
+) -> usize {
+    if dict_content_size > dict_buffer_capacity
+        || (dict_buffer.is_null() && dict_buffer_capacity > 0)
+    {
+        return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed);
+    }
+    // Copied out first: the dictionary is written over the buffer it sits in.
+    let buffer = unsafe { in_slice(dict_buffer.cast_const(), dict_buffer_capacity) };
+    let content = buffer[dict_buffer_capacity - dict_content_size..].to_vec();
+    unsafe {
+        train_into(
+            dict_buffer,
+            dict_buffer_capacity,
+            samples_buffer,
+            samples_sizes,
+            nb_samples,
+            |samples, sizes| {
+                codec::dictionary::finalize_raw_dict(
+                    &content,
+                    samples,
+                    sizes,
+                    dict_buffer_capacity,
+                    FinalizeOptions::default(),
+                )
+            },
+        )
+    }
+}
+
+/// `ZDICT_legacy_params_t` — the original trainer's tuning, ABI-identical to
+/// `zdict.h`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[allow(non_camel_case_types, non_snake_case)]
+pub struct ZDICT_legacy_params_t {
+    /// How rare a kept segment may be: it repeats at least `nbSamples >>
+    /// selectivityLevel` times (0 = the default, 9).
+    pub selectivityLevel: c_uint,
+    pub zParams: ZDICT_params_t,
+}
+
+/// `size_t ZDICT_trainFromBuffer_legacy(void* dictBuffer, size_t
+/// dictBufferCapacity, const void* samplesBuffer, const size_t* samplesSizes,
+/// unsigned nbSamples, ZDICT_legacy_params_t parameters)` — the original
+/// trainer (`zstd --train-legacy`). Samples totalling too little to train on
+/// give 0, no dictionary, as upstream gives.
+///
+/// # Safety
+/// Buffer contracts of [`ZDICT_trainFromBuffer`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZDICT_trainFromBuffer_legacy(
+    dict_buffer: *mut u8,
+    dict_capacity: usize,
+    samples_buffer: *const u8,
+    samples_sizes: *const usize,
+    nb_samples: c_uint,
+    parameters: ZDICT_legacy_params_t,
+) -> usize {
+    let mut too_few_samples = false;
+    let written = unsafe {
+        train_into(
+            dict_buffer,
+            dict_capacity,
+            samples_buffer,
+            samples_sizes,
+            nb_samples,
+            |samples, sizes| {
+                let mut dict = Vec::new();
+                let trained = codec::dictionary::create_legacy_dict_from_slice(
+                    samples,
+                    sizes,
+                    &mut dict,
+                    dict_capacity,
+                    parameters.selectivityLevel,
+                    finalize_options(&parameters.zParams),
+                );
+                too_few_samples = trained.as_ref().is_err_and(|err| {
+                    codec::dictionary::TrainingError::of(err)
+                        == Some(codec::dictionary::TrainingError::Samples)
+                });
+                trained.map(|()| dict)
+            },
+        )
+    };
+    if too_few_samples { 0 } else { written }
+}
+
 /// `unsigned ZDICT_getDictID(const void* dictBuffer, size_t dictSize)` — the
 /// dictionary ID from the header, or 0 if `dictBuffer` is not a valid
 /// dictionary (bad magic or too short).
@@ -495,14 +596,7 @@ pub unsafe extern "C" fn ZDICT_finalizeDictionary(
 /// `dictBuffer` must be valid for `dictSize` bytes (or NULL with `dictSize == 0`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZDICT_getDictID(dict_buffer: *const u8, dict_size: usize) -> c_uint {
-    let dict = unsafe { in_slice(dict_buffer, dict_size) };
-    if dict.len() < 8 {
-        return 0;
-    }
-    if u32::from_le_bytes(dict[..4].try_into().expect("4 bytes")) != DICT_MAGIC {
-        return 0;
-    }
-    u32::from_le_bytes(dict[4..8].try_into().expect("4 bytes"))
+    crate::cdict::dict_id_from_bytes(unsafe { in_slice(dict_buffer, dict_size) })
 }
 
 /// `size_t ZDICT_getDictHeaderSize(const void* dictBuffer, size_t dictSize)` —

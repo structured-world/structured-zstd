@@ -24,6 +24,10 @@ pub const MAX_BLOCK_SIZE: u32 = 128 * 1024;
 /// Re-exported at the crate root as the single source of truth; the C ABI
 /// parameter bounds import it from there.
 pub const MIN_TARGET_BLOCK_SIZE: u32 = 1340;
+/// Smallest accepted maximum block size (upstream `ZSTD_BLOCKSIZE_MAX_MIN`):
+/// with smaller blocks the frame could outgrow its compress bound. Re-exported
+/// at the crate root.
+pub const MIN_MAX_BLOCK_SIZE: u32 = 1024;
 
 /// The decoder's default window ceiling (128 MiB = `1 << 27`), upstream zstd's
 /// default `ZSTD_d_windowLogMax` (`ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`). On the

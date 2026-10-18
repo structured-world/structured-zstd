@@ -2445,13 +2445,17 @@ impl MatchTable {
     /// `nextToUpdate` to it), since the match itself is never searched.
     #[cfg(feature = "ldm")]
     pub(crate) fn skip_long_match(&mut self) {
-        debug_assert!(
-            !self.uses_bt,
-            "the optimal parser takes LDM matches as candidates"
-        );
         self.ensure_tables();
         let (start, len) = self.current_block_range();
         let end = start + len;
+        if self.uses_bt {
+            // The tree gets here only behind a producer, which parses in place
+            // of the optimal parser: it resumes near the body's end, as after
+            // a long match of its own.
+            self.apply_limited_update_after_long_match(end);
+            self.next_to_update3 = self.next_to_update3.max(self.skip_insert_until_abs);
+            return;
+        }
         self.backfill_boundary_positions(start, end);
         self.insert_positions(
             end - len.min(crate::encoding::ldm::LONG_MATCH_INDEXED_TAIL),

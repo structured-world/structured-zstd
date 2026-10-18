@@ -446,6 +446,11 @@ impl HuffmanScratch {
         self.table.heap_bytes()
     }
 
+    /// Most [`heap_bytes`](Self::heap_bytes) can report.
+    pub const fn max_heap_bytes() -> usize {
+        HuffmanTable::max_heap_bytes()
+    }
+
     /// Live Huffman literals table: the dictionary's (zero-copy) while the
     /// source is still `Dict`, else the locally-built one. `dict` is the
     /// call-scoped borrow threaded in by the decode pipeline (must be `Some`
@@ -593,6 +598,11 @@ impl FSEScratch {
         self.offsets.heap_bytes()
             + self.literal_lengths.heap_bytes()
             + self.match_lengths.heap_bytes()
+    }
+
+    /// Most [`heap_bytes`](Self::heap_bytes) can report.
+    pub const fn max_heap_bytes() -> usize {
+        3 * SeqFSETable::max_heap_bytes()
     }
 
     pub fn new() -> FSEScratch {

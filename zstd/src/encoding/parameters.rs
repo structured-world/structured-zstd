@@ -200,6 +200,23 @@ impl Bounds {
     pub const fn contains(&self, value: i64) -> bool {
         value >= self.lower_bound && value <= self.upper_bound
     }
+
+    /// `value` moved to the nearest end of the range when it falls outside.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::CParameter;
+    /// assert_eq!(CParameter::MinMatch.bounds().clamp(9), 7);
+    /// assert_eq!(CParameter::MinMatch.bounds().clamp(5), 5);
+    /// ```
+    pub const fn clamp(&self, value: i64) -> i64 {
+        if value < self.lower_bound {
+            self.lower_bound
+        } else if value > self.upper_bound {
+            self.upper_bound
+        } else {
+            value
+        }
+    }
 }
 
 impl CParameter {
@@ -308,6 +325,48 @@ impl LevelParameters {
             // Every row of the level table names one of the nine strategies.
             strategy: Strategy::from_ordinal(cp.strategy)
                 .expect("the level table only holds strategies 1..=9"),
+        }
+    }
+
+    /// These parameters fitted to a source of `source_size` bytes and a
+    /// `dictionary_size`-byte dictionary, the drop-in equivalent of C zstd's
+    /// `ZSTD_adjustCParams`: a window wider than the data comes down to it, and
+    /// the tables shrink with the window. `None` is a source of unknown size,
+    /// which leaves the tables alone.
+    ///
+    /// Every field must already lie within its [`CParameter::bounds`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_zstd::encoding::LevelParameters;
+    ///
+    /// let level_19 = LevelParameters::for_level(19, None, 0);
+    /// let small = level_19.adjusted(Some(1000), 0);
+    /// assert_eq!(small.window_log, 10);
+    /// assert!(small.hash_log <= 11);
+    /// assert_eq!(level_19.adjusted(None, 0), level_19);
+    /// ```
+    pub fn adjusted(self, source_size: Option<u64>, dictionary_size: usize) -> Self {
+        let cp = crate::encoding::cparams::CParams {
+            window_log: self.window_log,
+            chain_log: self.chain_log,
+            hash_log: self.hash_log,
+            search_log: self.search_log,
+            min_match: self.min_match,
+            target_length: self.target_length,
+            strategy: self.strategy.ordinal(),
+        };
+        let size = source_size.unwrap_or(crate::encoding::cparams::CONTENTSIZE_UNKNOWN);
+        let cp = crate::encoding::cparams::adjust_cparams(cp, size, dictionary_size, false);
+        Self {
+            window_log: cp.window_log,
+            chain_log: cp.chain_log,
+            hash_log: cp.hash_log,
+            search_log: cp.search_log,
+            min_match: cp.min_match,
+            target_length: cp.target_length,
+            strategy: self.strategy,
         }
     }
 }
@@ -440,6 +499,65 @@ impl CompressionParameters {
     /// How literals are entropy-coded (see [`LiteralCompressionMode`]).
     pub fn literal_compression_mode(&self) -> LiteralCompressionMode {
         self.overrides.literal_compression
+    }
+
+    /// The window, `log2`, the encoder gives a frame of `source_size` bytes
+    /// (`None` = unknown) with `dictionary_size` bytes of dictionary content
+    /// under these parameters: resolved exactly as the encoder resolves it.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionLevel, CompressionParameters};
+    ///
+    /// let params = CompressionParameters::builder(CompressionLevel::Level(19))
+    ///     .window_log(23)
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq!(params.window_log_for(None, 0), 23);
+    /// assert!(params.window_log_for(Some(1000), 0) < 23);
+    /// ```
+    pub fn window_log_for(&self, source_size: Option<u64>, dictionary_size: usize) -> u32 {
+        let sizes = crate::encoding::DictionarySizes {
+            content: dictionary_size,
+            serialized: dictionary_size,
+        };
+        let params =
+            crate::encoding::levels::config::frame_level_params(self, source_size, Some(sizes));
+        u32::from(params.window_log)
+    }
+
+    /// These parameters as a dictionary's own, driving a frame of
+    /// `source_size` bytes (`None` = unknown): an explicit window is raised to
+    /// cover the source, as far as 512 KiB, as upstream raises a prepared
+    /// dictionary's window for a frame of known size
+    /// (`ZSTD_compressBegin_usingCDict_internal`, zstd_compress.c:5844-5852).
+    /// A window left to the level is resolved for the source and covers it.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionLevel, CompressionParameters};
+    ///
+    /// let params = CompressionParameters::builder(CompressionLevel::Level(3))
+    ///     .window_log(10)
+    ///     .build()
+    ///     .unwrap();
+    /// let source = Some(1 << 20);
+    /// assert_eq!(params.for_dictionary_frame(source).window_log_for(source, 0), 19);
+    /// assert_eq!(params.for_dictionary_frame(None).window_log_for(None, 0), 10);
+    /// ```
+    pub fn for_dictionary_frame(mut self, source_size: Option<u64>) -> Self {
+        const RAISE_LIMIT: u64 = 1 << 19;
+        let known =
+            source_size.filter(|size| *size != crate::encoding::cparams::CONTENTSIZE_UNKNOWN);
+        if let (Some(window), Some(source)) = (self.overrides.window_log, known) {
+            // Bounded by `RAISE_LIMIT`, so it fits and its log is at most 19.
+            let limited = source.min(RAISE_LIMIT) as u32;
+            let source_log = if limited > 1 {
+                (u32::BITS - (limited - 1).leading_zeros()) as u8
+            } else {
+                1
+            };
+            self.overrides.window_log = Some(window.max(source_log));
+        }
+        self
     }
 
     pub(crate) fn overrides(&self) -> ParamOverrides {

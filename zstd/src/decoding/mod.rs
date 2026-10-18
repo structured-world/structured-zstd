@@ -287,6 +287,131 @@ pub fn frame_decompressed_bound(src: &[u8]) -> Result<u64, FrameSizeError> {
     Ok(walk.count.saturating_mul(block_size_max as u64))
 }
 
+/// What the first four bytes of a buffer announce, read by [`frame_magic`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FrameMagic {
+    /// A Zstandard frame (RFC 8878 §3.1.1).
+    Zstd,
+    /// A skippable frame (RFC 8878 §3.1.2) with its magic variant, `0..=15`.
+    Skippable(u8),
+}
+
+/// Which frame `src` starts with, judged by its magic number alone. Backs the
+/// C `ZSTD_isFrame` / `ZSTD_isSkippableFrame`. `None` when `src` is shorter
+/// than four bytes or the magic is no frame's.
+///
+/// ```rust
+/// use structured_zstd::decoding::{frame_magic, FrameMagic};
+/// assert_eq!(frame_magic(&[0x28, 0xB5, 0x2F, 0xFD]), Some(FrameMagic::Zstd));
+/// assert_eq!(frame_magic(&[0x53, 0x2A, 0x4D, 0x18]), Some(FrameMagic::Skippable(3)));
+/// assert_eq!(frame_magic(b"zip"), None);
+/// ```
+pub fn frame_magic(src: &[u8]) -> Option<FrameMagic> {
+    let magic = u32::from_le_bytes(src.get(..4)?.try_into().ok()?);
+    if magic == crate::common::MAGIC_NUM {
+        Some(FrameMagic::Zstd)
+    } else if magic & 0xFFFF_FFF0 == crate::skippable::SKIPPABLE_MAGIC_START {
+        Some(FrameMagic::Skippable((magic & 0xF) as u8))
+    } else {
+        None
+    }
+}
+
+/// Bytes the compressed input must trail the end of the output by for every
+/// frame in `src` to decode in place: the compressed data sits at the end of
+/// the output buffer and the decoder writes from its start. Backs the C
+/// `ZSTD_decompressionMargin`.
+///
+/// A frame costs its header, its checksum and three bytes per block, a
+/// skippable frame its whole length, and one largest block is added on top:
+/// a block may expand to its full size before its compressed bytes are
+/// consumed (upstream `zstd_decompress.c:838-879`).
+///
+/// # Errors
+/// [`FrameSizeError`] on an unreadable header, truncation, or an invalid block.
+///
+/// ```rust
+/// use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
+/// use structured_zstd::decoding::decompression_margin;
+/// let frame = compress_slice_to_vec(&[9u8; 4096], CompressionLevel::Default);
+/// assert!(decompression_margin(&frame).unwrap() >= frame.len().min(4096));
+/// ```
+pub fn decompression_margin(src: &[u8]) -> Result<usize, FrameSizeError> {
+    let mut rest = src;
+    let mut margin = 0usize;
+    let mut max_block_size = 0usize;
+    while !rest.is_empty() {
+        let consumed = match frame::read_frame_header_with_format(rest, false) {
+            Ok((header, header_len)) => {
+                let block_size_max = frame_block_size_max(&header);
+                let walk = walk_blocks(rest, header_len as usize, block_size_max)?;
+                let checksum = if header.descriptor.content_checksum_flag() {
+                    4
+                } else {
+                    0
+                };
+                let end = walk
+                    .end
+                    .checked_add(checksum)
+                    .filter(|end| *end <= rest.len())
+                    .ok_or(FrameSizeError::Truncated)?;
+                // Header, block headers and checksum all lie inside
+                // `..end <= rest.len()`, so the margin never exceeds the input.
+                margin += header_len as usize + checksum + 3 * walk.count as usize;
+                max_block_size = max_block_size.max(block_size_max);
+                end
+            }
+            Err(errors::ReadFrameHeaderError::SkipFrame { .. }) => {
+                let end = find_frame_compressed_size(rest)?;
+                margin += end;
+                end
+            }
+            Err(e) => return Err(FrameSizeError::Header(e)),
+        };
+        rest = &rest[consumed..];
+    }
+    Ok(margin + max_block_size)
+}
+
+/// Smallest output buffer a block-by-block decode of a frame can run in:
+/// the window, plus room for a block written after it and split literals,
+/// capped by the content size when the frame declares one. Backs the C
+/// `ZSTD_decodingBufferSize_min`; `None` when the result does not fit `usize`.
+///
+/// The two 32-byte terms are the over-copy allowance the sequence executor's
+/// wide copies may write past a match (upstream `WILDCOPY_OVERLENGTH`,
+/// `zstd_decompress.c:1965-1986`).
+///
+/// ```rust
+/// use structured_zstd::decoding::min_decoding_buffer_size;
+/// // A 1 MiB window with no declared content size.
+/// assert_eq!(min_decoding_buffer_size(1 << 20, None), Some((1 << 20) + 2 * 131_072 + 64));
+/// // A 1 KiB window holds no block over 1 KiB, so both block terms shrink.
+/// assert_eq!(min_decoding_buffer_size(1 << 10, None), Some((1 << 10) + 2 * 1024 + 64));
+/// // A frame whose whole content is smaller than that.
+/// assert_eq!(min_decoding_buffer_size(1 << 20, Some(1000)), Some(1000));
+/// ```
+pub fn min_decoding_buffer_size(
+    window_size: u64,
+    frame_content_size: Option<u64>,
+) -> Option<usize> {
+    const WILDCOPY_OVERLENGTH: u64 = 32;
+    // Both block terms are the largest block the frame can hold, not a fixed
+    // 128 KiB, since no block exceeds the window: RFC 8878 3.1.1.2.4,
+    // Block_Maximum_Size = min(Window_Size, 128 KiB); upstream
+    // zstd_decompress.c:1972-1980 computes window + 2 * that block + 64.
+    let block_size = window_size.min(crate::common::MAX_BLOCK_SIZE as u64);
+    let needed = window_size.checked_add(2 * block_size + 2 * WILDCOPY_OVERLENGTH);
+    let size = match (frame_content_size, needed) {
+        (Some(content), Some(needed)) => content.min(needed),
+        // A window past `u64` still decodes in a buffer the content fits.
+        (Some(content), None) => content,
+        (None, Some(needed)) => needed,
+        (None, None) => return None,
+    };
+    usize::try_from(size).ok()
+}
+
 /// Frame header fields decoded by [`read_frame_header_info`], mirroring the
 /// values the C `ZSTD_getFrameHeader` fills into a `ZSTD_FrameHeader`.
 #[derive(Copy, Clone, Debug)]
@@ -330,6 +455,52 @@ pub struct FrameHeaderInfo {
 /// ```
 pub fn frame_header_size(src: &[u8]) -> Result<usize, errors::ReadFrameHeaderError> {
     frame::measure_header_from_slice(src)
+}
+
+/// [`frame_header_size`] for a frame in either format: with `magicless` the
+/// header starts at its descriptor byte and its length counts no magic
+/// number.
+///
+/// ```rust
+/// use structured_zstd::decoding::frame_header_size_in_format;
+/// // A descriptor announcing a window byte only.
+/// assert_eq!(frame_header_size_in_format(&[0x00], true).unwrap(), 2);
+/// assert_eq!(frame_header_size_in_format(&[0x28, 0xB5, 0x2F, 0xFD, 0x00], false).unwrap(), 6);
+/// ```
+///
+/// # Errors
+/// As [`frame_header_size`]; a magicless input fails only when it is empty.
+pub fn frame_header_size_in_format(
+    src: &[u8],
+    magicless: bool,
+) -> Result<usize, errors::ReadFrameHeaderError> {
+    frame::measure_header_with_format(src, magicless)
+}
+
+/// How many bytes from its start the frame header beginning `src` takes to
+/// read whole, judged from what `src` holds of it: the bytes that hold the
+/// descriptor until they are all here (five, or one without the magic
+/// number), then the header's own length, and eight for a skippable frame.
+/// A caller reading a header in pieces asks this before
+/// [`read_frame_header_info`]; upstream's `ZSTD_getFrameHeader_advanced`
+/// returns the same counts.
+///
+/// ```rust
+/// use structured_zstd::decoding::frame_header_input_needed;
+/// assert_eq!(frame_header_input_needed(&[0x28, 0xB5], false).unwrap(), 5);
+/// // Magic number and a descriptor announcing a window byte only.
+/// assert_eq!(frame_header_input_needed(&[0x28, 0xB5, 0x2F, 0xFD, 0x00], false).unwrap(), 6);
+/// assert!(frame_header_input_needed(&[0x00, 0x01], false).is_err());
+/// ```
+///
+/// # Errors
+/// [`ReadFrameHeaderError::BadMagicNumber`](errors::ReadFrameHeaderError::BadMagicNumber)
+/// when the bytes start no known magic number.
+pub fn frame_header_input_needed(
+    src: &[u8],
+    magicless: bool,
+) -> Result<usize, errors::ReadFrameHeaderError> {
+    frame::header_input_needed(src, magicless)
 }
 
 /// Decode the leading frame header fields of `src` without decoding the body.
@@ -450,5 +621,7 @@ pub(crate) mod user_slice_buf;
 #[cfg(feature = "bench-internals")]
 pub(crate) use self::simd_copy::copy_bytes_overshooting_for_bench;
 
+#[cfg(test)]
+mod block_api_tests;
 #[cfg(test)]
 mod frame_inspection_tests;

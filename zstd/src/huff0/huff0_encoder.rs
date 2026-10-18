@@ -56,7 +56,8 @@ impl WeightDescription {
     /// encoder writes at most that before the length gate rejects the result.
     fn reserve_to_bound(&mut self) {
         if self.buf.capacity() < MAX_HUFFMAN_ALPHABET {
-            self.buf.reserve(MAX_HUFFMAN_ALPHABET - self.buf.len());
+            self.buf
+                .reserve_exact(MAX_HUFFMAN_ALPHABET - self.buf.len());
         }
     }
 }
@@ -461,7 +462,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         #[cfg(not(feature = "std"))]
         let want = weights.len();
         if encoded.capacity() < want {
-            encoded.reserve(want - encoded.len());
+            encoded.reserve_exact(want - encoded.len());
         }
         {
             fse_encoder::build_table_from_symbol_counts_into(&counts, 6, false, fse_table);
@@ -566,7 +567,13 @@ impl Clone for HuffmanTable {
     }
 
     fn clone_from(&mut self, source: &Self) {
+        // Exact first, so the copy's amortised growth cannot double a buffer
+        // past the 256 entries `max_heap_size` budgets.
+        self.codes.clear();
+        self.codes.reserve_exact(source.codes.len());
         self.codes.clone_from(&source.codes);
+        self.packed_codes.clear();
+        self.packed_codes.reserve_exact(source.packed_codes.len());
         self.packed_codes.clone_from(&source.packed_codes);
         self.table_log = source.table_log;
         #[cfg(feature = "std")]
@@ -616,6 +623,14 @@ impl HuffmanTable {
         self.codes.capacity() * core::mem::size_of::<(u32, u8)>()
             + self.packed_codes.capacity() * core::mem::size_of::<u64>()
             + cached
+    }
+
+    /// The most heap one table holds: a code and a packed code for each of the
+    /// 256 byte values, and room for the longest weight description (a header
+    /// byte and 255 four-bit weights, in a buffer grown to the next power of
+    /// two).
+    pub(crate) const fn max_heap_size() -> usize {
+        256 * core::mem::size_of::<(u32, u8)>() + 256 * core::mem::size_of::<u64>() + 256
     }
 
     pub fn build_from_data(data: &[u8]) -> Self {
@@ -1051,9 +1066,14 @@ impl HuffmanTable {
             Some(mut spare) => {
                 // Both buffers are overwritten in full below, so the recycled
                 // contents do not survive; only their allocations do.
+                // Exact reservations: an amortised `resize` would double a
+                // buffer grown one symbol at a time past the 256 entries any
+                // table holds, beyond what `max_heap_size` budgets.
                 spare.codes.clear();
+                spare.codes.reserve_exact(weights.len());
                 spare.codes.resize(weights.len(), (0, 0));
                 spare.packed_codes.clear();
+                spare.packed_codes.reserve_exact(weights.len());
                 spare.packed_codes.resize(weights.len(), 0u64);
                 spare.table_log = table_log as u32;
                 #[cfg(feature = "std")]
@@ -1371,7 +1391,10 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
     // Pre-size to the final node count (`2 * leaf_count - 1`) so the tree
     // build's resize never reallocates.
     nodes.clear();
-    nodes.reserve((2 * leaf_count).max(1));
+    // Exact, as the buffer is reused: an amortised reserve doubles a buffer
+    // grown block by block past the 512 nodes `WeightScratch::max_heap_size`
+    // budgets.
+    nodes.reserve_exact((2 * leaf_count).max(1));
 
     if leaf_count == 0 {
         return;
@@ -1567,7 +1590,10 @@ fn limited_weights_into(
     work: &mut Vec<HuffNode>,
     out: &mut Vec<usize>,
 ) -> bool {
+    // Exact reservations for the reused buffers, as in
+    // `build_huffman_leaf_depths_into`.
     out.clear();
+    out.reserve_exact(counts_len);
     out.resize(counts_len, 0);
     if leaves.len() <= 1 {
         if let Some(leaf) = leaves.first() {
@@ -1577,6 +1603,7 @@ fn limited_weights_into(
     }
 
     work.clear();
+    work.reserve_exact(leaves.len());
     work.extend_from_slice(leaves);
     enforce_max_height(work, max_nb_bits);
     // The height limiter restores a full, canonical code in one pass (matching
@@ -1661,6 +1688,16 @@ impl WeightScratch {
                 .weight_fse_table
                 .as_ref()
                 .map_or(0, |_| core::mem::size_of::<fse_encoder::FSETable>())
+    }
+
+    /// The most heap this scratch keeps: a leaf per byte value and a node array
+    /// for the tree over them, each at most twice the 256 values, a weight per
+    /// value, a parked table, and the FSE table weight descriptions build into.
+    pub(crate) const fn max_heap_size() -> usize {
+        2 * 512 * core::mem::size_of::<HuffNode>()
+            + 256 * core::mem::size_of::<usize>()
+            + HuffmanTable::max_heap_size()
+            + core::mem::size_of::<fse_encoder::FSETable>()
     }
 
     /// Park a table the caller is done with, for the next build to fill.
