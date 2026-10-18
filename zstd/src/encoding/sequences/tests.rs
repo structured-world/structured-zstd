@@ -496,6 +496,45 @@ impl SequenceProducer for AlwaysFails {
     }
 }
 
+/// Claims every block opens with three literals and a three-byte match at
+/// offset 3, whatever the bytes are: a parse of the right shape that does not
+/// reproduce the block.
+struct WrongMatch;
+
+impl SequenceProducer for WrongMatch {
+    fn produce(
+        &mut self,
+        block: &[u8],
+        _window_size: u64,
+        out: &mut Vec<ExternalSequence>,
+    ) -> Result<(), SequenceProducerError> {
+        out.push(seq(3, 3, 3));
+        out.push(ExternalSequence::delimiter(block.len() as u32 - 6));
+        Ok(())
+    }
+}
+
+/// A producer's parse that does not reproduce the block is refused as a
+/// failure, never written: the frame still decodes to the input.
+#[test]
+fn a_producer_parse_that_misreads_the_block_is_refused() {
+    // Compressible, so the block is written compressed rather than raw and a
+    // wrong match would reach the frame.
+    let mut input = b"abcxyz".to_vec();
+    input.extend(b"text the entropy coder shrinks ".repeat(150));
+    let mut strict = default_compressor();
+    strict.set_sequence_producer(Some(alloc::boxed::Box::new(WrongMatch)), false);
+    let frame = strict.compress_independent_frame(&input);
+    assert_eq!(decode(&frame), input);
+    assert!(strict.take_sequence_producer_failure());
+
+    let mut lenient = default_compressor();
+    lenient.set_sequence_producer(Some(alloc::boxed::Box::new(WrongMatch)), true);
+    let frame = lenient.compress_independent_frame(&input);
+    assert_eq!(decode(&frame), input);
+    assert!(!lenient.take_sequence_producer_failure());
+}
+
 /// A registered producer's parse is what the frame carries.
 #[test]
 fn producer_parse_builds_the_frame() {

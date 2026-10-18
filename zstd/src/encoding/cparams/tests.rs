@@ -46,6 +46,20 @@ fn a_row_strategy_hash_table_fits_one_hash() {
     assert_eq!(cp.hash_log, 30);
 }
 
+/// The CDict table helper sizes tables that have no rows, so the row cap does
+/// not narrow them: a dictionary large enough to fill a 2^30 table keeps it.
+#[test]
+fn cdict_table_logs_are_not_held_to_the_row_cap() {
+    let (hash_log, _) = create_cdict_table_logs(
+        30,
+        30,
+        30,
+        /* uses_bt */ false,
+        /* dict_size */ 1 << 29,
+    );
+    assert_eq!(hash_log, 30);
+}
+
 /// A CDict prepared under explicit parameters takes each knob in place of the
 /// level row's and is down-sized for the dictionary again
 /// (`ZSTD_getCParamsFromCCtxParams`): a 4 KiB dictionary at level 3 asked for

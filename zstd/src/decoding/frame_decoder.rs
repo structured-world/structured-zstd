@@ -1619,13 +1619,7 @@ impl FrameDecoder {
             return 3;
         }
         let size = (header >> 3) as usize;
-        // A window wider than the address space cannot bound a block below
-        // the 128 KiB maximum, so it counts as unbounded here.
-        let window = state
-            .frame_header
-            .window_size()
-            .map_or(usize::MAX, |w| usize::try_from(w).unwrap_or(usize::MAX));
-        if size > decoding::block_decoder::block_maximum(window) {
+        if size > state.block_maximum() {
             return 3;
         }
         // The block header is parsed again by the block decoder. Carrying it
@@ -4336,11 +4330,10 @@ impl FrameDecoder {
                 // block maximum is checked here as the general path checks it:
                 // a block past it is malformed, and the shortcut must not be
                 // the way around that.
-                let window = state.frame_header.window_size().unwrap_or(0) as usize;
                 if bh.last_block
                     && matches!(bh.block_type, crate::blocks::block::BlockType::Raw)
                     && declared_size.is_none_or(|declared| declared == n as u64)
-                    && n <= block_decoder::block_maximum(window)
+                    && n <= state.block_maximum()
                     && probe.len() >= n
                     && output.len() >= n
                 {

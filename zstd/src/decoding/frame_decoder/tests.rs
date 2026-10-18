@@ -1779,6 +1779,33 @@ fn max_block_size_refuses_a_bigger_block_on_every_path() {
     assert_eq!(decoder.decode_all(&big, &mut out).unwrap(), input.len());
 }
 
+/// A frame of one Raw block over the limit is refused on the shortcut that
+/// copies such a frame whole, and a block header past the limit asks only for
+/// itself, so a streaming caller does not gather a block that will be refused.
+#[test]
+fn max_block_size_holds_a_single_raw_block_too() {
+    // Incompressible: written as one Raw block.
+    let mut state = 7u64;
+    let input: Vec<u8> = (0..4096)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u8
+        })
+        .collect();
+    let frame = crate::encoding::compress_to_vec(input.as_slice(), CompressionLevel::Default);
+    let header_len = decoder_header_len(&frame);
+    assert_eq!((frame[header_len] >> 1) & 3, 0, "fixture is a Raw block");
+    let mut out = alloc::vec![0u8; input.len()];
+    let mut decoder = FrameDecoder::new();
+    decoder.set_max_block_size(Some(1024));
+    assert!(decoder.decode_all(&frame, &mut out).is_err());
+
+    decoder.reset(frame.as_slice()).unwrap();
+    assert_eq!(decoder.input_needed(&frame[header_len..]), 3);
+}
+
 /// The length of `frame`'s header, which `reset` takes from a source.
 fn decoder_header_len(frame: &[u8]) -> usize {
     usize::from(crate::decoding::frame::read_frame_header(frame).unwrap().1)

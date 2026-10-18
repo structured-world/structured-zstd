@@ -80,6 +80,68 @@ impl Matcher for NoDictionaryMatcher {
     }
 }
 
+/// [`NoDictionaryMatcher`] that asks for a block of no bytes: a custom
+/// matcher can, since `fixed_block_len` is a public hook.
+struct ZeroCutMatcher(NoDictionaryMatcher);
+
+impl Matcher for ZeroCutMatcher {
+    fn get_last_space(&mut self) -> &[u8] {
+        self.0.get_last_space()
+    }
+
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool) {
+        self.0.fill_in_place(capacity, fill)
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        self.0.uncommitted_input()
+    }
+
+    fn commit_filled(&mut self, len: usize) {
+        self.0.commit_filled(len);
+    }
+
+    fn skip_matching(&mut self) {}
+
+    fn start_matching(&mut self, handle_sequence: impl FnMut(Sequence)) {
+        self.0.start_matching(handle_sequence);
+    }
+
+    fn reset(&mut self, level: super::CompressionLevel) {
+        self.0.reset(level);
+    }
+
+    fn fixed_block_len(&self) -> Option<usize> {
+        Some(0)
+    }
+
+    fn window_size(&self) -> u64 {
+        self.0.window_size()
+    }
+}
+
+/// A matcher asking for an empty block does not end the frame early: the
+/// encoder takes the cut it would take without one, so no input is lost.
+#[test]
+fn a_zero_fixed_block_len_loses_no_input() {
+    let input = generate_data(7, 3000);
+    let mut compressor = FrameCompressor::new_with_matcher(
+        ZeroCutMatcher(NoDictionaryMatcher::new(1 << 17)),
+        super::CompressionLevel::Default,
+    );
+    let mut frame = Vec::new();
+    compressor.set_source(input.as_slice());
+    compressor.set_drain(&mut frame);
+    compressor.compress();
+    let mut out = vec![0u8; input.len()];
+    let n = FrameDecoder::new().decode_all(&frame, &mut out).unwrap();
+    assert_eq!(&out[..n], input.as_slice());
+}
+
 /// Reports one sequence whose literal length does not fit in 32 bits and
 /// whose low 32 bits would fit the block: `(1 << 32) + 1` literals, a match
 /// of 4, and the rest of the block as trailing literals.

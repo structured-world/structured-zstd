@@ -3044,7 +3044,9 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
             let mut block_len = available;
             let fixed_len = self.state.matcher.fixed_block_len();
             if let Some(len) = fixed_len {
-                if len < available {
+                // A block of no bytes would read below as the empty frame's
+                // terminal block and drop the input; such a cut is ignored.
+                if len > 0 && len < available {
                     block_len = len;
                     last_block = false;
                 }

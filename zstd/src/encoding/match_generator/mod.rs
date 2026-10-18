@@ -835,8 +835,11 @@ impl MatchGeneratorDriver {
         let window = self.window_size();
         let block = self.get_last_space();
         let block_len = block.len();
-        // The parse must cover the block exactly, with matches inside it: the
-        // producer sees no history (as upstream hands it none).
+        // The parse must cover the block exactly, with matches inside it (the
+        // producer sees no history, as upstream hands it none), and each match
+        // must copy the bytes it stands for: a parse of the right shape that
+        // misreads the block would otherwise write a frame decoding to other
+        // data.
         let produced = slot
             .producer
             .produce(block, window, &mut slot.parse)
@@ -849,7 +852,8 @@ impl MatchGeneratorDriver {
                 true,
                 block_len,
             )
-            .is_ok();
+            .is_ok()
+            && crate::encoding::sequences::parse_reproduces(&slot.parse, block, &[]).is_ok();
         if !produced && slot.fallback {
             self.producer = Some(slot);
             return false;

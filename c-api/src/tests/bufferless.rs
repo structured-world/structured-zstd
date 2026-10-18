@@ -40,7 +40,9 @@ fn step(dctx: *mut ZSTD_DCtx, src: &[u8], out: &mut [u8]) -> (u32, usize, usize)
     unsafe {
         let kind = ZSTD_nextInputType(dctx);
         let want = ZSTD_nextSrcSizeToDecompress(dctx);
-        let rc = ZSTD_decompressContinue(dctx, out.as_mut_ptr(), out.len(), src.as_ptr(), want);
+        // Sliced first: a short input fails here, not past the slice.
+        let part = &src[..want];
+        let rc = ZSTD_decompressContinue(dctx, out.as_mut_ptr(), out.len(), part.as_ptr(), want);
         (kind, want, rc)
     }
 }
@@ -67,7 +69,7 @@ fn decode_bufferless(
                     dctx,
                     out.as_mut_ptr(),
                     out.len(),
-                    src[pos..].as_ptr(),
+                    src[pos..pos + want].as_ptr(),
                     want,
                 )
             };

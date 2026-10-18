@@ -185,6 +185,31 @@ pub(crate) fn adjusted_window_log(window_log: u32, src_size: u64, dict_size: usi
 /// given `(src_size, dict_size, mode)`. `src_size == CONTENTSIZE_UNKNOWN`
 /// means unknown; `src_size == 0` means literally zero.
 pub(crate) fn adjust_cparams(
+    cp: CParams,
+    src_size: u64,
+    dict_size: usize,
+    create_cdict: bool,
+) -> CParams {
+    let mut cp = adjust_table_logs(cp, src_size, dict_size, create_cdict);
+    // The row finder hashes `hashLog - rowLog` row bits plus an 8-bit tag, all
+    // from one 32-bit hash, so the table may not outgrow it. Upstream assumes
+    // rows for greedy / lazy / lazy2 at this point, whatever the window, since
+    // the switch to rows is only decided later. Callers pass the frame's real
+    // strategy and search log: a placeholder would cap tables that have no
+    // rows, or rows of the wrong width.
+    if (3..=5).contains(&cp.strategy) {
+        let row_log = cp.search_log.clamp(4, 6);
+        let max_hash_log = 32 - ROW_HASH_TAG_BITS + row_log;
+        if cp.hash_log > max_hash_log {
+            cp.hash_log = max_hash_log;
+        }
+    }
+    cp
+}
+
+/// [`adjust_cparams`] without the row finder's cap, for tables that have no
+/// rows.
+fn adjust_table_logs(
     mut cp: CParams,
     mut src_size: u64,
     dict_size: usize,
@@ -224,20 +249,6 @@ pub(crate) fn adjust_cparams(
         }
         if cp.chain_log > max_short_cache_hash_log {
             cp.chain_log = max_short_cache_hash_log;
-        }
-    }
-
-    // The row finder hashes `hashLog - rowLog` row bits plus an 8-bit tag, all
-    // from one 32-bit hash, so the table may not outgrow it. Upstream assumes
-    // rows for greedy / lazy / lazy2 at this point, whatever the window, since
-    // the switch to rows is only decided later. Callers pass the frame's real
-    // strategy and search log: a placeholder would cap tables that have no
-    // rows, or rows of the wrong width.
-    if (3..=5).contains(&cp.strategy) {
-        let row_log = cp.search_log.clamp(4, 6);
-        let max_hash_log = 32 - ROW_HASH_TAG_BITS + row_log;
-        if cp.hash_log > max_hash_log {
-            cp.hash_log = max_hash_log;
         }
     }
 
@@ -412,7 +423,8 @@ pub(crate) fn create_cdict_table_logs(
         target_length: 0,
         strategy,
     };
-    let adj = adjust_cparams(
+    // The placeholder strategy has no rows: the row cap is not for it.
+    let adj = adjust_table_logs(
         cp,
         CONTENTSIZE_UNKNOWN,
         dict_size,
