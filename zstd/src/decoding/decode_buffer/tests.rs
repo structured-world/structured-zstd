@@ -208,7 +208,9 @@ fn short_writer() {
         assert_eq!(decode_buf.len(), 100);
     }
 
-    assert_eq!(short_writer.buf.len(), repeats * 50);
+    // Every byte is handed out as it is decoded, the first 100 with the first
+    // drain; the window stays as history, so the final drain adds nothing.
+    assert_eq!(short_writer.buf.len(), repeats * 50 + 100);
     decode_buf.drain_to_writer(&mut short_writer).unwrap();
     assert_eq!(short_writer.buf.len(), repeats * 50 + 100);
 }
@@ -271,7 +273,8 @@ fn wouldblock_writer() {
         assert_eq!(decode_buf.len(), 100);
     }
 
-    assert_eq!(short_writer.buf.len(), repeats * 50);
+    // As in `short_writer`: the first 100 bytes went out with the first drain.
+    assert_eq!(short_writer.buf.len(), repeats * 50 + 100);
     loop {
         match decode_buf.drain_to_writer(&mut short_writer) {
             Ok(written) => {
@@ -437,6 +440,7 @@ fn repeat_overlap_fast_paths_match_reference_behavior_with_wrapped_ringbuffer() 
     let seed = b"0123456789abcdef0123456789abcdef";
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(window);
     let mut model = Vec::new();
+    let mut delivered = 0;
 
     decode_buf.push::<ScalarKernel>(seed);
     model_push(&mut model, seed);
@@ -444,9 +448,9 @@ fn repeat_overlap_fast_paths_match_reference_behavior_with_wrapped_ringbuffer() 
     model_repeat(&mut model, 16, 16);
 
     let drained = decode_buf.drain_to_window_size().unwrap();
-    let model_drained = model_drain_to_window(&mut model, window);
-    assert_eq!(drained, model_drained);
+    assert_eq!(drained, model_deliver(&model, &mut delivered));
 
+    // The window wraps the ring as the matches below keep reading it.
     let cases = [(3usize, 97usize), (16usize, 64usize), (7usize, 73usize)];
     for (offset, match_len) in cases {
         decode_buf
@@ -454,13 +458,13 @@ fn repeat_overlap_fast_paths_match_reference_behavior_with_wrapped_ringbuffer() 
             .unwrap();
         model_repeat(&mut model, offset, match_len);
 
-        if let Some(got) = decode_buf.drain_to_window_size() {
-            let expected = model_drain_to_window(&mut model, window);
-            assert_eq!(got, expected, "offset={offset}, match_len={match_len}");
-        }
+        let got = decode_buf.drain_to_window_size().unwrap();
+        let expected = model_deliver(&model, &mut delivered);
+        assert_eq!(got, expected, "offset={offset}, match_len={match_len}");
+        assert_eq!(decode_buf.len(), window, "the window stays as history");
     }
 
-    assert_eq!(decode_buf.drain(), model);
+    assert!(decode_buf.drain().is_empty(), "everything was handed out");
 }
 
 fn expected_match_expansion(seed: &[u8], offset: usize, match_len: usize) -> Vec<u8> {
@@ -485,12 +489,11 @@ fn model_repeat(model: &mut Vec<u8>, offset: usize, match_len: usize) {
     }
 }
 
-fn model_drain_to_window(model: &mut Vec<u8>, window: usize) -> Vec<u8> {
-    if model.len() <= window {
-        return Vec::new();
-    }
-    let drain_len = model.len() - window;
-    model.drain(0..drain_len).collect()
+/// The model's output not handed out yet, all of it, as the buffer hands it.
+fn model_deliver(model: &[u8], delivered: &mut usize) -> Vec<u8> {
+    let out = model[*delivered..].to_vec();
+    *delivered = model.len();
+    out
 }
 
 /// Drive `DecodeBuffer::repeat` through the short-offset path and

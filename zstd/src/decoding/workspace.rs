@@ -954,15 +954,9 @@ impl<'w> WorkspaceDecoder<'w> {
         Err(WorkspaceDecodeError::Truncated)
     }
 
-    /// Bytes ready to deliver: past the window while the frame decodes, all
-    /// of it once its last block is in.
+    /// Decoded bytes not delivered yet, whether or not the frame is finished.
     fn pending(&self) -> usize {
-        let blocks_done = self.blocks_done;
-        with_window!(&self.window, buffer => if blocks_done {
-            buffer.can_drain()
-        } else {
-            buffer.can_drain_to_window_size().unwrap_or(0)
-        }, idle => 0)
+        with_window!(&self.window, buffer => buffer.undelivered(), idle => 0)
     }
 
     fn deliver(&mut self, output: &mut [u8]) -> usize {

@@ -534,8 +534,14 @@ impl DecoderScratchKind {
         for chunk in content.chunks(piece) {
             self.buffer_push(chunk, kernel);
             match self {
-                Self::Ring(s) => s.buffer.drop_to_window_size(),
-                Self::Flat(s) => s.buffer.drop_to_window_size(),
+                Self::Ring(s) => {
+                    s.buffer.mark_delivered();
+                    s.buffer.drop_to_window_size()
+                }
+                Self::Flat(s) => {
+                    s.buffer.mark_delivered();
+                    s.buffer.drop_to_window_size()
+                }
             };
         }
     }
@@ -649,17 +655,10 @@ impl DecoderScratchKind {
         }
     }
 
-    fn buffer_can_drain(&self) -> usize {
+    fn buffer_undelivered(&self) -> usize {
         match self {
-            Self::Ring(s) => s.buffer.can_drain(),
-            Self::Flat(s) => s.buffer.can_drain(),
-        }
-    }
-
-    fn buffer_can_drain_to_window_size(&self) -> Option<usize> {
-        match self {
-            Self::Ring(s) => s.buffer.can_drain_to_window_size(),
-            Self::Flat(s) => s.buffer.can_drain_to_window_size(),
+            Self::Ring(s) => s.buffer.undelivered(),
+            Self::Flat(s) => s.buffer.undelivered(),
         }
     }
 
@@ -670,8 +669,8 @@ impl DecoderScratchKind {
         }
     }
 
-    /// [`Self::buffer_read`], also reporting the drainable bytes `target` had
-    /// no room for.
+    /// [`Self::buffer_read`], also reporting the decoded bytes `target` had no
+    /// room for.
     fn buffer_read_reporting_pending(
         &mut self,
         target: &mut [u8],
@@ -3249,8 +3248,9 @@ impl FrameDecoder {
         })
     }
 
-    /// Collect bytes and retain window_size bytes while decoding is still going on.
-    /// After decoding of the frame (is_finished() == true) has finished it will collect all remaining bytes
+    /// Collect every decoded byte not collected yet. While the frame is still
+    /// decoding the window stays inside as history, already handed out; once
+    /// it is finished ([`Self::is_finished`]) the buffer is emptied.
     pub fn collect(&mut self) -> Option<Vec<u8>> {
         let finished = self.is_finished();
         let state = self.state.as_mut()?;
@@ -3261,8 +3261,7 @@ impl FrameDecoder {
         }
     }
 
-    /// Collect bytes and retain window_size bytes while decoding is still going on.
-    /// After decoding of the frame (is_finished() == true) has finished it will collect all remaining bytes
+    /// [`Self::collect`] into `w`.
     pub fn collect_to_writer(&mut self, w: impl Write) -> Result<usize, Error> {
         let finished = self.is_finished();
         let state = match &mut self.state {
@@ -3276,23 +3275,12 @@ impl FrameDecoder {
         }
     }
 
-    /// How many bytes can currently be collected from the decodebuffer, while decoding is going on this will be lower than the actual decodbuffer size
-    /// because window_size bytes need to be retained for decoding.
-    /// After decoding of the frame (is_finished() == true) has finished it will report all remaining bytes
+    /// How many decoded bytes are waiting to be collected: every byte decoded
+    /// and not collected yet, whether or not the frame is finished.
     pub fn can_collect(&self) -> usize {
-        let finished = self.is_finished();
-        let state = match &self.state {
-            None => return 0,
-            Some(s) => s,
-        };
-        if finished {
-            state.decoder_scratch.buffer_can_drain()
-        } else {
-            state
-                .decoder_scratch
-                .buffer_can_drain_to_window_size()
-                .unwrap_or(0)
-        }
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.decoder_scratch.buffer_undelivered())
     }
 
     /// Decodes blocks from the source slice and reads from the decodebuffer into the target slice, one block at a
@@ -3304,8 +3292,12 @@ impl FrameDecoder {
     /// By all means use decode_blocks if you have a io.Reader available. This is just for compatibility with other decompressors
     /// which try to serve an old-style c api
     ///
+    /// Every decoded byte goes to `target` as soon as it has room, the window
+    /// staying inside as history, so a frame that is not finished yet still
+    /// hands over everything its blocks so far decode to.
+    ///
     /// Returns (read, written). Both zero means the call made no progress: the
-    /// source holds no full block and the buffer no drainable output, so the
+    /// source holds no full block and the buffer no undelivered output, so the
     /// same input cannot advance. `read == 0` with `written > 0` is progress of
     /// the other kind: `target` filled from output already buffered, and the
     /// same input decodes further once the caller offers more room.
@@ -3404,10 +3396,10 @@ impl FrameDecoder {
                     if state.frame_finished {
                         break;
                     }
-                    // Hand what the window no longer needs to `target` before
-                    // decoding more, and decode no further while `target` cannot
-                    // take it: the buffer then holds one window plus the block
-                    // being decoded, whatever the caller supplies, as upstream
+                    // Hand every decoded byte to `target` before decoding more,
+                    // and decode no further while `target` cannot take it: the
+                    // buffer then holds one window plus the block being decoded,
+                    // whatever the caller supplies, as upstream
                     // `ZSTD_decompressStream` flushes each block before the next.
                     let (read, pending) = state
                         .decoder_scratch
