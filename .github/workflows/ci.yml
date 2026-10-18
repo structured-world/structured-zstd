@@ -755,6 +755,28 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+  miri:
+    # Miri's Stacked Borrows model over a round trip through every
+    # match-finder backend, with and without a dictionary: the backends hoist
+    # raw pointers into their tables above the hot loops, and a pointer taken
+    # through a temporary slice is invalidated by the next slice of the same
+    # table. The scalar kernel keeps Miri off SIMD intrinsics it does not model.
+    name: Miri
+    needs: lint
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: miri
+      - name: Miri (table pointers)
+        working-directory: zstd
+        run: cargo +nightly miri test -p structured-zstd --no-default-features --features std,hash,kernel-scalar --test pointer_provenance
+
   fuzz:
     # Short-budget libFuzzer smoke run across all targets in a single
     # runner. The asan+sancov sub-build of `structured-zstd` is the
@@ -850,7 +872,7 @@ jobs:
     # expected outcome. The bench jobs are left out: they never run on pull
     # requests.
     name: CI result
-    needs: [changes, lint, c-abi, test, cross-i686, msrv, no-std, wasm, codecov, fuzz]
+    needs: [changes, lint, c-abi, test, cross-i686, msrv, no-std, wasm, codecov, miri, fuzz]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest

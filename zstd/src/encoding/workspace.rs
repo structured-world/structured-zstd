@@ -750,8 +750,15 @@ impl<T: Copy> Table<T> {
 
     /// The first value's address, taken from the table's own pointer rather
     /// than through a slice: it stays usable while slices of the table are
-    /// made and dropped around it, until the table is laid out again.
-    pub(crate) fn base_ptr(&mut self) -> *mut T {
+    /// made and dropped around it, until the table is laid out again. The
+    /// slice method of the same name, reached through `Deref`, would derive it
+    /// from a temporary slice that the next one invalidates.
+    pub(crate) fn as_ptr(&self) -> *const T {
+        self.view.as_ptr()
+    }
+
+    /// Writable form of [`Self::as_ptr`], with the same lifetime.
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut T {
         self.view.as_mut_ptr()
     }
 

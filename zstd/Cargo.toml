@@ -239,6 +239,13 @@ name = "workspace_no_alloc"
 path = "tests/workspace_no_alloc.rs"
 required-features = ["caller-workspace", "std"]
 
+# Round trips through every match-finder backend, sized for Miri: a binary of
+# its own keeps the Miri run to these tests rather than the whole unit tree.
+[[test]]
+name = "pointer_provenance"
+path = "tests/pointer_provenance.rs"
+required-features = ["std"]
+
 # Pure-Rust examples of the caller-workspace decoder; unlike the examples the
 # `ffi-bench` crate builds, they link no C code.
 [[example]]

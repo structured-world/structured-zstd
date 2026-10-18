@@ -834,7 +834,7 @@ impl MatchTable {
     #[inline(always)]
     pub(crate) fn table_bases(&mut self) -> (*mut u32, *mut u32, *mut u32) {
         debug_assert!(self.chain_off <= self.hash3_off && self.hash3_off <= self.tables.len());
-        let base = self.tables.base_ptr();
+        let base = self.tables.as_mut_ptr();
         // SAFETY: both offsets are inside the buffer (asserted above; the
         // layout that set them sized the buffer to hold every region).
         unsafe { (base, base.add(self.chain_off), base.add(self.hash3_off)) }
