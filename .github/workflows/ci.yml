@@ -368,7 +368,8 @@ jobs:
       - name: Test
         if: needs.changes.outputs.code == 'true'
         working-directory: zstd
-        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder
+        # `lsm` included: its tests are compiled out of every other run.
+        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder,lsm
       - name: Test (caller-workspace)
         # The whole suite again with the feature on: the shared decode core
         # then runs on inline table storage, and the workspace decoder's own
