@@ -12,11 +12,8 @@ ZSTD_BIN="$(cd "$(dirname "${1:?usage: $0 <zstd-binary> [--test-large-data]}")" 
 shift
 LARGE_DATA="${1:-}"
 
-UPSTREAM_VERSION=1.5.7
-TARBALL="zstd-${UPSTREAM_VERSION}.tar.gz"
-TARBALL_URL="https://github.com/facebook/zstd/releases/download/v${UPSTREAM_VERSION}/${TARBALL}"
-# The digest upstream publishes next to the tarball (`${TARBALL}.sha256`).
-TARBALL_SHA256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+# shellcheck source=scripts/upstream-zstd.sh
+source "$(dirname "$0")/upstream-zstd.sh"
 
 if [[ -n "${CONFORMANCE_WORK:-}" ]]; then
   WORK="$CONFORMANCE_WORK"
@@ -27,25 +24,7 @@ else
   KEEP_WORK=0
 fi
 
-sha256_of() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | cut -d' ' -f1
-  else
-    shasum -a 256 "$1" | cut -d' ' -f1
-  fi
-}
-
-if [[ ! -f "$WORK/$TARBALL" ]]; then
-  curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL "$TARBALL_URL" -o "$WORK/$TARBALL"
-fi
-actual="$(sha256_of "$WORK/$TARBALL")"
-if [[ "$actual" != "$TARBALL_SHA256" ]]; then
-  echo "error: $TARBALL has digest $actual, expected $TARBALL_SHA256" >&2
-  exit 1
-fi
-rm -rf "$WORK/zstd-${UPSTREAM_VERSION}"
-tar -xzf "$WORK/$TARBALL" -C "$WORK"
-UPSTREAM="$WORK/zstd-${UPSTREAM_VERSION}"
+UPSTREAM="$(unpack_upstream "$WORK")"
 make -C "$UPSTREAM/tests" datagen >/dev/null
 DATAGEN_BIN="$UPSTREAM/tests/datagen"
 

@@ -34,10 +34,12 @@ def level_args(level):
 
 
 def compress(binary, level, src, dst):
+    # --single-thread on both: the reference otherwise compresses in worker
+    # threads, so its time would measure thread overlap, not the codec.
     start = time.perf_counter()
     with open(dst, "wb") as out:
         subprocess.run(
-            [binary, *level_args(level), "-q", "-c", "--", str(src)],
+            [binary, *level_args(level), "--single-thread", "-q", "-c", "--", str(src)],
             stdout=out,
             check=True,
         )
