@@ -173,7 +173,10 @@ fn generate_sequences_keeps_no_frame_behind() {
     let cctx = ZSTD_createCCtx();
     let parse = generate(cctx, &input);
     assert!(parse.last().unwrap().is_delimiter());
-    let kept = unsafe { (*cctx).scratch.capacity() };
+    let kept = unsafe { cctx.as_ref() }
+        .expect("a context was created")
+        .scratch
+        .capacity();
     assert!(
         kept < input.len() / 2,
         "the context keeps {kept} bytes of a frame it never handed out"
@@ -338,6 +341,90 @@ unsafe extern "C" fn literal_producer(
         out.write(ZSTD_Sequence::delimiter(src_size as u32));
     }
     1
+}
+
+/// Parses a block of one repeated byte as densely as a parse can be: one
+/// literal, then three-byte matches at offset 1, close to the sequence bound.
+unsafe extern "C" fn dense_producer(
+    _state: *mut c_void,
+    out: *mut ZSTD_Sequence,
+    capacity: usize,
+    _src: *const c_void,
+    src_size: usize,
+    _dict: *const c_void,
+    _dict_size: usize,
+    _level: c_int,
+    _window: usize,
+) -> usize {
+    let mut parse = Vec::new();
+    if src_size >= 4 {
+        parse.push(seq(1, 1, 3));
+        let mut at = 4;
+        while src_size - at >= 3 {
+            parse.push(seq(1, 0, 3));
+            at += 3;
+        }
+        parse.push(ZSTD_Sequence::delimiter((src_size - at) as u32));
+    } else {
+        parse.push(ZSTD_Sequence::delimiter(src_size as u32));
+    }
+    if parse.len() > capacity {
+        return usize::MAX;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(parse.as_ptr(), out, parse.len()) };
+    parse.len()
+}
+
+/// The context a parameter set compresses with, after one frame of `input`:
+/// its footprint and the set's estimates, one-shot and streaming.
+fn footprint_and_estimates(
+    input: &[u8],
+    producer: Option<crate::sequences::ZSTD_sequenceProducer_F>,
+) -> (usize, usize, usize) {
+    let params = ZSTD_createCCtxParams();
+    let cctx = ZSTD_createCCtx();
+    assert!(!params.is_null() && !cctx.is_null());
+    unsafe {
+        // The estimates and the context size the same frame.
+        let hint = c_int::try_from(input.len()).unwrap();
+        assert_eq!(
+            ZSTD_CCtxParams_setParameter(params, crate::params::ZSTD_C_SRC_SIZE_HINT, hint),
+            0
+        );
+        ZSTD_CCtxParams_registerSequenceProducer(params, core::ptr::null_mut(), producer);
+        assert_eq!(ZSTD_CCtx_setParametersUsingCCtxParams(cctx, params), 0);
+    }
+    let frame = compress2(cctx, input).unwrap();
+    assert_eq!(decode(&frame, input.len()), input);
+    let held = unsafe { crate::context::ZSTD_sizeof_CCtx(cctx) };
+    let estimate = unsafe { crate::cctx_params::ZSTD_estimateCCtxSize_usingCCtxParams(params) };
+    let stream = unsafe { crate::cctx_params::ZSTD_estimateCStreamSize_usingCCtxParams(params) };
+    assert_eq!(ZSTD_isError(estimate), 0, "{:?}", code(estimate));
+    assert_eq!(ZSTD_isError(stream), 0, "{:?}", code(stream));
+    unsafe {
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeCCtxParams(params);
+    }
+    (held, estimate, stream)
+}
+
+/// Registering a producer on a parameter set raises both of its estimates by
+/// at least what the context keeps for the producer's parse, as upstream
+/// budgets `ZSTD_sequenceBound(blockSize)` sequences for it
+/// (zstd_compress.c:1734-1736).
+#[test]
+fn a_producer_raises_the_estimates_by_its_parse() {
+    let input = vec![b'a'; 1 << 18];
+    let (held_plain, estimate_plain, stream_plain) = footprint_and_estimates(&input, None);
+    let (held, estimate, stream) = footprint_and_estimates(&input, Some(dense_producer));
+    let parse = held - held_plain;
+    assert!(parse > 0, "the producer's parse is kept");
+    assert!(
+        estimate - estimate_plain >= parse && stream - stream_plain >= parse,
+        "a {parse}-byte parse raised the estimates by {} and {}",
+        estimate - estimate_plain,
+        stream - stream_plain
+    );
 }
 
 /// Records the compression level it is asked at in the `c_int` its state

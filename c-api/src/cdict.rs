@@ -55,7 +55,9 @@ pub(crate) fn dict_id_from_bytes(dict: &[u8]) -> u32 {
 /// many can use one `CDict` concurrently without preparing it again.
 #[allow(non_camel_case_types)]
 pub struct ZSTD_CDict {
-    pub(crate) dict: EncoderDictionary,
+    /// The prepared dictionary; `None` for one made from no bytes, which
+    /// carries its parameters and no content, as upstream's does.
+    pub(crate) dict: Option<EncoderDictionary>,
     pub(crate) id: u32,
     pub(crate) level: c_int,
     /// Never-reused identity for context cache validation (see [`DICT_SERIAL`]).
@@ -100,6 +102,18 @@ pub(crate) fn prepare_compression_dictionary(
     prepared.ok().flatten()
 }
 
+/// What a CDict holds of `dict`: nothing for no bytes, which upstream takes as
+/// a CDict of parameters alone (zstd_compress.c:5562-5598), else the prepared
+/// dictionary. `Err` when the bytes cannot be prepared.
+fn prepare_cdict_content(dict: &[u8], raw_content: bool) -> Result<Option<EncoderDictionary>, ()> {
+    if dict.is_empty() {
+        return Ok(None);
+    }
+    prepare_compression_dictionary(dict, raw_content)
+        .map(Some)
+        .ok_or(())
+}
+
 /// `ZSTD_CDict* ZSTD_createCDict(const void* dictBuffer, size_t dictSize, int
 /// compressionLevel)` — parse and validate a dictionary for repeated
 /// compression at `compressionLevel`. Returns `NULL` on allocation failure or
@@ -115,13 +129,10 @@ pub unsafe extern "C" fn ZSTD_createCDict(
     compression_level: c_int,
 ) -> *mut ZSTD_CDict {
     let dict = unsafe { in_slice(dict_buffer, dict_size) };
-    if dict.is_empty() {
-        return core::ptr::null_mut();
-    }
     // Auto content type (upstream createCDict): a serialized dictionary must
     // parse for encoding, anything else is a raw-content dictionary.
     let raw_content = !codec::decoding::Dictionary::is_serialized(dict);
-    let Some(prepared) = prepare_compression_dictionary(dict, raw_content) else {
+    let Ok(prepared) = prepare_cdict_content(dict, raw_content) else {
         return core::ptr::null_mut();
     };
     try_box(ZSTD_CDict {
@@ -275,16 +286,13 @@ pub(crate) fn create_cdict_with_params(
     if !custom_mem.is_default() {
         return core::ptr::null_mut();
     }
-    if dict.is_empty() {
-        return core::ptr::null_mut();
-    }
     let Ok(raw_content) = crate::attach::encode_raw_content(dict, dict_content_type) else {
         return core::ptr::null_mut();
     };
     let Some(resolved) = params.resolve() else {
         return core::ptr::null_mut();
     };
-    let Some(prepared) = prepare_compression_dictionary(dict, raw_content) else {
+    let Ok(prepared) = prepare_cdict_content(dict, raw_content) else {
         return core::ptr::null_mut();
     };
     try_box(ZSTD_CDict {
@@ -367,7 +375,7 @@ pub unsafe extern "C" fn ZSTD_sizeof_CDict(cdict: *const ZSTD_CDict) -> usize {
         return 0;
     }
     let cdict = unsafe { &*cdict };
-    core::mem::size_of::<ZSTD_CDict>() + cdict.dict.heap_size()
+    core::mem::size_of::<ZSTD_CDict>() + cdict.dict.as_ref().map_or(0, EncoderDictionary::heap_size)
 }
 
 /// `unsigned ZSTD_getDictID_fromCDict(const ZSTD_CDict* cdict)` — the dictionary
@@ -420,7 +428,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
         } = cctx;
         // The kept compressor attaches the CDict once; the next call with it
         // reuses the primed snapshot that first frame captured.
-        let enc = kept_compressor(compressor, key, Some(&cdict_ref.dict), cdict_ref.level)?;
+        let enc = kept_compressor(compressor, key, cdict_ref.dict.as_ref(), cdict_ref.level)?;
         set_frame_parameters(enc, cdict_ref.params.as_ref(), cdict_ref.level);
         // Per-call frame flags: the compressor is shared with every other
         // one-shot entry point, whose flags must not leak into this one.
@@ -486,7 +494,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict_advanced(
             compressor,
             ..
         } = cctx;
-        let enc = kept_compressor(compressor, key, Some(&cdict_ref.dict), cdict_ref.level)?;
+        let enc = kept_compressor(compressor, key, cdict_ref.dict.as_ref(), cdict_ref.level)?;
         set_frame_parameters(enc, cdict_ref.params.as_ref(), cdict_ref.level);
         enc.set_content_checksum(fparams.checksumFlag != 0);
         enc.set_content_size_flag(fparams.contentSizeFlag != 0);

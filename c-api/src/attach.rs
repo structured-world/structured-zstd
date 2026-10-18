@@ -86,7 +86,7 @@ impl CCtxDictAttach {
             CCtxDictAttach::Load { dict, .. } | CCtxDictAttach::Prefix { dict, .. } => Some(dict),
             // SAFETY: C contract — the CDict outlives every context that
             // references it (`ZSTD_CCtx_refCDict` lifetime rule).
-            CCtxDictAttach::RefCDict { cdict, .. } => Some(&unsafe { &**cdict }.dict),
+            CCtxDictAttach::RefCDict { cdict, .. } => unsafe { &**cdict }.dict.as_ref(),
         }
     }
 }
@@ -193,7 +193,13 @@ pub(crate) fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<boo
 /// and reads it back at :5254 and :5837).
 pub(crate) fn cdict_params_describe_frame(cdict: &ZSTD_CDict, src_size: Option<u64>) -> bool {
     cdict.params.is_some()
-        || codec::encoding::dictionary_describes_frame(cdict.dict.content_size(), src_size)
+        || codec::encoding::dictionary_describes_frame(
+            cdict
+                .dict
+                .as_ref()
+                .map_or(0, codec::encoding::EncoderDictionary::content_size),
+            src_size,
+        )
 }
 
 impl ZSTD_CCtx {

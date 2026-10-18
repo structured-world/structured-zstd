@@ -79,7 +79,7 @@ impl BufferlessBegin {
             params,
             frame_params,
             level: cdict.level,
-            dictionary: Some(cdict.dict.clone()),
+            dictionary: cdict.dict.clone(),
             serial: cdict.serial,
             suppress_id: cdict.raw_content,
         }

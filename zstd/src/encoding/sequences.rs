@@ -70,6 +70,19 @@ pub const fn sequence_bound(src_size: usize) -> usize {
         + (src_size / crate::common::MIN_MAX_BLOCK_SIZE as usize + 1)
 }
 
+/// Heap bytes a compressor keeps for a [`SequenceProducer`]'s parse of blocks
+/// up to `block_size` bytes: room for [`sequence_bound`] sequences, as many as
+/// a parse it can use holds, kept from block to block (upstream reserves the
+/// same for its external sequences, zstd_compress.c:2236-2239).
+///
+/// ```
+/// use structured_zstd::encoding::sequences::{producer_parse_heap_bytes, sequence_bound};
+/// assert_eq!(producer_parse_heap_bytes(131_072), sequence_bound(131_072) * 16);
+/// ```
+pub const fn producer_parse_heap_bytes(block_size: usize) -> usize {
+    sequence_bound(block_size) * core::mem::size_of::<ExternalSequence>()
+}
+
 /// Remove every block delimiter from `sequences`, handing its literals to the
 /// sequence after it, and return how many sequences remain at the front (C
 /// `ZSTD_mergeBlockDelimiters`). A final delimiter's literals become the

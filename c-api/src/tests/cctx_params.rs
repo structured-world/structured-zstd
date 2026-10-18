@@ -638,6 +638,80 @@ fn cdict_from_a_parameter_set_round_trips() {
     }
 }
 
+/// An empty dictionary makes a CDict that carries its parameters and no
+/// content, as upstream's does (zstd_compress.c:5562-5598); only fullDict,
+/// which names a dictionary it does not get, refuses it (:5206-5207).
+#[test]
+fn an_empty_cdict_carries_parameters_only() {
+    let input: Vec<u8> = b"compressed under a parameter-only cdict "
+        .iter()
+        .copied()
+        .cycle()
+        .take(1 << 20)
+        .collect();
+    let default_mem = ZSTD_customMem {
+        customAlloc: core::ptr::null(),
+        customFree: core::ptr::null(),
+        opaque: core::ptr::null(),
+    };
+    let content = b"raw dictionary content the frame never matches ".repeat(20);
+    let params = ZSTD_createCCtxParams();
+    let cctx = ZSTD_createCCtx();
+    // The window the frame of `input` declares under `cdict`; the frame
+    // decodes with no dictionary when `standalone`.
+    let window_under = |cdict: *mut crate::cdict::ZSTD_CDict, standalone: bool| unsafe {
+        let mut frame = vec![0u8; ZSTD_compressBound(input.len())];
+        let n = ZSTD_compress_usingCDict(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            input.as_ptr(),
+            input.len(),
+            cdict,
+        );
+        assert_eq!(ZSTD_isError(n), 0, "{:?}", code(n));
+        let mut header = core::mem::MaybeUninit::<crate::frame::ZSTD_FrameHeader>::uninit();
+        let rc = crate::frame::ZSTD_getFrameHeader(header.as_mut_ptr(), frame.as_ptr(), n);
+        assert_eq!(rc, 0, "{:?}", code(rc));
+        let header = header.assume_init();
+        assert_eq!(header.dictID, 0);
+        if standalone {
+            let mut out = vec![0u8; input.len()];
+            let m = crate::simple::ZSTD_decompress(out.as_mut_ptr(), out.len(), frame.as_ptr(), n);
+            assert_eq!(m, input.len(), "{:?}", code(m));
+            assert_eq!(out, input);
+        }
+        header.windowSize
+    };
+    unsafe {
+        assert_eq!(ZSTD_CCtxParams_setParameter(params, WINDOW_LOG, 10), 0);
+        let plain = crate::cdict::ZSTD_createCDict(core::ptr::null(), 0, 3);
+        let empty = ZSTD_createCDict_advanced2(core::ptr::null(), 0, 0, 0, params, default_mem);
+        let full = ZSTD_createCDict_advanced2(core::ptr::null(), 0, 0, 2, params, default_mem);
+        let filled =
+            ZSTD_createCDict_advanced2(content.as_ptr(), content.len(), 0, 1, params, default_mem);
+        assert!(!plain.is_null() && !empty.is_null() && !filled.is_null());
+        assert!(full.is_null(), "fullDict over nothing is refused");
+
+        let plain_window = window_under(plain, true);
+        let empty_window = window_under(empty, true);
+        assert_eq!(
+            empty_window,
+            window_under(filled, false),
+            "an empty CDict runs its parameters as a filled one does"
+        );
+        assert!(
+            empty_window < plain_window,
+            "{empty_window} vs {plain_window}"
+        );
+        for cdict in [plain, empty, filled] {
+            ZSTD_freeCDict(cdict);
+        }
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeCCtxParams(params);
+    }
+}
+
 /// The estimates read the set: a wider window costs more, and the streaming
 /// budget covers the one-shot one.
 #[test]

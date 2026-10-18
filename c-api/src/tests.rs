@@ -762,9 +762,12 @@ fn create_cdict_treats_unmagicked_bytes_as_raw_content() {
     assert_eq!(unsafe { ZSTD_getDictID_fromCDict(cdict) }, 0);
     unsafe { ZSTD_freeCDict(cdict) };
 
-    // An empty dictionary is a creation failure.
+    // An empty dictionary makes a CDict of parameters alone, ID 0, as
+    // upstream's does (zstd_compress.c:5562-5598).
     let cdict = unsafe { ZSTD_createCDict(core::ptr::null(), 0, 3) };
-    assert!(cdict.is_null(), "empty createCDict must fail");
+    assert!(!cdict.is_null(), "empty createCDict must succeed");
+    assert_eq!(unsafe { ZSTD_getDictID_fromCDict(cdict) }, 0);
+    unsafe { ZSTD_freeCDict(cdict) };
 
     // A magic-prefixed blob whose tables don't parse is corrupt.
     let mut corrupt = vec![0x37u8, 0xA4, 0x30, 0xEC];

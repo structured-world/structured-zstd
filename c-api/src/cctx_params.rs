@@ -626,11 +626,22 @@ fn workspace_for(params: &CCtxParams) -> Result<usize, ZSTD_ErrorCode> {
         .resolve()
         .ok_or(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported)?;
     let hint = (params.src_size_hint > 0).then_some(params.src_size_hint as u64);
-    Ok(
-        codec::encoding::estimated_compression_workspace_bytes_for_parameters(
-            &resolved, hint, None,
-        ),
-    )
+    let workspace = codec::encoding::estimated_compression_workspace_bytes_for_parameters(
+        &resolved, hint, None,
+    );
+    // A registered producer's parse is kept from block to block, sized for the
+    // largest block the set allows.
+    let parse = if params.producer.is_some() {
+        let block = params
+            .max_block_size()
+            .map_or(codec::MAX_BLOCK_SIZE as usize, |size| size as usize);
+        codec::encoding::sequences::producer_parse_heap_bytes(block)
+    } else {
+        0
+    };
+    workspace
+        .checked_add(parse)
+        .ok_or(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound)
 }
 
 /// `size_t ZSTD_estimateCCtxSize_usingCCtxParams(const ZSTD_CCtx_params*

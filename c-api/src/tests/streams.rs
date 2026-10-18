@@ -663,6 +663,47 @@ fn decode_through_window(zds: *mut ZSTD_DCtx, stream: &[u8], window: usize) -> V
     }
 }
 
+/// A context that took literal-heavy blocks in small pieces, staging each,
+/// stays within the budget `ZSTD_estimateDStreamSize` gives for the frame's
+/// window, the staged input block included.
+#[test]
+fn a_stream_decoded_in_pieces_stays_within_its_estimate() {
+    let mut state = 0x9E37_79B9u32;
+    // Sixteen symbols in no repeating order: blocks of Huffman literals.
+    let input: Vec<u8> = (0..1usize << 20)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            b'a' + (state % 16) as u8
+        })
+        .collect();
+    let mut frame = vec![0u8; crate::simple::ZSTD_compressBound(input.len())];
+    let n = unsafe {
+        crate::simple::ZSTD_compress(
+            frame.as_mut_ptr(),
+            frame.len(),
+            input.as_ptr(),
+            input.len(),
+            3,
+        )
+    };
+    assert_eq!(ZSTD_isError(n), 0, "{:?}", code(n));
+    frame.truncate(n);
+    let window = usize::try_from(header(&frame).windowSize).unwrap();
+
+    let zds = ZSTD_createDStream();
+    assert!(!zds.is_null());
+    assert_eq!(decode_through_window(zds, &frame, 61), input);
+    let held = unsafe { crate::context::ZSTD_sizeof_DCtx(zds) };
+    let budget = crate::estimate::ZSTD_estimateDStreamSize(window);
+    assert!(
+        held <= budget,
+        "the context holds {held} bytes over a budget of {budget} for a {window}-byte window"
+    );
+    unsafe { ZSTD_freeDCtx(zds) };
+}
+
 /// A frame header split across calls is taken in as it arrives, one byte at
 /// a time if need be, and the context counts as inside a frame meanwhile.
 #[test]

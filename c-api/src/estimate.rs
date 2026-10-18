@@ -129,7 +129,8 @@ pub extern "C" fn ZSTD_estimateCStreamSize(max_compression_level: c_int) -> usiz
 
 /// `size_t ZSTD_estimateDStreamSize(size_t maxWindowSize)` — budget for a
 /// streaming decompression context decoding frames up to `maxWindowSize`:
-/// the window history buffer plus one output block plus the fixed tables.
+/// the window history buffer, one output block, the fixed tables, and the
+/// block a stream fed in pieces stages with its header until it is whole.
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_estimateDStreamSize(max_window_size: usize) -> usize {
     // A window beyond the format's maximum is invalid input, not a number
@@ -139,7 +140,9 @@ pub extern "C" fn ZSTD_estimateDStreamSize(max_window_size: usize) -> usize {
     if max_window_size > (1usize << WINDOW_LOG_MAX) {
         return crate::error::encode(crate::error::ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
     }
-    ZSTD_estimateDCtxSize() + max_window_size + BLOCK_SIZE_MAX
+    // RFC 8878 3.1.1.2: a block header is 3 bytes; the staged step is one.
+    const BLOCK_HEADER_SIZE: usize = 3;
+    ZSTD_estimateDCtxSize() + max_window_size + 2 * BLOCK_SIZE_MAX + BLOCK_HEADER_SIZE
 }
 
 /// `size_t ZSTD_estimateDStreamSize_fromFrame(const void* src, size_t

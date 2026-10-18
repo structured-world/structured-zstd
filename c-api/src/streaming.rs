@@ -1183,9 +1183,13 @@ fn decode_stream_frame(
         }
         let (read, written) = if staged.is_empty() {
             let available = &src[inp.pos..];
-            if decoder.input_needed(available) > available.len() && decoder.can_collect() == 0 {
+            let needed = decoder.input_needed(available);
+            if needed > available.len() && decoder.can_collect() == 0 {
                 // The step runs past the input, so all of the input is part
-                // of it.
+                // of it. Room for exactly the step, so the buffer holds at
+                // most a block header and a block, as upstream's inBuff does
+                // and as ZSTD_estimateDStreamSize budgets.
+                staged.reserve_exact(needed);
                 staged.extend_from_slice(available);
                 inp.pos = inp.size;
                 return Ok(false);
@@ -1198,6 +1202,7 @@ fn decode_stream_frame(
             if want > staged.len() {
                 let available = &src[inp.pos..];
                 let take = (want - staged.len()).min(available.len());
+                staged.reserve_exact(want - staged.len());
                 staged.extend_from_slice(&available[..take]);
                 inp.pos += take;
                 if staged.len() < want && decoder.can_collect() == 0 {
