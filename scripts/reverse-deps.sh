@@ -19,8 +19,14 @@
 set -euo pipefail
 
 abs() { echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; }
-ZSTD_BIN="$(abs "${1:?usage: $0 <our-zstd> <our-libzstd.so>}")"
-OUR_LIB="$(abs "${2:?usage: $0 <our-zstd> <our-libzstd.so>}")"
+for input in "${1:?usage: $0 <our-zstd> <our-libzstd.so>}" "${2:?usage: $0 <our-zstd> <our-libzstd.so>}"; do
+  if [[ ! -f "$input" ]]; then
+    echo "no such file: $input" >&2
+    exit 2
+  fi
+done
+ZSTD_BIN="$(abs "$1")"
+OUR_LIB="$(abs "$2")"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -72,14 +78,18 @@ preloaded() {
   local log="$WORK/ld-$1"
   shift
   LD_PRELOAD="$OUR_LIB" LD_DEBUG=bindings LD_DEBUG_OUTPUT="$log" "$@"
-  if ! cat "$log".* 2>/dev/null | grep -q "to $OUR_LIB .*symbol \`ZSTD_"; then
+  # grep reads the logs itself: behind a pipe, `grep -q` stopping at the first
+  # hit kills the writer with SIGPIPE, and pipefail reads that as no match.
+  if ! grep -qs "to $OUR_LIB .*symbol \`ZSTD_" "$log".*; then
     echo "no ZSTD_* call was bound to $OUR_LIB" >&2
     exit 1
   fi
 }
 
 links_libzstd() {
-  ldd "$(command -v "$1")" 2>/dev/null | grep -q 'libzstd\.so'
+  local deps
+  deps="$(ldd "$(command -v "$1")" 2>/dev/null)" || return 1
+  [[ "$deps" == *libzstd.so* ]]
 }
 
 echo "== bsdtar --zstd"
