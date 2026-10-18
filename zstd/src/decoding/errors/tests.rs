@@ -2,9 +2,132 @@ use alloc::{string::ToString, vec};
 
 use super::{
     BlockTypeError, DecodeBlockContentError, DecodeBufferError, DecodeSequenceError,
-    DecompressBlockError, DecompressLiteralsError, ExecuteSequencesError, FSETableError,
-    FrameDecoderError, HuffmanTableError,
+    DecompressBlockError, DecompressLiteralsError, DictionaryDecodeError, ErrorCode,
+    ExecuteSequencesError, FSETableError, FrameDecoderError, FrameDescriptorError,
+    FrameHeaderError, HuffmanTableError, ReadFrameHeaderError,
 };
+
+/// Every decoder failure maps to the libzstd code the C API returns for it, and
+/// a refused descriptor is told apart: a set reserved bit is an unsupported
+/// parameter, anything else a damaged frame.
+#[test]
+fn decoder_errors_map_to_their_libzstd_codes() {
+    let cases = [
+        (
+            FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::InvalidFrameDescriptor(
+                FrameDescriptorError::ReservedBitSet,
+            )),
+            ErrorCode::FrameParameterUnsupported,
+        ),
+        (
+            FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::InvalidFrameDescriptor(
+                FrameDescriptorError::InvalidFrameContentSizeFlag { got: 4 },
+            )),
+            ErrorCode::CorruptionDetected,
+        ),
+        (
+            FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(0)),
+            ErrorCode::PrefixUnknown,
+        ),
+        (
+            FrameDecoderError::FrameHeaderError(FrameHeaderError::FrameSizeIsZero),
+            ErrorCode::FrameParameterUnsupported,
+        ),
+        (
+            FrameDecoderError::FailedToInitialize(FrameHeaderError::WindowTooSmall { got: 1 }),
+            ErrorCode::FrameParameterUnsupported,
+        ),
+        (
+            FrameDecoderError::WindowSizeTooBig {
+                requested: 2,
+                limit: 1,
+            },
+            ErrorCode::FrameParameterWindowTooLarge,
+        ),
+        (
+            FrameDecoderError::WindowCeilingOutOfRange { requested: 0 },
+            ErrorCode::ParameterOutOfBound,
+        ),
+        (
+            FrameDecoderError::DictionaryDecodeError(DictionaryDecodeError::ZeroDictionaryId),
+            ErrorCode::DictionaryCorrupted,
+        ),
+        (
+            FrameDecoderError::DictNotProvided { dict_id: 7 },
+            ErrorCode::DictionaryWrong,
+        ),
+        (
+            FrameDecoderError::DictIdMismatch {
+                expected: 7,
+                provided: 8,
+            },
+            ErrorCode::DictionaryWrong,
+        ),
+        (
+            FrameDecoderError::DictAlreadyRegistered { dict_id: 7 },
+            ErrorCode::DictionaryWrong,
+        ),
+        (
+            FrameDecoderError::TargetTooSmall,
+            ErrorCode::DstSizeTooSmall,
+        ),
+        (FrameDecoderError::NotYetInitialized, ErrorCode::InitMissing),
+        (
+            FrameDecoderError::ChecksumMismatch {
+                expected: 1,
+                calculated: 2,
+            },
+            ErrorCode::ChecksumWrong,
+        ),
+        (
+            FrameDecoderError::FrameContentSizeMismatch {
+                declared: 1,
+                produced: 2,
+            },
+            ErrorCode::CorruptionDetected,
+        ),
+        (
+            FrameDecoderError::FailedToSkipFrame,
+            ErrorCode::CorruptionDetected,
+        ),
+    ];
+    for (err, code) in cases {
+        assert_eq!(err.code(), code, "{err:?}");
+    }
+}
+
+/// Each code carries libzstd's own message (`ZSTD_getErrorString`), the text
+/// the command line prints for it.
+#[test]
+fn error_codes_carry_the_libzstd_messages() {
+    let cases = [
+        (ErrorCode::PrefixUnknown, "Unknown frame descriptor"),
+        (
+            ErrorCode::FrameParameterUnsupported,
+            "Unsupported frame parameter",
+        ),
+        (
+            ErrorCode::FrameParameterWindowTooLarge,
+            "Frame requires too much memory for decoding",
+        ),
+        (ErrorCode::ParameterOutOfBound, "Parameter is out of bound"),
+        (ErrorCode::DictionaryCorrupted, "Dictionary is corrupted"),
+        (ErrorCode::DictionaryWrong, "Dictionary mismatch"),
+        (
+            ErrorCode::DstSizeTooSmall,
+            "Destination buffer is too small",
+        ),
+        (ErrorCode::InitMissing, "Context should be init first"),
+        (
+            ErrorCode::ChecksumWrong,
+            "Restored data doesn't match checksum",
+        ),
+        (ErrorCode::CorruptionDetected, "Data corruption detected"),
+    ];
+    for (code, message) in cases {
+        assert_eq!(code.message(), message, "{code:?}");
+    }
+}
 
 #[test]
 fn execute_sequences_output_overflow_requested_covers_all_arms() {

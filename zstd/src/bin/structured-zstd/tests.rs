@@ -5501,6 +5501,107 @@ fn decoding_benchmark_counts_the_dictionary_against_the_memory_limit() {
     assert!(err.contains("memory limit"), "{err}");
 }
 
+/// A decoding benchmark refuses what it cannot measure, each with its reason
+/// (no input, stdin, something that is not a file), and measures several
+/// files together or each on its own under `-S`.
+#[test]
+fn decoding_benchmark_refuses_unmeasurable_inputs_and_takes_several_files() {
+    use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
+
+    let scratch = Scratch::new("bench-decode-shapes");
+    let a = scratch.file(
+        "a.zst",
+        &compress_to_vec(&b"first file\n".repeat(50)[..], CompressionLevel::Default),
+    );
+    let b = scratch.file(
+        "b.zst",
+        &compress_to_vec(&b"second file\n".repeat(80)[..], CompressionLevel::Default),
+    );
+    let bench = |inputs: Vec<PathBuf>, extra: &[&str]| {
+        let mut args = vec!["-b", "-d", "-i0"];
+        args.extend_from_slice(extra);
+        args.push("x");
+        let mut opts = parse(&args).unwrap();
+        opts.inputs = inputs;
+        run_benchmark(&opts, None)
+    };
+    let refusal = |inputs: Vec<PathBuf>| bench(inputs, &["-q"]).unwrap_err().to_string();
+    assert!(refusal(vec![]).contains("data may be invalid"));
+    assert!(refusal(vec![PathBuf::from("-")]).contains("stdin"));
+    assert!(refusal(vec![scratch.path().to_path_buf()]).contains("regular files"));
+    bench(vec![a.clone(), b.clone()], &["-S"]).expect("each file measured on its own");
+    bench(vec![a, b], &[]).expect("both files measured together");
+}
+
+/// The compressing run's side paths: the parameters shown on request, the
+/// thread note, the summaries of empty inputs, the refusal of a
+/// multi-threaded mode beside one thread, and a directory given as input.
+#[test]
+fn compressing_run_covers_its_notes_summaries_and_refusals() {
+    let scratch = Scratch::new("run-side-paths");
+    let file = scratch.file("in.txt", &b"some text to compress\n".repeat(40));
+    let compress = |args: &[&str], inputs: Vec<PathBuf>| {
+        let mut opts = parse(args).unwrap();
+        opts.inputs = inputs;
+        run(opts)
+    };
+    assert_eq!(
+        compress(
+            &["--show-default-cparams", "-vv", "-f", "x"],
+            vec![file.clone()]
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        compress(&["-T2", "-q", "-f", "x"], vec![file.clone()]).unwrap(),
+        0
+    );
+    let empty = scratch.file("empty", b"");
+    let also_empty = scratch.file("also-empty", b"");
+    assert_eq!(compress(&["-f", "x"], vec![empty.clone()]).unwrap(), 0);
+    assert_eq!(compress(&["-f", "x"], vec![empty, also_empty]).unwrap(), 0);
+    let err = compress(&["--single-thread", "--rsyncable", "-q", "x"], vec![file])
+        .expect_err("rsyncable needs threads");
+    assert!(err.to_string().contains("Rsyncable"), "{err}");
+    assert_eq!(
+        single_thread_refusal(&parse(&["--single-thread", "f"]).unwrap()).map(|e| e.to_string()),
+        None
+    );
+    // A directory is refused as an input and counted as failed.
+    assert_eq!(
+        compress(&["-q", "x"], vec![scratch.path().to_path_buf()]).unwrap(),
+        1
+    );
+}
+
+/// A number too large for its field keeps the reference's own overflow line,
+/// by width, even inside a parameter list that otherwise reports the whole
+/// argument as incorrect.
+#[test]
+fn an_overflowing_number_reports_its_width() {
+    let refusal = |args: &[&str]| {
+        parse(args)
+            .err()
+            .expect("an overflowing number is refused")
+            .to_string()
+    };
+    let err = refusal(&["--zstd=wlog=99999999999", "f"]);
+    assert!(err.contains("overflows 32-bit unsigned int"), "{err}");
+    let err = refusal(&["--stream-size=999999999999999999999999", "f"]);
+    assert!(err.contains("overflows size_t"), "{err}");
+}
+
+/// A command line refused with an error of ours rather than a usage error
+/// fails with a status, and the small descriptive pieces read as intended.
+#[test]
+fn a_refused_command_line_fails_and_names_read_right() {
+    let raw: Vec<OsString> = vec!["zstd".into(), "-q".into(), "--format=gzip".into()];
+    assert_ne!(run_command(&raw, &mut io::empty()), 0);
+    assert_eq!(TooFewSamples.to_string(), "nb of samples too low");
+    assert_eq!(OutputFormat::Zstd.label(), "zstd");
+}
+
 /// One failing input does not end the run: the rest are processed and the
 /// failure count comes back to become the exit status, as the reference
 /// command's does.
