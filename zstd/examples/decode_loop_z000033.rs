@@ -204,6 +204,25 @@ fn main() {
                 total = total.wrapping_add(sink.len());
             }
         }
+        "read" => {
+            // `Read::read` into a 64 KiB buffer: output handed over block by
+            // block from the decode buffer, the path `read_to_end`'s direct
+            // decode of a sized frame bypasses.
+            use std::io::Read as _;
+            use structured_zstd::decoding::StreamingDecoder;
+            let mut buf = vec![0u8; 1 << 16];
+            for _ in 0..iters {
+                let mut decoder =
+                    StreamingDecoder::new(std::hint::black_box(compressed.as_slice()));
+                loop {
+                    let n = decoder.read(&mut buf).expect("stream decode");
+                    if n == 0 {
+                        break;
+                    }
+                    total = total.wrapping_add(n);
+                }
+            }
+        }
         _ => {
             let mut decoder = FrameDecoder::new();
             for _ in 0..iters {

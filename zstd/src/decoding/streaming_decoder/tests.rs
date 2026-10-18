@@ -791,15 +791,21 @@ fn read_to_end_after_a_part_read_raw_block_is_complete() {
     };
     let mut decoder = StreamingDecoder::new(source);
     let mut buf = [0u8; 64];
-    // The Raw block's first 100 bytes are taken, then the source blocks.
+    let mut out = alloc::vec::Vec::new();
+    // The Raw block's first 100 bytes are taken and handed out as they come,
+    // then the source blocks.
     loop {
         match decoder.read(&mut buf) {
             Err(e) if e.kind() == crate::io::ErrorKind::WouldBlock => break,
-            Ok(n) => assert_eq!(n, 0, "a frame's window holds its output until it ends"),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
             Err(e) => panic!("{e:?}"),
         }
     }
-    let mut out = alloc::vec::Vec::new();
+    assert_eq!(
+        out,
+        payload[..100],
+        "every byte is handed out as it arrives"
+    );
     decoder.read_to_end(&mut out).unwrap();
     assert!(out == payload, "decoded {} bytes", out.len());
 }
@@ -880,6 +886,41 @@ impl Read for Arrivals<'_> {
         self.served += n;
         Ok(n)
     }
+}
+
+/// A frame flushed and not ended yet, from a source that has nothing more for
+/// now, hands over every byte compressed before the flush: none of its last
+/// window waits for the end of a frame that has not come.
+#[test]
+fn a_flushed_frame_in_progress_hands_over_everything_so_far() {
+    let payload: alloc::vec::Vec<u8> = (0..50_000u32).flat_map(|i| (i / 7).to_le_bytes()).collect();
+    let mut context =
+        crate::encoding::CompressionContext::new(crate::encoding::CompressionLevel::Default);
+    let mut frame = alloc::vec::Vec::new();
+    context.write(&mut frame, &payload).unwrap();
+    context.flush(&mut frame).unwrap();
+    let stops = [frame.len()];
+    let source = Arrivals {
+        data: &frame,
+        served: 0,
+        stops: &stops,
+    };
+    let mut decoder = StreamingDecoder::new(source);
+    let mut buf = [0u8; 4096];
+    let mut out = alloc::vec::Vec::new();
+    loop {
+        match decoder.read(&mut buf) {
+            Err(e) if e.kind() == crate::io::ErrorKind::WouldBlock => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    assert!(
+        out == payload,
+        "handed over {} of {} bytes",
+        out.len(),
+        payload.len()
+    );
 }
 
 /// Input a `read` gathered before a `WouldBlock`, and whatever `read_to_end`

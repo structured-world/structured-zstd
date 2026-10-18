@@ -804,10 +804,28 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
                 self.position = Position::BetweenFrames;
                 continue;
             }
-            // A full `buf` never strands a checksum: a frame's last window of
-            // output is collectable only once the frame is finished, its
-            // checksum read, so the source already stands past the frame.
             if written == buf.len() {
+                // With the frame's output all handed over, its checksum is the
+                // next step, and it is taken in this call so the source stands
+                // past the frame, as upstream's stream decoder reads the
+                // checksum once the last block is flushed. A source that cannot
+                // give its four bytes now, or a step that fails, leaves it to
+                // the next call, which reports what went wrong: an error may
+                // not follow bytes this call delivers.
+                if decoder.awaits_checksum() && decoder.can_collect() == 0 {
+                    while self.input.pending().len() < 4 {
+                        match self.input.fill(&mut self.source, 4) {
+                            Ok(n) if n > 0 => {}
+                            _ => break,
+                        }
+                    }
+                    if self.input.pending().len() >= 4
+                        && let Ok((consumed, _)) =
+                            decoder.decode_available(&self.input.pending()[..4], &mut [], true)
+                    {
+                        self.input.consume(consumed);
+                    }
+                }
                 return Ok(written);
             }
             // A Raw block in progress reads on into the decode buffer once

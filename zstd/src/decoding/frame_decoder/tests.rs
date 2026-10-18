@@ -1451,6 +1451,33 @@ fn a_raw_block_after_a_compressed_one_fills_the_slice() {
     );
 }
 
+/// `decode_from_to` on a frame flushed and not ended hands over every byte
+/// compressed before the flush, the window staying inside as history.
+#[test]
+fn decode_from_to_hands_over_an_unfinished_frame() {
+    let payload: Vec<u8> = (0..50_000u32).flat_map(|i| (i / 7).to_le_bytes()).collect();
+    let mut context = crate::encoding::CompressionContext::new(CompressionLevel::Default);
+    let mut frame = Vec::new();
+    context.write(&mut frame, &payload).unwrap();
+    context.flush(&mut frame).unwrap();
+    let mut decoder = FrameDecoder::new();
+    let mut out = alloc::vec![0u8; payload.len() + 1];
+    let mut source = frame.as_slice();
+    let mut written = 0;
+    loop {
+        let (read, wrote) = decoder
+            .decode_from_to(source, &mut out[written..])
+            .expect("flushed blocks decode");
+        source = &source[read..];
+        written += wrote;
+        if read == 0 && wrote == 0 {
+            break;
+        }
+    }
+    assert!(&out[..written] == payload.as_slice(), "{written} bytes");
+    assert!(!decoder.is_finished());
+}
+
 /// A drain that fills `target` exactly leaves nothing pending, which is not a
 /// reason to decode another block: its output would have nowhere to go, and its
 /// input would be consumed for a caller that asked for no more.
@@ -1477,9 +1504,10 @@ fn a_filled_target_stops_before_the_next_block() {
         .decode_from_to(source, &mut chunk)
         .expect("frame decodes");
     assert_eq!(written, BLOCK as usize);
-    // Two blocks fill the window and hand one block over; the third is left
-    // for the next call, with its header and body unread.
-    assert_eq!(read, 2 * (3 + BLOCK as usize));
+    // The first block is handed over as soon as it is decoded and fills the
+    // target; the other two are left for the next call, headers and bodies
+    // unread.
+    assert_eq!(read, 3 + BLOCK as usize);
 }
 
 /// A frame that produces nothing is decoded with a slice that holds nothing,

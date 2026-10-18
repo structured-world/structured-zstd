@@ -57,6 +57,12 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     /// [`Self::block_maximum`]. Persists across `reset`: it mirrors a decoder
     /// setting, which the frame layer applies as each frame starts.
     block_limit: usize,
+    /// How many bytes at the front of the visible buffer have been handed out.
+    /// They stay as history while the window needs them; everything after
+    /// them is output not yet handed out. Every decoded byte is handed out as
+    /// soon as the caller has room for it, as upstream copies each decoded
+    /// block out of its window buffer (`zstd_decompress.c`, `zdss_flush`).
+    delivered: usize,
 }
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
@@ -88,23 +94,16 @@ impl<B: BufferBackend> Read for DecodeBuffer<B> {
 }
 
 impl<B: BufferBackend> DecodeBuffer<B> {
-    /// [`Read::read`], also reporting how many drainable bytes (past the
-    /// window) `target` had no room for, from the one length query the read
-    /// makes anyway.
+    /// [`Read::read`], also reporting how many decoded bytes `target` had no
+    /// room for, from the one length query the read makes anyway.
     pub(crate) fn read_reporting_pending(
         &mut self,
         target: &mut [u8],
     ) -> Result<(usize, usize), Error> {
-        let max_amount = self.can_drain_to_window_size().unwrap_or(0);
-        let amount = max_amount.min(target.len());
-
-        let mut written = 0;
-        self.drain_to(amount, |buf| {
-            target[written..][..buf.len()].copy_from_slice(buf);
-            written += buf.len();
-            (buf.len(), Ok(()))
-        })?;
-        Ok((amount, max_amount - amount))
+        let waiting = self.undelivered();
+        let amount = waiting.min(target.len());
+        self.deliver_into(target, amount, true)?;
+        Ok((amount, waiting - amount))
     }
 }
 
@@ -128,6 +127,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             window_size,
             declared_content: None,
             block_limit: crate::common::MAX_BLOCK_SIZE as usize,
+            delivered: 0,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -158,6 +158,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             window_size,
             declared_content: None,
             block_limit: crate::common::MAX_BLOCK_SIZE as usize,
+            delivered: 0,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -277,6 +278,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.window_size = window_size;
         self.declared_content = None;
         self.buffer.clear();
+        self.delivered = 0;
         self.buffer.set_growth_limit(peak_buffered_len(window_size));
         // No reserve here: capacity decisions are pushed up to the frame
         // layer. Direct-decode frames (`run_direct_decode`) write through
@@ -439,7 +441,16 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             self.hash.write(tail);
             self.hash_dirty = true;
         }
-        self.drop_to_window_size();
+        // Everything before the block was handed out with its own block.
+        debug_assert_eq!(self.undelivered(), n);
+        self.delivered = total;
+        self.release_delivered(true);
+    }
+
+    /// Count everything in the buffer as handed out: history the caller
+    /// already holds, such as a block it inserted itself.
+    pub(crate) fn mark_delivered(&mut self) {
+        self.delivered = self.buffer.len();
     }
 
     /// Capture a rollback point covering the buffer's write cursor and the
@@ -483,6 +494,9 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // responsible for treating any bytes between the captured tail
         // and the current tail as discarded.
         unsafe { self.buffer.set_tail(cp.tail) };
+        // Nothing is handed out between a checkpoint and its restore, so the
+        // delivered mark still lies inside the buffer.
+        debug_assert!(self.delivered <= self.buffer.len());
         self.total_output_counter = cp.total_output_counter;
         // No hash restore: see `DecodeBufferCheckpoint` doc. No
         // mutation site between `checkpoint()` and this call writes
@@ -1141,43 +1155,31 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.repeat::<K>(dict, offset, match_length)
     }
 
-    /// Check if and how many bytes can currently be drawn from the buffer
-    pub fn can_drain_to_window_size(&self) -> Option<usize> {
-        if self.buffer.len() > self.window_size {
-            Some(self.buffer.len() - self.window_size)
-        } else {
-            None
-        }
+    /// Decoded bytes not handed out yet.
+    pub fn undelivered(&self) -> usize {
+        self.buffer.len() - self.delivered
     }
 
-    //How many bytes can be drained if the window_size does not have to be maintained
-    pub fn can_drain(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// Drain as much as possible while retaining enough so that decoding si still possible with the required window_size
-    /// At best call only if can_drain_to_window_size reports a 'high' number of bytes to reduce allocations
+    /// Hand out every decoded byte not handed out yet, keeping the window as
+    /// history; `None` when there is none.
     pub fn drain_to_window_size(&mut self) -> Option<Vec<u8>> {
-        //TODO investigate if it is possible to return the std::vec::Drain iterator directly without collecting here
-        match self.can_drain_to_window_size() {
-            None => None,
-            Some(can_drain) => {
-                let mut vec = Vec::with_capacity(can_drain);
-                self.drain_to(can_drain, |buf| {
-                    vec.extend_from_slice(buf);
-                    (buf.len(), Ok(()))
-                })
-                .ok()?;
-                Some(vec)
-            }
+        let waiting = self.undelivered();
+        if waiting == 0 {
+            return None;
         }
+        let mut vec = Vec::with_capacity(waiting);
+        self.deliver_to(waiting, true, |buf| {
+            vec.extend_from_slice(buf);
+            (buf.len(), Ok(()))
+        })
+        .ok()?;
+        Some(vec)
     }
 
+    /// [`Self::drain_to_window_size`] into `sink`.
     pub fn drain_to_window_size_writer(&mut self, mut sink: impl Write) -> Result<usize, Error> {
-        match self.can_drain_to_window_size() {
-            None => Ok(0),
-            Some(can_drain) => self.drain_to(can_drain, |buf| write_all_bytes(&mut sink, buf)),
-        }
+        let waiting = self.undelivered();
+        self.deliver_to(waiting, true, |buf| write_all_bytes(&mut sink, buf))
     }
 
     /// Advance the backend's head past any bytes beyond `window_size`
@@ -1216,14 +1218,14 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// needs. On `RingBuffer` / `FlatBuf` the counter is already exact
     /// (`>= len()`) and the `max` is a no-op.
     pub fn drop_to_window_size(&mut self) -> usize {
-        match self.can_drain_to_window_size() {
-            None => 0,
-            Some(can_drop) => {
-                self.total_output_counter = self.total_output_counter.max(self.buffer.len() as u64);
-                self.buffer.drop_first_n(can_drop);
-                can_drop
-            }
-        }
+        let can_drop = match self.buffer.len().checked_sub(self.window_size) {
+            Some(past) if past > 0 => past,
+            _ => return 0,
+        };
+        self.total_output_counter = self.total_output_counter.max(self.buffer.len() as u64);
+        self.buffer.drop_first_n(can_drop);
+        self.delivered -= self.delivered.min(can_drop);
+        can_drop
     }
 
     /// Drop the first `n` visible bytes from the front without producing
@@ -1241,6 +1243,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         debug_assert!(n <= self.buffer.len());
         if n != 0 {
             self.buffer.drop_first_n(n);
+            self.delivered -= self.delivered.min(n);
         }
     }
 
@@ -1274,6 +1277,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             self.buffer
                 .extend::<crate::cpu_kernel::BaselineKernel>(prefix);
         }
+        // The caller's own output: history, never handed back.
+        self.mark_delivered();
         self.total_output_counter = total_output;
     }
 
@@ -1292,107 +1297,110 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.total_output_counter = produced;
     }
 
-    /// drain the buffer completely
+    /// Hand out every byte not handed out yet and empty the buffer: for a
+    /// finished frame, whose window nothing reads any more.
     pub fn drain(&mut self) -> Vec<u8> {
-        let (slice1, slice2) = self.buffer.as_slices();
-        #[cfg(feature = "hash")]
-        if self.compute_hash {
-            self.hash.write(slice1);
-            self.hash.write(slice2);
-            self.hash_dirty = true;
-        }
-
-        let mut vec = Vec::with_capacity(slice1.len() + slice2.len());
-        vec.extend_from_slice(slice1);
-        vec.extend_from_slice(slice2);
-        self.buffer.clear();
+        let mut vec = Vec::with_capacity(self.undelivered());
+        let waiting = self.undelivered();
+        // Writing into a `Vec` cannot fail.
+        let _written = self.deliver_to(waiting, false, |buf| {
+            vec.extend_from_slice(buf);
+            (buf.len(), Ok(()))
+        });
         vec
     }
 
+    /// [`Self::drain`] into `sink`.
     pub fn drain_to_writer(&mut self, mut sink: impl Write) -> Result<usize, Error> {
-        let write_limit = self.buffer.len();
-        self.drain_to(write_limit, |buf| write_all_bytes(&mut sink, buf))
+        let waiting = self.undelivered();
+        self.deliver_to(waiting, false, |buf| write_all_bytes(&mut sink, buf))
     }
 
+    /// [`Self::drain`] into `target`, as far as it takes.
     pub fn read_all(&mut self, target: &mut [u8]) -> Result<usize, Error> {
-        let amount = self.buffer.len().min(target.len());
+        let amount = self.undelivered().min(target.len());
+        self.deliver_into(target, amount, false)
+    }
 
+    /// Copy the next `amount` bytes not handed out yet into the front of
+    /// `target`; see [`Self::deliver_to`].
+    fn deliver_into(
+        &mut self,
+        target: &mut [u8],
+        amount: usize,
+        keep_window: bool,
+    ) -> Result<usize, Error> {
         let mut written = 0;
-        self.drain_to(amount, |buf| {
+        self.deliver_to(amount, keep_window, |buf| {
             target[written..][..buf.len()].copy_from_slice(buf);
             written += buf.len();
             (buf.len(), Ok(()))
-        })?;
-        Ok(amount)
+        })
     }
 
-    /// Semantics of write_bytes:
-    /// Should dump as many of the provided bytes as possible to whatever sink until no bytes are left or an error is encountered
-    /// Return how many bytes have actually been dumped to the sink.
-    fn drain_to(
+    /// Hand out up to `amount` bytes not handed out yet, oldest first, through
+    /// `write_bytes`, hashing what it takes, then let go of the handed-out
+    /// bytes the window no longer needs (all of them unless `keep_window`).
+    ///
+    /// `write_bytes` takes as many of the bytes as it can and returns how many
+    /// it took, with an error that stops the delivery there.
+    fn deliver_to(
         &mut self,
         amount: usize,
+        keep_window: bool,
         mut write_bytes: impl FnMut(&[u8]) -> (usize, Result<(), Error>),
     ) -> Result<usize, Error> {
-        if amount == 0 {
-            return Ok(0);
-        }
-
-        struct DrainGuard<'a, B: BufferBackend> {
-            buffer: &'a mut B,
-            amount: usize,
-        }
-
-        impl<B: BufferBackend> Drop for DrainGuard<'_, B> {
-            fn drop(&mut self) {
-                if self.amount != 0 {
-                    self.buffer.drop_first_n(self.amount);
-                }
-            }
-        }
-
-        let mut drain_guard = DrainGuard {
-            buffer: &mut self.buffer,
-            amount: 0,
-        };
-
-        let (slice1, slice2) = drain_guard.buffer.as_slices();
-        let n1 = slice1.len().min(amount);
-        let n2 = slice2.len().min(amount - n1);
-
-        if n1 != 0 {
-            let (written1, res1) = write_bytes(&slice1[..n1]);
+        let amount = amount.min(self.undelivered());
+        let mut taken = 0;
+        let mut outcome = Ok(());
+        if amount != 0 {
+            let (s1, s2) = self.buffer.as_slices();
+            let start = self.delivered;
+            let (head, tail) = if start >= s1.len() {
+                (&s2[start - s1.len()..], &[][..])
+            } else {
+                (&s1[start..], s2)
+            };
+            let n1 = head.len().min(amount);
+            let n2 = tail.len().min(amount - n1);
+            let (written1, result1) = write_bytes(&head[..n1]);
             #[cfg(feature = "hash")]
             if self.compute_hash {
-                self.hash.write(&slice1[..written1]);
+                self.hash.write(&head[..written1]);
                 self.hash_dirty = true;
             }
-            drain_guard.amount += written1;
-
-            // Apparently this is what clippy thinks is the best way of expressing this
-            res1?;
-
-            // Only if the first call to write_bytes was not a partial write we can continue with slice2
-            // Partial writes SHOULD never happen without res1 being an error, but lets just protect against it anyways.
-            if written1 == n1 && n2 != 0 {
-                let (written2, res2) = write_bytes(&slice2[..n2]);
+            taken = written1;
+            outcome = result1;
+            // A short write without an error should not happen; it stops the
+            // delivery all the same.
+            if outcome.is_ok() && written1 == n1 && n2 != 0 {
+                let (written2, result2) = write_bytes(&tail[..n2]);
                 #[cfg(feature = "hash")]
                 if self.compute_hash {
-                    self.hash.write(&slice2[..written2]);
+                    self.hash.write(&tail[..written2]);
                     self.hash_dirty = true;
                 }
-                drain_guard.amount += written2;
-
-                // Apparently this is what clippy thinks is the best way of expressing this
-                res2?;
+                taken += written2;
+                outcome = result2;
             }
         }
+        self.delivered += taken;
+        self.release_delivered(keep_window);
+        outcome.map(|()| taken)
+    }
 
-        let amount_written = drain_guard.amount;
-        // Make sure we don't accidentally drop `DrainGuard` earlier.
-        drop(drain_guard);
-
-        Ok(amount_written)
+    /// Let go of handed-out bytes past the window (all handed-out bytes
+    /// unless `keep_window`): nothing will read them again.
+    fn release_delivered(&mut self, keep_window: bool) {
+        let keep = if keep_window { self.window_size } else { 0 };
+        let Some(past) = self.buffer.len().checked_sub(keep) else {
+            return;
+        };
+        let release = past.min(self.delivered);
+        if release != 0 {
+            self.buffer.drop_first_n(release);
+            self.delivered -= release;
+        }
     }
 }
 

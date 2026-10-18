@@ -1134,6 +1134,95 @@ fn a_single_end_call_overrides_the_pledge() {
     }
 }
 
+/// One frame for a whole session, as rsync streams it: each file's data goes
+/// in with `ZSTD_e_continue` and is flushed with `ZSTD_e_flush` when the file
+/// ends, every call handed a fresh 16 KiB output buffer; the far end decodes
+/// each chunk with an output buffer of two blocks and must have every file's
+/// bytes in hand by the time its flush arrives (rsync token.c,
+/// send_zstd_token / recv_zstd_token).
+#[test]
+fn a_session_flushed_per_file_decodes_file_by_file() {
+    const MAX_DATA_COUNT: usize = 16383;
+    let files: Vec<Vec<u8>> = vec![
+        (1..=200_000u32)
+            .flat_map(|i| format!("{i}\n").into_bytes())
+            .collect(),
+        b"line of a log that repeats itself\n".repeat(300),
+        (0..300_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect(),
+        Vec::new(),
+        b"short".to_vec(),
+    ];
+    let zcs = ZSTD_createCStream();
+    let zds = ZSTD_createDStream();
+    let mut out = vec![0u8; MAX_DATA_COUNT];
+    let mut dbuf = vec![0u8; crate::streaming::ZSTD_DStreamOutSize() * 2];
+    let mut call = |src: &[u8], flush: c_int, chunks: &mut Vec<Vec<u8>>| {
+        let mut inb = ZSTD_inBuffer {
+            src: src.as_ptr().cast(),
+            size: src.len(),
+            pos: 0,
+        };
+        loop {
+            let mut outb = ZSTD_outBuffer {
+                dst: out.as_mut_ptr().cast(),
+                size: out.len(),
+                pos: 0,
+            };
+            let r = unsafe { ZSTD_compressStream2(zcs, &mut outb, &mut inb, flush) };
+            assert_eq!(ZSTD_isError(r), 0, "{:?}", code(r));
+            if outb.pos != 0 {
+                chunks.push(out[..outb.pos].to_vec());
+            }
+            let finished = if flush == 1 {
+                r == 0
+            } else {
+                inb.pos == inb.size
+            };
+            if finished {
+                return;
+            }
+        }
+    };
+    for file in &files {
+        let mut chunks = Vec::new();
+        for piece in file.chunks(32 * 1024) {
+            call(piece, 0, &mut chunks);
+        }
+        call(&[], 1, &mut chunks);
+        // Everything flushed so far decodes to exactly this file.
+        let mut restored = Vec::new();
+        for chunk in &chunks {
+            let mut inb = ZSTD_inBuffer {
+                src: chunk.as_ptr().cast(),
+                size: chunk.len(),
+                pos: 0,
+            };
+            loop {
+                let mut outb = ZSTD_outBuffer {
+                    dst: dbuf.as_mut_ptr().cast(),
+                    size: dbuf.len(),
+                    pos: 0,
+                };
+                let r =
+                    unsafe { crate::streaming::ZSTD_decompressStream(zds, &mut outb, &mut inb) };
+                assert_eq!(ZSTD_isError(r), 0, "{:?}", code(r));
+                restored.extend_from_slice(&dbuf[..outb.pos]);
+                if inb.pos == inb.size && outb.pos < outb.size {
+                    break;
+                }
+            }
+        }
+        assert_eq!(restored.len(), file.len());
+        assert!(restored == *file, "file of {} bytes", file.len());
+    }
+    unsafe {
+        ZSTD_freeCCtx(zcs);
+        ZSTD_freeDCtx(zds);
+    }
+}
+
 /// A skippable frame larger than the input buffer is skipped across calls,
 /// and the frame after it decodes.
 #[test]
