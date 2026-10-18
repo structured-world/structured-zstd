@@ -71,7 +71,7 @@ impl BufferlessBegin {
         params.pledged_src_size = pledged;
         let src_size = (pledged != CONTENTSIZE_UNKNOWN).then_some(pledged);
         let frame_params = if crate::attach::cdict_params_describe_frame(cdict, src_size) {
-            cdict.params
+            crate::cdict::cdict_frame_parameters(cdict, src_size)
         } else {
             None
         };

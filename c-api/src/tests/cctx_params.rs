@@ -712,6 +712,77 @@ fn an_empty_cdict_carries_parameters_only() {
     }
 }
 
+/// A CDict's explicit window is raised toward a source of known size, as far
+/// as 512 KiB, as upstream raises it (zstd_compress.c:5844-5852): a 1 KiB
+/// window over 1 MiB declares 512 KiB, through both usingCDict calls.
+#[test]
+fn a_cdict_window_is_raised_toward_the_source() {
+    let input: Vec<u8> = b"a source far larger than the cdict's window "
+        .iter()
+        .copied()
+        .cycle()
+        .take(1 << 20)
+        .collect();
+    let content = b"raw dictionary content for the window test ".repeat(20);
+    unsafe {
+        let params = ZSTD_createCCtxParams();
+        assert_eq!(ZSTD_CCtxParams_setParameter(params, WINDOW_LOG, 10), 0);
+        let cdict = ZSTD_createCDict_advanced2(
+            content.as_ptr(),
+            content.len(),
+            0,
+            1,
+            params,
+            ZSTD_customMem {
+                customAlloc: core::ptr::null(),
+                customFree: core::ptr::null(),
+                opaque: core::ptr::null(),
+            },
+        );
+        assert!(!cdict.is_null());
+        let cctx = ZSTD_createCCtx();
+        for advanced in [false, true] {
+            let mut frame = vec![0u8; ZSTD_compressBound(input.len())];
+            let n = if advanced {
+                crate::cdict::ZSTD_compress_usingCDict_advanced(
+                    cctx,
+                    frame.as_mut_ptr(),
+                    frame.len(),
+                    input.as_ptr(),
+                    input.len(),
+                    cdict,
+                    crate::cdict::ZSTD_frameParameters {
+                        contentSizeFlag: 1,
+                        checksumFlag: 0,
+                        noDictIDFlag: 0,
+                    },
+                )
+            } else {
+                ZSTD_compress_usingCDict(
+                    cctx,
+                    frame.as_mut_ptr(),
+                    frame.len(),
+                    input.as_ptr(),
+                    input.len(),
+                    cdict,
+                )
+            };
+            assert_eq!(ZSTD_isError(n), 0, "{:?}", code(n));
+            let mut header = core::mem::MaybeUninit::<crate::frame::ZSTD_FrameHeader>::uninit();
+            let rc = crate::frame::ZSTD_getFrameHeader(header.as_mut_ptr(), frame.as_ptr(), n);
+            assert_eq!(rc, 0, "{:?}", code(rc));
+            assert_eq!(
+                header.assume_init().windowSize,
+                1 << 19,
+                "advanced: {advanced}"
+            );
+        }
+        ZSTD_freeCDict(cdict);
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeCCtxParams(params);
+    }
+}
+
 /// The estimates read the set: a wider window costs more, and the streaming
 /// budget covers the one-shot one.
 #[test]

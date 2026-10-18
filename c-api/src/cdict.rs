@@ -391,6 +391,17 @@ pub unsafe extern "C" fn ZSTD_getDictID_fromCDict(cdict: *const ZSTD_CDict) -> c
     unsafe { &*cdict }.id
 }
 
+/// The parameters a `ZSTD_*_usingCDict*` frame of `src_size` bytes runs
+/// under: the CDict's own, as the codec adapts them to a frame of that size.
+pub(crate) fn cdict_frame_parameters(
+    cdict: &ZSTD_CDict,
+    src_size: Option<u64>,
+) -> Option<CompressionParameters> {
+    cdict
+        .params
+        .map(|params| params.for_dictionary_frame(src_size))
+}
+
 /// `size_t ZSTD_compress_usingCDict(ZSTD_CCtx* cctx, void* dst, size_t
 /// dstCapacity, const void* src, size_t srcSize, const ZSTD_CDict* cdict)` —
 /// compress `src` with `cdict` at the level baked into the `CDict`. The `cctx`
@@ -429,7 +440,8 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
         // The kept compressor attaches the CDict once; the next call with it
         // reuses the primed snapshot that first frame captured.
         let enc = kept_compressor(compressor, key, cdict_ref.dict.as_ref(), cdict_ref.level)?;
-        set_frame_parameters(enc, cdict_ref.params.as_ref(), cdict_ref.level);
+        let frame_params = cdict_frame_parameters(cdict_ref, Some(src.len() as u64));
+        set_frame_parameters(enc, frame_params.as_ref(), cdict_ref.level);
         // Per-call frame flags: the compressor is shared with every other
         // one-shot entry point, whose flags must not leak into this one.
         // Upstream ZSTD_compress_usingCDict leaves the checksum off unless the
@@ -495,7 +507,8 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict_advanced(
             ..
         } = cctx;
         let enc = kept_compressor(compressor, key, cdict_ref.dict.as_ref(), cdict_ref.level)?;
-        set_frame_parameters(enc, cdict_ref.params.as_ref(), cdict_ref.level);
+        let frame_params = cdict_frame_parameters(cdict_ref, Some(src.len() as u64));
+        set_frame_parameters(enc, frame_params.as_ref(), cdict_ref.level);
         enc.set_content_checksum(fparams.checksumFlag != 0);
         enc.set_content_size_flag(fparams.contentSizeFlag != 0);
         // Raw-content dictionaries never emit their synthetic ID regardless

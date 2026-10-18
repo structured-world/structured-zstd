@@ -525,6 +525,41 @@ impl CompressionParameters {
         u32::from(params.window_log)
     }
 
+    /// These parameters as a dictionary's own, driving a frame of
+    /// `source_size` bytes (`None` = unknown): an explicit window is raised to
+    /// cover the source, as far as 512 KiB, as upstream raises a prepared
+    /// dictionary's window for a frame of known size
+    /// (`ZSTD_compressBegin_usingCDict_internal`, zstd_compress.c:5844-5852).
+    /// A window left to the level is resolved for the source and covers it.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionLevel, CompressionParameters};
+    ///
+    /// let params = CompressionParameters::builder(CompressionLevel::Level(3))
+    ///     .window_log(10)
+    ///     .build()
+    ///     .unwrap();
+    /// let source = Some(1 << 20);
+    /// assert_eq!(params.for_dictionary_frame(source).window_log_for(source, 0), 19);
+    /// assert_eq!(params.for_dictionary_frame(None).window_log_for(None, 0), 10);
+    /// ```
+    pub fn for_dictionary_frame(mut self, source_size: Option<u64>) -> Self {
+        const RAISE_LIMIT: u64 = 1 << 19;
+        let known =
+            source_size.filter(|size| *size != crate::encoding::cparams::CONTENTSIZE_UNKNOWN);
+        if let (Some(window), Some(source)) = (self.overrides.window_log, known) {
+            // Bounded by `RAISE_LIMIT`, so it fits and its log is at most 19.
+            let limited = source.min(RAISE_LIMIT) as u32;
+            let source_log = if limited > 1 {
+                (u32::BITS - (limited - 1).leading_zeros()) as u8
+            } else {
+                1
+            };
+            self.overrides.window_log = Some(window.max(source_log));
+        }
+        self
+    }
+
     pub(crate) fn overrides(&self) -> ParamOverrides {
         self.overrides
     }
