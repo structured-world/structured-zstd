@@ -1742,6 +1742,21 @@ fn argv0_names_of_other_tools_take_their_presets() {
     assert_eq!(program_preset("zstd").format, OutputFormat::Zstd);
 }
 
+/// `--format=zstd` overrides the format a tool name selects, so `gzip
+/// --format=zstd f` writes zstd instead of refusing to write gzip.
+#[test]
+fn explicit_zstd_format_overrides_the_tool_name() {
+    for name in ["gzip", "xz", "lzma", "lz4"] {
+        let opts = parse_as(
+            &program_preset(name),
+            CompressionLevel::DEFAULT_LEVEL,
+            &["--format=zstd", "f"],
+        )
+        .unwrap();
+        assert_eq!(opts.format, OutputFormat::Zstd, "{name}");
+    }
+}
+
 /// This build writes zstd only. Compressing under a name that selects another
 /// format fails the whole run the way the reference command built without that
 /// codec does (`fileio.c` `EXM_THROW(20, ...)`): status 20, and the source
@@ -5379,6 +5394,37 @@ fn asking_for_threads_notes_that_there_are_none() {
     }
 }
 
+/// Whether a benchmark decodes follows the last operation flag, whatever its
+/// spelling: `--decompress` and `--uncompress` count as `-d`, and a later `-z`
+/// takes the benchmark back to compressing, so `plain` is not read as a frame.
+#[test]
+fn decode_only_benchmark_follows_the_last_operation_flag() {
+    for args in [
+        &["--decompress", "-b", "f"][..],
+        &["--uncompress", "-b", "f"][..],
+        &["-b", "--decompress", "f"][..],
+    ] {
+        let opts = parse(args).unwrap();
+        assert!(opts.bench && opts.bench_decode_only, "{args:?}");
+    }
+    for args in [
+        &["-d", "-z", "-b", "plain"][..],
+        &["-d", "--compress", "-b", "plain"][..],
+    ] {
+        let opts = parse(args).unwrap();
+        assert!(opts.bench && !opts.bench_decode_only, "{args:?}");
+    }
+    // A tool name that decompresses is the operation until a flag names
+    // another.
+    let unzstd = parse_as(
+        &program_preset("unzstd"),
+        CompressionLevel::DEFAULT_LEVEL,
+        &["-b", "f.zst"],
+    )
+    .unwrap();
+    assert!(unzstd.bench && unzstd.bench_decode_only);
+}
+
 /// `-d` makes a benchmark a decoding one in either order, as the reference
 /// reads it (zstdcli.c:1191-1196): the inputs are frames and only decoding is
 /// measured. Frames whose sizes are not declared, and input that is not frames,
@@ -5419,6 +5465,40 @@ fn bench_with_d_measures_decoding_of_frames() {
         .expect_err("an undeclared size cannot be measured")
         .to_string();
     assert!(err.contains("cannot be determined"), "{err}");
+}
+
+/// A decoding benchmark holds the parsed dictionary beside the frames and their
+/// decoded copy, so `-M` weighs all three together: a limit that covers the
+/// buffers alone, and the dictionary alone, still refuses them combined.
+#[test]
+fn decoding_benchmark_counts_the_dictionary_against_the_memory_limit() {
+    use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
+
+    let scratch = Scratch::new("bench-decode-memory");
+    let text: Vec<u8> = (0..2_000u32)
+        .flat_map(|i| format!("line {} of {}\n", i % 37, i % 11).into_bytes())
+        .collect();
+    let frame = compress_to_vec(text.as_slice(), CompressionLevel::Default);
+    let framed = scratch.file("framed.zst", &frame);
+    let buffers = (frame.len() + text.len()) as u64;
+    let dictionary = vec![b'd'; usize::try_from(buffers / 2).unwrap()];
+    // Room for the buffers and half the dictionary over the decoder's own floor.
+    let limit = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE
+        + DECODER_AUXILIARY_BYTES
+        + buffers
+        + dictionary.len() as u64 / 2;
+
+    let run = |dict: Option<Vec<u8>>| {
+        let mut opts = parse(&["-b", "-d", "-i0", "-q", "x"]).unwrap();
+        opts.inputs = vec![framed.clone()];
+        opts.memory_limit = Some(limit);
+        run_benchmark(&opts, dict)
+    };
+    run(None).expect("the buffers alone fit the limit");
+    let err = run(Some(dictionary))
+        .expect_err("buffers and dictionary together exceed it")
+        .to_string();
+    assert!(err.contains("memory limit"), "{err}");
 }
 
 /// One failing input does not end the run: the rest are processed and the

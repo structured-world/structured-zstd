@@ -10,10 +10,13 @@ For every file of every corpus at every level:
 and per (corpus, level) the summed compressed size and compression time of
 ours over the reference's are reported, and held to the given limits.
 
+A file's compression time is the fastest of --repeat runs of each tool, the
+two alternating, so a run the machine preempted does not decide the ratio.
+
 Usage:
   cross_validate.py --ours BIN --reference BIN --corpus NAME=DIR [...]
                     [--levels 1,3,9,19,22] [--ratio-limit 1.05]
-                    [--time-limit 1.5] [--json OUT]
+                    [--time-limit 1.5] [--repeat 3] [--json OUT]
 
 A limit of 0 reports the figure without holding it. Exits non-zero when any
 roundtrip fails or any figure is past its limit.
@@ -79,8 +82,11 @@ def main():
     parser.add_argument("--levels", default="1,3,9,19,22")
     parser.add_argument("--ratio-limit", type=float, default=1.05)
     parser.add_argument("--time-limit", type=float, default=1.5)
+    parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--json")
     args = parser.parse_args()
+    if args.repeat < 1:
+        parser.error("--repeat must be at least 1")
 
     levels = [int(level) for level in args.levels.split(",")]
     corpora = []
@@ -111,8 +117,14 @@ def main():
                 for path in files:
                     original = path.read_bytes()
                     row["input_bytes"] += len(original)
-                    row["ours_seconds"] += compress(args.ours, level, path, ours_frame)
-                    row["reference_seconds"] += compress(args.reference, level, path, reference_frame)
+                    ours_best = reference_best = float("inf")
+                    for _ in range(args.repeat):
+                        ours_best = min(ours_best, compress(args.ours, level, path, ours_frame))
+                        reference_best = min(
+                            reference_best, compress(args.reference, level, path, reference_frame)
+                        )
+                    row["ours_seconds"] += ours_best
+                    row["reference_seconds"] += reference_best
                     row["ours_bytes"] += ours_frame.stat().st_size
                     row["reference_bytes"] += reference_frame.stat().st_size
                     for check, binary, frame in (

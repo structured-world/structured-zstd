@@ -197,7 +197,9 @@ cross-validation compares the two `zstd` commands on whole corpora.
   both tools with `--single-thread`. Every file must round-trip: our frame
   through the reference, the reference's frame through ours, ours through ours.
   Per (corpus, level) the summed compressed size and compression time of ours
-  over the reference's are held to 1.05 and 1.5.
+  over the reference's are held to 1.05 and 1.5. A file's time is the fastest
+  of three runs of each tool, the two alternating, so one preempted run does
+  not decide the ratio.
 - **CI shard:** `cross-validate` in `ci.yml`, push-to-main only and gated on
   `rust_core` like the bench pipeline. It merges the run into
   `gh-pages/dev/bench/benchmark-xval.json`

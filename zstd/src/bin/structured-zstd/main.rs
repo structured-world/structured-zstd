@@ -1435,7 +1435,7 @@ fn parse_args_into(
         rsyncable: false,
         adapt: false,
         bench: false,
-        bench_decode_only: false,
+        bench_decode_only: preset.mode == Mode::Decompress,
         bench_start: default_level,
         bench_end: default_level,
         bench_secs: DEFAULT_BENCH_SECONDS,
@@ -1509,7 +1509,7 @@ fn parse_args_into(
         if let Some(long) = arg.strip_prefix("--") {
             match long {
                 "compress" => select_mode(&mut opts, Mode::Compress),
-                "decompress" | "uncompress" => select_mode(&mut opts, Mode::Decompress),
+                "decompress" | "uncompress" => select_decompression(&mut opts),
                 "test" => select_mode(&mut opts, Mode::Test),
                 "list" => select_mode(&mut opts, Mode::List),
                 // `--train` selects the mode and leaves the trainer alone, as
@@ -1736,6 +1736,9 @@ fn parse_args_into(
                         if v != "zstd" {
                             bail!("--format={v} is not supported; this build only writes zstd");
                         }
+                        // It overrides the format a tool name selected, so
+                        // `gzip --format=zstd` writes zstd.
+                        opts.format = OutputFormat::Zstd;
                     } else if let Some(v) = long.strip_prefix("zstd=") {
                         apply_advanced_params(v, &mut opts.advanced)
                             .map_err(|err| incorrect_unless_usage(err, &format!("--{long}")))?;
@@ -1823,15 +1826,7 @@ fn parse_args_into(
         while ci < chars.len() {
             let c = chars[ci];
             match c {
-                // `-d` also makes any benchmark a decoding one, whichever of
-                // `-b` and `-d` comes first, and within one it stays a
-                // benchmark (zstdcli.c:1191-1196).
-                'd' => {
-                    opts.bench_decode_only = true;
-                    if !opts.bench {
-                        select_mode(&mut opts, Mode::Decompress);
-                    }
-                }
+                'd' => select_decompression(&mut opts),
                 'z' => select_mode(&mut opts, Mode::Compress),
                 't' => select_mode(&mut opts, Mode::Test),
                 'l' => select_mode(&mut opts, Mode::List),
@@ -2066,6 +2061,18 @@ fn attached_path(arg: &std::ffi::OsStr, at: usize) -> PathBuf {
 fn select_mode(opts: &mut Options, mode: Mode) {
     opts.mode = mode;
     opts.bench = false;
+    opts.bench_decode_only = mode == Mode::Decompress;
+}
+
+/// Select decompression, in any of its spellings (`-d`, `--decompress`,
+/// `--uncompress`). Inside a benchmark it stays a benchmark and makes it a
+/// decoding one, whichever of the two flags comes first.
+fn select_decompression(opts: &mut Options) {
+    if opts.bench {
+        opts.bench_decode_only = true;
+    } else {
+        select_mode(opts, Mode::Decompress);
+    }
 }
 
 /// The note a compression run asked for worker threads gets, as the reference
@@ -3916,6 +3923,9 @@ fn benchmark_decoding(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     }
     let codecs = &mut Codecs::prepare(dict.as_deref(), opts.patch_from.is_some(), false, true)?;
     codecs.open_trace(opts, true)?;
+    // The blob goes once parsed; the decoder's form of it stays for the run,
+    // about as large.
+    let dictionary_bytes = dict.as_ref().map_or(0, |bytes| bytes.len() as u64);
     drop(dict);
     if opts.bench_separately {
         for (input, size) in opts.inputs.iter().zip(&sizes) {
@@ -3924,6 +3934,7 @@ fn benchmark_decoding(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
             benchmark_decoding_one(
                 opts,
                 codecs,
+                dictionary_bytes,
                 &input.display().to_string(),
                 &data,
                 std::slice::from_ref(size),
@@ -3936,15 +3947,16 @@ fn benchmark_decoding(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         [only] => only.display().to_string(),
         many => format!(" {} files", many.len()),
     };
-    benchmark_decoding_one(opts, codecs, &label, &data, &sizes)
+    benchmark_decoding_one(opts, codecs, dictionary_bytes, &label, &data, &sizes)
 }
 
 /// Measure decoding one subject of [`benchmark_decoding`]: `data` holds the
 /// files of `file_sizes`, each a run of frames whose declared sizes give what
-/// it decodes to.
+/// it decodes to; `dictionary_bytes` is the parsed dictionary held beside them.
 fn benchmark_decoding_one(
     opts: &Options,
     codecs: &mut Codecs,
+    dictionary_bytes: u64,
     label: &str,
     data: &[u8],
     file_sizes: &[u64],
@@ -3969,9 +3981,11 @@ fn benchmark_decoding_one(
             Err(_) => bail!("Error while trying to assess decompressed size: data may be invalid"),
         }
     }
-    // The input and its decoded copy are what the run holds.
+    // The input, its decoded copy and the dictionary are what the run holds,
+    // weighed together: each can clear the limit alone and still not together.
     let held = (data.len() as u64)
         .checked_add(decoded_size)
+        .and_then(|buffers| buffers.checked_add(dictionary_bytes))
         .ok_or_else(|| eyre!("decompressed size is too large for local system"))?;
     if let Some(limit) = opts.memory_limit {
         check_memory_limit(limit, held, 1)?;
