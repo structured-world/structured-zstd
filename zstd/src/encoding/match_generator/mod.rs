@@ -588,6 +588,29 @@ fn hc_attaches_dictionary(hc: &HcMatchGenerator, size_log: Option<u8>) -> bool {
 /// reaches is never written, so it is never resident: a one-byte stream through
 /// the CLI at levels 3, 19 and 22 peaks at the same RSS as a history grown by
 /// reading, and growing it instead measured no faster.
+/// The most history `backend` keeps for a `window`-byte window with
+/// `dict_len` bytes of dictionary and blocks of up to `block` bytes: the
+/// window, the slack it slides in, and the block being read.
+pub(crate) fn history_ceiling(
+    backend: super::strategy::BackendTag,
+    window: usize,
+    dict_len: usize,
+    block: usize,
+) -> usize {
+    use super::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
+    // `MAX_PRIMED_WINDOW_SIZE` is `(u32::MAX - MAX_BLOCK_SIZE) / 2`, so the
+    // ceiling stays inside `usize` on a 32-bit target; a sum past `usize` is
+    // past it too.
+    let window = window
+        .checked_add(dict_len)
+        .map_or(MAX_PRIMED_WINDOW_SIZE, |w| w.min(MAX_PRIMED_WINDOW_SIZE));
+    let slack = match backend {
+        super::strategy::BackendTag::Simple => window,
+        _ => window >> 2,
+    };
+    window + slack + block
+}
+
 fn frame_history_bytes(
     backend: super::strategy::BackendTag,
     workspace: &crate::encoding::workspace::Workspace,
@@ -597,19 +620,9 @@ fn frame_history_bytes(
     max_window_size: usize,
     level: CompressionLevel,
 ) -> usize {
-    use super::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
     use crate::encoding::workspace::IngestPlan;
     let block = workspace.block_for_window(max_window_size);
-    // `MAX_PRIMED_WINDOW_SIZE` is `(u32::MAX - MAX_BLOCK_SIZE) / 2`, so either
-    // ceiling stays inside `usize` on a 32-bit target.
-    let window = max_window_size
-        .checked_add(dict_len)
-        .map_or(MAX_PRIMED_WINDOW_SIZE, |w| w.min(MAX_PRIMED_WINDOW_SIZE));
-    let slack = match backend {
-        super::strategy::BackendTag::Simple => window,
-        _ => window >> 2,
-    };
-    let ceiling = window + slack + block;
+    let ceiling = history_ceiling(backend, max_window_size, dict_len, block);
     // A size past `usize` is past the ceiling too.
     let bytes = hint.map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX));
     // The input and the room past it its last read may ask for.

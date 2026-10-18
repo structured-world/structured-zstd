@@ -196,6 +196,46 @@ impl CompressedBlockScratch {
         Self::default()
     }
 
+    /// The most [`Self::retained_heap_size`] reports for blocks of up to
+    /// `block_capacity` bytes: the entropy-coded block, and where `splits` is
+    /// set, everything the post-split splitter keeps — its partitions, the
+    /// prefix sums, the probe tables and the nested scratch its probes use.
+    ///
+    /// The splitter recurses by halves down to `MIN_SEQUENCES_BLOCK_SPLITTING`
+    /// sequences and splits at most `MAX_NB_BLOCK_SPLITS` times, so a block
+    /// visits at most `2 * MAX_NB_BLOCK_SPLITS + 1` ranges at three probes
+    /// each, and holds at most three tables per live probe state, two states
+    /// per level of recursion.
+    pub(crate) fn max_retained_heap_size(block_capacity: usize, splits: bool) -> usize {
+        let compressed = crate::encoding::compress_bound(block_capacity);
+        if !splits {
+            return compressed;
+        }
+        let usize_sz = core::mem::size_of::<usize>();
+        let sequences = max_sequences(block_capacity);
+        let partitions = (MAX_NB_BLOCK_SPLITS + 1).next_power_of_two() * usize_sz;
+        // `lit` and `ml` are reserved exactly; the codes and their bit sums
+        // grow by doubling, so they keep up to twice what a block needed.
+        let prefix_sums =
+            2 * (sequences + 1) * usize_sz + 2 * (sequences + 1) * usize_sz + 2 * 2 * sequences;
+        let depth = (sequences / MIN_SEQUENCES_BLOCK_SPLITTING + 1)
+            .next_power_of_two()
+            .trailing_zeros() as usize
+            + 1;
+        let pooled_tables = 3 * (2 * depth + 4);
+        let probes = 3 * (2 * MAX_NB_BLOCK_SPLITS + 1) + 1;
+        let estimator = core::mem::size_of::<[usize; 256]>()
+            + 3 * core::mem::size_of::<SequenceHistogram>()
+            + pooled_tables.next_power_of_two() * core::mem::size_of::<SharedFseTable>()
+            + pooled_tables
+                * (core::mem::size_of::<FSETable>()
+                    + crate::encoding::frame_compressor::shared_table_overhead())
+            + probes.next_power_of_two() * core::mem::size_of::<huff0_encoder::HuffmanTable>();
+        let inner = core::mem::size_of::<CompressedBlockScratch>()
+            + Self::max_retained_heap_size(block_capacity, false);
+        compressed + partitions + prefix_sums + estimator + inner
+    }
+
     /// Workspace bytes the buffers need for blocks of up to `block_capacity`
     /// source bytes.
     pub(crate) fn workspace_bytes(block_capacity: usize) -> usize {

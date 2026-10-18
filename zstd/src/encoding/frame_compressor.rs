@@ -686,6 +686,17 @@ impl FseTables {
         total
     }
 
+    /// The most [`Self::heap_size`] reports: both slots of all three axes
+    /// owned, and the defaults where they are boxed per compressor.
+    pub(crate) const fn max_heap_size() -> usize {
+        let owned = 6 * (core::mem::size_of::<FSETable>() + shared_table_overhead());
+        if cfg!(any(target_has_atomic = "ptr", feature = "critical-section")) {
+            owned
+        } else {
+            owned + 3 * core::mem::size_of::<FSETable>()
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             ll_next: None,

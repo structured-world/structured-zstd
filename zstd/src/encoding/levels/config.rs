@@ -1102,16 +1102,23 @@ fn table_bytes(entry: usize, log: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// Window, match-finder tables, optimal-parser scratch and block staging for a
-/// frame resolved to `params`, plus `ldm` bytes of long-distance table.
+/// Everything a compressor keeps for a frame resolved to `params`, plus `ldm`
+/// bytes of long-distance table: the workspace (history, match-finder tables
+/// and block buffers, laid out by the same functions the reset uses), and
+/// what lives beside it (optimal-parser scratch, entropy tables, the block
+/// splitter's state, the window's block deque).
 fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
     use crate::encoding::strategy::{SearchMethod, StrategyTag};
+    use crate::encoding::workspace::{ALIGN, region_bytes};
     // A 30-bit window is a gibibyte, which a 32-bit `usize` cannot count: the
     // widest window is more memory than such a machine has, so the figure is
     // pinned rather than wrapped.
     let window = 1usize
         .checked_shl(u32::from(params.window_log))
         .unwrap_or(usize::MAX);
+    let block = (crate::common::MAX_BLOCK_SIZE as usize).min(window);
+    let backend = params.backend();
+    let history = crate::encoding::match_generator::history_ceiling(backend, window, 0, block);
     // Mirror `configure()`: the HC3 short-match side table exists only on
     // the btultra/btultra2 tags (minMatch 3), capped by the window log; the
     // BT pointer-pair layout fits inside the `4 << chain_log` chain term
@@ -1171,16 +1178,36 @@ fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
     } else {
         0
     };
-    // Block staging: literal + sequence buffers plus the compressed-block
-    // scratch, each bounded by the 128 KiB block size.
-    let staging = 3 * (128 * 1024);
+    // One allocation: each table region and the history rounded to `ALIGN`,
+    // the block buffers behind them, and the padding that aligns its start.
+    let laid_out = tables
+        .saturating_add(3 * ALIGN)
+        .saturating_add(region_bytes::<u8>(history))
+        .saturating_add(crate::encoding::blocks::CompressedBlockScratch::workspace_bytes(block))
+        .saturating_add(ALIGN - 1);
+    // The backends that slide their window by blocks keep one length per
+    // block in it, in a deque that grows by doubling. Plain arithmetic here
+    // and in `beside`: `history / block` is at most the window over the
+    // smallest block plus a few, and every term of `beside` is a constant or
+    // bounded by the 128 KiB block, so neither comes near `usize::MAX`.
+    let block_deque = if matches!(backend, crate::encoding::strategy::BackendTag::Simple) {
+        0
+    } else {
+        2 * (history / block + 2) * core::mem::size_of::<usize>()
+    };
+    let splits =
+        crate::encoding::levels::fastest::post_split_enabled(params.strategy_tag, window as u64);
+    let beside = crate::encoding::frame_compressor::FseTables::max_heap_size()
+        + crate::encoding::blocks::CompressedBlockScratch::max_retained_heap_size(block, splits)
+        + 2 * crate::huff0::huff0_encoder::HuffmanTable::max_heap_size()
+        + crate::huff0::huff0_encoder::WeightScratch::max_heap_size();
     // Saturating: the parts are each bounded, but their sum at the widest
     // window is more than a 32-bit `usize` counts, and a total that wrapped
     // would report a run as fitting a limit it cannot.
-    window
-        .saturating_add(tables)
+    laid_out
         .saturating_add(bt)
-        .saturating_add(staging)
+        .saturating_add(block_deque)
+        .saturating_add(beside)
         .saturating_add(ldm)
 }
 

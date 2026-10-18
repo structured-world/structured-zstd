@@ -618,6 +618,14 @@ impl HuffmanTable {
             + cached
     }
 
+    /// The most heap one table holds: a code and a packed code for each of the
+    /// 256 byte values, and room for the longest weight description (a header
+    /// byte and 255 four-bit weights, in a buffer grown to the next power of
+    /// two).
+    pub(crate) const fn max_heap_size() -> usize {
+        256 * core::mem::size_of::<(u32, u8)>() + 256 * core::mem::size_of::<u64>() + 256
+    }
+
     pub fn build_from_data(data: &[u8]) -> Self {
         let mut counts = [0; 256];
         let (max_symbol, _) = histogram::count_bytes(data, &mut counts);
@@ -1661,6 +1669,16 @@ impl WeightScratch {
                 .weight_fse_table
                 .as_ref()
                 .map_or(0, |_| core::mem::size_of::<fse_encoder::FSETable>())
+    }
+
+    /// The most heap this scratch keeps: a leaf per byte value and a node array
+    /// for the tree over them, each at most twice the 256 values, a weight per
+    /// value, a parked table, and the FSE table weight descriptions build into.
+    pub(crate) const fn max_heap_size() -> usize {
+        2 * 512 * core::mem::size_of::<HuffNode>()
+            + 256 * core::mem::size_of::<usize>()
+            + HuffmanTable::max_heap_size()
+            + core::mem::size_of::<fse_encoder::FSETable>()
     }
 
     /// Park a table the caller is done with, for the next build to fill.

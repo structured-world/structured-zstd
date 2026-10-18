@@ -498,7 +498,7 @@ pub(crate) fn compress_block_encoded_borrowed(
 /// Where the pass costs time, the cost is in the splitter itself, and that is
 /// what has to get cheaper.
 #[inline]
-fn post_split_enabled(strategy_tag: StrategyTag, window_size: u64) -> bool {
+pub(crate) fn post_split_enabled(strategy_tag: StrategyTag, window_size: u64) -> bool {
     matches!(
         strategy_tag,
         StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
