@@ -229,7 +229,32 @@ pub extern "C" fn ZSTD_createCCtx_advanced(
     ZSTD_createCCtx()
 }
 
+/// The most a context keeps of its one-shot frame buffer between calls: a
+/// frame of one full block, its header and checksum.
+pub(crate) const RETAINED_SCRATCH: usize =
+    codec::encoding::compress_bound(codec::MAX_BLOCK_SIZE as usize);
+
 impl ZSTD_CCtx {
+    /// Hand the one-shot frame in `scratch` to `dst`, or `dstSize_tooSmall`,
+    /// then let go of a buffer larger than a block's worth: upstream writes the
+    /// frame into `dst` and keeps none of it, so a context keeps only the room
+    /// that spares a small frame an allocation per call.
+    pub(crate) fn hand_out_frame(&mut self, dst: &mut [u8]) -> Result<usize, ZSTD_ErrorCode> {
+        let len = self.scratch.len();
+        let handed = if len > dst.len() {
+            Err(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall)
+        } else {
+            dst[..len].copy_from_slice(&self.scratch);
+            Ok(len)
+        };
+        if self.scratch.capacity() > RETAINED_SCRATCH {
+            self.scratch = Vec::new();
+        } else {
+            self.scratch.clear();
+        }
+        handed
+    }
+
     /// Whether a streaming frame is currently mid-flight (parameters are
     /// frozen until it finishes or the session is reset).
     pub(crate) fn stream_in_progress(&self) -> bool {
@@ -407,12 +432,11 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
             return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
         }
     }
-    let len = cctx.scratch.len();
-    if len > dst_capacity {
-        return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
-    }
     let dst = unsafe { out_slice(dst, dst_capacity) };
-    dst[..len].copy_from_slice(&cctx.scratch);
+    let len = match cctx.hand_out_frame(dst) {
+        Ok(len) => len,
+        Err(code) => return encode(code),
+    };
     cctx.progress = FrameProgress::one_shot(src.len(), len);
     len
 }
@@ -522,15 +546,14 @@ pub unsafe extern "C" fn ZSTD_compress2(
     }
     let cctx = unsafe { &mut *cctx };
     let src = unsafe { in_slice(src, src_size) };
-    let len = match compress_sticky_frame(cctx, src, None) {
+    if let Err(code) = compress_sticky_frame(cctx, src, None) {
+        return encode(code);
+    }
+    let dst = unsafe { out_slice(dst, dst_capacity) };
+    let len = match cctx.hand_out_frame(dst) {
         Ok(len) => len,
         Err(code) => return encode(code),
     };
-    if len > dst_capacity {
-        return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
-    }
-    let dst = unsafe { out_slice(dst, dst_capacity) };
-    dst[..len].copy_from_slice(&cctx.scratch);
     // The single-use prefix is spent only now that the frame actually
     // reached the caller: a dstSize_tooSmall failure above must leave it
     // armed for the retry with a bigger buffer.

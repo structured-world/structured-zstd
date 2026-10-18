@@ -184,6 +184,35 @@ fn generate_sequences_keeps_no_frame_behind() {
     unsafe { ZSTD_freeCCtx(cctx) };
 }
 
+/// A one-shot frame handed out leaves the context no frame-sized buffer: it
+/// keeps at most room for a block, as upstream writes straight into `dst`
+/// and keeps nothing of the frame.
+#[test]
+fn a_one_shot_frame_is_not_kept_after_it_is_handed_out() {
+    let mut state = 0x1357_2468u32;
+    let input: Vec<u8> = (0..1 << 20)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let cctx = ZSTD_createCCtx();
+    let frame = compress2(cctx, &input).unwrap();
+    assert_eq!(decode(&frame, input.len()), input);
+    let kept = unsafe { cctx.as_ref() }
+        .expect("a context was created")
+        .scratch
+        .capacity();
+    assert!(
+        kept <= ZSTD_compressBound(codec::MAX_BLOCK_SIZE as usize),
+        "the context keeps {kept} bytes of a {}-byte frame it handed out",
+        frame.len()
+    );
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
+
 /// Too small an output array and a block target are refused as upstream
 /// refuses them (`dstSize_tooSmall`, `parameter_unsupported`).
 #[test]

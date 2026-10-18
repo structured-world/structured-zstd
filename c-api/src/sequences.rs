@@ -347,11 +347,10 @@ impl ParseFrame<'_> {
 
 /// Hand the frame `compress_parse` left in `cctx.scratch` to `dst`.
 fn deliver(cctx: &mut ZSTD_CCtx, dst: &mut [u8], src_len: usize) -> usize {
-    let len = cctx.scratch.len();
-    if len > dst.len() {
-        return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
-    }
-    dst[..len].copy_from_slice(&cctx.scratch);
+    let len = match cctx.hand_out_frame(dst) {
+        Ok(len) => len,
+        Err(code) => return encode(code),
+    };
     cctx.consume_prefix();
     cctx.progress = FrameProgress::one_shot(src_len, len);
     len

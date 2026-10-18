@@ -659,7 +659,7 @@ pub unsafe extern "C" fn ZSTD_estimateCCtxSize_usingCCtxParams(
     // A sum past `usize` would read as an error code if saturated and as an
     // under-report if wrapped, so it is refused as the out-of-range set it is.
     match workspace_for(&source.params) {
-        Ok(workspace) => core::mem::size_of::<ZSTD_CCtx>()
+        Ok(workspace) => (core::mem::size_of::<ZSTD_CCtx>() + crate::context::RETAINED_SCRATCH)
             .checked_add(workspace)
             .unwrap_or_else(|| encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound)),
         Err(code) => encode(code),

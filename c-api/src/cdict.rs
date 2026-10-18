@@ -464,12 +464,11 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
             return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
         }
     }
-    let len = cctx.scratch.len();
-    if len > dst_capacity {
-        return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
-    }
     let dst = unsafe { out_slice(dst, dst_capacity) };
-    dst[..len].copy_from_slice(&cctx.scratch);
+    let len = match cctx.hand_out_frame(dst) {
+        Ok(len) => len,
+        Err(code) => return encode(code),
+    };
     cctx.progress = crate::context::FrameProgress::one_shot(src.len(), len);
     len
 }
@@ -527,12 +526,11 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict_advanced(
             return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
         }
     }
-    let len = cctx.scratch.len();
-    if len > dst_capacity {
-        return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
-    }
     let dst = unsafe { out_slice(dst, dst_capacity) };
-    dst[..len].copy_from_slice(&cctx.scratch);
+    let len = match cctx.hand_out_frame(dst) {
+        Ok(len) => len,
+        Err(code) => return encode(code),
+    };
     cctx.progress = crate::context::FrameProgress::one_shot(src.len(), len);
     len
 }

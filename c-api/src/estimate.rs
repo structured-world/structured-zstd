@@ -25,10 +25,12 @@ const WINDOW_LOG_MAX: core::ffi::c_uint = if usize::BITS >= 64 { 31 } else { 30 
 const TABLE_LOG_MAX: core::ffi::c_uint = if usize::BITS >= 64 { 30 } else { 29 };
 
 /// `size_t ZSTD_estimateCCtxSize(int maxCompressionLevel)` — budget for a
-/// one-shot compression context at the given level.
+/// one-shot compression context at the given level, with the frame buffer it
+/// keeps between calls.
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_estimateCCtxSize(max_compression_level: c_int) -> usize {
     core::mem::size_of::<ZSTD_CCtx>()
+        + crate::context::RETAINED_SCRATCH
         + estimated_compression_workspace_bytes(CompressionLevel::from_level(max_compression_level))
 }
 
@@ -74,7 +76,7 @@ pub extern "C" fn ZSTD_estimateCCtxSize_usingCParams(cparams: ZSTD_compressionPa
     // target the SUM can still wrap (e.g. windowLog 30 + hashLog 29 +
     // chainLog 29) — an under-reported budget is worse than an error for a
     // sizing contract, so overflow comes back encoded.
-    let Some(total) = core::mem::size_of::<ZSTD_CCtx>()
+    let Some(total) = (core::mem::size_of::<ZSTD_CCtx>() + crate::context::RETAINED_SCRATCH)
         .checked_add(window)
         .and_then(|v| v.checked_add(hash))
         .and_then(|v| v.checked_add(chain))
