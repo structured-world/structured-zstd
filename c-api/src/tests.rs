@@ -776,6 +776,85 @@ fn create_cdict_treats_unmagicked_bytes_as_raw_content() {
     assert!(cdict.is_null(), "corrupt full dict must fail");
 }
 
+/// A DDict is prepared when it is created, as upstream loads its entropy then
+/// (`ZSTD_loadEntropy_intoDDict`): a serialized dictionary whose tables do not
+/// parse is refused there, an empty one is a valid no-dictionary handle, and
+/// fullDict over nothing is refused.
+#[test]
+fn ddicts_are_prepared_when_created() {
+    const FULL_DICT: c_int = 2;
+    let default_mem = crate::cdict::ZSTD_customMem {
+        customAlloc: core::ptr::null(),
+        customFree: core::ptr::null(),
+        opaque: core::ptr::null(),
+    };
+    // The magic and an ID, and no tables.
+    let truncated = [0x37u8, 0xA4, 0x30, 0xEC, 1, 0, 0, 0];
+    unsafe {
+        assert!(ZSTD_createDDict(truncated.as_ptr(), truncated.len()).is_null());
+        assert!(
+            crate::cdict::ZSTD_createDDict_advanced(
+                truncated.as_ptr(),
+                truncated.len(),
+                0,
+                FULL_DICT,
+                default_mem
+            )
+            .is_null()
+        );
+        assert!(
+            crate::cdict::ZSTD_createDDict_advanced(
+                core::ptr::null(),
+                0,
+                0,
+                FULL_DICT,
+                default_mem
+            )
+            .is_null()
+        );
+
+        let empty = ZSTD_createDDict(core::ptr::null(), 0);
+        assert!(!empty.is_null(), "an empty DDict is a no-dictionary handle");
+        let input = b"decoded through an empty ddict ".repeat(40);
+        let mut frame = vec![0u8; input.len() + 64];
+        let n = ZSTD_compress(
+            frame.as_mut_ptr(),
+            frame.len(),
+            input.as_ptr(),
+            input.len(),
+            3,
+        );
+        assert_eq!(ZSTD_isError(n), 0);
+        let dctx = ZSTD_createDCtx();
+        let mut out = vec![0u8; input.len()];
+        let m = crate::cdict::ZSTD_decompress_usingDDict(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            n,
+            empty,
+        );
+        assert_eq!(m, input.len());
+        assert_eq!(out, input);
+        // No DDict at all decodes without a dictionary too, as upstream's
+        // ZSTD_decompressMultiFrame does with a NULL ddict.
+        out.fill(0);
+        let m = crate::cdict::ZSTD_decompress_usingDDict(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            n,
+            core::ptr::null(),
+        );
+        assert_eq!(m, input.len());
+        assert_eq!(out, input);
+        ZSTD_freeDCtx(dctx);
+        ZSTD_freeDDict(empty);
+    }
+}
+
 /// The two sides report a `ZSTD_dct_fullDict` selector over bytes that are not
 /// a dictionary with DIFFERENT codes, and a caller that branches on the code
 /// sees the difference: the compression side answers `dictionary_wrong`
@@ -3211,9 +3290,10 @@ fn ref_ddict_honours_raw_content_selection_for_magic_prefixed_bytes() {
 
 #[test]
 fn cdict_advanced_rejects_invalid_strategy_ordinal() {
-    // ZSTD_strategy spans 1 (fast) … 9 (btultra2); 0 and out-of-range
-    // ordinals are invalid input and must fail creation, not silently map
-    // onto the strongest tier.
+    // ZSTD_strategy spans 1 (fast) … 9 (btultra2); out-of-range ordinals are
+    // invalid input and must fail creation, not silently map onto the
+    // strongest tier. 0 is "the default level's", as for every other field
+    // (ZSTD_overrideCParams leaves a 0 field to the level).
     let raw = [0xABu8; 256];
     let no_mem = ZSTD_customMem {
         customAlloc: core::ptr::null(),
@@ -3229,7 +3309,7 @@ fn cdict_advanced_rejects_invalid_strategy_ordinal() {
         targetLength: 0,
         strategy: 0,
     };
-    for bad in [0u32, 10, 42] {
+    for bad in [10u32, 42] {
         let cparams = ZSTD_compressionParameters {
             strategy: bad,
             ..base
@@ -3240,6 +3320,45 @@ fn cdict_advanced_rejects_invalid_strategy_ordinal() {
             cdict.is_null(),
             "strategy ordinal {bad} must fail CDict creation"
         );
+    }
+    let cdict = unsafe { ZSTD_createCDict_advanced(raw.as_ptr(), raw.len(), 0, 1, base, no_mem) };
+    assert!(
+        !cdict.is_null(),
+        "all-zero parameters are the default level's"
+    );
+    let payload = b"default strategy through an all-zero cParams ".repeat(30);
+    let cctx = ZSTD_createCCtx();
+    let mut frame = vec![0u8; ZSTD_compressBound(payload.len())];
+    let written = unsafe {
+        ZSTD_compress_usingCDict(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+            cdict,
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    let dctx = ZSTD_createDCtx();
+    let mut out = vec![0u8; payload.len()];
+    let read = unsafe {
+        crate::attach::ZSTD_decompress_usingDict(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            written,
+            raw.as_ptr(),
+            raw.len(),
+        )
+    };
+    assert_eq!(read, payload.len());
+    assert_eq!(out, payload);
+    unsafe {
+        ZSTD_freeDCtx(dctx);
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeCDict(cdict);
     }
 }
 

@@ -46,7 +46,11 @@ impl ParamSwitch {
 /// searches, schedules or checks its work, with no counterpart in this
 /// encoder: stored as set so they read back, without effect on the frames.
 /// The sequence-format ones are read by the sequence entry points.
-const ADVISORY: [c_int; 14] = [
+const ADVISORY: [c_int; 18] = [
+    ZSTD_C_NB_WORKERS,
+    ZSTD_C_JOB_SIZE,
+    ZSTD_C_OVERLAP_LOG,
+    ZSTD_C_RSYNCABLE,
     ZSTD_C_FORCE_MAX_WINDOW,
     ZSTD_C_FORCE_ATTACH_DICT,
     ZSTD_C_ENABLE_DEDICATED_DICT_SEARCH,
@@ -297,12 +301,19 @@ impl CCtxParams {
                     _ => LiteralCompressionMode::Auto,
                 };
             }
-            // Multi-threading is not part of this build: only 0 is a value,
-            // as in upstream's single-threaded one.
-            ZSTD_C_NB_WORKERS | ZSTD_C_JOB_SIZE | ZSTD_C_OVERLAP_LOG | ZSTD_C_RSYNCABLE => {
-                if value != 0 {
-                    return Err(ZSTD_ErrorCode::ZSTD_error_parameter_unsupported);
-                }
+            // Clamped into range as upstream's multi-threaded build stores them
+            // (zstd_compress.c:866-908); frames are still built on the calling
+            // thread, which a worker count only permits, never requires.
+            ZSTD_C_NB_WORKERS | ZSTD_C_OVERLAP_LOG | ZSTD_C_RSYNCABLE => {
+                self.store_advisory(param, value.clamp(lower, upper));
+            }
+            ZSTD_C_JOB_SIZE => {
+                let value = if value != 0 && value < JOB_SIZE_MIN {
+                    JOB_SIZE_MIN
+                } else {
+                    value
+                };
+                self.store_advisory(param, value.clamp(lower, upper));
             }
             // Upstream takes any value for these two and keeps whether it is 0.
             ZSTD_C_FORCE_MAX_WINDOW | ZSTD_C_ENABLE_DEDICATED_DICT_SEARCH => {
@@ -360,11 +371,6 @@ impl CCtxParams {
                 LiteralCompressionMode::Enable => ParamSwitch::Enable.to_c(),
                 LiteralCompressionMode::Disable => ParamSwitch::Disable.to_c(),
             },
-            ZSTD_C_NB_WORKERS => 0,
-            // Upstream's single-threaded build has no value to report for these.
-            ZSTD_C_JOB_SIZE | ZSTD_C_OVERLAP_LOG | ZSTD_C_RSYNCABLE => {
-                return Err(ZSTD_ErrorCode::ZSTD_error_parameter_unsupported);
-            }
             _ => match advisory_slot(param) {
                 Some(slot) => self.advisory[slot],
                 None => return Err(ZSTD_ErrorCode::ZSTD_error_parameter_unsupported),

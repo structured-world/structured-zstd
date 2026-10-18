@@ -969,6 +969,23 @@ impl<M: Matcher> CompressionContext<M> {
         self.pending_len()
     }
 
+    /// How much more input completes the block being filled, or a whole block
+    /// when none is partly filled: the read size that lets the next write
+    /// compress a block straight away (upstream zstd `ZSTD_nextInputSizeHint`).
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel};
+    ///
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// let mut frame = Vec::new();
+    /// context.write(&mut frame, &[7u8; 100]).unwrap();
+    /// assert_eq!(context.next_input_size_hint(), 128 * 1024 - 100);
+    /// ```
+    pub fn next_input_size_hint(&self) -> usize {
+        let block = self.block_capacity();
+        block - self.pending_len() % block
+    }
+
     fn ensure_open(&self) -> Result<(), Error> {
         if self.errored {
             return Err(self.sticky_error());

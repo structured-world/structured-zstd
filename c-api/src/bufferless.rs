@@ -622,25 +622,8 @@ pub unsafe extern "C" fn ZSTD_decompressBegin_usingDDict(
     let Some(dctx) = (unsafe { dctx.as_mut() }) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     };
-    let Some(ddict) = (unsafe { ddict.as_ref() }) else {
-        return begin_decode(dctx, None);
-    };
-    // The parse is cached on the context by the DDict's identity, as the
-    // one-shot `ZSTD_decompress_usingDDict` caches it.
-    if dctx.ddict_serial != ddict.serial || dctx.ddict_handle.is_none() {
-        let parsed = catch_unwind(AssertUnwindSafe(|| {
-            crate::attach::parse_decode_dict(&ddict.raw, ddict.content_type)
-        }));
-        match parsed {
-            Ok(Ok(handle)) => {
-                dctx.ddict_handle = Some(handle);
-                dctx.ddict_serial = ddict.serial;
-            }
-            Ok(Err(code)) => return encode(code),
-            Err(_) => return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC),
-        }
-    }
-    let handle = dctx.ddict_handle.clone();
+    // The DDict was prepared at creation; the run shares its handle.
+    let handle = unsafe { ddict.as_ref() }.and_then(|ddict| ddict.prepared.clone());
     begin_decode(dctx, handle)
 }
 

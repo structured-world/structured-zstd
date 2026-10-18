@@ -61,6 +61,18 @@ pub(crate) const ZSTD_C_MAX_BLOCK_SIZE: c_int = 1015;
 pub(crate) const ZSTD_C_REPCODE_RESOLUTION: c_int = 1016;
 pub(crate) const ZSTD_C_BLOCK_SPLITTER_LEVEL: c_int = 1017;
 
+// Upstream's worker-pool limits (zstdmt_compress.h:29-36).
+#[cfg(target_pointer_width = "32")]
+const NB_WORKERS_MAX: c_int = 64;
+#[cfg(not(target_pointer_width = "32"))]
+const NB_WORKERS_MAX: c_int = 256;
+/// The smallest job size other than 0 (`ZSTDMT_JOBSIZE_MIN`).
+pub(crate) const JOB_SIZE_MIN: c_int = 512 << 10;
+#[cfg(target_pointer_width = "32")]
+const JOB_SIZE_MAX: c_int = 512 << 20;
+#[cfg(not(target_pointer_width = "32"))]
+const JOB_SIZE_MAX: c_int = 1 << 30;
+
 // `ZSTD_dParameter` discriminants.
 pub(crate) const ZSTD_D_WINDOW_LOG_MAX: c_int = 100;
 pub(crate) const ZSTD_D_FORMAT: c_int = 1000;
@@ -155,8 +167,11 @@ pub(crate) fn c_param_bounds(param: c_int) -> Option<(c_int, c_int)> {
         ZSTD_C_LDM_BUCKET_SIZE_LOG => from_codec(CParameter::LdmBucketSizeLog),
         ZSTD_C_LDM_HASH_RATE_LOG => from_codec(CParameter::LdmHashRateLog),
         ZSTD_C_CONTENT_SIZE_FLAG | ZSTD_C_CHECKSUM_FLAG | ZSTD_C_DICT_ID_FLAG => (0, 1),
-        // The bounds of upstream's single-threaded build.
-        ZSTD_C_NB_WORKERS | ZSTD_C_JOB_SIZE | ZSTD_C_OVERLAP_LOG => (0, 0),
+        // The bounds of upstream's multi-threaded build, the one systems ship
+        // (zstd_compress.c:480-506): its callers set these and expect them taken.
+        ZSTD_C_NB_WORKERS => (0, NB_WORKERS_MAX),
+        ZSTD_C_JOB_SIZE => (0, JOB_SIZE_MAX),
+        ZSTD_C_OVERLAP_LOG => (0, 9),
         ZSTD_C_RSYNCABLE
         | ZSTD_C_FORMAT
         | ZSTD_C_FORCE_MAX_WINDOW

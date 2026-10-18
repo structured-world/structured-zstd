@@ -38,6 +38,8 @@ const CHECKSUM: c_int = 201;
 const DICT_ID: c_int = 202;
 const NB_WORKERS: c_int = 400;
 const JOB_SIZE: c_int = 401;
+const OVERLAP_LOG: c_int = 402;
+const RSYNCABLE: c_int = 500;
 const FORMAT: c_int = 10;
 const FORCE_MAX_WINDOW: c_int = 1000;
 const FORCE_ATTACH_DICT: c_int = 1001;
@@ -250,14 +252,16 @@ fn parameter_set_stores_like_upstream() {
             code(ZSTD_CCtxParams_setParameter(params, MAX_BLOCK_SIZE, 100)),
             ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound
         );
-        assert_eq!(
-            code(ZSTD_CCtxParams_setParameter(params, NB_WORKERS, 2)),
-            ZSTD_ErrorCode::ZSTD_error_parameter_unsupported
-        );
-        assert_eq!(
-            get(params, JOB_SIZE),
-            Err(ZSTD_ErrorCode::ZSTD_error_parameter_unsupported)
-        );
+        // The worker-pool parameters are taken and clamped as upstream's
+        // multi-threaded build takes them.
+        assert_eq!(ZSTD_CCtxParams_setParameter(params, NB_WORKERS, 2), 0);
+        assert_eq!(get(params, NB_WORKERS), Ok(2));
+        assert_eq!(ZSTD_CCtxParams_setParameter(params, JOB_SIZE, 100), 0);
+        assert_eq!(get(params, JOB_SIZE), Ok(512 << 10));
+        assert_eq!(ZSTD_CCtxParams_setParameter(params, OVERLAP_LOG, 20), 0);
+        assert_eq!(get(params, OVERLAP_LOG), Ok(9));
+        assert_eq!(ZSTD_CCtxParams_setParameter(params, RSYNCABLE, 5), 0);
+        assert_eq!(get(params, RSYNCABLE), Ok(1));
         assert_eq!(ZSTD_CCtxParams_setParameter(params, FORCE_MAX_WINDOW, 7), 0);
         assert_eq!(get(params, FORCE_MAX_WINDOW), Ok(1));
         assert_eq!(

@@ -190,15 +190,6 @@ pub struct ZSTD_DCtx {
     /// `ZSTD_DCtx_refDDict` / `ZSTD_DCtx_refPrefix`), applied at every frame
     /// start by `ZSTD_decompressDCtx` / `ZSTD_decompressStream`.
     pub(crate) attached_ddict: crate::attach::DCtxDictAttach,
-    /// Identity of the `DDict` whose content was last loaded into `decoder`
-    /// (its never-reused serial; `0` = none), so repeated
-    /// `ZSTD_decompress_usingDDict` calls with the same DDict skip re-adding it.
-    /// Reset to `0` whenever `decoder` is replaced, so a fresh decoder is never
-    /// trusted to still hold the previously-loaded dictionary.
-    pub(crate) ddict_serial: u64,
-    /// Parsed-dictionary cache for `ZSTD_decompress_usingDDict`, keyed by
-    /// `ddict_serial`: repeated calls with the same DDict skip the re-parse.
-    pub(crate) ddict_handle: Option<codec::decoding::DictionaryHandle>,
 }
 
 /// `ZSTD_CCtx* ZSTD_createCCtx(void)`. Returns `NULL` on allocation failure
@@ -575,8 +566,6 @@ pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
         stream_entry: crate::streaming::StreamEntry::Entered,
         stream_staged: Vec::new(),
         attached_ddict: crate::attach::DCtxDictAttach::None,
-        ddict_serial: 0,
-        ddict_handle: None,
     })
 }
 
@@ -615,7 +604,6 @@ impl ZSTD_DCtx {
         // a frame boundary, so the streaming flag must say so too.
         self.replace_decoder();
         self.stream_frame_done = true;
-        self.ddict_handle = None;
         self.attached_ddict = crate::attach::DCtxDictAttach::None;
     }
 
@@ -624,7 +612,6 @@ impl ZSTD_DCtx {
     pub(crate) fn replace_decoder(&mut self) {
         self.decoder = FrameDecoder::new();
         self.decoder.set_magicless(self.magicless);
-        self.ddict_serial = 0;
     }
 }
 
@@ -661,13 +648,6 @@ pub unsafe extern "C" fn ZSTD_sizeof_DCtx(dctx: *const ZSTD_DCtx) -> usize {
         + dctx.decoder.workspace_size()
         + dctx.stream_staged.capacity()
         + dctx.attached_ddict.heap_size()
-        // The parsed-dictionary cache behind ZSTD_decompress_usingDDict is
-        // context-owned (the parse copy, not the caller's DDict bytes);
-        // same accounting as the attach path: content + entropy-table heap
-        // plus the inline struct.
-        + dctx.ddict_handle.as_ref().map_or(0, |h| {
-            h.as_dict().heap_bytes() + core::mem::size_of::<codec::decoding::Dictionary>()
-        })
 }
 
 /// `size_t ZSTD_decompressDCtx(ZSTD_DCtx* dctx, void* dst, size_t dstCapacity,
@@ -689,7 +669,11 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let dctx = unsafe { &mut *dctx };
-    let src = unsafe { in_slice(src, src_size) };
+    let src = match unsafe { crate::ffi::decode_input(src, src_size, dst, dst_capacity) } {
+        Ok(src) => src,
+        Err(code) => return encode(code),
+    };
+    let src = &*src;
     let dst = unsafe { out_slice(dst, dst_capacity) };
     // Verify the trailing content checksum like upstream ZSTD_decompress; the
     // setter is idempotent, so reapplying it on a reused DCtx is fine.
@@ -749,10 +733,7 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
             // A panic mid-decode can leave the decoder's internal state
             // partially consumed; replace it with a fresh one (same as
             // ZSTD_createDCtx) so a later call on this reused DCtx starts clean
-            // instead of observing a broken invariant. The fresh decoder no
-            // longer holds any previously-loaded dictionary, so clear the DDict
-            // cache key too — otherwise the next ZSTD_decompress_usingDDict with
-            // the same handle would skip re-loading it and decode without it.
+            // instead of observing a broken invariant.
             dctx.replace_decoder();
             dctx.stream_frame_done = true;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)

@@ -84,6 +84,25 @@ impl Dictionary {
             + self.huf.heap_bytes()
     }
 
+    /// Most [`heap_bytes`](Self::heap_bytes) a dictionary holding
+    /// `content_len` bytes of content can report, so a caller can budget for
+    /// one before parsing it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_zstd::decoding::Dictionary;
+    ///
+    /// let dict = Dictionary::from_raw_content(0, vec![7u8; 1024]).unwrap();
+    /// assert!(dict.heap_bytes() <= Dictionary::max_heap_bytes(1024));
+    /// ```
+    pub const fn max_heap_bytes(content_len: usize) -> usize {
+        content_len
+            + core::mem::size_of::<FSEScratch>()
+            + FSEScratch::max_heap_bytes()
+            + HuffmanScratch::max_heap_bytes()
+    }
+
     /// Build a dictionary from raw content bytes (without entropy table sections).
     ///
     /// This is primarily intended for dictionaries produced by the `dict-builder`

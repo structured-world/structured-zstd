@@ -282,6 +282,42 @@ fn write_skippable_frame_layout_and_errors() {
     }
 }
 
+/// The in-place layout `ZSTD_decompressionMargin` sizes, the frame stored at
+/// the end of the output buffer, decodes through every one-shot entry point.
+#[test]
+fn one_shots_decode_in_place() {
+    // A ready frame, so the test reaches only the decoders: single segment,
+    // content size 5, one last raw block.
+    let input = b"abcde";
+    let frame = &[
+        0x28, 0xB5, 0x2F, 0xFD, 0x20, 5, 0x29, 0, 0, b'a', b'b', b'c', b'd', b'e',
+    ][..];
+    let margin = unsafe { ZSTD_decompressionMargin(frame.as_ptr(), frame.len()) };
+    assert_eq!(ZSTD_isError(margin), 0);
+    let capacity = input.len() + margin;
+    let at = capacity - frame.len();
+    let decode = |run: &dyn Fn(*mut u8, usize, *const u8, usize) -> usize| {
+        let mut buffer = vec![0u8; capacity];
+        buffer[at..].copy_from_slice(frame);
+        let base = buffer.as_mut_ptr();
+        let written = run(base, capacity, unsafe { base.add(at) }, frame.len());
+        assert_eq!(written, input.len(), "{:?}", code(written));
+        assert_eq!(&buffer[..written], input.as_slice());
+    };
+    let dctx = ZSTD_createDCtx();
+    unsafe {
+        decode(&|dst, cap, src, len| crate::simple::ZSTD_decompress(dst, cap, src, len));
+        decode(&|dst, cap, src, len| ZSTD_decompressDCtx(dctx, dst, cap, src, len));
+        decode(&|dst, cap, src, len| {
+            crate::attach::ZSTD_decompress_usingDict(dctx, dst, cap, src, len, core::ptr::null(), 0)
+        });
+        decode(&|dst, cap, src, len| {
+            crate::cdict::ZSTD_decompress_usingDDict(dctx, dst, cap, src, len, core::ptr::null())
+        });
+        ZSTD_freeDCtx(dctx);
+    }
+}
+
 /// Each frame costs its header, checksum and three bytes per block, a
 /// skippable frame its whole length, plus one largest block (upstream: 1053
 /// for both frames, 1040 for the first alone).

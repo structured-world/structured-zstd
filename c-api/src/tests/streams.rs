@@ -1,7 +1,7 @@
 //! The stream init and reset family, the simple-argument streaming calls,
 //! frame progression, and the `_advanced` creators.
 
-use core::ffi::c_void;
+use core::ffi::{c_int, c_void};
 
 use super::experimental::code;
 use crate::attach::{ZSTD_DCtx_refDDict, ZSTD_decompress_usingDict, ZSTD_getDictID_fromFrame};
@@ -12,11 +12,11 @@ use crate::cdict::{
 use crate::context::{ZSTD_CCtx, ZSTD_DCtx, ZSTD_freeCCtx, ZSTD_freeDCtx};
 use crate::error::{ZSTD_ErrorCode, ZSTD_isError};
 use crate::frame::{ZSTD_FrameHeader, ZSTD_getFrameHeader};
-use crate::params::{ZSTD_DCtx_setFormat, ZSTD_getParams};
+use crate::params::{ZSTD_CCtx_setParameter, ZSTD_DCtx_setFormat, ZSTD_getParams};
 use crate::streaming::{
-    ZSTD_compressStream2, ZSTD_compressStream2_simpleArgs, ZSTD_createCStream,
+    ZSTD_compressStream, ZSTD_compressStream2, ZSTD_compressStream2_simpleArgs, ZSTD_createCStream,
     ZSTD_createCStream_advanced, ZSTD_createDStream, ZSTD_createDStream_advanced,
-    ZSTD_decompressStream_simpleArgs, ZSTD_getFrameProgression, ZSTD_inBuffer,
+    ZSTD_decompressStream_simpleArgs, ZSTD_getFrameProgression, ZSTD_inBuffer, ZSTD_initCStream,
     ZSTD_initCStream_advanced, ZSTD_initCStream_srcSize, ZSTD_initCStream_usingCDict,
     ZSTD_initCStream_usingCDict_advanced, ZSTD_initCStream_usingDict, ZSTD_initDStream,
     ZSTD_initDStream_usingDDict, ZSTD_initDStream_usingDict, ZSTD_outBuffer, ZSTD_resetCStream,
@@ -108,6 +108,58 @@ fn init_cstream_src_size_pledges_the_frame() {
             code(end_frame(zcs, &input).unwrap_err()),
             ZSTD_ErrorCode::ZSTD_error_srcSize_wrong
         );
+        ZSTD_freeCCtx(zcs);
+    }
+}
+
+/// `ZSTD_compressStream` answers the input that completes the block being
+/// filled, under the block size the context is set to.
+#[test]
+fn compress_stream_hints_the_rest_of_the_block() {
+    const MAX_BLOCK_SIZE: c_int = 1015;
+    let zcs = ZSTD_createCStream();
+    let input = [7u8; 100];
+    let mut out = vec![0u8; 1024];
+    let mut feed = |zcs: *mut ZSTD_CCtx| unsafe {
+        let mut inb = ZSTD_inBuffer {
+            src: input.as_ptr().cast(),
+            size: input.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: out.as_mut_ptr().cast(),
+            size: out.len(),
+            pos: 0,
+        };
+        let hint = ZSTD_compressStream(zcs, &mut outb, &mut inb);
+        assert_eq!(inb.pos, input.len());
+        hint
+    };
+    unsafe {
+        assert_eq!(ZSTD_initCStream(zcs, 3), 0);
+        assert_eq!(feed(zcs), (128 << 10) - 100);
+        assert_eq!(feed(zcs), (128 << 10) - 200);
+
+        assert_eq!(ZSTD_initCStream(zcs, 3), 0);
+        assert_eq!(ZSTD_CCtx_setParameter(zcs, MAX_BLOCK_SIZE, 64 << 10), 0);
+        assert_eq!(feed(zcs), (64 << 10) - 100);
+        ZSTD_freeCCtx(zcs);
+    }
+}
+
+/// An advanced init refused for its compression parameters installs nothing:
+/// the next frame on the context does not inherit the refused call's pledge.
+#[test]
+fn a_refused_advanced_init_leaves_no_pledge() {
+    let input = b"no pledge survives a refused init ".repeat(40);
+    let zcs = ZSTD_createCStream();
+    unsafe {
+        let mut params = crate::params::ZSTD_getParams(3, 0, 0);
+        params.cParams.windowLog = 1;
+        let rc = ZSTD_initCStream_advanced(zcs, core::ptr::null(), 0, params, 10);
+        assert_eq!(code(rc), ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
+        let frame = end_frame(zcs, &input).unwrap();
+        assert_eq!(header(&frame).frameContentSize, u64::MAX);
         ZSTD_freeCCtx(zcs);
     }
 }
@@ -598,18 +650,24 @@ fn init_dstream_variants() {
 }
 
 /// The default allocator creates the usual contexts; a custom one is refused.
+/// Default means both callbacks `NULL`, whatever `opaque` holds: upstream's
+/// default path never reads it (`ZSTD_customMalloc`, zstd_internal.h).
 #[test]
 fn advanced_creators_take_only_the_default_allocator() {
+    extern "C" fn no_alloc(_: *mut core::ffi::c_void, _: usize) -> *mut core::ffi::c_void {
+        core::ptr::null_mut()
+    }
+    let marker = 1u8;
     let default = ZSTD_customMem {
         customAlloc: core::ptr::null(),
         customFree: core::ptr::null(),
-        opaque: core::ptr::null(),
-    };
-    let marker = 1u8;
-    let custom = ZSTD_customMem {
         opaque: core::ptr::from_ref(&marker).cast(),
+    };
+    let custom = ZSTD_customMem {
+        customAlloc: no_alloc as *const core::ffi::c_void,
         ..default
     };
+    let dict = DICT;
     unsafe {
         let cctx = crate::context::ZSTD_createCCtx_advanced(default);
         assert!(!cctx.is_null());
@@ -623,6 +681,13 @@ fn advanced_creators_take_only_the_default_allocator() {
         let zds = ZSTD_createDStream_advanced(default);
         assert!(!zds.is_null());
         ZSTD_freeDCtx(zds);
+        let ddict =
+            crate::cdict::ZSTD_createDDict_advanced(dict.as_ptr(), dict.len(), 0, 0, default);
+        assert!(!ddict.is_null());
+        ZSTD_freeDDict(ddict);
+        let ddict =
+            crate::cdict::ZSTD_createDDict_advanced(dict.as_ptr(), dict.len(), 0, 0, custom);
+        assert!(ddict.is_null());
     }
     assert!(crate::context::ZSTD_createCCtx_advanced(custom).is_null());
     assert!(crate::context::ZSTD_createDCtx_advanced(custom).is_null());

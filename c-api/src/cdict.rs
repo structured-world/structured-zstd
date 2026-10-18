@@ -71,16 +71,43 @@ pub struct ZSTD_CDict {
     pub(crate) params: Option<CompressionParameters>,
 }
 
-/// Opaque prepared decompression dictionary: the dictionary bytes plus its ID.
+/// Opaque prepared decompression dictionary: parsed once at creation under the
+/// content type it was made with, as upstream loads a DDict's entropy then,
+/// and shared by every context that uses it, as upstream contexts point at it.
 #[allow(non_camel_case_types)]
 pub struct ZSTD_DDict {
-    pub(crate) raw: Vec<u8>,
+    /// `None` for one made from no bytes, a no-dictionary handle.
+    pub(crate) prepared: Option<codec::decoding::DictionaryHandle>,
     pub(crate) id: u32,
-    /// Never-reused identity for context cache validation (see [`DICT_SERIAL`]).
-    pub(crate) serial: u64,
-    /// `ZSTD_dictContentType_e` selected at creation (auto for the plain
-    /// constructors); honoured when the bytes are parsed at use.
-    pub(crate) content_type: c_int,
+}
+
+/// A DDict of `dict` read as `content_type`, `NULL` where upstream's
+/// `ZSTD_createDDict_advanced` fails: a selector it does not know, fullDict
+/// over bytes that are not a dictionary (nothing included), or a serialized
+/// dictionary whose tables do not parse (`ZSTD_loadEntropy_intoDDict`).
+fn create_ddict(dict: &[u8], content_type: c_int) -> *mut ZSTD_DDict {
+    let prepared = if dict.is_empty() {
+        if content_type != crate::attach::ZSTD_DCT_AUTO
+            && content_type != crate::attach::ZSTD_DCT_RAW_CONTENT
+        {
+            return core::ptr::null_mut();
+        }
+        None
+    } else {
+        let parsed = catch_unwind(AssertUnwindSafe(|| {
+            crate::attach::parse_decode_dict(dict, content_type)
+        }));
+        match parsed {
+            Ok(Ok(handle)) => Some(handle),
+            Ok(Err(_)) | Err(_) => return core::ptr::null_mut(),
+        }
+    };
+    let id = if content_type == crate::attach::ZSTD_DCT_RAW_CONTENT {
+        0
+    } else {
+        dict_id_from_bytes(dict)
+    };
+    try_box(ZSTD_DDict { prepared, id })
 }
 
 /// Prepare `dict` for compression the way a `CDict` holds it: a serialized
@@ -189,7 +216,7 @@ pub struct ZSTD_frameParameters {
 }
 
 /// `ZSTD_customMem` — ABI mirror (alloc fn, free fn, opaque). Custom
-/// allocators are not supported: only the all-`NULL` value (`ZSTD_defaultCMem`)
+/// allocators are not supported: only the default one (both callbacks `NULL`)
 /// is accepted; anything else fails creation.
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -201,17 +228,22 @@ pub struct ZSTD_customMem {
 }
 
 impl ZSTD_customMem {
-    /// Whether this is `ZSTD_defaultCMem`, the only allocator accepted.
+    /// Whether this selects the default allocator, the only one accepted:
+    /// both callbacks `NULL`, as upstream decides it; `opaque` is only ever
+    /// handed to the callbacks, so it does not matter here.
     pub(crate) fn is_default(&self) -> bool {
-        self.customAlloc.is_null() && self.customFree.is_null() && self.opaque.is_null()
+        self.customAlloc.is_null() && self.customFree.is_null()
     }
 }
 
 /// Representative compression level for an explicit strategy ordinal: feeds
-/// the level-derived defaults for the knobs `cParams` leaves at 0. `None`
-/// for ordinals outside `ZSTD_strategy`'s 1..=9 (invalid input, not a tier).
+/// the level-derived defaults for the knobs `cParams` leaves at 0. `0` leaves
+/// the strategy to the default level as well, as upstream's
+/// `ZSTD_overrideCParams` leaves any 0 field. `None` for ordinals past
+/// `ZSTD_strategy`'s 9 (invalid input, not a tier).
 fn level_for_strategy(strategy: c_uint) -> Option<c_int> {
     Some(match strategy {
+        0 => 3,  // ZSTD_CLEVEL_DEFAULT
         1 => 1,  // fast
         2 => 3,  // dfast
         3 => 5,  // greedy
@@ -227,7 +259,7 @@ fn level_for_strategy(strategy: c_uint) -> Option<c_int> {
 
 /// Map explicit `ZSTD_compressionParameters` to the sticky-parameter
 /// snapshot the codec resolves (0 = auto for every knob, upstream rule).
-/// `None` when the strategy ordinal is outside `ZSTD_strategy`'s range.
+/// `None` when the strategy ordinal is past `ZSTD_strategy`'s range.
 fn cctx_params_from_cparams(
     cparams: &ZSTD_compressionParameters,
 ) -> Option<crate::cctx_params::CCtxParams> {
@@ -329,28 +361,7 @@ pub unsafe extern "C" fn ZSTD_createDDict_advanced(
         return core::ptr::null_mut();
     }
     let dict = unsafe { in_slice(dict_buffer, dict_size) };
-    if dict.is_empty() {
-        return core::ptr::null_mut();
-    }
-    // FULL_DICT requires the dictionary magic up front: failing here mirrors
-    // the CDict creator and the loadDictionary paths, instead of handing out
-    // a handle that only fails later at decompression time.
-    match dict_content_type {
-        crate::attach::ZSTD_DCT_AUTO | crate::attach::ZSTD_DCT_RAW_CONTENT => {}
-        crate::attach::ZSTD_DCT_FULL_DICT if codec::decoding::Dictionary::is_serialized(dict) => {}
-        _ => return core::ptr::null_mut(),
-    }
-    let id = if dict_content_type == crate::attach::ZSTD_DCT_RAW_CONTENT {
-        0
-    } else {
-        dict_id_from_bytes(dict)
-    };
-    try_box(ZSTD_DDict {
-        raw: dict.to_vec(),
-        id,
-        serial: next_dict_serial(),
-        content_type: dict_content_type,
-    })
+    create_ddict(dict, dict_content_type)
 }
 
 /// `size_t ZSTD_freeCDict(ZSTD_CDict* CDict)` — free the dictionary; `NULL` is a
@@ -547,16 +558,7 @@ pub unsafe extern "C" fn ZSTD_createDDict(
     dict_size: usize,
 ) -> *mut ZSTD_DDict {
     let dict = unsafe { in_slice(dict_buffer, dict_size) };
-    if dict.is_empty() {
-        return core::ptr::null_mut();
-    }
-    let id = dict_id_from_bytes(dict);
-    try_box(ZSTD_DDict {
-        raw: dict.to_vec(),
-        id,
-        serial: next_dict_serial(),
-        content_type: crate::attach::ZSTD_DCT_AUTO,
-    })
+    create_ddict(dict, crate::attach::ZSTD_DCT_AUTO)
 }
 
 /// `ZSTD_DDict* ZSTD_createDDict_byReference(const void* dictBuffer, size_t
@@ -595,7 +597,10 @@ pub unsafe extern "C" fn ZSTD_sizeof_DDict(ddict: *const ZSTD_DDict) -> usize {
         return 0;
     }
     let ddict = unsafe { &*ddict };
-    core::mem::size_of::<ZSTD_DDict>() + ddict.raw.capacity()
+    core::mem::size_of::<ZSTD_DDict>()
+        + ddict.prepared.as_ref().map_or(0, |h| {
+            h.as_dict().heap_bytes() + core::mem::size_of::<codec::decoding::Dictionary>()
+        })
 }
 
 /// `unsigned ZSTD_getDictID_fromDDict(const ZSTD_DDict* ddict)` — the dictionary
@@ -613,13 +618,12 @@ pub unsafe extern "C" fn ZSTD_getDictID_fromDDict(ddict: *const ZSTD_DDict) -> c
 
 /// `size_t ZSTD_decompress_usingDDict(ZSTD_DCtx* dctx, void* dst, size_t
 /// dstCapacity, const void* src, size_t srcSize, const ZSTD_DDict* ddict)` —
-/// decompress a dictionary-compressed frame. The `dctx` caches the loaded
-/// dictionary keyed by the `DDict`'s serial, so repeated calls with the same
-/// `DDict` skip re-loading it.
+/// decompress a dictionary-compressed frame with the DDict's prepared
+/// dictionary, borrowed for the call; an empty DDict decodes without one.
 ///
 /// # Safety
-/// `dctx` / `ddict` must be live handles; `dst` / `src` valid for their lengths
-/// (or `NULL` + 0).
+/// `dctx` must be live, `ddict` live or `NULL`; `dst` / `src` valid for their
+/// lengths (or `NULL` + 0).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
     dctx: *mut ZSTD_DCtx,
@@ -629,39 +633,26 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
     src_size: usize,
     ddict: *const ZSTD_DDict,
 ) -> usize {
-    if dctx.is_null() || ddict.is_null() {
+    if dctx.is_null() {
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let dctx = unsafe { &mut *dctx };
-    let ddict_ref = unsafe { &*ddict };
-    let src = unsafe { in_slice(src, src_size) };
+    // A NULL DDict decodes without a dictionary, as upstream's
+    // ZSTD_decompressMultiFrame does.
+    let prepared = unsafe { ddict.as_ref() }.and_then(|ddict| ddict.prepared.as_ref());
+    let src = match unsafe { crate::ffi::decode_input(src, src_size, dst, dst_capacity) } {
+        Ok(src) => src,
+        Err(code) => return encode(code),
+    };
+    let src = &*src;
     let dst = unsafe { out_slice(dst, dst_capacity) };
-    let key = ddict_ref.serial;
 
-    // Parse the dictionary once per DDict (keyed by its serial); decoding
-    // then forces the parsed handle per frame, which also covers raw-content
+    // The handle is forced on every frame, which also covers raw-content
     // dictionaries and ID-less frames.
-    if dctx.ddict_serial != key || dctx.ddict_handle.is_none() {
-        let parsed = catch_unwind(AssertUnwindSafe(|| {
-            crate::attach::parse_decode_dict(&ddict_ref.raw, ddict_ref.content_type)
-        }));
-        match parsed {
-            Ok(Ok(handle)) => {
-                dctx.ddict_handle = Some(handle);
-                dctx.ddict_serial = key;
-            }
-            Ok(Err(code)) => return encode(code),
-            Err(_) => {
-                dctx.ddict_handle = None;
-                dctx.ddict_serial = 0;
-                return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
-            }
-        }
-    }
-    let handle = dctx.ddict_handle.clone().expect("just ensured Some");
     dctx.decoder.set_content_checksum(ContentChecksum::Verify);
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        dctx.decoder.decode_all_with_dict_handle(src, dst, &handle)
+    let outcome = catch_unwind(AssertUnwindSafe(|| match prepared {
+        Some(handle) => dctx.decoder.decode_all_with_dict_handle(src, dst, handle),
+        None => dctx.decoder.decode_all(src, dst),
     }));
     match outcome {
         Ok(Ok(written)) => {

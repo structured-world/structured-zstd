@@ -210,9 +210,13 @@ pub extern "C" fn ZSTD_estimateCDictSize_advanced(
 
 /// `size_t ZSTD_estimateDDictSize(size_t dictSize, ZSTD_dictLoadMethod_e
 /// dictLoadMethod)` — budget for a `ZSTD_DDict` made from a `dictSize`-byte
-/// dictionary, which always keeps its own copy of the bytes.
+/// dictionary, which always keeps its own parsed copy of the bytes.
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_estimateDDictSize(dict_size: usize, _dict_load_method: c_int) -> usize {
+    use codec::decoding::Dictionary;
+    let fixed = core::mem::size_of::<crate::cdict::ZSTD_DDict>()
+        + core::mem::size_of::<Dictionary>()
+        + Dictionary::max_heap_bytes(0);
     // An upper bound saturates: `usize::MAX` still bounds any allocation.
-    core::mem::size_of::<crate::cdict::ZSTD_DDict>().saturating_add(dict_size)
+    fixed.saturating_add(dict_size)
 }

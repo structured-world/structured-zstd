@@ -101,10 +101,9 @@ pub(crate) enum DCtxDictAttach {
     Load {
         handle: DictionaryHandle,
     },
-    /// `ZSTD_DCtx_refDDict`: sticky reference; the parse of the DDict's bytes
-    /// is cached here keyed by its serial.
+    /// `ZSTD_DCtx_refDDict`: sticky reference sharing the DDict's prepared
+    /// dictionary.
     RefDDict {
-        serial: u64,
         handle: DictionaryHandle,
     },
     /// `ZSTD_DCtx_refPrefix`: single-use raw-content dictionary.
@@ -116,14 +115,12 @@ pub(crate) enum DCtxDictAttach {
 impl DCtxDictAttach {
     /// Heap bytes owned by the attach state: the parsed dictionary behind
     /// `loadDictionary` / `refPrefix` is context-owned (counted); a
-    /// referenced `DDict`'s parse is cached here but its bytes belong to
-    /// the caller's handle, so only the parsed copy is reported.
+    /// referenced `DDict` belongs to the caller, so it is not, as upstream's
+    /// `ZSTD_sizeof_DCtx` leaves a referenced DDict out.
     pub(crate) fn heap_size(&self) -> usize {
         match self {
-            DCtxDictAttach::None => 0,
-            DCtxDictAttach::Load { handle }
-            | DCtxDictAttach::RefDDict { handle, .. }
-            | DCtxDictAttach::Prefix { handle } => {
+            DCtxDictAttach::None | DCtxDictAttach::RefDDict { .. } => 0,
+            DCtxDictAttach::Load { handle } | DCtxDictAttach::Prefix { handle } => {
                 // Content plus the parsed entropy tables' heap; the inline
                 // FSE decode arrays are covered by the struct size term.
                 handle.as_dict().heap_bytes() + core::mem::size_of::<codec::decoding::Dictionary>()
@@ -630,29 +627,14 @@ pub unsafe extern "C" fn ZSTD_DCtx_refDDict(
         dctx.attached_ddict = DCtxDictAttach::None;
         return 0;
     }
-    let ddict = unsafe { &*ddict };
-    if let DCtxDictAttach::RefDDict { serial, .. } = &dctx.attached_ddict
-        && *serial == ddict.serial
-    {
-        return 0;
-    }
-    // Honour the DDict's creation-time content-type selection (same as
-    // ZSTD_decompress_usingDDict): an explicit rawContent DDict must not be
-    // re-classified on the magic at use time.
-    let parsed = catch_unwind(AssertUnwindSafe(|| {
-        parse_decode_dict(&ddict.raw, ddict.content_type)
-    }));
-    match parsed {
-        Ok(Ok(handle)) => {
-            dctx.attached_ddict = DCtxDictAttach::RefDDict {
-                serial: ddict.serial,
-                handle,
-            };
-            0
-        }
-        Ok(Err(code)) => encode(code),
-        Err(_) => encode(ZSTD_ErrorCode::ZSTD_error_GENERIC),
-    }
+    // The DDict was prepared at creation; an empty one references nothing.
+    dctx.attached_ddict = match &unsafe { &*ddict }.prepared {
+        Some(handle) => DCtxDictAttach::RefDDict {
+            handle: handle.clone(),
+        },
+        None => DCtxDictAttach::None,
+    };
+    0
 }
 
 /// `size_t ZSTD_DCtx_refPrefix(ZSTD_DCtx* dctx, const void* prefix, size_t
@@ -843,7 +825,11 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let dctx = unsafe { &mut *dctx };
-    let src = unsafe { in_slice(src, src_size) };
+    let src = match unsafe { crate::ffi::decode_input(src, src_size, dst, dst_capacity) } {
+        Ok(src) => src,
+        Err(code) => return encode(code),
+    };
+    let src = &*src;
     let dst = unsafe { out_slice(dst, dst_capacity) };
     let dict = unsafe { in_slice(dict, dict_size) };
     // Deliberately NO `stream_frame_done` guard here: the stage_wrong check

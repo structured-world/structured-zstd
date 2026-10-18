@@ -612,11 +612,13 @@ pub unsafe extern "C" fn ZSTD_initCStream_advanced(
         pledged_src_size
     };
     cctx.reset_session();
-    cctx.params.pledged_src_size = pledged;
+    // Checked before any session state is installed, so a refused call
+    // leaves no pledge for the next frame to inherit.
     let checked = crate::params::ZSTD_checkCParams(params.cParams);
     if crate::error::result_is_error(checked) {
         return checked;
     }
+    cctx.params.pledged_src_size = pledged;
     cctx.params.set_explicit(&params.cParams, &params.fParams);
     unsafe { crate::attach::ZSTD_CCtx_loadDictionary(zcs, dict, dict_size) }
 }
@@ -797,8 +799,14 @@ pub unsafe extern "C" fn ZSTD_compressStream(
     if crate::error::ZSTD_isError(rc) != 0 {
         return rc;
     }
-    // Legacy return contract: a hint for the next read size.
-    BLOCK_SIZE_MAX
+    // This entry point answers a hint for the next read size: the input that
+    // completes the block being filled (upstream `ZSTD_nextInputSizeHint`).
+    unsafe { zcs.as_ref() }
+        .and_then(|cctx| cctx.stream.as_ref())
+        .filter(|stream| stream.open)
+        .map_or(BLOCK_SIZE_MAX, |stream| {
+            stream.context.next_input_size_hint()
+        })
 }
 
 /// `size_t ZSTD_flushStream(ZSTD_CStream* zcs, ZSTD_outBuffer* output)` —
