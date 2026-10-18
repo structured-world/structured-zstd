@@ -99,7 +99,7 @@ pub(crate) mod parameters;
 #[cfg(feature = "bench-internals")]
 pub mod sequence_capture;
 mod streaming_encoder;
-pub use frame_compressor::{EncoderDictionary, FrameCompressor};
+pub use frame_compressor::{DictionaryHold, EncoderDictionary, FrameCompressor};
 #[cfg(feature = "lsm")]
 pub use frame_emit_info::{BlockType, FrameBlock, FrameEmitInfo};
 pub use levels::config::{

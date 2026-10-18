@@ -386,6 +386,8 @@ pub fn decompression_margin(src: &[u8]) -> Result<usize, FrameSizeError> {
 /// use structured_zstd::decoding::min_decoding_buffer_size;
 /// // A 1 MiB window with no declared content size.
 /// assert_eq!(min_decoding_buffer_size(1 << 20, None), Some((1 << 20) + 2 * 131_072 + 64));
+/// // A 1 KiB window holds no block over 1 KiB, so both block terms shrink.
+/// assert_eq!(min_decoding_buffer_size(1 << 10, None), Some((1 << 10) + 2 * 1024 + 64));
 /// // A frame whose whole content is smaller than that.
 /// assert_eq!(min_decoding_buffer_size(1 << 20, Some(1000)), Some(1000));
 /// ```
@@ -394,9 +396,10 @@ pub fn min_decoding_buffer_size(
     frame_content_size: Option<u64>,
 ) -> Option<usize> {
     const WILDCOPY_OVERLENGTH: u64 = 32;
-    // Both block terms are the largest block the frame can hold, and no block
-    // exceeds the window: RFC 8878 3.1.1.2.4, Block_Maximum_Size =
-    // min(Window_Size, 128 KiB); upstream zstd_decompress.c:1972 likewise.
+    // Both block terms are the largest block the frame can hold, not a fixed
+    // 128 KiB, since no block exceeds the window: RFC 8878 3.1.1.2.4,
+    // Block_Maximum_Size = min(Window_Size, 128 KiB); upstream
+    // zstd_decompress.c:1972-1980 computes window + 2 * that block + 64.
     let block_size = window_size.min(crate::common::MAX_BLOCK_SIZE as u64);
     let needed = window_size.checked_add(2 * block_size + 2 * WILDCOPY_OVERLENGTH);
     let size = match (frame_content_size, needed) {

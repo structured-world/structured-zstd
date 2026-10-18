@@ -831,6 +831,57 @@ fn heap_size_counts_active_and_spare_huffman_tables() {
     );
 }
 
+/// A compressor that borrows a prepared dictionary writes the frame one that
+/// owns a clone of it writes, at every level, and leaves it out of its
+/// footprint: it belongs to the owner.
+#[test]
+fn a_borrowed_dictionary_writes_the_frame_an_owned_one_writes() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let prepared = super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse");
+    let payload = b"tenant=demo table=orders op=put key=1 value=aaaaabbbbbcccccdddddeeeee\n\
+              tenant=demo table=orders op=put key=2 value=aaaaabbbbbcccccdddddeeeee\n"
+        .repeat(8);
+    for level in [
+        super::CompressionLevel::Fastest,
+        super::CompressionLevel::Default,
+        super::CompressionLevel::Level(12),
+        super::CompressionLevel::Level(19),
+    ] {
+        let mut owned_frame = Vec::new();
+        let mut owned: FrameCompressor<&[u8], &mut Vec<u8>> = FrameCompressor::new_with_matcher(
+            crate::encoding::MatchGeneratorDriver::new(1 << 17, 1),
+            level,
+        );
+        owned.set_encoder_dictionary(prepared.clone()).unwrap();
+        owned.set_source(payload.as_slice());
+        owned.set_drain(&mut owned_frame);
+        owned.compress();
+        let owned_heap = owned.heap_size();
+
+        let mut borrowed_frame = Vec::new();
+        let mut borrowed: FrameCompressor<&[u8], &mut Vec<u8>, _, _> =
+            FrameCompressor::new_with_matcher_and_dictionary(
+                crate::encoding::MatchGeneratorDriver::new(1 << 17, 1),
+                level,
+                Some(&prepared),
+            )
+            .unwrap();
+        borrowed.set_source(payload.as_slice());
+        borrowed.set_drain(&mut borrowed_frame);
+        borrowed.compress();
+        assert_eq!(
+            borrowed.heap_size() + prepared.heap_size(),
+            owned_heap,
+            "{level:?}: the borrowed dictionary is left out of the footprint"
+        );
+        drop(borrowed);
+        assert!(
+            borrowed_frame == owned_frame,
+            "{level:?}: a borrowed dictionary writes another frame"
+        );
+    }
+}
+
 #[test]
 fn set_encoder_dictionary_reattaches_prepared_dict_without_reparse() {
     let dict_raw = include_bytes!("../../../dict_tests/dictionary");

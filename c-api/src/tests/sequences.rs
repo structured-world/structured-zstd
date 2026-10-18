@@ -156,6 +156,31 @@ fn generated_parse_round_trips_through_compress_sequences() {
     unsafe { ZSTD_freeCCtx(cctx) };
 }
 
+/// Generating the parse of an incompressible input leaves the context no
+/// larger than before by the frame it never hands out: upstream compresses
+/// into a buffer it frees before returning (zstd_compress.c:3537-3548).
+#[test]
+fn generate_sequences_keeps_no_frame_behind() {
+    let mut state = 0x2468_ACE1u32;
+    let input: Vec<u8> = (0..1 << 20)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let cctx = ZSTD_createCCtx();
+    let parse = generate(cctx, &input);
+    assert!(parse.last().unwrap().is_delimiter());
+    let kept = unsafe { (*cctx).scratch.capacity() };
+    assert!(
+        kept < input.len() / 2,
+        "the context keeps {kept} bytes of a frame it never handed out"
+    );
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
+
 /// Too small an output array and a block target are refused as upstream
 /// refuses them (`dstSize_tooSmall`, `parameter_unsupported`).
 #[test]

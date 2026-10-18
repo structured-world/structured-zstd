@@ -417,14 +417,15 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
     len
 }
 
-/// Compress `src` into `cctx.scratch` as one frame under the sticky
-/// parameters and the attached dictionary (the frame of `ZSTD_compress2`),
-/// recording the parse it takes into `capture` when one is given.
+/// Compress `src` as one frame under the sticky parameters and the attached
+/// dictionary (the frame of `ZSTD_compress2`) into `cctx.scratch`, or, when
+/// `capture` is given, only record the parse it takes there; returns the
+/// frame's length either way.
 pub(crate) fn compress_sticky_frame(
     cctx: &mut ZSTD_CCtx,
     src: &[u8],
     capture: Option<&mut Vec<codec::encoding::sequences::ExternalSequence>>,
-) -> Result<(), ZSTD_ErrorCode> {
+) -> Result<usize, ZSTD_ErrorCode> {
     cctx.begin_one_shot(src.len())?;
     // A referenced CDict's compression parameters are authoritative
     // (upstream rule), so the sticky knobs are resolved — and can reject —
@@ -438,7 +439,7 @@ pub(crate) fn compress_sticky_frame(
     let level = cctx.attach_level(src_size);
     let serial = cctx.attach_serial();
     let suppress_id = cctx.attach_suppresses_dict_id();
-    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<usize, ZSTD_ErrorCode> {
         let ZSTD_CCtx {
             scratch,
             compressor,
@@ -467,8 +468,18 @@ pub(crate) fn compress_sticky_frame(
         let (producer, fallback) = params.sequence_producer(level);
         enc.set_sequence_producer(producer, fallback);
         enc.set_sequence_capture(capture.is_some());
-        scratch.clear();
-        enc.compress_independent_frame_into(src, scratch);
+        // A parse is all a capturing caller hands out, so its frame goes to a
+        // buffer freed on return rather than into the kept scratch, as
+        // upstream's generateSequences frees its dst (zstd_compress.c:3548).
+        let mut transient = Vec::new();
+        let out = if capture.is_some() {
+            &mut transient
+        } else {
+            scratch
+        };
+        out.clear();
+        enc.compress_independent_frame_into(src, out);
+        let frame_len = out.len();
         if let Some(capture) = capture {
             *capture = enc.take_captured_sequences();
             enc.set_sequence_capture(false);
@@ -478,7 +489,7 @@ pub(crate) fn compress_sticky_frame(
         if enc.take_sequence_producer_failure() {
             return Err(ZSTD_ErrorCode::ZSTD_error_sequenceProducer_failed);
         }
-        Ok(())
+        Ok(frame_len)
     }));
     match outcome {
         Ok(result) => result,
@@ -511,10 +522,10 @@ pub unsafe extern "C" fn ZSTD_compress2(
     }
     let cctx = unsafe { &mut *cctx };
     let src = unsafe { in_slice(src, src_size) };
-    if let Err(code) = compress_sticky_frame(cctx, src, None) {
-        return encode(code);
-    }
-    let len = cctx.scratch.len();
+    let len = match compress_sticky_frame(cctx, src, None) {
+        Ok(len) => len,
+        Err(code) => return encode(code),
+    };
     if len > dst_capacity {
         return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
     }

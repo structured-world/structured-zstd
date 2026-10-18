@@ -186,11 +186,12 @@ pub unsafe extern "C" fn ZSTD_generateSequences(
     }
     let src = unsafe { in_slice(src, src_size) };
     let mut parse = Vec::new();
-    if let Err(code) = compress_sticky_frame(cctx, src, Some(&mut parse)) {
-        return encode(code);
-    }
+    let frame_len = match compress_sticky_frame(cctx, src, Some(&mut parse)) {
+        Ok(len) => len,
+        Err(code) => return encode(code),
+    };
     cctx.consume_prefix();
-    cctx.progress = FrameProgress::one_shot(src.len(), cctx.scratch.len());
+    cctx.progress = FrameProgress::one_shot(src.len(), frame_len);
     if parse.len() > out_seqs_size {
         return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
     }
@@ -318,13 +319,15 @@ impl ParseFrame<'_> {
             if self.dictionary.is_some() {
                 replay = replay.with_dictionary();
             }
-            let mut compressor: FrameCompressor<R, &mut Vec<u8>, SequenceReplay<'_>> =
-                FrameCompressor::new_with_matcher(replay, CompressionLevel::from_level(self.level));
-            if let Some(dictionary) = self.dictionary {
-                compressor
-                    .set_encoder_dictionary(dictionary.clone())
-                    .map_err(|_| ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted)?;
-            }
+            // The prepared dictionary is borrowed for the one frame, as
+            // upstream references the CDict, with no reference count taken.
+            let mut compressor: FrameCompressor<R, &mut Vec<u8>, SequenceReplay<'_>, _> =
+                FrameCompressor::new_with_matcher_and_dictionary(
+                    replay,
+                    CompressionLevel::from_level(self.level),
+                    self.dictionary,
+                )
+                .map_err(|_| ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted)?;
             compressor.set_content_checksum(params.checksum_flag);
             compressor.set_content_size_flag(params.content_size_flag);
             compressor.set_dictionary_id_flag(params.dict_id_flag && !self.suppress_id);

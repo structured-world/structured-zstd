@@ -303,6 +303,36 @@ impl EncoderDictionary {
     }
 }
 
+/// How a [`FrameCompressor`] holds its dictionary: owned, as
+/// [`FrameCompressor::set_encoder_dictionary`] attaches one, or borrowed for
+/// the compressor's lifetime through
+/// [`FrameCompressor::new_with_matcher_and_dictionary`], so a short-lived
+/// compressor reads a prepared dictionary without taking a reference on it.
+/// Implemented for [`EncoderDictionary`] and `&EncoderDictionary` only.
+pub trait DictionaryHold: core::borrow::Borrow<EncoderDictionary> + hold::Sealed {
+    /// Whether the compressor owns what it holds, so its footprint counts it.
+    const OWNED: bool;
+}
+
+impl DictionaryHold for EncoderDictionary {
+    const OWNED: bool = true;
+}
+
+impl DictionaryHold for &EncoderDictionary {
+    const OWNED: bool = false;
+}
+
+mod hold {
+    pub trait Sealed {}
+    impl Sealed for super::EncoderDictionary {}
+    impl Sealed for &super::EncoderDictionary {}
+}
+
+/// The dictionary `held` holds, however it holds it.
+fn attached<D: DictionaryHold>(held: &Option<D>) -> Option<&EncoderDictionary> {
+    held.as_ref().map(core::borrow::Borrow::borrow)
+}
+
 /// An interface for compressing arbitrary data with the ZStandard compression algorithm.
 ///
 /// `FrameCompressor` will generally be used by:
@@ -326,11 +356,12 @@ pub struct FrameCompressor<
     R: Read = &'static [u8],
     W: Write = Vec<u8>,
     M: Matcher = MatchGeneratorDriver,
+    D: DictionaryHold = EncoderDictionary,
 > {
     uncompressed_data: Option<R>,
     compressed_data: Option<W>,
     compression_level: CompressionLevel,
-    dictionary: Option<EncoderDictionary>,
+    dictionary: Option<D>,
     source_size_hint: Option<u64>,
     state: CompressState<M>,
     /// When true, emitted frames omit the 4-byte magic number prefix
@@ -2234,6 +2265,98 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
 impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Create a new `FrameCompressor` with a custom matching algorithm implementation
     pub fn new_with_matcher(matcher: M, compression_level: CompressionLevel) -> Self {
+        Self::with_matcher(matcher, compression_level)
+    }
+
+    /// Attach a pre-parsed dictionary to be used for subsequent compressions.
+    ///
+    /// In compressed modes, the dictionary id is written only when the active
+    /// matcher supports dictionary priming.
+    /// Uncompressed mode and non-priming matchers ignore the attached dictionary
+    /// at encode time.
+    pub fn set_dictionary(
+        &mut self,
+        dictionary: crate::decoding::Dictionary,
+    ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
+        self.attach_dictionary(EncoderDictionary::from_dictionary(dictionary))
+    }
+
+    /// Parse and attach a dictionary blob, in either of the two forms upstream
+    /// `ZSTD_CCtx_loadDictionary` takes (`ZSTD_dct_auto`): a
+    /// [serialized](crate::decoding::Dictionary::is_serialized) dictionary,
+    /// and anything else is raw content, which is why any file can
+    /// be handed to `zstd -D`. Raw content has no id, so the frame records none
+    /// and the decoder must be given the same bytes explicitly.
+    ///
+    /// A serialized blob parses through the encoder-only path (skips the
+    /// FSE/HUF decode lookup-table build the encoder never reads); the entropy
+    /// ENCODER tables — and thus the emitted frame — are identical to a full
+    /// parse. To reject anything but a serialized dictionary, parse with
+    /// [`EncoderDictionary::from_bytes`] (upstream `ZSTD_dct_fullDict`) and
+    /// attach the result.
+    ///
+    /// An empty buffer is how the same upstream entry point is told there is
+    /// no dictionary: it clears whatever was attached and succeeds, returning
+    /// it, rather than reporting a dictionary too small to use.
+    pub fn set_dictionary_from_bytes(
+        &mut self,
+        raw_dictionary: &[u8],
+    ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
+        if raw_dictionary.is_empty() {
+            return Ok(self.clear_dictionary());
+        }
+        self.attach_dictionary(EncoderDictionary::from_serialized_or_raw_content(
+            raw_dictionary,
+        )?)
+    }
+}
+
+impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, D> {
+    /// A compressor with a custom matcher that compresses every frame with
+    /// `dictionary`, or with none, held as given: a `&EncoderDictionary` is
+    /// borrowed for the compressor's lifetime, so a compressor built for one
+    /// frame reads a dictionary prepared once without taking a reference on it.
+    ///
+    /// # Errors
+    /// As [`Self::set_encoder_dictionary`].
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::sequences::{ExternalSequence, SequenceReplay};
+    /// use structured_zstd::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
+    ///
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(b"shared history").unwrap();
+    /// let input = b"shared history, once more";
+    /// // One block of literals; a parse may also reach into the dictionary.
+    /// let parse = [ExternalSequence::delimiter(input.len() as u32)];
+    /// let mut frame = Vec::new();
+    /// let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>, _, _> =
+    ///     FrameCompressor::new_with_matcher_and_dictionary(
+    ///         SequenceReplay::new(&parse, 1 << 17).with_dictionary(),
+    ///         CompressionLevel::Default,
+    ///         Some(&dictionary),
+    ///     )
+    ///     .unwrap();
+    /// compressor.set_source(&input[..]);
+    /// compressor.set_drain(&mut frame);
+    /// compressor.compress();
+    /// assert!(compressor.dictionary().is_some());
+    /// drop(compressor);
+    /// assert!(!frame.is_empty());
+    /// ```
+    pub fn new_with_matcher_and_dictionary(
+        matcher: M,
+        compression_level: CompressionLevel,
+        dictionary: Option<D>,
+    ) -> Result<Self, crate::decoding::errors::DictionaryDecodeError> {
+        let mut compressor = Self::with_matcher(matcher, compression_level);
+        if let Some(dictionary) = dictionary {
+            compressor.attach_dictionary(dictionary)?;
+        }
+        Ok(compressor)
+    }
+
+    fn with_matcher(matcher: M, compression_level: CompressionLevel) -> Self {
         Self {
             uncompressed_data: None,
             compressed_data: None,
@@ -2462,7 +2585,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         resolve_frame_params(
             self.compression_level,
             hint,
-            self.dictionary.as_ref().filter(|_| with_dictionary),
+            attached(&self.dictionary).filter(|_| with_dictionary),
         )
     }
 
@@ -2518,10 +2641,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         total += self.state.retained_scratch_heap_size();
         total += self.state.seen_content.heap_size();
         total += self.state.captured_parse_heap_size();
-        total += self
-            .dictionary
-            .as_ref()
-            .map_or(0, EncoderDictionary::heap_size);
+        // A borrowed dictionary belongs to its owner, as upstream's
+        // ZSTD_sizeof_CCtx counts a local dictionary and not a referenced CDict.
+        if D::OWNED {
+            total += attached(&self.dictionary).map_or(0, EncoderDictionary::heap_size);
+        }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         {
             total += self
@@ -2667,7 +2791,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // cParams tier and sizes its dictionary tables from the content. Set
         // before `reset` (which consumes it) and only when a dictionary will
         // actually be primed.
-        if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
+        if use_dictionary_state && let Some(dict) = attached(&self.dictionary) {
             self.state.matcher.set_dictionary_size_hint(dict.sizes());
         }
         // Clearing buffers to allow re-using of the compressor
@@ -2719,16 +2843,16 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             gate_target_length(
                 self.compression_level,
                 &self.tuning,
-                self.dictionary.as_ref().filter(|_| use_dictionary_state),
+                attached(&self.dictionary).filter(|_| use_dictionary_state),
             ),
             self.tuning.literal_compression,
         );
         let cached_entropy = if use_dictionary_state {
-            self.dictionary.as_ref().map(|dict| &dict.inner.entropy)
+            attached(&self.dictionary).map(|dict| &dict.inner.entropy)
         } else {
             None
         };
-        if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
+        if use_dictionary_state && let Some(dict) = attached(&self.dictionary) {
             // This state drives sequence encoding, while matcher priming below updates
             // the match generator's internal repeat-offset history for match finding.
             self.state.offset_hist = dict.inner.offset_hist;
@@ -3099,8 +3223,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             dictionary_id: if prep.use_dictionary_state && self.dict_id_flag {
                 // Id 0 is a raw-content dictionary: RFC 8878 spells "no
                 // dictionary ID" as an absent field, not as a stored zero.
-                self.dictionary
-                    .as_ref()
+                attached(&self.dictionary)
                     .map(|dict| dict.inner.id)
                     .filter(|id| *id != 0)
                     .map(u64::from)
@@ -3442,50 +3565,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.compression_level
     }
 
-    /// Attach a pre-parsed dictionary to be used for subsequent compressions.
-    ///
-    /// In compressed modes, the dictionary id is written only when the active
-    /// matcher supports dictionary priming.
-    /// Uncompressed mode and non-priming matchers ignore the attached dictionary
-    /// at encode time.
-    pub fn set_dictionary(
-        &mut self,
-        dictionary: crate::decoding::Dictionary,
-    ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
-        self.attach_dictionary(EncoderDictionary::from_dictionary(dictionary))
-    }
-
-    /// Parse and attach a dictionary blob, in either of the two forms upstream
-    /// `ZSTD_CCtx_loadDictionary` takes (`ZSTD_dct_auto`): a
-    /// [serialized](crate::decoding::Dictionary::is_serialized) dictionary,
-    /// and anything else is raw content, which is why any file can
-    /// be handed to `zstd -D`. Raw content has no id, so the frame records none
-    /// and the decoder must be given the same bytes explicitly.
-    ///
-    /// A serialized blob parses through the encoder-only path (skips the
-    /// FSE/HUF decode lookup-table build the encoder never reads); the entropy
-    /// ENCODER tables — and thus the emitted frame — are identical to a full
-    /// parse. To reject anything but a serialized dictionary, parse with
-    /// [`EncoderDictionary::from_bytes`] (upstream `ZSTD_dct_fullDict`) and
-    /// attach the result.
-    ///
-    /// An empty buffer is how the same upstream entry point is told there is
-    /// no dictionary: it clears whatever was attached and succeeds, returning
-    /// it, rather than reporting a dictionary too small to use.
-    pub fn set_dictionary_from_bytes(
-        &mut self,
-        raw_dictionary: &[u8],
-    ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
-        if raw_dictionary.is_empty() {
-            return Ok(self.clear_dictionary());
-        }
-        self.attach_dictionary(EncoderDictionary::from_serialized_or_raw_content(
-            raw_dictionary,
-        )?)
-    }
-
     /// Attach an already-parsed [`EncoderDictionary`] without reparsing a raw
-    /// blob.
+    /// blob, held the way this compressor holds one (see [`DictionaryHold`]).
     ///
     /// Accepts an `EncoderDictionary` produced once via
     /// [`EncoderDictionary::from_bytes`] / [`EncoderDictionary::from_dictionary`]
@@ -3493,10 +3574,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// return value, so callers can reattach or reuse a prepared dictionary
     /// across compressions without re-running the dictionary parse each time.
     /// Returns the previously-attached dictionary, if any.
+    ///
+    /// # Errors
+    /// [`ZeroRepeatOffsetInDictionary`](crate::decoding::errors::DictionaryDecodeError::ZeroRepeatOffsetInDictionary)
+    /// when a repeat offset of the dictionary is zero.
     pub fn set_encoder_dictionary(
         &mut self,
-        dictionary: EncoderDictionary,
-    ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
+        dictionary: D,
+    ) -> Result<Option<D>, crate::decoding::errors::DictionaryDecodeError> {
         self.attach_dictionary(dictionary)
     }
 
@@ -3513,11 +3598,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// assert_eq!(compressor.dictionary().map(EncoderDictionary::id), Some(0));
     /// ```
     pub fn dictionary(&self) -> Option<&EncoderDictionary> {
-        self.dictionary.as_ref()
+        attached(&self.dictionary)
     }
 
-    /// Remove the attached dictionary, returning it as an [`EncoderDictionary`].
-    pub fn clear_dictionary(&mut self) -> Option<EncoderDictionary> {
+    /// Remove the attached dictionary, returning it as it was held.
+    pub fn clear_dictionary(&mut self) -> Option<D> {
         // Drop the CDict prime snapshot — it is keyed to the dictionary
         // being removed and must not be restored against a different (or no)
         // dictionary on the next frame.
@@ -3531,12 +3616,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// `set_dictionary_from_bytes`, and `set_encoder_dictionary`.
     fn attach_dictionary(
         &mut self,
-        enc: EncoderDictionary,
-    ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
+        enc: D,
+    ) -> Result<Option<D>, crate::decoding::errors::DictionaryDecodeError> {
         // A zero id is not an error here: it marks a raw-content dictionary,
         // which has no header to carry one. The frame then records no
         // dictionary ID, so the decoder has to be handed the same bytes.
-        let dictionary = &enc.inner;
+        let prepared: &EncoderDictionary = core::borrow::Borrow::borrow(&enc);
+        let dictionary = &prepared.inner;
         if let Some(index) = dictionary.offset_hist.iter().position(|&rep| rep == 0) {
             return Err(
                 crate::decoding::errors::DictionaryDecodeError::ZeroRepeatOffsetInDictionary {
@@ -3548,7 +3634,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // dictionary; drop it so the first frame with the new dictionary
         // re-primes (and re-captures) instead of restoring stale tables.
         self.state.matcher.invalidate_primed_dictionary();
-        if !enc.is_used_for_compression() {
+        if !prepared.is_used_for_compression() {
             return Ok(self.dictionary.take());
         }
         Ok(self.dictionary.replace(enc))
