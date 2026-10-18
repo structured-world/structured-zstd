@@ -6,18 +6,10 @@ decoders skip past. The `structured-zstd` crate provides a typed
 `SkippableFrame` API (`structured_zstd::skippable` module) for emitting
 and parsing these but **does not allocate any variant**.
 
-> **Feature gate:** the typed `SkippableFrame` API and adjacent
-> storage-format extensions require enabling the `lsm` Cargo feature:
->
-> ```toml
-> [dependencies]
-> structured-zstd = { version = "0", features = ["lsm"] }
-> ```
->
-> The C FFI `cdylib` build remains strict drop-in for upstream `libzstd`
-> v1.5.7 regardless of which Rust features are enabled — magic-variant
-> allocations affect only Rust-side typed wrappers, not the cdylib
-> symbol surface.
+> The typed `SkippableFrame` API is part of every build. Magic-variant
+> allocations affect only the payloads applications write; the C
+> `ZSTD_writeSkippableFrame` / `ZSTD_readSkippableFrame` entry points take
+> the variant as an argument, as upstream `libzstd` does.
 
 Allocations are an application-protocol concern. Downstream consumers
 embedding metadata in zstd streams should register their variants here

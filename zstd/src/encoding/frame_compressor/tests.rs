@@ -8,7 +8,7 @@ use alloc::vec;
 use super::FrameCompressor;
 use crate::common::{MAGIC_NUM, MAX_BLOCK_SIZE};
 use crate::decoding::FrameDecoder;
-use crate::encoding::test_input::TestInput;
+use crate::encoding::block_input::BlockInput;
 use crate::encoding::{HistoryBuf, Matcher, Sequence};
 use alloc::vec::Vec;
 
@@ -29,14 +29,14 @@ fn generate_data(seed: u64, len: usize) -> Vec<u8> {
 // library crate never links libzstd.
 
 struct NoDictionaryMatcher {
-    input: TestInput,
+    input: BlockInput,
     window_size: u64,
 }
 
 impl NoDictionaryMatcher {
     fn new(window_size: u64) -> Self {
         Self {
-            input: TestInput::default(),
+            input: BlockInput::default(),
             window_size,
         }
     }
@@ -85,7 +85,7 @@ impl Matcher for NoDictionaryMatcher {
 /// of 4, and the rest of the block as trailing literals.
 #[cfg(target_pointer_width = "64")]
 struct OversizedLiteralsMatcher {
-    input: TestInput,
+    input: BlockInput,
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -141,7 +141,7 @@ fn a_sequence_length_past_32_bits_is_refused() {
     let data: Vec<u8> = (0..100u8).collect();
     let mut compressor = FrameCompressor::new_with_matcher(
         OversizedLiteralsMatcher {
-            input: TestInput::default(),
+            input: BlockInput::default(),
         },
         super::CompressionLevel::Default,
     );
@@ -155,7 +155,7 @@ fn a_sequence_length_past_32_bits_is_refused() {
 /// position: literals before a sequence, or sequences and trailing literals
 /// four bytes short of the block.
 struct MisreportingMatcher {
-    input: TestInput,
+    input: BlockInput,
     literals_first: bool,
 }
 
@@ -215,7 +215,7 @@ fn compress_with_misreporting_matcher(literals_first: bool) {
     let data: Vec<u8> = (0..100u8).collect();
     let mut compressor = FrameCompressor::new_with_matcher(
         MisreportingMatcher {
-            input: TestInput::default(),
+            input: BlockInput::default(),
             literals_first,
         },
         super::CompressionLevel::Default,
@@ -829,6 +829,57 @@ fn heap_size_counts_active_and_spare_huffman_tables() {
         base + active_bytes + spare_bytes,
         "heap_size must include the parked huff_table_spare"
     );
+}
+
+/// A compressor that borrows a prepared dictionary writes the frame one that
+/// owns a clone of it writes, at every level, and leaves it out of its
+/// footprint: it belongs to the owner.
+#[test]
+fn a_borrowed_dictionary_writes_the_frame_an_owned_one_writes() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let prepared = super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse");
+    let payload = b"tenant=demo table=orders op=put key=1 value=aaaaabbbbbcccccdddddeeeee\n\
+              tenant=demo table=orders op=put key=2 value=aaaaabbbbbcccccdddddeeeee\n"
+        .repeat(8);
+    for level in [
+        super::CompressionLevel::Fastest,
+        super::CompressionLevel::Default,
+        super::CompressionLevel::Level(12),
+        super::CompressionLevel::Level(19),
+    ] {
+        let mut owned_frame = Vec::new();
+        let mut owned: FrameCompressor<&[u8], &mut Vec<u8>> = FrameCompressor::new_with_matcher(
+            crate::encoding::MatchGeneratorDriver::new(1 << 17, 1),
+            level,
+        );
+        owned.set_encoder_dictionary(prepared.clone()).unwrap();
+        owned.set_source(payload.as_slice());
+        owned.set_drain(&mut owned_frame);
+        owned.compress();
+        let owned_heap = owned.heap_size();
+
+        let mut borrowed_frame = Vec::new();
+        let mut borrowed: FrameCompressor<&[u8], &mut Vec<u8>, _, _> =
+            FrameCompressor::new_with_matcher_and_dictionary(
+                crate::encoding::MatchGeneratorDriver::new(1 << 17, 1),
+                level,
+                Some(&prepared),
+            )
+            .unwrap();
+        borrowed.set_source(payload.as_slice());
+        borrowed.set_drain(&mut borrowed_frame);
+        borrowed.compress();
+        assert_eq!(
+            borrowed.heap_size() + prepared.heap_size(),
+            owned_heap,
+            "{level:?}: the borrowed dictionary is left out of the footprint"
+        );
+        drop(borrowed);
+        assert!(
+            borrowed_frame == owned_frame,
+            "{level:?}: a borrowed dictionary writes another frame"
+        );
+    }
 }
 
 #[test]
@@ -1632,57 +1683,46 @@ fn uncompressed_mode_does_not_require_dictionary() {
     assert_eq!(decoded, payload);
 }
 
+/// A raw dictionary under 8 bytes takes no part in compression, as zstd.h
+/// states for every dictionary entry point and upstream applies when it
+/// inserts one: attaching it attaches none, through every attach path, and
+/// the frame names no dictionary and decodes without one, even when the
+/// payload starts with the dictionary's bytes.
 #[test]
-fn default_level_tiny_raw_dict_compresses_cleanly() {
-    // Coverage for the dfast dict-attach fast path with a
-    // sub-min-match raw-content dictionary: the dict-table probe in
-    // `start_matching_fast_loop` is gated on the dict table actually
-    // existing (`table().is_some()`), not merely on `is_attached()`,
-    // so a dictionary whose hashable region is shorter than the
-    // short-hash lookahead (where `prime_dict_tables_for_range`
-    // returns before allocating the tables) never dereferences a
-    // null dict pointer. Compressing at the default (dfast) level
-    // with such a dict must succeed.
+fn a_raw_dictionary_under_eight_bytes_attaches_as_none() {
     let dict_id = 0xABCD_0009;
-    let dict = crate::decoding::Dictionary::from_raw_content(dict_id, b"abc".to_vec())
-        .expect("raw dictionary should be valid");
-    let payload = b"the quick brown fox jumps over the lazy dog, repeatedly and at length";
-    let mut output = Vec::new();
-    let mut compressor = FrameCompressor::new(super::CompressionLevel::Default);
+    let payload = b"abcdefg, the quick brown fox jumps over the lazy dog, at length";
+    let tiny = || {
+        crate::decoding::Dictionary::from_raw_content(dict_id, b"abcdefg".to_vec())
+            .expect("raw dictionary should be valid")
+    };
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Default);
     compressor
-        .set_dictionary(dict)
-        .expect("tiny raw dictionary should attach");
-    compressor.set_source(payload.as_slice());
-    compressor.set_drain(&mut output);
-    compressor.compress();
-    assert!(!output.is_empty(), "compression should produce a frame");
+        .set_dictionary(tiny())
+        .expect("attaching succeeds");
+    assert!(compressor.dictionary().is_none());
+    compressor.set_dictionary_from_bytes(b"abcdefg").unwrap();
+    assert!(compressor.dictionary().is_none());
+    compressor
+        .set_encoder_dictionary(super::EncoderDictionary::from_dictionary(tiny()))
+        .unwrap();
+    assert!(compressor.dictionary().is_none());
 
-    // The emitted frame must advertise the attached dictionary id, proving
-    // the tiny-dict path stayed active (the payload round-trips either way,
-    // so without this the test would also pass on a silent no-dict frame).
-    let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
+    let frame = compressor.compress_independent_frame(payload);
+    let (frame_header, _) = crate::decoding::frame::read_frame_header(frame.as_slice())
         .expect("encoded frame should have a readable header");
-    assert_eq!(
-        frame_header.dictionary_id(),
-        Some(dict_id),
-        "tiny raw dict frame should still advertise its dictionary id",
-    );
-
-    // Full roundtrip: decode the dict-compressed frame with the SAME
-    // dictionary attached and confirm byte-exact recovery — proves the
-    // tiny-dict fast path produces a correct frame, not just a non-empty
-    // one.
-    let decode_dict = crate::decoding::Dictionary::from_raw_content(dict_id, b"abc".to_vec())
-        .expect("raw dictionary should be valid");
-    let mut decoder = FrameDecoder::new();
-    decoder
-        .add_dict(decode_dict)
-        .expect("decoder dict should attach");
+    assert_eq!(frame_header.dictionary_id(), None);
     let mut decoded = Vec::with_capacity(payload.len());
-    decoder
-        .decode_all_to_vec(&output, &mut decoded)
-        .expect("dict roundtrip should decode");
-    assert_eq!(decoded, payload, "tiny-dict roundtrip mismatch");
+    FrameDecoder::new()
+        .decode_all_to_vec(&frame, &mut decoded)
+        .expect("the frame decodes without a dictionary");
+    assert_eq!(decoded, payload);
+
+    let mut context = crate::encoding::CompressionContext::new(super::CompressionLevel::Default);
+    context
+        .set_encoder_dictionary(super::EncoderDictionary::from_dictionary(tiny()))
+        .unwrap();
+    assert!(context.dictionary().is_none());
 }
 
 /// Exercises the dictionary dual-probe (live + immutable dict tables)
@@ -1690,8 +1730,7 @@ fn default_level_tiny_raw_dict_compresses_cleanly() {
 /// the payload actually reuses, so each backend's dict long/short
 /// probe (and the dfast `ip+1` dict-long retry) is reached and the
 /// dict-compressed frame round-trips through a decoder primed with the
-/// same dict. The 3-byte-dict test above only proves the null-table
-/// guard; this proves the full attach path produces correct frames.
+/// same dict: the full attach path produces correct frames.
 #[test]
 fn dict_attach_roundtrips_across_backends_with_matching_payload() {
     let dict_id = 0xD1C7_0001;
@@ -3798,8 +3837,15 @@ fn exclusive_heap_size_counts_what_only_the_set_holds() {
         EncoderDictionary::exclusive_heap_size(core::iter::empty::<&EncoderDictionary>()),
         0
     );
+    assert_eq!(first.content_size(), 4096);
+    // One handle listed twice is still one holder.
+    assert_eq!(
+        EncoderDictionary::exclusive_heap_size([&first, &first_again, &first]),
+        first.heap_size()
+    );
 
     let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(3));
+    assert_eq!(enc.compression_level(), super::CompressionLevel::Level(3));
     assert!(enc.dictionary().is_none());
     enc.set_encoder_dictionary(second.clone())
         .expect("the dictionary attaches");
@@ -4444,4 +4490,27 @@ fn a_prepared_dictionary_reports_everything_it_holds() {
         "{} < {floor}",
         prepared.heap_size()
     );
+}
+
+/// The estimate taken before preparing bounds what the prepared dictionary
+/// then holds, however it was parsed: a budget sized by it must not be
+/// overrun by the allocation it was made for.
+#[test]
+fn estimated_heap_size_bounds_every_prepared_form() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let estimate = super::EncoderDictionary::estimated_heap_size(dict_raw.len());
+    let forms = [
+        super::EncoderDictionary::from_bytes(dict_raw).unwrap(),
+        super::EncoderDictionary::from_dictionary(
+            crate::decoding::Dictionary::decode_dict(dict_raw).unwrap(),
+        ),
+        super::EncoderDictionary::from_serialized_or_raw_content(&dict_raw[8..]).unwrap(),
+    ];
+    for prepared in forms {
+        assert!(
+            prepared.heap_size() <= estimate,
+            "{} > {estimate}",
+            prepared.heap_size()
+        );
+    }
 }

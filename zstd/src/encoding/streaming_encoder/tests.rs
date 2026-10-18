@@ -3,6 +3,168 @@ use crate::encoding::{
     CompressionContext, CompressionLevel, EncoderDictionary, Matcher, Sequence, StreamingEncoder,
 };
 
+/// The read-size hint is the input that completes the block being filled,
+/// a whole block when none is partly filled, under the block size the
+/// context is set to.
+#[test]
+fn next_input_size_hint_completes_the_block() {
+    let mut context = CompressionContext::new(CompressionLevel::Default);
+    let mut frame = alloc::vec::Vec::new();
+    let block = context.next_input_size_hint();
+    assert_eq!(block, 128 * 1024);
+    context.write(&mut frame, &[7u8; 100]).unwrap();
+    assert_eq!(context.next_input_size_hint(), block - 100);
+    context.flush(&mut frame).unwrap();
+    assert_eq!(context.next_input_size_hint(), block);
+
+    let mut capped = CompressionContext::new(CompressionLevel::Default);
+    capped.set_target_block_size(Some(4096)).unwrap();
+    capped.write(&mut frame, &[7u8; 1000]).unwrap();
+    assert_eq!(capped.next_input_size_hint(), 4096 - 1000);
+}
+
+/// `compress_block` refuses a frame not begun, input still waiting for its
+/// block, and a block past the frame's block size; an empty or incompressible
+/// block appends nothing and reports it is to be stored as is.
+#[test]
+fn compress_block_refusals_and_raw_blocks() {
+    let mut context = CompressionContext::new(CompressionLevel::Default);
+    let mut payload = alloc::vec::Vec::new();
+    assert!(context.compress_block(b"abc", &mut payload).is_err());
+    let mut context = CompressionContext::new(CompressionLevel::Default);
+    let mut frame = alloc::vec::Vec::new();
+    context.write(&mut frame, b"waiting").unwrap();
+    assert!(context.compress_block(b"abc", &mut payload).is_err());
+
+    let mut context = CompressionContext::new(CompressionLevel::Default);
+    assert_eq!(context.frame_block_size(), None);
+    context.start_frame(&mut alloc::vec::Vec::new()).unwrap();
+    let limit = context.frame_block_size().unwrap();
+    assert!(
+        context
+            .compress_block(&alloc::vec![1u8; limit + 1], &mut payload)
+            .is_err()
+    );
+    assert!(!context.compress_block(&[], &mut payload).unwrap());
+    let mut state = 0x1234_5678u32;
+    let noise: alloc::vec::Vec<u8> = (0..4096)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    assert!(!context.compress_block(&noise, &mut payload).unwrap());
+    assert!(payload.is_empty());
+}
+
+/// The maximum block size caps every block of a streamed frame, and like the
+/// other settings it is fixed once the frame has input.
+#[test]
+fn max_block_size_caps_streamed_blocks() {
+    let input = b"streamed in small blocks ".repeat(400);
+    let mut context = CompressionContext::new(CompressionLevel::Default);
+    context.set_max_block_size(Some(1500)).unwrap();
+    // Below the format's smallest maximum it is raised to it.
+    let mut lower = CompressionContext::new(CompressionLevel::Default);
+    lower.set_max_block_size(Some(10)).unwrap();
+    lower.start_frame(&mut alloc::vec::Vec::new()).unwrap();
+    assert_eq!(lower.frame_block_size(), Some(1024));
+
+    let mut frame = alloc::vec::Vec::new();
+    context.write(&mut frame, &input).unwrap();
+    assert!(context.set_max_block_size(None).is_err());
+    assert_eq!(context.frame_block_size(), Some(1500));
+    context.finish_frame(&mut frame).unwrap();
+    let mut decoder = StreamingDecoder::new(frame.as_slice());
+    let mut out = alloc::vec::Vec::new();
+    crate::io::Read::read_to_end(&mut decoder, &mut out).unwrap();
+    assert_eq!(out, input);
+
+    let mut out = alloc::vec::Vec::new();
+    let mut encoder = StreamingEncoder::new(&mut out, CompressionLevel::Default);
+    encoder.set_max_block_size(Some(2048)).unwrap();
+    crate::io::Write::write_all(&mut encoder, &input).unwrap();
+    encoder.finish().unwrap();
+}
+
+/// A hint is dropped by `clear_source_size_hint`, before a frame's input only.
+#[test]
+fn clear_source_size_hint_before_input() {
+    let mut context = CompressionContext::new(CompressionLevel::Level(19));
+    context.set_source_size_hint(1000).unwrap();
+    context.clear_source_size_hint().unwrap();
+    let mut frame = alloc::vec::Vec::new();
+    context.write(&mut frame, b"x").unwrap();
+    assert!(context.clear_source_size_hint().is_err());
+    assert_eq!(context.buffered_input_len(), 1);
+    context.finish_frame(&mut frame).unwrap();
+    assert_eq!(context.buffered_input_len(), 0);
+}
+
+/// A failing producer on a streaming context: its blocks go out as literals
+/// and the failure is reported once.
+#[test]
+fn compression_context_reports_producer_failure() {
+    struct Fails;
+    impl crate::encoding::sequences::SequenceProducer for Fails {
+        fn produce(
+            &mut self,
+            _block: &[u8],
+            _window_size: u64,
+            _out: &mut alloc::vec::Vec<crate::encoding::sequences::ExternalSequence>,
+        ) -> Result<(), crate::encoding::sequences::SequenceProducerError> {
+            Err(crate::encoding::sequences::SequenceProducerError)
+        }
+    }
+    let input = b"producer producer producer ".repeat(100);
+    let mut context = CompressionContext::new(CompressionLevel::Default);
+    context.set_sequence_producer(Some(alloc::boxed::Box::new(Fails)), false);
+    let mut frame = alloc::vec::Vec::new();
+    context.write(&mut frame, &input).unwrap();
+    context.finish_frame(&mut frame).unwrap();
+    assert!(context.take_sequence_producer_failure());
+    assert!(!context.take_sequence_producer_failure());
+    context.set_sequence_producer(None, false);
+}
+
+/// `compress_block` hands back ONE block's content even at the optimal
+/// levels, whose frames split a block of text then noise into several
+/// physical blocks: the caller writes one header for it.
+#[test]
+fn compress_block_returns_one_block_at_splitting_levels() {
+    let mut block = Vec::new();
+    let mut i = 0u32;
+    while block.len() < 64 * 1024 {
+        block.extend_from_slice(alloc::format!("record {i} status=shipped region=eu\n").as_bytes());
+        i += 1;
+    }
+    block.truncate(64 * 1024);
+    let mut state = 0x2545_F491u32;
+    while block.len() < 128 * 1024 {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        block.push(state as u8);
+    }
+    let mut context = CompressionContext::new(CompressionLevel::Level(19));
+    context.start_frame(&mut alloc::vec::Vec::new()).unwrap();
+    assert_eq!(context.frame_block_size(), Some(block.len()));
+    let mut payload = alloc::vec::Vec::new();
+    assert!(context.compress_block(&block, &mut payload).unwrap());
+
+    let mut decoder = crate::decoding::FrameDecoder::new();
+    decoder.begin_blocks(None).unwrap();
+    // RFC 8878 3.1.1.2: Last_Block 0, Block_Type 2 (Compressed), Block_Size.
+    let header = ((payload.len() as u32) << 3 | 2 << 1).to_le_bytes();
+    let mut out = alloc::vec![0u8; block.len()];
+    let n = decoder
+        .decode_block([header[0], header[1], header[2]], &payload, &mut out)
+        .unwrap();
+    assert_eq!(&out[..n], &block[..]);
+}
+
 /// A context reused frame after frame writes exactly the frames a fresh
 /// encoder writes for each, at every band of levels, with a dictionary and
 /// without, pledged and not, small and past the dictionary attach cutoff:
@@ -438,7 +600,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 struct TinyMatcher {
-    input: crate::encoding::test_input::TestInput,
+    input: crate::encoding::block_input::BlockInput,
     window_size: u64,
 }
 

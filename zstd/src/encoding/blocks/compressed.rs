@@ -196,6 +196,46 @@ impl CompressedBlockScratch {
         Self::default()
     }
 
+    /// The most [`Self::retained_heap_size`] reports for blocks of up to
+    /// `block_capacity` bytes: the entropy-coded block, and where `splits` is
+    /// set, everything the post-split splitter keeps — its partitions, the
+    /// prefix sums, the probe tables and the nested scratch its probes use.
+    ///
+    /// The splitter recurses by halves down to `MIN_SEQUENCES_BLOCK_SPLITTING`
+    /// sequences and splits at most `MAX_NB_BLOCK_SPLITS` times, so a block
+    /// visits at most `2 * MAX_NB_BLOCK_SPLITS + 1` ranges at three probes
+    /// each, and holds at most three tables per live probe state, two states
+    /// per level of recursion.
+    pub(crate) fn max_retained_heap_size(block_capacity: usize, splits: bool) -> usize {
+        let compressed = crate::encoding::compress_bound(block_capacity);
+        if !splits {
+            return compressed;
+        }
+        let usize_sz = core::mem::size_of::<usize>();
+        let sequences = max_sequences(block_capacity);
+        let partitions = (MAX_NB_BLOCK_SPLITS + 1).next_power_of_two() * usize_sz;
+        // `lit` and `ml` are reserved exactly; the codes and their bit sums
+        // grow by doubling, so they keep up to twice what a block needed.
+        let prefix_sums =
+            2 * (sequences + 1) * usize_sz + 2 * (sequences + 1) * usize_sz + 2 * 2 * sequences;
+        let depth = (sequences / MIN_SEQUENCES_BLOCK_SPLITTING + 1)
+            .next_power_of_two()
+            .trailing_zeros() as usize
+            + 1;
+        let pooled_tables = 3 * (2 * depth + 4);
+        let probes = 3 * (2 * MAX_NB_BLOCK_SPLITS + 1) + 1;
+        let estimator = core::mem::size_of::<[usize; 256]>()
+            + 3 * core::mem::size_of::<SequenceHistogram>()
+            + pooled_tables.next_power_of_two() * core::mem::size_of::<SharedFseTable>()
+            + pooled_tables
+                * (core::mem::size_of::<FSETable>()
+                    + crate::encoding::frame_compressor::shared_table_overhead())
+            + probes.next_power_of_two() * core::mem::size_of::<huff0_encoder::HuffmanTable>();
+        let inner = core::mem::size_of::<CompressedBlockScratch>()
+            + Self::max_retained_heap_size(block_capacity, false);
+        compressed + partitions + prefix_sums + estimator + inner
+    }
+
     /// Workspace bytes the buffers need for blocks of up to `block_capacity`
     /// source bytes.
     pub(crate) fn workspace_bytes(block_capacity: usize) -> usize {
@@ -485,6 +525,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         built_huff,
         scratch_state: CompressState {
             matcher: EntropyOnlyMatcher,
+            sequence_capture: None,
             // The splitter's scratch state never reaches the raw-skip, which
             // is decided one level up on the whole block.
             seen_content: Default::default(),
@@ -636,12 +677,26 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
     // every matcher's scan, where two would compile each backend twice, and the
     // flag is fixed for the block, so its test at each emit site predicts.
     let code_offsets = uses_fast_offset_codes(state.strategy_tag);
+    let block_start_hist = state.offset_hist;
     let mut hist = state.offset_hist;
     state.matcher.start_matching(|seq| {
         record_sequence(seq, &mut tail, sequences, code_offsets, &mut hist);
     });
     if code_offsets {
         state.offset_hist = hist;
+    }
+    // Once per block, after the match loop: the loop itself is the same
+    // whether or not anyone records it. One delimiter per matched block is
+    // one per written block, as `compress_block_encoded` keeps the post-split
+    // off while a parse is recorded.
+    if let Some(capture) = state.sequence_capture.as_mut() {
+        record_block_parse(
+            capture,
+            &parts.sequences,
+            tail,
+            code_offsets,
+            block_start_hist,
+        );
     }
     let kernel = state.copy_kernel;
     literal_runs::gather_literals(
@@ -651,6 +706,41 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
         tail,
         &mut parts.literals,
     );
+}
+
+/// Append a block's parse to `capture` as external sequences with plain
+/// offsets and their repeat-offset numbers, against the `history` the block
+/// started from, closed by a delimiter carrying the `tail` literals. With
+/// `code_offsets` the block's offsets are wire codes, otherwise plain.
+#[cold]
+fn record_block_parse(
+    capture: &mut Vec<crate::encoding::sequences::ExternalSequence>,
+    sequences: &[RawSequence],
+    tail: usize,
+    code_offsets: bool,
+    mut history: [u32; 3],
+) {
+    use crate::encoding::sequences::ExternalSequence;
+    for sequence in sequences {
+        let (offset, code) = if code_offsets {
+            let code = sequence.off_base;
+            let offset = crate::encoding::sequences::plain_offset(code, sequence.ll, &mut history);
+            (offset, code)
+        } else {
+            let offset = sequence.off_base;
+            let code = encode_offset_with_history(offset, sequence.ll, &mut history);
+            (offset, code)
+        };
+        capture.push(ExternalSequence {
+            offset,
+            lit_len: sequence.ll,
+            match_len: sequence.ml,
+            // Codes 1..=3 are the repeat offsets (RFC 8878 3.1.1.5).
+            rep: if code <= 3 { code } else { 0 },
+        });
+    }
+    // A block is at most 128 KiB.
+    capture.push(ExternalSequence::delimiter(tail as u32));
 }
 
 /// Record one reported sequence. With `code_offsets` the offset is replaced by

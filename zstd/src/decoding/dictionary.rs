@@ -84,6 +84,25 @@ impl Dictionary {
             + self.huf.heap_bytes()
     }
 
+    /// Most [`heap_bytes`](Self::heap_bytes) a dictionary holding
+    /// `content_len` bytes of content can report, so a caller can budget for
+    /// one before parsing it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_zstd::decoding::Dictionary;
+    ///
+    /// let dict = Dictionary::from_raw_content(0, vec![7u8; 1024]).unwrap();
+    /// assert!(dict.heap_bytes() <= Dictionary::max_heap_bytes(1024));
+    /// ```
+    pub const fn max_heap_bytes(content_len: usize) -> usize {
+        content_len
+            + core::mem::size_of::<FSEScratch>()
+            + FSEScratch::max_heap_bytes()
+            + HuffmanScratch::max_heap_bytes()
+    }
+
     /// Build a dictionary from raw content bytes (without entropy table sections).
     ///
     /// This is primarily intended for dictionaries produced by the `dict-builder`
@@ -120,14 +139,28 @@ impl Dictionary {
         Self::decode_dict_inner(raw, true)
     }
 
+    /// Whether `raw` is a serialized dictionary rather than raw content: it
+    /// starts with [`MAGIC_NUM`] and has room for the ID after it. A shorter
+    /// blob is raw content whatever it starts with, as upstream zstd reads it
+    /// (zstd_ddict.c:97, zstd_compress.c:5206).
+    ///
+    /// ```
+    /// use structured_zstd::decoding::{Dictionary, DICTIONARY_MAGIC};
+    /// assert!(!Dictionary::is_serialized(&DICTIONARY_MAGIC));
+    /// assert!(Dictionary::is_serialized(&[0x37, 0xA4, 0x30, 0xEC, 7, 0, 0, 0]));
+    /// ```
+    pub fn is_serialized(raw: &[u8]) -> bool {
+        raw.len() >= 8 && raw.starts_with(&MAGIC_NUM)
+    }
+
     /// Loads whichever kind of dictionary `raw` holds, the way `zstd -D` does:
-    /// a blob starting with [`MAGIC_NUM`] is a serialized dictionary with
-    /// entropy tables and an ID, and anything else is taken as raw content,
+    /// a [serialized](Self::is_serialized) dictionary with entropy tables and
+    /// an ID, and anything else is taken as raw content,
     /// which is why any file can be handed to `-D`. A raw-content dictionary
     /// has no ID, so it must be supplied explicitly on both sides — see
     /// [`Self::from_raw_content`].
     pub fn from_serialized_or_raw_content(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
-        if raw.starts_with(&MAGIC_NUM) {
+        if Self::is_serialized(raw) {
             Self::decode_dict(raw)
         } else if raw.is_empty() {
             // A zero-sized buffer is a dictionary with nothing in it rather
@@ -331,14 +364,105 @@ impl DictionaryHandle {
         }
     }
 
+    /// Heap bytes the handle keeps alive: the shared allocation the
+    /// dictionary lives in and the dictionary's own content and tables.
+    /// Clones share all of it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_zstd::decoding::{Dictionary, DictionaryHandle};
+    ///
+    /// let handle = DictionaryHandle::from_dictionary(
+    ///     Dictionary::from_raw_content(0, vec![7u8; 1024]).unwrap(),
+    /// );
+    /// assert!(handle.heap_size() > handle.as_dict().heap_bytes());
+    /// assert!(handle.heap_size() <= DictionaryHandle::max_heap_size(1024));
+    /// ```
+    pub fn heap_size(&self) -> usize {
+        Self::shared_allocation_size() + self.inner.heap_bytes()
+    }
+
+    /// Most [`Self::heap_size`] a handle over `content_len` bytes of content
+    /// can report, for budgeting before the dictionary is parsed.
+    pub fn max_heap_size(content_len: usize) -> usize {
+        Self::shared_allocation_size() + Dictionary::max_heap_bytes(content_len)
+    }
+
+    /// Heap bytes that `handles` alone keep alive: each distinct dictionary
+    /// among them once, and only when no handle outside them shares it. For an
+    /// owner holding several handles, such as a decoding context that keeps a
+    /// dictionary attached and its decoder keeps the last frame's.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_zstd::decoding::{Dictionary, DictionaryHandle};
+    ///
+    /// let handle = DictionaryHandle::from_dictionary(
+    ///     Dictionary::from_raw_content(0, vec![7u8; 64]).unwrap(),
+    /// );
+    /// let copy = handle.clone();
+    /// // Both handles are in the set: counted once.
+    /// assert_eq!(
+    ///     DictionaryHandle::exclusive_heap_size([&handle, &copy]),
+    ///     handle.heap_size()
+    /// );
+    /// // `copy` is held elsewhere: nothing is this set's alone.
+    /// assert_eq!(DictionaryHandle::exclusive_heap_size([&handle]), 0);
+    /// ```
+    pub fn exclusive_heap_size<'a, I>(handles: I) -> usize
+    where
+        I: IntoIterator<Item = &'a DictionaryHandle>,
+        I::IntoIter: Clone,
+    {
+        let handles = handles.into_iter();
+        let mut total = 0;
+        for (position, handle) in handles.clone().enumerate() {
+            let same =
+                |other: &&DictionaryHandle| SharedDictionary::ptr_eq(&handle.inner, &other.inner);
+            // The first handle to an allocation speaks for all of them.
+            if handles.clone().take(position).any(|other| same(&other)) {
+                continue;
+            }
+            // Holders, not references: one handle listed twice is one count.
+            let held_here = handles
+                .clone()
+                .enumerate()
+                .filter(|(at, other)| {
+                    same(other)
+                        && !handles
+                            .clone()
+                            .take(*at)
+                            .any(|earlier| core::ptr::eq(earlier, *other))
+                })
+                .count();
+            if SharedDictionary::strong_count(&handle.inner) == held_here {
+                total += handle.heap_size();
+            }
+        }
+        total
+    }
+
+    /// Bytes of the shared allocation itself: `Arc` and `Rc` both place two
+    /// word-sized counts ahead of the value, padded to its alignment.
+    fn shared_allocation_size() -> usize {
+        core::alloc::Layout::new::<[usize; 2]>()
+            .extend(core::alloc::Layout::new::<Dictionary>())
+            .expect("a fixed-size layout extends")
+            .0
+            .pad_to_align()
+            .size()
+    }
+
     /// Parse a serialized dictionary and return a reusable shared handle.
     pub fn decode_dict(raw: &[u8]) -> Result<Self, DictionaryDecodeError> {
         Dictionary::decode_dict(raw).map(Self::from_dictionary)
     }
 
     /// Load whichever kind of dictionary `raw` holds, as `ZSTD_createDDict`
-    /// does: a blob starting with [`MAGIC_NUM`] is a serialized dictionary,
-    /// anything else is raw content. See
+    /// does: a [serialized](Dictionary::is_serialized) dictionary, or raw
+    /// content. See
     /// [`Dictionary::from_serialized_or_raw_content`].
     pub fn from_serialized_or_raw_content(raw: &[u8]) -> Result<Self, DictionaryDecodeError> {
         Dictionary::from_serialized_or_raw_content(raw).map(Self::from_dictionary)

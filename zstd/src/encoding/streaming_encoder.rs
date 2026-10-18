@@ -91,6 +91,9 @@ pub struct CompressionContext<M: Matcher = MatchGeneratorDriver> {
     /// semantics; see `FrameCompressor::set_target_block_size`). `None` =
     /// the format's 128 KiB ceiling.
     target_block_size: Option<u32>,
+    /// Largest block a frame may carry (upstream `ZSTD_c_maxBlockSize`); see
+    /// [`Self::set_max_block_size`].
+    max_block_size: Option<u32>,
     /// The pledged size of the frame in progress; cleared when it ends.
     pledged_content_size: Option<u64>,
     /// Advisory source-size hint from [`set_source_size_hint`](Self::set_source_size_hint).
@@ -201,6 +204,12 @@ impl<W: Write, M: Matcher, C: BorrowMut<CompressionContext<M>>> StreamingEncoder
     /// first write.
     pub fn set_target_block_size(&mut self, target: Option<u32>) -> Result<(), Error> {
         self.context.borrow_mut().set_target_block_size(target)
+    }
+
+    /// Cap each block's size; see [`CompressionContext::set_max_block_size`].
+    /// Must be set before the first write.
+    pub fn set_max_block_size(&mut self, size: Option<u32>) -> Result<(), Error> {
+        self.context.borrow_mut().set_max_block_size(size)
     }
 
     /// Enable or disable the trailing XXH64 content checksum; see
@@ -381,6 +390,26 @@ impl CompressionContext<MatchGeneratorDriver> {
         self.state.matcher.set_param_overrides(Some(overrides));
         Ok(())
     }
+
+    /// Ask `producer` for each block's parse in place of the built-in
+    /// matchers; `None` removes it. With `fallback` a block the producer fails
+    /// on is matched as usual; without, it goes out uncompressed and
+    /// [`Self::take_sequence_producer_failure`] reports it. With long-distance
+    /// matching on, the long matches are taken outright and the producer
+    /// parses the literals between them.
+    pub fn set_sequence_producer(
+        &mut self,
+        producer: Option<alloc::boxed::Box<dyn crate::encoding::sequences::SequenceProducer>>,
+        fallback: bool,
+    ) {
+        self.state.matcher.set_sequence_producer(producer, fallback);
+    }
+
+    /// Whether a block went out uncompressed because the producer failed on it
+    /// with no fallback, since this was last asked.
+    pub fn take_sequence_producer_failure(&mut self) -> bool {
+        self.state.matcher.take_producer_failure()
+    }
 }
 
 impl<M: Matcher> CompressionContext<M> {
@@ -393,6 +422,7 @@ impl<M: Matcher> CompressionContext<M> {
             compression_level,
             state: CompressState {
                 matcher,
+                sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
                 huff_table_spare: None,
@@ -420,6 +450,7 @@ impl<M: Matcher> CompressionContext<M> {
             last_error_message: None,
             frame_started: false,
             target_block_size: None,
+            max_block_size: None,
             pledged_content_size: None,
             source_size_hint: None,
             content_size_flag: true,
@@ -472,6 +503,21 @@ impl<M: Matcher> CompressionContext<M> {
         self.target_block_size = target.map(|t| {
             t.clamp(
                 crate::common::MIN_TARGET_BLOCK_SIZE,
+                crate::common::MAX_BLOCK_SIZE,
+            )
+        });
+        Ok(())
+    }
+
+    /// Cap every block at `size` bytes (upstream `ZSTD_c_maxBlockSize`),
+    /// clamped to `[MIN_MAX_BLOCK_SIZE, MAX_BLOCK_SIZE]`; mirrors
+    /// `FrameCompressor::set_max_block_size`. Must be set before the frame's
+    /// first write.
+    pub fn set_max_block_size(&mut self, size: Option<u32>) -> Result<(), Error> {
+        self.ensure_settable("the maximum block size must be set before the first write")?;
+        self.max_block_size = size.map(|s| {
+            s.clamp(
+                crate::common::MIN_MAX_BLOCK_SIZE,
                 crate::common::MAX_BLOCK_SIZE,
             )
         });
@@ -553,11 +599,20 @@ impl<M: Matcher> CompressionContext<M> {
         Ok(())
     }
 
+    /// Drop the hint [`set_source_size_hint`](Self::set_source_size_hint)
+    /// set, so later frames are sized by their pledge alone. Must be called
+    /// before the frame's first [`write`](Self::write).
+    pub fn clear_source_size_hint(&mut self) -> Result<(), Error> {
+        self.ensure_settable("source size hint must be cleared before the first write")?;
+        self.source_size_hint = None;
+        Ok(())
+    }
+
     /// Attach a dictionary blob to each frame (upstream zstd
     /// `ZSTD_CCtx_loadDictionary` on a streaming context, which loads in
-    /// `ZSTD_dct_auto` mode): a blob prefixed with
-    /// [`DICTIONARY_MAGIC`](crate::decoding::DICTIONARY_MAGIC) is a serialized
-    /// dictionary, anything else is raw content. The dictionary primes the
+    /// `ZSTD_dct_auto` mode): a
+    /// [serialized](crate::decoding::Dictionary::is_serialized) dictionary,
+    /// or raw content. The dictionary primes the
     /// match-finder and seeds the first block's entropy tables + repeat
     /// offsets; a serialized one's ID is written into the frame header, while
     /// raw content has none to write, so the decoder must be given the same
@@ -608,7 +663,9 @@ impl<M: Matcher> CompressionContext<M> {
         // The match finder's primed snapshot and resident copy belong to the
         // dictionary being replaced; the next frame primes the new one.
         self.state.matcher.invalidate_primed_dictionary();
-        self.dictionary = Some(dict);
+        // One under 8 bytes is attached as none; see
+        // `EncoderDictionary::is_used_for_compression`.
+        self.dictionary = dict.is_used_for_compression().then_some(dict);
         Ok(())
     }
 
@@ -650,6 +707,7 @@ impl<M: Matcher> CompressionContext<M> {
         total += self.state.huff_weights.heap_size();
         total += self.state.retained_scratch_heap_size();
         total += self.state.seen_content.heap_size();
+        total += self.state.captured_parse_heap_size();
         total += self.encoded_scratch.capacity();
         total += self
             .dictionary
@@ -808,6 +866,126 @@ impl<M: Matcher> CompressionContext<M> {
         self.encoded_scratch.clear();
     }
 
+    /// Start the next frame now, writing its header to `drain`, rather than at
+    /// its first [`write`](Self::write). Settings are fixed from here on, as
+    /// after a write; a frame already open is left as it is.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel};
+    ///
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// let mut frame = Vec::new();
+    /// context.start_frame(&mut frame).unwrap();
+    /// assert!(!frame.is_empty());
+    /// assert!(context.frame_block_size().is_some());
+    /// ```
+    pub fn start_frame<D: Write + ?Sized>(&mut self, drain: &mut D) -> Result<(), Error> {
+        self.ensure_open()?;
+        self.ensure_frame_started(drain)
+    }
+
+    /// The largest block the open frame cuts: the block size limits held to
+    /// the window (upstream `ZSTD_getBlockSize`). `None` between frames.
+    pub fn frame_block_size(&self) -> Option<usize> {
+        self.frame_started.then(|| self.block_capacity())
+    }
+
+    /// Compress `block` as one block of the open frame and append its content,
+    /// without the block header, to `payload` (upstream `ZSTD_compressBlock`).
+    /// Returns whether it compressed: `false` appends nothing, and the caller
+    /// stores the block raw, as a decoder then takes it into its history.
+    /// Either way the block joins the history later blocks match against.
+    ///
+    /// The frame must be open ([`start_frame`](Self::start_frame)), hold no
+    /// input still waiting for its block, and `block` must fit
+    /// [`frame_block_size`](Self::frame_block_size).
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel};
+    ///
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// context.start_frame(&mut Vec::new()).unwrap();
+    /// let mut payload = Vec::new();
+    /// let compressed = context.compress_block(&b"blocks".repeat(100), &mut payload).unwrap();
+    /// assert!(compressed && payload.len() < 600);
+    /// ```
+    pub fn compress_block(&mut self, block: &[u8], payload: &mut Vec<u8>) -> Result<bool, Error> {
+        self.ensure_open()?;
+        if !self.frame_started {
+            return Err(invalid_input_error(
+                "the frame must be started before a block of it is compressed",
+            ));
+        }
+        if self.pending_len() != 0 {
+            return Err(invalid_input_error(
+                "a block cannot follow input still waiting for its block",
+            ));
+        }
+        if block.len() > self.block_capacity() {
+            return Err(invalid_input_error(
+                "the block is larger than the frame's block size",
+            ));
+        }
+        if block.is_empty() {
+            return Ok(false);
+        }
+        self.buffer_input(block);
+        let start = payload.len();
+        // One block in, one block out: the caller writes its single header,
+        // so the post-split, which would emit several physical blocks, stays
+        // off (upstream `ZSTD_compressBlock` never splits either).
+        let post_split = core::mem::replace(&mut self.state.post_split_allowed, false);
+        let encoded = self.encode_block(payload, block.len(), false);
+        self.state.post_split_allowed = post_split;
+        encoded.map_err(|err| self.fail(err))?;
+        self.bytes_consumed += block.len() as u64;
+        // RFC 8878 3.1.1.2.2: Block_Type 2 is Compressed. A Raw or RLE block
+        // changes no entropy table and no repeat offset, exactly as a block
+        // the caller stores raw does on the decoding side.
+        let compressed = (payload[start] >> 1) & 3 == 2;
+        if compressed {
+            payload.drain(start..start + BLOCK_HEADER_LEN);
+        } else {
+            payload.truncate(start);
+        }
+        Ok(compressed)
+    }
+
+    /// Input written to the open frame that no block has compressed yet: it
+    /// waits for its block to fill, or for a flush. Zero between frames.
+    /// Backs the progress the C `ZSTD_getFrameProgression` reports.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel};
+    ///
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// let mut frame = Vec::new();
+    /// context.write(&mut frame, b"less than a block").unwrap();
+    /// assert_eq!(context.buffered_input_len(), 17);
+    /// context.flush(&mut frame).unwrap();
+    /// assert_eq!(context.buffered_input_len(), 0);
+    /// ```
+    pub fn buffered_input_len(&self) -> usize {
+        self.pending_len()
+    }
+
+    /// How much more input completes the block being filled, or a whole block
+    /// when none is partly filled: the read size that lets the next write
+    /// compress a block straight away (upstream zstd `ZSTD_nextInputSizeHint`).
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel};
+    ///
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// let mut frame = Vec::new();
+    /// context.write(&mut frame, &[7u8; 100]).unwrap();
+    /// assert_eq!(context.next_input_size_hint(), 128 * 1024 - 100);
+    /// ```
+    pub fn next_input_size_hint(&self) -> usize {
+        let block = self.block_capacity();
+        block - self.pending_len() % block
+    }
+
     fn ensure_open(&self) -> Result<(), Error> {
         if self.errored {
             return Err(self.sticky_error());
@@ -880,9 +1058,10 @@ impl<M: Matcher> CompressionContext<M> {
         if let Some(size) = self.pledged_content_size.or(self.source_size_hint) {
             self.state.matcher.set_source_size_hint(size);
         }
-        let block_target = self
-            .target_block_size
-            .map_or(MAX_BLOCK_SIZE as usize, |t| t as usize);
+        let block_target = crate::encoding::frame_compressor::block_ceiling(
+            self.target_block_size,
+            self.max_block_size,
+        );
         // Raw frames keep no history; everything else is read block by block,
         // and a pledge makes its length exact. One past what the address space
         // holds is laid out as a stream, which sizes to the window anyway.
@@ -1048,9 +1227,10 @@ impl<M: Matcher> CompressionContext<M> {
 
     fn block_capacity(&self) -> usize {
         let matcher_window = self.state.matcher.window_size() as usize;
-        let ceiling = self
-            .target_block_size
-            .map_or(MAX_BLOCK_SIZE as usize, |t| t as usize);
+        let ceiling = crate::encoding::frame_compressor::block_ceiling(
+            self.target_block_size,
+            self.max_block_size,
+        );
         core::cmp::max(1, core::cmp::min(matcher_window, ceiling))
     }
 

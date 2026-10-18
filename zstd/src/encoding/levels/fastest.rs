@@ -144,8 +144,11 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // consume it: when no sink collects checksums (the common case), and when
     // the block is headed for the post-split helper, which emits several
     // physical blocks and records a checksum per partition of its own.
-    let post_split =
-        state.post_split_allowed && post_split_enabled(state.strategy_tag, window_size);
+    // A captured parse is recorded per matched block, before any split, so
+    // capturing keeps each block whole and its delimiter true.
+    let post_split = state.post_split_allowed
+        && state.sequence_capture.is_none()
+        && post_split_enabled(state.strategy_tag, window_size);
     #[cfg(all(feature = "lsm", feature = "hash"))]
     let post_split_path = rle_byte_opt.is_none() && !raw_fast_path && post_split;
     #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -166,6 +169,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         }
         state.matcher.commit_filled(block_len);
         state.matcher.skip_matching_with_hint(Some(false));
+        record_unsearched_block(state, block_size);
         let header = BlockHeader {
             last_block,
             block_type: BlockType::RLE,
@@ -186,6 +190,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         }
         state.matcher.commit_filled(block_len);
         state.matcher.skip_matching_with_hint(Some(true));
+        record_unsearched_block(state, block_size);
         let header = BlockHeader {
             last_block,
             block_type: BlockType::Raw,
@@ -277,6 +282,17 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             output[hdr_off..hdr_off + 3].copy_from_slice(&header.to_le_bytes());
             BlockType::Compressed
         }
+    }
+}
+
+/// A block written out unsearched parses as literals alone: one delimiter
+/// carrying all of it, when the parse is being recorded.
+#[inline]
+fn record_unsearched_block<M: Matcher>(state: &mut CompressState<M>, block_size: u32) {
+    if let Some(capture) = state.sequence_capture.as_mut() {
+        capture.push(crate::encoding::sequences::ExternalSequence::delimiter(
+            block_size,
+        ));
     }
 }
 
@@ -375,6 +391,7 @@ pub(crate) fn compress_block_encoded_borrowed(
         }
         state.matcher.set_borrowed_block(block_start, block_end);
         state.matcher.skip_matching_with_hint(Some(false));
+        record_unsearched_block(state, block_size);
         let header = BlockHeader {
             last_block,
             block_type: BlockType::RLE,
@@ -394,6 +411,7 @@ pub(crate) fn compress_block_encoded_borrowed(
         }
         state.matcher.set_borrowed_block(block_start, block_end);
         state.matcher.skip_matching_with_hint(Some(true));
+        record_unsearched_block(state, block_size);
         let header = BlockHeader {
             last_block,
             block_type: BlockType::Raw,
@@ -480,7 +498,7 @@ pub(crate) fn compress_block_encoded_borrowed(
 /// Where the pass costs time, the cost is in the splitter itself, and that is
 /// what has to get cheaper.
 #[inline]
-fn post_split_enabled(strategy_tag: StrategyTag, window_size: u64) -> bool {
+pub(crate) fn post_split_enabled(strategy_tag: StrategyTag, window_size: u64) -> bool {
     matches!(
         strategy_tag,
         StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2

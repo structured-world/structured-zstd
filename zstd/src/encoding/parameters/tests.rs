@@ -1,6 +1,90 @@
 use super::*;
 
 #[test]
+fn bounds_clamp_to_the_nearest_end() {
+    let bounds = CParameter::WindowLog.bounds();
+    assert_eq!(bounds.clamp(i64::MIN), bounds.lower_bound);
+    assert_eq!(bounds.clamp(i64::MAX), bounds.upper_bound);
+    assert_eq!(bounds.clamp(20), 20);
+}
+
+/// Fitting parameters to a small source brings the window and tables down;
+/// an unknown size leaves them alone; a dictionary keeps room for itself.
+#[test]
+fn level_parameters_fit_the_source() {
+    let level = LevelParameters::for_level(19, None, 0);
+    assert_eq!(level.adjusted(None, 0), level);
+    let small = level.adjusted(Some(1000), 0);
+    assert_eq!(small.window_log, 10);
+    assert!(small.hash_log < level.hash_log);
+    assert_eq!(small.strategy, level.strategy);
+    let with_dict = level.adjusted(Some(1000), 64 * 1024);
+    assert!(with_dict.window_log > small.window_log);
+}
+
+/// A dictionary frame raises an explicit window toward a source of known
+/// size, up to 2^19 (upstream `ZSTD_compress_usingCDict_internal`): never
+/// lowers it, leaves it for an unknown source, and leaves a level's own
+/// window, which no override fixed, to the level.
+#[test]
+fn a_dictionary_frame_raises_an_explicit_window_toward_the_source() {
+    let explicit = |log| {
+        CompressionParameters::builder(CompressionLevel::Level(3))
+            .window_log(log)
+            .build()
+            .unwrap()
+    };
+    let raised = |params: CompressionParameters, source| {
+        params.for_dictionary_frame(source).overrides().window_log
+    };
+    assert_eq!(raised(explicit(10), Some(1 << 20)), Some(19));
+    assert_eq!(raised(explicit(10), Some(5000)), Some(13));
+    assert_eq!(raised(explicit(10), Some(1)), Some(10));
+    assert_eq!(raised(explicit(21), Some(5000)), Some(21));
+    assert_eq!(raised(explicit(10), None), Some(10));
+    assert_eq!(
+        raised(
+            explicit(10),
+            Some(crate::encoding::cparams::CONTENTSIZE_UNKNOWN)
+        ),
+        Some(10)
+    );
+    let level = CompressionParameters::builder(CompressionLevel::Level(3))
+        .build()
+        .unwrap();
+    assert_eq!(raised(level, Some(1 << 20)), None);
+}
+
+/// A raw frame's window is the one the encoder writes for it, not a panic:
+/// the builder accepts `Uncompressed`, so the query must answer for it.
+#[test]
+fn window_log_for_raw_frames_is_the_encoders() {
+    let raw = CompressionParameters::builder(CompressionLevel::Uncompressed)
+        .build()
+        .unwrap();
+    assert_eq!(raw.window_log_for(None, 0), 17);
+    assert_eq!(raw.window_log_for(Some(1000), 0), 17);
+    let wide = CompressionParameters::builder(CompressionLevel::Uncompressed)
+        .window_log(20)
+        .build()
+        .unwrap();
+    assert_eq!(wide.window_log_for(None, 0), 20);
+    // A dictionary does not send a raw frame into a dictionary tier.
+    assert_eq!(raw.window_log_for(Some(5000), 4096), 17);
+    let sizes = crate::encoding::DictionarySizes {
+        content: 4096,
+        serialized: 4096,
+    };
+    assert!(
+        crate::encoding::estimated_compression_workspace_bytes_for_parameters(
+            &raw,
+            Some(5000),
+            Some(sizes)
+        ) > 0
+    );
+}
+
+#[test]
 fn strategy_ordinals_round_trip() {
     for ordinal in 1..=9 {
         let s = Strategy::from_ordinal(ordinal).expect("valid ordinal");

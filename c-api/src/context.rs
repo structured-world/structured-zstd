@@ -53,6 +53,26 @@ pub(crate) unsafe fn free_boxed<T>(ptr: *mut T) {
     }
 }
 
+/// Bytes the current or last frame of a context has taken in, produced and
+/// handed out; reset when a frame starts.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct FrameProgress {
+    pub(crate) ingested: u64,
+    pub(crate) produced: u64,
+    pub(crate) flushed: u64,
+}
+
+impl FrameProgress {
+    /// A one-shot frame: all of `src_len` taken, all of `frame_len` handed out.
+    pub(crate) fn one_shot(src_len: usize, frame_len: usize) -> Self {
+        Self {
+            ingested: src_len as u64,
+            produced: frame_len as u64,
+            flushed: frame_len as u64,
+        }
+    }
+}
+
 /// Opaque compression context: what upstream keeps in a `ZSTD_CCtx`, kept
 /// here the same way, from one call to the next.
 ///
@@ -68,13 +88,18 @@ pub(crate) unsafe fn free_boxed<T>(ptr: *mut T) {
 pub struct ZSTD_CCtx {
     pub(crate) scratch: Vec<u8>,
     /// Sticky advanced parameters (`ZSTD_CCtx_setParameter` family).
-    pub(crate) params: crate::params::CCtxParams,
+    pub(crate) params: crate::cctx_params::CCtxParams,
     /// Streaming state (`ZSTD_compressStream2`), kept between frames; `None`
     /// before the first streamed frame.
     pub(crate) stream: Option<crate::streaming::CStreamState>,
     /// The one-shot compressor and the serial of the dictionary it holds
     /// (`0` = none); `None` before the first one-shot call.
     pub(crate) compressor: Option<(u64, FrameCompressor)>,
+    /// How far the current or last frame got (`ZSTD_getFrameProgression`).
+    pub(crate) progress: FrameProgress,
+    /// The buffer-less frame begun by `ZSTD_compressBegin*`, compressed on
+    /// the streaming context; `None` outside one.
+    pub(crate) bufferless: Option<crate::bufferless::BufferlessFrame>,
     /// Context-attached dictionary (`ZSTD_CCtx_loadDictionary` /
     /// `ZSTD_CCtx_refCDict` / `ZSTD_CCtx_refPrefix`), applied at every frame
     /// start by `ZSTD_compress2` / `ZSTD_compressStream2`.
@@ -123,30 +148,65 @@ pub(crate) fn set_frame_parameters(
     }
 }
 
+/// Put the block limits, the magic number and the matchers back to a plain
+/// frame's: the compressor is shared with `ZSTD_compress2`, whose sticky
+/// parameters may have set them, and the one-shot entry points do not read
+/// those (upstream runs them on `simpleApiParams`, without a sequence
+/// producer).
+pub(crate) fn plain_frame_shape(compressor: &mut FrameCompressor) {
+    compressor.set_target_block_size(None);
+    compressor.set_max_block_size(None);
+    compressor.set_magicless(false);
+    compressor.set_sequence_producer(None, false);
+}
+
 /// Opaque decompression context. Wraps a reusable [`FrameDecoder`] so its
 /// internal buffers persist across `ZSTD_decompressDCtx` calls.
 #[allow(non_camel_case_types)]
 pub struct ZSTD_DCtx {
     pub(crate) decoder: FrameDecoder,
-    /// `ZSTD_d_windowLogMax`: streaming window-size acceptance ceiling
-    /// (log2). Defaults to `ZSTD_WINDOWLOG_LIMIT_DEFAULT`.
-    pub(crate) window_log_max: core::ffi::c_int,
+    /// Streaming window-size acceptance ceiling in bytes, set as a log by
+    /// `ZSTD_d_windowLogMax` or exactly by `ZSTD_DCtx_setMaxWindowSize`.
+    /// Defaults to `1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT`.
+    pub(crate) max_window_size: u64,
+    /// `ZSTD_d_format`: frames carry no magic number. Kept here as well as in
+    /// `decoder` so a replacement decoder starts with it.
+    pub(crate) magicless: bool,
+    /// How every decode path takes a frame's checksum: verified, or with
+    /// `ZSTD_d_forceIgnoreChecksum` not computed at all.
+    pub(crate) content_checksum: ContentChecksum,
+    /// `ZSTD_d_refMultipleDDicts`: `ZSTD_DCtx_refDDict` adds to the DDicts
+    /// a frame may pick from by its dictionary ID, rather than replacing.
+    pub(crate) ref_multiple_ddicts: bool,
+    /// `ZSTD_d_maxBlockSize`; 0 = the format's 128 KiB.
+    pub(crate) max_block_size: c_int,
+    /// `ZSTD_d_stableOutBuffer` and `ZSTD_d_disableHuffmanAssembly`: promises
+    /// and switches about upstream's own buffering and assembly, stored so
+    /// they read back. This decoder keeps its window either way and has no
+    /// assembly kernels, so neither changes what a decode produces.
+    pub(crate) stable_out_buffer: bool,
+    pub(crate) disable_huffman_assembly: bool,
+    /// Where the buffer-less decode (`ZSTD_decompressBegin*` /
+    /// `ZSTD_decompressContinue`) stands.
+    pub(crate) bufferless: crate::bufferless::BufferlessDecode,
     /// Whether the streaming decoder sits at a frame boundary (the next
     /// `ZSTD_decompressStream` input starts a new frame). `true` initially.
     pub(crate) stream_frame_done: bool,
+    /// How far `ZSTD_decompressStream` has got into the frame it is entering,
+    /// read only while `stream_frame_done` is `false`: a boundary leaves it
+    /// behind, whatever set the boundary.
+    pub(crate) stream_entry: crate::streaming::StreamEntry,
+    /// The part of the frame's next block (or of its checksum) that the input
+    /// has brought so far, held until the rest arrives; at most one block.
+    /// Read only inside a frame, and emptied as each frame starts.
+    pub(crate) stream_staged: Vec<u8>,
+    /// Consecutive `ZSTD_decompressStream` calls inside a frame that moved
+    /// neither position; see [`crate::streaming::NO_FORWARD_PROGRESS_MAX`].
+    pub(crate) stream_no_progress: u32,
     /// Context-attached dictionary (`ZSTD_DCtx_loadDictionary` /
     /// `ZSTD_DCtx_refDDict` / `ZSTD_DCtx_refPrefix`), applied at every frame
     /// start by `ZSTD_decompressDCtx` / `ZSTD_decompressStream`.
     pub(crate) attached_ddict: crate::attach::DCtxDictAttach,
-    /// Identity of the `DDict` whose content was last loaded into `decoder`
-    /// (its never-reused serial; `0` = none), so repeated
-    /// `ZSTD_decompress_usingDDict` calls with the same DDict skip re-adding it.
-    /// Reset to `0` whenever `decoder` is replaced, so a fresh decoder is never
-    /// trusted to still hold the previously-loaded dictionary.
-    pub(crate) ddict_serial: u64,
-    /// Parsed-dictionary cache for `ZSTD_decompress_usingDDict`, keyed by
-    /// `ddict_serial`: repeated calls with the same DDict skip the re-parse.
-    pub(crate) ddict_handle: Option<codec::decoding::DictionaryHandle>,
 }
 
 /// `ZSTD_CCtx* ZSTD_createCCtx(void)`. Returns `NULL` on allocation failure
@@ -155,14 +215,54 @@ pub struct ZSTD_DCtx {
 pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
     try_box(ZSTD_CCtx {
         scratch: Vec::new(),
-        params: crate::params::CCtxParams::default(),
+        params: crate::cctx_params::CCtxParams::default(),
         stream: None,
         compressor: None,
+        progress: FrameProgress::default(),
+        bufferless: None,
         attached_dict: crate::attach::CCtxDictAttach::None,
     })
 }
 
+/// `ZSTD_CCtx* ZSTD_createCCtx_advanced(ZSTD_customMem customMem)` —
+/// [`ZSTD_createCCtx`]; custom allocators are not supported, so anything but
+/// `ZSTD_defaultCMem` returns `NULL`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_createCCtx_advanced(
+    custom_mem: crate::cdict::ZSTD_customMem,
+) -> *mut ZSTD_CCtx {
+    if !custom_mem.is_default() {
+        return core::ptr::null_mut();
+    }
+    ZSTD_createCCtx()
+}
+
+/// The most a context keeps of its one-shot frame buffer between calls: a
+/// frame of one full block, its header and checksum.
+pub(crate) const RETAINED_SCRATCH: usize =
+    codec::encoding::compress_bound(codec::MAX_BLOCK_SIZE as usize);
+
 impl ZSTD_CCtx {
+    /// Hand the one-shot frame in `scratch` to `dst`, or `dstSize_tooSmall`,
+    /// then let go of a buffer larger than a block's worth: upstream writes the
+    /// frame into `dst` and keeps none of it, so a context keeps only the room
+    /// that spares a small frame an allocation per call.
+    pub(crate) fn hand_out_frame(&mut self, dst: &mut [u8]) -> Result<usize, ZSTD_ErrorCode> {
+        let len = self.scratch.len();
+        let handed = if len > dst.len() {
+            Err(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall)
+        } else {
+            dst[..len].copy_from_slice(&self.scratch);
+            Ok(len)
+        };
+        if self.scratch.capacity() > RETAINED_SCRATCH {
+            self.scratch = Vec::new();
+        } else {
+            self.scratch.clear();
+        }
+        handed
+    }
+
     /// Whether a streaming frame is currently mid-flight (parameters are
     /// frozen until it finishes or the session is reset).
     pub(crate) fn stream_in_progress(&self) -> bool {
@@ -179,13 +279,25 @@ impl ZSTD_CCtx {
         if self.stream_in_progress() {
             self.stream = None;
         }
+        self.bufferless = None;
         self.params.pledged_src_size = crate::params::CONTENTSIZE_UNKNOWN;
+    }
+
+    /// Start a one-shot frame: it abandons a streamed or buffer-less frame
+    /// left open, with its pledge, and the real size of the input it has in
+    /// hand drives the header. Upstream begins every one-shot from a fresh
+    /// session: `ZSTD_compress2` resets it (zstd_compress.c:6575, and
+    /// `ZSTD_generateSequences` runs through it), the simple calls through
+    /// `ZSTD_compressBegin_internal`, and `ZSTD_compressSequences` re-inits the
+    /// stream with the input's size as its pledge (`ZSTD_CCtx_init_compressStream2`).
+    pub(crate) fn begin_one_shot(&mut self) {
+        self.reset_session();
     }
 
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
     /// dictionary references, including the ones the kept compressors hold.
     pub(crate) fn reset_parameters(&mut self) {
-        self.params = crate::params::CCtxParams::default();
+        self.params = crate::cctx_params::CCtxParams::default();
         self.replace_attached_dict(crate::attach::CCtxDictAttach::None);
         // A `*_usingCDict` call's dictionary is not an attachment, and goes too.
         if let Some((held, compressor)) = &mut self.compressor
@@ -255,6 +367,9 @@ pub unsafe extern "C" fn ZSTD_sizeof_CCtx(cctx: *const ZSTD_CCtx) -> usize {
                 cctx.attached_dict.owned(),
                 compressor_dictionary,
                 stream_dictionary,
+                cctx.bufferless
+                    .as_ref()
+                    .and_then(crate::bufferless::BufferlessFrame::dictionary),
             ]
             .into_iter()
             .flatten(),
@@ -281,6 +396,7 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let cctx = unsafe { &mut *cctx };
+    cctx.begin_one_shot();
     let src = unsafe { in_slice(src, src_size) };
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
         let ZSTD_CCtx {
@@ -295,7 +411,7 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
         // Upstream ZSTD_compressCCtx defaults ZSTD_c_checksumFlag = 0; match it.
         enc.set_content_checksum(false);
         enc.set_content_size_flag(true);
-        enc.set_target_block_size(None);
+        plain_frame_shape(enc);
         scratch.clear();
         enc.compress_independent_frame_into(src, scratch);
         Ok(())
@@ -310,13 +426,98 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
             return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
         }
     }
-    let len = cctx.scratch.len();
-    if len > dst_capacity {
-        return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
-    }
     let dst = unsafe { out_slice(dst, dst_capacity) };
-    dst[..len].copy_from_slice(&cctx.scratch);
+    let len = match cctx.hand_out_frame(dst) {
+        Ok(len) => len,
+        Err(code) => return encode(code),
+    };
+    cctx.progress = FrameProgress::one_shot(src.len(), len);
     len
+}
+
+/// Compress `src` as one frame under the sticky parameters and the attached
+/// dictionary (the frame of `ZSTD_compress2`) into `cctx.scratch`, or, when
+/// `capture` is given, only record the parse it takes there; returns the
+/// frame's length either way.
+pub(crate) fn compress_sticky_frame(
+    cctx: &mut ZSTD_CCtx,
+    src: &[u8],
+    capture: Option<&mut Vec<codec::encoding::sequences::ExternalSequence>>,
+) -> Result<usize, ZSTD_ErrorCode> {
+    cctx.begin_one_shot();
+    // A referenced CDict's compression parameters are authoritative
+    // (upstream rule), so the sticky knobs are resolved — and can reject —
+    // only when they will actually drive the frame; an unsupported sticky
+    // combination must not break a valid RefCDict path.
+    // All the input is here, so the frame's size is known and decides whether a
+    // referenced CDict's parameters still describe it.
+    let src_size = Some(src.len() as u64);
+    let frame_params = cctx.frame_parameters(src_size)?;
+    let params = cctx.params;
+    let level = cctx.attach_level(src_size);
+    let serial = cctx.attach_serial();
+    let suppress_id = cctx.attach_suppresses_dict_id();
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<usize, ZSTD_ErrorCode> {
+        let ZSTD_CCtx {
+            scratch,
+            compressor,
+            attached_dict,
+            ..
+        } = cctx;
+        // The kept compressor, holding the attached dictionary: the same one
+        // on the next call is neither parsed nor attached again.
+        let enc = kept_compressor(compressor, serial, attached_dict.prepared(), level)?;
+        set_frame_parameters(enc, frame_params.as_ref(), level);
+        enc.set_content_checksum(params.checksum_flag);
+        enc.set_content_size_flag(params.content_size_flag);
+        enc.set_dictionary_id_flag(params.dict_id_flag && !suppress_id);
+        // The kept compressor outlives parameter changes: clear the cap
+        // explicitly when the sticky knob is back at 0 (auto), or a cap set
+        // by an earlier call would silently survive.
+        enc.set_target_block_size(params.target_block_size());
+        enc.set_max_block_size(params.max_block_size());
+        enc.set_magicless(params.magicless);
+        // An attached dictionary stays attached next to a producer: the frame
+        // names it and its entropy seeds the first block, as upstream 1.5.7
+        // writes the dictionary ID in that case too. The producer itself sees
+        // no history, which is what "no effect" means in the zstd.h notes.
+        // Long-distance matching stays on beside it, see `CStreamState`'s
+        // `configure`.
+        let (producer, fallback) = params.sequence_producer(level);
+        enc.set_sequence_producer(producer, fallback);
+        enc.set_sequence_capture(capture.is_some());
+        // A parse is all a capturing caller hands out, so its frame goes to a
+        // buffer freed on return rather than into the kept scratch, as
+        // upstream's generateSequences frees its dst (zstd_compress.c:3548).
+        let mut transient = Vec::new();
+        let out = if capture.is_some() {
+            &mut transient
+        } else {
+            scratch
+        };
+        out.clear();
+        enc.compress_independent_frame_into(src, out);
+        let frame_len = out.len();
+        if let Some(capture) = capture {
+            *capture = enc.take_captured_sequences();
+            enc.set_sequence_capture(false);
+        }
+        // Without fallback a producer failure fails the frame, as upstream's
+        // `ZSTD_buildSeqStore` returns it (zstd_compress.c:3396).
+        if enc.take_sequence_producer_failure() {
+            return Err(ZSTD_ErrorCode::ZSTD_error_sequenceProducer_failed);
+        }
+        Ok(frame_len)
+    }));
+    match outcome {
+        Ok(result) => result,
+        Err(_) => {
+            // A panic can leave the kept compressor torn; the next call
+            // builds a new one.
+            cctx.compressor = None;
+            Err(ZSTD_ErrorCode::ZSTD_error_GENERIC)
+        }
+    }
 }
 
 /// `size_t ZSTD_compress2(ZSTD_CCtx* cctx, void* dst, size_t dstCapacity,
@@ -338,84 +539,22 @@ pub unsafe extern "C" fn ZSTD_compress2(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let cctx = unsafe { &mut *cctx };
-    if cctx.stream_in_progress() {
-        // A one-shot frame would interleave with the unfinished streaming
-        // frame on this context (and consume its pledge); the stream must
-        // be ended or the session reset first.
-        return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
-    }
     let src = unsafe { in_slice(src, src_size) };
-    // The pledge is single-use: consumed by this frame regardless of
-    // outcome. With all input present in one call the actual srcSize drives
-    // the header, but a mismatching explicit pledge is a contract violation
-    // (upstream `srcSizeWrong`).
-    let pledged = core::mem::replace(
-        &mut cctx.params.pledged_src_size,
-        crate::params::CONTENTSIZE_UNKNOWN,
-    );
-    if pledged != crate::params::CONTENTSIZE_UNKNOWN && pledged != src_size as u64 {
-        return encode(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
-    }
-    // A referenced CDict's compression parameters are authoritative
-    // (upstream rule), so the sticky knobs are resolved — and can reject —
-    // only when they will actually drive the frame; an unsupported sticky
-    // combination must not break a valid RefCDict path.
-    // All the input is here, so the frame's size is known and decides whether a
-    // referenced CDict's parameters still describe it.
-    let src_size = Some(src.len() as u64);
-    let frame_params = match cctx.frame_parameters(src_size) {
-        Ok(frame_params) => frame_params,
-        Err(code) => return encode(code),
-    };
-    let params = cctx.params;
-    let level = cctx.attach_level(src_size);
-    let serial = cctx.attach_serial();
-    let suppress_id = cctx.attach_suppresses_dict_id();
-    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
-        let ZSTD_CCtx {
-            scratch,
-            compressor,
-            attached_dict,
-            ..
-        } = cctx;
-        // The kept compressor, holding the attached dictionary: the same one
-        // on the next call is neither parsed nor attached again.
-        let enc = kept_compressor(compressor, serial, attached_dict.prepared(), level)?;
-        set_frame_parameters(enc, frame_params.as_ref(), level);
-        enc.set_content_checksum(params.checksum_flag);
-        enc.set_content_size_flag(params.content_size_flag);
-        enc.set_dictionary_id_flag(params.dict_id_flag && !suppress_id);
-        // The kept compressor outlives parameter changes: clear the cap
-        // explicitly when the sticky knob is back at 0 (auto), or a cap set
-        // by an earlier call would silently survive.
-        enc.set_target_block_size(
-            (params.target_cblock_size > 0).then_some(params.target_cblock_size as u32),
-        );
-        scratch.clear();
-        enc.compress_independent_frame_into(src, scratch);
-        Ok(())
-    }));
-    match outcome {
-        Ok(Ok(())) => {}
-        // A refused dictionary leaves the kept compressor as it was.
-        Ok(Err(code)) => return encode(code),
-        Err(_) => {
-            // A panic can leave the kept compressor torn; the next call
-            // builds a new one.
-            cctx.compressor = None;
-            return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
-        }
-    }
-    let len = cctx.scratch.len();
-    if len > dst_capacity {
-        return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
+    let built = compress_sticky_frame(cctx, src, None);
+    // The single-use prefix is spent once the frame has started, whatever
+    // happens to it after: upstream clears it in ZSTD_CCtx_init_compressStream2
+    // (zstd_compress.c:6356), before compressing, so a caller that retries a
+    // failed call (dstSize_tooSmall included) does so without it.
+    cctx.consume_prefix();
+    if let Err(code) = built {
+        return encode(code);
     }
     let dst = unsafe { out_slice(dst, dst_capacity) };
-    dst[..len].copy_from_slice(&cctx.scratch);
-    // The single-use prefix is spent only now that the frame actually
-    // reached the caller: a dstSize_tooSmall failure above must leave it
-    // armed for the retry with a bigger buffer.
-    cctx.consume_prefix();
+    let len = match cctx.hand_out_frame(dst) {
+        Ok(len) => len,
+        Err(code) => return encode(code),
+    };
+    cctx.progress = FrameProgress::one_shot(src.len(), len);
     len
 }
 
@@ -425,12 +564,33 @@ pub unsafe extern "C" fn ZSTD_compress2(
 pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
     try_box(ZSTD_DCtx {
         decoder: FrameDecoder::new(),
-        window_log_max: crate::params::WINDOW_LOG_LIMIT_DEFAULT,
+        max_window_size: crate::params::MAX_WINDOW_SIZE_DEFAULT,
+        magicless: false,
+        content_checksum: ContentChecksum::Verify,
+        ref_multiple_ddicts: false,
+        max_block_size: 0,
+        stable_out_buffer: false,
+        disable_huffman_assembly: false,
+        bufferless: crate::bufferless::BufferlessDecode::new(false),
         stream_frame_done: true,
+        stream_entry: crate::streaming::StreamEntry::Entered,
+        stream_staged: Vec::new(),
+        stream_no_progress: 0,
         attached_ddict: crate::attach::DCtxDictAttach::None,
-        ddict_serial: 0,
-        ddict_handle: None,
     })
+}
+
+/// `ZSTD_DCtx* ZSTD_createDCtx_advanced(ZSTD_customMem customMem)` —
+/// [`ZSTD_createDCtx`]; custom allocators are not supported, so anything but
+/// `ZSTD_defaultCMem` returns `NULL`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_createDCtx_advanced(
+    custom_mem: crate::cdict::ZSTD_customMem,
+) -> *mut ZSTD_DCtx {
+    if !custom_mem.is_default() {
+        return core::ptr::null_mut();
+    }
+    ZSTD_createDCtx()
 }
 
 impl ZSTD_DCtx {
@@ -442,20 +602,43 @@ impl ZSTD_DCtx {
         // re-initialised by the next `init`/`reset` call; just mark the
         // stream as sitting at a frame boundary again.
         self.stream_frame_done = true;
+        self.stream_no_progress = 0;
     }
 
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
-    /// dictionary references.
+    /// dictionary references. Upstream accepts it only at a stream's frame
+    /// boundary and leaves a begun buffer-less run as it was begun
+    /// (`ZSTD_DCtx_resetParameters` touches neither), so the decoder and the
+    /// run stay; the new parameters apply from the next frame.
     pub(crate) fn reset_parameters(&mut self) {
-        self.window_log_max = crate::params::WINDOW_LOG_LIMIT_DEFAULT;
-        // Replace the decoder to drop any loaded dictionaries; the
-        // workspace re-grows on the next frame. The fresh decoder sits at
-        // a frame boundary, so the streaming flag must say so too.
-        self.decoder = FrameDecoder::new();
-        self.stream_frame_done = true;
-        self.ddict_serial = 0;
-        self.ddict_handle = None;
+        self.max_window_size = crate::params::MAX_WINDOW_SIZE_DEFAULT;
+        self.magicless = false;
+        self.decoder.set_magicless(false);
+        self.content_checksum = ContentChecksum::Verify;
+        self.ref_multiple_ddicts = false;
+        self.max_block_size = 0;
+        self.apply_max_block_size();
+        self.stable_out_buffer = false;
+        self.disable_huffman_assembly = false;
         self.attached_ddict = crate::attach::DCtxDictAttach::None;
+    }
+
+    /// Hand `ZSTD_d_maxBlockSize` to the decoder, which holds every frame it
+    /// starts to it; 0 is the format's 128 KiB.
+    pub(crate) fn apply_max_block_size(&mut self) {
+        let limit = u32::try_from(self.max_block_size)
+            .ok()
+            .filter(|&size| size != 0);
+        self.decoder.set_max_block_size(limit);
+    }
+
+    /// Start over with a fresh decoder, as after a panic that may have torn the
+    /// old one: the frame format and block limit carry over, the loaded
+    /// dictionaries do not.
+    pub(crate) fn replace_decoder(&mut self) {
+        self.decoder = FrameDecoder::new();
+        self.decoder.set_magicless(self.magicless);
+        self.apply_max_block_size();
     }
 }
 
@@ -477,8 +660,12 @@ pub unsafe extern "C" fn ZSTD_freeDCtx(dctx: *mut ZSTD_DCtx) -> usize {
 /// Sums the inline struct size and the `FrameDecoder`'s lazily-grown workspace
 /// (decode-window buffer, per-block literal/content buffers, entropy tables),
 /// matching the workspace term of upstream's `ZSTD_sizeof_DCtx`. The workspace
-/// is 0 until the first frame allocates it. Shared dictionaries (ref-counted
-/// handles) are not counted, as upstream excludes `refDDict` memory.
+/// is 0 until the first frame allocates it.
+///
+/// The dictionaries the context holds (the attached one, a buffer-less run's,
+/// the one the decoder kept from its last frame) may be one allocation: each
+/// counts once, and only when the context alone keeps it alive, so a
+/// referenced DDict's is the DDict's, as upstream leaves `refDDict` memory out.
 ///
 /// # Safety
 /// `dctx` must be a live pointer from [`ZSTD_createDCtx`], or `NULL`.
@@ -490,14 +677,26 @@ pub unsafe extern "C" fn ZSTD_sizeof_DCtx(dctx: *const ZSTD_DCtx) -> usize {
     let dctx = unsafe { &*dctx };
     core::mem::size_of::<ZSTD_DCtx>()
         + dctx.decoder.workspace_size()
-        + dctx.attached_ddict.heap_size()
-        // The parsed-dictionary cache behind ZSTD_decompress_usingDDict is
-        // context-owned (the parse copy, not the caller's DDict bytes);
-        // same accounting as the attach path: content + entropy-table heap
-        // plus the inline struct.
-        + dctx.ddict_handle.as_ref().map_or(0, |h| {
-            h.as_dict().heap_bytes() + core::mem::size_of::<codec::decoding::Dictionary>()
-        })
+        + dctx.stream_staged.capacity()
+        + codec::decoding::DictionaryHandle::exclusive_heap_size(
+            dctx.attached_ddict
+                .handles()
+                .iter()
+                .chain(dctx.bufferless.dictionary())
+                .chain(dctx.decoder.dictionary()),
+        )
+        + attached_set_size(&dctx.attached_ddict)
+}
+
+/// The list a multiple-DDict reference keeps of its handles, which upstream
+/// counts too (its DDict hash set lives in the context).
+fn attached_set_size(attached: &crate::attach::DCtxDictAttach) -> usize {
+    match attached {
+        crate::attach::DCtxDictAttach::RefDDicts { handles } => {
+            handles.capacity() * core::mem::size_of::<codec::decoding::DictionaryHandle>()
+        }
+        _ => 0,
+    }
 }
 
 /// `size_t ZSTD_decompressDCtx(ZSTD_DCtx* dctx, void* dst, size_t dstCapacity,
@@ -519,7 +718,11 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let dctx = unsafe { &mut *dctx };
-    let src = unsafe { in_slice(src, src_size) };
+    let src = match unsafe { crate::ffi::decode_input(src, src_size, dst, dst_capacity) } {
+        Ok(src) => src,
+        Err(code) => return encode(code),
+    };
+    let src = &*src;
     let dst = unsafe { out_slice(dst, dst_capacity) };
     // Verify the trailing content checksum like upstream ZSTD_decompress; the
     // setter is idempotent, so reapplying it on a reused DCtx is fine.
@@ -538,7 +741,7 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     // its one-shot path checks only the absolute ZSTD_WINDOWLOG_MAX bound.
     // The single-pass decode writes into the caller's dst with no window
     // buffer, so there is no allocation for the parameter to limit.
-    dctx.decoder.set_content_checksum(ContentChecksum::Verify);
+    dctx.decoder.set_content_checksum(dctx.content_checksum);
     // Context-attached dictionary (`ZSTD_DCtx_loadDictionary` / `refDDict` /
     // `refPrefix`) applies to the frames of this one-shot. A prefix is
     // single-use, but "use" means a frame actually started with it — the
@@ -546,10 +749,9 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     // one-shot consumes it only on success (a garbage input must not eat
     // the prefix out from under the retry).
     let decoder = &mut dctx.decoder;
-    let attached = dctx.attached_ddict.handle();
-    let outcome = catch_unwind(AssertUnwindSafe(|| match attached {
-        Some(handle) => decoder.decode_all_with_dict_handle(src, dst, handle),
-        None => decoder.decode_all(src, dst),
+    let attached = dctx.attached_ddict.handles();
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        decoder.decode_all_with_dict_handles(src, dst, attached)
     }));
     match outcome {
         Ok(Ok(written)) => {
@@ -579,13 +781,9 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
             // A panic mid-decode can leave the decoder's internal state
             // partially consumed; replace it with a fresh one (same as
             // ZSTD_createDCtx) so a later call on this reused DCtx starts clean
-            // instead of observing a broken invariant. The fresh decoder no
-            // longer holds any previously-loaded dictionary, so clear the DDict
-            // cache key too — otherwise the next ZSTD_decompress_usingDDict with
-            // the same handle would skip re-loading it and decode without it.
-            dctx.decoder = FrameDecoder::new();
+            // instead of observing a broken invariant.
+            dctx.replace_decoder();
             dctx.stream_frame_done = true;
-            dctx.ddict_serial = 0;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
     }

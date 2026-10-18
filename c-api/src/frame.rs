@@ -6,27 +6,28 @@ use core::ffi::{c_uint, c_ulonglong};
 
 use codec::decoding::errors::ReadFrameHeaderError;
 use codec::decoding::{
-    FrameContentSize, find_frame_compressed_size, frame_decompressed_bound, frame_header_size,
+    FrameContentSize, FrameMagic, FrameSizeError, decompression_margin, find_frame_compressed_size,
+    frame_decompressed_bound, frame_header_size, frame_magic, min_decoding_buffer_size,
     read_frame_content_size, read_frame_header_info,
+};
+use codec::skippable::{
+    SkippableFrameError, SkippableSliceError, parse_skippable_frame, write_skippable_frame,
 };
 
 use crate::error::{ZSTD_ErrorCode, code_for_descriptor_error, encode};
-use crate::ffi::in_slice;
+use crate::ffi::{in_slice, out_slice};
 
 /// `(0ULL - 1)` — content size could not be determined.
 const CONTENTSIZE_UNKNOWN: c_ulonglong = u64::MAX;
 /// `(0ULL - 2)` — an error occurred.
 const CONTENTSIZE_ERROR: c_ulonglong = u64::MAX - 1;
-/// `ZSTD_FRAMEHEADERSIZE_MAX` — the "need at most this many bytes" hint
-/// `ZSTD_getFrameHeader` returns when `src` is too short.
-const FRAMEHEADERSIZE_MAX: usize = 18;
 /// `ZSTD_BLOCKSIZE_MAX`: the codec's block maximum, named rather than
 /// re-declared.
 const BLOCKSIZE_MAX: u64 = codec::MAX_BLOCK_SIZE as u64;
 /// Base magic of the skippable-frame range; the low nibble is the variant.
-const SKIPPABLE_MAGIC_BASE: u32 = 0x184D_2A50;
+const SKIPPABLE_MAGIC_BASE: u32 = codec::skippable::SKIPPABLE_MAGIC_START;
 /// `ZSTD_SKIPPABLEHEADERSIZE` = 4-byte magic + 4-byte `Frame_Size`.
-const SKIPPABLE_HEADER_SIZE: usize = 8;
+const SKIPPABLE_HEADER_SIZE: usize = codec::skippable::SKIPPABLE_HEADER_SIZE;
 
 /// `ZSTD_FrameType_e` — `ZSTD_frame` (0) or `ZSTD_skippableFrame` (1).
 #[repr(C)]
@@ -145,8 +146,12 @@ unsafe fn fill_frame_header(zfh: *mut ZSTD_FrameHeader, src: &[u8], magicless: b
         Err(ReadFrameHeaderError::InvalidFrameDescriptor(descriptor)) => {
             encode(code_for_descriptor_error(&descriptor))
         }
-        // The remaining variants are short-read failures: ask for more input.
-        Err(_) => FRAMEHEADERSIZE_MAX,
+        // The remaining variants are short-read failures: ask for as much as
+        // the header still needs, as upstream does.
+        Err(_) => match codec::decoding::frame_header_input_needed(src, magicless) {
+            Ok(needed) => needed,
+            Err(_) => encode(ZSTD_ErrorCode::ZSTD_error_prefix_unknown),
+        },
     }
 }
 
@@ -226,6 +231,143 @@ pub unsafe extern "C" fn ZSTD_findDecompressedSize(src: *const u8, src_size: usi
         }
     }
     total
+}
+
+/// `unsigned ZSTD_isFrame(const void* buffer, size_t size)` — 1 when `buffer`
+/// starts with a frame or skippable-frame magic number, else 0.
+///
+/// # Safety
+/// `buffer` must be valid for `size` bytes (or `NULL` with `size == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_isFrame(buffer: *const u8, size: usize) -> c_uint {
+    let buffer = unsafe { in_slice(buffer, size) };
+    c_uint::from(frame_magic(buffer).is_some())
+}
+
+/// `unsigned ZSTD_isSkippableFrame(const void* buffer, size_t size)` — 1 when
+/// `buffer` starts with a skippable-frame magic number, else 0.
+///
+/// # Safety
+/// `buffer` must be valid for `size` bytes (or `NULL` with `size == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_isSkippableFrame(buffer: *const u8, size: usize) -> c_uint {
+    let buffer = unsafe { in_slice(buffer, size) };
+    c_uint::from(matches!(
+        frame_magic(buffer),
+        Some(FrameMagic::Skippable(_))
+    ))
+}
+
+/// `size_t ZSTD_readSkippableFrame(void* dst, size_t dstCapacity, unsigned*
+/// magicVariant, const void* src, size_t srcSize)` — copy the payload of the
+/// skippable frame `src` starts with into `dst` and return its length;
+/// `magicVariant` (optional) receives the variant.
+///
+/// # Safety
+/// `dst` valid for `dst_capacity` bytes, `src` for `src_size` (either may be
+/// `NULL` with a zero length); `magic_variant` writable or `NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_readSkippableFrame(
+    dst: *mut u8,
+    dst_capacity: usize,
+    magic_variant: *mut c_uint,
+    src: *const u8,
+    src_size: usize,
+) -> usize {
+    let src = unsafe { in_slice(src, src_size) };
+    let (variant, payload) = match parse_skippable_frame(src) {
+        Ok(frame) => frame,
+        Err(SkippableSliceError::BadMagicNumber(_)) => {
+            return encode(ZSTD_ErrorCode::ZSTD_error_frameParameter_unsupported);
+        }
+        Err(_) => return encode(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong),
+    };
+    if payload.len() > dst_capacity {
+        return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
+    }
+    // Upstream copies only into a non-NULL destination; NULL just measures.
+    if !payload.is_empty() && !dst.is_null() {
+        let dst = unsafe { out_slice(dst, dst_capacity) };
+        dst[..payload.len()].copy_from_slice(payload);
+    }
+    if !magic_variant.is_null() {
+        unsafe { magic_variant.write(c_uint::from(variant)) };
+    }
+    payload.len()
+}
+
+/// `size_t ZSTD_writeSkippableFrame(void* dst, size_t dstCapacity, const void*
+/// src, size_t srcSize, unsigned magicVariant)` — write `src` as a skippable
+/// frame with magic `0x184D2A50 + magicVariant` (`0..=15`); returns the bytes
+/// written.
+///
+/// # Safety
+/// `dst` valid for `dst_capacity` bytes, `src` for `src_size` (either may be
+/// `NULL` with a zero length).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_writeSkippableFrame(
+    dst: *mut u8,
+    dst_capacity: usize,
+    src: *const u8,
+    src_size: usize,
+    magic_variant: c_uint,
+) -> usize {
+    if src_size
+        .checked_add(SKIPPABLE_HEADER_SIZE)
+        .is_none_or(|size| size > dst_capacity)
+    {
+        return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
+    }
+    let src = unsafe { in_slice(src, src_size) };
+    let mut dst = unsafe { out_slice(dst, dst_capacity) };
+    // A variant past `u8` is out of range all the same; the codec rejects it.
+    let variant = u8::try_from(magic_variant).unwrap_or(u8::MAX);
+    match write_skippable_frame(variant, src, &mut dst) {
+        Ok(written) => written,
+        Err(SkippableFrameError::InvalidMagicVariant(_)) => {
+            encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound)
+        }
+        Err(SkippableFrameError::PayloadTooLarge(_)) => {
+            encode(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong)
+        }
+        // The capacity was checked above, so the slice writer cannot run out.
+        Err(_) => encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall),
+    }
+}
+
+/// `size_t ZSTD_decompressionMargin(const void* src, size_t srcSize)` — how
+/// far the compressed frames in `src` must end past the end of the output for
+/// an in-place decode, or an error code.
+///
+/// # Safety
+/// `src` must be valid for `src_size` bytes (or `NULL` with `src_size == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_decompressionMargin(src: *const u8, src_size: usize) -> usize {
+    let src = unsafe { in_slice(src, src_size) };
+    match decompression_margin(src) {
+        Ok(margin) => margin,
+        Err(FrameSizeError::Header(ReadFrameHeaderError::BadMagicNumber(_))) => {
+            encode(ZSTD_ErrorCode::ZSTD_error_prefix_unknown)
+        }
+        Err(FrameSizeError::Header(ReadFrameHeaderError::InvalidFrameDescriptor(descriptor))) => {
+            encode(code_for_descriptor_error(&descriptor))
+        }
+        Err(_) => encode(ZSTD_ErrorCode::ZSTD_error_corruption_detected),
+    }
+}
+
+/// `size_t ZSTD_decodingBufferSize_min(unsigned long long windowSize, unsigned
+/// long long frameContentSize)` — the smallest output buffer a block-by-block
+/// decode of a frame with this window and content size runs in.
+/// `frameContentSize` may be `ZSTD_CONTENTSIZE_UNKNOWN`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_decodingBufferSize_min(
+    window_size: c_ulonglong,
+    frame_content_size: c_ulonglong,
+) -> usize {
+    let content_size = (frame_content_size != CONTENTSIZE_UNKNOWN).then_some(frame_content_size);
+    min_decoding_buffer_size(window_size, content_size)
+        .unwrap_or_else(|| encode(ZSTD_ErrorCode::ZSTD_error_frameParameter_windowTooLarge))
 }
 
 /// `unsigned long long ZSTD_decompressBound(const void* src, size_t srcSize)` —

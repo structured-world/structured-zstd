@@ -24,6 +24,28 @@ fn create_cdict_table_logs_downsizes_for_unknown_source_with_dict() {
     assert_eq!(c2, 21, "no-dict CDict keeps the requested chain_log");
 }
 
+/// The row finder takes its row bits and an 8-bit tag from one 32-bit hash,
+/// so a row strategy's hash table is capped at `32 - 8 + rowLog`; a strategy
+/// without rows keeps the table it asked for.
+#[test]
+fn a_row_strategy_hash_table_fits_one_hash() {
+    let wide = |strategy| CParams {
+        window_log: 30,
+        chain_log: 29,
+        hash_log: 30,
+        search_log: 4,
+        min_match: 4,
+        target_length: 0,
+        strategy,
+    };
+    for strategy in 3..=5 {
+        let cp = adjust_cparams(wide(strategy), CONTENTSIZE_UNKNOWN, 0, false);
+        assert_eq!(cp.hash_log, 32 - 8 + 4, "strategy {strategy}");
+    }
+    let cp = adjust_cparams(wide(6), CONTENTSIZE_UNKNOWN, 0, false);
+    assert_eq!(cp.hash_log, 30);
+}
+
 /// A CDict prepared under explicit parameters takes each knob in place of the
 /// level row's and is down-sized for the dictionary again
 /// (`ZSTD_getCParamsFromCCtxParams`): a 4 KiB dictionary at level 3 asked for

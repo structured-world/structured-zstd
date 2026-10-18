@@ -1714,6 +1714,121 @@ fn a_block_past_the_block_maximum_is_rejected_on_the_ring() {
     );
 }
 
+/// A block limit refuses a block that holds more on every decode path (into
+/// the caller's buffer, through the decoder's own buffer, a block at a time),
+/// lets a frame of smaller blocks through, and goes away when cleared.
+#[test]
+fn max_block_size_refuses_a_bigger_block_on_every_path() {
+    let input: Vec<u8> = (0..20_000u32)
+        .map(|i| b"text with some repetition in it "[(i % 32) as usize] ^ (i / 997) as u8)
+        .collect();
+    let encode = |max_block: Option<u32>| {
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_max_block_size(max_block);
+        compressor.set_source(input.as_slice());
+        let mut frame = Vec::new();
+        compressor.set_drain(&mut frame);
+        compressor.compress();
+        frame
+    };
+    let big = encode(None);
+    let small = encode(Some(4096));
+    let mut out = alloc::vec![0u8; input.len()];
+    let mut decoder = FrameDecoder::new();
+    decoder.set_max_block_size(Some(4096));
+
+    assert!(
+        decoder.decode_all(&big, &mut out).is_err(),
+        "caller's buffer"
+    );
+    assert_eq!(decoder.decode_all(&small, &mut out).unwrap(), input.len());
+    assert_eq!(out, input);
+
+    decoder.reset(big.as_slice()).unwrap();
+    assert!(
+        decoder
+            .decode_blocks(
+                &big[decoder_header_len(&big)..],
+                super::BlockDecodingStrategy::All
+            )
+            .is_err(),
+        "decoder's own buffer"
+    );
+    decoder.reset(small.as_slice()).unwrap();
+    decoder
+        .decode_blocks(
+            &small[decoder_header_len(&small)..],
+            super::BlockDecodingStrategy::All,
+        )
+        .unwrap();
+    assert_eq!(decoder.collect().unwrap(), input);
+
+    let mut source = big.as_slice();
+    decoder.reset(&mut source).unwrap();
+    let (header, rest) = source.split_first_chunk::<3>().unwrap();
+    // The compressed block is under the limit; what it decodes to is not.
+    let (len, _) = decoder.block_content_len(*header).unwrap();
+    assert!(
+        decoder
+            .decode_block(*header, &rest[..len], &mut out)
+            .is_err(),
+        "a block at a time"
+    );
+
+    decoder.set_max_block_size(None);
+    assert_eq!(decoder.decode_all(&big, &mut out).unwrap(), input.len());
+}
+
+/// The length of `frame`'s header, which `reset` takes from a source.
+fn decoder_header_len(frame: &[u8]) -> usize {
+    usize::from(crate::decoding::frame::read_frame_header(frame).unwrap().1)
+}
+
+/// Given a choice of dictionaries, a frame decodes with the one its header
+/// names wherever it sits in the list; a list without it is a mismatch, and
+/// an empty list decodes as no dictionary does.
+#[test]
+fn dict_handles_pick_the_one_the_frame_names() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let full = DictionaryHandle::decode_dict(dict_raw).expect("dictionary should parse");
+    let other = DictionaryHandle::from_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0, b"unrelated content ".repeat(64)).unwrap(),
+    );
+    let payload: Vec<u8> = full.as_dict().dict_content[..4096].to_vec();
+    let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor
+        .set_dictionary_from_bytes(dict_raw)
+        .expect("dict load");
+    compressor.set_source(payload.as_slice());
+    let mut frame = Vec::new();
+    compressor.set_drain(&mut frame);
+    compressor.compress();
+
+    let mut decoder = FrameDecoder::new();
+    let mut out = alloc::vec![0u8; payload.len()];
+    let n = decoder
+        .decode_all_with_dict_handles(&frame, &mut out, &[full.clone(), other.clone()])
+        .expect("the named dictionary decodes the frame");
+    assert_eq!(&out[..n], payload.as_slice());
+
+    decoder
+        .reset_with_dict_handles(frame.as_slice(), &[full.clone(), other.clone()])
+        .expect("the named dictionary starts the frame");
+    assert_eq!(
+        decoder.dictionary().map(DictionaryHandle::id),
+        Some(full.id())
+    );
+
+    assert!(matches!(
+        decoder.decode_all_with_dict_handles(&frame, &mut out, &[other]),
+        Err(FrameDecoderError::DictIdMismatch { .. })
+    ));
+    assert!(matches!(
+        decoder.decode_all_with_dict_handles(&frame, &mut out, &[]),
+        Err(FrameDecoderError::DictNotProvided { .. })
+    ));
+}
+
 #[test]
 fn dict_frame_decodes_through_direct_path() {
     // A dictionary frame decoded via `decode_all_with_dict_handle`
