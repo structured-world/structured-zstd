@@ -267,31 +267,15 @@ impl ZSTD_CCtx {
     }
 
     /// Start a frame of a one-shot entry point that predates the advanced
-    /// parameters (`ZSTD_compressCCtx`, the `*_usingDict` and `*_usingCDict`
-    /// calls): upstream begins those with a reset of the session
-    /// (`ZSTD_compressBegin_internal`), which abandons a streamed or
-    /// buffer-less frame left open and its pledge.
-    pub(crate) fn begin_simple_one_shot(&mut self) {
+    /// Start a one-shot frame: it abandons a streamed or buffer-less frame
+    /// left open, with its pledge, and the real size of the input it has in
+    /// hand drives the header. Upstream begins every one-shot from a fresh
+    /// session: `ZSTD_compress2` resets it (zstd_compress.c:6575, and
+    /// `ZSTD_generateSequences` runs through it), the simple calls through
+    /// `ZSTD_compressBegin_internal`, and `ZSTD_compressSequences` re-inits the
+    /// stream with the input's size as its pledge (`ZSTD_CCtx_init_compressStream2`).
+    pub(crate) fn begin_one_shot(&mut self) {
         self.reset_session();
-    }
-
-    /// Start a one-shot frame over `src_len` bytes: refused while a streamed
-    /// frame is unfinished, whose pledge it would otherwise take. The pledge is
-    /// single-use, consumed here whatever the outcome; with all the input in
-    /// hand the real size drives the header, but a pledge that disagrees is a
-    /// contract violation (upstream `srcSize_wrong`).
-    pub(crate) fn begin_one_shot(&mut self, src_len: usize) -> Result<(), ZSTD_ErrorCode> {
-        if self.stream_in_progress() {
-            return Err(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
-        }
-        let pledged = core::mem::replace(
-            &mut self.params.pledged_src_size,
-            crate::params::CONTENTSIZE_UNKNOWN,
-        );
-        if pledged != crate::params::CONTENTSIZE_UNKNOWN && pledged != src_len as u64 {
-            return Err(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
-        }
-        Ok(())
     }
 
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
@@ -396,7 +380,7 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let cctx = unsafe { &mut *cctx };
-    cctx.begin_simple_one_shot();
+    cctx.begin_one_shot();
     let src = unsafe { in_slice(src, src_size) };
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
         let ZSTD_CCtx {
@@ -444,7 +428,7 @@ pub(crate) fn compress_sticky_frame(
     src: &[u8],
     capture: Option<&mut Vec<codec::encoding::sequences::ExternalSequence>>,
 ) -> Result<usize, ZSTD_ErrorCode> {
-    cctx.begin_one_shot(src.len())?;
+    cctx.begin_one_shot();
     // A referenced CDict's compression parameters are authoritative
     // (upstream rule), so the sticky knobs are resolved — and can reject —
     // only when they will actually drive the frame; an unsupported sticky
@@ -599,16 +583,14 @@ impl ZSTD_DCtx {
     }
 
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
-    /// dictionary references.
+    /// dictionary references. Upstream accepts it only at a stream's frame
+    /// boundary and leaves a begun buffer-less run as it was begun
+    /// (`ZSTD_DCtx_resetParameters` touches neither), so the decoder and the
+    /// run stay; the new parameters apply from the next frame.
     pub(crate) fn reset_parameters(&mut self) {
         self.max_window_size = crate::params::MAX_WINDOW_SIZE_DEFAULT;
         self.magicless = false;
-        self.bufferless = crate::bufferless::BufferlessDecode::new(false);
-        // Replace the decoder to drop any loaded dictionaries; the
-        // workspace re-grows on the next frame. The fresh decoder sits at
-        // a frame boundary, so the streaming flag must say so too.
-        self.replace_decoder();
-        self.stream_frame_done = true;
+        self.decoder.set_magicless(false);
         self.attached_ddict = crate::attach::DCtxDictAttach::None;
     }
 

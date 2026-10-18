@@ -635,3 +635,93 @@ fn decompress_begin_with_dictionaries_and_copy() {
         ZSTD_freeDDict(ddict);
     }
 }
+
+/// A parameter reset between `ZSTD_decompressBegin` and the input leaves the
+/// begun run as it was begun: a magicless run still asks for one byte and
+/// decodes a magicless frame. The reset applies to the next run.
+#[test]
+fn a_parameter_reset_leaves_a_begun_run_alone() {
+    const FORMAT: core::ffi::c_int = 10;
+    const MAGICLESS: core::ffi::c_int = 1;
+    let input = fox(5_000);
+    let cctx = ZSTD_createCCtx();
+    let dctx = ZSTD_createDCtx();
+    unsafe {
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, FORMAT, MAGICLESS), 0);
+        let mut frame = vec![0u8; crate::simple::ZSTD_compressBound(input.len())];
+        let n = crate::context::ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(ZSTD_isError(n), 0);
+        frame.truncate(n);
+
+        assert_eq!(crate::params::ZSTD_DCtx_setFormat(dctx, MAGICLESS), 0);
+        assert_eq!(ZSTD_decompressBegin(dctx), 0);
+        assert_eq!(crate::params::ZSTD_DCtx_reset(dctx, 2), 0);
+        assert_eq!(ZSTD_nextSrcSizeToDecompress(dctx), 1);
+        let mut output = Vec::new();
+        let mut out = vec![0u8; 1 << 17];
+        let mut pos = 0;
+        loop {
+            let want = ZSTD_nextSrcSizeToDecompress(dctx);
+            if want == 0 {
+                break;
+            }
+            let rc = ZSTD_decompressContinue(
+                dctx,
+                out.as_mut_ptr(),
+                out.len(),
+                frame[pos..].as_ptr(),
+                want,
+            );
+            assert_eq!(ZSTD_isError(rc), 0, "{:?}", code(rc));
+            output.extend_from_slice(&out[..rc]);
+            pos += want;
+        }
+        assert_eq!(output, input);
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeDCtx(dctx);
+    }
+}
+
+/// A frame ended with one large `ZSTD_compressEnd` piles its whole output up
+/// before it is copied out; once the frame is closed the context keeps room
+/// for one block, as the streaming path does, not the frame's peak.
+#[test]
+fn a_finished_frame_leaves_no_frame_sized_output_behind() {
+    let mut state = 0x2545_F491u32;
+    let noise: Vec<u8> = (0..4 << 20)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let cctx = ZSTD_createCCtx();
+    let mut frame = vec![0u8; crate::simple::ZSTD_compressBound(noise.len())];
+    unsafe {
+        assert_eq!(ZSTD_compressBegin(cctx, 1), 0);
+        let n = ZSTD_compressEnd(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            noise.as_ptr(),
+            noise.len(),
+        );
+        assert_eq!(ZSTD_isError(n), 0, "{:?}", code(n));
+        let kept = cctx
+            .as_ref()
+            .and_then(|cctx| cctx.stream.as_ref())
+            .map_or(0, crate::streaming::CStreamState::pending_capacity);
+        assert!(
+            kept <= crate::streaming::ZSTD_CStreamOutSize(),
+            "{kept} bytes of output kept after the frame"
+        );
+        ZSTD_freeCCtx(cctx);
+    }
+}

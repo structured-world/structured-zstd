@@ -315,6 +315,73 @@ fn inserting_a_huge_block_keeps_only_the_window() {
     assert_eq!(&target[..n], &repeat[..]);
 }
 
+/// History inserted into a frame that declared its size goes to the flat
+/// buffer that frame decodes into, as it goes to the ring otherwise.
+#[test]
+fn inserting_into_a_sized_frame_uses_its_flat_buffer() {
+    let frame = blocky_frame(&text(4_000));
+    let mut source = frame.as_slice();
+    let mut decoder = FrameDecoder::new();
+    decoder.reset(&mut source).unwrap();
+    decoder
+        .insert_block(b"history held in the flat buffer")
+        .unwrap();
+    assert!(decoder.workspace_size() > 0);
+}
+
+/// A block larger than the run's window is refused when its header is read,
+/// before its content is asked for.
+#[test]
+fn a_block_past_the_window_is_refused_by_its_header() {
+    let mut decoder = FrameDecoder::new();
+    decoder.set_max_window_size(1 << 10).unwrap();
+    decoder.begin_blocks(None).unwrap();
+    // A raw block of 2000 bytes: size << 3, type 0, not last.
+    let size = 2000u32 << 3;
+    let header = [size as u8, (size >> 8) as u8, (size >> 16) as u8];
+    assert!(decoder.block_content_len(header).is_err());
+}
+
+/// The decoder keeps the dictionary of the last frame it decoded with one,
+/// for an owner adding up what it holds.
+#[test]
+fn the_decoder_reports_the_dictionary_it_keeps() {
+    let dict_content = text(2_000);
+    let handle = DictionaryHandle::from_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0, dict_content.clone()).unwrap(),
+    );
+    let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor.set_dictionary_from_bytes(&dict_content).unwrap();
+    let input = text(3_000);
+    let frame = compressor.compress_independent_frame(&input);
+
+    let mut decoder = FrameDecoder::new();
+    assert!(decoder.dictionary().is_none());
+    let mut out = vec![0u8; input.len()];
+    decoder
+        .decode_all_with_dict_handle(&frame, &mut out, &handle)
+        .unwrap();
+    assert_eq!(out, input);
+    let kept = decoder
+        .dictionary()
+        .expect("the frame's dictionary is kept");
+    assert_eq!(kept.as_dict().dict_content, handle.as_dict().dict_content);
+}
+
+/// A frame with no checksum adds no checksum bytes to the margin.
+#[test]
+fn decompression_margin_without_a_checksum() {
+    let input = text(5_000);
+    let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor.set_max_block_size(Some(1024));
+    let plain = compressor.compress_independent_frame(&input);
+    let checked = blocky_frame(&input);
+    assert_eq!(
+        decompression_margin(&checked).unwrap() - decompression_margin(&plain).unwrap(),
+        4
+    );
+}
+
 #[test]
 fn frame_magic_names_each_kind() {
     assert_eq!(

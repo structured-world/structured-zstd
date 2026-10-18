@@ -512,6 +512,7 @@ pub(super) fn stream_decode(
         pos: 0,
     };
     loop {
+        let (in_before, out_before) = (inb.pos, outb.pos);
         let rc = unsafe { ZSTD_decompressStream(dctx, &mut outb, &mut inb) };
         if ZSTD_isError(rc) != 0 {
             return Err(rc);
@@ -520,7 +521,11 @@ pub(super) fn stream_decode(
             out.truncate(outb.pos);
             return Ok(out);
         }
-        assert!(inb.pos < inb.size, "decoder stalled");
+        // A call that moves neither position would repeat forever.
+        assert!(
+            inb.pos > in_before || outb.pos > out_before,
+            "decoder stalled"
+        );
     }
 }
 

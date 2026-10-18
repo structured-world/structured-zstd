@@ -27,6 +27,17 @@ fn parse_skippable_frame_borrows_or_refuses() {
         parse_skippable_frame(&above),
         Err(SkippableSliceError::BadMagicNumber(_))
     ));
+    // The edges: nothing at all, a frame with no payload, and the last
+    // variant of the band.
+    assert_eq!(
+        parse_skippable_frame(&[]),
+        Err(SkippableSliceError::Truncated)
+    );
+    let mut empty = Vec::new();
+    write_skippable_frame(0, b"", &mut empty).unwrap();
+    assert_eq!(parse_skippable_frame(&empty).unwrap(), (0, &b""[..]));
+    let last = [0x5F, 0x2A, 0x4D, 0x18, 2, 0, 0, 0, b'h', b'i'];
+    assert_eq!(parse_skippable_frame(&last).unwrap(), (15, &b"hi"[..]));
     assert!(alloc::format!("{}", SkippableSliceError::Truncated).contains("truncated"));
     assert!(
         alloc::format!("{}", SkippableSliceError::BadMagicNumber(0x1234_5678))

@@ -104,7 +104,10 @@ pub fn merge_block_delimiters(sequences: &mut [ExternalSequence]) -> usize {
         let sequence = sequences[index];
         if sequence.is_delimiter() {
             if let Some(next) = sequences.get_mut(index + 1) {
-                next.lit_len += sequence.lit_len;
+                // Wrapping, as upstream adds them: the C entry point has no
+                // error to return, a sum past `u32::MAX` describes no block,
+                // and `validate_parse` refuses such a parse later.
+                next.lit_len = next.lit_len.wrapping_add(sequence.lit_len);
             }
         } else {
             sequences[kept] = sequence;

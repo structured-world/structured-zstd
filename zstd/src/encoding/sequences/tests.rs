@@ -151,6 +151,16 @@ fn captured_parse_replays_to_the_input() {
     assert_eq!(decode(&replayed), input);
 }
 
+/// Literal runs merged past `u32::MAX` wrap, as upstream's
+/// `ZSTD_mergeBlockDelimiters` does, rather than panic inside the C entry
+/// point: no block holds that many literals, and validation refuses the parse.
+#[test]
+fn merging_delimiters_past_u32_max_wraps() {
+    let mut parse = [ExternalSequence::delimiter(u32::MAX), seq(4, 1, 5)];
+    assert_eq!(merge_block_delimiters(&mut parse), 1);
+    assert_eq!(parse[0].lit_len, 0);
+}
+
 /// A parse well-formed in shape still has to describe the input it is handed:
 /// a match whose bytes differ from the ones it copies would build a frame that
 /// decodes to something else. Overlapping copies and copies out of the
@@ -180,6 +190,31 @@ fn a_parse_must_reproduce_its_input() {
     assert_eq!(
         parse_reproduces(&[seq(3, 3, 3), seq(6, 1, 3)], b"abcabc-abd", &[]),
         Err(SequenceError::MatchMismatch { index: 1 })
+    );
+    // A copy that lies wholly inside the dictionary.
+    assert_eq!(parse_reproduces(&[seq(3, 0, 2)], b"xy", b"xyz"), Ok(()));
+    // A delimiter only moves past its literals.
+    assert_eq!(
+        parse_reproduces(
+            &[ExternalSequence::delimiter(3), seq(3, 0, 3)],
+            b"abcabc",
+            &[]
+        ),
+        Ok(())
+    );
+    // The dictionary part of a copy is checked as well as the input part.
+    assert_eq!(
+        parse_reproduces(&[seq(2, 0, 4)], b"qzyz", b"xyz"),
+        Err(SequenceError::MatchMismatch { index: 0 })
+    );
+    // Shapes `validate_parse` refuses are refused here too, not read past.
+    assert_eq!(
+        parse_reproduces(&[seq(5, 0, 2)], b"ab", b"xyz"),
+        Err(SequenceError::OffsetTooFar { index: 0 })
+    );
+    assert_eq!(
+        parse_reproduces(&[seq(3, 3, 9)], b"abcabc", &[]),
+        Err(SequenceError::LengthMismatch)
     );
 }
 
@@ -227,6 +262,18 @@ fn validate_parse_reports_each_defect() {
             4
         ),
         Err(SequenceError::BlockTooLarge)
+    );
+    // Without explicit delimiters a delimiter only carries literals.
+    assert_eq!(
+        validate_parse(
+            &[ExternalSequence::delimiter(3), seq(3, 0, 3)],
+            6,
+            1 << 20,
+            0,
+            false,
+            4
+        ),
+        Ok(())
     );
     // The dictionary extends the reach until the output passes the window.
     assert_eq!(
@@ -374,6 +421,9 @@ fn plain_offset_follows_the_zero_literal_shift() {
     // A plain offset code is the offset plus three.
     assert_eq!(plain_offset(40 + 3, 2, &mut history), 40);
     assert_eq!(history, [40, 3, 4]);
+    // Code 3 with literals is rep[2]; it moves to the front.
+    assert_eq!(plain_offset(3, 2, &mut history), 4);
+    assert_eq!(history, [4, 40, 3]);
 }
 
 /// A captured parse numbers its repeat offsets against the history each
@@ -838,6 +888,82 @@ fn a_final_literal_run_must_have_no_offset() {
     );
 }
 
+/// A replay told to use the compressor's dictionary may copy out of it: the
+/// frame decodes with that dictionary.
+#[test]
+fn replay_reaches_into_the_dictionary() {
+    let dict: Vec<u8> = (0..128u32).map(|i| (i * 37 % 251) as u8).collect();
+    let mut input = dict[..64].to_vec();
+    input.extend_from_slice(b"tail that is only literals");
+    // The first 64 bytes copy the dictionary's start, 128 back.
+    let parse = [seq(128, 0, 64)];
+    let mut frame = Vec::new();
+    let mut compressor = FrameCompressor::new_with_matcher(
+        SequenceReplay::new(&parse, 1 << 20).with_dictionary(),
+        CompressionLevel::Default,
+    );
+    compressor.set_dictionary_from_bytes(&dict).unwrap();
+    compressor.set_source(input.as_slice());
+    compressor.set_drain(&mut frame);
+    compressor.compress();
+    let handle = crate::decoding::DictionaryHandle::from_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0, dict.clone()).unwrap(),
+    );
+    let mut out = vec![0u8; input.len()];
+    let written = FrameDecoder::new()
+        .decode_all_with_dict_handle(&frame, &mut out, &handle)
+        .unwrap();
+    assert_eq!(&out[..written], input.as_slice());
+}
+
+/// A block cut through a run of literals carries the rest of the run into
+/// the next block.
+#[test]
+fn replay_cuts_through_a_literal_run() {
+    let mut input: Vec<u8> = (0..3000u32).map(|i| (i * 13 % 251) as u8).collect();
+    let copy = input[2997..3000].to_vec();
+    for i in 0..60 {
+        input.push(copy[i % 3]);
+    }
+    let parse = [seq(3, 3000, 60)];
+    let frame = replay_frame(&input, &parse, Some(1024));
+    assert_eq!(decode(&frame), input);
+}
+
+/// Delimiters set the blocks they close; what follows the last one is cut
+/// by the block size again.
+#[test]
+fn replay_after_the_last_delimiter_falls_back_to_the_block_size() {
+    let mut input: Vec<u8> = (0..100u32).map(|i| (i * 7 % 251) as u8).collect();
+    input.extend_from_slice(b"xyz");
+    for i in 0..50 {
+        input.push(b"xyz"[i % 3]);
+    }
+    let parse = [ExternalSequence::delimiter(100), seq(3, 3, 50)];
+    let frame = replay_frame(&input, &parse, None);
+    assert_eq!(decode(&frame), input);
+}
+
+/// A producer's parse is budgeted at a sequence per possible match of the
+/// block, at the size each one takes.
+#[test]
+fn producer_parse_budget_is_its_bound() {
+    assert_eq!(
+        producer_parse_heap_bytes(131_072),
+        sequence_bound(131_072) * core::mem::size_of::<ExternalSequence>()
+    );
+    assert!(producer_parse_heap_bytes(0) > 0, "room for the delimiter");
+}
+
+/// A source rebuilt from no sequences and no literals is empty.
+#[test]
+fn an_empty_rebuilt_source_says_so() {
+    let source = RebuiltSource::new(&[], &[], &[], 1 << 10).unwrap();
+    assert!(source.is_empty());
+    let source = RebuiltSource::new(&[], b"abc", &[], 1 << 10).unwrap();
+    assert!(!source.is_empty());
+}
+
 #[test]
 fn sequence_errors_read_as_what_went_wrong() {
     let cases = [
@@ -846,6 +972,10 @@ fn sequence_errors_read_as_what_went_wrong() {
         (SequenceError::OffsetTooFar { index: 4 }, "too far"),
         (SequenceError::ZeroOffset { index: 5 }, "offset 0"),
         (SequenceError::BlockTooLarge, "block size"),
+        (
+            SequenceError::MatchMismatch { index: 6 },
+            "sequence 6 copies bytes",
+        ),
     ];
     for (error, text) in cases {
         assert!(alloc::format!("{error}").contains(text), "{error}");

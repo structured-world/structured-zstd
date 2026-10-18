@@ -148,9 +148,15 @@ impl CStreamState {
             // frame the room stays: the caller's next call is likely to fill
             // it the same way, and shrinking would re-grow it every time.
             if !self.open {
-                self.pending.shrink_to(ZSTD_CStreamOutSize());
+                self.release_frame_output();
             }
         }
+    }
+
+    /// Keep room for one block of output (upstream's `outBuffSize`) once a
+    /// frame is closed and copied out, not the frame's peak.
+    pub(crate) fn release_frame_output(&mut self) {
+        self.pending.shrink_to(ZSTD_CStreamOutSize());
     }
 }
 

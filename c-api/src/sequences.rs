@@ -242,7 +242,7 @@ fn compress_parse(
     src_len: usize,
     input: ParseInput<'_>,
 ) -> Result<(), ZSTD_ErrorCode> {
-    cctx.begin_one_shot(src_len)?;
+    cctx.begin_one_shot();
     let src_size = Some(src_len as u64);
     let frame_params = cctx.frame_parameters(src_size)?;
     let params = cctx.params;

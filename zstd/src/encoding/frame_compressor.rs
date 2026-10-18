@@ -228,7 +228,18 @@ impl EncoderDictionary {
             if handles.clone().take(position).any(|other| same(&other)) {
                 continue;
             }
-            let held_here = handles.clone().filter(same).count();
+            // Holders, not references: one handle listed twice is one count.
+            let held_here = handles
+                .clone()
+                .enumerate()
+                .filter(|(at, other)| {
+                    same(other)
+                        && !handles
+                            .clone()
+                            .take(*at)
+                            .any(|earlier| core::ptr::eq(earlier, *other))
+                })
+                .count();
             if SharedEncoderDictionary::strong_count(&handle.inner) == held_here {
                 total += handle.heap_size();
             }

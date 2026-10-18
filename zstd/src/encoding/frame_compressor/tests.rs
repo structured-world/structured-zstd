@@ -3837,8 +3837,15 @@ fn exclusive_heap_size_counts_what_only_the_set_holds() {
         EncoderDictionary::exclusive_heap_size(core::iter::empty::<&EncoderDictionary>()),
         0
     );
+    assert_eq!(first.content_size(), 4096);
+    // One handle listed twice is still one holder.
+    assert_eq!(
+        EncoderDictionary::exclusive_heap_size([&first, &first_again, &first]),
+        first.heap_size()
+    );
 
     let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(3));
+    assert_eq!(enc.compression_level(), super::CompressionLevel::Level(3));
     assert!(enc.dictionary().is_none());
     enc.set_encoder_dictionary(second.clone())
         .expect("the dictionary attaches");

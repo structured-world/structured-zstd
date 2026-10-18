@@ -742,7 +742,7 @@ pub(crate) fn compress_with_dict_bytes(
     dict: &[u8],
     frame: &OneShotFrame,
 ) -> usize {
-    cctx.begin_simple_one_shot();
+    cctx.begin_one_shot();
     let compression_level = frame.level;
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
         // Bytes handed in per call have no identity to recognise them by, so

@@ -59,6 +59,7 @@ fn decode_simple(zds: *mut ZSTD_DCtx, frame: &[u8]) -> Result<Vec<u8>, usize> {
     let mut src_pos = 0;
     loop {
         let mut dst_pos = 0;
+        let before = src_pos;
         let src_end = (src_pos + 61).min(frame.len());
         let rc = unsafe {
             ZSTD_decompressStream_simpleArgs(
@@ -78,6 +79,12 @@ fn decode_simple(zds: *mut ZSTD_DCtx, frame: &[u8]) -> Result<Vec<u8>, usize> {
         if rc == 0 && src_pos == frame.len() {
             return Ok(restored);
         }
+        // A call that moves neither position would repeat forever.
+        assert!(
+            src_pos > before || dst_pos > 0,
+            "no progress at byte {src_pos} of {}",
+            frame.len()
+        );
     }
 }
 

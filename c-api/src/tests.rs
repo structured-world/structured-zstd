@@ -1050,7 +1050,9 @@ fn compress2_roundtrips_with_sticky_parameters() {
         assert_eq!(dsize, input.len());
         assert_eq!(restored, input);
 
-        // A mismatching pledge is rejected.
+        // A one-shot has all its input in hand, so a pledge that disagrees is
+        // dropped and the frame records the real size: upstream's
+        // ZSTD_compress2 begins with a session reset (zstd_compress.c:6575).
         assert_eq!(ZSTD_CCtx_setPledgedSrcSize(cctx, 1), 0);
         let rc = crate::context::ZSTD_compress2(
             cctx,
@@ -1059,9 +1061,10 @@ fn compress2_roundtrips_with_sticky_parameters() {
             input.as_ptr(),
             input.len(),
         );
+        assert_eq!(ZSTD_isError(rc), 0, "{:?}", ZSTD_getErrorCode(rc));
         assert_eq!(
-            ZSTD_getErrorCode(rc),
-            ZSTD_ErrorCode::ZSTD_error_srcSize_wrong
+            crate::simple::ZSTD_getFrameContentSize(compressed.as_ptr(), rc),
+            input.len() as u64
         );
 
         ZSTD_freeCCtx(cctx);
@@ -1493,12 +1496,11 @@ fn dctx_parameter_changes_rejected_mid_frame() {
     }
 }
 
-// Bug regression: ZSTD_compress2 on a context with a streaming frame in
-// flight must be rejected with stage_wrong — starting a one-shot frame
-// mid-stream would interleave two frame lifecycles on one context (and
-// consume the pledge that belongs to the streaming frame).
+// ZSTD_compress2 on a context with a streaming frame in flight abandons that
+// frame and compresses its own, as upstream does: it begins with a session
+// reset (zstd_compress.c:6575). The abandoned frame's pledge goes with it.
 #[test]
-fn compress2_rejected_while_stream_in_flight() {
+fn compress2_abandons_a_stream_in_flight() {
     let input = sample(64 * 1024);
     let zcs = crate::streaming::ZSTD_createCStream();
     let mut outbuf = vec![0u8; 1024];
@@ -1514,6 +1516,8 @@ fn compress2_rejected_while_stream_in_flight() {
             size: outbuf.len(),
             pos: 0,
         };
+        // A pledge past the input, so the frame stays open.
+        assert_eq!(ZSTD_CCtx_setPledgedSrcSize(zcs, 1 << 20), 0);
         let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 0);
         assert_eq!(ZSTD_isError(rc), 0);
 
@@ -1525,33 +1529,44 @@ fn compress2_rejected_while_stream_in_flight() {
             input.as_ptr(),
             input.len(),
         );
-        assert_eq!(
-            ZSTD_getErrorCode(rc),
-            ZSTD_ErrorCode::ZSTD_error_stage_wrong,
-            "compress2 mid-stream must be rejected"
+        assert_eq!(ZSTD_isError(rc), 0, "{:?}", ZSTD_getErrorCode(rc));
+        let mut restored = vec![0u8; input.len()];
+        let n = crate::simple::ZSTD_decompress(
+            restored.as_mut_ptr(),
+            restored.len(),
+            compressed.as_ptr(),
+            rc,
         );
+        assert_eq!(n, input.len());
+        assert_eq!(restored, input);
 
-        // After ending the stream the context accepts one-shots again.
+        // The abandoned frame is gone: a new stream starts afresh.
+        let mut inb = ZSTD_inBuffer {
+            src: input.as_ptr() as *const core::ffi::c_void,
+            size: input.len(),
+            pos: 0,
+        };
+        let mut frame = Vec::new();
         loop {
             let mut outb = ZSTD_outBuffer {
                 dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
                 size: outbuf.len(),
                 pos: 0,
             };
-            let rc = ZSTD_endStream(zcs, &mut outb);
-            assert_eq!(ZSTD_isError(rc), 0);
+            let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 2);
+            assert_eq!(ZSTD_isError(rc), 0, "{:?}", ZSTD_getErrorCode(rc));
+            frame.extend_from_slice(&outbuf[..outb.pos]);
             if rc == 0 {
                 break;
             }
         }
-        let rc = crate::context::ZSTD_compress2(
-            zcs,
-            compressed.as_mut_ptr(),
-            compressed.len(),
-            input.as_ptr(),
-            input.len(),
+        let n = crate::simple::ZSTD_decompress(
+            restored.as_mut_ptr(),
+            restored.len(),
+            frame.as_ptr(),
+            frame.len(),
         );
-        assert_eq!(ZSTD_isError(rc), 0, "compress2 must work between frames");
+        assert_eq!(n, input.len());
         crate::streaming::ZSTD_freeCStream(zcs);
     }
 }

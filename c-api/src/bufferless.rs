@@ -312,6 +312,7 @@ fn compress_step(cctx: &mut ZSTD_CCtx, dst: &mut [u8], src: &[u8], end: bool) ->
     frame.fresh = false;
     if end {
         state.open = false;
+        state.release_frame_output();
         *bufferless = None;
         let held = state.dictionary_serial();
         if held != attached {
@@ -526,6 +527,9 @@ pub(crate) struct BufferlessDecode {
     block_header: [u8; 3],
     /// Applied to every frame the run decodes.
     dictionary: Option<DictionaryHandle>,
+    /// The frame format the run was begun in. A parameter reset after the
+    /// begin changes the context's format for the next run, not this one.
+    magicless: bool,
 }
 
 impl BufferlessDecode {
@@ -543,6 +547,7 @@ impl BufferlessDecode {
             header_len: 0,
             block_header: [0; 3],
             dictionary: None,
+            magicless,
         }
     }
 }
@@ -582,6 +587,11 @@ fn begin_decode(dctx: &mut ZSTD_DCtx, dictionary: Option<DictionaryHandle>) -> u
 
 /// `size_t ZSTD_decompressBegin(ZSTD_DCtx* dctx)` — begin a buffer-less run
 /// without a dictionary.
+///
+/// The history blocks match against is held by `dctx`, where upstream reads
+/// it from the caller's buffers: it grows with the output decoded, nothing is
+/// reserved up front, and it is capped at the decoder's largest window plus
+/// one block. `ZSTD_sizeof_DCtx` reports what it holds.
 ///
 /// # Safety
 /// `dctx` must be a live pointer from `ZSTD_createDCtx`, or `NULL`.
@@ -721,7 +731,7 @@ fn decompress_step(
     let run = &mut dctx.bufferless;
     match run.stage {
         Stage::FrameHeaderSize => {
-            if let Some(codec::decoding::FrameMagic::Skippable(_)) = (!dctx.magicless)
+            if let Some(codec::decoding::FrameMagic::Skippable(_)) = (!run.magicless)
                 .then(|| codec::decoding::frame_magic(src))
                 .flatten()
             {
@@ -731,7 +741,7 @@ fn decompress_step(
                 run.stage = Stage::SkippableHeader;
                 return Ok(0);
             }
-            let header_size = codec::decoding::frame_header_size_in_format(src, dctx.magicless)
+            let header_size = codec::decoding::frame_header_size_in_format(src, run.magicless)
                 .map_err(|err| match err {
                     ReadFrameHeaderError::BadMagicNumber(_) => {
                         ZSTD_ErrorCode::ZSTD_error_prefix_unknown
@@ -754,11 +764,15 @@ fn decompress_step(
                 .set_max_window_size(dctx.max_window_size)
                 .map_err(failed)?;
             let mut header = &run.header[..end];
-            match run.dictionary.as_ref() {
+            // The header is read in the run's format, and the decoder goes
+            // back to the context's for the frames after it.
+            dctx.decoder.set_magicless(run.magicless);
+            let parsed = match run.dictionary.as_ref() {
                 Some(dictionary) => dctx.decoder.reset_with_dict_handle(&mut header, dictionary),
                 None => dctx.decoder.reset(&mut header),
-            }
-            .map_err(failed)?;
+            };
+            dctx.decoder.set_magicless(dctx.magicless);
+            parsed.map_err(failed)?;
             run.expected = 3;
             run.stage = Stage::BlockHeader;
             Ok(0)

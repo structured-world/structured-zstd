@@ -3,6 +3,26 @@ use crate::encoding::{
     CompressionContext, CompressionLevel, EncoderDictionary, Matcher, Sequence, StreamingEncoder,
 };
 
+/// The read-size hint is the input that completes the block being filled,
+/// a whole block when none is partly filled, under the block size the
+/// context is set to.
+#[test]
+fn next_input_size_hint_completes_the_block() {
+    let mut context = CompressionContext::new(CompressionLevel::Default);
+    let mut frame = alloc::vec::Vec::new();
+    let block = context.next_input_size_hint();
+    assert_eq!(block, 128 * 1024);
+    context.write(&mut frame, &[7u8; 100]).unwrap();
+    assert_eq!(context.next_input_size_hint(), block - 100);
+    context.flush(&mut frame).unwrap();
+    assert_eq!(context.next_input_size_hint(), block);
+
+    let mut capped = CompressionContext::new(CompressionLevel::Default);
+    capped.set_target_block_size(Some(4096)).unwrap();
+    capped.write(&mut frame, &[7u8; 1000]).unwrap();
+    assert_eq!(capped.next_input_size_hint(), 4096 - 1000);
+}
+
 /// `compress_block` refuses a frame not begun, input still waiting for its
 /// block, and a block past the frame's block size; an empty or incompressible
 /// block appends nothing and reports it is to be stored as is.

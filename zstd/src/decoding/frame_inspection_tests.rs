@@ -1,6 +1,6 @@
 use super::{
     FrameContentSize, FrameSizeError, find_frame_compressed_size, frame_decompressed_bound,
-    frame_header_size, read_frame_content_size, read_frame_header_info,
+    frame_header_input_needed, frame_header_size, read_frame_content_size, read_frame_header_info,
 };
 use crate::decoding::errors::{FrameDescriptorError, ReadFrameHeaderError};
 use crate::encoding::{CompressionLevel, compress_slice_to_vec};
@@ -9,6 +9,56 @@ use alloc::vec::Vec;
 
 fn frame(content: &[u8]) -> Vec<u8> {
     compress_slice_to_vec(content, CompressionLevel::Default)
+}
+
+/// A header read in pieces asks for the bytes that hold the descriptor, then
+/// for the header's own length, and eight for a skippable frame; a prefix of
+/// no known magic number is refused at once, however short (upstream
+/// `ZSTD_getFrameHeader_advanced`).
+#[test]
+fn header_input_needed_follows_the_pieces() {
+    let full = frame(b"a header read a piece at a time");
+    let header_len = frame_header_size(&full).unwrap();
+    // Nothing yet, and any prefix of the magic number: the first five bytes.
+    assert_eq!(frame_header_input_needed(&[], false).unwrap(), 5);
+    for n in 1..5 {
+        assert_eq!(frame_header_input_needed(&full[..n], false).unwrap(), 5);
+    }
+    // Once the descriptor is here, the header's own length.
+    assert_eq!(
+        frame_header_input_needed(&full[..5], false).unwrap(),
+        header_len
+    );
+    assert_eq!(frame_header_input_needed(&full, false).unwrap(), header_len);
+    // Without the magic number, one byte holds the descriptor.
+    assert_eq!(frame_header_input_needed(&[], true).unwrap(), 1);
+    assert_eq!(
+        frame_header_input_needed(&full[4..5], true).unwrap(),
+        header_len - 4
+    );
+    // A skippable frame: its magic in part asks for five, in whole for eight.
+    let skippable = [0x53, 0x2A, 0x4D, 0x18, 3, 0, 0, 0];
+    assert_eq!(
+        frame_header_input_needed(&skippable[..2], false).unwrap(),
+        5
+    );
+    assert_eq!(
+        frame_header_input_needed(&skippable[..4], false).unwrap(),
+        5
+    );
+    assert_eq!(
+        frame_header_input_needed(&skippable[..5], false).unwrap(),
+        8
+    );
+    // Bytes no magic number starts with, short or not.
+    assert!(matches!(
+        frame_header_input_needed(&[0x00], false),
+        Err(ReadFrameHeaderError::BadMagicNumber(_))
+    ));
+    assert!(matches!(
+        frame_header_input_needed(&[0x28, 0xB5, 0x2F, 0x00, 0x00], false),
+        Err(ReadFrameHeaderError::BadMagicNumber(_))
+    ));
 }
 
 /// A hand-built single raw-block frame that omits `Frame_Content_Size`

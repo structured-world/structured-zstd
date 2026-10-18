@@ -435,7 +435,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let cctx = unsafe { &mut *cctx };
-    cctx.begin_simple_one_shot();
+    cctx.begin_one_shot();
     let cdict_ref = unsafe { &*cdict };
     let src = unsafe { in_slice(src, src_size) };
     let key = cdict_ref.serial;
@@ -505,7 +505,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict_advanced(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let cctx = unsafe { &mut *cctx };
-    cctx.begin_simple_one_shot();
+    cctx.begin_one_shot();
     let cdict_ref = unsafe { &*cdict };
     let src = unsafe { in_slice(src, src_size) };
     let key = cdict_ref.serial;

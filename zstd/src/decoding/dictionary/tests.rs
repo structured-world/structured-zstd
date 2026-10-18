@@ -164,6 +164,40 @@ fn an_empty_buffer_is_a_dictionary_with_no_content() {
     assert!(Dictionary::from_raw_content(1, Vec::new()).is_err());
 }
 
+/// A handle reports the shared allocation with the dictionary, stays within
+/// the bound callers budget by before parsing, and a set of handles counts a
+/// dictionary once and only when nothing outside the set holds it.
+#[test]
+fn a_handle_accounts_for_what_it_keeps() {
+    let raw = include_bytes!("../../../dict_tests/dictionary");
+    let parsed = DictionaryHandle::decode_dict(raw).unwrap();
+    // The two counts ahead of the value are heap too.
+    let shared = 2 * core::mem::size_of::<usize>() + core::mem::size_of::<Dictionary>();
+    assert!(parsed.heap_size() >= shared + parsed.as_dict().heap_bytes());
+    assert!(parsed.heap_size() <= DictionaryHandle::max_heap_size(raw.len()));
+    assert!(parsed.as_dict().heap_bytes() <= Dictionary::max_heap_bytes(raw.len()));
+
+    let raw_content = DictionaryHandle::from_dictionary(
+        Dictionary::from_raw_content(0, vec![7u8; 4096]).unwrap(),
+    );
+    assert!(raw_content.heap_size() <= DictionaryHandle::max_heap_size(4096));
+
+    let copy = parsed.clone();
+    // Both handles in the set, and the same one twice: counted once.
+    assert_eq!(
+        DictionaryHandle::exclusive_heap_size([&parsed, &copy, &parsed]),
+        parsed.heap_size()
+    );
+    // `copy` is held outside the set: nothing is the set's alone.
+    assert_eq!(DictionaryHandle::exclusive_heap_size([&parsed]), 0);
+    // Two different dictionaries, each held only here.
+    assert_eq!(
+        DictionaryHandle::exclusive_heap_size([&copy, &raw_content, &parsed]),
+        parsed.heap_size() + raw_content.heap_size()
+    );
+    assert_eq!(DictionaryHandle::exclusive_heap_size([]), 0);
+}
+
 #[test]
 fn dictionary_handle_clones_share_inner() {
     let raw = include_bytes!("../../../dict_tests/dictionary");

@@ -22,6 +22,39 @@ fn level_parameters_fit_the_source() {
     assert!(with_dict.window_log > small.window_log);
 }
 
+/// A dictionary frame raises an explicit window toward a source of known
+/// size, up to 2^19 (upstream `ZSTD_compress_usingCDict_internal`): never
+/// lowers it, leaves it for an unknown source, and leaves a level's own
+/// window, which no override fixed, to the level.
+#[test]
+fn a_dictionary_frame_raises_an_explicit_window_toward_the_source() {
+    let explicit = |log| {
+        CompressionParameters::builder(CompressionLevel::Level(3))
+            .window_log(log)
+            .build()
+            .unwrap()
+    };
+    let raised = |params: CompressionParameters, source| {
+        params.for_dictionary_frame(source).overrides().window_log
+    };
+    assert_eq!(raised(explicit(10), Some(1 << 20)), Some(19));
+    assert_eq!(raised(explicit(10), Some(5000)), Some(13));
+    assert_eq!(raised(explicit(10), Some(1)), Some(10));
+    assert_eq!(raised(explicit(21), Some(5000)), Some(21));
+    assert_eq!(raised(explicit(10), None), Some(10));
+    assert_eq!(
+        raised(
+            explicit(10),
+            Some(crate::encoding::cparams::CONTENTSIZE_UNKNOWN)
+        ),
+        Some(10)
+    );
+    let level = CompressionParameters::builder(CompressionLevel::Level(3))
+        .build()
+        .unwrap();
+    assert_eq!(raised(level, Some(1 << 20)), None);
+}
+
 /// A raw frame's window is the one the encoder writes for it, not a panic:
 /// the builder accepts `Uncompressed`, so the query must answer for it.
 #[test]
