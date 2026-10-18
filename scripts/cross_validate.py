@@ -17,14 +17,20 @@ Usage:
 
 A limit of 0 reports the figure without holding it. Exits non-zero when any
 roundtrip fails or any figure is past its limit.
+
+--json writes the rows as one dashboard snapshot (one record per corpus and
+level), stamped with GITHUB_SHA and STRUCTURED_ZSTD_BENCH_GENERATED_AT when
+set, in the layout .github/scripts/merge-timeseries.py folds into history.
 """
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -135,7 +141,30 @@ def main():
                     )
 
     if args.json:
-        Path(args.json).write_text(json.dumps(rows, indent=2) + "\n")
+        commit_sha = os.environ.get("GITHUB_SHA")
+        generated_at = (
+            os.environ.get("STRUCTURED_ZSTD_BENCH_GENERATED_AT")
+            or datetime.now(timezone.utc).isoformat()
+        )
+        records = [
+            {
+                "kind": "cli",
+                "scenario": row.pop("corpus"),
+                "engine": "ours",
+                **row,
+                "commit_sha": commit_sha,
+                "generated_at": generated_at,
+            }
+            for row in rows
+        ]
+        payload = {
+            "version": 1,
+            "reference_engine": "reference",
+            "engines": ["ours"],
+            "limits": {"size_ratio": args.ratio_limit, "time_ratio": args.time_limit},
+            "records": records,
+        }
+        Path(args.json).write_text(json.dumps(payload, indent=2) + "\n")
     for failure in failures:
         print(f"FAIL {failure}", file=sys.stderr)
     if failures:

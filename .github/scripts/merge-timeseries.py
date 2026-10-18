@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Merge this run's wasm bench records into the persisted gh-pages timeseries.
+"""Merge one run's records into a persisted gh-pages timeseries.
 
-Mirrors `merge-benchmarks.py`'s accumulate-then-trim behaviour for the wasm
-section: the dashboard's `benchmark-wasm.json` is an append-only history of
-(scenario, level, engine) datapoints across commits. Each push adds one
-snapshot; old snapshots age out after `RETENTION_DAYS`.
+Mirrors `merge-benchmarks.py`'s accumulate-then-trim behaviour for the
+dashboard sections that keep their own history (the wasm bench in
+`benchmark-wasm.json`, the cross-validation in `benchmark-xval.json`): an
+append-only list of (kind, scenario, level, engine) datapoints across
+commits. Each push adds one snapshot; old snapshots age out after
+`RETENTION_DAYS`. The run payload's other top-level fields (reference
+engine, engines, limits) replace the persisted ones.
 
 Env vars:
-  WASM_RUN_FILE       this run's records (default: benchmark-wasm-run.json)
-  WASM_EXISTING_FILE  persisted history to merge into (optional — first run
-                      on a fresh gh-pages has none)
-  WASM_OUTPUT_FILE    merged output path (default: benchmark-wasm.json)
+  TIMESERIES_RUN_FILE       this run's payload (required)
+  TIMESERIES_EXISTING_FILE  persisted history to merge into (optional; a
+                            fresh gh-pages has none)
+  TIMESERIES_OUTPUT_FILE    merged output path (required)
 """
 import json
 import os
@@ -55,7 +58,7 @@ def load_records(path):
         payload = json.loads(p.read_text())
     except (json.JSONDecodeError, ValueError) as exc:
         # A corrupted persisted file (partial write, manual tamper) must not
-        # block every future wasm publish. Warn loudly (visible in CI logs)
+        # block every future publish. Warn loudly (visible in CI logs)
         # and rebuild from this run's records — history re-accumulates over
         # subsequent pushes rather than wedging the shard permanently.
         print(f"WARN: corrupted existing file {path}, starting fresh: {exc}", file=sys.stderr)
@@ -64,18 +67,21 @@ def load_records(path):
 
 
 def main():
-    run_file = os.environ.get("WASM_RUN_FILE", "benchmark-wasm-run.json")
-    existing_file = os.environ.get("WASM_EXISTING_FILE")
-    output_file = os.environ.get("WASM_OUTPUT_FILE", "benchmark-wasm.json")
+    run_file = os.environ.get("TIMESERIES_RUN_FILE")
+    existing_file = os.environ.get("TIMESERIES_EXISTING_FILE")
+    output_file = os.environ.get("TIMESERIES_OUTPUT_FILE")
+    if not run_file or not output_file:
+        print("ERROR: set TIMESERIES_RUN_FILE and TIMESERIES_OUTPUT_FILE", file=sys.stderr)
+        return 2
 
     run_path = Path(run_file)
     if not run_path.is_file():
-        print(f"ERROR: WASM_RUN_FILE={run_file} not found", file=sys.stderr)
+        print(f"ERROR: TIMESERIES_RUN_FILE={run_file} not found", file=sys.stderr)
         return 2
     run_payload = json.loads(run_path.read_text())
     run_records = run_payload.get("records", [])
     if not run_records:
-        print("ERROR: this run produced no wasm records to merge", file=sys.stderr)
+        print("ERROR: this run produced no records to merge", file=sys.stderr)
         return 1
 
     merged = {}
@@ -101,16 +107,18 @@ def main():
     if len(retained) > MAX_RECORDS:
         retained = retained[-MAX_RECORDS:]
 
+    # Snapshot-level fields (commit, timestamp) live on every record; the
+    # section-level ones (reference engine, engines, limits) carry over.
+    snapshot_fields = {"records", "commit_sha", "commit_message", "generated_at"}
     payload = {
+        **{k: v for k, v in run_payload.items() if k not in snapshot_fields},
         "version": 1,
-        "reference_engine": run_payload.get("reference_engine", "bokuweb"),
-        "engines": run_payload.get("engines", []),
         "records": retained,
     }
     Path(output_file).write_text(json.dumps(payload, indent=2) + "\n")
     print(
         f"Merged {len(run_records)} new + {len(merged) - len(run_records)} "
-        f"existing → {len(retained)} retained wasm records → {output_file}",
+        f"existing → {len(retained)} retained records → {output_file}",
         file=sys.stderr,
     )
     return 0

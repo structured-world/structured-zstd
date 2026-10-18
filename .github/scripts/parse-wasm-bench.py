@@ -10,7 +10,7 @@ in its own dashboard section rather than the relative deltas payload.
 
 This script reads the captured stdout and emits one flat record per
 (kind, scenario, level, engine) carrying ratio + compress/decompress
-throughput. `merge-wasm-bench.py` folds these into the persisted
+throughput. `merge-timeseries.py` folds these into the persisted
 `benchmark-wasm.json` timeseries on gh-pages.
 
 Env vars:
