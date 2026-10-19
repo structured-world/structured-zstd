@@ -17,7 +17,18 @@ mod fixtures {
         pub(super) frame: Vec<u8>,
         pub(super) content: Vec<u8>,
         pub(super) dict: Option<Vec<u8>>,
+        /// `dict` as the dictionary parser reads it.
+        pub(super) parsed: Option<crate::decoding::Dictionary>,
         pub(super) version: LegacyVersion,
+    }
+
+    impl Fixture {
+        /// The fixture's dictionary as the decoders take it.
+        pub(super) fn legacy_dict(&self) -> LegacyDict<'_> {
+            self.parsed
+                .as_ref()
+                .map_or(LegacyDict::None, LegacyDict::Parsed)
+        }
     }
 
     fn root() -> &'static Path {
@@ -56,11 +67,15 @@ mod fixtures {
                 } else {
                     root().join("decodecorpus_files").join(&stem)
                 };
+                let dict =
+                    is_dict.then(|| std::fs::read(dir.join(format!("dictionary.{rest}"))).unwrap());
                 Fixture {
                     frame: std::fs::read(dir.join(&name)).unwrap(),
                     content: std::fs::read(&source).unwrap(),
-                    dict: is_dict
-                        .then(|| std::fs::read(dir.join(format!("dictionary.{rest}"))).unwrap()),
+                    parsed: dict.as_deref().map(|raw| {
+                        crate::decoding::Dictionary::from_serialized_or_raw_content(raw).unwrap()
+                    }),
+                    dict,
                     version,
                     name,
                 }
@@ -96,11 +111,7 @@ fn fixtures_decode_to_their_content() {
             "{}",
             fixture.name
         );
-        let dict = fixture
-            .dict
-            .as_deref()
-            .map_or(LegacyDict::None, LegacyDict::Raw);
-        let (decoded, consumed) = decode_to_vec(&fixture.frame, dict)
+        let (decoded, consumed) = decode_to_vec(&fixture.frame, fixture.legacy_dict())
             .unwrap_or_else(|err| panic!("{}: {err}", fixture.name));
         assert_eq!(consumed, fixture.frame.len(), "{}", fixture.name);
         assert!(
@@ -117,10 +128,7 @@ fn fixtures_decode_to_their_content() {
 #[test]
 fn fixtures_decode_into_a_slice() {
     for fixture in fixtures() {
-        let dict = fixture
-            .dict
-            .as_deref()
-            .map_or(LegacyDict::None, LegacyDict::Raw);
+        let dict = fixture.legacy_dict();
         let mut buf = vec![0u8; fixture.content.len()];
         let mut out = SliceOutput {
             buf: &mut buf,
@@ -182,8 +190,9 @@ fn a_v07_frame_naming_a_dictionary_needs_it() {
         );
         let mut other = fixture.dict.clone().unwrap();
         other[4] ^= 1;
+        let other = crate::decoding::Dictionary::decode_dict(&other).unwrap();
         assert_eq!(
-            decode_to_vec(&fixture.frame, LegacyDict::Raw(&other)).unwrap_err(),
+            decode_to_vec(&fixture.frame, LegacyDict::Parsed(&other)).unwrap_err(),
             Error::DictionaryMismatch {
                 expected: 7,
                 provided: 6
@@ -289,6 +298,154 @@ fn decode_all_decodes_the_fixtures() {
     assert!(out == expected);
 }
 
+/// A source that hands out one byte per read.
+#[cfg(feature = "std")]
+struct Trickle<'a>(&'a [u8]);
+
+#[cfg(feature = "std")]
+impl std::io::Read for Trickle<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some((&first, rest)) = self.0.split_first() else {
+            return Ok(0);
+        };
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        buf[0] = first;
+        self.0 = rest;
+        Ok(1)
+    }
+}
+
+/// `StreamingDecoder` decodes each fixture whole, and from a source that
+/// gives one byte at a time into a small buffer, which drives the stream a
+/// step at a time and keeps only a window of history; a stream mixing these
+/// frames with RFC 8878 ones decodes in order.
+#[cfg(feature = "std")]
+#[test]
+fn streaming_decoder_decodes_the_fixtures() {
+    use crate::decoding::{DictionaryHandle, StreamingDecoder};
+    use std::io::Read;
+    for fixture in fixtures() {
+        let dict = fixture
+            .dict
+            .as_deref()
+            .map(|raw| DictionaryHandle::from_serialized_or_raw_content(raw).unwrap());
+        let open = |source| match &dict {
+            None => StreamingDecoder::new(source),
+            Some(dict) => StreamingDecoder::new_with_dictionary_handle(source, dict).unwrap(),
+        };
+        let mut whole = Vec::new();
+        open(&fixture.frame[..])
+            .read_to_end(&mut whole)
+            .unwrap_or_else(|err| panic!("{}: {err}", fixture.name));
+        assert!(whole == fixture.content, "{}", fixture.name);
+
+        if fixture.frame.len() < 64 * 1024 {
+            let mut decoder = match &dict {
+                None => StreamingDecoder::new(Trickle(&fixture.frame)),
+                Some(dict) => {
+                    StreamingDecoder::new_with_dictionary_handle(Trickle(&fixture.frame), dict)
+                        .unwrap()
+                }
+            };
+            let mut pieces = Vec::new();
+            let mut buf = [0u8; 1000];
+            loop {
+                let n = decoder
+                    .read(&mut buf)
+                    .unwrap_or_else(|err| panic!("{}: {err}", fixture.name));
+                if n == 0 {
+                    break;
+                }
+                pieces.extend_from_slice(&buf[..n]);
+            }
+            assert!(pieces == fixture.content, "{} in pieces", fixture.name);
+        }
+    }
+
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name == "z000001.v07.l19.zst")
+        .unwrap();
+    let rfc = crate::encoding::compress_to_vec(
+        &b"between"[..],
+        crate::encoding::CompressionLevel::Fastest,
+    );
+    let mut input = rfc.clone();
+    input.extend_from_slice(&fixture.frame);
+    input.extend_from_slice(&rfc);
+    input.extend_from_slice(&fixture.frame);
+    let mut expected = b"between".to_vec();
+    expected.extend_from_slice(&fixture.content);
+    expected.extend_from_slice(b"between");
+    expected.extend_from_slice(&fixture.content);
+    let mut out = Vec::new();
+    StreamingDecoder::new(&input[..])
+        .read_to_end(&mut out)
+        .unwrap();
+    assert!(out == expected);
+    let mut out = Vec::new();
+    let mut decoder = StreamingDecoder::new(&input[..]);
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = decoder.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    assert!(out == expected);
+}
+
+/// The block-level interface drives these frames too: `reset` starts one,
+/// `decode_blocks` decodes it a block at a time and `collect` hands it out;
+/// `decode_from_to` decodes it from input given in small pieces.
+#[cfg(feature = "std")]
+#[test]
+fn frame_decoder_steps_through_the_fixtures() {
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
+    for fixture in fixtures().into_iter().filter(|f| f.dict.is_none()) {
+        let mut source = &fixture.frame[..];
+        let mut decoder = FrameDecoder::new();
+        decoder.reset(&mut source).unwrap();
+        let mut out = Vec::new();
+        while !decoder
+            .decode_blocks(&mut source, BlockDecodingStrategy::UptoBlocks(1))
+            .unwrap_or_else(|err| panic!("{}: {err}", fixture.name))
+        {
+            out.extend(decoder.collect().unwrap());
+        }
+        out.extend(decoder.collect().unwrap());
+        assert!(source.is_empty(), "{}", fixture.name);
+        assert!(out == fixture.content, "{}", fixture.name);
+        assert_eq!(
+            decoder.bytes_read_from_source(),
+            fixture.frame.len() as u64,
+            "{}",
+            fixture.name
+        );
+
+        // `decode_from_to` with what the decoder asks for, and a target
+        // smaller than a block.
+        let mut decoder = FrameDecoder::new();
+        let mut source = &fixture.frame[..];
+        decoder.reset(&mut source).unwrap();
+        let mut out = Vec::new();
+        let mut target = [0u8; 777];
+        while !(decoder.is_finished() && decoder.can_collect() == 0) {
+            let need = decoder.input_needed(source).min(source.len());
+            let (read, written) = decoder
+                .decode_from_to(&source[..need], &mut target)
+                .unwrap_or_else(|err| panic!("{}: {err}", fixture.name));
+            source = &source[read..];
+            out.extend_from_slice(&target[..written]);
+            assert!(read > 0 || written > 0, "{} stalled", fixture.name);
+        }
+        assert!(out == fixture.content, "{}", fixture.name);
+    }
+}
+
 /// The frame queries answer for these frames as libzstd does: a frame, its
 /// length through the end block, its declared size or unknown, and a bound
 /// of 128 KiB per block; a cut frame is truncated.
@@ -346,10 +503,7 @@ fn frame_queries_answer_for_the_fixtures() {
 #[test]
 fn truncated_frames_are_refused() {
     for fixture in fixtures().into_iter().filter(|f| f.frame.len() < 4096) {
-        let dict = fixture
-            .dict
-            .as_deref()
-            .map_or(LegacyDict::None, LegacyDict::Raw);
+        let dict = fixture.legacy_dict();
         for len in 0..fixture.frame.len() {
             assert!(
                 decode_to_vec(&fixture.frame[..len], dict).is_err(),
@@ -361,21 +515,35 @@ fn truncated_frames_are_refused() {
 }
 
 /// Flipping any one bit of a frame is refused or decodes to some output, but
-/// never panics; in a v0.7 frame with a checksum a change to the content is
-/// caught.
+/// never panics; a v0.7 frame with a checksum decodes to other content only
+/// when that content's checksum is the one the frame carries, which with 22
+/// bits of it does happen.
 #[cfg(feature = "std")]
 #[test]
 fn damaged_frames_never_panic() {
     for fixture in fixtures().into_iter().filter(|f| f.frame.len() < 4096) {
-        let dict = fixture
-            .dict
-            .as_deref()
-            .map_or(LegacyDict::None, LegacyDict::Raw);
+        let dict = fixture.legacy_dict();
         let mut frame = fixture.frame.clone();
         for byte in 0..frame.len() {
             for bit in 0..8 {
                 frame[byte] ^= 1 << bit;
-                let _ = decode_to_vec(&frame, dict);
+                let decoded = decode_to_vec(&frame, dict);
+                #[cfg(feature = "hash")]
+                if let Ok((content, end)) = &decoded
+                    && *content != fixture.content
+                    && read_header(&frame).is_ok_and(|header| header.checksum)
+                {
+                    let carried = u64::from(frame[end - 1])
+                        | u64::from(frame[end - 2]) << 8
+                        | u64::from(frame[end - 3] & 0x3F) << 16;
+                    let digest = twox_hash::XxHash64::oneshot(0, content) >> 11 & 0x3F_FFFF;
+                    assert_eq!(
+                        digest, carried,
+                        "{}: bit {bit} of byte {byte} changed the content unchecked",
+                        fixture.name
+                    );
+                }
+                drop(decoded);
                 frame[byte] ^= 1 << bit;
             }
         }
@@ -512,6 +680,43 @@ fn frame_size_reads_only_the_size_fields() {
     v05.extend_from_slice(&end);
     assert_eq!(frame_size(LegacyVersion::V05, &v05), Some((8, 0)));
     assert_eq!(frame_size(LegacyVersion::V05, &v05[..4]), None);
+}
+
+/// A stream keeps its window and a block of history, not the whole frame:
+/// a frame of a 1 KiB window and 1 MiB of blocks decodes in order while the
+/// buffer stays within a few blocks.
+#[test]
+fn a_stream_holds_its_window_not_the_frame() {
+    // v0.7, window byte 0: a 1 KiB window.
+    let mut frame = vec![0x27, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
+    let mut expected = Vec::new();
+    for n in 0..8u8 {
+        let size = 128 * 1024 - 1;
+        // A raw block of `size` bytes of `n`.
+        frame.extend_from_slice(&[0x40 | (size >> 16) as u8, (size >> 8) as u8, size as u8]);
+        frame.extend(core::iter::repeat_n(n, size));
+        expected.extend(core::iter::repeat_n(n, size));
+    }
+    frame.extend_from_slice(&[0xC0, 0, 0]);
+    let header = read_header(&frame).unwrap();
+    let mut stream = LegacyStream::new();
+    stream.start(header, None).unwrap();
+    let mut src = &frame[header.size..];
+    let mut out = Vec::new();
+    let mut target = vec![0u8; 50_000];
+    let mut largest = 0;
+    while !(stream.is_finished() && stream.undelivered() == 0) {
+        let (read, written) = stream.decode(src, &mut target).unwrap();
+        src = &src[read..];
+        out.extend_from_slice(&target[..written]);
+        largest = largest.max(stream.heap_bytes());
+        assert!(read > 0 || written > 0);
+    }
+    assert!(src.is_empty());
+    assert!(out == expected);
+    assert_eq!(stream.produced(), expected.len() as u64);
+    assert_eq!(stream.consumed(), frame.len() as u64);
+    assert!(largest <= 4 * BLOCK_SIZE_MAX, "held {largest} bytes");
 }
 
 /// An RLE block repeats its byte, in every format.

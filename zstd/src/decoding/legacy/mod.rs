@@ -63,9 +63,6 @@ fn corrupt(reason: &'static str) -> Error {
 #[derive(Clone, Copy)]
 pub(crate) enum LegacyDict<'a> {
     None,
-    /// The bytes as the caller supplied them; each format reads its own
-    /// layout from them.
-    Raw(&'a [u8]),
     /// A dictionary the RFC 8878 parser has read. Its layout is the v0.7 one,
     /// so a v0.7 frame takes its tables, repeat offsets and ID; v0.5 and v0.6
     /// read any dictionary of the v0.7 layout as plain content, and are given
@@ -81,10 +78,9 @@ impl<'a> LegacyDict<'a> {
     /// the end of those bytes: a match reaching past it into the header
     /// fails as reaching before the dictionary, rather than decoding to
     /// other bytes.
-    fn content_bytes(&self) -> &'a [u8] {
+    pub(crate) fn content_bytes(&self) -> &'a [u8] {
         match *self {
             LegacyDict::None => &[],
-            LegacyDict::Raw(bytes) => bytes,
             LegacyDict::Parsed(dict) => &dict.dict_content,
         }
     }
@@ -102,7 +98,9 @@ pub(crate) struct FrameHeader {
     pub(crate) content_size: Option<u64>,
     /// The dictionary the frame names, 0 for none.
     pub(crate) dict_id: u32,
-    /// Whether a v0.7 frame carries a content checksum.
+    /// Whether a v0.7 frame carries a content checksum. Read only where the
+    /// checksum can be computed, under `hash`; the header parses it always.
+    #[cfg_attr(not(feature = "hash"), allow(dead_code))]
     pub(crate) checksum: bool,
 }
 
@@ -168,7 +166,7 @@ fn ends_frame(version: LegacyVersion, block: Block) -> bool {
 /// The length of the frame header at the start of `src` from its size fields
 /// alone, its other fields unchecked, as upstream's size walks read it
 /// (`ZSTDv0{6,7}_frameHeaderSize`; v0.5 headers are always 5 bytes).
-fn header_len(version: LegacyVersion, src: &[u8]) -> Result<usize, Error> {
+pub(crate) fn header_len(version: LegacyVersion, src: &[u8]) -> Result<usize, Error> {
     let descriptor = *src.get(4).ok_or(Error::Truncated)?;
     Ok(match version {
         LegacyVersion::V05 => 5,
@@ -223,6 +221,7 @@ pub(crate) trait Output {
     fn copy_back(&mut self, offset: usize, len: usize);
     /// The bytes produced since `from` (a value of `produced()`), for the
     /// content checksum.
+    #[cfg(feature = "hash")]
     fn since(&self, from: usize) -> &[u8];
 }
 
@@ -273,6 +272,7 @@ impl Output for VecOutput<'_> {
         }
     }
 
+    #[cfg(feature = "hash")]
     fn since(&self, from: usize) -> &[u8] {
         &self.buf[self.start + (from - self.dropped)..]
     }
@@ -322,6 +322,7 @@ impl Output for SliceOutput<'_> {
         self.pos += len;
     }
 
+    #[cfg(feature = "hash")]
     fn since(&self, from: usize) -> &[u8] {
         &self.buf[from..self.pos]
     }
@@ -546,26 +547,28 @@ impl<O: Output> Output for Budget<'_, O> {
     fn copy_back(&mut self, offset: usize, len: usize) {
         self.out.copy_back(offset, len);
     }
+    #[cfg(feature = "hash")]
     fn since(&self, from: usize) -> &[u8] {
         self.out.since(from)
     }
 }
 
 /// A frame being decoded block by block: the whole-buffer and the streaming
-/// decoders both drive one.
-pub(crate) struct LegacyFrame<'d> {
-    header: FrameHeader,
+/// decoders both drive one. The dictionary it was started with is passed to
+/// each block again, as [`LegacyDict::content_bytes`], so the frame holds no
+/// borrow and a stream can keep it beside the dictionary's handle.
+pub(crate) struct LegacyFrame {
+    version: LegacyVersion,
     decoder: VersionDecoder,
-    /// The bytes holding the dictionary's content, at `content`.
-    dict: &'d [u8],
+    /// Where the dictionary's content lies within its bytes.
     content: core::ops::Range<usize>,
     #[cfg(feature = "hash")]
     hash: Option<twox_hash::XxHash64>,
 }
 
-impl<'d> LegacyFrame<'d> {
+impl LegacyFrame {
     /// Start decoding the frame `header` describes.
-    pub(crate) fn new(header: FrameHeader, dict: LegacyDict<'d>) -> Result<LegacyFrame<'d>, Error> {
+    pub(crate) fn new(header: FrameHeader, dict: LegacyDict<'_>) -> Result<LegacyFrame, Error> {
         let bytes = dict.content_bytes();
         let (decoder, content) = match header.version {
             LegacyVersion::V07 => {
@@ -588,23 +591,29 @@ impl<'d> LegacyFrame<'d> {
             }
         };
         Ok(LegacyFrame {
-            header,
+            version: header.version,
             decoder,
-            dict: bytes,
             content,
             #[cfg(feature = "hash")]
             hash: header.checksum.then(|| twox_hash::XxHash64::with_seed(0)),
         })
     }
 
-    /// Decode one block, `body` being the bytes after its header.
-    fn block<O: Output>(&mut self, block: Block, body: &[u8], out: &mut O) -> Result<(), Error> {
+    /// Decode one block, `body` being the bytes after its header, with the
+    /// bytes of the dictionary the frame was started with.
+    fn block<O: Output>(
+        &mut self,
+        block: Block,
+        body: &[u8],
+        out: &mut O,
+        dict_bytes: &[u8],
+    ) -> Result<(), Error> {
         let before = out.produced();
         let mut out = Budget {
             end: before + BLOCK_SIZE_MAX,
             out,
         };
-        let dict = &self.dict[self.content.clone()];
+        let dict = &dict_bytes[self.content.clone()];
         match block {
             Block::Compressed(_) => match &mut self.decoder {
                 VersionDecoder::V05(decoder) => decoder.block(body, &mut out, dict)?,
@@ -670,6 +679,7 @@ pub(crate) fn decode_frame<O: Output>(
 ) -> Result<usize, Error> {
     let header = read_header(src)?;
     let mut frame = LegacyFrame::new(header, dict)?;
+    let dict_bytes = dict.content_bytes();
     let mut at = header.size;
     loop {
         let block_header = src.get(at..at + 3).ok_or(Error::Truncated)?;
@@ -681,8 +691,246 @@ pub(crate) fn decode_frame<O: Output>(
             frame.finish(end)?;
             return Ok(at);
         }
-        frame.block(block, body, out)?;
+        frame.block(block, body, out, dict_bytes)?;
         at += body.len();
+    }
+}
+
+/// A v0.5-v0.7 frame decoded from input that arrives in pieces, a block at a
+/// time, its output handed out as each block completes. It holds the window
+/// the formats reach back into plus one block, as upstream's buffered
+/// decoders (`ZBUFFv0{5,6,7}`) size theirs, and drops older output once it
+/// has been handed out.
+pub(crate) struct LegacyStream {
+    /// The frame in progress; `None` when no frame is.
+    frame: Option<LegacyFrame>,
+    /// The dictionary the frame was started with.
+    dict: Option<crate::decoding::DictionaryHandle>,
+    /// Output still within reach of a match, and output not handed out yet.
+    buf: Vec<u8>,
+    /// Bytes of the frame dropped from the front of `buf`.
+    dropped: usize,
+    /// How much of `buf` has been handed out.
+    delivered: usize,
+    /// History kept for matches: the window and one block.
+    keep: usize,
+    /// Whether the frame's end block has been read.
+    finished: bool,
+    /// Bytes of the frame read so far, its header included.
+    consumed: u64,
+    /// A block read from a `Read` source, held while it decodes.
+    block: Vec<u8>,
+}
+
+impl LegacyStream {
+    pub(crate) const fn new() -> LegacyStream {
+        LegacyStream {
+            frame: None,
+            dict: None,
+            buf: Vec::new(),
+            dropped: 0,
+            delivered: 0,
+            keep: 0,
+            finished: false,
+            consumed: 0,
+            block: Vec::new(),
+        }
+    }
+
+    /// Start the frame `header` describes, with `dict`. A frame already in
+    /// progress is dropped.
+    pub(crate) fn start(
+        &mut self,
+        header: FrameHeader,
+        dict: Option<crate::decoding::DictionaryHandle>,
+    ) -> Result<(), Error> {
+        let legacy_dict = dict
+            .as_ref()
+            .map_or(LegacyDict::None, |dict| LegacyDict::Parsed(dict.as_dict()));
+        self.frame = Some(LegacyFrame::new(header, legacy_dict)?);
+        self.dict = dict;
+        self.buf.clear();
+        self.dropped = 0;
+        self.delivered = 0;
+        // Every header reader holds the window to its format's largest, at
+        // most 128 MiB, which every target addresses.
+        debug_assert!(header.window <= 1 << 27);
+        self.keep = header.window as usize + BLOCK_SIZE_MAX;
+        self.finished = false;
+        self.consumed = header.size as u64;
+        Ok(())
+    }
+
+    /// Leave the frame in progress, if any, keeping the buffer's capacity.
+    pub(crate) fn end(&mut self) {
+        self.frame = None;
+        self.dict = None;
+        self.buf.clear();
+        self.delivered = 0;
+        self.finished = false;
+    }
+
+    /// Whether a frame is in progress, or finished with output still to hand
+    /// out.
+    pub(crate) fn active(&self) -> bool {
+        self.frame.is_some()
+    }
+
+    /// Whether the frame's end block has been read.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Decoded bytes not handed out yet.
+    pub(crate) fn undelivered(&self) -> usize {
+        self.buf.len() - self.delivered
+    }
+
+    /// Bytes the frame has decoded to so far.
+    pub(crate) fn produced(&self) -> u64 {
+        (self.dropped + self.buf.len()) as u64
+    }
+
+    /// Bytes of the frame read so far, its header included.
+    pub(crate) fn consumed(&self) -> u64 {
+        self.consumed
+    }
+
+    /// Heap bytes the stream holds.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.buf.capacity() + self.block.capacity()
+    }
+
+    /// How many bytes from the start of `pending` the next step needs: a
+    /// block header, then the whole block; 0 once the frame is finished.
+    pub(crate) fn input_needed(&self, pending: &[u8]) -> usize {
+        if self.finished {
+            return 0;
+        }
+        match Block::read(pending) {
+            Ok(block) => 3 + block.body_len(),
+            Err(_) => 3,
+        }
+    }
+
+    /// Decode the whole steps `src` holds into `target`, a block at a time,
+    /// decoding no further while `target` cannot take what is decoded.
+    /// Returns the bytes read and written.
+    pub(crate) fn decode(
+        &mut self,
+        src: &[u8],
+        target: &mut [u8],
+    ) -> Result<(usize, usize), Error> {
+        let mut read = 0;
+        let mut written = 0;
+        loop {
+            written += self.hand_out(&mut target[written..]);
+            if self.undelivered() > 0 || self.finished {
+                break;
+            }
+            let rest = &src[read..];
+            let need = self.input_needed(rest);
+            if need > rest.len() {
+                break;
+            }
+            self.step(&rest[..need])?;
+            read += need;
+        }
+        Ok((read, written))
+    }
+
+    /// Hand out what `target` takes of the undelivered output.
+    pub(crate) fn hand_out(&mut self, target: &mut [u8]) -> usize {
+        let n = self.undelivered().min(target.len());
+        target[..n].copy_from_slice(&self.buf[self.delivered..self.delivered + n]);
+        self.delivered += n;
+        n
+    }
+
+    /// The undelivered output, which [`Self::mark_delivered`] then hands out.
+    pub(crate) fn undelivered_bytes(&self) -> &[u8] {
+        &self.buf[self.delivered..]
+    }
+
+    /// Count the first `n` undelivered bytes as handed out.
+    pub(crate) fn mark_delivered(&mut self, n: usize) {
+        debug_assert!(n <= self.undelivered());
+        self.delivered += n;
+    }
+
+    /// Read the next block from `source` and decode it.
+    pub(crate) fn read_step<R: crate::io::Read>(
+        &mut self,
+        source: &mut R,
+    ) -> Result<(), crate::decoding::errors::FrameDecoderError> {
+        use crate::blocks::block::BlockType;
+        use crate::decoding::errors::{
+            BlockHeaderReadError, DecodeBlockContentError, FrameDecoderError,
+        };
+        // Lent out while the block decodes, which needs `self`.
+        let mut block = core::mem::take(&mut self.block);
+        block.clear();
+        block.resize(3, 0);
+        let result = source
+            .read_exact(&mut block)
+            .map_err(|source| {
+                FrameDecoderError::FailedToReadBlockHeader(BlockHeaderReadError::ReadError(source))
+            })
+            .and_then(|()| {
+                let need = self.input_needed(&block);
+                block.resize(need, 0);
+                source.read_exact(&mut block[3..]).map_err(|source| {
+                    FrameDecoderError::FailedToReadBlockBody(DecodeBlockContentError::ReadError {
+                        step: BlockType::Compressed,
+                        source,
+                    })
+                })
+            })
+            .and_then(|()| Ok(self.step(&block)?));
+        self.block = block;
+        result
+    }
+
+    /// Decode one block, `step` holding its header and body.
+    fn step(&mut self, step: &[u8]) -> Result<(), Error> {
+        let LegacyStream {
+            frame,
+            dict,
+            buf,
+            dropped,
+            delivered,
+            keep,
+            finished,
+            consumed,
+            block: _,
+        } = self;
+        let frame = frame.as_mut().ok_or(corrupt("no frame in progress"))?;
+        let block = Block::read(step)?;
+        *consumed += step.len() as u64;
+        if ends_frame(frame.version, block) {
+            frame.finish([step[0], step[1], step[2]])?;
+            *finished = true;
+            return Ok(());
+        }
+        // Drop history out of reach once it has been handed out, a block's
+        // worth at a time so the move is paid once per block at most.
+        if buf.len() > *keep + BLOCK_SIZE_MAX {
+            let drop = (buf.len() - *keep).min(*delivered);
+            buf.drain(..drop);
+            *delivered -= drop;
+            *dropped += drop;
+        }
+        let dict_bytes = dict
+            .as_ref()
+            .map_or(LegacyDict::None, |dict| LegacyDict::Parsed(dict.as_dict()))
+            .content_bytes();
+        let mut out = VecOutput {
+            buf,
+            start: 0,
+            dropped: *dropped,
+            limit: usize::MAX,
+        };
+        frame.block(block, &step[3..], &mut out, dict_bytes)
     }
 }
 

@@ -12,9 +12,6 @@ use super::{
 use crate::decoding::errors::LegacyFrameError as Error;
 use alloc::vec::Vec;
 
-/// Magic number of a v0.7 dictionary; RFC 8878 dictionaries kept it.
-pub(super) const DICT_MAGIC: u32 = 0xEC30_A437;
-
 /// Largest window a frame may ask for (`ZSTDv07_WINDOWLOG_MAX`).
 const WINDOW_LOG_MAX: u32 = if usize::BITS == 32 { 25 } else { 27 };
 
@@ -132,53 +129,6 @@ pub(super) fn read_header(src: &[u8]) -> Result<FrameHeader, Error> {
     })
 }
 
-/// The tables and offsets a dictionary primes, read as `ZSTDv07_loadEntropy`
-/// reads them; `dict_size` is the size the repeat offsets are checked
-/// against, the dictionary less its magic number and ID.
-fn load_entropy(src: &[u8], dict_size: usize) -> Result<(Decoder, usize), Error> {
-    let bad = |_| Error::DictionaryCorrupted;
-    let (huf, mut at) = HufTable::read(src, StreamEnd::PastStart).map_err(bad)?;
-    let mut table = |max: usize, max_log: u32| -> Result<FseTable, Error> {
-        let (dist, len) = super::entropy::read_distribution(
-            src.get(at..).ok_or(Error::DictionaryCorrupted)?,
-            max,
-        )
-        .map_err(bad)?;
-        if dist.table_log() > max_log {
-            return Err(Error::DictionaryCorrupted);
-        }
-        at += len;
-        FseTable::new(&dist).map_err(bad)
-    };
-    let of = table(MAX_OFF, OFF_LOG)?;
-    let ml = table(MAX_ML, ML_LOG)?;
-    let ll = table(MAX_LL, LL_LOG)?;
-    let reps_bytes = src.get(at..at + 12).ok_or(Error::DictionaryCorrupted)?;
-    let mut reps = [0usize; 3];
-    for (rep, bytes) in reps.iter_mut().zip(reps_bytes.chunks_exact(4)) {
-        let value = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        if value == 0 || value >= dict_size {
-            return Err(Error::DictionaryCorrupted);
-        }
-        *rep = value;
-    }
-    Ok((
-        Decoder {
-            huf: Some(huf),
-            tables: SeqTables {
-                ll: Some(ll),
-                of: Some(of),
-                ml: Some(ml),
-            },
-            repeat_tables: true,
-            reps,
-            literals: Vec::new(),
-            dict_id: 0,
-        },
-        at + 12,
-    ))
-}
-
 /// The tables and offsets a dictionary of the v0.7 layout primes, taken from
 /// what the RFC 8878 parser read of it: the two layouts are the same bytes,
 /// so the parsed distributions and code lengths are the ones
@@ -252,9 +202,8 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    /// A decoder primed with `dict`, and where the dictionary's content
-    /// lies within the bytes the returned range indexes: `dict`'s raw bytes,
-    /// or a split dictionary's content.
+    /// A decoder primed with `dict`, and where the dictionary's content lies
+    /// within [`LegacyDict::content_bytes`].
     pub(super) fn new(dict: LegacyDict<'_>) -> Result<(Decoder, core::ops::Range<usize>), Error> {
         let fresh = || Decoder {
             huf: None,
@@ -266,17 +215,6 @@ impl Decoder {
         };
         match dict {
             LegacyDict::None => Ok((fresh(), 0..0)),
-            LegacyDict::Raw(raw) => {
-                if raw.len() < 8
-                    || u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) != DICT_MAGIC
-                {
-                    return Ok((fresh(), 0..raw.len()));
-                }
-                let id = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-                let (mut decoder, len) = load_entropy(&raw[8..], raw.len() - 8)?;
-                decoder.dict_id = id;
-                Ok((decoder, 8 + len..raw.len()))
-            }
             LegacyDict::Parsed(dict) => {
                 let content = 0..dict.dict_content.len();
                 // A raw-content dictionary has no tables to load.

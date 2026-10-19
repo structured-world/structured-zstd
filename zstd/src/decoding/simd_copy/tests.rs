@@ -36,37 +36,38 @@ fn small_exact_copy_writes_exactly_the_run() {
 /// a kernel only the tier dispatch reaches would otherwise be checked only on
 /// the hosts that select it.
 fn runnable_medium_kernels() -> vec::Vec<(&'static str, CopyKernel)> {
-    let mut kernels: vec::Vec<(&'static str, CopyKernel)> =
-        vec![("copy_exact_u64", copy_exact_u64)];
-    #[cfg(all(
-        feature = "std",
-        any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel-sse"
-    ))]
-    if std::arch::is_x86_feature_detected!("sse2") {
-        kernels.push(("copy_exact_sse2", copy_exact_sse2));
-    }
-    #[cfg(all(
-        feature = "std",
-        any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel-avx2"
-    ))]
-    if std::arch::is_x86_feature_detected!("avx2") {
-        kernels.push(("copy_exact_avx2", copy_exact_avx2));
-    }
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_feature = "neon",
-        feature = "kernel-neon"
-    ))]
-    kernels.push(("copy_exact_neon", copy_exact_neon));
-    #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        feature = "kernel-simd128"
-    ))]
-    kernels.push(("copy_exact_simd128", copy_exact_simd128));
-    kernels
+    // Which entries exist depends on the build's kernel features, so the list
+    // is one array with each entry under its own `cfg`.
+    let kernels: &[Option<(&'static str, CopyKernel)>] = &[
+        Some(("copy_exact_u64", copy_exact_u64)),
+        #[cfg(all(
+            feature = "std",
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel-sse"
+        ))]
+        std::arch::is_x86_feature_detected!("sse2")
+            .then_some(("copy_exact_sse2", copy_exact_sse2 as CopyKernel)),
+        #[cfg(all(
+            feature = "std",
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel-avx2"
+        ))]
+        std::arch::is_x86_feature_detected!("avx2")
+            .then_some(("copy_exact_avx2", copy_exact_avx2 as CopyKernel)),
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_feature = "neon",
+            feature = "kernel-neon"
+        ))]
+        Some(("copy_exact_neon", copy_exact_neon)),
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel-simd128"
+        ))]
+        Some(("copy_exact_simd128", copy_exact_simd128)),
+    ];
+    kernels.iter().copied().flatten().collect()
 }
 
 #[test]
