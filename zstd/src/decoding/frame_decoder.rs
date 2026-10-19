@@ -3553,11 +3553,17 @@ impl FrameDecoder {
     ) -> Result<usize, FrameDecoderError> {
         #[cfg(not(feature = "lsm"))]
         {
-            self.decode_all_impl(input, output, |this, src| this.reset_from_slice(src))
+            self.decode_all_impl(input, output, |this, src| this.reset_from_slice(src), &[])
         }
         #[cfg(feature = "lsm")]
         {
-            self.decode_all_impl(input, output, |this, src| this.reset_from_slice(src), None)
+            self.decode_all_impl(
+                input,
+                output,
+                |this, src| this.reset_from_slice(src),
+                None,
+                &[],
+            )
         }
     }
 
@@ -3610,6 +3616,7 @@ impl FrameDecoder {
             output,
             |this, src| this.reset_from_slice(src),
             Some(&mut visitor),
+            &[],
         )
     }
 
@@ -3638,9 +3645,12 @@ impl FrameDecoder {
     ) -> Result<usize, FrameDecoderError> {
         #[cfg(not(feature = "lsm"))]
         {
-            self.decode_all_impl(input, output, |this, src| {
-                this.reset_from_slice_with_dict_handle(src, dict)
-            })
+            self.decode_all_impl(
+                input,
+                output,
+                |this, src| this.reset_from_slice_with_dict_handle(src, dict),
+                core::slice::from_ref(dict),
+            )
         }
         #[cfg(feature = "lsm")]
         {
@@ -3649,6 +3659,7 @@ impl FrameDecoder {
                 output,
                 |this, src| this.reset_from_slice_with_dict_handle(src, dict),
                 None,
+                core::slice::from_ref(dict),
             )
         }
     }
@@ -3688,9 +3699,12 @@ impl FrameDecoder {
         }
         #[cfg(not(feature = "lsm"))]
         {
-            self.decode_all_impl(input, output, |this, src| {
-                this.reset_from_slice_with_dict_handles(src, dicts)
-            })
+            self.decode_all_impl(
+                input,
+                output,
+                |this, src| this.reset_from_slice_with_dict_handles(src, dicts),
+                dicts,
+            )
         }
         #[cfg(feature = "lsm")]
         {
@@ -3699,6 +3713,7 @@ impl FrameDecoder {
                 output,
                 |this, src| this.reset_from_slice_with_dict_handles(src, dicts),
                 None,
+                dicts,
             )
         }
     }
@@ -3903,6 +3918,53 @@ impl FrameDecoder {
         Ok(produced as usize)
     }
 
+    /// The dictionary registered under `dict_id`, owned or shared.
+    #[cfg(feature = "legacy")]
+    fn registered_dict(&self, dict_id: u32) -> Option<&DictionaryHandle> {
+        let owned = self.owned_dicts.get(&dict_id);
+        #[cfg(target_has_atomic = "ptr")]
+        let owned = owned.or_else(|| self.shared_dicts.get(&dict_id));
+        owned
+    }
+
+    /// Decode the v0.5-v0.7 frame starting `*input` into the start of
+    /// `output`, advancing `*input` past it; returns the bytes written.
+    ///
+    /// A v0.7 frame naming a dictionary takes the one of `dicts` with that ID
+    /// (else the last, which then fails the ID check), or with no `dicts` the
+    /// one registered under it. A frame naming none takes the last of `dicts`.
+    #[cfg(feature = "legacy")]
+    fn decode_legacy_frame(
+        &self,
+        input: &mut &[u8],
+        output: &mut [u8],
+        dicts: &[DictionaryHandle],
+    ) -> Result<usize, FrameDecoderError> {
+        use crate::decoding::errors::LegacyFrameError;
+        use crate::decoding::legacy::{self, LegacyDict, SliceOutput};
+        let header = legacy::read_header(input)?;
+        let named = (header.dict_id != 0).then_some(header.dict_id);
+        let dict = match (named, dicts.is_empty()) {
+            (_, false) => Some(dictionary_for_frame(dicts, named)),
+            (Some(dict_id), true) => Some(
+                self.registered_dict(dict_id)
+                    .ok_or(FrameDecoderError::DictNotProvided { dict_id })?,
+            ),
+            (None, true) => None,
+        };
+        let dict = dict.map_or(LegacyDict::None, |dict| LegacyDict::Parsed(dict.as_dict()));
+        let mut out = SliceOutput {
+            buf: output,
+            pos: 0,
+        };
+        let consumed = legacy::decode_frame(input, dict, &mut out).map_err(|err| match err {
+            LegacyFrameError::OutputTooSmall => FrameDecoderError::TargetTooSmall,
+            err => err.into(),
+        })?;
+        *input = &input[consumed..];
+        Ok(out.pos)
+    }
+
     /// Default-feature decode_all_impl: no visitor parameter so the
     /// no-lsm build's call surface and codegen are byte-identical to
     /// the pre-#172 implementation. Compiles only when `lsm` is OFF.
@@ -3912,9 +3974,18 @@ impl FrameDecoder {
         mut input: &[u8],
         mut output: &mut [u8],
         mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
+        // The dictionaries a v0.5-v0.7 frame chooses from.
+        #[cfg_attr(not(feature = "legacy"), allow(unused_variables))] dicts: &[DictionaryHandle],
     ) -> Result<usize, FrameDecoderError> {
         let mut total_bytes_written = 0;
         while !input.is_empty() {
+            #[cfg(feature = "legacy")]
+            if !self.magicless && crate::decoding::LegacyVersion::of(input).is_some() {
+                let written = self.decode_legacy_frame(&mut input, output, dicts)?;
+                output = &mut output[written..];
+                total_bytes_written += written;
+                continue;
+            }
             match init_frame(self, &mut input) {
                 Ok(_) => {}
                 Err(FrameDecoderError::ReadFrameHeaderError(
@@ -4059,9 +4130,18 @@ impl FrameDecoder {
         mut output: &mut [u8],
         mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
         mut skippable_visitor: Option<&mut dyn FnMut(u8, &[u8])>,
+        // The dictionaries a v0.5-v0.7 frame chooses from.
+        #[cfg_attr(not(feature = "legacy"), allow(unused_variables))] dicts: &[DictionaryHandle],
     ) -> Result<usize, FrameDecoderError> {
         let mut total_bytes_written = 0;
         while !input.is_empty() {
+            #[cfg(feature = "legacy")]
+            if !self.magicless && crate::decoding::LegacyVersion::of(input).is_some() {
+                let written = self.decode_legacy_frame(&mut input, output, dicts)?;
+                output = &mut output[written..];
+                total_bytes_written += written;
+                continue;
+            }
             match init_frame(self, &mut input) {
                 Ok(_) => {}
                 Err(FrameDecoderError::ReadFrameHeaderError(

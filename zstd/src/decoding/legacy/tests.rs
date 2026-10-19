@@ -153,7 +153,7 @@ fn fixtures_decode_into_a_slice() {
 #[test]
 fn frame_size_matches_the_decoded_frame() {
     for fixture in fixtures() {
-        let (size, bound) = frame_size(&fixture.frame).unwrap();
+        let (size, bound) = frame_size(fixture.version, &fixture.frame).unwrap();
         assert_eq!(size, fixture.frame.len(), "{}", fixture.name);
         assert!(bound >= fixture.content.len() as u64, "{}", fixture.name);
         assert_eq!(bound % BLOCK_SIZE_MAX as u64, 0, "{}", fixture.name);
@@ -194,26 +194,150 @@ fn a_v07_frame_naming_a_dictionary_needs_it() {
     }
 }
 
-/// A v0.7 dictionary split by the RFC 8878 parser primes the decoder as its
-/// raw bytes do.
+/// A v0.7 dictionary read by the RFC 8878 parser primes the decoder as its
+/// raw bytes do, and a raw-content one gives its content and its ID.
 #[cfg(feature = "std")]
 #[test]
-fn a_split_v07_dictionary_decodes_like_its_bytes() {
-    for fixture in fixtures()
-        .into_iter()
-        .filter(|f| f.version == LegacyVersion::V07 && f.dict.is_some())
-    {
+fn a_parsed_dictionary_decodes_like_its_bytes() {
+    for fixture in fixtures().into_iter().filter(|f| f.dict.is_some()) {
         let raw = fixture.dict.as_deref().unwrap();
-        let parsed = crate::decoding::Dictionary::decode_dict(raw).unwrap();
-        let content_start = raw.len() - parsed.dict_content.len();
-        let split = LegacyDict::Split {
-            id: parsed.id,
-            entropy: &raw[8..content_start],
-            content: &raw[content_start..],
-        };
-        let (decoded, _) = decode_to_vec(&fixture.frame, split).unwrap();
+        let parsed = crate::decoding::Dictionary::from_serialized_or_raw_content(raw).unwrap();
+        let (decoded, _) = decode_to_vec(&fixture.frame, LegacyDict::Parsed(&parsed))
+            .unwrap_or_else(|err| panic!("{}: {err}", fixture.name));
         assert!(decoded == fixture.content, "{}", fixture.name);
     }
+    // A raw-content dictionary answers to the ID it was given.
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name.ends_with(".v07.dict.zst"))
+        .unwrap();
+    let raw = crate::decoding::Dictionary::from_raw_content(6, vec![0; 64]).unwrap();
+    assert_eq!(
+        decode_to_vec(&fixture.frame, LegacyDict::Parsed(&raw)).unwrap_err(),
+        Error::DictionaryMismatch {
+            expected: 7,
+            provided: 6
+        }
+    );
+}
+
+/// `FrameDecoder::decode_all` decodes each fixture, its dictionary given as a
+/// handle or registered under the ID a v0.7 frame names, and a frame between
+/// RFC 8878 frames; a slice one byte short is too small.
+#[cfg(feature = "std")]
+#[test]
+fn decode_all_decodes_the_fixtures() {
+    use crate::decoding::{DictionaryHandle, FrameDecoder, errors::FrameDecoderError};
+    for fixture in fixtures() {
+        let mut out = vec![0u8; fixture.content.len()];
+        let mut decoder = FrameDecoder::new();
+        let written = match &fixture.dict {
+            None => decoder.decode_all(&fixture.frame, &mut out),
+            Some(raw) => {
+                let dict = DictionaryHandle::from_serialized_or_raw_content(raw).unwrap();
+                decoder.decode_all_with_dict_handle(&fixture.frame, &mut out, &dict)
+            }
+        }
+        .unwrap_or_else(|err| panic!("{}: {err}", fixture.name));
+        assert_eq!(written, fixture.content.len(), "{}", fixture.name);
+        assert!(out == fixture.content, "{}", fixture.name);
+        if let Some(short) = fixture.content.len().checked_sub(1)
+            && fixture.dict.is_none()
+        {
+            assert!(matches!(
+                FrameDecoder::new().decode_all(&fixture.frame, &mut out[..short]),
+                Err(FrameDecoderError::TargetTooSmall)
+            ));
+        }
+    }
+
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name.ends_with(".v07.dict.zst"))
+        .unwrap();
+    let mut out = vec![0u8; fixture.content.len()];
+    assert!(matches!(
+        FrameDecoder::new().decode_all(&fixture.frame, &mut out),
+        Err(FrameDecoderError::DictNotProvided { dict_id: 7 })
+    ));
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .add_dict_from_bytes(fixture.dict.as_deref().unwrap())
+        .unwrap();
+    decoder.decode_all(&fixture.frame, &mut out).unwrap();
+    assert!(out == fixture.content);
+
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name == "abc.txt.v06.l1.zst")
+        .unwrap();
+    let rfc = crate::encoding::compress_to_vec(
+        &b"between"[..],
+        crate::encoding::CompressionLevel::Fastest,
+    );
+    let mut input = rfc.clone();
+    input.extend_from_slice(&fixture.frame);
+    input.extend_from_slice(&rfc);
+    let mut expected = b"between".to_vec();
+    expected.extend_from_slice(&fixture.content);
+    expected.extend_from_slice(b"between");
+    let mut out = vec![0u8; expected.len()];
+    assert_eq!(
+        FrameDecoder::new().decode_all(&input, &mut out).unwrap(),
+        expected.len()
+    );
+    assert!(out == expected);
+}
+
+/// The frame queries answer for these frames as libzstd does: a frame, its
+/// length through the end block, its declared size or unknown, and a bound
+/// of 128 KiB per block; a cut frame is truncated.
+#[cfg(feature = "std")]
+#[test]
+fn frame_queries_answer_for_the_fixtures() {
+    use crate::decoding::{
+        FrameContentSize, FrameSizeError, find_decompressed_size, find_frame_compressed_size,
+        frame_decompressed_bound, is_frame, read_frame_content_size,
+    };
+    for fixture in fixtures() {
+        let frame = &fixture.frame;
+        assert!(is_frame(frame), "{}", fixture.name);
+        assert_eq!(
+            find_frame_compressed_size(frame).unwrap(),
+            frame.len(),
+            "{}",
+            fixture.name
+        );
+        let bound = frame_decompressed_bound(frame).unwrap();
+        assert!(bound >= fixture.content.len() as u64, "{}", fixture.name);
+        let declared = declared_content_size(frame);
+        let expected = declared.map_or(FrameContentSize::Unknown, FrameContentSize::Known);
+        assert_eq!(
+            read_frame_content_size(frame).unwrap(),
+            expected,
+            "{}",
+            fixture.name
+        );
+        assert_eq!(
+            find_decompressed_size(frame).unwrap(),
+            expected,
+            "{}",
+            fixture.name
+        );
+        assert!(matches!(
+            find_frame_compressed_size(&frame[..frame.len() - 1]),
+            Err(FrameSizeError::Truncated)
+        ));
+    }
+    // v0.5 declares no size.
+    let v05 = fixtures()
+        .into_iter()
+        .find(|f| f.name == "abc.txt.v05.l1.zst")
+        .unwrap();
+    assert_eq!(
+        read_frame_content_size(&v05.frame).unwrap(),
+        FrameContentSize::Unknown
+    );
 }
 
 /// Every truncation of every fixture is refused or decodes to a prefix, and
@@ -351,16 +475,43 @@ fn an_empty_block_ends_only_older_frames() {
     let end = [0xC0, 0, 0];
     let mut v06 = vec![0x26, 0xB5, 0x2F, 0xFD, 0x00];
     v06.extend_from_slice(&empty_raw);
-    assert_eq!(frame_size(&v06).unwrap(), (8, 0));
+    assert_eq!(frame_size(LegacyVersion::V06, &v06), Some((8, 0)));
     let mut v07 = vec![0x27, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
     v07.extend_from_slice(&empty_raw);
-    assert_eq!(frame_size(&v07).unwrap_err(), Error::Truncated);
+    assert_eq!(frame_size(LegacyVersion::V07, &v07), None);
     v07.extend_from_slice(&end);
-    assert_eq!(frame_size(&v07).unwrap(), (12, BLOCK_SIZE_MAX as u64));
+    assert_eq!(
+        frame_size(LegacyVersion::V07, &v07),
+        Some((12, BLOCK_SIZE_MAX as u64))
+    );
     assert_eq!(
         decode_to_vec(&v07, LegacyDict::None).unwrap(),
         (Vec::new(), 12)
     );
+}
+
+/// The size walk measures a header from its size fields alone, as upstream's
+/// does: a reserved bit the decoder refuses does not stop the walk.
+#[test]
+fn frame_size_reads_only_the_size_fields() {
+    let end = [0xC0, 0, 0];
+    // v0.6 with the reserved bit and a one-byte content size.
+    let mut v06 = vec![0x26, 0xB5, 0x2F, 0xFD, 0x60, 9];
+    v06.extend_from_slice(&end);
+    assert_eq!(frame_size(LegacyVersion::V06, &v06), Some((9, 0)));
+    // v0.7 with the reserved bit, a two-byte dictionary ID and a window byte.
+    let mut v07 = vec![0x27, 0xB5, 0x2F, 0xFD, 0x0A, 0, 1, 2];
+    v07.extend_from_slice(&end);
+    assert_eq!(frame_size(LegacyVersion::V07, &v07), Some((11, 0)));
+    // v0.7 single segment without a size field still carries one byte of it.
+    let mut v07 = vec![0x27, 0xB5, 0x2F, 0xFD, 0x20, 7];
+    v07.extend_from_slice(&end);
+    assert_eq!(frame_size(LegacyVersion::V07, &v07), Some((9, 0)));
+    // v0.5 headers are five bytes whatever the descriptor says.
+    let mut v05 = vec![0x25, 0xB5, 0x2F, 0xFD, 0xF0];
+    v05.extend_from_slice(&end);
+    assert_eq!(frame_size(LegacyVersion::V05, &v05), Some((8, 0)));
+    assert_eq!(frame_size(LegacyVersion::V05, &v05[..4]), None);
 }
 
 /// An RLE block repeats its byte, in every format.

@@ -179,6 +179,55 @@ fn load_entropy(src: &[u8], dict_size: usize) -> Result<(Decoder, usize), Error>
     ))
 }
 
+/// The tables and offsets a dictionary of the v0.7 layout primes, taken from
+/// what the RFC 8878 parser read of it: the two layouts are the same bytes,
+/// so the parsed distributions and code lengths are the ones
+/// `ZSTDv07_loadEntropy` would read, held to the v0.7 symbol limits.
+///
+/// The repeat offsets are not held to the dictionary's size here, as the
+/// parser kept no count of its table bytes; one reaching past the content
+/// fails at the match that uses it.
+fn parsed_entropy(dict: &crate::decoding::Dictionary) -> Result<Decoder, Error> {
+    let bad = |_| Error::DictionaryCorrupted;
+    let huf_table = &dict.huf.table;
+    let huf = HufTable::from_code_lengths(huf_table.code_lengths(), huf_table.max_num_bits)
+        .map_err(bad)?;
+    let table = |fse: &crate::decoding::scratch::AlignedFSETable,
+                 max: usize,
+                 max_log: u32|
+     -> Result<FseTable, Error> {
+        let log = u32::from(fse.accuracy_log);
+        if log > max_log {
+            return Err(Error::DictionaryCorrupted);
+        }
+        let dist =
+            Distribution::from_probabilities(&fse.symbol_probabilities, log, max).map_err(bad)?;
+        FseTable::new(&dist).map_err(bad)
+    };
+    let of = table(&dict.fse.offsets, MAX_OFF, OFF_LOG)?;
+    let ml = table(&dict.fse.match_lengths, MAX_ML, ML_LOG)?;
+    let ll = table(&dict.fse.literal_lengths, MAX_LL, LL_LOG)?;
+    let mut reps = [0usize; 3];
+    for (rep, &offset) in reps.iter_mut().zip(&dict.offset_hist) {
+        if offset == 0 {
+            return Err(Error::DictionaryCorrupted);
+        }
+        *rep = offset as usize;
+    }
+    Ok(Decoder {
+        huf: Some(huf),
+        tables: SeqTables {
+            ll: Some(ll),
+            of: Some(of),
+            ml: Some(ml),
+        },
+        repeat_tables: true,
+        reps,
+        literals: Vec::new(),
+        dict_id: 0,
+    })
+}
+
 /// The literal length, offset and match length tables last in use, which a
 /// block may keep instead of sending new ones.
 #[derive(Default)]
@@ -228,17 +277,17 @@ impl Decoder {
                 decoder.dict_id = id;
                 Ok((decoder, 8 + len..raw.len()))
             }
-            LegacyDict::Split {
-                id,
-                entropy,
-                content,
-            } => {
-                let (mut decoder, len) = load_entropy(entropy, entropy.len() + content.len())?;
-                if len != entropy.len() {
-                    return Err(Error::DictionaryCorrupted);
+            LegacyDict::Parsed(dict) => {
+                let content = 0..dict.dict_content.len();
+                // A raw-content dictionary has no tables to load.
+                if dict.huf.table.max_num_bits == 0 {
+                    let mut decoder = fresh();
+                    decoder.dict_id = dict.id;
+                    return Ok((decoder, content));
                 }
-                decoder.dict_id = id;
-                Ok((decoder, 0..content.len()))
+                let mut decoder = parsed_entropy(dict)?;
+                decoder.dict_id = dict.id;
+                Ok((decoder, content))
             }
         }
     }

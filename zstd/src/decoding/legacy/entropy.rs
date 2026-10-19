@@ -175,6 +175,27 @@ impl Distribution {
         }
     }
 
+    /// The distribution an RFC 8878 table description parsed to, listing at
+    /// most `max_symbol + 1` symbols.
+    pub(super) fn from_probabilities(
+        probabilities: &[i32],
+        table_log: u32,
+        max_symbol: usize,
+    ) -> Result<Distribution, Error> {
+        if probabilities.is_empty() || probabilities.len() > max_symbol + 1 {
+            return Err(corrupt("FSE description lists too many symbols"));
+        }
+        let mut counts = [0i16; 256];
+        for (count, &probability) in counts.iter_mut().zip(probabilities) {
+            *count = i16::try_from(probability).map_err(|_| corrupt("FSE count out of range"))?;
+        }
+        Ok(Distribution {
+            counts,
+            max_symbol: probabilities.len() - 1,
+            table_log,
+        })
+    }
+
     pub(super) fn table_log(&self) -> u32 {
         self.table_log
     }
@@ -442,7 +463,31 @@ impl HufTable {
                 (fse_decompress(body, &mut weights, 255, end)?, len + 1)
             }
         };
+        Ok((HufTable::from_weights(&mut weights, explicit)?, consumed))
+    }
 
+    /// The table whose weights are an RFC 8878 description's code lengths,
+    /// the last one included, under a longest code of `max_bits`.
+    pub(super) fn from_code_lengths(lengths: &[u8], max_bits: u8) -> Result<HufTable, Error> {
+        let explicit = lengths
+            .len()
+            .checked_sub(1)
+            .filter(|&explicit| explicit < 256)
+            .ok_or(corrupt("Huffman description without symbols"))?;
+        let mut weights = [0u8; 256];
+        for (weight, &len) in weights.iter_mut().zip(&lengths[..explicit]) {
+            if len > max_bits {
+                return Err(corrupt("Huffman code longer than its table"));
+            }
+            *weight = if len == 0 { 0 } else { max_bits + 1 - len };
+        }
+        // The last weight is inferred again, from the others.
+        HufTable::from_weights(&mut weights, explicit)
+    }
+
+    /// Build the table from the first `explicit` weights, inferring the
+    /// weight of the symbol after them.
+    fn from_weights(weights: &mut [u8; 256], explicit: usize) -> Result<HufTable, Error> {
         let mut ranks = [0u32; HUF_WEIGHT_LIMIT as usize + 1];
         let mut total = 0u32;
         for &weight in &weights[..explicit] {
@@ -492,7 +537,7 @@ impl HufTable {
             cells[first..first + len].fill((symbol as u8, (log + 1 - u32::from(weight)) as u8));
             start[usize::from(weight)] += len as u32;
         }
-        Ok((HufTable { log, cells }, consumed))
+        Ok(HufTable { log, cells })
     }
 
     #[inline]

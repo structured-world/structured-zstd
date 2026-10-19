@@ -81,6 +81,11 @@ pub enum FrameContentSize {
 /// This backs the C `ZSTD_getFrameContentSize` entry point, where the two
 /// variants map to a concrete size and `ZSTD_CONTENTSIZE_UNKNOWN`.
 ///
+/// With the `legacy` feature a v0.5-v0.7 frame reports the size its header
+/// declares, and [`FrameContentSize::Unknown`] when it declares none or its
+/// header does not read, as libzstd does: the field is advisory in those
+/// formats.
+///
 /// # Errors
 /// Returns [`ReadFrameHeaderError`](errors::ReadFrameHeaderError) when `src`
 /// is too short to hold a header, carries a bad magic number, or begins with
@@ -95,6 +100,11 @@ pub enum FrameContentSize {
 pub fn read_frame_content_size(
     src: &[u8],
 ) -> Result<FrameContentSize, errors::ReadFrameHeaderError> {
+    #[cfg(feature = "legacy")]
+    if LegacyVersion::of(src).is_some() {
+        return Ok(legacy::declared_content_size(src)
+            .map_or(FrameContentSize::Unknown, FrameContentSize::Known));
+    }
     let (header, _consumed) = frame::read_frame_header_with_format(src, false)?;
     Ok(if header.fcs_declared() {
         FrameContentSize::Known(header.frame_content_size())
@@ -125,9 +135,10 @@ pub enum FrameSizeError {
 /// header, every block, and the trailing content checksum when present —
 /// computed by walking the block headers without decoding any block body.
 ///
-/// For a skippable frame, returns its full `8 + Frame_Size` length. This backs
-/// the C `ZSTD_findFrameCompressedSize` entry point; the returned value is the
-/// offset at which a following concatenated frame would begin.
+/// For a skippable frame, returns its full `8 + Frame_Size` length, and with
+/// the `legacy` feature a v0.5-v0.7 frame's length through its end block. This
+/// backs the C `ZSTD_findFrameCompressedSize` entry point; the returned value
+/// is the offset at which a following concatenated frame would begin.
 ///
 /// # Errors
 /// [`FrameSizeError`] when the header is unreadable, the buffer is truncated
@@ -140,6 +151,12 @@ pub enum FrameSizeError {
 /// assert_eq!(find_frame_compressed_size(&frame).unwrap(), frame.len());
 /// ```
 pub fn find_frame_compressed_size(src: &[u8]) -> Result<usize, FrameSizeError> {
+    #[cfg(feature = "legacy")]
+    if let Some(version) = LegacyVersion::of(src) {
+        return legacy::frame_size(version, src)
+            .map(|(size, _)| size)
+            .ok_or(FrameSizeError::Truncated);
+    }
     let (header, header_len) = match frame::read_frame_header_with_format(src, false) {
         Ok(parsed) => parsed,
         // Skippable frame: magic (4) + Frame_Size field (4) + payload.
@@ -295,11 +312,20 @@ fn walk_blocks(
 /// Returns the exact size when the header declares `Frame_Content_Size`;
 /// otherwise a valid (loose) bound of `block_count * block_size_max`, where
 /// `block_size_max = min(window_size, 128 KiB)` — every block decompresses to
-/// at most that many bytes. Skippable frames contribute `0`.
+/// at most that many bytes. Skippable frames contribute `0`. With the `legacy`
+/// feature a v0.5-v0.7 frame is bounded by 128 KiB per block whatever its
+/// header declares, as libzstd bounds it, since those formats do not hold a
+/// frame to its declared size.
 ///
 /// # Errors
 /// [`FrameSizeError`] on an unreadable header, truncation, or a reserved block.
 pub fn frame_decompressed_bound(src: &[u8]) -> Result<u64, FrameSizeError> {
+    #[cfg(feature = "legacy")]
+    if let Some(version) = LegacyVersion::of(src) {
+        return legacy::frame_size(version, src)
+            .map(|(_, bound)| bound)
+            .ok_or(FrameSizeError::Truncated);
+    }
     let (header, header_len) = match frame::read_frame_header_with_format(src, false) {
         Ok(parsed) => parsed,
         // Skippable frame contributes 0, but its full payload must be present:
@@ -366,6 +392,25 @@ pub fn frame_magic(src: &[u8]) -> Option<FrameMagic> {
     } else {
         None
     }
+}
+
+/// Whether `src` starts with a frame this build decodes or skips: a Zstandard
+/// frame, a skippable frame, or with the `legacy` feature a v0.5-v0.7 frame.
+/// Backs the C `ZSTD_isFrame`, which answers the same for upstream's default
+/// build.
+///
+/// ```rust
+/// use structured_zstd::decoding::is_frame;
+/// assert!(is_frame(&[0x28, 0xB5, 0x2F, 0xFD]));
+/// assert!(is_frame(&[0x50, 0x2A, 0x4D, 0x18]));
+/// assert!(!is_frame(b"zip"));
+/// ```
+pub fn is_frame(src: &[u8]) -> bool {
+    #[cfg(feature = "legacy")]
+    if LegacyVersion::of(src).is_some() {
+        return true;
+    }
+    frame_magic(src).is_some()
 }
 
 /// Bytes the compressed input must trail the end of the output by for every

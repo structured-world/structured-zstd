@@ -14,6 +14,7 @@ mod v05;
 mod v06;
 mod v07;
 
+use crate::decoding::Dictionary;
 use crate::decoding::errors::LegacyFrameError as Error;
 use alloc::vec::Vec;
 
@@ -65,38 +66,26 @@ pub(crate) enum LegacyDict<'a> {
     /// The bytes as the caller supplied them; each format reads its own
     /// layout from them.
     Raw(&'a [u8]),
-    /// A dictionary already split by the RFC 8878 parser, whose layout is the
-    /// v0.7 one: its ID, the bytes from its entropy tables through its repeat
-    /// offsets, and its content.
-    Split {
-        id: u32,
-        entropy: &'a [u8],
-        content: &'a [u8],
-    },
+    /// A dictionary the RFC 8878 parser has read. Its layout is the v0.7 one,
+    /// so a v0.7 frame takes its tables, repeat offsets and ID; v0.5 and v0.6
+    /// read any dictionary of the v0.7 layout as plain content, and are given
+    /// its content.
+    Parsed(&'a Dictionary),
 }
 
 impl<'a> LegacyDict<'a> {
-    /// The dictionary's bytes as one contiguous run, for a format that reads
-    /// a split dictionary as plain content. Only a split dictionary needs the
-    /// copy; it is rare enough (an RFC 8878 dictionary with a v0.5 or v0.6
-    /// frame) to pay for one.
-    fn whole(&self) -> alloc::borrow::Cow<'a, [u8]> {
-        use alloc::borrow::Cow;
+    /// The bytes a v0.5 or v0.6 frame reads as its dictionary.
+    ///
+    /// Those formats take a dictionary of the v0.7 layout whole, header and
+    /// tables too, as content. A parsed one keeps only its content, which is
+    /// the end of those bytes: a match reaching past it into the header
+    /// fails as reaching before the dictionary, rather than decoding to
+    /// other bytes.
+    fn content_bytes(&self) -> &'a [u8] {
         match *self {
-            LegacyDict::None => Cow::Borrowed(&[]),
-            LegacyDict::Raw(bytes) => Cow::Borrowed(bytes),
-            LegacyDict::Split {
-                id,
-                entropy,
-                content,
-            } => {
-                let mut whole = Vec::with_capacity(8 + entropy.len() + content.len());
-                whole.extend_from_slice(&v07::DICT_MAGIC.to_le_bytes());
-                whole.extend_from_slice(&id.to_le_bytes());
-                whole.extend_from_slice(entropy);
-                whole.extend_from_slice(content);
-                Cow::Owned(whole)
-            }
+            LegacyDict::None => &[],
+            LegacyDict::Raw(bytes) => bytes,
+            LegacyDict::Parsed(dict) => &dict.dict_content,
         }
     }
 }
@@ -176,26 +165,45 @@ fn ends_frame(version: LegacyVersion, block: Block) -> bool {
     }
 }
 
-/// Where the frame starting `src` ends, and the most it can decode to: one
-/// block's maximum per block (`ZSTD_findFrameSizeInfoLegacy`).
-pub(crate) fn frame_size(src: &[u8]) -> Result<(usize, u64), Error> {
-    let header = read_header(src)?;
-    let mut at = header.size;
+/// The length of the frame header at the start of `src` from its size fields
+/// alone, its other fields unchecked, as upstream's size walks read it
+/// (`ZSTDv0{6,7}_frameHeaderSize`; v0.5 headers are always 5 bytes).
+fn header_len(version: LegacyVersion, src: &[u8]) -> Result<usize, Error> {
+    let descriptor = *src.get(4).ok_or(Error::Truncated)?;
+    Ok(match version {
+        LegacyVersion::V05 => 5,
+        LegacyVersion::V06 => 5 + [0, 1, 2, 8][usize::from(descriptor >> 6)],
+        LegacyVersion::V07 => {
+            let single_segment = descriptor & 0x20 != 0;
+            let fcs = [0, 2, 4, 8][usize::from(descriptor >> 6)];
+            let window = usize::from(!single_segment);
+            // A single-segment frame always carries its size, one byte at least.
+            let short_size = usize::from(single_segment && fcs == 0);
+            5 + window + [0, 1, 2, 4][usize::from(descriptor & 3)] + fcs + short_size
+        }
+    })
+}
+
+/// Where the `version` frame starting `src` ends, and the most it can decode
+/// to: one block's maximum per block (`ZSTD_findFrameSizeInfoLegacy`). `None`
+/// when `src` ends inside the frame, the only way the walk fails.
+pub(crate) fn frame_size(version: LegacyVersion, src: &[u8]) -> Option<(usize, u64)> {
+    let mut at = header_len(version, src).ok()?;
     let mut blocks = 0u64;
     loop {
-        let block = Block::read(&src[at.min(src.len())..])?;
+        let block = Block::read(src.get(at..)?).ok()?;
         at += 3;
         let body = block.body_len();
-        if body > src.len() - at.min(src.len()) {
-            return Err(Error::Truncated);
+        if body > src.len().checked_sub(at)? {
+            return None;
         }
-        if ends_frame(header.version, block) {
+        if ends_frame(version, block) {
             break;
         }
         at += body;
         blocks += 1;
     }
-    Ok((at, blocks * BLOCK_SIZE_MAX as u64))
+    Some((at, blocks * BLOCK_SIZE_MAX as u64))
 }
 
 /// Where decoded bytes go: an output that knows how much of the frame it has
@@ -549,7 +557,7 @@ pub(crate) struct LegacyFrame<'d> {
     header: FrameHeader,
     decoder: VersionDecoder,
     /// The bytes holding the dictionary's content, at `content`.
-    dict: alloc::borrow::Cow<'d, [u8]>,
+    dict: &'d [u8],
     content: core::ops::Range<usize>,
     #[cfg(feature = "hash")]
     hash: Option<twox_hash::XxHash64>,
@@ -558,32 +566,25 @@ pub(crate) struct LegacyFrame<'d> {
 impl<'d> LegacyFrame<'d> {
     /// Start decoding the frame `header` describes.
     pub(crate) fn new(header: FrameHeader, dict: LegacyDict<'d>) -> Result<LegacyFrame<'d>, Error> {
-        use alloc::borrow::Cow;
-        let (decoder, bytes, content) = match header.version {
+        let bytes = dict.content_bytes();
+        let (decoder, content) = match header.version {
             LegacyVersion::V07 => {
                 let (decoder, content) = v07::Decoder::new(dict)?;
-                let bytes: &'d [u8] = match dict {
-                    LegacyDict::None => &[],
-                    LegacyDict::Raw(raw) => raw,
-                    LegacyDict::Split { content, .. } => content,
-                };
                 if header.dict_id != 0 && header.dict_id != decoder.dict_id {
                     return Err(Error::DictionaryMismatch {
                         expected: header.dict_id,
                         provided: decoder.dict_id,
                     });
                 }
-                (VersionDecoder::V07(decoder), Cow::Borrowed(bytes), content)
+                (VersionDecoder::V07(decoder), content)
             }
             LegacyVersion::V06 => {
-                let whole = dict.whole();
-                let (decoder, content) = v06::Decoder::new(&whole)?;
-                (VersionDecoder::V06(decoder), whole, content)
+                let (decoder, content) = v06::Decoder::new(bytes)?;
+                (VersionDecoder::V06(decoder), content)
             }
             LegacyVersion::V05 => {
-                let whole = dict.whole();
-                let (decoder, content) = v05::Decoder::new(&whole)?;
-                (VersionDecoder::V05(decoder), whole, content)
+                let (decoder, content) = v05::Decoder::new(bytes)?;
+                (VersionDecoder::V05(decoder), content)
             }
         };
         Ok(LegacyFrame {
@@ -594,10 +595,6 @@ impl<'d> LegacyFrame<'d> {
             #[cfg(feature = "hash")]
             hash: header.checksum.then(|| twox_hash::XxHash64::with_seed(0)),
         })
-    }
-
-    pub(crate) fn header(&self) -> &FrameHeader {
-        &self.header
     }
 
     /// Decode one block, `body` being the bytes after its header.
