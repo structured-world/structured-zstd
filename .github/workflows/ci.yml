@@ -813,7 +813,11 @@ jobs:
     timeout-minutes: 120
     runs-on: ubuntu-latest
     steps:
+      # The build and the reference's make run third-party code; only the
+      # gh-pages checkout below needs a credential, and it brings its own.
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

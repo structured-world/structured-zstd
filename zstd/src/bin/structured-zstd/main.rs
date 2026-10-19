@@ -4049,9 +4049,9 @@ fn benchmark_decoding_one(
             break;
         }
     }
-    if decoded.len() as u64 != decoded_size {
-        bail!("-b: {label} decoded to a size its frames do not declare");
-    }
+    // Every frame declared its size (an undeclared one was refused above), and
+    // the decoder fails a frame whose output differs from its declaration.
+    debug_assert_eq!(decoded.len() as u64, decoded_size, "-b: {label}");
     let result = BenchResult {
         level: 0,
         input: decoded_size,

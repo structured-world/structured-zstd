@@ -5629,6 +5629,123 @@ fn an_overflowing_number_reports_its_width() {
     assert!(err.contains("overflows size_t"), "{err}");
 }
 
+/// Each kind of parameter display runs on its own: the defaults without the
+/// actual ones, and the actual ones at `-vv` without the defaults.
+#[test]
+fn either_parameter_display_runs_alone() {
+    let scratch = Scratch::new("cparams-alone");
+    let file = scratch.file("in.txt", &b"text to compress\n".repeat(30));
+    for args in [
+        &["--show-default-cparams", "-f", "x"][..],
+        &["-vv", "-f", "x"][..],
+    ] {
+        let mut opts = parse(args).unwrap();
+        opts.inputs = vec![file.clone()];
+        assert_eq!(run(opts).unwrap(), 0, "{args:?}");
+    }
+}
+
+/// Compressing stdin under a tool name whose format this build cannot write
+/// is refused like a named file, with status 20, naming stdin.
+#[test]
+fn compressing_stdin_to_a_foreign_format_is_refused() {
+    let opts = parse_as(
+        &program_preset("gzip"),
+        CompressionLevel::DEFAULT_LEVEL,
+        &["-q", "-"],
+    )
+    .unwrap();
+    let err = run(opts).expect_err("this build writes zstd only");
+    assert_eq!(exit_status(&err), 20);
+    assert!(err.to_string().contains(STDIN_MARK), "{err}");
+}
+
+/// Under `-S` a decoding benchmark weighs `-M` against its largest input
+/// before reading, and an input that is not frames fails the run even when
+/// an earlier one measured.
+#[test]
+fn decoding_benchmark_per_file_weighs_and_reports() {
+    use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
+
+    let scratch = Scratch::new("bench-decode-per-file");
+    let framed = scratch.file(
+        "a.zst",
+        &compress_to_vec(&b"a file\n".repeat(40)[..], CompressionLevel::Default),
+    );
+    let big = scratch.file("big.zst", &vec![b'x'; 64 * 1024]);
+    let bench = |inputs: Vec<PathBuf>, limit: Option<u64>| {
+        let mut opts = parse(&["-b", "-d", "-S", "-i0", "-q", "x"]).unwrap();
+        opts.inputs = inputs;
+        opts.memory_limit = limit;
+        run_benchmark(&opts, None)
+    };
+    let tight =
+        structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE + DECODER_AUXILIARY_BYTES + 1024;
+    let err = bench(vec![framed.clone(), big.clone()], Some(tight))
+        .expect_err("the largest input exceeds the limit")
+        .to_string();
+    assert!(err.contains("memory limit"), "{err}");
+    let err = bench(vec![framed, big], None)
+        .expect_err("the second input is not frames")
+        .to_string();
+    assert!(err.contains("data may be invalid"), "{err}");
+}
+
+/// A decoding benchmark with a time budget runs again until the budget is
+/// spent, and keeps the fastest pass.
+#[test]
+fn decoding_benchmark_repeats_within_its_budget() {
+    use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
+
+    let scratch = Scratch::new("bench-decode-budget");
+    let framed = scratch.file(
+        "a.zst",
+        &compress_to_vec(&b"a file\n".repeat(40)[..], CompressionLevel::Default),
+    );
+    let mut opts = parse(&["-b", "-d", "-i1", "-q", "x"]).unwrap();
+    opts.inputs = vec![framed];
+    let start = std::time::Instant::now();
+    run_benchmark(&opts, None).expect("frames are measured");
+    assert!(start.elapsed() >= std::time::Duration::from_secs(1));
+}
+
+/// A training run under `-M` reports the limit it trains within and still
+/// writes its dictionary.
+#[test]
+fn training_under_a_memory_limit_reports_it() {
+    let scratch = Scratch::new("train-memory");
+    let samples: Vec<PathBuf> = (0..8)
+        .map(|i| {
+            let text: Vec<u8> = (0..400u32)
+                .flat_map(|j| format!("sample {i} row {} key {}\n", j % 31, j % 7).into_bytes())
+                .collect();
+            scratch.file(&format!("s{i}"), &text)
+        })
+        .collect();
+    let output = scratch.path().join("dict");
+    let mut opts = parse(&["--train", "-q", "-M", "64MB", "s"]).unwrap();
+    opts.inputs = samples;
+    opts.output = Some(output.clone());
+    train_dictionary(&opts).expect("training within the limit succeeds");
+    assert!(fs::metadata(&output).unwrap().len() > 0);
+}
+
+/// A device given as input is not a file: it is refused and counted as
+/// failed, the run going on.
+#[cfg(unix)]
+#[test]
+fn a_device_input_is_refused() {
+    let mut opts = parse(&["-q", "x"]).unwrap();
+    opts.inputs = vec![PathBuf::from("/dev/null")];
+    assert_eq!(run(opts).unwrap(), 1);
+}
+
+/// An error the operating system did not raise keeps its own text.
+#[test]
+fn os_error_text_keeps_a_plain_error() {
+    assert_eq!(os_error_text(&io::Error::other("plain")), "plain");
+}
+
 /// A command line refused with an error of ours rather than a usage error
 /// fails with a status, and the small descriptive pieces read as intended.
 #[test]

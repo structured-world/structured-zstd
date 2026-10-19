@@ -48,14 +48,16 @@ def level_args(level):
 def compress(binary, level, src, dst):
     # --single-thread on both: the reference otherwise compresses in worker
     # threads, so its time would measure thread overlap, not the codec.
+    # Returns the seconds taken, or None when the tool failed: a failure is a
+    # result to report, not a reason to stop measuring the rest.
     start = time.perf_counter()
     with open(dst, "wb") as out:
-        subprocess.run(
+        result = subprocess.run(
             [binary, *level_args(level), "--single-thread", "-q", "-c", "--", str(src)],
             stdout=out,
-            check=True,
         )
-    return time.perf_counter() - start
+    elapsed = time.perf_counter() - start
+    return elapsed if result.returncode == 0 else None
 
 
 def decodes_to(binary, frame, original):
@@ -65,6 +67,10 @@ def decodes_to(binary, frame, original):
         stderr=subprocess.PIPE,
     )
     return result.returncode == 0 and result.stdout == original
+
+
+def ratio(value, places):
+    return "n/a" if value is None else f"{value:.{places}f}"
 
 
 def corpus_files(directory):
@@ -122,11 +128,25 @@ def main():
                     original = path.read_bytes()
                     row["input_bytes"] += len(original)
                     ours_best = reference_best = float("inf")
+                    failed = []
                     for _ in range(args.repeat):
-                        ours_best = min(ours_best, compress(args.ours, level, path, ours_frame))
-                        reference_best = min(
-                            reference_best, compress(args.reference, level, path, reference_frame)
+                        ours = compress(args.ours, level, path, ours_frame)
+                        reference = compress(args.reference, level, path, reference_frame)
+                        if ours is None:
+                            failed.append("ours")
+                        if reference is None:
+                            failed.append("reference")
+                        if failed:
+                            break
+                        ours_best = min(ours_best, ours)
+                        reference_best = min(reference_best, reference)
+                    if failed:
+                        # The file is left out of the sums so the ratios still
+                        # compare the same files on both sides.
+                        failures.append(
+                            f"compress ({', '.join(failed)}) {name} level {level}: {path}"
                         )
+                        continue
                     row["ours_seconds"] += ours_best
                     row["reference_seconds"] += reference_best
                     row["ours_bytes"] += ours_frame.stat().st_size
@@ -138,23 +158,30 @@ def main():
                     ):
                         if not decodes_to(binary, frame, original):
                             failures.append(f"{check} {name} level {level}: {path}")
-                row["size_ratio"] = row["ours_bytes"] / row["reference_bytes"]
-                row["time_ratio"] = row["ours_seconds"] / row["reference_seconds"]
+                # A cell where no file compressed on both sides has no ratio;
+                # the failures above already say why.
+                measured = row["reference_bytes"] > 0
+                row["size_ratio"] = (
+                    row["ours_bytes"] / row["reference_bytes"] if measured else None
+                )
+                row["time_ratio"] = (
+                    row["ours_seconds"] / row["reference_seconds"] if measured else None
+                )
                 # Below the floor the time is mostly process start-up, not the
                 # codec, so the ratio is reported but not held. Each record
                 # carries the limits it was held to.
-                held = row["reference_seconds"] >= args.time_floor
-                row["size_limit"] = args.ratio_limit
+                held = measured and row["reference_seconds"] >= args.time_floor
+                row["size_limit"] = args.ratio_limit if measured else 0
                 row["time_limit"] = args.time_limit if held else 0
                 rows.append(row)
                 print(
                     f"{name:<12} -{level:<3} files {row['files']:>3}  "
-                    f"size {row['ours_bytes']:>11} / {row['reference_bytes']:>11} = {row['size_ratio']:.4f}  "
-                    f"time {row['ours_seconds']:8.2f}s / {row['reference_seconds']:8.2f}s = {row['time_ratio']:.2f}"
+                    f"size {row['ours_bytes']:>11} / {row['reference_bytes']:>11} = {ratio(row['size_ratio'], 4)}  "
+                    f"time {row['ours_seconds']:8.2f}s / {row['reference_seconds']:8.2f}s = {ratio(row['time_ratio'], 2)}"
                     f"{'' if held else '  (below the time floor, not held)'}",
                     flush=True,
                 )
-                if args.ratio_limit and row["size_ratio"] > args.ratio_limit:
+                if row["size_limit"] and row["size_ratio"] > row["size_limit"]:
                     failures.append(
                         f"size {name} level {level}: {row['size_ratio']:.4f} > {args.ratio_limit}"
                     )

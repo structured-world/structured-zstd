@@ -406,6 +406,19 @@
         </div>
         <div id="legend-xval" class="html-legend"></div>
         <div id="xval-status" style="margin-top: 8px; font-size: 0.88rem"></div>
+        <table id="xval-table" style="margin-top: 8px">
+          <caption>Values behind the chart for the selected corpus and level (a limit of "-" was not held)</caption>
+          <thead>
+            <tr>
+              <th scope="col">Snapshot</th>
+              <th scope="col">Size ours ÷ reference</th>
+              <th scope="col">Size limit</th>
+              <th scope="col">Time ours ÷ reference</th>
+              <th scope="col">Time limit</th>
+            </tr>
+          </thead>
+          <tbody id="xval-table-body"></tbody>
+        </table>
       </section>
 
       <details class="card">
@@ -2594,6 +2607,26 @@
         statusEl.textContent = rows.length
           ? `Showing ${snapshots.length} snapshot(s), corpus=${corpus}, level=${level}.`
           : `No cross-validation points for corpus=${corpus}, level=${level}.`;
+        // The same values as text, for readers the canvas does not reach.
+        const cell = (value, digits) => (value === null || value <= 0 ? "-" : value.toFixed(digits));
+        el("xval-table-body").replaceChildren(
+          ...snapshots.map((snap) => {
+            const tr = document.createElement("tr");
+            const values = [
+              snap,
+              cell(at(snap, "size_ratio"), 4),
+              cell(at(snap, "size_limit"), 2),
+              cell(at(snap, "time_ratio"), 2),
+              cell(at(snap, "time_limit"), 2),
+            ];
+            for (const value of values) {
+              const td = document.createElement("td");
+              td.textContent = value;
+              tr.appendChild(td);
+            }
+            return tr;
+          }),
+        );
         const scales = {
           x: {
             title: { display: true, text: "Snapshot (generated_at / commit)" },
