@@ -50,6 +50,26 @@ impl LegacyVersion {
             LegacyVersion::V07 => 7,
         }
     }
+
+    /// The length of a frame header of this format starting `src`, magic
+    /// number included, as its size fields give it; `None` until `src` holds
+    /// the descriptor byte after the magic number. For a caller reading a
+    /// header in pieces, as [`frame_header_input_needed`] serves an RFC 8878
+    /// one.
+    ///
+    /// [`frame_header_input_needed`]: crate::decoding::frame_header_input_needed
+    ///
+    /// ```
+    /// use structured_zstd::decoding::LegacyVersion;
+    /// // v0.7, a one-byte dictionary ID and a window byte.
+    /// let header = [0x27, 0xB5, 0x2F, 0xFD, 0x01];
+    /// let version = LegacyVersion::of(&header).unwrap();
+    /// assert_eq!(version.header_size(&header[..4]), None);
+    /// assert_eq!(version.header_size(&header), Some(7));
+    /// ```
+    pub fn header_size(self, src: &[u8]) -> Option<usize> {
+        header_len(self, src).ok()
+    }
 }
 
 /// Most bytes one block decodes to, the formats' `BLOCKSIZE`.

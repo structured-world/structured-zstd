@@ -49,13 +49,6 @@ pub enum LegacyFrameError {
     /// The frame header sets a reserved bit or asks for a window the format
     /// does not allow.
     UnsupportedParameter,
-    /// The frame's window is past the ceiling in force.
-    WindowTooLarge {
-        /// The window the frame declares.
-        requested: u64,
-        /// The ceiling it exceeded.
-        limit: u64,
-    },
     /// The frame is malformed; `reason` names the structure that is.
     Corrupted {
         /// What failed to decode.
@@ -87,7 +80,6 @@ impl LegacyFrameError {
     pub fn code(&self) -> ErrorCode {
         match self {
             LegacyFrameError::UnsupportedParameter => ErrorCode::FrameParameterUnsupported,
-            LegacyFrameError::WindowTooLarge { .. } => ErrorCode::FrameParameterWindowTooLarge,
             LegacyFrameError::OutputTooSmall => ErrorCode::DstSizeTooSmall,
             LegacyFrameError::DictionaryCorrupted => ErrorCode::DictionaryCorrupted,
             LegacyFrameError::DictionaryMismatch { .. } => ErrorCode::DictionaryWrong,
@@ -110,10 +102,6 @@ impl fmt::Display for LegacyFrameError {
                     "the v0.5-v0.7 frame header asks for an unsupported setting"
                 )
             }
-            Self::WindowTooLarge { requested, limit } => write!(
-                f,
-                "the frame's window of {requested} bytes is past the ceiling of {limit}"
-            ),
             Self::Corrupted { reason } => write!(f, "corrupt v0.5-v0.7 frame: {reason}"),
             Self::OutputTooSmall => write!(f, "the output buffer is too small for the frame"),
             Self::DictionaryCorrupted => write!(f, "the dictionary could not be read"),
