@@ -391,6 +391,13 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         working-directory: zstd
         run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder,caller-workspace
+      - name: Test (without legacy)
+        # The default build decodes v0.5-v0.7 frames; without the feature the
+        # decoders and the command line refuse them as an unknown format. The
+        # feature changes only those two, so their tests run again here.
+        if: needs.changes.outputs.code == 'true'
+        working-directory: zstd
+        run: cargo nextest run --profile ci -p structured-zstd --no-default-features --features hash,std,dict-builder -E 'test(/^decoding::/) | binary_id(structured-zstd::bin/structured-zstd)'
       - name: Doc tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test --doc -p structured-zstd --features hash,std,dict-builder,caller-workspace
@@ -559,6 +566,11 @@ jobs:
       - name: Clippy (no_std + caller-workspace)
         working-directory: zstd
         run: cargo clippy -p structured-zstd --no-default-features --features caller-workspace,hash -- -D warnings
+      # The v0.5-v0.7 decoders without `hash`, where their content checksum
+      # is not computed.
+      - name: Clippy (no_std + legacy)
+        working-directory: zstd
+        run: cargo clippy -p structured-zstd --no-default-features --features legacy -- -D warnings
       # The clippy steps above compile for the host, which has SSE2 and a
       # float unit. A kernel target has neither (x86_64-unknown-none is
       # -sse,-sse2,...,+soft-float), so a vector type that
@@ -575,6 +587,7 @@ jobs:
             cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features hash
             cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features kernel-avx2,hash
             cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features caller-workspace,hash
+            cargo build -p structured-zstd --lib --profile "$profile" --target x86_64-unknown-none --no-default-features --features legacy,hash
           done
 
   wasm:
@@ -1005,6 +1018,13 @@ jobs:
         # feature, which the targets above must not get.
         working-directory: zstd/fuzz
         run: cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" --features workspace decode_workspace -- -max_total_time=90 -timeout=30
+      - name: Fuzz decode_legacy (90s, seeded with the v0.5-v0.7 frames)
+        # Seeded from `zstd/legacy_frames`: blind mutation rarely gets past
+        # these formats' entropy headers to their blocks.
+        working-directory: zstd/fuzz
+        run: |
+          mkdir -p corpus/decode_legacy
+          cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" decode_legacy corpus/decode_legacy ../legacy_frames -- -max_total_time=90 -timeout=30
       - name: Upload new crash artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v7

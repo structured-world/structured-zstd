@@ -1833,6 +1833,7 @@ fn decoding_names_the_foreign_format_it_cannot_read() {
 /// The v0.5-v0.7 frames the reference command decodes by default decode here
 /// too, and a v0.7 frame naming a dictionary it was not given fails as the
 /// reference's does.
+#[cfg(feature = "legacy")]
 #[test]
 fn decoding_reads_the_v05_to_v07_formats() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("legacy_frames");
