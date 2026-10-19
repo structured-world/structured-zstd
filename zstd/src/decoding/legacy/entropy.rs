@@ -9,7 +9,6 @@
 use super::corrupt;
 use crate::bit_io::BitReaderReversed;
 use crate::decoding::errors::LegacyFrameError as Error;
-use alloc::vec;
 use alloc::vec::Vec;
 
 /// A backward bitstream, read from its last byte toward its first.
@@ -230,15 +229,35 @@ pub(super) enum StreamEnd {
 }
 
 impl FseTable {
+    /// A table holding nothing yet, for [`Self::build`] and the setters to
+    /// fill.
+    pub(super) const fn empty() -> FseTable {
+        FseTable {
+            log: 0,
+            cells: Vec::new(),
+            fast: false,
+        }
+    }
+
     /// The table a distribution spreads (`FSEv07_buildDTable`).
     pub(super) fn new(dist: &Distribution) -> Result<FseTable, Error> {
+        let mut table = FseTable::empty();
+        table.build(dist)?;
+        Ok(table)
+    }
+
+    /// Spread `dist` into this table, in the cells it already has, as a block
+    /// sending a new description rebuilds its field's table.
+    pub(super) fn build(&mut self, dist: &Distribution) -> Result<(), Error> {
         let log = dist.table_log;
         if log > FSE_MAX_TABLE_LOG {
             return Err(corrupt("FSE table log too large"));
         }
         let size = 1usize << log;
         let counts = &dist.counts[..=dist.max_symbol];
-        let mut cells = vec![FseCell::default(); size];
+        let cells = &mut self.cells;
+        cells.clear();
+        cells.resize(size, FseCell::default());
         let mut next = [0u16; 256];
 
         // Symbols below one state take the top cells, one each.
@@ -275,7 +294,7 @@ impl FseTable {
             return Err(corrupt("FSE distribution does not fill its table"));
         }
 
-        for cell in &mut cells {
+        for cell in cells.iter_mut() {
             let state = next[usize::from(cell.symbol)];
             next[usize::from(cell.symbol)] += 1;
             let nb_bits = log - (31 - u32::from(state).leading_zeros());
@@ -283,37 +302,34 @@ impl FseTable {
             cell.new_state = ((u32::from(state) << nb_bits) - size as u32) as u16;
         }
         let large = 1i16 << (log - 1);
-        let fast = counts.iter().all(|&count| count < large);
-        Ok(FseTable { log, cells, fast })
+        self.fast = counts.iter().all(|&count| count < large);
+        self.log = log;
+        Ok(())
     }
 
-    /// A table reading every symbol as `nb_bits` raw bits (`FSEv07_buildDTable_raw`).
-    pub(super) fn raw(nb_bits: u32) -> FseTable {
-        let cells = (0..1usize << nb_bits)
-            .map(|symbol| FseCell {
+    /// Read every symbol as `nb_bits` raw bits (`FSEv07_buildDTable_raw`).
+    pub(super) fn set_raw(&mut self, nb_bits: u32) {
+        self.cells.clear();
+        self.cells
+            .extend((0..1usize << nb_bits).map(|symbol| FseCell {
                 new_state: 0,
                 symbol: symbol as u8,
                 nb_bits: nb_bits as u8,
-            })
-            .collect();
-        FseTable {
-            log: nb_bits,
-            cells,
-            fast: true,
-        }
+            }));
+        self.log = nb_bits;
+        self.fast = true;
     }
 
-    /// A table producing `symbol` without reading (`FSEv07_buildDTable_rle`).
-    pub(super) fn rle(symbol: u8) -> FseTable {
-        FseTable {
-            log: 0,
-            cells: vec![FseCell {
-                new_state: 0,
-                symbol,
-                nb_bits: 0,
-            }],
-            fast: false,
-        }
+    /// Produce `symbol` without reading (`FSEv07_buildDTable_rle`).
+    pub(super) fn set_rle(&mut self, symbol: u8) {
+        self.cells.clear();
+        self.cells.push(FseCell {
+            new_state: 0,
+            symbol,
+            nb_bits: 0,
+        });
+        self.log = 0;
+        self.fast = false;
     }
 }
 
@@ -352,6 +368,7 @@ fn fse_decompress(
     out: &mut [u8; 256],
     limit: usize,
     end: StreamEnd,
+    table: &mut FseTable,
 ) -> Result<usize, Error> {
     if src.len() < 2 {
         return Err(Error::Truncated);
@@ -360,33 +377,34 @@ fn fse_decompress(
     if description_len >= src.len() {
         return Err(Error::Truncated);
     }
-    let table = FseTable::new(&dist)?;
+    table.build(&dist)?;
+    let table = &*table;
     let mut bits = open_bits(&src[description_len..])?;
-    let mut first = FseState::new(&table, &mut bits);
-    let mut second = FseState::new(&table, &mut bits);
+    let mut first = FseState::new(table, &mut bits);
+    let mut second = FseState::new(table, &mut bits);
     if end == StreamEnd::Exact {
-        return decode_to_exact_end(&table, &mut bits, [first, second], out, limit);
+        return decode_to_exact_end(table, &mut bits, [first, second], out, limit);
     }
     let mut n = 0usize;
     loop {
         if n + 2 > limit {
             return Err(corrupt("FSE stream decodes past its output"));
         }
-        out[n] = first.symbol(&table);
+        out[n] = first.symbol(table);
         n += 1;
-        first.update(&table, &mut bits);
+        first.update(table, &mut bits);
         if overflowed(&bits) {
-            out[n] = second.symbol(&table);
+            out[n] = second.symbol(table);
             return Ok(n + 1);
         }
         if n + 2 > limit {
             return Err(corrupt("FSE stream decodes past its output"));
         }
-        out[n] = second.symbol(&table);
+        out[n] = second.symbol(table);
         n += 1;
-        second.update(&table, &mut bits);
+        second.update(table, &mut bits);
         if overflowed(&bits) {
-            out[n] = first.symbol(&table);
+            out[n] = first.symbol(table);
             return Ok(n + 1);
         }
     }
@@ -429,6 +447,9 @@ pub(super) struct HufTable {
     log: u32,
     /// `(symbol, code length)` per entry.
     cells: Vec<(u8, u8)>,
+    /// The table an FSE-coded weight description is read with, kept for the
+    /// next description.
+    weight_table: FseTable,
 }
 
 /// Run lengths a description starting with byte `242 + i` stands for: that
@@ -436,10 +457,27 @@ pub(super) struct HufTable {
 const WEIGHT_RUNS: [usize; 14] = [1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128];
 
 impl HufTable {
+    /// A table holding nothing yet, for [`Self::read_into`] to fill.
+    pub(super) const fn empty() -> HufTable {
+        HufTable {
+            log: 0,
+            cells: Vec::new(),
+            weight_table: FseTable::empty(),
+        }
+    }
+
     /// Read a Huffman table description (`HUFv07_readStats` and
     /// `HUFv07_readDTableX2`), its weights FSE-coded with the ending `end`.
     /// Returns the table and the bytes read.
     pub(super) fn read(src: &[u8], end: StreamEnd) -> Result<(HufTable, usize), Error> {
+        let mut table = HufTable::empty();
+        let consumed = table.read_into(src, end)?;
+        Ok((table, consumed))
+    }
+
+    /// [`Self::read`] into this table's own storage, as each block with a
+    /// new description replaces the table. Returns the bytes read.
+    pub(super) fn read_into(&mut self, src: &[u8], end: StreamEnd) -> Result<usize, Error> {
         let &header = src.first().ok_or(Error::Truncated)?;
         let mut weights = [0u8; 256];
         let (explicit, consumed) = match header {
@@ -460,10 +498,13 @@ impl HufTable {
             _ => {
                 let len = usize::from(header);
                 let body = src.get(1..1 + len).ok_or(Error::Truncated)?;
-                (fse_decompress(body, &mut weights, 255, end)?, len + 1)
+                let explicit =
+                    fse_decompress(body, &mut weights, 255, end, &mut self.weight_table)?;
+                (explicit, len + 1)
             }
         };
-        Ok((HufTable::from_weights(&mut weights, explicit)?, consumed))
+        self.fill(&mut weights, explicit)?;
+        Ok(consumed)
     }
 
     /// The table whose weights are an RFC 8878 description's code lengths,
@@ -482,12 +523,14 @@ impl HufTable {
             *weight = if len == 0 { 0 } else { max_bits + 1 - len };
         }
         // The last weight is inferred again, from the others.
-        HufTable::from_weights(&mut weights, explicit)
+        let mut table = HufTable::empty();
+        table.fill(&mut weights, explicit)?;
+        Ok(table)
     }
 
     /// Build the table from the first `explicit` weights, inferring the
     /// weight of the symbol after them.
-    fn from_weights(weights: &mut [u8; 256], explicit: usize) -> Result<HufTable, Error> {
+    fn fill(&mut self, weights: &mut [u8; 256], explicit: usize) -> Result<(), Error> {
         let mut ranks = [0u32; HUF_WEIGHT_LIMIT as usize + 1];
         let mut total = 0u32;
         for &weight in &weights[..explicit] {
@@ -527,7 +570,9 @@ impl HufTable {
             start[weight] = next;
             next += ranks[weight] << (weight - 1);
         }
-        let mut cells = vec![(0u8, 0u8); 1 << log];
+        let cells = &mut self.cells;
+        cells.clear();
+        cells.resize(1 << log, (0, 0));
         for (symbol, &weight) in weights[..=explicit].iter().enumerate() {
             if weight == 0 {
                 continue;
@@ -537,7 +582,8 @@ impl HufTable {
             cells[first..first + len].fill((symbol as u8, (log + 1 - u32::from(weight)) as u8));
             start[usize::from(weight)] += len as u32;
         }
-        Ok(HufTable { log, cells })
+        self.log = log;
+        Ok(())
     }
 
     #[inline]

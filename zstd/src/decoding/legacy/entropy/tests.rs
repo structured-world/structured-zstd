@@ -1,5 +1,6 @@
 use super::*;
 use crate::decoding::legacy::v07::{LL_DEFAULT, LL_DEFAULT_LOG};
+use alloc::vec;
 
 /// A bitstream opens past the padding up to its end mark; an empty one, or
 /// one whose last byte has no mark, is refused.
@@ -37,6 +38,33 @@ fn predefined_distributions_fill_their_table() {
     }
 }
 
+/// A table built over another's storage, a larger one or one set to raw
+/// bits, is the table a fresh build gives: nothing of the earlier table stays.
+#[test]
+fn a_table_rebuilt_in_place_is_a_fresh_one() {
+    let dist = Distribution::predefined(&LL_DEFAULT, LL_DEFAULT_LOG);
+    let fresh = FseTable::new(&dist).unwrap();
+    let mut reused = FseTable::empty();
+    reused.set_raw(9);
+    reused.build(&dist).unwrap();
+    assert_eq!(reused.log, fresh.log);
+    assert_eq!(reused.fast, fresh.fast);
+    assert_eq!(reused.cells.len(), fresh.cells.len());
+    for (a, b) in reused.cells.iter().zip(&fresh.cells) {
+        assert_eq!(
+            (a.symbol, a.nb_bits, a.new_state),
+            (b.symbol, b.nb_bits, b.new_state)
+        );
+    }
+    // A Huffman table read over a wider one is the narrower table alone.
+    let (fresh, _) = HufTable::read(&[127 + 2, 0x11], StreamEnd::PastStart).unwrap();
+    let (mut reused, _) = HufTable::read(&[255], StreamEnd::PastStart).unwrap();
+    reused
+        .read_into(&[127 + 2, 0x11], StreamEnd::PastStart)
+        .unwrap();
+    assert_eq!((reused.log, &reused.cells), (fresh.log, &fresh.cells));
+}
+
 /// A distribution that does not sum to its table is refused, as one with
 /// more below-one symbols than cells.
 #[test]
@@ -64,7 +92,8 @@ fn bad_descriptions_are_refused() {
 /// backward; a one-symbol table reads nothing.
 #[test]
 fn raw_and_rle_tables_read_as_described() {
-    let raw = FseTable::raw(5);
+    let mut raw = FseTable::empty();
+    raw.set_raw(5);
     // Under the end mark: 11010 then 11, padded with zeros past the start.
     let mut bits = open_bits(&[0b1110_1011]).unwrap();
     let mut state = FseState::new(&raw, &mut bits);
@@ -73,7 +102,9 @@ fn raw_and_rle_tables_read_as_described() {
     assert_eq!(state.symbol(&raw), 0b11000);
     assert!(overflowed(&bits));
 
-    let rle = FseTable::rle(42);
+    // Set over the raw table's storage, as a block's next mode is.
+    let mut rle = raw;
+    rle.set_rle(42);
     let mut bits = open_bits(&[0x80]).unwrap();
     let mut state = FseState::new(&rle, &mut bits);
     for _ in 0..3 {

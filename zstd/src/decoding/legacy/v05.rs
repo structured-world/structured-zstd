@@ -54,6 +54,8 @@ pub(super) fn read_header(src: &[u8]) -> Result<FrameHeader, Error> {
 pub(super) struct Decoder {
     /// The dictionary's Huffman table, which repeat-table literals use.
     dict_huf: Option<HufTable>,
+    /// The table a block's own Huffman description is read into.
+    huf: HufTable,
     tables: SeqTables,
     /// Whether a block may keep the previous tables: once a dictionary has
     /// been loaded (`flagStaticTables`).
@@ -67,6 +69,7 @@ impl Decoder {
     pub(super) fn new(bytes: &[u8]) -> Result<(Decoder, core::ops::Range<usize>), Error> {
         let mut decoder = Decoder {
             dict_huf: None,
+            huf: HufTable::empty(),
             tables: SeqTables::default(),
             repeat_tables: false,
             literals: Vec::new(),
@@ -136,7 +139,13 @@ impl Decoder {
                 self.literals.clear();
                 if single_stream {
                     self.literals.resize(size, 0);
-                    huffman(src, &mut self.literals, false, StreamEnd::Exact)?;
+                    huffman(
+                        &mut self.huf,
+                        src,
+                        &mut self.literals,
+                        false,
+                        StreamEnd::Exact,
+                    )?;
                 } else {
                     // `HUFv05_decompress`: an uncompressed section is not
                     // Huffman literals here, a one-byte section is a run.
@@ -147,7 +156,13 @@ impl Decoder {
                         self.literals.resize(size, src[0]);
                     } else {
                         self.literals.resize(size, 0);
-                        huffman(src, &mut self.literals, true, StreamEnd::Exact)?;
+                        huffman(
+                            &mut self.huf,
+                            src,
+                            &mut self.literals,
+                            true,
+                            StreamEnd::Exact,
+                        )?;
                     }
                 }
                 (LiteralSource::Buffer, header + compressed)
@@ -335,9 +350,21 @@ fn field_table(
     field: Field,
     repeat: bool,
 ) -> Result<usize, Error> {
-    let (new, len) = match mode {
+    if mode == 2 {
+        if !repeat || table.is_none() {
+            return Err(corrupt("sequence table repeated before one was sent"));
+        }
+        return Ok(0);
+    }
+    // Built in the previous table's storage; left unset should the
+    // description be bad, so no later block repeats a half-built table.
+    let mut new = table.take().unwrap_or_else(FseTable::empty);
+    let len = match mode {
         // Every symbol read as raw bits.
-        0 => (FseTable::raw(field.raw_bits), 0),
+        0 => {
+            new.set_raw(field.raw_bits);
+            0
+        }
         1 => {
             if field.checked_rle && at + 2 > src.len() {
                 return Err(Error::Truncated);
@@ -350,13 +377,8 @@ fn field_table(
             } else {
                 symbol
             };
-            (FseTable::rle(symbol), 1)
-        }
-        2 => {
-            if !repeat || table.is_none() {
-                return Err(corrupt("sequence table repeated before one was sent"));
-            }
-            return Ok(0);
+            new.set_rle(symbol);
+            1
         }
         _ => {
             let (dist, len) = super::entropy::read_distribution(&src[at..], field.max)
@@ -364,7 +386,8 @@ fn field_table(
             if dist.table_log() > field.max_log {
                 return Err(corrupt("sequence table too large"));
             }
-            (FseTable::new(&dist)?, len)
+            new.build(&dist)?;
+            len
         }
     };
     *table = Some(new);

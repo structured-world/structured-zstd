@@ -46,6 +46,15 @@ build() {
 rm -rf "$out"
 mkdir -p "$out"
 
+# A frame several windows long, whose matches reach back across the point
+# where a buffered decoder starts its next segment: z000000 eight times, each
+# copy a match on the one before. Tests rebuild it from the name `<file>x<N>`.
+repeated="$work/z000000x8"
+: >"$repeated"
+for _ in 1 2 3 4 5 6 7 8; do
+  cat "$corpus/z000000" >>"$repeated"
+done
+
 for release in "${releases[@]}"; do
   read -r version digest <<<"$release"
   tag="v0${version:2:1}"
@@ -56,6 +65,7 @@ for release in "${releases[@]}"; do
       "$zstd_bin" -q -f "-$level" "$corpus/$input" -o "$out/$input.$tag.l$level.zst"
     done
   done
+  "$zstd_bin" -q -f -1 "$repeated" -o "$out/z000000x8.$tag.l1.zst"
 
   # A dictionary trained by the release itself, and frames that need it.
   # The training set is listed in sorted order, so the dictionary is the same

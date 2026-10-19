@@ -265,7 +265,12 @@ impl Decoder {
                 if !single_stream && (compressed >= size || compressed <= 1) {
                     return Err(corrupt("Huffman literals no smaller than their content"));
                 }
-                let (table, table_len) = HufTable::read(src, StreamEnd::PastStart)
+                // Built in the previous table's storage; left unset should the
+                // description be bad, so no later block repeats a half-built
+                // table.
+                let mut table = self.huf.take().unwrap_or_else(HufTable::empty);
+                let table_len = table
+                    .read_into(src, StreamEnd::PastStart)
                     .map_err(|_| corrupt("bad Huffman table"))?;
                 if table_len >= src.len() {
                     return Err(corrupt("Huffman table fills the literal section"));
@@ -447,26 +452,30 @@ pub(super) fn seq_table(
     repeat: bool,
 ) -> Result<usize, Error> {
     let (max, max_log, default, default_log) = field;
-    let (new, len) = match mode {
+    // The previous table, in place.
+    if mode == 2 {
+        if !repeat || table.is_none() {
+            return Err(corrupt("sequence table repeated before one was sent"));
+        }
+        return Ok(0);
+    }
+    // Built in the previous table's storage; left unset should the
+    // description be bad, so no later block repeats a half-built table.
+    let mut new = table.take().unwrap_or_else(FseTable::empty);
+    let len = match mode {
         // Predefined.
-        0 => (
-            FseTable::new(&Distribution::predefined(default, default_log))?,
-            0,
-        ),
+        0 => {
+            new.build(&Distribution::predefined(default, default_log))?;
+            0
+        }
         // One symbol throughout.
         1 => {
             let &symbol = src.first().ok_or(Error::Truncated)?;
             if usize::from(symbol) > max {
                 return Err(corrupt("sequence symbol out of range"));
             }
-            (FseTable::rle(symbol), 1)
-        }
-        // The previous table, in place.
-        2 => {
-            if !repeat || table.is_none() {
-                return Err(corrupt("sequence table repeated before one was sent"));
-            }
-            return Ok(0);
+            new.set_rle(symbol);
+            1
         }
         _ => {
             let (dist, len) = super::entropy::read_distribution(src, max)
@@ -474,7 +483,8 @@ pub(super) fn seq_table(
             if dist.table_log() > max_log {
                 return Err(corrupt("sequence table too large"));
             }
-            (FseTable::new(&dist)?, len)
+            new.build(&dist)?;
+            len
         }
     };
     *table = Some(new);

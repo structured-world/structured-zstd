@@ -60,6 +60,8 @@ pub(super) fn read_header(src: &[u8]) -> Result<FrameHeader, Error> {
 pub(super) struct Decoder {
     /// The dictionary's Huffman table, which repeat-table literals use.
     dict_huf: Option<HufTable>,
+    /// The table a block's own Huffman description is read into.
+    huf: HufTable,
     tables: SeqTables,
     /// Whether the next block may use the dictionary's tables: from loading a
     /// dictionary until the first sequence section is read
@@ -74,6 +76,7 @@ impl Decoder {
     pub(super) fn new(bytes: &[u8]) -> Result<(Decoder, core::ops::Range<usize>), Error> {
         let mut decoder = Decoder {
             dict_huf: None,
+            huf: HufTable::empty(),
             tables: SeqTables::default(),
             repeat_tables: false,
             literals: Vec::new(),
@@ -143,7 +146,13 @@ impl Decoder {
                 self.literals.clear();
                 if single_stream {
                     self.literals.resize(size, 0);
-                    huffman(src, &mut self.literals, false, StreamEnd::PastStart)?;
+                    huffman(
+                        &mut self.huf,
+                        src,
+                        &mut self.literals,
+                        false,
+                        StreamEnd::PastStart,
+                    )?;
                 } else {
                     // `HUFv06_decompress`: a section as long as its content
                     // is the content, a one-byte section is a run of it.
@@ -156,7 +165,13 @@ impl Decoder {
                         self.literals.resize(size, src[0]);
                     } else {
                         self.literals.resize(size, 0);
-                        huffman(src, &mut self.literals, true, StreamEnd::PastStart)?;
+                        huffman(
+                            &mut self.huf,
+                            src,
+                            &mut self.literals,
+                            true,
+                            StreamEnd::PastStart,
+                        )?;
                     }
                 }
                 (LiteralSource::Buffer, header + compressed)
@@ -289,16 +304,19 @@ impl Decoder {
     }
 }
 
-/// Decode Huffman literals with the table their section starts with, into
-/// `out` (`HUFv06_decompress1X2` / `HUFv06_decompress4X2`); `end` is how the
-/// format ends the table's FSE-coded weights.
+/// Decode Huffman literals with the table their section starts with, read
+/// into `table`, into `out` (`HUFv06_decompress1X2` / `HUFv06_decompress4X2`);
+/// `end` is how the format ends the table's FSE-coded weights.
 pub(super) fn huffman(
+    table: &mut HufTable,
     src: &[u8],
     out: &mut [u8],
     four_streams: bool,
     end: StreamEnd,
 ) -> Result<(), Error> {
-    let (table, table_len) = HufTable::read(src, end).map_err(|_| corrupt("bad Huffman table"))?;
+    let table_len = table
+        .read_into(src, end)
+        .map_err(|_| corrupt("bad Huffman table"))?;
     if table_len >= src.len() {
         return Err(corrupt("Huffman table fills the literal section"));
     }

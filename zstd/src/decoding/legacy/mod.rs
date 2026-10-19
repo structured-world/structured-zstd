@@ -243,21 +243,28 @@ pub(crate) trait Output {
     /// content checksum.
     #[cfg(feature = "hash")]
     fn since(&self, from: usize) -> &[u8];
+    /// Append a match of `len` bytes from `offset` back. An output holding
+    /// the whole frame takes it from the frame, the dictionary in front of
+    /// it, or both ([`copy_match`]); the room for `len` bytes is reserved.
+    fn copy_match(&mut self, offset: usize, len: usize, dict: &[u8]) -> Result<(), Error>
+    where
+        Self: Sized,
+    {
+        copy_match(self, offset, len, dict)
+    }
 }
 
 /// Output into a growing vector, the current frame starting at `start`.
 pub(crate) struct VecOutput<'a> {
     pub(crate) buf: &'a mut Vec<u8>,
     pub(crate) start: usize,
-    /// Bytes of the frame already handed on and dropped from `buf`.
-    pub(crate) dropped: usize,
     /// Most bytes the frame may produce.
     pub(crate) limit: usize,
 }
 
 impl Output for VecOutput<'_> {
     fn produced(&self) -> usize {
-        self.dropped + self.held()
+        self.held()
     }
 
     fn held(&self) -> usize {
@@ -294,7 +301,7 @@ impl Output for VecOutput<'_> {
 
     #[cfg(feature = "hash")]
     fn since(&self, from: usize) -> &[u8] {
-        &self.buf[self.start + (from - self.dropped)..]
+        &self.buf[self.start + from..]
     }
 }
 
@@ -405,7 +412,7 @@ fn execute<O: Output>(
         .ok_or(corrupt("sequence takes more literals than the block has"))?;
     out.extend(lits);
     *lit_pos += lit_len;
-    copy_match(out, offset, match_len, dict)
+    out.copy_match(offset, match_len, dict)
 }
 
 /// The literal section's header, common to the three formats.
@@ -571,6 +578,9 @@ impl<O: Output> Output for Budget<'_, O> {
     fn since(&self, from: usize) -> &[u8] {
         self.out.since(from)
     }
+    fn copy_match(&mut self, offset: usize, len: usize, dict: &[u8]) -> Result<(), Error> {
+        self.out.copy_match(offset, len, dict)
+    }
 }
 
 /// A frame being decoded block by block: the whole-buffer and the streaming
@@ -726,14 +736,20 @@ pub(crate) struct LegacyStream {
     frame: Option<LegacyFrame>,
     /// The dictionary the frame was started with.
     dict: Option<crate::decoding::DictionaryHandle>,
-    /// Output still within reach of a match, and output not handed out yet.
+    /// The output segments: the current one at `..end`, and past it what is
+    /// left of the one before.
     buf: Vec<u8>,
-    /// Bytes of the frame dropped from the front of `buf`.
-    dropped: usize,
-    /// How much of `buf` has been handed out.
+    /// End of the current segment.
+    end: usize,
+    /// Bytes of the frame in segments before the current one.
+    earlier: usize,
+    /// End of the segment before the current one, once there is one.
+    previous_end: Option<usize>,
+    /// How much of the current segment has been handed out.
     delivered: usize,
-    /// History kept for matches: the window and one block.
-    keep: usize,
+    /// Most the buffer holds before a block starts a new segment: the window
+    /// and one block, so the segment before keeps the window in reach.
+    capacity: usize,
     /// Whether the frame's end block has been read.
     finished: bool,
     /// Bytes of the frame read so far, its header included.
@@ -748,9 +764,11 @@ impl LegacyStream {
             frame: None,
             dict: None,
             buf: Vec::new(),
-            dropped: 0,
+            end: 0,
+            earlier: 0,
+            previous_end: None,
             delivered: 0,
-            keep: 0,
+            capacity: 0,
             finished: false,
             consumed: 0,
             block: Vec::new(),
@@ -770,12 +788,14 @@ impl LegacyStream {
         self.frame = Some(LegacyFrame::new(header, legacy_dict)?);
         self.dict = dict;
         self.buf.clear();
-        self.dropped = 0;
+        self.end = 0;
+        self.earlier = 0;
+        self.previous_end = None;
         self.delivered = 0;
         // Every header reader holds the window to its format's largest, at
         // most 128 MiB, which every target addresses.
         debug_assert!(header.window <= 1 << 27);
-        self.keep = header.window as usize + BLOCK_SIZE_MAX;
+        self.capacity = header.window as usize + BLOCK_SIZE_MAX;
         self.finished = false;
         self.consumed = header.size as u64;
         Ok(())
@@ -786,6 +806,7 @@ impl LegacyStream {
         self.frame = None;
         self.dict = None;
         self.buf.clear();
+        self.end = 0;
         self.delivered = 0;
         self.finished = false;
     }
@@ -803,12 +824,12 @@ impl LegacyStream {
 
     /// Decoded bytes not handed out yet.
     pub(crate) fn undelivered(&self) -> usize {
-        self.buf.len() - self.delivered
+        self.end - self.delivered
     }
 
     /// Bytes the frame has decoded to so far.
     pub(crate) fn produced(&self) -> u64 {
-        (self.dropped + self.buf.len()) as u64
+        (self.earlier + self.end) as u64
     }
 
     /// Bytes of the frame read so far, its header included.
@@ -869,7 +890,7 @@ impl LegacyStream {
 
     /// The undelivered output, which [`Self::mark_delivered`] then hands out.
     pub(crate) fn undelivered_bytes(&self) -> &[u8] {
-        &self.buf[self.delivered..]
+        &self.buf[self.delivered..self.end]
     }
 
     /// Count the first `n` undelivered bytes as handed out.
@@ -917,9 +938,11 @@ impl LegacyStream {
             frame,
             dict,
             buf,
-            dropped,
+            end,
+            earlier,
+            previous_end,
             delivered,
-            keep,
+            capacity,
             finished,
             consumed,
             block: _,
@@ -932,25 +955,144 @@ impl LegacyStream {
             *finished = true;
             return Ok(());
         }
-        // Drop history out of reach once it has been handed out, a block's
-        // worth at a time so the move is paid once per block at most.
-        if buf.len() > *keep + BLOCK_SIZE_MAX {
-            let drop = (buf.len() - *keep).min(*delivered);
-            buf.drain(..drop);
-            *delivered -= drop;
-            *dropped += drop;
+        // A block that would not fit starts a new segment at the buffer's
+        // start, once the current one is all handed out; the one before stays
+        // where it is for matches, as upstream's buffered decoders wrap
+        // (`ZBUFFv07_decompressContinue`). Output held back by a caller that
+        // has not collected it grows the buffer instead.
+        if *end + BLOCK_SIZE_MAX > *capacity && *delivered == *end && *end > 0 {
+            *earlier += *end;
+            *previous_end = Some(*end);
+            *end = 0;
+            *delivered = 0;
         }
         let dict_bytes = dict
             .as_ref()
             .map_or(LegacyDict::None, |dict| LegacyDict::Parsed(dict.as_dict()))
             .content_bytes();
-        let mut out = VecOutput {
+        let mut out = SegmentOutput {
             buf,
-            start: 0,
-            dropped: *dropped,
-            limit: usize::MAX,
+            end: *end,
+            earlier: *earlier,
+            previous_end: *previous_end,
+            capacity: *capacity,
         };
-        frame.block(block, &step[3..], &mut out, dict_bytes)
+        let decoded = frame.block(block, &step[3..], &mut out, dict_bytes);
+        *end = out.end;
+        decoded
+    }
+}
+
+/// Output into a stream's segments: the current segment from the buffer's
+/// start to `end`, and the segment before it, which ends at `previous_end`,
+/// past the current one.
+struct SegmentOutput<'b> {
+    buf: &'b mut Vec<u8>,
+    end: usize,
+    earlier: usize,
+    previous_end: Option<usize>,
+    /// What the buffer grows to at most while segments wrap.
+    capacity: usize,
+}
+
+impl SegmentOutput<'_> {
+    /// Make room for `len` more bytes at `end`; the buffer grows only where
+    /// the segment runs past what it holds, doubling up to `capacity` and
+    /// past it only for output a caller holds back.
+    fn room(&mut self, len: usize) -> core::ops::Range<usize> {
+        let to = self.end + len;
+        if to > self.buf.capacity() {
+            // A `Vec` holds at most `isize::MAX` bytes, so doubling its
+            // length stays within `usize`.
+            let doubled = 2 * self.buf.len();
+            let target = if to <= self.capacity {
+                doubled.clamp(to, self.capacity)
+            } else {
+                doubled.max(to)
+            };
+            self.buf.reserve_exact(target - self.buf.len());
+        }
+        if to > self.buf.len() {
+            self.buf.resize(to, 0);
+        }
+        self.end..to
+    }
+}
+
+impl Output for SegmentOutput<'_> {
+    fn produced(&self) -> usize {
+        self.earlier + self.end
+    }
+
+    fn held(&self) -> usize {
+        self.end
+    }
+
+    fn reserve(&mut self, _len: usize) -> Result<(), Error> {
+        // The block's own budget bounds what it adds.
+        Ok(())
+    }
+
+    fn extend(&mut self, bytes: &[u8]) {
+        let at = self.room(bytes.len());
+        self.buf[at].copy_from_slice(bytes);
+        self.end += bytes.len();
+    }
+
+    fn repeat(&mut self, byte: u8, len: usize) {
+        let at = self.room(len);
+        self.buf[at].fill(byte);
+        self.end += len;
+    }
+
+    fn copy_back(&mut self, offset: usize, len: usize) {
+        let from = self.end - offset;
+        let at = self.room(len);
+        if offset >= len {
+            self.buf.copy_within(from..from + len, at.start);
+        } else {
+            for i in 0..len {
+                self.buf[at.start + i] = self.buf[from + i];
+            }
+        }
+        self.end += len;
+    }
+
+    #[cfg(feature = "hash")]
+    fn since(&self, from: usize) -> &[u8] {
+        &self.buf[self.end - (self.produced() - from)..self.end]
+    }
+
+    fn copy_match(&mut self, offset: usize, len: usize, dict: &[u8]) -> Result<(), Error> {
+        let Some(previous_end) = self.previous_end else {
+            // One segment so far: it holds the whole frame.
+            return copy_match(self, offset, len, dict);
+        };
+        if offset == 0 {
+            return Err(corrupt("match with offset 0"));
+        }
+        if offset <= self.end {
+            self.copy_back(offset, len);
+            return Ok(());
+        }
+        // Into the segment before, which the current one has not yet
+        // overwritten from `end` on.
+        let back = offset - self.end;
+        let from = previous_end
+            .checked_sub(back)
+            .filter(|&from| from >= self.end)
+            .ok_or(corrupt("match reaches before the window"))?;
+        let first = len.min(back);
+        let at = self.room(first);
+        self.buf.copy_within(from..from + first, at.start);
+        self.end += first;
+        let rest = len - first;
+        if rest > 0 {
+            // The match runs on from the current segment's first byte.
+            let distance = self.end;
+            self.copy_back(distance, rest);
+        }
+        Ok(())
     }
 }
 

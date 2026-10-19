@@ -4169,7 +4169,6 @@ impl FrameDecoder {
         let mut out = VecOutput {
             buf: output,
             start,
-            dropped: 0,
             limit: usize::MAX,
         };
         let decoded = legacy::decode_frame(input, legacy_dict(dict), &mut out);

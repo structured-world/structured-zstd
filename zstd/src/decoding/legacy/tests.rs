@@ -62,16 +62,21 @@ mod fixtures {
                     _ => LegacyVersion::V07,
                 };
                 let is_dict = name.contains(".dict");
+                // `<file>x<N>` is the file N times over.
+                let (file, times) = stem
+                    .rsplit_once('x')
+                    .and_then(|(file, n)| Some((file, n.parse::<usize>().ok()?)))
+                    .unwrap_or((stem.as_str(), 1));
                 let source: PathBuf = if is_dict {
-                    root().join("dict_tests/files").join(&stem)
+                    root().join("dict_tests/files").join(file)
                 } else {
-                    root().join("decodecorpus_files").join(&stem)
+                    root().join("decodecorpus_files").join(file)
                 };
                 let dict =
                     is_dict.then(|| std::fs::read(dir.join(format!("dictionary.{rest}"))).unwrap());
                 Fixture {
                     frame: std::fs::read(dir.join(&name)).unwrap(),
-                    content: std::fs::read(&source).unwrap(),
+                    content: std::fs::read(&source).unwrap().repeat(times),
                     parsed: dict.as_deref().map(|raw| {
                         crate::decoding::Dictionary::from_serialized_or_raw_content(raw).unwrap()
                     }),
@@ -92,7 +97,6 @@ fn decode_to_vec(frame: &[u8], dict: LegacyDict<'_>) -> Result<(Vec<u8>, usize),
     let mut out = VecOutput {
         buf: &mut buf,
         start: 0,
-        dropped: 0,
         limit: usize::MAX,
     };
     let consumed = decode_frame(frame, dict, &mut out)?;
@@ -717,6 +721,47 @@ fn a_stream_holds_its_window_not_the_frame() {
     assert_eq!(stream.produced(), expected.len() as u64);
     assert_eq!(stream.consumed(), frame.len() as u64);
     assert!(largest <= 4 * BLOCK_SIZE_MAX, "held {largest} bytes");
+}
+
+/// A frame several windows long decodes through the stream with its matches
+/// reaching into the segment before the current one, the buffer never past
+/// the window and a block.
+#[cfg(feature = "std")]
+#[test]
+fn a_stream_reads_matches_from_the_segment_before() {
+    for fixture in fixtures()
+        .into_iter()
+        .filter(|f| f.name.starts_with("z000000x8."))
+    {
+        let header = read_header(&fixture.frame).unwrap();
+        let capacity = header.window as usize + BLOCK_SIZE_MAX;
+        assert!(
+            fixture.content.len() > 2 * capacity,
+            "{}: the frame must outrun the buffer",
+            fixture.name
+        );
+        let mut stream = LegacyStream::new();
+        stream.start(header, None).unwrap();
+        let mut src = &fixture.frame[header.size..];
+        let mut out = Vec::new();
+        let mut target = vec![0u8; 4096];
+        while !(stream.is_finished() && stream.undelivered() == 0) {
+            let (read, written) = stream
+                .decode(src, &mut target)
+                .unwrap_or_else(|err| panic!("{}: {err}", fixture.name));
+            assert!(read > 0 || written > 0, "{} stalled", fixture.name);
+            src = &src[read..];
+            out.extend_from_slice(&target[..written]);
+        }
+        assert!(out == fixture.content, "{}", fixture.name);
+        assert!(
+            stream.heap_bytes() <= capacity,
+            "{}: held {} bytes for a window of {}",
+            fixture.name,
+            stream.heap_bytes(),
+            header.window
+        );
+    }
 }
 
 /// An RLE block repeats its byte, in every format.

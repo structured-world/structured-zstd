@@ -48,14 +48,19 @@ fn fixtures() -> Vec<Fixture> {
                 })
                 .expect("fixture name carries its version");
             let is_dict = name.contains(".dict");
+            // `<file>x<N>` is the file N times over.
+            let (file, times) = stem
+                .rsplit_once('x')
+                .and_then(|(file, n)| Some((file, n.parse::<usize>().ok()?)))
+                .unwrap_or((stem.as_str(), 1));
             let source = if is_dict {
-                codec_dir().join("dict_tests/files").join(&stem)
+                codec_dir().join("dict_tests/files").join(file)
             } else {
-                codec_dir().join("decodecorpus_files").join(&stem)
+                codec_dir().join("decodecorpus_files").join(file)
             };
             Fixture {
                 frame: std::fs::read(dir.join(&name)).unwrap(),
-                content: std::fs::read(source).unwrap(),
+                content: std::fs::read(source).unwrap().repeat(times),
                 dict: is_dict
                     .then(|| std::fs::read(dir.join(format!("dictionary.{tag}"))).unwrap()),
                 name,
