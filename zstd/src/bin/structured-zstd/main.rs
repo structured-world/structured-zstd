@@ -2082,6 +2082,10 @@ fn attached_path(arg: &std::ffi::OsStr, at: usize) -> PathBuf {
 fn select_mode(opts: &mut Options, mode: Mode) {
     opts.mode = mode;
     opts.bench = false;
+    // Whether a benchmark decodes follows the last operation, in every
+    // spelling. The reference latches it on a short `-d` alone, so `-d -z -b
+    // plain` reads plain input as frames and fails, and `--decompress -b` or
+    // `unzstd -b` time compressing a `.zst`; no script depends on either.
     opts.bench_decode_only = mode == Mode::Decompress;
 }
 
