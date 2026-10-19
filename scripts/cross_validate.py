@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Cross-validate our `zstd` against the reference `zstd` on whole corpora.
+
+For every file of every corpus at every level:
+
+  A1  our frame decodes through the reference to the input,
+  A2  the reference's frame decodes through ours to the input,
+  A3  our frame decodes through ours to the input,
+
+and per (corpus, level) the summed compressed size and compression time of
+ours over the reference's are reported, and held to the given limits.
+
+A file's compression time is the fastest of --repeat runs of each tool, the
+two alternating, so a run the machine preempted does not decide the ratio.
+The time limit holds only where the reference's summed time reaches
+--time-floor seconds; below it the time is mostly process start-up.
+
+Usage:
+  cross_validate.py --ours BIN --reference BIN --corpus NAME=DIR [...]
+                    [--levels 1,3,9,19,22] [--ratio-limit 1.05]
+                    [--time-limit 1.5] [--time-floor 1.0] [--repeat 3]
+                    [--json OUT]
+
+A limit of 0 reports the figure without holding it. Exits non-zero when any
+roundtrip fails or any figure is past its limit.
+
+--json writes the rows as one dashboard snapshot (one record per corpus and
+level), stamped with GITHUB_SHA and STRUCTURED_ZSTD_BENCH_GENERATED_AT when
+set, in the layout .github/scripts/merge-timeseries.py folds into history.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def level_args(level):
+    # Levels past 19 need --ultra on both tools.
+    return (["--ultra"] if level > 19 else []) + [f"-{level}"]
+
+
+def compress(binary, level, src, dst):
+    # --single-thread on both: the reference otherwise compresses in worker
+    # threads, so its time would measure thread overlap, not the codec.
+    # Returns the seconds taken, or None when the tool failed: a failure is a
+    # result to report, not a reason to stop measuring the rest.
+    start = time.perf_counter()
+    with open(dst, "wb") as out:
+        result = subprocess.run(
+            [binary, *level_args(level), "--single-thread", "-q", "-c", "--", str(src)],
+            stdout=out,
+        )
+    elapsed = time.perf_counter() - start
+    return elapsed if result.returncode == 0 else None
+
+
+def decodes_to(binary, frame, original):
+    result = subprocess.run(
+        [binary, "-d", "-q", "-c", "--", str(frame)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return result.returncode == 0 and result.stdout == original
+
+
+def ratio(value, places):
+    return "n/a" if value is None else f"{value:.{places}f}"
+
+
+def corpus_files(directory):
+    # A `.zst` beside its source (the decodecorpus fixtures keep both) is a
+    # frame, not an input. Empty files stay: an empty input is a case too.
+    return sorted(
+        p for p in Path(directory).rglob("*") if p.is_file() and p.suffix != ".zst"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--ours", required=True)
+    parser.add_argument("--reference", required=True)
+    parser.add_argument("--corpus", action="append", required=True, metavar="NAME=DIR")
+    parser.add_argument("--levels", default="1,3,9,19,22")
+    parser.add_argument("--ratio-limit", type=float, default=1.05)
+    parser.add_argument("--time-limit", type=float, default=1.5)
+    parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--time-floor", type=float, default=1.0)
+    parser.add_argument("--json")
+    args = parser.parse_args()
+    if args.repeat < 1:
+        parser.error("--repeat must be at least 1")
+
+    levels = [int(level) for level in args.levels.split(",")]
+    corpora = []
+    for spec in args.corpus:
+        name, separator, directory = spec.partition("=")
+        if not name or not separator or not directory:
+            parser.error(f"corpus {spec!r} is not NAME=DIR")
+        files = corpus_files(directory)
+        if not files:
+            parser.error(f"corpus {spec!r} names no files")
+        corpora.append((name, files))
+
+    failures = []
+    rows = []
+    with tempfile.TemporaryDirectory() as work:
+        ours_frame = Path(work) / "ours.zst"
+        reference_frame = Path(work) / "reference.zst"
+        for name, files in corpora:
+            for level in levels:
+                row = {
+                    "corpus": name,
+                    "level": level,
+                    "files": len(files),
+                    "measured_files": 0,
+                    "input_bytes": 0,
+                    "ours_bytes": 0,
+                    "reference_bytes": 0,
+                    "ours_seconds": 0.0,
+                    "reference_seconds": 0.0,
+                }
+                for path in files:
+                    original = path.read_bytes()
+                    ours_best = reference_best = float("inf")
+                    failed = []
+                    for _ in range(args.repeat):
+                        ours = compress(args.ours, level, path, ours_frame)
+                        reference = compress(args.reference, level, path, reference_frame)
+                        if ours is None:
+                            failed.append("ours")
+                        if reference is None:
+                            failed.append("reference")
+                        if failed:
+                            break
+                        ours_best = min(ours_best, ours)
+                        reference_best = min(reference_best, reference)
+                    if failed:
+                        # The file is left out of every sum, so the sums still
+                        # cover the same files on both sides.
+                        failures.append(
+                            f"compress ({', '.join(failed)}) {name} level {level}: {path}"
+                        )
+                        continue
+                    row["measured_files"] += 1
+                    row["input_bytes"] += len(original)
+                    row["ours_seconds"] += ours_best
+                    row["reference_seconds"] += reference_best
+                    row["ours_bytes"] += ours_frame.stat().st_size
+                    row["reference_bytes"] += reference_frame.stat().st_size
+                    for check, binary, frame in (
+                        ("A1", args.reference, ours_frame),
+                        ("A2", args.ours, reference_frame),
+                        ("A3", args.ours, ours_frame),
+                    ):
+                        if not decodes_to(binary, frame, original):
+                            failures.append(f"{check} {name} level {level}: {path}")
+                # A cell where a file failed to compress has no ratio: over a
+                # subset of the corpus it would not compare with the cell's
+                # history. The failures above already say why.
+                measured = row["measured_files"] == row["files"]
+                row["size_ratio"] = (
+                    row["ours_bytes"] / row["reference_bytes"] if measured else None
+                )
+                row["time_ratio"] = (
+                    row["ours_seconds"] / row["reference_seconds"] if measured else None
+                )
+                # Below the floor the time is mostly process start-up, not the
+                # codec, so the ratio is reported but not held. Each record
+                # carries the limits it was held to.
+                held = measured and row["reference_seconds"] >= args.time_floor
+                row["size_limit"] = args.ratio_limit if measured else 0
+                row["time_limit"] = args.time_limit if held else 0
+                rows.append(row)
+                print(
+                    f"{name:<12} -{level:<3} files {row['measured_files']:>3}/{row['files']:<3}  "
+                    f"size {row['ours_bytes']:>11} / {row['reference_bytes']:>11} = {ratio(row['size_ratio'], 4)}  "
+                    f"time {row['ours_seconds']:8.2f}s / {row['reference_seconds']:8.2f}s = {ratio(row['time_ratio'], 2)}"
+                    f"{'' if held else '  (below the time floor, not held)'}",
+                    flush=True,
+                )
+                if row["size_limit"] and row["size_ratio"] > row["size_limit"]:
+                    failures.append(
+                        f"size {name} level {level}: {row['size_ratio']:.4f} > {args.ratio_limit}"
+                    )
+                if row["time_limit"] and row["time_ratio"] > row["time_limit"]:
+                    failures.append(
+                        f"time {name} level {level}: {row['time_ratio']:.2f} > {args.time_limit}"
+                    )
+
+    if args.json:
+        commit_sha = os.environ.get("GITHUB_SHA")
+        generated_at = (
+            os.environ.get("STRUCTURED_ZSTD_BENCH_GENERATED_AT")
+            or datetime.now(timezone.utc).isoformat()
+        )
+        records = [
+            {
+                "kind": "cli",
+                "scenario": row.pop("corpus"),
+                "engine": "ours",
+                **row,
+                "commit_sha": commit_sha,
+                "generated_at": generated_at,
+            }
+            for row in rows
+        ]
+        payload = {
+            "version": 1,
+            "reference_engine": "reference",
+            "engines": ["ours"],
+            "records": records,
+        }
+        Path(args.json).write_text(json.dumps(payload, indent=2) + "\n")
+    for failure in failures:
+        print(f"FAIL {failure}", file=sys.stderr)
+    if failures:
+        sys.exit(1)
+    print("== cross-validation passed")
+
+
+if __name__ == "__main__":
+    main()

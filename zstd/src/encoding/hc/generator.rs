@@ -1346,10 +1346,15 @@ impl HcMatchGenerator {
         // only this block says so. A reused compressor starts each frame at
         // the previous frame's end, so a test on the absolute origin would
         // skip the seed there and make the frame depend on what came before.
+        //
+        // Long-distance matches do not count against it: they reach the
+        // parser as candidates, not as sequences already stored, and
+        // upstream zstd's "no ldm" condition is that empty sequence store
+        // (`zstd_opt.c:1534`, left empty by `zstd_ldm.c:698-704`). Both
+        // passes see the same candidates, from the block's start.
         bt.opt_state.lit_length_sum == 0
             && bt.opt_state.dictionary_seed.is_none()
             && !self.table.dictionary_primed_for_frame
-            && bt.ldm_sequences.is_empty()
             && self.table.window_size == current_len
             && self.table.chunk_lens.len() == 1
             && current_len > HC_PREDEF_THRESHOLD

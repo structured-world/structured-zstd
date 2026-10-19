@@ -1288,26 +1288,30 @@ fn btultra2_seed_pass_disabled_when_not_at_frame_start() {
     );
 }
 
+/// Long-distance matches are candidates to the optimal parser, not sequences
+/// already stored, so they do not keep btultra2 from its statistics pass:
+/// upstream zstd's "no ldm" condition is an empty sequence store
+/// (`zstd_opt.c:1534`), which `ZSTD_ldm_blockCompress` leaves empty when it
+/// hands btopt and up the matches as candidates (`zstd_ldm.c:698-704`).
 #[test]
-fn btultra2_seed_pass_disabled_when_ldm_sequences_exist() {
+fn btultra2_seed_pass_runs_alongside_ldm_candidates() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(
         BTULTRA2_HC_CONFIG,
         super::super::strategy::StrategyTag::BtUltra2,
         26,
     );
-    hc.table.window_size = HC_PREDEF_THRESHOLD + 64;
-    hc.table.chunk_lens.push_back(HC_PREDEF_THRESHOLD + 64);
+    let block_len = HC_PREDEF_THRESHOLD + 64;
+    hc.table.window_size = block_len;
+    hc.table.chunk_lens.push_back(block_len);
     hc.backend.bt_mut().ldm_sequences.push(HcRawSeq {
         lit_length: 8,
         offset: 16,
         match_length: 32,
     });
     assert!(
-        !hc.should_run_btultra2_seed_pass::<super::super::strategy::BtUltra2>(
-            HC_PREDEF_THRESHOLD + 32
-        ),
-        "btultra2 warmup must not run when LDM already produced sequences"
+        hc.should_run_btultra2_seed_pass::<super::super::strategy::BtUltra2>(block_len),
+        "the first block takes the statistics pass with long-distance candidates too"
     );
 }
 

@@ -203,6 +203,9 @@ pub struct ZSTD_DCtx {
     /// Consecutive `ZSTD_decompressStream` calls inside a frame that moved
     /// neither position; see [`crate::streaming::NO_FORWARD_PROGRESS_MAX`].
     pub(crate) stream_no_progress: u32,
+    /// Whether `ZSTD_decompressStream` holds back the frame's last input byte
+    /// because the frame is decoded but its output not all handed out yet.
+    pub(crate) stream_hostage: bool,
     /// Context-attached dictionary (`ZSTD_DCtx_loadDictionary` /
     /// `ZSTD_DCtx_refDDict` / `ZSTD_DCtx_refPrefix`), applied at every frame
     /// start by `ZSTD_decompressDCtx` / `ZSTD_decompressStream`.
@@ -576,6 +579,7 @@ pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
         stream_entry: crate::streaming::StreamEntry::Entered,
         stream_staged: Vec::new(),
         stream_no_progress: 0,
+        stream_hostage: false,
         attached_ddict: crate::attach::DCtxDictAttach::None,
     })
 }
@@ -603,6 +607,7 @@ impl ZSTD_DCtx {
         // stream as sitting at a frame boundary again.
         self.stream_frame_done = true;
         self.stream_no_progress = 0;
+        self.stream_hostage = false;
     }
 
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop

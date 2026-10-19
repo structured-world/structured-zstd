@@ -51,15 +51,77 @@ trait WrapErr<T> {
     fn wrap_err_with<D: core::fmt::Display, F: FnOnce() -> D>(self, msg: F) -> Result<T>;
 }
 
-impl<T, E: core::fmt::Display> WrapErr<T> for core::result::Result<T, E> {
+impl<T, E: Into<Error>> WrapErr<T> for core::result::Result<T, E> {
     fn wrap_err(self, msg: impl core::fmt::Display) -> Result<T> {
-        self.map_err(|source| eyre!("{msg}: {source}"))
+        self.map_err(|source| with_context(source.into(), || msg.to_string()))
     }
 
     fn wrap_err_with<D: core::fmt::Display, F: FnOnce() -> D>(self, msg: F) -> Result<T> {
-        self.map_err(|source| eyre!("{}: {source}", msg()))
+        self.map_err(|source| with_context(source.into(), || msg().to_string()))
     }
 }
+
+/// `source` after `context`, unless its text is already the reference
+/// command's own line, which carries no context there either.
+fn with_context(source: Error, context: impl FnOnce() -> String) -> Error {
+    if source.is::<Usage>() || source.is::<DecodeFailure>() || source.is::<Fatal>() {
+        return source;
+    }
+    eyre!("{}: {source}", context())
+}
+
+/// A command-line error printed as the reference command prints it: the line
+/// as it stands, and the usage after it for a parameter it does not accept
+/// (`zstdcli.c` `badUsage`, `errorOut`).
+#[derive(Debug)]
+struct Usage {
+    message: String,
+    show_usage: bool,
+}
+
+impl Usage {
+    /// An argument the command does not accept (`badUsage`).
+    fn incorrect(parameter: impl core::fmt::Display) -> Error {
+        Box::new(Usage {
+            message: format!("Incorrect parameter: {parameter} "),
+            show_usage: true,
+        })
+    }
+
+    /// A line that ends the run on its own (`errorOut`, and the reference's
+    /// other one-line refusals).
+    fn plain(message: impl Into<String>) -> Error {
+        Box::new(Usage {
+            message: message.into(),
+            show_usage: false,
+        })
+    }
+}
+
+impl core::fmt::Display for Usage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Usage {}
+
+/// `err` from parsing the value of `argument`, as the reference reports a
+/// value it cannot read: the whole argument named as an incorrect parameter.
+/// A number the value held that does not fit keeps its own line, which the
+/// reference prints instead (`readU32FromChar`).
+fn incorrect_unless_usage(err: Error, argument: &str) -> Error {
+    if err.is::<Usage>() {
+        err
+    } else {
+        Usage::incorrect(argument)
+    }
+}
+
+/// The reference's refusal of `--output-dir-flat=` / `--output-dir-mirror=`
+/// with nothing after the `=` (`zstdcli.c:1086`).
+const EMPTY_OUTPUT_DIR: &str =
+    "error: output dir cannot be empty string (did you mean to pass '.' instead?)";
 /// Say something on stderr when `$verbosity` reaches `$level`: `1` carries
 /// errors, `2` results and warnings, `3` progress, `4` detail. A tool this
 /// size does not need a tracing subscriber; a macro keeps every call site a
@@ -158,6 +220,8 @@ struct Options {
     /// by upstream's default when not `-k`/stdout, but we keep the input unless
     /// `--rm` is given — safer default for a young tool).
     remove_source: bool,
+    /// The format compression writes, from the name the tool was run by.
+    format: OutputFormat,
     /// Positional inputs; empty or a lone `-` means stdin. Held as paths
     /// rather than text: a filename is bytes and need not be UTF-8.
     inputs: Vec<PathBuf>,
@@ -167,7 +231,17 @@ struct Options {
     dict_id: Option<u32>,
     /// Benchmark mode (`-b`); benchmarks `bench_start..=bench_end`. The start
     /// is the compression level, as the reference command takes it.
+    /// The worker count `-T#` / `--threads=#` asked for, `0` from
+    /// `--single-thread`; `None` when never given.
+    threads: Option<u32>,
+    /// `--rsyncable` and `--adapt`: multi-threaded modes that change nothing
+    /// in this build, refused only beside an explicit single thread.
+    rsyncable: bool,
+    adapt: bool,
     bench: bool,
+    /// `-d` alongside `-b`: the inputs are frames, and only decoding them is
+    /// measured (the reference's `BMK_decodeOnly`).
+    bench_decode_only: bool,
     bench_start: i32,
     bench_end: i32,
     /// Per-level benchmark time budget in seconds (`-i`, default 1). Zero
@@ -372,20 +446,44 @@ enum SuffixCase {
     Any,
 }
 
+/// The type an option's number is read into, which bounds it and names it when
+/// it overflows. Named rather than inferred from the bound: on a 32-bit target
+/// `size_t` and `u32` share one, and still read as different fields.
+#[derive(Clone, Copy)]
+enum NumberWidth {
+    /// `NEXT_UINT32` / `readU32FromChar`.
+    U32,
+    /// `NEXT_TSIZE` / `readSizeTFromChar`: as wide as the platform's `size_t`.
+    SizeT,
+}
+
+impl NumberWidth {
+    fn max(self) -> u64 {
+        match self {
+            NumberWidth::U32 => u64::from(u32::MAX),
+            NumberWidth::SizeT => usize::MAX as u64,
+        }
+    }
+
+    /// The reference's line for a value past the type (zstdcli.c).
+    fn overflow_line(self) -> &'static str {
+        match self {
+            NumberWidth::U32 => "error: numeric value overflows 32-bit unsigned int ",
+            NumberWidth::SizeT => "error: numeric value overflows size_t ",
+        }
+    }
+}
+
 /// Read the leading number of `text` the way upstream's argument readers do
 /// (`readU32FromCharChecked` and `readSizeTFromCharChecked`, zstdcli.c:355-460):
 /// a run of decimal digits, then an optional `K`, `M` or `G` multiplier, which
 /// may be followed by `i` and then `B`. The multipliers are powers of two
-/// whatever the spelling, so `KB`, `K` and `KiB` are all 1024. `max` is the
-/// widest value the destination holds. Reading stops after the suffix and the
-/// rest is handed back; an empty digit run reads as zero.
-fn read_leading_number(text: &str, max: u64, case: SuffixCase) -> Result<(u64, &str)> {
-    let overflow = || {
-        eyre!(
-            "numeric value `{text}` overflows {} bits",
-            64 - max.leading_zeros()
-        )
-    };
+/// whatever the spelling, so `KB`, `K` and `KiB` are all 1024. `width` is the
+/// type the destination holds. Reading stops after the suffix and the rest is
+/// handed back; an empty digit run reads as zero.
+fn read_leading_number(text: &str, width: NumberWidth, case: SuffixCase) -> Result<(u64, &str)> {
+    let max = width.max();
+    let overflow = || Usage::plain(width.overflow_line());
     let bytes = text.as_bytes();
     let mut at = 0;
     let mut value: u64 = 0;
@@ -421,27 +519,32 @@ fn read_leading_number(text: &str, max: u64, case: SuffixCase) -> Result<(u64, &
 /// after it, as upstream's `NEXT_UINT32` / `NEXT_TSIZE` require. An empty value
 /// is refused, where the reference reads it as zero: `--size-hint=$UNSET` is a
 /// script that lost its value, not one asking for nothing.
-fn parse_number(text: &str, max: u64) -> Result<u64> {
+fn parse_number(text: &str, width: NumberWidth) -> Result<u64> {
+    // The reference's line for anything but a number (`NEXT_UINT32`); the
+    // `G` suffixes read here as well are an extension it does not list.
+    let not_a_number = || {
+        Usage::plain(
+            "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed ",
+        )
+    };
     if !text.starts_with(|c: char| c.is_ascii_digit()) {
-        bail!("`{text}`: expected a number");
+        return Err(not_a_number());
     }
-    let (value, rest) = read_leading_number(text, max, SuffixCase::Any)?;
+    let (value, rest) = read_leading_number(text, width, SuffixCase::Any)?;
     if !rest.is_empty() {
-        bail!(
-            "`{text}`: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB, G, GB, GiB are allowed"
-        );
+        return Err(not_a_number());
     }
     Ok(value)
 }
 
 /// A size option (`NEXT_TSIZE`): as wide as the platform's `size_t`.
 fn parse_size(text: &str) -> Result<u64> {
-    parse_number(text, usize::MAX as u64)
+    parse_number(text, NumberWidth::SizeT)
 }
 
 /// A count option (`NEXT_UINT32`).
 fn parse_u32(text: &str) -> Result<u32> {
-    let value = parse_number(text, u64::from(u32::MAX))?;
+    let value = parse_number(text, NumberWidth::U32)?;
     Ok(u32::try_from(value).expect("parse_number caps the value at u32::MAX"))
 }
 
@@ -459,7 +562,7 @@ fn cluster_u32(chars: &[char], at: usize) -> Result<(u32, usize)> {
 /// [`read_leading_number`] into a `u32`, for the short options and the
 /// sub-options that read a number and then look at what follows it.
 fn read_leading_u32(text: &str) -> Result<(u32, &str)> {
-    let (value, rest) = read_leading_number(text, u64::from(u32::MAX), SuffixCase::Upper)?;
+    let (value, rest) = read_leading_number(text, NumberWidth::U32, SuffixCase::Upper)?;
     Ok((
         u32::try_from(value).expect("read_leading_number caps the value at u32::MAX"),
         rest,
@@ -901,12 +1004,24 @@ fn command_status(raw: &[OsString], pause: &mut bool) -> i32 {
         }
         Err(failure) => {
             *pause = failure.pause;
-            display!(failure.verbosity, 1, "zstd: {}", failure.error);
-            if failure.verbosity >= DEFAULT_LEVEL {
+            // The reference's own lines stand as they are and bring the usage
+            // only for a parameter it does not take (`badUsage`); a refusal of
+            // ours is named after the tool and shows the usage too.
+            let show_usage = match failure.error.downcast_ref::<Usage>() {
+                Some(usage) => {
+                    display!(failure.verbosity, 1, "{usage}");
+                    usage.show_usage
+                }
+                None => {
+                    display!(failure.verbosity, 1, "zstd: {}", failure.error);
+                    true
+                }
+            };
+            if show_usage && failure.verbosity >= DEFAULT_LEVEL {
                 let mut stderr = io::stderr().lock();
                 let _ = write_short_usage(&mut stderr, &preset.name);
             }
-            return 1;
+            return exit_status(&failure.error);
         }
     };
     let verbosity = options.verbosity;
@@ -932,17 +1047,43 @@ fn command_status(raw: &[OsString], pause: &mut bool) -> i32 {
         Ok(0) => 0,
         Ok(_failed_inputs) => 1,
         Err(err) => {
-            display!(verbosity, 1, "zstd: {err}");
-            1
+            report(verbosity, &err);
+            exit_status(&err)
+        }
+    }
+}
+
+/// The format compression writes. Only zstd is built in; the others are what
+/// the names of other compressors ask for, and compressing to them is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputFormat {
+    Zstd,
+    Gzip,
+    Xz,
+    Lzma,
+    Lz4,
+}
+
+impl OutputFormat {
+    /// How the reference command names the format in its refusal.
+    fn label(self) -> &'static str {
+        match self {
+            OutputFormat::Zstd => "zstd",
+            OutputFormat::Gzip => "gzip",
+            OutputFormat::Xz | OutputFormat::Lzma => "xz/lzma",
+            OutputFormat::Lz4 => "lz4",
         }
     }
 }
 
 /// What `argv[0]` presets before any flag is read: the conventional symlink
-/// dispatch. `unzstd` decompresses; `zstdcat` and `zcat` decompress to
-/// stdout, overwriting, passing non-zstd input through, and quietly, as the
-/// reference command sets them up; `zstdmt` compresses like `zstd` (its
-/// worker count has no effect here).
+/// dispatch of the reference command (`zstdcli.c` "preset behaviors").
+/// `unzstd` decompresses; `zstdcat`, `zcat` and `gzcat` decompress to stdout,
+/// overwriting, passing non-zstd input through, and quietly; `gunzip`,
+/// `unxz`, `unlzma` and `unlz4` decompress, and all but `unlz4` remove the
+/// source as the tool they stand in for does; `gzip`, `xz`, `lzma` and `lz4`
+/// select that tool's format; `zstdmt` compresses like `zstd` (its worker
+/// count has no effect here).
 struct ProgramPreset {
     /// The name the tool was invoked by, as the usage text shows it.
     name: String,
@@ -951,6 +1092,10 @@ struct ProgramPreset {
     force: bool,
     pass_through: Option<bool>,
     verbosity: i32,
+    remove_source: bool,
+    format: OutputFormat,
+    /// A default level of the tool's own (gzip's 6), ahead of `ZSTD_CLEVEL`.
+    level: Option<i32>,
 }
 
 fn program_preset(prog: &str) -> ProgramPreset {
@@ -958,31 +1103,175 @@ fn program_preset(prog: &str) -> ProgramPreset {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(prog);
-    // Strip a trailing `.exe` for Windows symlink names.
-    let stem = name.strip_suffix(".exe").unwrap_or(name);
-    let plain = ProgramPreset {
+    // The reference's `exeNameMatch`: the name, then nothing or an extension.
+    let is = |tool: &str| {
+        name.strip_prefix(tool)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    };
+    let decompress = |remove_source| ProgramPreset {
+        mode: Mode::Decompress,
+        remove_source,
+        ..plain_like(name)
+    };
+    let compress_as = |format, remove_source, level| ProgramPreset {
+        format,
+        remove_source,
+        level,
+        ..plain_like(name)
+    };
+    if is("unzstd") {
+        decompress(false)
+    } else if is("zstdcat") || is("zcat") || is("gzcat") {
+        ProgramPreset {
+            mode: Mode::Decompress,
+            to_stdout: true,
+            force: true,
+            pass_through: Some(true),
+            verbosity: 1,
+            ..plain_like(name)
+        }
+    } else if is("gunzip") || is("unxz") || is("unlzma") {
+        decompress(true)
+    } else if is("unlz4") {
+        decompress(false)
+    } else if is("gzip") {
+        compress_as(OutputFormat::Gzip, true, Some(6))
+    } else if is("xz") {
+        compress_as(OutputFormat::Xz, true, None)
+    } else if is("lzma") {
+        compress_as(OutputFormat::Lzma, true, None)
+    } else if is("lz4") {
+        compress_as(OutputFormat::Lz4, false, None)
+    } else {
+        // "zstd", "zstdmt", anything else: compress by default.
+        plain_like(name)
+    }
+}
+
+/// The preset for a name with no behaviour of its own.
+fn plain_like(name: &str) -> ProgramPreset {
+    ProgramPreset {
         name: name.to_string(),
         mode: Mode::Compress,
         to_stdout: false,
         force: false,
         pass_through: None,
         verbosity: DEFAULT_LEVEL,
-    };
-    match stem {
-        "unzstd" => ProgramPreset {
-            mode: Mode::Decompress,
-            ..plain
-        },
-        "zstdcat" | "zcat" => ProgramPreset {
-            mode: Mode::Decompress,
-            to_stdout: true,
-            force: true,
-            pass_through: Some(true),
-            verbosity: 1,
-            ..plain
-        },
-        // "zstd", "zstdmt", anything else: compress by default.
-        _ => plain,
+        remove_source: false,
+        format: OutputFormat::Zstd,
+        level: None,
+    }
+}
+
+/// An error that ends the run with an exit status of its own, as the
+/// reference command's `EXM_THROW` does, instead of the generic 1.
+#[derive(Debug)]
+struct Fatal {
+    status: i32,
+    message: String,
+}
+
+impl core::fmt::Display for Fatal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "error {} : {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for Fatal {}
+
+/// The exit status an error ends the run with.
+fn exit_status(err: &Error) -> i32 {
+    if let Some(fatal) = err.downcast_ref::<Fatal>() {
+        return fatal.status;
+    }
+    err.downcast_ref::<Reported>()
+        .map_or(1, |reported| reported.status)
+}
+
+/// A decoding failure, still to be named after the input it came from (see
+/// [`named`]): input that is not a frame at all, or the lines about a frame
+/// that failed to decode.
+#[derive(Debug)]
+struct DecodeFailure {
+    in_frame: bool,
+    lines: Vec<String>,
+}
+
+impl DecodeFailure {
+    /// The input is not a frame: `zstd: NAME: message`.
+    fn not_a_frame(message: impl Into<String>) -> Error {
+        Box::new(DecodeFailure {
+            in_frame: false,
+            lines: vec![message.into()],
+        })
+    }
+
+    /// A frame failed to decode: `NAME : line` for every line of `report`.
+    fn in_frame(report: &str) -> Error {
+        Box::new(DecodeFailure {
+            in_frame: true,
+            lines: report.lines().map(str::to_string).collect(),
+        })
+    }
+}
+
+impl core::fmt::Display for DecodeFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.lines.join("\n"))
+    }
+}
+
+impl std::error::Error for DecodeFailure {}
+
+/// An error whose text is complete, the input's name included, and is printed
+/// as it stands; the run ends with `status`.
+#[derive(Debug)]
+struct Reported {
+    text: String,
+    status: i32,
+}
+
+impl core::fmt::Display for Reported {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for Reported {}
+
+/// `err` with the input's `name` written in, the way the reference command
+/// names it (`fileio.c` 2463, 2748-2796); any other error is returned as it
+/// is.
+fn named(err: Error, name: &str) -> Error {
+    match err.downcast::<DecodeFailure>() {
+        Ok(failure) => {
+            let lines: Vec<String> = failure
+                .lines
+                .iter()
+                // Every one of these reference lines ends in a space.
+                .map(|line| {
+                    if failure.in_frame {
+                        format!("{name} : {line} ")
+                    } else {
+                        format!("zstd: {name}: {line} ")
+                    }
+                })
+                .collect();
+            Box::new(Reported {
+                text: lines.join("\n"),
+                status: 1,
+            })
+        }
+        Err(err) => err,
+    }
+}
+
+/// Print an error that ends an input or the run: a [`Reported`] one as it
+/// stands, anything else after the tool's name.
+fn report(verbosity: i32, err: &Error) {
+    match err.downcast_ref::<Reported>() {
+        Some(reported) => display!(verbosity, 1, "{reported}"),
+        None => display!(verbosity, 1, "zstd: {err}"),
     }
 }
 
@@ -1017,7 +1306,7 @@ fn level_from_env(value: Option<&OsStr>, verbosity: i32) -> i32 {
                 display!(
                     verbosity,
                     2,
-                    "Ignore environment variable setting ZSTD_CLEVEL={text}: numeric value too large"
+                    "Ignore environment variable setting ZSTD_CLEVEL={text}: numeric value too large "
                 );
                 return CompressionLevel::DEFAULT_LEVEL;
             }
@@ -1027,7 +1316,8 @@ fn level_from_env(value: Option<&OsStr>, verbosity: i32) -> i32 {
     display!(
         verbosity,
         2,
-        "Ignore environment variable setting ZSTD_CLEVEL={text}: not a valid integer value"
+        // The reference's lines, trailing space included (`zstdcli.c:763-789`).
+        "Ignore environment variable setting ZSTD_CLEVEL={text}: not a valid integer value "
     );
     CompressionLevel::DEFAULT_LEVEL
 }
@@ -1048,7 +1338,7 @@ fn check_threads_env(value: Option<&OsStr>, verbosity: i32) {
                 display!(
                     verbosity,
                     2,
-                    "Ignore environment variable setting ZSTD_NBTHREADS={text}: numeric value too large"
+                    "Ignore environment variable setting ZSTD_NBTHREADS={text}: numeric value too large "
                 );
                 return;
             }
@@ -1058,7 +1348,7 @@ fn check_threads_env(value: Option<&OsStr>, verbosity: i32) {
     display!(
         verbosity,
         2,
-        "Ignore environment variable setting ZSTD_NBTHREADS={text}: not a valid unsigned value"
+        "Ignore environment variable setting ZSTD_NBTHREADS={text}: not a valid unsigned value "
     );
 }
 
@@ -1146,6 +1436,9 @@ fn parse_args_into(
     verbosity: &mut i32,
     pause: &mut bool,
 ) -> Result<Parsed> {
+    // A tool's own default (gzip's 6) wins over `ZSTD_CLEVEL`, as the
+    // reference's preset sets it after reading the environment.
+    let default_level = preset.level.unwrap_or(default_level);
     let mut opts = Options {
         mode: preset.mode,
         level: default_level,
@@ -1154,11 +1447,16 @@ fn parse_args_into(
         output: None,
         force: preset.force,
         keep: false,
-        remove_source: false,
+        remove_source: preset.remove_source,
+        format: preset.format,
         inputs: Vec::new(),
         max_dict: DEFAULT_MAX_DICT,
         dict_id: None,
+        threads: None,
+        rsyncable: false,
+        adapt: false,
         bench: false,
+        bench_decode_only: preset.mode == Mode::Decompress,
         bench_start: default_level,
         bench_end: default_level,
         bench_secs: DEFAULT_BENCH_SECONDS,
@@ -1232,7 +1530,7 @@ fn parse_args_into(
         if let Some(long) = arg.strip_prefix("--") {
             match long {
                 "compress" => select_mode(&mut opts, Mode::Compress),
-                "decompress" | "uncompress" => select_mode(&mut opts, Mode::Decompress),
+                "decompress" | "uncompress" => select_decompression(&mut opts),
                 "test" => select_mode(&mut opts, Mode::Test),
                 "list" => select_mode(&mut opts, Mode::List),
                 // `--train` selects the mode and leaves the trainer alone, as
@@ -1318,9 +1616,10 @@ fn parse_args_into(
                 // yields the same valid stream. Upstream takes them, so a
                 // script that passes them must not fail here: that is the
                 // whole drop-in contract.
-                "single-thread"
-                | "adapt"
-                | "sparse"
+                "single-thread" => opts.threads = Some(0),
+                "adapt" => opts.adapt = true,
+                "rsyncable" => opts.rsyncable = true,
+                "sparse"
                 | "no-sparse"
                 | "asyncio"
                 | "no-asyncio"
@@ -1403,7 +1702,9 @@ fn parse_args_into(
                         // misspelled key or a non-numeric bound is still a
                         // broken command line, and the contract is that ignored
                         // options validate what they are given.
-                        parse_adapt_params(params)?;
+                        parse_adapt_params(params)
+                            .map_err(|err| incorrect_unless_usage(err, &format!("--{long}")))?;
+                        opts.adapt = true;
                     } else if let Some(v) = option_text(long, "auto-threads", arg_os, &mut iter)? {
                         // Single-threaded: the choice has no effect, but a bad
                         // value is still a bad command line.
@@ -1419,7 +1720,7 @@ fn parse_args_into(
                             eyre!("--target-compressed-block-size={v} is too large")
                         })?);
                     } else if let Some(v) = option_text(long, "threads", arg_os, &mut iter)? {
-                        parse_u32(&v).wrap_err("invalid --threads")?;
+                        opts.threads = Some(parse_u32(&v).wrap_err("invalid --threads")?);
                     } else if let Some(v) = first_option_text(
                         long,
                         &["block-size", "split", "jobsize"],
@@ -1439,18 +1740,14 @@ fn parse_args_into(
                         option_value(long, "output-dir-flat", arg_os, &mut iter)?
                     {
                         if dir.as_os_str().is_empty() {
-                            bail!(
-                                "error: output dir cannot be empty string (did you mean to pass '.' instead?)"
-                            );
+                            return Err(Usage::plain(EMPTY_OUTPUT_DIR));
                         }
                         opts.output_dir = Some(dir);
                     } else if let Some(dir) =
                         option_value(long, "output-dir-mirror", arg_os, &mut iter)?
                     {
                         if dir.as_os_str().is_empty() {
-                            bail!(
-                                "error: output dir cannot be empty string (did you mean to pass '.' instead?)"
-                            );
+                            return Err(Usage::plain(EMPTY_OUTPUT_DIR));
                         }
                         opts.output_dir_mirror = Some(dir);
                     } else if let Some(v) = long.strip_prefix("format=") {
@@ -1460,33 +1757,37 @@ fn parse_args_into(
                         if v != "zstd" {
                             bail!("--format={v} is not supported; this build only writes zstd");
                         }
+                        // It overrides the format a tool name selected, so
+                        // `gzip --format=zstd` writes zstd.
+                        opts.format = OutputFormat::Zstd;
                     } else if let Some(v) = long.strip_prefix("zstd=") {
-                        apply_advanced_params(v, &mut opts.advanced)?;
+                        apply_advanced_params(v, &mut opts.advanced)
+                            .map_err(|err| incorrect_unless_usage(err, &format!("--{long}")))?;
                     } else if let Some(v) = long.strip_prefix("cpu=") {
                         opts.cpu = Some(v.parse().map_err(|err| eyre!("--cpu={v}: {err}"))?);
                     } else if let Some(v) = long.strip_prefix("train-cover=") {
                         select_mode(&mut opts, Mode::Train);
                         opts.trainer = Trainer::Cover;
-                        opts.trainer_params = parse_trainer_params(v, false)?;
+                        opts.trainer_params = parse_trainer_params(v, false)
+                            .map_err(|err| incorrect_unless_usage(err, &format!("--{long}")))?;
                     } else if let Some(v) = long.strip_prefix("train-fastcover=") {
                         select_mode(&mut opts, Mode::Train);
                         opts.trainer = Trainer::FastCover;
-                        opts.trainer_params = parse_trainer_params(v, true)?;
+                        opts.trainer_params = parse_trainer_params(v, true)
+                            .map_err(|err| incorrect_unless_usage(err, &format!("--{long}")))?;
                     } else if let Some(v) = long.strip_prefix("train-legacy=") {
                         // `s=#` or `selectivity=#`, as `parseLegacyParameters`
                         // reads it.
                         select_mode(&mut opts, Mode::Train);
                         opts.trainer = Trainer::Legacy;
+                        let incorrect = || Usage::incorrect(format!("--{long}"));
                         let value = v
                             .strip_prefix("selectivity=")
                             .or_else(|| v.strip_prefix("s="))
-                            .ok_or_else(|| {
-                                eyre!("--train-legacy takes `s=#` or `selectivity=#`, got `{v}`")
-                            })?;
-                        let (selectivity, tail) = read_leading_u32(value)
-                            .wrap_err("invalid --train-legacy selectivity")?;
+                            .ok_or_else(incorrect)?;
+                        let (selectivity, tail) = read_leading_u32(value)?;
                         if !tail.is_empty() {
-                            bail!("invalid --train-legacy selectivity `{value}`");
+                            return Err(incorrect());
                         }
                         opts.selectivity = selectivity;
                     } else if let Some(reference) =
@@ -1516,11 +1817,6 @@ fn parse_args_into(
                         // frame is appended to, as a reference build with library
                         // tracing writes it (`programs/zstdcli_trace.c`).
                         opts.trace = Some(path);
-                    } else if long == "rsyncable" {
-                        // Synchronisation points are cut between the jobs of a
-                        // multi-threaded run, which this build does not have;
-                        // the reference command refuses the pair too.
-                        bail!("--rsyncable is not compatible with single-thread mode");
                     } else if long == "long" {
                         // Bare `--long` is `--long=27` upstream. The window is
                         // the point of the flag, so leaving the level's own one
@@ -1539,7 +1835,7 @@ fn parse_args_into(
                         opts.long = true;
                         opts.long_window_log = Some(log);
                     } else {
-                        bail!("unknown option: --{long}");
+                        return Err(Usage::incorrect(format!("--{long}")));
                     }
                 }
             }
@@ -1551,7 +1847,7 @@ fn parse_args_into(
         while ci < chars.len() {
             let c = chars[ci];
             match c {
-                'd' => select_mode(&mut opts, Mode::Decompress),
+                'd' => select_decompression(&mut opts),
                 'z' => select_mode(&mut opts, Mode::Compress),
                 't' => select_mode(&mut opts, Mode::Test),
                 'l' => select_mode(&mut opts, Mode::List),
@@ -1589,8 +1885,8 @@ fn parse_args_into(
                         // so it is kept and has no effect there.
                         'B' => opts.block_size = (value != 0).then_some(u64::from(value)),
                         // The thread count: single-threaded here, so it steers
-                        // nothing, but it is read like every other number.
-                        'T' => {}
+                        // nothing but the note that says so.
+                        'T' => opts.threads = Some(value),
                         // `-s#`, the legacy trainer's selectivity: the one flag
                         // of this arm left.
                         _ => {
@@ -1683,12 +1979,15 @@ fn parse_args_into(
                     // The level, and the cluster goes on after it (`-19c`).
                     let (level, next) = cluster_u32(&chars, ci)
                         .wrap_err_with(|| format!("invalid level (in {arg})"))?;
-                    opts.level = i32::try_from(level)
-                        .wrap_err_with(|| format!("invalid level `{level}`"))?;
+                    // The reference reads an unsigned value and takes it as an
+                    // `int` (zstdcli.c:1210), so the top of the 32-bit range
+                    // wraps to the negative levels it names there.
+                    opts.level = level.cast_signed();
                     ci = next;
                     continue;
                 }
-                _ => bail!("unknown flag: -{c} (in {arg})"),
+                // The reference names the one flag it did not take.
+                _ => return Err(Usage::incorrect(format!("-{c}"))),
             }
             ci += 1;
         }
@@ -1707,42 +2006,31 @@ fn parse_args_into(
     {
         check_memory_limit(limit, 0, 0)?;
     }
-    validate_level(opts.level)?;
     // The benchmark starts at the compression level, however it was given
     // (`-b19`, `-19 -b`, `ZSTD_CLEVEL`), as the reference starts at `cLevel`.
-    opts.bench_start = opts.level;
+    // Both ends are bounded by the scale alone (upstream zstdcli.c:1456-1458).
+    opts.bench_start = clamp_level(opts.level);
     // An end below the start is raised to it, as upstream raises `cLevelLast`.
-    opts.bench_end = bench_end.map_or(opts.bench_start, |end: i32| end.max(opts.bench_start));
-    // The levels 20-22 are expensive enough that upstream asks for them by
-    // name. Benchmarking compresses the range `-b`/`-e` give rather than the
-    // level `-N` set, so the gate reads the range's top when there is one —
-    // `-b20` reaches an ultra level as surely as `-20` does.
-    let (lowest_level, highest_level) = if opts.bench {
-        (
-            opts.bench_start.min(opts.bench_end),
-            opts.bench_start.max(opts.bench_end),
-        )
-    } else {
-        (opts.level, opts.level)
-    };
-    // Both ends run, so both are checked here rather than at the level that
-    // reaches them: a range starting below the scale would otherwise stat and
-    // read every input before the first pass refused it.
-    validate_level(lowest_level)?;
-    validate_level(highest_level)?;
+    opts.bench_end = bench_end.map_or(opts.bench_start, |end: i32| {
+        clamp_level(end).max(opts.bench_start)
+    });
     // Unnamed, an ultra level is not refused but reduced, with a warning, the
-    // way upstream reduces it — a script that runs `zstd -22` compresses at 19
-    // rather than failing, and refusing here is what would break it.
-    if !ultra && highest_level > CLI_MAX_LEVEL_WITHOUT_ULTRA {
+    // way upstream reduces it (zstdcli.c:1557-1566): a script that runs
+    // `zstd -22` compresses at 19 rather than failing. The benchmark has left
+    // before that gate there, so it is not reduced here either.
+    let level_cap = if ultra {
+        CompressionLevel::MAX_LEVEL
+    } else {
+        CLI_MAX_LEVEL_WITHOUT_ULTRA
+    };
+    if !opts.bench && opts.level > level_cap {
         display!(
             *verbosity,
             2,
-            "Warning : compression level higher than max, reduced to {CLI_MAX_LEVEL_WITHOUT_ULTRA}"
+            "Warning : compression level higher than max, reduced to {level_cap}"
         );
-        opts.level = opts.level.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
-        opts.bench_start = opts.bench_start.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
-        opts.bench_end = opts.bench_end.min(CLI_MAX_LEVEL_WITHOUT_ULTRA);
     }
+    opts.level = clamp_level(opts.level).min(level_cap);
     // Window logs are validated here, before any file is opened, against the
     // mode the whole command line settled on; a knob out of its range is a
     // broken command line.
@@ -1794,6 +2082,55 @@ fn attached_path(arg: &std::ffi::OsStr, at: usize) -> PathBuf {
 fn select_mode(opts: &mut Options, mode: Mode) {
     opts.mode = mode;
     opts.bench = false;
+    // Whether a benchmark decodes follows the last operation, in every
+    // spelling. The reference latches it on a short `-d` alone, so `-d -z -b
+    // plain` reads plain input as frames and fails, and `--decompress -b` or
+    // `unzstd -b` time compressing a `.zst`; no script depends on either.
+    opts.bench_decode_only = mode == Mode::Decompress;
+}
+
+/// Select decompression, in any of its spellings (`-d`, `--decompress`,
+/// `--uncompress`). Inside a benchmark it stays a benchmark and makes it a
+/// decoding one, whichever of the two flags comes first.
+fn select_decompression(opts: &mut Options) {
+    if opts.bench {
+        opts.bench_decode_only = true;
+    } else {
+        select_mode(opts, Mode::Decompress);
+    }
+}
+
+/// The note a compression run asked for worker threads gets, as the reference
+/// built without threads gives it (fileio.c `FIO_setNbWorkers`): any count
+/// above zero, `-T1` included. Scripts read it to tell a single-threaded build.
+fn multithreading_note(opts: &Options) -> Option<&'static str> {
+    (opts.mode == Mode::Compress && !opts.bench && opts.threads.is_some_and(|count| count > 0))
+        // The trailing space is the reference's line (`fileio.c:371`).
+        .then_some("Note : multi-threading is disabled ")
+}
+
+/// The refusal of a multi-threaded mode beside an explicit single thread, as
+/// the reference built without threads gives it when compressing
+/// (`FIO_setAdaptiveMode`, `FIO_setRsyncable`): `--single-thread`, `-T0`.
+/// Without one they are taken and change nothing, as there.
+fn single_thread_refusal(opts: &Options) -> Option<Error> {
+    if opts.mode != Mode::Compress || opts.bench || opts.threads != Some(0) {
+        return None;
+    }
+    let mode = if opts.adapt {
+        "Adaptive"
+    } else if opts.rsyncable {
+        "Rsyncable"
+    } else {
+        return None;
+    };
+    Some(
+        Fatal {
+            status: 1,
+            message: format!("{mode} mode is not compatible with single thread mode "),
+        }
+        .into(),
+    )
 }
 
 /// Whether this run will decode anything, and so whether `-M` binds it.
@@ -1810,25 +2147,23 @@ fn compresses(opts: &Options) -> bool {
     opts.bench || matches!(opts.mode, Mode::Compress)
 }
 
-fn validate_level(level: i32) -> Result<()> {
-    let (min, max) = (CompressionLevel::MIN_LEVEL, CompressionLevel::MAX_LEVEL);
-    if !(min..=max).contains(&level) {
-        bail!("compression level {level} out of range [{min}, {max}]");
-    }
-    Ok(())
+/// `level` brought onto the scale, as the library brings it (upstream
+/// zstd_compress.c:8294-8304): past either end it compresses at that end.
+fn clamp_level(level: i32) -> i32 {
+    level.clamp(CompressionLevel::MIN_LEVEL, CompressionLevel::MAX_LEVEL)
 }
 
-/// `--version`: the reference command version this tool follows, and this
-/// build's own. Below the default display level (`-qV`) only the bare
-/// version number is printed, for a script to read; at `-vV` the supported
-/// formats follow, as they do there.
+/// `--version`: this tool's name, version and maker. Below the default display
+/// level (`-qV`) only the bare format version it implements is printed, the
+/// number scripts compare to decide which zstd features they can use; at
+/// `-vV` the supported formats follow.
 fn print_version(verbosity: i32) {
     if verbosity < DEFAULT_LEVEL {
         println!("{UPSTREAM_VERSION}");
         return;
     }
     println!(
-        "zstd version {UPSTREAM_VERSION} (structured-zstd v{})",
+        "structured-zstd v{} by Structured World",
         env!("CARGO_PKG_VERSION")
     );
     if verbosity >= 3 {
@@ -1854,7 +2189,9 @@ fn write_short_usage(out: &mut impl Write, program: &str) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  -k, --keep                    Preserve INPUT file(s). [Default]"
+        // The usage is the reference's text as it prints it (`zstdcli.c:144-174`),
+        // trailing space and wording included.
+        "  -k, --keep                    Preserve INPUT file(s). [Default] "
     )?;
     writeln!(
         out,
@@ -1895,7 +2232,7 @@ fn write_short_usage(out: &mut impl Write, program: &str) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "                                passed through as-is.\n"
+        "                                passed-through through as-is.\n"
     )?;
     writeln!(
         out,
@@ -2008,13 +2345,13 @@ Environment: ZSTD_CLEVEL sets the default compression level; ZSTD_NBTHREADS is r
 
 Accepted for compatibility, with no effect here: -T#/--threads=#, --single-thread,
 --auto-threads, -B# and --block-size=# when compressing (the job size of a
-multi-threaded run), --adapt, --zstd=ovlog=#, --[no-]sparse,
+multi-threaded run), --adapt, --rsyncable, --zstd=ovlog=#, --[no-]sparse,
 --[no-]asyncio, --[no-]mmap-dict, --[no-]row-match-finder (compression runs
-single-threaded).
+single-threaded). --adapt and --rsyncable are refused beside --single-thread or
+-T0 when compressing.
 
 Rejected rather than ignored, because they would change the result: --format=
-other than zstd, --rsyncable (needs worker threads), and -M/--memory below the
-enforced ceiling when decoding.
+other than zstd, and -M/--memory below the enforced ceiling when decoding.
 Trainer shrink[=#] takes effect: the smallest dictionary within # percent
 (default 1) of the full one is kept.
 A new output file keeps its source's permissions.
@@ -2067,9 +2404,36 @@ fn write_default_cparams(
     writeln!(out, " - strategy      : {strategy} ({ordinal})")
 }
 
-/// Print `--show-default-cparams` for every input of a compressing run, on
-/// stderr and whatever the verbosity, as the reference command does.
-fn show_default_cparams(opts: &Options) -> Result<()> {
+/// Write the parameters `level` and the `--zstd=` knobs compress an input of
+/// `size` with, as the `--zstd=` option that reproduces them (upstream
+/// zstdcli.c `printActualCParams`). A knob of zero leaves the level's value.
+fn write_actual_cparams(
+    out: &mut impl Write,
+    size: Option<u64>,
+    dictionary_size: usize,
+    level: i32,
+    advanced: &AdvancedParams,
+) -> io::Result<()> {
+    let params =
+        LevelParameters::for_level(level, size.filter(|&bytes| bytes != 0), dictionary_size);
+    let knob = |set: Option<u32>, own: u32| set.filter(|&value| value != 0).unwrap_or(own);
+    writeln!(
+        out,
+        "--zstd=wlog={},clog={},hlog={},slog={},mml={},tlen={},strat={}",
+        knob(advanced.window_log, params.window_log),
+        knob(advanced.chain_log, params.chain_log),
+        knob(advanced.hash_log, params.hash_log),
+        knob(advanced.search_log, params.search_log),
+        knob(advanced.min_match, params.min_match),
+        knob(advanced.target_length, params.target_length),
+        advanced.strategy.unwrap_or(params.strategy).ordinal(),
+    )
+}
+
+/// Print, for every input of a compressing run, the default parameters when
+/// `--show-default-cparams` asked for them and the actual ones at `-vv`, on
+/// stderr, as the reference command does (zstdcli.c:1649-1657).
+fn show_cparams(opts: &Options) -> Result<()> {
     let dictionary_size = match dictionary_path(opts) {
         Some(path) => fs::metadata(path)
             .wrap_err_with(|| format!("failed to inspect dictionary file {}", path.display()))?
@@ -2095,10 +2459,31 @@ fn show_default_cparams(opts: &Options) -> Result<()> {
                 .map(|metadata| metadata.len());
             (input.display().to_string(), size)
         };
-        write_default_cparams(&mut err, &name, size, dictionary_size, opts.level)
-            .wrap_err("failed to write the default parameters")?;
+        if opts.show_default_cparams {
+            write_default_cparams(&mut err, &name, size, dictionary_size, opts.level)
+                .wrap_err("failed to write the default parameters")?;
+        }
+        if opts.verbosity >= 4 {
+            write_actual_cparams(
+                &mut err,
+                size,
+                dictionary_size,
+                opts.level,
+                &shown_advanced_params(opts),
+            )
+            .wrap_err("failed to write the compression parameters")?;
+        }
     }
     Ok(())
+}
+
+/// The `--zstd=` knobs `-vv` shows: `--long=N` sets the window when `--zstd=`
+/// has not (`zstdcli.c:1127-1129`).
+fn shown_advanced_params(opts: &Options) -> AdvancedParams {
+    AdvancedParams {
+        window_log: opts.advanced.window_log.or(opts.long_window_log),
+        ..opts.advanced
+    }
 }
 
 /// The file the run's dictionary comes from: `-D`, or the `--patch-from`
@@ -2709,6 +3094,26 @@ fn run_selected(mut opts: Options) -> Result<usize> {
         bail!("stdin is a console, aborting");
     }
     refuse_console_stdout(&opts, opts.console.stdout())?;
+    // Only zstd is written. The reference command built without a codec stops
+    // the whole run at the first input it would compress to it
+    // (`fileio.c` `EXM_THROW(20, ...)`), before writing or removing anything.
+    if let Some(refusal) = single_thread_refusal(&opts) {
+        return Err(refusal);
+    }
+    if opts.mode == Mode::Compress && !opts.bench && opts.format != OutputFormat::Zstd {
+        let first = match opts.inputs.first() {
+            Some(input) if input != Path::new("-") => input.display().to_string(),
+            _ => STDIN_MARK.to_string(),
+        };
+        return Err(Fatal {
+            status: 20,
+            message: format!(
+                "zstd: {first}: file cannot be compressed as {} (this build writes zstd only) -- ignored",
+                opts.format.label()
+            ),
+        }
+        .into());
+    }
     let has_stdout_output = matches!(opts.mode, Mode::Compress | Mode::Decompress)
         && !opts.bench
         && writes_stdout(&opts);
@@ -2786,6 +3191,9 @@ fn run_selected(mut opts: Options) -> Result<usize> {
         run_benchmark(&opts, dict_bytes)?;
         return Ok(0);
     }
+    if let Some(note) = multithreading_note(&opts) {
+        display!(opts.verbosity, 2, "{note}");
+    }
     let mut codecs = Codecs::prepare(
         dict_bytes.as_deref(),
         opts.patch_from.is_some(),
@@ -2816,13 +3224,11 @@ fn run_selected(mut opts: Options) -> Result<usize> {
     // Decompression has no parameters to show; testing is not decompression
     // there, so it is not refused, and prints nothing since it compresses
     // nothing.
-    if opts.show_default_cparams {
-        if opts.mode == Mode::Decompress {
-            bail!("error : can't use --show-default-cparams in decompression mode");
-        }
-        if opts.mode == Mode::Compress {
-            show_default_cparams(&opts)?;
-        }
+    if opts.show_default_cparams && opts.mode == Mode::Decompress {
+        bail!("error : can't use --show-default-cparams in decompression mode");
+    }
+    if opts.mode == Mode::Compress && (opts.show_default_cparams || opts.verbosity >= 4) {
+        show_cparams(&opts)?;
     }
 
     // A destination named outright belongs to the whole run, whatever it reads:
@@ -2998,7 +3404,8 @@ fn process_concatenated(
                             sink,
                         ),
                         None => stream_stdin(opts, codecs, sink),
-                    })?;
+                    })
+                    .map_err(|err| named(err, &name))?;
                 match written {
                     Some((processed, placement)) => {
                         file_summary(
@@ -3058,13 +3465,12 @@ fn process_concatenated(
 /// fails is reported and the rest are still processed, as the reference
 /// command does; the count that failed decides the exit status.
 fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Result<usize> {
-    // The inputs are processed one after another, so an output derived from an
-    // early one can land on a file still waiting its turn: `-f foo foo.zst`
-    // would replace `foo.zst` before it is ever read. The `-D` dictionary is a
-    // file this run needs too, and the one a frame will need to be read back,
-    // so writing over it destroys the key to what was just produced. `-f`
-    // permits overwriting the output, not destroying either, so everything the
-    // run reads is checked before the first byte is written.
+    // The `-D` dictionary is a file this run needs, and the one a frame will
+    // need to be read back, so writing over it destroys the key to what was
+    // just produced; it is checked before the first byte is written. Another
+    // input is not: under `-f` an output derived from an early input replaces
+    // a later one of that name, as the reference command does
+    // (`-f foo foo.zst` writes `foo.zst`, then compresses it in turn).
     //
     // Only for the modes that write one. Testing decodes into a sink and names
     // no destination, so asking what it would produce has no answer. An input
@@ -3111,15 +3517,6 @@ fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Resu
                     dict.display(),
                 );
             }
-            for other in &opts.inputs {
-                if other != Path::new("-") && names_the_same_file(&output, other)? {
-                    bail!(
-                        "{} would be written over {}, which is also an input",
-                        input.display(),
-                        other.display(),
-                    );
-                }
-            }
         }
     }
     let mut tally = Tally::default();
@@ -3141,7 +3538,7 @@ fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Resu
             match process_file(opts, input, codecs, total) {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    display!(opts.verbosity, 1, "zstd: {err}");
+                    report(opts.verbosity, &named(err, &input.display().to_string()));
                     Outcome::Refused
                 }
             }
@@ -3198,6 +3595,9 @@ enum Outcome {
 struct Processed {
     read: u64,
     written: u64,
+    /// The input was not zstd and went through unchanged: it has no result
+    /// line of its own.
+    passed_through: bool,
 }
 
 /// The run's running totals, for the multi-file summary and the exit status.
@@ -3232,10 +3632,11 @@ fn file_summary(
     destination: &str,
     processed: &Processed,
 ) {
-    if total > 1 && opts.verbosity < 3 {
+    if (total > 1 && opts.verbosity < 3) || processed.passed_through {
         return;
     }
     let verbose = opts.verbosity > 3;
+    let level = opts.progress.summary_level();
     match opts.mode {
         Mode::Compress => {
             let read = HumanSize::new(processed.read, verbose);
@@ -3243,20 +3644,27 @@ fn file_summary(
             if processed.read == 0 {
                 display!(
                     opts.verbosity,
-                    2,
-                    "{name:<20} :  ({read:>6} => {written:>6}, {destination})"
+                    level,
+                    // The trailing space is the reference's line, byte for
+                    // byte (`fileio.c:1793-1799`), as are those below.
+                    "{name:<20} :  ({read:>6} => {written:>6}, {destination}) "
                 );
             } else {
                 display!(
                     opts.verbosity,
-                    2,
-                    "{name:<20} :{:>6.2}%   ({read:>6} => {written:>6}, {destination})",
+                    level,
+                    "{name:<20} :{:>6.2}%   ({read:>6} => {written:>6}, {destination}) ",
                     processed.written as f64 / processed.read as f64 * 100.0
                 );
             }
         }
         Mode::Decompress | Mode::Test => {
-            display!(opts.verbosity, 2, "{name:<20}: {} bytes", processed.written);
+            display!(
+                opts.verbosity,
+                level,
+                "{name:<20}: {} bytes ",
+                processed.written
+            );
         }
         Mode::List | Mode::Train => {}
     }
@@ -3269,6 +3677,7 @@ fn multi_summary(opts: &Options, total: usize, tally: &Tally) {
         return;
     }
     let verbose = opts.verbosity > 3;
+    let level = opts.progress.summary_level();
     match opts.mode {
         Mode::Compress => {
             let read = HumanSize::new(tally.read, verbose);
@@ -3276,7 +3685,7 @@ fn multi_summary(opts: &Options, total: usize, tally: &Tally) {
             if tally.read == 0 {
                 display!(
                     opts.verbosity,
-                    2,
+                    level,
                     "{:>3} files compressed : ({} => {})",
                     tally.processed,
                     read.columns(6),
@@ -3285,7 +3694,7 @@ fn multi_summary(opts: &Options, total: usize, tally: &Tally) {
             } else {
                 display!(
                     opts.verbosity,
-                    2,
+                    level,
                     "{:>3} files compressed : {:.2}% ({} => {})",
                     tally.processed,
                     tally.written as f64 / tally.read as f64 * 100.0,
@@ -3297,8 +3706,9 @@ fn multi_summary(opts: &Options, total: usize, tally: &Tally) {
         Mode::Decompress | Mode::Test => {
             display!(
                 opts.verbosity,
-                2,
-                "{} files decompressed : {:>6} bytes total",
+                level,
+                // `fileio.c:3138`, trailing space included.
+                "{} files decompressed : {:>6} bytes total ",
                 tally.processed,
                 tally.written
             );
@@ -3313,6 +3723,9 @@ fn multi_summary(opts: &Options, total: usize, tally: &Tally) {
 /// `-D` so dictionary throughput can be measured. Time-budgeted per level
 /// rather than fixed-iteration.
 fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
+    if opts.bench_decode_only {
+        return benchmark_decoding(opts, dict);
+    }
     // With no input named the reference measures data it generates
     // (`BMK_syntheticTest`): `-B` bytes of it, ten million by default.
     let synthetic = opts.inputs.is_empty();
@@ -3513,6 +3926,161 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     benchmark_one(opts, codecs, &decode, &label, &data, &sizes)
 }
 
+/// `-b -d`: the inputs are frames, and only decoding them is measured, each
+/// file whole, at the size its frames declare (`benchzstd.c`, `BMK_decodeOnly`).
+/// Every input together is one measurement, or each on its own under `-S`.
+fn benchmark_decoding(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
+    if opts.inputs.is_empty() {
+        // The reference generates text and then cannot read a size from it.
+        bail!("Error while trying to assess decompressed size: data may be invalid");
+    }
+    if opts.inputs.iter().any(|input| input == Path::new("-")) {
+        bail!("-b cannot benchmark stdin; name a file (`./-` for one called `-`)");
+    }
+    let mut sizes = Vec::with_capacity(opts.inputs.len());
+    for input in &opts.inputs {
+        let metadata = fs::metadata(input)
+            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
+        if !metadata.is_file() {
+            bail!("-b needs regular files: {} is not one", input.display());
+        }
+        sizes.push(metadata.len());
+    }
+    // The blob goes once parsed; the decoder's form of it stays for the run,
+    // about as large.
+    let dictionary_bytes = dict.as_ref().map_or(0, |bytes| bytes.len() as u64);
+    // The frames and the dictionary are weighed from their sizes before any
+    // work, the dictionary's parse and the trace included; the decoded copy
+    // joins them once the frames declare it. The parse holds the blob and its
+    // parsed form together, before any frame is read, so the peak is the
+    // larger of that pair and the frames beside one form.
+    if let Some(limit) = opts.memory_limit {
+        let inputs = if opts.bench_separately {
+            sizes.iter().copied().max().unwrap_or(0)
+        } else {
+            sizes
+                .iter()
+                .try_fold(0u64, |sum, &size| sum.checked_add(size))
+                .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?
+        };
+        let held = inputs
+            .checked_add(dictionary_bytes)
+            .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
+        // A dictionary is a file read into memory, so twice its length stays
+        // within u64.
+        check_memory_limit(limit, held.max(2 * dictionary_bytes), 1)?;
+    }
+    let codecs = &mut Codecs::prepare(dict.as_deref(), opts.patch_from.is_some(), false, true)?;
+    codecs.open_trace(opts, true)?;
+    drop(dict);
+    if opts.bench_separately {
+        for (input, size) in opts.inputs.iter().zip(&sizes) {
+            let data =
+                read_inputs_bounded(std::slice::from_ref(input), std::slice::from_ref(size))?;
+            benchmark_decoding_one(
+                opts,
+                codecs,
+                dictionary_bytes,
+                &input.display().to_string(),
+                &data,
+                std::slice::from_ref(size),
+            )?;
+        }
+        return Ok(());
+    }
+    let data = read_inputs_bounded(&opts.inputs, &sizes)?;
+    let label = match opts.inputs.as_slice() {
+        [only] => only.display().to_string(),
+        many => format!(" {} files", many.len()),
+    };
+    benchmark_decoding_one(opts, codecs, dictionary_bytes, &label, &data, &sizes)
+}
+
+/// Measure decoding one subject of [`benchmark_decoding`]: `data` holds the
+/// files of `file_sizes`, each a run of frames whose declared sizes give what
+/// it decodes to; `dictionary_bytes` is the parsed dictionary held beside them.
+fn benchmark_decoding_one(
+    opts: &Options,
+    codecs: &mut Codecs,
+    dictionary_bytes: u64,
+    label: &str,
+    data: &[u8],
+    file_sizes: &[u64],
+) -> Result<()> {
+    use std::time::Instant;
+    use structured_zstd::decoding::{FrameContentSize, find_decompressed_size};
+
+    let mut decoded_size = 0u64;
+    let mut at = 0usize;
+    for &size in file_sizes {
+        let file = &data[at..at + size as usize];
+        at += size as usize;
+        match find_decompressed_size(file) {
+            Ok(FrameContentSize::Known(size)) => {
+                decoded_size = decoded_size
+                    .checked_add(size)
+                    .ok_or_else(|| eyre!("decompressed size is too large for local system"))?;
+            }
+            Ok(FrameContentSize::Unknown) => {
+                bail!("Decompressed size cannot be determined: cannot benchmark")
+            }
+            Err(_) => bail!("Error while trying to assess decompressed size: data may be invalid"),
+        }
+    }
+    // The input, its decoded copy and the dictionary are what the run holds,
+    // weighed together: each can clear the limit alone and still not together.
+    let held = (data.len() as u64)
+        .checked_add(decoded_size)
+        .and_then(|buffers| buffers.checked_add(dictionary_bytes))
+        .ok_or_else(|| eyre!("decompressed size is too large for local system"))?;
+    if let Some(limit) = opts.memory_limit {
+        check_memory_limit(limit, held, 1)?;
+    }
+    let decode = bench_decode_settings(opts, Some(held));
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(
+            usize::try_from(decoded_size)
+                .map_err(|_| eyre!("decompressed size is too large for local system"))?,
+        )
+        .map_err(|err| eyre!("-b: not enough memory to decode {label}: {err}"))?;
+    if let Some(header) = bench_quiet_header(opts, data.len()) {
+        println!("{header}");
+    }
+    let mut best = f64::MAX;
+    let start = Instant::now();
+    loop {
+        decoded.clear();
+        let t = Instant::now();
+        decompress_stream(data, &mut decoded, codecs, &decode)?;
+        best = best.min(t.elapsed().as_secs_f64());
+        if start.elapsed().as_secs_f64() >= opts.bench_secs {
+            break;
+        }
+    }
+    // Every frame declared its size (an undeclared one was refused above), and
+    // the decoder fails a frame whose output differs from its declaration.
+    debug_assert_eq!(decoded.len() as u64, decoded_size, "-b: {label}");
+    let result = BenchResult {
+        level: 0,
+        input: decoded_size,
+        output: data.len() as u64,
+        compress_mb_s: 0.0,
+        decompress_mb_s: if best > 0.0 {
+            decoded_size as f64 / 1e6 / best
+        } else {
+            f64::INFINITY
+        },
+    };
+    let name = bench_display_name(label);
+    if opts.verbosity >= DEFAULT_LEVEL {
+        println!("{}", result.line(&name));
+    } else if opts.verbosity == 1 {
+        println!("{}", result.quiet_line(&name, opts.bench_param));
+    }
+    Ok(())
+}
+
 /// The settings a benchmark decodes with. `held` is what the benchmark holds
 /// while it decodes (input, frames, decoded copy, encoder, dictionaries), as
 /// weighed against `-M`; the window may have only what the promise leaves after
@@ -3709,7 +4277,11 @@ fn benchmark_one(
         None
     };
     for level in opts.bench_start..=opts.bench_end {
-        validate_level(level)?;
+        debug_assert_eq!(
+            level,
+            clamp_level(level),
+            "the range was clamped at parse time"
+        );
         let settings = FrameSettings {
             level,
             size_hint: None,
@@ -3891,7 +4463,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         bail!("--train cannot read stdin; name the sample files (`./-` for one called `-`)");
     }
     if opts.inputs.is_empty() {
-        bail!("--train requires one or more sample files");
+        return Err(too_few_samples(opts.verbosity));
     }
     // `-c` and `-o` clear one another, so this pair leaves no destination and
     // the default below would stand in: the run would write a file nobody
@@ -3944,13 +4516,12 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // Settled before the corpus is read: whether this run may write at all is
     // knowable now, and a command that is going to be refused should not first
     // load every sample and spend minutes training a dictionary to throw away.
-    // A device or pipe is written in place, as for any other output.
+    // A device or pipe is written in place, as for any other output. An
+    // existing file is replaced without `-f`, as the reference's trainer
+    // replaces it (`DiB_saveDict`, `fopen(dictFileName, "wb")`).
     let in_place = writes_in_place(&output)?;
     if !in_place {
         ensure_regular_output_destination(&output)?;
-        if output.exists() && !opts.force {
-            bail!("{} already exists; use -f to overwrite", output.display());
-        }
     }
     // The default destination is a plain `dictionary`, which a sample can
     // easily be named: the run would read that file and then replace it with
@@ -4011,7 +4582,17 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     };
     let set = load_training_samples(&opts.inputs, opts.block_size, opts.memory_limit, |count| {
         enough_samples(count).map_err(failed)
+    })
+    .map_err(|err| {
+        if err.is::<TooFewSamples>() {
+            too_few_samples(opts.verbosity)
+        } else {
+            err
+        }
     })?;
+    for (level, line) in training_load_notices(&set, opts.memory_limit) {
+        display!(opts.verbosity, level, "{line}");
+    }
     let dict = match plan {
         Plan::Legacy => {
             let mut dict = Vec::new();
@@ -4105,6 +4686,40 @@ const TRAINING_DATA_MAX: u64 = 2 << 30;
 /// Fewest samples a trainer is given (`dibio.c`: "nb of samples too low").
 const TRAINING_SAMPLES_MIN: usize = 5;
 
+/// Fewer than [`TRAINING_SAMPLES_MIN`] samples were found; reported through
+/// [`too_few_samples`] where the display level is known.
+#[derive(Debug)]
+struct TooFewSamples;
+
+impl core::fmt::Display for TooFewSamples {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("nb of samples too low")
+    }
+}
+
+impl std::error::Error for TooFewSamples {}
+
+/// The refusal of fewer than [`TRAINING_SAMPLES_MIN`] samples, none included,
+/// as the reference's trainer gives it (`dibio.c:364-368`): the advice as
+/// warnings, then its error line, status 14.
+fn too_few_samples(verbosity: i32) -> Error {
+    display!(
+        verbosity,
+        2,
+        "!  Warning : nb of samples too low for proper processing ! "
+    );
+    display!(verbosity, 2, "!  Please provide _one file per sample_. ");
+    display!(
+        verbosity,
+        2,
+        "!  Alternatively, split files into fixed-size blocks representative of samples, with -B# "
+    );
+    Box::new(Reported {
+        text: "Error 14 : nb of samples too low".to_string(),
+        status: 14,
+    })
+}
+
 /// The samples a trainer is handed, loaded the way the reference's command
 /// loads them (`dibio.c`, `DiB_trainFromFiles`).
 struct TrainingSet {
@@ -4114,6 +4729,38 @@ struct TrainingSet {
     sizes: Vec<usize>,
     /// What each file read was, taken from the open file.
     sources: Vec<fs::Metadata>,
+    /// Bytes the samples hold before any budget (`dibio.c`, `totalSizeToLoad`).
+    requested: u128,
+    /// Most bytes loaded: [`TRAINING_DATA_MAX`], or `-M` when smaller.
+    budget: u64,
+}
+
+/// What the reference's trainer says about the samples it loads, as
+/// `(level, line)` (dibio.c, `DiB_trainFromFiles`): the `-M` limit as a warning,
+/// and that the samples outgrew the budget.
+fn training_load_notices(set: &TrainingSet, memory_limit: Option<u64>) -> Vec<(i32, String)> {
+    const MB: u64 = 1 << 20;
+    let mut notices = Vec::new();
+    if let Some(limit) = memory_limit {
+        notices.push((
+            2,
+            format!(
+                "!  Warning : setting manual memory limit for dictionary training data at {} MB",
+                limit / MB
+            ),
+        ));
+    }
+    if u128::from(set.budget) < set.requested {
+        notices.push((
+            1,
+            format!(
+                "Training samples set too large ({} MB); training on {} MB only...",
+                set.requested / u128::from(MB),
+                set.budget / MB
+            ),
+        ));
+    }
+    notices
 }
 
 /// Reorder the sample files the way the reference does before loading
@@ -4203,6 +4850,19 @@ fn plan_training_load(
     (plan, bytes)
 }
 
+/// Bytes the samples hold before any budget: each file whole under `-B`,
+/// otherwise up to [`TRAINING_SAMPLE_MAX`]. The sizes are what directory
+/// entries claim, so the sum is kept wide enough never to wrap.
+fn training_requested(file_sizes: &[u64], block_size: Option<u64>) -> u128 {
+    file_sizes
+        .iter()
+        .map(|&size| match block_size {
+            Some(_) => u128::from(size),
+            None => u128::from(size.min(TRAINING_SAMPLE_MAX)),
+        })
+        .sum()
+}
+
 /// Load the training samples as the reference's command does: files in its
 /// shuffled order, each one sample of at most [`TRAINING_SAMPLE_MAX`] bytes, or
 /// cut whole into `block_size` samples when `-B` gives one; empty files left
@@ -4228,12 +4888,10 @@ fn load_training_samples(
     }
     let samples = training_extent(&file_sizes, block_size);
     if samples < TRAINING_SAMPLES_MIN as u128 {
-        bail!(
-            "{samples} training sample(s) is too few; provide one file per sample, or \
-             split files into fixed-size samples with -B#"
-        );
+        return Err(Box::new(TooFewSamples));
     }
     let budget = TRAINING_DATA_MAX.min(memory_limit.unwrap_or(u64::MAX));
+    let requested = training_requested(&file_sizes, block_size);
     let (plan, bytes) = plan_training_load(&file_sizes, block_size, budget, samples);
     // What the budget keeps, not what the files hold, is what the trainer gets.
     // The five-sample floor above is on the files, as upstream's is
@@ -4253,6 +4911,8 @@ fn load_training_samples(
         corpus: Vec::with_capacity(corpus_room),
         sizes: Vec::with_capacity(entries),
         sources: Vec::new(),
+        requested,
+        budget,
     };
     for ((input, &size), &pieces) in order.into_iter().zip(&file_sizes).zip(&plan) {
         if pieces == 0 {
@@ -4932,7 +5592,10 @@ fn list_file(path: &Path, verbose: bool, verbosity: i32) -> Result<ArchiveSummar
         .decompressed
         .map(|decompressed| decompressed as f64 / summary.compressed as f64);
     let check = if summary.check { "XXH64" } else { "None" };
-    let compressed = HumanSize::new(summary.compressed, false);
+    // `-vv` prints sizes as exact byte counts, as the reference's one display
+    // level governs its size formatting too (`g_utilDisplayLevel`).
+    let raw = verbosity > 3;
+    let compressed = HumanSize::new(summary.compressed, raw);
     if !verbose {
         match (summary.decompressed, ratio) {
             (Some(decompressed), Some(ratio)) => println!(
@@ -4940,7 +5603,7 @@ fn list_file(path: &Path, verbose: bool, verbosity: i32) -> Result<ArchiveSummar
                 summary.frames,
                 summary.skips,
                 compressed.columns(6),
-                HumanSize::new(decompressed, false).columns(8),
+                HumanSize::new(decompressed, raw).columns(8),
                 path.display()
             ),
             _ => println!(
@@ -4962,14 +5625,14 @@ fn list_file(path: &Path, verbose: bool, verbosity: i32) -> Result<ArchiveSummar
     println!("DictID: {}", summary.dict_id.unwrap_or(0));
     println!(
         "Window Size: {} ({} B)",
-        HumanSize::new(summary.window_size, false),
+        HumanSize::new(summary.window_size, raw),
         summary.window_size
     );
     println!("Compressed Size: {compressed} ({} B)", summary.compressed);
     if let (Some(decompressed), Some(ratio)) = (summary.decompressed, ratio) {
         println!(
             "Decompressed Size: {} ({decompressed} B)",
-            HumanSize::new(decompressed, false)
+            HumanSize::new(decompressed, raw)
         );
         println!("Ratio: {ratio:.4}");
     }
@@ -5096,16 +5759,38 @@ fn is_block_device_type(kind: &fs::FileType) -> bool {
 /// path is only a name, and can be made to name something else between the
 /// look and the open.
 fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata)>> {
-    let named = fs::metadata(input)
-        .map_err(|err| eyre!("can't stat {} : {err} -- ignored", input.display()))?;
+    // The reference's lines, trailing space included (`fileio.c:555-564`,
+    // 2040).
+    let named = fs::metadata(input).map_err(|err| {
+        eyre!(
+            "can't stat {} : {} -- ignored ",
+            input.display(),
+            os_error_text(&err)
+        )
+    })?;
     if named.is_dir() {
-        bail!("{} is a directory -- ignored", input.display());
+        bail!("{} is a directory -- ignored ", input.display());
+    }
+    // The file a frame is compressed against is not also its content, as the
+    // reference refuses it per input (fileio.c `FIO_compressFilename_srcFile`,
+    // compared by file identity like its `UTIL_isSameFileStat`).
+    if compresses(opts)
+        && let Some(input_id) = identity::of_path(input)
+        && [&opts.dict, &opts.patch_from]
+            .into_iter()
+            .flatten()
+            .any(|dict| identity::of_path(dict) == Some(input_id))
+    {
+        bail!(
+            "cannot use {} as an input file and dictionary",
+            input.display()
+        );
     }
     let admissible = |kind: &fs::FileType| {
         kind.is_file() || is_fifo_type(kind) || (opts.force && is_block_device_type(kind))
     };
     if !admissible(&named.file_type()) {
-        bail!("{} is not a regular file -- ignored", input.display());
+        bail!("{} is not a regular file -- ignored ", input.display());
     }
     if skips_as_compressed(opts, input) {
         display!(
@@ -5121,9 +5806,21 @@ fn open_input(opts: &Options, input: &Path) -> Result<Option<(File, fs::Metadata
         .metadata()
         .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
     if metadata.is_dir() || !admissible(&metadata.file_type()) {
-        bail!("{} is not a regular file -- ignored", input.display());
+        bail!("{} is not a regular file -- ignored ", input.display());
     }
     Ok(Some((source, metadata)))
+}
+
+/// The system's description of `err`, as `strerror` gives it: without the
+/// ` (os error N)` the standard library appends.
+fn os_error_text(err: &io::Error) -> String {
+    let text = err.to_string();
+    match err.raw_os_error() {
+        Some(code) => text
+            .strip_suffix(&format!(" (os error {code})"))
+            .map_or(text.clone(), str::to_string),
+        None => text,
+    }
 }
 
 /// Stream one opened input through the codec into `sink`.
@@ -5211,15 +5908,17 @@ fn stream<R: BufRead, W: Write>(
                 ..FrameSettings::from_options(opts)
             },
             codecs,
-        )?,
-        Mode::Decompress => decompress_stream(&mut reader, &mut sink, codecs, decode)?,
-        Mode::Test => decompress_stream(&mut reader, io::sink(), codecs, decode)?,
+        )
+        .map(Decoded::Frames)?,
+        Mode::Decompress => decode_or_pass(&mut reader, &mut sink, codecs, decode)?,
+        Mode::Test => decode_or_pass(&mut reader, io::sink(), codecs, decode)?,
         Mode::List | Mode::Train => unreachable!("list / train never stream"),
     };
     sink.flush().wrap_err("failed to flush output")?;
     Ok(Processed {
         read: reader.read,
-        written,
+        written: written.bytes(),
+        passed_through: matches!(written, Decoded::PassedThrough(_)),
     })
 }
 
@@ -5235,16 +5934,16 @@ fn stream_input_to<W: Write>(
     destination: &str,
     total: usize,
 ) -> Result<Outcome> {
-    let (name, processed) = if input == Path::new("-") {
+    let (name, streamed) = if input == Path::new("-") {
         (
             STDIN_MARK.to_string(),
-            stream_stdin(opts, codecs, &mut sink)?,
+            stream_stdin(opts, codecs, &mut sink),
         )
     } else {
         match open_input(opts, input) {
             Ok(Some((source, metadata))) => (
                 input.display().to_string(),
-                stream_opened(opts, codecs, source, &metadata, &mut sink)?,
+                stream_opened(opts, codecs, source, &metadata, &mut sink),
             ),
             Ok(None) => return Ok(Outcome::Skipped),
             Err(err) => {
@@ -5252,6 +5951,19 @@ fn stream_input_to<W: Write>(
                 return Ok(Outcome::Refused);
             }
         }
+    };
+    let processed = match streamed {
+        Ok(processed) => processed,
+        // A decoded input that fails is reported and the next one decoded, as
+        // the reference command goes on (`FIO_decompressMultipleFilenames`):
+        // what each input decodes to stands on its own in the output. A
+        // compressed input that fails ends the run instead, since the frame
+        // it left half-written would corrupt every frame after it.
+        Err(err) if opts.mode != Mode::Compress => {
+            report(opts.verbosity, &named(err, &name));
+            return Ok(Outcome::Refused);
+        }
+        Err(err) => return Err(named(err, &name)),
     };
     file_summary(opts, total, &name, destination, &processed);
     Ok(Outcome::Done(processed))
@@ -5365,6 +6077,16 @@ fn write_output_file_if<T>(
         let mut sink = temp_file;
         let value = fill(&mut sink)?;
         sink.flush().wrap_err("failed to flush output")?;
+        // The output of a regular file is dated as the file (upstream
+        // fileio.c:2140, 3122, `UTIL_utime`); stamped on the temporary, so the
+        // rename below carries it into place.
+        if let Some(metadata) = source.filter(|metadata| metadata.is_file()) {
+            let modified = metadata
+                .modified()
+                .wrap_err("failed to read the source's modification time")?;
+            sink.set_modified(modified)
+                .wrap_err("failed to apply the source's modification time to the output")?;
+        }
         Ok(value)
     })();
     let value = match result {
@@ -5950,10 +6672,38 @@ const SKIPPABLE_MAGIC_BASE: u32 = 0x184D_2A50;
 /// refused either way, with the reference command's message.
 fn decompress_stream<R: Read, W: Write>(
     reader: R,
-    mut writer: W,
+    writer: W,
     codecs: &mut Codecs,
     settings: &DecodeSettings,
 ) -> Result<u64> {
+    decode_or_pass(reader, writer, codecs, settings).map(Decoded::bytes)
+}
+
+/// What [`decode_or_pass`] wrote: the content of the frames, or the input
+/// itself passed through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decoded {
+    Frames(u64),
+    PassedThrough(u64),
+}
+
+impl Decoded {
+    fn bytes(self) -> u64 {
+        match self {
+            Decoded::Frames(bytes) | Decoded::PassedThrough(bytes) => bytes,
+        }
+    }
+}
+
+/// [`decompress_stream`], saying whether the input was decoded or passed
+/// through: the reference reports no result for a passed-through input
+/// (`FIO_passThrough` returns ahead of the summary).
+fn decode_or_pass<R: Read, W: Write>(
+    reader: R,
+    mut writer: W,
+    codecs: &mut Codecs,
+    settings: &DecodeSettings,
+) -> Result<Decoded> {
     // Parsed once for the whole run rather than per stream or per frame, and
     // decoded against by one decoder: the decoder keeps its buffers and, for
     // this one dictionary, the handle it took on the first frame.
@@ -5990,15 +6740,28 @@ fn decompress_stream<R: Read, W: Write>(
             // other, and passes through as the empty output (the reference
             // command refuses it there too; `cat`, `zcat -f` and `xzcat -f`
             // pass it).
-            if frames == 0 && !settings.pass_through {
-                bail!("unexpected end of file");
-            }
-            return Ok(written);
+            return match frames {
+                0 if settings.pass_through => Ok(Decoded::PassedThrough(0)),
+                0 => Err(DecodeFailure::not_a_frame("unexpected end of file")),
+                _ => Ok(Decoded::Frames(written)),
+            };
         }
         let is_frame = read == 4 && {
             let magic = u32::from_le_bytes(magic);
             magic == FRAME_MAGIC || magic & 0xFFFF_FFF0 == SKIPPABLE_MAGIC_BASE
         };
+        // Another compressor's stream is named and refused, pass-through or
+        // not, in the order the reference checks it (`FIO_decompressFrames`):
+        // copying it through would hand on compressed bytes as content. Input
+        // shorter than a magic number is nobody's stream, whatever its bytes,
+        // and goes on to the pass-through / unknown-header handling below.
+        if read == 4
+            && let Some(format) = foreign_format(&magic)
+        {
+            return Err(DecodeFailure::not_a_frame(format!(
+                "{format} file cannot be uncompressed (this build reads zstd only) -- ignored"
+            )));
+        }
         if !is_frame {
             // Only input that is not zstd from its first byte is passed
             // through. What follows a frame and is not one is a damaged or
@@ -6012,12 +6775,12 @@ fn decompress_stream<R: Read, W: Write>(
                 written += read as u64;
                 written += io::copy(&mut source, &mut writer)
                     .wrap_err("failed to pass the input through")?;
-                return Ok(written);
+                return Ok(Decoded::PassedThrough(written));
             }
             if read < 4 {
-                bail!("unknown header");
+                return Err(DecodeFailure::not_a_frame("unknown header"));
             }
-            bail!("unsupported format");
+            return Err(DecodeFailure::not_a_frame("unsupported format"));
         }
         frames += 1;
         let stream = Frames {
@@ -6137,13 +6900,22 @@ fn decode_frames<R: Read, W: Write, C: ReadClock>(
     {
         Some(&FrameDecoderError::WindowSizeTooBig {
             requested, limit, ..
-        }) => bail!(
-            "{}",
-            window_too_large_message(requested, limit, settings.memory_overhead)
-        ),
+        }) => Err(DecodeFailure::in_frame(&window_too_large_message(
+            requested,
+            limit,
+            settings.memory_overhead,
+        ))),
         Some(frame_err) => match after_frame_message(frame_err) {
-            Some(message) => bail!("{message}"),
-            None => bail!("invalid zstd frame: {frame_err:?}"),
+            Some(message) if message.starts_with("Decoding error") => {
+                Err(DecodeFailure::in_frame(message))
+            }
+            Some(message) => Err(DecodeFailure::not_a_frame(message)),
+            // libzstd's message for the failure's class through the decoding
+            // error line (`fileio.c:2463`).
+            None => Err(DecodeFailure::in_frame(&format!(
+                "Decoding error (36) : {}",
+                frame_err.code().message()
+            ))),
         },
         None => Err(err).wrap_err("streaming decompression failed"),
     }
@@ -6336,6 +7108,18 @@ fn window_too_large_message(window: u64, limit: u64, memory_overhead: Option<u64
             "{head}\nWindow log larger than ZSTD_WINDOWLOG_MAX={}; not supported",
             MAX_DECODER_WINDOW_SIZE.ilog2()
         )
+    }
+}
+
+/// The other compressor whose stream starts with `head`, by the magic numbers
+/// the reference command recognises (`fileio.c` `FIO_decompressFrames`):
+/// gzip `1F 8B`, xz `FD 37`, lzma's headerless `5D 00`, and lz4's frame magic.
+fn foreign_format(head: &[u8]) -> Option<&'static str> {
+    match head {
+        [0x1F, 0x8B, ..] => Some("gzip"),
+        [0xFD, 0x37, ..] | [0x5D, 0x00, ..] => Some("xz/lzma"),
+        [0x04, 0x22, 0x4D, 0x18] => Some("lz4"),
+        _ => None,
     }
 }
 

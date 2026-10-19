@@ -1223,6 +1223,193 @@ fn a_session_flushed_per_file_decodes_file_by_file() {
     }
 }
 
+/// libarchive's zstd writer (archive_write_add_filter_zstd.c, drive_compressor):
+/// an output buffer of `ZSTD_CStreamOutSize()` rounded down to tar's 10240-byte
+/// blocks, so smaller than a raw block; tar records fed through
+/// `ZSTD_compressStream`, the buffer written only when full; then
+/// `ZSTD_endStream` until it returns 0. Incompressible input makes raw blocks
+/// that cannot fit the buffer whole, and the stream must still carry the whole
+/// frame.
+#[test]
+fn a_raw_block_larger_than_the_output_buffer_reaches_the_end_of_the_frame() {
+    use crate::streaming::{ZSTD_CStreamOutSize, ZSTD_DStreamOutSize, ZSTD_endStream};
+
+    const RECORD: usize = 10240;
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let noise: Vec<u8> = (0..300_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect();
+    let mut input = b"a line of text that repeats\n".repeat(2000);
+    input.extend_from_slice(&noise);
+    input.extend_from_slice(b"tail");
+
+    let zcs = ZSTD_createCStream();
+    assert_eq!(ZSTD_isError(unsafe { ZSTD_initCStream(zcs, 3) }), 0);
+    unsafe {
+        ZSTD_CCtx_setParameter(zcs, crate::params::ZSTD_C_NB_WORKERS, 0);
+        ZSTD_CCtx_setParameter(zcs, crate::params::ZSTD_C_WINDOW_LOG, 0);
+    }
+    let size = ZSTD_CStreamOutSize() - ZSTD_CStreamOutSize() % RECORD;
+    let mut buf = vec![0u8; size];
+    let mut stream = Vec::new();
+    let mut outb = ZSTD_outBuffer {
+        dst: buf.as_mut_ptr().cast(),
+        size,
+        pos: 0,
+    };
+    for record in input.chunks(RECORD) {
+        let mut inb = ZSTD_inBuffer {
+            src: record.as_ptr().cast(),
+            size: record.len(),
+            pos: 0,
+        };
+        while inb.pos < inb.size {
+            let r = unsafe { ZSTD_compressStream(zcs, &mut outb, &mut inb) };
+            assert_eq!(ZSTD_isError(r), 0, "{:?}", code(r));
+            if outb.pos == outb.size {
+                stream.extend_from_slice(&buf[..outb.pos]);
+                outb.pos = 0;
+            }
+        }
+    }
+    loop {
+        let r = unsafe { ZSTD_endStream(zcs, &mut outb) };
+        assert_eq!(ZSTD_isError(r), 0, "{:?}", code(r));
+        stream.extend_from_slice(&buf[..outb.pos]);
+        outb.pos = 0;
+        if r == 0 {
+            break;
+        }
+    }
+
+    let zds = ZSTD_createDStream();
+    let mut restored = Vec::new();
+    let mut dbuf = vec![0u8; ZSTD_DStreamOutSize()];
+    let mut inb = ZSTD_inBuffer {
+        src: stream.as_ptr().cast(),
+        size: stream.len(),
+        pos: 0,
+    };
+    let mut last = usize::MAX;
+    while inb.pos < inb.size || last != 0 {
+        let mut doutb = ZSTD_outBuffer {
+            dst: dbuf.as_mut_ptr().cast(),
+            size: dbuf.len(),
+            pos: 0,
+        };
+        let before = inb.pos;
+        last = unsafe { crate::streaming::ZSTD_decompressStream(zds, &mut doutb, &mut inb) };
+        assert_eq!(ZSTD_isError(last), 0, "{:?}", code(last));
+        restored.extend_from_slice(&dbuf[..doutb.pos]);
+        assert!(
+            inb.pos > before || doutb.pos > 0,
+            "the frame stops short at byte {} of {}",
+            inb.pos,
+            stream.len()
+        );
+    }
+    assert_eq!(restored.len(), input.len());
+    assert!(restored == input);
+    unsafe {
+        ZSTD_freeCCtx(zcs);
+        ZSTD_freeDCtx(zds);
+    }
+}
+
+/// libarchive's zstd reader (archive_read_support_filter_zstd.c,
+/// zstd_filter_read): an output block of `ZSTD_DStreamOutSize()` filled call
+/// by call from 10240-byte reads, a frame counted as open while the last call
+/// returned non-zero, and input running out inside an open frame reported as
+/// truncated. A finished frame must say so by the time its last byte is taken.
+#[test]
+fn a_finished_frame_reports_zero_by_its_last_input_byte() {
+    use crate::streaming::ZSTD_DStreamOutSize;
+
+    const RECORD: usize = 10240;
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let noise: Vec<u8> = (0..300_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect();
+    let mut text = b"a line of text that repeats\n".repeat(2000);
+    text.extend_from_slice(&noise);
+    // Sizes that end the frame on, just before and just after an output block.
+    let block = ZSTD_DStreamOutSize();
+    let inputs = [
+        text.clone(),
+        noise[..block].to_vec(),
+        noise[..2 * block].to_vec(),
+        noise[..block - 1].to_vec(),
+        noise[..block + 1].to_vec(),
+    ];
+    for checksum in [0, 1] {
+        for input in &inputs {
+            let zcs = ZSTD_createCStream();
+            unsafe {
+                ZSTD_CCtx_setParameter(zcs, crate::params::ZSTD_C_CHECKSUM_FLAG, checksum);
+            }
+            let frame = end_frame(zcs, input).unwrap();
+            unsafe { ZSTD_freeCCtx(zcs) };
+
+            let zds = ZSTD_createDStream();
+            let mut out = vec![0u8; block];
+            let mut restored = Vec::new();
+            let mut taken = 0;
+            let mut in_frame = false;
+            let mut eof = false;
+            while !eof {
+                let mut outb = ZSTD_outBuffer {
+                    dst: out.as_mut_ptr().cast(),
+                    size: out.len(),
+                    pos: 0,
+                };
+                while outb.pos < outb.size && !eof {
+                    if !in_frame {
+                        assert_eq!(ZSTD_isError(unsafe { ZSTD_initDStream(zds) }), 0);
+                    }
+                    let end = frame.len().min(taken - taken % RECORD + RECORD);
+                    if taken == frame.len() {
+                        assert!(
+                            !in_frame,
+                            "truncated: {} bytes, checksum {checksum}",
+                            input.len()
+                        );
+                        eof = true;
+                        break;
+                    }
+                    let mut inb = ZSTD_inBuffer {
+                        src: frame[taken..].as_ptr().cast(),
+                        size: end - taken,
+                        pos: 0,
+                    };
+                    let r = unsafe {
+                        crate::streaming::ZSTD_decompressStream(zds, &mut outb, &mut inb)
+                    };
+                    assert_eq!(ZSTD_isError(r), 0, "{:?}", code(r));
+                    taken += inb.pos;
+                    in_frame = r != 0;
+                }
+                restored.extend_from_slice(&out[..outb.pos]);
+            }
+            assert!(
+                restored == *input,
+                "{} bytes, checksum {checksum}",
+                input.len()
+            );
+            unsafe { ZSTD_freeDCtx(zds) };
+        }
+    }
+}
+
 /// A skippable frame larger than the input buffer is skipped across calls,
 /// and the frame after it decodes.
 #[test]

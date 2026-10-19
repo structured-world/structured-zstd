@@ -603,6 +603,77 @@ impl From<HuffmanTableError> for DictionaryDecodeError {
     }
 }
 
+/// The class a decoding failure falls in, as libzstd's stable error codes name
+/// it (`zstd_errors.h`). The C API returns these codes and the command line
+/// prints [`ErrorCode::message`], so both report a failure alike.
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::decoding::errors::{ErrorCode, FrameDecoderError};
+///
+/// let err = FrameDecoderError::DictNotProvided { dict_id: 7 };
+/// assert_eq!(err.code(), ErrorCode::DictionaryWrong);
+/// assert_eq!(err.code().message(), "Dictionary mismatch");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorCode {
+    /// Not a frame: the magic number is unknown.
+    PrefixUnknown,
+    /// The frame header asks for something this decoder does not support.
+    FrameParameterUnsupported,
+    /// The frame's window is past the ceiling in force.
+    FrameParameterWindowTooLarge,
+    /// A setting lies outside its allowed range.
+    ParameterOutOfBound,
+    /// The dictionary could not be read.
+    DictionaryCorrupted,
+    /// The frame needs another dictionary than the one supplied, or one that
+    /// was not supplied.
+    DictionaryWrong,
+    /// The output buffer is too small.
+    DstSizeTooSmall,
+    /// The decoder was used before a frame was started.
+    InitMissing,
+    /// The content checksum does not match the decoded data.
+    ChecksumWrong,
+    /// The frame is malformed or damaged.
+    CorruptionDetected,
+}
+
+impl ErrorCode {
+    /// libzstd's message for the code (`ZSTD_getErrorString`).
+    pub fn message(self) -> &'static str {
+        match self {
+            ErrorCode::PrefixUnknown => "Unknown frame descriptor",
+            ErrorCode::FrameParameterUnsupported => "Unsupported frame parameter",
+            ErrorCode::FrameParameterWindowTooLarge => {
+                "Frame requires too much memory for decoding"
+            }
+            ErrorCode::ParameterOutOfBound => "Parameter is out of bound",
+            ErrorCode::DictionaryCorrupted => "Dictionary is corrupted",
+            ErrorCode::DictionaryWrong => "Dictionary mismatch",
+            ErrorCode::DstSizeTooSmall => "Destination buffer is too small",
+            ErrorCode::InitMissing => "Context should be init first",
+            ErrorCode::ChecksumWrong => "Restored data doesn't match checksum",
+            ErrorCode::CorruptionDetected => "Data corruption detected",
+        }
+    }
+}
+
+impl FrameDescriptorError {
+    /// The code libzstd returns for the refused descriptor.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            // A set Reserved_bit is an unsupported frame parameter
+            // (upstream zstd `zstd_decompress.c:511`).
+            FrameDescriptorError::ReservedBitSet => ErrorCode::FrameParameterUnsupported,
+            _ => ErrorCode::CorruptionDetected,
+        }
+    }
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FrameDecoderError {
@@ -773,6 +844,38 @@ pub enum FrameDecoderError {
     /// to make it resumable.
     #[cfg(feature = "lsm")]
     ResumeUnidentifiedDictionary,
+}
+
+impl FrameDecoderError {
+    /// The code libzstd returns for the same failure. A variant with no exact
+    /// counterpart is `CorruptionDetected`, the code for a malformed frame.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            FrameDecoderError::ReadFrameHeaderError(
+                ReadFrameHeaderError::InvalidFrameDescriptor(descriptor),
+            ) => descriptor.code(),
+            FrameDecoderError::ReadFrameHeaderError(_) => ErrorCode::PrefixUnknown,
+            // A window past the format's maximum is refused while the header
+            // is read, before the ceiling check, and is the same failure.
+            FrameDecoderError::FrameHeaderError(FrameHeaderError::WindowTooBig { .. })
+            | FrameDecoderError::FailedToInitialize(FrameHeaderError::WindowTooBig { .. }) => {
+                ErrorCode::FrameParameterWindowTooLarge
+            }
+            FrameDecoderError::FrameHeaderError(_) | FrameDecoderError::FailedToInitialize(_) => {
+                ErrorCode::FrameParameterUnsupported
+            }
+            FrameDecoderError::WindowSizeTooBig { .. } => ErrorCode::FrameParameterWindowTooLarge,
+            FrameDecoderError::WindowCeilingOutOfRange { .. } => ErrorCode::ParameterOutOfBound,
+            FrameDecoderError::DictionaryDecodeError(_) => ErrorCode::DictionaryCorrupted,
+            FrameDecoderError::DictNotProvided { .. }
+            | FrameDecoderError::DictIdMismatch { .. }
+            | FrameDecoderError::DictAlreadyRegistered { .. } => ErrorCode::DictionaryWrong,
+            FrameDecoderError::TargetTooSmall => ErrorCode::DstSizeTooSmall,
+            FrameDecoderError::NotYetInitialized => ErrorCode::InitMissing,
+            FrameDecoderError::ChecksumMismatch { .. } => ErrorCode::ChecksumWrong,
+            _ => ErrorCode::CorruptionDetected,
+        }
+    }
 }
 
 #[cfg(feature = "std")]

@@ -75,6 +75,51 @@ fn adjust_bucket_size_log_clamps_strategy_to_bounds() {
     assert_eq!(LdmParams::adjust_for(27, 9).bucket_size_log, 8);
 }
 
+/// A pinned `hash_log` at or above the window leaves `hash_rate_log` at 0,
+/// a split at every position: upstream zstd derives the rate from the
+/// strategy only when no `hash_log` is pinned (`zstd_ldm.c:141-153`, the
+/// `else` belongs to `hashLog > 0`). `--max` on a small input lands here:
+/// the window shrinks to the source while `hash_log` stays at its maximum.
+#[test]
+fn pinned_hash_log_at_or_above_the_window_keeps_a_zero_hash_rate() {
+    let pinned = LdmParams {
+        window_log: 17,
+        hash_log: 30,
+        ..LdmParams::default()
+    }
+    .derive(9);
+    assert_eq!(pinned.hash_rate_log, 0);
+    let equal = LdmParams {
+        window_log: 20,
+        hash_log: 20,
+        ..LdmParams::default()
+    }
+    .derive(5);
+    assert_eq!(equal.hash_rate_log, 0);
+    // Below the window the rate is the gap, as before.
+    let below = LdmParams {
+        window_log: 27,
+        hash_log: 20,
+        ..LdmParams::default()
+    }
+    .derive(5);
+    assert_eq!(below.hash_rate_log, 7);
+}
+
+/// A bucket is never larger than the table holding it: upstream zstd caps
+/// `bucket_size_log` at `hash_log` after deriving both (`zstd_ldm.c:166`).
+#[test]
+fn bucket_size_log_never_exceeds_hash_log() {
+    let pinned = LdmParams {
+        window_log: 27,
+        hash_log: 6,
+        bucket_size_log: 8,
+        ..LdmParams::default()
+    }
+    .derive(9);
+    assert_eq!(pinned.bucket_size_log, 6);
+}
+
 /// Derived hash-table size + bucket slots agree with the
 /// `1 << log` definitions and with each other.
 #[test]

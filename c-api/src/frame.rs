@@ -6,9 +6,9 @@ use core::ffi::{c_uint, c_ulonglong};
 
 use codec::decoding::errors::ReadFrameHeaderError;
 use codec::decoding::{
-    FrameContentSize, FrameMagic, FrameSizeError, decompression_margin, find_frame_compressed_size,
-    frame_decompressed_bound, frame_header_size, frame_magic, min_decoding_buffer_size,
-    read_frame_content_size, read_frame_header_info,
+    FrameContentSize, FrameMagic, FrameSizeError, decompression_margin, find_decompressed_size,
+    find_frame_compressed_size, frame_decompressed_bound, frame_header_size, frame_magic,
+    min_decoding_buffer_size, read_frame_header_info,
 };
 use codec::skippable::{
     SkippableFrameError, SkippableSliceError, parse_skippable_frame, write_skippable_frame,
@@ -210,27 +210,13 @@ pub unsafe extern "C" fn ZSTD_getFrameHeader_advanced(
 /// `src` must be valid for `src_size` bytes (or `NULL` with `src_size == 0`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_findDecompressedSize(src: *const u8, src_size: usize) -> c_ulonglong {
-    let mut rest = unsafe { in_slice(src, src_size) };
-    let mut total: u64 = 0;
-    while !rest.is_empty() {
-        match read_frame_content_size(rest) {
-            // checked_add, not saturating: a saturated u64::MAX would alias the
-            // CONTENTSIZE_UNKNOWN sentinel and mask the overflow.
-            Ok(FrameContentSize::Known(size)) => match total.checked_add(size) {
-                Some(sum) => total = sum,
-                None => return CONTENTSIZE_ERROR,
-            },
-            Ok(FrameContentSize::Unknown) => return CONTENTSIZE_UNKNOWN,
-            // Skippable frames add nothing to the decompressed size.
-            Err(ReadFrameHeaderError::SkipFrame { .. }) => {}
-            Err(_) => return CONTENTSIZE_ERROR,
-        }
-        match find_frame_compressed_size(rest) {
-            Ok(consumed) if consumed > 0 && consumed <= rest.len() => rest = &rest[consumed..],
-            _ => return CONTENTSIZE_ERROR,
-        }
+    match find_decompressed_size(unsafe { in_slice(src, src_size) }) {
+        Ok(FrameContentSize::Known(total)) => total,
+        Ok(FrameContentSize::Unknown) => CONTENTSIZE_UNKNOWN,
+        // An overflowing sum is an error, not a size: `u64::MAX` would alias
+        // the CONTENTSIZE_UNKNOWN sentinel.
+        Err(_) => CONTENTSIZE_ERROR,
     }
-    total
 }
 
 /// `unsigned ZSTD_isFrame(const void* buffer, size_t size)` — 1 when `buffer`
