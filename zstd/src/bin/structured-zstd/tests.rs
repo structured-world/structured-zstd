@@ -5486,6 +5486,26 @@ fn decoding_benchmark_weighs_the_memory_limit_before_reading() {
     assert!(err.contains("memory limit"), "{err}");
 }
 
+/// A decoding benchmark that `-M` refuses on sizes alone does so before any
+/// work: the dictionary is not parsed and the trace file is not created.
+#[test]
+fn a_decoding_benchmark_refused_on_sizes_does_no_work_first() {
+    let scratch = Scratch::new("bench-decode-refuse-early");
+    let input = scratch.file("big.zst", &vec![b'x'; 64 * 1024]);
+    let trace = scratch.path().join("trace.csv");
+    let mut opts = parse(&["-b", "-d", "-i0", "-q", "x"]).unwrap();
+    opts.inputs = vec![input];
+    opts.trace = Some(trace.clone());
+    opts.memory_limit = Some(
+        structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE + DECODER_AUXILIARY_BYTES + 1024,
+    );
+    let err = run_benchmark(&opts, Some(vec![b'd'; 512]))
+        .expect_err("the input alone exceeds the limit")
+        .to_string();
+    assert!(err.contains("memory limit"), "{err}");
+    assert!(!trace.exists(), "the trace was opened before the refusal");
+}
+
 /// The bytes a training run is asked to load are summed wide: sizes the
 /// directory entries claim can add up past `u64` (sparse files under `-B`),
 /// and the notice comparing them with the budget must still be true.

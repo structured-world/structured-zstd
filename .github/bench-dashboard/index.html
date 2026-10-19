@@ -2565,9 +2565,17 @@
         const corpus = xvalState.selectors.corpus.value;
         const level = xvalState.selectors.level.value;
         const rows = xvalState.records.filter((r) => r.scenario === corpus && String(r.level) === level);
-        const snapshots = uniq(rows.map((r) => r.generated_at || r.commit_sha || "local-run"));
+        // A snapshot is a timestamp and a commit together, as the merge keys
+        // it: two commits stamped alike stay two points.
+        const keyOf = (r) => `${r.generated_at || "local-run"}|${r.commit_sha || ""}`;
+        const snapshots = uniq(rows.map(keyOf));
+        const labelOf = (key) => {
+          const [time, sha] = key.split("|");
+          return sha ? `${time} ${sha.slice(0, 7)}` : time;
+        };
+        const labels = snapshots.map(labelOf);
         const at = (snap, field) => {
-          const row = rows.find((r) => (r.generated_at || r.commit_sha || "local-run") === snap);
+          const row = rows.find((r) => keyOf(r) === snap);
           return row && typeof row[field] === "number" ? row[field] : null;
         };
         // Each record carries the limits its run held it to (0 = not held), so
@@ -2613,7 +2621,7 @@
           ...snapshots.map((snap) => {
             const tr = document.createElement("tr");
             const values = [
-              snap,
+              labelOf(snap),
               cell(at(snap, "size_ratio"), 4),
               cell(at(snap, "size_limit"), 2),
               cell(at(snap, "time_ratio"), 2),
@@ -2636,13 +2644,13 @@
         };
         if (xvalState.chart) {
           xvalState.chart.options.scales = scales;
-          xvalState.chart.data.labels = snapshots;
+          xvalState.chart.data.labels = labels;
           xvalState.chart.data.datasets = datasets;
           xvalState.chart.update("none");
         } else {
           xvalState.chart = new Chart(el("chart-xval"), {
             type: "line",
-            data: { labels: snapshots, datasets },
+            data: { labels, datasets },
             options: {
               responsive: true,
               maintainAspectRatio: false,
