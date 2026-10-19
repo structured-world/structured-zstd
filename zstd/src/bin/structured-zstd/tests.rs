@@ -376,36 +376,31 @@ fn target_block_size_reaches_the_encoder() {
     );
 }
 
-/// Inputs are processed one after another, so an output derived from an early
-/// one can land on a file still waiting its turn: `-f foo foo.zst` replaces
-/// `foo.zst` before it is ever read, and the original is gone. `-f` says
-/// overwrite the output, not destroy another input.
+/// Inputs are processed one after another, and under `-f` an output derived
+/// from an early one replaces a later input of that name before it is read, as
+/// the reference command does (its own suite runs `zstd -f tmp*` over `tmp`
+/// and `tmp.zst`): `-f foo foo.zst` writes `foo.zst` from `foo`, then
+/// compresses that into `foo.zst.zst`.
 #[test]
-fn an_output_may_not_land_on_another_input() {
-    let dir = std::env::temp_dir();
-    let plain = dir.join(format!("szstd-alias-{}", std::process::id()));
-    let archive = PathBuf::from(format!("{}.zst", plain.display()));
-    fs::write(&plain, b"first input").unwrap();
-    fs::write(&archive, b"second input, would be destroyed").unwrap();
+fn an_output_may_land_on_a_later_input_under_force() {
+    let scratch = Scratch::new("alias");
+    let plain = scratch.file("data", b"first input");
+    let archive = scratch.file("data.zst", b"second input, overwritten");
 
-    let mut opts = parse(&["-f", "a", "b"]).unwrap();
-    opts.inputs = vec![plain.clone(), archive.clone()];
-    let refused = run(opts);
+    let mut opts = parse(&["-q", "-f", "a", "b"]).unwrap();
+    opts.inputs = vec![plain, archive.clone()];
+    assert_eq!(run(opts).expect("the run goes ahead"), 0, "no input failed");
 
-    let survived = fs::read(&archive).unwrap_or_default();
-    let _ = fs::remove_file(&plain);
-    let _ = fs::remove_file(&archive);
-    let err = refused
-        .expect_err("an output that is also an input must be refused")
-        .to_string();
-    assert!(
-        err.contains("input"),
-        "the refusal must name the collision: {err}"
-    );
-    assert_eq!(
-        survived, b"second input, would be destroyed",
-        "the second input must still be there"
-    );
+    let decode = |frame: &[u8]| {
+        let mut out = Vec::new();
+        structured_zstd::decoding::StreamingDecoder::new(frame)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    };
+    assert_eq!(decode(&fs::read(&archive).unwrap()), b"first input");
+    let twice = fs::read(scratch.path().join("data.zst.zst")).unwrap();
+    assert_eq!(decode(&decode(&twice)), b"first input");
 }
 
 /// `--rm` deletes an input once its output is safely written, but an input that
@@ -828,39 +823,6 @@ fn an_output_may_not_land_on_the_dictionary() {
     assert_eq!(survived.len(), 4096, "the dictionary must still be there");
 }
 
-/// The same file can be named many ways — `foo.zst`, `./foo.zst`,
-/// `dir/../dir/foo.zst` — and a guard that compares the spelling rather than
-/// the file lets every one of those through. The second input is destroyed just
-/// the same.
-#[test]
-fn an_output_may_not_land_on_another_input_spelled_differently() {
-    let dir = std::env::temp_dir();
-    let plain = dir.join(format!("szstd-spelling-{}", std::process::id()));
-    let archive = PathBuf::from(format!("{}.zst", plain.display()));
-    fs::write(&plain, b"first input").unwrap();
-    fs::write(&archive, b"second input, would be destroyed").unwrap();
-
-    // The same archive, reached through the directory rather than named
-    // directly: a different string for one file.
-    let indirect = dir
-        .join("..")
-        .join(dir.file_name().expect("a temp dir has a name"))
-        .join(archive.file_name().expect("the archive has a name"));
-
-    let mut opts = parse(&["-f", "a", "b"]).unwrap();
-    opts.inputs = vec![plain.clone(), indirect];
-    let refused = run(opts);
-
-    let survived = fs::read(&archive).unwrap_or_default();
-    let _ = fs::remove_file(&plain);
-    let _ = fs::remove_file(&archive);
-    refused.expect_err("the collision is the file, not the spelling");
-    assert_eq!(
-        survived, b"second input, would be destroyed",
-        "the second input must still be there"
-    );
-}
-
 /// Training reads every sample whole, so a sample has to be a file with an end:
 /// a FIFO blocks on a read that never returns and a character device grows the
 /// corpus until the allocator gives up — the same reason benchmarking and
@@ -992,6 +954,39 @@ fn a_new_output_inherits_the_source_permissions() {
         mode.expect("the archive must exist"),
         0o600,
         "the archive must be no more readable than the file it came from"
+    );
+}
+
+/// The output of a regular file carries the file's modification time, both
+/// ways, as the reference command sets it (fileio.c:2140 and 3122,
+/// `UTIL_utime`): a round trip leaves the restored file dated as the original.
+#[test]
+fn an_output_keeps_the_source_modification_time() {
+    let scratch = Scratch::new("mtime");
+    let input = scratch.file("dated.txt", b"payload with a date");
+    let dated = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(946_677_600);
+    File::options()
+        .write(true)
+        .open(&input)
+        .unwrap()
+        .set_modified(dated)
+        .unwrap();
+    let mtime = |path: &Path| fs::metadata(path).unwrap().modified().unwrap();
+
+    let mut opts = parse(&["-3", "-q", "f"]).unwrap();
+    opts.inputs = vec![input.clone()];
+    process_file(&opts, &input, &mut no_dict(), 1).expect("compressing must succeed");
+    let archive = scratch.path().join("dated.txt.zst");
+    assert_eq!(mtime(&archive), dated, "the archive is dated as its source");
+
+    fs::remove_file(&input).unwrap();
+    let mut opts = parse(&["-d", "-q", "f"]).unwrap();
+    opts.inputs = vec![archive.clone()];
+    process_file(&opts, &archive, &mut no_dict(), 1).expect("decompressing must succeed");
+    assert_eq!(
+        mtime(&input),
+        dated,
+        "the restored file is dated as the archive"
     );
 }
 
@@ -1697,6 +1692,219 @@ fn argv0_zstdcat_decompresses_to_stdout_passing_plain_input_through() {
     assert_eq!(program_preset("zstdmt").mode, Mode::Compress);
 }
 
+/// The other names the reference command answers to (`zstdcli.c` "preset
+/// behaviors"): `gzcat` is another `zcat`; the `un*` names decompress, and all
+/// but `unlz4` remove the source like the tool they stand in for; the
+/// compressor names select that tool's format, remove the source the same way
+/// and, for `gzip`, take gzip's default level. A trailing `.anything` is
+/// ignored, as `exeNameMatch` ignores it.
+#[test]
+fn argv0_names_of_other_tools_take_their_presets() {
+    let gzcat = program_preset("gzcat");
+    assert_eq!(gzcat.mode, Mode::Decompress);
+    assert!(gzcat.to_stdout && gzcat.force);
+    assert_eq!(gzcat.pass_through, Some(true));
+    assert_eq!(gzcat.verbosity, 1);
+
+    for (name, removes) in [
+        ("gunzip", true),
+        ("unxz", true),
+        ("unlzma", true),
+        ("unlz4", false),
+    ] {
+        let preset = program_preset(name);
+        assert_eq!(preset.mode, Mode::Decompress, "{name}");
+        assert_eq!(preset.remove_source, removes, "{name}");
+        assert_eq!(
+            preset.format,
+            OutputFormat::Zstd,
+            "{name} writes plain output"
+        );
+    }
+
+    for (name, format, removes, level) in [
+        ("gzip", OutputFormat::Gzip, true, Some(6)),
+        ("xz", OutputFormat::Xz, true, None),
+        ("lzma", OutputFormat::Lzma, true, None),
+        ("lz4", OutputFormat::Lz4, false, None),
+    ] {
+        let preset = program_preset(name);
+        assert_eq!(preset.mode, Mode::Compress, "{name}");
+        assert_eq!(preset.format, format, "{name}");
+        assert_eq!(preset.remove_source, removes, "{name}");
+        assert_eq!(preset.level, level, "{name}");
+    }
+
+    assert_eq!(program_preset("gzip.exe").format, OutputFormat::Gzip);
+    assert_eq!(program_preset("unxz.1").mode, Mode::Decompress);
+    // A longer name that merely starts with one is not that tool.
+    assert_eq!(program_preset("gzipper").format, OutputFormat::Zstd);
+    assert_eq!(program_preset("zstd").format, OutputFormat::Zstd);
+}
+
+/// `--format=zstd` overrides the format a tool name selects, so `gzip
+/// --format=zstd f` writes zstd instead of refusing to write gzip.
+#[test]
+fn explicit_zstd_format_overrides_the_tool_name() {
+    for name in ["gzip", "xz", "lzma", "lz4"] {
+        let opts = parse_as(
+            &program_preset(name),
+            CompressionLevel::DEFAULT_LEVEL,
+            &["--format=zstd", "f"],
+        )
+        .unwrap();
+        assert_eq!(opts.format, OutputFormat::Zstd, "{name}");
+    }
+}
+
+/// This build writes zstd only. Compressing under a name that selects another
+/// format fails the whole run the way the reference command built without that
+/// codec does (`fileio.c` `EXM_THROW(20, ...)`): status 20, and the source
+/// left in place even though the name implies removing it.
+#[test]
+fn compressing_to_a_format_this_build_cannot_write_fails_with_status_20() {
+    let scratch = Scratch::new("argv0gz");
+    let input = scratch.file("plain", b"some data");
+    for name in ["gzip", "xz", "lzma", "lz4"] {
+        let raw: Vec<OsString> = vec![name.into(), input.clone().into_os_string(), "-q".into()];
+        assert_eq!(run_command(&raw, &mut io::empty()), 20, "{name}");
+        assert!(input.exists(), "{name} keeps the source");
+    }
+    let leftovers: Vec<_> = fs::read_dir(scratch.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(leftovers, ["plain"], "nothing was written");
+}
+
+/// Decoding recognises the other formats by their magic and says which one it
+/// cannot read, as the reference command built without their codecs does,
+/// instead of calling them an unsupported format. Pass-through does not copy
+/// them either: the reference checks these magics before it passes input
+/// through (`FIO_decompressFrames`), so `zcat` on a gzip file fails rather than
+/// printing the compressed bytes.
+#[test]
+fn decoding_names_the_foreign_format_it_cannot_read() {
+    let pass = DecodeSettings {
+        pass_through: true,
+        ..DecodeSettings::default()
+    };
+    let decode_stream_message = |bytes: &[u8]| {
+        let refused = decompress_stream(
+            bytes,
+            io::sink(),
+            &mut no_dict(),
+            &DecodeSettings::default(),
+        )
+        .expect_err("a foreign format is refused")
+        .to_string();
+        if !refused.contains("unsupported format") {
+            let passed = decompress_stream(bytes, io::sink(), &mut no_dict(), &pass)
+                .expect_err("pass-through refuses it too")
+                .to_string();
+            assert_eq!(passed, refused, "{bytes:02x?}");
+        }
+        refused
+    };
+    for (bytes, message) in [
+        (
+            &[0x1F, 0x8B, 8, 0, 0][..],
+            "gzip file cannot be uncompressed",
+        ),
+        (
+            &[0xFD, 0x37, 0x7A, 0x58, 0x5A][..],
+            "xz/lzma file cannot be uncompressed",
+        ),
+        (
+            &[0x5D, 0x00, 0x00, 0x80, 0x00][..],
+            "xz/lzma file cannot be uncompressed",
+        ),
+        (
+            &[0x04, 0x22, 0x4D, 0x18, 0x00][..],
+            "lz4 file cannot be uncompressed",
+        ),
+    ] {
+        let err = decode_stream_message(bytes);
+        assert!(err.contains(message), "{bytes:02x?}: {err}");
+    }
+    assert!(decode_stream_message(b"some data").contains("unsupported format"));
+}
+
+/// A decoding failure is reported against the input, in the reference
+/// command's two shapes (`fileio.c` 2463, 2748-2796): `zstd: NAME: message`
+/// for input that is not a frame, and `NAME : Decoding error (36) : <libzstd's
+/// message>` for a frame that fails, every line of a multi-line report named.
+#[test]
+fn decode_failures_name_the_input_like_the_reference() {
+    let failure = |bytes: &[u8], settings: &DecodeSettings| {
+        let err = decompress_stream(bytes, io::sink(), &mut no_dict(), settings)
+            .expect_err("the input is refused");
+        named(err, "in.zst").to_string()
+    };
+    assert_eq!(
+        failure(b"plain text", &DecodeSettings::default()),
+        "zstd: in.zst: unsupported format "
+    );
+    assert_eq!(
+        failure(b"", &DecodeSettings::default()),
+        "zstd: in.zst: unexpected end of file "
+    );
+    // A dictionary frame decoded without its dictionary.
+    let dictionary_frame = include_bytes!("../../../dict_tests/files/ModemManager.service.zst");
+    assert_eq!(
+        failure(dictionary_frame, &DecodeSettings::default()),
+        "in.zst : Decoding error (36) : Dictionary mismatch "
+    );
+    let narrow = DecodeSettings {
+        max_window: 1 << 10,
+        ..DecodeSettings::default()
+    };
+    let report = failure(&frame_of(&[7u8; 1 << 16]), &narrow);
+    assert!(
+        report.starts_with("in.zst : Decoding error (36) : Frame requires too much memory"),
+        "{report}"
+    );
+    assert!(
+        report.lines().all(|line| line.starts_with("in.zst : ")),
+        "every line is named: {report}"
+    );
+    // Anything else keeps its own text.
+    let other = named(eyre!("can't stat x"), "in.zst").to_string();
+    assert_eq!(other, "can't stat x");
+}
+
+/// A passed-through input is told apart from a decoded one, so it gets no
+/// result line: the reference prints none for it (`FIO_passThrough` returns
+/// ahead of the summary).
+#[test]
+fn a_passed_through_input_is_told_apart_from_a_decoded_one() {
+    let pass = DecodeSettings {
+        pass_through: true,
+        ..DecodeSettings::default()
+    };
+    let decode = |bytes: &[u8]| decode_or_pass(bytes, io::sink(), &mut no_dict(), &pass).unwrap();
+    assert_eq!(decode(b"some data"), Decoded::PassedThrough(9));
+    assert_eq!(decode(b""), Decoded::PassedThrough(0));
+    assert_eq!(decode(&frame_of(b"framed")), Decoded::Frames(6));
+}
+
+/// One input that fails to decode does not end a run over several: the
+/// reference command reports it and goes on to the next (`FIO_decompressMultipleFilenames`),
+/// so the inputs after it are still written and the exit status counts the
+/// failure.
+#[test]
+fn a_failed_input_does_not_end_a_concatenated_decode() {
+    let scratch = Scratch::new("deccont");
+    let bad = scratch.file("bad", b"plain text");
+    let good = scratch.file("good.zst", &frame_of(b"after the bad one"));
+    let output = scratch.path().join("out");
+    let mut opts = parse(&["-d", "-qq", "-f", "-o", "x", "a", "b"]).unwrap();
+    opts.inputs = vec![bad, good];
+    opts.output = Some(output.clone());
+    assert_eq!(run(opts).expect("a failed input is counted"), 1);
+    assert_eq!(fs::read(&output).unwrap(), b"after the bad one");
+}
+
 /// The preset is the starting point, not the last word: `zstdcat -v` still
 /// raises the level, and `--no-pass-through` still turns pass-through off.
 #[test]
@@ -1733,19 +1941,38 @@ fn levels_above_19_without_ultra_fall_back_to_19() {
     assert_eq!(parse(&["-20", "in.txt"]).unwrap().level, 19);
     // Named, they run as asked.
     assert_eq!(parse(&["--ultra", "-22", "in.txt"]).unwrap().level, 22);
-    // Benchmarking compresses the range `-b`/`-e` name rather than the level
-    // `-N` sets, so the range is what gets clamped: `-b20` reaches an ultra
-    // level as surely as `-20` does.
-    let opts = parse(&["-b20", "in.txt"]).unwrap();
-    assert_eq!((opts.bench_start, opts.bench_end), (19, 19));
-    let opts = parse(&["-b3", "-e22", "in.txt"]).unwrap();
-    assert_eq!((opts.bench_start, opts.bench_end), (3, 19));
-    assert_eq!(
-        parse(&["--ultra", "-b20", "in.txt"]).unwrap().bench_start,
-        20
-    );
     // Below the ultra band nothing moves.
     assert_eq!(parse(&["-19", "in.txt"]).unwrap().level, 19);
+}
+
+/// A level past the scale is not refused either (upstream zstdcli.c:1557-1566):
+/// `zstd -99` warns and compresses at 19, or at 22 under `--ultra`, as the
+/// reference's own test suite expects ("too large compression level =>
+/// auto-fix"). A level below the scale compresses at the fastest one, as the
+/// library clamps it (zstd_compress.c:8303).
+#[test]
+fn levels_past_the_scale_are_reduced_to_it() {
+    assert_eq!(parse(&["-99", "in.txt"]).unwrap().level, 19);
+    assert_eq!(parse(&["--ultra", "-99", "in.txt"]).unwrap().level, 22);
+    let min = CompressionLevel::MIN_LEVEL;
+    assert_eq!(parse_as(&plain(), min - 5, &["in.txt"]).unwrap().level, min);
+    // The digit run still has to fit 32 bits.
+    assert!(parse(&["-5000000000", "in.txt"]).is_err());
+    // Within 32 bits it is the reference's unsigned read taken as an `int`
+    // (zstdcli.c:1210): the largest value is level -1, which its test suite
+    // compresses at ("max allowed numeric value is 4294967295").
+    assert_eq!(parse(&["-4294967295", "in.txt"]).unwrap().level, -1);
+}
+
+/// Benchmarking leaves before the `--ultra` gate (upstream zstdcli.c:1456-1484,
+/// `goto _end`), so `-b20` measures level 20 without `--ultra`; only the top
+/// of the scale bounds the range.
+#[test]
+fn benchmark_range_is_bounded_by_the_scale_alone() {
+    let opts = parse(&["-b20", "in.txt"]).unwrap();
+    assert_eq!((opts.bench_start, opts.bench_end), (20, 20));
+    let opts = parse(&["-b3", "-e99", "in.txt"]).unwrap();
+    assert_eq!((opts.bench_start, opts.bench_end), (3, 22));
 }
 
 #[test]
@@ -1924,42 +2151,46 @@ fn long_window_log_reaches_the_encoder() {
     );
 }
 
-/// Training writes a file like any other output, so it answers to `-f` like any
-/// other output. Without the gate `--train -o existing` replaces the file with
-/// no warning, and naming a sample as the destination destroys the sample.
+/// `--train -o existing` replaces the file without `-f`, as the reference's
+/// trainer does (`DiB_saveDict` opens the output with `fopen("wb")`): scripts
+/// written for it retrain into the same path, upstream's own test suite among
+/// them.
 #[test]
-fn training_refuses_to_overwrite_without_force() {
+fn training_replaces_an_existing_output() {
     let dir = std::env::temp_dir();
-    let sample = dir.join(format!("szstd-train-sample-{}.bin", std::process::id()));
     let existing = dir.join(format!("szstd-train-out-{}.bin", std::process::id()));
-    fs::write(&sample, vec![7u8; 4096]).unwrap();
-    fs::write(&existing, b"precious").unwrap();
+    fs::write(&existing, b"an older dictionary").unwrap();
+    let samples: Vec<PathBuf> = (0..8)
+        .map(|i| {
+            let sample = dir.join(format!("szstd-train-sample-{}-{i}.bin", std::process::id()));
+            let text: Vec<u8> = (0..400u32)
+                .flat_map(|j| format!("sample {i} row {} key {}\n", j % 31, j % 7).into_bytes())
+                .collect();
+            fs::write(&sample, text).unwrap();
+            sample
+        })
+        .collect();
 
-    // Unreadable, so the answer says which step ran first: a command that
-    // cannot write its result should be refused before it spends the memory
-    // and minutes of building one.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&sample, fs::Permissions::from_mode(0o000)).unwrap();
-    }
-
-    let mut opts = parse(&["--train", "s"]).unwrap();
-    opts.inputs = vec![sample.clone()];
+    let mut opts = parse(&["--train", "-q", "s"]).unwrap();
+    opts.inputs = samples.clone();
     opts.output = Some(existing.clone());
-    let refused = train_dictionary(&opts);
+    let trained = train_dictionary(&opts);
 
-    let survived = fs::read(&existing).unwrap_or_default();
-    let _ = fs::remove_file(&sample);
+    let written = fs::read(&existing).unwrap_or_default();
+    for sample in &samples {
+        let _ = fs::remove_file(sample);
+    }
     let _ = fs::remove_file(&existing);
-    let err = refused
-        .expect_err("an existing dictionary must not be replaced without -f")
-        .to_string();
-    assert!(
-        err.contains("already exists"),
-        "the refusal must be the destination, before any sample is read: {err}"
+    trained.expect("training into an existing output succeeds without -f");
+    assert_ne!(
+        written, b"an older dictionary",
+        "the output was not replaced"
     );
-    assert_eq!(survived, b"precious", "the existing file must be untouched");
+    assert_eq!(
+        written.get(..4),
+        Some(&[0x37, 0xA4, 0x30, 0xEC][..]),
+        "the output holds a trained dictionary"
+    );
 }
 
 /// The trainer flags name algorithms, and the algorithm decides what the
@@ -2064,6 +2295,45 @@ fn training_samples_are_loaded_the_way_the_reference_loads_them() {
     );
     let limited = load_training_samples(&many, None, Some(300 << 10), |_| Ok(())).unwrap();
     assert_eq!(limited.sizes.len(), 2, "-M bounds what is loaded");
+}
+
+/// The trainer says what the reference's says about its load (dibio.c,
+/// `DiB_trainFromFiles`): a `-M` limit as a warning, in whole megabytes, and
+/// that samples past the budget are trained on in part. Under the budget
+/// only the warning is said, and without `-M` nothing.
+#[test]
+fn training_reports_the_memory_limit_and_a_partial_load() {
+    let dir = Scratch::new("training-notices");
+    let mut many = Vec::new();
+    for i in 0..12 {
+        many.push(dir.file(&format!("chunked{i}"), &vec![b'z'; 1 << 20]));
+    }
+    let limited = load_training_samples(&many, Some(2 << 10), Some(5 << 20), |_| Ok(())).unwrap();
+    assert_eq!(
+        training_load_notices(&limited, Some(5 << 20)),
+        vec![
+            (
+                2,
+                "!  Warning : setting manual memory limit for dictionary training data at 5 MB"
+                    .to_string()
+            ),
+            (
+                1,
+                "Training samples set too large (12 MB); training on 5 MB only...".to_string()
+            ),
+        ]
+    );
+    let roomy = load_training_samples(&many, Some(2 << 10), Some(64 << 20), |_| Ok(())).unwrap();
+    assert_eq!(
+        training_load_notices(&roomy, Some(64 << 20)),
+        vec![(
+            2,
+            "!  Warning : setting manual memory limit for dictionary training data at 64 MB"
+                .to_string()
+        )]
+    );
+    let unlimited = load_training_samples(&many, Some(2 << 10), None, |_| Ok(())).unwrap();
+    assert!(training_load_notices(&unlimited, None).is_empty());
 }
 
 /// The files are taken in the reference's shuffled order (`DiB_shuffle`), so
@@ -2307,14 +2577,14 @@ fn out_of_range_long_window_log_is_refused() {
     assert!(parse(&["-19", &past, "in.txt"]).is_err());
 }
 
-/// A benchmark range is two levels, and both of them run. Checking only the
-/// top lets `-b-200000` through parsing, so the files are stat'd and read whole
-/// before the first level is rejected — work for a command that was never going
-/// to run.
+/// A benchmark range is two levels, and both of them run. A sign inside the
+/// cluster is not a level, so `-b-200000` is a broken command line; an end past
+/// the scale is bounded by it (upstream zstdcli.c:1457).
 #[test]
 fn a_benchmark_range_is_validated_at_both_ends() {
     assert!(parse(&["-b-200000", "in.txt"]).is_err());
-    assert!(parse(&["-b3", "-e200000", "in.txt"]).is_err());
+    let opts = parse(&["-b3", "-e200000", "in.txt"]).unwrap();
+    assert_eq!((opts.bench_start, opts.bench_end), (3, 22));
     assert!(parse(&["-b1", "-e19", "in.txt"]).is_ok());
 }
 
@@ -4195,16 +4465,138 @@ fn size_arguments_parse_upstream_spellings() {
 /// a zstd frame, or a patch built against no reference at all.
 #[test]
 fn unimplemented_output_changing_flags_are_rejected() {
-    for args in [
-        &["--format=gzip", "f"][..],
-        &["--format=xz", "f"][..],
-        &["--rsyncable", "f"][..],
-    ] {
+    for args in [&["--format=gzip", "f"][..], &["--format=xz", "f"][..]] {
         assert!(
             parse(args).is_err(),
             "{args:?} changes the output and is not implemented; it must not be silently accepted"
         );
     }
+}
+
+/// `--rsyncable` and `--adapt` act on the jobs of a multi-threaded run. The
+/// reference built without threads takes them and changes nothing, refusing
+/// them only beside an explicit single thread when it compresses
+/// (`FIO_setAdaptiveMode`, `FIO_setRsyncable`: `nbWorkers == 0`), with
+/// status 1.
+#[test]
+fn multi_threaded_modes_are_refused_only_beside_a_single_thread() {
+    for args in [
+        &["--rsyncable", "f"][..],
+        &["--adapt", "f"],
+        &["--adapt=min=1,max=9", "f"],
+        &["-T2", "--rsyncable", "f"],
+        &["-d", "-T0", "--rsyncable", "f.zst"],
+    ] {
+        let opts = parse(args).unwrap();
+        assert!(single_thread_refusal(&opts).is_none(), "{args:?}");
+    }
+    for (args, mode) in [
+        (&["--single-thread", "--rsyncable", "f"][..], "Rsyncable"),
+        (&["-T0", "--adapt", "f"], "Adaptive"),
+        (&["-T0", "--adapt", "--rsyncable", "f"], "Adaptive"),
+    ] {
+        let opts = parse(args).unwrap();
+        let refusal = single_thread_refusal(&opts).expect("refused");
+        assert_eq!(exit_status(&refusal), 1, "{args:?}");
+        assert_eq!(
+            refusal.to_string(),
+            format!("error 1 : {mode} mode is not compatible with single thread mode "),
+            "{args:?}"
+        );
+    }
+}
+
+/// The parameters `-vv` shows carry the window `--long` set, unless `--zstd=`
+/// named one, as the reference's `printActualCParams` shows them.
+#[test]
+fn shown_parameters_carry_the_long_window() {
+    let shown = |args: &[&str]| shown_advanced_params(&parse(args).unwrap()).window_log;
+    assert_eq!(shown(&["-19", "f"]), None);
+    assert_eq!(shown(&["-19", "--long", "f"]), Some(27));
+    assert_eq!(shown(&["--long=30", "f"]), Some(30));
+    assert_eq!(shown(&["--zstd=wlog=20", "--long", "f"]), Some(20));
+}
+
+/// Training on no samples, or fewer than the trainer needs, ends with the
+/// reference trainer's status 14 (`dibio.c` `EXM_THROW(14, "nb of samples too
+/// low")`) rather than the generic 1.
+#[test]
+fn training_on_too_few_samples_exits_with_status_14() {
+    let none: Vec<OsString> = vec!["zstd".into(), "--train".into(), "-qq".into()];
+    assert_eq!(run_command(&none, &mut io::empty()), 14);
+    let scratch = Scratch::new("trainfew");
+    let one = scratch.file("one", b"a single sample");
+    let raw: Vec<OsString> = vec![
+        "zstd".into(),
+        "--train".into(),
+        "-qq".into(),
+        one.into_os_string(),
+        "-o".into(),
+        scratch.path().join("dict").into_os_string(),
+    ];
+    assert_eq!(run_command(&raw, &mut io::empty()), 14);
+}
+
+/// Command-line errors read as the reference prints them (`zstdcli.c`
+/// `badUsage`, `errorOut`): an argument it does not take is named whole as an
+/// incorrect parameter, followed by the usage; a number that overflows or is
+/// not a number gets its one line and no usage.
+#[test]
+fn command_line_errors_read_as_the_reference_prints_them() {
+    let usage = |args: &[&str]| {
+        let Err(err) = parse(args) else {
+            panic!("{args:?} is refused");
+        };
+        let usage = err.downcast_ref::<Usage>().expect("a reference line");
+        (usage.message.clone(), usage.show_usage)
+    };
+    assert_eq!(
+        usage(&["--blah"]),
+        ("Incorrect parameter: --blah ".to_string(), true)
+    );
+    assert_eq!(
+        usage(&["-xz"]),
+        ("Incorrect parameter: -x ".to_string(), true)
+    );
+    assert_eq!(
+        usage(&["--adapt=min=1,maxx=2", "f"]),
+        (
+            "Incorrect parameter: --adapt=min=1,maxx=2 ".to_string(),
+            true
+        )
+    );
+    assert_eq!(
+        usage(&["--train-cover=k=48,d=8,steps32", "f"]),
+        (
+            "Incorrect parameter: --train-cover=k=48,d=8,steps32 ".to_string(),
+            true
+        )
+    );
+    assert_eq!(
+        usage(&["--zstd=wlog=x", "f"]),
+        ("Incorrect parameter: --zstd=wlog=x ".to_string(), true)
+    );
+    let overflow = (
+        "error: numeric value overflows 32-bit unsigned int ".to_string(),
+        false,
+    );
+    assert_eq!(usage(&["-5000000000", "f"]), overflow);
+    assert_eq!(usage(&["--fast=5000000000", "f"]), overflow);
+    let not_a_number = (
+        "error: only numeric values with optional suffixes K, KB, KiB, M, MB, MiB are allowed "
+            .to_string(),
+        false,
+    );
+    assert_eq!(usage(&["--memory=32LB", "f"]), not_a_number);
+    assert_eq!(usage(&["--memory=hello", "f"]), not_a_number);
+    assert_eq!(
+        usage(&["--output-dir-flat=", "f"]),
+        (
+            "error: output dir cannot be empty string (did you mean to pass '.' instead?)"
+                .to_string(),
+            false
+        )
+    );
 }
 
 /// `--format=zstd` is the default and names what we actually produce.
@@ -4930,6 +5322,323 @@ fn already_compressed_inputs_are_skipped_and_directories_refused() {
     assert!(err.contains("can't stat"), "{err}");
 }
 
+/// Compressing the dictionary file with itself is refused for that input, as
+/// the reference refuses it (`zstd: cannot use %s as an input file and
+/// dictionary`, fileio.c `FIO_compressFilename_srcFile`), whether the file is
+/// the `-D` dictionary or the `--patch-from` reference and however the path is
+/// spelled. Other inputs of the run still compress, and decompressing is not
+/// affected.
+#[test]
+fn the_dictionary_is_not_an_input_to_compress_with_itself() {
+    let scratch = Scratch::new("dict-input");
+    let dict = scratch.file("dict", &vec![b'd'; 4096]);
+    let other = scratch.file("other", b"another input");
+    let respelled = scratch.path().join(".").join("dict");
+    for flag in ["-D", "--patch-from"] {
+        let mut opts = parse(&["-q", flag, "dict", "f"]).unwrap();
+        if flag == "-D" {
+            opts.dict = Some(dict.clone());
+        } else {
+            opts.patch_from = Some(dict.clone());
+        }
+        for spelling in [&dict, &respelled] {
+            let err = open_input(&opts, spelling)
+                .expect_err("the dictionary is refused as an input")
+                .to_string();
+            assert!(
+                err.contains("cannot use") && err.contains("as an input file and dictionary"),
+                "{flag}: {err}"
+            );
+        }
+        assert!(
+            open_input(&opts, &other).unwrap().is_some(),
+            "{flag}: another input opens"
+        );
+    }
+    let mut decoding = parse(&["-d", "-q", "-D", "dict", "f"]).unwrap();
+    decoding.dict = Some(dict.clone());
+    assert!(
+        open_input(&decoding, &dict).unwrap().is_some(),
+        "decoding opens it"
+    );
+}
+
+/// A compression run asked for worker threads says that this build has none,
+/// as the reference built without threads says it, for any count above zero;
+/// upstream's playTests.sh decides from that line whether to run its
+/// multi-threaded scenarios. No count, a zero, `--single-thread`, and runs that
+/// do not compress say nothing.
+#[test]
+fn asking_for_threads_notes_that_there_are_none() {
+    // The reference's line, trailing space included.
+    const NOTE: &str = "Note : multi-threading is disabled ";
+    for args in [
+        &["-T2", "f"][..],
+        &["-T1", "f"],
+        &["--threads=4", "f"],
+        &["-v", "-T2", "-"],
+    ] {
+        let opts = parse(args).unwrap();
+        assert_eq!(multithreading_note(&opts), Some(NOTE), "{args:?}");
+    }
+    for args in [
+        &["f"][..],
+        &["-T0", "f"],
+        &["--single-thread", "f"],
+        &["-T4", "--single-thread", "f"],
+        &["-d", "-T2", "f.zst"],
+        &["-b", "-T2", "f"],
+    ] {
+        let opts = parse(args).unwrap();
+        assert_eq!(multithreading_note(&opts), None, "{args:?}");
+    }
+}
+
+/// Whether a benchmark decodes follows the last operation flag, whatever its
+/// spelling: `--decompress` and `--uncompress` count as `-d`, and a later `-z`
+/// takes the benchmark back to compressing, so `plain` is not read as a frame.
+#[test]
+fn decode_only_benchmark_follows_the_last_operation_flag() {
+    for args in [
+        &["--decompress", "-b", "f"][..],
+        &["--uncompress", "-b", "f"][..],
+        &["-b", "--decompress", "f"][..],
+    ] {
+        let opts = parse(args).unwrap();
+        assert!(opts.bench && opts.bench_decode_only, "{args:?}");
+    }
+    for args in [
+        &["-d", "-z", "-b", "plain"][..],
+        &["-d", "--compress", "-b", "plain"][..],
+    ] {
+        let opts = parse(args).unwrap();
+        assert!(opts.bench && !opts.bench_decode_only, "{args:?}");
+    }
+    // A tool name that decompresses is the operation until a flag names
+    // another.
+    let unzstd = parse_as(
+        &program_preset("unzstd"),
+        CompressionLevel::DEFAULT_LEVEL,
+        &["-b", "f.zst"],
+    )
+    .unwrap();
+    assert!(unzstd.bench && unzstd.bench_decode_only);
+}
+
+/// `-d` makes a benchmark a decoding one in either order, as the reference
+/// reads it (zstdcli.c:1191-1196): the inputs are frames and only decoding is
+/// measured. Frames whose sizes are not declared, and input that is not frames,
+/// are refused with the reference's messages; alone, `-d` still decompresses.
+#[test]
+fn bench_with_d_measures_decoding_of_frames() {
+    use structured_zstd::encoding::{CompressionLevel, StreamingEncoder, compress_to_vec};
+
+    for args in [["-b", "-d"], ["-d", "-b"]] {
+        let opts = parse(&[args[0], args[1], "-i0", "f.zst"]).unwrap();
+        assert!(opts.bench && opts.bench_decode_only, "{args:?}");
+    }
+    let plain = parse(&["-d", "f.zst"]).unwrap();
+    assert!(!plain.bench && plain.mode == Mode::Decompress);
+
+    let scratch = Scratch::new("bench-decode");
+    let text: Vec<u8> = (0..2_000u32)
+        .flat_map(|i| format!("line {} of {}\n", i % 37, i % 11).into_bytes())
+        .collect();
+    let framed = scratch.file(
+        "framed.zst",
+        &compress_to_vec(text.as_slice(), CompressionLevel::Default),
+    );
+    let raw = scratch.file("raw", &text);
+    let mut streamed = StreamingEncoder::new(Vec::new(), CompressionLevel::Default);
+    std::io::Write::write_all(&mut streamed, &text).unwrap();
+    let undeclared = scratch.file("undeclared.zst", &streamed.finish().unwrap());
+
+    let run = |input: &Path| {
+        let mut opts = parse(&["-b", "-d", "-i0", "-q", "x"]).unwrap();
+        opts.inputs = vec![input.to_path_buf()];
+        run_benchmark(&opts, None)
+    };
+    run(&framed).expect("frames with declared sizes are measured");
+    let err = run(&raw).expect_err("raw input is not frames").to_string();
+    assert!(err.contains("data may be invalid"), "{err}");
+    let err = run(&undeclared)
+        .expect_err("an undeclared size cannot be measured")
+        .to_string();
+    assert!(err.contains("cannot be determined"), "{err}");
+}
+
+/// `-M` is weighed against the inputs' sizes before a decoding benchmark reads
+/// them: input larger than the limit is refused on its size, not read in and
+/// only then turned down (here it is not even frames, which the read would
+/// have reported instead).
+#[test]
+fn decoding_benchmark_weighs_the_memory_limit_before_reading() {
+    let scratch = Scratch::new("bench-decode-preread");
+    let input = scratch.file("big.zst", &vec![b'x'; 64 * 1024]);
+    let mut opts = parse(&["-b", "-d", "-i0", "-q", "x"]).unwrap();
+    opts.inputs = vec![input];
+    opts.memory_limit = Some(
+        structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE + DECODER_AUXILIARY_BYTES + 1024,
+    );
+    let err = run_benchmark(&opts, None)
+        .expect_err("the input alone exceeds the limit")
+        .to_string();
+    assert!(err.contains("memory limit"), "{err}");
+}
+
+/// The bytes a training run is asked to load are summed wide: sizes the
+/// directory entries claim can add up past `u64` (sparse files under `-B`),
+/// and the notice comparing them with the budget must still be true.
+#[test]
+fn training_size_total_does_not_wrap() {
+    let total = training_requested(&[u64::MAX, u64::MAX], Some(1 << 20));
+    assert_eq!(total, 2 * u128::from(u64::MAX));
+    // Without `-B` each file counts up to one sample.
+    assert_eq!(
+        training_requested(&[u64::MAX, 7], None),
+        u128::from(TRAINING_SAMPLE_MAX) + 7
+    );
+}
+
+/// A decoding benchmark holds the parsed dictionary beside the frames and their
+/// decoded copy, so `-M` weighs all three together: a limit that covers the
+/// buffers alone, and the dictionary alone, still refuses them combined.
+#[test]
+fn decoding_benchmark_counts_the_dictionary_against_the_memory_limit() {
+    use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
+
+    let scratch = Scratch::new("bench-decode-memory");
+    let text: Vec<u8> = (0..2_000u32)
+        .flat_map(|i| format!("line {} of {}\n", i % 37, i % 11).into_bytes())
+        .collect();
+    let frame = compress_to_vec(text.as_slice(), CompressionLevel::Default);
+    let framed = scratch.file("framed.zst", &frame);
+    let buffers = (frame.len() + text.len()) as u64;
+    let dictionary = vec![b'd'; usize::try_from(buffers / 2).unwrap()];
+    // Room for the buffers and half the dictionary over the decoder's own floor.
+    let limit = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE
+        + DECODER_AUXILIARY_BYTES
+        + buffers
+        + dictionary.len() as u64 / 2;
+
+    let run = |dict: Option<Vec<u8>>| {
+        let mut opts = parse(&["-b", "-d", "-i0", "-q", "x"]).unwrap();
+        opts.inputs = vec![framed.clone()];
+        opts.memory_limit = Some(limit);
+        run_benchmark(&opts, dict)
+    };
+    run(None).expect("the buffers alone fit the limit");
+    let err = run(Some(dictionary))
+        .expect_err("buffers and dictionary together exceed it")
+        .to_string();
+    assert!(err.contains("memory limit"), "{err}");
+}
+
+/// A decoding benchmark refuses what it cannot measure, each with its reason
+/// (no input, stdin, something that is not a file), and measures several
+/// files together or each on its own under `-S`.
+#[test]
+fn decoding_benchmark_refuses_unmeasurable_inputs_and_takes_several_files() {
+    use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
+
+    let scratch = Scratch::new("bench-decode-shapes");
+    let a = scratch.file(
+        "a.zst",
+        &compress_to_vec(&b"first file\n".repeat(50)[..], CompressionLevel::Default),
+    );
+    let b = scratch.file(
+        "b.zst",
+        &compress_to_vec(&b"second file\n".repeat(80)[..], CompressionLevel::Default),
+    );
+    let bench = |inputs: Vec<PathBuf>, extra: &[&str]| {
+        let mut args = vec!["-b", "-d", "-i0"];
+        args.extend_from_slice(extra);
+        args.push("x");
+        let mut opts = parse(&args).unwrap();
+        opts.inputs = inputs;
+        run_benchmark(&opts, None)
+    };
+    let refusal = |inputs: Vec<PathBuf>| bench(inputs, &["-q"]).unwrap_err().to_string();
+    assert!(refusal(vec![]).contains("data may be invalid"));
+    assert!(refusal(vec![PathBuf::from("-")]).contains("stdin"));
+    assert!(refusal(vec![scratch.path().to_path_buf()]).contains("regular files"));
+    bench(vec![a.clone(), b.clone()], &["-S"]).expect("each file measured on its own");
+    bench(vec![a, b], &[]).expect("both files measured together");
+}
+
+/// The compressing run's side paths: the parameters shown on request, the
+/// thread note, the summaries of empty inputs, the refusal of a
+/// multi-threaded mode beside one thread, and a directory given as input.
+#[test]
+fn compressing_run_covers_its_notes_summaries_and_refusals() {
+    let scratch = Scratch::new("run-side-paths");
+    let file = scratch.file("in.txt", &b"some text to compress\n".repeat(40));
+    let compress = |args: &[&str], inputs: Vec<PathBuf>| {
+        let mut opts = parse(args).unwrap();
+        opts.inputs = inputs;
+        run(opts)
+    };
+    assert_eq!(
+        compress(
+            &["--show-default-cparams", "-vv", "-f", "x"],
+            vec![file.clone()]
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        compress(&["-T2", "-q", "-f", "x"], vec![file.clone()]).unwrap(),
+        0
+    );
+    let empty = scratch.file("empty", b"");
+    let also_empty = scratch.file("also-empty", b"");
+    assert_eq!(compress(&["-f", "x"], vec![empty.clone()]).unwrap(), 0);
+    assert_eq!(compress(&["-f", "x"], vec![empty, also_empty]).unwrap(), 0);
+    let err = compress(&["--single-thread", "--rsyncable", "-q", "x"], vec![file])
+        .expect_err("rsyncable needs threads");
+    assert!(err.to_string().contains("Rsyncable"), "{err}");
+    assert_eq!(
+        single_thread_refusal(&parse(&["--single-thread", "f"]).unwrap()).map(|e| e.to_string()),
+        None
+    );
+    // A directory is refused as an input and counted as failed.
+    assert_eq!(
+        compress(&["-q", "x"], vec![scratch.path().to_path_buf()]).unwrap(),
+        1
+    );
+}
+
+/// A number too large for its field keeps the reference's own overflow line,
+/// by width, even inside a parameter list that otherwise reports the whole
+/// argument as incorrect.
+#[test]
+fn an_overflowing_number_reports_its_width() {
+    let refusal = |args: &[&str]| {
+        parse(args)
+            .err()
+            .expect("an overflowing number is refused")
+            .to_string()
+    };
+    let err = refusal(&["--zstd=wlog=99999999999", "f"]);
+    assert!(err.contains("overflows 32-bit unsigned int"), "{err}");
+    let err = refusal(&["--maxdict=4294967296", "f"]);
+    assert!(err.contains("overflows 32-bit unsigned int"), "{err}");
+    // A size_t field keeps its own name, on a 32-bit target as well, where
+    // its bound is the same as a u32's.
+    let err = refusal(&["--stream-size=999999999999999999999999", "f"]);
+    assert!(err.contains("overflows size_t"), "{err}");
+}
+
+/// A command line refused with an error of ours rather than a usage error
+/// fails with a status, and the small descriptive pieces read as intended.
+#[test]
+fn a_refused_command_line_fails_and_names_read_right() {
+    let raw: Vec<OsString> = vec!["zstd".into(), "-q".into(), "--format=gzip".into()];
+    assert_ne!(run_command(&raw, &mut io::empty()), 0);
+    assert_eq!(TooFewSamples.to_string(), "nb of samples too low");
+    assert_eq!(OutputFormat::Zstd.label(), "zstd");
+}
+
 /// One failing input does not end the run: the rest are processed and the
 /// failure count comes back to become the exit status, as the reference
 /// command's does.
@@ -5287,6 +5996,33 @@ fn show_default_cparams_sizes_an_empty_file_as_unknown() {
     assert!(small.contains(" - windowLog     : 12\n"), "{small}");
 }
 
+/// At `-vv` the parameters a file compresses with are printed as the
+/// `--zstd=` option that reproduces them (upstream zstdcli.c
+/// `printActualCParams`): the level's row, with every knob `--zstd=` set in
+/// its place and a zero knob meaning the level's own value.
+#[test]
+fn actual_cparams_print_as_the_zstd_option() {
+    let mut out = Vec::new();
+    write_actual_cparams(&mut out, None, 0, 3, &AdvancedParams::default()).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "--zstd=wlog=21,clog=16,hlog=17,slog=1,mml=5,tlen=0,strat=2\n"
+    );
+
+    let advanced = AdvancedParams {
+        window_log: Some(23),
+        search_log: Some(0),
+        strategy: Some(Strategy::Btopt),
+        ..AdvancedParams::default()
+    };
+    let mut out = Vec::new();
+    write_actual_cparams(&mut out, None, 0, 3, &advanced).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "--zstd=wlog=23,clog=16,hlog=17,slog=1,mml=5,tlen=0,strat=7\n"
+    );
+}
+
 /// Decompression has no parameters to show, so the flag is refused there, as
 /// the reference command refuses it.
 #[test]
@@ -5442,6 +6178,34 @@ fn an_empty_input_passes_through_and_is_refused_otherwise() {
     .expect_err("an empty archive is refused without pass-through")
     .to_string();
     assert!(err.contains("unexpected end of file"), "{err}");
+}
+
+/// Input shorter than a magic number is no other compressor's stream either,
+/// even when its bytes begin one (gzip's `1F 8B`, xz's `FD 37`): it passes
+/// through under `--pass-through` and is an unknown header otherwise.
+#[test]
+fn a_short_input_is_not_named_as_a_foreign_format() {
+    let pass = DecodeSettings {
+        pass_through: true,
+        ..DecodeSettings::default()
+    };
+    for short in [&b"\x1F\x8B"[..], b"\xFD\x37", b"\x5D\x00\x01"] {
+        let mut out = Vec::new();
+        let written = decompress_stream(short, &mut out, &mut no_dict(), &pass)
+            .expect("a short input passes through");
+        assert_eq!(written, short.len() as u64, "{short:02x?}");
+        assert_eq!(out, short);
+
+        let err = decompress_stream(
+            short,
+            io::sink(),
+            &mut no_dict(),
+            &DecodeSettings::default(),
+        )
+        .expect_err("a short input is no frame")
+        .to_string();
+        assert!(err.contains("unknown header"), "{short:02x?}: {err}");
+    }
 }
 
 /// Input that is not a zstd stream is copied through under `--pass-through`,

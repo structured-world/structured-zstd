@@ -173,7 +173,7 @@ emscripten build of the C reference).
   dashboard. It builds the npm payloads, runs the harness, parses the
   `REPORT*` lines (`.github/scripts/parse-wasm-bench.py`), and merges the
   result into the persisted `gh-pages/dev/bench/benchmark-wasm.json` timeseries
-  (`.github/scripts/merge-wasm-bench.py`, 180-day retention).
+  (`.github/scripts/merge-timeseries.py`, 180-day retention).
 - **Dashboard:** the `dev/bench` page renders a dedicated *WebAssembly* section
   plotting compress speed, decompress speed, and output ratio per engine over
   time, with our throughput shown as a multiple of bokuweb (`>1` = faster).
@@ -184,3 +184,34 @@ emscripten build of the C reference).
 `benchmark-wasm.json` record dimensions: `kind` (`plain` / `dict`),
 `scenario`, `level`, `engine`; metrics: `ratio`, `compress_bytes_per_sec`,
 `decompress_bytes_per_sec`.
+
+## Cross-validation against the reference CLI
+
+The criterion matrix compares the libraries in one process; the
+cross-validation compares the two `zstd` commands on whole corpora.
+
+- **Harness:** `scripts/cross-validate.sh <our-zstd>` builds the reference CLI
+  from the pinned upstream release, downloads silesia, canterbury and enwik8
+  against their digests, and runs `scripts/cross_validate.py` over them (the
+  first MiB of enwik8) and the decodecorpus fixtures at levels 1/3/9/19/22,
+  both tools with `--single-thread`. Every file must round-trip: our frame
+  through the reference, the reference's frame through ours, ours through ours.
+  Per (corpus, level) the summed compressed size and compression time of ours
+  over the reference's are held to 1.05 and 1.5. A file's time is the fastest
+  of three runs of each tool, the two alternating, so one preempted run does
+  not decide the ratio. The time limit holds only where the reference's summed
+  time reaches a second; below that the time is mostly process start-up, and
+  the ratio is reported without being held.
+- **CI shard:** `cross-validate` in `ci.yml`, push-to-main only, and run when
+  the codec or the harness changes. It merges the run into
+  `gh-pages/dev/bench/benchmark-xval.json`
+  (`.github/scripts/merge-timeseries.py`), publishing the snapshot even when a
+  limit fails, then fails.
+- **Dashboard:** the *Cross-validation* section plots the size and time ratios
+  per corpus and level over time, each snapshot's limits dashed.
+
+`benchmark-xval.json` record dimensions: `scenario` (the corpus), `level`;
+metrics: `size_ratio`, `time_ratio`, and the summed `ours_bytes`,
+`reference_bytes`, `ours_seconds`, `reference_seconds`, `input_bytes`; the
+limits the run held the record to: `size_limit`, `time_limit` (0 when not
+held).

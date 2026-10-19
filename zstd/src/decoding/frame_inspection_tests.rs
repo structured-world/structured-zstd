@@ -1,6 +1,7 @@
 use super::{
-    FrameContentSize, FrameSizeError, find_frame_compressed_size, frame_decompressed_bound,
-    frame_header_input_needed, frame_header_size, read_frame_content_size, read_frame_header_info,
+    DecompressedSizeError, FrameContentSize, FrameSizeError, find_decompressed_size,
+    find_frame_compressed_size, frame_decompressed_bound, frame_header_input_needed,
+    frame_header_size, read_frame_content_size, read_frame_header_info,
 };
 use crate::decoding::errors::{FrameDescriptorError, ReadFrameHeaderError};
 use crate::encoding::{CompressionLevel, compress_slice_to_vec};
@@ -9,6 +10,64 @@ use alloc::vec::Vec;
 
 fn frame(content: &[u8]) -> Vec<u8> {
     compress_slice_to_vec(content, CompressionLevel::Default)
+}
+
+/// A single-segment frame declaring `size` in an 8-byte Frame_Content_Size
+/// field, holding one empty last raw block (RFC 8878 3.1.1).
+fn frame_declaring(size: u64) -> Vec<u8> {
+    let mut bytes = 0xFD2F_B528u32.to_le_bytes().to_vec();
+    bytes.push(0b1110_0000);
+    bytes.extend_from_slice(&size.to_le_bytes());
+    bytes.extend_from_slice(&[0x01, 0x00, 0x00]);
+    bytes
+}
+
+/// The declared sizes add up across frames, a skippable frame counting zero;
+/// one frame without a size makes the total unknown; sizes past `u64` and
+/// damaged frames are errors, each told apart.
+#[test]
+fn find_decompressed_size_sums_what_the_frames_declare() {
+    let mut frames = frame(&[1u8; 300]);
+    // A skippable frame of four bytes between the two.
+    frames.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+    frames.extend_from_slice(&4u32.to_le_bytes());
+    frames.extend_from_slice(b"skip");
+    frames.extend(frame(&[2u8; 200]));
+    assert_eq!(
+        find_decompressed_size(&frames).unwrap(),
+        FrameContentSize::Known(500)
+    );
+    assert_eq!(
+        find_decompressed_size(&[]).unwrap(),
+        FrameContentSize::Known(0)
+    );
+
+    // No Frame_Content_Size: a window descriptor and nothing else.
+    let mut unknown = frame(&[1u8; 300]);
+    unknown.extend_from_slice(&0xFD2F_B528u32.to_le_bytes());
+    unknown.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x00]);
+    assert_eq!(
+        find_decompressed_size(&unknown).unwrap(),
+        FrameContentSize::Unknown
+    );
+
+    let mut overflow = frame_declaring(u64::MAX / 2 + 1);
+    overflow.extend(frame_declaring(u64::MAX / 2 + 1));
+    assert!(matches!(
+        find_decompressed_size(&overflow),
+        Err(DecompressedSizeError::Overflow)
+    ));
+
+    assert!(matches!(
+        find_decompressed_size(b"not a frame at all"),
+        Err(DecompressedSizeError::Header(_))
+    ));
+
+    let whole = frame(&[3u8; 300]);
+    assert!(matches!(
+        find_decompressed_size(&whole[..whole.len() - 1]),
+        Err(DecompressedSizeError::Frame(_))
+    ));
 }
 
 /// A header read in pieces asks for the bytes that hold the descriptor, then

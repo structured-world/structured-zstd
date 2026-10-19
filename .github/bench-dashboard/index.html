@@ -78,7 +78,7 @@
         margin-top: 14px;
         min-height: 460px;
       }
-      #chart, #chart-profile, #chart-aggregate, #chart-wasm {
+      #chart, #chart-profile, #chart-aggregate, #chart-wasm, #chart-xval {
         width: 100% !important;
         height: 440px !important;
       }
@@ -375,6 +375,37 @@
         </div>
         <div id="legend-wasm" class="html-legend"></div>
         <div id="wasm-status" style="margin-top: 8px; font-size: 0.88rem"></div>
+      </section>
+
+      <section class="card" id="xval-section" style="margin-top: 14px">
+        <h2 style="margin: 0 0 8px; font-size: 1.2rem">Cross-validation: structured-zstd CLI vs the reference CLI</h2>
+        <p style="font-size: 0.9rem">
+          Our <code>zstd</code> command against the reference one built from
+          the pinned upstream release, on whole corpora (silesia, canterbury,
+          the first MiB of enwik8, the decodecorpus fixtures), both
+          single-threaded. Every file round-trips through both tools in both
+          directions; the chart tracks, per <strong>Corpus</strong> and
+          <strong>Level</strong>, the summed compressed size and the summed
+          compression time (each file's fastest of three runs) of ours over the
+          reference's (<code>&lt;1 =
+          ours smaller / faster</code>), with the limits each run was held to
+          dashed. Source: <code>scripts/cross-validate.sh</code>, run as a
+          push-to-main shard (<code>cross-validate</code> in
+          <code>ci.yml</code>).
+        </p>
+        <div class="filters">
+          <label>Corpus
+            <select id="xf-corpus"></select>
+          </label>
+          <label>Level
+            <select id="xf-level"></select>
+          </label>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="chart-xval"></canvas>
+        </div>
+        <div id="legend-xval" class="html-legend"></div>
+        <div id="xval-status" style="margin-top: 8px; font-size: 0.88rem"></div>
       </section>
 
       <details class="card">
@@ -2502,8 +2533,125 @@
         renderWasmChart();
       }
 
+      // ---- Cross-validation section (our CLI vs the reference CLI) ----
+      // Reads `benchmark-xval.json` (the push-only `cross-validate` shard):
+      // one record per (snapshot, corpus, level) carrying the size and time
+      // ratios ours/reference, plus the limits the run held them to.
+      const xvalState = {
+        records: [],
+        chart: null,
+        selectors: { corpus: el("xf-corpus"), level: el("xf-level") },
+      };
+
+      function renderXvalChart() {
+        const statusEl = el("xval-status");
+        if (!xvalState.records.length) {
+          statusEl.textContent = "No cross-validation data published yet; the cross-validate shard runs on the next push that touches the codec.";
+          return;
+        }
+        const corpus = xvalState.selectors.corpus.value;
+        const level = xvalState.selectors.level.value;
+        const rows = xvalState.records.filter((r) => r.scenario === corpus && String(r.level) === level);
+        const snapshots = uniq(rows.map((r) => r.generated_at || r.commit_sha || "local-run"));
+        const at = (snap, field) => {
+          const row = rows.find((r) => (r.generated_at || r.commit_sha || "local-run") === snap);
+          return row && typeof row[field] === "number" ? row[field] : null;
+        };
+        // Each record carries the limits its run held it to (0 = not held), so
+        // a later change of limit never redraws an older point's threshold.
+        const series = [
+          { field: "size_ratio", limitField: "size_limit", label: "size ours ÷ reference", color: "hsl(150 65% 38%)" },
+          { field: "time_ratio", limitField: "time_limit", label: "time ours ÷ reference", color: "hsl(20 75% 50%)" },
+        ];
+        const datasets = [];
+        for (const s of series) {
+          datasets.push({
+            label: s.label,
+            data: snapshots.map((snap) => at(snap, s.field)),
+            borderColor: s.color,
+            backgroundColor: s.color.replace(")", " / 0.2)").replace("hsl(", "hsla("),
+            borderWidth: 2,
+            pointRadius: 3,
+            spanGaps: true,
+            tension: 0.25,
+          });
+          const limits = snapshots.map((snap) => {
+            const held = at(snap, s.limitField);
+            return held > 0 ? held : null;
+          });
+          if (limits.some((limit) => limit !== null)) {
+            datasets.push({
+              label: `${s.label} limit`,
+              data: limits,
+              borderColor: s.color,
+              backgroundColor: "transparent",
+              borderWidth: 1,
+              borderDash: [6, 4],
+              pointRadius: 0,
+            });
+          }
+        }
+        statusEl.textContent = rows.length
+          ? `Showing ${snapshots.length} snapshot(s), corpus=${corpus}, level=${level}.`
+          : `No cross-validation points for corpus=${corpus}, level=${level}.`;
+        const scales = {
+          x: {
+            title: { display: true, text: "Snapshot (generated_at / commit)" },
+            ticks: { autoSkip: true, maxTicksLimit: 12, maxRotation: 60, minRotation: 30 },
+          },
+          y: { type: "linear", title: { display: true, text: "ours ÷ reference (<1 = smaller / faster)" } },
+        };
+        if (xvalState.chart) {
+          xvalState.chart.options.scales = scales;
+          xvalState.chart.data.labels = snapshots;
+          xvalState.chart.data.datasets = datasets;
+          xvalState.chart.update("none");
+        } else {
+          xvalState.chart = new Chart(el("chart-xval"), {
+            type: "line",
+            data: { labels: snapshots, datasets },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              interaction: { mode: "index", intersect: false },
+              scales,
+              plugins: { legend: { display: false }, tooltip: { mode: "index", intersect: false } },
+            },
+          });
+        }
+        renderHtmlLegend(xvalState.chart, el("legend-xval"));
+      }
+
+      async function initXvalSection() {
+        const response = await fetch("./benchmark-xval.json", { cache: "no-store" });
+        if (response.status === 404) {
+          // No cross-validation run has published yet.
+          renderXvalChart();
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`Unable to load benchmark-xval.json (${response.status})`);
+        }
+        const payload = await response.json();
+        xvalState.records = payload.records || [];
+        const corpora = uniq(xvalState.records.map((r) => r.scenario));
+        const levels = uniq(xvalState.records.map((r) => r.level)).sort((a, b) => Number(a) - Number(b));
+        wasmRenderPlainOptions(xvalState.selectors.corpus, corpora, null);
+        wasmRenderPlainOptions(xvalState.selectors.level, levels, null);
+        if (corpora.includes("silesia")) xvalState.selectors.corpus.value = "silesia";
+        if (levels.map(String).includes("3")) xvalState.selectors.level.value = "3";
+        for (const control of Object.values(xvalState.selectors)) {
+          control.addEventListener("change", renderXvalChart);
+        }
+        renderXvalChart();
+      }
+
       main().catch((err) => {
         setStatusText(String(err), "outside-band");
+      });
+
+      initXvalSection().catch((err) => {
+        el("xval-status").textContent = `cross-validation section error: ${err}`;
       });
 
       // Independent of main(): a wasm-payload fetch failure must not blank

@@ -101,12 +101,15 @@ impl LdmParams {
 
         let mut params = self;
 
-        // hash_rate_log: upstream zstd `zstd_ldm.c:141-153`. With `hash_log`
-        // still zero (the only path we expose), upstream zstd falls into the
-        // `7 - strategy/3` branch.
+        // hash_rate_log: upstream zstd `zstd_ldm.c:141-153`. A pinned
+        // `hash_log` sets the rate to the gap below the window, and leaves it
+        // at 0 (a split at every position) when there is no gap; only an
+        // unpinned `hash_log` takes the strategy's rate.
         if params.hash_rate_log == 0 {
-            if params.hash_log > 0 && params.window_log > params.hash_log {
-                params.hash_rate_log = params.window_log - params.hash_log;
+            if params.hash_log > 0 {
+                if params.window_log > params.hash_log {
+                    params.hash_rate_log = params.window_log - params.hash_log;
+                }
             } else {
                 // Map [fast=1, rate 7] .. [btultra2=9, rate 4].
                 // Upstream zstd `zstd_ldm.c:151`.
@@ -140,6 +143,8 @@ impl LdmParams {
         if params.bucket_size_log == 0 {
             params.bucket_size_log = bounded(LDM_BUCKET_SIZE_LOG, strategy, LDM_BUCKETSIZELOG_MAX);
         }
+        // A bucket is never larger than the table (`zstd_ldm.c:166`).
+        params.bucket_size_log = params.bucket_size_log.min(params.hash_log);
 
         params
     }

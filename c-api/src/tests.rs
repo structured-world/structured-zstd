@@ -4090,3 +4090,27 @@ fn the_reserved_descriptor_bit_is_frame_parameter_unsupported() {
         6
     );
 }
+
+/// The codec names each failure class with libzstd's message, and the C
+/// surface keeps its own NUL-terminated copy for `ZSTD_getErrorString`: the
+/// two must read the same, or the command line and a C caller would describe
+/// one failure differently.
+#[test]
+fn codec_error_messages_match_the_c_messages() {
+    use codec::decoding::errors::ErrorCode;
+    for code in [
+        ErrorCode::PrefixUnknown,
+        ErrorCode::FrameParameterUnsupported,
+        ErrorCode::FrameParameterWindowTooLarge,
+        ErrorCode::ParameterOutOfBound,
+        ErrorCode::DictionaryCorrupted,
+        ErrorCode::DictionaryWrong,
+        ErrorCode::DstSizeTooSmall,
+        ErrorCode::InitMissing,
+        ErrorCode::ChecksumWrong,
+        ErrorCode::CorruptionDetected,
+    ] {
+        let c_message = crate::error::message(crate::error::code_for(code));
+        assert_eq!(c_message.to_str().unwrap(), code.message(), "{code:?}");
+    }
+}

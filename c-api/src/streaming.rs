@@ -1164,6 +1164,7 @@ fn start_stream_frame(
             dctx.stream_entry = StreamEntry::Entered;
             dctx.stream_staged.clear();
             dctx.stream_frame_done = false;
+            dctx.stream_hostage = false;
             dctx.consume_prefix();
             Ok(())
         }
@@ -1294,7 +1295,26 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
         decode_stream_frame(dctx, inp, src, out, dst)
     }));
     match outcome {
-        Ok(Ok(finished)) => {
+        Ok(Ok(mut finished)) => {
+            // A frame decoded to its last byte with output still to hand out
+            // keeps that byte back, so the caller still has input and calls
+            // again for the rest; a caller that stops on empty input inside a
+            // frame (libarchive's reader does) would otherwise see a finished
+            // frame as truncated. The byte is taken once the output is out
+            // (upstream zstd, zstd_decompress.c:2366-2383, hostageByte).
+            if finished {
+                if dctx.stream_hostage {
+                    if inp.pos < inp.size {
+                        inp.pos += 1;
+                        dctx.stream_hostage = false;
+                    } else {
+                        finished = false;
+                    }
+                }
+            } else if !dctx.stream_hostage && inp.pos > in_start && dctx.decoder.is_finished() {
+                inp.pos -= 1;
+                dctx.stream_hostage = true;
+            }
             dctx.stream_frame_done = finished;
             // A caller looping on a frame that can never finish is stopped,
             // with the reason, rather than handed hints forever (upstream
