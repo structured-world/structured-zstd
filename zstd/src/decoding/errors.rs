@@ -38,6 +38,103 @@ impl fmt::Display for FrameDescriptorError {
 #[cfg(feature = "std")]
 impl StdError for FrameDescriptorError {}
 
+/// Why a frame of the v0.5, v0.6 or v0.7 format could not be decoded.
+#[cfg(feature = "legacy")]
+#[cfg_attr(docsrs, doc(cfg(feature = "legacy")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LegacyFrameError {
+    /// The input ends inside the frame.
+    Truncated,
+    /// The frame header sets a reserved bit or asks for a window the format
+    /// does not allow.
+    UnsupportedParameter,
+    /// The frame's window is past the ceiling in force.
+    WindowTooLarge {
+        /// The window the frame declares.
+        requested: u64,
+        /// The ceiling it exceeded.
+        limit: u64,
+    },
+    /// The frame is malformed; `reason` names the structure that is.
+    Corrupted {
+        /// What failed to decode.
+        reason: &'static str,
+    },
+    /// The output buffer is too small for the frame's content.
+    OutputTooSmall,
+    /// The dictionary could not be read.
+    DictionaryCorrupted,
+    /// The frame needs a dictionary with another ID than the one supplied.
+    DictionaryMismatch {
+        /// The ID the frame names.
+        expected: u32,
+        /// The ID of the dictionary supplied, 0 for none.
+        provided: u32,
+    },
+    /// The 22-bit content checksum of a v0.7 frame does not match its output.
+    ChecksumMismatch {
+        /// The value the frame stores.
+        expected: u32,
+        /// The value computed over the output.
+        calculated: u32,
+    },
+}
+
+#[cfg(feature = "legacy")]
+impl LegacyFrameError {
+    /// The code libzstd returns for the same failure.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            LegacyFrameError::UnsupportedParameter => ErrorCode::FrameParameterUnsupported,
+            LegacyFrameError::WindowTooLarge { .. } => ErrorCode::FrameParameterWindowTooLarge,
+            LegacyFrameError::OutputTooSmall => ErrorCode::DstSizeTooSmall,
+            LegacyFrameError::DictionaryCorrupted => ErrorCode::DictionaryCorrupted,
+            LegacyFrameError::DictionaryMismatch { .. } => ErrorCode::DictionaryWrong,
+            LegacyFrameError::ChecksumMismatch { .. } => ErrorCode::ChecksumWrong,
+            LegacyFrameError::Truncated | LegacyFrameError::Corrupted { .. } => {
+                ErrorCode::CorruptionDetected
+            }
+        }
+    }
+}
+
+#[cfg(feature = "legacy")]
+impl fmt::Display for LegacyFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "the input ends inside a v0.5-v0.7 frame"),
+            Self::UnsupportedParameter => {
+                write!(
+                    f,
+                    "the v0.5-v0.7 frame header asks for an unsupported setting"
+                )
+            }
+            Self::WindowTooLarge { requested, limit } => write!(
+                f,
+                "the frame's window of {requested} bytes is past the ceiling of {limit}"
+            ),
+            Self::Corrupted { reason } => write!(f, "corrupt v0.5-v0.7 frame: {reason}"),
+            Self::OutputTooSmall => write!(f, "the output buffer is too small for the frame"),
+            Self::DictionaryCorrupted => write!(f, "the dictionary could not be read"),
+            Self::DictionaryMismatch { expected, provided } => write!(
+                f,
+                "the frame needs dictionary 0x{expected:X}, the one supplied is 0x{provided:X}"
+            ),
+            Self::ChecksumMismatch {
+                expected,
+                calculated,
+            } => write!(
+                f,
+                "content checksum mismatch: frame stored 0x{expected:06X}, decoder calculated 0x{calculated:06X}"
+            ),
+        }
+    }
+}
+
+#[cfg(all(feature = "legacy", feature = "std"))]
+impl StdError for LegacyFrameError {}
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FrameHeaderError {
@@ -844,6 +941,17 @@ pub enum FrameDecoderError {
     /// to make it resumable.
     #[cfg(feature = "lsm")]
     ResumeUnidentifiedDictionary,
+    /// A frame of the v0.5, v0.6 or v0.7 format failed to decode.
+    #[cfg(feature = "legacy")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "legacy")))]
+    LegacyFrame(LegacyFrameError),
+}
+
+#[cfg(feature = "legacy")]
+impl From<LegacyFrameError> for FrameDecoderError {
+    fn from(err: LegacyFrameError) -> Self {
+        FrameDecoderError::LegacyFrame(err)
+    }
 }
 
 impl FrameDecoderError {
@@ -873,6 +981,8 @@ impl FrameDecoderError {
             FrameDecoderError::TargetTooSmall => ErrorCode::DstSizeTooSmall,
             FrameDecoderError::NotYetInitialized => ErrorCode::InitMissing,
             FrameDecoderError::ChecksumMismatch { .. } => ErrorCode::ChecksumWrong,
+            #[cfg(feature = "legacy")]
+            FrameDecoderError::LegacyFrame(err) => err.code(),
             _ => ErrorCode::CorruptionDetected,
         }
     }
@@ -894,6 +1004,8 @@ impl StdError for FrameDecoderError {
             FrameDecoderError::FailedToReadChecksum(source) => Some(source),
             FrameDecoderError::FailedToInitialize(source) => Some(source),
             FrameDecoderError::FailedToDrainDecodebuffer(source) => Some(source),
+            #[cfg(feature = "legacy")]
+            FrameDecoderError::LegacyFrame(source) => Some(source),
             _ => None,
         }
     }
@@ -1069,6 +1181,8 @@ impl core::fmt::Display for FrameDecoderError {
                     "a dictionary with no ID cannot be told from another one, so it cannot carry a resume state across frames"
                 )
             }
+            #[cfg(feature = "legacy")]
+            FrameDecoderError::LegacyFrame(e) => write!(f, "{e}"),
         }
     }
 }

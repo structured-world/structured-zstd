@@ -41,6 +41,9 @@ pub mod workspace;
 
 pub use dictionary::{Dictionary, DictionaryHandle, MAGIC_NUM as DICTIONARY_MAGIC};
 pub use frame_decoder::{BlockDecodingStrategy, ContentChecksum, FrameDecoder};
+#[cfg(feature = "legacy")]
+#[cfg_attr(docsrs, doc(cfg(feature = "legacy")))]
+pub use legacy::LegacyVersion;
 
 /// Largest window a frame may declare before a decoder that holds the window
 /// itself refuses it, unless [`FrameDecoder::set_max_window_size`] raised the
@@ -616,6 +619,8 @@ pub(crate) mod exec_sequence_inline;
 // rationale.
 pub(crate) mod flat_buf;
 pub(crate) mod frame;
+#[cfg(feature = "legacy")]
+pub(crate) mod legacy;
 pub(crate) mod literals_section_decoder;
 pub(crate) mod prefetch;
 mod ringbuffer;
