@@ -99,8 +99,10 @@ jobs:
               - 'README.md'
               - 'zstd/README.md'
             # The cross-validation figures move with the codec and with the
-            # harness that measures and publishes them.
+            # harness that measures and publishes them, the job's own
+            # invocation in this workflow included.
             cross_validate:
+              - '.github/workflows/ci.yml'
               - 'zstd/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
