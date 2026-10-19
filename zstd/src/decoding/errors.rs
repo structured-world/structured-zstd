@@ -855,6 +855,12 @@ impl FrameDecoderError {
                 ReadFrameHeaderError::InvalidFrameDescriptor(descriptor),
             ) => descriptor.code(),
             FrameDecoderError::ReadFrameHeaderError(_) => ErrorCode::PrefixUnknown,
+            // A window past the format's maximum is refused while the header
+            // is read, before the ceiling check, and is the same failure.
+            FrameDecoderError::FrameHeaderError(FrameHeaderError::WindowTooBig { .. })
+            | FrameDecoderError::FailedToInitialize(FrameHeaderError::WindowTooBig { .. }) => {
+                ErrorCode::FrameParameterWindowTooLarge
+            }
             FrameDecoderError::FrameHeaderError(_) | FrameDecoderError::FailedToInitialize(_) => {
                 ErrorCode::FrameParameterUnsupported
             }

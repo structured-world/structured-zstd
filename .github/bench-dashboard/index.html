@@ -388,7 +388,7 @@
           <strong>Level</strong>, the summed compressed size and the summed
           compression time (each file's fastest of three runs) of ours over the
           reference's (<code>&lt;1 =
-          ours smaller / faster</code>), with the limits the run is held to
+          ours smaller / faster</code>), with the limits each run was held to
           dashed. Source: <code>scripts/cross-validate.sh</code>, run as a
           push-to-main shard (<code>cross-validate</code> in
           <code>ci.yml</code>).
@@ -2539,7 +2539,6 @@
       // ratios ours/reference, plus the limits the run held them to.
       const xvalState = {
         records: [],
-        limits: {},
         chart: null,
         selectors: { corpus: el("xf-corpus"), level: el("xf-level") },
       };
@@ -2558,9 +2557,11 @@
           const row = rows.find((r) => (r.generated_at || r.commit_sha || "local-run") === snap);
           return row && typeof row[field] === "number" ? row[field] : null;
         };
+        // Each record carries the limits its run held it to (0 = not held), so
+        // a later change of limit never redraws an older point's threshold.
         const series = [
-          { field: "size_ratio", label: "size ours ÷ reference", color: "hsl(150 65% 38%)" },
-          { field: "time_ratio", label: "time ours ÷ reference", color: "hsl(20 75% 50%)" },
+          { field: "size_ratio", limitField: "size_limit", label: "size ours ÷ reference", color: "hsl(150 65% 38%)" },
+          { field: "time_ratio", limitField: "time_limit", label: "time ours ÷ reference", color: "hsl(20 75% 50%)" },
         ];
         const datasets = [];
         for (const s of series) {
@@ -2574,11 +2575,14 @@
             spanGaps: true,
             tension: 0.25,
           });
-          const limit = xvalState.limits[s.field];
-          if (typeof limit === "number" && limit > 0) {
+          const limits = snapshots.map((snap) => {
+            const held = at(snap, s.limitField);
+            return held > 0 ? held : null;
+          });
+          if (limits.some((limit) => limit !== null)) {
             datasets.push({
-              label: `${s.label} limit (${limit})`,
-              data: snapshots.map(() => limit),
+              label: `${s.label} limit`,
+              data: limits,
               borderColor: s.color,
               backgroundColor: "transparent",
               borderWidth: 1,
@@ -2630,7 +2634,6 @@
         }
         const payload = await response.json();
         xvalState.records = payload.records || [];
-        xvalState.limits = payload.limits || {};
         const corpora = uniq(xvalState.records.map((r) => r.scenario));
         const levels = uniq(xvalState.records.map((r) => r.level)).sort((a, b) => Number(a) - Number(b));
         wasmRenderPlainOptions(xvalState.selectors.corpus, corpora, null);

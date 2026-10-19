@@ -7,7 +7,8 @@ dashboard sections that keep their own history (the wasm bench in
 append-only list of (kind, scenario, level, engine) datapoints across
 commits. Each push adds one snapshot; old snapshots age out after
 `RETENTION_DAYS`. The run payload's other top-level fields (reference
-engine, engines, limits) replace the persisted ones.
+engine, engines) replace the persisted ones; anything that must stay true of
+an old snapshot lives on its records.
 
 Env vars:
   TIMESERIES_RUN_FILE       this run's payload (required)
@@ -108,7 +109,7 @@ def main():
         retained = retained[-MAX_RECORDS:]
 
     # Snapshot-level fields (commit, timestamp) live on every record; the
-    # section-level ones (reference engine, engines, limits) carry over.
+    # section-level ones (reference engine, engines) carry over.
     snapshot_fields = {"records", "commit_sha", "commit_message", "generated_at"}
     payload = {
         **{k: v for k, v in run_payload.items() if k not in snapshot_fields},

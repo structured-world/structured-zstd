@@ -199,15 +199,19 @@ cross-validation compares the two `zstd` commands on whole corpora.
   Per (corpus, level) the summed compressed size and compression time of ours
   over the reference's are held to 1.05 and 1.5. A file's time is the fastest
   of three runs of each tool, the two alternating, so one preempted run does
-  not decide the ratio.
-- **CI shard:** `cross-validate` in `ci.yml`, push-to-main only and gated on
-  `rust_core` like the bench pipeline. It merges the run into
+  not decide the ratio. The time limit holds only where the reference's summed
+  time reaches a second; below that the time is mostly process start-up, and
+  the ratio is reported without being held.
+- **CI shard:** `cross-validate` in `ci.yml`, push-to-main only, and run when
+  the codec or the harness changes. It merges the run into
   `gh-pages/dev/bench/benchmark-xval.json`
   (`.github/scripts/merge-timeseries.py`), publishing the snapshot even when a
   limit fails, then fails.
 - **Dashboard:** the *Cross-validation* section plots the size and time ratios
-  per corpus and level over time with the limits dashed.
+  per corpus and level over time, each snapshot's limits dashed.
 
 `benchmark-xval.json` record dimensions: `scenario` (the corpus), `level`;
 metrics: `size_ratio`, `time_ratio`, and the summed `ours_bytes`,
-`reference_bytes`, `ours_seconds`, `reference_seconds`, `input_bytes`.
+`reference_bytes`, `ours_seconds`, `reference_seconds`, `input_bytes`; the
+limits the run held the record to: `size_limit`, `time_limit` (0 when not
+held).

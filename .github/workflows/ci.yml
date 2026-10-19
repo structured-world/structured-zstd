@@ -54,6 +54,7 @@ jobs:
       pull-requests: read
     outputs:
       rust_core: ${{ steps.filter.outputs.rust_core }}
+      cross_validate: ${{ steps.filter.outputs.cross_validate }}
       # Only a pull request can be docs-only here: pushes of documentation do
       # not start the workflow, and a manual run always builds.
       # The root README is the crate's rustdoc page and its code blocks run as
@@ -97,6 +98,17 @@ jobs:
             readme:
               - 'README.md'
               - 'zstd/README.md'
+            # The cross-validation figures move with the codec and with the
+            # harness that measures and publishes them.
+            cross_validate:
+              - 'zstd/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'scripts/cross-validate.sh'
+              - 'scripts/cross_validate.py'
+              - 'scripts/upstream-zstd.sh'
+              - '.github/scripts/merge-timeseries.py'
 
   lint:
     # Skipped on a docs-only pull request; every job that needs `lint` is
@@ -788,14 +800,14 @@ jobs:
     # whole corpora at levels 1/3/9/19/22: every file round-trips through
     # both tools both ways, and per (corpus, level) the size and time ratios
     # ours/reference are held to 1.05 and 1.5. Push-to-main only, like the
-    # rest of the bench pipeline, and gated the same way as `bench-wasm`
-    # (the figures move when the codec does). It publishes only
+    # rest of the bench pipeline, and run when the codec or the harness
+    # changes (the `cross_validate` filter). It publishes only
     # `benchmark-xval.json`, so it never writes a file another publisher
     # owns. The snapshot is published even when a limit fails, so the
     # dashboard shows the failing point; the job fails afterwards.
     name: Cross-validate vs the reference CLI (dashboard shard)
     needs: [lint, changes]
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.rust_core == 'true')
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.cross_validate == 'true')
     timeout-minutes: 120
     runs-on: ubuntu-latest
     steps:

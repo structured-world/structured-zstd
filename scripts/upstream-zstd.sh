@@ -25,6 +25,8 @@ fetch_verified() {
   actual="$(sha256_of "$3")"
   if [[ "$actual" != "$2" ]]; then
     echo "error: $3 has digest $actual, expected $2" >&2
+    # Gone, so a kept work directory downloads it afresh next time.
+    rm -f "$3"
     exit 1
   fi
 }

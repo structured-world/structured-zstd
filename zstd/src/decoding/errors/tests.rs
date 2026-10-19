@@ -38,6 +38,14 @@ fn decoder_errors_map_to_their_libzstd_codes() {
             ErrorCode::FrameParameterUnsupported,
         ),
         (
+            FrameDecoderError::FrameHeaderError(FrameHeaderError::WindowTooBig { got: u64::MAX }),
+            ErrorCode::FrameParameterWindowTooLarge,
+        ),
+        (
+            FrameDecoderError::FailedToInitialize(FrameHeaderError::WindowTooBig { got: u64::MAX }),
+            ErrorCode::FrameParameterWindowTooLarge,
+        ),
+        (
             FrameDecoderError::WindowSizeTooBig {
                 requested: 2,
                 limit: 1,

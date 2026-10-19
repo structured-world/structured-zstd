@@ -63,11 +63,13 @@ PATH="$OURS_PATH" tar --zstd -xf "$WORK/system.tar.zst" -C "$WORK/tar-ours-out"
 same_tree "$WORK/tar-ours-out"
 passed+=(tar)
 
-echo "== zstdcat | wc -c"
-expected="$(zstd -dc "$WORK/ours.tar.zst" | wc -c)"
-actual="$("$WORK/bin/zstdcat" "$WORK/system.tar.zst" | wc -c)"
-if [[ "$actual" != "$expected" ]]; then
-  echo "zstdcat produced $actual bytes, expected $expected" >&2
+echo "== zstdcat | cat"
+# The same frame through the system's zstd and through ours as zstdcat, at the
+# head of a pipeline; the outputs must match byte for byte.
+zstd -dc "$WORK/system.tar.zst" > "$WORK/system.tar"
+"$WORK/bin/zstdcat" "$WORK/system.tar.zst" | cat > "$WORK/zstdcat.tar"
+if ! cmp -s "$WORK/system.tar" "$WORK/zstdcat.tar"; then
+  echo "zstdcat output differs from the system zstd's" >&2
   exit 1
 fi
 passed+=(zstdcat)

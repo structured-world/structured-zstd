@@ -446,23 +446,44 @@ enum SuffixCase {
     Any,
 }
 
+/// The type an option's number is read into, which bounds it and names it when
+/// it overflows. Named rather than inferred from the bound: on a 32-bit target
+/// `size_t` and `u32` share one, and still read as different fields.
+#[derive(Clone, Copy)]
+enum NumberWidth {
+    /// `NEXT_UINT32` / `readU32FromChar`.
+    U32,
+    /// `NEXT_TSIZE` / `readSizeTFromChar`: as wide as the platform's `size_t`.
+    SizeT,
+}
+
+impl NumberWidth {
+    fn max(self) -> u64 {
+        match self {
+            NumberWidth::U32 => u64::from(u32::MAX),
+            NumberWidth::SizeT => usize::MAX as u64,
+        }
+    }
+
+    /// The reference's line for a value past the type (zstdcli.c).
+    fn overflow_line(self) -> &'static str {
+        match self {
+            NumberWidth::U32 => "error: numeric value overflows 32-bit unsigned int ",
+            NumberWidth::SizeT => "error: numeric value overflows size_t ",
+        }
+    }
+}
+
 /// Read the leading number of `text` the way upstream's argument readers do
 /// (`readU32FromCharChecked` and `readSizeTFromCharChecked`, zstdcli.c:355-460):
 /// a run of decimal digits, then an optional `K`, `M` or `G` multiplier, which
 /// may be followed by `i` and then `B`. The multipliers are powers of two
-/// whatever the spelling, so `KB`, `K` and `KiB` are all 1024. `max` is the
-/// widest value the destination holds. Reading stops after the suffix and the
-/// rest is handed back; an empty digit run reads as zero.
-fn read_leading_number(text: &str, max: u64, case: SuffixCase) -> Result<(u64, &str)> {
-    // The reference's lines, by the width it read into (`readU32FromChar`,
-    // `readSizeTFromChar`).
-    let overflow = || {
-        Usage::plain(if max == u64::from(u32::MAX) {
-            "error: numeric value overflows 32-bit unsigned int "
-        } else {
-            "error: numeric value overflows size_t "
-        })
-    };
+/// whatever the spelling, so `KB`, `K` and `KiB` are all 1024. `width` is the
+/// type the destination holds. Reading stops after the suffix and the rest is
+/// handed back; an empty digit run reads as zero.
+fn read_leading_number(text: &str, width: NumberWidth, case: SuffixCase) -> Result<(u64, &str)> {
+    let max = width.max();
+    let overflow = || Usage::plain(width.overflow_line());
     let bytes = text.as_bytes();
     let mut at = 0;
     let mut value: u64 = 0;
@@ -498,7 +519,7 @@ fn read_leading_number(text: &str, max: u64, case: SuffixCase) -> Result<(u64, &
 /// after it, as upstream's `NEXT_UINT32` / `NEXT_TSIZE` require. An empty value
 /// is refused, where the reference reads it as zero: `--size-hint=$UNSET` is a
 /// script that lost its value, not one asking for nothing.
-fn parse_number(text: &str, max: u64) -> Result<u64> {
+fn parse_number(text: &str, width: NumberWidth) -> Result<u64> {
     // The reference's line for anything but a number (`NEXT_UINT32`); the
     // `G` suffixes read here as well are an extension it does not list.
     let not_a_number = || {
@@ -509,7 +530,7 @@ fn parse_number(text: &str, max: u64) -> Result<u64> {
     if !text.starts_with(|c: char| c.is_ascii_digit()) {
         return Err(not_a_number());
     }
-    let (value, rest) = read_leading_number(text, max, SuffixCase::Any)?;
+    let (value, rest) = read_leading_number(text, width, SuffixCase::Any)?;
     if !rest.is_empty() {
         return Err(not_a_number());
     }
@@ -518,12 +539,12 @@ fn parse_number(text: &str, max: u64) -> Result<u64> {
 
 /// A size option (`NEXT_TSIZE`): as wide as the platform's `size_t`.
 fn parse_size(text: &str) -> Result<u64> {
-    parse_number(text, usize::MAX as u64)
+    parse_number(text, NumberWidth::SizeT)
 }
 
 /// A count option (`NEXT_UINT32`).
 fn parse_u32(text: &str) -> Result<u32> {
-    let value = parse_number(text, u64::from(u32::MAX))?;
+    let value = parse_number(text, NumberWidth::U32)?;
     Ok(u32::try_from(value).expect("parse_number caps the value at u32::MAX"))
 }
 
@@ -541,7 +562,7 @@ fn cluster_u32(chars: &[char], at: usize) -> Result<(u32, usize)> {
 /// [`read_leading_number`] into a `u32`, for the short options and the
 /// sub-options that read a number and then look at what follows it.
 fn read_leading_u32(text: &str) -> Result<(u32, &str)> {
-    let (value, rest) = read_leading_number(text, u64::from(u32::MAX), SuffixCase::Upper)?;
+    let (value, rest) = read_leading_number(text, NumberWidth::U32, SuffixCase::Upper)?;
     Ok((
         u32::try_from(value).expect("read_leading_number caps the value at u32::MAX"),
         rest,
@@ -2320,13 +2341,13 @@ Environment: ZSTD_CLEVEL sets the default compression level; ZSTD_NBTHREADS is r
 
 Accepted for compatibility, with no effect here: -T#/--threads=#, --single-thread,
 --auto-threads, -B# and --block-size=# when compressing (the job size of a
-multi-threaded run), --adapt, --zstd=ovlog=#, --[no-]sparse,
+multi-threaded run), --adapt, --rsyncable, --zstd=ovlog=#, --[no-]sparse,
 --[no-]asyncio, --[no-]mmap-dict, --[no-]row-match-finder (compression runs
-single-threaded).
+single-threaded). --adapt and --rsyncable are refused beside --single-thread or
+-T0 when compressing.
 
 Rejected rather than ignored, because they would change the result: --format=
-other than zstd, --rsyncable (needs worker threads), and -M/--memory below the
-enforced ceiling when decoding.
+other than zstd, and -M/--memory below the enforced ceiling when decoding.
 Trainer shrink[=#] takes effect: the smallest dictionary within # percent
 (default 1) of the full one is kept.
 A new output file keeps its source's permissions.
@@ -3927,6 +3948,22 @@ fn benchmark_decoding(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     // about as large.
     let dictionary_bytes = dict.as_ref().map_or(0, |bytes| bytes.len() as u64);
     drop(dict);
+    // The frames and the dictionary are weighed from their sizes before any
+    // file is read; the decoded copy joins them once the frames declare it.
+    if let Some(limit) = opts.memory_limit {
+        let inputs = if opts.bench_separately {
+            sizes.iter().copied().max().unwrap_or(0)
+        } else {
+            sizes
+                .iter()
+                .try_fold(0u64, |sum, &size| sum.checked_add(size))
+                .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?
+        };
+        let held = inputs
+            .checked_add(dictionary_bytes)
+            .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
+        check_memory_limit(limit, held, 1)?;
+    }
     if opts.bench_separately {
         for (input, size) in opts.inputs.iter().zip(&sizes) {
             let data =
@@ -4684,7 +4721,7 @@ struct TrainingSet {
     /// What each file read was, taken from the open file.
     sources: Vec<fs::Metadata>,
     /// Bytes the samples hold before any budget (`dibio.c`, `totalSizeToLoad`).
-    requested: u64,
+    requested: u128,
     /// Most bytes loaded: [`TRAINING_DATA_MAX`], or `-M` when smaller.
     budget: u64,
 }
@@ -4704,12 +4741,12 @@ fn training_load_notices(set: &TrainingSet, memory_limit: Option<u64>) -> Vec<(i
             ),
         ));
     }
-    if set.budget < set.requested {
+    if u128::from(set.budget) < set.requested {
         notices.push((
             1,
             format!(
                 "Training samples set too large ({} MB); training on {} MB only...",
-                set.requested / MB,
+                set.requested / u128::from(MB),
                 set.budget / MB
             ),
         ));
@@ -4804,6 +4841,19 @@ fn plan_training_load(
     (plan, bytes)
 }
 
+/// Bytes the samples hold before any budget: each file whole under `-B`,
+/// otherwise up to [`TRAINING_SAMPLE_MAX`]. The sizes are what directory
+/// entries claim, so the sum is kept wide enough never to wrap.
+fn training_requested(file_sizes: &[u64], block_size: Option<u64>) -> u128 {
+    file_sizes
+        .iter()
+        .map(|&size| match block_size {
+            Some(_) => u128::from(size),
+            None => u128::from(size.min(TRAINING_SAMPLE_MAX)),
+        })
+        .sum()
+}
+
 /// Load the training samples as the reference's command does: files in its
 /// shuffled order, each one sample of at most [`TRAINING_SAMPLE_MAX`] bytes, or
 /// cut whole into `block_size` samples when `-B` gives one; empty files left
@@ -4832,13 +4882,7 @@ fn load_training_samples(
         return Err(Box::new(TooFewSamples));
     }
     let budget = TRAINING_DATA_MAX.min(memory_limit.unwrap_or(u64::MAX));
-    let requested = file_sizes
-        .iter()
-        .map(|&size| match block_size {
-            Some(_) => size,
-            None => size.min(TRAINING_SAMPLE_MAX),
-        })
-        .sum();
+    let requested = training_requested(&file_sizes, block_size);
     let (plan, bytes) = plan_training_load(&file_sizes, block_size, budget, samples);
     // What the budget keeps, not what the files hold, is what the trainer gets.
     // The five-sample floor above is on the files, as upstream's is

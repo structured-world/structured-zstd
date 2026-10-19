@@ -12,11 +12,14 @@ ours over the reference's are reported, and held to the given limits.
 
 A file's compression time is the fastest of --repeat runs of each tool, the
 two alternating, so a run the machine preempted does not decide the ratio.
+The time limit holds only where the reference's summed time reaches
+--time-floor seconds; below it the time is mostly process start-up.
 
 Usage:
   cross_validate.py --ours BIN --reference BIN --corpus NAME=DIR [...]
                     [--levels 1,3,9,19,22] [--ratio-limit 1.05]
-                    [--time-limit 1.5] [--repeat 3] [--json OUT]
+                    [--time-limit 1.5] [--time-floor 1.0] [--repeat 3]
+                    [--json OUT]
 
 A limit of 0 reports the figure without holding it. Exits non-zero when any
 roundtrip fails or any figure is past its limit.
@@ -66,11 +69,9 @@ def decodes_to(binary, frame, original):
 
 def corpus_files(directory):
     # A `.zst` beside its source (the decodecorpus fixtures keep both) is a
-    # frame, not an input.
+    # frame, not an input. Empty files stay: an empty input is a case too.
     return sorted(
-        p
-        for p in Path(directory).rglob("*")
-        if p.is_file() and p.suffix != ".zst" and p.stat().st_size > 0
+        p for p in Path(directory).rglob("*") if p.is_file() and p.suffix != ".zst"
     )
 
 
@@ -83,6 +84,7 @@ def main():
     parser.add_argument("--ratio-limit", type=float, default=1.05)
     parser.add_argument("--time-limit", type=float, default=1.5)
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--time-floor", type=float, default=1.0)
     parser.add_argument("--json")
     args = parser.parse_args()
     if args.repeat < 1:
@@ -91,9 +93,11 @@ def main():
     levels = [int(level) for level in args.levels.split(",")]
     corpora = []
     for spec in args.corpus:
-        name, _, directory = spec.partition("=")
+        name, separator, directory = spec.partition("=")
+        if not name or not separator or not directory:
+            parser.error(f"corpus {spec!r} is not NAME=DIR")
         files = corpus_files(directory)
-        if not name or not files:
+        if not files:
             parser.error(f"corpus {spec!r} names no files")
         corpora.append((name, files))
 
@@ -136,18 +140,25 @@ def main():
                             failures.append(f"{check} {name} level {level}: {path}")
                 row["size_ratio"] = row["ours_bytes"] / row["reference_bytes"]
                 row["time_ratio"] = row["ours_seconds"] / row["reference_seconds"]
+                # Below the floor the time is mostly process start-up, not the
+                # codec, so the ratio is reported but not held. Each record
+                # carries the limits it was held to.
+                held = row["reference_seconds"] >= args.time_floor
+                row["size_limit"] = args.ratio_limit
+                row["time_limit"] = args.time_limit if held else 0
                 rows.append(row)
                 print(
                     f"{name:<12} -{level:<3} files {row['files']:>3}  "
                     f"size {row['ours_bytes']:>11} / {row['reference_bytes']:>11} = {row['size_ratio']:.4f}  "
-                    f"time {row['ours_seconds']:8.2f}s / {row['reference_seconds']:8.2f}s = {row['time_ratio']:.2f}",
+                    f"time {row['ours_seconds']:8.2f}s / {row['reference_seconds']:8.2f}s = {row['time_ratio']:.2f}"
+                    f"{'' if held else '  (below the time floor, not held)'}",
                     flush=True,
                 )
                 if args.ratio_limit and row["size_ratio"] > args.ratio_limit:
                     failures.append(
                         f"size {name} level {level}: {row['size_ratio']:.4f} > {args.ratio_limit}"
                     )
-                if args.time_limit and row["time_ratio"] > args.time_limit:
+                if row["time_limit"] and row["time_ratio"] > row["time_limit"]:
                     failures.append(
                         f"time {name} level {level}: {row['time_ratio']:.2f} > {args.time_limit}"
                     )
@@ -173,7 +184,6 @@ def main():
             "version": 1,
             "reference_engine": "reference",
             "engines": ["ours"],
-            "limits": {"size_ratio": args.ratio_limit, "time_ratio": args.time_limit},
             "records": records,
         }
         Path(args.json).write_text(json.dumps(payload, indent=2) + "\n")

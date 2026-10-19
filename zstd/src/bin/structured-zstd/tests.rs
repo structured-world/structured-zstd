@@ -5467,6 +5467,39 @@ fn bench_with_d_measures_decoding_of_frames() {
     assert!(err.contains("cannot be determined"), "{err}");
 }
 
+/// `-M` is weighed against the inputs' sizes before a decoding benchmark reads
+/// them: input larger than the limit is refused on its size, not read in and
+/// only then turned down (here it is not even frames, which the read would
+/// have reported instead).
+#[test]
+fn decoding_benchmark_weighs_the_memory_limit_before_reading() {
+    let scratch = Scratch::new("bench-decode-preread");
+    let input = scratch.file("big.zst", &vec![b'x'; 64 * 1024]);
+    let mut opts = parse(&["-b", "-d", "-i0", "-q", "x"]).unwrap();
+    opts.inputs = vec![input];
+    opts.memory_limit = Some(
+        structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE + DECODER_AUXILIARY_BYTES + 1024,
+    );
+    let err = run_benchmark(&opts, None)
+        .expect_err("the input alone exceeds the limit")
+        .to_string();
+    assert!(err.contains("memory limit"), "{err}");
+}
+
+/// The bytes a training run is asked to load are summed wide: sizes the
+/// directory entries claim can add up past `u64` (sparse files under `-B`),
+/// and the notice comparing them with the budget must still be true.
+#[test]
+fn training_size_total_does_not_wrap() {
+    let total = training_requested(&[u64::MAX, u64::MAX], Some(1 << 20));
+    assert_eq!(total, 2 * u128::from(u64::MAX));
+    // Without `-B` each file counts up to one sample.
+    assert_eq!(
+        training_requested(&[u64::MAX, 7], None),
+        u128::from(TRAINING_SAMPLE_MAX) + 7
+    );
+}
+
 /// A decoding benchmark holds the parsed dictionary beside the frames and their
 /// decoded copy, so `-M` weighs all three together: a limit that covers the
 /// buffers alone, and the dictionary alone, still refuses them combined.
@@ -5588,6 +5621,10 @@ fn an_overflowing_number_reports_its_width() {
     };
     let err = refusal(&["--zstd=wlog=99999999999", "f"]);
     assert!(err.contains("overflows 32-bit unsigned int"), "{err}");
+    let err = refusal(&["--maxdict=4294967296", "f"]);
+    assert!(err.contains("overflows 32-bit unsigned int"), "{err}");
+    // A size_t field keeps its own name, on a 32-bit target as well, where
+    // its bound is the same as a u32's.
     let err = refusal(&["--stream-size=999999999999999999999999", "f"]);
     assert!(err.contains("overflows size_t"), "{err}");
 }
