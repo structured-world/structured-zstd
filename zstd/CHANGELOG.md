@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/structured-world/structured-zstd/compare/v0.2.2...v0.2.3) - 2026-10-19
+
+### Added
+
+- *(c-api)* the experimental zstd.h and zdict.h surface ([#602](https://github.com/structured-world/structured-zstd/pull/602))
+
+### Fixed
+
+- *(decoder)* hand out every decoded byte, not only what left the window ([#605](https://github.com/structured-world/structured-zstd/pull/605))
+- *(encoder)* take table pointers from the table, not a slice ([#598](https://github.com/structured-world/structured-zstd/pull/598))
+
+### Testing
+
+- *(ci)* prove the drop-in claim against upstream's suites, the reference CLI and real consumers ([#610](https://github.com/structured-world/structured-zstd/pull/610))
+- run the lsm tests in CI and fix the one that rotted ([#608](https://github.com/structured-world/structured-zstd/pull/608))
+
 ## [0.2.2](https://github.com/structured-world/structured-zstd/compare/v0.2.1...v0.2.2) - 2026-10-17
 
 ### Added
