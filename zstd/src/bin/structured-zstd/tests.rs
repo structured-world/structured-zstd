@@ -5506,6 +5506,31 @@ fn a_decoding_benchmark_refused_on_sizes_does_no_work_first() {
     assert!(!trace.exists(), "the trace was opened before the refusal");
 }
 
+/// Parsing the dictionary holds the blob and its parsed form at once (a
+/// `--patch-from` reference is copied whole), so `-M` weighs the dictionary
+/// twice while it is parsed: a limit that covers the frames plus one copy of
+/// a large reference, but not two copies, is refused before the parse.
+#[test]
+fn decoding_benchmark_weighs_the_dictionary_parse_peak() {
+    let scratch = Scratch::new("bench-decode-parse-peak");
+    let input = scratch.file("small.zst", &[b'x'; 16]);
+    let reference = vec![b'r'; 64 * 1024];
+    let mut opts = parse(&["-b", "-d", "-i0", "-q", "x"]).unwrap();
+    opts.inputs = vec![input];
+    opts.patch_from = Some(scratch.file("reference", &reference));
+    opts.memory_limit = Some(
+        structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE
+            + DECODER_AUXILIARY_BYTES
+            + reference.len() as u64
+            + 16
+            + 1024,
+    );
+    let err = run_benchmark(&opts, Some(reference))
+        .expect_err("two copies of the reference exceed the limit")
+        .to_string();
+    assert!(err.contains("memory limit"), "{err}");
+}
+
 /// The bytes a training run is asked to load are summed wide: sizes the
 /// directory entries claim can add up past `u64` (sparse files under `-B`),
 /// and the notice comparing them with the budget must still be true.

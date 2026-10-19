@@ -3951,7 +3951,9 @@ fn benchmark_decoding(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     let dictionary_bytes = dict.as_ref().map_or(0, |bytes| bytes.len() as u64);
     // The frames and the dictionary are weighed from their sizes before any
     // work, the dictionary's parse and the trace included; the decoded copy
-    // joins them once the frames declare it.
+    // joins them once the frames declare it. The parse holds the blob and its
+    // parsed form together, before any frame is read, so the peak is the
+    // larger of that pair and the frames beside one form.
     if let Some(limit) = opts.memory_limit {
         let inputs = if opts.bench_separately {
             sizes.iter().copied().max().unwrap_or(0)
@@ -3964,7 +3966,9 @@ fn benchmark_decoding(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         let held = inputs
             .checked_add(dictionary_bytes)
             .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
-        check_memory_limit(limit, held, 1)?;
+        // A dictionary is a file read into memory, so twice its length stays
+        // within u64.
+        check_memory_limit(limit, held.max(2 * dictionary_bytes), 1)?;
     }
     let codecs = &mut Codecs::prepare(dict.as_deref(), opts.patch_from.is_some(), false, true)?;
     codecs.open_trace(opts, true)?;

@@ -212,6 +212,7 @@ cross-validation compares the two `zstd` commands on whole corpora.
 
 `benchmark-xval.json` record dimensions: `scenario` (the corpus), `level`;
 metrics: `size_ratio`, `time_ratio`, and the summed `ours_bytes`,
-`reference_bytes`, `ours_seconds`, `reference_seconds`, `input_bytes`; the
-limits the run held the record to: `size_limit`, `time_limit` (0 when not
-held).
+`reference_bytes`, `ours_seconds`, `reference_seconds`, `input_bytes` over
+the `measured_files` of the corpus's `files` that compressed on both sides;
+the ratios are null unless every file did. The limits the run held the record
+to: `size_limit`, `time_limit` (0 when not held).
