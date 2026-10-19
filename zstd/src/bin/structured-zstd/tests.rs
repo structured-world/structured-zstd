@@ -1830,6 +1830,46 @@ fn decoding_names_the_foreign_format_it_cannot_read() {
     assert!(decode_stream_message(b"some data").contains("unsupported format"));
 }
 
+/// The v0.5-v0.7 frames the reference command decodes by default decode here
+/// too, and a v0.7 frame naming a dictionary it was not given fails as the
+/// reference's does.
+#[test]
+fn decoding_reads_the_v05_to_v07_formats() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("legacy_frames");
+    for name in [
+        "abc.txt.v05.l19.zst",
+        "z000000.v06.l1.zst",
+        "z000001.v07.l19.zst",
+    ] {
+        let frame = fs::read(dir.join(name)).unwrap();
+        let stem = name.split_once(".v0").unwrap().0;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("decodecorpus_files")
+            .join(stem);
+        let mut out = Vec::new();
+        decompress_stream(
+            &frame[..],
+            &mut out,
+            &mut no_dict(),
+            &DecodeSettings::default(),
+        )
+        .unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert!(out == fs::read(source).unwrap(), "{name}");
+    }
+    let frame = fs::read(dir.join("ModemManager.service.v07.dict.zst")).unwrap();
+    let err = decompress_stream(
+        &frame[..],
+        io::sink(),
+        &mut no_dict(),
+        &DecodeSettings::default(),
+    )
+    .expect_err("the frame names a dictionary");
+    assert_eq!(
+        named(err, "in.zst").to_string(),
+        "in.zst : Decoding error (36) : Dictionary mismatch "
+    );
+}
+
 /// A decoding failure is reported against the input, in the reference
 /// command's two shapes (`fileio.c` 2463, 2748-2796): `zstd: NAME: message`
 /// for input that is not a frame, and `NAME : Decoding error (36) : <libzstd's
