@@ -65,7 +65,9 @@ pub struct ZSTD_FrameHeader {
 }
 
 /// `size_t ZSTD_frameHeaderSize(const void* src, size_t srcSize)` — length of
-/// the frame header (including the magic number), or an error code.
+/// the frame header (including the magic number), or an error code. A
+/// v0.5-v0.7 header, which `ZSTD_isFrame` accepts, is measured by its own
+/// format's size fields.
 ///
 /// # Safety
 /// `src` must be valid for `src_size` bytes (or `NULL` with `src_size == 0`).
