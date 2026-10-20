@@ -16,6 +16,8 @@
 //!
 //! Frames that name a dictionary are refused with
 //! [`Unsupported::Dictionary`]; this decoder keeps no dictionary registry.
+//! With the `legacy` feature, v0.5-v0.7 frames are refused with
+//! `Unsupported::LegacyFrame`, since their decoders allocate.
 //!
 //! The decoding itself is the same code the other decoders run, so output is
 //! identical to theirs.
@@ -356,6 +358,14 @@ pub enum Unsupported {
         /// The dictionary id the frame header names.
         id: u32,
     },
+    /// A v0.5, v0.6 or v0.7 frame, which the owned decoders read and this
+    /// one does not: their decoders allocate. Upstream's static context
+    /// refuses them likewise.
+    #[cfg(feature = "legacy")]
+    LegacyFrame {
+        /// The format of the frame.
+        version: crate::decoding::LegacyVersion,
+    },
 }
 
 /// How the input breaks the zstd format.
@@ -437,6 +447,12 @@ impl core::fmt::Display for WorkspaceDecodeError {
                     "frame needs dictionary {id}, which this decoder does not take"
                 )
             }
+            #[cfg(feature = "legacy")]
+            Self::Unsupported(Unsupported::LegacyFrame { version }) => write!(
+                f,
+                "v0.{} frame, which this decoder does not read",
+                version.minor()
+            ),
             Self::Truncated => write!(f, "input ended in the middle of a frame"),
             Self::Failed => write!(f, "an earlier step failed; reset the decoder"),
         }
@@ -1000,6 +1016,13 @@ impl<'w> WorkspaceDecoder<'w> {
                 } else if magic == MAGIC_NUM {
                     self.expect_header(Phase::Descriptor, 5);
                 } else {
+                    #[cfg(feature = "legacy")]
+                    if let Some(version) = crate::decoding::LegacyVersion::of(&magic.to_le_bytes())
+                    {
+                        return Err(WorkspaceDecodeError::Unsupported(
+                            Unsupported::LegacyFrame { version },
+                        ));
+                    }
                     return Err(Malformed(MalformedInput::FrameHeader(
                         ReadFrameHeaderError::BadMagicNumber(magic),
                     )));

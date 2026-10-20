@@ -291,6 +291,13 @@ impl HuffmanTable {
         self.fse_table.reset();
     }
 
+    /// Code length of every symbol the parsed description lists, 0 for a
+    /// symbol it leaves out, the last symbol's inferred length included.
+    #[cfg(feature = "legacy")]
+    pub(crate) fn code_lengths(&self) -> &[u8] {
+        &self.bits
+    }
+
     /// Build the equivalent encoder-side Huffman table from parsed weights.
     pub(crate) fn to_encoder_table(&self) -> Option<crate::huff0::huff0_encoder::HuffmanTable> {
         if self.bits.is_empty() || self.max_num_bits == 0 {

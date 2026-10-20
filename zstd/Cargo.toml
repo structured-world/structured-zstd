@@ -11,7 +11,9 @@ license = "Apache-2.0"
 homepage = "https://structured-world.github.io/structured-zstd/dev/bench/"
 repository = "https://github.com/structured-world/structured-zstd"
 description = "Pure-Rust Zstandard (zstd) compression and decompression: all levels, streaming, dictionaries, no_std and WebAssembly ready — no FFI, no cmake"
-exclude = ["fuzz_decodecorpus/*", "decodecorpus_files/*", "dict_tests/files/**"]
+# Test corpora stay in the repository: the published crate carries the library
+# and the command line, and its tests run from a checkout, not from the package.
+exclude = ["fuzz_decodecorpus/*", "decodecorpus_files/*", "dict_tests/files/**", "legacy_frames/*"]
 # Package metadata points at a crate-local symlink so the packaged crate and repo root README stay in sync.
 readme = "README.md"
 keywords = ["zstd", "zstandard", "decompression", "compression", "no-std"]
@@ -129,6 +131,7 @@ default = [
     # does not want it turns default features off, as `no_std` builds already
     # do.
     "dict-builder",
+    "legacy",
 ]
 # Per-CPU-tier kernel selection, covering the decoder and the encoder. The
 # default build enables every kernel except `kernel-vbmi2`; with `std`,
@@ -168,6 +171,11 @@ kernel-sve = ["kernel-neon"]
 # simd128 equivalent and stay scalar on wasm.
 kernel-simd128 = []
 dict-builder = ["std", "dep:fastrand"]
+# Decode frames of the v0.5, v0.6 and v0.7 formats, the ones every libzstd
+# 1.5.7 build reads by default (upstream's legacy level 5). Without it such a
+# frame is refused as an unknown format, as a libzstd built at level 0
+# refuses it. Pure decoding code, no dependency.
+legacy = []
 hash = ["dep:twox-hash"]
 # Long-distance matching in the encoder. Implies `hash`: the LDM match finder
 # hashes each `min_match_length` window with XXH64. Without it the parameter
@@ -254,6 +262,11 @@ required-features = ["caller-workspace", "std"]
 name = "workspace_decode_loop"
 path = "examples/workspace_decode_loop.rs"
 required-features = ["caller-workspace", "std"]
+
+[[example]]
+name = "legacy_decode_loop"
+path = "examples/legacy_decode_loop.rs"
+required-features = ["legacy", "std"]
 
 # All benches, integration tests, and FFI diagnostic examples are targets of
 # the non-published `ffi-bench` crate (they link the C `zstd` bindings); their

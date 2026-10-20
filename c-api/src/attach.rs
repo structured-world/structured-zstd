@@ -136,13 +136,12 @@ pub(crate) fn parse_decode_dict(
         }
         _ => return Err(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound),
     };
-    let parsed = if full {
-        Dictionary::decode_dict(dict)
-            .map_err(|_| ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted)?
-    } else {
-        Dictionary::from_raw_content(RAW_CONTENT_DICT_ID, dict.to_vec())
-            .map_err(|_| ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted)?
-    };
+    if full {
+        return DictionaryHandle::decode_dict(dict)
+            .map_err(|_| ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted);
+    }
+    let parsed = Dictionary::from_raw_content(RAW_CONTENT_DICT_ID, dict.to_vec())
+        .map_err(|_| ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted)?;
     Ok(DictionaryHandle::from_dictionary(parsed))
 }
 

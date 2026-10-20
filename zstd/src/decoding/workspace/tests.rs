@@ -506,6 +506,36 @@ fn dictionary_frame_is_unsupported() {
     ));
 }
 
+/// A v0.5-v0.7 frame, which the owned decoders read, is refused as
+/// unsupported rather than as malformed: decoding it would allocate.
+#[cfg(feature = "legacy")]
+#[test]
+fn v05_to_v07_frames_are_unsupported() {
+    // v0.7 with a one-byte dictionary ID of 0 and no blocks before its end.
+    let frame = [
+        0x27, 0xB5, 0x2F, 0xFD, 0x51, 0x00, 0x00, 0xFA, 0x00, 0xFF, 0x00, 0x00,
+    ];
+    let mut out = [0u8; 16];
+    assert_eq!(
+        crate::decoding::FrameDecoder::new()
+            .decode_all(&frame, &mut out)
+            .unwrap(),
+        0
+    );
+    assert!(matches!(
+        decode_whole(&frame, DecodeLimits::new(1 << 20)),
+        Err(WorkspaceDecodeError::Unsupported(
+            Unsupported::LegacyFrame {
+                version: crate::decoding::LegacyVersion::V07
+            }
+        ))
+    ));
+    let message = alloc::string::ToString::to_string(
+        &decode_whole(&frame, DecodeLimits::new(1 << 20)).unwrap_err(),
+    );
+    assert!(message.contains("v0.7"), "{message}");
+}
+
 /// Bytes after the last frame that are not a frame are malformed; the error
 /// holds until a reset, after which the decoder works again.
 #[test]
