@@ -36,6 +36,11 @@ pub(super) fn read_header(src: &[u8]) -> Result<FrameHeader, Error> {
     let &descriptor = src.get(4).ok_or(Error::Truncated)?;
     let fcs_len = [0usize, 1, 2, 8][usize::from(descriptor >> 6)];
     let header = src.get(..5 + fcs_len).ok_or(Error::Truncated)?;
+    // Descriptor bits (upstream zstd_v06.c:2826-2832): 0-3 window log less
+    // 12, 4 a minimum-match flag, 5 reserved, 6-7 the content size field.
+    // The window field is four bits, 27 at most. Bit 4 is read by no
+    // decoder and written by no encoder, so a frame setting it decodes, as
+    // in upstream (zstd_v06.c:2937-2938); only bit 5 is refused.
     let window_log = u32::from(descriptor & 0xF) + 12;
     if descriptor & 0x20 != 0 || (usize::BITS == 32 && window_log > 25) {
         return Err(Error::UnsupportedParameter);
