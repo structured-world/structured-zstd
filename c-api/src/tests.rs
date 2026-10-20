@@ -6,6 +6,7 @@
 mod bufferless;
 mod cctx_params;
 mod experimental;
+mod legacy;
 mod provided;
 mod sequences;
 mod streams;

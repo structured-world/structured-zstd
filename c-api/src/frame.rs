@@ -7,7 +7,7 @@ use core::ffi::{c_uint, c_ulonglong};
 use codec::decoding::errors::ReadFrameHeaderError;
 use codec::decoding::{
     FrameContentSize, FrameMagic, FrameSizeError, decompression_margin, find_decompressed_size,
-    find_frame_compressed_size, frame_decompressed_bound, frame_header_size, frame_magic,
+    find_frame_compressed_size, frame_decompressed_bound, frame_header_size, frame_magic, is_frame,
     min_decoding_buffer_size, read_frame_header_info,
 };
 use codec::skippable::{
@@ -65,7 +65,9 @@ pub struct ZSTD_FrameHeader {
 }
 
 /// `size_t ZSTD_frameHeaderSize(const void* src, size_t srcSize)` — length of
-/// the frame header (including the magic number), or an error code.
+/// the frame header (including the magic number), or an error code. A
+/// v0.5-v0.7 header, which `ZSTD_isFrame` accepts, is measured by its own
+/// format's size fields.
 ///
 /// # Safety
 /// `src` must be valid for `src_size` bytes (or `NULL` with `src_size == 0`).
@@ -220,14 +222,15 @@ pub unsafe extern "C" fn ZSTD_findDecompressedSize(src: *const u8, src_size: usi
 }
 
 /// `unsigned ZSTD_isFrame(const void* buffer, size_t size)` — 1 when `buffer`
-/// starts with a frame or skippable-frame magic number, else 0.
+/// starts with a frame, skippable-frame or v0.5-v0.7 frame magic number,
+/// else 0.
 ///
 /// # Safety
 /// `buffer` must be valid for `size` bytes (or `NULL` with `size == 0`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_isFrame(buffer: *const u8, size: usize) -> c_uint {
     let buffer = unsafe { in_slice(buffer, size) };
-    c_uint::from(frame_magic(buffer).is_some())
+    c_uint::from(is_frame(buffer))
 }
 
 /// `unsigned ZSTD_isSkippableFrame(const void* buffer, size_t size)` — 1 when

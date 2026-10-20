@@ -107,7 +107,7 @@ pub fn read_frame_header_with_format(
     Ok((frame_header, bytes_read as u8))
 }
 
-fn eof() -> crate::io::Error {
+pub(crate) fn eof() -> crate::io::Error {
     crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof)
 }
 

@@ -51,14 +51,24 @@ pub struct Dictionary {
     pub offset_hist: [u32; 3],
 }
 
+/// What a [`DictionaryHandle`] shares: the parsed dictionary and, for one
+/// parsed from serialized bytes, the bytes in front of its content (magic
+/// number, ID, tables, repeat offsets). A v0.5 or v0.6 frame takes a
+/// dictionary of this layout whole as history, header too.
+pub(crate) struct HeldDictionary {
+    pub(crate) dict: Dictionary,
+    #[cfg(feature = "legacy")]
+    pub(crate) serialized_header: Vec<u8>,
+}
+
 /// A parsed dictionary held by however many users need it at once.
 ///
 /// Both sides prime frame after frame from one dictionary, so what they hold is
 /// shared rather than copied: `Arc` where atomics exist, `Rc` where they do not.
 #[cfg(target_has_atomic = "ptr")]
-pub(crate) type SharedDictionary = Arc<Dictionary>;
+pub(crate) type SharedDictionary = Arc<HeldDictionary>;
 #[cfg(not(target_has_atomic = "ptr"))]
-pub(crate) type SharedDictionary = Rc<Dictionary>;
+pub(crate) type SharedDictionary = Rc<HeldDictionary>;
 
 /// Shared pre-parsed dictionary handle for repeated decoding.
 ///
@@ -360,8 +370,19 @@ impl DictionaryHandle {
     /// Wrap an already-parsed dictionary in a shared handle.
     pub fn from_dictionary(dict: Dictionary) -> Self {
         Self {
-            inner: SharedDictionary::new(dict),
+            inner: SharedDictionary::new(HeldDictionary {
+                dict,
+                #[cfg(feature = "legacy")]
+                serialized_header: Vec::new(),
+            }),
         }
+    }
+
+    /// The bytes of the serialized dictionary in front of its content, empty
+    /// for one built from raw content or from a parsed [`Dictionary`].
+    #[cfg(feature = "legacy")]
+    pub(crate) fn serialized_header(&self) -> &[u8] {
+        &self.inner.serialized_header
     }
 
     /// Heap bytes the handle keeps alive: the shared allocation the
@@ -380,11 +401,15 @@ impl DictionaryHandle {
     /// assert!(handle.heap_size() <= DictionaryHandle::max_heap_size(1024));
     /// ```
     pub fn heap_size(&self) -> usize {
-        Self::shared_allocation_size() + self.inner.heap_bytes()
+        let bytes = Self::shared_allocation_size() + self.inner.dict.heap_bytes();
+        #[cfg(feature = "legacy")]
+        let bytes = bytes + self.inner.serialized_header.capacity();
+        bytes
     }
 
-    /// Most [`Self::heap_size`] a handle over `content_len` bytes of content
-    /// can report, for budgeting before the dictionary is parsed.
+    /// Most [`Self::heap_size`] a handle over a dictionary of `content_len`
+    /// bytes can report, serialized header included, for budgeting before
+    /// the dictionary is parsed.
     pub fn max_heap_size(content_len: usize) -> usize {
         Self::shared_allocation_size() + Dictionary::max_heap_bytes(content_len)
     }
@@ -448,7 +473,7 @@ impl DictionaryHandle {
     /// word-sized counts ahead of the value, padded to its alignment.
     fn shared_allocation_size() -> usize {
         core::alloc::Layout::new::<[usize; 2]>()
-            .extend(core::alloc::Layout::new::<Dictionary>())
+            .extend(core::alloc::Layout::new::<HeldDictionary>())
             .expect("a fixed-size layout extends")
             .0
             .pad_to_align()
@@ -457,7 +482,17 @@ impl DictionaryHandle {
 
     /// Parse a serialized dictionary and return a reusable shared handle.
     pub fn decode_dict(raw: &[u8]) -> Result<Self, DictionaryDecodeError> {
-        Dictionary::decode_dict(raw).map(Self::from_dictionary)
+        let dict = Dictionary::decode_dict(raw)?;
+        // The content is the tail of the serialized bytes.
+        #[cfg(feature = "legacy")]
+        let serialized_header = raw[..raw.len() - dict.dict_content.len()].to_vec();
+        Ok(Self {
+            inner: SharedDictionary::new(HeldDictionary {
+                dict,
+                #[cfg(feature = "legacy")]
+                serialized_header,
+            }),
+        })
     }
 
     /// Load whichever kind of dictionary `raw` holds, as `ZSTD_createDDict`
@@ -465,15 +500,19 @@ impl DictionaryHandle {
     /// content. See
     /// [`Dictionary::from_serialized_or_raw_content`].
     pub fn from_serialized_or_raw_content(raw: &[u8]) -> Result<Self, DictionaryDecodeError> {
-        Dictionary::from_serialized_or_raw_content(raw).map(Self::from_dictionary)
+        if Dictionary::is_serialized(raw) {
+            Self::decode_dict(raw)
+        } else {
+            Dictionary::from_serialized_or_raw_content(raw).map(Self::from_dictionary)
+        }
     }
 
     pub fn id(&self) -> u32 {
-        self.inner.id
+        self.inner.dict.id
     }
 
     pub fn as_dict(&self) -> &Dictionary {
-        &self.inner
+        &self.inner.dict
     }
 }
 
