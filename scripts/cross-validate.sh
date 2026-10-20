@@ -36,11 +36,16 @@ REFERENCE="$UPSTREAM/programs/zstd"
 
 CORPORA="$WORK/corpora"
 mkdir -p "$CORPORA"
-fetch_verified https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip \
+# The archives come from this repository's `bench-corpora` release, which
+# mirrors sun.aei.polsl.pl, corpus.canterbury.ac.nz and mattmahoney.net: a
+# publishing host answers GitHub-hosted runners with 403. The digests are
+# those of the original archives.
+CORPUS_RELEASE=https://github.com/structured-world/structured-zstd/releases/download/bench-corpora
+fetch_verified "$CORPUS_RELEASE/silesia.zip" \
   0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af "$CORPORA/silesia.zip"
-fetch_verified https://corpus.canterbury.ac.nz/resources/cantrbry.tar.gz \
+fetch_verified "$CORPUS_RELEASE/cantrbry.tar.gz" \
   f140e8a5b73d3f53198555a63bfb827889394a42f20825df33c810c3d5e3f8fb "$CORPORA/cantrbry.tar.gz"
-fetch_verified https://mattmahoney.net/dc/enwik8.zip \
+fetch_verified "$CORPUS_RELEASE/enwik8.zip" \
   547994d9980ebed1288380d652999f38a14fe291a6247c157c3d33d4932534bc "$CORPORA/enwik8.zip"
 
 rm -rf "$CORPORA/silesia" "$CORPORA/canterbury" "$CORPORA/enwiki-1m"
