@@ -12,6 +12,41 @@ fn frame(content: &[u8]) -> Vec<u8> {
     compress_slice_to_vec(content, CompressionLevel::Default)
 }
 
+/// Built without `legacy`, a v0.5-v0.7 frame is no frame: every query and
+/// the decoder refuse its magic number as an unknown prefix, the error a
+/// libzstd built at legacy level 0 returns.
+#[cfg(not(feature = "legacy"))]
+#[test]
+fn without_the_legacy_feature_older_frames_are_unknown() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::errors::{ErrorCode, FrameDecoderError};
+    let frame = include_bytes!("../../legacy_frames/abc.txt.v07.l1.zst");
+    assert!(!super::is_frame(frame));
+    assert!(matches!(
+        read_frame_content_size(frame),
+        Err(ReadFrameHeaderError::BadMagicNumber(0xFD2F_B527))
+    ));
+    assert!(matches!(
+        find_frame_compressed_size(frame),
+        Err(FrameSizeError::Header(
+            ReadFrameHeaderError::BadMagicNumber(0xFD2F_B527)
+        ))
+    ));
+    let err = FrameDecoder::new()
+        .decode_all(frame, &mut [0u8; 64])
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::PrefixUnknown);
+    assert!(
+        matches!(
+            err,
+            FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(
+                0xFD2F_B527
+            ))
+        ),
+        "{err}"
+    );
+}
+
 /// A single-segment frame declaring `size` in an 8-byte Frame_Content_Size
 /// field, holding one empty last raw block (RFC 8878 3.1.1).
 fn frame_declaring(size: u64) -> Vec<u8> {

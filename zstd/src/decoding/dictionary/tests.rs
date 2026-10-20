@@ -164,6 +164,23 @@ fn an_empty_buffer_is_a_dictionary_with_no_content() {
     assert!(Dictionary::from_raw_content(1, Vec::new()).is_err());
 }
 
+/// The bound callers budget a handle by leaves room, beyond the parsed tables
+/// at their largest, for the bytes a serialized dictionary keeps in front of
+/// its content.
+#[cfg(feature = "legacy")]
+#[test]
+fn the_heap_bound_covers_the_kept_serialized_header() {
+    let raw = include_bytes!("../../../dict_tests/dictionary");
+    let parsed = DictionaryHandle::decode_dict(raw).unwrap();
+    let content_len = parsed.as_dict().dict_content.len();
+    let beyond_tables = DictionaryHandle::max_heap_size(content_len)
+        - DictionaryHandle::shared_allocation_size()
+        - Dictionary::max_heap_bytes(content_len);
+    let kept = parsed.inner.serialized_header.capacity();
+    assert!(kept > 0);
+    assert!(beyond_tables >= kept);
+}
+
 /// A handle reports the shared allocation with the dictionary, stays within
 /// the bound callers budget by before parsing, and a set of handles counts a
 /// dictionary once and only when nothing outside the set holds it.
@@ -171,11 +188,12 @@ fn an_empty_buffer_is_a_dictionary_with_no_content() {
 fn a_handle_accounts_for_what_it_keeps() {
     let raw = include_bytes!("../../../dict_tests/dictionary");
     let parsed = DictionaryHandle::decode_dict(raw).unwrap();
+    let content_len = parsed.as_dict().dict_content.len();
     // The two counts ahead of the value are heap too.
     let shared = 2 * core::mem::size_of::<usize>() + core::mem::size_of::<Dictionary>();
     assert!(parsed.heap_size() >= shared + parsed.as_dict().heap_bytes());
-    assert!(parsed.heap_size() <= DictionaryHandle::max_heap_size(raw.len()));
-    assert!(parsed.as_dict().heap_bytes() <= Dictionary::max_heap_bytes(raw.len()));
+    assert!(parsed.heap_size() <= DictionaryHandle::max_heap_size(content_len));
+    assert!(parsed.as_dict().heap_bytes() <= Dictionary::max_heap_bytes(content_len));
 
     let raw_content = DictionaryHandle::from_dictionary(
         Dictionary::from_raw_content(0, vec![7u8; 4096]).unwrap(),
