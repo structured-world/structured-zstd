@@ -76,6 +76,9 @@ pub(super) fn read_header(src: &[u8]) -> Result<FrameHeader, Error> {
         + fcs_len
         + usize::from(single_segment && fcs_len == 0);
     let header = src.get(..size).ok_or(Error::Truncated)?;
+    // The field's own code, as the stream reports it; a frame decoded whole
+    // reports it as corruption (`read_header_whole`), as libzstd's one-shot
+    // decoder does for every header error.
     if descriptor & 0x08 != 0 {
         return Err(Error::UnsupportedParameter);
     }

@@ -40,7 +40,8 @@ pub(super) fn read_header(src: &[u8]) -> Result<FrameHeader, Error> {
     // 12, 4 a minimum-match flag, 5 reserved, 6-7 the content size field.
     // The window field is four bits, 27 at most. Bit 4 is read by no
     // decoder and written by no encoder, so a frame setting it decodes, as
-    // in upstream (zstd_v06.c:2937-2938); only bit 5 is refused.
+    // in upstream (zstd_v06.c:2937-2938); only bit 5 is refused, with the
+    // stream's code; decoded whole it is corruption (`read_header_whole`).
     let window_log = u32::from(descriptor & 0xF) + 12;
     if descriptor & 0x20 != 0 || (usize::BITS == 32 && window_log > 25) {
         return Err(Error::UnsupportedParameter);
