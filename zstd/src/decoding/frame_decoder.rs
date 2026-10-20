@@ -4305,9 +4305,13 @@ impl FrameDecoder {
         dicts: &[DictionaryHandle],
         out: &mut O,
     ) -> Result<usize, FrameDecoderError> {
-        let header = decoding::legacy::read_header(input)?;
+        let header = decoding::legacy::read_header_whole(input)?;
         #[cfg(feature = "lsm")]
         self.validate_legacy_expectations(&header, input)?;
+        // No window ceiling here: the frame decodes into the caller's output
+        // and holds no window of its own, as for an RFC 8878 frame on this
+        // path (see `set_max_window_size`); upstream applies the ceiling only
+        // in `ZSTD_decompressStream` (`zstd_decompress.c:2229-2231`).
         let dict = self.legacy_frame_dict(header.dict_id, dicts)?;
         Ok(stream.decode_whole(input, dict, self.legacy_frame_options(), out)?)
     }

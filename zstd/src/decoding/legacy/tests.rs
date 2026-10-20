@@ -713,13 +713,16 @@ fn an_empty_block_ends_only_older_frames() {
     let end = [0xC0, 0, 0];
     let mut v06 = vec![0x26, 0xB5, 0x2F, 0xFD, 0x00];
     v06.extend_from_slice(&empty_raw);
-    assert_eq!(frame_size(LegacyVersion::V06, &v06), Some((8, 0)));
+    assert_eq!(frame_size(LegacyVersion::V06, &v06).unwrap(), (8, 0));
     let mut v07 = vec![0x27, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
     v07.extend_from_slice(&empty_raw);
-    assert_eq!(frame_size(LegacyVersion::V07, &v07), None);
+    assert!(matches!(
+        frame_size(LegacyVersion::V07, &v07),
+        Err(FrameSizeError::Truncated)
+    ));
     v07.extend_from_slice(&end);
     // A stored block bounds the content by its own size.
-    assert_eq!(frame_size(LegacyVersion::V07, &v07), Some((12, 0)));
+    assert_eq!(frame_size(LegacyVersion::V07, &v07).unwrap(), (12, 0));
     assert_eq!(
         decode_to_vec(&v07, LegacyDict::None).unwrap(),
         (Vec::new(), 12)
@@ -734,20 +737,23 @@ fn frame_size_reads_only_the_size_fields() {
     // v0.6 with the reserved bit and a one-byte content size.
     let mut v06 = vec![0x26, 0xB5, 0x2F, 0xFD, 0x60, 9];
     v06.extend_from_slice(&end);
-    assert_eq!(frame_size(LegacyVersion::V06, &v06), Some((9, 0)));
+    assert_eq!(frame_size(LegacyVersion::V06, &v06).unwrap(), (9, 0));
     // v0.7 with the reserved bit, a two-byte dictionary ID and a window byte.
     let mut v07 = vec![0x27, 0xB5, 0x2F, 0xFD, 0x0A, 0, 1, 2];
     v07.extend_from_slice(&end);
-    assert_eq!(frame_size(LegacyVersion::V07, &v07), Some((11, 0)));
+    assert_eq!(frame_size(LegacyVersion::V07, &v07).unwrap(), (11, 0));
     // v0.7 single segment without a size field still carries one byte of it.
     let mut v07 = vec![0x27, 0xB5, 0x2F, 0xFD, 0x20, 7];
     v07.extend_from_slice(&end);
-    assert_eq!(frame_size(LegacyVersion::V07, &v07), Some((9, 0)));
+    assert_eq!(frame_size(LegacyVersion::V07, &v07).unwrap(), (9, 0));
     // v0.5 headers are five bytes whatever the descriptor says.
     let mut v05 = vec![0x25, 0xB5, 0x2F, 0xFD, 0xF0];
     v05.extend_from_slice(&end);
-    assert_eq!(frame_size(LegacyVersion::V05, &v05), Some((8, 0)));
-    assert_eq!(frame_size(LegacyVersion::V05, &v05[..4]), None);
+    assert_eq!(frame_size(LegacyVersion::V05, &v05).unwrap(), (8, 0));
+    assert!(matches!(
+        frame_size(LegacyVersion::V05, &v05[..4]),
+        Err(FrameSizeError::Truncated)
+    ));
 }
 
 /// A stream keeps its window and a block of history, not the whole frame:
@@ -1689,7 +1695,10 @@ fn matches_read_a_history_in_two_pieces() {
 fn frame_size_refuses_a_cut_block() {
     let fixture = fixture("z000000.v07.l1.zst");
     let frame = &fixture.frame[..fixture.frame.len() - 10];
-    assert_eq!(frame_size(LegacyVersion::V07, frame), None);
+    assert!(matches!(
+        frame_size(LegacyVersion::V07, frame),
+        Err(FrameSizeError::Truncated)
+    ));
 }
 
 /// An RLE block decodes into a caller's slice and through a stream as it
@@ -2039,6 +2048,126 @@ fn the_declared_content_size_is_not_enforced() {
         .unwrap();
     assert_eq!(declared_content_size(&fixture.frame), Some(128 * 1024));
     assert_eq!(fixture.content.len(), 224_787);
+}
+
+/// A header field the formats refuse carries libzstd's code for the path:
+/// decoded whole, v0.6 and v0.7 report it as corruption, as their one-shot
+/// decoders wrap every header error (`ZSTDv0{6,7}_decompressFrame`); through
+/// a stream, as their buffered decoders do, an unsupported parameter. v0.5
+/// reports its own code on both paths.
+#[cfg(feature = "std")]
+#[test]
+fn refused_header_fields_carry_the_code_of_their_path() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::errors::ErrorCode;
+    let end = [0xC0, 0, 0];
+    let frame = |header: &[u8]| {
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(&end);
+        frame
+    };
+    let cases = [
+        // v0.7 reserved bit 3.
+        (
+            frame(&[0x27, 0xB5, 0x2F, 0xFD, 0x08, 0x00]),
+            ErrorCode::CorruptionDetected,
+        ),
+        // v0.7 window past the format's largest.
+        (
+            frame(&[0x27, 0xB5, 0x2F, 0xFD, 0x00, 0xF8]),
+            ErrorCode::CorruptionDetected,
+        ),
+        // v0.6 reserved bit 5.
+        (
+            frame(&[0x26, 0xB5, 0x2F, 0xFD, 0x20]),
+            ErrorCode::CorruptionDetected,
+        ),
+        // v0.5 reserved descriptor bits.
+        (
+            frame(&[0x25, 0xB5, 0x2F, 0xFD, 0x10]),
+            ErrorCode::FrameParameterUnsupported,
+        ),
+    ];
+    for (frame, whole) in cases {
+        let mut out = [0u8; 8];
+        let err = FrameDecoder::new()
+            .decode_all(&frame, &mut out)
+            .unwrap_err();
+        assert_eq!(err.code(), whole, "{frame:02x?}");
+        let err = FrameDecoder::new().reset(&frame[..]).unwrap_err();
+        assert_eq!(
+            err.code(),
+            ErrorCode::FrameParameterUnsupported,
+            "{frame:02x?}"
+        );
+    }
+}
+
+/// The size queries refuse a block the decoder refuses from its header, as
+/// they refuse an RFC 8878 one: a compressed block past 128 KiB, and an RLE
+/// block in v0.5 or v0.6, which reserve the type.
+#[test]
+fn size_queries_refuse_blocks_the_decoder_refuses() {
+    use crate::decoding::{FrameSizeError, find_frame_compressed_size, frame_decompressed_bound};
+    let oversized = one_block_frame(LegacyVersion::V07, &vec![0u8; BLOCK_SIZE_MAX + 1]);
+    assert!(matches!(
+        find_frame_compressed_size(&oversized),
+        Err(FrameSizeError::OversizedBlock)
+    ));
+    assert!(matches!(
+        frame_decompressed_bound(&oversized),
+        Err(FrameSizeError::OversizedBlock)
+    ));
+    let mut rle = vec![
+        0x26, 0xB5, 0x2F, 0xFD, 0x00, 0x80, 0x00, 0x04, b'z', 0xC0, 0, 0,
+    ];
+    assert!(matches!(
+        find_frame_compressed_size(&rle),
+        Err(FrameSizeError::ReservedBlock)
+    ));
+    // The same block is a run in v0.7.
+    rle.splice(..5, [0x27, 0xB5, 0x2F, 0xFD, 0x00, 0x00]);
+    assert_eq!(find_frame_compressed_size(&rle).unwrap(), rle.len());
+}
+
+/// A stored block past 128 KiB that arrives while the segment is still short
+/// of the window grows the buffer by that block, not by doubling it: the
+/// stream holds at most its window and one block of any type.
+#[test]
+fn a_large_stored_block_grows_the_stream_by_itself() {
+    // v0.7 with a 1 MiB window.
+    let mut frame = vec![0x27, 0xB5, 0x2F, 0xFD, 0x00, 0x50];
+    let mut content = Vec::new();
+    for n in 0..7u8 {
+        frame.extend_from_slice(&[0x40 | 0x02, 0x00, 0x00]);
+        let block = vec![n; 128 * 1024];
+        frame.extend_from_slice(&block);
+        content.extend_from_slice(&block);
+    }
+    let big: Vec<u8> = (0..500_000u32).map(|n| (n % 253) as u8).collect();
+    frame.extend_from_slice(&[0x40 | 0x07, 0xA1, 0x20]);
+    frame.extend_from_slice(&big);
+    content.extend_from_slice(&big);
+    frame.extend_from_slice(&[0xC0, 0x00, 0x00]);
+
+    let header = read_header(&frame).unwrap();
+    let mut stream = LegacyStream::new();
+    stream.start(header, None, FrameOptions::default()).unwrap();
+    let mut out = vec![0u8; content.len()];
+    let (mut read, mut written) = (header.size, 0);
+    while !stream.is_finished() {
+        let (r, w) = stream.decode(&frame[read..], &mut out[written..]).unwrap();
+        assert!(r > 0 || w > 0);
+        read += r;
+        written += w;
+    }
+    assert_eq!(written, content.len());
+    assert!(out == content);
+    assert!(
+        stream.buf.capacity() <= (1 << 20) + STORED_BLOCK_MAX,
+        "{}",
+        stream.buf.capacity()
+    );
 }
 
 /// A frame of `version` holding one compressed block, `body`, then an end.

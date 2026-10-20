@@ -153,9 +153,7 @@ pub enum FrameSizeError {
 pub fn find_frame_compressed_size(src: &[u8]) -> Result<usize, FrameSizeError> {
     #[cfg(feature = "legacy")]
     if let Some(version) = LegacyVersion::of(src) {
-        return legacy::frame_size(version, src)
-            .map(|(size, _)| size)
-            .ok_or(FrameSizeError::Truncated);
+        return legacy::frame_size(version, src).map(|(size, _)| size);
     }
     let (header, header_len) = match frame::read_frame_header_with_format(src, false) {
         Ok(parsed) => parsed,
@@ -331,9 +329,7 @@ fn walk_blocks(
 pub fn frame_decompressed_bound(src: &[u8]) -> Result<u64, FrameSizeError> {
     #[cfg(feature = "legacy")]
     if let Some(version) = LegacyVersion::of(src) {
-        return legacy::frame_size(version, src)
-            .map(|(_, bound)| bound)
-            .ok_or(FrameSizeError::Truncated);
+        return legacy::frame_size(version, src).map(|(_, bound)| bound);
     }
     let (header, header_len) = match frame::read_frame_header_with_format(src, false) {
         Ok(parsed) => parsed,

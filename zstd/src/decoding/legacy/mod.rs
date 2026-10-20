@@ -17,6 +17,7 @@ mod v07;
 #[cfg(feature = "hash")]
 use crate::decoding::ContentChecksum;
 use crate::decoding::Dictionary;
+use crate::decoding::FrameSizeError;
 use crate::decoding::errors::LegacyFrameError as Error;
 use alloc::vec::Vec;
 
@@ -232,6 +233,23 @@ pub(crate) fn read_header(src: &[u8]) -> Result<FrameHeader, Error> {
     }
 }
 
+/// [`read_header`] for a frame decoded whole, with libzstd's code for that
+/// path: its v0.6 and v0.7 one-shot decoders report any header field they
+/// refuse, reserved bit or window alike, as corruption (`zstd_v06.c:3523`,
+/// `zstd_v07.c:3758`), where their buffered decoders report the field's own
+/// unsupported-parameter error. v0.5 passes its header's error through on
+/// both paths (`zstd_v05.c:3386-3391`).
+pub(crate) fn read_header_whole(src: &[u8]) -> Result<FrameHeader, Error> {
+    match read_header(src) {
+        Err(Error::UnsupportedParameter)
+            if LegacyVersion::of(src).is_some_and(|version| version != LegacyVersion::V05) =>
+        {
+            Err(corrupt("frame header"))
+        }
+        result => result,
+    }
+}
+
 /// The content size the frame at the start of `src` declares, `None` when it
 /// declares none or its header does not read: libzstd reports both as an
 /// unknown size (`ZSTD_getDecompressedSize_legacy`).
@@ -376,17 +394,37 @@ impl HeaderFields {
 /// Where the `version` frame starting `src` ends, and the most it can decode
 /// to: the formats' largest per compressed block, as
 /// `ZSTD_findFrameSizeInfoLegacy` counts every block, and a stored block's
-/// own size, which can be more. `None` when `src` ends inside the frame, the
-/// only way the walk fails.
-pub(crate) fn frame_size(version: LegacyVersion, src: &[u8]) -> Option<(usize, u64)> {
-    let mut at = header_len(version, src).ok()?;
+/// own size, which can be more.
+///
+/// # Errors
+/// [`FrameSizeError::Truncated`] when `src` ends inside the frame, and a
+/// block the decoder refuses from its header, as the RFC 8878 walk refuses
+/// one: [`FrameSizeError::ReservedBlock`] for an RLE block in v0.5 or v0.6,
+/// [`FrameSizeError::OversizedBlock`] for a compressed block past 128 KiB.
+/// (Upstream's walk takes both; its decoders then refuse them.)
+pub(crate) fn frame_size(
+    version: LegacyVersion,
+    src: &[u8],
+) -> Result<(usize, u64), FrameSizeError> {
+    let mut at = header_len(version, src).map_err(|_| FrameSizeError::Truncated)?;
     let mut bound = 0u64;
     loop {
-        let block = Block::read(src.get(at..)?).ok()?;
+        let rest = src.get(at..).ok_or(FrameSizeError::Truncated)?;
+        let block = Block::read(rest).map_err(|_| FrameSizeError::Truncated)?;
+        if block
+            .check(version, BlockLimits::of(BLOCK_SIZE_MAX))
+            .is_err()
+        {
+            // `check` refuses a reserved type or a block past its limit.
+            return Err(match block {
+                Block::Rle(_) => FrameSizeError::ReservedBlock,
+                _ => FrameSizeError::OversizedBlock,
+            });
+        }
         at += 3;
         let body = block.body_len();
-        if body > src.len().checked_sub(at)? {
-            return None;
+        if body > src.len() - at {
+            return Err(FrameSizeError::Truncated);
         }
         if ends_frame(version, block) {
             break;
@@ -394,7 +432,7 @@ pub(crate) fn frame_size(version: LegacyVersion, src: &[u8]) -> Option<(usize, u
         at += body;
         bound += block.decoded_max() as u64;
     }
-    Some((at, bound))
+    Ok((at, bound))
 }
 
 /// Where decoded bytes go: an output that knows how much of the frame it has
@@ -1057,7 +1095,7 @@ fn decode_frame<O: Output>(
     workspace: &mut Workspace,
     out: &mut O,
 ) -> Result<(usize, LegacyFrame), Error> {
-    let header = read_header(src)?;
+    let header = read_header_whole(src)?;
     let mut frame = LegacyFrame::new(header, dict, options, workspace)?;
     let mut at = header.size;
     loop {
@@ -1435,7 +1473,7 @@ impl LegacyStream {
             frame,
             workspace,
             dict,
-            window: _,
+            window,
             window_refused_at: _,
             buf,
             end,
@@ -1459,21 +1497,32 @@ impl LegacyStream {
         // A block that would not fit starts a new segment at the buffer's
         // start, once the current one is all handed out; the one before stays
         // where it is for matches, as upstream's buffered decoders wrap
-        // (`ZBUFFv07_decompressContinue`). Output held back by a caller that
-        // has not collected it grows the buffer instead.
-        if *end + BLOCK_SIZE_MAX > *capacity && *delivered == *end && *end > 0 {
+        // (`ZBUFFv07_decompressContinue`). Only a segment that holds the
+        // window may become the one before, so matches into it stay in reach.
+        // Output held back by a caller that has not collected it grows the
+        // buffer instead.
+        let block_max = block.decoded_max();
+        let handed_out = *delivered == *end;
+        if *end + block_max > *capacity && handed_out && *end > 0 && *end as u64 >= *window {
             *earlier += *end;
             *previous_end = Some(*end);
             *end = 0;
             *delivered = 0;
         }
+        // A stored block past 128 KiB that cannot wrap grows the buffer by
+        // itself: the stream holds its window and one block of any type.
+        let limit = if handed_out {
+            (*capacity).max(*end + block_max)
+        } else {
+            *capacity
+        };
         let dict = dict.as_ref().map_or(LegacyDict::None, LegacyDict::of);
         let mut out = SegmentOutput {
             buf,
             end: *end,
             earlier: *earlier,
             previous_end: *previous_end,
-            capacity: *capacity,
+            capacity: limit,
         };
         let decoded = frame.block(workspace, block, &step[3..], &mut out, dict);
         *end = out.end;
