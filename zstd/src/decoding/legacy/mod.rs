@@ -857,6 +857,19 @@ impl LegacyFrame {
         Ok(())
     }
 
+    /// Take `mode` for the blocks still to come. A digest starts only while
+    /// no block has been decoded: one begun later could not cover the
+    /// content, so a frame switched on past its first block stays unchecked.
+    #[cfg(feature = "hash")]
+    fn set_checksum_mode(&mut self, mode: ContentChecksum) {
+        self.checksum_mode = mode;
+        if mode == ContentChecksum::None {
+            self.hash = None;
+        } else if self.hash.is_none() && self.has_checksum && self.blocks == 0 {
+            self.hash = Some(twox_hash::XxHash64::with_seed(0));
+        }
+    }
+
     /// Decode one block, `body` being the bytes after its header, with the
     /// dictionary the frame was started with. The block has passed
     /// [`Block::check`].
@@ -1176,6 +1189,18 @@ impl LegacyStream {
     #[cfg(feature = "hash")]
     pub(crate) fn calculated_checksum(&self) -> Option<u32> {
         self.frame.as_ref()?.calculated_checksum
+    }
+
+    /// Take the decoder's checksum mode for the rest of the frame in
+    /// progress, as an RFC 8878 frame reads it at each decode step.
+    #[cfg(feature = "hash")]
+    pub(crate) fn set_checksum_mode(&mut self, mode: ContentChecksum) {
+        if self.finished {
+            return;
+        }
+        if let Some(frame) = self.frame.as_mut() {
+            frame.set_checksum_mode(mode);
+        }
     }
 
     /// Decode the rest of the frame with `dict`, as an RFC 8878 frame takes a

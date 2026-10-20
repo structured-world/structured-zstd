@@ -81,6 +81,35 @@ pub struct DictionaryHandle {
 /// This 4 byte (little endian) magic number refers to the start of a dictionary
 pub const MAGIC_NUM: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 
+/// Most bytes [`Dictionary::decode_dict`] accepts in front of a dictionary's
+/// content: magic number and ID, a Huffman description (its size byte and at
+/// most 127 more), the three FSE descriptions at their largest, and the
+/// repeat offsets.
+#[cfg(feature = "legacy")]
+const MAX_SERIALIZED_HEADER_LEN: usize = 8
+    + 128
+    + max_fse_description_len(
+        crate::blocks::sequence_section::MAX_OFFSET_CODE,
+        crate::decoding::sequence_section_decoder::OF_MAX_LOG,
+    )
+    + max_fse_description_len(
+        crate::blocks::sequence_section::MAX_MATCH_LENGTH_CODE,
+        crate::decoding::sequence_section_decoder::ML_MAX_LOG,
+    )
+    + max_fse_description_len(
+        crate::blocks::sequence_section::MAX_LITERAL_LENGTH_CODE,
+        crate::decoding::sequence_section_decoder::LL_MAX_LOG,
+    )
+    + 12;
+
+/// Most bytes an FSE description of symbols `0..=max_symbol` at accuracy log
+/// `max_log` takes: the 4-bit log, then per symbol a count of at most
+/// `max_log + 1` bits and, amortized, at most 2 bits of zero-run flags.
+#[cfg(feature = "legacy")]
+const fn max_fse_description_len(max_symbol: u8, max_log: u8) -> usize {
+    (4 + (max_symbol as usize + 1) * (max_log as usize + 3)).div_ceil(8)
+}
+
 impl Dictionary {
     /// Heap bytes owned by this dictionary: the content plus the parsed
     /// entropy tables' heap. `fse` is a `Box`, so the fixed-size FSE decode
@@ -411,7 +440,10 @@ impl DictionaryHandle {
     /// bytes can report, serialized header included, for budgeting before
     /// the dictionary is parsed.
     pub fn max_heap_size(content_len: usize) -> usize {
-        Self::shared_allocation_size() + Dictionary::max_heap_bytes(content_len)
+        let bytes = Self::shared_allocation_size() + Dictionary::max_heap_bytes(content_len);
+        #[cfg(feature = "legacy")]
+        let bytes = bytes + MAX_SERIALIZED_HEADER_LEN;
+        bytes
     }
 
     /// Heap bytes that `handles` alone keep alive: each distinct dictionary
@@ -486,6 +518,8 @@ impl DictionaryHandle {
         // The content is the tail of the serialized bytes.
         #[cfg(feature = "legacy")]
         let serialized_header = raw[..raw.len() - dict.dict_content.len()].to_vec();
+        #[cfg(feature = "legacy")]
+        debug_assert!(serialized_header.capacity() <= MAX_SERIALIZED_HEADER_LEN);
         Ok(Self {
             inner: SharedDictionary::new(HeldDictionary {
                 dict,

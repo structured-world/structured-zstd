@@ -2974,14 +2974,15 @@ impl Codecs {
                 Some(dictionary.map_err(|err| eyre!("invalid dictionary: {err:?}"))?);
         }
         if for_decoding {
+            // The handle parsed from the serialized bytes keeps the ones in
+            // front of the content too: a v0.5 or v0.6 frame matches into them.
             let dictionary = if raw_content {
-                Dictionary::from_raw_content(0, raw.to_vec())
+                Dictionary::from_raw_content(0, raw.to_vec()).map(DictionaryHandle::from_dictionary)
             } else {
-                Dictionary::from_serialized_or_raw_content(raw)
+                DictionaryHandle::from_serialized_or_raw_content(raw)
             };
-            prepared.decoder = Some(DictionaryHandle::from_dictionary(
-                dictionary.map_err(|err| eyre!("failed to parse dictionary: {err:?}"))?,
-            ));
+            prepared.decoder =
+                Some(dictionary.map_err(|err| eyre!("failed to parse dictionary: {err:?}"))?);
         }
         Ok(prepared)
     }

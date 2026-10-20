@@ -1275,6 +1275,19 @@ impl FrameDecoder {
         self.legacy.as_deref_mut().filter(|stream| stream.active())
     }
 
+    /// Refuse a call that takes RFC 8878 blocks while a v0.5-v0.7 frame is
+    /// the current one: the RFC 8878 state a reused decoder still holds
+    /// belongs to an earlier frame, possibly one left before its last block.
+    /// Upstream's block-level calls likewise take no v0.5-v0.7 frame.
+    #[inline]
+    fn refuse_during_legacy_frame(&self) -> Result<(), FrameDecoderError> {
+        #[cfg(feature = "legacy")]
+        if self.legacy_frame().is_some() {
+            return Err(FrameDecoderError::NotYetInitialized);
+        }
+        Ok(())
+    }
+
     /// Leave any v0.5-v0.7 frame in progress: an RFC 8878 frame has started.
     #[inline]
     fn end_legacy_frame(&mut self) {
@@ -1430,9 +1443,15 @@ impl FrameDecoder {
     /// Select how the frame's optional content checksum is handled
     /// (compute, expose, verify, or skip). See [`ContentChecksum`].
     /// Default [`ContentChecksum::EmitOnly`]. Takes effect on the next
-    /// decode; safe to call between frames on a reused decoder.
+    /// decode; safe to call between frames on a reused decoder. A v0.7
+    /// frame's checksum covers its content from the first block, so turning
+    /// it on after that block leaves the frame unchecked.
     pub fn set_content_checksum(&mut self, mode: ContentChecksum) {
         self.content_checksum = mode;
+        #[cfg(all(feature = "legacy", feature = "hash"))]
+        if let Some(stream) = self.legacy_frame_mut() {
+            stream.set_checksum_mode(mode);
+        }
     }
 
     /// Opt in to per-block XXH64 verification during decode.
@@ -1963,7 +1982,8 @@ impl FrameDecoder {
     /// As a block [`Self::decode_from_to`] decodes, plus
     /// [`FrameDecoderError::TargetTooSmall`] when `target` cannot take the
     /// block's output, and [`FrameDecoderError::NotYetInitialized`] when no
-    /// frame is waiting for a block. A block refused before it is decoded (a
+    /// RFC 8878 frame is waiting for a block (a v0.5-v0.7 frame decodes
+    /// through [`Self::decode_blocks`] and its kin). A block refused before it is decoded (a
     /// bad header, a block past the maximum, content of the wrong length)
     /// leaves the frame as it was, as upstream checks the size before it
     /// changes any state; one that fails while decoding, or whose output
@@ -1989,6 +2009,7 @@ impl FrameDecoder {
         content: &[u8],
         target: &mut [u8],
     ) -> Result<usize, FrameDecoderError> {
+        self.refuse_during_legacy_frame()?;
         self.check_window_still_admitted()?;
         let kernel = self.kernel;
         #[cfg(feature = "hash")]
@@ -2084,6 +2105,7 @@ impl FrameDecoder {
     /// [`Self::decode_block`] reports them; [`FrameDecoderError::NotYetInitialized`]
     /// when no frame is waiting for a block.
     pub fn block_content_len(&self, header: [u8; 3]) -> Result<(usize, bool), FrameDecoderError> {
+        self.refuse_during_legacy_frame()?;
         let state = self
             .state
             .as_ref()
@@ -2177,6 +2199,7 @@ impl FrameDecoder {
     /// # Errors
     /// [`FrameDecoderError::NotYetInitialized`] when no run of blocks is open.
     pub fn insert_block(&mut self, content: &[u8]) -> Result<(), FrameDecoderError> {
+        self.refuse_during_legacy_frame()?;
         let kernel = self.kernel;
         let state = self
             .state
@@ -3170,7 +3193,8 @@ impl FrameDecoder {
     /// # Errors
     ///
     /// Returns [`FrameDecoderError::NotYetInitialized`] if the decoder has not
-    /// been reset, [`FrameDecoderError::WindowSizeTooBig`] if the window
+    /// been reset or the current frame is a v0.5-v0.7 one,
+    /// [`FrameDecoderError::WindowSizeTooBig`] if the window
     /// ceiling was lowered below the frame's window after it started (see
     /// [`set_max_window_size`](Self::set_max_window_size)),
     /// [`FrameDecoderError::InvalidBlockRange`] if the effective
@@ -3197,6 +3221,9 @@ impl FrameDecoder {
         emit_resume: bool,
     ) -> Result<PartialDecode, FrameDecoderError> {
         use FrameDecoderError as err;
+        // Block indices, resume snapshots and the emit info are RFC 8878
+        // frame structure; a v0.5-v0.7 frame has none of them.
+        self.refuse_during_legacy_frame()?;
         self.check_window_still_admitted()?;
         #[cfg(feature = "hash")]
         let checksum_mode = self.content_checksum;

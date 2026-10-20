@@ -1871,6 +1871,28 @@ fn decoding_reads_the_v05_to_v07_formats() {
     );
 }
 
+/// `-D` with an RFC 8878 dictionary decodes the v0.5 and v0.6 frames made with
+/// it, which match into its header as well as its content: the run keeps the
+/// whole serialized dictionary, not only what it parses to.
+#[cfg(feature = "legacy")]
+#[test]
+fn decoding_gives_v05_and_v06_frames_the_whole_dictionary() {
+    let raw = include_bytes!("../../../dict_tests/dictionary");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("legacy_frames/rfc_dict");
+    for name in ["dictionary.v05.zst", "dictionary.v06.zst"] {
+        let frame = fs::read(dir.join(name)).unwrap();
+        let mut out = Vec::new();
+        decompress_stream(
+            &frame[..],
+            &mut out,
+            &mut prepared_dict(raw),
+            &DecodeSettings::default(),
+        )
+        .unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert!(out == raw[..], "{name}");
+    }
+}
+
 /// A decoding failure is reported against the input, in the reference
 /// command's two shapes (`fileio.c` 2463, 2748-2796): `zstd: NAME: message`
 /// for input that is not a frame, and `NAME : Decoding error (36) : <libzstd's

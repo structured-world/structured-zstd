@@ -928,6 +928,82 @@ fn the_checksum_mode_applies_to_v07_frames() {
     }
 }
 
+/// A checksum mode set after `reset`, before the frame's first block, applies
+/// to the frame, as it applies to an RFC 8878 frame's: turned to `Verify` it
+/// refuses a damaged frame, turned to `None` it computes nothing.
+#[cfg(all(feature = "std", feature = "hash"))]
+#[test]
+fn a_checksum_mode_set_after_reset_applies() {
+    use crate::decoding::errors::FrameDecoderError;
+    use crate::decoding::{BlockDecodingStrategy, ContentChecksum, FrameDecoder};
+    let fixture = fixture("abc.txt.v07.l1.zst");
+    let mut frame = fixture.frame.clone();
+    let last = frame.len() - 1;
+    frame[last] ^= 1;
+    let run = |before, after| {
+        let mut decoder = FrameDecoder::new();
+        decoder.set_content_checksum(before);
+        let mut src = &frame[..];
+        decoder.reset(&mut src)?;
+        decoder.set_content_checksum(after);
+        decoder.decode_blocks(&mut src, BlockDecodingStrategy::All)?;
+        let content = decoder.collect().unwrap();
+        Ok::<_, FrameDecoderError>((content, decoder.get_calculated_checksum()))
+    };
+    assert!(matches!(
+        run(ContentChecksum::None, ContentChecksum::Verify),
+        Err(FrameDecoderError::LegacyFrame(
+            Error::ChecksumMismatch { .. }
+        ))
+    ));
+    let (content, calculated) = run(ContentChecksum::Verify, ContentChecksum::None).unwrap();
+    assert!(content == fixture.content);
+    assert_eq!(calculated, None);
+}
+
+/// The calls that take RFC 8878 blocks refuse while one of these frames is
+/// the current one, even on a decoder that still holds an RFC 8878 frame it
+/// left before its last block: that frame is not the one the caller started,
+/// and its blocks are not these. The frame itself still decodes afterwards.
+#[cfg(feature = "std")]
+#[test]
+fn block_calls_refuse_these_frames_on_a_reused_decoder() {
+    use crate::decoding::errors::FrameDecoderError;
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
+    use crate::encoding::{CompressionLevel, compress_to_vec};
+    let fixture = fixture("z000001.v07.l19.zst");
+    let rfc = compress_to_vec(&[7u8; 300_000][..], CompressionLevel::Fastest);
+    let mut decoder = FrameDecoder::new();
+    let mut rfc_src = rfc.as_slice();
+    decoder.reset(&mut rfc_src).unwrap();
+    // The RFC 8878 frame is left with every block still to come.
+    let mut src = &fixture.frame[..];
+    decoder.reset(&mut src).unwrap();
+    let header = *rfc_src.first_chunk::<3>().unwrap();
+    let mut out = [0u8; 64];
+    assert!(matches!(
+        decoder.block_content_len(header),
+        Err(FrameDecoderError::NotYetInitialized)
+    ));
+    assert!(matches!(
+        decoder.decode_block(header, &rfc_src[3..], &mut out),
+        Err(FrameDecoderError::NotYetInitialized)
+    ));
+    assert!(matches!(
+        decoder.insert_block(b"history"),
+        Err(FrameDecoderError::NotYetInitialized)
+    ));
+    #[cfg(feature = "lsm")]
+    assert!(matches!(
+        decoder.decode_blocks_partial(&mut &src[..], 0, 1, None, false),
+        Err(FrameDecoderError::NotYetInitialized)
+    ));
+    decoder
+        .decode_blocks(&mut src, BlockDecodingStrategy::All)
+        .unwrap();
+    assert!(decoder.collect().unwrap() == fixture.content);
+}
+
 /// A block limit set on the decoder holds these frames' blocks to it, on
 /// both paths.
 #[cfg(feature = "std")]

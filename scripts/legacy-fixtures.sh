@@ -74,11 +74,16 @@ for release in "${releases[@]}"; do
   if [[ "$tag" == v07 ]]; then
     dict_args=(--dictID 7)
   fi
-  find "$samples" -type f | LC_ALL=C sort | head -n 200 >"$work/samples.$tag"
+  # The listings are cut by `awk`, which reads its input to the end: `head`
+  # would close the pipe early, and `pipefail` would stop the script on the
+  # writer's SIGPIPE.
+  find "$samples" -type f | LC_ALL=C sort | awk 'NR <= 200' >"$work/samples.$tag"
+  # An empty array expands under `set -u` only in this form on bash before 4.4,
+  # the one macOS ships.
   # shellcheck disable=SC2046
   "$zstd_bin" -q -f --train $(cat "$work/samples.$tag") --maxdict 16384 \
-    "${dict_args[@]}" -o "$out/dictionary.$tag"
-  for sample in $(LC_ALL=C ls "$samples" | head -n 3); do
+    ${dict_args[@]+"${dict_args[@]}"} -o "$out/dictionary.$tag"
+  for sample in $(LC_ALL=C ls "$samples" | awk 'NR <= 3'); do
     "$zstd_bin" -q -f -3 -D "$out/dictionary.$tag" "$samples/$sample" \
       -o "$out/$sample.$tag.dict.zst"
   done
@@ -94,7 +99,7 @@ for release in "${releases[@]}"; do
   if [[ "$tag" == v07 ]]; then
     # The content checksum and the dictionary ID are optional in v0.7.
     "$zstd_bin" -q -f -3 --no-check "$corpus/z000000" -o "$out/z000000.$tag.nocheck.zst"
-    sample="$(LC_ALL=C ls "$samples" | head -n 1)"
+    sample="$(LC_ALL=C ls "$samples" | awk 'NR <= 1')"
     "$zstd_bin" -q -f -3 --no-dictID -D "$out/dictionary.$tag" "$samples/$sample" \
       -o "$out/$sample.$tag.dict-noid.zst"
   fi
