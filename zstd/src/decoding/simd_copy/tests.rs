@@ -46,14 +46,14 @@ fn runnable_medium_kernels() -> vec::Vec<(&'static str, CopyKernel)> {
             feature = "kernel-sse"
         ))]
         std::arch::is_x86_feature_detected!("sse2")
-            .then_some(("copy_exact_sse2", copy_exact_sse2 as CopyKernel)),
+            .then_some::<(&'static str, CopyKernel)>(("copy_exact_sse2", copy_exact_sse2)),
         #[cfg(all(
             feature = "std",
             any(target_arch = "x86", target_arch = "x86_64"),
             feature = "kernel-avx2"
         ))]
         std::arch::is_x86_feature_detected!("avx2")
-            .then_some(("copy_exact_avx2", copy_exact_avx2 as CopyKernel)),
+            .then_some::<(&'static str, CopyKernel)>(("copy_exact_avx2", copy_exact_avx2)),
         #[cfg(all(
             target_arch = "aarch64",
             target_feature = "neon",

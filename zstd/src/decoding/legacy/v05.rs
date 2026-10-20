@@ -2,7 +2,7 @@
 //! symbols with long values in a separate "dumps" area, a single repeat
 //! offset, and a minimum match of 4.
 
-use super::entropy::{FseState, FseTable, HufTable, StreamEnd, open_bits, overflowed};
+use super::entropy::{FseState, FseTable, HufTable, Slot, StreamEnd, open_bits, overflowed};
 use super::v06::huffman;
 use super::v07::{SeqTables, sequence_count};
 use super::{
@@ -53,7 +53,7 @@ pub(super) fn read_header(src: &[u8]) -> Result<FrameHeader, Error> {
 /// The decoding state a v0.5 frame carries from block to block.
 pub(super) struct Decoder {
     /// The dictionary's Huffman table, which repeat-table literals use.
-    dict_huf: Option<HufTable>,
+    dict_huf: Slot<HufTable>,
     /// The table a block's own Huffman description is read into.
     huf: HufTable,
     tables: SeqTables,
@@ -64,29 +64,41 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    /// A decoder primed with the dictionary `bytes`, and where its content
-    /// lies in them.
-    pub(super) fn new(bytes: &[u8]) -> Result<(Decoder, core::ops::Range<usize>), Error> {
-        let mut decoder = Decoder {
-            dict_huf: None,
+    pub(super) const fn empty() -> Decoder {
+        Decoder {
+            dict_huf: Slot::<HufTable>::empty(),
             huf: HufTable::empty(),
-            tables: SeqTables::default(),
+            tables: SeqTables::empty(),
             repeat_tables: false,
             literals: Vec::new(),
-        };
+        }
+    }
+
+    /// Ready the decoder for a frame primed with the dictionary `bytes`, in
+    /// the storage the previous frame left, and say where its content lies in
+    /// them.
+    pub(super) fn reset(&mut self, bytes: &[u8]) -> Result<core::ops::Range<usize>, Error> {
+        self.dict_huf.set = false;
+        self.tables.unset();
+        self.repeat_tables = false;
+        self.literals.clear();
         if bytes.len() < 4
             || u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != DICT_MAGIC
         {
-            return Ok((decoder, 0..bytes.len()));
+            return Ok(0..bytes.len());
         }
         // `ZSTDv05_loadEntropy`.
         let src = &bytes[4..];
         let bad = |_| Error::DictionaryCorrupted;
-        let (huf, mut at) = HufTable::read(src, StreamEnd::Exact).map_err(bad)?;
+        let mut at = self
+            .dict_huf
+            .table
+            .read_into(src, StreamEnd::Exact)
+            .map_err(bad)?;
         for (slot, max, max_log) in [
-            (&mut decoder.tables.of, MAX_OFF, OFF_LOG),
-            (&mut decoder.tables.ml, MAX_ML, ML_LOG),
-            (&mut decoder.tables.ll, MAX_LL, LL_LOG),
+            (&mut self.tables.of, MAX_OFF, OFF_LOG),
+            (&mut self.tables.ml, MAX_ML, ML_LOG),
+            (&mut self.tables.ll, MAX_LL, LL_LOG),
         ] {
             let (dist, len) = super::entropy::read_distribution(
                 src.get(at..).ok_or(Error::DictionaryCorrupted)?,
@@ -96,12 +108,21 @@ impl Decoder {
             if dist.table_log() > max_log {
                 return Err(Error::DictionaryCorrupted);
             }
-            *slot = Some(FseTable::new(&dist).map_err(bad)?);
+            slot.table.build(&dist).map_err(bad)?;
+            slot.set = true;
             at += len;
         }
-        decoder.dict_huf = Some(huf);
-        decoder.repeat_tables = true;
-        Ok((decoder, 4 + at..bytes.len()))
+        self.dict_huf.set = true;
+        self.repeat_tables = true;
+        Ok(4 + at..bytes.len())
+    }
+
+    /// Heap bytes the decoder holds.
+    pub(super) fn heap_bytes(&self) -> usize {
+        self.dict_huf.table.heap_bytes()
+            + self.huf.heap_bytes()
+            + self.tables.heap_bytes()
+            + self.literals.capacity()
     }
 
     /// Decode one compressed block into `out` (`ZSTDv05_decompressBlock_internal`).
@@ -171,7 +192,7 @@ impl Decoder {
                 if !self.repeat_tables {
                     return Err(Error::DictionaryCorrupted);
                 }
-                let table = self.dict_huf.as_ref().ok_or(Error::DictionaryCorrupted)?;
+                let table = self.dict_huf.get().ok_or(Error::DictionaryCorrupted)?;
                 self.literals.clear();
                 self.literals.resize(size, 0);
                 table
@@ -343,7 +364,7 @@ impl Field {
 /// Set one field's table by its mode, the description starting at
 /// `src[at..]` (`ZSTDv05_decodeSeqHeaders`). Returns the bytes it took.
 fn field_table(
-    table: &mut Option<FseTable>,
+    slot: &mut Slot<FseTable>,
     mode: u8,
     src: &[u8],
     at: usize,
@@ -351,14 +372,15 @@ fn field_table(
     repeat: bool,
 ) -> Result<usize, Error> {
     if mode == 2 {
-        if !repeat || table.is_none() {
+        if !repeat || !slot.set {
             return Err(corrupt("sequence table repeated before one was sent"));
         }
         return Ok(0);
     }
     // Built in the previous table's storage; left unset should the
     // description be bad, so no later block repeats a half-built table.
-    let mut new = table.take().unwrap_or_else(FseTable::empty);
+    slot.set = false;
+    let new = &mut slot.table;
     let len = match mode {
         // Every symbol read as raw bits.
         0 => {
@@ -390,7 +412,7 @@ fn field_table(
             len
         }
     };
-    *table = Some(new);
+    slot.set = true;
     Ok(len)
 }
 

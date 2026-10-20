@@ -1024,6 +1024,12 @@ jobs:
         working-directory: zstd/fuzz
         run: |
           mkdir -p corpus/decode_legacy
+          # Crash inputs committed for this target replay first, as the
+          # other targets' do.
+          shopt -s dotglob
+          if [ -d artifacts/decode_legacy ] && [ -n "$(find artifacts/decode_legacy -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" decode_legacy artifacts/decode_legacy/*
+          fi
           cargo fuzz run --target "$FUZZ_TARGET_TRIPLE" decode_legacy corpus/decode_legacy ../legacy_frames -- -max_total_time=90 -timeout=30
       - name: Upload new crash artifacts on failure
         if: failure()

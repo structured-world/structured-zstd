@@ -3,7 +3,7 @@
 //! from block to block.
 
 use super::entropy::{
-    Distribution, FseState, FseTable, HufTable, StreamEnd, open_bits, overflowed,
+    Distribution, FseState, FseTable, HufTable, Slot, StreamEnd, open_bits, overflowed,
 };
 use super::{
     BLOCK_SIZE_MAX, FrameHeader, LegacyDict, LegacyVersion, LiteralSource, Literals, Output,
@@ -129,68 +129,39 @@ pub(super) fn read_header(src: &[u8]) -> Result<FrameHeader, Error> {
     })
 }
 
-/// The tables and offsets a dictionary of the v0.7 layout primes, taken from
-/// what the RFC 8878 parser read of it: the two layouts are the same bytes,
-/// so the parsed distributions and code lengths are the ones
-/// `ZSTDv07_loadEntropy` would read, held to the v0.7 symbol limits.
-///
-/// The repeat offsets are not held to the dictionary's size here, as the
-/// parser kept no count of its table bytes; one reaching past the content
-/// fails at the match that uses it.
-fn parsed_entropy(dict: &crate::decoding::Dictionary) -> Result<Decoder, Error> {
-    let bad = |_| Error::DictionaryCorrupted;
-    let huf_table = &dict.huf.table;
-    let huf = HufTable::from_code_lengths(huf_table.code_lengths(), huf_table.max_num_bits)
-        .map_err(bad)?;
-    let table = |fse: &crate::decoding::scratch::AlignedFSETable,
-                 max: usize,
-                 max_log: u32|
-     -> Result<FseTable, Error> {
-        let log = u32::from(fse.accuracy_log);
-        if log > max_log {
-            return Err(Error::DictionaryCorrupted);
-        }
-        let dist =
-            Distribution::from_probabilities(&fse.symbol_probabilities, log, max).map_err(bad)?;
-        FseTable::new(&dist).map_err(bad)
-    };
-    let of = table(&dict.fse.offsets, MAX_OFF, OFF_LOG)?;
-    let ml = table(&dict.fse.match_lengths, MAX_ML, ML_LOG)?;
-    let ll = table(&dict.fse.literal_lengths, MAX_LL, LL_LOG)?;
-    let mut reps = [0usize; 3];
-    for (rep, &offset) in reps.iter_mut().zip(&dict.offset_hist) {
-        if offset == 0 {
-            return Err(Error::DictionaryCorrupted);
-        }
-        *rep = offset as usize;
-    }
-    Ok(Decoder {
-        huf: Some(huf),
-        tables: SeqTables {
-            ll: Some(ll),
-            of: Some(of),
-            ml: Some(ml),
-        },
-        repeat_tables: true,
-        reps,
-        literals: Vec::new(),
-        dict_id: 0,
-    })
-}
-
 /// The literal length, offset and match length tables last in use, which a
 /// block may keep instead of sending new ones.
-#[derive(Default)]
 pub(super) struct SeqTables {
-    pub(super) ll: Option<FseTable>,
-    pub(super) of: Option<FseTable>,
-    pub(super) ml: Option<FseTable>,
+    pub(super) ll: Slot<FseTable>,
+    pub(super) of: Slot<FseTable>,
+    pub(super) ml: Slot<FseTable>,
+}
+
+impl SeqTables {
+    pub(super) const fn empty() -> SeqTables {
+        SeqTables {
+            ll: Slot::<FseTable>::empty(),
+            of: Slot::<FseTable>::empty(),
+            ml: Slot::<FseTable>::empty(),
+        }
+    }
+
+    /// Set none of the tables, keeping their storage.
+    pub(super) fn unset(&mut self) {
+        self.ll.set = false;
+        self.of.set = false;
+        self.ml.set = false;
+    }
+
+    pub(super) fn heap_bytes(&self) -> usize {
+        self.ll.table.heap_bytes() + self.of.table.heap_bytes() + self.ml.table.heap_bytes()
+    }
 }
 
 /// The decoding state a v0.7 frame carries from block to block.
 pub(super) struct Decoder {
     /// The last Huffman table, which repeat-table literals reuse.
-    huf: Option<HufTable>,
+    huf: Slot<HufTable>,
     tables: SeqTables,
     /// Whether a block may keep the previous tables: once a dictionary or a
     /// block with sequences has set them (`fseEntropy`).
@@ -202,32 +173,92 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    /// A decoder primed with `dict`, and where the dictionary's content lies
-    /// within [`LegacyDict::content_bytes`].
-    pub(super) fn new(dict: LegacyDict<'_>) -> Result<(Decoder, core::ops::Range<usize>), Error> {
-        let fresh = || Decoder {
-            huf: None,
-            tables: SeqTables::default(),
+    pub(super) const fn empty() -> Decoder {
+        Decoder {
+            huf: Slot::<HufTable>::empty(),
+            tables: SeqTables::empty(),
             repeat_tables: false,
             reps: [1, 4, 8],
             literals: Vec::new(),
             dict_id: 0,
-        };
+        }
+    }
+
+    /// Ready the decoder for a frame primed with `dict`, in the storage the
+    /// previous frame left, and say where the dictionary's content lies
+    /// within [`LegacyDict::content_bytes`].
+    pub(super) fn reset(&mut self, dict: LegacyDict<'_>) -> Result<core::ops::Range<usize>, Error> {
+        self.huf.set = false;
+        self.tables.unset();
+        self.repeat_tables = false;
+        self.reps = [1, 4, 8];
+        self.literals.clear();
+        self.dict_id = 0;
         match dict {
-            LegacyDict::None => Ok((fresh(), 0..0)),
+            LegacyDict::None => Ok(0..0),
             LegacyDict::Parsed(dict) => {
-                let content = 0..dict.dict_content.len();
                 // A raw-content dictionary has no tables to load.
-                if dict.huf.table.max_num_bits == 0 {
-                    let mut decoder = fresh();
-                    decoder.dict_id = dict.id;
-                    return Ok((decoder, content));
+                if dict.huf.table.max_num_bits != 0 {
+                    self.load_parsed(dict)?;
                 }
-                let mut decoder = parsed_entropy(dict)?;
-                decoder.dict_id = dict.id;
-                Ok((decoder, content))
+                self.dict_id = dict.id;
+                Ok(0..dict.dict_content.len())
             }
         }
+    }
+
+    /// Heap bytes the decoder holds.
+    pub(super) fn heap_bytes(&self) -> usize {
+        self.huf.table.heap_bytes() + self.tables.heap_bytes() + self.literals.capacity()
+    }
+
+    /// Load the tables and offsets a dictionary of the v0.7 layout primes,
+    /// from what the RFC 8878 parser read of it: the two layouts are the same
+    /// bytes, so the parsed distributions and code lengths are the ones
+    /// `ZSTDv07_loadEntropy` would read, held to the v0.7 symbol limits.
+    ///
+    /// The repeat offsets are not held to the dictionary's size here, as the
+    /// parser kept no count of its table bytes; one reaching past the content
+    /// fails at the match that uses it.
+    fn load_parsed(&mut self, dict: &crate::decoding::Dictionary) -> Result<(), Error> {
+        let bad = |_| Error::DictionaryCorrupted;
+        let huf_table = &dict.huf.table;
+        self.huf
+            .table
+            .fill_from_code_lengths(huf_table.code_lengths(), huf_table.max_num_bits)
+            .map_err(bad)?;
+        self.huf.set = true;
+        let load = |slot: &mut Slot<FseTable>,
+                    fse: &crate::decoding::scratch::AlignedFSETable,
+                    max: usize,
+                    max_log: u32|
+         -> Result<(), Error> {
+            let log = u32::from(fse.accuracy_log);
+            if log > max_log {
+                return Err(Error::DictionaryCorrupted);
+            }
+            let dist = Distribution::from_probabilities(&fse.symbol_probabilities, log, max)
+                .map_err(bad)?;
+            slot.table.build(&dist).map_err(bad)?;
+            slot.set = true;
+            Ok(())
+        };
+        load(&mut self.tables.of, &dict.fse.offsets, MAX_OFF, OFF_LOG)?;
+        load(&mut self.tables.ml, &dict.fse.match_lengths, MAX_ML, ML_LOG)?;
+        load(
+            &mut self.tables.ll,
+            &dict.fse.literal_lengths,
+            MAX_LL,
+            LL_LOG,
+        )?;
+        for (rep, &offset) in self.reps.iter_mut().zip(&dict.offset_hist) {
+            if offset == 0 {
+                return Err(Error::DictionaryCorrupted);
+            }
+            *rep = offset as usize;
+        }
+        self.repeat_tables = true;
+        Ok(())
     }
 
     /// Decode one compressed block into `out` (`ZSTDv07_decompressBlock_internal`).
@@ -268,7 +299,8 @@ impl Decoder {
                 // Built in the previous table's storage; left unset should the
                 // description be bad, so no later block repeats a half-built
                 // table.
-                let mut table = self.huf.take().unwrap_or_else(HufTable::empty);
+                self.huf.set = false;
+                let table = &mut self.huf.table;
                 let table_len = table
                     .read_into(src, StreamEnd::PastStart)
                     .map_err(|_| corrupt("bad Huffman table"))?;
@@ -284,11 +316,11 @@ impl Decoder {
                     table.decode_four_streams(streams, &mut self.literals)
                 }
                 .map_err(|_| corrupt("bad Huffman literals"))?;
-                self.huf = Some(table);
+                self.huf.set = true;
                 (LiteralSource::Buffer, header + compressed)
             }
             Literals::Repeat { size, compressed } => {
-                let table = self.huf.as_ref().ok_or(Error::DictionaryCorrupted)?;
+                let table = self.huf.get().ok_or(Error::DictionaryCorrupted)?;
                 self.literals.clear();
                 self.literals.resize(size, 0);
                 table
@@ -432,7 +464,7 @@ pub(super) fn sequence_count(src: &[u8], long_form: bool) -> Result<(usize, usiz
 impl SeqTables {
     /// The three tables, all set once a block has used them.
     pub(super) fn all(&self) -> Result<(&FseTable, &FseTable, &FseTable), Error> {
-        match (&self.ll, &self.of, &self.ml) {
+        match (self.ll.get(), self.of.get(), self.ml.get()) {
             (Some(ll), Some(of), Some(ml)) => Ok((ll, of, ml)),
             _ => Err(corrupt("sequence table repeated before one was sent")),
         }
@@ -441,11 +473,11 @@ impl SeqTables {
 
 /// Set the table one sequence field is coded with, by its mode
 /// (`ZSTDv07_buildSeqTable`): `field` gives the largest symbol, the largest
-/// table log, and the predefined distribution; the repeat mode keeps `table`
+/// table log, and the predefined distribution; the repeat mode keeps `slot`
 /// as it is, where `repeat` allows it. Returns the bytes the mode's
 /// description took.
 pub(super) fn seq_table(
-    table: &mut Option<FseTable>,
+    slot: &mut Slot<FseTable>,
     mode: u8,
     src: &[u8],
     field: (usize, u32, &[i16], u32),
@@ -454,14 +486,15 @@ pub(super) fn seq_table(
     let (max, max_log, default, default_log) = field;
     // The previous table, in place.
     if mode == 2 {
-        if !repeat || table.is_none() {
+        if !repeat || !slot.set {
             return Err(corrupt("sequence table repeated before one was sent"));
         }
         return Ok(0);
     }
     // Built in the previous table's storage; left unset should the
     // description be bad, so no later block repeats a half-built table.
-    let mut new = table.take().unwrap_or_else(FseTable::empty);
+    slot.set = false;
+    let new = &mut slot.table;
     let len = match mode {
         // Predefined.
         0 => {
@@ -487,6 +520,6 @@ pub(super) fn seq_table(
             len
         }
     };
-    *table = Some(new);
+    slot.set = true;
     Ok(len)
 }

@@ -240,6 +240,7 @@ impl FseTable {
     }
 
     /// The table a distribution spreads (`FSEv07_buildDTable`).
+    #[cfg(test)]
     pub(super) fn new(dist: &Distribution) -> Result<FseTable, Error> {
         let mut table = FseTable::empty();
         table.build(dist)?;
@@ -330,6 +331,43 @@ impl FseTable {
         });
         self.log = 0;
         self.fast = false;
+    }
+
+    /// Heap bytes the table holds.
+    pub(super) fn heap_bytes(&self) -> usize {
+        self.cells.capacity() * core::mem::size_of::<FseCell>()
+    }
+}
+
+/// A table a later block may use again, with whether one is set: unsetting
+/// it keeps its storage for the next table built into it.
+pub(super) struct Slot<T> {
+    pub(super) table: T,
+    pub(super) set: bool,
+}
+
+impl Slot<FseTable> {
+    pub(super) const fn empty() -> Self {
+        Slot {
+            table: FseTable::empty(),
+            set: false,
+        }
+    }
+}
+
+impl Slot<HufTable> {
+    pub(super) const fn empty() -> Self {
+        Slot {
+            table: HufTable::empty(),
+            set: false,
+        }
+    }
+}
+
+impl<T> Slot<T> {
+    /// The table, once one is set.
+    pub(super) fn get(&self) -> Option<&T> {
+        self.set.then_some(&self.table)
     }
 }
 
@@ -466,17 +504,23 @@ impl HufTable {
         }
     }
 
-    /// Read a Huffman table description (`HUFv07_readStats` and
-    /// `HUFv07_readDTableX2`), its weights FSE-coded with the ending `end`.
-    /// Returns the table and the bytes read.
+    /// [`Self::read_into`] a new table. Returns the table and the bytes read.
+    #[cfg(test)]
     pub(super) fn read(src: &[u8], end: StreamEnd) -> Result<(HufTable, usize), Error> {
         let mut table = HufTable::empty();
         let consumed = table.read_into(src, end)?;
         Ok((table, consumed))
     }
 
-    /// [`Self::read`] into this table's own storage, as each block with a
-    /// new description replaces the table. Returns the bytes read.
+    /// Heap bytes the table holds, its weight table's included.
+    pub(super) fn heap_bytes(&self) -> usize {
+        self.cells.capacity() * core::mem::size_of::<(u8, u8)>() + self.weight_table.heap_bytes()
+    }
+
+    /// Read a Huffman table description (`HUFv07_readStats` and
+    /// `HUFv07_readDTableX2`), its weights FSE-coded with the ending `end`,
+    /// into this table's own storage, as each block with a new description
+    /// replaces the table. Returns the bytes read.
     pub(super) fn read_into(&mut self, src: &[u8], end: StreamEnd) -> Result<usize, Error> {
         let &header = src.first().ok_or(Error::Truncated)?;
         let mut weights = [0u8; 256];
@@ -507,9 +551,13 @@ impl HufTable {
         Ok(consumed)
     }
 
-    /// The table whose weights are an RFC 8878 description's code lengths,
-    /// the last one included, under a longest code of `max_bits`.
-    pub(super) fn from_code_lengths(lengths: &[u8], max_bits: u8) -> Result<HufTable, Error> {
+    /// Build the table whose weights are an RFC 8878 description's code
+    /// lengths, the last one included, under a longest code of `max_bits`.
+    pub(super) fn fill_from_code_lengths(
+        &mut self,
+        lengths: &[u8],
+        max_bits: u8,
+    ) -> Result<(), Error> {
         let explicit = lengths
             .len()
             .checked_sub(1)
@@ -523,9 +571,7 @@ impl HufTable {
             *weight = if len == 0 { 0 } else { max_bits + 1 - len };
         }
         // The last weight is inferred again, from the others.
-        let mut table = HufTable::empty();
-        table.fill(&mut weights, explicit)?;
-        Ok(table)
+        self.fill(&mut weights, explicit)
     }
 
     /// Build the table from the first `explicit` weights, inferring the

@@ -2,7 +2,7 @@
 //! a dictionary ID or checksum, repeat offsets that restart every block, and
 //! offsets coded two higher.
 
-use super::entropy::{FseState, FseTable, HufTable, StreamEnd, open_bits, overflowed};
+use super::entropy::{FseState, HufTable, Slot, StreamEnd, open_bits, overflowed};
 use super::v07::{
     LL_BASE, LL_BITS, LL_DEFAULT, LL_DEFAULT_LOG, ML_BASE, ML_BITS, ML_DEFAULT, ML_DEFAULT_LOG,
     OF_DEFAULT, OF_DEFAULT_LOG, SeqTables, seq_table, sequence_count,
@@ -59,7 +59,7 @@ pub(super) fn read_header(src: &[u8]) -> Result<FrameHeader, Error> {
 /// The decoding state a v0.6 frame carries from block to block.
 pub(super) struct Decoder {
     /// The dictionary's Huffman table, which repeat-table literals use.
-    dict_huf: Option<HufTable>,
+    dict_huf: Slot<HufTable>,
     /// The table a block's own Huffman description is read into.
     huf: HufTable,
     tables: SeqTables,
@@ -71,29 +71,41 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    /// A decoder primed with `dict`, and where the dictionary's content lies
-    /// in `bytes`, the bytes `dict` reads as one run.
-    pub(super) fn new(bytes: &[u8]) -> Result<(Decoder, core::ops::Range<usize>), Error> {
-        let mut decoder = Decoder {
-            dict_huf: None,
+    pub(super) const fn empty() -> Decoder {
+        Decoder {
+            dict_huf: Slot::<HufTable>::empty(),
             huf: HufTable::empty(),
-            tables: SeqTables::default(),
+            tables: SeqTables::empty(),
             repeat_tables: false,
             literals: Vec::new(),
-        };
+        }
+    }
+
+    /// Ready the decoder for a frame primed with the dictionary `bytes`, in
+    /// the storage the previous frame left, and say where its content lies in
+    /// them.
+    pub(super) fn reset(&mut self, bytes: &[u8]) -> Result<core::ops::Range<usize>, Error> {
+        self.dict_huf.set = false;
+        self.tables.unset();
+        self.repeat_tables = false;
+        self.literals.clear();
         if bytes.len() < 4
             || u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != DICT_MAGIC
         {
-            return Ok((decoder, 0..bytes.len()));
+            return Ok(0..bytes.len());
         }
         // `ZSTDv06_loadEntropy`.
         let src = &bytes[4..];
         let bad = |_| Error::DictionaryCorrupted;
-        let (huf, mut at) = HufTable::read(src, StreamEnd::PastStart).map_err(bad)?;
+        let mut at = self
+            .dict_huf
+            .table
+            .read_into(src, StreamEnd::PastStart)
+            .map_err(bad)?;
         for (slot, max, max_log) in [
-            (&mut decoder.tables.of, MAX_OFF, OFF_LOG),
-            (&mut decoder.tables.ml, MAX_ML, ML_LOG),
-            (&mut decoder.tables.ll, MAX_LL, LL_LOG),
+            (&mut self.tables.of, MAX_OFF, OFF_LOG),
+            (&mut self.tables.ml, MAX_ML, ML_LOG),
+            (&mut self.tables.ll, MAX_LL, LL_LOG),
         ] {
             let (dist, len) = super::entropy::read_distribution(
                 src.get(at..).ok_or(Error::DictionaryCorrupted)?,
@@ -103,12 +115,21 @@ impl Decoder {
             if dist.table_log() > max_log {
                 return Err(Error::DictionaryCorrupted);
             }
-            *slot = Some(FseTable::new(&dist).map_err(bad)?);
+            slot.table.build(&dist).map_err(bad)?;
+            slot.set = true;
             at += len;
         }
-        decoder.dict_huf = Some(huf);
-        decoder.repeat_tables = true;
-        Ok((decoder, 4 + at..bytes.len()))
+        self.dict_huf.set = true;
+        self.repeat_tables = true;
+        Ok(4 + at..bytes.len())
+    }
+
+    /// Heap bytes the decoder holds.
+    pub(super) fn heap_bytes(&self) -> usize {
+        self.dict_huf.table.heap_bytes()
+            + self.huf.heap_bytes()
+            + self.tables.heap_bytes()
+            + self.literals.capacity()
     }
 
     /// Decode one compressed block into `out` (`ZSTDv06_decompressBlock_internal`).
@@ -180,7 +201,7 @@ impl Decoder {
                 if !self.repeat_tables {
                     return Err(Error::DictionaryCorrupted);
                 }
-                let table = self.dict_huf.as_ref().ok_or(Error::DictionaryCorrupted)?;
+                let table = self.dict_huf.get().ok_or(Error::DictionaryCorrupted)?;
                 self.literals.clear();
                 self.literals.resize(size, 0);
                 table
