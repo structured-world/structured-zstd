@@ -707,6 +707,8 @@ impl<O: Output> Output for Budget<'_, O> {
 /// per-format decoder is passed too, so it outlives the frame.
 struct LegacyFrame {
     version: LegacyVersion,
+    /// The dictionary the header names, 0 for none.
+    dict_id: u32,
     /// Where the dictionary's content lies within its bytes.
     content: core::ops::Range<usize>,
     /// Most bytes a block may hold, the caller's limit within the formats'.
@@ -750,21 +752,7 @@ impl LegacyFrame {
                 LegacyVersion::V07 => VersionDecoder::V07(v07::Decoder::empty()),
             });
         }
-        let bytes = dict.content_bytes();
-        let content = match decoder.as_mut().expect("set above") {
-            VersionDecoder::V07(decoder) => {
-                let content = decoder.reset(dict)?;
-                if header.dict_id != 0 && header.dict_id != decoder.dict_id {
-                    return Err(Error::DictionaryMismatch {
-                        expected: header.dict_id,
-                        provided: decoder.dict_id,
-                    });
-                }
-                content
-            }
-            VersionDecoder::V06(decoder) => decoder.reset(bytes)?,
-            VersionDecoder::V05(decoder) => decoder.reset(bytes)?,
-        };
+        let content = prime(header.dict_id, dict, workspace)?;
         // Without `hash` no digest can be computed, so `Verify` checks
         // nothing, as for an RFC 8878 frame.
         #[cfg(feature = "hash")]
@@ -772,6 +760,7 @@ impl LegacyFrame {
             .then(|| twox_hash::XxHash64::with_seed(0));
         Ok(LegacyFrame {
             version: header.version,
+            dict_id: header.dict_id,
             content,
             block_max: options.block_max.min(BLOCK_SIZE_MAX),
             #[cfg(feature = "hash")]
@@ -787,6 +776,15 @@ impl LegacyFrame {
             #[cfg(all(feature = "lsm", feature = "hash"))]
             block_digests: options.block_digests,
         })
+    }
+
+    /// Prime the frame's decoder with `dict` for the blocks still to come, as
+    /// an RFC 8878 frame's decoder takes a forced dictionary: its tables and
+    /// repeat offsets become the dictionary's, and matches reach into its
+    /// content. What the frame has decoded so far stands.
+    fn set_dict(&mut self, dict: LegacyDict<'_>, workspace: &mut Workspace) -> Result<(), Error> {
+        self.content = prime(self.dict_id, dict, workspace)?;
+        Ok(())
     }
 
     /// Decode one block, `body` being the bytes after its header, with the
@@ -870,6 +868,34 @@ impl LegacyFrame {
         }
         Ok(())
     }
+}
+
+/// Load `dict` into `workspace`'s decoder, readied for the frame's format,
+/// and say where the dictionary's content lies in its bytes. A v0.7 header
+/// naming a dictionary (`dict_id`, 0 for none) takes only that one, as
+/// `ZSTDv07_decompressFrameHeader` refuses another.
+fn prime(
+    dict_id: u32,
+    dict: LegacyDict<'_>,
+    workspace: &mut Workspace,
+) -> Result<core::ops::Range<usize>, Error> {
+    let bytes = dict.content_bytes();
+    Ok(
+        match workspace.decoder.as_mut().expect("readied for the frame") {
+            VersionDecoder::V07(decoder) => {
+                let content = decoder.reset(dict)?;
+                if dict_id != 0 && dict_id != decoder.dict_id {
+                    return Err(Error::DictionaryMismatch {
+                        expected: dict_id,
+                        provided: decoder.dict_id,
+                    });
+                }
+                content
+            }
+            VersionDecoder::V06(decoder) => decoder.reset(bytes)?,
+            VersionDecoder::V05(decoder) => decoder.reset(bytes)?,
+        },
+    )
 }
 
 /// Decode the frame starting `src` into `out`, in `workspace`. Returns the
@@ -1055,6 +1081,23 @@ impl LegacyStream {
         self.frame.as_ref()?.calculated_checksum
     }
 
+    /// Decode the rest of the frame with `dict`, as an RFC 8878 frame takes a
+    /// forced dictionary.
+    pub(crate) fn force_dict(
+        &mut self,
+        dict: crate::decoding::DictionaryHandle,
+    ) -> Result<(), Error> {
+        let frame = self.frame.as_mut().ok_or(corrupt("no frame in progress"))?;
+        frame.set_dict(LegacyDict::Parsed(dict.as_dict()), &mut self.workspace)?;
+        self.dict = Some(dict);
+        Ok(())
+    }
+
+    /// The dictionary the frame decodes with, when the stream holds one.
+    pub(crate) fn dictionary(&self) -> Option<&crate::decoding::DictionaryHandle> {
+        self.dict.as_ref()
+    }
+
     /// The frame's per-block digests so far, when they were asked for.
     #[cfg(all(feature = "lsm", feature = "hash"))]
     pub(crate) fn block_digests(&self) -> &[u32] {
@@ -1190,9 +1233,15 @@ impl LegacyStream {
             .and_then(|()| {
                 let need = self.input_needed(&block);
                 block.resize(need, 0);
+                // The header names the block whose body is read.
+                let step = match Block::read(&block) {
+                    Ok(Block::Raw(_)) => BlockType::Raw,
+                    Ok(Block::Rle(_)) => BlockType::RLE,
+                    _ => BlockType::Compressed,
+                };
                 source.read_exact(&mut block[3..]).map_err(|source| {
                     FrameDecoderError::FailedToReadBlockBody(DecodeBlockContentError::ReadError {
-                        step: BlockType::Compressed,
+                        step,
                         source,
                     })
                 })

@@ -1561,6 +1561,83 @@ fn read_to_end_keeps_a_forced_dictionary_for_these_frames() {
     assert_eq!(out, leading);
 }
 
+/// `force_dict` gives a started v0.7 frame that names no dictionary the
+/// registered one, as it does an RFC 8878 frame, and `dictionary()` reports
+/// the handle the frame decodes with.
+#[cfg(all(feature = "std", target_has_atomic = "ptr"))]
+#[test]
+fn force_dict_and_dictionary_cover_these_frames() {
+    use crate::decoding::{BlockDecodingStrategy, DictionaryHandle, FrameDecoder};
+    let noid = fixture("ModemManager.service.v07.dict-noid.zst");
+    let dict =
+        DictionaryHandle::from_serialized_or_raw_content(noid.dict.as_deref().unwrap()).unwrap();
+    let id = dict.id();
+    let mut decoder = FrameDecoder::new();
+    decoder.add_dict_handle(dict).unwrap();
+
+    let mut src = &noid.frame[..];
+    decoder.reset(&mut src).unwrap();
+    assert!(decoder.dictionary().is_none());
+    decoder.force_dict(id).unwrap();
+    assert_eq!(decoder.dictionary().map(DictionaryHandle::id), Some(id));
+    decoder
+        .decode_blocks(&mut src, BlockDecodingStrategy::All)
+        .unwrap();
+    assert!(decoder.collect().unwrap() == noid.content);
+
+    // A frame naming the dictionary takes it from the registry.
+    let named = fixture("ModemManager.service.v07.dict.zst");
+    decoder.reset(&named.frame[..]).unwrap();
+    assert_eq!(decoder.dictionary().map(DictionaryHandle::id), Some(id));
+}
+
+/// The header size query measures these frames by their own size fields.
+#[test]
+fn frame_header_size_measures_these_frames() {
+    use crate::decoding::frame_header_size;
+    assert_eq!(
+        frame_header_size(&[0x25, 0xB5, 0x2F, 0xFD, 0x01]).unwrap(),
+        5
+    );
+    assert_eq!(
+        frame_header_size(&[0x26, 0xB5, 0x2F, 0xFD, 0x80]).unwrap(),
+        7
+    );
+    assert_eq!(
+        frame_header_size(&[0x27, 0xB5, 0x2F, 0xFD, 0xE3]).unwrap(),
+        17
+    );
+    assert!(frame_header_size(&[0x27, 0xB5, 0x2F, 0xFD]).is_err());
+}
+
+/// A reader failing inside a raw or RLE block's body names that block's
+/// type, not a compressed block's.
+#[cfg(feature = "std")]
+#[test]
+fn reader_errors_name_the_block_type() {
+    use crate::blocks::block::BlockType;
+    use crate::decoding::errors::{DecodeBlockContentError, FrameDecoderError};
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
+    // v0.7, a raw block of five bytes cut after two.
+    let frame = [0x27, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x40, 0, 5, b'a', b'b'];
+    let mut decoder = FrameDecoder::new();
+    let mut src = &frame[..];
+    decoder.reset(&mut src).unwrap();
+    let err = decoder
+        .decode_blocks(&mut src, BlockDecodingStrategy::All)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FrameDecoderError::FailedToReadBlockBody(DecodeBlockContentError::ReadError {
+                step: BlockType::Raw,
+                ..
+            })
+        ),
+        "{err:?}"
+    );
+}
+
 /// Output a caller does not collect stays in the buffer however far past the
 /// window it grows, and all of it is handed out once collected.
 #[cfg(feature = "std")]

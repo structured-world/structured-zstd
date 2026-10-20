@@ -2680,6 +2680,16 @@ impl FrameDecoder {
 
     pub fn force_dict(&mut self, dict_id: u32) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
+        #[cfg(feature = "legacy")]
+        if self.legacy_frame().is_some() {
+            // The stream outlives this call, so it holds the handle.
+            let dict = self
+                .registered_dict(dict_id)
+                .ok_or(err::DictNotProvided { dict_id })?
+                .clone();
+            let stream = self.legacy_frame_mut().expect("checked above");
+            return Ok(stream.force_dict(dict)?);
+        }
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
         let owned_dicts = &self.owned_dicts;
         #[cfg(target_has_atomic = "ptr")]
@@ -2893,6 +2903,10 @@ impl FrameDecoder {
     /// assert!(FrameDecoder::new().dictionary().is_none());
     /// ```
     pub fn dictionary(&self) -> Option<&DictionaryHandle> {
+        #[cfg(feature = "legacy")]
+        if let Some(stream) = self.legacy_frame() {
+            return stream.dictionary();
+        }
         self.state.as_ref().and_then(|s| s.active_dict.as_ref())
     }
 

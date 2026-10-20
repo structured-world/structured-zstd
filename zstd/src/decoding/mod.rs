@@ -546,7 +546,9 @@ pub struct FrameHeaderInfo {
 /// prefix learns how much of the header is still to read. Upstream's
 /// `ZSTD_frameHeaderSize` measures it the same way
 /// (`zstd_decompress.c:416-429`), without looking at the descriptor's other
-/// bits, so a header this library refuses to decode is still measured.
+/// bits, so a header this library refuses to decode is still measured. With
+/// the `legacy` feature a v0.5-v0.7 header is measured by its own format's
+/// size fields, as [`LegacyVersion::header_size`] does.
 ///
 /// # Errors
 /// [`ReadFrameHeaderError`](errors::ReadFrameHeaderError) when `src` is shorter
@@ -558,6 +560,14 @@ pub struct FrameHeaderInfo {
 /// assert_eq!(frame_header_size(&[0x28, 0xB5, 0x2F, 0xFD, 0x00]).unwrap(), 6);
 /// ```
 pub fn frame_header_size(src: &[u8]) -> Result<usize, errors::ReadFrameHeaderError> {
+    // A v0.5-v0.7 header is measured by its own format's size fields. Upstream
+    // reads every header with RFC 8878's layout, which only v0.7 shares.
+    #[cfg(feature = "legacy")]
+    if let Some(version) = LegacyVersion::of(src) {
+        return version
+            .header_size(src)
+            .ok_or_else(|| errors::ReadFrameHeaderError::FrameDescriptorReadError(frame::eof()));
+    }
     frame::measure_header_from_slice(src)
 }
 

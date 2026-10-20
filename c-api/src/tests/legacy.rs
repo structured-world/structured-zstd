@@ -9,7 +9,7 @@ use crate::attach::ZSTD_decompress_usingDict;
 use crate::cdict::{ZSTD_createDDict, ZSTD_freeDDict};
 use crate::context::{ZSTD_createDCtx, ZSTD_freeDCtx};
 use crate::error::{ZSTD_ErrorCode, ZSTD_getErrorCode, ZSTD_isError};
-use crate::frame::{ZSTD_decompressBound, ZSTD_isFrame};
+use crate::frame::{ZSTD_decompressBound, ZSTD_frameHeaderSize, ZSTD_isFrame};
 use crate::simple::{ZSTD_decompress, ZSTD_findFrameCompressedSize, ZSTD_getFrameContentSize};
 use crate::streaming::{
     ZSTD_createDStream, ZSTD_decompressStream, ZSTD_freeDStream, ZSTD_inBuffer,
@@ -87,6 +87,10 @@ fn frame_queries_read_these_frames() {
             "{}",
             fixture.name
         );
+        // A frame `ZSTD_isFrame` accepts has a header to measure.
+        let header = unsafe { ZSTD_frameHeaderSize(frame.as_ptr(), frame.len()) };
+        assert_eq!(ZSTD_isError(header), 0, "{}", fixture.name);
+        assert!((5..=18).contains(&header), "{}: {header}", fixture.name);
         let bound = unsafe { ZSTD_decompressBound(frame.as_ptr(), frame.len()) };
         assert!(bound >= fixture.content.len() as u64, "{}", fixture.name);
         assert_eq!(bound % (128 * 1024), 0, "{}", fixture.name);
