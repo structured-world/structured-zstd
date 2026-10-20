@@ -1740,7 +1740,9 @@ impl FrameDecoder {
     /// `size` is clamped to 1 KiB ..= 128 KiB; `None` restores the format's
     /// 128 KiB. A frame whose window is smaller still holds its blocks to the
     /// window. Applies on every path, including decoding into a caller's
-    /// buffer, as upstream's one-shot honours it too.
+    /// buffer, as upstream's one-shot honours it too. A v0.5-v0.7 stored
+    /// block, which its format lets run past 128 KiB, is held to `size` only
+    /// when it is lowered below that.
     ///
     /// ```
     /// use structured_zstd::decoding::FrameDecoder;
@@ -2357,8 +2359,9 @@ impl FrameDecoder {
         let magicless = self.magicless;
         let max_window = crate::common::MAX_DECODER_WINDOW_SIZE;
         let block_limit = self.max_block_size;
-        let (frame_header, header_size) = frame::read_frame_header_from_slice(input, magicless)?;
+        // A new header ends any v0.5-v0.7 frame, whether or not it reads.
         self.end_legacy_frame();
+        let (frame_header, header_size) = frame::read_frame_header_from_slice(input, magicless)?;
         let dict_id = match &mut self.state {
             Some(s) => {
                 s.reset_with_parsed_header(frame_header, header_size, max_window, block_limit)?;
@@ -2609,8 +2612,8 @@ impl FrameDecoder {
         // Into the caller's buffer, like `reset_from_slice`: no window held.
         let max_window = crate::common::MAX_DECODER_WINDOW_SIZE;
         let block_limit = self.max_block_size;
-        let (frame_header, header_size) = frame::read_frame_header_from_slice(input, magicless)?;
         self.end_legacy_frame();
+        let (frame_header, header_size) = frame::read_frame_header_from_slice(input, magicless)?;
         match &mut self.state {
             Some(s) => {
                 s.reset_with_parsed_header(frame_header, header_size, max_window, block_limit)?;

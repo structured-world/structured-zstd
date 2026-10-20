@@ -70,7 +70,7 @@ fn fixtures() -> Vec<Fixture> {
 }
 
 /// The frame queries: a frame, its length through the end block, a bound of
-/// whole blocks, and the declared size or unknown.
+/// its blocks, and the declared size or unknown.
 #[test]
 fn frame_queries_read_these_frames() {
     for fixture in fixtures() {
@@ -93,7 +93,6 @@ fn frame_queries_read_these_frames() {
         assert!((5..=18).contains(&header), "{}: {header}", fixture.name);
         let bound = unsafe { ZSTD_decompressBound(frame.as_ptr(), frame.len()) };
         assert!(bound >= fixture.content.len() as u64, "{}", fixture.name);
-        assert_eq!(bound % (128 * 1024), 0, "{}", fixture.name);
         // Cut short, the frame's length cannot be told.
         let cut = unsafe { ZSTD_findFrameCompressedSize(frame.as_ptr(), frame.len() - 1) };
         assert_eq!(
@@ -166,6 +165,30 @@ fn one_shot_decoders_decode_these_frames() {
                 "{}",
                 fixture.name
             );
+            // A frame cut short is a source of the wrong size, as libzstd
+            // reports it, on the one-shot path and through a context.
+            let cut = &fixture.frame[..fixture.frame.len() - 1];
+            for rc in [
+                unsafe { ZSTD_decompress(out.as_mut_ptr(), out.len(), cut.as_ptr(), cut.len()) },
+                unsafe {
+                    ZSTD_decompress_usingDict(
+                        dctx,
+                        out.as_mut_ptr(),
+                        out.len(),
+                        cut.as_ptr(),
+                        cut.len(),
+                        core::ptr::null(),
+                        0,
+                    )
+                },
+            ] {
+                assert_eq!(
+                    ZSTD_getErrorCode(rc),
+                    ZSTD_ErrorCode::ZSTD_error_srcSize_wrong,
+                    "{}",
+                    fixture.name
+                );
+            }
         }
     }
     unsafe { ZSTD_freeDCtx(dctx) };

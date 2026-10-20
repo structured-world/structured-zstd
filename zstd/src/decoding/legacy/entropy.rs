@@ -418,31 +418,26 @@ fn fse_decompress(
     table.build(&dist)?;
     let table = &*table;
     let mut bits = open_bits(&src[description_len..])?;
-    let mut first = FseState::new(table, &mut bits);
-    let mut second = FseState::new(table, &mut bits);
+    let first = FseState::new(table, &mut bits);
+    let second = FseState::new(table, &mut bits);
+    let mut states = [first, second];
     if end == StreamEnd::Exact {
-        return decode_to_exact_end(table, &mut bits, [first, second], out, limit);
+        return decode_to_exact_end(table, &mut bits, states, out, limit);
     }
+    // The two states take turns; once the stream is read past its start,
+    // the state whose turn is next gives the last symbol.
     let mut n = 0usize;
+    let mut turn = 0;
     loop {
         if n + 2 > limit {
             return Err(corrupt("FSE stream decodes past its output"));
         }
-        out[n] = first.symbol(table);
+        out[n] = states[turn].symbol(table);
         n += 1;
-        first.update(table, &mut bits);
+        states[turn].update(table, &mut bits);
+        turn ^= 1;
         if overflowed(&bits) {
-            out[n] = second.symbol(table);
-            return Ok(n + 1);
-        }
-        if n + 2 > limit {
-            return Err(corrupt("FSE stream decodes past its output"));
-        }
-        out[n] = second.symbol(table);
-        n += 1;
-        second.update(table, &mut bits);
-        if overflowed(&bits) {
-            out[n] = first.symbol(table);
+            out[n] = states[turn].symbol(table);
             return Ok(n + 1);
         }
     }

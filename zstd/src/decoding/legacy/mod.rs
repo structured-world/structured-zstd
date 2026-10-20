@@ -74,8 +74,47 @@ impl LegacyVersion {
     }
 }
 
-/// Most bytes one block decodes to, the formats' `BLOCKSIZE`.
+/// Most bytes one compressed block decodes to, the formats' `BLOCKSIZE`.
 const BLOCK_SIZE_MAX: usize = 128 * 1024;
+
+/// Most bytes a stored block (raw, or RLE in v0.7) holds: its 19-bit size
+/// field, which upstream's one-shot decoders check against nothing but the
+/// output's room (`ZSTDv0{5,6,7}_decompressFrame`).
+const STORED_BLOCK_MAX: usize = (1 << 19) - 1;
+
+/// Most bytes a block may decode to, by its type.
+#[derive(Debug, Clone, Copy)]
+struct BlockLimits {
+    compressed: usize,
+    stored: usize,
+}
+
+impl BlockLimits {
+    /// Each type's own limit, or the caller's `block_max` for every type
+    /// where it lowered the setting below the formats' 128 KiB: a limit set
+    /// for memory binds whatever the block's type.
+    fn of(block_max: usize) -> BlockLimits {
+        if block_max >= BLOCK_SIZE_MAX {
+            BlockLimits {
+                compressed: BLOCK_SIZE_MAX,
+                stored: STORED_BLOCK_MAX,
+            }
+        } else {
+            BlockLimits {
+                compressed: block_max,
+                stored: block_max,
+            }
+        }
+    }
+
+    /// The limit `block`'s output is held to.
+    fn of_block(self, block: Block) -> usize {
+        match block {
+            Block::Compressed(_) => self.compressed,
+            Block::Raw(_) | Block::Rle(_) | Block::End => self.stored,
+        }
+    }
+}
 
 fn corrupt(reason: &'static str) -> Error {
     Error::Corrupted { reason }
@@ -234,17 +273,29 @@ impl Block {
 
     /// Refuse a block its header alone rules out: an RLE block in v0.5 or
     /// v0.6, which reserve the type (`ZSTDv0{5,6}_decompressFrame` fail on
-    /// `bt_rle`), and a body past `block_max`.
-    fn check(self, version: LegacyVersion, block_max: usize) -> Result<(), Error> {
-        if let Block::Rle(_) = self
-            && version != LegacyVersion::V07
-        {
-            return Err(corrupt("reserved block type"));
-        }
-        if self.body_len() > block_max {
+    /// `bt_rle`), and a block past its type's limit.
+    fn check(self, version: LegacyVersion, limits: BlockLimits) -> Result<(), Error> {
+        let size = match self {
+            Block::Rle(_) if version != LegacyVersion::V07 => {
+                return Err(corrupt("reserved block type"));
+            }
+            Block::Compressed(size) | Block::Raw(size) | Block::Rle(size) => size,
+            Block::End => 0,
+        };
+        if size > limits.of_block(self) {
             return Err(corrupt("block larger than the block maximum"));
         }
         Ok(())
+    }
+
+    /// Most bytes the block decodes to: its size for a stored block, the
+    /// formats' largest for a compressed one.
+    fn decoded_max(self) -> usize {
+        match self {
+            Block::Compressed(_) => BLOCK_SIZE_MAX,
+            Block::Raw(size) | Block::Rle(size) => size,
+            Block::End => 0,
+        }
     }
 }
 
@@ -323,11 +374,13 @@ impl HeaderFields {
 }
 
 /// Where the `version` frame starting `src` ends, and the most it can decode
-/// to: one block's maximum per block (`ZSTD_findFrameSizeInfoLegacy`). `None`
-/// when `src` ends inside the frame, the only way the walk fails.
+/// to: the formats' largest per compressed block, as
+/// `ZSTD_findFrameSizeInfoLegacy` counts every block, and a stored block's
+/// own size, which can be more. `None` when `src` ends inside the frame, the
+/// only way the walk fails.
 pub(crate) fn frame_size(version: LegacyVersion, src: &[u8]) -> Option<(usize, u64)> {
     let mut at = header_len(version, src).ok()?;
-    let mut blocks = 0u64;
+    let mut bound = 0u64;
     loop {
         let block = Block::read(src.get(at..)?).ok()?;
         at += 3;
@@ -339,9 +392,9 @@ pub(crate) fn frame_size(version: LegacyVersion, src: &[u8]) -> Option<(usize, u
             break;
         }
         at += body;
-        blocks += 1;
+        bound += block.decoded_max() as u64;
     }
-    Some((at, blocks * BLOCK_SIZE_MAX as u64))
+    Some((at, bound))
 }
 
 /// Where decoded bytes go: an output that knows how much of the frame it has
@@ -490,9 +543,10 @@ fn copy_match<O: Output>(
     // An output that drops older bytes reads matches through its own
     // `Output::copy_match`.
     debug_assert_eq!(out.held(), out.produced());
-    if offset == 0 {
-        return Err(corrupt("match with offset 0"));
-    }
+    // Every format's offsets are at least 1 by construction: a repeat offset
+    // starts at 1 (or a dictionary's, which must not be 0), and a coded one
+    // is a base of at least 1 plus extra bits.
+    debug_assert!(offset >= 1);
     let held = out.held();
     if offset <= held {
         out.copy_back(offset, len);
@@ -712,7 +766,8 @@ pub(crate) struct FrameOptions {
     /// Without `hash` no checksum is computed, whatever the mode.
     #[cfg(feature = "hash")]
     pub(crate) checksum: ContentChecksum,
-    /// Most bytes a block may hold, compressed or decoded.
+    /// Most bytes a block may hold, compressed or decoded; at the formats'
+    /// 128 KiB, each block type's own limit ([`BlockLimits::of`]).
     pub(crate) block_max: usize,
     /// Whether each data block's output is digested, for the per-block
     /// checksums.
@@ -733,7 +788,8 @@ impl Default for FrameOptions {
 }
 
 /// An output that refuses to grow past `end` produced bytes: a block decodes
-/// to at most [`BLOCK_SIZE_MAX`], however many sequences it holds.
+/// to at most its type's limit ([`BlockLimits`]), however many sequences it
+/// holds.
 struct Budget<'o, O: Output> {
     out: &'o mut O,
     end: usize,
@@ -781,8 +837,8 @@ struct LegacyFrame {
     dict_id: u32,
     /// What of the dictionary matches reach.
     history: HistoryShape,
-    /// Most bytes a block may hold, the caller's limit within the formats'.
-    block_max: usize,
+    /// Most bytes a block may hold, by type.
+    limits: BlockLimits,
     #[cfg(feature = "hash")]
     checksum_mode: ContentChecksum,
     /// The declared content size, 0 when the frame declares none.
@@ -832,7 +888,7 @@ impl LegacyFrame {
             version: header.version,
             dict_id: header.dict_id,
             history,
-            block_max: options.block_max.min(BLOCK_SIZE_MAX),
+            limits: BlockLimits::of(options.block_max),
             #[cfg(feature = "hash")]
             checksum_mode: options.checksum,
             content_size: header.content_size.unwrap_or(0),
@@ -884,7 +940,7 @@ impl LegacyFrame {
         let decoder = workspace.decoder.as_mut().expect("readied with the frame");
         let before = out.produced();
         let mut out = Budget {
-            end: before + self.block_max,
+            end: before + self.limits.of_block(block),
             out,
         };
         let dict = self.history.of(dict);
@@ -1007,7 +1063,7 @@ fn decode_frame<O: Output>(
     loop {
         let block_header = src.get(at..at + 3).ok_or(Error::Truncated)?;
         let block = Block::read(block_header)?;
-        block.check(header.version, frame.block_max)?;
+        block.check(header.version, frame.limits)?;
         let end = [block_header[0], block_header[1], block_header[2]];
         at += 3;
         let body = src.get(at..at + block.body_len()).ok_or(Error::Truncated)?;
@@ -1284,7 +1340,7 @@ impl LegacyStream {
             return 3;
         };
         match &self.frame {
-            Some(frame) if block.check(frame.version, frame.block_max).is_err() => 3,
+            Some(frame) if block.check(frame.version, frame.limits).is_err() => 3,
             _ => 3 + block.body_len(),
         }
     }
@@ -1393,7 +1449,7 @@ impl LegacyStream {
         } = self;
         let frame = frame.as_mut().ok_or(corrupt("no frame in progress"))?;
         let block = Block::read(step)?;
-        block.check(frame.version, frame.block_max)?;
+        block.check(frame.version, frame.limits)?;
         *consumed += step.len() as u64;
         if ends_frame(frame.version, block) {
             frame.finish([step[0], step[1], step[2]])?;
@@ -1510,9 +1566,8 @@ impl Output for SegmentOutput<'_> {
             // One segment so far: it holds the whole frame.
             return copy_match(self, offset, len, dict);
         };
-        if offset == 0 {
-            return Err(corrupt("match with offset 0"));
-        }
+        // At least 1 by construction, as in `copy_match`.
+        debug_assert!(offset >= 1);
         if offset <= self.end {
             self.copy_back(offset, len);
             return Ok(());

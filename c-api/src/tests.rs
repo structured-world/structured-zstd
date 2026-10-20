@@ -4109,6 +4109,7 @@ fn codec_error_messages_match_the_c_messages() {
         ErrorCode::DstSizeTooSmall,
         ErrorCode::InitMissing,
         ErrorCode::ChecksumWrong,
+        ErrorCode::SrcSizeWrong,
         ErrorCode::CorruptionDetected,
     ] {
         let c_message = crate::error::message(crate::error::code_for(code));

@@ -67,7 +67,10 @@ pub struct ZSTD_FrameHeader {
 /// `size_t ZSTD_frameHeaderSize(const void* src, size_t srcSize)` — length of
 /// the frame header (including the magic number), or an error code. A
 /// v0.5-v0.7 header, which `ZSTD_isFrame` accepts, is measured by its own
-/// format's size fields.
+/// format's size fields. Upstream reads any five bytes as an RFC 8878
+/// descriptor here (`zstd_decompress.c:416-438`), which for these formats is
+/// no header length at all, and nothing in its API takes such a frame after
+/// skipping that many bytes; the true length serves the same callers.
 ///
 /// # Safety
 /// `src` must be valid for `src_size` bytes (or `NULL` with `src_size == 0`).

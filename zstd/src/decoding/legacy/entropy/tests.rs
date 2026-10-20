@@ -219,3 +219,48 @@ fn arbitrary_descriptions_never_panic() {
         }
     }
 }
+
+/// A run of zero counts read where fewer than five bytes are left shifts the
+/// held bits instead of reloading them, as `FSEv07_readNCount` does; a
+/// description that then lists no table's worth of counts is refused.
+#[test]
+fn a_zero_run_at_the_end_shifts_the_held_bits() {
+    // Log 5; symbol 0 has count 0; sixteen run bits of 1, a run of 24 more.
+    let src = [0x10, 0xFE, 0xFF, 0x01];
+    assert!(read_distribution(&src, 255).is_err());
+}
+
+/// An RFC 8878 table description with more probabilities than the field has
+/// symbols, or none, is refused.
+#[test]
+fn probabilities_past_the_field_are_refused() {
+    assert!(Distribution::from_probabilities(&[1; 40], 5, 31).is_err());
+    assert!(Distribution::from_probabilities(&[], 5, 31).is_err());
+    assert!(Distribution::from_probabilities(&[32], 5, 31).is_ok());
+}
+
+/// A distribution whose low-probability symbols take every cell leaves none
+/// for the rest: refused rather than spread.
+#[test]
+fn a_distribution_that_overfills_its_table_is_refused() {
+    let mut counts = [-1i16; 33];
+    counts[32] = 1;
+    let dist = Distribution::predefined(&counts, 5);
+    assert!(FseTable::new(&dist).is_err());
+}
+
+/// An RFC 8878 Huffman description is held to the v0.5-v0.7 limits: no code
+/// longer than its table, no weight past 15, no table past 12 bits.
+#[test]
+fn code_lengths_past_the_formats_limits_are_refused() {
+    let mut table = HufTable::empty();
+    assert!(table.fill_from_code_lengths(&[5, 1, 1], 3).is_err());
+    // A code of length 1 under 20 bits is a weight of 20.
+    assert!(table.fill_from_code_lengths(&[1, 1, 0], 20).is_err());
+    // Weights 13 down to 1, one each, and an implied last 1: a 13-bit table.
+    let lengths: vec::Vec<u8> = (1..=13).chain([0]).collect();
+    assert!(table.fill_from_code_lengths(&lengths, 13).is_err());
+    // The same shape one bit shorter fits.
+    let lengths: vec::Vec<u8> = (1..=12).chain([0]).collect();
+    assert!(table.fill_from_code_lengths(&lengths, 12).is_ok());
+}

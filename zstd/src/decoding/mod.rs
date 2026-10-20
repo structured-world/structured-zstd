@@ -321,9 +321,10 @@ fn walk_blocks(
 /// otherwise a valid (loose) bound of `block_count * block_size_max`, where
 /// `block_size_max = min(window_size, 128 KiB)` — every block decompresses to
 /// at most that many bytes. Skippable frames contribute `0`. With the `legacy`
-/// feature a v0.5-v0.7 frame is bounded by 128 KiB per block whatever its
-/// header declares, as libzstd bounds it, since those formats do not hold a
-/// frame to its declared size.
+/// feature a v0.5-v0.7 frame is bounded by its blocks whatever its header
+/// declares, since those formats do not hold a frame to its declared size:
+/// 128 KiB per compressed block, as libzstd bounds it, and a stored block's
+/// own size, which can be more.
 ///
 /// # Errors
 /// [`FrameSizeError`] on an unreadable header, truncation, or a reserved block.

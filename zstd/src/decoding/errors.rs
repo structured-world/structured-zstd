@@ -84,9 +84,10 @@ impl LegacyFrameError {
             LegacyFrameError::DictionaryCorrupted => ErrorCode::DictionaryCorrupted,
             LegacyFrameError::DictionaryMismatch { .. } => ErrorCode::DictionaryWrong,
             LegacyFrameError::ChecksumMismatch { .. } => ErrorCode::ChecksumWrong,
-            LegacyFrameError::Truncated | LegacyFrameError::Corrupted { .. } => {
-                ErrorCode::CorruptionDetected
-            }
+            // A cut frame, as `ZSTD_findFrameSizeInfoLegacy` and the legacy
+            // decoders' size checks report it (`srcSize_wrong`).
+            LegacyFrameError::Truncated => ErrorCode::SrcSizeWrong,
+            LegacyFrameError::Corrupted { .. } => ErrorCode::CorruptionDetected,
         }
     }
 }
@@ -723,6 +724,8 @@ pub enum ErrorCode {
     InitMissing,
     /// The content checksum does not match the decoded data.
     ChecksumWrong,
+    /// The input ends inside the frame.
+    SrcSizeWrong,
     /// The frame is malformed or damaged.
     CorruptionDetected,
 }
@@ -742,6 +745,7 @@ impl ErrorCode {
             ErrorCode::DstSizeTooSmall => "Destination buffer is too small",
             ErrorCode::InitMissing => "Context should be init first",
             ErrorCode::ChecksumWrong => "Restored data doesn't match checksum",
+            ErrorCode::SrcSizeWrong => "Src size is incorrect",
             ErrorCode::CorruptionDetected => "Data corruption detected",
         }
     }

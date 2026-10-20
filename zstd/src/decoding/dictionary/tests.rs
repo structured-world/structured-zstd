@@ -181,6 +181,22 @@ fn the_heap_bound_covers_the_kept_serialized_header() {
     assert!(beyond_tables >= kept);
 }
 
+/// The header bound adds the largest description each table can take: the
+/// 4-bit log, then per symbol a count and two bits of zero-run flags.
+#[cfg(feature = "legacy")]
+#[test]
+fn the_serialized_header_bound_sums_its_parts() {
+    // 32 offset codes at log 8: 4 + 32 * 11 bits, 45 bytes.
+    assert_eq!(max_fse_description_len(31, 8), 45);
+    let sum = 8
+        + 128
+        + max_fse_description_len(31, 8)
+        + max_fse_description_len(52, 9)
+        + max_fse_description_len(35, 9)
+        + 12;
+    assert_eq!(sum, MAX_SERIALIZED_HEADER_LEN);
+}
+
 /// A handle reports the shared allocation with the dictionary, stays within
 /// the bound callers budget by before parsing, and a set of handles counts a
 /// dictionary once and only when nothing outside the set holds it.
