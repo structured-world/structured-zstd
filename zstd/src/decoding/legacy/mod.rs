@@ -207,6 +207,24 @@ pub(crate) fn header_len(version: LegacyVersion, src: &[u8]) -> Result<usize, Er
     Ok(5 + fields.window + fields.dict_id + fields.content_size)
 }
 
+impl FrameHeader {
+    /// The window byte of the header starting `src`, which a v0.7 header
+    /// that is not single-segment carries right after its descriptor, laid
+    /// out as RFC 8878's `Window_Descriptor`. v0.5 and v0.6 headers keep
+    /// their window in the descriptor and carry none.
+    #[cfg(feature = "lsm")]
+    pub(crate) fn window_descriptor(&self, src: &[u8]) -> Option<u8> {
+        let fields = HeaderFields::of(self.version, src[4]);
+        (fields.window == 1).then(|| src[5])
+    }
+
+    /// The dictionary ID the header names, `None` for none.
+    #[cfg(feature = "lsm")]
+    pub(crate) fn dictionary_id(&self) -> Option<u32> {
+        (self.dict_id != 0).then_some(self.dict_id)
+    }
+}
+
 /// The lengths of the fields that follow a frame header's descriptor byte,
 /// in the order they follow it.
 #[derive(Debug, Clone, Copy)]
@@ -300,8 +318,6 @@ pub(crate) trait Output {
 pub(crate) struct VecOutput<'a> {
     pub(crate) buf: &'a mut Vec<u8>,
     pub(crate) start: usize,
-    /// Most bytes the frame may produce.
-    pub(crate) limit: usize,
 }
 
 impl Output for VecOutput<'_> {
@@ -314,9 +330,7 @@ impl Output for VecOutput<'_> {
     }
 
     fn reserve(&mut self, len: usize) -> Result<(), Error> {
-        if len > self.limit - self.produced() {
-            return Err(Error::OutputTooSmall);
-        }
+        // The block budget in front of this output bounds `len`.
         self.buf.reserve(len);
         Ok(())
     }
@@ -399,8 +413,12 @@ impl Output for SliceOutput<'_> {
 
 /// Copy a match of `len` bytes from `offset` back: within the frame, from
 /// the dictionary's content in front of it, or across both
-/// (`ZSTDv07_execSequence`). The output has room for `len` more bytes.
+/// (`ZSTDv07_execSequence`). The output holds the whole frame so far and has
+/// room for `len` more bytes.
 fn copy_match<O: Output>(out: &mut O, offset: usize, len: usize, dict: &[u8]) -> Result<(), Error> {
+    // An output that drops older bytes reads matches through its own
+    // `Output::copy_match`.
+    debug_assert_eq!(out.held(), out.produced());
     if offset == 0 {
         return Err(corrupt("match with offset 0"));
     }
@@ -409,11 +427,7 @@ fn copy_match<O: Output>(out: &mut O, offset: usize, len: usize, dict: &[u8]) ->
         out.copy_back(offset, len);
         return Ok(());
     }
-    let produced = out.produced();
-    if offset <= produced {
-        return Err(corrupt("match reaches before the window"));
-    }
-    let back = offset - produced;
+    let back = offset - held;
     if back > dict.len() {
         return Err(corrupt("match reaches before the dictionary"));
     }
@@ -423,9 +437,6 @@ fn copy_match<O: Output>(out: &mut O, offset: usize, len: usize, dict: &[u8]) ->
     let rest = len - first;
     if rest > 0 {
         // The match runs on from the frame's first byte.
-        if produced != held {
-            return Err(corrupt("match reaches before the window"));
-        }
         let distance = out.held();
         out.copy_back(distance, rest);
     }
@@ -606,6 +617,25 @@ impl VersionDecoder {
     }
 }
 
+/// What a frame decodes in, kept from frame to frame so its storage is
+/// reused: the per-format decoder, and the per-block digests when asked for.
+#[derive(Default)]
+struct Workspace {
+    decoder: Option<VersionDecoder>,
+    /// The current frame's per-block XXH64 digests, low 32 bits.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    block_digests: Vec<u32>,
+}
+
+impl Workspace {
+    fn heap_bytes(&self) -> usize {
+        let bytes = self.decoder.as_ref().map_or(0, VersionDecoder::heap_bytes);
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        let bytes = bytes + self.block_digests.capacity() * core::mem::size_of::<u32>();
+        bytes
+    }
+}
+
 /// What the caller set on the decoder that a frame of these formats obeys.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FrameOptions {
@@ -614,6 +644,10 @@ pub(crate) struct FrameOptions {
     pub(crate) checksum: ContentChecksum,
     /// Most bytes a block may hold, compressed or decoded.
     pub(crate) block_max: usize,
+    /// Whether each data block's output is digested, for the per-block
+    /// checksums.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    pub(crate) block_digests: bool,
 }
 
 impl Default for FrameOptions {
@@ -622,6 +656,8 @@ impl Default for FrameOptions {
             #[cfg(feature = "hash")]
             checksum: ContentChecksum::EmitOnly,
             block_max: BLOCK_SIZE_MAX,
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            block_digests: false,
         }
     }
 }
@@ -691,17 +727,22 @@ struct LegacyFrame {
     calculated_checksum: Option<u32>,
     #[cfg(feature = "hash")]
     hash: Option<twox_hash::XxHash64>,
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    block_digests: bool,
 }
 
 impl LegacyFrame {
-    /// Start decoding the frame `header` describes, readying `decoder` for
-    /// it: the one the previous frame left, when of the same format.
+    /// Start decoding the frame `header` describes, readying `workspace` for
+    /// it: the decoder the previous frame left, when of the same format.
     fn new(
         header: FrameHeader,
         dict: LegacyDict<'_>,
         options: FrameOptions,
-        decoder: &mut Option<VersionDecoder>,
+        workspace: &mut Workspace,
     ) -> Result<LegacyFrame, Error> {
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        workspace.block_digests.clear();
+        let decoder = &mut workspace.decoder;
         if decoder.as_ref().map(VersionDecoder::version) != Some(header.version) {
             *decoder = Some(match header.version {
                 LegacyVersion::V05 => VersionDecoder::V05(v05::Decoder::empty()),
@@ -743,6 +784,8 @@ impl LegacyFrame {
             calculated_checksum: None,
             #[cfg(feature = "hash")]
             hash,
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            block_digests: options.block_digests,
         })
     }
 
@@ -751,12 +794,13 @@ impl LegacyFrame {
     /// passed [`Block::check`].
     fn block<O: Output>(
         &mut self,
-        decoder: &mut VersionDecoder,
+        workspace: &mut Workspace,
         block: Block,
         body: &[u8],
         out: &mut O,
         dict_bytes: &[u8],
     ) -> Result<(), Error> {
+        let decoder = workspace.decoder.as_mut().expect("readied with the frame");
         let before = out.produced();
         let mut out = Budget {
             end: before + self.block_max,
@@ -783,6 +827,12 @@ impl LegacyFrame {
         if let Some(hash) = &mut self.hash {
             use core::hash::Hasher;
             hash.write(out.since(before));
+        }
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        if self.block_digests {
+            let digest = twox_hash::XxHash64::oneshot(0, out.since(before));
+            // The low 32 bits, as for an RFC 8878 frame's blocks.
+            workspace.block_digests.push(digest as u32);
         }
         self.blocks += 1;
         Ok(())
@@ -822,18 +872,17 @@ impl LegacyFrame {
     }
 }
 
-/// Decode the frame starting `src` into `out`, in `decoder`'s storage.
-/// Returns the bytes the frame took.
+/// Decode the frame starting `src` into `out`, in `workspace`. Returns the
+/// bytes the frame took and the frame, finished.
 fn decode_frame<O: Output>(
     src: &[u8],
     dict: LegacyDict<'_>,
     options: FrameOptions,
-    decoder: &mut Option<VersionDecoder>,
+    workspace: &mut Workspace,
     out: &mut O,
-) -> Result<usize, Error> {
+) -> Result<(usize, LegacyFrame), Error> {
     let header = read_header(src)?;
-    let mut frame = LegacyFrame::new(header, dict, options, decoder)?;
-    let decoder = decoder.as_mut().expect("the frame readied it");
+    let mut frame = LegacyFrame::new(header, dict, options, workspace)?;
     let dict_bytes = dict.content_bytes();
     let mut at = header.size;
     loop {
@@ -845,9 +894,9 @@ fn decode_frame<O: Output>(
         let body = src.get(at..at + block.body_len()).ok_or(Error::Truncated)?;
         if ends_frame(header.version, block) {
             frame.finish(end)?;
-            return Ok(at);
+            return Ok((at, frame));
         }
-        frame.block(decoder, block, body, out, dict_bytes)?;
+        frame.block(workspace, block, body, out, dict_bytes)?;
         at += body.len();
     }
 }
@@ -860,8 +909,8 @@ fn decode_frame<O: Output>(
 pub(crate) struct LegacyStream {
     /// The frame in progress; `None` when no frame is.
     frame: Option<LegacyFrame>,
-    /// The per-format decoder, kept across frames, whole-buffer ones too.
-    decoder: Option<VersionDecoder>,
+    /// What frames decode in, kept across frames, whole-buffer ones too.
+    workspace: Workspace,
     /// The dictionary the frame was started with.
     dict: Option<crate::decoding::DictionaryHandle>,
     /// The window the frame needs.
@@ -895,7 +944,11 @@ impl LegacyStream {
     pub(crate) const fn new() -> LegacyStream {
         LegacyStream {
             frame: None,
-            decoder: None,
+            workspace: Workspace {
+                decoder: None,
+                #[cfg(all(feature = "lsm", feature = "hash"))]
+                block_digests: Vec::new(),
+            },
             dict: None,
             window: 0,
             window_refused_at: None,
@@ -927,7 +980,7 @@ impl LegacyStream {
             header,
             legacy_dict,
             options,
-            &mut self.decoder,
+            &mut self.workspace,
         )?);
         self.dict = dict;
         self.window = header.window;
@@ -959,8 +1012,9 @@ impl LegacyStream {
     }
 
     /// Decode the whole frame starting `src` into `out`, in the stream's
-    /// decoder, leaving any frame the stream had in progress. Returns the
-    /// bytes the frame took.
+    /// workspace, leaving any frame the stream had in progress. The frame
+    /// stays the stream's, finished with all its output handed out, so the
+    /// decoder's accessors describe it. Returns the bytes the frame took.
     pub(crate) fn decode_whole<O: Output>(
         &mut self,
         src: &[u8],
@@ -969,7 +1023,14 @@ impl LegacyStream {
         out: &mut O,
     ) -> Result<usize, Error> {
         self.end();
-        decode_frame(src, dict, options, &mut self.decoder, out)
+        let before = out.produced();
+        let (consumed, frame) = decode_frame(src, dict, options, &mut self.workspace, out)?;
+        self.frame = Some(frame);
+        self.earlier = out.produced() - before;
+        self.previous_end = None;
+        self.finished = true;
+        self.consumed = consumed as u64;
+        Ok(consumed)
     }
 
     /// The content size the frame declares, 0 when it declares none.
@@ -992,6 +1053,12 @@ impl LegacyStream {
     #[cfg(feature = "hash")]
     pub(crate) fn calculated_checksum(&self) -> Option<u32> {
         self.frame.as_ref()?.calculated_checksum
+    }
+
+    /// The frame's per-block digests so far, when they were asked for.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    pub(crate) fn block_digests(&self) -> &[u32] {
+        &self.workspace.block_digests
     }
 
     /// Take a new window ceiling: a frame whose window it no longer admits
@@ -1037,9 +1104,7 @@ impl LegacyStream {
     /// Heap bytes the stream holds: its buffers and the decoder's tables and
     /// literal buffer.
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.buf.capacity()
-            + self.block.capacity()
-            + self.decoder.as_ref().map_or(0, VersionDecoder::heap_bytes)
+        self.buf.capacity() + self.block.capacity() + self.workspace.heap_bytes()
     }
 
     /// How many bytes from the start of `pending` the next step needs: a
@@ -1141,7 +1206,7 @@ impl LegacyStream {
     fn step(&mut self, step: &[u8]) -> Result<(), Error> {
         let LegacyStream {
             frame,
-            decoder,
+            workspace,
             dict,
             window: _,
             window_refused_at: _,
@@ -1156,7 +1221,6 @@ impl LegacyStream {
             block: _,
         } = self;
         let frame = frame.as_mut().ok_or(corrupt("no frame in progress"))?;
-        let decoder = decoder.as_mut().expect("started with the frame");
         let block = Block::read(step)?;
         block.check(frame.version, frame.block_max)?;
         *consumed += step.len() as u64;
@@ -1187,7 +1251,7 @@ impl LegacyStream {
             previous_end: *previous_end,
             capacity: *capacity,
         };
-        let decoded = frame.block(decoder, block, &step[3..], &mut out, dict_bytes);
+        let decoded = frame.block(workspace, block, &step[3..], &mut out, dict_bytes);
         *end = out.end;
         decoded
     }

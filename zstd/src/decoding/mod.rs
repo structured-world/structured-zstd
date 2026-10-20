@@ -211,6 +211,14 @@ pub fn find_decompressed_size(src: &[u8]) -> Result<FrameContentSize, Decompress
     let mut rest = src;
     let mut total: u64 = 0;
     while !rest.is_empty() {
+        // A v0.5-v0.7 frame's size is advisory, so a header too short to read
+        // passes as unknown on its own; here a tail shorter than a frame's
+        // first five bytes is an error, as upstream's `ZSTD_findDecompressedSize`
+        // walks frames only while five remain.
+        #[cfg(feature = "legacy")]
+        if rest.len() < 5 && LegacyVersion::of(rest).is_some() {
+            return Err(DecompressedSizeError::Frame(FrameSizeError::Truncated));
+        }
         match read_frame_content_size(rest) {
             Ok(FrameContentSize::Known(size)) => {
                 total = total

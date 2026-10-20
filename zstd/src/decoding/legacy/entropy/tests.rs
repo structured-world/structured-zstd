@@ -178,3 +178,44 @@ fn four_streams_fill_their_quarters() {
     src.extend_from_slice(&[stream, stream, stream, stream]);
     assert!(table.decode_four_streams(&src, &mut out).is_err());
 }
+
+/// Arbitrary bytes read as FSE or Huffman descriptions, and as Huffman
+/// streams under whatever table they described, are refused or decode, but
+/// never panic or read past their input: the descriptions in a damaged
+/// frame are attacker-chosen.
+#[test]
+fn arbitrary_descriptions_never_panic() {
+    // xorshift64: deterministic, so a failure reproduces.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut table = FseTable::empty();
+    let mut huf = HufTable::empty();
+    for _ in 0..20_000 {
+        let len = (next() % 24) as usize + 1;
+        let src: vec::Vec<u8> = (0..len).map(|_| next() as u8).collect();
+        for max_symbol in [28, 35, 52, 255] {
+            if let Ok((dist, consumed)) = read_distribution(&src, max_symbol) {
+                assert!(consumed <= src.len());
+                // A description may still ask for a table too large to build.
+                let _built = table.build(&dist).is_ok();
+            }
+        }
+        for end in [StreamEnd::PastStart, StreamEnd::Exact] {
+            let Ok(consumed) = huf.read_into(&src, end) else {
+                continue;
+            };
+            assert!(consumed <= src.len());
+            let stream: vec::Vec<u8> = (0..(next() % 16) as usize + 1)
+                .map(|_| next() as u8)
+                .collect();
+            let mut out = vec![0u8; (next() % 32) as usize + 1];
+            let _one = huf.decode_one_stream(&stream, &mut out).is_ok();
+            let _four = huf.decode_four_streams(&stream, &mut out).is_ok();
+        }
+    }
+}

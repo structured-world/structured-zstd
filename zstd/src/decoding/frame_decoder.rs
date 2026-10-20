@@ -1301,6 +1301,8 @@ impl FrameDecoder {
         source: &mut R,
         #[cfg_attr(not(feature = "legacy"), allow(unused_variables))] dicts: &[DictionaryHandle],
     ) -> Result<bool, FrameDecoderError> {
+        // A new header ends any v0.5-v0.7 frame, whether or not it reads.
+        self.end_legacy_frame();
         let magicless = self.magicless;
         let max_window = self.max_window_size;
         let block_limit = self.max_block_size;
@@ -1317,10 +1319,7 @@ impl FrameDecoder {
             }
         };
         match parsed {
-            Ok(()) => {
-                self.end_legacy_frame();
-                Ok(true)
-            }
+            Ok(()) => Ok(true),
             #[cfg(feature = "legacy")]
             Err(FrameDecoderError::ReadFrameHeaderError(
                 crate::decoding::errors::ReadFrameHeaderError::BadMagicNumber(magic),
@@ -1367,6 +1366,8 @@ impl FrameDecoder {
         read_field(fields.dict_id, ReadError::DictionaryIdReadError)?;
         read_field(fields.content_size, ReadError::FrameContentSizeReadError)?;
         let header = legacy::read_header(&bytes[..at])?;
+        #[cfg(feature = "lsm")]
+        self.validate_legacy_expectations(&header, &bytes[..at])?;
         if header.window > self.max_window_size {
             return Err(FrameDecoderError::WindowSizeTooBig {
                 requested: header.window,
@@ -1390,6 +1391,8 @@ impl FrameDecoder {
             #[cfg(feature = "hash")]
             checksum: self.content_checksum,
             block_max: self.max_block_size,
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            block_digests: self.per_block_checksums_enabled,
         }
     }
 
@@ -1466,6 +1469,10 @@ impl FrameDecoder {
     /// Behind `all(feature = "lsm", feature = "hash")`.
     #[cfg(all(feature = "lsm", feature = "hash"))]
     pub fn computed_block_checksums(&self) -> &[u32] {
+        #[cfg(feature = "legacy")]
+        if let Some(stream) = self.legacy_frame() {
+            return stream.block_digests();
+        }
         &self.computed_block_checksums
     }
 
@@ -1547,8 +1554,37 @@ impl FrameDecoder {
         &self,
         frame_header: &frame::FrameHeader,
     ) -> Result<(), FrameDecoderError> {
+        self.validate_pinned_fields(
+            frame_header.dictionary_id(),
+            frame_header.window_descriptor(),
+        )
+    }
+
+    /// [`Self::validate_expectations`] for a v0.5-v0.7 header, whose fields
+    /// are held to the same pins: a v0.7 header carries both, v0.5 and v0.6
+    /// ones neither.
+    #[cfg(all(feature = "lsm", feature = "legacy"))]
+    fn validate_legacy_expectations(
+        &self,
+        header: &decoding::legacy::FrameHeader,
+        header_bytes: &[u8],
+    ) -> Result<(), FrameDecoderError> {
+        self.validate_pinned_fields(
+            header.dictionary_id(),
+            header.window_descriptor(header_bytes),
+        )
+    }
+
+    /// Hold a header's dictionary ID and window descriptor, `None` where it
+    /// carries none, to the pinned expectations.
+    #[cfg(feature = "lsm")]
+    fn validate_pinned_fields(
+        &self,
+        dictionary_id: Option<u32>,
+        window_descriptor: Option<u8>,
+    ) -> Result<(), FrameDecoderError> {
         if let Some(expected) = self.expect_dict_id {
-            let found = frame_header.dictionary_id();
+            let found = dictionary_id;
             // `Some(0)` is the "no dictionary expected" sentinel —
             // matches a frame whose header omits the optional
             // dict_id field (which is reported as `None` by the
@@ -1566,7 +1602,7 @@ impl FrameDecoder {
             }
         }
         if let Some(expected) = self.expect_window_descriptor {
-            let found = frame_header.window_descriptor();
+            let found = window_descriptor;
             if found != Some(expected) {
                 return Err(FrameDecoderError::UnexpectedWindowDescriptor { expected, found });
             }
@@ -4192,48 +4228,46 @@ impl FrameDecoder {
             buf: output,
             pos: 0,
         };
-        let consumed = self
-            .decode_whole_legacy_frame(input, dicts, &mut out)
-            .map_err(|err| match err {
-                FrameDecoderError::LegacyFrame(LegacyFrameError::OutputTooSmall) => {
-                    FrameDecoderError::TargetTooSmall
-                }
-                err => err,
-            })?;
+        let mut stream = self.take_legacy_stream();
+        let decoded = self.decode_whole_legacy_frame(&mut stream, input, dicts, &mut out);
+        self.legacy = Some(stream);
+        let consumed = decoded.map_err(|err| match err {
+            FrameDecoderError::LegacyFrame(LegacyFrameError::OutputTooSmall) => {
+                FrameDecoderError::TargetTooSmall
+            }
+            err => err,
+        })?;
         *input = &input[consumed..];
         Ok(out.pos)
     }
 
+    /// The decoder's v0.5-v0.7 stream, taken out so a whole-buffer decode can
+    /// run in its workspace while dictionaries are borrowed from the decoder;
+    /// the caller puts it back.
+    #[cfg(feature = "legacy")]
+    fn take_legacy_stream(&mut self) -> alloc::boxed::Box<decoding::legacy::LegacyStream> {
+        self.legacy
+            .take()
+            .unwrap_or_else(|| alloc::boxed::Box::new(decoding::legacy::LegacyStream::new()))
+    }
+
     /// Decode the v0.5-v0.7 frame starting `input` into `out`, with the
-    /// dictionary [`Self::legacy_frame_dict`] picks from `dicts`, in the
-    /// stream's decoder so its tables are reused from frame to frame.
+    /// dictionary [`Self::legacy_frame_dict`] picks from `dicts`, in
+    /// `stream`'s workspace so its tables are reused from frame to frame.
     /// Returns the bytes the frame took.
     #[cfg(feature = "legacy")]
     fn decode_whole_legacy_frame<O: decoding::legacy::Output>(
-        &mut self,
+        &self,
+        stream: &mut decoding::legacy::LegacyStream,
         input: &[u8],
         dicts: &[DictionaryHandle],
         out: &mut O,
     ) -> Result<usize, FrameDecoderError> {
-        use crate::decoding::legacy::{self, LegacyStream};
-        // Taken out while the dictionary is borrowed from the decoder.
-        let mut stream = self
-            .legacy
-            .take()
-            .unwrap_or_else(|| alloc::boxed::Box::new(LegacyStream::new()));
-        let decoded = legacy::read_header(input)
-            .map_err(FrameDecoderError::from)
-            .and_then(|header| self.legacy_frame_dict(header.dict_id, dicts))
-            .and_then(|dict| {
-                Ok(stream.decode_whole(
-                    input,
-                    legacy_dict(dict),
-                    self.legacy_frame_options(),
-                    out,
-                )?)
-            });
-        self.legacy = Some(stream);
-        decoded
+        let header = decoding::legacy::read_header(input)?;
+        #[cfg(feature = "lsm")]
+        self.validate_legacy_expectations(&header, input)?;
+        let dict = self.legacy_frame_dict(header.dict_id, dicts)?;
+        Ok(stream.decode_whole(input, legacy_dict(dict), self.legacy_frame_options(), out)?)
     }
 
     /// Decode the v0.5-v0.7 frame starting `*input`, appending to `output`
@@ -4247,25 +4281,20 @@ impl FrameDecoder {
         keep_dictionary: bool,
     ) -> Result<(), FrameDecoderError> {
         use crate::decoding::legacy::VecOutput;
-        // A handle count per frame: the held dictionary is borrowed from the
-        // decoder, which the decode borrows mutably.
+        let mut stream = self.take_legacy_stream();
         let held = if keep_dictionary {
             self.state
                 .as_ref()
                 .and_then(|state| state.active_dict.as_ref())
                 .or(self.armed_dict.as_ref())
-                .cloned()
         } else {
             None
         };
-        let dicts = held.as_slice();
+        let dicts = held.map_or(&[][..], core::slice::from_ref);
         let start = output.len();
-        let mut out = VecOutput {
-            buf: output,
-            start,
-            limit: usize::MAX,
-        };
-        let decoded = self.decode_whole_legacy_frame(input, dicts, &mut out);
+        let mut out = VecOutput { buf: output, start };
+        let decoded = self.decode_whole_legacy_frame(&mut stream, input, dicts, &mut out);
+        self.legacy = Some(stream);
         match decoded {
             Ok(consumed) => {
                 *input = &input[consumed..];

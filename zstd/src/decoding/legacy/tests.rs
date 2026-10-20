@@ -93,7 +93,12 @@ mod fixtures {
 use fixtures::all as fixtures;
 
 fn decode_to_vec(frame: &[u8], dict: LegacyDict<'_>) -> Result<(Vec<u8>, usize), Error> {
-    decode_to_vec_in(frame, dict, FrameOptions::default(), &mut None)
+    decode_to_vec_in(
+        frame,
+        dict,
+        FrameOptions::default(),
+        &mut Workspace::default(),
+    )
 }
 
 /// [`decode_to_vec`] refusing a frame whose content checksum does not match.
@@ -103,24 +108,23 @@ fn decode_verified(frame: &[u8], dict: LegacyDict<'_>) -> Result<(Vec<u8>, usize
         checksum: crate::decoding::ContentChecksum::Verify,
         ..FrameOptions::default()
     };
-    decode_to_vec_in(frame, dict, options, &mut None)
+    decode_to_vec_in(frame, dict, options, &mut Workspace::default())
 }
 
-/// [`decode_to_vec`] with `options`, in `decoder`, the storage an earlier
+/// [`decode_to_vec`] with `options`, in `workspace`, the storage an earlier
 /// frame left.
 fn decode_to_vec_in(
     frame: &[u8],
     dict: LegacyDict<'_>,
     options: FrameOptions,
-    decoder: &mut Option<VersionDecoder>,
+    workspace: &mut Workspace,
 ) -> Result<(Vec<u8>, usize), Error> {
     let mut buf = Vec::new();
     let mut out = VecOutput {
         buf: &mut buf,
         start: 0,
-        limit: usize::MAX,
     };
-    let consumed = decode_frame(frame, dict, options, decoder, &mut out)?;
+    let (consumed, _) = decode_frame(frame, dict, options, workspace, &mut out)?;
     Ok((buf, consumed))
 }
 
@@ -130,7 +134,7 @@ fn decode_to_vec_in(
 #[cfg(feature = "std")]
 #[test]
 fn fixtures_decode_to_their_content() {
-    let mut reused = None;
+    let mut reused = Workspace::default();
     for fixture in fixtures() {
         assert_eq!(
             LegacyVersion::of(&fixture.frame),
@@ -138,12 +142,12 @@ fn fixtures_decode_to_their_content() {
             "{}",
             fixture.name
         );
-        for decoder in [&mut None, &mut reused] {
+        for workspace in [&mut Workspace::default(), &mut reused] {
             let (decoded, consumed) = decode_to_vec_in(
                 &fixture.frame,
                 fixture.legacy_dict(),
                 FrameOptions::default(),
-                decoder,
+                workspace,
             )
             .unwrap_or_else(|err| panic!("{}: {err}", fixture.name));
             assert_eq!(consumed, fixture.frame.len(), "{}", fixture.name);
@@ -172,7 +176,7 @@ fn fixtures_decode_into_a_slice() {
             &fixture.frame,
             dict,
             FrameOptions::default(),
-            &mut None,
+            &mut Workspace::default(),
             &mut out,
         )
         .unwrap_or_else(|err| panic!("{}: {err}", fixture.name));
@@ -185,15 +189,17 @@ fn fixtures_decode_into_a_slice() {
                 buf: &mut buf,
                 pos: 0,
             };
-            assert_eq!(
-                decode_frame(
-                    &fixture.frame,
-                    dict,
-                    FrameOptions::default(),
-                    &mut None,
-                    &mut out
+            assert!(
+                matches!(
+                    decode_frame(
+                        &fixture.frame,
+                        dict,
+                        FrameOptions::default(),
+                        &mut Workspace::default(),
+                        &mut out
+                    ),
+                    Err(Error::OutputTooSmall)
                 ),
-                Err(Error::OutputTooSmall),
                 "{}",
                 fixture.name
             );
@@ -971,6 +977,14 @@ fn a_lowered_window_ceiling_binds_a_started_frame() {
         .decode_blocks(&mut src, BlockDecodingStrategy::All)
         .unwrap();
     assert!(decoder.collect().unwrap() == fixture.content);
+
+    // A ceiling below the window refuses the frame from its header.
+    decoder.set_max_window_size(window / 2).unwrap();
+    assert!(matches!(
+        decoder.reset(&fixture.frame[..]),
+        Err(FrameDecoderError::WindowSizeTooBig { requested, limit })
+            if requested == window && limit == window / 2
+    ));
 }
 
 /// The decoder's accessors describe a started frame of these formats: its
@@ -1006,12 +1020,211 @@ fn the_accessors_describe_these_frames() {
         decoder.blocks_decoded() as u64,
         bound / BLOCK_SIZE_MAX as u64
     );
+    // The stream's buffers, past a block of output, count toward the
+    // decoder's footprint.
+    assert!(decoder.workspace_size() > BLOCK_SIZE_MAX);
 
     // v0.5 declares none.
     let v05 = fixture("abc.txt.v05.l1.zst");
     let mut src = &v05.frame[..];
     decoder.reset(&mut src).unwrap();
     assert_eq!(decoder.content_size(), 0);
+}
+
+/// Each failure carries the code libzstd returns for it, and keeps that code,
+/// its message and itself as the source when the frame decoder wraps it.
+#[cfg(feature = "std")]
+#[test]
+fn errors_report_libzstd_codes() {
+    use crate::decoding::errors::{ErrorCode, FrameDecoderError};
+    use std::error::Error as _;
+    use std::string::ToString;
+    let cases = [
+        (
+            Error::Truncated,
+            ErrorCode::CorruptionDetected,
+            "ends inside",
+        ),
+        (
+            Error::UnsupportedParameter,
+            ErrorCode::FrameParameterUnsupported,
+            "unsupported setting",
+        ),
+        (
+            Error::Corrupted {
+                reason: "bad table",
+            },
+            ErrorCode::CorruptionDetected,
+            "bad table",
+        ),
+        (
+            Error::OutputTooSmall,
+            ErrorCode::DstSizeTooSmall,
+            "too small",
+        ),
+        (
+            Error::DictionaryCorrupted,
+            ErrorCode::DictionaryCorrupted,
+            "dictionary could not be read",
+        ),
+        (
+            Error::DictionaryMismatch {
+                expected: 0xAB,
+                provided: 0,
+            },
+            ErrorCode::DictionaryWrong,
+            "dictionary 0xAB",
+        ),
+        (
+            Error::ChecksumMismatch {
+                expected: 1,
+                calculated: 2,
+            },
+            ErrorCode::ChecksumWrong,
+            "0x000001",
+        ),
+    ];
+    for (err, code, text) in cases {
+        assert_eq!(err.code(), code, "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains(text), "{message}");
+        let wrapped = FrameDecoderError::from(err);
+        assert_eq!(wrapped.code(), code);
+        assert_eq!(wrapped.to_string(), message);
+        assert!(
+            wrapped
+                .source()
+                .is_some_and(|source| source.to_string() == message)
+        );
+    }
+}
+
+/// After `decode_all` the accessors describe the frame it decoded last, as
+/// they do an RFC 8878 one, not the frame decoded before it.
+#[cfg(feature = "std")]
+#[test]
+fn the_accessors_describe_a_frame_decoded_whole() {
+    use crate::decoding::FrameDecoder;
+    let rfc = crate::encoding::compress_slice_to_vec(
+        &[7u8; 500],
+        crate::encoding::CompressionLevel::Fastest,
+    );
+    let v06 = fixture("z000000.v06.l1.zst");
+    let mut decoder = FrameDecoder::new();
+    let mut out = vec![0u8; v06.content.len()];
+    decoder.decode_all(&rfc, &mut out).unwrap();
+    assert_eq!(decoder.content_size(), 500);
+
+    assert_eq!(
+        decoder.decode_all(&v06.frame, &mut out).unwrap(),
+        v06.content.len()
+    );
+    let (_, bound) = frame_size(LegacyVersion::V06, &v06.frame).unwrap();
+    assert_eq!(decoder.content_size(), 128 * 1024);
+    assert_eq!(
+        decoder.blocks_decoded() as u64,
+        bound / BLOCK_SIZE_MAX as u64
+    );
+    assert_eq!(decoder.bytes_read_from_source(), v06.frame.len() as u64);
+    assert!(decoder.is_finished());
+    assert_eq!(decoder.can_collect(), 0);
+
+    #[cfg(feature = "hash")]
+    {
+        let v07 = fixture("abc.txt.v07.l1.zst");
+        let end = &v07.frame[v07.frame.len() - 3..];
+        let stored = u32::from(end[2]) | u32::from(end[1]) << 8 | u32::from(end[0] & 0x3F) << 16;
+        decoder.decode_all(&v07.frame, &mut out).unwrap();
+        assert_eq!(decoder.get_checksum_from_data(), Some(stored));
+        assert_eq!(decoder.get_calculated_checksum(), Some(stored));
+    }
+}
+
+/// Per-block checksums cover these frames' blocks on every path, as they
+/// cover an RFC 8878 frame's.
+#[cfg(all(feature = "std", feature = "lsm", feature = "hash"))]
+#[test]
+fn per_block_checksums_cover_these_frames() {
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
+    // One data block: its digest is the content's.
+    let one = fixture("abc.txt.v07.l1.zst");
+    let digest = twox_hash::XxHash64::oneshot(0, &one.content) as u32;
+    let many = fixture("z000000.v07.l1.zst");
+    let (_, bound) = frame_size(LegacyVersion::V07, &many.frame).unwrap();
+    let blocks = (bound / BLOCK_SIZE_MAX as u64) as usize;
+
+    let mut decoder = FrameDecoder::new();
+    decoder.enable_per_block_checksums();
+    let mut out = vec![0u8; many.content.len()];
+    decoder.decode_all(&one.frame, &mut out).unwrap();
+    assert_eq!(decoder.computed_block_checksums(), [digest]);
+    decoder.decode_all(&many.frame, &mut out).unwrap();
+    assert_eq!(decoder.computed_block_checksums().len(), blocks);
+
+    let mut src = &one.frame[..];
+    decoder.reset(&mut src).unwrap();
+    decoder
+        .decode_blocks(&mut src, BlockDecodingStrategy::All)
+        .unwrap();
+    assert_eq!(decoder.computed_block_checksums(), [digest]);
+}
+
+/// A pinned dictionary ID or window descriptor holds these frames to it, on
+/// both paths: v0.7 carries both fields, v0.5 and v0.6 neither.
+#[cfg(all(feature = "std", feature = "lsm"))]
+#[test]
+fn pinned_header_fields_bind_these_frames() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::errors::FrameDecoderError;
+    let v07 = fixture("z000000x8.v07.l1.zst");
+    // Not single-segment: the window byte follows the descriptor.
+    assert_eq!(v07.frame[4] & 0x20, 0);
+    let window = v07.frame[5];
+    let v05 = fixture("abc.txt.v05.l1.zst");
+    let mut out = vec![0u8; v07.content.len()];
+
+    let mut decoder = FrameDecoder::new();
+    decoder.expect_dict_id(Some(5));
+    assert!(matches!(
+        decoder.decode_all(&v07.frame, &mut out),
+        Err(FrameDecoderError::UnexpectedDictId {
+            expected: Some(5),
+            found: None
+        })
+    ));
+    assert!(matches!(
+        decoder.reset(&v07.frame[..]),
+        Err(FrameDecoderError::UnexpectedDictId { .. })
+    ));
+    decoder.expect_dict_id(Some(0));
+    decoder.expect_window_descriptor(Some(window ^ 1));
+    assert!(matches!(
+        decoder.decode_all(&v07.frame, &mut out),
+        Err(FrameDecoderError::UnexpectedWindowDescriptor { found: Some(w), .. }) if w == window
+    ));
+    assert!(matches!(
+        decoder.reset(&v05.frame[..]),
+        Err(FrameDecoderError::UnexpectedWindowDescriptor { found: None, .. })
+    ));
+    decoder.expect_window_descriptor(Some(window));
+    assert_eq!(
+        decoder.decode_all(&v07.frame, &mut out).unwrap(),
+        v07.content.len()
+    );
+}
+
+/// A v0.5-v0.7 magic number with nothing after it is a truncated frame to
+/// the aggregate size query, as upstream's `ZSTD_findDecompressedSize`
+/// refuses a tail shorter than a frame's first five bytes.
+#[cfg(feature = "std")]
+#[test]
+fn a_bare_magic_number_is_a_truncated_frame() {
+    use crate::decoding::find_decompressed_size;
+    let magic = [0x27, 0xB5, 0x2F, 0xFD];
+    assert!(find_decompressed_size(&magic).is_err());
+    let mut stream = fixture("z000000.v07.l1.zst").frame;
+    stream.extend_from_slice(&magic);
+    assert!(find_decompressed_size(&stream).is_err());
 }
 
 /// A reader failing after the magic number hands its own error back, in the
@@ -1057,6 +1270,18 @@ fn reader_errors_inside_the_header_are_kept() {
         ),
         "{err:?}"
     );
+    // v0.7 with its window byte read and a one-byte dictionary ID to come.
+    let err = decoder
+        .reset(Stalls(&[0x27, 0xB5, 0x2F, 0xFD, 0x01, 0x00]))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::DictionaryIdReadError(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "{err:?}"
+    );
     // v0.6 with a two-byte content size still to come.
     let err = decoder
         .reset(Stalls(&[0x26, 0xB5, 0x2F, 0xFD, 0x80, 1]))
@@ -1076,20 +1301,26 @@ fn reader_errors_inside_the_header_are_kept() {
 #[cfg(feature = "std")]
 #[test]
 fn the_stream_footprint_counts_its_tables() {
-    let fixture = fixture("z000000.v07.l1.zst");
-    let header = read_header(&fixture.frame).unwrap();
-    let mut stream = LegacyStream::new();
-    stream.start(header, None, FrameOptions::default()).unwrap();
-    let mut target = vec![0u8; fixture.content.len()];
-    stream
-        .decode(&fixture.frame[header.size..], &mut target)
-        .unwrap();
-    assert!(
-        stream.heap_bytes() > stream.buf.capacity() + stream.block.capacity(),
-        "{} bytes held, {} of them the output buffer",
-        stream.heap_bytes(),
-        stream.buf.capacity()
-    );
+    for name in [
+        "z000000.v05.l1.zst",
+        "z000000.v06.l1.zst",
+        "z000000.v07.l1.zst",
+    ] {
+        let fixture = fixture(name);
+        let header = read_header(&fixture.frame).unwrap();
+        let mut stream = LegacyStream::new();
+        stream.start(header, None, FrameOptions::default()).unwrap();
+        let mut target = vec![0u8; fixture.content.len()];
+        stream
+            .decode(&fixture.frame[header.size..], &mut target)
+            .unwrap();
+        assert!(
+            stream.heap_bytes() > stream.buf.capacity() + stream.block.capacity(),
+            "{name}: {} bytes held, {} of them the output buffer",
+            stream.heap_bytes(),
+            stream.buf.capacity()
+        );
+    }
 }
 
 /// A block whose header declares more than the largest block is refused from
@@ -1101,11 +1332,285 @@ fn an_oversized_block_is_refused_from_its_header() {
     let header = read_header(&frame).unwrap();
     let mut stream = LegacyStream::new();
     stream.start(header, None, FrameOptions::default()).unwrap();
+    // Less than a block header asks for the header.
+    assert_eq!(stream.input_needed(&[0x40]), 3);
     // A raw block of 0x3FFFF bytes, compressed and raw alike.
     for kind in [0x00u8, 0x40] {
         let block = [kind | 0x03, 0xFF, 0xFF];
         assert_eq!(stream.input_needed(&block), 3);
         assert!(stream.decode(&block, &mut [0u8; 16]).is_err());
+    }
+}
+
+/// A v0.7 block whose sequence tables are each one symbol decodes, and one
+/// naming a symbol past its field is refused.
+#[test]
+fn one_symbol_sequence_tables_decode_in_v07() {
+    // Raw literals "a"; one sequence; every table one symbol: literal length
+    // code 1, offset code 2 (two extra bits, here 0, so offset 1), match
+    // length code 0 (3 bytes). The bitstream holds those two bits under its
+    // end mark.
+    let block = [0x81, b'a', 0x01, 0x54, 1, 2, 0, 0x04];
+    let mut frame = vec![0x27, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x00, 0x00];
+    frame.push(block.len() as u8);
+    frame.extend_from_slice(&block);
+    frame.extend_from_slice(&[0xC0, 0, 0]);
+    assert_eq!(decode_to_vec(&frame, LegacyDict::None).unwrap().0, b"aaaa");
+    // A match length symbol past the field's largest.
+    let at = frame.len() - 4;
+    frame[at - 1] = 200;
+    assert!(matches!(
+        decode_to_vec(&frame, LegacyDict::None),
+        Err(Error::Corrupted { .. })
+    ));
+}
+
+/// A sequence count takes one byte below 0x80, two up to 0x7EFF, and three
+/// after a 0xFF where the format allows them.
+#[test]
+fn sequence_counts_take_their_forms() {
+    assert_eq!(v07::sequence_count(&[0x7F], true).unwrap(), (0x7F, 1));
+    assert_eq!(
+        v07::sequence_count(&[0x81, 0x02], true).unwrap(),
+        (0x102, 2)
+    );
+    assert_eq!(
+        v07::sequence_count(&[0xFF, 0x01, 0x00], true).unwrap(),
+        (0x7F01, 3)
+    );
+    assert_eq!(
+        v07::sequence_count(&[0xFF, 0x01], false).unwrap(),
+        (0x7F01, 2)
+    );
+    assert!(v07::sequence_count(&[], true).is_err());
+    assert!(v07::sequence_count(&[0xFF, 0x01], true).is_err());
+    assert!(v07::sequence_count(&[0x80], true).is_err());
+}
+
+/// The version queries: each format's minor version, and a header's length
+/// from its size fields once the descriptor is in hand.
+#[test]
+fn versions_answer_their_queries() {
+    assert_eq!(LegacyVersion::V05.minor(), 5);
+    assert_eq!(LegacyVersion::V06.minor(), 6);
+    assert_eq!(LegacyVersion::V07.minor(), 7);
+    let v05 = [0x25, 0xB5, 0x2F, 0xFD, 0x01];
+    assert_eq!(LegacyVersion::V05.header_size(&v05[..4]), None);
+    assert_eq!(LegacyVersion::V05.header_size(&v05), Some(5));
+    // v0.6 with a two-byte content size.
+    assert_eq!(
+        LegacyVersion::V06.header_size(&[0x26, 0xB5, 0x2F, 0xFD, 0x80]),
+        Some(7)
+    );
+    // v0.7, single-segment with an eight-byte content size and a four-byte
+    // dictionary ID.
+    assert_eq!(
+        LegacyVersion::V07.header_size(&[0x27, 0xB5, 0x2F, 0xFD, 0xE3]),
+        Some(17)
+    );
+}
+
+/// A literal section header the block cannot hold, or one past the largest
+/// block, is refused before anything decodes.
+#[test]
+fn literal_headers_refuse_what_does_not_fit() {
+    for header in [
+        // Huffman literals with less than their five-byte minimum.
+        &[0x00, 0, 0, 0][..],
+        // Huffman literals declaring more than a block.
+        &[0x3F, 0xFF, 0xFC, 0, 0, 0],
+        // Huffman literals running past the block.
+        &[0x00, 0x04, 0xFF, 0, 0],
+        // Repeated-table literals in a form other than the small one.
+        &[0x40, 0, 0],
+        // Repeated-table literals running past the block.
+        &[0x50, 0x03, 0xFF],
+        // Raw literals running past the block.
+        &[0x9F, 0, 0],
+        // A run with a three-byte header and nothing after it.
+        &[0xF0, 0, 0],
+        // A run longer than a block.
+        &[0xFF, 0xFF, 0xFF, 0],
+        // Less than any literal section.
+        &[0x80, 0],
+    ] {
+        assert!(
+            matches!(Literals::read(header), Err(Error::Corrupted { .. })),
+            "{header:02X?}"
+        );
+    }
+}
+
+/// A block's budget passes everything but its size check to the output it
+/// guards.
+#[cfg(feature = "hash")]
+#[test]
+fn a_budget_passes_through_to_its_output() {
+    let mut buf = Vec::new();
+    let mut inner = VecOutput {
+        buf: &mut buf,
+        start: 0,
+    };
+    let mut out = Budget {
+        out: &mut inner,
+        end: 8,
+    };
+    out.reserve(2).unwrap();
+    out.extend(b"ab");
+    out.repeat(b'c', 2);
+    out.copy_back(4, 2);
+    assert_eq!((out.produced(), out.held()), (6, 6));
+    assert_eq!(out.since(2), b"ccab");
+    assert!(out.reserve(3).is_err());
+    out.copy_match(1, 2, &[]).unwrap();
+    assert_eq!(buf, b"abccabbb");
+}
+
+/// The size walk refuses a frame cut inside a block's body.
+#[cfg(feature = "std")]
+#[test]
+fn frame_size_refuses_a_cut_block() {
+    let fixture = fixture("z000000.v07.l1.zst");
+    let frame = &fixture.frame[..fixture.frame.len() - 10];
+    assert_eq!(frame_size(LegacyVersion::V07, frame), None);
+}
+
+/// An RLE block decodes into a caller's slice and through a stream as it
+/// does into a vector.
+#[cfg(feature = "std")]
+#[test]
+fn rle_blocks_decode_on_every_path() {
+    use crate::decoding::FrameDecoder;
+    let frame = [
+        0x27, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x80, 0, 5, b'z', 0xC0, 0, 0,
+    ];
+    let mut out = [0u8; 5];
+    assert_eq!(FrameDecoder::new().decode_all(&frame, &mut out).unwrap(), 5);
+    assert_eq!(&out, b"zzzzz");
+    let mut decoder = FrameDecoder::new();
+    let mut target = [0u8; 8];
+    let (read, written) = decoder.decode_from_to(&frame, &mut target).unwrap();
+    assert_eq!((read, &target[..written]), (frame.len(), &b"zzzzz"[..]));
+}
+
+/// A `Read` source failing inside a block hands back its own error, in the
+/// block header or the body it failed in.
+#[cfg(feature = "std")]
+#[test]
+fn reader_errors_inside_a_block_are_kept() {
+    use crate::decoding::errors::FrameDecoderError;
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
+    let fixture = fixture("z000000.v07.l1.zst");
+    let header = read_header(&fixture.frame).unwrap();
+    for (cut, header_error) in [(header.size + 1, true), (header.size + 4, false)] {
+        let mut decoder = FrameDecoder::new();
+        let mut src = &fixture.frame[..cut];
+        decoder.reset(&mut src).unwrap();
+        let err = decoder
+            .decode_blocks(&mut src, BlockDecodingStrategy::All)
+            .unwrap_err();
+        if header_error {
+            assert!(
+                matches!(err, FrameDecoderError::FailedToReadBlockHeader(_)),
+                "{err:?}"
+            );
+        } else {
+            assert!(
+                matches!(err, FrameDecoderError::FailedToReadBlockBody(_)),
+                "{err:?}"
+            );
+        }
+    }
+}
+
+/// `read_to_end` over an RFC 8878 frame and then a v0.7 one decodes both
+/// with the dictionary the reader was forced to, and hands out nothing of a
+/// v0.7 frame that fails.
+#[cfg(feature = "std")]
+#[test]
+fn read_to_end_keeps_a_forced_dictionary_for_these_frames() {
+    use crate::decoding::{DictionaryHandle, StreamingDecoder};
+    use std::io::Read;
+    let v07 = fixture("ModemManager.service.v07.dict.zst");
+    let dict =
+        DictionaryHandle::from_serialized_or_raw_content(v07.dict.as_deref().unwrap()).unwrap();
+    let leading = b"a leading frame";
+    let mut input =
+        crate::encoding::compress_slice_to_vec(leading, crate::encoding::CompressionLevel::Fastest);
+    let rfc_len = input.len();
+    input.extend_from_slice(&v07.frame);
+    let mut out = Vec::new();
+    StreamingDecoder::new_with_dictionary_handle(&input[..], &dict)
+        .unwrap()
+        .read_to_end(&mut out)
+        .unwrap();
+    let mut expected = leading.to_vec();
+    expected.extend_from_slice(&v07.content);
+    assert!(out == expected);
+
+    // The v0.7 frame cut short: its bytes are not handed out.
+    let cut = &input[..input.len() - 1];
+    assert!(cut.len() > rfc_len);
+    let mut out = Vec::new();
+    assert!(
+        StreamingDecoder::new_with_dictionary_handle(cut, &dict)
+            .unwrap()
+            .read_to_end(&mut out)
+            .is_err()
+    );
+    assert_eq!(out, leading);
+}
+
+/// Output a caller does not collect stays in the buffer however far past the
+/// window it grows, and all of it is handed out once collected.
+#[cfg(feature = "std")]
+#[test]
+fn output_held_back_grows_the_buffer() {
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
+    let fixture = fixture("z000000x8.v07.l1.zst");
+    let mut decoder = FrameDecoder::new();
+    let mut src = &fixture.frame[..];
+    decoder.reset(&mut src).unwrap();
+    decoder
+        .decode_blocks(&mut src, BlockDecodingStrategy::All)
+        .unwrap();
+    assert!(decoder.collect().unwrap() == fixture.content);
+}
+
+/// Damaged frames are refused or decode to some output, but never panic,
+/// wherever the damage lands: random bytes overwritten, through every format
+/// and both decoding paths.
+#[cfg(feature = "std")]
+#[test]
+fn overwritten_bytes_never_panic() {
+    use crate::decoding::FrameDecoder;
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for fixture in fixtures().into_iter().filter(|f| f.frame.len() < 16384) {
+        let dict = fixture.legacy_dict();
+        let header = read_header(&fixture.frame).unwrap().size;
+        for _ in 0..64 {
+            let mut frame = fixture.frame.clone();
+            for _ in 0..(next() % 4) + 1 {
+                let at = header + (next() as usize) % (frame.len() - header);
+                frame[at] = next() as u8;
+            }
+            let _whole = decode_verified(&frame, dict).is_ok();
+            let mut decoder = FrameDecoder::new();
+            let mut target = vec![0u8; 4096];
+            let mut src = &frame[..];
+            while let Ok((read, written)) = decoder.decode_from_to(src, &mut target) {
+                if read == 0 && written == 0 {
+                    break;
+                }
+                src = &src[read..];
+            }
+        }
     }
 }
 
