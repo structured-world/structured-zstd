@@ -495,20 +495,35 @@ impl Output for VecOutput<'_> {
     }
 
     fn copy_back(&mut self, offset: usize, len: usize) {
+        // A match longer than its offset repeats the bytes it has just
+        // written: each piece copies everything from `from` on, so the
+        // pieces double until the match is whole.
         let from = self.buf.len() - offset;
-        if offset >= len {
-            self.buf.extend_from_within(from..from + len);
-        } else {
-            for i in 0..len {
-                let byte = self.buf[from + i];
-                self.buf.push(byte);
-            }
+        let mut left = len;
+        while left > 0 {
+            let piece = left.min(self.buf.len() - from);
+            self.buf.extend_from_within(from..from + piece);
+            left -= piece;
         }
     }
 
     #[cfg(feature = "hash")]
     fn since(&self, from: usize) -> &[u8] {
         &self.buf[self.start + from..]
+    }
+}
+
+/// Copy `len` bytes from `from` to `to` within `buf`, `from < to`. The source
+/// may run into the bytes being written, a match longer than its offset: the
+/// first `to - from` bytes repeat, copied in pieces that double as what is
+/// written becomes source, so no piece overlaps its own destination.
+fn copy_repeating(buf: &mut [u8], from: usize, to: usize, len: usize) {
+    debug_assert!(from < to);
+    let mut done = 0;
+    while done < len {
+        let piece = (to + done - from).min(len - done);
+        buf.copy_within(from..from + piece, to + done);
+        done += piece;
     }
 }
 
@@ -545,14 +560,7 @@ impl Output for SliceOutput<'_> {
     }
 
     fn copy_back(&mut self, offset: usize, len: usize) {
-        let from = self.pos - offset;
-        if offset >= len {
-            self.buf.copy_within(from..from + len, self.pos);
-        } else {
-            for i in 0..len {
-                self.buf[self.pos + i] = self.buf[from + i];
-            }
-        }
+        copy_repeating(self.buf, self.pos - offset, self.pos, len);
         self.pos += len;
     }
 
@@ -1595,13 +1603,7 @@ impl Output for SegmentOutput<'_> {
     fn copy_back(&mut self, offset: usize, len: usize) {
         let from = self.end - offset;
         let at = self.room(len);
-        if offset >= len {
-            self.buf.copy_within(from..from + len, at.start);
-        } else {
-            for i in 0..len {
-                self.buf[at.start + i] = self.buf[from + i];
-            }
-        }
+        copy_repeating(self.buf, from, at.start, len);
         self.end += len;
     }
 

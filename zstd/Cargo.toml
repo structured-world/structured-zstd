@@ -263,6 +263,11 @@ name = "workspace_decode_loop"
 path = "examples/workspace_decode_loop.rs"
 required-features = ["caller-workspace", "std"]
 
+[[example]]
+name = "legacy_decode_loop"
+path = "examples/legacy_decode_loop.rs"
+required-features = ["legacy", "std"]
+
 # All benches, integration tests, and FFI diagnostic examples are targets of
 # the non-published `ffi-bench` crate (they link the C `zstd` bindings); their
 # source files remain under `benches/`, `tests/`, and `examples/` here and are
