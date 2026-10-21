@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/structured-world/structured-zstd/compare/v0.2.3...v0.2.4) - 2026-10-21
+
+### Added
+
+- *(decoding)* decode the v0.5, v0.6 and v0.7 frame formats ([#616](https://github.com/structured-world/structured-zstd/pull/616))
+
+### Performance
+
+- *(encode)* reuse the match tables when a compressor's dictionary changes ([#618](https://github.com/structured-world/structured-zstd/pull/618))
+
 ## [0.2.3](https://github.com/structured-world/structured-zstd/compare/v0.2.2...v0.2.3) - 2026-10-19
 
 ### Added
