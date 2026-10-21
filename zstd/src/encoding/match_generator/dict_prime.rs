@@ -543,7 +543,9 @@ impl MatchGeneratorDriver {
         } else {
             // Into the buffers of the snapshot it replaces, or of the one a
             // dictionary change set aside, where the backend copies in place;
-            // a fresh clone otherwise.
+            // a fresh clone otherwise. The fast backend's `clone_from` costs
+            // more instructions than its clone (a level-1 dictionary-swap loop
+            // retired 1.2% more), so it clones.
             let replaced = self
                 .primed
                 .take()
@@ -558,10 +560,6 @@ impl MatchGeneratorDriver {
                     snapshot.restore_snapshot(live);
                     MatcherStorage::Row(snapshot)
                 }
-                (Some(MatcherStorage::Simple(mut snapshot)), MatcherStorage::Simple(live)) => {
-                    snapshot.clone_from(live);
-                    MatcherStorage::Simple(snapshot)
-                }
                 (_, live) => live.clone(),
             };
             self.primed = Some((snapshot, self.dictionary_retained_budget, key));
@@ -570,9 +568,11 @@ impl MatchGeneratorDriver {
 
     pub(super) fn invalidate_primed_dictionary_impl(&mut self) {
         // The snapshot belongs to the dictionary being replaced; its buffers
-        // stay for the next one's.
+        // stay for the next one's where the capture copies into them.
         if let Some((storage, ..)) = self.primed.take() {
-            self.primed_spare = Some(storage);
+            self.primed_spare =
+                matches!(storage, MatcherStorage::Dfast(_) | MatcherStorage::Row(_))
+                    .then_some(storage);
         }
         // Drop the Fast-backend CDict-equivalent table cache too: it is keyed
         // to the dictionary being removed / replaced. Left in place, the next
