@@ -432,7 +432,7 @@ impl Decoder {
                     lit_len,
                     match_len,
                     offset,
-                    dict,
+                    &dict,
                 )?;
             }
             self.reps = reps;

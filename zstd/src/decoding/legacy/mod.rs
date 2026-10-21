@@ -471,7 +471,7 @@ pub(crate) trait Output {
     /// Append a match of `len` bytes from `offset` back. An output holding
     /// the whole frame takes it from the frame, the dictionary in front of
     /// it, or both ([`copy_match`]); the room for `len` bytes is reserved.
-    fn copy_match(&mut self, offset: usize, len: usize, dict: History<'_>) -> Result<(), Error>
+    fn copy_match(&mut self, offset: usize, len: usize, dict: &History<'_>) -> Result<(), Error>
     where
         Self: Sized,
     {
@@ -598,7 +598,7 @@ fn copy_match<O: Output>(
     out: &mut O,
     offset: usize,
     len: usize,
-    dict: History<'_>,
+    dict: &History<'_>,
 ) -> Result<(), Error> {
     // An output that drops older bytes reads matches through its own
     // `Output::copy_match`.
@@ -636,7 +636,7 @@ fn execute<O: Output>(
     lit_len: usize,
     match_len: usize,
     offset: usize,
-    dict: History<'_>,
+    dict: &History<'_>,
 ) -> Result<(), Error> {
     out.reserve(
         lit_len
@@ -881,7 +881,7 @@ impl<O: Output> Output for Budget<'_, O> {
     fn since(&self, from: usize) -> &[u8] {
         self.out.since(from)
     }
-    fn copy_match(&mut self, offset: usize, len: usize, dict: History<'_>) -> Result<(), Error> {
+    fn copy_match(&mut self, offset: usize, len: usize, dict: &History<'_>) -> Result<(), Error> {
         self.out.copy_match(offset, len, dict)
     }
 }
@@ -1634,7 +1634,7 @@ impl Output for SegmentOutput<'_> {
         &self.buf[self.end - (self.produced() - from)..self.end]
     }
 
-    fn copy_match(&mut self, offset: usize, len: usize, dict: History<'_>) -> Result<(), Error> {
+    fn copy_match(&mut self, offset: usize, len: usize, dict: &History<'_>) -> Result<(), Error> {
         let Some(previous_end) = self.previous_end else {
             // One segment so far: it holds the whole frame.
             return copy_match(self, offset, len, dict);

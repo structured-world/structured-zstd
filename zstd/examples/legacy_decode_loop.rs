@@ -2,7 +2,7 @@
 //! legacy decoders on a frame an old release wrote.
 //!
 //! Build: cargo build --profile bench -p structured-zstd --example legacy_decode_loop
-//! Run:   target/bench/examples/legacy_decode_loop <frame> <iters> [whole|stream]
+//! Run:   target/release/examples/legacy_decode_loop <frame> <iters> [whole|stream]
 
 use std::env;
 use std::io::Read as _;

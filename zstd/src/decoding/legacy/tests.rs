@@ -1659,7 +1659,7 @@ fn a_budget_passes_through_to_its_output() {
     out.copy_match(
         1,
         2,
-        History {
+        &History {
             head: &[],
             tail: &[],
         },
@@ -1682,12 +1682,12 @@ fn matches_read_a_history_in_two_pieces() {
         start: 0,
     };
     // From the second byte of the head, across into the tail.
-    out.copy_match(3, 2, history).unwrap();
+    out.copy_match(3, 2, &history).unwrap();
     // Back into the tail's first byte, past its end into the frame.
-    out.copy_match(5, 4, history).unwrap();
+    out.copy_match(5, 4, &history).unwrap();
     // Six bytes out and four of dictionary: an offset of eleven reaches
     // before both.
-    assert!(out.copy_match(11, 1, history).is_err());
+    assert!(out.copy_match(11, 1, &history).is_err());
     assert_eq!(buf, b"bcbcdb");
 }
 
