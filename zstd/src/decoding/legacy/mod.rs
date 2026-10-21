@@ -1410,8 +1410,10 @@ impl LegacyStream {
     /// Returns the bytes read and written.
     ///
     /// A step that fails after output went to `target` in the same call
-    /// reports the error alone, as the RFC 8878 loop and upstream's
-    /// `ZSTD_decompressStream` do. The `Read` adapter never meets that case:
+    /// reports the error alone, as the RFC 8878 loop does and as upstream's
+    /// buffered decoders do: they flush, decode the next block in the same
+    /// call and return its error (`zstd_v07.c:4421`, `:4447`, reached from
+    /// `ZSTD_decompressStream`). The `Read` adapter never meets that case:
     /// it holds one step of input at a time and returns delivered bytes
     /// before it reads the next.
     pub(crate) fn decode(
