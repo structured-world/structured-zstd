@@ -71,6 +71,16 @@ pub(crate) const MAX_HC_SEARCH_DEPTH: usize = 512;
 /// search writes into it without a capacity check.
 pub(crate) const HC_OPT_CANDIDATE_CAPACITY: usize = MAX_HC_SEARCH_DEPTH + 8;
 
+// The capacity above holds only while no strategy that runs the binary-tree
+// search can spend more compares than `MAX_HC_SEARCH_DEPTH`.
+const _: () = {
+    use crate::encoding::strategy::{BtOpt, BtUltra, BtUltra2, Btlazy2, Strategy};
+    assert!(BtOpt::MAX_CHAIN_DEPTH <= MAX_HC_SEARCH_DEPTH);
+    assert!(BtUltra::MAX_CHAIN_DEPTH <= MAX_HC_SEARCH_DEPTH);
+    assert!(BtUltra2::MAX_CHAIN_DEPTH <= MAX_HC_SEARCH_DEPTH);
+    assert!(Btlazy2::MAX_CHAIN_DEPTH <= MAX_HC_SEARCH_DEPTH);
+};
+
 /// Hash-chain matcher state used by the `Lazy2` parse mode (and the
 /// short-history fast path of the BT cascade's initial pass).
 ///
