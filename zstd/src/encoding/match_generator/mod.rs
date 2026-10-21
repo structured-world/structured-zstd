@@ -428,6 +428,12 @@ pub struct MatchGeneratorDriver {
     // is only restored into a reset that resolved the identical matcher. `None`
     // before the first `reset`.
     reset_shape: Option<(LevelParams, usize, bool, bool)>,
+    /// How much of the frame's dictionary the match-finder tables index, as
+    /// a log of its suffix length: from the CDict's cParams, so every frame
+    /// of one dictionary indexes the same part of it, as every frame upstream
+    /// takes the CDict's tables (`ZSTD_loadDictionaryContent`). `None`
+    /// without a dictionary.
+    dict_reach_log: Option<u32>,
     // One-shot borrowed block range `[start, end)` staged by the borrowed
     // Fast frame path (`set_borrowed_block`) for the NEXT
     // `start_matching` / `skip_matching_with_hint`. `Some` routes that
@@ -769,6 +775,7 @@ impl MatchGeneratorDriver {
             reset_size_log: None,
             reset_dict_attach_ok: true,
             reset_shape: None,
+            dict_reach_log: None,
             dictionary_retained_budget: 0,
             source_size_hint: None,
             dictionary_size_hint: None,
@@ -1456,6 +1463,17 @@ impl Matcher for MatchGeneratorDriver {
         // carries `dict_plan` to the Row backend. The dictionary is prepared
         // under the caller's parameters, so they are part of those cParams.
         let overrides = self.param_overrides.unwrap_or_default();
+        // Upstream indexes the last `1 << max(hashLog + 3, chainLog + 1)`
+        // bytes of a dictionary into its CDict, at the CDict's cParams
+        // (`ZSTD_loadDictionaryContent`).
+        self.dict_reach_log = dict_hint.map(|sizes| {
+            let cd = crate::encoding::cparams::get_cdict_cparams(
+                crate::encoding::levels::config::numeric_level(level),
+                sizes.serialized,
+                &overrides,
+            );
+            (cd.hash_log + 3).max(cd.chain_log + 1).min(31)
+        });
         // A dictionary frame runs the shape the dictionary was prepared with,
         // whatever the source size. Upstream stops doing that once the source
         // outgrows the dictionary and resolves the frame's own instead

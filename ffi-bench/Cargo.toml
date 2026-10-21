@@ -271,6 +271,14 @@ name = "ffi_loop_dict"
 path = "../zstd/examples/ffi_loop_dict.rs"
 
 [[example]]
+name = "encode_loop_dict_swap"
+path = "../zstd/examples/encode_loop_dict_swap.rs"
+
+[[example]]
+name = "ffi_loop_dict_swap"
+path = "../zstd/examples/ffi_loop_dict_swap.rs"
+
+[[example]]
 name = "stack_budget"
 path = "../zstd/examples/stack_budget.rs"
 

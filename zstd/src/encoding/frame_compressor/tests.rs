@@ -1099,6 +1099,112 @@ fn dict_tables_survive_copied_frames_and_dictionary_changes() {
     }
 }
 
+/// A dictionary index a small frame built does not stand in for a larger
+/// frame's. How much of the dictionary the index covers is the dictionary's
+/// own (upstream builds it once into the CDict), not the frame's: a tiny
+/// frame followed by one of 28 KiB under the same dictionary compresses the
+/// second as a fresh compressor does.
+#[test]
+fn a_small_frame_does_not_narrow_the_dictionary_index_of_the_next() {
+    let corpus = include_bytes!("../../../decodecorpus_files/z000033");
+    let prepare =
+        |bytes: &[u8]| super::EncoderDictionary::from_serialized_or_raw_content(bytes).unwrap();
+    let first = &corpus[800_000..812_000];
+    let second = &corpus[500_000..551_962];
+    let frames: [(&[u8], usize, usize); 6] = [
+        (first, 238_806, 11_496),
+        (first, 13_515, 38_031),
+        (first, 725_550, 35_141),
+        (second, 725_191, 48_262),
+        (second, 1_018_318, 152),
+        (second, 163_394, 28_769),
+    ];
+    let mut compressor: FrameCompressor =
+        FrameCompressor::new(super::CompressionLevel::from_level(5));
+    for (n, (dictionary, start, size)) in frames.into_iter().enumerate() {
+        if n == 0 || n == 3 {
+            compressor
+                .set_encoder_dictionary(prepare(dictionary))
+                .unwrap();
+        }
+        let input = &corpus[start..start + size];
+        let mut fresh: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::from_level(5));
+        fresh.set_encoder_dictionary(prepare(dictionary)).unwrap();
+        assert!(
+            compressor.compress_independent_frame(input) == fresh.compress_independent_frame(input),
+            "frame {n} of {size} bytes"
+        );
+    }
+}
+
+/// A compressor reused across dictionaries and frame sizes compresses every
+/// frame as a fresh one with the same dictionary does, at every backend: what
+/// it keeps from earlier frames (dictionary indexes, snapshots, tables) is
+/// keyed so it never stands in for state the frame would build differently.
+/// Frames of either attach or copy mode, under dictionaries of several
+/// lengths, in a random order fixed per level.
+#[test]
+fn reused_compressor_matches_a_fresh_one_across_dictionaries_and_sizes() {
+    let corpus = include_bytes!("../../../decodecorpus_files/z000033");
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let dicts: Vec<Vec<u8>> = vec![
+        dict_raw.to_vec(),
+        corpus[100_000..152_000].to_vec(),
+        corpus[300_000..316_000].to_vec(),
+        corpus[500_000..551_962].to_vec(),
+        corpus[700_000..716_384].to_vec(),
+        corpus[800_000..812_000].to_vec(),
+    ];
+    let prepare =
+        |bytes: &[u8]| super::EncoderDictionary::from_serialized_or_raw_content(bytes).unwrap();
+    for level in [1, 3, 4, 5, 9, 13, 19] {
+        let mut seed = 0x1234_5678u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::from_level(level));
+        let mut log = Vec::new();
+        for round in 0..30 {
+            let di = (next() % dicts.len() as u64) as usize;
+            let d = &dicts[di];
+            compressor.set_encoder_dictionary(prepare(d)).unwrap();
+            for _ in 0..4 {
+                // Either side of every backend's attach cutoff (8-32 KiB).
+                let size = 100 + (next() % 48_000) as usize;
+                let start = (next() % (corpus.len() - size) as u64) as usize;
+                log.push((di, start, size));
+                let input = &corpus[start..start + size];
+                let frame = compressor.compress_independent_frame(input);
+                let mut fresh: FrameCompressor =
+                    FrameCompressor::new(super::CompressionLevel::from_level(level));
+                fresh.set_encoder_dictionary(prepare(d)).unwrap();
+                let expected = fresh.compress_independent_frame(input);
+                if frame != expected {
+                    let mut decoder = FrameDecoder::new();
+                    let mut out = vec![0u8; input.len()];
+                    let handle =
+                        crate::decoding::DictionaryHandle::from_serialized_or_raw_content(d)
+                            .unwrap();
+                    let decodes = decoder
+                        .decode_all_with_dict_handle(&frame, &mut out, &handle)
+                        .is_ok_and(|n| n == input.len() && out == input);
+                    panic!(
+                        "level {level} round {round}: reused {} fresh {} bytes, decodes {decodes}; history {:?}",
+                        frame.len(),
+                        expected.len(),
+                        &log[log.len().saturating_sub(6)..]
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn dict_primed_matcher_cache_reused_across_small_attach_frames_is_byte_identical() {
     // CDict-equivalent ATTACH path (small source, at/below the Fast 8 KiB

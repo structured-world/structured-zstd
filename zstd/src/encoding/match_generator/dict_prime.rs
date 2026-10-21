@@ -108,12 +108,14 @@ impl MatchGeneratorDriver {
         #[cfg(feature = "ldm")]
         let ldm_dict_start = self.ldm_committed_end;
         // The match-finder tables index only as much of the dictionary's end as
-        // they can hold (upstream `ZSTD_loadDictionaryContent`,
-        // `zstd_compress.c:4987`); the whole of it is committed all the same,
-        // so every byte stays in reach of an offset.
-        let reach_log = self
-            .reset_shape
-            .map_or(31, |(params, ..)| params.dictionary_reach_log());
+        // the CDict's tables hold, the same for every frame of the dictionary
+        // (upstream `ZSTD_loadDictionaryContent`, `zstd_compress.c:4962`); the
+        // whole of it is committed all the same, so every byte stays in reach
+        // of an offset.
+        let reach_log = self.dict_reach_log.unwrap_or_else(|| {
+            self.reset_shape
+                .map_or(31, |(params, ..)| params.dictionary_reach_log())
+        });
         self.storage
             .set_dictionary_index_floor(dict_content.len().saturating_sub(1usize << reach_log));
         // A dictionary attached again after frames that copied it takes back
