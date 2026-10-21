@@ -177,8 +177,12 @@ impl<T> DictAttach<T> {
 /// not attach it, or one kept only for its allocation. A cache of the
 /// holder's, not matcher state: a clone of it is empty, so a snapshot of the
 /// matcher carries none.
+///
+/// The table sits in a slot allocated at the first park and kept until
+/// [`Self::release`], so a holder costs its matcher one pointer and a park
+/// allocates nothing after the first.
 #[derive(Debug, Default)]
-pub(crate) struct DictKeep<T>(Option<Kept<T>>);
+pub(crate) struct DictKeep<T>(Option<alloc::boxed::Box<Option<Kept<T>>>>);
 
 #[derive(Debug)]
 enum Kept<T> {
@@ -205,9 +209,36 @@ impl<T> DictKeep<T> {
 
     /// The table kept, for the owner's heap accounting.
     pub(crate) fn table(&self) -> Option<&T> {
-        match &self.0 {
+        match self.kept() {
             Some(Kept::Parked { table, .. } | Kept::Spare(table)) => Some(table),
             None => None,
+        }
+    }
+
+    /// The bytes the slot itself takes, for the owner's heap accounting.
+    pub(crate) fn slot_bytes(&self) -> usize {
+        self.0
+            .as_ref()
+            .map_or(0, |_| core::mem::size_of::<Option<Kept<T>>>())
+    }
+
+    fn kept(&self) -> Option<&Kept<T>> {
+        self.0.as_deref().and_then(Option::as_ref)
+    }
+
+    fn is_parked(&self) -> bool {
+        matches!(self.kept(), Some(Kept::Parked { .. }))
+    }
+
+    fn take(&mut self) -> Option<Kept<T>> {
+        self.0.as_deref_mut().and_then(Option::take)
+    }
+
+    fn store(&mut self, kept: Option<Kept<T>>) {
+        match &mut self.0 {
+            Some(slot) => **slot = kept,
+            None if kept.is_some() => self.0 = Some(alloc::boxed::Box::new(kept)),
+            None => {}
         }
     }
 
@@ -218,14 +249,14 @@ impl<T> DictKeep<T> {
     pub(crate) fn park(&mut self, attach: &mut DictAttach<T>) {
         match attach.take_table() {
             Some((table, true, region_len, next_to_update)) => {
-                self.0 = Some(Kept::Parked {
+                self.store(Some(Kept::Parked {
                     table,
                     region_len,
                     next_to_update,
-                });
+                }));
             }
-            Some((table, false, ..)) if !matches!(self.0, Some(Kept::Parked { .. })) => {
-                self.0 = Some(Kept::Spare(table));
+            Some((table, false, ..)) if !self.is_parked() => {
+                self.store(Some(Kept::Spare(table)));
             }
             _ => {}
         }
@@ -240,19 +271,19 @@ impl<T> DictKeep<T> {
         attach: &mut DictAttach<T>,
         accept: impl FnOnce(&T, usize) -> bool,
     ) -> bool {
-        if !matches!(self.0, Some(Kept::Parked { .. })) {
+        if !self.is_parked() {
             return false;
         }
         let Some(Kept::Parked {
             table,
             region_len,
             next_to_update,
-        }) = self.0.take()
+        }) = self.take()
         else {
             unreachable!("checked just above");
         };
         if attach.is_attached() || !accept(&table, region_len) {
-            self.0 = Some(Kept::Spare(table));
+            self.store(Some(Kept::Spare(table)));
             return false;
         }
         attach.table = Some(table);
@@ -269,28 +300,28 @@ impl<T> DictKeep<T> {
             .take_table()
             .map(|(table, ..)| table)
             .or_else(|| self.take_any());
-        self.0 = kept.map(Kept::Spare);
+        self.store(kept.map(Kept::Spare));
     }
 
     /// The spare, for a build to empty and reuse. A parked table is not one:
     /// it stays for [`Self::revive`].
     pub(crate) fn take_spare(&mut self) -> Option<T> {
-        match self.0.take() {
+        if !matches!(self.kept(), Some(Kept::Spare(_))) {
+            return None;
+        }
+        match self.take() {
             Some(Kept::Spare(table)) => Some(table),
-            other => {
-                self.0 = other;
-                None
-            }
+            _ => unreachable!("checked just above"),
         }
     }
 
-    /// Drop whatever is kept.
+    /// Drop whatever is kept, slot included.
     pub(crate) fn release(&mut self) {
         self.0 = None;
     }
 
     fn take_any(&mut self) -> Option<T> {
-        self.0.take().map(|kept| match kept {
+        self.take().map(|kept| match kept {
             Kept::Parked { table, .. } | Kept::Spare(table) => table,
         })
     }

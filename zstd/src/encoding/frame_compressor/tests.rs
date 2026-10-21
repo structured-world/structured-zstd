@@ -1051,12 +1051,13 @@ fn dict_primed_matcher_snapshot_reused_across_frames_is_byte_identical() {
     }
 }
 
-/// A compressor that alternates frames under the dfast attach cutoff with
-/// frames past it, and then takes another dictionary of the same shape,
-/// builds the attached dictionary tables once per dictionary and allocates
-/// them once in all: frames that copy the dictionary set the tables aside
-/// for the next attaching frame, and the second dictionary's tables reuse the
-/// first's allocation. Every frame is byte-identical to a fresh compressor's.
+/// A compressor that alternates frames under the attach cutoff with frames
+/// past it, and then takes another dictionary of the same shape, builds the
+/// attached dictionary tables once per dictionary and allocates them once in
+/// all, on the dfast (level 3) and row (level 5) backends: frames that copy
+/// the dictionary set the tables aside for the next attaching frame, and the
+/// second dictionary's tables reuse the first's allocation. Every frame is
+/// byte-identical to a fresh compressor's.
 #[test]
 fn dict_tables_survive_copied_frames_and_dictionary_changes() {
     let dict_raw = include_bytes!("../../../dict_tests/dictionary");
@@ -1075,27 +1076,37 @@ fn dict_tables_survive_copied_frames_and_dictionary_changes() {
     let prepare =
         |bytes: &[u8]| super::EncoderDictionary::from_serialized_or_raw_content(bytes).unwrap();
 
-    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Default);
-    for (round, dictionary) in [&dict_raw[..], &other[..]].into_iter().enumerate() {
-        compressor
-            .set_encoder_dictionary(prepare(dictionary))
-            .unwrap();
-        for input in [&small, &large, &small, &large, &small] {
-            let frame = compressor.compress_independent_frame(input);
-            let mut fresh: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Default);
-            fresh.set_encoder_dictionary(prepare(dictionary)).unwrap();
+    for number in [3, 5] {
+        let level = super::CompressionLevel::from_level(number);
+        let builds = |compressor: &FrameCompressor| {
+            if number == 3 {
+                compressor.state.matcher.dfast_dict_table_builds()
+            } else {
+                compressor.state.matcher.row_dict_index_builds()
+            }
+        };
+        let mut compressor: FrameCompressor = FrameCompressor::new(level);
+        for (round, dictionary) in [&dict_raw[..], &other[..]].into_iter().enumerate() {
+            compressor
+                .set_encoder_dictionary(prepare(dictionary))
+                .unwrap();
+            for input in [&small, &large, &small, &large, &small] {
+                let frame = compressor.compress_independent_frame(input);
+                let mut fresh: FrameCompressor = FrameCompressor::new(level);
+                fresh.set_encoder_dictionary(prepare(dictionary)).unwrap();
+                assert_eq!(
+                    frame,
+                    fresh.compress_independent_frame(input),
+                    "{level:?}, dictionary {round}, a {}-byte frame",
+                    input.len()
+                );
+            }
             assert_eq!(
-                frame,
-                fresh.compress_independent_frame(input),
-                "dictionary {round}, a {}-byte frame",
-                input.len()
+                builds(&compressor),
+                (round + 1, 1),
+                "{level:?} after dictionary {round}: builds started, of them allocating"
             );
         }
-        assert_eq!(
-            compressor.state.matcher.dfast_dict_table_builds(),
-            (round + 1, 1),
-            "after dictionary {round}: builds started, of them allocating"
-        );
     }
 }
 

@@ -609,6 +609,7 @@ impl DfastMatchGenerator {
                 .chain(self.dict_keep.table())
                 .map(|t| (t.long.capacity() + t.short.capacity()) * u32_sz)
                 .sum::<usize>()
+            + self.dict_keep.slot_bytes()
     }
 
     /// Settles, ahead of the next frame's layout, what [`Self::reset`] keeps of

@@ -121,11 +121,18 @@ impl MatchGeneratorDriver {
         // A dictionary attached again after frames that copied it takes back
         // the tables built for it, so a compressor alternating small and large
         // frames builds them once per dictionary, as upstream builds a CDict.
-        if self.active_backend() == super::super::strategy::BackendTag::Dfast
-            && self.dfast_attaches_dictionary(dict_content.len())
-        {
-            self.dfast_matcher_mut()
-                .revive_dict_cache(dict_content.len());
+        match self.active_backend() {
+            super::super::strategy::BackendTag::Dfast
+                if self.dfast_attaches_dictionary(dict_content.len()) =>
+            {
+                self.dfast_matcher_mut()
+                    .revive_dict_cache(dict_content.len());
+            }
+            // The row backend's plan says whether this frame attaches.
+            super::super::strategy::BackendTag::Row => {
+                self.row_matcher_mut().revive_dict_cache(dict_content.len());
+            }
+            _ => {}
         }
 
         // Dictionary bytes should stay addressable until produced frame output

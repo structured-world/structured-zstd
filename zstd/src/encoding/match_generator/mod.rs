@@ -1096,6 +1096,13 @@ impl MatchGeneratorDriver {
         self.dfast_matcher().dict_table_builds
     }
 
+    /// The row backend's dict index builds started and how many allocated.
+    /// Test-only.
+    #[cfg(test)]
+    pub(crate) fn row_dict_index_builds(&self) -> (usize, usize) {
+        self.row_matcher().dict_index_builds
+    }
+
     fn dfast_matcher_mut(&mut self) -> &mut DfastMatchGenerator {
         match &mut self.storage {
             MatcherStorage::Dfast(m) => m,
