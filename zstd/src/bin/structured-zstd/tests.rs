@@ -1830,6 +1830,69 @@ fn decoding_names_the_foreign_format_it_cannot_read() {
     assert!(decode_stream_message(b"some data").contains("unsupported format"));
 }
 
+/// The v0.5-v0.7 frames the reference command decodes by default decode here
+/// too, and a v0.7 frame naming a dictionary it was not given fails as the
+/// reference's does.
+#[cfg(feature = "legacy")]
+#[test]
+fn decoding_reads_the_v05_to_v07_formats() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("legacy_frames");
+    for name in [
+        "abc.txt.v05.l19.zst",
+        "z000000.v06.l1.zst",
+        "z000001.v07.l19.zst",
+    ] {
+        let frame = fs::read(dir.join(name)).unwrap();
+        let stem = name.split_once(".v0").unwrap().0;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("decodecorpus_files")
+            .join(stem);
+        let mut out = Vec::new();
+        decompress_stream(
+            &frame[..],
+            &mut out,
+            &mut no_dict(),
+            &DecodeSettings::default(),
+        )
+        .unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert!(out == fs::read(source).unwrap(), "{name}");
+    }
+    let frame = fs::read(dir.join("ModemManager.service.v07.dict.zst")).unwrap();
+    let err = decompress_stream(
+        &frame[..],
+        io::sink(),
+        &mut no_dict(),
+        &DecodeSettings::default(),
+    )
+    .expect_err("the frame names a dictionary");
+    assert_eq!(
+        named(err, "in.zst").to_string(),
+        "in.zst : Decoding error (36) : Dictionary mismatch "
+    );
+}
+
+/// `-D` with an RFC 8878 dictionary decodes the v0.5 and v0.6 frames made with
+/// it, which match into its header as well as its content: the run keeps the
+/// whole serialized dictionary, not only what it parses to.
+#[cfg(feature = "legacy")]
+#[test]
+fn decoding_gives_v05_and_v06_frames_the_whole_dictionary() {
+    let raw = include_bytes!("../../../dict_tests/dictionary");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("legacy_frames/rfc_dict");
+    for name in ["dictionary.v05.zst", "dictionary.v06.zst"] {
+        let frame = fs::read(dir.join(name)).unwrap();
+        let mut out = Vec::new();
+        decompress_stream(
+            &frame[..],
+            &mut out,
+            &mut prepared_dict(raw),
+            &DecodeSettings::default(),
+        )
+        .unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert!(out == raw[..], "{name}");
+    }
+}
+
 /// A decoding failure is reported against the input, in the reference
 /// command's two shapes (`fileio.c` 2463, 2748-2796): `zstd: NAME: message`
 /// for input that is not a frame, and `NAME : Decoding error (36) : <libzstd's

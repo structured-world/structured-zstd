@@ -668,7 +668,7 @@ pub unsafe extern "C" fn ZSTD_freeDCtx(dctx: *mut ZSTD_DCtx) -> usize {
 /// is 0 until the first frame allocates it.
 ///
 /// The dictionaries the context holds (the attached one, a buffer-less run's,
-/// the one the decoder kept from its last frame) may be one allocation: each
+/// every one the decoder keeps) may be one allocation: each
 /// counts once, and only when the context alone keeps it alive, so a
 /// referenced DDict's is the DDict's, as upstream leaves `refDDict` memory out.
 ///
@@ -688,7 +688,7 @@ pub unsafe extern "C" fn ZSTD_sizeof_DCtx(dctx: *const ZSTD_DCtx) -> usize {
                 .handles()
                 .iter()
                 .chain(dctx.bufferless.dictionary())
-                .chain(dctx.decoder.dictionary()),
+                .chain(dctx.decoder.dictionaries()),
         )
         + attached_set_size(&dctx.attached_ddict)
 }

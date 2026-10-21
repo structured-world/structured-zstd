@@ -2974,14 +2974,15 @@ impl Codecs {
                 Some(dictionary.map_err(|err| eyre!("invalid dictionary: {err:?}"))?);
         }
         if for_decoding {
+            // The handle parsed from the serialized bytes keeps the ones in
+            // front of the content too: a v0.5 or v0.6 frame matches into them.
             let dictionary = if raw_content {
-                Dictionary::from_raw_content(0, raw.to_vec())
+                Dictionary::from_raw_content(0, raw.to_vec()).map(DictionaryHandle::from_dictionary)
             } else {
-                Dictionary::from_serialized_or_raw_content(raw)
+                DictionaryHandle::from_serialized_or_raw_content(raw)
             };
-            prepared.decoder = Some(DictionaryHandle::from_dictionary(
-                dictionary.map_err(|err| eyre!("failed to parse dictionary: {err:?}"))?,
-            ));
+            prepared.decoder =
+                Some(dictionary.map_err(|err| eyre!("failed to parse dictionary: {err:?}"))?);
         }
         Ok(prepared)
     }
@@ -6650,13 +6651,6 @@ fn encode_frame<R: BufRead, W: Write>(
     encoder.finish().wrap_err("failed to finalize zstd frame")
 }
 
-/// The magic number every zstd frame opens with (RFC 8878 §3.1.1).
-const FRAME_MAGIC: u32 = 0xFD2F_B528;
-
-/// The 16 magic numbers a skippable frame may open with, less their low
-/// nibble (RFC 8878 §3.1.2).
-const SKIPPABLE_MAGIC_BASE: u32 = 0x184D_2A50;
-
 /// Streaming decompression core (file, stdout, or sink), optionally
 /// dict-primed. Returns the number of bytes written.
 ///
@@ -6746,10 +6740,9 @@ fn decode_or_pass<R: Read, W: Write>(
                 _ => Ok(Decoded::Frames(written)),
             };
         }
-        let is_frame = read == 4 && {
-            let magic = u32::from_le_bytes(magic);
-            magic == FRAME_MAGIC || magic & 0xFFFF_FFF0 == SKIPPABLE_MAGIC_BASE
-        };
+        // The codec's answer, as the reference asks `ZSTD_isFrame`: with the
+        // `legacy` feature a v0.5-v0.7 frame is one.
+        let is_frame = read == 4 && structured_zstd::decoding::is_frame(&magic);
         // Another compressor's stream is named and refused, pass-through or
         // not, in the order the reference checks it (`FIO_decompressFrames`):
         // copying it through would hand on compressed bytes as content. Input

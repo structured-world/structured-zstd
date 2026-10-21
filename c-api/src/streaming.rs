@@ -1084,6 +1084,21 @@ fn enter_stream_frame(
         let take = (FRAME_HEADER_MAX - held_len).min(available.len());
         view[held_len..held_len + take].copy_from_slice(&available[..take]);
         let view = &view[..held_len + take];
+        // A v0.5-v0.7 header is measured by its own size fields; once whole,
+        // the decoder starts it from the same reader (upstream's
+        // `ZSTD_decompressStream` hands such a frame to its legacy streams).
+        if !dctx.magicless
+            && let Some(version) = codec::decoding::LegacyVersion::of(view)
+        {
+            if version
+                .header_size(view)
+                .is_some_and(|len| len <= view.len())
+            {
+                start_stream_frame(dctx, inp, src, &held[..held_len])?;
+                return Ok(FrameEntry::Started);
+            }
+            return Ok(hold_header(dctx, inp, view, take));
+        }
         match codec::decoding::read_frame_header_info(view, dctx.magicless) {
             Ok(_) => {
                 start_stream_frame(dctx, inp, src, &held[..held_len])?;
@@ -1105,16 +1120,7 @@ fn enter_stream_frame(
                 | ReadFrameHeaderError::DictionaryIdReadError(_)
                 | ReadFrameHeaderError::FrameContentSizeReadError(_),
             ) => {
-                debug_assert!(view.len() < FRAME_HEADER_MAX, "no header is longer");
-                inp.pos += take;
-                let mut bytes = [0; FRAME_HEADER_MAX];
-                bytes[..view.len()].copy_from_slice(view);
-                dctx.stream_entry = StreamEntry::Header {
-                    bytes,
-                    len: view.len(),
-                };
-                dctx.stream_frame_done = false;
-                return Ok(FrameEntry::WantsInput);
+                return Ok(hold_header(dctx, inp, view, take));
             }
             // A malformed header (bad magic, invalid descriptor, ...) is a
             // decode error: the need-more-input hint with nothing consumed
@@ -1126,6 +1132,26 @@ fn enter_stream_frame(
             }
         }
     }
+}
+
+/// Hold `view`, a frame header the input has not all brought yet: the `take`
+/// bytes of it from the input are consumed, and the frame has begun.
+fn hold_header(
+    dctx: &mut ZSTD_DCtx,
+    inp: &mut ZSTD_inBuffer,
+    view: &[u8],
+    take: usize,
+) -> FrameEntry {
+    debug_assert!(view.len() < FRAME_HEADER_MAX, "no header is longer");
+    inp.pos += take;
+    let mut bytes = [0; FRAME_HEADER_MAX];
+    bytes[..view.len()].copy_from_slice(view);
+    dctx.stream_entry = StreamEntry::Header {
+        bytes,
+        len: view.len(),
+    };
+    dctx.stream_frame_done = false;
+    FrameEntry::WantsInput
 }
 
 /// Start the decoder on the frame whose header is `held` followed by the

@@ -32,6 +32,10 @@ name = "decode"
 path = "fuzz_targets/decode.rs"
 
 [[bin]]
+name = "decode_legacy"
+path = "fuzz_targets/decode_legacy.rs"
+
+[[bin]]
 name = "decode_direct"
 path = "fuzz_targets/decode_direct.rs"
 

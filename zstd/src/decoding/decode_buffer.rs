@@ -1405,7 +1405,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
 }
 
 /// Like Write::write_all but returns partial write length even on error
-fn write_all_bytes(mut sink: impl Write, buf: &[u8]) -> (usize, Result<(), Error>) {
+pub(crate) fn write_all_bytes(mut sink: impl Write, buf: &[u8]) -> (usize, Result<(), Error>) {
     let mut written = 0;
     while written < buf.len() {
         match sink.write(&buf[written..]) {

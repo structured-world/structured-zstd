@@ -316,6 +316,11 @@ fn header_len(bytes: &[u8], magicless: bool) -> usize {
             return 8;
         }
         if magic != crate::common::MAGIC_NUM {
+            // A v0.5-v0.7 header: its descriptor, then the fields it names.
+            #[cfg(feature = "legacy")]
+            if let Some(version) = crate::decoding::LegacyVersion::of(bytes) {
+                return crate::decoding::legacy::header_len(version, bytes).unwrap_or(5);
+            }
             return 4;
         }
         4

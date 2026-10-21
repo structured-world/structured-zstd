@@ -10,7 +10,7 @@
 
 ## Highlights
 
-- **Production-grade decoder** — complete [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878) implementation: dictionary-backed streams, raw / RLE / compressed blocks, the full frame format, optional content checksums, runtime-dispatched SIMD kernels (SSE2 / BMI2 / AVX2 / NEON, opt-in AVX-512).
+- **Production-grade decoder** — complete [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878) implementation: dictionary-backed streams, raw / RLE / compressed blocks, the full frame format, optional content checksums, runtime-dispatched SIMD kernels (SSE2 / BMI2 / AVX2 / NEON, opt-in AVX-512). It also reads the v0.5-v0.7 frame formats, as every libzstd 1.5.7 build does by default.
 - **Full-range encoder** — every C-zstd level (`-131072..=22`) produces valid frames decodable by this crate and by upstream C zstd; named presets, per-knob parameter overrides, long-distance matching, streaming via `std::io::Write`.
 - **Dictionaries end to end** — compress and decompress with the same dictionary format C zstd consumes; reusable parsed handles; pure-Rust COVER / FastCOVER / legacy training behind the `dict-builder` feature.
 - **Wire-compatible both ways** — frames interoperate with C zstd in either direction; interop is enforced in CI against the reference implementation.
@@ -332,7 +332,8 @@ in pure Rust:
 | `kernel-simd128` | ✅ | WebAssembly SIMD kernel (needs `-C target-feature=+simd128`) |
 | `kernel-vbmi2` | ❌ | AVX-512 decode kernel (see note below) |
 | `kernel-scalar` | ✅ | Marker for the always-compiled scalar fallback |
-| `dict-builder` | ❌ | Pure-Rust COVER / FastCOVER / legacy dictionary training |
+| `dict-builder` | ✅ | Pure-Rust COVER / FastCOVER / legacy dictionary training |
+| `legacy` | ✅ | Decoding of the v0.5, v0.6 and v0.7 frame formats; without it they are refused as an unknown format |
 | `lsm` | ❌ | [Storage-format extensions](#storage-format-extensions) |
 | `caller-workspace` | ❌ | [Decoding in caller-owned memory](#decoding-in-caller-owned-memory) |
 

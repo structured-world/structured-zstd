@@ -155,6 +155,7 @@ pub fn code_for(code: ErrorCode) -> ZSTD_ErrorCode {
         ErrorCode::DstSizeTooSmall => ZSTD_error_dstSize_tooSmall,
         ErrorCode::InitMissing => ZSTD_error_init_missing,
         ErrorCode::ChecksumWrong => ZSTD_error_checksum_wrong,
+        ErrorCode::SrcSizeWrong => ZSTD_error_srcSize_wrong,
         // `ErrorCode` is non-exhaustive: a class added later that this layer
         // does not know yet is a malformed frame here.
         _ => ZSTD_error_corruption_detected,
