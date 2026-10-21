@@ -143,6 +143,17 @@ impl<T> DictAttach<T> {
         self.table.get_or_insert_with(init)
     }
 
+    /// Take the table out with how far it was built (whether fully, its
+    /// boundary and fill origin), leaving the state of [`Self::invalidate`].
+    fn take_table(&mut self) -> Option<(T, bool, usize, usize)> {
+        let taken = self
+            .table
+            .take()
+            .map(|table| (table, self.primed, self.region_len, self.next_to_update));
+        self.invalidate();
+        taken
+    }
+
     /// Mutable reference to the table, if attached (for the build/fill pass).
     #[inline]
     pub(crate) fn table_mut(&mut self) -> Option<&mut T> {
@@ -158,6 +169,161 @@ impl<T> DictAttach<T> {
         self.region_len = 0;
         self.primed = false;
         self.next_to_update = 0;
+    }
+}
+
+/// Dictionary tables a backend detached and keeps for later: one fully built
+/// for the dictionary it still compresses with, set aside while frames do
+/// not attach it, or one kept only for its allocation. A cache of the
+/// holder's, not matcher state: a clone of it is empty, so a snapshot of the
+/// matcher carries none.
+///
+/// The table sits in a slot allocated at the first park and kept until
+/// [`Self::release`], so a holder costs its matcher one pointer and a park
+/// allocates nothing after the first.
+#[derive(Debug, Default)]
+pub(crate) struct DictKeep<T>(Option<alloc::boxed::Box<Option<Kept<T>>>>);
+
+#[derive(Debug)]
+enum Kept<T> {
+    /// Fully built, with the boundary and fill origin it was built to.
+    Parked {
+        table: T,
+        region_len: usize,
+        next_to_update: usize,
+    },
+    /// Built for an earlier dictionary, or only in part.
+    Spare(T),
+}
+
+impl<T> Clone for DictKeep<T> {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl<T> DictKeep<T> {
+    pub(crate) const fn new() -> Self {
+        Self(None)
+    }
+
+    /// The table kept, for the owner's heap accounting.
+    pub(crate) fn table(&self) -> Option<&T> {
+        match self.kept() {
+            Some(Kept::Parked { table, .. } | Kept::Spare(table)) => Some(table),
+            None => None,
+        }
+    }
+
+    /// The bytes the slot itself takes, for the owner's heap accounting.
+    pub(crate) fn slot_bytes(&self) -> usize {
+        self.0
+            .as_ref()
+            .map_or(0, |_| core::mem::size_of::<Option<Kept<T>>>())
+    }
+
+    fn kept(&self) -> Option<&Kept<T>> {
+        self.0.as_deref().and_then(Option::as_ref)
+    }
+
+    fn is_parked(&self) -> bool {
+        matches!(self.kept(), Some(Kept::Parked { .. }))
+    }
+
+    fn take(&mut self) -> Option<Kept<T>> {
+        self.0.as_deref_mut().and_then(Option::take)
+    }
+
+    fn store(&mut self, kept: Option<Kept<T>>) {
+        match &mut self.0 {
+            Some(slot) => **slot = kept,
+            None if kept.is_some() => self.0 = Some(alloc::boxed::Box::new(kept)),
+            None => {}
+        }
+    }
+
+    /// Detach `attach`'s table, leaving the state of
+    /// [`DictAttach::invalidate`], and keep it: parked when fully built, for
+    /// [`Self::revive`], else as the spare unless a parked table is already
+    /// kept. With no table attached, what is kept stays.
+    pub(crate) fn park(&mut self, attach: &mut DictAttach<T>) {
+        match attach.take_table() {
+            Some((table, true, region_len, next_to_update)) => {
+                self.store(Some(Kept::Parked {
+                    table,
+                    region_len,
+                    next_to_update,
+                }));
+            }
+            Some((table, false, ..)) if !self.is_parked() => {
+                self.store(Some(Kept::Spare(table)));
+            }
+            _ => {}
+        }
+    }
+
+    /// Attach the parked table to `attach` again, fully built, when `accept`
+    /// takes it for the dictionary about to be primed (given the table and
+    /// the boundary it was built to). A refused one becomes the spare.
+    /// Returns whether a table was revived.
+    pub(crate) fn revive(
+        &mut self,
+        attach: &mut DictAttach<T>,
+        accept: impl FnOnce(&T, usize) -> bool,
+    ) -> bool {
+        if !self.is_parked() {
+            return false;
+        }
+        let Some(Kept::Parked {
+            table,
+            region_len,
+            next_to_update,
+        }) = self.take()
+        else {
+            unreachable!("checked just above");
+        };
+        if attach.is_attached() || !accept(&table, region_len) {
+            self.store(Some(Kept::Spare(table)));
+            return false;
+        }
+        attach.table = Some(table);
+        attach.region_len = region_len;
+        attach.primed = true;
+        attach.next_to_update = next_to_update;
+        true
+    }
+
+    /// The dictionary changed: detach `attach`'s table and keep one table
+    /// only as the spare, for the next dictionary's build.
+    pub(crate) fn forget(&mut self, attach: &mut DictAttach<T>) {
+        let kept = attach
+            .take_table()
+            .map(|(table, ..)| table)
+            .or_else(|| self.take_any());
+        self.store(kept.map(Kept::Spare));
+    }
+
+    /// The spare, for a build to empty and reuse. A parked table is not one:
+    /// it stays for [`Self::revive`].
+    pub(crate) fn take_spare(&mut self) -> Option<T> {
+        if !matches!(self.kept(), Some(Kept::Spare(_))) {
+            return None;
+        }
+        match self.take() {
+            Some(Kept::Spare(table)) => Some(table),
+            _ => unreachable!("checked just above"),
+        }
+    }
+
+    /// Drop whatever is kept, slot included.
+    pub(crate) fn release(&mut self) {
+        self.0 = None;
+    }
+
+    fn take_any(&mut self) -> Option<T> {
+        self.take().map(|kept| match kept {
+            Kept::Parked { table, .. } | Kept::Spare(table) => table,
+        })
     }
 }
 

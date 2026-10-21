@@ -108,14 +108,32 @@ impl MatchGeneratorDriver {
         #[cfg(feature = "ldm")]
         let ldm_dict_start = self.ldm_committed_end;
         // The match-finder tables index only as much of the dictionary's end as
-        // they can hold (upstream `ZSTD_loadDictionaryContent`,
-        // `zstd_compress.c:4987`); the whole of it is committed all the same,
-        // so every byte stays in reach of an offset.
-        let reach_log = self
-            .reset_shape
-            .map_or(31, |(params, ..)| params.dictionary_reach_log());
+        // the CDict's tables hold, the same for every frame of the dictionary
+        // (upstream `ZSTD_loadDictionaryContent`, `zstd_compress.c:4962`); the
+        // whole of it is committed all the same, so every byte stays in reach
+        // of an offset.
+        let reach_log = self.dict_reach_log.unwrap_or_else(|| {
+            self.reset_shape
+                .map_or(31, |(params, ..)| params.dictionary_reach_log())
+        });
         self.storage
             .set_dictionary_index_floor(dict_content.len().saturating_sub(1usize << reach_log));
+        // A dictionary attached again after frames that copied it takes back
+        // the tables built for it, so a compressor alternating small and large
+        // frames builds them once per dictionary, as upstream builds a CDict.
+        match self.active_backend() {
+            super::super::strategy::BackendTag::Dfast
+                if self.dfast_attaches_dictionary(dict_content.len()) =>
+            {
+                self.dfast_matcher_mut()
+                    .revive_dict_cache(dict_content.len());
+            }
+            // The row backend's plan says whether this frame attaches.
+            super::super::strategy::BackendTag::Row => {
+                self.row_matcher_mut().revive_dict_cache(dict_content.len());
+            }
+            _ => {}
+        }
 
         // Dictionary bytes should stay addressable until produced frame output
         // itself exceeds the live window size. We bump `max_window_size`
@@ -523,12 +541,39 @@ impl MatchGeneratorDriver {
             hc.table.hash3_off = hash3_off;
             self.primed = Some((snapshot, self.dictionary_retained_budget, key));
         } else {
-            self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, key));
+            // Into the buffers of the snapshot it replaces, or of the one a
+            // dictionary change set aside, where the backend copies in place;
+            // a fresh clone otherwise. The fast backend's `clone_from` costs
+            // more instructions than its clone (a level-1 dictionary-swap loop
+            // retired 1.2% more), so it clones.
+            let replaced = self
+                .primed
+                .take()
+                .map(|(storage, ..)| storage)
+                .or_else(|| self.primed_spare.take());
+            let snapshot = match (replaced, &mut self.storage) {
+                (Some(MatcherStorage::Dfast(mut snapshot)), MatcherStorage::Dfast(live)) => {
+                    snapshot.restore_snapshot(live);
+                    MatcherStorage::Dfast(snapshot)
+                }
+                (Some(MatcherStorage::Row(mut snapshot)), MatcherStorage::Row(live)) => {
+                    snapshot.restore_snapshot(live);
+                    MatcherStorage::Row(snapshot)
+                }
+                (_, live) => live.clone(),
+            };
+            self.primed = Some((snapshot, self.dictionary_retained_budget, key));
         }
     }
 
     pub(super) fn invalidate_primed_dictionary_impl(&mut self) {
-        self.primed = None;
+        // The snapshot belongs to the dictionary being replaced; its buffers
+        // stay for the next one's where the capture copies into them.
+        if let Some((storage, ..)) = self.primed.take() {
+            self.primed_spare =
+                matches!(storage, MatcherStorage::Dfast(_) | MatcherStorage::Row(_))
+                    .then_some(storage);
+        }
         // Drop the Fast-backend CDict-equivalent table cache too: it is keyed
         // to the dictionary being removed / replaced. Left in place, the next
         // same-params `reset` would retain it and the kernel would probe a

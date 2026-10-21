@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
-use super::dict_attach::DictAttach;
+use super::dict_attach::{DictAttach, DictKeep};
 use super::levels::config::{RowConfig, RowDictPlan};
 use super::match_generator::{
     ROW_EMPTY_SLOT, ROW_HASH_BITS, ROW_HASH_KEY_LEN, ROW_LOG, ROW_MIN_MATCH_LEN, ROW_SEARCH_DEPTH,
@@ -235,14 +235,57 @@ pub(crate) struct RowDictTables {
     /// BT_IDX_BASE`, 0 = none).
     pub(crate) hc_hash: Vec<u32>,
     pub(crate) hc_chain: Vec<u32>,
-    /// Geometry the index was built with (the CDict's cParams): `hash_log`
-    /// (`hashLog`), `chain_log`, `row_log` (`clamp(searchLog, 4, 6)`); the
-    /// row form uses `hash_log - row_log` row bits.
+    /// The cParams the index was built with.
+    pub(crate) shape: RowDictShape,
+    /// How far into the dictionary the index starts (the matcher's
+    /// `dict_index_floor` when it was built).
+    pub(crate) index_floor: usize,
+}
+
+/// Everything besides the dictionary that a dictionary index's contents
+/// depend on, all from the CDict's cParams: the table geometry and form, and
+/// the key width and tree depth its positions were hashed and sorted with.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowDictShape {
+    /// `hashLog`; the row form uses `hash_log - row_log` row bits.
     pub(crate) hash_log: usize,
     pub(crate) chain_log: usize,
+    /// `clamp(searchLog, 4, 6)`.
     pub(crate) row_log: usize,
     pub(crate) use_row: bool,
     pub(crate) use_bt: bool,
+    /// Key width: `minMatch` clamped to 4..=6.
+    pub(crate) mls: u32,
+    /// Compares per tree insert, `1 << searchLog`; 0 for the row and chain
+    /// forms, which do not sort.
+    pub(crate) nb_compares: usize,
+}
+
+impl RowDictShape {
+    /// The index a frame planned by `plan` attaches: the tree when the
+    /// frame's finder is the tree, else the CDict's row or chain form.
+    fn of(plan: RowDictPlan, use_bt: bool) -> Self {
+        let cd = plan.cdict;
+        Self {
+            hash_log: cd.hash_log as usize,
+            chain_log: cd.chain_log as usize,
+            row_log: (cd.search_log as usize).clamp(4, 6),
+            use_row: plan.use_row && !use_bt,
+            use_bt,
+            mls: cd.min_match.clamp(4, 6),
+            nb_compares: if use_bt { 1usize << cd.search_log } else { 0 },
+        }
+    }
+
+    /// Whether an index of `other`'s shape has tables of this one's sizes,
+    /// so its allocation can hold this index once emptied.
+    fn same_tables(&self, other: &Self) -> bool {
+        self.hash_log == other.hash_log
+            && self.chain_log == other.chain_log
+            && self.row_log == other.row_log
+            && self.use_row == other.use_row
+            && self.use_bt == other.use_bt
+    }
 }
 use super::match_table::helpers::{
     INCOMPRESSIBLE_SKIP_STEP, best_len_offset_candidate, extend_backwards_shared,
@@ -615,18 +658,18 @@ macro_rules! row_find_best_match {
         // position at the dictionary's row width (`ZSTD_hashPtr(ip,
         // dms->rowHashLog + 8, mls)`), walked with the attempts the live row
         // left (`nbAttempts` is shared), each entry gated by a 4-byte compare
-        // at the match head. `dict.row_log == $rl` (the frame keeps the
+        // at the match head. `dict.shape.row_log == $rl` (the frame keeps the
         // CDict's `searchLog`).
         if ml < limit
             && attempts > 0
             && $ctx.attached
             && let Some(dict) = $m.dict.table()
-            && dict.use_row
+            && dict.shape.use_row
         {
-            debug_assert_eq!(dict.row_log, $rl);
+            debug_assert_eq!(dict.shape.row_log, $rl);
             let mut dattempts = attempts;
             let dict_end = $m.dict.region_len();
-            let dict_row_hash_log = dict.hash_log - $rl;
+            let dict_row_hash_log = dict.shape.hash_log - $rl;
             // SAFETY: `cur_idx + 16 <= $ctx.len`.
             let dcombined = unsafe {
                 RowMatchGenerator::key_hash_raw(
@@ -843,11 +886,11 @@ macro_rules! hc_find_best_match {
             && attempts > 0
             && $ctx.attached
             && let Some(dict) = $m.dict.table()
-            && !dict.use_row
-            && !dict.use_bt
+            && !dict.shape.use_row
+            && !dict.shape.use_bt
         {
             let dict_end = $m.dict.region_len();
-            let dchain_mask = (1usize << dict.chain_log) - 1;
+            let dchain_mask = (1usize << dict.shape.chain_log) - 1;
             let dmin_chain = dict_end.saturating_sub(dchain_mask + 1);
             // SAFETY: `cur_idx + 16 <= $ctx.len`.
             let dh = unsafe {
@@ -856,7 +899,7 @@ macro_rules! hc_find_best_match {
                     $ctx.len,
                     cur_idx,
                     $ctx.key_mls(),
-                    dict.hash_log,
+                    dict.shape.hash_log,
                     0,
                 )
             } as usize;
@@ -1174,10 +1217,10 @@ macro_rules! dubt_find_best_match {
             if $ctx.attached
                 && nb_compares > 0
                 && let Some(dict) = $m.dict.table()
-                && dict.use_bt
+                && dict.shape.use_bt
             {
                 let dict_end = $m.dict.region_len();
-                let dbt_mask = (1usize << (dict.chain_log - 1)) - 1;
+                let dbt_mask = (1usize << (dict.shape.chain_log - 1)) - 1;
                 let dhigh = dict_end + BT_IDX_BASE;
                 let dlow = BT_IDX_BASE;
                 let dbt_low = if dbt_mask >= dhigh - dlow {
@@ -1192,7 +1235,7 @@ macro_rules! dubt_find_best_match {
                         $ctx.len,
                         cur_idx,
                         $ctx.key_mls(),
-                        dict.hash_log,
+                        dict.shape.hash_log,
                         0,
                     )
                 } as usize;
@@ -2490,6 +2533,14 @@ pub(crate) struct RowMatchGenerator {
     /// activates the bounded dict probe in `row_candidate_rl`; built once and
     /// cached across frames via `DictAttach`, invalidated on eviction / resize.
     pub(crate) dict: DictAttach<RowDictTables>,
+    /// Dict indexes detached from [`Self::dict`] and kept: built for the
+    /// dictionary in use while frames copy it instead of attaching it, or
+    /// kept for their allocation when the dictionary changed. Neither
+    /// travels with a snapshot.
+    dict_keep: DictKeep<RowDictTables>,
+    /// Dict index builds started, and how many of them allocated. Test-only.
+    #[cfg(test)]
+    pub(crate) dict_index_builds: (usize, usize),
     /// Borrowed (no-copy) one-shot input window: `(ptr, len)` into the
     /// caller's slice. When set, the borrowed scan reads candidate/cursor
     /// bytes straight from here instead of the owned `history` mirror, so an
@@ -2558,6 +2609,9 @@ impl RowMatchGenerator {
             tags_len: 0,
             tag_kernel: crate::encoding::fastpath::select_kernel(),
             dict: DictAttach::new(),
+            dict_keep: DictKeep::new(),
+            #[cfg(test)]
+            dict_index_builds: (0, 0),
             borrowed_input: None,
             borrowed_block: None,
             borrowed_extent: 0,
@@ -2569,7 +2623,9 @@ impl RowMatchGenerator {
     /// into the buffers this matcher already holds (the first two in a
     /// context's workspace) instead of cloning them into new allocations. The
     /// buffers are lent out of `snapshot` for the clone of the rest and put
-    /// back.
+    /// back. Copies the other way as well, so a snapshot is captured into the
+    /// buffers of the one it replaces. The indexes each side keeps for later
+    /// stay with it.
     pub(crate) fn restore_snapshot(&mut self, snapshot: &mut Self) {
         let snapshot_tables = core::mem::take(&mut snapshot.tables);
         let snapshot_history = core::mem::take(&mut snapshot.history);
@@ -2577,6 +2633,9 @@ impl RowMatchGenerator {
         let mut tables = core::mem::take(&mut self.tables);
         let mut history = core::mem::take(&mut self.history);
         let mut chunks = core::mem::take(&mut self.chunk_lens);
+        let dict_keep = core::mem::take(&mut self.dict_keep);
+        #[cfg(test)]
+        let dict_index_builds = self.dict_index_builds;
         tables.clone_from(&snapshot_tables);
         history.clone_from(&snapshot_history);
         chunks.clone_from(&snapshot_chunks);
@@ -2584,6 +2643,11 @@ impl RowMatchGenerator {
         self.tables = tables;
         self.history = history;
         self.chunk_lens = chunks;
+        self.dict_keep = dict_keep;
+        #[cfg(test)]
+        {
+            self.dict_index_builds = dict_index_builds;
+        }
         snapshot.tables = snapshot_tables;
         snapshot.history = snapshot_history;
         snapshot.chunk_lens = snapshot_chunks;
@@ -2600,12 +2664,19 @@ impl RowMatchGenerator {
             // it is not in a context's workspace.
             + self.history.owned_bytes()
             + self.tables.owned_bytes()
-            + self.dict.table().map_or(0, |t| {
-                t.heads.capacity()
-                    + t.positions.capacity() * u32_sz
-                    + t.tags.capacity()
-                    + (t.hc_hash.capacity() + t.hc_chain.capacity()) * u32_sz
-            })
+            + self
+                .dict
+                .table()
+                .into_iter()
+                .chain(self.dict_keep.table())
+                .map(|t| {
+                    t.heads.capacity()
+                        + t.positions.capacity() * u32_sz
+                        + t.tags.capacity()
+                        + (t.hc_hash.capacity() + t.hc_chain.capacity()) * u32_sz
+                })
+                .sum::<usize>()
+            + self.dict_keep.slot_bytes()
     }
 
     /// Effective row hash width currently configured (`row_hash_log +
@@ -2745,9 +2816,15 @@ impl RowMatchGenerator {
     /// `ZSTD_resetCCtx_usingCDict`) before [`Self::configure`], which reads
     /// it for the match-finder and salt; `None` for a plain frame.
     pub(crate) fn set_dict_plan(&mut self, plan: Option<RowDictPlan>) {
-        if self.dict_plan != plan {
-            // The prepared dictionary index was built for another plan.
+        if plan.is_none() {
+            // A frame without a dictionary lets go of every dict index.
             self.dict.invalidate();
+            self.dict_keep.release();
+        } else if self.dict_plan != plan {
+            // The prepared index was built for another plan: a frame that
+            // copies the dictionary, say. Parked, it serves the next frame
+            // that attaches this dictionary with the same geometry.
+            self.dict_keep.park(&mut self.dict);
         }
         self.dict_plan = plan;
     }
@@ -3012,7 +3089,10 @@ impl RowMatchGenerator {
         // and a dictionary match starting at the block's first byte is exactly
         // what is legal there.
         if self.history_start != evicted_from {
-            self.dict.invalidate();
+            // The index's concat positions no longer address the dictionary;
+            // parked, it serves the next frame, which commits it at the front
+            // again.
+            self.dict_keep.park(&mut self.dict);
             // Cap the history near the live window: once eviction starts, grow
             // it linearly to (window + window/4 + one block) rather than
             // doubling; `compact_history`'s quarter-window drain keeps the
@@ -3060,7 +3140,7 @@ impl RowMatchGenerator {
 
     pub(crate) fn trim_to_window(&mut self) {
         if self.window_size > self.max_window_size {
-            self.dict.invalidate();
+            self.dict_keep.park(&mut self.dict);
         }
         while self.window_size > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
@@ -4558,16 +4638,16 @@ impl RowMatchGenerator {
     /// the search as `dictMatchState`. Skipped when the cached tree for this
     /// dictionary is already primed.
     fn prime_dict_tree(&mut self, plan: RowDictPlan, concat_len: usize) {
-        let cd = plan.cdict;
-        let hash_log = cd.hash_log as usize;
-        let chain_log = cd.chain_log as usize;
-        let row_log = (cd.search_log as usize).clamp(4, 6);
-        let nb_compares = 1usize << cd.search_log;
-        let mls = cd.min_match.clamp(4, 6);
-        if self.dict.table().is_some_and(|d| {
-            d.hash_log != hash_log || d.chain_log != chain_log || d.row_log != row_log || !d.use_bt
-        }) {
-            self.dict.invalidate();
+        let shape = RowDictShape::of(plan, true);
+        let RowDictShape {
+            hash_log,
+            chain_log,
+            nb_compares,
+            mls,
+            ..
+        } = shape;
+        if self.dict.table().is_some_and(|d| d.shape != shape) {
+            self.dict_keep.park(&mut self.dict);
         }
         self.dict.set_region_len(concat_len);
         if self.dict.is_primed() {
@@ -4576,18 +4656,33 @@ impl RowMatchGenerator {
         let base = self.history.as_ptr();
         let history_start = self.history_start;
         let floor = self.dict_index_floor;
-        let dict = self.dict.table_mut_or_init(|| RowDictTables {
-            heads: Vec::new(),
-            positions: Vec::new(),
-            tags: Vec::new(),
-            hc_hash: alloc::vec![0u32; 1usize << hash_log],
-            hc_chain: alloc::vec![0u32; 1usize << chain_log],
-            hash_log,
-            chain_log,
-            row_log,
-            use_row: false,
-            use_bt: true,
+        // An earlier dictionary's tree of this shape is emptied below and
+        // rebuilt in its allocation.
+        let spare = if self.dict.is_attached() {
+            None
+        } else {
+            self.dict_keep
+                .take_spare()
+                .filter(|d| d.shape.same_tables(&shape))
+        };
+        #[cfg(test)]
+        if !self.dict.is_attached() {
+            self.dict_index_builds.0 += 1;
+            self.dict_index_builds.1 += usize::from(spare.is_none());
+        }
+        let dict = self.dict.table_mut_or_init(|| {
+            spare.unwrap_or_else(|| RowDictTables {
+                heads: Vec::new(),
+                positions: Vec::new(),
+                tags: Vec::new(),
+                hc_hash: alloc::vec![0u32; 1usize << hash_log],
+                hc_chain: alloc::vec![0u32; 1usize << chain_log],
+                shape,
+                index_floor: floor,
+            })
         });
+        dict.shape = shape;
+        dict.index_floor = floor;
         // A cached tree of the right shape that was not marked primed was
         // built for another dictionary of the same length: rebuild it.
         dict.hc_hash.fill(0);
@@ -4610,10 +4705,27 @@ impl RowMatchGenerator {
         }
     }
 
-    /// Drop the cached dict row index (next frame carries no dict, or eviction /
-    /// resize staled the concat positions).
+    /// Let go of the cached dict index: the dictionary changed. Its
+    /// allocation stays for the next dictionary's index.
     pub(crate) fn invalidate_dict_cache(&mut self) {
-        self.dict.invalidate();
+        self.dict_keep.forget(&mut self.dict);
+    }
+
+    /// Attach the parked dict index again for a dictionary of `dict_len`
+    /// bytes about to be primed into a frame that attaches it, when it was
+    /// built for one of that length with the [`RowDictShape`] and index floor
+    /// this frame resolves: the dictionary is the same one (a change goes
+    /// through [`Self::invalidate_dict_cache`]), so the index is what a
+    /// rebuild would produce. Returns whether it was.
+    pub(crate) fn revive_dict_cache(&mut self, dict_len: usize) -> bool {
+        let Some(plan) = self.dict_plan.filter(|plan| plan.attach) else {
+            return false;
+        };
+        let shape = RowDictShape::of(plan, self.finder == LazyFinder::Tree);
+        let floor = self.dict_index_floor;
+        self.dict_keep.revive(&mut self.dict, |index, region_len| {
+            index.shape == shape && index.index_floor == floor && region_len == dict_len
+        })
     }
 
     /// Index the just-committed dictionary block (current `chunk_lens` tail)
@@ -4711,20 +4823,17 @@ impl RowMatchGenerator {
     /// CONCAT indices (stable across rebases). Skipped when the cached index
     /// for this dictionary is already primed.
     fn prime_dict_tables(&mut self, plan: RowDictPlan, concat_len: usize, indexable_end: usize) {
-        let cd = plan.cdict;
-        let hash_log = cd.hash_log as usize;
-        let chain_log = cd.chain_log as usize;
-        let row_log = (cd.search_log as usize).clamp(4, 6);
-        let use_row = plan.use_row;
-        let mls = cd.min_match.clamp(4, 6);
-        if self.dict.table().is_some_and(|d| {
-            d.hash_log != hash_log
-                || d.chain_log != chain_log
-                || d.row_log != row_log
-                || d.use_row != use_row
-                || d.use_bt
-        }) {
-            self.dict.invalidate();
+        let shape = RowDictShape::of(plan, false);
+        let RowDictShape {
+            hash_log,
+            chain_log,
+            row_log,
+            use_row,
+            mls,
+            ..
+        } = shape;
+        if self.dict.table().is_some_and(|d| d.shape != shape) {
+            self.dict_keep.park(&mut self.dict);
         }
         self.dict.set_region_len(concat_len);
         if self.dict.is_primed() {
@@ -4739,7 +4848,32 @@ impl RowMatchGenerator {
         // Raw history base taken before the mutable dict borrow (disjoint
         // fields; the raw ptr holds no borrow).
         let base = self.history.as_ptr();
+        let index_floor = self.dict_index_floor;
+        // An earlier dictionary's index of this shape, emptied in place
+        // rather than allocated anew.
+        let spare = if self.dict.is_attached() {
+            None
+        } else {
+            self.dict_keep
+                .take_spare()
+                .filter(|d| d.shape.same_tables(&shape))
+        };
+        #[cfg(test)]
+        if !self.dict.is_attached() {
+            self.dict_index_builds.0 += 1;
+            self.dict_index_builds.1 += usize::from(spare.is_none());
+        }
         let dict = self.dict.table_mut_or_init(|| {
+            if let Some(mut index) = spare {
+                index.heads.fill(0);
+                index.positions.fill(ROW_EMPTY_SLOT);
+                index.tags.fill(0);
+                index.hc_hash.fill(ROW_EMPTY_SLOT);
+                index.hc_chain.fill(ROW_EMPTY_SLOT);
+                index.shape = shape;
+                index.index_floor = index_floor;
+                return index;
+            }
             let (row_count, total) = if use_row {
                 (1usize << (hash_log - row_log), 1usize << hash_log)
             } else {
@@ -4759,11 +4893,8 @@ impl RowMatchGenerator {
                 } else {
                     alloc::vec![ROW_EMPTY_SLOT; 1usize << chain_log]
                 },
-                hash_log,
-                chain_log,
-                row_log,
-                use_row,
-                use_bt: false,
+                shape,
+                index_floor,
             }
         });
         // SAFETY: `concat + 8 <= concat_len` for every indexed position

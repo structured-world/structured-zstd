@@ -15,7 +15,7 @@ use core::convert::TryInto;
 
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
-use super::dict_attach::DictAttach;
+use super::dict_attach::{DictAttach, DictKeep};
 use super::fastpath::{FastpathKernel, select_kernel};
 use super::incompressible::block_looks_incompressible;
 use super::levels::config::MIN_WINDOW_LOG;
@@ -162,6 +162,14 @@ pub(crate) struct DfastMatchGenerator {
     /// `is_attached()` activates the dual-probe kernel; `region_len()` is the
     /// dict/input boundary (`dict_end`, a concat index).
     pub(crate) dict: DictAttach<DfastDictTables>,
+    /// Dict tables detached from [`Self::dict`] and kept: built for the
+    /// dictionary in use while frames copy it instead of attaching it, or
+    /// kept for their allocation when the dictionary changed. Neither
+    /// travels with a snapshot.
+    dict_keep: DictKeep<DfastDictTables>,
+    /// Dict table builds started, and how many of them allocated. Test-only.
+    #[cfg(test)]
+    pub(crate) dict_table_builds: (usize, usize),
     /// The attached dictionary tables' widths for the next dictionary frame
     /// (the CDict's `hashLog` / `chainLog`), set by the driver; `None` uses
     /// the live widths.
@@ -217,6 +225,9 @@ pub(crate) struct DfastDictTables {
     /// probes hash the position at these widths.
     pub(crate) long_bits: usize,
     pub(crate) short_bits: usize,
+    /// How far into the dictionary the tables start indexing (the matcher's
+    /// `dict_index_floor` when they were built).
+    pub(crate) index_floor: usize,
 }
 
 /// Upstream `ZSTD_SHORT_CACHE_TAG_BITS`: the low bits of a tagged slot hold a
@@ -315,6 +326,9 @@ impl DfastMatchGenerator {
             long_hash_bits: DFAST_HASH_BITS,
             short_hash_bits: DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA,
             dict: DictAttach::new(),
+            dict_keep: DictKeep::new(),
+            #[cfg(test)]
+            dict_table_builds: (0, 0),
             dict_table_bits: None,
             kernel: select_kernel(),
             borrowed_input: None,
@@ -391,10 +405,10 @@ impl DfastMatchGenerator {
             self.tables = Table::empty();
         }
         if resized {
-            // A table-size change makes the cached dict tables (sized to the old
-            // bits) and their hash indices invalid — drop the attach so the next
-            // prime rebuilds at the new shape.
-            self.dict.invalidate();
+            // A table-size change detaches the cached dict tables; parked, they
+            // come back at the next prime only if their own widths are still
+            // the ones it resolves.
+            self.dict_keep.park(&mut self.dict);
         }
     }
 
@@ -541,14 +555,26 @@ impl DfastMatchGenerator {
     /// into the buffers this matcher already holds (the first two in a
     /// context's workspace) instead of cloning them into new allocations. The
     /// buffers are lent out of `snapshot` for the clone of the rest and put
-    /// back.
+    /// back. Copies the other way as well, so a snapshot is captured into the
+    /// buffers of the one it replaces.
+    ///
+    /// The attached-dictionary state is neither side's to give: a snapshot
+    /// is taken and restored only in frames that copy the dictionary into
+    /// the live tables, where it is detached, and each side keeps the tables
+    /// it parked for the frames that attach.
     pub(crate) fn restore_snapshot(&mut self, snapshot: &mut Self) {
+        debug_assert!(!self.dict.is_attached() && !snapshot.dict.is_attached());
         let snapshot_tables = core::mem::take(&mut snapshot.tables);
         let snapshot_history = core::mem::take(&mut snapshot.history);
         let snapshot_blocks = core::mem::take(&mut snapshot.window_blocks);
+        let snapshot_dict = core::mem::take(&mut snapshot.dict);
         let mut tables = core::mem::take(&mut self.tables);
         let mut history = core::mem::take(&mut self.history);
         let mut blocks = core::mem::take(&mut self.window_blocks);
+        let dict = core::mem::take(&mut self.dict);
+        let dict_keep = core::mem::take(&mut self.dict_keep);
+        #[cfg(test)]
+        let dict_table_builds = self.dict_table_builds;
         tables.clone_from(&snapshot_tables);
         history.clone_from(&snapshot_history);
         blocks.clone_from(&snapshot_blocks);
@@ -556,9 +582,16 @@ impl DfastMatchGenerator {
         self.tables = tables;
         self.history = history;
         self.window_blocks = blocks;
+        self.dict = dict;
+        self.dict_keep = dict_keep;
+        #[cfg(test)]
+        {
+            self.dict_table_builds = dict_table_builds;
+        }
         snapshot.tables = snapshot_tables;
         snapshot.history = snapshot_history;
         snapshot.window_blocks = snapshot_blocks;
+        snapshot.dict = snapshot_dict;
     }
 
     /// Heap bytes this matcher owns: the history and the long/short hash
@@ -572,7 +605,11 @@ impl DfastMatchGenerator {
             + self
                 .dict
                 .table()
-                .map_or(0, |t| (t.long.capacity() + t.short.capacity()) * u32_sz)
+                .into_iter()
+                .chain(self.dict_keep.table())
+                .map(|t| (t.long.capacity() + t.short.capacity()) * u32_sz)
+                .sum::<usize>()
+            + self.dict_keep.slot_bytes()
     }
 
     /// Settles, ahead of the next frame's layout, what [`Self::reset`] keeps of
@@ -796,9 +833,10 @@ impl DfastMatchGenerator {
         if self.window_size + len > self.max_window_size {
             // Eviction advances `history_start`, so the dict tables' concat
             // indices (primed at `history_start == 0`) stop addressing the dict
-            // bytes: drop the attach (the dict's ratio benefit ends once it
-            // slides out of the window, as on the Fast backend).
-            self.dict.invalidate();
+            // bytes: detach them (the dict's ratio benefit ends once it slides
+            // out of the window, as on the Fast backend). Parked, they serve
+            // the next frame, which commits the dictionary at the front again.
+            self.dict_keep.park(&mut self.dict);
             // Cap the history near the live window: once eviction starts, grow
             // linearly to window + window/4 + one block rather than doubling;
             // `compact_history`'s quarter-window drain keeps the length under
@@ -830,8 +868,9 @@ impl DfastMatchGenerator {
     pub(crate) fn trim_to_window(&mut self) {
         if self.window_size > self.max_window_size || self.history_start != 0 {
             // Any history shift slides the dictionary out of (or within) the
-            // concat, staling the dict tables' concat indices — drop the attach.
-            self.dict.invalidate();
+            // concat, staling the dict tables' concat indices: detach them
+            // (parked, as on eviction).
+            self.dict_keep.park(&mut self.dict);
         }
         while self.window_size > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
@@ -989,10 +1028,36 @@ impl DfastMatchGenerator {
         self.dict.mark_primed();
     }
 
-    /// Drop the cached dict tables (next frame carries no dict, or eviction /
-    /// param change staled the concat positions).
+    /// Let go of the cached dict tables: the dictionary changed. Their
+    /// allocation stays for the next dictionary's tables.
     pub(crate) fn invalidate_dict_cache(&mut self) {
-        self.dict.invalidate();
+        self.dict_keep.forget(&mut self.dict);
+    }
+
+    /// Detach the dict tables for a frame that copies the dictionary into the
+    /// live tables instead; the next attaching frame of the same dictionary
+    /// takes them back ([`Self::revive_dict_cache`]).
+    pub(crate) fn park_dict_cache(&mut self) {
+        self.dict_keep.park(&mut self.dict);
+    }
+
+    /// Attach the parked dict tables again for a dictionary of `dict_len`
+    /// bytes about to be primed, when they were built for one of that length
+    /// at the widths and index floor this prime resolves: the dictionary is
+    /// the same one (a change goes through [`Self::invalidate_dict_cache`]),
+    /// so the tables are what a rebuild would produce. Returns whether they
+    /// were.
+    pub(crate) fn revive_dict_cache(&mut self, dict_len: usize) -> bool {
+        let (long_bits, short_bits) = self
+            .dict_table_bits
+            .unwrap_or((self.long_hash_bits, self.short_hash_bits));
+        let floor = self.dict_index_floor;
+        self.dict_keep.revive(&mut self.dict, |tables, region_len| {
+            tables.long_bits == long_bits
+                && tables.short_bits == short_bits
+                && tables.index_floor == floor
+                && region_len == dict_len
+        })
     }
 
     /// The attached dictionary tables' `(long, short)` widths for the next
@@ -1005,15 +1070,18 @@ impl DfastMatchGenerator {
         // another CDict geometry (the dual-probe kernel would hash at the
         // new widths into the old table). Dropping it makes the reset
         // re-prime (or run plain) instead.
-        let stale = match (self.dict.table(), bits) {
-            (Some(_), None) => true,
-            (Some(table), Some((long_bits, short_bits))) => {
-                table.long_bits != long_bits || table.short_bits != short_bits
+        match (self.dict.table(), bits) {
+            // A frame without a dictionary lets go of every dict table.
+            (_, None) => {
+                self.dict.invalidate();
+                self.dict_keep.release();
             }
-            (None, _) => false,
-        };
-        if stale {
-            self.dict.invalidate();
+            (Some(table), Some((long_bits, short_bits)))
+                if table.long_bits != long_bits || table.short_bits != short_bits =>
+            {
+                self.dict_keep.park(&mut self.dict);
+            }
+            _ => {}
         }
         self.dict_table_bits = bits;
     }
@@ -1063,7 +1131,9 @@ impl DfastMatchGenerator {
             .table()
             .is_some_and(|d| d.long_bits != long_bits || d.short_bits != short_bits)
         {
-            self.dict.invalidate();
+            // Not fully built (the primed return above), so this keeps only
+            // its allocation.
+            self.dict_keep.park(&mut self.dict);
             self.dict.set_region_len(end_concat);
         }
         // Lookahead-safe cutoffs within the concat: long needs 8 readable
@@ -1085,11 +1155,35 @@ impl DfastMatchGenerator {
         if backfill_floor >= short_safe_end {
             return;
         }
-        let dict = self.dict.table_mut_or_init(|| DfastDictTables {
-            long: alloc::vec![DFAST_EMPTY_SLOT; 1usize << long_bits],
-            short: alloc::vec![DFAST_EMPTY_SLOT; 1usize << short_bits],
-            long_bits,
-            short_bits,
+        let index_floor = self.dict_index_floor;
+        // The previous dictionary's tables at these widths are emptied in
+        // place rather than allocated anew.
+        let spare = if self.dict.is_attached() {
+            None
+        } else {
+            self.dict_keep
+                .take_spare()
+                .filter(|tables| tables.long_bits == long_bits && tables.short_bits == short_bits)
+        };
+        #[cfg(test)]
+        if !self.dict.is_attached() {
+            self.dict_table_builds.0 += 1;
+            self.dict_table_builds.1 += usize::from(spare.is_none());
+        }
+        let dict = self.dict.table_mut_or_init(|| match spare {
+            Some(mut tables) => {
+                tables.long.fill(DFAST_EMPTY_SLOT);
+                tables.short.fill(DFAST_EMPTY_SLOT);
+                tables.index_floor = index_floor;
+                tables
+            }
+            None => DfastDictTables {
+                long: alloc::vec![DFAST_EMPTY_SLOT; 1usize << long_bits],
+                short: alloc::vec![DFAST_EMPTY_SLOT; 1usize << short_bits],
+                long_bits,
+                short_bits,
+                index_floor,
+            },
         });
         let short_shift = 64 - short_bits;
         let long_shift = 64 - long_bits;
