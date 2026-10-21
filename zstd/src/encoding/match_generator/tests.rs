@@ -1442,7 +1442,9 @@ fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
     // reads it; `hc.search_depth` above is the configure-time source and does
     // not reach the walk on its own.
     hc.table.search_depth = 0;
-    hc.table.history = b"xyzxyzxyzxyz".to_vec().into();
+    // Eight bytes past the searched position, as the parser leaves every
+    // position it searches.
+    hc.table.history = b"xyzxyzxyzxyzxyzxyz".to_vec().into();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
 

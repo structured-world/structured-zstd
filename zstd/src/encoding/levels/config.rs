@@ -22,19 +22,17 @@ pub(crate) struct HcConfig {
     pub(crate) chain_log: usize,
     pub(crate) search_depth: usize,
     pub(crate) target_len: usize,
-    /// Binary-tree finder hash width. Upstream uses `mls = BOUNDED(3, minMatch, 6)`
-    /// (`ZSTD_selectBtGetAllMatches`, zstd_opt.c:896) — i.e. mls=3 on the
-    /// btultra/btultra2 levels (L18-22, minMatch=3) — and surfaces 3-byte matches
-    /// through a fallback-only HC3 finder (zstd_opt.c:691-720: distance < 256 KiB,
-    /// taken only when no longer/repcode match exists). Our optimal parser does
-    /// NOT yet replicate that 3-byte handling — it emits short matches C prices
-    /// out, breaking level-22 sequence parity — so the BT hash width is clamped UP
-    /// to 4 (`cp.min_match.clamp(4, 6)`) to keep the finder from surfacing those
-    /// 3-byte matches and so match C's output. This is a deliberate workaround,
-    /// NOT C's finder width; drop the clamp once the optimal parser is C-faithful
-    /// at minMatch 3 (tracked in #337). Carried explicitly per level so a
-    /// `target_length` override can't silently change the finder's hashing width.
-    /// Only the BT body reads it; HC / lazy levels keep it at 4.
+    /// Key width the binary tree hashes. A level's own `minMatch` is clamped to
+    /// `4..=6`: upstream templates its finder on `mls = BOUNDED(3, minMatch, 6)`
+    /// (`ZSTD_selectBtGetAllMatches`, zstd_opt.c), but its `ZSTD_hashPtr` has no
+    /// 3-byte case and hashes `mls = 3` on four bytes (the `default` arm,
+    /// zstd_compress_internal.h), taking 3-byte matches from the hash3 table.
+    /// A `minMatch` of 3 set explicitly keys the tree on three bytes instead:
+    /// here the hash3 table serves btultra2 only, and on the other optimal
+    /// strategies a 4-byte key would leave the tree as the only source of the
+    /// short matches the knob asks for and miss them (z000033 at level 16 with
+    /// `minMatch` 3: 443,830 bytes against 428,164). Only the BT body reads it;
+    /// HC / lazy levels keep it at 4.
     pub(crate) search_mls: usize,
 }
 
@@ -436,11 +434,8 @@ pub(crate) fn apply_param_overrides(
                     hc.target_len = target_length as usize;
                 }
                 if let Some(min_match) = ov.min_match {
-                    // BT finder hash width, derived from cParams.minMatch exactly
-                    // as upstream zstd: `mls = BOUNDED(3, cParams.minMatch, 6)`
-                    // (zstd_opt.c:896 ZSTD_selectBtGetAllMatches). minMatch=3
-                    // tiers hash on 3 bytes (btultra/btultra2 path). Only the BT
-                    // body reads `search_mls`; HC/lazy hash on 4 bytes regardless.
+                    // A `minMatch` of 3 asked for explicitly keys the tree on
+                    // three bytes (see `HcConfig::search_mls`).
                     hc.search_mls = (min_match as usize).clamp(3, 6);
                 }
             }
@@ -657,10 +652,7 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
         chain_log: cp.chain_log as usize,
         search_depth,
         target_len,
-        // Clamp UP to 4: C's BT finder uses mls=3 on L18-22, but our optimal
-        // parser diverges on the resulting 3-byte matches (breaks level-22
-        // sequence parity), so we keep the finder at >=4 as a workaround until
-        // the parser is C-faithful at minMatch 3. See `HcConfig::search_mls` (#337).
+        // See `HcConfig::search_mls`: a `minMatch` of 3 hashes four bytes.
         search_mls: cp.min_match.clamp(4, 6) as usize,
     };
     let row = RowConfig {
