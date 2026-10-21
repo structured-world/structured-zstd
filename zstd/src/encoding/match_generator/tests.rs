@@ -1511,6 +1511,7 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
     // offset 12 while the 4-byte hash of `abcZ` misses `abcQ`. Run under the
     // scalar kernel so the scalar dispatch arm is exercised too.
     for tag in [
+        StrategyTag::Btlazy2,
         StrategyTag::BtOpt,
         StrategyTag::BtUltra,
         StrategyTag::BtUltra2,
@@ -1547,6 +1548,78 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
             found_hash3_match, uses_hash3,
             "tag {tag:?}: presence of the hash3-only 3-byte match must equal USE_HASH3 \
              (a cross-group dispatch mis-mapping would flip this)"
+        );
+    }
+}
+
+/// The candidate search dispatches on the cached kernel tier, and each tier the
+/// CPU can run finds the same candidates at every position of a block: the
+/// scalar fallback and the SIMD kernels agree on the search itself, not only on
+/// the sequences the parser builds from it. Forcing the tier runs the arms the
+/// runtime detection leaves cold on this machine. x86 only, where the tier is a
+/// runtime choice.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn hc_collect_optimal_candidates_agree_across_kernel_tiers() {
+    use crate::encoding::fastpath::FastpathKernel;
+    use crate::encoding::strategy::StrategyTag;
+
+    // Only tiers the running CPU may execute: each dispatch arm assumes its
+    // target feature is present.
+    #[allow(unused_mut)]
+    let mut tiers = alloc::vec![FastpathKernel::Scalar];
+    #[cfg(feature = "kernel-sse")]
+    if std::is_x86_feature_detected!("sse2") {
+        tiers.push(FastpathKernel::Sse2);
+    }
+    #[cfg(feature = "kernel-sse")]
+    if std::is_x86_feature_detected!("sse4.2") {
+        tiers.push(FastpathKernel::Sse42);
+    }
+    #[cfg(feature = "kernel-avx2")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
+        tiers.push(FastpathKernel::Avx2Bmi2);
+    }
+
+    // Mixed redundancy, so the repeat, hash3 and tree probes all find matches.
+    let data: Vec<u8> = (0..4096usize)
+        .map(|i| ((i * 7 + i / 13) % 67) as u8)
+        .collect();
+    let run = |tier: FastpathKernel| -> Vec<Vec<(usize, usize)>> {
+        let mut hc = HcMatchGenerator::new(1 << 20);
+        hc.configure(BTULTRA2_HC_CONFIG, StrategyTag::BtUltra2, 26);
+        hc.table.commit_input(&data);
+        hc.table.kernel = tier;
+        let mut out = Vec::new();
+        (0..data.len() - 8)
+            .map(|pos| {
+                hc.collect_optimal_candidates(
+                    pos,
+                    data.len(),
+                    usize::MAX / 2,
+                    HcCandidateQuery {
+                        reps: [1, 4, 8],
+                        lit_len: 1,
+                        ldm_candidate: None,
+                    },
+                    &mut out,
+                );
+                out.iter().map(|c| (c.offset, c.match_len)).collect()
+            })
+            .collect()
+    };
+
+    let reference = run(tiers[0]);
+    assert!(
+        reference.iter().any(|found| !found.is_empty()),
+        "the search should find candidates on mixed-redundancy input"
+    );
+    for &tier in &tiers[1..] {
+        assert_eq!(
+            run(tier),
+            reference,
+            "kernel tier {tier:?} found different candidates from {:?}",
+            tiers[0],
         );
     }
 }

@@ -28,11 +28,10 @@ pub(crate) struct HcConfig {
     /// 3-byte case and hashes `mls = 3` on four bytes (the `default` arm,
     /// zstd_compress_internal.h), taking 3-byte matches from the hash3 table.
     /// A `minMatch` of 3 set explicitly keys the tree on three bytes instead:
-    /// here the hash3 table serves btultra2 only, and on the other optimal
-    /// strategies a 4-byte key would leave the tree as the only source of the
-    /// short matches the knob asks for and miss them (z000033 at level 16 with
-    /// `minMatch` 3: 443,830 bytes against 428,164). Only the BT body reads it;
-    /// HC / lazy levels keep it at 4.
+    /// here only btultra and btultra2 search the hash3 table, and on btopt a
+    /// 4-byte key would leave no source for the short matches the knob asks for
+    /// (z000033 at level 16 with `minMatch` 3: 443,830 bytes against 428,164).
+    /// Only the BT body reads it; HC / lazy levels keep it at 4.
     pub(crate) search_mls: usize,
 }
 
