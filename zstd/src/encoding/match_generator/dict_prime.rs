@@ -116,6 +116,15 @@ impl MatchGeneratorDriver {
             .map_or(31, |(params, ..)| params.dictionary_reach_log());
         self.storage
             .set_dictionary_index_floor(dict_content.len().saturating_sub(1usize << reach_log));
+        // A dictionary attached again after frames that copied it takes back
+        // the tables built for it, so a compressor alternating small and large
+        // frames builds them once per dictionary, as upstream builds a CDict.
+        if self.active_backend() == super::super::strategy::BackendTag::Dfast
+            && self.dfast_attaches_dictionary(dict_content.len())
+        {
+            self.dfast_matcher_mut()
+                .revive_dict_cache(dict_content.len());
+        }
 
         // Dictionary bytes should stay addressable until produced frame output
         // itself exceeds the live window size. We bump `max_window_size`
@@ -523,12 +532,39 @@ impl MatchGeneratorDriver {
             hc.table.hash3_off = hash3_off;
             self.primed = Some((snapshot, self.dictionary_retained_budget, key));
         } else {
-            self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, key));
+            // Into the buffers of the snapshot it replaces, or of the one a
+            // dictionary change set aside, where the backend copies in place;
+            // a fresh clone otherwise.
+            let replaced = self
+                .primed
+                .take()
+                .map(|(storage, ..)| storage)
+                .or_else(|| self.primed_spare.take());
+            let snapshot = match (replaced, &mut self.storage) {
+                (Some(MatcherStorage::Dfast(mut snapshot)), MatcherStorage::Dfast(live)) => {
+                    snapshot.restore_snapshot(live);
+                    MatcherStorage::Dfast(snapshot)
+                }
+                (Some(MatcherStorage::Row(mut snapshot)), MatcherStorage::Row(live)) => {
+                    snapshot.restore_snapshot(live);
+                    MatcherStorage::Row(snapshot)
+                }
+                (Some(MatcherStorage::Simple(mut snapshot)), MatcherStorage::Simple(live)) => {
+                    snapshot.clone_from(live);
+                    MatcherStorage::Simple(snapshot)
+                }
+                (_, live) => live.clone(),
+            };
+            self.primed = Some((snapshot, self.dictionary_retained_budget, key));
         }
     }
 
     pub(super) fn invalidate_primed_dictionary_impl(&mut self) {
-        self.primed = None;
+        // The snapshot belongs to the dictionary being replaced; its buffers
+        // stay for the next one's.
+        if let Some((storage, ..)) = self.primed.take() {
+            self.primed_spare = Some(storage);
+        }
         // Drop the Fast-backend CDict-equivalent table cache too: it is keyed
         // to the dictionary being removed / replaced. Left in place, the next
         // same-params `reset` would retain it and the kernel would probe a

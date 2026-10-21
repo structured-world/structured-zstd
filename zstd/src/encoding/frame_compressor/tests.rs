@@ -1051,6 +1051,54 @@ fn dict_primed_matcher_snapshot_reused_across_frames_is_byte_identical() {
     }
 }
 
+/// A compressor that alternates frames under the dfast attach cutoff with
+/// frames past it, and then takes another dictionary of the same shape,
+/// builds the attached dictionary tables once per dictionary and allocates
+/// them once in all: frames that copy the dictionary set the tables aside
+/// for the next attaching frame, and the second dictionary's tables reuse the
+/// first's allocation. Every frame is byte-identical to a fresh compressor's.
+#[test]
+fn dict_tables_survive_copied_frames_and_dictionary_changes() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    // A second dictionary of the same serialized size resolves the same
+    // table widths: raw content this time.
+    let other: Vec<u8> = (0..dict_raw.len())
+        .map(|n| b"key=value; table=orders; tenant=demo\n"[n % 37] ^ (n / 37 % 7) as u8)
+        .collect();
+    let small: Vec<u8> = dict_raw[1000..3000].to_vec();
+    let large: Vec<u8> = dict_raw[..40 * 1024]
+        .iter()
+        .rev()
+        .copied()
+        .chain(dict_raw[..8 * 1024].iter().copied())
+        .collect();
+    let prepare =
+        |bytes: &[u8]| super::EncoderDictionary::from_serialized_or_raw_content(bytes).unwrap();
+
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Default);
+    for (round, dictionary) in [&dict_raw[..], &other[..]].into_iter().enumerate() {
+        compressor
+            .set_encoder_dictionary(prepare(dictionary))
+            .unwrap();
+        for input in [&small, &large, &small, &large, &small] {
+            let frame = compressor.compress_independent_frame(input);
+            let mut fresh: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Default);
+            fresh.set_encoder_dictionary(prepare(dictionary)).unwrap();
+            assert_eq!(
+                frame,
+                fresh.compress_independent_frame(input),
+                "dictionary {round}, a {}-byte frame",
+                input.len()
+            );
+        }
+        assert_eq!(
+            compressor.state.matcher.dfast_dict_table_builds(),
+            (round + 1, 1),
+            "after dictionary {round}: builds started, of them allocating"
+        );
+    }
+}
+
 #[test]
 fn dict_primed_matcher_cache_reused_across_small_attach_frames_is_byte_identical() {
     // CDict-equivalent ATTACH path (small source, at/below the Fast 8 KiB
