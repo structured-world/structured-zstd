@@ -121,6 +121,20 @@ fn corrupt(reason: &'static str) -> Error {
     Error::Corrupted { reason }
 }
 
+/// Whether `raw` is a dictionary in the v0.5 or v0.6 layout: that format's
+/// magic number, its tables, then content. Its decoder parses it whole, so it
+/// is kept whole as content; an RFC 8878 frame reads it as raw content, as
+/// upstream reads any dictionary without the RFC 8878 magic number
+/// (`zstd_ddict.c:97`).
+pub(crate) fn is_older_dictionary(raw: &[u8]) -> bool {
+    raw.first_chunk::<4>().is_some_and(|magic| {
+        matches!(
+            u32::from_le_bytes(*magic),
+            v05::DICT_MAGIC | v06::DICT_MAGIC
+        )
+    })
+}
+
 /// A dictionary as the legacy decoders take it.
 #[derive(Clone, Copy)]
 pub(crate) enum LegacyDict<'a> {
@@ -1394,6 +1408,12 @@ impl LegacyStream {
     /// Decode the whole steps `src` holds into `target`, a block at a time,
     /// decoding no further while `target` cannot take what is decoded.
     /// Returns the bytes read and written.
+    ///
+    /// A step that fails after output went to `target` in the same call
+    /// reports the error alone, as the RFC 8878 loop and upstream's
+    /// `ZSTD_decompressStream` do. The `Read` adapter never meets that case:
+    /// it holds one step of input at a time and returns delivered bytes
+    /// before it reads the next.
     pub(crate) fn decode(
         &mut self,
         src: &[u8],

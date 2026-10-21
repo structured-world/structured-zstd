@@ -2914,10 +2914,11 @@ impl FrameDecoder {
         self.state.as_ref().is_some_and(|s| s.active_dict.is_some())
     }
 
-    /// The dictionary the decoder keeps from the last frame it started with
-    /// one, which [`Self::workspace_size`] leaves out because the handle is
-    /// shared: an owner adding up its footprint counts it with the other
-    /// handles it holds (see [`DictionaryHandle::exclusive_heap_size`]).
+    /// The dictionary the current frame decodes with, or the one kept from
+    /// the last frame started with one. [`Self::workspace_size`] leaves it
+    /// out because the handle is shared; an owner adding up its footprint
+    /// counts [`Self::dictionaries`], which also has the handles kept for
+    /// reuse.
     ///
     /// # Examples
     ///
@@ -2932,6 +2933,28 @@ impl FrameDecoder {
             return stream.dictionary();
         }
         self.state.as_ref().and_then(|s| s.active_dict.as_ref())
+    }
+
+    /// Every dictionary handle the decoder holds: [`Self::dictionary`] and
+    /// those it keeps for reuse from frames of another kind (RFC 8878 or
+    /// v0.5-v0.7) or armed for a frame not started yet. An owner adding up
+    /// its footprint passes them to [`DictionaryHandle::exclusive_heap_size`]
+    /// with its own handles; a handle may appear more than once.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_zstd::decoding::FrameDecoder;
+    ///
+    /// assert_eq!(FrameDecoder::new().dictionaries().count(), 0);
+    /// ```
+    pub fn dictionaries(&self) -> impl Iterator<Item = &DictionaryHandle> + Clone {
+        let frame = self.state.as_ref().and_then(|s| s.active_dict.as_ref());
+        #[cfg(feature = "legacy")]
+        let legacy = self.legacy.as_deref().and_then(|s| s.dictionary());
+        #[cfg(not(feature = "legacy"))]
+        let legacy: Option<&DictionaryHandle> = None;
+        frame.into_iter().chain(legacy).chain(&self.armed_dict)
     }
 
     /// Whether the current frames last block has been decoded yet
@@ -3555,11 +3578,11 @@ impl FrameDecoder {
     pub fn collect_to_writer(&mut self, w: impl Write) -> Result<usize, Error> {
         #[cfg(feature = "legacy")]
         if let Some(stream) = self.legacy_frame_mut() {
-            let mut w = w;
-            let len = stream.undelivered();
-            w.write_all(stream.undelivered_bytes())?;
-            stream.mark_delivered(len);
-            return Ok(len);
+            // What the writer took before failing counts as handed out.
+            let (taken, result) =
+                decoding::decode_buffer::write_all_bytes(w, stream.undelivered_bytes());
+            stream.mark_delivered(taken);
+            return result.map(|()| taken);
         }
         let finished = self.is_finished();
         let state = match &mut self.state {

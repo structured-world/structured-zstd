@@ -1840,6 +1840,97 @@ fn a_frame_decoded_whole_keeps_its_dictionary() {
     );
 }
 
+/// The byte-taking entry points accept a dictionary in the v0.5 or v0.6
+/// layout, which those formats' command lines train, as libzstd's
+/// `ZSTD_decompress_usingDict` does.
+#[cfg(feature = "std")]
+#[test]
+fn byte_entry_points_take_v05_and_v06_dictionaries() {
+    use crate::decoding::{FrameDecoder, StreamingDecoder};
+    use std::io::Read;
+    let mut seen = 0;
+    for fixture in fixtures() {
+        let Some(dict) = fixture.dict.as_deref() else {
+            continue;
+        };
+        if fixture.version == LegacyVersion::V07 {
+            continue;
+        }
+        seen += 1;
+        let mut out = vec![0u8; fixture.content.len()];
+        let written = FrameDecoder::new()
+            .decode_all_with_dict_bytes(&fixture.frame, &mut out, dict)
+            .unwrap_or_else(|err| panic!("{}: {err}", fixture.name));
+        assert_eq!(written, fixture.content.len(), "{}", fixture.name);
+        assert!(out == fixture.content, "{}", fixture.name);
+
+        let mut streamed = Vec::new();
+        StreamingDecoder::new_with_dictionary_bytes(&fixture.frame[..], dict)
+            .unwrap_or_else(|refused| panic!("{}: {}", fixture.name, refused.error()))
+            .read_to_end(&mut streamed)
+            .unwrap();
+        assert!(streamed == fixture.content, "{}", fixture.name);
+    }
+    assert!(seen >= 4);
+}
+
+/// A dictionary the decoder keeps for reuse from one kind of frame is still
+/// reported for its footprint while a frame of the other kind is current, so
+/// an owner counting its handles counts it once, when only they keep it.
+#[cfg(feature = "std")]
+#[test]
+fn dictionaries_kept_across_frame_kinds_are_reported() {
+    use crate::decoding::{DictionaryHandle, FrameDecoder};
+    let named = fixture("ModemManager.service.v07.dict.zst");
+    let dict =
+        DictionaryHandle::from_serialized_or_raw_content(named.dict.as_deref().unwrap()).unwrap();
+    let rfc = crate::encoding::compress_slice_to_vec(
+        b"plain",
+        crate::encoding::CompressionLevel::Fastest,
+    );
+    let footprint = DictionaryHandle::exclusive_heap_size([&dict, &dict.clone()]);
+    assert!(footprint > 0);
+
+    // A v0.7 frame with the dictionary, then an RFC 8878 frame without.
+    let mut decoder = FrameDecoder::new();
+    let mut out = vec![0u8; named.content.len()];
+    decoder
+        .decode_all_with_dict_handle(&named.frame, &mut out, &dict)
+        .unwrap();
+    decoder.decode_all(&rfc, &mut out).unwrap();
+    assert_eq!(
+        DictionaryHandle::exclusive_heap_size(
+            core::iter::once(&dict).chain(decoder.dictionaries())
+        ),
+        footprint
+    );
+    drop(decoder);
+
+    // An RFC 8878 frame with the dictionary, then a v0.5 frame without.
+    let mut compressor =
+        crate::encoding::FrameCompressor::new(crate::encoding::CompressionLevel::Fastest);
+    compressor
+        .set_dictionary_from_bytes(named.dict.as_deref().unwrap())
+        .unwrap();
+    compressor.set_source(&b"primed"[..]);
+    let mut with_dict = Vec::new();
+    compressor.set_drain(&mut with_dict);
+    compressor.compress();
+    drop(compressor);
+    let v05 = fixture("abc.txt.v05.l1.zst");
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .decode_all_with_dict_handle(&with_dict, &mut out, &dict)
+        .unwrap();
+    decoder.decode_all(&v05.frame, &mut out).unwrap();
+    assert_eq!(
+        DictionaryHandle::exclusive_heap_size(
+            core::iter::once(&dict).chain(decoder.dictionaries())
+        ),
+        footprint
+    );
+}
+
 /// v0.5 and v0.6 take a dictionary of the RFC 8878 layout whole, header and
 /// tables too, as history: a frame matching into that header decodes, on
 /// the whole-buffer path and the stream alike, as libzstd decodes it.
@@ -2444,4 +2535,83 @@ fn the_step_interface_covers_these_frames() {
     let mut read = [0u8; 16];
     assert_eq!(decoder.read(&mut read).unwrap(), 7);
     assert_eq!(&read[..7], b"zzzzzab");
+}
+
+/// A damaged block after output already handed to the reader is reported by
+/// the next read, not by the one that delivered: `Read` may not return an
+/// error for a call that filled part of its buffer. Covers output left from
+/// an earlier read and output decoded in the same read.
+#[cfg(feature = "std")]
+#[test]
+fn a_damaged_block_after_delivered_output_waits_for_the_next_read() {
+    use crate::decoding::StreamingDecoder;
+    use std::io::Read;
+    let mut frame = vec![0x27, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
+    frame.extend_from_slice(&[0x40, 0x00, 0x08]);
+    frame.extend_from_slice(b"abcdefgh");
+    // Three literals declared, one present.
+    frame.extend_from_slice(&[0x00, 0x00, 0x02, 0x83, b'a']);
+    frame.extend_from_slice(&[0xC0, 0x00, 0x00]);
+
+    let mut decoder = StreamingDecoder::new(&frame[..]);
+    let mut buf = [0u8; 64];
+    assert_eq!(decoder.read(&mut buf).unwrap(), 8);
+    assert_eq!(&buf[..8], b"abcdefgh");
+    assert!(decoder.read(&mut buf).is_err());
+
+    let mut decoder = StreamingDecoder::new(&frame[..]);
+    assert_eq!(decoder.read(&mut buf[..3]).unwrap(), 3);
+    assert_eq!(decoder.read(&mut buf).unwrap(), 5);
+    assert_eq!(&buf[..5], b"defgh");
+    assert!(decoder.read(&mut buf).is_err());
+}
+
+/// A writer that takes part of the output and then fails keeps that part:
+/// the next collection starts after it, as for RFC 8878 frames.
+#[cfg(feature = "std")]
+#[test]
+fn collect_to_writer_keeps_what_a_failing_writer_took() {
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
+    use std::io::{ErrorKind, Write};
+
+    /// Takes `room` bytes, then would block.
+    struct Partial {
+        took: Vec<u8>,
+        room: usize,
+    }
+    impl Write for Partial {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.room == 0 {
+                return Err(ErrorKind::WouldBlock.into());
+            }
+            let n = buf.len().min(self.room);
+            self.took.extend_from_slice(&buf[..n]);
+            self.room -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut frame = vec![0x27, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
+    frame.extend_from_slice(&[0x40, 0x00, 0x08]);
+    frame.extend_from_slice(b"abcdefgh");
+    frame.extend_from_slice(&[0xC0, 0x00, 0x00]);
+    let mut decoder = FrameDecoder::new();
+    let mut src = &frame[..];
+    decoder.reset(&mut src).unwrap();
+    decoder
+        .decode_blocks(&mut src, BlockDecodingStrategy::All)
+        .unwrap();
+    let mut sink = Partial {
+        took: Vec::new(),
+        room: 3,
+    };
+    assert!(decoder.collect_to_writer(&mut sink).is_err());
+    assert_eq!(sink.took, b"abc");
+    assert_eq!(decoder.can_collect(), 5);
+    sink.room = 16;
+    assert_eq!(decoder.collect_to_writer(&mut sink).unwrap(), 5);
+    assert_eq!(sink.took, b"abcdefgh");
 }

@@ -513,7 +513,15 @@ impl DictionaryHandle {
     }
 
     /// Parse a serialized dictionary and return a reusable shared handle.
+    ///
+    /// With the `legacy` feature a dictionary in the v0.5 or v0.6 layout is
+    /// taken too, whole as content with no ID: frames of its format parse
+    /// its tables from it, as libzstd's `ZSTD_decompress_usingDict` does.
     pub fn decode_dict(raw: &[u8]) -> Result<Self, DictionaryDecodeError> {
+        #[cfg(feature = "legacy")]
+        if crate::decoding::legacy::is_older_dictionary(raw) {
+            return Dictionary::from_raw_content(0, raw.to_vec()).map(Self::from_dictionary);
+        }
         let dict = Dictionary::decode_dict(raw)?;
         // The content is the tail of the serialized bytes.
         #[cfg(feature = "legacy")]

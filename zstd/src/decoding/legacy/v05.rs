@@ -13,7 +13,7 @@ use crate::decoding::errors::LegacyFrameError as Error;
 use alloc::vec::Vec;
 
 /// Magic number of a v0.5 dictionary.
-const DICT_MAGIC: u32 = 0xEC30_A435;
+pub(super) const DICT_MAGIC: u32 = 0xEC30_A435;
 
 const LL_BITS: u32 = 6;
 const ML_BITS: u32 = 7;
