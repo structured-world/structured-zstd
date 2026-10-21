@@ -235,34 +235,56 @@ pub(crate) struct RowDictTables {
     /// BT_IDX_BASE`, 0 = none).
     pub(crate) hc_hash: Vec<u32>,
     pub(crate) hc_chain: Vec<u32>,
-    /// Geometry the index was built with (the CDict's cParams): `hash_log`
-    /// (`hashLog`), `chain_log`, `row_log` (`clamp(searchLog, 4, 6)`); the
-    /// row form uses `hash_log - row_log` row bits.
-    pub(crate) hash_log: usize,
-    pub(crate) chain_log: usize,
-    pub(crate) row_log: usize,
-    pub(crate) use_row: bool,
-    pub(crate) use_bt: bool,
+    /// The cParams the index was built with.
+    pub(crate) shape: RowDictShape,
     /// How far into the dictionary the index starts (the matcher's
     /// `dict_index_floor` when it was built).
     pub(crate) index_floor: usize,
 }
 
-impl RowDictTables {
-    /// Whether the index has this geometry and form.
-    fn has_shape(
-        &self,
-        hash_log: usize,
-        chain_log: usize,
-        row_log: usize,
-        use_row: bool,
-        use_bt: bool,
-    ) -> bool {
-        self.hash_log == hash_log
-            && self.chain_log == chain_log
-            && self.row_log == row_log
-            && self.use_row == use_row
-            && self.use_bt == use_bt
+/// Everything besides the dictionary that a dictionary index's contents
+/// depend on, all from the CDict's cParams: the table geometry and form, and
+/// the key width and tree depth its positions were hashed and sorted with.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowDictShape {
+    /// `hashLog`; the row form uses `hash_log - row_log` row bits.
+    pub(crate) hash_log: usize,
+    pub(crate) chain_log: usize,
+    /// `clamp(searchLog, 4, 6)`.
+    pub(crate) row_log: usize,
+    pub(crate) use_row: bool,
+    pub(crate) use_bt: bool,
+    /// Key width: `minMatch` clamped to 4..=6.
+    pub(crate) mls: u32,
+    /// Compares per tree insert, `1 << searchLog`; 0 for the row and chain
+    /// forms, which do not sort.
+    pub(crate) nb_compares: usize,
+}
+
+impl RowDictShape {
+    /// The index a frame planned by `plan` attaches: the tree when the
+    /// frame's finder is the tree, else the CDict's row or chain form.
+    fn of(plan: RowDictPlan, use_bt: bool) -> Self {
+        let cd = plan.cdict;
+        Self {
+            hash_log: cd.hash_log as usize,
+            chain_log: cd.chain_log as usize,
+            row_log: (cd.search_log as usize).clamp(4, 6),
+            use_row: plan.use_row && !use_bt,
+            use_bt,
+            mls: cd.min_match.clamp(4, 6),
+            nb_compares: if use_bt { 1usize << cd.search_log } else { 0 },
+        }
+    }
+
+    /// Whether an index of `other`'s shape has tables of this one's sizes,
+    /// so its allocation can hold this index once emptied.
+    fn same_tables(&self, other: &Self) -> bool {
+        self.hash_log == other.hash_log
+            && self.chain_log == other.chain_log
+            && self.row_log == other.row_log
+            && self.use_row == other.use_row
+            && self.use_bt == other.use_bt
     }
 }
 use super::match_table::helpers::{
@@ -636,18 +658,18 @@ macro_rules! row_find_best_match {
         // position at the dictionary's row width (`ZSTD_hashPtr(ip,
         // dms->rowHashLog + 8, mls)`), walked with the attempts the live row
         // left (`nbAttempts` is shared), each entry gated by a 4-byte compare
-        // at the match head. `dict.row_log == $rl` (the frame keeps the
+        // at the match head. `dict.shape.row_log == $rl` (the frame keeps the
         // CDict's `searchLog`).
         if ml < limit
             && attempts > 0
             && $ctx.attached
             && let Some(dict) = $m.dict.table()
-            && dict.use_row
+            && dict.shape.use_row
         {
-            debug_assert_eq!(dict.row_log, $rl);
+            debug_assert_eq!(dict.shape.row_log, $rl);
             let mut dattempts = attempts;
             let dict_end = $m.dict.region_len();
-            let dict_row_hash_log = dict.hash_log - $rl;
+            let dict_row_hash_log = dict.shape.hash_log - $rl;
             // SAFETY: `cur_idx + 16 <= $ctx.len`.
             let dcombined = unsafe {
                 RowMatchGenerator::key_hash_raw(
@@ -864,11 +886,11 @@ macro_rules! hc_find_best_match {
             && attempts > 0
             && $ctx.attached
             && let Some(dict) = $m.dict.table()
-            && !dict.use_row
-            && !dict.use_bt
+            && !dict.shape.use_row
+            && !dict.shape.use_bt
         {
             let dict_end = $m.dict.region_len();
-            let dchain_mask = (1usize << dict.chain_log) - 1;
+            let dchain_mask = (1usize << dict.shape.chain_log) - 1;
             let dmin_chain = dict_end.saturating_sub(dchain_mask + 1);
             // SAFETY: `cur_idx + 16 <= $ctx.len`.
             let dh = unsafe {
@@ -877,7 +899,7 @@ macro_rules! hc_find_best_match {
                     $ctx.len,
                     cur_idx,
                     $ctx.key_mls(),
-                    dict.hash_log,
+                    dict.shape.hash_log,
                     0,
                 )
             } as usize;
@@ -1195,10 +1217,10 @@ macro_rules! dubt_find_best_match {
             if $ctx.attached
                 && nb_compares > 0
                 && let Some(dict) = $m.dict.table()
-                && dict.use_bt
+                && dict.shape.use_bt
             {
                 let dict_end = $m.dict.region_len();
-                let dbt_mask = (1usize << (dict.chain_log - 1)) - 1;
+                let dbt_mask = (1usize << (dict.shape.chain_log - 1)) - 1;
                 let dhigh = dict_end + BT_IDX_BASE;
                 let dlow = BT_IDX_BASE;
                 let dbt_low = if dbt_mask >= dhigh - dlow {
@@ -1213,7 +1235,7 @@ macro_rules! dubt_find_best_match {
                         $ctx.len,
                         cur_idx,
                         $ctx.key_mls(),
-                        dict.hash_log,
+                        dict.shape.hash_log,
                         0,
                     )
                 } as usize;
@@ -4616,17 +4638,15 @@ impl RowMatchGenerator {
     /// the search as `dictMatchState`. Skipped when the cached tree for this
     /// dictionary is already primed.
     fn prime_dict_tree(&mut self, plan: RowDictPlan, concat_len: usize) {
-        let cd = plan.cdict;
-        let hash_log = cd.hash_log as usize;
-        let chain_log = cd.chain_log as usize;
-        let row_log = (cd.search_log as usize).clamp(4, 6);
-        let nb_compares = 1usize << cd.search_log;
-        let mls = cd.min_match.clamp(4, 6);
-        if self
-            .dict
-            .table()
-            .is_some_and(|d| !d.has_shape(hash_log, chain_log, row_log, false, true))
-        {
+        let shape = RowDictShape::of(plan, true);
+        let RowDictShape {
+            hash_log,
+            chain_log,
+            nb_compares,
+            mls,
+            ..
+        } = shape;
+        if self.dict.table().is_some_and(|d| d.shape != shape) {
             self.dict_keep.park(&mut self.dict);
         }
         self.dict.set_region_len(concat_len);
@@ -4643,7 +4663,7 @@ impl RowMatchGenerator {
         } else {
             self.dict_keep
                 .take_spare()
-                .filter(|d| d.has_shape(hash_log, chain_log, row_log, false, true))
+                .filter(|d| d.shape.same_tables(&shape))
         };
         #[cfg(test)]
         if !self.dict.is_attached() {
@@ -4657,14 +4677,11 @@ impl RowMatchGenerator {
                 tags: Vec::new(),
                 hc_hash: alloc::vec![0u32; 1usize << hash_log],
                 hc_chain: alloc::vec![0u32; 1usize << chain_log],
-                hash_log,
-                chain_log,
-                row_log,
-                use_row: false,
-                use_bt: true,
+                shape,
                 index_floor: floor,
             })
         });
+        dict.shape = shape;
         dict.index_floor = floor;
         // A cached tree of the right shape that was not marked primed was
         // built for another dictionary of the same length: rebuild it.
@@ -4696,7 +4713,7 @@ impl RowMatchGenerator {
 
     /// Attach the parked dict index again for a dictionary of `dict_len`
     /// bytes about to be primed into a frame that attaches it, when it was
-    /// built for one of that length with the geometry, form and index floor
+    /// built for one of that length with the [`RowDictShape`] and index floor
     /// this frame resolves: the dictionary is the same one (a change goes
     /// through [`Self::invalidate_dict_cache`]), so the index is what a
     /// rebuild would produce. Returns whether it was.
@@ -4704,20 +4721,10 @@ impl RowMatchGenerator {
         let Some(plan) = self.dict_plan.filter(|plan| plan.attach) else {
             return false;
         };
-        let cd = plan.cdict;
-        let row_log = (cd.search_log as usize).clamp(4, 6);
-        let use_bt = self.finder == LazyFinder::Tree;
-        let use_row = plan.use_row && !use_bt;
+        let shape = RowDictShape::of(plan, self.finder == LazyFinder::Tree);
         let floor = self.dict_index_floor;
         self.dict_keep.revive(&mut self.dict, |index, region_len| {
-            index.has_shape(
-                cd.hash_log as usize,
-                cd.chain_log as usize,
-                row_log,
-                use_row,
-                use_bt,
-            ) && index.index_floor == floor
-                && region_len == dict_len
+            index.shape == shape && index.index_floor == floor && region_len == dict_len
         })
     }
 
@@ -4816,17 +4823,16 @@ impl RowMatchGenerator {
     /// CONCAT indices (stable across rebases). Skipped when the cached index
     /// for this dictionary is already primed.
     fn prime_dict_tables(&mut self, plan: RowDictPlan, concat_len: usize, indexable_end: usize) {
-        let cd = plan.cdict;
-        let hash_log = cd.hash_log as usize;
-        let chain_log = cd.chain_log as usize;
-        let row_log = (cd.search_log as usize).clamp(4, 6);
-        let use_row = plan.use_row;
-        let mls = cd.min_match.clamp(4, 6);
-        if self
-            .dict
-            .table()
-            .is_some_and(|d| !d.has_shape(hash_log, chain_log, row_log, use_row, false))
-        {
+        let shape = RowDictShape::of(plan, false);
+        let RowDictShape {
+            hash_log,
+            chain_log,
+            row_log,
+            use_row,
+            mls,
+            ..
+        } = shape;
+        if self.dict.table().is_some_and(|d| d.shape != shape) {
             self.dict_keep.park(&mut self.dict);
         }
         self.dict.set_region_len(concat_len);
@@ -4850,7 +4856,7 @@ impl RowMatchGenerator {
         } else {
             self.dict_keep
                 .take_spare()
-                .filter(|d| d.has_shape(hash_log, chain_log, row_log, use_row, false))
+                .filter(|d| d.shape.same_tables(&shape))
         };
         #[cfg(test)]
         if !self.dict.is_attached() {
@@ -4864,6 +4870,7 @@ impl RowMatchGenerator {
                 index.tags.fill(0);
                 index.hc_hash.fill(ROW_EMPTY_SLOT);
                 index.hc_chain.fill(ROW_EMPTY_SLOT);
+                index.shape = shape;
                 index.index_floor = index_floor;
                 return index;
             }
@@ -4886,11 +4893,7 @@ impl RowMatchGenerator {
                 } else {
                     alloc::vec![ROW_EMPTY_SLOT; 1usize << chain_log]
                 },
-                hash_log,
-                chain_log,
-                row_log,
-                use_row,
-                use_bt: false,
+                shape,
                 index_floor,
             }
         });

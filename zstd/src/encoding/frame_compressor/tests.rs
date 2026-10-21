@@ -1216,6 +1216,65 @@ fn reused_compressor_matches_a_fresh_one_across_dictionaries_and_sizes() {
     }
 }
 
+/// A dictionary index built with one key width or search depth is not taken
+/// back for parameters that hash or sort it differently: after
+/// `set_parameters` moves `min_match` or `search_log` with the table
+/// geometry unchanged, a reused compressor writes the frame a fresh one with
+/// the same dictionary and parameters writes, for the row, chain and tree
+/// forms of the index.
+#[test]
+fn a_dictionary_index_is_not_reused_across_key_width_or_search_depth() {
+    use crate::encoding::{CompressionLevel, CompressionParameters, Strategy};
+    let corpus = include_bytes!("../../../decodecorpus_files/z000033");
+    let dict_bytes = corpus[100_000..116_000].to_vec();
+    let prepare = || super::EncoderDictionary::from_serialized_or_raw_content(&dict_bytes).unwrap();
+    // A frame under every lazy backend's attach cutoff, repeating the
+    // dictionary so the attached index decides the output.
+    let input = &dict_bytes[3_000..5_000];
+    let level = CompressionLevel::from_level(5);
+    // (strategy, search_log, min_match) before and after; each pair keeps
+    // hash_log, chain_log and the clamped row width.
+    let cases = [
+        (Strategy::Greedy, (4, 4), (4, 5)),
+        (Strategy::Greedy, (4, 5), (4, 4)),
+        (Strategy::Lazy, (5, 4), (5, 6)),
+        (Strategy::Lazy2, (6, 6), (6, 4)),
+        (Strategy::Btlazy2, (4, 5), (4, 4)),
+        (Strategy::Btlazy2, (7, 4), (8, 4)),
+    ];
+    let mut diverged = Vec::new();
+    for (strategy, before, after) in cases {
+        let params = |(search_log, min_match): (u32, u32)| {
+            CompressionParameters::builder(level)
+                .strategy(strategy)
+                .hash_log(16)
+                .chain_log(16)
+                .search_log(search_log)
+                .min_match(min_match)
+                .build()
+                .unwrap()
+        };
+        let mut reused: FrameCompressor = FrameCompressor::new(level);
+        reused.set_encoder_dictionary(prepare()).unwrap();
+        reused.set_parameters(&params(before));
+        reused.compress_independent_frame(input);
+        reused.set_parameters(&params(after));
+        let frame = reused.compress_independent_frame(input);
+        let mut fresh: FrameCompressor = FrameCompressor::new(level);
+        fresh.set_encoder_dictionary(prepare()).unwrap();
+        fresh.set_parameters(&params(after));
+        let expected = fresh.compress_independent_frame(input);
+        if frame != expected {
+            diverged.push(alloc::format!(
+                "{strategy:?} {before:?} -> {after:?}: reused {} bytes, fresh {}",
+                frame.len(),
+                expected.len()
+            ));
+        }
+    }
+    assert!(diverged.is_empty(), "{diverged:#?}");
+}
+
 #[test]
 fn dict_primed_matcher_cache_reused_across_small_attach_frames_is_byte_identical() {
     // CDict-equivalent ATTACH path (small source, at/below the Fast 8 KiB

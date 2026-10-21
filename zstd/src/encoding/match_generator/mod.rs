@@ -1752,6 +1752,10 @@ impl Matcher for MatchGeneratorDriver {
         // below; HC/Fast leave it `0` because their widths live in `params`
         // (`hc.{hash,chain}_log` / `fast_hash_log`) — already part of the key.
         let mut resolved_table_bits: usize = 0;
+        // The prime makes the same decision through the same helper, so the
+        // layout chosen here is the one the dictionary is primed into.
+        let dfast_attach_next =
+            dict_hint.is_some_and(|sizes| self.dfast_attaches_dictionary(sizes.content));
         match &mut self.storage {
             MatcherStorage::Simple(m) => {
                 // Per-level Fast cParams threaded from
@@ -1903,11 +1907,6 @@ impl Matcher for MatchGeneratorDriver {
                 // unhinted attach frame followed by a large hinted one whose
                 // live widths coincide at the level's full widths. Parked, the
                 // tables serve the next frame that attaches this dictionary.
-                let dfast_attach_next = dict_hint.is_some_and(|sizes| {
-                    sizes.content <= crate::encoding::dfast::DFAST_ATTACH_DICT_MAX_LEN
-                }) && self
-                    .reset_size_log
-                    .is_none_or(|log| log <= DFAST_ATTACH_DICT_CUTOFF_LOG);
                 if dict_hint.is_some() && !dfast_attach_next {
                     dfast.park_dict_cache();
                 }
