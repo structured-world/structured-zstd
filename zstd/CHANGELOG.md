@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/structured-world/structured-zstd/compare/v0.2.4...v0.2.5) - 2026-10-22
+
+### Fixed
+
+- *(cli)* keep sources when flat outputs collide under --rm ([#624](https://github.com/structured-world/structured-zstd/pull/624))
+
+### Performance
+
+- *(encode)* trim the optimal parser's per-search work ([#621](https://github.com/structured-world/structured-zstd/pull/621))
+
 ## [0.2.4](https://github.com/structured-world/structured-zstd/compare/v0.2.3...v0.2.4) - 2026-10-21
 
 ### Added
