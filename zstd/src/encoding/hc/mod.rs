@@ -61,9 +61,25 @@ impl HcMatch {
     }
 }
 
-/// Hard cap on chain-walk depth, and the capacity the optimal parser reserves
-/// for its per-position candidate buffer.
+/// Hard cap on chain-walk depth.
 pub(crate) const MAX_HC_SEARCH_DEPTH: usize = 512;
+
+/// Capacity the optimal parser reserves for its per-position candidate buffer:
+/// one search adds at most three repeats, one hash3 match and one candidate per
+/// tree compare (the live and the dictionary tree share a budget of at most
+/// [`MAX_HC_SEARCH_DEPTH`]), and the long-distance producer one more, so the
+/// search writes into it without a capacity check.
+pub(crate) const HC_OPT_CANDIDATE_CAPACITY: usize = MAX_HC_SEARCH_DEPTH + 8;
+
+// The capacity above holds only while no strategy that runs the binary-tree
+// search can spend more compares than `MAX_HC_SEARCH_DEPTH`.
+const _: () = {
+    use crate::encoding::strategy::{BtOpt, BtUltra, BtUltra2, Btlazy2, Strategy};
+    assert!(BtOpt::MAX_CHAIN_DEPTH <= MAX_HC_SEARCH_DEPTH);
+    assert!(BtUltra::MAX_CHAIN_DEPTH <= MAX_HC_SEARCH_DEPTH);
+    assert!(BtUltra2::MAX_CHAIN_DEPTH <= MAX_HC_SEARCH_DEPTH);
+    assert!(Btlazy2::MAX_CHAIN_DEPTH <= MAX_HC_SEARCH_DEPTH);
+};
 
 /// Hash-chain matcher state used by the `Lazy2` parse mode (and the
 /// short-history fast path of the BT cascade's initial pass).

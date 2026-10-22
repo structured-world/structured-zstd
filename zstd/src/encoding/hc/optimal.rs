@@ -16,7 +16,7 @@
 use super::generator::HcMatchGenerator;
 use crate::encoding::Sequence;
 use crate::encoding::blocks::encode_offset_with_history;
-use crate::encoding::hc::MAX_HC_SEARCH_DEPTH;
+use crate::encoding::hc::HC_OPT_CANDIDATE_CAPACITY;
 use crate::encoding::hc::priceset::{
     priceset_avx2, priceset_neon, priceset_scalar, priceset_simd128, priceset_sse2, priceset_sse41,
 };
@@ -46,6 +46,19 @@ use crate::encoding::{
         MatchCandidate,
     },
 };
+
+/// One position's search, built for the block's strategy, key width and kernel
+/// (`collect_optimal_candidates_initialized_<kernel>`), as the block's pass
+/// calls it.
+type OptimalCollectFn = unsafe fn(
+    &mut HcMatchGenerator,
+    usize,
+    usize,
+    usize,
+    &[u32; 3],
+    bool,
+    &mut Vec<MatchCandidate>,
+);
 
 macro_rules! build_optimal_plan_impl_body {
     (
@@ -212,7 +225,8 @@ macro_rules! build_optimal_plan_impl_body {
                 // kernel's target_feature umbrella, entered under the runtime
                 // detector.
                 unsafe {
-                    $self.$collect::<$strategy_ty>(
+                    $collect(
+                        &mut *$self,
                         $current_abs_start + skipped_literals,
                         current_abs_end,
                         profile.sufficient_match_len,
@@ -317,7 +331,8 @@ macro_rules! build_optimal_plan_impl_body {
                 // `$collect` kernel variant; the runtime kernel detector already
                 // gated entry into the wrapper.
                 unsafe {
-                    $self.$collect::<$strategy_ty>(
+                    $collect(
+                        &mut *$self,
                         $current_abs_start,
                         current_abs_end,
                         profile.sufficient_match_len,
@@ -710,7 +725,8 @@ macro_rules! build_optimal_plan_impl_body {
             // stays live across it; the post-call reads below are a fresh load
             // of the same stable `nodes[pos]`.
             unsafe {
-                $self.$collect::<$strategy_ty>(
+                $collect(
+                    &mut *$self,
                     abs_pos,
                     current_abs_end,
                     profile.sufficient_match_len,
@@ -1103,6 +1119,25 @@ macro_rules! optimal_block_body {
     ) => {{
         // The block is armed, so the tree's coordinates hold for the whole pass.
         $self.table.capture_block_coords();
+        // The tree's insert cursor starts inside the history, so no search has
+        // to pull it up: within the pass it only moves forward.
+        $self.table.skip_insert_until_abs = $self
+            .table
+            .skip_insert_until_abs
+            .max($self.table.history_abs_start);
+        // The search's key width is fixed for the block, so the search built
+        // for it is chosen once here and every position calls it directly, as
+        // upstream picks `ZSTD_btGetAllMatches_<dictMode>_<mls>` per block
+        // (`ZSTD_selectBtGetAllMatches`).
+        let collect: OptimalCollectFn = match $self.table.search_mls {
+            3 => HcMatchGenerator::$collect::<$strategy_ty, 3>,
+            5 => HcMatchGenerator::$collect::<$strategy_ty, 5>,
+            6 => HcMatchGenerator::$collect::<$strategy_ty, 6>,
+            mls => {
+                debug_assert_eq!(mls, 4, "the binary tree keys on three to six bytes");
+                HcMatchGenerator::$collect::<$strategy_ty, 4>
+            }
+        };
         // Everything the pass carries between segments lives in `$buffers.pass`,
         // read at the top of a segment and written at its end, so none of it is
         // live across the segment body (see `HcOptimalPlanBuffers::pass`).
@@ -1139,7 +1174,7 @@ macro_rules! optimal_block_body {
                     segment_stats,
                     $plan,
                     $buffers,
-                    $collect,
+                    collect,
                     $priceset,
                     $current,
                     $opt_state,
@@ -1173,10 +1208,15 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $reps:ident,
         $ll0:ident,
         $out:ident,
+        $mls:expr,
         $bt_insert_range:ident,
         $cpl:path,
         $cmf:path $(,)?
     ) => {{
+        debug_assert_eq!(
+            $mls, $self.table.search_mls,
+            "the block chose the search for its key width"
+        );
         // Per-strategy compile-time const: only BtUltra2 drives the
         // hash3 short-match table. All other monomorphisations drop
         // the entire hash3 lookup block at codegen time. The relaxed
@@ -1203,11 +1243,10 @@ macro_rules! collect_optimal_candidates_initialized_body {
             // binary tree before this position's search, as one run (upstream
             // zstd ZSTD_updateTree). `$bt_insert_range` overshoots the target
             // with no clamp (a long match skips the positions it covers),
-            // exactly as upstream.
-            if $self.table.skip_insert_until_abs < $self.table.history_abs_start {
-                $self.table.skip_insert_until_abs = $self.table.history_abs_start;
-            }
+            // exactly as upstream. The pass starts the cursor inside the
+            // history and only ever moves it forward.
             let update_abs = $self.table.skip_insert_until_abs;
+            debug_assert!(update_abs >= $self.table.history_abs_start);
             // No rebase guard: `arm_block_positions` cleared every position in
             // this block before the parse began, and the catch-up only inserts
             // positions below `$abs_pos`, which is in it.
@@ -1224,8 +1263,10 @@ macro_rules! collect_optimal_candidates_initialized_body {
             $self.table.skip_insert_until_abs = $abs_pos;
         }
         let current_idx = $abs_pos - $self.table.history_abs_start;
-        // The pass's live history length, taken with its coordinates.
-        if current_idx + 4 > $self.table.block_live.1 {
+        // Every probe below reads up to eight bytes at the position; the parser
+        // searches only positions with that much of the block left, so this is
+        // the one length check the search needs.
+        if current_idx + 8 > $self.table.block_live.1 {
             return;
         }
         let mut best_len_for_skip = 0usize;
@@ -1254,6 +1295,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 $reps,
                 $ll0,
                 use_hash3,
+                $mls,
                 $cpl,
                 $cmf,
             );
@@ -1740,9 +1782,8 @@ impl HcMatchGenerator {
         if node_prices.len() < HC_OPT_NODE_LEN {
             node_prices = alloc::boxed::Box::new_uninit_slice(HC_OPT_NODE_LEN);
         }
-        if candidates.capacity() < MAX_HC_SEARCH_DEPTH {
-            candidates.reserve_exact(MAX_HC_SEARCH_DEPTH - candidates.capacity());
-        }
+        candidates.clear();
+        candidates.reserve_exact(HC_OPT_CANDIDATE_CAPACITY);
         if price_arena.len() < HC_OPT_PRICE_ARENA_LEN {
             price_arena = alloc::vec![[0u32; 2]; HC_OPT_PRICE_ARENA_LEN].into_boxed_slice();
         }
@@ -2055,6 +2096,14 @@ impl HcMatchGenerator {
         use crate::encoding::strategy::{self, StrategyTag};
         self.table.ensure_tables();
         self.table.capture_block_coords();
+        // As a block's pass starts it (see `optimal_block_body!`), and with
+        // the room the search writes its candidates into.
+        self.table.skip_insert_until_abs = self
+            .table
+            .skip_insert_until_abs
+            .max(self.table.history_abs_start);
+        out.clear();
+        out.reserve_exact(HC_OPT_CANDIDATE_CAPACITY);
         let reps = &query.reps;
         let ll0 = query.lit_len == 0;
         // Dispatch purely from `self.strategy_tag` (set by
@@ -2062,42 +2111,50 @@ impl HcMatchGenerator {
         // way production does — wiring up `table.hash3_log` directly
         // without setting a matching `strategy_tag` is no longer
         // allowed.
+        // The key width picks the search the way the block's pass picks it.
+        macro_rules! search {
+            ($strategy:ty) => {
+                match self.table.search_mls {
+                    3 => self.collect_optimal_candidates_initialized::<$strategy, 3>(
+                        abs_pos,
+                        current_abs_end,
+                        sufficient_match_len,
+                        reps,
+                        ll0,
+                        out,
+                    ),
+                    5 => self.collect_optimal_candidates_initialized::<$strategy, 5>(
+                        abs_pos,
+                        current_abs_end,
+                        sufficient_match_len,
+                        reps,
+                        ll0,
+                        out,
+                    ),
+                    6 => self.collect_optimal_candidates_initialized::<$strategy, 6>(
+                        abs_pos,
+                        current_abs_end,
+                        sufficient_match_len,
+                        reps,
+                        ll0,
+                        out,
+                    ),
+                    _ => self.collect_optimal_candidates_initialized::<$strategy, 4>(
+                        abs_pos,
+                        current_abs_end,
+                        sufficient_match_len,
+                        reps,
+                        ll0,
+                        out,
+                    ),
+                }
+            };
+        }
         match self.strategy_tag {
-            StrategyTag::BtUltra2 => self
-                .collect_optimal_candidates_initialized::<strategy::BtUltra2>(
-                    abs_pos,
-                    current_abs_end,
-                    sufficient_match_len,
-                    reps,
-                    ll0,
-                    out,
-                ),
-            StrategyTag::BtUltra => self
-                .collect_optimal_candidates_initialized::<strategy::BtUltra>(
-                    abs_pos,
-                    current_abs_end,
-                    sufficient_match_len,
-                    reps,
-                    ll0,
-                    out,
-                ),
-            StrategyTag::Btlazy2 => self
-                .collect_optimal_candidates_initialized::<strategy::Btlazy2>(
-                    abs_pos,
-                    current_abs_end,
-                    sufficient_match_len,
-                    reps,
-                    ll0,
-                    out,
-                ),
-            StrategyTag::BtOpt => self.collect_optimal_candidates_initialized::<strategy::BtOpt>(
-                abs_pos,
-                current_abs_end,
-                sufficient_match_len,
-                reps,
-                ll0,
-                out,
-            ),
+            StrategyTag::BtUltra2 => search!(strategy::BtUltra2),
+            StrategyTag::BtUltra => search!(strategy::BtUltra),
+            StrategyTag::Btlazy2 => search!(strategy::Btlazy2),
+            StrategyTag::BtOpt => search!(strategy::BtOpt),
             StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
                 // Optimal candidate collection is binary-tree only (btopt /
                 // btultra / btultra2 / btlazy2). The Fast / Dfast / Greedy / Lazy
@@ -2137,7 +2194,10 @@ impl HcMatchGenerator {
     /// cover the rest.
     #[allow(dead_code)]
     #[inline(always)]
-    pub(crate) fn collect_optimal_candidates_initialized<S: crate::encoding::strategy::Strategy>(
+    pub(crate) fn collect_optimal_candidates_initialized<
+        S: crate::encoding::strategy::Strategy,
+        const MLS: usize,
+    >(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -2152,7 +2212,7 @@ impl HcMatchGenerator {
             feature = "kernel-neon"
         ))]
         unsafe {
-            self.collect_optimal_candidates_initialized_neon::<S>(
+            self.collect_optimal_candidates_initialized_neon::<S, MLS>(
                 abs_pos,
                 current_abs_end,
                 sufficient_match_len,
@@ -2167,7 +2227,7 @@ impl HcMatchGenerator {
             match self.table.kernel {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.collect_optimal_candidates_initialized_avx2_bmi2::<S>(
+                    self.collect_optimal_candidates_initialized_avx2_bmi2::<S, MLS>(
                         abs_pos,
                         current_abs_end,
                         sufficient_match_len,
@@ -2178,7 +2238,7 @@ impl HcMatchGenerator {
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 => unsafe {
-                    self.collect_optimal_candidates_initialized_sse2::<S>(
+                    self.collect_optimal_candidates_initialized_sse2::<S, MLS>(
                         abs_pos,
                         current_abs_end,
                         sufficient_match_len,
@@ -2189,7 +2249,7 @@ impl HcMatchGenerator {
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse42 => unsafe {
-                    self.collect_optimal_candidates_initialized_sse42::<S>(
+                    self.collect_optimal_candidates_initialized_sse42::<S, MLS>(
                         abs_pos,
                         current_abs_end,
                         sufficient_match_len,
@@ -2198,14 +2258,15 @@ impl HcMatchGenerator {
                         out,
                     )
                 },
-                FastpathKernel::Scalar => self.collect_optimal_candidates_initialized_scalar::<S>(
-                    abs_pos,
-                    current_abs_end,
-                    sufficient_match_len,
-                    reps,
-                    ll0,
-                    out,
-                ),
+                FastpathKernel::Scalar => self
+                    .collect_optimal_candidates_initialized_scalar::<S, MLS>(
+                        abs_pos,
+                        current_abs_end,
+                        sufficient_match_len,
+                        reps,
+                        ll0,
+                        out,
+                    ),
             }
         }
         // wasm resolves `simd128` at compile time (no runtime detection), so
@@ -2218,7 +2279,7 @@ impl HcMatchGenerator {
         // SAFETY: the `cfg` above establishes `simd128` at compile time, which
         // is exactly the umbrella the callee declares.
         unsafe {
-            self.collect_optimal_candidates_initialized_simd128::<S>(
+            self.collect_optimal_candidates_initialized_simd128::<S, MLS>(
                 abs_pos,
                 current_abs_end,
                 sufficient_match_len,
@@ -2242,7 +2303,7 @@ impl HcMatchGenerator {
             )
         )))]
         {
-            self.collect_optimal_candidates_initialized_scalar::<S>(
+            self.collect_optimal_candidates_initialized_scalar::<S, MLS>(
                 abs_pos,
                 current_abs_end,
                 sufficient_match_len,
@@ -2266,6 +2327,7 @@ impl HcMatchGenerator {
     #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_neon<
         S: crate::encoding::strategy::Strategy,
+        const MLS: usize,
     >(
         &mut self,
         abs_pos: usize,
@@ -2284,6 +2346,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
+            MLS,
             bt_insert_range_neon,
             crate::encoding::fastpath::neon::common_prefix_len_ptr,
             crate::encoding::fastpath::neon::count_match_from_indices,
@@ -2298,6 +2361,7 @@ impl HcMatchGenerator {
     #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_sse42<
         S: crate::encoding::strategy::Strategy,
+        const MLS: usize,
     >(
         &mut self,
         abs_pos: usize,
@@ -2316,6 +2380,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
+            MLS,
             bt_insert_range_sse2,
             crate::encoding::fastpath::sse2::common_prefix_len_ptr,
             crate::encoding::fastpath::sse2::count_match_from_indices,
@@ -2336,6 +2401,7 @@ impl HcMatchGenerator {
     #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_sse2<
         S: crate::encoding::strategy::Strategy,
+        const MLS: usize,
     >(
         &mut self,
         abs_pos: usize,
@@ -2354,6 +2420,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
+            MLS,
             bt_insert_range_sse2,
             crate::encoding::fastpath::sse2::common_prefix_len_ptr,
             crate::encoding::fastpath::sse2::count_match_from_indices,
@@ -2368,6 +2435,7 @@ impl HcMatchGenerator {
     #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_avx2_bmi2<
         S: crate::encoding::strategy::Strategy,
+        const MLS: usize,
     >(
         &mut self,
         abs_pos: usize,
@@ -2386,6 +2454,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
+            MLS,
             bt_insert_range_avx2_bmi2,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
             crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
@@ -2407,6 +2476,7 @@ impl HcMatchGenerator {
     #[inline(never)]
     unsafe fn collect_optimal_candidates_initialized_simd128<
         S: crate::encoding::strategy::Strategy,
+        const MLS: usize,
     >(
         &mut self,
         abs_pos: usize,
@@ -2425,6 +2495,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
+            MLS,
             bt_insert_range_simd128,
             crate::encoding::fastpath::simd128::common_prefix_len_ptr,
             crate::encoding::fastpath::simd128::count_match_from_indices,
@@ -2442,6 +2513,7 @@ impl HcMatchGenerator {
     #[inline(never)]
     pub(crate) fn collect_optimal_candidates_initialized_scalar<
         S: crate::encoding::strategy::Strategy,
+        const MLS: usize,
     >(
         &mut self,
         abs_pos: usize,
@@ -2460,6 +2532,7 @@ impl HcMatchGenerator {
             reps,
             ll0,
             out,
+            MLS,
             bt_insert_range_scalar,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
             crate::encoding::fastpath::scalar::count_match_from_indices,
