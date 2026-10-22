@@ -6,7 +6,7 @@ use std::path::Path;
 
 /// A file as the filesystem identifies it: device and inode on Unix, volume
 /// serial number and the 128-bit file ID on Windows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileId(u64, u128);
 
 /// The file `path` names, following symlinks; `None` when there is none, or
@@ -91,6 +91,23 @@ mod sys {
         file_id: [u8; 16],
     }
 
+    /// `BY_HANDLE_FILE_INFORMATION`: the 32-bit volume serial and the 64-bit
+    /// file index, which every Windows file system reports.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: [u32; 2],
+        last_access_time: [u32; 2],
+        last_write_time: [u32; 2],
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetFileInformationByHandleEx(
@@ -98,6 +115,11 @@ mod sys {
             class: i32,
             information: *mut c_void,
             size: u32,
+        ) -> i32;
+
+        fn GetFileInformationByHandle(
+            file: *mut c_void,
+            information: *mut ByHandleFileInformation,
         ) -> i32;
     }
 
@@ -115,10 +137,22 @@ mod sys {
                 core::mem::size_of::<FileIdInfo>() as u32,
             )
         };
-        (ok != 0).then(|| {
-            FileId(
+        if ok != 0 {
+            return Some(FileId(
                 information.volume_serial_number,
                 u128::from_le_bytes(information.file_id),
+            ));
+        }
+        // FAT32, exFAT and some network shares have no `FileIdInfo`; the
+        // 64-bit index identifies the file there, as `std::filesystem`'s
+        // `equivalent` falls back to it in the MSVC STL.
+        let mut index = ByHandleFileInformation::default();
+        // SAFETY: as above; `index` is a writable `BY_HANDLE_FILE_INFORMATION`.
+        let ok = unsafe { GetFileInformationByHandle(handle.cast(), &raw mut index) };
+        (ok != 0).then(|| {
+            FileId(
+                u64::from(index.volume_serial_number),
+                (u128::from(index.file_index_high) << 32) | u128::from(index.file_index_low),
             )
         })
     }

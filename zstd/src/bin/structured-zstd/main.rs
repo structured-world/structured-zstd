@@ -9,6 +9,7 @@
 //! stays O(window), not O(file). Exit status is 0, 1 when any input failed,
 //! and 2 when interrupted, as the reference command's is.
 
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
@@ -3520,6 +3521,30 @@ fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Resu
             }
         }
     }
+    // Under `--output-dir-flat` two inputs named alike land on one output, the
+    // later replacing the earlier. Without `--rm` that is the reference
+    // command's behaviour and both sources remain; with it both sources would
+    // be removed and one input would survive nowhere, so the run stops before
+    // anything is written.
+    let collisions = flat_output_collisions(opts);
+    let removes_sources = opts.remove_source && !opts.keep;
+    if removes_sources && let Some(name) = collisions.first() {
+        bail!(
+            "two inputs would write {} under --output-dir-flat, and --rm would then delete both \
+             sources; nothing was written",
+            Path::new(name).display()
+        );
+    }
+    // Outputs whose names differ can still be one file where the file system
+    // ignores case or Unicode normalisation (`a.txt.zst` and `A.txt.zst`), which
+    // no comparison of names can know. The file system answers instead: an
+    // output that is a file this run already wrote is refused, and its source
+    // kept, rather than replaced and its source removed.
+    let guards_outputs = removes_sources
+        && opts.output_dir.is_some()
+        && opts.output_dir_mirror.is_none()
+        && matches!(opts.mode, Mode::Compress | Mode::Decompress);
+    let mut written: HashSet<identity::FileId> = HashSet::new();
     let mut tally = Tally::default();
     if opts.inputs.is_empty() {
         let outcome = stream_input_to(
@@ -3536,17 +3561,51 @@ fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Resu
         let outcome = if input == Path::new("-") {
             stream_input_to(opts, codecs, input, io::stdout().lock(), STDOUT_MARK, total)?
         } else {
-            match process_file(opts, input, codecs, total) {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    report(opts.verbosity, &named(err, &input.display().to_string()));
-                    Outcome::Refused
+            let output = if guards_outputs {
+                derive_output_path(opts, input).ok()
+            } else {
+                None
+            };
+            // An existing output the platform cannot identify may be one this
+            // run wrote, so it is refused as well: keeping a source costs a
+            // rerun, losing one costs the data.
+            let occupied = output
+                .as_deref()
+                .is_some_and(|path| match identity::of_path(path) {
+                    Some(id) => written.contains(&id),
+                    None => path.exists(),
+                });
+            if let (Some(output), true) = (&output, occupied) {
+                report(
+                    opts.verbosity,
+                    &eyre!(
+                        "{}: {} may be a file this run already wrote from another input; \
+                         not overwritten, and the input is kept",
+                        input.display(),
+                        output.display()
+                    ),
+                );
+                Outcome::Refused
+            } else {
+                match process_file(opts, input, codecs, total) {
+                    Ok(outcome) => {
+                        if let (Outcome::Done(_), Some(output)) = (&outcome, &output)
+                            && let Some(id) = identity::of_path(output)
+                        {
+                            written.insert(id);
+                        }
+                        outcome
+                    }
+                    Err(err) => {
+                        report(opts.verbosity, &named(err, &input.display().to_string()));
+                        Outcome::Refused
+                    }
                 }
             }
         };
         tally.record(outcome);
     }
-    for name in flat_output_collisions(opts) {
+    for name in collisions {
         display!(
             opts.verbosity,
             2,
@@ -3565,7 +3624,8 @@ fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Resu
 /// Judged by the derived output names rather than the inputs' own, which the
 /// reference command compares: decompression drops a suffix, so `a/foo.zst`
 /// and `b/foo.zstd` are two names for one `out/foo`. An input whose output
-/// cannot be derived writes nothing and collides with nothing.
+/// cannot be derived, or that `--exclude-compressed` leaves alone, writes
+/// nothing and collides with nothing.
 fn flat_output_collisions(opts: &Options) -> Vec<OsString> {
     if opts.output_dir.is_none()
         || opts.output_dir_mirror.is_some()
@@ -3577,6 +3637,7 @@ fn flat_output_collisions(opts: &Options) -> Vec<OsString> {
         .inputs
         .iter()
         .filter(|input| input.as_path() != Path::new("-"))
+        .filter(|input| !skips_as_compressed(opts, input))
         .filter_map(|input| derive_output_path(opts, input).ok())
         .collect();
     inputs::shared_file_names(&outputs)
