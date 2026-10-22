@@ -5302,6 +5302,129 @@ fn flat_output_collisions_are_judged_by_the_output_names() {
     assert!(flat_output_collisions(&beside).is_empty());
 }
 
+/// `-f --rm --output-dir-flat` with two inputs named alike must not run: the
+/// second output would replace the first and `--rm` would then delete both
+/// sources, leaving one of the two inputs nowhere. The run is refused before
+/// anything is written, every source stays.
+#[test]
+fn flat_collision_under_rm_is_refused_before_any_write() {
+    let scratch = Scratch::new("flat-rm-compress");
+    let first = scratch.file("d1/x.txt", b"first input\n");
+    let second = scratch.file("d2/x.txt", b"second input\n");
+    let out = scratch.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let opts = parse(&[
+        "-q",
+        "-f",
+        "--rm",
+        "--output-dir-flat",
+        out.to_str().unwrap(),
+        first.to_str().unwrap(),
+        second.to_str().unwrap(),
+    ])
+    .unwrap();
+    let err = run(opts).expect_err("a collision under --rm must stop the run");
+    assert!(
+        err.to_string().contains("x.txt.zst"),
+        "the refusal must name the shared output: {err}"
+    );
+    assert_eq!(fs::read(&first).unwrap(), b"first input\n");
+    assert_eq!(fs::read(&second).unwrap(), b"second input\n");
+    assert!(!out.join("x.txt.zst").exists(), "nothing may be written");
+}
+
+/// The same refusal for decompression, where the collision is on the name
+/// left once the suffix is gone: `d1/foo.zst` and `d2/foo.zstd` both become
+/// `out/foo`.
+#[test]
+fn flat_decompression_collision_under_rm_is_refused_before_any_write() {
+    let scratch = Scratch::new("flat-rm-decompress");
+    let first_frame = frame_of(b"first input\n");
+    let second_frame = frame_of(b"second input\n");
+    let first = scratch.file("d1/foo.zst", &first_frame);
+    let second = scratch.file("d2/foo.zstd", &second_frame);
+    let out = scratch.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let opts = parse(&[
+        "-q",
+        "-d",
+        "-f",
+        "--rm",
+        "--output-dir-flat",
+        out.to_str().unwrap(),
+        first.to_str().unwrap(),
+        second.to_str().unwrap(),
+    ])
+    .unwrap();
+    run(opts).expect_err("a collision under --rm must stop the run");
+    assert_eq!(fs::read(&first).unwrap(), first_frame);
+    assert_eq!(fs::read(&second).unwrap(), second_frame);
+    assert!(!out.join("foo").exists(), "nothing may be written");
+}
+
+/// Without `--rm` no source is at stake, and the run does what the reference
+/// command does: every input is processed, the later output replaces the
+/// earlier under `-f`, and both sources stay.
+#[test]
+fn flat_collision_without_rm_keeps_the_last_output() {
+    let scratch = Scratch::new("flat-no-rm");
+    let first = scratch.file("d1/x.txt", b"first input\n");
+    let second = scratch.file("d2/x.txt", b"second input\n");
+    let out = scratch.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let opts = parse(&[
+        "-q",
+        "-f",
+        "--output-dir-flat",
+        out.to_str().unwrap(),
+        first.to_str().unwrap(),
+        second.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(run(opts).unwrap(), 0);
+    assert!(first.exists() && second.exists());
+    let archive = fs::read(out.join("x.txt.zst")).unwrap();
+    assert_eq!(decoded(&archive).unwrap(), b"second input\n");
+}
+
+/// Two names that differ can still reach one file on a file system that
+/// ignores case (the default on macOS and Windows): `d1/a.txt` and `d2/A.txt`
+/// write one `out/a.txt.zst`. Under `--rm` an input whose output is a file
+/// this run already wrote is refused and kept, so the archive written first
+/// survives beside the source of the second, and the run reports the failure.
+/// Elsewhere the two outputs are distinct files and there is nothing to check.
+#[test]
+fn flat_case_only_collision_under_rm_keeps_the_source() {
+    let scratch = Scratch::new("flat-rm-case");
+    let probe = scratch.file("probe", b"");
+    if !scratch.path().join("PROBE").exists() {
+        return;
+    }
+    fs::remove_file(probe).unwrap();
+    let first = scratch.file("d1/a.txt", b"first input\n");
+    let second = scratch.file("d2/A.txt", b"second input\n");
+    let out = scratch.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let opts = parse(&[
+        "-q",
+        "-f",
+        "--rm",
+        "--output-dir-flat",
+        out.to_str().unwrap(),
+        first.to_str().unwrap(),
+        second.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(run(opts).unwrap(), 1, "the second input must fail");
+    assert!(
+        !first.exists(),
+        "the first input was compressed and removed"
+    );
+    assert_eq!(fs::read(&second).unwrap(), b"second input\n");
+    let archive = fs::read(out.join("a.txt.zst")).unwrap();
+    assert_eq!(decoded(&archive).unwrap(), b"first input\n");
+}
+
 /// Outputs land where the directory flags say: `--output-dir-flat` beside
 /// nothing but the file name, `--output-dir-mirror` under the replayed source
 /// directory, and the mirror wins when both are given, as it does in the

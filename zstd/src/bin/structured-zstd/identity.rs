@@ -6,7 +6,7 @@ use std::path::Path;
 
 /// A file as the filesystem identifies it: device and inode on Unix, volume
 /// serial number and the 128-bit file ID on Windows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileId(u64, u128);
 
 /// The file `path` names, following symlinks; `None` when there is none, or
