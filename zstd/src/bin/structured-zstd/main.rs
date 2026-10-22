@@ -3566,15 +3566,20 @@ fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Resu
             } else {
                 None
             };
-            let earlier = output
+            // An existing output the platform cannot identify may be one this
+            // run wrote, so it is refused as well: keeping a source costs a
+            // rerun, losing one costs the data.
+            let occupied = output
                 .as_deref()
-                .and_then(identity::of_path)
-                .filter(|id| written.contains(id));
-            if let (Some(output), Some(_)) = (&output, earlier) {
+                .is_some_and(|path| match identity::of_path(path) {
+                    Some(id) => written.contains(&id),
+                    None => path.exists(),
+                });
+            if let (Some(output), true) = (&output, occupied) {
                 report(
                     opts.verbosity,
                     &eyre!(
-                        "{}: {} is a file this run already wrote from another input; \
+                        "{}: {} may be a file this run already wrote from another input; \
                          not overwritten, and the input is kept",
                         input.display(),
                         output.display()
@@ -3619,7 +3624,8 @@ fn process_separately(opts: &Options, codecs: &mut Codecs, total: usize) -> Resu
 /// Judged by the derived output names rather than the inputs' own, which the
 /// reference command compares: decompression drops a suffix, so `a/foo.zst`
 /// and `b/foo.zstd` are two names for one `out/foo`. An input whose output
-/// cannot be derived writes nothing and collides with nothing.
+/// cannot be derived, or that `--exclude-compressed` leaves alone, writes
+/// nothing and collides with nothing.
 fn flat_output_collisions(opts: &Options) -> Vec<OsString> {
     if opts.output_dir.is_none()
         || opts.output_dir_mirror.is_some()
@@ -3631,6 +3637,7 @@ fn flat_output_collisions(opts: &Options) -> Vec<OsString> {
         .inputs
         .iter()
         .filter(|input| input.as_path() != Path::new("-"))
+        .filter(|input| !skips_as_compressed(opts, input))
         .filter_map(|input| derive_output_path(opts, input).ok())
         .collect();
     inputs::shared_file_names(&outputs)

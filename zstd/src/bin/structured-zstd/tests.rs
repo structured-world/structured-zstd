@@ -5362,6 +5362,40 @@ fn flat_decompression_collision_under_rm_is_refused_before_any_write() {
     assert!(!out.join("foo").exists(), "nothing may be written");
 }
 
+/// Inputs `--exclude-compressed` leaves alone write nothing, so they collide
+/// with nothing: two skipped `x.zst` must not stop a `--rm` run from
+/// compressing the inputs it does take.
+#[test]
+fn flat_collision_ignores_inputs_excluded_as_compressed() {
+    let scratch = Scratch::new("flat-rm-excluded");
+    let first = scratch.file("d1/x.zst", b"first skipped\n");
+    let second = scratch.file("d2/x.zst", b"second skipped\n");
+    let taken = scratch.file("d3/y.txt", b"taken input\n");
+    let out = scratch.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let opts = parse(&[
+        "-q",
+        "-f",
+        "--rm",
+        "--exclude-compressed",
+        "--output-dir-flat",
+        out.to_str().unwrap(),
+        first.to_str().unwrap(),
+        second.to_str().unwrap(),
+        taken.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(run(opts).unwrap(), 0);
+    assert_eq!(fs::read(&first).unwrap(), b"first skipped\n");
+    assert_eq!(fs::read(&second).unwrap(), b"second skipped\n");
+    assert!(
+        !taken.exists(),
+        "the taken input was compressed and removed"
+    );
+    let archive = fs::read(out.join("y.txt.zst")).unwrap();
+    assert_eq!(decoded(&archive).unwrap(), b"taken input\n");
+}
+
 /// Without `--rm` no source is at stake, and the run does what the reference
 /// command does: every input is processed, the later output replaces the
 /// earlier under `-f`, and both sources stay.
