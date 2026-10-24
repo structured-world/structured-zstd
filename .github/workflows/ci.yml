@@ -225,7 +225,9 @@ jobs:
               -e 'match\s+[A-Za-z_]+::TIER\b' \
               -e 'match\s+<[^>]+>::TIER\b' \
               -e '::TIER\s*[=!]=' \
-              -e 'start_matching(_borrowed)?::<K>\(\s*\|' \
+              zstd/src/ || true)
+          found+=$(rg -n --no-heading -g '*tests*.rs' \
+              -e 'start_matching\w*::<K>\(\s*\|' \
               zstd/src/ || true)
           if [ -n "$found" ]; then
             echo "$found"

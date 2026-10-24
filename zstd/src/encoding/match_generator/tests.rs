@@ -779,14 +779,14 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
         let mut seqs = Vec::new();
         crate::encoding::fastpath::with_encode_tier!(
             tier,
-            K => hc.start_matching_with::<K>(|seq| match seq {
+            K => hc.start_matching_with::<K>(dyn_sink(&mut |seq| match seq {
                 Sequence::Triple {
                     literal_len,
                     offset,
                     match_len,
                 } => seqs.push((literal_len, offset, match_len)),
                 Sequence::Literals { len } => seqs.push((len, 0, 0)),
-            })
+            }))
         );
         seqs
     };
@@ -880,14 +880,14 @@ fn dfast_dictionary_all_kernel_tiers_emit_identical_sequences() {
                 "level 3 with a dictionary must run the dfast backend",
             );
             driver.commit_input(&block);
-            driver.start_matching_with::<K>(|seq| match seq {
+            driver.start_matching_with::<K>(dyn_sink(&mut |seq| match seq {
                 Sequence::Triple {
                     literal_len,
                     offset,
                     match_len,
                 } => seqs.push((literal_len, offset, match_len)),
                 Sequence::Literals { len } => seqs.push((len, 0, 0)),
-            });
+            }));
         });
         seqs
     };

@@ -683,13 +683,16 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
     let code_offsets = uses_fast_offset_codes(state.strategy_tag);
     let block_start_hist = state.offset_hist;
     let mut hist = state.offset_hist;
-    let record = |seq| record_sequence(seq, &mut tail, sequences, code_offsets, &mut hist);
     // The built-in matcher searches compiled for the frame's tier; a matcher
     // from outside the crate knows nothing of tiers. The branch folds per
     // matcher type.
     match state.matcher.builtin_driver() {
-        Some(driver) => driver.start_matching_with::<K>(record),
-        None => state.matcher.start_matching(record),
+        Some(driver) => {
+            builtin_block_sequences::<K>(driver, &mut tail, sequences, code_offsets, &mut hist)
+        }
+        None => state.matcher.start_matching(|seq| {
+            record_sequence(seq, &mut tail, sequences, code_offsets, &mut hist)
+        }),
     }
     if code_offsets {
         state.offset_hist = hist;
@@ -713,6 +716,23 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
         tail,
         &mut parts.literals,
     );
+}
+
+/// The built-in matcher's search of the block under tier `K`, recorded as in
+/// [`collect_block_parts`]. Generic over the tier alone: the record closure's
+/// type carries every parameter of the function it is written in, so written
+/// in `collect_block_parts` it would compile the whole search again for each
+/// matcher type that wraps the driver.
+#[inline]
+fn builtin_block_sequences<K: EncodeTier>(
+    driver: &mut crate::encoding::match_generator::MatchGeneratorDriver,
+    tail: &mut usize,
+    sequences: &mut RegionVec<RawSequence>,
+    code_offsets: bool,
+    hist: &mut [u32; 3],
+) {
+    driver
+        .start_matching_with::<K>(|seq| record_sequence(seq, tail, sequences, code_offsets, hist));
 }
 
 /// Append a block's parse to `capture` as external sequences with plain
