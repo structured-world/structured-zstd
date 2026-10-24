@@ -92,7 +92,7 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         (block.len(), false)
     });
 
-    let emitted = compress_block_encoded(
+    let emitted = crate::encoding::fastpath::with_host_tier!(K => compress_block_encoded::<_, K>(
         &mut state,
         CompressionLevel::Fastest,
         true,
@@ -103,7 +103,7 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         None,
         #[cfg(all(feature = "lsm", feature = "hash"))]
         None,
-    );
+    ));
     assert_eq!(emitted, BlockType::RLE);
 
     assert_eq!(

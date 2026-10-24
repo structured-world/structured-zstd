@@ -6,7 +6,7 @@ use crate::{
     bit_io::BitWriter,
     blocks::block::BlockType,
     encoding::block_header::BlockHeader,
-    encoding::fastpath::{EncodeTier, with_encode_tier},
+    encoding::fastpath::EncodeTier,
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
     encoding::workspace::{RegionVec, Workspace, region_bytes},
     encoding::{Matcher, Sequence},
@@ -431,15 +431,7 @@ impl Matcher for EntropyOnlyMatcher {
 /// returned for the caller to [`commit_block_tables`] if it keeps the block,
 /// or [`discard_block_tables`] if it writes the block raw instead.
 #[must_use = "the block's tables have to be committed or discarded"]
-pub(crate) fn compress_block<M: Matcher>(
-    state: &mut CompressState<M>,
-    output: &mut Vec<u8>,
-) -> BlockTables {
-    with_encode_tier!(state.copy_kernel, K => compress_block_with::<M, K>(state, output))
-}
-
-/// [`compress_block`] compiled for the tier `K`.
-fn compress_block_with<M: Matcher, K: EncodeTier>(
+pub(crate) fn compress_block<M: Matcher, K: EncodeTier>(
     state: &mut CompressState<M>,
     output: &mut Vec<u8>,
 ) -> BlockTables {
@@ -456,29 +448,7 @@ fn compress_block_with<M: Matcher, K: EncodeTier>(
     tables
 }
 
-pub(crate) fn compress_block_with_post_split<M: Matcher>(
-    state: &mut CompressState<M>,
-    last_block: bool,
-    output: &mut Vec<u8>,
-    #[cfg(feature = "lsm")] block_decompressed_sizes: Option<&mut Vec<u32>>,
-    #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
-) {
-    with_encode_tier!(
-        state.copy_kernel,
-        K => compress_block_with_post_split_with::<M, K>(
-            state,
-            last_block,
-            output,
-            #[cfg(feature = "lsm")]
-            block_decompressed_sizes,
-            #[cfg(all(feature = "lsm", feature = "hash"))]
-            block_checksums,
-        )
-    )
-}
-
-/// [`compress_block_with_post_split`] compiled for the tier `K`.
-fn compress_block_with_post_split_with<M: Matcher, K: EncodeTier>(
+pub(crate) fn compress_block_with_post_split<M: Matcher, K: EncodeTier>(
     state: &mut CompressState<M>,
     last_block: bool,
     output: &mut Vec<u8>,
@@ -713,9 +683,14 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
     let code_offsets = uses_fast_offset_codes(state.strategy_tag);
     let block_start_hist = state.offset_hist;
     let mut hist = state.offset_hist;
-    state.matcher.start_matching(|seq| {
-        record_sequence(seq, &mut tail, sequences, code_offsets, &mut hist);
-    });
+    let record = |seq| record_sequence(seq, &mut tail, sequences, code_offsets, &mut hist);
+    // The built-in matcher searches compiled for the frame's tier; a matcher
+    // from outside the crate knows nothing of tiers. The branch folds per
+    // matcher type.
+    match state.matcher.builtin_driver() {
+        Some(driver) => driver.start_matching_with::<K>(record),
+        None => state.matcher.start_matching(record),
+    }
     if code_offsets {
         state.offset_hist = hist;
     }

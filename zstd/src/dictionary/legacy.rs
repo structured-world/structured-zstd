@@ -13,9 +13,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::suffix_array::suffix_array;
-use crate::encoding::fastpath::{
-    FastpathKernel, dispatch_common_prefix_len_ptr_with_kernel, select_kernel,
-};
+use crate::encoding::fastpath::{EncodeTier, select_kernel};
 
 /// Fewest repetitions that make a prefix a candidate (`MINRATIO`).
 const MIN_RATIO: u32 = 4;
@@ -80,19 +78,20 @@ fn noise_band() -> [u8; NOISE_LENGTH] {
 /// the two. The reference copies the whole corpus into a buffer one band
 /// longer (`ZDICT_trainFromBuffer_legacy`), a second copy of the samples while
 /// the caller still holds them for the finalizer.
-struct Corpus<'a> {
+///
+/// `K` is the compare kernel tier, chosen once for the whole run.
+struct Corpus<'a, K: EncodeTier> {
     samples: &'a [u8],
     noise: [u8; NOISE_LENGTH],
-    /// The compare kernel for this CPU, resolved once for the whole run.
-    kernel: FastpathKernel,
+    tier: core::marker::PhantomData<K>,
 }
 
-impl<'a> Corpus<'a> {
+impl<'a, K: EncodeTier> Corpus<'a, K> {
     fn new(samples: &'a [u8]) -> Self {
         Self {
             samples,
             noise: noise_band(),
-            kernel: select_kernel(),
+            tier: core::marker::PhantomData,
         }
     }
 
@@ -156,14 +155,7 @@ impl<'a> Corpus<'a> {
         let base = samples.as_ptr();
         // SAFETY: `a, b <= max(a, b)` and `in_samples == samples.len() -
         // max(a, b)`, so both runs of `in_samples` bytes lie in the samples.
-        let n = unsafe {
-            dispatch_common_prefix_len_ptr_with_kernel(
-                self.kernel,
-                base.add(a),
-                base.add(b),
-                in_samples,
-            )
-        };
+        let n = unsafe { K::common_prefix_len_ptr(base.add(a), base.add(b), in_samples) };
         if n < in_samples {
             return n;
         }
@@ -318,8 +310,24 @@ pub(crate) fn train_legacy_raw(
         kept -= 1;
         used -= sample_sizes[kept];
     }
-    let corpus = Corpus::new(&samples[..used]);
-    find_segments(&mut list, &corpus, used, min_rep);
+    // The run's one choice of compare kernel: the analysis below is compiled
+    // for it.
+    crate::encoding::fastpath::with_encode_tier!(
+        select_kernel(),
+        K => select_content::<K>(&mut list, &samples[..used], min_rep, dict_size)
+    )
+}
+
+/// Analyse `samples` and assemble the dictionary content from the best
+/// segments that fit in `dict_size`, comparing through the tier `K`.
+fn select_content<K: EncodeTier>(
+    list: &mut [DictItem],
+    samples: &[u8],
+    min_rep: u32,
+    dict_size: usize,
+) -> Result<Vec<u8>, TooSmall> {
+    let corpus = Corpus::<K>::new(samples);
+    find_segments(list, &corpus, samples.len(), min_rep);
 
     let segments = list[0].pos as usize;
     let content_size: usize = list[1..segments].iter().map(|d| d.length as usize).sum();
@@ -353,7 +361,12 @@ pub(crate) fn train_legacy_raw(
 
 /// `ZDICT_trainBuffer_legacy`: walk every uncovered position of the corpus in
 /// text order and insert the segment its suffix neighbourhood yields.
-fn find_segments(list: &mut [DictItem], corpus: &Corpus<'_>, len: usize, min_rep: u32) {
+fn find_segments<K: EncodeTier>(
+    list: &mut [DictItem],
+    corpus: &Corpus<'_, K>,
+    len: usize,
+    min_rep: u32,
+) {
     let min_ratio = min_rep.max(MIN_RATIO);
     debug_assert_eq!(corpus.samples.len(), len);
     let sa = suffix_array(corpus.samples);
@@ -410,11 +423,11 @@ fn mark_run(done: &mut [bool], at: usize, len: usize) {
 
 /// `ZDICT_analyzePos`: the segment the suffix of rank `start` leads to, or an
 /// empty one. Every position the analysis settles is marked in `done`.
-fn analyze_position(
+fn analyze_position<K: EncodeTier>(
     done: &mut [bool],
     suffixes: &Suffixes,
     mut start: i64,
-    corpus: &Corpus<'_>,
+    corpus: &Corpus<'_, K>,
     min_ratio: u32,
 ) -> DictItem {
     let mut pos = suffixes.at(start);
@@ -575,7 +588,7 @@ fn analyze_position(
 /// Whether the `length` bytes at `a` equal those at `b` (`isIncluded`); both
 /// runs must lie inside the corpus. Compares `length` bytes and no more, where
 /// `common` would run on to the end of the shared prefix.
-fn is_included(corpus: &Corpus<'_>, a: usize, b: usize, length: usize) -> bool {
+fn is_included<K: EncodeTier>(corpus: &Corpus<'_, K>, a: usize, b: usize, length: usize) -> bool {
     let samples = corpus.samples;
     if let (Some(x), Some(y)) = (samples.get(a..a + length), samples.get(b..b + length)) {
         return x == y;
@@ -597,7 +610,12 @@ fn promote(list: &mut [DictItem], mut at: usize) -> usize {
 
 /// `ZDICT_tryMerge`: fold `elt` into an entry it overlaps, skipping entry
 /// `skip`. Returns the merged entry's index, or 0 when nothing merged.
-fn try_merge(list: &mut [DictItem], elt: DictItem, skip: usize, corpus: &Corpus<'_>) -> usize {
+fn try_merge<K: EncodeTier>(
+    list: &mut [DictItem],
+    elt: DictItem,
+    skip: usize,
+    corpus: &Corpus<'_, K>,
+) -> usize {
     let size = list[0].pos as usize;
     let elt_end = elt.pos + elt.length;
 
@@ -682,7 +700,12 @@ fn remove_item(list: &mut [DictItem], id: usize) {
 /// `ZDICT_insertDictItem`: merge `elt` into the table if it overlaps an entry,
 /// and keep merging while the merged entry overlaps another; otherwise insert
 /// it in savings order, dropping the last entry when the table is full.
-fn insert_item(list: &mut [DictItem], max_size: u32, elt: DictItem, corpus: &Corpus<'_>) {
+fn insert_item<K: EncodeTier>(
+    list: &mut [DictItem],
+    max_size: u32,
+    elt: DictItem,
+    corpus: &Corpus<'_, K>,
+) {
     let mut merge_id = try_merge(list, elt, 0, corpus);
     if merge_id != 0 {
         loop {

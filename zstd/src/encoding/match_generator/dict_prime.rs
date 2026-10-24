@@ -66,7 +66,9 @@ impl MatchGeneratorDriver {
         self.index_dictionary_in_place();
     }
 
-    pub(super) fn prime_with_dictionary_impl(
+    /// [`crate::encoding::Matcher::prime_with_dictionary`] compiled for the kernel tier `K`, the one the encoder chose for the
+    /// frame.
+    pub(crate) fn prime_with_dictionary_with<K: crate::encoding::fastpath::EncodeTier>(
         &mut self,
         dict_content: &[u8],
         offset_hist: [u32; 3],
@@ -244,7 +246,7 @@ impl MatchGeneratorDriver {
                 (chunk.len(), false)
             });
             self.commit_filled(chunk.len());
-            self.skip_matching_for_dictionary_priming(dict_content.len());
+            self.skip_matching_for_dictionary_priming::<K>(dict_content.len());
             committed_dict_budget += end - start;
             start = end;
         }

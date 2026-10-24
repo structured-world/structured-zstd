@@ -12,7 +12,7 @@ fn neighbour_walks_stop_at_the_noise_slots() {
     // The corpus is the band itself, and its one suffix is the only rank in
     // the array: every walk leaves the array on its first step.
     let band = noise_band();
-    let corpus = Corpus::new(&band);
+    let corpus = Corpus::<crate::encoding::fastpath::ScalarTier>::new(&band);
     let suffixes = Suffixes::new(vec![0], band.len());
     let mut done = vec![false; band.len() + 16];
     let solution = analyze_position(&mut done, &suffixes, 0, &corpus, MIN_RATIO);
@@ -33,7 +33,7 @@ fn the_measuring_walk_stops_at_the_noise_slot() {
         .cycle()
         .take(4 * NOISE_LENGTH)
         .collect();
-    let corpus = Corpus::new(&corpus_bytes);
+    let corpus = Corpus::<crate::encoding::fastpath::ScalarTier>::new(&corpus_bytes);
     // In suffix order: each copy's suffix is a prefix of the one before it.
     let suffixes = Suffixes::new(vec![96, 64, 32, 0], corpus_bytes.len());
     let mut done = vec![false; corpus_bytes.len() + 16];

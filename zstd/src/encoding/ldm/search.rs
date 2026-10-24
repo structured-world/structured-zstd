@@ -165,7 +165,7 @@ pub(crate) struct FindBestMatchInputs<'a> {
 /// [`LdmHashTable::bucket_mask`]. All positions in
 /// [`FindBestMatchInputs`] are absolute stream coordinates; the
 /// returned [`LdmMatch::match_pos`] is also absolute.
-pub(crate) fn find_best_match(
+pub(crate) fn find_best_match<K: crate::encoding::fastpath::EncodeTier>(
     table: &LdmHashTable,
     hash_id: u32,
     checksum: u32,
@@ -252,7 +252,7 @@ pub(crate) fn find_best_match(
         // history before the current block are legitimate (upstream zstd
         // `pMatch < iend` is automatically true when the entry's
         // absolute offset is below `iend_abs`).
-        let forward_len = common_prefix_len(
+        let forward_len = common_prefix_len::<K>(
             &live_history[split_idx..split_idx_end],
             &live_history[match_idx..],
         );

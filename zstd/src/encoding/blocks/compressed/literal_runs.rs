@@ -7,7 +7,7 @@
 //! block, so no copy below the dispatch asks which kernel to use.
 
 use crate::decoding::simd_copy;
-use crate::encoding::fastpath::{EncodeTier, FastpathKernel};
+use crate::encoding::fastpath::EncodeTier;
 use crate::encoding::workspace::RegionVec;
 
 use super::RawSequence;
@@ -41,13 +41,16 @@ pub(super) fn gather_literals<K: EncodeTier>(
             feature = "kernel-avx2"
         ))]
         // SAFETY: the tier is only selected after confirming AVX2 (and BMI2).
-        FastpathKernel::Avx2Bmi2 => unsafe { gather_avx2(block, sequences, tail, dst) },
+        crate::encoding::fastpath::FastpathKernel::Avx2Bmi2 => unsafe {
+            gather_avx2(block, sequences, tail, dst)
+        },
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
             feature = "kernel-sse"
         ))]
         // SAFETY: both tiers are only selected after confirming SSE2.
-        FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
+        crate::encoding::fastpath::FastpathKernel::Sse2
+        | crate::encoding::fastpath::FastpathKernel::Sse42 => unsafe {
             gather_sse2(block, sequences, tail, dst)
         },
         #[cfg(all(
@@ -55,13 +58,15 @@ pub(super) fn gather_literals<K: EncodeTier>(
             target_endian = "little",
             feature = "kernel-neon"
         ))]
-        FastpathKernel::Neon => gather_neon(block, sequences, tail, dst),
+        crate::encoding::fastpath::FastpathKernel::Neon => gather_neon(block, sequences, tail, dst),
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
             feature = "kernel-simd128"
         ))]
-        FastpathKernel::Simd128 => gather_simd128(block, sequences, tail, dst),
+        crate::encoding::fastpath::FastpathKernel::Simd128 => {
+            gather_simd128(block, sequences, tail, dst)
+        }
         _ => gather_scalar(block, sequences, tail, dst),
     }
 }

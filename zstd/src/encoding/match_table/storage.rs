@@ -22,6 +22,7 @@ use super::super::Sequence;
 use super::super::blocks::encode_offset_with_history;
 use super::super::cost_model::HC_OPT_NUM;
 use super::super::dict_attach::DictAttach;
+use super::super::fastpath::EncodeTier;
 use super::super::hc::HC_MIN_MATCH_LEN;
 use super::super::opt::types::{HcOptimalSequence, MatchCandidate};
 use super::super::workspace::{HistoryBuf, Table, Workspace, region_bytes};
@@ -323,13 +324,6 @@ pub(crate) struct MatchTable {
     /// Active borrowed block range `[start, end)` within `borrowed_input`,
     /// staged before each borrowed scan.
     pub(crate) borrowed_block: Option<(usize, usize)>,
-    /// SIMD kernel tier, resolved ONCE at construction (upstream-style
-    /// once-per-encoder-invoke detection: the CPU does not change mid-run, so
-    /// `select_kernel()`'s CPUID/`OnceLock` read is paid a single time here).
-    /// The per-block strategy entries and the BT walker dispatch off this
-    /// cached value instead of re-detecting in the hot path. Mirrors the
-    /// `kernel` field the Fast / Row / Dfast matchers already cache.
-    pub(crate) kernel: crate::encoding::fastpath::FastpathKernel,
     /// Set by [`Self::retire_history`] ahead of a layout and taken by the next
     /// [`Self::reset`], which would otherwise read the floor off a history
     /// already cut down to what it keeps.
@@ -379,7 +373,6 @@ impl Clone for MatchTable {
             dms: self.dms.clone(),
             borrowed_input: self.borrowed_input,
             borrowed_block: self.borrowed_block,
-            kernel: self.kernel,
             retired: self.retired,
         }
     }
@@ -425,7 +418,6 @@ impl Clone for MatchTable {
         self.block_live = (core::ptr::null(), 0);
         self.borrowed_input = source.borrowed_input;
         self.borrowed_block = source.borrowed_block;
-        self.kernel = source.kernel;
         self.retired = source.retired;
     }
 }
@@ -560,7 +552,6 @@ impl MatchTable {
             dms: DictAttach::new(),
             borrowed_input: None,
             borrowed_block: None,
-            kernel: crate::encoding::fastpath::select_kernel(),
             retired: None,
         }
     }
@@ -1743,7 +1734,7 @@ impl MatchTable {
     /// `target_feature` umbrella. Every position in the range must already be
     /// representable (see [`Self::arm_block_positions`]).
     #[inline(always)]
-    pub(crate) fn bt_insert_range(
+    pub(crate) fn bt_insert_range<K: EncodeTier>(
         &mut self,
         from: usize,
         stop: usize,
@@ -1761,7 +1752,7 @@ impl MatchTable {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match self.kernel {
+            match K::TIER {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.bt_insert_range_avx2_bmi2(from, stop, current_abs_end, target_abs)
@@ -1776,7 +1767,7 @@ impl MatchTable {
             }
         }
         // wasm has no runtime CPU detection: `simd128` is resolved at compile
-        // time, so the tier is picked by `cfg` rather than by `self.kernel`.
+        // time, so the tier is picked by `cfg` rather than by `K`.
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
@@ -1950,9 +1941,13 @@ impl MatchTable {
     /// BT-side history replay after [`Self::begin_rebase`]. Re-walks
     /// `history_start..abs_pos` through the tree insertion so the pointer-pair
     /// table is consistent with the freshly reset `position_base`.
-    pub(crate) fn replay_history_for_rebase_bt(&mut self, history_start: usize, abs_pos: usize) {
+    pub(crate) fn replay_history_for_rebase_bt<K: EncodeTier>(
+        &mut self,
+        history_start: usize,
+        abs_pos: usize,
+    ) {
         let rebuild_end = self.history_abs_end();
-        let _ = self.bt_insert_range(history_start, abs_pos, rebuild_end, abs_pos);
+        let _ = self.bt_insert_range::<K>(history_start, abs_pos, rebuild_end, abs_pos);
     }
 
     /// Insert every position from the insertion frontier up to `abs_pos`
@@ -1964,7 +1959,11 @@ impl MatchTable {
     /// covered stay out of the tree. Clamping to `abs_pos` inserted them and
     /// gave the tree candidates upstream never surfaces (a longer but farther
     /// match the optimal parser then forced over a cheaper closer one).
-    pub(crate) fn bt_update_tree_until(&mut self, abs_pos: usize, current_abs_end: usize) {
+    pub(crate) fn bt_update_tree_until<K: EncodeTier>(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+    ) {
         if self.skip_insert_until_abs < self.history_abs_start {
             self.skip_insert_until_abs = self.history_abs_start;
         }
@@ -1972,7 +1971,7 @@ impl MatchTable {
         if update_abs < abs_pos {
             if self.can_skip_rebase_check(abs_pos) {
                 // Every position up to the target is representable: one run.
-                let _ = self.bt_insert_range(update_abs, abs_pos, current_abs_end, abs_pos);
+                let _ = self.bt_insert_range::<K>(update_abs, abs_pos, current_abs_end, abs_pos);
             } else {
                 // A rebase may be due inside the run, and it moves the
                 // coordinates the range hoists, so go one position at a time.
@@ -1980,8 +1979,12 @@ impl MatchTable {
                     if !self.can_skip_rebase_check(abs_pos) {
                         self.maybe_rebase_positions(update_abs);
                     }
-                    update_abs =
-                        self.bt_insert_range(update_abs, update_abs + 1, current_abs_end, abs_pos);
+                    update_abs = self.bt_insert_range::<K>(
+                        update_abs,
+                        update_abs + 1,
+                        current_abs_end,
+                        abs_pos,
+                    );
                 }
             }
         }
@@ -2147,8 +2150,16 @@ impl MatchTable {
         let history_start = self.history_abs_start;
         // Rebuild only the already-inserted prefix. The caller inserts abs_pos
         // immediately after this, and later positions are added in-order.
+        //
+        // With the scalar compare, fixed: this runs once per ~4 GiB of stream,
+        // below every position insert, and the tiers' compares return the same
+        // lengths, so the tree is the same and only this rare pass's speed
+        // depends on it.
         if self.uses_bt {
-            self.replay_history_for_rebase_bt(history_start, abs_pos);
+            self.replay_history_for_rebase_bt::<crate::encoding::fastpath::ScalarTier>(
+                history_start,
+                abs_pos,
+            );
         } else {
             self.replay_history_for_rebase_hc(history_start, abs_pos);
         }
@@ -2321,7 +2332,7 @@ impl MatchTable {
     /// Backfill the last `< 4` bytes of the previous slice (which couldn't
     /// be hashed at the time because `insert_position` needs 4 bytes of
     /// lookahead) before the next slice's matching pass.
-    pub(crate) fn backfill_boundary_positions(
+    pub(crate) fn backfill_boundary_positions<K: EncodeTier>(
         &mut self,
         current_abs_start: usize,
         current_abs_end: usize,
@@ -2331,7 +2342,7 @@ impl MatchTable {
             .max(self.history_abs_start);
         if backfill_start < current_abs_start {
             if self.uses_bt {
-                self.bt_update_tree_until(current_abs_start, current_abs_end);
+                self.bt_update_tree_until::<K>(current_abs_start, current_abs_end);
             } else {
                 self.insert_positions(backfill_start, current_abs_start);
             }
@@ -2356,7 +2367,7 @@ impl MatchTable {
     /// (which threads the binary tree) and then densely inserts the
     /// final `HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP` positions so
     /// the very last hashable starts are present for the next slice.
-    pub(crate) fn bt_insert_sparse_incompressible_block(
+    pub(crate) fn bt_insert_sparse_incompressible_block<K: EncodeTier>(
         &mut self,
         current_abs_start: usize,
         current_abs_end: usize,
@@ -2364,7 +2375,7 @@ impl MatchTable {
         let mut pos = current_abs_start;
         while pos < current_abs_end {
             self.maybe_rebase_positions(pos);
-            let _ = self.bt_insert_range(pos, pos + 1, current_abs_end, current_abs_end);
+            let _ = self.bt_insert_range::<K>(pos, pos + 1, current_abs_end, current_abs_end);
             self.insert_hash3_only_no_rebase(pos);
             let next = pos.saturating_add(INCOMPRESSIBLE_SKIP_STEP);
             if next <= pos {
@@ -2383,7 +2394,7 @@ impl MatchTable {
                 continue;
             }
             self.maybe_rebase_positions(pos);
-            let _ = self.bt_insert_range(pos, pos + 1, current_abs_end, current_abs_end);
+            let _ = self.bt_insert_range::<K>(pos, pos + 1, current_abs_end, current_abs_end);
             self.insert_hash3_only_no_rebase(pos);
         }
 
@@ -2444,7 +2455,7 @@ impl MatchTable {
     /// catches up on after one (`ZSTD_ldm_limitTableUpdate` moves
     /// `nextToUpdate` to it), since the match itself is never searched.
     #[cfg(feature = "ldm")]
-    pub(crate) fn skip_long_match(&mut self) {
+    pub(crate) fn skip_long_match<K: EncodeTier>(&mut self) {
         self.ensure_tables();
         let (start, len) = self.current_block_range();
         let end = start + len;
@@ -2456,7 +2467,7 @@ impl MatchTable {
             self.next_to_update3 = self.next_to_update3.max(self.skip_insert_until_abs);
             return;
         }
-        self.backfill_boundary_positions(start, end);
+        self.backfill_boundary_positions::<K>(start, end);
         self.insert_positions(
             end - len.min(crate::encoding::ldm::LONG_MATCH_INDEXED_TAIL),
             end,
@@ -2474,7 +2485,7 @@ impl MatchTable {
         );
     }
 
-    pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
+    pub(crate) fn skip_matching<K: EncodeTier>(&mut self, incompressible_hint: Option<bool>) {
         self.ensure_tables();
         let (current_abs_start, current_len) = self.current_block_range();
         let current_abs_end = current_abs_start + current_len;
@@ -2482,13 +2493,13 @@ impl MatchTable {
         // indexed only from its floor on.
         let floor = (self.history_abs_start + self.dict_index_floor).min(current_abs_end);
         let current_abs_start = current_abs_start.max(floor);
-        self.backfill_boundary_positions(current_abs_start, current_abs_end);
+        self.backfill_boundary_positions::<K>(current_abs_start, current_abs_end);
         if self.uses_bt {
             if incompressible_hint == Some(true) {
-                self.bt_insert_sparse_incompressible_block(current_abs_start, current_abs_end);
+                self.bt_insert_sparse_incompressible_block::<K>(current_abs_start, current_abs_end);
                 return;
             }
-            self.bt_update_tree_until(current_abs_end, current_abs_end);
+            self.bt_update_tree_until::<K>(current_abs_end, current_abs_end);
             return;
         }
         if incompressible_hint == Some(true) {
@@ -2518,7 +2529,7 @@ impl MatchTable {
     /// `collect_optimal_candidates_initialized_<kernel>` umbrella.
     #[allow(dead_code)]
     #[inline(always)]
-    pub(crate) fn hash3_candidate(
+    pub(crate) fn hash3_candidate<K: EncodeTier>(
         &self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -2535,7 +2546,7 @@ impl MatchTable {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match self.kernel {
+            match K::TIER {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.hash3_candidate_avx2_bmi2(abs_pos, current_abs_end, min_match_len)

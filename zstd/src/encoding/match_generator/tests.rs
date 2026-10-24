@@ -3,6 +3,7 @@
 //! optimal round-trips, and dictionary-priming behaviour.
 
 use super::*;
+use crate::encoding::fastpath::with_host_tier;
 use crate::encoding::test_support::BlockReplay;
 use alloc::vec::Vec;
 
@@ -230,12 +231,12 @@ fn row_mls_knob_gates_matches_and_roundtrips() {
         let mut out: Vec<u8> = Vec::with_capacity(data.len());
         let mut shortest_match = usize::MAX;
         let mut replay = BlockReplay::new(&data);
-        matcher.start_matching(|seq| {
+        with_host_tier!(K => matcher.start_matching::<K>(|seq| {
             if let Sequence::Triple { match_len, .. } = seq {
                 shortest_match = shortest_match.min(match_len);
             }
             replay.apply(&mut out, seq);
-        });
+        }));
 
         assert_eq!(out, data, "mls={mls} round-trip diverged");
         if shortest_match != usize::MAX {
@@ -870,22 +871,23 @@ fn dfast_dictionary_all_kernel_tiers_emit_identical_sequences() {
         driver.set_source_size_hint(block.len() as u64);
         driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
         driver.reset(CompressionLevel::Level(3));
-        driver.prime_with_dictionary(&dict, [1, 4, 8]);
-        assert_eq!(
-            driver.active_backend(),
-            super::super::strategy::BackendTag::Dfast,
-            "level 3 with a dictionary must run the dfast backend",
-        );
-        driver.dfast_matcher_mut().kernel = tier;
-        driver.commit_input(&block);
         let mut seqs = Vec::new();
-        driver.start_matching(|seq| match seq {
-            Sequence::Triple {
-                literal_len,
-                offset,
-                match_len,
-            } => seqs.push((literal_len, offset, match_len)),
-            Sequence::Literals { len } => seqs.push((len, 0, 0)),
+        crate::encoding::fastpath::with_encode_tier!(tier, K => {
+            driver.prime_with_dictionary_with::<K>(&dict, [1, 4, 8]);
+            assert_eq!(
+                driver.active_backend(),
+                super::super::strategy::BackendTag::Dfast,
+                "level 3 with a dictionary must run the dfast backend",
+            );
+            driver.commit_input(&block);
+            driver.start_matching_with::<K>(|seq| match seq {
+                Sequence::Triple {
+                    literal_len,
+                    offset,
+                    match_len,
+                } => seqs.push((literal_len, offset, match_len)),
+                Sequence::Literals { len } => seqs.push((len, 0, 0)),
+            });
         });
         seqs
     };
@@ -1395,7 +1397,7 @@ fn hc_repcode_candidates_respect_litlen_dependent_rep_order() {
     let reps = [6u32, 3u32, 9u32];
 
     let mut lit_pos_candidates = Vec::new();
-    hc.hc.for_each_repcode_candidate_with_reps(
+    with_host_tier!(K => hc.hc.for_each_repcode_candidate_with_reps::<K>(
         &hc.table,
         abs_pos,
         1,
@@ -1405,14 +1407,14 @@ fn hc_repcode_candidates_respect_litlen_dependent_rep_order() {
         |c| {
             lit_pos_candidates.push(c.offset);
         },
-    );
+    ));
     assert!(
         lit_pos_candidates.contains(&6),
         "when lit_len>0, rep0 should be considered and match"
     );
 
     let mut ll0_candidates = Vec::new();
-    hc.hc.for_each_repcode_candidate_with_reps(
+    with_host_tier!(K => hc.hc.for_each_repcode_candidate_with_reps::<K>(
         &hc.table,
         abs_pos,
         0,
@@ -1422,7 +1424,7 @@ fn hc_repcode_candidates_respect_litlen_dependent_rep_order() {
         |c| {
             ll0_candidates.push(c.offset);
         },
-    );
+    ));
     assert!(
         !ll0_candidates.contains(&6),
         "when lit_len==0, rep0 is not directly eligible (ll0 semantics)"
@@ -1451,7 +1453,7 @@ fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
     let abs_pos = 6usize;
     let current_abs_end = hc.table.history.len();
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         current_abs_end,
         usize::MAX / 2,
@@ -1461,7 +1463,7 @@ fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
             ldm_candidate: None,
         },
         &mut out,
-    );
+    ));
     assert!(
         !out.is_empty(),
         "rep candidates should remain available even when chain depth is zero"
@@ -1485,7 +1487,7 @@ fn hc_collect_optimal_candidates_panics_for_non_bt_strategy() {
     hc.table.history_abs_start = 0;
     hc.table.ensure_tables();
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    hc.collect_optimal_candidates::<crate::encoding::fastpath::ScalarTier>(
         6,
         hc.table.history.len(),
         usize::MAX / 2,
@@ -1500,7 +1502,7 @@ fn hc_collect_optimal_candidates_panics_for_non_bt_strategy() {
 
 #[test]
 fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
-    use crate::encoding::fastpath::FastpathKernel;
+    use crate::encoding::fastpath::ScalarTier;
     use crate::encoding::strategy::StrategyTag;
     // The public dispatcher must route every BT strategy tag to the collector
     // AND to the specialization carrying that tag's consts — not just survive.
@@ -1518,7 +1520,6 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
     ] {
         let mut hc = HcMatchGenerator::new(64);
         hc.strategy_tag = tag;
-        hc.table.kernel = FastpathKernel::Scalar;
         hc.table.history = b"abcQ00000000abcZ00000000".to_vec().into();
         hc.table.history_start = 0;
         hc.table.history_abs_start = 0;
@@ -1529,7 +1530,7 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
         hc.table.search_depth = 8;
         let abs_pos = 12usize;
         let mut out = Vec::new();
-        hc.collect_optimal_candidates(
+        hc.collect_optimal_candidates::<ScalarTier>(
             abs_pos,
             hc.table.history.len(),
             usize::MAX / 2,
@@ -1589,20 +1590,22 @@ fn hc_collect_optimal_candidates_agree_across_kernel_tiers() {
         let mut hc = HcMatchGenerator::new(1 << 20);
         hc.configure(BTULTRA2_HC_CONFIG, StrategyTag::BtUltra2, 26);
         hc.table.commit_input(&data);
-        hc.table.kernel = tier;
         let mut out = Vec::new();
         (0..data.len() - 8)
             .map(|pos| {
-                hc.collect_optimal_candidates(
-                    pos,
-                    data.len(),
-                    usize::MAX / 2,
-                    HcCandidateQuery {
-                        reps: [1, 4, 8],
-                        lit_len: 1,
-                        ldm_candidate: None,
-                    },
-                    &mut out,
+                crate::encoding::fastpath::with_encode_tier!(
+                    tier,
+                    K => hc.collect_optimal_candidates::<K>(
+                        pos,
+                        data.len(),
+                        usize::MAX / 2,
+                        HcCandidateQuery {
+                            reps: [1, 4, 8],
+                            lit_len: 1,
+                            ldm_candidate: None,
+                        },
+                        &mut out,
+                    )
                 );
                 out.iter().map(|c| (c.offset, c.match_len)).collect()
             })
@@ -1639,7 +1642,7 @@ fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
 
     hc.table.search_depth = 32;
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         hc.table.history.len(),
         usize::MAX / 2,
@@ -1649,7 +1652,7 @@ fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
             ldm_candidate: None,
         },
         &mut out,
-    );
+    ));
 
     assert!(
         out.iter()
@@ -1674,7 +1677,7 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
 
     hc.table.search_depth = 32;
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         hc.table.history.len(),
         usize::MAX / 2,
@@ -1684,7 +1687,7 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
             ldm_candidate: None,
         },
         &mut out,
-    );
+    ));
 
     assert!(
         hc.table.skip_insert_until_abs > abs_pos,
@@ -1707,7 +1710,7 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
     hc.table.skip_insert_until_abs = 0;
     hc.table.search_depth = 0;
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         hc.table.history.len(),
         usize::MAX / 2,
@@ -1717,7 +1720,7 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
             ldm_candidate: None,
         },
         &mut out,
-    );
+    ));
 
     assert_eq!(
         hc.table.skip_insert_until_abs,
@@ -1759,7 +1762,7 @@ fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
 
     hc.table.search_depth = 0;
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         current_abs_end,
         usize::MAX / 2,
@@ -1769,7 +1772,7 @@ fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
             ldm_candidate: Some(ldm),
         },
         &mut out,
-    );
+    ));
     assert!(
         out.iter().any(
             |candidate| candidate.offset == ldm.offset && candidate.match_len == ldm.match_len
@@ -1800,7 +1803,7 @@ fn hc_ldm_candidate_survives_the_search_early_exit() {
         match_len: 12,
     };
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         hc.table.history.len(),
         // Below the repeat match's length, so the repeat probe ends the search.
@@ -1811,7 +1814,7 @@ fn hc_ldm_candidate_survives_the_search_early_exit() {
             ldm_candidate: Some(ldm),
         },
         &mut out,
-    );
+    ));
     assert!(
         out.iter().any(|c| c.offset == 10 && c.match_len == 5),
         "the repeat match that ends the search is kept"
@@ -1869,7 +1872,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     let mut hc = HcMatchGenerator::new(256);
     hc.configure(test_config, StrategyTag::BtUltra2, window_log);
     prepare_history(&mut hc, abs_pos);
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         160,
         usize::MAX / 2,
@@ -1879,7 +1882,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
             ldm_candidate: None,
         },
         &mut out,
-    );
+    ));
     assert!(
         out.iter().any(|candidate| candidate.offset >= 32),
         "btultra2 should retain dictionary candidates on upstream zstd-parity path"
@@ -1888,7 +1891,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     let mut hc = HcMatchGenerator::new(256);
     hc.configure(test_config, StrategyTag::BtUltra, window_log);
     prepare_history(&mut hc, abs_pos);
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         160,
         usize::MAX / 2,
@@ -1898,7 +1901,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
             ldm_candidate: None,
         },
         &mut out,
-    );
+    ));
     assert!(
         out.iter().any(|candidate| candidate.offset >= 32),
         "btultra should retain dictionary candidates"
@@ -2643,13 +2646,13 @@ fn row_matches_roundtrip_multi_block_pattern() {
     matcher.commit_input(&first_block);
     let mut history = Vec::new();
     let mut replay = BlockReplay::new(&first_block);
-    matcher.start_matching(|seq| replay.apply(&mut history, seq));
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| replay.apply(&mut history, seq)));
     assert_eq!(history, first_block);
 
     matcher.commit_input(&second_block);
     let prefix_len = history.len();
     let mut replay = BlockReplay::new(&second_block);
-    matcher.start_matching(|seq| replay.apply(&mut history, seq));
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| replay.apply(&mut history, seq)));
 
     assert_eq!(&history[prefix_len..], second_block.as_slice());
 
@@ -2658,7 +2661,7 @@ fn row_matches_roundtrip_multi_block_pattern() {
     matcher.commit_input(&third_block);
     let third_prefix = history.len();
     let mut replay = BlockReplay::new(&third_block);
-    matcher.start_matching(|seq| replay.apply(&mut history, seq));
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| replay.apply(&mut history, seq)));
     assert_eq!(&history[third_prefix..], third_block.as_slice());
 }
 
@@ -2672,10 +2675,10 @@ fn row_short_block_emits_literals_only() {
     let mut saw_triple = false;
     let mut reconstructed = Vec::new();
     let mut replay = BlockReplay::new(b"abcde");
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
         saw_triple |= matches!(seq, Sequence::Triple { .. });
         replay.apply(&mut reconstructed, seq);
-    });
+    }));
 
     assert!(
         !saw_triple,
@@ -2688,11 +2691,11 @@ fn row_short_block_emits_literals_only() {
     // searches (upstream zstd `lazy_generic` `ilimit`).
     saw_triple = false;
     matcher.commit_input(b"abcdeabcdeabcdeabcde-padding-past-ilimit");
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
         if let Sequence::Triple { .. } = seq {
             saw_triple = true;
         }
-    });
+    }));
     assert!(
         saw_triple,
         "row backend should emit triples on repeated data"
@@ -2739,14 +2742,14 @@ fn row_backfills_previous_block_tail_for_cross_boundary_match() {
     matcher.commit_input(&first_block);
     let mut reconstructed = Vec::new();
     let mut replay = BlockReplay::new(&first_block);
-    matcher.start_matching(|seq| replay.apply(&mut reconstructed, seq));
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| replay.apply(&mut reconstructed, seq)));
     assert_eq!(reconstructed, first_block);
 
     matcher.commit_input(&second_block);
     let mut saw_cross_boundary = false;
     let prefix_len = reconstructed.len();
     let mut replay = BlockReplay::new(&second_block);
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
         if let Sequence::Triple {
             literal_len: 0,
             offset: 3,
@@ -2757,7 +2760,7 @@ fn row_backfills_previous_block_tail_for_cross_boundary_match() {
             saw_cross_boundary = true;
         }
         replay.apply(&mut reconstructed, seq);
-    });
+    }));
 
     assert!(
         saw_cross_boundary,
@@ -3719,7 +3722,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
             let a = &base[start..];
             let b = a.to_vec();
             assert_eq!(
-                common_prefix_len(a, &b),
+                with_host_tier!(K => common_prefix_len::<K>(a, &b)),
                 scalar_reference(a, &b),
                 "equal slices total_len={total_len} start={start}"
             );
@@ -3732,7 +3735,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
                 let mut altered = b.clone();
                 altered[mismatch] ^= 0x5A;
                 assert_eq!(
-                    common_prefix_len(a, &altered),
+                    with_host_tier!(K => common_prefix_len::<K>(a, &altered)),
                     scalar_reference(a, &altered),
                     "total_len={total_len} start={start} mismatch={mismatch}"
                 );
@@ -3743,7 +3746,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
                 let mut altered = b.clone();
                 altered[mismatch] ^= 0xA5;
                 assert_eq!(
-                    common_prefix_len(a, &altered),
+                    with_host_tier!(K => common_prefix_len::<K>(a, &altered)),
                     scalar_reference(a, &altered),
                     "tail mismatch total_len={total_len} start={start} mismatch={mismatch}"
                 );
@@ -3754,7 +3757,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
     let long = alloc::vec![0xAB; 320];
     let shorter = alloc::vec![0xAB; 137];
     assert_eq!(
-        common_prefix_len(&long, &shorter),
+        with_host_tier!(K => common_prefix_len::<K>(&long, &shorter)),
         scalar_reference(&long, &shorter)
     );
 }
@@ -3897,7 +3900,7 @@ fn row_repcode_skips_candidate_before_history_start() {
     matcher.history_abs_start = 10;
     matcher.offset_hist = [3, 0, 0];
 
-    assert!(matcher.repcode_candidate(12, 1).is_none());
+    assert!(with_host_tier!(K => matcher.repcode_candidate::<K>(12, 1)).is_none());
 }
 
 #[test]
@@ -3909,7 +3912,7 @@ fn row_repcode_returns_none_when_position_too_close_to_history_end() {
     matcher.history_abs_start = 0;
     matcher.offset_hist = [1, 0, 0];
 
-    assert!(matcher.repcode_candidate(4, 1).is_none());
+    assert!(with_host_tier!(K => matcher.repcode_candidate::<K>(4, 1)).is_none());
 }
 
 #[test]
@@ -4051,7 +4054,7 @@ fn hc_sparse_skip_matching_preserves_tail_cross_block_match() {
     let tail_start = first.len() - tail.len();
     first[tail_start..].copy_from_slice(tail);
     matcher.table.commit_input(&first);
-    matcher.skip_matching(Some(true));
+    with_host_tier!(K => matcher.skip_matching::<K>(Some(true)));
 
     let mut second = tail.to_vec();
     second.extend_from_slice(b"after-tail-literals");
@@ -4102,7 +4105,7 @@ fn btultra2_sparse_skip_matching_preserves_tail_cross_block_match() {
     let tail_start = first.len() - tail.len();
     first[tail_start..].copy_from_slice(tail);
     matcher.table.commit_input(&first);
-    matcher.skip_matching(Some(true));
+    with_host_tier!(K => matcher.skip_matching::<K>(Some(true)));
 
     let mut second = tail.to_vec();
     second.extend_from_slice(b"after-tail-literals");
@@ -4145,7 +4148,7 @@ fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
     let mut matcher = HcMatchGenerator::new(1 << 22);
     let first = deterministic_high_entropy_bytes(0xC2B2_AE3D_27D4_EB4F, 4096);
     matcher.table.commit_input(&first);
-    matcher.skip_matching(Some(true));
+    with_host_tier!(K => matcher.skip_matching::<K>(Some(true)));
 
     let current_len = first.len();
     let current_abs_start =
@@ -4440,7 +4443,7 @@ fn hc_rebases_positions_after_u32_boundary() {
     // Simulate a long-running stream where absolute history positions crossed
     // the u32 range. Before #51 this disabled HC inserts entirely.
     matcher.table.history_abs_start = history_abs_start;
-    matcher.skip_matching(None);
+    with_host_tier!(K => matcher.skip_matching::<K>(None));
     assert_eq!(
         matcher.table.position_base, matcher.table.history_abs_start,
         "rebase should anchor to the oldest live absolute position"
@@ -4567,7 +4570,7 @@ fn dfast_skip_matching_handles_window_eviction() {
 
     let mut reconstructed = alloc::vec![7, 8, 9, 10, 11, 12];
     let mut replay = BlockReplay::new(&[7, 8, 9, 10, 11, 12]);
-    matcher.start_matching(|seq| replay.apply(&mut reconstructed, seq));
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| replay.apply(&mut reconstructed, seq)));
 
     assert_eq!(reconstructed, [7, 8, 9, 10, 11, 12, 7, 8, 9, 10, 11, 12]);
 }
@@ -4687,18 +4690,18 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
     matcher.commit_input(b"012345bcdea");
     let mut history = Vec::new();
     let mut replay = BlockReplay::new(b"012345bcdea");
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
         assert!(
             matches!(seq, Sequence::Literals { .. }),
             "first block should not match history"
         );
         replay.apply(&mut history, seq);
-    });
+    }));
     assert_eq!(history, b"012345bcdea");
 
     matcher.commit_input(b"bcdeabcdeab");
     let mut saw_first_sequence = false;
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
         assert!(!saw_first_sequence, "expected a single cross-block match");
         saw_first_sequence = true;
         match seq {
@@ -4720,7 +4723,7 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
                 }
             }
         }
-    });
+    }));
 
     assert!(
         saw_first_sequence,
@@ -4833,7 +4836,7 @@ fn dfast_dense_skip_matching_backfills_previous_tail_for_next_block() {
     matcher.commit_input(&second);
 
     let mut first_sequence = None;
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
         if first_sequence.is_some() {
             return;
         }
@@ -4845,7 +4848,7 @@ fn dfast_dense_skip_matching_backfills_previous_tail_for_next_block() {
                 match_len,
             } => (literal_len, offset, match_len),
         });
-    });
+    }));
 
     let (lit_len, offset, match_len) = first_sequence.expect("expected at least one sequence");
     assert_eq!(
@@ -4879,7 +4882,7 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
     matcher.commit_input(&second);
 
     let mut first_sequence = None;
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
         if first_sequence.is_some() {
             return;
         }
@@ -4891,7 +4894,7 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
                 match_len,
             } => (literal_len, offset, match_len),
         });
-    });
+    }));
 
     let (lit_len, offset, match_len) = first_sequence.expect("expected at least one sequence");
     assert_eq!(
@@ -5104,7 +5107,7 @@ fn dfast_sparse_skip_matching_backfills_previous_tail_for_consecutive_sparse_blo
     matcher.commit_input(&third);
 
     let mut first_sequence = None;
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
         if first_sequence.is_some() {
             return;
         }
@@ -5116,7 +5119,7 @@ fn dfast_sparse_skip_matching_backfills_previous_tail_for_consecutive_sparse_blo
                 match_len,
             } => (literal_len, offset, match_len),
         });
-    });
+    }));
 
     let (lit_len, offset, match_len) = first_sequence.expect("expected at least one sequence");
     assert_eq!(

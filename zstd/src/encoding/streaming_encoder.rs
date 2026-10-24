@@ -10,6 +10,7 @@ use core::hash::Hasher;
 #[cfg(feature = "hash")]
 use twox_hash::XxHash64;
 
+use crate::encoding::fastpath::EncodeTier;
 use crate::encoding::levels::compress_block_encoded;
 use crate::encoding::{
     CompressionLevel, EncoderDictionary, MatchGeneratorDriver, Matcher, block_header::BlockHeader,
@@ -725,6 +726,20 @@ impl<M: Matcher> CompressionContext<M> {
     /// set with [`set_pledged_content_size`](Self::set_pledged_content_size)
     /// allows less.
     pub fn write<D: Write + ?Sized>(&mut self, drain: &mut D, buf: &[u8]) -> Result<usize, Error> {
+        // The call's one choice of kernel tier: the frame start and every block
+        // it emits run compiled for it.
+        crate::encoding::fastpath::with_encode_tier!(
+            self.state.copy_kernel,
+            K => self.write_with::<D, K>(drain, buf)
+        )
+    }
+
+    /// [`Self::write`] compiled for the kernel tier `K`.
+    fn write_with<D: Write + ?Sized, K: EncodeTier>(
+        &mut self,
+        drain: &mut D,
+        buf: &[u8],
+    ) -> Result<usize, Error> {
         self.ensure_open()?;
         if buf.is_empty() {
             return Ok(0);
@@ -741,7 +756,7 @@ impl<M: Matcher> CompressionContext<M> {
             ));
         }
 
-        self.ensure_frame_started(drain)?;
+        self.ensure_frame_started::<D, K>(drain)?;
 
         // Enforce pledged upper bound: truncate the accepted slice to the
         // remaining allowance so that partial-write semantics are honored
@@ -773,7 +788,10 @@ impl<M: Matcher> CompressionContext<M> {
             remaining = &remaining[to_take..];
             consumed += to_take;
 
-            if self.emit_full_pending_block(drain, block_capacity).is_err() {
+            if self
+                .emit_full_pending_block::<D, K>(drain, block_capacity)
+                .is_err()
+            {
                 // The bytes this call took are reported; the failure, sticky
                 // on the context now, is what the next call returns.
                 break;
@@ -789,8 +807,13 @@ impl<M: Matcher> CompressionContext<M> {
         if self.pending_len() == 0 {
             return drain.flush().map_err(|err| self.fail(err));
         }
-        self.ensure_frame_started(drain)?;
-        self.emit_pending_block(drain, false)?;
+        crate::encoding::fastpath::with_encode_tier!(
+            self.state.copy_kernel,
+            K => {
+                self.ensure_frame_started::<D, K>(drain)?;
+                self.emit_pending_block::<D, K>(drain, false)
+            }
+        )?;
         drain.flush().map_err(|err| self.fail(err))
     }
 
@@ -812,10 +835,15 @@ impl<M: Matcher> CompressionContext<M> {
             ));
         }
 
-        self.ensure_frame_started(drain)?;
         // An empty frame, or one whose input ended on a block boundary, closes
         // with an empty last block.
-        self.emit_pending_block(drain, true)?;
+        crate::encoding::fastpath::with_encode_tier!(
+            self.state.copy_kernel,
+            K => {
+                self.ensure_frame_started::<D, K>(drain)?;
+                self.emit_pending_block::<D, K>(drain, true)
+            }
+        )?;
 
         #[cfg(feature = "hash")]
         if self.content_checksum {
@@ -881,7 +909,10 @@ impl<M: Matcher> CompressionContext<M> {
     /// ```
     pub fn start_frame<D: Write + ?Sized>(&mut self, drain: &mut D) -> Result<(), Error> {
         self.ensure_open()?;
-        self.ensure_frame_started(drain)
+        crate::encoding::fastpath::with_encode_tier!(
+            self.state.copy_kernel,
+            K => self.ensure_frame_started::<D, K>(drain)
+        )
     }
 
     /// The largest block the open frame cuts: the block size limits held to
@@ -935,7 +966,11 @@ impl<M: Matcher> CompressionContext<M> {
         // so the post-split, which would emit several physical blocks, stays
         // off (upstream `ZSTD_compressBlock` never splits either).
         let post_split = core::mem::replace(&mut self.state.post_split_allowed, false);
-        let encoded = self.encode_block(payload, block.len(), false);
+        // The context's one choice of kernel tier for this block.
+        let encoded = crate::encoding::fastpath::with_encode_tier!(
+            self.state.copy_kernel,
+            K => self.encode_block::<_, K>(payload, block.len(), false)
+        );
         self.state.post_split_allowed = post_split;
         encoded.map_err(|err| self.fail(err))?;
         self.bytes_consumed += block.len() as u64;
@@ -1021,7 +1056,10 @@ impl<M: Matcher> CompressionContext<M> {
         }
     }
 
-    fn ensure_frame_started<D: Write + ?Sized>(&mut self, drain: &mut D) -> Result<(), Error> {
+    fn ensure_frame_started<D: Write + ?Sized, K: EncodeTier>(
+        &mut self,
+        drain: &mut D,
+    ) -> Result<(), Error> {
         if self.frame_started {
             return Ok(());
         }
@@ -1119,7 +1157,7 @@ impl<M: Matcher> CompressionContext<M> {
         self.state.offset_hist = [1, 4, 8];
         if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
             self.state.offset_hist = dict.inner.offset_hist;
-            crate::encoding::frame_compressor::load_frame_dictionary(
+            crate::encoding::frame_compressor::load_frame_dictionary::<M, K>(
                 &mut self.state,
                 self.compression_level,
                 dict,
@@ -1268,7 +1306,7 @@ impl<M: Matcher> CompressionContext<M> {
     /// `remaining` is the input still to come as far as the splitter knows:
     /// a full block again while writes continue, the buffered bytes at the
     /// end of the frame.
-    fn pre_split_len(&mut self, block_capacity: usize, remaining: usize) -> usize {
+    fn pre_split_len<K: EncodeTier>(&mut self, block_capacity: usize, remaining: usize) -> usize {
         if matches!(self.compression_level, CompressionLevel::Uncompressed) {
             return self.pending_len();
         }
@@ -1285,7 +1323,10 @@ impl<M: Matcher> CompressionContext<M> {
         // The splitter sees byte statistics only; a cut it proposes inside a
         // match the matcher already knows of is moved out.
         if cut < window {
-            self.state.matcher.settle_block_cut(window, cut)
+            match self.state.matcher.builtin_driver() {
+                Some(driver) => driver.settle_block_cut_with::<K>(window, cut),
+                None => self.state.matcher.settle_block_cut(window, cut),
+            }
         } else {
             cut
         }
@@ -1294,7 +1335,7 @@ impl<M: Matcher> CompressionContext<M> {
     /// Emit the pending block once it is full, cut where the pre-splitter
     /// says; the suffix stays pending and heads the next block. A failure
     /// leaves the context failed.
-    fn emit_full_pending_block<D: Write + ?Sized>(
+    fn emit_full_pending_block<D: Write + ?Sized, K: EncodeTier>(
         &mut self,
         drain: &mut D,
         block_capacity: usize,
@@ -1302,12 +1343,12 @@ impl<M: Matcher> CompressionContext<M> {
         if self.pending_len() != block_capacity {
             return Ok(());
         }
-        let block_len = self.pre_split_len(block_capacity, block_capacity);
-        self.encode_block(drain, block_len, false)
+        let block_len = self.pre_split_len::<K>(block_capacity, block_capacity);
+        self.encode_block::<D, K>(drain, block_len, false)
             .map_err(|err| self.fail(err))
     }
 
-    fn emit_pending_block<D: Write + ?Sized>(
+    fn emit_pending_block<D: Write + ?Sized, K: EncodeTier>(
         &mut self,
         drain: &mut D,
         last_block: bool,
@@ -1318,16 +1359,16 @@ impl<M: Matcher> CompressionContext<M> {
             // path splits it with `remaining = len`); each cut prefix goes
             // out as a non-last block and the suffix is re-examined.
             while self.pending_len() == block_capacity {
-                let block_len = self.pre_split_len(block_capacity, block_capacity);
+                let block_len = self.pre_split_len::<K>(block_capacity, block_capacity);
                 if block_len == block_capacity {
                     break;
                 }
-                self.encode_block(drain, block_len, false)
+                self.encode_block::<D, K>(drain, block_len, false)
                     .map_err(|err| self.fail(err))?;
             }
         }
         let block_len = self.pending_len();
-        self.encode_block(drain, block_len, last_block)
+        self.encode_block::<D, K>(drain, block_len, last_block)
             .map_err(|err| self.fail(err))
     }
 
@@ -1347,7 +1388,7 @@ impl<M: Matcher> CompressionContext<M> {
 
     /// Writes the first `block_len` pending bytes to `drain` as one block,
     /// `last_block` if it closes the frame.
-    fn encode_block<D: Write + ?Sized>(
+    fn encode_block<D: Write + ?Sized, K: EncodeTier>(
         &mut self,
         drain: &mut D,
         block_len: usize,
@@ -1384,7 +1425,7 @@ impl<M: Matcher> CompressionContext<M> {
         }
         let dict_active =
             self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
-        compress_block_encoded(
+        compress_block_encoded::<M, K>(
             &mut self.state,
             self.compression_level,
             last_block,

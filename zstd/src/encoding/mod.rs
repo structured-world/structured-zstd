@@ -537,6 +537,15 @@ pub trait Matcher {
     /// holds anything there.
     #[doc(hidden)]
     fn leave_workspace(&mut self) {}
+    /// The built-in matcher, when this is it. The encoder then runs its
+    /// backends compiled for the kernel tier it chose for the block, rather
+    /// than through [`start_matching`](Self::start_matching), which leaves the
+    /// tier to the matcher. Every other matcher keeps the default.
+    #[doc(hidden)]
+    #[inline]
+    fn builtin_driver(&mut self) -> Option<&mut match_generator::MatchGeneratorDriver> {
+        None
+    }
     /// Provide a hint about the total uncompressed size for the next frame.
     ///
     /// Implementations may use this to select smaller hash tables and windows

@@ -10,6 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::*;
+use crate::encoding::fastpath::with_host_tier;
 
 /// Capture every sequence the matcher emits into an owned record, so the
 /// assertions can match on `lit_len` / `offset` / `match_len` shape directly.
@@ -81,13 +82,13 @@ fn dfast_repcode_extension_emits_zero_literal_rep_on_constant_run() {
     let mut seqs = Vec::new();
     let new_pos = {
         let mut rec = record_seq(&mut seqs);
-        dfast.extend_with_repcode_after_match(
+        with_host_tier!(K => dfast.extend_with_repcode_after_match::<K>(
             current_abs_start,
             current_len,
             pos,
             &mut literals_start,
             &mut rec,
-        )
+        ))
     };
 
     assert!(
@@ -153,13 +154,13 @@ fn dfast_repcode_extension_walks_into_retained_history() {
     let mut seqs = Vec::new();
     let new_pos = {
         let mut rec = record_seq(&mut seqs);
-        dfast.extend_with_repcode_after_match(
+        with_host_tier!(K => dfast.extend_with_repcode_after_match::<K>(
             current_abs_start,
             current_len,
             pos,
             &mut literals_start,
             &mut rec,
-        )
+        ))
     };
 
     assert!(
@@ -226,13 +227,13 @@ fn dfast_repcode_extension_accepts_exactly_four_byte_rep() {
     let mut seqs = Vec::new();
     let new_pos = {
         let mut rec = record_seq(&mut seqs);
-        dfast.extend_with_repcode_after_match(
+        with_host_tier!(K => dfast.extend_with_repcode_after_match::<K>(
             current_abs_start,
             current_len,
             pos,
             &mut literals_start,
             &mut rec,
-        )
+        ))
     };
 
     // Helper must emit a single 4-byte rep, then stop because
@@ -371,12 +372,12 @@ fn dfast_borrowed_window_matches_owned_sequence_stream() {
     owned.commit_input(&whole[..split]);
     {
         let mut rec = record_seq(&mut owned_seqs);
-        owned.start_matching(&mut rec);
+        with_host_tier!(K => owned.start_matching::<K>(&mut rec));
     }
     owned.commit_input(&whole[split..]);
     {
         let mut rec = record_seq(&mut owned_seqs);
-        owned.start_matching(&mut rec);
+        with_host_tier!(K => owned.start_matching::<K>(&mut rec));
     }
 
     // Borrowed: same bytes, scanned in place by absolute block range.
@@ -388,11 +389,11 @@ fn dfast_borrowed_window_matches_owned_sequence_stream() {
     unsafe { borrowed.set_borrowed_window(&whole) };
     {
         let mut rec = record_seq(&mut borrowed_seqs);
-        borrowed.start_matching_borrowed(0, split, &mut rec);
+        with_host_tier!(K => borrowed.start_matching_borrowed::<K>(0, split, &mut rec));
     }
     {
         let mut rec = record_seq(&mut borrowed_seqs);
-        borrowed.start_matching_borrowed(split, whole.len(), &mut rec);
+        with_host_tier!(K => borrowed.start_matching_borrowed::<K>(split, whole.len(), &mut rec));
     }
 
     assert_eq!(

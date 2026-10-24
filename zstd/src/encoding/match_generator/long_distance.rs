@@ -6,6 +6,7 @@
 //! storage directly.
 
 use super::{MatchGeneratorDriver, Sequence, owned_sink};
+use crate::encoding::fastpath::EncodeTier;
 
 impl MatchGeneratorDriver {
     /// Search the input from where the last search stopped up to `to`, a
@@ -17,7 +18,7 @@ impl MatchGeneratorDriver {
     /// window back from it, or the whole dictionary while the window has not
     /// yet passed the dictionary's end. Every match then holds an offset valid
     /// at its last byte, wherever in the range it lies.
-    fn search_long_distance_to(&mut self, to: usize) {
+    fn search_long_distance_to<K: EncodeTier>(&mut self, to: usize) {
         let Some(producer) = self.ldm.as_mut() else {
             return;
         };
@@ -36,7 +37,7 @@ impl MatchGeneratorDriver {
         let floor = reach_floor.max(live_start);
         debug_assert!(floor <= from, "a search range wider than the window");
         self.ldm_found.clear();
-        producer.generate_into(
+        producer.generate_into::<K>(
             &live[floor - live_start..],
             floor,
             from,
@@ -56,11 +57,11 @@ impl MatchGeneratorDriver {
 
     /// The matches of the last committed block, into [`Self::ldm_block`],
     /// searched first as far as the block reaches. Returns the block's length.
-    pub(super) fn take_long_distance_block(&mut self) -> usize {
+    pub(super) fn take_long_distance_block<K: EncodeTier>(&mut self) -> usize {
         let block_len = self.storage.last_block_len();
         let block_end = self.ldm_committed_end;
         self.align_long_distance_store(block_end - block_len);
-        self.search_long_distance_to(block_end);
+        self.search_long_distance_to::<K>(block_end);
         let min_match = self.reset_shape.map_or(
             crate::encoding::cost_model::HC_FORMAT_MINMATCH,
             |(params, ..)| params.min_match(),
@@ -73,13 +74,17 @@ impl MatchGeneratorDriver {
     /// See [`crate::encoding::Matcher::settle_block_cut`]: the next `window`
     /// uncommitted bytes are searched now, and the cut moved out of any long
     /// match.
-    pub(super) fn settle_long_distance_cut(&mut self, window: usize, cut: usize) -> usize {
+    pub(super) fn settle_long_distance_cut<K: EncodeTier>(
+        &mut self,
+        window: usize,
+        cut: usize,
+    ) -> usize {
         if self.ldm.is_none() {
             return cut;
         }
         let start = self.ldm_committed_end;
         self.align_long_distance_store(start);
-        self.search_long_distance_to(start + window);
+        self.search_long_distance_to::<K>(start + window);
         self.ldm_store.cut_outside_matches(window, cut)
     }
 
@@ -93,12 +98,12 @@ impl MatchGeneratorDriver {
     /// ordinary search. With `produced`, the caller has emptied the optimal
     /// parser's candidates first, so a piece the producer fails on is never
     /// matched against an earlier block's long matches.
-    pub(super) fn start_matching_long_distance(
+    pub(super) fn start_matching_long_distance<K: EncodeTier>(
         &mut self,
         handle_sequence: &mut impl FnMut(Sequence),
         produced: bool,
     ) -> bool {
-        let block_len = self.take_long_distance_block();
+        let block_len = self.take_long_distance_block::<K>();
         if self.ldm_block.is_empty() {
             return false;
         }
@@ -110,11 +115,11 @@ impl MatchGeneratorDriver {
             let mut gap = Some(0usize);
             if seq.lit_length != 0 {
                 self.storage.commit_piece(seq.lit_length);
-                self.match_gap(produced, &mut owned_sink(handle_sequence, &mut gap));
+                self.match_gap::<K>(produced, &mut owned_sink(handle_sequence, &mut gap));
             }
             let gap_literals = gap.expect("the gap sink only ever writes Some");
             self.storage.commit_piece(seq.match_length);
-            self.storage.skip_long_match();
+            self.storage.skip_long_match::<K>();
             handle_sequence(Sequence::Triple {
                 literal_len: gap_literals,
                 offset: seq.offset,
@@ -127,7 +132,7 @@ impl MatchGeneratorDriver {
         if tail != 0 {
             self.storage.commit_piece(tail);
             let mut forward = None;
-            self.match_gap(produced, &mut owned_sink(handle_sequence, &mut forward));
+            self.match_gap::<K>(produced, &mut owned_sink(handle_sequence, &mut forward));
         }
         self.ldm_block = sequences;
         self.ldm_split_block = Some(block_len);
@@ -136,10 +141,10 @@ impl MatchGeneratorDriver {
 
     /// Match the piece just committed between long matches: by the producer
     /// when `produced` and it gives a parse, by the backend otherwise.
-    fn match_gap(&mut self, produced: bool, sink: &mut impl FnMut(Sequence)) {
-        if produced && self.match_produced(sink) {
+    fn match_gap<K: EncodeTier>(&mut self, produced: bool, sink: &mut impl FnMut(Sequence)) {
+        if produced && self.match_produced::<K>(sink) {
             return;
         }
-        self.start_matching_owned(sink);
+        self.start_matching_owned::<K>(sink);
     }
 }
