@@ -2101,7 +2101,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<
     };
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        match K::TIER {
+        crate::encoding::fastpath::tier_match!(K {
             #[cfg(feature = "kernel-avx2")]
             FastpathKernel::Avx2Bmi2 => unsafe {
                 cbfd_borrowed_avx2_bmi2::<MLS, USE_CMOV>(
@@ -2135,8 +2135,8 @@ pub(crate) fn compress_block_fast_dict_borrowed<
             FastpathKernel::Scalar => {
                 let mut hs = handle_sequence;
                 scalar(inp, dict, main_table, dict_table, &mut hs)
-            }
-        }
+            },
+        })
     }
     #[cfg(all(
         target_arch = "aarch64",
@@ -2144,7 +2144,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<
         feature = "kernel-neon"
     ))]
     {
-        match K::TIER {
+        crate::encoding::fastpath::tier_match!(K {
             FastpathKernel::Neon => unsafe {
                 cbfd_borrowed_neon::<MLS, USE_CMOV>(
                     inp,
@@ -2162,8 +2162,8 @@ pub(crate) fn compress_block_fast_dict_borrowed<
             FastpathKernel::Scalar => {
                 let mut hs = handle_sequence;
                 scalar(inp, dict, main_table, dict_table, &mut hs)
-            }
-        }
+            },
+        })
     }
     #[cfg(all(
         target_arch = "wasm32",
@@ -2171,7 +2171,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<
         feature = "kernel-simd128"
     ))]
     {
-        match K::TIER {
+        crate::encoding::fastpath::tier_match!(K {
             FastpathKernel::Simd128 => unsafe {
                 cbfd_borrowed_simd128::<MLS, USE_CMOV>(
                     inp,
@@ -2189,8 +2189,8 @@ pub(crate) fn compress_block_fast_dict_borrowed<
             FastpathKernel::Scalar => {
                 let mut hs = handle_sequence;
                 scalar(inp, dict, main_table, dict_table, &mut hs)
-            }
-        }
+            },
+        })
     }
     #[cfg(not(any(
         target_arch = "x86",

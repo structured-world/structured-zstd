@@ -507,7 +507,7 @@ macro_rules! dispatch_tag_kernel {
             feature = "kernel-simd128"
         )))]
         {
-            match <$tier as EncodeTier>::TIER {
+            crate::encoding::fastpath::tier_match!($tier {
                 #[cfg(all(
                     any(target_arch = "x86", target_arch = "x86_64"),
                     feature = "kernel-avx2"
@@ -519,7 +519,7 @@ macro_rules! dispatch_tag_kernel {
                 ))]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => {
                     $self.$k_method::<Sse2Tags>($($arg),*)
-                }
+                },
                 #[cfg(all(
                     target_arch = "aarch64",
                     target_endian = "little",
@@ -527,7 +527,7 @@ macro_rules! dispatch_tag_kernel {
                 ))]
                 FastpathKernel::Neon => $self.$k_method::<NeonTags>($($arg),*),
                 FastpathKernel::Scalar => $self.$k_method::<ScalarTags>($($arg),*),
-            }
+            })
         }
     }};
 }
@@ -4009,7 +4009,7 @@ impl RowMatchGenerator {
     pub(crate) fn start_matching<K: EncodeTier>(&mut self, handle_sequence: impl FnMut(Sequence)) {
         // SAFETY: same per-tier umbrella contract as `start_matching_greedy`:
         // `K` names a tier the encoder confirmed this CPU runs.
-        match K::TIER {
+        crate::encoding::fastpath::tier_match!(K {
             #[cfg(all(
                 any(target_arch = "x86", target_arch = "x86_64"),
                 feature = "kernel-avx2"
@@ -4046,7 +4046,7 @@ impl RowMatchGenerator {
             FastpathKernel::Scalar => unsafe {
                 dispatch_lazy!(self.lazy_scalar::<ScalarTags>(handle_sequence))
             },
-        }
+        })
     }
 
     gen_lazy_monolith!(

@@ -366,7 +366,7 @@ impl<'a> HufCStream<'a> {
         table: &[u64],
         data: &[u8],
     ) {
-        match K::TIER {
+        crate::encoding::fastpath::tier_match!(K {
             #[cfg(all(
                 any(target_arch = "x86", target_arch = "x86_64"),
                 feature = "kernel-avx2"
@@ -378,7 +378,7 @@ impl<'a> HufCStream<'a> {
                 self.encode_unrolled_bmi2::<K_UNROLL, K_FAST_FLUSH, K_LAST_FAST>(table, data)
             },
             _ => self.encode_unrolled_scalar::<K_UNROLL, K_FAST_FLUSH, K_LAST_FAST>(table, data),
-        }
+        })
     }
 
     /// Portable burst-encode kernel (no target feature). Bit-identical output to

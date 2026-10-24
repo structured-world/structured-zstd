@@ -747,7 +747,7 @@ impl HcMatcher {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match K::TIER {
+            crate::encoding::fastpath::tier_match!(K {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.for_each_repcode_candidate_with_reps_avx2_bmi2(
@@ -781,7 +781,7 @@ impl HcMatcher {
                     min_match_len,
                     f,
                 ),
-            }
+            })
         }
         #[cfg(not(any(
             all(

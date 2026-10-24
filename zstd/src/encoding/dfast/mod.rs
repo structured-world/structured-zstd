@@ -3792,8 +3792,8 @@ impl DfastMatchGenerator {
     /// The dfast loop of the encoder tier `K`: its
     /// `start_matching_fast_loop_<tier>` wrapper, so every per-position
     /// `common_prefix_len_ptr` inlines under one `#[target_feature]` umbrella
-    /// (mirrors `build_optimal_plan_impl`). The match on `K::TIER` folds to
-    /// that one call.
+    /// (mirrors `build_optimal_plan_impl`). The tier match keeps only that one
+    /// call.
     fn start_matching_fast_loop<K: EncodeTier>(
         &mut self,
         current_abs_start: usize,
@@ -3867,7 +3867,9 @@ impl DfastMatchGenerator {
             // target can check the two against each other — the branch is
             // `cfg(test)` and does not exist in a shipped build.
             #[cfg(test)]
-            if use_dict && K::TIER == crate::encoding::fastpath::FastpathKernel::Scalar {
+            if use_dict
+                && const { matches!(K::TIER, crate::encoding::fastpath::FastpathKernel::Scalar) }
+            {
                 return self.start_matching_dict_loop_scalar(
                     current_abs_start,
                     current_len,
@@ -3879,7 +3881,7 @@ impl DfastMatchGenerator {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match K::TIER {
+            crate::encoding::fastpath::tier_match!(K {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     dispatch_dict!(
@@ -3895,7 +3897,7 @@ impl DfastMatchGenerator {
                     start_matching_fast_loop_scalar,
                     start_matching_dict_loop_scalar
                 ),
-            }
+            })
         }
         #[cfg(all(
             target_arch = "wasm32",
@@ -3907,7 +3909,9 @@ impl DfastMatchGenerator {
             // compile time here, so without it this target could never run the
             // scalar dictionary loop to check the SIMD one against.
             #[cfg(test)]
-            if use_dict && K::TIER == crate::encoding::fastpath::FastpathKernel::Scalar {
+            if use_dict
+                && const { matches!(K::TIER, crate::encoding::fastpath::FastpathKernel::Scalar) }
+            {
                 return self.start_matching_dict_loop_scalar(
                     current_abs_start,
                     current_len,

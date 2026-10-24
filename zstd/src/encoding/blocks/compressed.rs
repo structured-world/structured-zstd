@@ -3028,7 +3028,7 @@ fn encode_sequences<K: EncodeTier>(
     // the caller is holding its slots.
     defaults: [&FSETable; 3],
 ) {
-    match K::TIER {
+    crate::encoding::fastpath::tier_match!(K {
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
             feature = "kernel-avx2"
@@ -3038,7 +3038,7 @@ fn encode_sequences<K: EncodeTier>(
             encode_sequences_bmi2(sequences, codes, writer, modes, defaults)
         },
         _ => encode_sequences_scalar(sequences, codes, writer, modes, defaults),
-    }
+    })
 }
 
 #[cfg(all(

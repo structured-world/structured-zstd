@@ -310,9 +310,9 @@ fn detect_kernel_uncached() -> FastpathKernel {
 
 /// A [`FastpathKernel`] tier as a type. The encoder chooses its tier once, in
 /// [`with_encode_tier`], and everything below that choice is compiled per tier:
-/// a leaf that runs a different kernel per tier matches on `K::TIER`, which
-/// folds to the one kernel at monomorphisation, so no tier is asked at run time
-/// below the choice.
+/// a leaf that runs a different kernel per tier picks it with [`tier_match`],
+/// which keeps the one kernel at monomorphisation, so no tier is asked at run
+/// time below the choice.
 pub(crate) trait EncodeTier {
     /// The tier this type stands for.
     const TIER: FastpathKernel;
@@ -454,6 +454,37 @@ macro_rules! with_encode_tier {
     }};
 }
 pub(crate) use with_encode_tier;
+
+/// A `match` on `$k`'s [`EncodeTier::TIER`] that instantiates only the arm of
+/// that tier.
+///
+/// A plain `match` on the constant folds in an optimised build, but an
+/// unoptimised one still instantiates every arm's callee for every tier, so
+/// each tier's monomorph would carry the kernels of all the others. Each arm
+/// here is an `if` on an inline `const`, whose untaken branch the compiler
+/// drops before code generation. The arms are checked for exhaustiveness as the
+/// `match` they stand for.
+macro_rules! tier_match {
+    ($k:ty { $( $(#[$attr:meta])* $pat:pat => $arm:expr ),+ $(,)? }) => {{
+        const {
+            match <$k as $crate::encoding::fastpath::EncodeTier>::TIER {
+                $( $(#[$attr])* $pat => (), )+
+            }
+        };
+        'tier: {
+            $(
+                $(#[$attr])*
+                if const {
+                    matches!(<$k as $crate::encoding::fastpath::EncodeTier>::TIER, $pat)
+                } {
+                    break 'tier ($arm);
+                }
+            )+
+            unreachable!()
+        }
+    }};
+}
+pub(crate) use tier_match;
 
 /// [`with_encode_tier!`] on this CPU's tier, the one the encoder picks: unit
 /// tests drive a backend directly through the kernels it would ship with.

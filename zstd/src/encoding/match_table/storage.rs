@@ -1752,7 +1752,7 @@ impl MatchTable {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match K::TIER {
+            crate::encoding::fastpath::tier_match!(K {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.bt_insert_range_avx2_bmi2(from, stop, current_abs_end, target_abs)
@@ -1763,8 +1763,8 @@ impl MatchTable {
                 },
                 FastpathKernel::Scalar => {
                     self.bt_insert_range_scalar(from, stop, current_abs_end, target_abs)
-                }
-            }
+                },
+            })
         }
         // wasm has no runtime CPU detection: `simd128` is resolved at compile
         // time, so the tier is picked by `cfg` rather than by `K`.
@@ -2546,7 +2546,7 @@ impl MatchTable {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match K::TIER {
+            crate::encoding::fastpath::tier_match!(K {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.hash3_candidate_avx2_bmi2(abs_pos, current_abs_end, min_match_len)
@@ -2557,8 +2557,8 @@ impl MatchTable {
                 },
                 FastpathKernel::Scalar => {
                     self.hash3_candidate_scalar(abs_pos, current_abs_end, min_match_len)
-                }
-            }
+                },
+            })
         }
         #[cfg(all(
             target_arch = "wasm32",

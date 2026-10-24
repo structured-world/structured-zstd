@@ -35,7 +35,7 @@ pub(super) fn gather_literals<K: EncodeTier>(
     if dst.capacity() - dst.len() < block.len() {
         crate::encoding::workspace::capacity_exhausted();
     }
-    match K::TIER {
+    crate::encoding::fastpath::tier_match!(K {
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
             feature = "kernel-avx2"
@@ -66,9 +66,9 @@ pub(super) fn gather_literals<K: EncodeTier>(
         ))]
         crate::encoding::fastpath::FastpathKernel::Simd128 => {
             gather_simd128(block, sequences, tail, dst)
-        }
+        },
         _ => gather_scalar(block, sequences, tail, dst),
-    }
+    })
 }
 
 /// Bytes of the block that must remain past a run for it to be copied in whole

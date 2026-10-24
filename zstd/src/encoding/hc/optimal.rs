@@ -1504,7 +1504,7 @@ impl HcMatchGenerator {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match K::TIER {
+            crate::encoding::fastpath::tier_match!(K {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => run_main_loop!(run_optimal_block_avx2_bmi2),
                 #[cfg(feature = "kernel-sse")]
@@ -1512,7 +1512,7 @@ impl HcMatchGenerator {
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse42 => run_main_loop!(run_optimal_block_sse42),
                 FastpathKernel::Scalar => run_main_loop!(run_optimal_block_scalar),
-            }
+            })
         }
         #[cfg(all(
             target_arch = "wasm32",
@@ -1705,7 +1705,7 @@ impl HcMatchGenerator {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match K::TIER {
+            crate::encoding::fastpath::tier_match!(K {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => run_seed_loop!(run_optimal_block_avx2_bmi2),
                 #[cfg(feature = "kernel-sse")]
@@ -1713,7 +1713,7 @@ impl HcMatchGenerator {
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse42 => run_seed_loop!(run_optimal_block_sse42),
                 FastpathKernel::Scalar => run_seed_loop!(run_optimal_block_scalar),
-            }
+            })
         }
         #[cfg(all(
             target_arch = "wasm32",
@@ -2231,7 +2231,7 @@ impl HcMatchGenerator {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match K::TIER {
+            crate::encoding::fastpath::tier_match!(K {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.collect_optimal_candidates_initialized_avx2_bmi2::<S, MLS>(
@@ -2274,7 +2274,7 @@ impl HcMatchGenerator {
                         ll0,
                         out,
                     ),
-            }
+            })
         }
         // wasm resolves `simd128` at compile time (no runtime detection), so
         // the tier comes from `cfg`, not from `self.table.kernel`.
