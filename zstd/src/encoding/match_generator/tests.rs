@@ -3,7 +3,7 @@
 //! optimal round-trips, and dictionary-priming behaviour.
 
 use super::*;
-use crate::encoding::fastpath::with_host_tier;
+use crate::encoding::fastpath::{dyn_sink, with_host_tier};
 use crate::encoding::test_support::BlockReplay;
 use alloc::vec::Vec;
 
@@ -231,12 +231,12 @@ fn row_mls_knob_gates_matches_and_roundtrips() {
         let mut out: Vec<u8> = Vec::with_capacity(data.len());
         let mut shortest_match = usize::MAX;
         let mut replay = BlockReplay::new(&data);
-        with_host_tier!(K => matcher.start_matching::<K>(|seq| {
+        with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
             if let Sequence::Triple { match_len, .. } = seq {
                 shortest_match = shortest_match.min(match_len);
             }
             replay.apply(&mut out, seq);
-        }));
+        })));
 
         assert_eq!(out, data, "mls={mls} round-trip diverged");
         if shortest_match != usize::MAX {
@@ -2646,13 +2646,13 @@ fn row_matches_roundtrip_multi_block_pattern() {
     matcher.commit_input(&first_block);
     let mut history = Vec::new();
     let mut replay = BlockReplay::new(&first_block);
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| replay.apply(&mut history, seq)));
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| replay.apply(&mut history, seq))));
     assert_eq!(history, first_block);
 
     matcher.commit_input(&second_block);
     let prefix_len = history.len();
     let mut replay = BlockReplay::new(&second_block);
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| replay.apply(&mut history, seq)));
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| replay.apply(&mut history, seq))));
 
     assert_eq!(&history[prefix_len..], second_block.as_slice());
 
@@ -2661,7 +2661,7 @@ fn row_matches_roundtrip_multi_block_pattern() {
     matcher.commit_input(&third_block);
     let third_prefix = history.len();
     let mut replay = BlockReplay::new(&third_block);
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| replay.apply(&mut history, seq)));
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| replay.apply(&mut history, seq))));
     assert_eq!(&history[third_prefix..], third_block.as_slice());
 }
 
@@ -2675,10 +2675,10 @@ fn row_short_block_emits_literals_only() {
     let mut saw_triple = false;
     let mut reconstructed = Vec::new();
     let mut replay = BlockReplay::new(b"abcde");
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         saw_triple |= matches!(seq, Sequence::Triple { .. });
         replay.apply(&mut reconstructed, seq);
-    }));
+    })));
 
     assert!(
         !saw_triple,
@@ -2691,11 +2691,11 @@ fn row_short_block_emits_literals_only() {
     // searches (upstream zstd `lazy_generic` `ilimit`).
     saw_triple = false;
     matcher.commit_input(b"abcdeabcdeabcdeabcde-padding-past-ilimit");
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         if let Sequence::Triple { .. } = seq {
             saw_triple = true;
         }
-    }));
+    })));
     assert!(
         saw_triple,
         "row backend should emit triples on repeated data"
@@ -2742,14 +2742,14 @@ fn row_backfills_previous_block_tail_for_cross_boundary_match() {
     matcher.commit_input(&first_block);
     let mut reconstructed = Vec::new();
     let mut replay = BlockReplay::new(&first_block);
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| replay.apply(&mut reconstructed, seq)));
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| replay.apply(&mut reconstructed, seq))));
     assert_eq!(reconstructed, first_block);
 
     matcher.commit_input(&second_block);
     let mut saw_cross_boundary = false;
     let prefix_len = reconstructed.len();
     let mut replay = BlockReplay::new(&second_block);
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         if let Sequence::Triple {
             literal_len: 0,
             offset: 3,
@@ -2760,7 +2760,7 @@ fn row_backfills_previous_block_tail_for_cross_boundary_match() {
             saw_cross_boundary = true;
         }
         replay.apply(&mut reconstructed, seq);
-    }));
+    })));
 
     assert!(
         saw_cross_boundary,
@@ -4570,7 +4570,7 @@ fn dfast_skip_matching_handles_window_eviction() {
 
     let mut reconstructed = alloc::vec![7, 8, 9, 10, 11, 12];
     let mut replay = BlockReplay::new(&[7, 8, 9, 10, 11, 12]);
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| replay.apply(&mut reconstructed, seq)));
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| replay.apply(&mut reconstructed, seq))));
 
     assert_eq!(reconstructed, [7, 8, 9, 10, 11, 12, 7, 8, 9, 10, 11, 12]);
 }
@@ -4690,18 +4690,18 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
     matcher.commit_input(b"012345bcdea");
     let mut history = Vec::new();
     let mut replay = BlockReplay::new(b"012345bcdea");
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         assert!(
             matches!(seq, Sequence::Literals { .. }),
             "first block should not match history"
         );
         replay.apply(&mut history, seq);
-    }));
+    })));
     assert_eq!(history, b"012345bcdea");
 
     matcher.commit_input(b"bcdeabcdeab");
     let mut saw_first_sequence = false;
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         assert!(!saw_first_sequence, "expected a single cross-block match");
         saw_first_sequence = true;
         match seq {
@@ -4723,7 +4723,7 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
                 }
             }
         }
-    }));
+    })));
 
     assert!(
         saw_first_sequence,
@@ -4836,7 +4836,7 @@ fn dfast_dense_skip_matching_backfills_previous_tail_for_next_block() {
     matcher.commit_input(&second);
 
     let mut first_sequence = None;
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         if first_sequence.is_some() {
             return;
         }
@@ -4848,7 +4848,7 @@ fn dfast_dense_skip_matching_backfills_previous_tail_for_next_block() {
                 match_len,
             } => (literal_len, offset, match_len),
         });
-    }));
+    })));
 
     let (lit_len, offset, match_len) = first_sequence.expect("expected at least one sequence");
     assert_eq!(
@@ -4882,7 +4882,7 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
     matcher.commit_input(&second);
 
     let mut first_sequence = None;
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         if first_sequence.is_some() {
             return;
         }
@@ -4894,7 +4894,7 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
                 match_len,
             } => (literal_len, offset, match_len),
         });
-    }));
+    })));
 
     let (lit_len, offset, match_len) = first_sequence.expect("expected at least one sequence");
     assert_eq!(
@@ -5107,7 +5107,7 @@ fn dfast_sparse_skip_matching_backfills_previous_tail_for_consecutive_sparse_blo
     matcher.commit_input(&third);
 
     let mut first_sequence = None;
-    with_host_tier!(K => matcher.start_matching::<K>(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         if first_sequence.is_some() {
             return;
         }
@@ -5119,7 +5119,7 @@ fn dfast_sparse_skip_matching_backfills_previous_tail_for_consecutive_sparse_blo
                 match_len,
             } => (literal_len, offset, match_len),
         });
-    }));
+    })));
 
     let (lit_len, offset, match_len) = first_sequence.expect("expected at least one sequence");
     assert_eq!(

@@ -500,5 +500,15 @@ macro_rules! with_host_tier {
 #[cfg(test)]
 pub(crate) use with_host_tier;
 
+/// A test's sequence closure as the one sink type tests hand a backend, so
+/// each search is compiled once per tier for all of them rather than once per
+/// closure and tier.
+#[cfg(test)]
+pub(crate) fn dyn_sink(
+    sink: &mut impl FnMut(crate::encoding::Sequence),
+) -> &mut dyn FnMut(crate::encoding::Sequence) {
+    sink
+}
+
 #[cfg(test)]
 mod tests;
