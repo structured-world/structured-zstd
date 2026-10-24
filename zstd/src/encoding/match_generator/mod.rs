@@ -2273,15 +2273,20 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
-    fn start_matching(&mut self, handle_sequence: impl FnMut(Sequence)) {
+    fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
         // For a caller driving the matcher through the trait itself, such as
         // a wrapper that records what it emits. The encoder does not come
         // here: it reaches the driver through `builtin_driver` and searches
         // under the tier it chose for the frame. Either way the tier was
         // detected once, at construction.
+        //
+        // The sink is passed on as one `dyn` type, so the search is compiled
+        // once per tier for every such caller rather than once per caller's
+        // closure; the encoder's own path keeps its sink's concrete type.
+        let sink: &mut dyn FnMut(Sequence) = &mut handle_sequence;
         crate::encoding::fastpath::with_encode_tier!(
             self.tier,
-            K => self.start_matching_with::<K>(handle_sequence)
+            K => self.start_matching_with::<K>(&mut *sink)
         )
     }
 
