@@ -2235,16 +2235,19 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             let savings = start as i64 - (out.len() - blocks_start) as i64;
             // Borrowed path only: warm the pre-split window before the
             // cache-cold strided fingerprint read. Gated to exactly the
-            // conditions under which `optimal_block_size` reads `block`
-            // (a pre-split level, a full 128 KiB block remaining, the
-            // block-size cap admits a full block, and `savings >= 3` so the
-            // splitter actually runs) — so non-pre-split levels, the first
-            // block, and the trailing partial block pay nothing. See
-            // `warm_presplit_window`.
+            // conditions under which `optimal_block_size` reads the whole
+            // window (a sampling pre-split level, a full 128 KiB block
+            // remaining, the block-size cap admits a full block, and
+            // `savings >= 3` so the splitter actually runs) — so other
+            // levels, the first block, and the trailing partial block pay
+            // nothing. Level 0 reads three 512-byte segments
+            // (`ZSTD_splitBlock_fromBorders`, `zstd_preSplit.c:198-226`), not
+            // the window, so warming 128 KiB for it was 2048 loads a block
+            // for 1.5 KiB read. See `warm_presplit_window`.
             if savings >= 3
                 && input.len() - start >= MAX_BLOCK_SIZE as usize
                 && block_capacity >= MAX_BLOCK_SIZE as usize
-                && pre_split.is_some()
+                && pre_split.is_some_and(|split_level| split_level != 0)
             {
                 warm_presplit_window(&input[start..start + MAX_BLOCK_SIZE as usize]);
             }
