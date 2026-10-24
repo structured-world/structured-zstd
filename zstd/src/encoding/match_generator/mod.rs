@@ -496,6 +496,10 @@ pub struct MatchGeneratorDriver {
     /// A parser asked for each block in place of the backends, when one is
     /// installed (C `ZSTD_registerSequenceProducer`).
     producer: Option<ProducerSlot>,
+    /// This CPU's kernel tier, detected once at construction: the tier the
+    /// [`Matcher`] entry points run under when a caller drives the driver
+    /// through the trait rather than through the encoder's own tier.
+    tier: super::fastpath::FastpathKernel,
 }
 
 /// A [`SequenceProducer`] and what to do when it gives no parse.
@@ -800,6 +804,7 @@ impl MatchGeneratorDriver {
             #[cfg(feature = "ldm")]
             ldm_split_block: None,
             producer: None,
+            tier: super::fastpath::select_kernel(),
         }
     }
 
@@ -2112,7 +2117,7 @@ impl Matcher for MatchGeneratorDriver {
         // For a caller driving the matcher through the trait; the encoder
         // calls `prime_with_dictionary_with` under its frame's tier.
         crate::encoding::fastpath::with_encode_tier!(
-            crate::encoding::fastpath::select_kernel(),
+            self.tier,
             K => self.prime_with_dictionary_with::<K>(dict_content, offset_hist)
         )
     }
@@ -2176,7 +2181,7 @@ impl Matcher for MatchGeneratorDriver {
         // For a caller driving the matcher through the trait; the encoder
         // calls `settle_block_cut_with` under its frame's tier.
         crate::encoding::fastpath::with_encode_tier!(
-            crate::encoding::fastpath::select_kernel(),
+            self.tier,
             K => self.settle_block_cut_with::<K>(window, cut)
         )
     }
@@ -2269,11 +2274,13 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn start_matching(&mut self, handle_sequence: impl FnMut(Sequence)) {
-        // For a caller driving the matcher through the trait itself. The
-        // encoder does not come here: it reaches the driver through
-        // `builtin_driver` and searches under the tier it chose for the frame.
+        // For a caller driving the matcher through the trait itself, such as
+        // a wrapper that records what it emits. The encoder does not come
+        // here: it reaches the driver through `builtin_driver` and searches
+        // under the tier it chose for the frame. Either way the tier was
+        // detected once, at construction.
         crate::encoding::fastpath::with_encode_tier!(
-            crate::encoding::fastpath::select_kernel(),
+            self.tier,
             K => self.start_matching_with::<K>(handle_sequence)
         )
     }
@@ -2291,7 +2298,7 @@ impl Matcher for MatchGeneratorDriver {
         // For a caller driving the matcher through the trait; the encoder
         // calls `skip_matching_with_hint_with` under its frame's tier.
         crate::encoding::fastpath::with_encode_tier!(
-            crate::encoding::fastpath::select_kernel(),
+            self.tier,
             K => self.skip_matching_with_hint_with::<K>(incompressible_hint)
         )
     }

@@ -1338,7 +1338,7 @@ fn every_tier_writes_the_block_the_scalar_tier_writes() {
         .collect();
     // Lengths and offsets across their extra-bit ranges, so the field widths
     // the loop shifts by vary from one sequence to the next.
-    let sequences: Vec<RawSequence> = (0..4_000u32)
+    let mut sequences: Vec<RawSequence> = (0..4_000u32)
         .map(|i| {
             let mix = i.wrapping_mul(0x9E37_79B9);
             RawSequence {
@@ -1348,6 +1348,18 @@ fn every_tier_writes_the_block_the_scalar_tier_writes() {
             }
         })
         .collect();
+    // Wide extras for both conditional flushes of the loop: 16 + 16 + 24 =
+    // 56 extra bits takes the one before the extras (31 or more) alone, and
+    // 16 + 16 + 30 = 62 takes the one before the offset (more than 56) too.
+    for (k, seq) in sequences.iter_mut().step_by(97).enumerate() {
+        seq.ll = 40_000 + k as u32;
+        seq.ml = 60_000 + k as u32;
+        seq.off_base = if k % 2 == 0 {
+            (1u32 << 24) + k as u32
+        } else {
+            (1u32 << 30) + k as u32
+        };
+    }
     let encode = |kernel| {
         let mut state = CompressState::<EntropyOnlyMatcher> {
             matcher: EntropyOnlyMatcher,
