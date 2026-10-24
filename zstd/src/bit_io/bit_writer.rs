@@ -415,9 +415,12 @@ impl<V: AsMut<Vec<u8>>> BitBurst<'_, V> {
             self.cursor.wrapping_add(8) <= self.end,
             "a burst flushed past the room it reserved",
         );
-        // SAFETY: the cursor is 8 bytes short of the reserved end (above).
+        // SAFETY: the cursor is 8 bytes short of the reserved end (above), and
+        // an unaligned store has no alignment requirement.
         unsafe {
-            core::ptr::copy_nonoverlapping(self.partial.to_le_bytes().as_ptr(), self.cursor, 8);
+            self.cursor
+                .cast::<u64>()
+                .write_unaligned(self.partial.to_le());
             self.cursor = self.cursor.add(nb_bytes);
         }
         // A full accumulator (64 bits) leaves nothing: shifting a `u64` by 64

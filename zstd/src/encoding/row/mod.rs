@@ -4007,51 +4007,45 @@ impl RowMatchGenerator {
     // siblings directly with the type and const already bound. `skip` does
     // no tag compare, so it dispatches on `row_log` only.
     pub(crate) fn start_matching<K: EncodeTier>(&mut self, handle_sequence: impl FnMut(Sequence)) {
-        // SAFETY: same per-tier umbrella contract as `start_matching_greedy`.
-        #[cfg(all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel-simd128"
-        ))]
-        {
-            // SAFETY: simd128 is a compile-time feature here; no runtime gate.
-            unsafe { dispatch_lazy!(self.lazy_simd128::<Simd128Tags>(handle_sequence)) }
-        }
-        #[cfg(not(all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel-simd128"
-        )))]
-        {
-            match K::TIER {
-                #[cfg(all(
-                    any(target_arch = "x86", target_arch = "x86_64"),
-                    feature = "kernel-avx2"
-                ))]
-                FastpathKernel::Avx2Bmi2 => unsafe {
-                    dispatch_lazy!(self.lazy_avx2bmi2::<Avx2Bmi2Tags>(handle_sequence))
-                },
-                #[cfg(all(
-                    any(target_arch = "x86", target_arch = "x86_64"),
-                    feature = "kernel-sse"
-                ))]
-                FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    dispatch_lazy!(self.lazy_sse2::<Sse2Tags>(handle_sequence))
-                },
-                #[cfg(all(
-                    target_arch = "aarch64",
-                    target_endian = "little",
-                    feature = "kernel-neon"
-                ))]
-                FastpathKernel::Neon => unsafe {
-                    dispatch_lazy!(self.lazy_neon::<NeonTags>(handle_sequence))
-                },
-                // SAFETY: the scalar kernel has no `#[target_feature]`; the
-                // fn is `unsafe` only for macro uniformity.
-                FastpathKernel::Scalar => unsafe {
-                    dispatch_lazy!(self.lazy_scalar::<ScalarTags>(handle_sequence))
-                },
-            }
+        // SAFETY: same per-tier umbrella contract as `start_matching_greedy`:
+        // `K` names a tier the encoder confirmed this CPU runs.
+        match K::TIER {
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-avx2"
+            ))]
+            FastpathKernel::Avx2Bmi2 => unsafe {
+                dispatch_lazy!(self.lazy_avx2bmi2::<Avx2Bmi2Tags>(handle_sequence))
+            },
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-sse"
+            ))]
+            FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
+                dispatch_lazy!(self.lazy_sse2::<Sse2Tags>(handle_sequence))
+            },
+            #[cfg(all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                feature = "kernel-neon"
+            ))]
+            FastpathKernel::Neon => unsafe {
+                dispatch_lazy!(self.lazy_neon::<NeonTags>(handle_sequence))
+            },
+            // simd128 is a compile-time feature on wasm; no runtime gate.
+            #[cfg(all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel-simd128"
+            ))]
+            FastpathKernel::Simd128 => unsafe {
+                dispatch_lazy!(self.lazy_simd128::<Simd128Tags>(handle_sequence))
+            },
+            // SAFETY: the scalar kernel has no `#[target_feature]`; the
+            // fn is `unsafe` only for macro uniformity.
+            FastpathKernel::Scalar => unsafe {
+                dispatch_lazy!(self.lazy_scalar::<ScalarTags>(handle_sequence))
+            },
         }
     }
 
