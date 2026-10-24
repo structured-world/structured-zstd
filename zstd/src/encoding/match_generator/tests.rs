@@ -729,13 +729,11 @@ fn btultra2_seed_pass_initializes_opt_state() {
     );
 }
 
-/// Every per-CPU kernel tier emits a bit-identical sequence stream. Forcing
-/// `table.kernel` runs each tier's monomorphized BT-collect / DP wrapper on
-/// one machine (only the runtime-selected tier would otherwise execute), which
-/// both pins the scalar-vs-SIMD bit-identity invariant and exercises the
-/// per-tier wrappers the runtime dispatch leaves cold. x86-only: the aarch64
-/// path dispatches NEON unconditionally, so the cached field is read only in
-/// the x86 `cfg` block.
+/// Every per-CPU kernel tier emits a bit-identical sequence stream. Running
+/// the search under each tier the CPU supports executes each monomorphized
+/// BT-collect / DP wrapper on one machine (only the detected tier would
+/// otherwise run), which pins the scalar-vs-SIMD bit-identity invariant.
+/// x86-only: aarch64 has a single NEON tier.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
 fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
@@ -778,16 +776,18 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
             26,
         );
         hc.table.commit_input(&data);
-        hc.table.kernel = tier;
         let mut seqs = Vec::new();
-        hc.start_matching(|seq| match seq {
-            Sequence::Triple {
-                literal_len,
-                offset,
-                match_len,
-            } => seqs.push((literal_len, offset, match_len)),
-            Sequence::Literals { len } => seqs.push((len, 0, 0)),
-        });
+        crate::encoding::fastpath::with_encode_tier!(
+            tier,
+            K => hc.start_matching_with::<K>(|seq| match seq {
+                Sequence::Triple {
+                    literal_len,
+                    offset,
+                    match_len,
+                } => seqs.push((literal_len, offset, match_len)),
+                Sequence::Literals { len } => seqs.push((len, 0, 0)),
+            })
+        );
         seqs
     };
 

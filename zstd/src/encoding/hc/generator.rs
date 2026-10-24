@@ -1548,7 +1548,10 @@ impl HcMatchGenerator {
 
     /// [`Self::start_matching`] compiled for the tier `K`.
     #[cfg(test)]
-    fn start_matching_with<K: EncodeTier>(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
+    pub(crate) fn start_matching_with<K: EncodeTier>(
+        &mut self,
+        mut handle_sequence: impl FnMut(Sequence),
+    ) {
         use crate::encoding::strategy::{self, StrategyTag};
         // Dispatch on the mirrored `strategy_tag` so each test runs
         // under the same monomorphisation production would pick.
