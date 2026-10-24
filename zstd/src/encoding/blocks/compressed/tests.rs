@@ -424,12 +424,15 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
             let mut emitted: Vec<u8> = Vec::new();
             let mut codes_ws = Workspace::new();
-            encode_block_parts(
-                &mut emit_state,
-                &literals,
-                &mut [],
-                &mut code_buffer(&mut codes_ws, 0),
-                &mut emitted,
+            crate::encoding::fastpath::with_encode_tier!(
+                emit_state.copy_kernel,
+                K => encode_block_parts::<_, K>(
+                    &mut emit_state,
+                    &literals,
+                    &mut [],
+                    &mut code_buffer(&mut codes_ws, 0),
+                    &mut emitted,
+                )
             );
             assert_eq!(
                 est,
@@ -493,12 +496,15 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
     let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
     let mut emitted: Vec<u8> = Vec::new();
     let mut codes_ws = Workspace::new();
-    encode_block_parts(
-        &mut emit_state,
-        &literals,
-        &mut [],
-        &mut code_buffer(&mut codes_ws, 0),
-        &mut emitted,
+    crate::encoding::fastpath::with_encode_tier!(
+        emit_state.copy_kernel,
+        K => encode_block_parts::<_, K>(
+            &mut emit_state,
+            &literals,
+            &mut [],
+            &mut code_buffer(&mut codes_ws, 0),
+            &mut emitted,
+        )
     );
 
     assert_eq!(
@@ -795,12 +801,15 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
         let mut to_emit = sequences.clone();
         let mut codes_ws = Workspace::new();
         let mut codes = code_buffer(&mut codes_ws, to_emit.len());
-        encode_block_parts(
-            &mut emit_state,
-            &literals,
-            &mut to_emit,
-            &mut codes,
-            &mut emitted,
+        crate::encoding::fastpath::with_encode_tier!(
+            emit_state.copy_kernel,
+            K => encode_block_parts::<_, K>(
+                &mut emit_state,
+                &literals,
+                &mut to_emit,
+                &mut codes,
+                &mut emitted,
+            )
         );
 
         // Both sides must have advanced the repeat-offset history the same
@@ -870,13 +879,16 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         compressed: &mut compressed_scratch,
         codes: &mut code_scratch,
     };
-    let emitted_raw = emit_single_sequence_block(
-        &mut state,
-        true,
-        source.len(),
-        &[],
-        &mut sequences,
-        &mut emit_buffers,
+    let emitted_raw = crate::encoding::fastpath::with_encode_tier!(
+        state.copy_kernel,
+        K => emit_single_sequence_block::<_, K>(
+            &mut state,
+            true,
+            source.len(),
+            &[],
+            &mut sequences,
+            &mut emit_buffers,
+        )
     );
     if emitted_raw {
         output.extend_from_slice(&source);
@@ -1206,8 +1218,7 @@ fn literals_buffer(capacity: usize) -> (Workspace, RegionVec<u8>) {
 #[should_panic(expected = "workspace buffer sized below what the frame put in it")]
 fn literals_past_the_buffer_stop_instead_of_overflowing() {
     let (_ws, mut literals) = literals_buffer(4);
-    super::literal_runs::gather_literals(
-        crate::encoding::fastpath::FastpathKernel::Scalar,
+    super::literal_runs::gather_literals::<crate::encoding::fastpath::ScalarTier>(
         &[0xA5; 8],
         &[],
         8,
@@ -1227,8 +1238,7 @@ fn sequences_past_the_block_are_refused() {
         ml: 60,
         off_base: 1,
     }];
-    super::literal_runs::gather_literals(
-        crate::encoding::fastpath::FastpathKernel::Scalar,
+    super::literal_runs::gather_literals::<crate::encoding::fastpath::ScalarTier>(
         &[0x5A; 32],
         &sequences,
         0,
@@ -1306,8 +1316,79 @@ fn gathered_literals_are_the_runs_in_order() {
     expected.extend_from_slice(&block[pos..]);
     for kernel in runnable_fastpath_kernels() {
         let (_ws, mut literals) = literals_buffer(block_len);
-        super::literal_runs::gather_literals(kernel, &block, &sequences, 13, &mut literals);
+        crate::encoding::fastpath::with_encode_tier!(
+            kernel,
+            K => super::literal_runs::gather_literals::<K>(&block, &sequences, 13, &mut literals)
+        );
         assert_eq!(&literals[..], &expected[..], "{kernel:?}");
+    }
+}
+
+/// Every tier this CPU can run writes the same block, byte for byte, as the
+/// scalar tier: the tiers differ in the instructions of the Huffman burst and
+/// the sequence-section loop (BMI2 against base shifts), never in their output.
+/// The block carries a Huffman-coded literals section and thousands of
+/// sequences, so both loops run on every tier.
+#[test]
+fn every_tier_writes_the_block_the_scalar_tier_writes() {
+    use super::{CompressedBlockScratch, EntropyOnlyMatcher, encode_block_parts};
+    // Skewed literals, so the section is Huffman-coded rather than raw.
+    let literals: Vec<u8> = (0..24_000u32)
+        .map(|i| b"eeeettaoinshrdlucmfwyp"[(i.wrapping_mul(2654435761) >> 27) as usize % 22])
+        .collect();
+    // Lengths and offsets across their extra-bit ranges, so the field widths
+    // the loop shifts by vary from one sequence to the next.
+    let sequences: Vec<RawSequence> = (0..4_000u32)
+        .map(|i| {
+            let mix = i.wrapping_mul(0x9E37_79B9);
+            RawSequence {
+                ll: (mix >> 7) % 70,
+                ml: 3 + (mix >> 13) % 300,
+                off_base: 1 + (mix >> 3) % 100_000,
+            }
+        })
+        .collect();
+    let encode = |kernel| {
+        let mut state = CompressState::<EntropyOnlyMatcher> {
+            matcher: EntropyOnlyMatcher,
+            sequence_capture: None,
+            copy_kernel: kernel,
+            last_huff_table: None,
+            huff_table_spare: None,
+            huff_weights: Default::default(),
+            seen_content: Default::default(),
+            fse_tables: FseTables::new(),
+            block_scratch: CompressedBlockScratch::new(),
+            workspace: Workspace::new(),
+            offset_hist: [1, 4, 8],
+            strategy_tag: StrategyTag::Lazy,
+            pre_split: None,
+            huf_optimal_search: true,
+            literal_compression_disabled: false,
+            post_split_allowed: true,
+        };
+        let mut emitted = Vec::new();
+        let mut to_emit = sequences.clone();
+        let mut codes_ws = Workspace::new();
+        let mut codes = code_buffer(&mut codes_ws, to_emit.len());
+        crate::encoding::fastpath::with_encode_tier!(
+            kernel,
+            K => encode_block_parts::<_, K>(
+                &mut state,
+                &literals,
+                &mut to_emit,
+                &mut codes,
+                &mut emitted,
+            )
+        );
+        emitted
+    };
+    let scalar = encode(crate::encoding::fastpath::FastpathKernel::Scalar);
+    // The literals section is Huffman-coded (Literals_Block_Type 2 in the low
+    // two bits of its first byte, RFC 8878 3.1.1.3.1.1), so the burst ran.
+    assert_eq!(scalar[0] & 0b11, 2, "literals section is not Huffman-coded");
+    for kernel in runnable_fastpath_kernels() {
+        assert_eq!(encode(kernel), scalar, "{kernel:?}");
     }
 }
 

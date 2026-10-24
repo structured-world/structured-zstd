@@ -6,7 +6,7 @@ use crate::{
     bit_io::BitWriter,
     blocks::block::BlockType,
     encoding::block_header::BlockHeader,
-    encoding::fastpath::FastpathKernel,
+    encoding::fastpath::{EncodeTier, with_encode_tier},
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
     encoding::workspace::{RegionVec, Workspace, region_bytes},
     encoding::{Matcher, Sequence},
@@ -435,9 +435,17 @@ pub(crate) fn compress_block<M: Matcher>(
     state: &mut CompressState<M>,
     output: &mut Vec<u8>,
 ) -> BlockTables {
+    with_encode_tier!(state.copy_kernel, K => compress_block_with::<M, K>(state, output))
+}
+
+/// [`compress_block`] compiled for the tier `K`.
+fn compress_block_with<M: Matcher, K: EncodeTier>(
+    state: &mut CompressState<M>,
+    output: &mut Vec<u8>,
+) -> BlockTables {
     let mut scratch = core::mem::take(&mut state.block_scratch);
-    collect_block_parts(state, &mut scratch.parts);
-    let tables = encode_block_parts(
+    collect_block_parts::<M, K>(state, &mut scratch.parts);
+    let tables = encode_block_parts::<M, K>(
         state,
         &scratch.parts.literals,
         &mut scratch.parts.sequences,
@@ -452,11 +460,33 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     state: &mut CompressState<M>,
     last_block: bool,
     output: &mut Vec<u8>,
+    #[cfg(feature = "lsm")] block_decompressed_sizes: Option<&mut Vec<u32>>,
+    #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
+) {
+    with_encode_tier!(
+        state.copy_kernel,
+        K => compress_block_with_post_split_with::<M, K>(
+            state,
+            last_block,
+            output,
+            #[cfg(feature = "lsm")]
+            block_decompressed_sizes,
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            block_checksums,
+        )
+    )
+}
+
+/// [`compress_block_with_post_split`] compiled for the tier `K`.
+fn compress_block_with_post_split_with<M: Matcher, K: EncodeTier>(
+    state: &mut CompressState<M>,
+    last_block: bool,
+    output: &mut Vec<u8>,
     #[cfg(feature = "lsm")] mut block_decompressed_sizes: Option<&mut Vec<u32>>,
     #[cfg(all(feature = "lsm", feature = "hash"))] mut block_checksums: Option<&mut Vec<u32>>,
 ) {
     let mut scratch = core::mem::take(&mut state.block_scratch);
-    collect_block_parts(state, &mut scratch.parts);
+    collect_block_parts::<M, K>(state, &mut scratch.parts);
     if scratch.parts.sequences.len() <= 4 {
         let source_len = state.matcher.get_last_space().len();
         #[cfg(feature = "lsm")]
@@ -481,7 +511,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             compressed: &mut scratch.compressed,
             codes: &mut scratch.sequence_codes,
         };
-        let emitted_raw = emit_single_sequence_block(
+        let emitted_raw = emit_single_sequence_block::<M, K>(
             state,
             last_block,
             source_len,
@@ -626,7 +656,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             compressed: &mut scratch.compressed,
             codes: &mut scratch.sequence_codes,
         };
-        let emitted_raw = emit_single_sequence_block(
+        let emitted_raw = emit_single_sequence_block::<M, K>(
             state,
             last_block && last_partition,
             src_size,
@@ -654,7 +684,10 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
 /// sequence (`ZSTD_storeSeq`); here the match loop calls the emit from a dozen
 /// sites, and a copy inlined at each of them costs the loop more in decode
 /// pressure than the calls it saves (+2.16% cycles at level 3, measured).
-fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut EncodedBlockParts) {
+fn collect_block_parts<M: Matcher, K: EncodeTier>(
+    state: &mut CompressState<M>,
+    parts: &mut EncodedBlockParts,
+) {
     parts.literals.clear();
     parts.sequences.clear();
     // Trailing literals, reported after the last sequence; the runs are read
@@ -699,9 +732,7 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
             block_start_hist,
         );
     }
-    let kernel = state.copy_kernel;
-    literal_runs::gather_literals(
-        kernel,
+    literal_runs::gather_literals::<K>(
         state.matcher.get_last_space(),
         &parts.sequences,
         tail,
@@ -787,7 +818,7 @@ fn record_sequence(
     }
 }
 
-fn encode_block_parts<M: Matcher>(
+fn encode_block_parts<M: Matcher, K: EncodeTier>(
     state: &mut CompressState<M>,
     literals_vec: &[u8],
     raw_sequences: &mut [RawSequence],
@@ -855,7 +886,7 @@ fn encode_block_parts<M: Matcher>(
         rle_literals(literals_vec, &mut writer);
         HuffOutcome::Clear
     } else if literals_vec.len() >= min_lits {
-        match compress_literals(
+        match compress_literals::<K>(
             literals_vec,
             state.last_huff_table.as_ref(),
             &mut writer,
@@ -918,7 +949,6 @@ fn encode_block_parts<M: Matcher>(
             )
         });
 
-        let kernel = state.copy_kernel;
         // Destructured because the default-table accessors borrow the whole of
         // `FseTables`, which would collide with taking a `*_next` slot mutably.
         let FseTables {
@@ -976,8 +1006,7 @@ fn encode_block_parts<M: Matcher>(
         encode_table(&of_mode, &mut writer);
         encode_table(&ml_mode, &mut writer);
 
-        encode_sequences(
-            kernel,
+        encode_sequences::<K>(
             raw_sequences,
             codes,
             &mut writer,
@@ -1746,7 +1775,7 @@ struct SingleSequenceEmitBuffers<'a> {
     codes: &'a mut RegionVec<u32>,
 }
 
-fn emit_single_sequence_block<M: Matcher>(
+fn emit_single_sequence_block<M: Matcher, K: EncodeTier>(
     state: &mut CompressState<M>,
     last_block: bool,
     source_len: usize,
@@ -1758,7 +1787,7 @@ fn emit_single_sequence_block<M: Matcher>(
     // The tables are only read here and the block's decisions come back to be
     // committed, so writing the partition raw leaves nothing to restore.
     buffers.compressed.clear();
-    let tables = encode_block_parts(
+    let tables = encode_block_parts::<M, K>(
         state,
         literals,
         sequences,
@@ -3007,14 +3036,12 @@ macro_rules! encode_sequences_body {
 /// Write the sequence section's bitstream for `sequences` under the three
 /// table `modes`, in LL / ML / OF order.
 ///
-/// `kernel` is the tier resolved when the compressor was built. Where it has
-/// BMI2 the loop runs under it, as upstream's does (`ZSTD_encodeSequences_bmi2`):
-/// every field is written at a width known only at run time, and BMI2's
-/// `shlx` / `shrx` / `bzhi` take that width in any register, where the base
-/// x86 shifts take it only in `CL` and stall on the flags they leave. The bytes
-/// written are the same on every tier.
-fn encode_sequences(
-    kernel: FastpathKernel,
+/// Where the tier `K` has BMI2 the loop runs under it, as upstream's does
+/// (`ZSTD_encodeSequences_bmi2`): every field is written at a width known only
+/// at run time, and BMI2's `shlx` / `shrx` / `bzhi` take that width in any
+/// register, where the base x86 shifts take it only in `CL` and stall on the
+/// flags they leave. The bytes written are the same on every tier.
+fn encode_sequences<K: EncodeTier>(
     sequences: &[RawSequence],
     // One packed [`SequenceCode`] per sequence, in the same order, from the
     // pass that derived the offset codes.
@@ -3026,13 +3053,13 @@ fn encode_sequences(
     // the caller is holding its slots.
     defaults: [&FSETable; 3],
 ) {
-    match kernel {
+    match K::TIER {
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
             feature = "kernel-avx2"
         ))]
         // SAFETY: the tier is only selected after confirming BMI2 (and AVX2).
-        FastpathKernel::Avx2Bmi2 => unsafe {
+        crate::encoding::fastpath::FastpathKernel::Avx2Bmi2 => unsafe {
             encode_sequences_bmi2(sequences, codes, writer, modes, defaults)
         },
         _ => encode_sequences_scalar(sequences, codes, writer, modes, defaults),
@@ -3337,7 +3364,7 @@ fn rle_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
 /// `compress_literals` byte-for-byte (same size_format ladder, same
 /// min_gain raw-fallback gate) so the wire output is identical to
 /// the size-comparison reuse path when both would pick reuse.
-fn emit_reuse_literals(
+fn emit_reuse_literals<K: EncodeTier>(
     literals: &[u8],
     last_table: &huff0_encoder::HuffmanTable,
     writer: &mut BitWriter<&mut Vec<u8>>,
@@ -3364,7 +3391,7 @@ fn emit_reuse_literals(
     if size_format == 0 {
         encoder.encode(literals, false);
     } else {
-        encoder.encode4x(literals, false);
+        encoder.encode4x::<K>(literals, false);
     }
     let encoded_len = (writer.index() - index_before) / 8;
     writer.change_bits(size_index, encoded_len as u64, size_bits);
@@ -3434,7 +3461,7 @@ fn end_samples_look_flat(literals: &[u8], counts: &mut [usize; 256]) -> bool {
     head_largest + tail_largest <= ((2 * SUSPECT_SAMPLE_SIZE) >> 7) + 4
 }
 
-fn compress_literals(
+fn compress_literals<K: EncodeTier>(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
     writer: &mut BitWriter<&mut Vec<u8>>,
@@ -3459,7 +3486,7 @@ fn compress_literals(
         && let Some(prev) = last_table
         && prev.estimate_compressed_size(literals).is_some()
     {
-        return emit_reuse_literals(literals, prev, writer, reset_idx, strategy);
+        return emit_reuse_literals::<K>(literals, prev, writer, reset_idx, strategy);
     }
 
     let mut counts = [0usize; 256];
@@ -3557,7 +3584,7 @@ fn compress_literals(
     if size_format == 0 {
         encoder.encode(literals, new_table)
     } else {
-        encoder.encode4x(literals, new_table)
+        encoder.encode4x::<K>(literals, new_table)
     };
     let encoded_len = (writer.index() - index_before) / 8;
     writer.change_bits(size_index, encoded_len as u64, size_bits);

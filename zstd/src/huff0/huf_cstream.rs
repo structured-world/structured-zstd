@@ -25,6 +25,8 @@
 
 use alloc::vec::Vec;
 
+use crate::encoding::fastpath::EncodeTier;
+
 /// Upstream zstd `HUF_BITS_IN_CONTAINER = sizeof(size_t) * 8`. We hard-code 64
 /// regardless of target pointer width. Upstream zstd's `MEM_32bits()` branch
 /// switches the container to `u32` on 32-bit hosts; this crate's CI
@@ -109,24 +111,6 @@ pub(crate) struct HufCStream<'a> {
     /// an undersized `dst_capacity` would silently succeed with a
     /// truncated stream.
     overflow: bool,
-}
-
-/// Whether to run the BMI2-targeted burst-encode kernel. BMI2 lets the codegen
-/// use `shrx`/`shlx` for the bit-container's variable shifts (no CL dependency,
-/// no flag stall) instead of `shr`/`shl`; the emitted instruction stream differs
-/// but the logic — and therefore the compressed output — is identical. Detected
-/// at the per-stream entry, never inside the symbol loop.
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-#[inline]
-fn huf_encode_use_bmi2() -> bool {
-    use crate::cpu_kernel::{CpuLevel, cpu_allows};
-    cpu_allows(CpuLevel::Bmi2) && std::arch::is_x86_feature_detected!("bmi2")
-}
-#[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
-#[inline]
-fn huf_encode_use_bmi2() -> bool {
-    use crate::cpu_kernel::{CpuLevel, cpu_allows};
-    cpu_allows(CpuLevel::Bmi2) && cfg!(target_feature = "bmi2")
 }
 
 /// One symbol into bit container `$bc` / bit position `$bp`. Mirrors
@@ -367,8 +351,13 @@ impl<'a> HufCStream<'a> {
     /// `2 * K_UNROLL`, (3) dual-container main loop processing
     /// `2 * K_UNROLL` symbols per iteration. Symbols consumed in reverse
     /// (`data[--n]`).
+    ///
+    /// The kernel is the encoder tier `K`'s: BMI2 lets the container's variable
+    /// shifts be `shrx`/`shlx` (no `CL` dependency, no flag stall) instead of
+    /// `shr`/`shl`. The instructions differ, the output does not.
     #[inline]
     pub(crate) fn encode_unrolled<
+        K: EncodeTier,
         const K_UNROLL: usize,
         const K_FAST_FLUSH: bool,
         const K_LAST_FAST: bool,
@@ -377,20 +366,19 @@ impl<'a> HufCStream<'a> {
         table: &[u64],
         data: &[u8],
     ) {
-        // Pick the burst kernel ONCE per stream, never inside the symbol loop.
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            if huf_encode_use_bmi2() {
-                // SAFETY: `huf_encode_use_bmi2()` returned true, so the running
-                // CPU has BMI2; the body adds no unsafe beyond the 8-byte store
-                // already justified in `huf_flush!`.
-                unsafe {
-                    self.encode_unrolled_bmi2::<K_UNROLL, K_FAST_FLUSH, K_LAST_FAST>(table, data);
-                }
-                return;
-            }
+        match K::TIER {
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-avx2"
+            ))]
+            // SAFETY: the tier is only selected after confirming BMI2 (and
+            // AVX2); the body adds no unsafe beyond the 8-byte store already
+            // justified in `huf_flush!`.
+            crate::encoding::fastpath::FastpathKernel::Avx2Bmi2 => unsafe {
+                self.encode_unrolled_bmi2::<K_UNROLL, K_FAST_FLUSH, K_LAST_FAST>(table, data)
+            },
+            _ => self.encode_unrolled_scalar::<K_UNROLL, K_FAST_FLUSH, K_LAST_FAST>(table, data),
         }
-        self.encode_unrolled_scalar::<K_UNROLL, K_FAST_FLUSH, K_LAST_FAST>(table, data);
     }
 
     /// Portable burst-encode kernel (no target feature). Bit-identical output to
@@ -412,8 +400,12 @@ impl<'a> HufCStream<'a> {
     /// the container's variable shifts lower to `shrx`/`shlx`.
     ///
     /// # Safety
-    /// The caller must have verified BMI2 is available (`huf_encode_use_bmi2()`).
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    /// The caller must have verified BMI2 is available: the encoder tier
+    /// running it is [`crate::encoding::fastpath::FastpathKernel::Avx2Bmi2`].
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
     #[target_feature(enable = "bmi2")]
     unsafe fn encode_unrolled_bmi2<
         const K_UNROLL: usize,

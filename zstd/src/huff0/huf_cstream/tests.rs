@@ -66,7 +66,7 @@ fn encode_unrolled_dual_container_size_is_deterministic() {
     // Every symbol maps to the same 4-bit code (value 0b1010).
     let table = [pack_huf_celt(0b1010, 4); 256];
     let data = [0u8; 16];
-    s.encode_unrolled::<4, false, false>(&table, &data);
+    s.encode_unrolled::<crate::encoding::fastpath::ScalarTier, 4, false, false>(&table, &data);
     let n = s.close();
     assert_eq!(
         n, 9,

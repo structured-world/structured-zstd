@@ -308,6 +308,153 @@ fn detect_kernel_uncached() -> FastpathKernel {
     FastpathKernel::Scalar
 }
 
+/// A [`FastpathKernel`] tier as a type. The encoder chooses its tier once, in
+/// [`with_encode_tier`], and everything below that choice is compiled per tier:
+/// a leaf that runs a different kernel per tier matches on `K::TIER`, which
+/// folds to the one kernel at monomorphisation, so no tier is asked at run time
+/// below the choice.
+pub(crate) trait EncodeTier {
+    /// The tier this type stands for.
+    const TIER: FastpathKernel;
+}
+
+/// [`FastpathKernel::Scalar`] as a type.
+pub(crate) struct ScalarTier;
+impl EncodeTier for ScalarTier {
+    const TIER: FastpathKernel = FastpathKernel::Scalar;
+}
+
+/// [`FastpathKernel::Neon`] as a type.
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    feature = "kernel-neon"
+))]
+pub(crate) struct NeonTier;
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    feature = "kernel-neon"
+))]
+impl EncodeTier for NeonTier {
+    const TIER: FastpathKernel = FastpathKernel::Neon;
+}
+
+/// [`FastpathKernel::Sse2`] as a type.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
+))]
+pub(crate) struct Sse2Tier;
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
+))]
+impl EncodeTier for Sse2Tier {
+    const TIER: FastpathKernel = FastpathKernel::Sse2;
+}
+
+/// [`FastpathKernel::Sse42`] as a type.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
+))]
+pub(crate) struct Sse42Tier;
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
+))]
+impl EncodeTier for Sse42Tier {
+    const TIER: FastpathKernel = FastpathKernel::Sse42;
+}
+
+/// [`FastpathKernel::Avx2Bmi2`] as a type.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
+))]
+pub(crate) struct Avx2Bmi2Tier;
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
+))]
+impl EncodeTier for Avx2Bmi2Tier {
+    const TIER: FastpathKernel = FastpathKernel::Avx2Bmi2;
+}
+
+/// [`FastpathKernel::Simd128`] as a type.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel-simd128"
+))]
+pub(crate) struct Simd128Tier;
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel-simd128"
+))]
+impl EncodeTier for Simd128Tier {
+    const TIER: FastpathKernel = FastpathKernel::Simd128;
+}
+
+/// The encoder's one choice of tier: evaluate `$body` with `$k` naming the
+/// [`EncodeTier`] type of the tier `$tier` holds.
+macro_rules! with_encode_tier {
+    ($tier:expr, $k:ident => $body:expr) => {{
+        use $crate::encoding::fastpath as tiers;
+        match $tier {
+            tiers::FastpathKernel::Scalar => {
+                type $k = tiers::ScalarTier;
+                $body
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                feature = "kernel-neon"
+            ))]
+            tiers::FastpathKernel::Neon => {
+                type $k = tiers::NeonTier;
+                $body
+            }
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-sse"
+            ))]
+            tiers::FastpathKernel::Sse2 => {
+                type $k = tiers::Sse2Tier;
+                $body
+            }
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-sse"
+            ))]
+            tiers::FastpathKernel::Sse42 => {
+                type $k = tiers::Sse42Tier;
+                $body
+            }
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-avx2"
+            ))]
+            tiers::FastpathKernel::Avx2Bmi2 => {
+                type $k = tiers::Avx2Bmi2Tier;
+                $body
+            }
+            #[cfg(all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel-simd128"
+            ))]
+            tiers::FastpathKernel::Simd128 => {
+                type $k = tiers::Simd128Tier;
+                $body
+            }
+        }
+    }};
+}
+pub(crate) use with_encode_tier;
+
 /// Public entry point for raw-pointer prefix-length scans (BT byte compare,
 /// repcode extend, etc.): resolves the tier via [`select_kernel`] on every
 /// call, so hot loops should cache the kernel and call

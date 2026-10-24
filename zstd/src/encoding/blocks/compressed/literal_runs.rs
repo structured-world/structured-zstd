@@ -7,7 +7,7 @@
 //! block, so no copy below the dispatch asks which kernel to use.
 
 use crate::decoding::simd_copy;
-use crate::encoding::fastpath::FastpathKernel;
+use crate::encoding::fastpath::{EncodeTier, FastpathKernel};
 use crate::encoding::workspace::RegionVec;
 
 use super::RawSequence;
@@ -18,16 +18,12 @@ use super::RawSequence;
 const LITERAL_INLINE_COPY_MAX: usize = 2048;
 
 /// Append the literal runs of `sequences`, then `tail` trailing literal bytes,
-/// from `block` to `dst`.
-///
-/// `kernel` is the tier resolved when the compressor was built; this is the
-/// only place it is looked at, once per block.
+/// from `block` to `dst`, with the copies of the tier `K`.
 ///
 /// # Panics
 /// If the sequences and the tail reach past `block`, which a matcher that
 /// reports its sequences correctly never produces.
-pub(super) fn gather_literals(
-    kernel: FastpathKernel,
+pub(super) fn gather_literals<K: EncodeTier>(
     block: &[u8],
     sequences: &[RawSequence],
     tail: usize,
@@ -39,7 +35,7 @@ pub(super) fn gather_literals(
     if dst.capacity() - dst.len() < block.len() {
         crate::encoding::workspace::capacity_exhausted();
     }
-    match kernel {
+    match K::TIER {
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
             feature = "kernel-avx2"
