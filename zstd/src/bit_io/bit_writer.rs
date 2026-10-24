@@ -115,143 +115,36 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bit_idx += data.len() * 8;
     }
 
-    /// Pre-reserve additional capacity in the output buffer so the
-    /// upstream zstd-faithful FSE fast path can do `flush_bulk` writes without
-    /// triggering `Vec::extend_from_slice`'s grow-on-realloc branch.
-    /// `additional` is the number of bytes the upcoming bursts will
-    /// emit (caller's bit budget / 8, rounded up).
-    #[inline]
-    pub fn reserve_output(&mut self, additional: usize) {
-        self.output.as_mut().reserve(additional);
-    }
-
-    /// Upstream zstd `BIT_addBitsFast` (`bitstream.h:193-200`): always accumulate
-    /// `bits` into the bottom of `partial`, no overflow check.
+    /// Start a [`BitBurst`] that commits at most `max_bytes` bytes, counting the
+    /// up to 7 whole bytes it drains from the accumulator here so that it starts
+    /// with under 8 bits held.
     ///
-    /// # Safety
-    ///
-    /// Caller MUST guarantee BOTH preconditions BEFORE calling:
-    ///
-    /// 1. `num_bits + bits_in_partial <= 64` AND **not both 64**, i.e.
-    ///    if `bits_in_partial == 64` then `num_bits` MUST be 0 — and
-    ///    the explicit `num_bits == 0` early-return below handles that
-    ///    case without ever evaluating `bits << bits_in_partial`. The
-    ///    point of the precondition: any other combination would either
-    ///    shift-by-64 (undefined for `u64 << 64` in Rust) or overflow
-    ///    `bits_in_partial` past 64.
-    /// 2. `num_bits == 64 || bits >> num_bits == 0` — value must be
-    ///    clean of high junk past `num_bits`. Dirty high bits leak
-    ///    into the packed stream at the next OR.
-    ///
-    /// The `debug_assert!`s below catch both in test/debug builds but
-    /// do NOT survive `cargo build --release`, hence the `unsafe`
-    /// signature. The function does not perform any memory-unsafe
-    /// operation, but a violation produces a silently-corrupted
-    /// output stream that decoders cannot recover — equivalent in
-    /// blast radius to undefined behaviour for the consumer.
-    ///
-    /// Used by the upstream zstd-faithful FSE sequence encoder which knows its
-    /// per-sequence bit budget at compile time and inserts explicit
-    /// [`Self::flush_bulk`] calls between bursts — saving the
-    /// per-call branch + spill that `write_bits_64`'s overflow check
-    /// pays.
-    #[inline(always)]
-    pub unsafe fn write_bits_64_no_check(&mut self, bits: u64, num_bits: usize) {
-        debug_assert!(
-            num_bits + self.bits_in_partial <= 64,
-            "write_bits_64_no_check would overflow partial: would push to {} bits",
-            num_bits + self.bits_in_partial,
-        );
-        debug_assert!(
-            self.bits_in_partial < 64 || num_bits == 0,
-            "write_bits_64_no_check called with full accumulator and num_bits>0; \
-             caller must flush_bulk before adding more bits",
-        );
-        debug_assert!(
-            num_bits == 64 || bits >> num_bits == 0,
-            "value has dirty high bits beyond num_bits={num_bits}",
-        );
-        // Masked so a full accumulator cannot make this a shift by 64, which is
-        // undefined for `u64`. It is not a guard costing anything: x86 and
-        // AArch64 shift instructions mask the count themselves, so the mask
-        // disappears. It replaces a `num_bits == 0` early return, which was a
-        // branch on every call, and there are six a sequence. Upstream needs
-        // neither, because its `BIT_addBitsFast` keeps `bitPos` strictly under
-        // 64 and can shift unconditionally.
-        //
-        // Correct in the one case the mask changes: the accumulator is full
-        // only where the caller passes `num_bits == 0`, and the second
-        // precondition then forces `bits == 0`, so the OR contributes nothing
-        // whatever the shift count.
-        self.partial |= bits << (self.bits_in_partial & 63);
-        self.bits_in_partial += num_bits;
-    }
-
-    /// Upstream zstd `BIT_flushBitsFast` (`bitstream.h:202-214`): write the
-    /// full 8 bytes of `partial` directly to the output buffer via a
-    /// single `MEM_writeLEST` (unaligned 8-byte LE store), then
-    /// advance the Vec's `len` by only `nb_bytes` so the scratch
-    /// bytes past the commit point get overwritten by the next
-    /// flush. No overflow check — caller must have pre-reserved at
-    /// least 8 bytes of spare capacity via [`Self::reserve_output`].
-    ///
-    /// `extend_from_slice` for tiny (0..=7-byte) tails was previously
-    /// hot — its per-call capacity check + memcpy dispatch cost
-    /// dwarfs the actual byte write at FSE flush cadence (~54K
-    /// flushes per compress on the L1 fast path). The direct
-    /// unaligned store path matches upstream zstd's hot loop cycle-for-cycle.
-    ///
-    /// # Safety
-    ///
-    /// Caller MUST guarantee that `output.capacity() >= output.len() +
-    /// 8` BEFORE calling this method (typically via a prior
-    /// [`Self::reserve_output`]). Violating the precondition produces a
-    /// 8-byte out-of-bounds write to whatever memory follows the
-    /// `Vec`'s allocation — undefined behaviour. The accompanying
-    /// `debug_assert!` catches misuse in test/debug builds but does
-    /// NOT survive `cargo build --release`, hence the `unsafe`
-    /// signature.
-    #[inline(always)]
-    pub unsafe fn flush_bulk(&mut self) {
-        let nb_bytes = self.bits_in_partial >> 3;
-        let bytes = self.partial.to_le_bytes();
+    /// For a loop that knows its bit budget per step and flushes between
+    /// steps itself, which is how upstream writes the sequence section.
+    pub(crate) fn burst(&mut self, max_bytes: usize) -> BitBurst<'_, V> {
+        // Room for every flush of the burst: each writes 8 bytes and keeps at
+        // most 7 of them, so `max_bytes` committed plus 8 past the last.
+        let room = max_bytes
+            .checked_add(8)
+            .expect("a burst larger than the address space");
         let output = self.output.as_mut();
-        // `bit_idx` counts the bits already committed to `output`, and every
-        // path that appends bytes advances both, so it is the buffer's length
-        // in bits at all times. Taking the length from it keeps this off the
-        // `Vec` header, which is otherwise loaded on every flush, and this runs
-        // two to three times per encoded sequence.
-        let len = self.bit_idx >> 3;
-        debug_assert_eq!(
-            len,
-            output.len(),
-            "bit_idx must track the committed output length",
-        );
-        debug_assert!(
-            output.capacity() >= len + 8,
-            "flush_bulk requires 8 bytes of spare capacity; caller forgot reserve_output",
-        );
-        // SAFETY: the function-level Safety contract requires
-        // `output.capacity() >= len + 8`. We write 8 bytes starting at
-        // `len`, then commit only `nb_bytes` — the remaining `8 -
-        // nb_bytes` bytes stay within capacity but past `len`, and
-        // the next flush_bulk overwrites them.
-        unsafe {
-            let dst = output.as_mut_ptr().add(len);
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, 8);
-            output.set_len(len + nb_bytes);
-        }
-        // `nb_bytes == 8` means the accumulator was full (64 bits). A
-        // raw `partial >>= 64` is UB on `u64`, so we zero explicitly.
-        // Upstream zstd's `BIT_flushBitsFast` writes a fresh 8 bytes the next
-        // round so the post-flush state must be clean either way.
-        if nb_bytes == 8 {
-            self.partial = 0;
-        } else {
-            self.partial >>= nb_bytes * 8;
-        }
-        self.bits_in_partial &= 7;
-        self.bit_idx += nb_bytes * 8;
+        output.reserve(room);
+        let len = output.len();
+        debug_assert_eq!(len * 8, self.bit_idx, "bit_idx tracks the output length");
+        let base = output.as_mut_ptr();
+        let mut burst = BitBurst {
+            partial: self.partial,
+            bits_in_partial: self.bits_in_partial,
+            // SAFETY: `len <= capacity`.
+            cursor: unsafe { base.add(len) },
+            // SAFETY: `reserve(room)` above made `len + room <= capacity`.
+            end: unsafe { base.add(len + room) },
+            writer: self,
+        };
+        // SAFETY: the accumulator holds under 64 bits outside a burst
+        // (`write_bits_64` drains it at 64), and the reserve covers 8 bytes.
+        unsafe { burst.flush() };
+        burst
     }
 
     /// Bridge for the upstream zstd-faithful Huffman encoder (`HufCStream`) so
@@ -449,6 +342,108 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         } else {
             8 - (idx % 8)
         }
+    }
+}
+
+/// A run of unchecked writes into a [`BitWriter`] with the accumulator and the
+/// output cursor held in locals, upstream's `BIT_CStream_t` (`bitstream.h`).
+///
+/// Through the writer, every add stored the accumulator back and every flush
+/// reloaded the buffer pointer from the `Vec` and stored its length: the byte
+/// store goes through a `u8` pointer, which may alias the writer and the `Vec`
+/// header, so neither could stay in a register across it. The burst holds no
+/// such state behind a reference and commits the length once, in
+/// [`Self::finish`].
+#[must_use = "a burst's bits reach the writer only through `finish`"]
+pub(crate) struct BitBurst<'a, V: AsMut<Vec<u8>>> {
+    writer: &'a mut BitWriter<V>,
+    partial: u64,
+    bits_in_partial: usize,
+    /// Next byte to write.
+    cursor: *mut u8,
+    /// End of the room [`BitWriter::burst`] reserved; every flush stays
+    /// 8 bytes short of it.
+    end: *mut u8,
+}
+
+impl<V: AsMut<Vec<u8>>> BitBurst<'_, V> {
+    /// Upstream zstd `BIT_addBitsFast` (`bitstream.h:193-200`): accumulate the
+    /// low `num_bits` of `bits` above what is held, with no overflow check.
+    ///
+    /// # Safety
+    ///
+    /// The accumulator must have room: `bits_in_partial + num_bits <= 64`, and
+    /// `bits` must be clean above `num_bits` (`num_bits == 64 || bits >>
+    /// num_bits == 0`). Neither violation touches memory, but either corrupts
+    /// the stream with nothing to detect it, so the caller proves both from
+    /// its bit budget. Debug builds assert them.
+    #[inline(always)]
+    pub(crate) unsafe fn add(&mut self, bits: u64, num_bits: usize) {
+        debug_assert!(
+            self.bits_in_partial + num_bits <= 64,
+            "{num_bits} bits do not fit beside the {} held",
+            self.bits_in_partial,
+        );
+        debug_assert!(
+            num_bits == 64 || bits >> num_bits == 0,
+            "value has dirty high bits beyond num_bits={num_bits}",
+        );
+        // Masked so a full accumulator cannot make this a shift by 64, which is
+        // undefined for `u64`. x86 and AArch64 shifts mask the count
+        // themselves, so the mask costs nothing, where a `num_bits == 0` early
+        // return was a branch on every add. The accumulator is full only when
+        // `num_bits == 0`, and the second precondition then makes `bits == 0`,
+        // so the OR adds nothing whatever the count.
+        self.partial |= bits << (self.bits_in_partial & 63);
+        self.bits_in_partial += num_bits;
+    }
+
+    /// Upstream zstd `BIT_flushBitsFast` (`bitstream.h:202-214`): store all
+    /// 8 bytes of the accumulator at the cursor (one unaligned store) and
+    /// advance it by the whole bytes only; the rest is rewritten by the next
+    /// flush.
+    ///
+    /// # Safety
+    ///
+    /// The burst must still be within the `max_bytes` it was started with, so
+    /// that the 8-byte store lands inside the reserved room. Debug builds
+    /// assert it.
+    #[inline(always)]
+    pub(crate) unsafe fn flush(&mut self) {
+        let nb_bytes = self.bits_in_partial >> 3;
+        debug_assert!(
+            self.cursor.wrapping_add(8) <= self.end,
+            "a burst flushed past the room it reserved",
+        );
+        // SAFETY: the cursor is 8 bytes short of the reserved end (above).
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.partial.to_le_bytes().as_ptr(), self.cursor, 8);
+            self.cursor = self.cursor.add(nb_bytes);
+        }
+        // A full accumulator (64 bits) leaves nothing: shifting a `u64` by 64
+        // is undefined, so it is zeroed instead.
+        self.partial = if nb_bytes == 8 {
+            0
+        } else {
+            self.partial >> (nb_bytes * 8)
+        };
+        self.bits_in_partial &= 7;
+    }
+
+    /// Commit the bytes written and hand the bits still held back to the
+    /// writer.
+    pub(crate) fn finish(self) {
+        let writer = self.writer;
+        let output = writer.output.as_mut();
+        // SAFETY: the cursor started inside this allocation and every flush
+        // kept it within the reserved room, and the writer is borrowed for the
+        // whole burst, so the buffer was never reallocated.
+        let len = unsafe { self.cursor.offset_from(output.as_mut_ptr()) } as usize;
+        // SAFETY: `[old len, len)` was written by the flushes, within capacity.
+        unsafe { output.set_len(len) };
+        writer.bit_idx = len * 8;
+        writer.partial = self.partial;
+        writer.bits_in_partial = self.bits_in_partial;
     }
 }
 

@@ -2815,8 +2815,9 @@ macro_rules! encode_sequences_body {
         writer.write_bits(of_add_bits, of_num_bits);
 
         // Upstream zstd-faithful sequence loop: write state diffs + extras via
-        // unchecked fast-path adds with explicit `flush_bulk` calls at
-        // safe burst boundaries. Per-sequence bit budget:
+        // unchecked adds with explicit flushes at safe boundaries, through a
+        // burst that keeps the accumulator and the cursor in registers.
+        // Per-sequence bit budget:
         //   state diffs: of (<=8) + ml (<=9) + ll (<=9) = 26 bits.
         //   extras:      ll (<=16) + ml (<=16) + of (<=31).
         //
@@ -2826,22 +2827,12 @@ macro_rules! encode_sequences_body {
         // (`zstd_compress_sequences.c:303-367`), and the one at the end of the
         // body is what leaves the accumulator with under a byte for the next
         // round.
-        //
-        // Pre-reserve output capacity for the worst-case sequence section
-        // size (~10 bytes/sequence + 32 byte slack) so the per-flush
-        // `extend_from_slice` never triggers a Vec realloc.
         if sequences.len() > 1 {
-            writer.reserve_output(sequences.len() * 12 + 64);
-            // Pre-loop flush: the safe `write_bits` calls above for the
-            // final sequence's add_bits leave `bits_in_partial` in
-            // 0..=63. Before the first unchecked-add burst we drain to
-            // < 8 leftover so the per-burst budget math (state diffs ≤
-            // 30 + leftover ≤ 8 = 38 < 64) holds invariantly.
-            // SAFETY: `reserve_output` above guarantees capacity ≥
-            // current_len + sequences.len() * 12 + 64 ≥ current_len + 8.
-            unsafe {
-                writer.flush_bulk();
-            }
+            // At most 63 bits a sequence leave as whole bytes, under 8 bytes;
+            // 12 a sequence and 64 over covers that and the up to 7 bytes the
+            // burst drains from the init-state writes above as it starts,
+            // which also leaves it holding under 8 bits.
+            let mut burst = writer.burst(sequences.len() * 12 + 64);
             // Walked as a slice rather than by index: the same order, without
             // the bounds check and the index arithmetic that `sequences[i]`
             // pays on every sequence. The last one is coded through the FSE
@@ -2863,18 +2854,16 @@ macro_rules! encode_sequences_body {
                 // acc_log ≤ 9 ll/ml + acc_log ≤ 8 of) + ≤ 7 leftover from
                 // prior flush = ≤ 37 bits total — well under 64.
                 //
-                // SAFETY (for every `write_bits_64_no_check` below):
-                // - the prior `flush_bulk` left `bits_in_partial ≤ 7`;
+                // SAFETY (for every `burst.add` below):
+                // - the prior flush left `bits_in_partial ≤ 7`;
                 // - each FSE state diff has `next.num_bits ≤ acc_log ≤ 10`;
                 //   three diffs back-to-back add ≤ 30 bits → total ≤ 37,
                 //   well below the 64-bit accumulator cap.
                 // - `diff = state.index - next.baseline` cannot exceed
                 //   `(1 << num_bits) - 1`, so `diff >> num_bits == 0`.
-                // `reserve_output(sequences.len() * 12 + 64)` above
-                // pre-allocated enough spare capacity to cover every
-                // per-sequence flush in this loop (≤ 16 bytes per
-                // sequence, plus the 32-byte slack on top of the 64-byte
-                // header reserve).
+                // And for every `burst.flush`: the burst was started with room
+                // for 12 bytes a sequence, more than one sequence's flushes
+                // commit.
                 //
                 // What the three diffs actually put in the accumulator, tallied
                 // so the budget below is checked against the widths the FSE
@@ -2886,7 +2875,7 @@ macro_rules! encode_sequences_body {
                     let next = table.next_state(of_code, of_state);
                     let diff = crate::fse::fse_encoder::transition_bits(of_state, next.num_bits);
                     unsafe {
-                        writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                        burst.add(diff as u64, next.num_bits as usize);
                     }
                     #[cfg(debug_assertions)]
                     {
@@ -2898,7 +2887,7 @@ macro_rules! encode_sequences_body {
                     let next = table.next_state(ml_code, ml_state);
                     let diff = crate::fse::fse_encoder::transition_bits(ml_state, next.num_bits);
                     unsafe {
-                        writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                        burst.add(diff as u64, next.num_bits as usize);
                     }
                     #[cfg(debug_assertions)]
                     {
@@ -2910,7 +2899,7 @@ macro_rules! encode_sequences_body {
                     let next = table.next_state(ll_code, ll_state);
                     let diff = crate::fse::fse_encoder::transition_bits(ll_state, next.num_bits);
                     unsafe {
-                        writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                        burst.add(diff as u64, next.num_bits as usize);
                     }
                     #[cfg(debug_assertions)]
                     {
@@ -2960,7 +2949,7 @@ macro_rules! encode_sequences_body {
                 }
                 if extra_bits_total >= 31 {
                     unsafe {
-                        writer.flush_bulk();
+                        burst.flush();
                     }
                 }
 
@@ -2977,8 +2966,8 @@ macro_rules! encode_sequences_body {
                 // for when the offset field still fits beside what is already
                 // there.
                 unsafe {
-                    writer.write_bits_64_no_check(ll_add_bits as u64, ll_num_bits);
-                    writer.write_bits_64_no_check(ml_add_bits as u64, ml_num_bits);
+                    burst.add(ll_add_bits as u64, ll_num_bits);
+                    burst.add(ml_add_bits as u64, ml_num_bits);
                 }
                 // Upstream `zstd_compress_sequences.c:355`: with the
                 // accumulator drained before the diffs, 7 leftover plus all
@@ -2986,14 +2975,15 @@ macro_rules! encode_sequences_body {
                 // its own container only past 56 bits of extras.
                 if extra_bits_total > 56 {
                     unsafe {
-                        writer.flush_bulk();
+                        burst.flush();
                     }
                 }
                 unsafe {
-                    writer.write_bits_64_no_check(of_add_bits as u64, of_num_bits);
-                    writer.flush_bulk();
+                    burst.add(of_add_bits as u64, of_num_bits);
+                    burst.flush();
                 }
             }
+            burst.finish();
         }
         if let Some(table) = ml_table {
             writer.write_bits(ml_state as u64, table.table_size.ilog2() as usize);
