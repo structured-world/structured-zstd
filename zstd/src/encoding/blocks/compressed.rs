@@ -6,6 +6,7 @@ use crate::{
     bit_io::BitWriter,
     blocks::block::BlockType,
     encoding::block_header::BlockHeader,
+    encoding::fastpath::FastpathKernel,
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
     encoding::workspace::{RegionVec, Workspace, region_bytes},
     encoding::{Matcher, Sequence},
@@ -917,6 +918,7 @@ fn encode_block_parts<M: Matcher>(
             )
         });
 
+        let kernel = state.copy_kernel;
         // Destructured because the default-table accessors borrow the whole of
         // `FseTables`, which would collide with taking a `*_next` slot mutably.
         let FseTables {
@@ -975,12 +977,11 @@ fn encode_block_parts<M: Matcher>(
         encode_table(&ml_mode, &mut writer);
 
         encode_sequences(
+            kernel,
             raw_sequences,
             codes,
             &mut writer,
-            &ll_mode,
-            &ml_mode,
-            &of_mode,
+            [&ll_mode, &ml_mode, &of_mode],
             [ll_default, ml_default, of_default],
         );
 
@@ -2776,243 +2777,301 @@ fn commit_last_used_table(
     }
 }
 
+/// The sequence section's bitstream, shared by [`encode_sequences_scalar`] and
+/// `encode_sequences_bmi2`. A macro so each tier's loop is compiled inside its
+/// own function and the bit writer and the FSE lookups inline into it.
+macro_rules! encode_sequences_body {
+    ($sequences:expr, $codes:expr, $writer:expr, $modes:expr, $defaults:expr) => {{
+        let sequences: &[RawSequence] = $sequences;
+        let codes: &[u32] = $codes;
+        let writer: &mut BitWriter<&mut Vec<u8>> = $writer;
+        let [ll_mode, ml_mode, of_mode]: [&FseTableMode<'_>; 3] = $modes;
+        let [ll_default, ml_default, of_default]: [&FSETable; 3] = $defaults;
+
+        debug_assert_eq!(codes.len(), sequences.len());
+        let sequence = sequences[sequences.len() - 1];
+        let code = SequenceCode(codes[codes.len() - 1]);
+        let (ll_code, ll_num_bits) = (code.ll_code(), code.ll_bits());
+        let (ml_code, ml_num_bits) = (code.ml_code(), code.ml_bits());
+        let (of_code, of_num_bits) = (code.of_code(), code.of_bits());
+        let ll_add_bits = low_bits(sequence.ll, ll_num_bits);
+        let ml_add_bits = low_bits(sequence.ml - 3, ml_num_bits);
+        let of_add_bits = low_bits(sequence.off_base, of_num_bits);
+        let ll_table = ll_mode.as_table(ll_default);
+        let ml_table = ml_mode.as_table(ml_default);
+        let of_table = of_mode.as_table(of_default);
+        // Carried as bare indices, not `Option`s. A component has a state
+        // exactly when it has a table, and the tables are resolved once above
+        // the loop, so wrapping the state too meant re-asking the same question
+        // three times per sequence and re-wrapping the answer. An absent
+        // component's index is never read: every site that touches one is
+        // already inside its table's `Some`.
+        let mut ll_state = ll_table.map_or(0, |table| table.start_state(ll_code).index);
+        let mut ml_state = ml_table.map_or(0, |table| table.start_state(ml_code).index);
+        let mut of_state = of_table.map_or(0, |table| table.start_state(of_code).index);
+
+        writer.write_bits(ll_add_bits, ll_num_bits);
+        writer.write_bits(ml_add_bits, ml_num_bits);
+        writer.write_bits(of_add_bits, of_num_bits);
+
+        // Upstream zstd-faithful sequence loop: write state diffs + extras via
+        // unchecked fast-path adds with explicit `flush_bulk` calls at
+        // safe burst boundaries. Per-sequence bit budget:
+        //   state diffs: of (<=8) + ml (<=9) + ll (<=9) = 26 bits.
+        //   extras:      ll (<=16) + ml (<=16) + of (<=31).
+        //
+        // One flush per sequence is the common case: the two inside the body
+        // are conditional on the extras not fitting beside the diffs, which is
+        // upstream's own accounting in `ZSTD_encodeSequences_body`
+        // (`zstd_compress_sequences.c:303-367`), and the one at the end of the
+        // body is what leaves the accumulator with under a byte for the next
+        // round.
+        //
+        // Pre-reserve output capacity for the worst-case sequence section
+        // size (~10 bytes/sequence + 32 byte slack) so the per-flush
+        // `extend_from_slice` never triggers a Vec realloc.
+        if sequences.len() > 1 {
+            writer.reserve_output(sequences.len() * 12 + 64);
+            // Pre-loop flush: the safe `write_bits` calls above for the
+            // final sequence's add_bits leave `bits_in_partial` in
+            // 0..=63. Before the first unchecked-add burst we drain to
+            // < 8 leftover so the per-burst budget math (state diffs ≤
+            // 30 + leftover ≤ 8 = 38 < 64) holds invariantly.
+            // SAFETY: `reserve_output` above guarantees capacity ≥
+            // current_len + sequences.len() * 12 + 64 ≥ current_len + 8.
+            unsafe {
+                writer.flush_bulk();
+            }
+            // Walked as a slice rather than by index: the same order, without
+            // the bounds check and the index arithmetic that `sequences[i]`
+            // pays on every sequence. The last one is coded through the FSE
+            // init states above, so it is not in this range.
+            for (&sequence, &code) in sequences[..sequences.len() - 1]
+                .iter()
+                .zip(codes[..codes.len() - 1].iter())
+                .rev()
+            {
+                let code = SequenceCode(code);
+                let (ll_code, ll_num_bits) = (code.ll_code(), code.ll_bits());
+                let (ml_code, ml_num_bits) = (code.ml_code(), code.ml_bits());
+                let (of_code, of_num_bits) = (code.of_code(), code.of_bits());
+                let ll_add_bits = low_bits(sequence.ll, ll_num_bits);
+                let ml_add_bits = low_bits(sequence.ml - 3, ml_num_bits);
+                let of_add_bits = low_bits(sequence.off_base, of_num_bits);
+
+                // State diffs burst: max 30 bits (10+10+9 worst case for
+                // acc_log ≤ 9 ll/ml + acc_log ≤ 8 of) + ≤ 7 leftover from
+                // prior flush = ≤ 37 bits total — well under 64.
+                //
+                // SAFETY (for every `write_bits_64_no_check` below):
+                // - the prior `flush_bulk` left `bits_in_partial ≤ 7`;
+                // - each FSE state diff has `next.num_bits ≤ acc_log ≤ 10`;
+                //   three diffs back-to-back add ≤ 30 bits → total ≤ 37,
+                //   well below the 64-bit accumulator cap.
+                // - `diff = state.index - next.baseline` cannot exceed
+                //   `(1 << num_bits) - 1`, so `diff >> num_bits == 0`.
+                // `reserve_output(sequences.len() * 12 + 64)` above
+                // pre-allocated enough spare capacity to cover every
+                // per-sequence flush in this loop (≤ 16 bytes per
+                // sequence, plus the 32-byte slack on top of the 64-byte
+                // header reserve).
+                //
+                // What the three diffs actually put in the accumulator, tallied
+                // so the budget below is checked against the widths the FSE
+                // tables produced rather than against the ceiling its
+                // derivation assumed.
+                #[cfg(debug_assertions)]
+                let mut state_diff_bits = 0usize;
+                if let Some(table) = of_table {
+                    let next = table.next_state(of_code, of_state);
+                    let diff = crate::fse::fse_encoder::transition_bits(of_state, next.num_bits);
+                    unsafe {
+                        writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                    }
+                    #[cfg(debug_assertions)]
+                    {
+                        state_diff_bits += next.num_bits as usize;
+                    }
+                    of_state = next.index;
+                }
+                if let Some(table) = ml_table {
+                    let next = table.next_state(ml_code, ml_state);
+                    let diff = crate::fse::fse_encoder::transition_bits(ml_state, next.num_bits);
+                    unsafe {
+                        writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                    }
+                    #[cfg(debug_assertions)]
+                    {
+                        state_diff_bits += next.num_bits as usize;
+                    }
+                    ml_state = next.index;
+                }
+                if let Some(table) = ll_table {
+                    let next = table.next_state(ll_code, ll_state);
+                    let diff = crate::fse::fse_encoder::transition_bits(ll_state, next.num_bits);
+                    unsafe {
+                        writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
+                    }
+                    #[cfg(debug_assertions)]
+                    {
+                        state_diff_bits += next.num_bits as usize;
+                    }
+                    ll_state = next.index;
+                }
+                // The three state diffs and the three extra-bit fields share
+                // one 64-bit accumulator, and a flush here is only needed when
+                // the extras that follow would not fit beside them. Upstream
+                // asks exactly that question (`zstd_compress_sequences.c:350`):
+                // `ofBits + mlBits + llBits >= 64 - 7 - (LLFSELog + MLFSELog +
+                // OffFSELog)`, which with our accumulator logs (9 + 9 + 8 = 26)
+                // is 31. Below it the accumulator holds at most 7 leftover + 26
+                // diff bits + 30 extra bits = 63, so nothing has to leave yet.
+                // Flushing unconditionally instead cost a second store, length
+                // commit and shift on every sequence, and a level-1 block has
+                // hundreds of thousands of them.
+                let extra_bits_total = of_num_bits + ml_num_bits + ll_num_bits;
+                // The thresholds are arithmetic on widths, so they are only
+                // right while the widths are what they were derived from.
+                // Pinned here, where the arithmetic happens, so a widened
+                // encoder fails at its cause rather than as an accumulator
+                // overflow further down or, in a release build, as a corrupted
+                // stream with nothing to point at.
+                #[cfg(debug_assertions)]
+                {
+                    debug_assert!(
+                        state_diff_bits <= 26,
+                        "state diffs took {state_diff_bits} bits; the thresholds below are \
+                         derived from a 26-bit ceiling (LLFSELog 9 + MLFSELog 9 + OffFSELog 8)",
+                    );
+                    debug_assert!(
+                        ll_num_bits <= 16 && ml_num_bits <= 16 && of_num_bits <= 31,
+                        "extra-bit widths ll={ll_num_bits} ml={ml_num_bits} of={of_num_bits} \
+                         exceed the 16 / 16 / 31 the thresholds are derived from",
+                    );
+                    // The bound the branch itself rests on: without a flush,
+                    // the leftover, the diffs and all three extra fields have
+                    // to fit.
+                    debug_assert!(
+                        extra_bits_total >= 31 || 7 + state_diff_bits + extra_bits_total <= 64,
+                        "no flush at {extra_bits_total} extra bits, but 7 leftover + \
+                         {state_diff_bits} diff bits + {extra_bits_total} would overflow the \
+                         64-bit accumulator",
+                    );
+                }
+                if extra_bits_total >= 31 {
+                    unsafe {
+                        writer.flush_bulk();
+                    }
+                }
+
+                // Extras burst: ll (≤16) + ml (≤16) + of (≤ 31). Whether the
+                // accumulator was drained above or not, ll and ml fit: after a
+                // flush it holds ≤ 7 + 32 = 39, and without one the three
+                // extras together were under 31.
+                //
+                // SAFETY: `encode_literal_length` / `encode_match_len`
+                // bound `*_num_bits ≤ 16` and return a clean `*_add_bits`
+                // (low `num_bits` bits only). `encode_offset` bounds
+                // `of_num_bits ≤ ilog2(of) ≤ 31`, and the two conditionals
+                // (`>= 31` above, `> 56` below) are upstream's own accounting
+                // for when the offset field still fits beside what is already
+                // there.
+                unsafe {
+                    writer.write_bits_64_no_check(ll_add_bits as u64, ll_num_bits);
+                    writer.write_bits_64_no_check(ml_add_bits as u64, ml_num_bits);
+                }
+                // Upstream `zstd_compress_sequences.c:355`: with the
+                // accumulator drained before the diffs, 7 leftover plus all
+                // three extra fields must stay under 64, so the offset needs
+                // its own container only past 56 bits of extras.
+                if extra_bits_total > 56 {
+                    unsafe {
+                        writer.flush_bulk();
+                    }
+                }
+                unsafe {
+                    writer.write_bits_64_no_check(of_add_bits as u64, of_num_bits);
+                    writer.flush_bulk();
+                }
+            }
+        }
+        if let Some(table) = ml_table {
+            writer.write_bits(ml_state as u64, table.table_size.ilog2() as usize);
+        }
+        if let Some(table) = of_table {
+            writer.write_bits(of_state as u64, table.table_size.ilog2() as usize);
+        }
+        if let Some(table) = ll_table {
+            writer.write_bits(ll_state as u64, table.table_size.ilog2() as usize);
+        }
+
+        let bits_to_fill = writer.misaligned();
+        if bits_to_fill == 0 {
+            writer.write_bits(1u32, 8);
+        } else {
+            writer.write_bits(1u32, bits_to_fill);
+        }
+    }};
+}
+
+/// Write the sequence section's bitstream for `sequences` under the three
+/// table `modes`, in LL / ML / OF order.
+///
+/// `kernel` is the tier resolved when the compressor was built. Where it has
+/// BMI2 the loop runs under it, as upstream's does (`ZSTD_encodeSequences_bmi2`):
+/// every field is written at a width known only at run time, and BMI2's
+/// `shlx` / `shrx` / `bzhi` take that width in any register, where the base
+/// x86 shifts take it only in `CL` and stall on the flags they leave. The bytes
+/// written are the same on every tier.
 fn encode_sequences(
+    kernel: FastpathKernel,
     sequences: &[RawSequence],
     // One packed [`SequenceCode`] per sequence, in the same order, from the
     // pass that derived the offset codes.
     codes: &[u32],
     writer: &mut BitWriter<&mut Vec<u8>>,
-    ll_mode: &FseTableMode<'_>,
-    ml_mode: &FseTableMode<'_>,
-    of_mode: &FseTableMode<'_>,
-    // The three predefined tables, in LL / ML / OF order. Passed rather than
-    // read off `FseTables`, whose accessors borrow the whole struct while the
-    // caller is holding its slots.
+    modes: [&FseTableMode<'_>; 3],
+    // The three predefined tables, in the same order as `modes`. Passed rather
+    // than read off `FseTables`, whose accessors borrow the whole struct while
+    // the caller is holding its slots.
     defaults: [&FSETable; 3],
 ) {
-    fn mode_table<'a>(mode: &'a FseTableMode<'_>, default: &'a FSETable) -> Option<&'a FSETable> {
-        mode.as_table(default)
+    match kernel {
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel-avx2"
+        ))]
+        // SAFETY: the tier is only selected after confirming BMI2 (and AVX2).
+        FastpathKernel::Avx2Bmi2 => unsafe {
+            encode_sequences_bmi2(sequences, codes, writer, modes, defaults)
+        },
+        _ => encode_sequences_scalar(sequences, codes, writer, modes, defaults),
     }
+}
 
-    debug_assert_eq!(codes.len(), sequences.len());
-    let sequence = sequences[sequences.len() - 1];
-    let code = SequenceCode(codes[codes.len() - 1]);
-    let (ll_code, ll_num_bits) = (code.ll_code(), code.ll_bits());
-    let (ml_code, ml_num_bits) = (code.ml_code(), code.ml_bits());
-    let (of_code, of_num_bits) = (code.of_code(), code.of_bits());
-    let ll_add_bits = low_bits(sequence.ll, ll_num_bits);
-    let ml_add_bits = low_bits(sequence.ml - 3, ml_num_bits);
-    let of_add_bits = low_bits(sequence.off_base, of_num_bits);
-    let [ll_default, ml_default, of_default] = defaults;
-    let ll_table = mode_table(ll_mode, ll_default);
-    let ml_table = mode_table(ml_mode, ml_default);
-    let of_table = mode_table(of_mode, of_default);
-    // Carried as bare indices, not `Option`s. A component has a state exactly
-    // when it has a table, and the tables are resolved once above the loop, so
-    // wrapping the state too meant re-asking the same question three times per
-    // sequence and re-wrapping the answer. An absent component's index is never
-    // read: every site that touches one is already inside its table's `Some`.
-    let mut ll_state = ll_table.map_or(0, |table| table.start_state(ll_code).index);
-    let mut ml_state = ml_table.map_or(0, |table| table.start_state(ml_code).index);
-    let mut of_state = of_table.map_or(0, |table| table.start_state(of_code).index);
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
+))]
+#[target_feature(enable = "bmi2")]
+unsafe fn encode_sequences_bmi2(
+    sequences: &[RawSequence],
+    codes: &[u32],
+    writer: &mut BitWriter<&mut Vec<u8>>,
+    modes: [&FseTableMode<'_>; 3],
+    defaults: [&FSETable; 3],
+) {
+    encode_sequences_body!(sequences, codes, writer, modes, defaults)
+}
 
-    writer.write_bits(ll_add_bits, ll_num_bits);
-    writer.write_bits(ml_add_bits, ml_num_bits);
-    writer.write_bits(of_add_bits, of_num_bits);
-
-    // Upstream zstd-faithful sequence loop: write state diffs + extras via
-    // unchecked fast-path adds with explicit `flush_bulk` calls at
-    // safe burst boundaries. Per-sequence bit budget:
-    //   state diffs: of (<=8) + ml (<=9) + ll (<=9) = 26 bits.
-    //   extras:      ll (<=16) + ml (<=16) + of (<=31).
-    //
-    // One flush per sequence is the common case: the two inside the body are
-    // conditional on the extras not fitting beside the diffs, which is
-    // upstream's own accounting in `ZSTD_encodeSequences_body`
-    // (`zstd_compress_sequences.c:303-367`), and the one at the end of the
-    // body is what leaves the accumulator with under a byte for the next
-    // round.
-    //
-    // Pre-reserve output capacity for the worst-case sequence section
-    // size (~10 bytes/sequence + 32 byte slack) so the per-flush
-    // `extend_from_slice` never triggers a Vec realloc.
-    if sequences.len() > 1 {
-        writer.reserve_output(sequences.len() * 12 + 64);
-        // Pre-loop flush: the safe `write_bits` calls above for the
-        // final sequence's add_bits leave `bits_in_partial` in
-        // 0..=63. Before the first unchecked-add burst we drain to
-        // < 8 leftover so the per-burst budget math (state diffs ≤
-        // 30 + leftover ≤ 8 = 38 < 64) holds invariantly.
-        // SAFETY: `reserve_output` above guarantees capacity ≥
-        // current_len + sequences.len() * 12 + 64 ≥ current_len + 8.
-        unsafe {
-            writer.flush_bulk();
-        }
-        // Walked as a slice rather than by index: the same order, without the
-        // bounds check and the index arithmetic that `sequences[i]` pays on
-        // every sequence. The last one is coded through the FSE init states
-        // above, so it is not in this range.
-        for (&sequence, &code) in sequences[..sequences.len() - 1]
-            .iter()
-            .zip(codes[..codes.len() - 1].iter())
-            .rev()
-        {
-            let code = SequenceCode(code);
-            let (ll_code, ll_num_bits) = (code.ll_code(), code.ll_bits());
-            let (ml_code, ml_num_bits) = (code.ml_code(), code.ml_bits());
-            let (of_code, of_num_bits) = (code.of_code(), code.of_bits());
-            let ll_add_bits = low_bits(sequence.ll, ll_num_bits);
-            let ml_add_bits = low_bits(sequence.ml - 3, ml_num_bits);
-            let of_add_bits = low_bits(sequence.off_base, of_num_bits);
-
-            // State diffs burst: max 30 bits (10+10+9 worst case for
-            // acc_log ≤ 9 ll/ml + acc_log ≤ 8 of) + ≤ 7 leftover from
-            // prior flush = ≤ 37 bits total — well under 64.
-            //
-            // SAFETY (for every `write_bits_64_no_check` below):
-            // - the prior `flush_bulk` left `bits_in_partial ≤ 7`;
-            // - each FSE state diff has `next.num_bits ≤ acc_log ≤ 10`;
-            //   three diffs back-to-back add ≤ 30 bits → total ≤ 37,
-            //   well below the 64-bit accumulator cap.
-            // - `diff = state.index - next.baseline` cannot exceed
-            //   `(1 << num_bits) - 1`, so `diff >> num_bits == 0`.
-            // `reserve_output(sequences.len() * 12 + 64)` above
-            // pre-allocated enough spare capacity to cover every
-            // per-sequence flush in this loop (≤ 16 bytes per
-            // sequence, plus the 32-byte slack on top of the 64-byte
-            // header reserve).
-            //
-            // What the three diffs actually put in the accumulator, tallied so
-            // the budget below is checked against the widths the FSE tables
-            // produced rather than against the ceiling its derivation assumed.
-            #[cfg(debug_assertions)]
-            let mut state_diff_bits = 0usize;
-            if let Some(table) = of_table {
-                let next = table.next_state(of_code, of_state);
-                let diff = crate::fse::fse_encoder::transition_bits(of_state, next.num_bits);
-                unsafe {
-                    writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
-                }
-                #[cfg(debug_assertions)]
-                {
-                    state_diff_bits += next.num_bits as usize;
-                }
-                of_state = next.index;
-            }
-            if let Some(table) = ml_table {
-                let next = table.next_state(ml_code, ml_state);
-                let diff = crate::fse::fse_encoder::transition_bits(ml_state, next.num_bits);
-                unsafe {
-                    writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
-                }
-                #[cfg(debug_assertions)]
-                {
-                    state_diff_bits += next.num_bits as usize;
-                }
-                ml_state = next.index;
-            }
-            if let Some(table) = ll_table {
-                let next = table.next_state(ll_code, ll_state);
-                let diff = crate::fse::fse_encoder::transition_bits(ll_state, next.num_bits);
-                unsafe {
-                    writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
-                }
-                #[cfg(debug_assertions)]
-                {
-                    state_diff_bits += next.num_bits as usize;
-                }
-                ll_state = next.index;
-            }
-            // The three state diffs and the three extra-bit fields share one
-            // 64-bit accumulator, and a flush here is only needed when the
-            // extras that follow would not fit beside them. Upstream asks
-            // exactly that question (`zstd_compress_sequences.c:350`):
-            // `ofBits + mlBits + llBits >= 64 - 7 - (LLFSELog + MLFSELog +
-            // OffFSELog)`, which with our accumulator logs (9 + 9 + 8 = 26) is
-            // 31. Below it the accumulator holds at most 7 leftover + 26 diff
-            // bits + 30 extra bits = 63, so nothing has to leave yet. Flushing
-            // unconditionally instead cost a second store, length commit and
-            // shift on every sequence, and a level-1 block has hundreds of
-            // thousands of them.
-            let extra_bits_total = of_num_bits + ml_num_bits + ll_num_bits;
-            // The thresholds are arithmetic on widths, so they are only right
-            // while the widths are what they were derived from. Pinned here,
-            // where the arithmetic happens, so a widened encoder fails at its
-            // cause rather than as an accumulator overflow further down or, in
-            // a release build, as a corrupted stream with nothing to point at.
-            #[cfg(debug_assertions)]
-            {
-                debug_assert!(
-                    state_diff_bits <= 26,
-                    "state diffs took {state_diff_bits} bits; the thresholds below are \
-                     derived from a 26-bit ceiling (LLFSELog 9 + MLFSELog 9 + OffFSELog 8)",
-                );
-                debug_assert!(
-                    ll_num_bits <= 16 && ml_num_bits <= 16 && of_num_bits <= 31,
-                    "extra-bit widths ll={ll_num_bits} ml={ml_num_bits} of={of_num_bits} \
-                     exceed the 16 / 16 / 31 the thresholds are derived from",
-                );
-                // The bound the branch itself rests on: without a flush, the
-                // leftover, the diffs and all three extra fields have to fit.
-                debug_assert!(
-                    extra_bits_total >= 31 || 7 + state_diff_bits + extra_bits_total <= 64,
-                    "no flush at {extra_bits_total} extra bits, but 7 leftover + \
-                     {state_diff_bits} diff bits + {extra_bits_total} would overflow the \
-                     64-bit accumulator",
-                );
-            }
-            if extra_bits_total >= 31 {
-                unsafe {
-                    writer.flush_bulk();
-                }
-            }
-
-            // Extras burst: ll (≤16) + ml (≤16) + of (≤ 31). Whether the
-            // accumulator was drained above or not, ll and ml fit: after a
-            // flush it holds ≤ 7 + 32 = 39, and without one the three extras
-            // together were under 31.
-            //
-            // SAFETY: `encode_literal_length` / `encode_match_len`
-            // bound `*_num_bits ≤ 16` and return a clean `*_add_bits`
-            // (low `num_bits` bits only). `encode_offset` bounds
-            // `of_num_bits ≤ ilog2(of) ≤ 31`, and the two conditionals
-            // (`>= 31` above, `> 56` below) are upstream's own accounting for
-            // when the offset field still fits beside what is already there.
-            unsafe {
-                writer.write_bits_64_no_check(ll_add_bits as u64, ll_num_bits);
-                writer.write_bits_64_no_check(ml_add_bits as u64, ml_num_bits);
-            }
-            // Upstream `zstd_compress_sequences.c:355`: with the accumulator
-            // drained before the diffs, 7 leftover plus all three extra fields
-            // must stay under 64, so the offset needs its own container only
-            // past 56 bits of extras.
-            if extra_bits_total > 56 {
-                unsafe {
-                    writer.flush_bulk();
-                }
-            }
-            unsafe {
-                writer.write_bits_64_no_check(of_add_bits as u64, of_num_bits);
-                writer.flush_bulk();
-            }
-        }
-    }
-    if let Some(table) = ml_table {
-        writer.write_bits(ml_state as u64, table.table_size.ilog2() as usize);
-    }
-    if let Some(table) = of_table {
-        writer.write_bits(of_state as u64, table.table_size.ilog2() as usize);
-    }
-    if let Some(table) = ll_table {
-        writer.write_bits(ll_state as u64, table.table_size.ilog2() as usize);
-    }
-
-    let bits_to_fill = writer.misaligned();
-    if bits_to_fill == 0 {
-        writer.write_bits(1u32, 8);
-    } else {
-        writer.write_bits(1u32, bits_to_fill);
-    }
+fn encode_sequences_scalar(
+    sequences: &[RawSequence],
+    codes: &[u32],
+    writer: &mut BitWriter<&mut Vec<u8>>,
+    modes: [&FseTableMode<'_>; 3],
+    defaults: [&FSETable; 3],
+) {
+    encode_sequences_body!(sequences, codes, writer, modes, defaults)
 }
 
 fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
