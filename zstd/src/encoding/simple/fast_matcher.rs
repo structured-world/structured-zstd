@@ -248,14 +248,6 @@ pub(crate) struct FastKernelMatcher {
     /// `adjust_params_for_source_size` clamps `window_log` below
     /// the upstream zstd default of 19, flipping `use_cmov` on).
     use_cmov: bool,
-    /// Cached per-tier SIMD kernel selection (resolved once via
-    /// [`crate::encoding::fastpath::select_kernel`] at construction / reset),
-    /// mirroring the Dfast/Row backends. Drives the `#[target_feature]`
-    /// umbrella dispatch in the borrowed dual-base dict scan so the
-    /// match-length `common_prefix_len_ptr` is the tier's 32-byte AVX2 /
-    /// 16-byte SSE4.2 / NEON / wasm-simd128 compare instead of the generic
-    /// word-at-a-time `count_forward`.
-    kernel: crate::encoding::fastpath::FastpathKernel,
     /// Initial step the kernel uses for the 4-cursor body's skip
     /// schedule. Upstream zstd `stepSize = targetLength + !(targetLength) +
     /// 1` (min 2). Negative-level frames set this to 2..8 to
@@ -358,7 +350,6 @@ impl Clone for FastKernelMatcher {
             max_window_size: self.max_window_size,
             window_log: self.window_log,
             use_cmov: self.use_cmov,
-            kernel: self.kernel,
             step_size: self.step_size,
             staged_block: self.staged_block,
             last_block_start: self.last_block_start,
@@ -388,7 +379,6 @@ impl Clone for FastKernelMatcher {
         self.max_window_size = source.max_window_size;
         self.window_log = source.window_log;
         self.use_cmov = source.use_cmov;
-        self.kernel = source.kernel;
         self.step_size = source.step_size;
         self.staged_block = source.staged_block;
         self.last_block_start = source.last_block_start;
@@ -626,7 +616,6 @@ impl FastKernelMatcher {
             max_window_size: 1usize << window_log,
             window_log,
             use_cmov: window_log < 19,
-            kernel: crate::encoding::fastpath::select_kernel(),
             step_size,
             staged_block: None,
             borrowed: None,
@@ -1450,7 +1439,7 @@ impl FastKernelMatcher {
     /// lookahead, dense fills, backward extension, immediate repcode-2 loop) —
     /// the prior scalar greedy scan had none of these and was +68% slower.
     /// Validated by roundtrip + cross-validation + the FFI ratio gate.
-    pub(crate) fn start_matching_borrowed_dict(
+    pub(crate) fn start_matching_borrowed_dict<K: crate::encoding::fastpath::EncodeTier>(
         &mut self,
         block_start: usize,
         block_end: usize,
@@ -1484,7 +1473,6 @@ impl FastKernelMatcher {
         let use_cmov = self.use_cmov;
         let step_size = self.step_size;
         let rep_in = self.rep;
-        let kernel = self.kernel;
 
         // Window bounds in VIRTUAL `[dict][input]` coords, so the kernel's gates
         // match the owned flat dict kernel: `window_low` is the absolute floor;
@@ -1539,7 +1527,7 @@ impl FastKernelMatcher {
 
         macro_rules! run {
             ($mls:literal, $cmov:literal) => {
-                compress_block_fast_dict_borrowed::<$mls, $cmov>(
+                compress_block_fast_dict_borrowed::<K, $mls, $cmov>(
                     inp,
                     dict,
                     block_start,
@@ -1550,7 +1538,6 @@ impl FastKernelMatcher {
                     rep_in,
                     step_size,
                     &mut handle_sequence,
-                    kernel,
                 )
             };
         }

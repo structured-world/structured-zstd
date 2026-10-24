@@ -2050,12 +2050,15 @@ fast_dict_borrowed_wrapper!(
     crate::encoding::fastpath::simd128::common_prefix_len_ptr
 );
 
-/// Dispatch the borrowed dual-base dict kernel to the resolved per-tier SIMD
-/// wrapper. `kernel` is the matcher's once-resolved
-/// [`FastpathKernel`](crate::encoding::fastpath::FastpathKernel); the
-/// scalar arm carries no `#[target_feature]` (generic word-at-a-time count).
+/// The borrowed dual-base dict kernel compiled for the encoder tier `K`: its
+/// per-tier SIMD wrapper, or for the scalar tier the plain body (generic
+/// word-at-a-time count, no `#[target_feature]`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: bool>(
+pub(crate) fn compress_block_fast_dict_borrowed<
+    K: crate::encoding::fastpath::EncodeTier,
+    const MLS: u32,
+    const USE_CMOV: bool,
+>(
     inp: &[u8],
     dict: &[u8],
     block_start: usize,
@@ -2066,7 +2069,6 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
     rep: [u32; 2],
     step_size: usize,
     handle_sequence: impl FnMut(Sequence),
-    kernel: crate::encoding::fastpath::FastpathKernel,
 ) -> FastBlockResult {
     // Used by the per-tier match arms below; on a target with no SIMD tier
     // (e.g. wasm32 without simd128) only the scalar fallback compiles and the
@@ -2099,7 +2101,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
     };
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        match kernel {
+        match K::TIER {
             #[cfg(feature = "kernel-avx2")]
             FastpathKernel::Avx2Bmi2 => unsafe {
                 cbfd_borrowed_avx2_bmi2::<MLS, USE_CMOV>(
@@ -2142,7 +2144,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
         feature = "kernel-neon"
     ))]
     {
-        match kernel {
+        match K::TIER {
             FastpathKernel::Neon => unsafe {
                 cbfd_borrowed_neon::<MLS, USE_CMOV>(
                     inp,
@@ -2169,7 +2171,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
         feature = "kernel-simd128"
     ))]
     {
-        match kernel {
+        match K::TIER {
             FastpathKernel::Simd128 => unsafe {
                 cbfd_borrowed_simd128::<MLS, USE_CMOV>(
                     inp,
@@ -2205,7 +2207,6 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
         )
     )))]
     {
-        let _ = kernel;
         let mut hs = handle_sequence;
         scalar(inp, dict, main_table, dict_table, &mut hs)
     }

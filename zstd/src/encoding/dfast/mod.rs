@@ -16,7 +16,7 @@ use core::convert::TryInto;
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
 use super::dict_attach::{DictAttach, DictKeep};
-use super::fastpath::{FastpathKernel, select_kernel};
+use super::fastpath::EncodeTier;
 use super::incompressible::block_looks_incompressible;
 use super::levels::config::MIN_WINDOW_LOG;
 use super::match_generator::{
@@ -24,7 +24,7 @@ use super::match_generator::{
     DFAST_REBASE_GUARD_BAND, DFAST_SHORT_HASH_BITS_DELTA, DFAST_SHORT_HASH_LOOKAHEAD,
     DFAST_SKIP_STEP_GROWTH_INTERVAL,
 };
-use super::match_table::helpers::{common_prefix_len_with_kernel, extend_backwards_shared};
+use super::match_table::helpers::extend_backwards_shared;
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
 use super::util::hash_top_bits;
@@ -174,10 +174,6 @@ pub(crate) struct DfastMatchGenerator {
     /// (the CDict's `hashLog` / `chainLog`), set by the driver; `None` uses
     /// the live widths.
     dict_table_bits: Option<(usize, usize)>,
-    /// CPU kernel for the `common_prefix_len` / repcode byte-compares,
-    /// resolved once at construction so the per-byte match-finder scans skip
-    /// the `select_kernel()` `OnceLock` atomic on every call.
-    pub(crate) kernel: FastpathKernel,
     /// Borrowed one-shot input window, registered once per frame:
     /// `(input_base_ptr, total_len)`. When `Some`, the fast loop sources
     /// bytes from the caller's in-place input slice with absolute input
@@ -330,7 +326,6 @@ impl DfastMatchGenerator {
             #[cfg(test)]
             dict_table_builds: (0, 0),
             dict_table_bits: None,
-            kernel: select_kernel(),
             borrowed_input: None,
             borrowed_block: None,
             dict_resident: false,
@@ -1248,7 +1243,10 @@ impl DfastMatchGenerator {
         }
     }
 
-    pub(crate) fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
+    pub(crate) fn start_matching<K: EncodeTier>(
+        &mut self,
+        mut handle_sequence: impl FnMut(Sequence),
+    ) {
         self.ensure_hash_tables();
 
         let current_len = self.window_blocks.back().copied().unwrap_or(0);
@@ -1272,7 +1270,7 @@ impl DfastMatchGenerator {
         // dfast is the upstream zstd's greedy double-fast at every level (no lazy
         // variant exists — lazy parsing is the separate `ZSTD_lazy`/`lazy2`
         // strategy), so there is a single match path.
-        self.start_matching_fast_loop(current_abs_start, current_len, &mut handle_sequence);
+        self.start_matching_fast_loop::<K>(current_abs_start, current_len, &mut handle_sequence);
     }
 
     /// Register the caller's in-place input buffer for the borrowed one-shot
@@ -1327,7 +1325,7 @@ impl DfastMatchGenerator {
     /// offsets, candidate reads land in the same buffer, and the seam re-seed
     /// re-hashes the prior block's short-key tail exactly as the owned loop
     /// does once `history` spans it.
-    pub(crate) fn start_matching_borrowed(
+    pub(crate) fn start_matching_borrowed<K: EncodeTier>(
         &mut self,
         block_start: usize,
         block_end: usize,
@@ -1350,7 +1348,7 @@ impl DfastMatchGenerator {
         if backfill_start < current_abs_start {
             self.insert_positions(backfill_start, current_abs_start);
         }
-        self.start_matching_fast_loop(current_abs_start, current_len, &mut handle_sequence);
+        self.start_matching_fast_loop::<K>(current_abs_start, current_len, &mut handle_sequence);
     }
 
     /// Borrowed one-shot equivalent of [`Self::skip_matching`]: stage the
@@ -1423,7 +1421,7 @@ impl DfastMatchGenerator {
     /// updated by this helper — the caller routes through
     /// `emit_candidate` which inserts via `insert_positions` over the
     /// emitted range, exactly like the inner loop's hit path.
-    fn probe_tail_ip0_only(
+    fn probe_tail_ip0_only<K: EncodeTier>(
         &self,
         current_abs_start: usize,
         current_len: usize,
@@ -1533,9 +1531,7 @@ impl DfastMatchGenerator {
                     unsafe {
                         let lhs = history_base_ptr.add(history_start_offset + cand_idx + 8);
                         let rhs = history_base_ptr.add(history_start_offset + concat_idx0 + 8);
-                        let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
-                            lhs, rhs, max_fwd,
-                        );
+                        let ext = K::common_prefix_len_ptr(lhs, rhs, max_fwd);
                         match_len += ext;
                     }
                     let concat = unsafe {
@@ -1573,9 +1569,7 @@ impl DfastMatchGenerator {
                     unsafe {
                         let lhs = history_base_ptr.add(history_start_offset + cand_idx_s + 4);
                         let rhs = history_base_ptr.add(history_start_offset + concat_idx0 + 4);
-                        let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
-                            lhs, rhs, max_fwd,
-                        );
+                        let ext = K::common_prefix_len_ptr(lhs, rhs, max_fwd);
                         s_match_len += ext;
                     }
                     let concat = unsafe {
@@ -1623,7 +1617,7 @@ impl DfastMatchGenerator {
     /// rep is a net win over re-running the full hash search. Returns
     /// the new value of `pos` and updates `literals_start` in place to
     /// the post-rep-chain anchor.
-    fn extend_with_repcode_after_match(
+    fn extend_with_repcode_after_match<K: EncodeTier>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -1688,8 +1682,15 @@ impl DfastMatchGenerator {
             if !gate_eq {
                 break;
             }
-            let match_len =
-                common_prefix_len_with_kernel(self.kernel, &concat[cand_idx..], &concat[cur_idx..]);
+            // SAFETY: `cand_idx < cur_idx < concat.len()` (above), and the
+            // compare stops at the shorter of the two tails.
+            let match_len = unsafe {
+                K::common_prefix_len_ptr(
+                    concat.as_ptr().add(cand_idx),
+                    concat.as_ptr().add(cur_idx),
+                    concat.len() - cur_idx,
+                )
+            };
             if match_len < DFAST_REP_MIN_MATCH_LEN {
                 break;
             }
@@ -2368,7 +2369,7 @@ fn short_hash_key(data: &[u8]) -> u64 {
 /// cpl calls inline under one umbrella and `select_kernel()` is resolved ONCE
 /// per block in the bare dispatcher, never per cpl call.
 macro_rules! start_matching_fast_loop_body {
-    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path, $borrowed:expr, $tagged:expr) => {{
+    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path, $tier:ty, $borrowed:expr, $tagged:expr) => {{
         // Behaviour change vs the pre-refactor `start_matching_general`:
         // this fast loop deliberately drops the strict-incompressible
         // early-skip path (the `block_looks_incompressible_strict` short
@@ -2520,7 +2521,7 @@ macro_rules! start_matching_fast_loop_body {
             // they're skipped — upstream zstd accepts that exact tradeoff at
             // the iend boundary).
             if ip1 + HASH_READ_SIZE > $current_len {
-                if let Some(committed) = $self.probe_tail_ip0_only(
+                if let Some(committed) = $self.probe_tail_ip0_only::<$tier>(
                     $current_abs_start,
                     $current_len,
                     ip0,
@@ -2535,7 +2536,7 @@ macro_rules! start_matching_fast_loop_body {
                         $handle_sequence,
                     );
                     pos = start + committed.match_len;
-                    pos = $self.extend_with_repcode_after_match(
+                    pos = $self.extend_with_repcode_after_match::<$tier>(
                         $current_abs_start,
                         $current_len,
                         pos,
@@ -3272,7 +3273,7 @@ macro_rules! start_matching_fast_loop_body {
                         $handle_sequence,
                     );
                     pos = start + candidate.match_len;
-                    pos = $self.extend_with_repcode_after_match(
+                    pos = $self.extend_with_repcode_after_match::<$tier>(
                         $current_abs_start,
                         $current_len,
                         pos,
@@ -3336,7 +3337,7 @@ macro_rules! start_matching_fast_loop_body {
 /// slightly FEWER than it does — what is left there is execution density, not
 /// work.
 macro_rules! start_matching_dict_loop_body {
-    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path) => {{
+    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path, $tier:ty) => {{
         debug_assert!($current_len > 0, "dict_loop precondition: $current_len > 0");
         $self.ensure_room_for($current_abs_start + $current_len - 1);
         const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
@@ -3758,7 +3759,7 @@ macro_rules! start_matching_dict_loop_body {
                         $handle_sequence,
                     );
                     pos = start + candidate.match_len;
-                    pos = $self.extend_with_repcode_after_match(
+                    pos = $self.extend_with_repcode_after_match::<$tier>(
                         $current_abs_start,
                         $current_len,
                         pos,
@@ -3788,13 +3789,12 @@ enum DfastInnerExit {
 }
 
 impl DfastMatchGenerator {
-    /// Dispatcher for the per-kernel dfast fast loop: resolve the tier ONCE
-    /// per block via `select_kernel()` and call the matching
-    /// `start_matching_fast_loop_<kernel>` wrapper, so every per-position
+    /// The dfast loop of the encoder tier `K`: its
+    /// `start_matching_fast_loop_<tier>` wrapper, so every per-position
     /// `common_prefix_len_ptr` inlines under one `#[target_feature]` umbrella
-    /// (mirrors `build_optimal_plan_impl`). Replaces the prior per-cpl
-    /// `dispatch_common_prefix_len_ptr` runtime dispatch.
-    fn start_matching_fast_loop(
+    /// (mirrors `build_optimal_plan_impl`). The match on `K::TIER` folds to
+    /// that one call.
+    fn start_matching_fast_loop<K: EncodeTier>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -3867,7 +3867,7 @@ impl DfastMatchGenerator {
             // target can check the two against each other — the branch is
             // `cfg(test)` and does not exist in a shipped build.
             #[cfg(test)]
-            if use_dict && self.kernel == crate::encoding::fastpath::FastpathKernel::Scalar {
+            if use_dict && K::TIER == crate::encoding::fastpath::FastpathKernel::Scalar {
                 return self.start_matching_dict_loop_scalar(
                     current_abs_start,
                     current_len,
@@ -3879,10 +3879,7 @@ impl DfastMatchGenerator {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            // Use the matcher-level cached kernel (resolved once in `new()`),
-            // not a per-block `select_kernel()` — the cache only helps if the
-            // hot path actually reads it. Mirrors the Row backend.
-            match self.kernel {
+            match K::TIER {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     dispatch_dict!(
@@ -3910,7 +3907,7 @@ impl DfastMatchGenerator {
             // compile time here, so without it this target could never run the
             // scalar dictionary loop to check the SIMD one against.
             #[cfg(test)]
-            if use_dict && self.kernel == crate::encoding::fastpath::FastpathKernel::Scalar {
+            if use_dict && K::TIER == crate::encoding::fastpath::FastpathKernel::Scalar {
                 return self.start_matching_dict_loop_scalar(
                     current_abs_start,
                     current_len,
@@ -3964,6 +3961,7 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::neon::common_prefix_len_ptr,
+            crate::encoding::fastpath::NeonTier,
             BORROWED,
             TAGGED
         )
@@ -3986,6 +3984,7 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::sse2::common_prefix_len_ptr,
+            crate::encoding::fastpath::Sse2Tier,
             BORROWED,
             TAGGED
         )
@@ -4008,6 +4007,7 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+            crate::encoding::fastpath::Avx2Bmi2Tier,
             BORROWED,
             TAGGED
         )
@@ -4031,6 +4031,7 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::simd128::common_prefix_len_ptr,
+            crate::encoding::fastpath::Simd128Tier,
             BORROWED,
             TAGGED
         )
@@ -4061,6 +4062,7 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+            crate::encoding::fastpath::ScalarTier,
             BORROWED,
             TAGGED
         )
@@ -4083,7 +4085,8 @@ impl DfastMatchGenerator {
             current_abs_start,
             current_len,
             handle_sequence,
-            crate::encoding::fastpath::neon::common_prefix_len_ptr
+            crate::encoding::fastpath::neon::common_prefix_len_ptr,
+            crate::encoding::fastpath::NeonTier
         )
     }
 
@@ -4103,7 +4106,8 @@ impl DfastMatchGenerator {
             current_abs_start,
             current_len,
             handle_sequence,
-            crate::encoding::fastpath::sse2::common_prefix_len_ptr
+            crate::encoding::fastpath::sse2::common_prefix_len_ptr,
+            crate::encoding::fastpath::Sse2Tier
         )
     }
 
@@ -4123,7 +4127,8 @@ impl DfastMatchGenerator {
             current_abs_start,
             current_len,
             handle_sequence,
-            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+            crate::encoding::fastpath::Avx2Bmi2Tier
         )
     }
 
@@ -4144,7 +4149,8 @@ impl DfastMatchGenerator {
             current_abs_start,
             current_len,
             handle_sequence,
-            crate::encoding::fastpath::simd128::common_prefix_len_ptr
+            crate::encoding::fastpath::simd128::common_prefix_len_ptr,
+            crate::encoding::fastpath::Simd128Tier
         )
     }
 
@@ -4180,7 +4186,8 @@ impl DfastMatchGenerator {
             current_abs_start,
             current_len,
             handle_sequence,
-            crate::encoding::fastpath::scalar::common_prefix_len_ptr
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+            crate::encoding::fastpath::ScalarTier
         )
     }
 }

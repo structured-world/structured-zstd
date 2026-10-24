@@ -605,7 +605,7 @@ fn match_found_rejects_a_candidate_whose_tag_differs() {
 /// the byte-accounting invariant.
 #[test]
 fn borrowed_dict_kernel_reconstructs_via_dual_base() {
-    use crate::encoding::fastpath::FastpathKernel;
+    use crate::encoding::fastpath::ScalarTier;
 
     let hash_log = 12u32;
     const MLS: u32 = 4;
@@ -642,7 +642,7 @@ fn borrowed_dict_kernel_reconstructs_via_dual_base() {
     let mut replay = BlockReplay::new(&inp);
     let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
 
-    let result = compress_block_fast_dict_borrowed::<MLS, false>(
+    let result = compress_block_fast_dict_borrowed::<ScalarTier, MLS, false>(
         &inp,
         &dict,
         0,
@@ -656,7 +656,6 @@ fn borrowed_dict_kernel_reconstructs_via_dual_base() {
         [0, 0],
         2,
         &mut handle,
-        FastpathKernel::Scalar,
     );
 
     // Reconstruct against the logical [dict][input] window: start from the
@@ -706,7 +705,7 @@ fn borrowed_dict_kernel_reconstructs_via_dual_base() {
 /// four-byte gate has to hold there too: the match is real and must be found.
 #[test]
 fn borrowed_dict_kernel_takes_a_repcode_whose_candidate_is_in_the_dictionary() {
-    use crate::encoding::fastpath::FastpathKernel;
+    use crate::encoding::fastpath::ScalarTier;
 
     let hash_log = 12u32;
     const MLS: u32 = 4;
@@ -731,7 +730,7 @@ fn borrowed_dict_kernel_takes_a_repcode_whose_candidate_is_in_the_dictionary() {
     let mut replay = BlockReplay::new(&inp);
     let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
 
-    let result = compress_block_fast_dict_borrowed::<MLS, false>(
+    let result = compress_block_fast_dict_borrowed::<ScalarTier, MLS, false>(
         &inp,
         &dict,
         0,
@@ -745,7 +744,6 @@ fn borrowed_dict_kernel_takes_a_repcode_whose_candidate_is_in_the_dictionary() {
         [offset_1, 0],
         2,
         &mut handle,
-        FastpathKernel::Scalar,
     );
 
     let mut window = dict.clone();
@@ -783,7 +781,7 @@ fn borrowed_dict_kernel_takes_a_repcode_whose_candidate_is_in_the_dictionary() {
 /// failed four-byte gate would have rejected it.
 #[test]
 fn borrowed_dict_kernel_rejects_a_short_repcode_in_the_dictionary_tail() {
-    use crate::encoding::fastpath::FastpathKernel;
+    use crate::encoding::fastpath::ScalarTier;
 
     let hash_log = 12u32;
     const MLS: u32 = 4;
@@ -801,7 +799,7 @@ fn borrowed_dict_kernel_rejects_a_short_repcode_in_the_dictionary_tail() {
     let mut replay = BlockReplay::new(&inp);
     let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
 
-    let result = compress_block_fast_dict_borrowed::<MLS, false>(
+    let result = compress_block_fast_dict_borrowed::<ScalarTier, MLS, false>(
         &inp,
         &dict,
         0,
@@ -815,7 +813,6 @@ fn borrowed_dict_kernel_rejects_a_short_repcode_in_the_dictionary_tail() {
         [3, 0],
         2,
         &mut handle,
-        FastpathKernel::Scalar,
     );
 
     assert!(
@@ -836,7 +833,7 @@ fn borrowed_dict_kernel_rejects_a_short_repcode_in_the_dictionary_tail() {
 /// must still be found, which is what the gate must not cost.
 #[test]
 fn borrowed_dict_kernel_finds_a_match_starting_in_the_dictionary_tail() {
-    use crate::encoding::fastpath::FastpathKernel;
+    use crate::encoding::fastpath::ScalarTier;
 
     let hash_log = 12u32;
     const MLS: u32 = 4;
@@ -868,7 +865,7 @@ fn borrowed_dict_kernel_finds_a_match_starting_in_the_dictionary_tail() {
     let mut replay = BlockReplay::new(&inp);
     let mut handle = |seq: Sequence| tuples.push(capture(&mut replay, seq));
 
-    let result = compress_block_fast_dict_borrowed::<MLS, false>(
+    let result = compress_block_fast_dict_borrowed::<ScalarTier, MLS, false>(
         &inp,
         &dict,
         0,
@@ -882,7 +879,6 @@ fn borrowed_dict_kernel_finds_a_match_starting_in_the_dictionary_tail() {
         [0, 0],
         2,
         &mut handle,
-        FastpathKernel::Scalar,
     );
 
     let mut window = dict.clone();

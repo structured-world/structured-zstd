@@ -16,6 +16,7 @@
 use super::generator::HcMatchGenerator;
 use crate::encoding::Sequence;
 use crate::encoding::blocks::encode_offset_with_history;
+use crate::encoding::fastpath::EncodeTier;
 use crate::encoding::hc::HC_OPT_CANDIDATE_CAPACITY;
 use crate::encoding::hc::priceset::{
     priceset_avx2, priceset_neon, priceset_scalar, priceset_simd128, priceset_sse2, priceset_sse41,
@@ -1306,7 +1307,7 @@ impl HcMatchGenerator {
     // The scalar arm of `run_main_loop!` wraps a safe `*_scalar` call in
     // `unsafe` (the SIMD arms need it); allow the redundant block here.
     #[allow(unused_unsafe)]
-    pub(crate) fn start_matching_optimal<S: crate::encoding::strategy::Strategy>(
+    pub(crate) fn start_matching_optimal<S: crate::encoding::strategy::Strategy, K: EncodeTier>(
         &mut self,
         mut handle_sequence: impl FnMut(Sequence),
     ) {
@@ -1335,7 +1336,7 @@ impl HcMatchGenerator {
             .skip_insert_until_abs
             .max(self.table.history_abs_start);
         self.table
-            .backfill_boundary_positions(current_abs_start, current_abs_end);
+            .backfill_boundary_positions::<K>(current_abs_start, current_abs_end);
         self.table.next_to_update3 = hash3_start_cursor;
 
         // Take the five DP scratch buffers ONCE for both the seed pass and the
@@ -1344,7 +1345,12 @@ impl HcMatchGenerator {
         // separate take + restore round-trip.
         let mut plan_buffers = self.take_optimal_plan_buffers();
         if self.should_run_btultra2_seed_pass::<S>(current_len) {
-            self.run_btultra2_seed_pass(current, current_abs_start, current_len, &mut plan_buffers);
+            self.run_btultra2_seed_pass::<K>(
+                current,
+                current_abs_start,
+                current_len,
+                &mut plan_buffers,
+            );
             // The seed pass pushes the stored-index offset past everything it
             // inserted, so the block has to be cleared again for the main pass
             // against the offset it leaves behind.
@@ -1498,7 +1504,7 @@ impl HcMatchGenerator {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match self.table.kernel {
+            match K::TIER {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => run_main_loop!(run_optimal_block_avx2_bmi2),
                 #[cfg(feature = "kernel-sse")]
@@ -1547,7 +1553,7 @@ impl HcMatchGenerator {
 
     // The scalar arm of `run_seed_loop!` wraps a safe call in `unsafe`.
     #[allow(unused_unsafe)]
-    fn run_btultra2_seed_pass(
+    fn run_btultra2_seed_pass<K: EncodeTier>(
         &mut self,
         current: &[u8],
         current_abs_start: usize,
@@ -1699,7 +1705,7 @@ impl HcMatchGenerator {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match self.table.kernel {
+            match K::TIER {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => run_seed_loop!(run_optimal_block_avx2_bmi2),
                 #[cfg(feature = "kernel-sse")]
@@ -2085,7 +2091,7 @@ impl HcMatchGenerator {
     }
 
     #[cfg(test)]
-    pub(crate) fn collect_optimal_candidates(
+    pub(crate) fn collect_optimal_candidates<K: EncodeTier>(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -2115,7 +2121,7 @@ impl HcMatchGenerator {
         macro_rules! search {
             ($strategy:ty) => {
                 match self.table.search_mls {
-                    3 => self.collect_optimal_candidates_initialized::<$strategy, 3>(
+                    3 => self.collect_optimal_candidates_initialized::<$strategy, K, 3>(
                         abs_pos,
                         current_abs_end,
                         sufficient_match_len,
@@ -2123,7 +2129,7 @@ impl HcMatchGenerator {
                         ll0,
                         out,
                     ),
-                    5 => self.collect_optimal_candidates_initialized::<$strategy, 5>(
+                    5 => self.collect_optimal_candidates_initialized::<$strategy, K, 5>(
                         abs_pos,
                         current_abs_end,
                         sufficient_match_len,
@@ -2131,7 +2137,7 @@ impl HcMatchGenerator {
                         ll0,
                         out,
                     ),
-                    6 => self.collect_optimal_candidates_initialized::<$strategy, 6>(
+                    6 => self.collect_optimal_candidates_initialized::<$strategy, K, 6>(
                         abs_pos,
                         current_abs_end,
                         sufficient_match_len,
@@ -2139,7 +2145,7 @@ impl HcMatchGenerator {
                         ll0,
                         out,
                     ),
-                    _ => self.collect_optimal_candidates_initialized::<$strategy, 4>(
+                    _ => self.collect_optimal_candidates_initialized::<$strategy, K, 4>(
                         abs_pos,
                         current_abs_end,
                         sufficient_match_len,
@@ -2196,6 +2202,7 @@ impl HcMatchGenerator {
     #[inline(always)]
     pub(crate) fn collect_optimal_candidates_initialized<
         S: crate::encoding::strategy::Strategy,
+        K: EncodeTier,
         const MLS: usize,
     >(
         &mut self,
@@ -2224,7 +2231,7 @@ impl HcMatchGenerator {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match self.table.kernel {
+            match K::TIER {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.collect_optimal_candidates_initialized_avx2_bmi2::<S, MLS>(

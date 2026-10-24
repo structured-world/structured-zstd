@@ -3,6 +3,7 @@
 //! helpers, chain-walk self-loop branch, and the lazy-pick
 //! "next match is better" decline paths.
 use super::*;
+use crate::encoding::fastpath::with_host_tier;
 use crate::encoding::match_table::storage::MatchTable;
 
 fn table_with_history(buf: &[u8]) -> MatchTable {
@@ -26,7 +27,7 @@ fn repcode_candidate_returns_none_when_suffix_too_short() {
     let mut t = table_with_history(b"abc");
     t.offset_hist = [1, 2, 3];
     // current_idx + HC_MIN_MATCH_LEN > concat.len() → early no-match.
-    assert!(!HcMatcher::repcode_candidate(&t, 0, 1).is_match());
+    assert!(!with_host_tier!(K => HcMatcher::repcode_candidate::<K>(&t, 0, 1)).is_match());
 }
 
 #[test]
@@ -37,7 +38,7 @@ fn repcode_candidate_skips_rep_at_history_boundary() {
     t.offset_hist = [5, 6, 7];
     // No match possible at abs_pos=4 because every rep aims past
     // history start.
-    let result = HcMatcher::repcode_candidate(&t, 4, 1);
+    let result = with_host_tier!(K => HcMatcher::repcode_candidate::<K>(&t, 4, 1));
     assert!(!result.is_match(), "no rep can land in-range");
 }
 
@@ -46,7 +47,7 @@ fn find_best_match_returns_none_for_short_suffix() {
     let hc = HcMatcher::new(2, 4, 32);
     let t = table_with_history(b"abc");
     assert!(
-        !hc.find_best_match::<false>(t.live_history(), false, &t, 0, 1)
+        !with_host_tier!(K => hc.find_best_match::<K, false>(t.live_history(), false, &t, 0, 1))
             .is_match()
     );
 }
@@ -85,7 +86,8 @@ fn hash_chain_candidate_picks_longest_forward_over_shorter_with_backward_room() 
     let hc = HcMatcher::new(2, 16, 64);
 
     // The forward winner (idx 12, forward 8) has no backward room.
-    let c0 = hc.hash_chain_candidate::<false>(t.live_history(), false, &t, 24);
+    let c0 =
+        with_host_tier!(K => hc.hash_chain_candidate::<K, false>(t.live_history(), false, &t, 24));
     assert!(c0.is_match(), "forward match must be found");
     assert_eq!(c0.match_len, 8, "longest forward match is 8 (idx 12)");
     assert_eq!(
@@ -135,7 +137,9 @@ fn hash_chain_candidate_forward_ties_keep_first_visited() {
     t.chain_table_mut()[18 & chain_mask] = HC_EMPTY;
 
     let hc = HcMatcher::new(2, 16, 64);
-    let cand = hc.hash_chain_candidate::<false>(t.live_history(), false, &t, abs_pos);
+    let cand = with_host_tier!(
+        K => hc.hash_chain_candidate::<K, false>(t.live_history(), false, &t, abs_pos)
+    );
     assert!(cand.is_match(), "walk must still produce a match");
     assert_eq!(
         cand.match_len, 8,

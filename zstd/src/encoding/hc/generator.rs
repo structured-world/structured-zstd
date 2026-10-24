@@ -10,6 +10,7 @@
 use crate::encoding::Sequence;
 use crate::encoding::blocks::encode_offset_with_history;
 use crate::encoding::cost_model::HC_PREDEF_THRESHOLD;
+use crate::encoding::fastpath::EncodeTier;
 use crate::encoding::hc::{HC_MIN_MATCH_LEN, HcMatch, MAX_HC_SEARCH_DEPTH};
 use crate::encoding::levels::config::HcConfig;
 use crate::encoding::match_generator::{HC_SEARCH_DEPTH, HC_TARGET_LEN, HcBackend};
@@ -1528,8 +1529,8 @@ impl HcMatchGenerator {
 
     /// Backfill positions from the tail of the previous slice that couldn't be
     /// hashed at the time (insert_position needs 4 bytes of lookahead).
-    pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
-        self.table.skip_matching(incompressible_hint);
+    pub(crate) fn skip_matching<K: EncodeTier>(&mut self, incompressible_hint: Option<bool>) {
+        self.table.skip_matching::<K>(incompressible_hint);
     }
 
     /// Runtime-dispatched entry kept only for in-crate tests. Production
@@ -1538,7 +1539,19 @@ impl HcMatchGenerator {
     /// which pick the lazy / optimal arm from `S::USE_BT` at
     /// monomorphisation time.
     #[cfg(test)]
-    pub(crate) fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
+    pub(crate) fn start_matching(&mut self, handle_sequence: impl FnMut(Sequence)) {
+        crate::encoding::fastpath::with_encode_tier!(
+            crate::encoding::fastpath::select_kernel(),
+            K => self.start_matching_with::<K>(handle_sequence)
+        )
+    }
+
+    /// [`Self::start_matching`] compiled for the tier `K`.
+    #[cfg(test)]
+    pub(crate) fn start_matching_with<K: EncodeTier>(
+        &mut self,
+        mut handle_sequence: impl FnMut(Sequence),
+    ) {
         use crate::encoding::strategy::{self, StrategyTag};
         // Dispatch on the mirrored `strategy_tag` so each test runs
         // under the same monomorphisation production would pick.
@@ -1547,17 +1560,17 @@ impl HcMatchGenerator {
         // BtOpt from BtUltra.
         match self.strategy_tag {
             StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
-                self.start_matching_lazy(&mut handle_sequence)
+                self.start_matching_lazy::<K>(&mut handle_sequence)
             }
             StrategyTag::Btlazy2 => unreachable!("btlazy2 runs on the lazy (Row) backend"),
             StrategyTag::BtOpt => {
-                self.start_matching_optimal::<strategy::BtOpt>(&mut handle_sequence)
+                self.start_matching_optimal::<strategy::BtOpt, K>(&mut handle_sequence)
             }
             StrategyTag::BtUltra => {
-                self.start_matching_optimal::<strategy::BtUltra>(&mut handle_sequence)
+                self.start_matching_optimal::<strategy::BtUltra, K>(&mut handle_sequence)
             }
             StrategyTag::BtUltra2 => {
-                self.start_matching_optimal::<strategy::BtUltra2>(&mut handle_sequence)
+                self.start_matching_optimal::<strategy::BtUltra2, K>(&mut handle_sequence)
             }
         }
     }
@@ -1572,7 +1585,7 @@ impl HcMatchGenerator {
     /// `HcMatchGenerator::start_matching` reaches the same arms by
     /// runtime-matching on `self.strategy_tag` (the parse-mode field
     /// has been removed); production never invokes that path.
-    pub(crate) fn start_matching_strategy<S: crate::encoding::strategy::Strategy>(
+    pub(crate) fn start_matching_strategy<S: crate::encoding::strategy::Strategy, K: EncodeTier>(
         &mut self,
         handle_sequence: &mut impl FnMut(Sequence),
     ) {
@@ -1582,9 +1595,9 @@ impl HcMatchGenerator {
             "Strategy::USE_BT disagrees with runtime table.uses_bt at HC dispatch"
         );
         if S::USE_BT {
-            self.start_matching_optimal::<S>(handle_sequence)
+            self.start_matching_optimal::<S, K>(handle_sequence)
         } else {
-            self.start_matching_lazy(handle_sequence)
+            self.start_matching_lazy::<K>(handle_sequence)
         }
     }
 
@@ -1592,15 +1605,18 @@ impl HcMatchGenerator {
     /// (attach-mode dictionary), else the no-dict monomorph. Mirrors upstream's
     /// compile-time `dictMode` split — the `DICT = false` body carries no dms
     /// code at all, so the no-dict hot path is unaffected by the dict search.
-    pub(crate) fn start_matching_lazy(&mut self, handle_sequence: impl FnMut(Sequence)) {
+    pub(crate) fn start_matching_lazy<K: EncodeTier>(
+        &mut self,
+        handle_sequence: impl FnMut(Sequence),
+    ) {
         if self.table.dms.is_primed() {
-            self.start_matching_lazy_impl::<true>(handle_sequence);
+            self.start_matching_lazy_impl::<K, true>(handle_sequence);
         } else {
-            self.start_matching_lazy_impl::<false>(handle_sequence);
+            self.start_matching_lazy_impl::<K, false>(handle_sequence);
         }
     }
 
-    pub(crate) fn start_matching_lazy_impl<const DICT: bool>(
+    pub(crate) fn start_matching_lazy_impl<K: EncodeTier, const DICT: bool>(
         &mut self,
         mut handle_sequence: impl FnMut(Sequence),
     ) {
@@ -1635,7 +1651,7 @@ impl HcMatchGenerator {
 
         let current_abs_end = current_abs_start + current_len;
         self.table
-            .backfill_boundary_positions(current_abs_start, current_abs_end);
+            .backfill_boundary_positions::<K>(current_abs_start, current_abs_end);
 
         let mut pos = 0usize;
         let mut literals_start = 0usize;
@@ -1660,7 +1676,7 @@ impl HcMatchGenerator {
             // forward `(offset, length)` in registers (`HcMatch`, 16 bytes).
             let best = match carried.take() {
                 Some(m) => m,
-                None => self.hc.find_best_match::<DICT>(
+                None => self.hc.find_best_match::<K, DICT>(
                     concat,
                     dms_primed,
                     &self.table,
@@ -1674,7 +1690,7 @@ impl HcMatchGenerator {
                 // position during its own search, before the depth loop probes
                 // the next one.
                 self.table.insert_position(abs_pos);
-                if let Some(carry) = self.hc.lazy_decide_carry::<DICT>(
+                if let Some(carry) = self.hc.lazy_decide_carry::<K, DICT>(
                     concat,
                     dms_primed,
                     &self.table,
@@ -1791,26 +1807,26 @@ impl HcMatchGenerator {
     /// parse reads its range via `current_block_range()` and its bytes via
     /// `get_last_space()` / `live_history()`, all borrowed-aware, so the block
     /// is scanned in place with the per-position window_low offset cap.
-    pub(crate) fn start_matching_lazy_borrowed(
+    pub(crate) fn start_matching_lazy_borrowed<K: EncodeTier>(
         &mut self,
         block_start: usize,
         block_end: usize,
         handle_sequence: impl FnMut(Sequence),
     ) {
         self.table.stage_borrowed_block(block_start, block_end);
-        self.start_matching_lazy(handle_sequence);
+        self.start_matching_lazy::<K>(handle_sequence);
     }
 
     /// Borrowed (no-copy) equivalent of the lazy `skip_matching`: stage the
     /// in-place block, then seed positions without an owned-history append.
-    pub(crate) fn skip_matching_borrowed(
+    pub(crate) fn skip_matching_borrowed<K: EncodeTier>(
         &mut self,
         block_start: usize,
         block_end: usize,
         incompressible_hint: Option<bool>,
     ) {
         self.table.stage_borrowed_block(block_start, block_end);
-        self.table.skip_matching(incompressible_hint);
+        self.table.skip_matching::<K>(incompressible_hint);
     }
 }
 

@@ -100,6 +100,7 @@ impl Clone for WeightDescription {
 
 use crate::{
     bit_io::BitWriter,
+    encoding::fastpath::EncodeTier,
     fse::fse_encoder::{self, FSEEncoder},
     histogram,
 };
@@ -155,7 +156,9 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     /// (`huf_compress.c:1077-1108`) so each instantiation keeps the
     /// container's per-symbol nb_bits sum below 64 - 4 (the upstream zstd "≥
     /// 4 free bits" precondition for `kFast=1`).
-    pub fn encode4x(&mut self, data: &[u8], with_table: bool) {
+    ///
+    /// The streams are written with the burst kernel of the encoder tier `K`.
+    pub fn encode4x<K: EncodeTier>(&mut self, data: &[u8], with_table: bool) {
         assert!(
             data.len() >= 12,
             "upstream zstd HUF_compress4X requires srcSize >= 12"
@@ -203,7 +206,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
                     "HufCStream::new returned None — dst_capacity (from \
                          huf_tight_compress_bound) must be > 8 for a non-empty segment",
                 );
-                Self::encode_one_stream(packed_codes, &mut bit_c, segment, table_log);
+                Self::encode_one_stream::<K>(packed_codes, &mut bit_c, segment, table_log);
                 bit_c.close()
             });
             // Upstream zstd `HUF_CStream_close` returns 0 on overflow (the
@@ -249,7 +252,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     /// Dispatch on table_log to pick `kUnroll`, `kFastFlush`,
     /// `kLastFast` matching upstream zstd's 64-bit branch in
     /// `huf_compress.c:1092-1110`.
-    fn encode_one_stream(
+    fn encode_one_stream<K: EncodeTier>(
         table: &[u64],
         bit_c: &mut super::huf_cstream::HufCStream<'_>,
         data: &[u8],
@@ -262,14 +265,14 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         // routes here, which clevels.h does not produce for L1-L22
         // Fast/DFast workloads but is correct to handle defensively.
         match table_log {
-            11 => Self::encode_one_stream_unrolled::<5, true, false>(table, bit_c, data),
-            10 => Self::encode_one_stream_unrolled::<5, true, true>(table, bit_c, data),
-            9 => Self::encode_one_stream_unrolled::<6, true, false>(table, bit_c, data),
-            8 => Self::encode_one_stream_unrolled::<7, true, false>(table, bit_c, data),
-            7 => Self::encode_one_stream_unrolled::<8, true, false>(table, bit_c, data),
+            11 => Self::encode_one_stream_unrolled::<K, 5, true, false>(table, bit_c, data),
+            10 => Self::encode_one_stream_unrolled::<K, 5, true, true>(table, bit_c, data),
+            9 => Self::encode_one_stream_unrolled::<K, 6, true, false>(table, bit_c, data),
+            8 => Self::encode_one_stream_unrolled::<K, 7, true, false>(table, bit_c, data),
+            7 => Self::encode_one_stream_unrolled::<K, 8, true, false>(table, bit_c, data),
             // tableLog ∈ {1..=6, 12} — upstream zstd's "default" branch falls
             // here too. kUnroll=4 keeps per-flush bit budget safe.
-            _ => Self::encode_one_stream_unrolled::<4, false, false>(table, bit_c, data),
+            _ => Self::encode_one_stream_unrolled::<K, 4, false, false>(table, bit_c, data),
         }
     }
 
@@ -300,6 +303,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     /// each unroll group. Safe when `K_UNROLL * max_nb_bits + 4 <=
     /// 64`, i.e. `K_UNROLL <= (60 / table_log)`.
     fn encode_one_stream_unrolled<
+        K: EncodeTier,
         const K_UNROLL: usize,
         const K_FAST_FLUSH: bool,
         const K_LAST_FAST: bool,
@@ -312,7 +316,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         // which keeps the bit containers / positions / cursor
         // register-resident (upstream zstd's `HUF_CStream_t` shape) instead of
         // reloading them from `*bit_c` per symbol. Byte-identical output.
-        bit_c.encode_unrolled::<K_UNROLL, K_FAST_FLUSH, K_LAST_FAST>(table, data);
+        bit_c.encode_unrolled::<K, K_UNROLL, K_FAST_FLUSH, K_LAST_FAST>(table, data);
     }
 
     /// Encode one stream and pad it to fill the last byte
@@ -2035,7 +2039,10 @@ pub(crate) fn huf_encode4x_for_test(data: &[u8]) -> Vec<u8> {
     {
         let mut writer = BitWriter::from(&mut encoded);
         let mut encoder = HuffmanEncoder::new(&table, &mut writer);
-        encoder.encode4x(data, true);
+        crate::encoding::fastpath::with_encode_tier!(
+            crate::encoding::fastpath::select_kernel(),
+            K => encoder.encode4x::<K>(data, true)
+        );
         writer.flush();
     }
     encoded

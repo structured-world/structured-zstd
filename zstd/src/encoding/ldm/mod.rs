@@ -238,7 +238,7 @@ impl LdmProducer {
     /// The producer covers the **prefix-only** path; the
     /// two-segment `extDict` variant is documented and deferred
     /// in [`search`].
-    pub(crate) fn generate_into(
+    pub(crate) fn generate_into<K: crate::encoding::fastpath::EncodeTier>(
         &mut self,
         live_history: &[u8],
         history_abs_start: usize,
@@ -361,7 +361,7 @@ impl LdmProducer {
                 // mechanism becomes load-bearing only when the
                 // caller drives multiple compress_block windows
                 // through the same producer.
-                let best = find_best_match(
+                let best = find_best_match::<K>(
                     &self.hash_table,
                     hash_id,
                     checksum,

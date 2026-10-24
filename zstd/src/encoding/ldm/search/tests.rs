@@ -7,6 +7,18 @@ fn fresh_table() -> LdmHashTable {
     LdmHashTable::new(4, 2)
 }
 
+/// [`find_best_match`] on this CPU's kernel tier.
+fn find_best(
+    table: &LdmHashTable,
+    hash_id: u32,
+    checksum: u32,
+    inputs: FindBestMatchInputs<'_>,
+) -> Option<LdmMatch> {
+    crate::encoding::fastpath::with_host_tier!(
+        K => find_best_match::<K>(table, hash_id, checksum, inputs)
+    )
+}
+
 /// `count_backwards_match` honours both lower bounds and
 /// stops on the first mismatch. Fixture: "XXXabc" matches
 /// "YYYabc" with 3 backward bytes from offset 3 in each.
@@ -47,7 +59,7 @@ fn find_best_match_returns_none_on_checksum_mismatch() {
     let mut table = fresh_table();
     table.insert_absolute(1, 4, 0x1111_1111);
     let history = b"abcdefghabcdefgh";
-    let m = find_best_match(
+    let m = find_best(
         &table,
         1,
         0xDEAD_BEEF,
@@ -77,7 +89,7 @@ fn find_best_match_rejects_stale_entries() {
     // → rejected. (At lowest_index_abs = 4 the entry would
     // exactly meet the floor and survive — that's the edge
     // case the inclusive bound is designed to preserve.)
-    let m = find_best_match(
+    let m = find_best(
         &table,
         1,
         0xCAFE,
@@ -108,7 +120,7 @@ fn find_best_match_picks_longest_combined_match() {
     let history = b"PPPPabcdefghabcdefgh";
     // split at position 12, anchor at 12 → no backward room.
     // The forward count should match 8 bytes ("abcdefgh").
-    let m = find_best_match(
+    let m = find_best(
         &table,
         1,
         0xCAFE,
@@ -141,7 +153,7 @@ fn find_best_match_extends_backwards_into_pre_split_bytes() {
     // split at 12 (start of second "abcdefgh"), anchor at 10
     // → backward up to 2 bytes ("XY" at positions 10..12 vs
     // 0..2). Forward count: 8 bytes ("abcdefgh").
-    let m = find_best_match(
+    let m = find_best(
         &table,
         1,
         0xCAFE,
@@ -178,7 +190,7 @@ fn find_best_match_prefers_longer_total_across_slots() {
     // offset 8 ("abcdefgh") gives 8 bytes forward; match at
     // offset 4 ("abcdabcd...") gives only 4 bytes forward
     // because the 5th byte ('a' vs 'e') mismatches.
-    let m = find_best_match(
+    let m = find_best(
         &table,
         1,
         0xCAFE,
@@ -210,7 +222,7 @@ fn find_best_match_rejects_entries_at_or_past_split() {
     // direct caller / test fixture / future extDict variant.
     table.insert_absolute(1, 12, 0xCAFE);
     let history = b"PPPPabcdefghabcdefgh";
-    let m = find_best_match(
+    let m = find_best(
         &table,
         1,
         0xCAFE,
@@ -230,7 +242,7 @@ fn find_best_match_rejects_entries_at_or_past_split() {
     // must be rejected.
     let mut table_after = fresh_table();
     table_after.insert_absolute(1, 16, 0xCAFE);
-    let m_after = find_best_match(
+    let m_after = find_best(
         &table_after,
         1,
         0xCAFE,
@@ -261,7 +273,7 @@ fn find_best_match_forward_count_is_bounded_by_iend_abs() {
     // iend_abs = 16 (4 bytes past the split) the match must
     // cap at 4.
     let history = b"PPPPabcdefghabcdefgh";
-    let m = find_best_match(
+    let m = find_best(
         &table,
         1,
         0xCAFE,
@@ -291,7 +303,7 @@ fn find_best_match_filters_short_forward_matches() {
     let history = b"PPPPabXXXXXXab";
     // 2-byte forward match from split=12 vs match=4, but
     // min_match_length = 4 → rejected.
-    let m = find_best_match(
+    let m = find_best(
         &table,
         1,
         0xCAFE,

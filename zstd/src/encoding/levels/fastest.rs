@@ -8,6 +8,7 @@ use crate::{
             commit_block_tables, compress_block, compress_block_with_post_split,
             discard_block_tables,
         },
+        fastpath::EncodeTier,
         frame_compressor::CompressState,
         incompressible::{
             block_looks_incompressible, block_looks_incompressible_strict,
@@ -40,7 +41,7 @@ use alloc::vec::Vec;
 // emit-fn shape for no readability gain.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-pub(crate) fn compress_block_encoded<M: Matcher>(
+pub(crate) fn compress_block_encoded<M: Matcher, K: EncodeTier>(
     state: &mut CompressState<M>,
     compression_level: CompressionLevel,
     last_block: bool,
@@ -168,7 +169,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             sink.push(precomputed_checksum.expect("checksum is hashed whenever a sink exists"));
         }
         state.matcher.commit_filled(block_len);
-        state.matcher.skip_matching_with_hint(Some(false));
+        skip_block::<M, K>(state, false);
         record_unsearched_block(state, block_size);
         let header = BlockHeader {
             last_block,
@@ -189,7 +190,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             sink.push(precomputed_checksum.expect("checksum is hashed whenever a sink exists"));
         }
         state.matcher.commit_filled(block_len);
-        state.matcher.skip_matching_with_hint(Some(true));
+        skip_block::<M, K>(state, true);
         record_unsearched_block(state, block_size);
         let header = BlockHeader {
             last_block,
@@ -209,7 +210,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             // loop so the cardinality matches the decoder's per-block count
             // exactly.
             #[cfg(all(feature = "lsm", feature = "hash"))]
-            compress_block_with_post_split(
+            compress_block_with_post_split::<M, K>(
                 state,
                 last_block,
                 output,
@@ -217,9 +218,14 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
                 block_checksums,
             );
             #[cfg(all(feature = "lsm", not(feature = "hash")))]
-            compress_block_with_post_split(state, last_block, output, block_decompressed_sizes);
+            compress_block_with_post_split::<M, K>(
+                state,
+                last_block,
+                output,
+                block_decompressed_sizes,
+            );
             #[cfg(not(feature = "lsm"))]
-            compress_block_with_post_split(state, last_block, output);
+            compress_block_with_post_split::<M, K>(state, last_block, output);
             return BlockType::Compressed;
         }
         #[cfg(feature = "lsm")]
@@ -244,7 +250,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         let hdr_off = output.len();
         output.extend_from_slice(&[0u8; 3]);
         let payload_off = output.len();
-        let tables = compress_block(state, output);
+        let tables = compress_block::<M, K>(state, output);
         let payload_len = output.len() - payload_off;
         // Fall back to a raw block when the compressed payload is not
         // smaller than the source (`payload >= block_size`) or exceeds the
@@ -285,6 +291,17 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     }
 }
 
+/// Index the committed block without searching it, under the frame's tier `K`
+/// when the matcher is the built-in one (which still searches it for
+/// long-distance matches).
+#[inline]
+fn skip_block<M: Matcher, K: EncodeTier>(state: &mut CompressState<M>, incompressible: bool) {
+    match state.matcher.builtin_driver() {
+        Some(driver) => driver.skip_matching_with_hint_with::<K>(Some(incompressible)),
+        None => state.matcher.skip_matching_with_hint(Some(incompressible)),
+    }
+}
+
 /// A block written out unsearched parses as literals alone: one delimiter
 /// carrying all of it, when the parse is being recorded.
 #[inline]
@@ -311,7 +328,7 @@ fn record_unsearched_block<M: Matcher>(state: &mut CompressState<M>, block_size:
 /// strategy, and the borrowed path is gated to the fast one), so it is
 /// omitted.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn compress_block_encoded_borrowed(
+pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
     state: &mut CompressState<MatchGeneratorDriver>,
     compression_level: CompressionLevel,
     last_block: bool,
@@ -390,7 +407,7 @@ pub(crate) fn compress_block_encoded_borrowed(
             sink.push(crate::encoding::frame_compressor::xxh64_block_low32(block));
         }
         state.matcher.set_borrowed_block(block_start, block_end);
-        state.matcher.skip_matching_with_hint(Some(false));
+        state.matcher.skip_matching_with_hint_with::<K>(Some(false));
         record_unsearched_block(state, block_size);
         let header = BlockHeader {
             last_block,
@@ -410,7 +427,7 @@ pub(crate) fn compress_block_encoded_borrowed(
             sink.push(crate::encoding::frame_compressor::xxh64_block_low32(block));
         }
         state.matcher.set_borrowed_block(block_start, block_end);
-        state.matcher.skip_matching_with_hint(Some(true));
+        state.matcher.skip_matching_with_hint_with::<K>(Some(true));
         record_unsearched_block(state, block_size);
         let header = BlockHeader {
             last_block,
@@ -452,7 +469,7 @@ pub(crate) fn compress_block_encoded_borrowed(
         let hdr_off = output.len();
         output.extend_from_slice(&[0u8; 3]);
         let payload_off = output.len();
-        let tables = compress_block(state, output);
+        let tables = compress_block::<MatchGeneratorDriver, K>(state, output);
         let payload_len = output.len() - payload_off;
         if payload_len >= MAX_BLOCK_SIZE as usize || payload_len >= block_size as usize {
             // Incompressible (compressed payload not smaller than the source,

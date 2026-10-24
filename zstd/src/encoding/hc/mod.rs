@@ -20,6 +20,7 @@ pub(crate) mod optimal;
 pub(crate) mod priceset;
 
 use super::cost_model::{HC_FORMAT_MINMATCH, HC_OPT_NUM, HcOptimalCostProfile};
+use super::fastpath::EncodeTier;
 use super::match_table::helpers::common_prefix_len;
 use super::match_table::storage::{HC_EMPTY, MatchTable};
 use super::opt::types::MatchCandidate;
@@ -141,7 +142,11 @@ impl HcMatcher {
     /// Probe the 3 rep-code offsets (with the upstream zstd `ll0 ↦ rep[0] − 1`
     /// fallback) and return the best in-range match. Pure helper —
     /// only reads from `MatchTable`, no HcMatcher state needed.
-    pub(crate) fn repcode_candidate(table: &MatchTable, abs_pos: usize, lit_len: usize) -> HcMatch {
+    pub(crate) fn repcode_candidate<K: EncodeTier>(
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> HcMatch {
         let reps = if lit_len == 0 {
             [
                 Some(table.offset_hist[1] as usize),
@@ -195,7 +200,8 @@ impl HcMatcher {
             {
                 continue;
             }
-            let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+            let match_len =
+                common_prefix_len::<K>(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= HC_MIN_MATCH_LEN {
                 best = Self::better_candidate(
                     best,
@@ -223,7 +229,7 @@ impl HcMatcher {
     /// `ZSTD_HcFindBestMatch` shape — reached by a single call per position, not
     /// the find->chain->dms call chain that an out-of-line chain walk adds.
     #[inline(always)]
-    pub(crate) fn hash_chain_candidate<const DICT: bool>(
+    pub(crate) fn hash_chain_candidate<K: EncodeTier, const DICT: bool>(
         &self,
         concat: &[u8],
         dms_primed: bool,
@@ -358,7 +364,7 @@ impl HcMatcher {
                 };
                 if gate_ok {
                     let current_ml =
-                        common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+                        common_prefix_len::<K>(&concat[candidate_idx..], &concat[current_idx..]);
                     // `currentMl > ml`: strictly longer forward match wins; ties
                     // keep the first (closest, the walk is newest-first).
                     if current_ml > ml {
@@ -401,7 +407,7 @@ impl HcMatcher {
             // dms runs only in the `DICT = true` monomorph, which uses the
             // `ml >= MIN_MATCH` match test, so the walk tracks `(ml, best_idx)`
             // and never the `found` flag.
-            let walk = self.dms_chain_walk(
+            let walk = self.dms_chain_walk::<K>(
                 table,
                 concat,
                 current_idx,
@@ -450,7 +456,7 @@ impl HcMatcher {
     /// path.
     #[inline]
     #[allow(clippy::too_many_arguments)]
-    fn dms_chain_walk(
+    fn dms_chain_walk<K: EncodeTier>(
         &self,
         table: &MatchTable,
         concat: &[u8],
@@ -524,7 +530,8 @@ impl HcMatcher {
                         == MatchTable::read_le_u32_ptr(base_ptr.add(current_idx + gate_off))
                 };
                 if gate_ok {
-                    let current_ml = common_prefix_len(&concat[dict_idx..], &concat[current_idx..]);
+                    let current_ml =
+                        common_prefix_len::<K>(&concat[dict_idx..], &concat[current_idx..]);
                     if current_ml > ml {
                         ml = current_ml;
                         best_idx = dict_idx;
@@ -557,7 +564,7 @@ impl HcMatcher {
     /// folded into the (out-of-line) `find_best_match` monolith so the rep is
     /// part of the single per-position find call, not a nested out-of-line probe.
     #[inline(always)]
-    pub(crate) fn repcode_candidate_offset1(
+    pub(crate) fn repcode_candidate_offset1<K: EncodeTier>(
         concat: &[u8],
         table: &MatchTable,
         abs_pos: usize,
@@ -590,7 +597,7 @@ impl HcMatcher {
         {
             return HcMatch::NONE;
         }
-        let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+        let match_len = common_prefix_len::<K>(&concat[candidate_idx..], &concat[current_idx..]);
         if match_len >= HC_MIN_MATCH_LEN {
             HcMatch {
                 offset: rep,
@@ -616,7 +623,7 @@ impl HcMatcher {
     /// `rax:rdx`, so the find->loop boundary stays a register pair, not a stack
     /// spill.
     #[inline(never)]
-    pub(crate) fn find_best_match<const DICT: bool>(
+    pub(crate) fn find_best_match<K: EncodeTier, const DICT: bool>(
         &self,
         concat: &[u8],
         dms_primed: bool,
@@ -637,11 +644,11 @@ impl HcMatcher {
         // The `lit_len == 0` case keeps the full rotated probe for encode
         // correctness (the ll0 `rep[0]-1` rule).
         let rep = if lit_len == 0 {
-            Self::repcode_candidate(table, abs_pos, lit_len)
+            Self::repcode_candidate::<K>(table, abs_pos, lit_len)
         } else {
-            Self::repcode_candidate_offset1(concat, table, abs_pos)
+            Self::repcode_candidate_offset1::<K>(concat, table, abs_pos)
         };
-        let hash = self.hash_chain_candidate::<DICT>(concat, dms_primed, table, abs_pos);
+        let hash = self.hash_chain_candidate::<K, DICT>(concat, dms_primed, table, abs_pos);
         Self::better_candidate(rep, hash)
     }
 
@@ -662,7 +669,7 @@ impl HcMatcher {
     /// the `pos + 1` / `pos + 2` lookahead sees `abs_pos` at offset 1 — matching
     /// upstream, where the searched position is inserted during its own search,
     /// before the depth loop probes the next one.
-    pub(crate) fn lazy_decide_carry<const DICT: bool>(
+    pub(crate) fn lazy_decide_carry<K: EncodeTier, const DICT: bool>(
         &self,
         concat: &[u8],
         dms_primed: bool,
@@ -689,7 +696,7 @@ impl HcMatcher {
             history_end = history_end,
             min_match = HC_MIN_MATCH_LEN,
             search = |pos, ll| {
-                let m = self.find_best_match::<DICT>(concat, dms_primed, table, pos, ll);
+                let m = self.find_best_match::<K, DICT>(concat, dms_primed, table, pos, ll);
                 m.is_match().then_some(m)
             },
         ) {
@@ -709,7 +716,7 @@ impl HcMatcher {
     #[allow(dead_code)]
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn for_each_repcode_candidate_with_reps(
+    pub(crate) fn for_each_repcode_candidate_with_reps<K: EncodeTier>(
         &self,
         table: &MatchTable,
         abs_pos: usize,
@@ -740,7 +747,7 @@ impl HcMatcher {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             use crate::encoding::fastpath::FastpathKernel;
-            match table.kernel {
+            match K::TIER {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.for_each_repcode_candidate_with_reps_avx2_bmi2(

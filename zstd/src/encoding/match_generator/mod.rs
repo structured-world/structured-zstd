@@ -22,6 +22,7 @@ use super::cost_model::{
 #[cfg(test)]
 use super::cost_model::{HC_BLOCKSIZE_MAX, HC_MAX_LL, HC_MAX_ML, HC_MAX_OFF, HcOptPriceType};
 use super::dfast::DfastMatchGenerator;
+use super::fastpath::EncodeTier;
 #[cfg(test)]
 use super::hc::HC_MIN_MATCH_LEN;
 #[cfg(test)]
@@ -315,12 +316,12 @@ impl MatcherStorage {
 
     /// See the backends' `skip_long_match`.
     #[cfg(feature = "ldm")]
-    fn skip_long_match(&mut self) {
+    fn skip_long_match<K: EncodeTier>(&mut self) {
         match self {
             Self::Simple(m) => m.skip_long_match(),
             Self::Dfast(m) => m.skip_long_match(),
             Self::Row(m) => m.skip_long_match(),
-            Self::HashChain(m) => m.table.skip_long_match(),
+            Self::HashChain(m) => m.table.skip_long_match::<K>(),
         }
     }
 
@@ -495,6 +496,10 @@ pub struct MatchGeneratorDriver {
     /// A parser asked for each block in place of the backends, when one is
     /// installed (C `ZSTD_registerSequenceProducer`).
     producer: Option<ProducerSlot>,
+    /// This CPU's kernel tier, detected once at construction: the tier the
+    /// [`Matcher`] entry points run under when a caller drives the driver
+    /// through the trait rather than through the encoder's own tier.
+    tier: super::fastpath::FastpathKernel,
 }
 
 /// A [`SequenceProducer`] and what to do when it gives no parse.
@@ -799,6 +804,7 @@ impl MatchGeneratorDriver {
             #[cfg(feature = "ldm")]
             ldm_split_block: None,
             producer: None,
+            tier: super::fastpath::select_kernel(),
         }
     }
 
@@ -838,7 +844,10 @@ impl MatchGeneratorDriver {
     /// piece of one between long matches, indexing it as an unsearched one.
     /// Returns `false`, having done nothing, when the producer failed and the
     /// backend is to match it.
-    fn match_produced(&mut self, handle_sequence: &mut impl FnMut(Sequence)) -> bool {
+    fn match_produced<K: EncodeTier>(
+        &mut self,
+        handle_sequence: &mut impl FnMut(Sequence),
+    ) -> bool {
         let mut slot = self
             .producer
             .take()
@@ -871,7 +880,7 @@ impl MatchGeneratorDriver {
             return false;
         }
         // The block's long matches, if any, were taken before it got here.
-        self.skip_backend(None);
+        self.skip_backend::<K>(None);
         if produced {
             let mut literals = 0usize;
             for sequence in &slot.parse {
@@ -1272,7 +1281,7 @@ impl MatchGeneratorDriver {
                 .is_none_or(|log| log <= DFAST_ATTACH_DICT_CUTOFF_LOG)
     }
 
-    fn skip_matching_for_dictionary_priming(&mut self, dict_len: usize) {
+    fn skip_matching_for_dictionary_priming<K: EncodeTier>(&mut self, dict_len: usize) {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
                 // Upstream zstd `ZSTD_shouldAttachDict` mode selection for the Fast
@@ -1343,7 +1352,7 @@ impl MatchGeneratorDriver {
                 if self.hc_dict_attach_mode() {
                     self.hc_matcher_mut().table.skip_matching_dict_bt();
                 } else {
-                    self.hc_matcher_mut().skip_matching(Some(false));
+                    self.hc_matcher_mut().skip_matching::<K>(Some(false));
                 }
             }
         }
@@ -2105,7 +2114,12 @@ impl Matcher for MatchGeneratorDriver {
 
     #[inline]
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
-        self.prime_with_dictionary_impl(dict_content, offset_hist)
+        // For a caller driving the matcher through the trait; the encoder
+        // calls `prime_with_dictionary_with` under its frame's tier.
+        crate::encoding::fastpath::with_encode_tier!(
+            self.tier,
+            K => self.prime_with_dictionary_with::<K>(dict_content, offset_hist)
+        )
     }
 
     #[inline]
@@ -2164,13 +2178,12 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn settle_block_cut(&mut self, window: usize, cut: usize) -> usize {
-        #[cfg(feature = "ldm")]
-        return self.settle_long_distance_cut(window, cut);
-        #[cfg(not(feature = "ldm"))]
-        {
-            let _ = window;
-            cut
-        }
+        // For a caller driving the matcher through the trait; the encoder
+        // calls `settle_block_cut_with` under its frame's tier.
+        crate::encoding::fastpath::with_encode_tier!(
+            self.tier,
+            K => self.settle_block_cut_with::<K>(window, cut)
+        )
     }
 
     fn get_last_space(&mut self) -> &[u8] {
@@ -2260,107 +2273,21 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
-    fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
-        // Borrowed one-shot Fast path: if the frame driver staged a
-        // block range via `set_borrowed_block`, scan it in place against
-        // the borrowed window instead of the owned committed block. Only
-        // the Simple backend is instrumented (the gate guarantees it),
-        // and the stage is consumed so the next block re-stages.
-        if let Some((block_start, block_end)) = self.borrowed_pending.take() {
-            // The borrowed scans share their kernels with the owned ones, so
-            // they report through the same sink type.
-            let mut forward = None;
-            let mut sink = owned_sink(&mut handle_sequence, &mut forward);
-            match self.active_backend() {
-                super::strategy::BackendTag::Simple => {
-                    let m = self.simple_mut();
-                    if m.dict_is_attached() {
-                        // Dict-attach borrowed scan: live matches read the
-                        // borrowed input in place, dict matches read the
-                        // committed dict prefix via the 2-segment counter.
-                        m.start_matching_borrowed_dict(block_start, block_end, &mut sink);
-                    } else {
-                        m.start_matching_borrowed(block_start, block_end, &mut sink);
-                    }
-                }
-                super::strategy::BackendTag::Dfast => self
-                    .dfast_matcher_mut()
-                    .start_matching_borrowed(block_start, block_end, &mut sink),
-                super::strategy::BackendTag::Row => {
-                    // Same greedy/lazy parse split as the owned RowHash arm.
-                    let greedy = self.parse == super::strategy::ParseMode::Greedy;
-                    self.row_matcher_mut().start_matching_borrowed(
-                        block_start,
-                        block_end,
-                        greedy,
-                        &mut sink,
-                    );
-                }
-                super::strategy::BackendTag::HashChain => match self.search {
-                    super::strategy::SearchMethod::HashChain => self
-                        .hc_matcher_mut()
-                        .start_matching_lazy_borrowed(block_start, block_end, &mut sink),
-                    // `borrowed_supported()` keeps the optimal parsers on the
-                    // owned path and `set_borrowed_block` asserts it.
-                    other => {
-                        unreachable!("HashChain backend with unexpected borrowed search {other:?}")
-                    }
-                },
-            }
-            return;
-        }
-        if self.producer.is_some() {
-            // A producer stands in for every parser, the optimal one too, so
-            // its block's long matches are taken outright at any strategy and
-            // the producer parses the literals between them. Upstream refuses
-            // the pair instead (zstd.h, block-level sequence producer
-            // limitations); taking both loses neither.
-            #[cfg(feature = "ldm")]
-            if self.ldm.is_some() {
-                // Where the producer fails with fallback, the backend matches
-                // what is left without long-match candidates: this block's are
-                // taken outright, and the optimal parser still holds the last
-                // block's, whose block-relative positions would name the wrong
-                // bytes here (its candidates are trusted, not re-checked).
-                if matches!(self.search, super::strategy::SearchMethod::BinaryTree) {
-                    let MatcherStorage::HashChain(hc) = &mut self.storage else {
-                        unreachable!("the optimal parser runs on the hash-chain backend");
-                    };
-                    hc.backend.bt_mut().ldm_sequences.clear();
-                }
-                if self.start_matching_long_distance(&mut handle_sequence, true) {
-                    return;
-                }
-                if self.match_produced(&mut handle_sequence) {
-                    return;
-                }
-                // The producer failed with fallback on a block with no long
-                // match, which is already taken: the backend matches it.
-                let mut gap_literals = None;
-                self.start_matching_owned(&mut owned_sink(&mut handle_sequence, &mut gap_literals));
-                return;
-            }
-            if self.match_produced(&mut handle_sequence) {
-                return;
-            }
-        }
-        #[cfg(feature = "ldm")]
-        if self.ldm.is_some() {
-            // The optimal parser weighs long-distance matches as candidates;
-            // below it they are taken outright (upstream
-            // `ZSTD_ldm_blockCompress`, `zstd_ldm.c:685-749`).
-            if matches!(self.search, super::strategy::SearchMethod::BinaryTree) {
-                self.take_long_distance_block();
-                let MatcherStorage::HashChain(hc) = &mut self.storage else {
-                    unreachable!("the optimal parser runs on the hash-chain backend");
-                };
-                core::mem::swap(&mut self.ldm_block, &mut hc.backend.bt_mut().ldm_sequences);
-            } else if self.start_matching_long_distance(&mut handle_sequence, false) {
-                return;
-            }
-        }
-        let mut gap_literals = None;
-        self.start_matching_owned(&mut owned_sink(&mut handle_sequence, &mut gap_literals));
+    fn start_matching(&mut self, handle_sequence: impl FnMut(Sequence)) {
+        // For a caller driving the matcher through the trait itself, such as
+        // a wrapper that records what it emits. The encoder does not come
+        // here: it reaches the driver through `builtin_driver` and searches
+        // under the tier it chose for the frame. Either way the tier was
+        // detected once, at construction.
+        crate::encoding::fastpath::with_encode_tier!(
+            self.tier,
+            K => self.start_matching_with::<K>(handle_sequence)
+        )
+    }
+
+    #[inline]
+    fn builtin_driver(&mut self) -> Option<&mut MatchGeneratorDriver> {
+        Some(self)
     }
 
     fn skip_matching(&mut self) {
@@ -2368,6 +2295,22 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
+        // For a caller driving the matcher through the trait; the encoder
+        // calls `skip_matching_with_hint_with` under its frame's tier.
+        crate::encoding::fastpath::with_encode_tier!(
+            self.tier,
+            K => self.skip_matching_with_hint_with::<K>(incompressible_hint)
+        )
+    }
+}
+
+impl MatchGeneratorDriver {
+    /// [`Matcher::skip_matching_with_hint`] compiled for the kernel tier `K`:
+    /// the block is still searched for long-distance matches.
+    pub(crate) fn skip_matching_with_hint_with<K: EncodeTier>(
+        &mut self,
+        incompressible_hint: Option<bool>,
+    ) {
         // Borrowed one-shot Fast path: a staged block range routes to the
         // borrowed skip (records the range for `get_last_space`, primes
         // hashes on the dict-priming hint) with no owned-history append
@@ -2389,7 +2332,7 @@ impl Matcher for MatchGeneratorDriver {
                 ),
                 super::strategy::BackendTag::HashChain => self
                     .hc_matcher_mut()
-                    .skip_matching_borrowed(block_start, block_end, incompressible_hint),
+                    .skip_matching_borrowed::<K>(block_start, block_end, incompressible_hint),
             }
             return;
         }
@@ -2398,16 +2341,16 @@ impl Matcher for MatchGeneratorDriver {
         // taken past.
         #[cfg(feature = "ldm")]
         if self.ldm.is_some() {
-            self.take_long_distance_block();
+            self.take_long_distance_block::<K>();
         }
-        self.skip_backend(incompressible_hint);
+        self.skip_backend::<K>(incompressible_hint);
     }
 }
 
 impl MatchGeneratorDriver {
     /// Index the last committed block (or piece of one) in the backend
     /// without searching it, leaving the long-distance state alone.
-    fn skip_backend(&mut self, incompressible_hint: Option<bool>) {
+    fn skip_backend<K: EncodeTier>(&mut self, incompressible_hint: Option<bool>) {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
                 self.simple_mut()
@@ -2419,9 +2362,9 @@ impl MatchGeneratorDriver {
             super::strategy::BackendTag::Row => self
                 .row_matcher_mut()
                 .skip_matching_with_hint(incompressible_hint),
-            super::strategy::BackendTag::HashChain => {
-                self.hc_matcher_mut().skip_matching(incompressible_hint)
-            }
+            super::strategy::BackendTag::HashChain => self
+                .hc_matcher_mut()
+                .skip_matching::<K>(incompressible_hint),
         }
     }
 }
@@ -2457,9 +2400,135 @@ fn owned_sink<'a, F: FnMut(Sequence)>(
 }
 
 impl MatchGeneratorDriver {
+    /// [`Matcher::start_matching`] compiled for the kernel tier `K`, the one
+    /// the encoder chose for the frame. Nothing below asks for a tier.
+    pub(crate) fn start_matching_with<K: EncodeTier>(
+        &mut self,
+        mut handle_sequence: impl FnMut(Sequence),
+    ) {
+        // Borrowed one-shot Fast path: if the frame driver staged a
+        // block range via `set_borrowed_block`, scan it in place against
+        // the borrowed window instead of the owned committed block. Only
+        // the Simple backend is instrumented (the gate guarantees it),
+        // and the stage is consumed so the next block re-stages.
+        if let Some((block_start, block_end)) = self.borrowed_pending.take() {
+            // The borrowed scans share their kernels with the owned ones, so
+            // they report through the same sink type.
+            let mut forward = None;
+            let mut sink = owned_sink(&mut handle_sequence, &mut forward);
+            match self.active_backend() {
+                super::strategy::BackendTag::Simple => {
+                    let m = self.simple_mut();
+                    if m.dict_is_attached() {
+                        // Dict-attach borrowed scan: live matches read the
+                        // borrowed input in place, dict matches read the
+                        // committed dict prefix via the 2-segment counter.
+                        m.start_matching_borrowed_dict::<K>(block_start, block_end, &mut sink);
+                    } else {
+                        m.start_matching_borrowed(block_start, block_end, &mut sink);
+                    }
+                }
+                super::strategy::BackendTag::Dfast => self
+                    .dfast_matcher_mut()
+                    .start_matching_borrowed::<K>(block_start, block_end, &mut sink),
+                super::strategy::BackendTag::Row => {
+                    // Same greedy/lazy parse split as the owned RowHash arm.
+                    let greedy = self.parse == super::strategy::ParseMode::Greedy;
+                    self.row_matcher_mut().start_matching_borrowed::<K>(
+                        block_start,
+                        block_end,
+                        greedy,
+                        &mut sink,
+                    );
+                }
+                super::strategy::BackendTag::HashChain => match self.search {
+                    super::strategy::SearchMethod::HashChain => self
+                        .hc_matcher_mut()
+                        .start_matching_lazy_borrowed::<K>(block_start, block_end, &mut sink),
+                    // `borrowed_supported()` keeps the optimal parsers on the
+                    // owned path and `set_borrowed_block` asserts it.
+                    other => {
+                        unreachable!("HashChain backend with unexpected borrowed search {other:?}")
+                    }
+                },
+            }
+            return;
+        }
+        if self.producer.is_some() {
+            // A producer stands in for every parser, the optimal one too, so
+            // its block's long matches are taken outright at any strategy and
+            // the producer parses the literals between them. Upstream refuses
+            // the pair instead (zstd.h, block-level sequence producer
+            // limitations); taking both loses neither.
+            #[cfg(feature = "ldm")]
+            if self.ldm.is_some() {
+                // Where the producer fails with fallback, the backend matches
+                // what is left without long-match candidates: this block's are
+                // taken outright, and the optimal parser still holds the last
+                // block's, whose block-relative positions would name the wrong
+                // bytes here (its candidates are trusted, not re-checked).
+                if matches!(self.search, super::strategy::SearchMethod::BinaryTree) {
+                    let MatcherStorage::HashChain(hc) = &mut self.storage else {
+                        unreachable!("the optimal parser runs on the hash-chain backend");
+                    };
+                    hc.backend.bt_mut().ldm_sequences.clear();
+                }
+                if self.start_matching_long_distance::<K>(&mut handle_sequence, true) {
+                    return;
+                }
+                if self.match_produced::<K>(&mut handle_sequence) {
+                    return;
+                }
+                // The producer failed with fallback on a block with no long
+                // match, which is already taken: the backend matches it.
+                let mut gap_literals = None;
+                self.start_matching_owned::<K>(&mut owned_sink(
+                    &mut handle_sequence,
+                    &mut gap_literals,
+                ));
+                return;
+            }
+            if self.match_produced::<K>(&mut handle_sequence) {
+                return;
+            }
+        }
+        #[cfg(feature = "ldm")]
+        if self.ldm.is_some() {
+            // The optimal parser weighs long-distance matches as candidates;
+            // below it they are taken outright (upstream
+            // `ZSTD_ldm_blockCompress`, `zstd_ldm.c:685-749`).
+            if matches!(self.search, super::strategy::SearchMethod::BinaryTree) {
+                self.take_long_distance_block::<K>();
+                let MatcherStorage::HashChain(hc) = &mut self.storage else {
+                    unreachable!("the optimal parser runs on the hash-chain backend");
+                };
+                core::mem::swap(&mut self.ldm_block, &mut hc.backend.bt_mut().ldm_sequences);
+            } else if self.start_matching_long_distance::<K>(&mut handle_sequence, false) {
+                return;
+            }
+        }
+        let mut gap_literals = None;
+        self.start_matching_owned::<K>(&mut owned_sink(&mut handle_sequence, &mut gap_literals));
+    }
+
+    /// [`Matcher::settle_block_cut`] compiled for the kernel tier `K`.
+    pub(crate) fn settle_block_cut_with<K: EncodeTier>(
+        &mut self,
+        window: usize,
+        cut: usize,
+    ) -> usize {
+        #[cfg(feature = "ldm")]
+        return self.settle_long_distance_cut::<K>(window, cut);
+        #[cfg(not(feature = "ldm"))]
+        {
+            let _ = window;
+            cut
+        }
+    }
+
     /// Match the last committed block of the owned history with the frame's
     /// backend.
-    fn start_matching_owned(&mut self, handle_sequence: &mut impl FnMut(Sequence)) {
+    fn start_matching_owned<K: EncodeTier>(&mut self, handle_sequence: &mut impl FnMut(Sequence)) {
         use super::strategy::{self, StrategyTag};
         // Decoupled parse×search dispatch (fires once per block). The
         // search axis (`self.search`) picks the candidate-finding backend;
@@ -2475,7 +2544,8 @@ impl MatchGeneratorDriver {
                 self.simple_mut().start_matching(handle_sequence);
             }
             SearchMethod::DoubleFast => {
-                self.dfast_matcher_mut().start_matching(handle_sequence);
+                self.dfast_matcher_mut()
+                    .start_matching::<K>(handle_sequence);
             }
             SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => {
                 // One upstream `lazy_generic` body for greedy (depth 0: a
@@ -2483,17 +2553,22 @@ impl MatchGeneratorDriver {
                 // / lazy2 (`lazy_depth` 1 / 2) and btlazy2 (depth 2 over the
                 // binary-tree finder); the finder (rows / chain / tree) was
                 // resolved at `configure`.
-                self.row_matcher_mut().start_matching(handle_sequence);
+                self.row_matcher_mut().start_matching::<K>(handle_sequence);
             }
             SearchMethod::HashChain => {
                 // Greedy/lazy/lazy2 all flow through the lazy parser; it
                 // reads `hc.lazy_depth` (0 = greedy commit).
-                self.hc_matcher_mut().start_matching_lazy(handle_sequence);
+                self.hc_matcher_mut()
+                    .start_matching_lazy::<K>(handle_sequence);
             }
             SearchMethod::BinaryTree => match self.strategy_tag {
-                StrategyTag::BtOpt => self.compress_block::<strategy::BtOpt>(handle_sequence),
-                StrategyTag::BtUltra => self.compress_block::<strategy::BtUltra>(handle_sequence),
-                StrategyTag::BtUltra2 => self.compress_block::<strategy::BtUltra2>(handle_sequence),
+                StrategyTag::BtOpt => self.compress_block::<strategy::BtOpt, K>(handle_sequence),
+                StrategyTag::BtUltra => {
+                    self.compress_block::<strategy::BtUltra, K>(handle_sequence)
+                }
+                StrategyTag::BtUltra2 => {
+                    self.compress_block::<strategy::BtUltra2, K>(handle_sequence)
+                }
                 _ => unreachable!(
                     "SearchMethod::BinaryTree requires an optimal strategy tag (BtOpt/BtUltra/BtUltra2)"
                 ),
@@ -2512,7 +2587,7 @@ impl MatchGeneratorDriver {
     /// backends (Fast / DoubleFast / RowHash / HashChain) are dispatched
     /// directly off the search axis and never reach this method, so all
     /// strategies arriving here are HashChain-backed.
-    fn compress_block<S: super::strategy::Strategy>(
+    fn compress_block<S: super::strategy::Strategy, K: EncodeTier>(
         &mut self,
         handle_sequence: &mut impl FnMut(Sequence),
     ) {
@@ -2522,7 +2597,7 @@ impl MatchGeneratorDriver {
             "compress_block only handles the optimal (BT) path"
         );
         self.hc_matcher_mut()
-            .start_matching_strategy::<S>(handle_sequence);
+            .start_matching_strategy::<S, K>(handle_sequence);
     }
 }
 

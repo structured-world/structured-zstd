@@ -84,7 +84,7 @@ fn skip_matching_bt_incompressible_routes_through_sparse_block() {
     t.is_btultra2 = false;
     t.search_depth = 4;
     let before_skip_until = t.skip_insert_until_abs;
-    t.skip_matching(Some(true));
+    crate::encoding::fastpath::with_host_tier!(K => t.skip_matching::<K>(Some(true)));
     // BT + incompressible path must take the
     // `bt_insert_sparse_incompressible_block` branch and advance
     // `skip_insert_until_abs` to current_abs_end.
@@ -101,7 +101,7 @@ fn skip_matching_bt_dense_routes_through_bt_update_tree() {
     t.is_btultra2 = false;
     t.search_depth = 4;
     // `incompressible_hint = None` → dense bt_update_tree_until path
-    t.skip_matching(None);
+    crate::encoding::fastpath::with_host_tier!(K => t.skip_matching::<K>(None));
     assert_eq!(t.skip_insert_until_abs, t.history_abs_start + t.window_size);
 }
 
@@ -126,7 +126,7 @@ fn replay_history_for_rebase_bt_walks_inserted_prefix() {
     // ground-truth observation is "some hash slots are no longer
     // HC_EMPTY".
     assert!(t.hash_table().iter().all(|&v| v == HC_EMPTY));
-    t.replay_history_for_rebase_bt(0, 32);
+    crate::encoding::fastpath::with_host_tier!(K => t.replay_history_for_rebase_bt::<K>(0, 32));
     assert!(
         t.hash_table().iter().any(|&v| v != HC_EMPTY),
         "BT replay must populate hash table"
