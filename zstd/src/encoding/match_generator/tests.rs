@@ -752,41 +752,44 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
         .map(|i| ((i * 7 + i / 13) % 67) as u8)
         .collect();
 
-    let run = |tier: FastpathKernel| -> Vec<(usize, usize, usize)> {
-        let mut hc = HcMatchGenerator::new(1 << 20);
-        hc.configure(
-            BTULTRA2_HC_CONFIG,
-            super::super::strategy::StrategyTag::BtUltra2,
-            26,
-        );
-        hc.table.commit_input(&data);
-        let mut seqs = Vec::new();
-        crate::encoding::fastpath::with_encode_tier!(
-            tier,
-            K => hc.start_matching_with::<K>(dyn_sink(&mut |seq| match seq {
-                Sequence::Triple {
-                    literal_len,
-                    offset,
-                    match_len,
-                } => seqs.push((literal_len, offset, match_len)),
-                Sequence::Literals { len } => seqs.push((len, 0, 0)),
-            }))
-        );
-        seqs
-    };
+    use super::super::strategy::StrategyTag;
+    for strategy in [
+        StrategyTag::BtOpt,
+        StrategyTag::BtUltra,
+        StrategyTag::BtUltra2,
+    ] {
+        let run = |tier: FastpathKernel| -> Vec<(usize, usize, usize)> {
+            let mut hc = HcMatchGenerator::new(1 << 20);
+            hc.configure(BTULTRA2_HC_CONFIG, strategy, 26);
+            hc.table.commit_input(&data);
+            let mut seqs = Vec::new();
+            crate::encoding::fastpath::with_encode_tier!(
+                tier,
+                K => hc.start_matching_with::<K>(dyn_sink(&mut |seq| match seq {
+                    Sequence::Triple {
+                        literal_len,
+                        offset,
+                        match_len,
+                    } => seqs.push((literal_len, offset, match_len)),
+                    Sequence::Literals { len } => seqs.push((len, 0, 0)),
+                }))
+            );
+            seqs
+        };
 
-    let reference = run(tiers[0]);
-    assert!(
-        !reference.is_empty(),
-        "btultra2 should emit sequences on mixed-redundancy input"
-    );
-    for &tier in &tiers[1..] {
-        assert_eq!(
-            run(tier),
-            reference,
-            "kernel tier {tier:?} diverged from {:?}: scalar/SIMD bit-identity broken",
-            tiers[0],
+        let reference = run(tiers[0]);
+        assert!(
+            !reference.is_empty(),
+            "{strategy:?} should emit sequences on mixed-redundancy input"
         );
+        for &tier in &tiers[1..] {
+            assert_eq!(
+                run(tier),
+                reference,
+                "{strategy:?}: kernel tier {tier:?} diverged from {:?}: scalar/SIMD bit-identity broken",
+                tiers[0],
+            );
+        }
     }
 }
 

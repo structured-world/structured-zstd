@@ -2003,6 +2003,32 @@ fn a_buffer_filled_by_the_last_write_is_pre_split_where_its_content_changes() {
     assert_eq!(decoded, payload);
 }
 
+/// A drain refusing the block a flush or a finish emits fails that call and
+/// leaves the context failed, so a later write reports the failure rather than
+/// continuing a frame with a block missing.
+#[test]
+fn a_drain_refusing_the_pending_block_fails_flush_and_finish() {
+    for finish in [false, true] {
+        let mut context = CompressionContext::new(CompressionLevel::Fastest);
+        // The header goes out with the first write; the block is the second.
+        let mut drain = FailingWriteOnce::new(2);
+        context.write(&mut drain, b"ABCD").unwrap();
+        let emitted = if finish {
+            context.finish_frame(&mut drain)
+        } else {
+            context.flush(&mut drain)
+        };
+        assert!(
+            emitted.is_err(),
+            "finish {finish}: the refused block must fail the call"
+        );
+        assert!(
+            context.write(&mut drain, b"EFGH").is_err(),
+            "finish {finish}: the context must stay failed",
+        );
+    }
+}
+
 /// Write `input` in pieces that end off block boundaries, flushing once
 /// partway, and finish the frame.
 fn stream_in_pieces<M: Matcher>(
