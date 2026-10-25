@@ -638,11 +638,11 @@ fn discarded_block_keeps_the_entry_tables() {
         },
     );
     assert_eq!(
-        state.last_huff_table.as_ref().unwrap().packed_codes(),
+        state.last_huff_table.as_ref().unwrap().packed_codes()[..],
         entry_codes
     );
     assert_eq!(
-        state.huff_table_spare.as_ref().unwrap().packed_codes(),
+        state.huff_table_spare.as_ref().unwrap().packed_codes()[..],
         built_codes
     );
     let previous = [
