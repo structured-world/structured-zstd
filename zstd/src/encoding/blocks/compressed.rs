@@ -3002,10 +3002,10 @@ macro_rules! encode_sequences_body {
                     // the leftover, the diffs and all three extra fields have
                     // to fit.
                     debug_assert!(
-                        extra_bits_total >= 31 || 7 + state_diff_bits + extra_bits_total <= 64,
+                        extra_bits_total >= 31 || 7 + state_diff_bits + extra_bits_total < 64,
                         "no flush at {extra_bits_total} extra bits, but 7 leftover + \
-                         {state_diff_bits} diff bits + {extra_bits_total} would overflow the \
-                         64-bit accumulator",
+                         {state_diff_bits} diff bits + {extra_bits_total} would fill the \
+                         accumulator, which keeps a bit free",
                     );
                 }
                 if extra_bits_total >= 31 {

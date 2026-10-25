@@ -372,29 +372,25 @@ impl<V: AsMut<Vec<u8>>> BitBurst<'_, V> {
     ///
     /// # Safety
     ///
-    /// The accumulator must have room: `bits_in_partial + num_bits <= 64`, and
-    /// `bits` must be clean above `num_bits` (`num_bits == 64 || bits >>
-    /// num_bits == 0`). Neither violation touches memory, but either corrupts
-    /// the stream with nothing to detect it, so the caller proves both from
-    /// its bit budget. Debug builds assert them.
+    /// The accumulator must keep a bit free: `bits_in_partial + num_bits < 64`
+    /// (upstream's `assert(nbBits + bitPos < 64)`), and `bits` must be clean
+    /// above `num_bits` (`bits >> num_bits == 0`). Neither violation touches
+    /// memory, but either corrupts the stream with nothing to detect it, so the
+    /// caller proves both from its bit budget. Debug builds assert them.
     #[inline(always)]
     pub(crate) unsafe fn add(&mut self, bits: u64, num_bits: usize) {
         debug_assert!(
-            self.bits_in_partial + num_bits <= 64,
+            self.bits_in_partial + num_bits < 64,
             "{num_bits} bits do not fit beside the {} held",
             self.bits_in_partial,
         );
         debug_assert!(
-            num_bits == 64 || bits >> num_bits == 0,
+            bits >> num_bits == 0,
             "value has dirty high bits beyond num_bits={num_bits}",
         );
-        // Masked so a full accumulator cannot make this a shift by 64, which is
-        // undefined for `u64`. x86 and AArch64 shifts mask the count
-        // themselves, so the mask costs nothing, where a `num_bits == 0` early
-        // return was a branch on every add. The accumulator is full only when
-        // `num_bits == 0`, and the second precondition then makes `bits == 0`,
-        // so the OR adds nothing whatever the count.
-        self.partial |= bits << (self.bits_in_partial & 63);
+        // `bits_in_partial < 64` by the first precondition, so the shift is in
+        // range.
+        self.partial |= bits << self.bits_in_partial;
         self.bits_in_partial += num_bits;
     }
 
@@ -423,13 +419,9 @@ impl<V: AsMut<Vec<u8>>> BitBurst<'_, V> {
                 .write_unaligned(self.partial.to_le());
             self.cursor = self.cursor.add(nb_bytes);
         }
-        // A full accumulator (64 bits) leaves nothing: shifting a `u64` by 64
-        // is undefined, so it is zeroed instead.
-        self.partial = if nb_bytes == 8 {
-            0
-        } else {
-            self.partial >> (nb_bytes * 8)
-        };
+        // `add` keeps the accumulator under 64 bits, so at most 7 bytes leave
+        // and the shift is in range (upstream `BIT_flushBitsFast`, unguarded).
+        self.partial >>= nb_bytes * 8;
         self.bits_in_partial &= 7;
     }
 

@@ -160,26 +160,39 @@ fn add_multiple_aligned() {
     assert_eq!(vec![0xFF, 0xF0, 0x0F, 0x00], bw.dump());
 }
 
-/// A burst flushing a full accumulator writes all eight bytes and holds
-/// nothing after, so the next bits land on a clean byte rather than on bits
-/// of the flushed value.
+/// A burst flushing the fullest accumulator it allows (63 bits) writes the
+/// seven whole bytes, keeps the last 7 bits, and lands the next bits right
+/// after them rather than on bits of the flushed value.
 #[test]
-fn a_burst_flushes_a_full_accumulator_clean() {
+fn a_burst_flushes_63_bits_and_keeps_the_partial_byte() {
     let mut bw = BitWriter::new();
     let mut burst = bw.burst(16);
-    // SAFETY: 64 bits into an empty accumulator, then 8 into an empty one,
+    // SAFETY: 63 bits into an empty accumulator, then 1 beside the 7 kept,
     // within the 16 bytes reserved.
     unsafe {
-        burst.add(0x0123_4567_89AB_CDEF, 64);
+        burst.add(0x7123_4567_89AB_CDEF, 63);
         burst.flush();
-        burst.add(0xA5, 8);
+        burst.add(0x1, 1);
         burst.flush();
     }
     burst.finish();
     assert_eq!(
         bw.dump(),
-        vec![0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01, 0xA5]
+        vec![0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0xF1]
     );
+}
+
+/// An add that would fill all 64 bits breaks the burst's contract (the flush
+/// shifts by the whole bytes held, which must stay under 8); debug builds
+/// catch it at the add.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "do not fit")]
+fn a_burst_refuses_a_full_accumulator() {
+    let mut bw = BitWriter::new();
+    let mut burst = bw.burst(16);
+    // SAFETY: the debug assertion fires before anything is written.
+    unsafe { burst.add(0x0123_4567_89AB_CDEF, 64) };
 }
 
 // #[test]
