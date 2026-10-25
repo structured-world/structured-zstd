@@ -149,7 +149,10 @@ pub(crate) struct SymbolTT {
     /// fixed-point math. Upstream zstd `fse_compress.c` uses `U32` throughout
     /// the same arithmetic for the same reason.
     pub(crate) delta_nb_bits: u32,
-    pub(crate) delta_find_state: isize,
+    /// `i32` as upstream's `int deltaFindState`: its magnitude is under the
+    /// 512-entry table, and the pair then packs into 8 bytes, half a cache line
+    /// for two symbols where an `isize` padded it to 16.
+    pub(crate) delta_find_state: i32,
 }
 
 /// Largest next-state table any FSE encoder table can carry: the accuracy log
@@ -237,10 +240,20 @@ impl FSETable {
         let tt = self.symbol_tt[symbol as usize];
         let value = (self.table_size + idx) as u32;
         let nb_bits = ((value + tt.delta_nb_bits) >> 16) as usize;
-        let slot = ((value >> nb_bits) as isize + tt.delta_find_state) as usize;
+        let slot = ((value >> nb_bits) as i32 + tt.delta_find_state) as usize;
+        // Inside `0..table_size` by construction, as upstream's
+        // `FSE_encodeSymbol` relies on: the transition of a state of a present
+        // symbol lands on one of that symbol's own slots.
+        debug_assert!(
+            slot < self.table_size,
+            "next-state slot {slot} outside a {}-entry table",
+            self.table_size
+        );
+        // SAFETY: `slot < table_size <= MAX_FSE_TABLE_SIZE`, asserted above
+        // and held by the build.
         State {
             num_bits: nb_bits as u8,
-            index: self.state_table_flat[slot] as usize,
+            index: unsafe { *self.state_table_flat.get_unchecked(slot) } as usize,
         }
     }
 
@@ -1048,10 +1061,12 @@ pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, ou
             };
             continue;
         }
-        let (delta_nb_bits, delta_find_state): (u32, isize) = match prob {
+        // `total` and `prob` are at most the 512-entry table, so the
+        // difference fits `i32`.
+        let (delta_nb_bits, delta_find_state): (u32, i32) = match prob {
             -1 | 1 => (
                 ((acc_log as u32) << 16).saturating_sub(1u32 << acc_log),
-                total as isize - 1,
+                total as i32 - 1,
             ),
             p if p > 1 => {
                 let p_u32 = p as u32;
@@ -1059,7 +1074,7 @@ pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, ou
                 let min_state_plus = p_u32 << max_bits_out;
                 (
                     (max_bits_out << 16).saturating_sub(min_state_plus),
-                    total as isize - p_u32 as isize,
+                    total as i32 - p,
                 )
             }
             _ => unreachable!("probability is one of {{-1, 1+}} after the prob==0 gate above"),
@@ -1075,7 +1090,7 @@ pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, ou
         // where `nbBitsOut = (deltaNbBits + (1<<15)) >> 16`.
         let init_nb_bits_out = (delta_nb_bits + (1 << 15)) >> 16;
         let init_value = (init_nb_bits_out << 16).saturating_sub(delta_nb_bits);
-        let state_table_index = (init_value >> init_nb_bits_out) as isize + delta_find_state;
+        let state_table_index = (init_value >> init_nb_bits_out) as i32 + delta_find_state;
         // Upstream zstd `FSE_initCState2` guarantees this index is in
         // `0..table_size` by construction (`delta_find_state` is bounded
         // by `total - probability`, and `(value >> nb_bits_out)` is
