@@ -382,11 +382,6 @@ impl SequenceStateTables {
             index: unsafe { *self.next[S].get_unchecked(slot) } as usize,
         }
     }
-
-    /// Width a stream's final state is written in: its table's log, 0 for RLE.
-    pub(crate) fn state_bits(&self, stream: usize) -> usize {
-        self.table_size[stream].ilog2() as usize
-    }
 }
 
 /// Write the NCount description of the normalized distribution of `len`

@@ -2870,12 +2870,6 @@ macro_rules! encode_sequences_body {
         let mut ll_state = ll_table.map_or(0, |table| table.start_state(ll_code).index);
         let mut ml_state = ml_table.map_or(0, |table| table.start_state(ml_code).index);
         let mut of_state = of_table.map_or(0, |table| table.start_state(of_code).index);
-        // Streams 0 / 1 / 2 are LL / ML / OF.
-        let mut view = crate::fse::fse_encoder::SequenceStateTables::new();
-        view.set(0, ll_table);
-        view.set(1, ml_table);
-        view.set(2, of_table);
-        let view = &view;
 
         writer.write_bits(ll_add_bits, ll_num_bits);
         writer.write_bits(ml_add_bits, ml_num_bits);
@@ -2895,6 +2889,18 @@ macro_rules! encode_sequences_body {
         // body is what leaves the accumulator with under a byte for the next
         // round.
         if sequences.len() > 1 {
+            // Streams 0 / 1 / 2 are LL / ML / OF; built only for a block that
+            // runs the loop. A local on purpose, not scratch kept on the
+            // compressor: addressed off the stack pointer it needs no base
+            // register, and the loop keeps two of the three states in
+            // registers. Held behind a pointer the same loop spilled one state
+            // more, +0.4..0.6% instructions at level 1 against the per-block
+            // clearing this costs.
+            let mut view = crate::fse::fse_encoder::SequenceStateTables::new();
+            view.set(0, ll_table);
+            view.set(1, ml_table);
+            view.set(2, of_table);
+            let view = &view;
             // At most 63 bits a sequence leave as whole bytes, under 8 bytes;
             // 12 a sequence and 64 over covers that and the up to 7 bytes the
             // burst drains from the init-state writes above as it starts,
@@ -3052,10 +3058,16 @@ macro_rules! encode_sequences_body {
             }
             burst.finish();
         }
-        // An RLE stream's single state takes no bits.
-        writer.write_bits(ml_state as u64, view.state_bits(1));
-        writer.write_bits(of_state as u64, view.state_bits(2));
-        writer.write_bits(ll_state as u64, view.state_bits(0));
+        // An RLE stream has no state to write.
+        if let Some(table) = ml_table {
+            writer.write_bits(ml_state as u64, table.table_size.ilog2() as usize);
+        }
+        if let Some(table) = of_table {
+            writer.write_bits(of_state as u64, table.table_size.ilog2() as usize);
+        }
+        if let Some(table) = ll_table {
+            writer.write_bits(ll_state as u64, table.table_size.ilog2() as usize);
+        }
 
         let bits_to_fill = writer.misaligned();
         if bits_to_fill == 0 {
