@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792694662279,
+  "lastUpdate": 1792937372804,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -18359,6 +18359,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.129,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "971dbc46b553d8292f3aa4e97a93a7ce518c1f95",
+          "message": "feat(encode): faster entropy stage and a lazy match-finder switch (#626)\n\n## Summary\n- Speeds up the encoder's sequence and literal entropy stage, most\nvisibly at the fast levels.\n- The encoder picks the CPU kernel tier exactly once per public call and\nruns everything below it as code compiled for that tier: no cached\nkernel fields, no per-compare or per-stage kernel choice.\n- The greedy, lazy and lazy2 strategies' match finder (rows or hash\nchain) can be chosen, as upstream's `ZSTD_c_useRowMatchFinder` chooses\nit: `CompressionParametersBuilder::row_match_finder`, the C ABI\nparameter and `--[no-]row-match-finder`, all three of which had no\neffect before.\n- Output at the default settings is byte-identical to `main` at every\nlevel, with and without a dictionary.\n\n## Changes\n- The sequence section is written by a BMI2-compiled loop on CPUs whose\ntier has BMI2, from one shared loop body.\n- The sequence bitstream's accumulator and cursor live in locals across\nthe loop (`BitBurst`) instead of in the writer between fields.\n- The pre-split window is warmed only for the sampling splitter; the\nborder splitter reads too little to need it.\n- `with_encode_tier!` maps the detected tier to a type `K: EncodeTier`\nat each public entry (one-shot and `Read`-driven frames, every streaming\ncall, the legacy dictionary trainer); frame setup, dictionary priming,\nthe block cut, every matcher backend, LDM, the literal gather and the\nHUF/FSE stages are generic over `K`.\n- Below that choice a per-tier kernel is picked with `tier_match!`,\nwhose untaken arms are dropped before code generation, so even an\nunoptimised build compiles each tier's kernels only into that tier's\nmonomorph. The search is compiled once per tier: the built-in driver's\nblock search is generic over the tier alone, and callers that drive the\nmatcher through the `Matcher` trait hand it a `dyn` sink. A lint-job\ngate rejects a plain `match` on `K::TIER` and a test closure passed\nstraight to a search.\n- Prefix compares call `K::common_prefix_len_ptr` directly; the runtime\n`dispatch_common_prefix_len_ptr(_with_kernel)` helpers and the\nper-backend `kernel` fields are removed.\n- The encoder reaches the built-in match generator through a hidden\n`Matcher::builtin_driver()`; callers that drive it through the `Matcher`\ntrait (wrappers that record what it emits) run under the tier the driver\ndetected once at construction.\n- `RowMatchFinderMode` (`Auto` / `Enable` / `Disable`) decides rows or\nchain in the row backend; `Auto` keeps the window rule (rows above\n2^14). A dictionary frame keeps its dictionary's choice, as upstream's\nCDict does.\n- The hash-chain backend's own lazy parser, which no build reached (the\nlazy band runs one parse in the row backend, chain finder included), is\nremoved with its chain table layout, chain dictionary state, borrowed\nscan and backend discriminator; that backend now holds only the optimal\nparsers' binary tree. The streaming encoder's unreachable last-block\npre-split loop and the unreferenced hash3 and repeat-offset candidate\ndispatchers are removed too.\n- Tests run backends on the host tier through `with_host_tier!` with\ntheir sinks passed through `dyn_sink`. Tier-identity tests run every\ntier the CPU supports, scalar included: whole frames and streams through\nevery compressor and streaming entry point and through a trait-driven\nmatcher, with and without a dictionary, plus the row probes, the optimal\nsearch and the dictionary trainer.\n\n## Testing\nFormatting, clippy in every CI feature configuration (including no-std,\nscalar-only and `x86_64-unknown-none`), rustdoc with warnings denied,\nthe nextest suites, doc tests, the C ABI and ffi-bench tests pass on\nx86_64 Linux and aarch64 macOS. Compressed frames were compared against\n`main` across levels -5..22 on log, decodecorpus, random and small\ninputs, and with a dictionary on attach- and copy-sized inputs:\nidentical. Frames written with the match finder forced either way decode\nwith the reference `zstd` CLI.\n\nPart of #493\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added automatic, enabled, and disabled row match finder settings for\ncompression. Configure the mode with `--row-match-finder` or\n`--no-row-match-finder` in the CLI, or through the C API.\n\n* **Performance**\n* Compression and dictionary training now use CPU-optimized paths more\nconsistently across supported hardware.\n\n* **Bug Fixes**\n* Fixed a bit-writing edge case when a full buffer is flushed before\nmore data is added.\n* Improved streaming completion when input fills the buffer and leaves a\nremaining suffix.\n\n* **Tests**\n* Expanded checks for consistent compression output across CPU tiers,\nframe decoding, and streaming drain failures.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-25T13:12:29Z",
+          "tree_id": "c2aab76bc2019cdefbc82266d3a6ebe8bbd91c56",
+          "url": "https://github.com/structured-world/structured-zstd/commit/971dbc46b553d8292f3aa4e97a93a7ce518c1f95"
+        },
+        "date": 1792937351808,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.056,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 144.857,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 228.223,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.503,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.196,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.385,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.931,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.418,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.958,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 8.226,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.707,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.091,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.212,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.373,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.194,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.521,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.286,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.187,
             "unit": "ms"
           }
         ]
