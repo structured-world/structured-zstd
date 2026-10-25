@@ -100,19 +100,27 @@ macro_rules! gather_body {
                 // SAFETY (both arms): `written <= pos`, and the capacity check in
                 // `gather_literals` gives the buffer `src_len` bytes past
                 // `start`. The chunked arm reads and writes at most
-                // `len + $chunk - 1 < len + WILDCOPY_SLACK <= room` bytes from
-                // `pos` / `written`; the exact arm, `len <= room` bytes.
+                // `max($chunk, len + $chunk - 1) <= len + WILDCOPY_SLACK <= room`
+                // bytes from `pos` / `written` (`$chunk <= WILDCOPY_SLACK`); the
+                // exact arm, `len <= room` bytes.
                 unsafe {
                     let s = src.add(pos);
                     let d = out.add(written);
                     if room >= WILDCOPY_SLACK && len <= room - WILDCOPY_SLACK {
-                        // A repcode match right after the last one has no
-                        // literals, and the wild copy would still run its loop
-                        // checks for none (skipping it measured -1.0% at level
-                        // 1 and -0.5% at level 4 on decodecorpus z000033).
+                        // Upstream's shape (`ZSTD_wildcopy`): one chunk
+                        // unconditionally, which is the whole run for most of
+                        // them, and a loop only for the rest of a longer one.
+                        // The first chunk is a constant-length copy, a single
+                        // load and store, so an empty run costs less to copy
+                        // than to test for.
                         if len < LITERAL_INLINE_COPY_MAX {
-                            if len != 0 {
-                                $wild(s, d, len.next_multiple_of($chunk));
+                            $wild(s, d, $chunk);
+                            if len > $chunk {
+                                $wild(
+                                    s.add($chunk),
+                                    d.add($chunk),
+                                    (len - $chunk).next_multiple_of($chunk),
+                                );
                             }
                         } else {
                             core::ptr::copy_nonoverlapping(s, d, len);
