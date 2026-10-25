@@ -457,7 +457,7 @@ pub fn build_table_from_data(
     build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
 }
 
-#[cfg(any(test, feature = "fuzz-exports"))]
+#[cfg(test)]
 pub(crate) fn build_table_from_symbol_counts(
     counts: &[usize],
     max_log: u8,
