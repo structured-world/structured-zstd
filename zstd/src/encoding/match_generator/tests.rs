@@ -57,6 +57,12 @@ impl MatchGeneratorDriver {
         );
         self.reset(level);
     }
+
+    /// Test-only: the tier the [`Matcher`] entry points run under, in place
+    /// of the one detected at construction.
+    pub(crate) fn set_tier(&mut self, tier: crate::encoding::fastpath::FastpathKernel) {
+        self.tier = tier;
+    }
 }
 
 /// Drive a full compress parse for `data` at `level` (optionally with a
@@ -733,34 +739,12 @@ fn btultra2_seed_pass_initializes_opt_state() {
 /// the search under each tier the CPU supports executes each monomorphized
 /// BT-collect / DP wrapper on one machine (only the detected tier would
 /// otherwise run), which pins the scalar-vs-SIMD bit-identity invariant.
-/// x86-only: aarch64 has a single NEON tier.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
 fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
     use crate::encoding::Sequence;
     use crate::encoding::fastpath::FastpathKernel;
 
-    // Tiers the running CPU can legally execute: each dispatch arm is `unsafe`
-    // and assumes the tier's target_feature is present. Scalar is always safe;
-    // the SIMD tiers gate on runtime detection so the test stays valid on any
-    // x86 box (including a CI runner without AVX2).
-    // Seeded with the always-present scalar tier; the SIMD entries below are
-    // feature-gated, so `mut` goes unused in a build with every kernel
-    // compiled out.
-    #[allow(unused_mut)]
-    let mut tiers = alloc::vec![FastpathKernel::Scalar];
-    #[cfg(feature = "kernel-sse")]
-    if std::is_x86_feature_detected!("sse2") {
-        tiers.push(FastpathKernel::Sse2);
-    }
-    #[cfg(feature = "kernel-sse")]
-    if std::is_x86_feature_detected!("sse4.2") {
-        tiers.push(FastpathKernel::Sse42);
-    }
-    #[cfg(feature = "kernel-avx2")]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
-        tiers.push(FastpathKernel::Avx2Bmi2);
-    }
+    let tiers = crate::encoding::fastpath::runnable_tiers();
 
     // Mixed-redundancy input so the BT walk, the rep-code probe, and the hash3
     // short-match probe all fire (a pure ramp would never exercise the rep path).
@@ -822,36 +806,7 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
 fn dfast_dictionary_all_kernel_tiers_emit_identical_sequences() {
     use crate::encoding::fastpath::FastpathKernel;
 
-    // Only tiers the running CPU may legally execute: each dispatch arm is
-    // `unsafe` and assumes its target feature is present.
-    #[allow(unused_mut)]
-    let mut tiers = alloc::vec![FastpathKernel::Scalar];
-    #[cfg(all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel-sse"
-    ))]
-    if std::is_x86_feature_detected!("sse2") {
-        tiers.push(FastpathKernel::Sse2);
-    }
-    #[cfg(all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel-avx2"
-    ))]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
-        tiers.push(FastpathKernel::Avx2Bmi2);
-    }
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_endian = "little",
-        feature = "kernel-neon"
-    ))]
-    tiers.push(FastpathKernel::Neon);
-    #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        feature = "kernel-simd128"
-    ))]
-    tiers.push(FastpathKernel::Simd128);
+    let tiers = crate::encoding::fastpath::runnable_tiers();
 
     let dict: Vec<u8> = (0..20 * 1024u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
@@ -1557,30 +1512,13 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
 /// CPU can run finds the same candidates at every position of a block: the
 /// scalar fallback and the SIMD kernels agree on the search itself, not only on
 /// the sequences the parser builds from it. Forcing the tier runs the arms the
-/// runtime detection leaves cold on this machine. x86 only, where the tier is a
-/// runtime choice.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// runtime detection leaves cold on this machine.
 #[test]
 fn hc_collect_optimal_candidates_agree_across_kernel_tiers() {
     use crate::encoding::fastpath::FastpathKernel;
     use crate::encoding::strategy::StrategyTag;
 
-    // Only tiers the running CPU may execute: each dispatch arm assumes its
-    // target feature is present.
-    #[allow(unused_mut)]
-    let mut tiers = alloc::vec![FastpathKernel::Scalar];
-    #[cfg(feature = "kernel-sse")]
-    if std::is_x86_feature_detected!("sse2") {
-        tiers.push(FastpathKernel::Sse2);
-    }
-    #[cfg(feature = "kernel-sse")]
-    if std::is_x86_feature_detected!("sse4.2") {
-        tiers.push(FastpathKernel::Sse42);
-    }
-    #[cfg(feature = "kernel-avx2")]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
-        tiers.push(FastpathKernel::Avx2Bmi2);
-    }
+    let tiers = crate::encoding::fastpath::runnable_tiers();
 
     // Mixed redundancy, so the repeat, hash3 and tree probes all find matches.
     let data: Vec<u8> = (0..4096usize)
@@ -2413,6 +2351,38 @@ fn driver_rows_frame_releases_the_tree_buffer_capacity() {
         "a rows frame must lay out only its rows, kept {} of {tree_capacity}",
         driver.row_matcher().tables_len()
     );
+}
+
+/// A block skipped through the plain [`Matcher::skip_matching`] is indexed as
+/// one skipped with no hint: the next block finds the same matches into it.
+#[test]
+fn a_plain_skip_indexes_the_block_as_a_skip_without_a_hint() {
+    let first = b"tenant=demo table=orders region=eu-west payload=".repeat(20);
+    let run = |plain: bool| {
+        let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+        driver.set_source_size_hint(4 * first.len() as u64);
+        driver.reset(CompressionLevel::Level(3));
+        driver.commit_input(&first);
+        if plain {
+            driver.skip_matching();
+        } else {
+            driver.skip_matching_with_hint(None);
+        }
+        driver.commit_input(&first);
+        let mut seqs = Vec::new();
+        driver.start_matching(|seq| seqs.push(seq));
+        seqs
+    };
+    let reference = run(false);
+    // From its first byte the block can only match into the skipped one.
+    assert!(
+        matches!(
+            reference.first(),
+            Some(Sequence::Triple { literal_len: 0, .. })
+        ),
+        "fixture precondition: the second block must match into the skipped one",
+    );
+    assert_eq!(run(true), reference);
 }
 
 #[test]

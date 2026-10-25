@@ -139,10 +139,6 @@ use super::match_table::storage::{HC_PRIME3BYTES, HC_PRIME4BYTES};
 // macros / configs / tests keep their unqualified names.
 #[cfg(test)]
 use super::match_table::storage::HC_EMPTY;
-// HC3_MAX_OFFSET moved to encoding::bt alongside the hash3 candidate
-// probe macro that consumes it; the macro references it via the
-// fully-qualified `$crate::encoding::bt::HC3_MAX_OFFSET` path so this
-// module no longer needs a local import.
 pub(crate) const HC_SEARCH_DEPTH: usize = 16;
 // HC_MIN_MATCH_LEN moved to encoding::hc; re-imported here so
 // existing references compile unchanged.

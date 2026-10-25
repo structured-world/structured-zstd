@@ -160,6 +160,28 @@ fn add_multiple_aligned() {
     assert_eq!(vec![0xFF, 0xF0, 0x0F, 0x00], bw.dump());
 }
 
+/// A burst flushing a full accumulator writes all eight bytes and holds
+/// nothing after, so the next bits land on a clean byte rather than on bits
+/// of the flushed value.
+#[test]
+fn a_burst_flushes_a_full_accumulator_clean() {
+    let mut bw = BitWriter::new();
+    let mut burst = bw.burst(16);
+    // SAFETY: 64 bits into an empty accumulator, then 8 into an empty one,
+    // within the 16 bytes reserved.
+    unsafe {
+        burst.add(0x0123_4567_89AB_CDEF, 64);
+        burst.flush();
+        burst.add(0xA5, 8);
+        burst.flush();
+    }
+    burst.finish();
+    assert_eq!(
+        bw.dump(),
+        vec![0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01, 0xA5]
+    );
+}
+
 // #[test]
 // fn catches_more_than_in_buf() {
 //     todo!();

@@ -18,6 +18,7 @@ use super::super::cost_model::HcOptimalCostProfile;
 /// One candidate match produced by a match-finder probe. Carries the
 /// absolute starting position and the upstream zstd-style offset/length pair.
 #[derive(Copy, Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub(crate) struct MatchCandidate {
     pub(crate) start: usize,
     pub(crate) offset: usize,

@@ -272,6 +272,24 @@ pub(crate) fn train_legacy_raw(
     dict_size: usize,
     selectivity: u32,
 ) -> Result<Vec<u8>, TooSmall> {
+    train_legacy_raw_under(
+        select_kernel(),
+        samples,
+        sample_sizes,
+        dict_size,
+        selectivity,
+    )
+}
+
+/// [`train_legacy_raw`] comparing through the tier `tier`, the run's one
+/// choice of compare kernel.
+fn train_legacy_raw_under(
+    tier: crate::encoding::fastpath::FastpathKernel,
+    samples: &[u8],
+    sample_sizes: &[usize],
+    dict_size: usize,
+    selectivity: u32,
+) -> Result<Vec<u8>, TooSmall> {
     let total: usize = sample_sizes.iter().sum();
     debug_assert_eq!(total, samples.len(), "the sizes describe the corpus");
     // The corpus first, as upstream checks it before anything else
@@ -310,10 +328,9 @@ pub(crate) fn train_legacy_raw(
         kept -= 1;
         used -= sample_sizes[kept];
     }
-    // The run's one choice of compare kernel: the analysis below is compiled
-    // for it.
+    // The analysis below is compiled for the run's tier.
     crate::encoding::fastpath::with_encode_tier!(
-        select_kernel(),
+        tier,
         K => select_content::<K>(&mut list, &samples[..used], min_rep, dict_size)
     )
 }

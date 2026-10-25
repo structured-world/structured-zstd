@@ -1352,8 +1352,10 @@ fn every_tier_writes_the_block_the_scalar_tier_writes() {
     // 56 extra bits takes the one before the extras (31 or more) alone, and
     // 16 + 16 + 30 = 62 takes the one before the offset (more than 56) too.
     for (k, seq) in sequences.iter_mut().step_by(97).enumerate() {
-        seq.ll = 40_000 + k as u32;
-        seq.ml = 60_000 + k as u32;
+        // The first values with 16 extra bits: literal length 65536 and match
+        // length 65539 (`ml` counts the 3 the match-length code leaves out).
+        seq.ll = 65_536 + k as u32;
+        seq.ml = 65_539 + k as u32;
         seq.off_base = if k % 2 == 0 {
             (1u32 << 24) + k as u32
         } else {

@@ -1302,11 +1302,9 @@ impl<M: Matcher> CompressionContext<M> {
 
     /// Where the full pending block is cut (upstream `ZSTD_compress_frameChunk`
     /// sizing every block with `ZSTD_optimalBlockSize`): the pre-splitter's
-    /// boundary once the frame has saved enough, else the whole block.
-    /// `remaining` is the input still to come as far as the splitter knows:
-    /// a full block again while writes continue, the buffered bytes at the
-    /// end of the frame.
-    fn pre_split_len<K: EncodeTier>(&mut self, block_capacity: usize, remaining: usize) -> usize {
+    /// boundary once the frame has saved enough, else the whole block. Writes
+    /// may continue, so the splitter is told a full block is still to come.
+    fn pre_split_len<K: EncodeTier>(&mut self, block_capacity: usize) -> usize {
         if matches!(self.compression_level, CompressionLevel::Uncompressed) {
             return self.pending_len();
         }
@@ -1315,7 +1313,7 @@ impl<M: Matcher> CompressionContext<M> {
         let cut = crate::encoding::frame_compressor::optimal_block_size_with(
             self.state.pre_split.map(usize::from),
             pending,
-            remaining,
+            block_capacity,
             block_capacity,
             self.savings,
         )
@@ -1343,7 +1341,7 @@ impl<M: Matcher> CompressionContext<M> {
         if self.pending_len() != block_capacity {
             return Ok(());
         }
-        let block_len = self.pre_split_len::<K>(block_capacity, block_capacity);
+        let block_len = self.pre_split_len::<K>(block_capacity);
         self.encode_block::<D, K>(drain, block_len, false)
             .map_err(|err| self.fail(err))
     }
@@ -1353,21 +1351,11 @@ impl<M: Matcher> CompressionContext<M> {
         drain: &mut D,
         last_block: bool,
     ) -> Result<(), Error> {
-        let block_capacity = self.block_capacity();
-        if last_block {
-            // A full final buffer is cut like any other block (the reader
-            // path splits it with `remaining = len`); each cut prefix goes
-            // out as a non-last block and the suffix is re-examined.
-            while self.pending_len() == block_capacity {
-                let block_len = self.pre_split_len::<K>(block_capacity, block_capacity);
-                if block_len == block_capacity {
-                    break;
-                }
-                self.encode_block::<D, K>(drain, block_len, false)
-                    .map_err(|err| self.fail(err))?;
-            }
-        }
+        // `write` emits a block the moment it fills, so what is left here is
+        // always short of one and goes out whole; a write that failed on the
+        // full block left the context failed, and `ensure_open` stops here.
         let block_len = self.pending_len();
+        debug_assert!(block_len < self.block_capacity());
         self.encode_block::<D, K>(drain, block_len, last_block)
             .map_err(|err| self.fail(err))
     }

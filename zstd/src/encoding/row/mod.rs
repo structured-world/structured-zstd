@@ -4192,18 +4192,24 @@ impl RowMatchGenerator {
         self.skip_matching_with_hint(incompressible_hint);
     }
 
+    /// The best match at `abs_pos`, which every tier the CPU runs must find
+    /// alike.
     #[cfg(test)]
     pub(crate) fn best_match(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
-        crate::encoding::fastpath::with_encode_tier!(
-            crate::encoding::fastpath::select_kernel(),
-            T => dispatch_tag_kernel!(T, self.best_match_k(abs_pos, lit_len))
-        )
+        crate::encoding::fastpath::same_under_every_tier(|tier| {
+            crate::encoding::fastpath::with_encode_tier!(
+                tier,
+                T => dispatch_tag_kernel!(T, self.best_match_k(abs_pos, lit_len))
+            )
+        })
     }
     #[cfg(test)]
     fn best_match_k<K: RowTags>(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
         dispatch_row_log!(self.best_match_rl::<K>(abs_pos, lit_len))
     }
 
+    /// The lazy pick at `abs_pos`, which every tier the CPU runs must make
+    /// alike.
     #[cfg(test)]
     pub(crate) fn pick_lazy_match(
         &self,
@@ -4211,10 +4217,12 @@ impl RowMatchGenerator {
         lit_len: usize,
         best: Option<MatchCandidate>,
     ) -> Option<MatchCandidate> {
-        crate::encoding::fastpath::with_encode_tier!(
-            crate::encoding::fastpath::select_kernel(),
-            T => dispatch_tag_kernel!(T, self.pick_lazy_match_k(abs_pos, lit_len, best))
-        )
+        crate::encoding::fastpath::same_under_every_tier(|tier| {
+            crate::encoding::fastpath::with_encode_tier!(
+                tier,
+                T => dispatch_tag_kernel!(T, self.pick_lazy_match_k(abs_pos, lit_len, best))
+            )
+        })
     }
     #[cfg(test)]
     fn pick_lazy_match_k<K: RowTags>(
@@ -4232,10 +4240,12 @@ impl RowMatchGenerator {
     // its `#[target_feature]` umbrella (no dispatcher branch inside the loop).
     #[cfg(test)]
     pub(crate) fn row_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
-        crate::encoding::fastpath::with_encode_tier!(
-            crate::encoding::fastpath::select_kernel(),
-            T => dispatch_tag_kernel!(T, self.row_candidate_k(abs_pos, lit_len))
-        )
+        crate::encoding::fastpath::same_under_every_tier(|tier| {
+            crate::encoding::fastpath::with_encode_tier!(
+                tier,
+                T => dispatch_tag_kernel!(T, self.row_candidate_k(abs_pos, lit_len))
+            )
+        })
     }
     #[cfg(test)]
     fn row_candidate_k<K: RowTags>(

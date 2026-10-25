@@ -500,6 +500,67 @@ macro_rules! with_host_tier {
 #[cfg(test)]
 pub(crate) use with_host_tier;
 
+/// Every tier this CPU may execute, scalar first: each SIMD arm assumes its
+/// target feature is present, so a test forcing a tier takes it from here. A
+/// test comparing tiers checks the scalar fallback against every SIMD kernel
+/// the machine has, including the ones the detection leaves cold.
+#[cfg(test)]
+pub(crate) fn runnable_tiers() -> alloc::vec::Vec<FastpathKernel> {
+    #[allow(unused_mut)]
+    let mut tiers = alloc::vec![FastpathKernel::Scalar];
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
+    {
+        if std::is_x86_feature_detected!("sse2") {
+            tiers.push(FastpathKernel::Sse2);
+        }
+        if std::is_x86_feature_detected!("sse4.2") {
+            tiers.push(FastpathKernel::Sse42);
+        }
+    }
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
+        tiers.push(FastpathKernel::Avx2Bmi2);
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    ))]
+    tiers.push(FastpathKernel::Neon);
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    tiers.push(FastpathKernel::Simd128);
+    tiers
+}
+
+/// `run` under every [`runnable_tiers`] tier, asserting they all agree, and
+/// the answer they agree on.
+#[cfg(test)]
+pub(crate) fn same_under_every_tier<R: PartialEq + core::fmt::Debug>(
+    run: impl Fn(FastpathKernel) -> R,
+) -> R {
+    let tiers = runnable_tiers();
+    let answer = run(tiers[0]);
+    for &tier in &tiers[1..] {
+        assert_eq!(
+            run(tier),
+            answer,
+            "tier {tier:?} disagrees with {:?}",
+            tiers[0]
+        );
+    }
+    answer
+}
+
 /// A test's sequence closure as the one sink type tests hand a backend, so
 /// each search is compiled once per tier for all of them rather than once per
 /// closure and tier.

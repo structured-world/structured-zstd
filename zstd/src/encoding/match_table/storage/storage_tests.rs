@@ -333,6 +333,73 @@ fn rebase_positions_cold_rebuilds_hash3_for_btultra2() {
     );
 }
 
+/// A binary-tree table over 64 bytes of period-17 input, every position
+/// representable from the origin.
+fn bt_table() -> MatchTable {
+    let mut t = new_table(64);
+    t.history = (0..64u8)
+        .map(|i| i % 17)
+        .collect::<alloc::vec::Vec<_>>()
+        .into();
+    t.history_start = 0;
+    t.history_abs_start = 0;
+    t.window_size = 64;
+    t.position_base = 0;
+    t.search_depth = 4;
+    t.uses_bt = true;
+    t.ensure_tables();
+    t
+}
+
+/// The tree the rebase replays is the tree the walk had built: the replay
+/// runs on the scalar compare whatever tier built the original, so the two
+/// agree only if every tier reports the same lengths, and a rebase that lost
+/// or added a node would change what the optimal parser sees afterwards.
+#[test]
+fn rebase_positions_cold_rebuilds_the_binary_tree_the_walk_built() {
+    let mut t = bt_table();
+    crate::encoding::fastpath::with_host_tier!(K => t.bt_update_tree_until::<K>(32, 64));
+    let walked = (t.hash_table().to_vec(), t.chain_table().to_vec());
+    assert!(
+        walked.0.iter().any(|&v| v != HC_EMPTY),
+        "fixture precondition: the walk must populate the tree",
+    );
+
+    t.rebase_positions_cold(32);
+
+    assert_eq!(t.position_base, t.history_abs_start);
+    assert_eq!(
+        (t.hash_table().to_vec(), t.chain_table().to_vec()),
+        walked,
+        "the replayed tree differs from the walked one",
+    );
+}
+
+/// A tree walk whose target is past the index range goes one position at a
+/// time, rebasing before the first insert, and ends with the tree a walk from
+/// a representable start builds.
+#[test]
+fn a_tree_walk_past_the_index_range_rebases_then_matches_a_plain_walk() {
+    let mut plain = bt_table();
+    crate::encoding::fastpath::with_host_tier!(K => plain.bt_update_tree_until::<K>(40, 64));
+
+    let mut t = bt_table();
+    t.index_shift = u32::MAX as usize - 10;
+    assert!(
+        !t.can_skip_rebase_check(40),
+        "fixture precondition: the target must not be representable",
+    );
+    crate::encoding::fastpath::with_host_tier!(K => t.bt_update_tree_until::<K>(40, 64));
+
+    assert_eq!(t.index_shift, 0, "the positions were re-encoded");
+    assert_eq!(t.skip_insert_until_abs, 40);
+    assert_eq!(
+        (t.hash_table(), t.chain_table()),
+        (plain.hash_table(), plain.chain_table()),
+        "the position-at-a-time walk built a different tree",
+    );
+}
+
 #[test]
 fn insert_positions_with_step_zero_step_is_noop() {
     let mut t = new_table(32);

@@ -345,65 +345,6 @@ macro_rules! bt_insert_range_body {
 }
 pub(crate) use bt_insert_range_body;
 
-/// `hash3_candidate` body parameterized over the per-CPU
-/// `common_prefix_len_ptr` symbol. The hash3 probe checks one candidate per
-/// position when invoked, so the per-call ABI savings compound across the
-/// segment. Crate-private (see `bt_insert_range_body!`).
-macro_rules! hash3_candidate_body {
-    (
-        $table:expr,
-        $abs_pos:ident,
-        $current_abs_end:ident,
-        $min_match_len:ident,
-        $cpl:path $(,)?
-    ) => {{
-        if $table.hash3_log == 0 {
-            return None;
-        }
-        let idx = $abs_pos.checked_sub($table.history_abs_start)?;
-        let concat = $table.live_history();
-        if idx + 4 > concat.len() {
-            return None;
-        }
-        let hash3 = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
-            concat,
-            idx,
-            $table.hash3_log,
-            3,
-        );
-        let entry = $table
-            .hash3_table()
-            .get(hash3)
-            .copied()
-            .unwrap_or($crate::encoding::match_table::storage::HC_EMPTY);
-        let candidate_abs =
-            $crate::encoding::match_table::storage::MatchTable::stored_abs_position_fast(
-                entry,
-                $table.position_base,
-                $table.index_shift,
-            )?;
-        if candidate_abs < $table.history_abs_start || candidate_abs >= $abs_pos {
-            return None;
-        }
-        let offset = $abs_pos - candidate_abs;
-        if offset >= $crate::encoding::bt::HC3_MAX_OFFSET {
-            return None;
-        }
-        let candidate_idx = candidate_abs - $table.history_abs_start;
-        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
-        let base = concat.as_ptr();
-        // SAFETY: candidate/idx are within history range; tail_limit
-        // bounds the scan within `concat`.
-        let match_len = unsafe { $cpl(base.add(candidate_idx), base.add(idx), tail_limit) };
-        (match_len >= $min_match_len).then_some($crate::encoding::opt::types::MatchCandidate {
-            start: $abs_pos,
-            offset,
-            match_len,
-        })
-    }};
-}
-pub(crate) use hash3_candidate_body;
-
 /// `for_each_repcode_candidate_with_reps` body parameterized over the per-CPU
 /// `common_prefix_len_ptr` symbol so the per-rep prefix probe inlines under
 /// the wrapper's `target_feature` umbrella instead of crossing the ABI

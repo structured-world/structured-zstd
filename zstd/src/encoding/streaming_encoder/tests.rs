@@ -1960,13 +1960,15 @@ fn a_streamed_raw_frame_carries_a_valid_checksum() {
     assert_eq!(decoded, payload);
 }
 
-/// A full final buffer is cut like any other block: where the content changes
-/// inside it, the pre-split sends the prefix out as a block of its own before
-/// the last one, and the frame still decodes to its input.
+/// The buffer the last write fills is cut where its content changes, once the
+/// frame has saved enough for the pre-splitter to run: the prefix goes out
+/// when the buffer fills and the suffix waits to close the frame. Uncut, the
+/// whole buffer would go out with the write and the frame would close on an
+/// empty last block.
 #[test]
-fn a_full_last_buffer_is_pre_split_where_its_content_changes() {
-    let mut payload = b"log line with a steady shape, ".repeat(64 * 1024 / 30);
-    payload.truncate(64 * 1024);
+fn a_buffer_filled_by_the_last_write_is_pre_split_where_its_content_changes() {
+    let mut payload = b"log line with a steady shape, ".repeat(320 * 1024 / 30 + 1);
+    payload.truncate(320 * 1024);
     let mut state = 0x2545_F491_u32;
     payload.extend((0..64 * 1024).map(|_| {
         state ^= state << 13;
@@ -1977,8 +1979,121 @@ fn a_full_last_buffer_is_pre_split_where_its_content_changes() {
     let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(19));
     encoder.write_all(&payload).unwrap();
     let compressed = encoder.finish().unwrap();
+    // RFC 8878 3.1.1.2: a 3-byte header (Last_Block, Block_Type, Block_Size)
+    // then the content: Block_Size bytes, or one byte for an RLE block.
+    let (_, header_len) = crate::decoding::frame::read_frame_header(&compressed[..]).unwrap();
+    let mut at = usize::from(header_len);
+    let last = loop {
+        let header =
+            u32::from_le_bytes([compressed[at], compressed[at + 1], compressed[at + 2], 0]);
+        let (block_type, size) = ((header >> 1) & 3, (header >> 3) as usize);
+        at += 3 + if block_type == 1 { 1 } else { size };
+        if header & 1 == 1 {
+            break (block_type, size);
+        }
+    };
+    assert_ne!(
+        last,
+        (0, 0),
+        "the full buffer went out uncut: the frame closed on an empty block"
+    );
     let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
+}
+
+/// Write `input` in pieces that end off block boundaries, flushing once
+/// partway, and finish the frame.
+fn stream_in_pieces<M: Matcher>(
+    mut encoder: StreamingEncoder<Vec<u8>, M>,
+    input: &[u8],
+) -> Vec<u8> {
+    for (i, piece) in input.chunks(100_000).enumerate() {
+        encoder.write_all(piece).unwrap();
+        if i == 0 {
+            encoder.flush().unwrap();
+        }
+    }
+    encoder.finish().unwrap()
+}
+
+/// What streaming `input` under `tier` writes: frames from the built-in
+/// matcher and from one reached only by the trait, and a frame start with one
+/// block compressed on its own.
+fn streams_under_tier(
+    tier: crate::encoding::fastpath::FastpathKernel,
+    level: CompressionLevel,
+    input: &[u8],
+    dict: bool,
+) -> Vec<Vec<u8>> {
+    use crate::encoding::test_support::{TraitDriver, tier_dictionary};
+    let dictionary = || EncoderDictionary::from_dictionary(tier_dictionary());
+    let mut streams = Vec::new();
+
+    let mut encoder = StreamingEncoder::new(Vec::new(), level);
+    encoder.context.state.copy_kernel = tier;
+    if dict {
+        encoder.set_encoder_dictionary(dictionary()).unwrap();
+    }
+    streams.push(stream_in_pieces(encoder, input));
+
+    let mut encoder = StreamingEncoder::new_with_matcher(TraitDriver::new(tier), Vec::new(), level);
+    encoder.context.state.copy_kernel = tier;
+    if dict {
+        encoder.set_encoder_dictionary(dictionary()).unwrap();
+    }
+    streams.push(stream_in_pieces(encoder, input));
+
+    let mut context = CompressionContext::new(level);
+    context.state.copy_kernel = tier;
+    if dict {
+        context.set_encoder_dictionary(dictionary()).unwrap();
+    }
+    let mut block = Vec::new();
+    context.start_frame(&mut block).unwrap();
+    assert!(
+        context
+            .compress_block(&input[..64 * 1024], &mut block)
+            .unwrap()
+    );
+    streams.push(block);
+    streams
+}
+
+/// Every tier the CPU can run streams the same frames, with and without a
+/// dictionary, at a level of each backend, and every finished frame decodes
+/// to its input: the streaming counterpart of the frame compressor's check,
+/// over the write, flush, finish and single-block entry points.
+#[test]
+fn every_tier_streams_the_same_frames() {
+    use crate::encoding::test_support::{TIER_LEVELS, tier_dictionary, tier_fixture};
+    let input = tier_fixture();
+    let tiers = crate::encoding::fastpath::runnable_tiers();
+    for level in TIER_LEVELS {
+        let level = CompressionLevel::Level(level);
+        for dict in [false, true] {
+            let reference = streams_under_tier(tiers[0], level, &input, dict);
+            // The last entry is one block's content, not a frame.
+            for frame in &reference[..reference.len() - 1] {
+                let mut decoder = crate::decoding::FrameDecoder::new();
+                if dict {
+                    decoder.add_dict(tier_dictionary()).unwrap();
+                }
+                let mut decoded = Vec::with_capacity(input.len());
+                decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+                assert!(
+                    decoded == input,
+                    "{level:?} dict {dict}: a frame does not decode to its input"
+                );
+            }
+            for &tier in &tiers[1..] {
+                assert!(
+                    streams_under_tier(tier, level, &input, dict) == reference,
+                    "{level:?} dict {dict}: tier {tier:?} streamed other bytes than {:?}",
+                    tiers[0],
+                );
+            }
+        }
+    }
 }

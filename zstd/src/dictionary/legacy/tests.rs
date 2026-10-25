@@ -85,6 +85,18 @@ fn the_content_is_made_of_repeated_corpus_runs() {
     assert!(!text.contains(&format!("ts={:08}", 3 * 7919)));
 }
 
+/// Every tier the CPU can run trains the same content: the run compares
+/// through one tier, and the scalar fallback must find what the SIMD compares
+/// find.
+#[test]
+fn every_tier_trains_the_same_content() {
+    let (samples, sizes) = log_samples(400);
+    let content = crate::encoding::fastpath::same_under_every_tier(|tier| {
+        train_legacy_raw_under(tier, &samples, &sizes, 4096, 0)
+    });
+    assert!(content.is_ok_and(|content| !content.is_empty()));
+}
+
 /// A size below the reference's minimum, a corpus under 512 bytes, and a corpus
 /// with nothing repeated are refused, as `ZDICT_trainFromBuffer_legacy` refuses
 /// them.
