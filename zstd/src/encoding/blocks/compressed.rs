@@ -2870,6 +2870,12 @@ macro_rules! encode_sequences_body {
         let mut ll_state = ll_table.map_or(0, |table| table.start_state(ll_code).index);
         let mut ml_state = ml_table.map_or(0, |table| table.start_state(ml_code).index);
         let mut of_state = of_table.map_or(0, |table| table.start_state(of_code).index);
+        // Streams 0 / 1 / 2 are LL / ML / OF.
+        let mut view = crate::fse::fse_encoder::SequenceStateTables::new();
+        view.set(0, ll_table);
+        view.set(1, ml_table);
+        view.set(2, of_table);
+        let view = &view;
 
         writer.write_bits(ll_add_bits, ll_num_bits);
         writer.write_bits(ml_add_bits, ml_num_bits);
@@ -2932,8 +2938,8 @@ macro_rules! encode_sequences_body {
                 // derivation assumed.
                 #[cfg(debug_assertions)]
                 let mut state_diff_bits = 0usize;
-                if let Some(table) = of_table {
-                    let next = table.next_state(of_code, of_state);
+                {
+                    let next = view.next_state::<2>(of_code, of_state);
                     let diff = crate::fse::fse_encoder::transition_bits(of_state, next.num_bits);
                     unsafe {
                         burst.add(diff as u64, next.num_bits as usize);
@@ -2944,8 +2950,8 @@ macro_rules! encode_sequences_body {
                     }
                     of_state = next.index;
                 }
-                if let Some(table) = ml_table {
-                    let next = table.next_state(ml_code, ml_state);
+                {
+                    let next = view.next_state::<1>(ml_code, ml_state);
                     let diff = crate::fse::fse_encoder::transition_bits(ml_state, next.num_bits);
                     unsafe {
                         burst.add(diff as u64, next.num_bits as usize);
@@ -2956,8 +2962,8 @@ macro_rules! encode_sequences_body {
                     }
                     ml_state = next.index;
                 }
-                if let Some(table) = ll_table {
-                    let next = table.next_state(ll_code, ll_state);
+                {
+                    let next = view.next_state::<0>(ll_code, ll_state);
                     let diff = crate::fse::fse_encoder::transition_bits(ll_state, next.num_bits);
                     unsafe {
                         burst.add(diff as u64, next.num_bits as usize);
@@ -3046,15 +3052,10 @@ macro_rules! encode_sequences_body {
             }
             burst.finish();
         }
-        if let Some(table) = ml_table {
-            writer.write_bits(ml_state as u64, table.table_size.ilog2() as usize);
-        }
-        if let Some(table) = of_table {
-            writer.write_bits(of_state as u64, table.table_size.ilog2() as usize);
-        }
-        if let Some(table) = ll_table {
-            writer.write_bits(ll_state as u64, table.table_size.ilog2() as usize);
-        }
+        // An RLE stream's single state takes no bits.
+        writer.write_bits(ml_state as u64, view.state_bits(1));
+        writer.write_bits(of_state as u64, view.state_bits(2));
+        writer.write_bits(ll_state as u64, view.state_bits(0));
 
         let bits_to_fill = writer.misaligned();
         if bits_to_fill == 0 {

@@ -315,6 +315,80 @@ impl FSETable {
     }
 }
 
+/// Symbols a sequence-code stream can carry: the widest alphabet, match
+/// lengths, has 53 codes (RFC 8878 3.1.1.3.2.1.1), under 64.
+const SEQUENCE_CODE_SYMBOLS: usize = 64;
+
+/// The parts of the three sequence streams' tables the sequence loop reads —
+/// transforms, next states, sizes — side by side at fixed offsets, so the
+/// loop reaches all three from one base and the registers three table
+/// pointers held stay free for the stream states, which are on the loop's
+/// dependency chain. A stream in RLE mode is a one-state table whose
+/// transitions write nothing, as upstream's `FSE_buildCTable_rle`.
+pub(crate) struct SequenceStateTables {
+    symbol_tt: [[SymbolTT; SEQUENCE_CODE_SYMBOLS]; 3],
+    next: [[u16; MAX_FSE_TABLE_SIZE]; 3],
+    table_size: [usize; 3],
+}
+
+impl SequenceStateTables {
+    pub(crate) fn new() -> Self {
+        Self {
+            symbol_tt: [[SymbolTT::default(); SEQUENCE_CODE_SYMBOLS]; 3],
+            next: [[0; MAX_FSE_TABLE_SIZE]; 3],
+            table_size: [0; 3],
+        }
+    }
+
+    /// Take stream `stream`'s parts from `table`, or an RLE stream's
+    /// one-state table for `None`.
+    pub(crate) fn set(&mut self, stream: usize, table: Option<&FSETable>) {
+        match table {
+            Some(table) => {
+                self.symbol_tt[stream].copy_from_slice(&table.symbol_tt[..SEQUENCE_CODE_SYMBOLS]);
+                let size = table.table_size;
+                self.next[stream][..size].copy_from_slice(&table.state_table_flat[..size]);
+                self.table_size[stream] = size;
+            }
+            None => {
+                // One state: `nb_bits = (1 + 0) >> 16 = 0`, slot `1 - 1 = 0`.
+                self.symbol_tt[stream] = [SymbolTT {
+                    delta_nb_bits: 0,
+                    delta_find_state: -1,
+                }; SEQUENCE_CODE_SYMBOLS];
+                self.next[stream][0] = 0;
+                self.table_size[stream] = 1;
+            }
+        }
+    }
+
+    /// Stream `S`'s transition on `symbol` out of state `idx`, as
+    /// [`FSETable::next_state`].
+    #[inline(always)]
+    pub(crate) fn next_state<const S: usize>(&self, symbol: u8, idx: usize) -> State {
+        let tt = self.symbol_tt[S][symbol as usize % SEQUENCE_CODE_SYMBOLS];
+        let size = self.table_size[S];
+        let value = (size + idx) as u32;
+        let nb_bits = ((value + tt.delta_nb_bits) >> 16) as usize;
+        let slot = ((value >> nb_bits) as i32 + tt.delta_find_state) as usize;
+        debug_assert!(
+            slot < size,
+            "next-state slot {slot} outside a {size}-entry table"
+        );
+        State {
+            num_bits: nb_bits as u8,
+            // SAFETY: `slot < table_size <= MAX_FSE_TABLE_SIZE` (asserted
+            // above, held by the build that filled this stream).
+            index: unsafe { *self.next[S].get_unchecked(slot) } as usize,
+        }
+    }
+
+    /// Width a stream's final state is written in: its table's log, 0 for RLE.
+    pub(crate) fn state_bits(&self, stream: usize) -> usize {
+        self.table_size[stream].ilog2() as usize
+    }
+}
+
 /// Write the NCount description of the normalized distribution of `len`
 /// symbols, `prob(i)` the probability of symbol `i`, at `acc_log` (RFC 8878
 /// 4.1.1), padded to a byte. The probabilities are read where they live, so a
