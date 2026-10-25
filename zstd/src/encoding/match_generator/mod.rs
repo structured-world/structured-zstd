@@ -207,11 +207,8 @@ enum MatcherStorage {
     /// `SearchMethod::BinaryTreeLazy`. The Row backend itself searches a hash
     /// chain instead of rows when the resolved window is small.
     Row(RowMatchGenerator),
-    /// The hash-chain matcher, for `SearchMethod::HashChain` and
-    /// `SearchMethod::BinaryTree`; the latter carries the BT-based optimal
-    /// modes (`btopt` / `btultra` / `btultra2`). The [`HcMatchGenerator`]'s
-    /// internal [`HcBackend`] discriminator decides whether BT scratch is
-    /// allocated.
+    /// The binary-tree matcher of the optimal parsers (`btopt` / `btultra` /
+    /// `btultra2`), for `SearchMethod::BinaryTree`.
     HashChain(HcMatchGenerator),
 }
 
@@ -312,12 +309,12 @@ impl MatcherStorage {
 
     /// See the backends' `skip_long_match`.
     #[cfg(feature = "ldm")]
-    fn skip_long_match<K: EncodeTier>(&mut self) {
+    fn skip_long_match(&mut self) {
         match self {
             Self::Simple(m) => m.skip_long_match(),
             Self::Dfast(m) => m.skip_long_match(),
             Self::Row(m) => m.skip_long_match(),
-            Self::HashChain(m) => m.table.skip_long_match::<K>(),
+            Self::HashChain(m) => m.table.skip_long_match(),
         }
     }
 
@@ -565,15 +562,11 @@ struct PrimedKey {
 /// Whether a configured HashChain matcher attaches the dictionary for a frame
 /// of `size_log` (see [`MatchGeneratorDriver::hc_dict_attach_mode`]).
 fn hc_attaches_dictionary(hc: &HcMatchGenerator, size_log: Option<u8>) -> bool {
-    let cutoff = if hc.table.uses_bt {
-        match hc.strategy_tag {
-            super::strategy::StrategyTag::BtUltra | super::strategy::StrategyTag::BtUltra2 => {
-                BT_ULTRA_ATTACH_DICT_CUTOFF_LOG
-            }
-            _ => BT_OPT_ATTACH_DICT_CUTOFF_LOG,
+    let cutoff = match hc.strategy_tag {
+        super::strategy::StrategyTag::BtUltra | super::strategy::StrategyTag::BtUltra2 => {
+            BT_ULTRA_ATTACH_DICT_CUTOFF_LOG
         }
-    } else {
-        HC_ATTACH_DICT_CUTOFF_LOG
+        _ => BT_OPT_ATTACH_DICT_CUTOFF_LOG,
     };
     size_log.is_none_or(|log| log <= cutoff)
 }
@@ -925,13 +918,9 @@ impl MatchGeneratorDriver {
     }
 
     /// Whether the borrowed (no-copy, in-place over-window) scan is
-    /// implemented for the current backend + search configuration. The
-    /// HashChain backend serves both the lazy CHAIN parser
-    /// (`SearchMethod::HashChain`) and the BT/optimal parsers
-    /// (`SearchMethod::BinaryTree`); only the lazy chain has a borrowed scan
-    /// so far, so BT/optimal stay on the owned path.
+    /// implemented for the current backend.
     pub(crate) fn borrowed_supported(&self) -> bool {
-        use super::strategy::{BackendTag, SearchMethod};
+        use super::strategy::BackendTag;
         // A producer reads the committed block, which the in-place scan never
         // commits.
         if self.producer.is_some() {
@@ -939,18 +928,11 @@ impl MatchGeneratorDriver {
         }
         match self.active_backend() {
             BackendTag::Simple | BackendTag::Dfast | BackendTag::Row => true,
-            // The HashChain backend covers two searches: the lazy CHAIN parser
-            // (borrowed-capable) and the BINARY-TREE search (btlazy2 L13-15 +
-            // optimal BtOpt/BtUltra/BtUltra2 L16-22). btlazy2's BT-tree borrowed
-            // scan is byte-identical to owned (reads via live_history()), so it
-            // takes the in-place path. The OPTIMAL parsers stay owned: their
-            // cost-based DP is sensitive to candidate quality, and the borrowed
-            // continuous-index scan yields slightly different (ratio-worse)
-            // candidates than the owned evict+rehash scan — borrowed optimal
-            // both diverged from owned and fell outside the ffi ratio bound.
-            // Search-aware (not just strategy_tag) so optimal BT can never be
-            // staged on the borrowed path even via an internal caller.
-            BackendTag::HashChain => matches!(self.search, SearchMethod::HashChain),
+            // The optimal parsers stay owned: their cost-based DP is sensitive
+            // to candidate quality, and a borrowed continuous-index scan yields
+            // different (ratio-worse) candidates than the owned evict+rehash
+            // scan.
+            BackendTag::HashChain => false,
         }
     }
 
@@ -1027,9 +1009,9 @@ impl MatchGeneratorDriver {
             super::strategy::BackendTag::Row => unsafe {
                 self.row_matcher_mut().set_borrowed_window(buffer)
             },
-            super::strategy::BackendTag::HashChain => unsafe {
-                self.hc_matcher_mut().set_borrowed_window(buffer)
-            },
+            super::strategy::BackendTag::HashChain => {
+                unreachable!("the optimal parsers have no borrowed scan")
+            }
         }
     }
 
@@ -1040,9 +1022,7 @@ impl MatchGeneratorDriver {
             super::strategy::BackendTag::Simple => self.simple_mut().clear_borrowed_window(),
             super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().clear_borrowed_window(),
             super::strategy::BackendTag::Row => self.row_matcher_mut().clear_borrowed_window(),
-            super::strategy::BackendTag::HashChain => self.hc_matcher_mut().clear_borrowed_window(),
-            #[allow(unreachable_patterns)]
-            _ => {}
+            super::strategy::BackendTag::HashChain => {}
         }
         self.borrowed_pending = None;
     }
@@ -1079,10 +1059,9 @@ impl MatchGeneratorDriver {
             super::strategy::BackendTag::Row => self
                 .row_matcher_mut()
                 .stage_borrowed_block(block_start, block_end),
-            super::strategy::BackendTag::HashChain => self
-                .hc_matcher_mut()
-                .table
-                .stage_borrowed_block(block_start, block_end),
+            super::strategy::BackendTag::HashChain => {
+                unreachable!("`borrowed_supported` refuses the optimal parsers")
+            }
         }
     }
 
@@ -1335,16 +1314,13 @@ impl MatchGeneratorDriver {
                 self.row_matcher_mut().prime_dictionary_current_block();
             }
             super::strategy::BackendTag::HashChain => {
-                // Lazy-HC AND BT/optimal both follow upstream zstd `ZSTD_shouldAttachDict`
-                // per-strategy: ATTACH (a separate dms — hash-chain dms for lazy,
-                // DUBT dms for BT) for small / unknown inputs, COPY (merge the dict
-                // into the live chain/tree) for large known inputs. ATTACH keeps
-                // the dict in history but out of the live structure via
-                // `skip_matching_dict_bt` (the cursor advance is shared by both
-                // arms); COPY routes through the normal `skip_matching` (its
-                // `uses_bt` branch fills the live tree, the lazy branch the live
-                // chain). The dms is built-or-dropped to match in
-                // `prime_with_dictionary`.
+                // Upstream zstd `ZSTD_shouldAttachDict` per strategy: ATTACH (a
+                // separate DUBT dms) for small / unknown inputs, COPY (merge the
+                // dict into the live tree) for large known inputs. ATTACH keeps
+                // the dict in history but out of the live tree via
+                // `skip_matching_dict_bt`; COPY routes through the normal
+                // `skip_matching`, which fills the live tree. The dms is
+                // built-or-dropped to match in `prime_with_dictionary`.
                 if self.hc_dict_attach_mode() {
                     self.hc_matcher_mut().table.skip_matching_dict_bt();
                 } else {
@@ -1536,8 +1512,8 @@ impl Matcher for MatchGeneratorDriver {
             params.search = search;
             params.lazy_depth = parse.lazy_depth();
             // The matrix sweep can pair a level with a backend its native
-            // row doesn't populate (e.g. greedy L5, which carries only `row`,
-            // run on HashChain). Synthesize a default config for the
+            // row doesn't populate (e.g. dfast L3, which carries only `dfast`,
+            // run on rows). Synthesize a default config for the
             // overridden backend so its `configure` arm has something to read.
             use super::strategy::SearchMethod;
             match search {
@@ -1551,7 +1527,7 @@ impl Matcher for MatchGeneratorDriver {
                     let row = params.row.get_or_insert(ROW_CONFIG);
                     row.bt = matches!(search, SearchMethod::BinaryTreeLazy);
                 }
-                SearchMethod::HashChain | SearchMethod::BinaryTree => {
+                SearchMethod::BinaryTree => {
                     params.hc.get_or_insert(HC_CONFIG);
                 }
             }
@@ -2002,19 +1978,16 @@ impl Matcher for MatchGeneratorDriver {
             }
             MatcherStorage::HashChain(hc) => {
                 hc.table.max_window_size = max_window_size;
-                hc.hc.lazy_depth = params.lazy_depth;
                 let mut hc_cfg = params.hc.expect("HashChain level row carries an HcConfig");
-                // Cap the hash / chain table logs by the hinted window so a small
+                // Cap the hash / tree table logs by the hinted window so a small
                 // input doesn't allocate the full level's tables (the upstream zstd
                 // `ZSTD_adjustCParams_internal` clamp: `hashLog <= windowLog + 1`,
-                // and `cycleLog <= windowLog` — `cycleLog == chainLog` for the HC
-                // finder, `chainLog - 1` for the BT pair table, so `chainLog <=
-                // windowLog` (+1 for BT)). Ratio-neutral: a hinted window of
-                // `2^wlog` bytes holds at most `2^wlog` positions, so the slots
-                // beyond that are never populated — capping only sheds unused
-                // allocation. Was the source of L10-lazy peak-alloc ~2.15x the
-                // upstream zstd on a 1 MiB input. Only applied when hinted; an
-                // unknown-size stream keeps the full level tables.
+                // and `cycleLog <= windowLog` with `cycleLog == chainLog - 1` for
+                // the BT pair table, so `chainLog <= windowLog + 1`).
+                // Ratio-neutral: a hinted window of `2^wlog` bytes holds at most
+                // `2^wlog` positions, so the slots beyond that are never
+                // populated — capping only sheds unused allocation. Only applied
+                // when hinted; an unknown-size stream keeps the full level tables.
                 // Skip for dictionary frames: their `hc_cfg.{hash,chain}_log`
                 // are the CDict's (verbatim when the dictionary is copied
                 // into the live tables, source-adjusted when it is attached);
@@ -2022,15 +1995,8 @@ impl Matcher for MatchGeneratorDriver {
                 // dictionary's tables to the small hinted source.
                 if hinted && dict_hint.is_none() {
                     let wlog = hc_hash_bits_for_window(table_window_size);
-                    let uses_bt = matches!(
-                        strategy_tag,
-                        super::strategy::StrategyTag::Btlazy2
-                            | super::strategy::StrategyTag::BtOpt
-                            | super::strategy::StrategyTag::BtUltra
-                            | super::strategy::StrategyTag::BtUltra2
-                    );
                     hc_cfg.hash_log = hc_cfg.hash_log.min(wlog + 1);
-                    hc_cfg.chain_log = hc_cfg.chain_log.min(if uses_bt { wlog + 1 } else { wlog });
+                    hc_cfg.chain_log = hc_cfg.chain_log.min(wlog + 1);
                 }
                 hc.configure(hc_cfg, strategy_tag, params.window_log);
                 // A copy-mode frame merges the dictionary into the live tables,
@@ -2331,9 +2297,9 @@ impl MatchGeneratorDriver {
                     block_end,
                     incompressible_hint,
                 ),
-                super::strategy::BackendTag::HashChain => self
-                    .hc_matcher_mut()
-                    .skip_matching_borrowed::<K>(block_start, block_end, incompressible_hint),
+                super::strategy::BackendTag::HashChain => {
+                    unreachable!("`borrowed_supported` refuses the optimal parsers")
+                }
             }
             return;
         }
@@ -2442,16 +2408,9 @@ impl MatchGeneratorDriver {
                         &mut sink,
                     );
                 }
-                super::strategy::BackendTag::HashChain => match self.search {
-                    super::strategy::SearchMethod::HashChain => self
-                        .hc_matcher_mut()
-                        .start_matching_lazy_borrowed::<K>(block_start, block_end, &mut sink),
-                    // `borrowed_supported()` keeps the optimal parsers on the
-                    // owned path and `set_borrowed_block` asserts it.
-                    other => {
-                        unreachable!("HashChain backend with unexpected borrowed search {other:?}")
-                    }
-                },
+                super::strategy::BackendTag::HashChain => {
+                    unreachable!("`borrowed_supported` refuses the optimal parsers")
+                }
             }
             return;
         }
@@ -2472,7 +2431,7 @@ impl MatchGeneratorDriver {
                     let MatcherStorage::HashChain(hc) = &mut self.storage else {
                         unreachable!("the optimal parser runs on the hash-chain backend");
                     };
-                    hc.backend.bt_mut().ldm_sequences.clear();
+                    hc.bt.ldm_sequences.clear();
                 }
                 if self.start_matching_long_distance::<K>(&mut handle_sequence, true) {
                     return;
@@ -2503,7 +2462,7 @@ impl MatchGeneratorDriver {
                 let MatcherStorage::HashChain(hc) = &mut self.storage else {
                     unreachable!("the optimal parser runs on the hash-chain backend");
                 };
-                core::mem::swap(&mut self.ldm_block, &mut hc.backend.bt_mut().ldm_sequences);
+                core::mem::swap(&mut self.ldm_block, &mut hc.bt.ldm_sequences);
             } else if self.start_matching_long_distance::<K>(&mut handle_sequence, false) {
                 return;
             }
@@ -2556,12 +2515,6 @@ impl MatchGeneratorDriver {
                 // resolved at `configure`.
                 self.row_matcher_mut().start_matching::<K>(handle_sequence);
             }
-            SearchMethod::HashChain => {
-                // Greedy/lazy/lazy2 all flow through the lazy parser; it
-                // reads `hc.lazy_depth` (0 = greedy commit).
-                self.hc_matcher_mut()
-                    .start_matching_lazy::<K>(handle_sequence);
-            }
             SearchMethod::BinaryTree => match self.strategy_tag {
                 StrategyTag::BtOpt => self.compress_block::<strategy::BtOpt, K>(handle_sequence),
                 StrategyTag::BtUltra => {
@@ -2584,10 +2537,9 @@ impl MatchGeneratorDriver {
     /// the concrete opt `S: Strategy` (BtOpt / BtUltra / BtUltra2) off
     /// `strategy_tag`, so the optimiser keeps the cost-model predicates
     /// (`S::USE_BT` / `S::USE_HASH3` / `S::ACCURATE_PRICE` /
-    /// `S::TWO_PASS_SEED`) const-folded per strategy. The non-opt search
-    /// backends (Fast / DoubleFast / RowHash / HashChain) are dispatched
-    /// directly off the search axis and never reach this method, so all
-    /// strategies arriving here are HashChain-backed.
+    /// `S::TWO_PASS_SEED`) const-folded per strategy. The other search
+    /// backends are dispatched directly off the search axis and never reach
+    /// this method.
     fn compress_block<S: super::strategy::Strategy, K: EncodeTier>(
         &mut self,
         handle_sequence: &mut impl FnMut(Sequence),
@@ -2598,31 +2550,8 @@ impl MatchGeneratorDriver {
             "compress_block only handles the optimal (BT) path"
         );
         self.hc_matcher_mut()
-            .start_matching_strategy::<S, K>(handle_sequence);
+            .start_matching_optimal::<S, K>(handle_sequence);
     }
-}
-
-/// Stage D: backend storage discriminator.
-///
-/// HC (lazy / lazy2) modes carry no extra per-frame state beyond the
-/// shared `MatchTable` and `HcMatcher` runtime knobs, so the
-/// [`HcBackend::Hc`] variant is zero-sized — no BT scratch is
-/// allocated. BT-flavoured modes (`btopt` / `btultra` / `btultra2`)
-/// hold the full [`super::bt::BtMatcher`] inside the
-/// [`HcBackend::Bt`] variant (cost model, optimal-parser scratch
-/// arenas, LDM candidate buffer).
-///
-/// The discriminator lives next to `parse_mode` so `configure()` can
-/// promote between the two on a level change without touching the
-/// `MatchTable` storage.
-#[derive(Clone)]
-pub(crate) enum HcBackend {
-    /// Lazy / lazy2 modes — no per-frame backend state.
-    Hc,
-    /// BT-driven modes — owns the optimal parser's per-frame scratch.
-    /// Boxed so the enum stays pointer-sized: HC-only matchers pay
-    /// just the `Box`-niche, not the 4 KiB `BtMatcher` payload.
-    Bt(alloc::boxed::Box<super::bt::BtMatcher>),
 }
 
 #[cfg(feature = "bench-internals")]

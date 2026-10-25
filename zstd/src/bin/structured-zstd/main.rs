@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use structured_zstd::encoding::{
     CompressionContext, CompressionLevel, CompressionParameters, LevelParameters,
-    LiteralCompressionMode, Strategy, StreamingEncoder,
+    LiteralCompressionMode, RowMatchFinderMode, Strategy, StreamingEncoder,
 };
 
 /// Error type for the tool: a boxed message, which is all a command-line
@@ -341,6 +341,8 @@ struct Options {
     advanced: AdvancedParams,
     /// Whether literals are entropy-coded (`--[no-]compress-literals`).
     literals: LiteralCompressionMode,
+    /// The greedy / lazy band's finder (`--[no-]row-match-finder`).
+    row_match_finder: RowMatchFinderMode,
     /// Reference file for `--patch-from`: raw-content dictionary compression
     /// with the window sized to the input, so the whole reference is
     /// reachable.
@@ -1498,6 +1500,7 @@ fn parse_args_into(
         progress: Progress::Auto,
         advanced: AdvancedParams::default(),
         literals: LiteralCompressionMode::Auto,
+        row_match_finder: RowMatchFinderMode::Auto,
         patch_from: None,
         show_default_cparams: false,
         trainer: Trainer::FastCover,
@@ -1612,7 +1615,7 @@ fn parse_args_into(
                     return Ok(Parsed::Handled { pause: *pause });
                 }
                 // Flags that steer HOW the work is done, not what comes out:
-                // thread counts, IO strategy, matcher hints. We are
+                // thread counts, IO strategy. We are
                 // single-threaded and pick our own limits, so accepting them
                 // yields the same valid stream. Upstream takes them, so a
                 // script that passes them must not fail here: that is the
@@ -1620,14 +1623,8 @@ fn parse_args_into(
                 "single-thread" => opts.threads = Some(0),
                 "adapt" => opts.adapt = true,
                 "rsyncable" => opts.rsyncable = true,
-                "sparse"
-                | "no-sparse"
-                | "asyncio"
-                | "no-asyncio"
-                | "mmap-dict"
-                | "no-mmap-dict"
-                | "row-match-finder"
-                | "no-row-match-finder" => {}
+                "sparse" | "no-sparse" | "asyncio" | "no-asyncio" | "mmap-dict"
+                | "no-mmap-dict" => {}
                 // The reference prints a trace of its own file-system helpers
                 // by their C names (`UTIL_stat`, `UTIL_isLink`, ...). There is
                 // nothing of ours that output would describe, and taking the
@@ -1643,6 +1640,8 @@ fn parse_args_into(
                 "fake-stderr-is-console" => opts.console.stderr = true,
                 "compress-literals" => opts.literals = LiteralCompressionMode::Enable,
                 "no-compress-literals" => opts.literals = LiteralCompressionMode::Disable,
+                "row-match-finder" => opts.row_match_finder = RowMatchFinderMode::Enable,
+                "no-row-match-finder" => opts.row_match_finder = RowMatchFinderMode::Disable,
                 _ => {
                     if long == "fast" {
                         // `--fast` is the level -1 alias.
@@ -2310,6 +2309,8 @@ Advanced compression options:
   --no-dictID                   Don't write `dictID` into the header (dictionary compression only).
   --[no-]content-size           Write the input size into the frame header when it is known. [Default: Write]
   --[no-]compress-literals      Force (un)compressed literals.
+  --[no-]row-match-finder       Explicitly enable/disable the fast, row-based matchfinder for
+                                the 'greedy', 'lazy', and 'lazy2' strategies.
 
   --format=zstd                 Compress files to the `.zst` format. [Default]
 
@@ -2347,8 +2348,7 @@ Environment: ZSTD_CLEVEL sets the default compression level; ZSTD_NBTHREADS is r
 Accepted for compatibility, with no effect here: -T#/--threads=#, --single-thread,
 --auto-threads, -B# and --block-size=# when compressing (the job size of a
 multi-threaded run), --adapt, --rsyncable, --zstd=ovlog=#, --[no-]sparse,
---[no-]asyncio, --[no-]mmap-dict, --[no-]row-match-finder (compression runs
-single-threaded). --adapt and --rsyncable are refused beside --single-thread or
+--[no-]asyncio, --[no-]mmap-dict (compression runs single-threaded). --adapt and --rsyncable are refused beside --single-thread or
 -T0 when compressing.
 
 Rejected rather than ignored, because they would change the result: --format=
@@ -6291,6 +6291,8 @@ struct FrameSettings {
     advanced: AdvancedParams,
     /// Whether literals are entropy-coded (`--[no-]compress-literals`).
     literals: LiteralCompressionMode,
+    /// The greedy / lazy band's finder (`--[no-]row-match-finder`).
+    row_match_finder: RowMatchFinderMode,
 }
 
 impl Default for FrameSettings {
@@ -6310,6 +6312,7 @@ impl Default for FrameSettings {
             dict_id_flag: true,
             advanced: AdvancedParams::default(),
             literals: LiteralCompressionMode::Auto,
+            row_match_finder: RowMatchFinderMode::Auto,
         }
     }
 }
@@ -6330,21 +6333,26 @@ impl FrameSettings {
             dict_id_flag: opts.dict_id_flag,
             advanced: opts.advanced,
             literals: opts.literals,
+            row_match_finder: opts.row_match_finder,
         }
     }
 }
 
 /// The fine-grained parameters a frame runs under, or `None` when nothing
 /// overrides the level: `--zstd=` knobs, `--long` (whose window yields to a
-/// `--zstd=wlog=`, as the reference command has it), and the literal mode.
-/// The long-distance knobs from `--zstd=` reach the encoder only with
-/// `--long`, since there they tune a matcher that otherwise does not run.
+/// `--zstd=wlog=`, as the reference command has it), and the literal and
+/// match-finder modes. The long-distance knobs from `--zstd=` reach the
+/// encoder only with `--long`, since there they tune a matcher that otherwise
+/// does not run.
 fn frame_parameters(
     level: CompressionLevel,
     settings: &FrameSettings,
 ) -> Result<Option<CompressionParameters>> {
     let advanced = settings.advanced;
-    if !settings.long && advanced.is_default() && settings.literals == LiteralCompressionMode::Auto
+    if !settings.long
+        && advanced.is_default()
+        && settings.literals == LiteralCompressionMode::Auto
+        && settings.row_match_finder == RowMatchFinderMode::Auto
     {
         return Ok(None);
     }
@@ -6388,7 +6396,9 @@ fn frame_parameters(
             builder = builder.ldm_hash_rate_log(log);
         }
     }
-    builder = builder.literal_compression(settings.literals);
+    builder = builder
+        .literal_compression(settings.literals)
+        .row_match_finder(settings.row_match_finder);
     builder
         .build()
         .map(Some)

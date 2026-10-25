@@ -2015,8 +2015,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             return attached;
         }
         // The borrowed (no-copy, in-place over-window) scan exists for the
-        // Simple (Fast), Dfast, and Row backends, and for the HashChain
-        // backend's lazy CHAIN parser; BT/optimal (BinaryTree search) stay on
+        // Simple (Fast), Dfast, and Row backends; the optimal parsers stay on
         // the owned path. Every borrowed scan applies the per-position
         // `window_low = abs_ip - advertised_window` offset cap so over-window
         // inputs are matched in place (no input->history copy), matching C's

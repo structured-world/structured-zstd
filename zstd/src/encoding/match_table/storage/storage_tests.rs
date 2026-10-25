@@ -38,49 +38,10 @@ fn set_dictionary_limit_from_primed_bytes_offsets_from_history_start() {
 }
 
 #[test]
-fn dms_cache_rebuilds_across_hc_bt_layout_switch() {
-    // A reused compressor that changes level across the HC↔BT boundary lands
-    // back in prime_dms_* with the SAME (region, mls, hash_log) but the OTHER
-    // builder. Without a layout discriminator in the cache key, the second
-    // prime would reuse the first builder's tables verbatim (HC single-link
-    // chain reinterpreted as a BT DUBT, or vice versa) — a silent corruption.
-    // The cache key must include the layout so the switch forces a rebuild.
-    let mut t = new_table(64);
-    // dms_hash_log clamps to [10, hash_log]; keep hash_log above the floor.
-    t.hash_log = 12;
-    // Match HC's fixed mls (HC_MIN_MATCH_LEN == 4) so the BT prime resolves
-    // the SAME (region, mls, hash_log) as the HC prime — then the LAYOUT field
-    // is the only differing key, which is exactly what this test guards. With
-    // search_mls != 4 the rebuild would happen via the mls mismatch and the
-    // test would pass even without the layout discriminator.
-    t.search_mls = 4;
-    t.push_test_chunk(vec![7u8; 48]);
-    t.ensure_tables();
-    let region = 48;
-
-    t.prime_dms_hc(region);
-    assert_eq!(t.dms.table().unwrap().layout, DmsDictLayout::Hc);
-    // HC chain has one `next` per dict position.
-    assert_eq!(t.dms.table().unwrap().chain_table.len(), region);
-
-    // Same region/mls/hash_log, but the BT builder must NOT reuse the HC
-    // tables: it rebuilds to the BT layout (2 children per dict position).
-    t.prime_dms_bt(region);
-    assert_eq!(t.dms.table().unwrap().layout, DmsDictLayout::Bt);
-    assert_eq!(t.dms.table().unwrap().chain_table.len(), 2 * region);
-
-    // And back to HC rebuilds again.
-    t.prime_dms_hc(region);
-    assert_eq!(t.dms.table().unwrap().layout, DmsDictLayout::Hc);
-    assert_eq!(t.dms.table().unwrap().chain_table.len(), region);
-}
-
-#[test]
 fn skip_matching_bt_incompressible_routes_through_sparse_block() {
     let mut t = new_table(32);
     t.push_test_chunk(vec![0u8; 32]);
     t.ensure_tables();
-    t.uses_bt = true;
     t.is_btultra2 = false;
     t.search_depth = 4;
     let before_skip_until = t.skip_insert_until_abs;
@@ -97,7 +58,6 @@ fn skip_matching_bt_dense_routes_through_bt_update_tree() {
     let mut t = new_table(32);
     t.push_test_chunk(vec![1u8; 32]);
     t.ensure_tables();
-    t.uses_bt = true;
     t.is_btultra2 = false;
     t.search_depth = 4;
     // `incompressible_hint = None` → dense bt_update_tree_until path
@@ -119,7 +79,6 @@ fn replay_history_for_rebase_bt_walks_inserted_prefix() {
     t.window_size = 64;
     t.position_base = 0;
     t.search_depth = 4;
-    t.uses_bt = true;
     t.ensure_tables();
     // Replay the first 32 positions; the BT walker writes entries
     // into the hash table (via `hash_table[hash] = stored`) so the
@@ -346,7 +305,6 @@ fn bt_table() -> MatchTable {
     t.window_size = 64;
     t.position_base = 0;
     t.search_depth = 4;
-    t.uses_bt = true;
     t.ensure_tables();
     t
 }
@@ -401,57 +359,10 @@ fn a_tree_walk_past_the_index_range_rebases_then_matches_a_plain_walk() {
 }
 
 #[test]
-fn insert_positions_with_step_zero_step_is_noop() {
-    let mut t = new_table(32);
-    t.history = vec![0u8; 32].into();
-    t.push_test_chunk(vec![0u8; 32]);
-    t.ensure_tables();
-    let next_to_update3_before = t.next_to_update3;
-    // step=0 must early-return without touching anything.
-    t.insert_positions_with_step(0, 16, 0);
-    assert!(t.hash_table().iter().all(|&v| v == HC_EMPTY));
-    assert_eq!(t.next_to_update3, next_to_update3_before);
-}
-
-#[test]
-fn insert_positions_with_step_saturating_step_breaks_loop() {
-    // step = usize::MAX so first iteration overflows
-    // `pos.saturating_add(step)` to usize::MAX, then the `next <= pos`
-    // guard breaks out of the loop after one insert.
-    let mut t = new_table(32);
-    t.history = vec![1u8; 32].into();
-    t.push_test_chunk(vec![1u8; 32]);
-    t.ensure_tables();
-    t.insert_positions_with_step(0, 16, usize::MAX);
-    // Exactly one position should have been inserted before the
-    // loop terminated — observe that only one slot is non-empty.
-    let non_empty = t.hash_table().iter().filter(|&&v| v != HC_EMPTY).count();
-    assert!(
-        non_empty <= 1,
-        "step=usize::MAX must break after the first insert"
-    );
-}
-
-#[test]
-fn apply_limited_update_after_long_match_hc_mode_is_noop() {
-    // HC mode (`uses_bt = false`) — function must early-return
-    // without mutating `skip_insert_until_abs`.
-    let mut t = new_table(32);
-    t.uses_bt = false;
-    t.skip_insert_until_abs = 100;
-    t.apply_limited_update_after_long_match(1000);
-    assert_eq!(
-        t.skip_insert_until_abs, 100,
-        "HC mode must not adjust skip cursor"
-    );
-}
-
-#[test]
 fn apply_limited_update_after_long_match_bt_mode_caps_gap_at_384() {
-    // BT mode with gap > 384 → cap the skip cursor so future
-    // `bt_update_tree_until` doesn't walk an unbounded prefix.
+    // A gap > 384 → cap the skip cursor so future `bt_update_tree_until`
+    // doesn't walk an unbounded prefix.
     let mut t = new_table(32);
-    t.uses_bt = true;
     t.skip_insert_until_abs = 0;
     // current_abs_start = 1000 → gap = 1000 → cap subtracts
     // (gap - 384).min(192) = 192, so result is 1000 - 192 = 808.
@@ -462,7 +373,6 @@ fn apply_limited_update_after_long_match_bt_mode_caps_gap_at_384() {
 #[test]
 fn apply_limited_update_after_long_match_small_gap_is_noop() {
     let mut t = new_table(32);
-    t.uses_bt = true;
     t.skip_insert_until_abs = 800;
     // gap = 200 < 384 → no change.
     t.apply_limited_update_after_long_match(1000);

@@ -4,7 +4,9 @@
 
 use core::ffi::c_int;
 
-use codec::encoding::{CompressionLevel, CompressionParameters, LiteralCompressionMode, Strategy};
+use codec::encoding::{
+    CompressionLevel, CompressionParameters, LiteralCompressionMode, RowMatchFinderMode, Strategy,
+};
 
 use crate::cdict::ZSTD_compressionParameters;
 use crate::context::{ZSTD_CCtx, free_boxed, try_box};
@@ -46,7 +48,7 @@ impl ParamSwitch {
 /// searches, schedules or checks its work, with no counterpart in this
 /// encoder: stored as set so they read back, without effect on the frames.
 /// The sequence-format ones are read by the sequence entry points.
-const ADVISORY: [c_int; 18] = [
+const ADVISORY: [c_int; 17] = [
     ZSTD_C_NB_WORKERS,
     ZSTD_C_JOB_SIZE,
     ZSTD_C_OVERLAP_LOG,
@@ -59,7 +61,6 @@ const ADVISORY: [c_int; 18] = [
     ZSTD_C_BLOCK_DELIMITERS,
     ZSTD_C_VALIDATE_SEQUENCES,
     ZSTD_C_SPLIT_AFTER_SEQUENCES,
-    ZSTD_C_USE_ROW_MATCH_FINDER,
     ZSTD_C_DETERMINISTIC_REF_PREFIX,
     ZSTD_C_PREFETCH_CDICT_TABLES,
     ZSTD_C_ENABLE_SEQ_PRODUCER_FALLBACK,
@@ -105,6 +106,8 @@ pub(crate) struct CCtxParams {
     pub(crate) magicless: bool,
     /// `ZSTD_c_literalCompressionMode`.
     pub(crate) literal_compression: LiteralCompressionMode,
+    /// `ZSTD_c_useRowMatchFinder`.
+    pub(crate) row_match_finder: RowMatchFinderMode,
     /// `ZSTD_c_srcSizeHint`; 0 = none.
     pub(crate) src_size_hint: c_int,
     /// The [`ADVISORY`] parameters, in that order.
@@ -147,6 +150,7 @@ impl CCtxParams {
             max_block_size: 0,
             magicless: false,
             literal_compression: LiteralCompressionMode::Auto,
+            row_match_finder: RowMatchFinderMode::Auto,
             src_size_hint: 0,
             advisory: [0; ADVISORY.len()],
             pledged_src_size: CONTENTSIZE_UNKNOWN,
@@ -179,7 +183,8 @@ impl CCtxParams {
     /// (should be unreachable: every knob was bounds-checked on entry).
     pub(crate) fn resolve(&self) -> Option<CompressionParameters> {
         let mut builder = CompressionParameters::builder(CompressionLevel::from_level(self.level))
-            .literal_compression(self.literal_compression);
+            .literal_compression(self.literal_compression)
+            .row_match_finder(self.row_match_finder);
         if let Some(v) = self.window_log {
             builder = builder.window_log(v);
         }
@@ -301,6 +306,13 @@ impl CCtxParams {
                     _ => LiteralCompressionMode::Auto,
                 };
             }
+            ZSTD_C_USE_ROW_MATCH_FINDER => {
+                self.row_match_finder = match ParamSwitch::from_c(within(value)?) {
+                    Some(ParamSwitch::Enable) => RowMatchFinderMode::Enable,
+                    Some(ParamSwitch::Disable) => RowMatchFinderMode::Disable,
+                    _ => RowMatchFinderMode::Auto,
+                };
+            }
             // Clamped into range as upstream's multi-threaded build stores them
             // (zstd_compress.c:866-908); frames are still built on the calling
             // thread, which a worker count only permits, never requires.
@@ -370,6 +382,11 @@ impl CCtxParams {
                 LiteralCompressionMode::Auto => ParamSwitch::Auto.to_c(),
                 LiteralCompressionMode::Enable => ParamSwitch::Enable.to_c(),
                 LiteralCompressionMode::Disable => ParamSwitch::Disable.to_c(),
+            },
+            ZSTD_C_USE_ROW_MATCH_FINDER => match self.row_match_finder {
+                RowMatchFinderMode::Auto => ParamSwitch::Auto.to_c(),
+                RowMatchFinderMode::Enable => ParamSwitch::Enable.to_c(),
+                RowMatchFinderMode::Disable => ParamSwitch::Disable.to_c(),
             },
             _ => match advisory_slot(param) {
                 Some(slot) => self.advisory[slot],

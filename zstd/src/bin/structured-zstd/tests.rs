@@ -4491,7 +4491,6 @@ fn performance_only_flags_are_accepted() {
         &["--sparse", "f"][..],
         &["--no-asyncio", "f"][..],
         &["--no-mmap-dict", "f"][..],
-        &["--no-row-match-finder", "f"][..],
     ] {
         let parsed = parse(args);
         assert!(
@@ -7470,6 +7469,65 @@ fn literal_compression_flags_reach_the_frame() {
         fast_auto.len()
     );
     assert_eq!(decoded(&fast_coded).unwrap(), payload);
+}
+
+/// `--[no-]row-match-finder` picks the greedy / lazy band's finder: forcing the
+/// hash chain on a source wide enough for rows writes another frame than the
+/// level's own, forcing rows writes the level's own, and both decode.
+#[test]
+fn row_match_finder_flags_reach_the_frame() {
+    assert_eq!(
+        parse(&["--no-row-match-finder", "f"])
+            .unwrap()
+            .row_match_finder,
+        RowMatchFinderMode::Disable
+    );
+    assert_eq!(
+        parse(&["--row-match-finder", "f"])
+            .unwrap()
+            .row_match_finder,
+        RowMatchFinderMode::Enable
+    );
+    assert_eq!(
+        parse(&["f"]).unwrap().row_match_finder,
+        RowMatchFinderMode::Auto
+    );
+
+    let mut payload = Vec::new();
+    let mut state = 0x9E37_79B9u32;
+    for i in 0..6000u32 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        payload.extend_from_slice(
+            format!(
+                "{i:06} level=info shard={} took={}ms\n",
+                state % 13,
+                state >> 22
+            )
+            .as_bytes(),
+        );
+    }
+    let frame_with = |row_match_finder: RowMatchFinderMode| {
+        let mut frame = Vec::new();
+        compress_stream(
+            payload.as_slice(),
+            &mut frame,
+            &FrameSettings {
+                level: 7,
+                pledged_size: Some(payload.len() as u64),
+                row_match_finder,
+                ..FrameSettings::default()
+            },
+            &mut no_dict(),
+        )
+        .unwrap();
+        frame
+    };
+    let auto = frame_with(RowMatchFinderMode::Auto);
+    let rows = frame_with(RowMatchFinderMode::Enable);
+    let chain = frame_with(RowMatchFinderMode::Disable);
+    assert_eq!(rows, auto);
+    assert_ne!(chain, auto);
+    assert_eq!(decoded(&chain).unwrap(), payload);
 }
 
 /// The trainer flags take their tuning the way the reference command reads

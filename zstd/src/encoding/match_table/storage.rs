@@ -1,19 +1,9 @@
-//! Shared match-finder storage.
+//! Match-finder storage of the optimal parsers.
 //!
-//! `MatchTable` owns every byte of state that both the hash-chain (HC /
-//! lazy / lazy2) and binary-tree (BT / optimal parser) backends touch:
-//! the rolling window, the contiguous `history` mirror, the absolute
-//! position cursors, the hash / hash3 / chain (or BT pointer-pair)
-//! tables, and the dictionary-priming flags. Both backends operate on
-//! the same physical buffers; the only difference is the semantics of
-//! `chain_table` entries — HC mode threads single-link chain pointers
-//! through it, BT mode lays out pairs of pointers per node — and that
-//! interpretation is the matcher's concern, not the table's.
-//!
-//! Extracted from `HcMatchGenerator` in #111 Phase 1d Stage 1 so the
-//! follow-up stages can pull the HC and BT matchers into their own
-//! modules without dragging this shared storage around as a forest of
-//! `&mut Vec<u32>` arguments.
+//! `MatchTable` owns every byte of state the binary-tree search touches: the
+//! rolling window, the contiguous `history` mirror, the absolute position
+//! cursors, the hash / hash3 / binary-tree pointer-pair tables, and the
+//! dictionary-priming flags.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -176,33 +166,24 @@ pub(crate) struct BtCoords {
     pub(crate) bt_mask: usize,
 }
 
-/// Shared storage backing every match finder. Holds the contiguous
-/// Immutable dictionary match structure (upstream zstd `ZSTD_dictMatchState`) for
-/// the binary-tree / optimal path. A hash + single-link chain over the
-/// dictionary content concat range, searched in addition to the live BT
-/// with its OWN compare budget so dictionary candidates are reachable even
-/// when the live tree's budget is spent on recent positions. Slots store
-/// `dict_rel + 1` (dictionary-relative concat index); `0` is empty.
-/// Which matcher built a [`DmsDictTables`]: the hash-chain (`prime_dms_hc`) and
-/// the binary-tree (`prime_dms_bt`) populate `hash_table` / `chain_table` with
-/// incompatible meanings, so a cached dms must only be reused by the SAME
-/// builder. Part of the cache-reuse key alongside `mls` / `hash_log` / region so
-/// a reused compressor that switches level across the HC↔BT boundary (same
-/// `mls` / `hash_log`) rebuilds instead of reinterpreting the other layout.
+/// Whether a [`DmsDictTables`] holds a built tree; part of the cache-reuse key
+/// alongside `mls` / `hash_log` / region.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub(crate) enum DmsDictLayout {
     /// Unbuilt / invalidated — never matches a reuse probe.
     #[default]
     None,
-    /// Hash-chain dms (`prime_dms_hc`): single-link chain for the lazy backend.
-    Hc,
     /// Binary-tree dms (`prime_dms_bt`): unsorted DUBT for the optimal backend.
     Bt,
 }
 
+/// Immutable dictionary match structure (upstream zstd `ZSTD_dictMatchState`)
+/// of the optimal path: a binary tree over the dictionary content, searched in
+/// addition to the live tree. Slots store `dict_rel + 1` (dictionary-relative
+/// concat index); `0` is empty.
 #[derive(Clone, Default)]
 pub(crate) struct DmsDictTables {
-    /// Builder that populated the tables (HC vs BT), part of the reuse key.
+    /// Whether the tables are built, part of the reuse key.
     pub(crate) layout: DmsDictLayout,
     /// Per-hash-bucket binary-tree root (`1 << hash_log` entries), packed
     /// `dict_rel + 1` (`0` = empty).
@@ -220,10 +201,8 @@ pub(crate) struct DmsDictTables {
     pub(crate) mls: usize,
 }
 
-/// history buffer, the rolling window, and the hash / chain / hash3
-/// tables. Methods on this struct contain only logic that's identical
-/// between HC and BT modes — backend-specific table interpretation
-/// lives in the matcher modules.
+/// Storage of the optimal parsers' binary-tree search: the contiguous history
+/// buffer, the rolling window, and the hash / tree / hash3 tables.
 pub(crate) struct MatchTable {
     pub(crate) max_window_size: usize,
     /// Per-chunk lengths of the live window, in add order. The bytes
@@ -291,17 +270,11 @@ pub(crate) struct MatchTable {
     /// `configure()` so the BT walker and rebase machinery can stay
     /// on `MatchTable` without consulting the outer generator.
     pub(crate) is_btultra2: bool,
-    /// Whether the active backend is one of the BT parsers (`btopt`,
-    /// `btultra`, `btultra2`). Mirrored from the active strategy for
-    /// the same reason as `is_btultra2`.
-    pub(crate) uses_bt: bool,
     /// Binary-tree finder hash width (`mls`), upstream zstd `ZSTD_hashPtr` mls =
-    /// `BOUNDED(4, cParams.minMatch, 6)`. clevels.h gives the btlazy2 / btopt
-    /// band (levels 13-16) `minMatch = 5` → a 5-byte (8-byte read) hash that
-    /// shortens the chains the BT walks (speed), so it is set per level in
-    /// `configure`. Only the BT body reads it (the BT hash sites already
-    /// guarantee 8 readable bytes); the HC `hash_position` stays 4-byte.
-    /// Defaults to `4`.
+    /// `BOUNDED(4, cParams.minMatch, 6)`. clevels.h gives btopt level 16
+    /// `minMatch = 5` → a 5-byte (8-byte read) hash that shortens the chains
+    /// the BT walks (speed), so it is set per level in `configure`. The BT hash
+    /// sites guarantee 8 readable bytes. Defaults to `4`.
     pub(crate) search_mls: usize,
     /// Tree coordinates of the block being parsed, taken by
     /// [`Self::capture_block_coords`] before the parse.
@@ -315,15 +288,6 @@ pub(crate) struct MatchTable {
     /// searched by the BT/optimal collect alongside the live tree. `Some`
     /// once primed from a non-empty dictionary on a BT level.
     pub(crate) dms: DictAttach<DmsDictTables>,
-    /// Borrowed (no-copy) one-shot input window `(ptr, len)`. When set, the
-    /// scan reads candidate/cursor bytes straight from the caller's slice
-    /// instead of the owned `history` mirror, so an over-window one-shot
-    /// input is matched in place (no input->mirror memmove). Raw pointer:
-    /// live until `clear_borrowed_window` / `reset`.
-    pub(crate) borrowed_input: Option<(*const u8, usize)>,
-    /// Active borrowed block range `[start, end)` within `borrowed_input`,
-    /// staged before each borrowed scan.
-    pub(crate) borrowed_block: Option<(usize, usize)>,
     /// Set by [`Self::retire_history`] ahead of a layout and taken by the next
     /// [`Self::reset`], which would otherwise read the floor off a history
     /// already cut down to what it keeps.
@@ -364,15 +328,12 @@ impl Clone for MatchTable {
             dict_resident: self.dict_resident,
             search_depth: self.search_depth,
             is_btultra2: self.is_btultra2,
-            uses_bt: self.uses_bt,
             search_mls: self.search_mls,
             block_coords: self.block_coords,
             // Points into this table's history, not the copy's; taken again
             // when the copy parses a block.
             block_live: (core::ptr::null(), 0),
             dms: self.dms.clone(),
-            borrowed_input: self.borrowed_input,
-            borrowed_block: self.borrowed_block,
             retired: self.retired,
         }
     }
@@ -411,13 +372,10 @@ impl Clone for MatchTable {
         self.dict_resident = source.dict_resident;
         self.search_depth = source.search_depth;
         self.is_btultra2 = source.is_btultra2;
-        self.uses_bt = source.uses_bt;
         self.search_mls = source.search_mls;
         self.block_coords = source.block_coords;
         // The source's view points into the source's history.
         self.block_live = (core::ptr::null(), 0);
-        self.borrowed_input = source.borrowed_input;
-        self.borrowed_block = source.borrowed_block;
         self.retired = source.retired;
     }
 }
@@ -439,16 +397,14 @@ pub(crate) fn dms_hash_log(region: usize, hash_log: usize) -> usize {
     (usize::BITS - (region - 1).leading_zeros()).clamp(10.min(hash_log), hash_log) as usize
 }
 
-/// Shared scaffold for the two `prime_dms_*` dictionary-match-state builders.
+/// Scaffold of the dictionary-match-state builder.
 ///
-/// Both resolve the dict `region` (capped to the live history), bail on an
-/// undersized dict, derive the dict-sized hash log, short-circuit when a
-/// same-shape table is already primed, recycle the prior tables' capacity, run
-/// the layout-specific `$build` over the dict bytes at the front of the live
-/// history, then publish the tables and mark the cache primed. Only the build
-/// pass (HC single-link chain vs BT binary tree), the minimum readable region,
-/// and the chain entries per dict position differ — those are the macro
-/// parameters. `$build` sees `concat` (the dict bytes), `&mut` `hash_table` /
+/// Resolves the dict `region` (capped to the live history), bails on an
+/// undersized dict, derives the dict-sized hash log, short-circuits when a
+/// same-shape table is already primed, recycles the prior tables' capacity,
+/// runs `$build` over the dict bytes at the front of the live history, then
+/// publishes the tables and marks the cache primed. `$build` sees `concat`
+/// (the dict bytes), `&mut` `hash_table` /
 /// `chain_table`, `dms_hash_log`, and `region` in scope; `mls` and any
 /// build-only widths come from the caller's surrounding locals.
 macro_rules! build_dms {
@@ -545,13 +501,10 @@ impl MatchTable {
             dict_resident: false,
             search_depth: 0,
             is_btultra2: false,
-            uses_bt: false,
             search_mls: 4,
             block_coords: BtCoords::default(),
             block_live: (core::ptr::null(), 0),
             dms: DictAttach::new(),
-            borrowed_input: None,
-            borrowed_block: None,
             retired: None,
         }
     }
@@ -646,15 +599,8 @@ impl MatchTable {
             return;
         }
         let idx = abs_pos - self.history_abs_start;
-        // Borrowed-aware: hash the SAME bytes the finder reads via
-        // `live_history()` (borrowed window in no-copy mode, owned mirror
-        // otherwise). Reading `self.history[history_start..]` directly hashed
-        // the EMPTY owned mirror on the borrowed one-shot path, so every hash3
-        // insert early-returned and the HC3 side table stayed empty — btultra2
-        // short-match probing then found nothing. This is the identical bug
-        // already fixed for `insert_position_no_rebase`; the hash3 inserter was
-        // missed. `hash3` is the only value needed past the borrow, so it ends
-        // before the table write.
+        // `hash3` is the only value needed past the borrow, so it ends before
+        // the table write.
         let hash3 = {
             let concat = self.live_history();
             if idx + 4 > concat.len() {
@@ -668,60 +614,12 @@ impl MatchTable {
         self.hash3_table_mut()[hash3] = relative_pos + 1;
     }
 
-    /// Insert a position into the main hash / chain table without
-    /// running the rebase check. Caller pre-validates that the
-    /// position is representable as a `(rel + 1)` u32, either via
-    /// `maybe_rebase_positions` (HC) or `bt_update_tree_until` (BT).
-    /// Upstream zstd parity: `ZSTD_insertAndFindFirstIndex` inner body.
-    #[inline]
-    pub(crate) fn insert_position_no_rebase(&mut self, abs_pos: usize) {
-        let idx = abs_pos.wrapping_sub(self.history_abs_start);
-        // Borrowed-aware: read the SAME bytes the finder hashes via
-        // `live_history()` (borrowed window in no-copy mode, owned mirror
-        // otherwise). Reading `self.history[history_start..]` directly would
-        // hash the empty owned mirror on the borrowed HC lazy/greedy path
-        // (live=input, mirror=0) — the insert would skip or hash garbage while
-        // the finder hashes the real input, so the chain stays empty and no
-        // matches are ever found. `hash` is the only value needed past this
-        // borrow, so it ends before the table mutation below.
-        let hash = {
-            let concat = self.live_history();
-            if idx + 4 > concat.len() {
-                return;
-            }
-            Self::hash_position_at(concat, idx, self.hash_log, 4)
-        };
-        let Some(relative_pos) = self.relative_position(abs_pos) else {
-            return;
-        };
-        let stored = relative_pos + 1;
-        let chain_mask = (1usize << self.chain_log) - 1;
-        let chain_idx = relative_pos as usize & chain_mask;
-        // SAFETY: `hash` is produced by `hash_value_with_mls` which masks
-        // the result down to `hash_log` bits, and `hash_table.len() == 1 <<
-        // hash_log` (`ensure_tables`). `chain_idx` is `& chain_mask` so
-        // `< chain_table.len() == 1 << chain_log`. Both indices are
-        // provably in bounds, so the elided bounds checks save ~4
-        // instructions per call on this per-byte-of-input hot path.
-        debug_assert!(hash < self.chain_off);
-        debug_assert!(chain_idx < self.hash3_off - self.chain_off);
-        // Both regions come from the one buffer; the split ends with this
-        // statement, so it costs the same two base pointers the separate
-        // vectors did.
-        let (hash_tbl, chain_tbl) = self.hash_and_chain_mut();
-        unsafe {
-            let prev = *hash_tbl.get_unchecked(hash);
-            *chain_tbl.get_unchecked_mut(chain_idx) = prev;
-            *hash_tbl.get_unchecked_mut(hash) = stored;
-        }
-    }
-
-    /// Allocate the hash / chain / hash3 tables sized to the current
+    /// Allocate the hash / tree / hash3 tables sized to the current
     /// `hash_log` / `chain_log` / `hash3_log` configuration. Each table
     /// is reallocated whenever its current length doesn't match the
-    /// width implied by its `*_log` field — `insert_position_no_rebase`
-    /// reaches via `get_unchecked`, so a stale-width table after a
-    /// level change would index out of bounds (UB) on the next encode.
+    /// width implied by its `*_log` field — the tree walk reaches them
+    /// through raw pointers, so a stale-width table after a level change
+    /// would index out of bounds (UB) on the next encode.
     pub(crate) fn ensure_tables(&mut self) {
         let (hash_size, chain_size, total) = self.table_sizes();
         // The three regions share one buffer, so a width change on any of them
@@ -921,13 +819,6 @@ impl MatchTable {
         Self::hash_value_with_mls(value, hash_log, mls)
     }
 
-    /// Main hash for the current matcher (4-byte MLS, `hash_log` from
-    /// the table's configuration).
-    #[inline(always)]
-    pub(crate) fn hash_position(&self, data: &[u8]) -> usize {
-        Self::hash_position_with_mls(data, self.hash_log, 4)
-    }
-
     /// 3-byte hash used by the HC3 side table. Test-only — the
     /// production path uses inlined per-kernel variants.
     #[cfg(test)]
@@ -967,8 +858,8 @@ impl MatchTable {
     /// position (`[smaller_child, larger_child]`), `hash_table` the per-bucket
     /// tree roots. `dict_rel + 1` packing, `0` sentinel. Dict positions are
     /// concat indices at the front of the shared buffer, so the walk's offset is
-    /// `idx - dict_idx` directly (no upstream zstd `dmsIndexDelta`). Called on BT levels
-    /// (`uses_bt`); cached across frames via `DictAttach::is_primed`.
+    /// `idx - dict_idx` directly (no upstream zstd `dmsIndexDelta`). Cached across
+    /// frames via `DictAttach::is_primed`.
     pub(crate) fn prime_dms_bt(&mut self, region_len: usize) {
         // Upstream zstd `ZSTD_dictMatchState` searches the dict at the live cParams
         // `minMatch` (= our `search_mls`), NOT a fixed 3 — a fixed 3 surfaces
@@ -1038,44 +929,6 @@ impl MatchTable {
                     }
                     chain_table[smaller_slot] = 0;
                     chain_table[larger_slot] = 0;
-                    current += 1;
-                }
-            }
-        );
-    }
-
-    /// Build a SEPARATE dictionary match state for the lazy hash-chain path
-    /// (upstream `ZSTD_dictMatchState`, the dms HC4 walk in
-    /// `ZSTD_HcFindBestMatch` `zstd_lazy.c:748-770`) over the first `region_len`
-    /// bytes of the live history (the dictionary at the front). Unlike
-    /// [`Self::prime_dms_bt`] this is a single-link hash chain (one `next` entry
-    /// per dict position, like the live HC chain), not a binary tree: the lazy
-    /// parser walks it with a bounded compare budget rather than descending to
-    /// the longest match. `hash_table` holds per-bucket chain heads, packed
-    /// `dict_rel + 1` (`0` = empty); `chain_table[dict_rel]` is the previous
-    /// dict position in the same bucket, same packing. Dict positions are concat
-    /// indices at the front of the shared buffer, so the offset is `idx -
-    /// dict_idx` directly. Hashed at `HC_MIN_MATCH_LEN` (4), matching the live
-    /// chain. Cached across frames via `DictAttach::is_primed`.
-    pub(crate) fn prime_dms_hc(&mut self, region_len: usize) {
-        let mls = HC_MIN_MATCH_LEN;
-        let floor = self.dict_index_floor;
-        // Single `next` link per dict position (HC4 chain, not the BT's 2/pos).
-        build_dms!(
-            self,
-            region_len,
-            DmsDictLayout::Hc,
-            mls,
-            mls,
-            1,
-            |concat, hash_table, chain_table, dms_hash_log, region| {
-                let mut current = floor;
-                while current + mls <= region {
-                    let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
-                    // Prepend `current` to its bucket chain (upstream zstd
-                    // `ZSTD_insertAndFindFirstIndex` head insert).
-                    chain_table[current] = hash_table[h];
-                    hash_table[h] = (current + 1) as u32;
                     current += 1;
                 }
             }
@@ -1237,21 +1090,6 @@ impl MatchTable {
     /// `history` Vec.
     #[inline]
     pub(crate) fn live_history(&self) -> &[u8] {
-        // Borrowed one-shot: expose `[0, block_end)` of the caller's input so
-        // candidate/cursor reads land in place (the owned `history` mirror is
-        // empty under the no-copy path). Loop-invariant branch, inlines.
-        if let Some((_start, end)) = self.borrowed_block {
-            let (ptr, total) = self
-                .borrowed_input
-                .expect("borrowed_block set without a registered borrowed window");
-            debug_assert!(
-                end <= total,
-                "borrowed block end {end} exceeds window {total}"
-            );
-            // SAFETY: `ptr` is the registered window start (live by contract);
-            // `end <= total` in bounds.
-            return unsafe { core::slice::from_raw_parts(ptr, end) };
-        }
         // Stop at the committed end, not at `history.len()`: the next block's
         // bytes may already be read into the tail, and a scan must not see
         // past the block it is compressing.
@@ -1267,65 +1105,20 @@ impl MatchTable {
     /// the most recent buffer in the rolling window — panics if no
     /// data has been committed yet.
     pub(crate) fn get_last_space(&self) -> &[u8] {
-        if let (Some((ptr, _total)), Some((block_start, block_end))) =
-            (self.borrowed_input, self.borrowed_block)
-        {
-            // SAFETY: borrowed liveness contract; range validated when staged.
-            return unsafe {
-                core::slice::from_raw_parts(ptr.add(block_start), block_end - block_start)
-            };
-        }
         let last = *self.chunk_lens.back().unwrap();
         &self.history[self.history.len() - self.uncommitted_len - last
             ..self.history.len() - self.uncommitted_len]
     }
 
-    /// Register the borrowed input window. Zeroes `history_abs_start` so
-    /// borrowed positions are absolute input offsets (the owned floor-advance
-    /// reset leaves it non-zero across frames; a borrowed frame commits
-    /// nothing, so it stays 0 for the frame). Every probed candidate is byte-verified, so
-    /// stale table entries from a prior frame are rejected (or, if their bytes
-    /// coincidentally match, are genuine in-window matches).
-    ///
-    /// # Safety
-    /// `buffer` must stay live and unmodified until `clear_borrowed_window`
-    /// or `reset`.
-    pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
-        self.borrowed_input = Some((buffer.as_ptr(), buffer.len()));
-        self.borrowed_block = None;
-        self.history_abs_start = 0;
-    }
-
-    pub(crate) fn clear_borrowed_window(&mut self) {
-        self.borrowed_input = None;
-        self.borrowed_block = None;
-    }
-
-    /// Stage `[block_start, block_end)` as the active borrowed block.
-    pub(crate) fn stage_borrowed_block(&mut self, block_start: usize, block_end: usize) {
-        let (_ptr, total) = self
-            .borrowed_input
-            .expect("stage_borrowed_block requires a registered borrowed window");
-        assert!(
-            block_start <= block_end && block_end <= total,
-            "borrowed block bounds out of range: start={block_start} end={block_end} total={total}",
-        );
-        self.borrowed_block = Some((block_start, block_end));
-    }
-
-    /// `(current_abs_start, current_len)` for the active scan. Borrowed: the
-    /// staged block range. Owned: the last committed chunk in the live window,
-    /// or an empty range at the window's end when none has been committed.
+    /// `(current_abs_start, current_len)` for the active scan: the last
+    /// committed chunk in the live window, or an empty range at the window's
+    /// end when none has been committed.
     pub(crate) fn current_block_range(&self) -> (usize, usize) {
-        if let Some((start, end)) = self.borrowed_block {
-            (start, end - start)
-        } else {
-            let current_len = self.chunk_lens.back().copied().unwrap_or(0);
-            (
-                self.history_abs_start + self.window_size - current_len,
-                current_len,
-            )
-        }
+        let current_len = self.chunk_lens.back().copied().unwrap_or(0);
+        (
+            self.history_abs_start + self.window_size - current_len,
+            current_len,
+        )
     }
 
     /// Test-only: append a chunk to the live window without eviction or
@@ -1587,10 +1380,6 @@ impl MatchTable {
         self.window_size = 0;
         self.offset_hist = [1, 4, 8];
         self.skip_insert_until_abs = 0;
-        // Clear borrowed-window state so a following OWNED frame reads the
-        // owned mirror; a borrowed frame re-arms via `set_borrowed_window`.
-        self.borrowed_input = None;
-        self.borrowed_block = None;
         self.dictionary_primed_for_frame = false;
         if let Some(region) = reborrow_region {
             // Keep `[0, region)` (the dict); drop the previous frame's input.
@@ -2138,11 +1927,9 @@ impl MatchTable {
         }
     }
 
-    /// Cold rebase: clear the hash / hash3 / chain tables and replay
-    /// the inserted history prefix through the active backend's walker
-    /// so the new `position_base` is consistent. The `uses_bt` flag
-    /// (mirrored from `HcParseMode`) selects between the HC and BT
-    /// replay variants.
+    /// Cold rebase: clear the hash / hash3 / tree tables and replay the
+    /// inserted history prefix through the tree walk so the new
+    /// `position_base` is consistent.
     #[cold]
     #[inline(never)]
     pub(crate) fn rebase_positions_cold(&mut self, abs_pos: usize) {
@@ -2155,14 +1942,10 @@ impl MatchTable {
         // below every position insert, and the tiers' compares return the same
         // lengths, so the tree is the same and only this rare pass's speed
         // depends on it.
-        if self.uses_bt {
-            self.replay_history_for_rebase_bt::<crate::encoding::fastpath::ScalarTier>(
-                history_start,
-                abs_pos,
-            );
-        } else {
-            self.replay_history_for_rebase_hc(history_start, abs_pos);
-        }
+        self.replay_history_for_rebase_bt::<crate::encoding::fastpath::ScalarTier>(
+            history_start,
+            abs_pos,
+        );
         // begin_rebase() also clears `hash3_table`. Rewind `next_to_update3`
         // to the inserted prefix start so `update_hash3_until` re-fills the
         // HC3 side table — without this, every HC3 probe up to `abs_pos`
@@ -2174,164 +1957,9 @@ impl MatchTable {
         }
     }
 
-    /// Insert a single position into the hash / chain tables, rebasing
-    /// first if required.
-    #[inline]
-    pub(crate) fn insert_position(&mut self, abs_pos: usize) {
-        self.maybe_rebase_positions(abs_pos);
-        self.insert_position_no_rebase(abs_pos);
-    }
-
-    /// Insert every position in `[start, end)` into the hash / chain
-    /// tables and advance the hash3 fill cursor past `end`.
-    ///
-    /// The rebase guard is hoisted out of the per-position loop: a single
-    /// `(rel + 1)`-representability check on both ends of the range decides
-    /// whether the whole span fits without a rebase. The check is monotone
-    /// in `pos` (rebase only fires as the relative position approaches
-    /// `u32::MAX`), so when neither end needs a rebase no interior position
-    /// can either, and the
-    /// fill runs as a tight loop with raw `(pos - position_base)` index
-    /// arithmetic and hoisted base pointers. This mirrors the upstream zstd's
-    /// once-per-block `ZSTD_window_correctOverflow` followed by an
-    /// unchecked fill, and matters on highly repetitive inputs where a
-    /// single long match makes this loop fill the entire block. When a
-    /// rebase is required the cold per-position path runs unchanged.
-    pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
-        if start < end {
-            if self.needs_rebase(start) || self.needs_rebase(end - 1) {
-                // Cold path: at least one position in the range needs a
-                // rebase. Defer to the guarded per-position insert, which
-                // rebases exactly when each position requires it.
-                for pos in start..end {
-                    self.insert_position(pos);
-                }
-            } else {
-                self.fill_hash_chain_positions(start, end);
-            }
-        }
-        self.next_to_update3 = self.next_to_update3.max(end);
-    }
-
-    /// Index a just-emitted match span with the upstream zstd skip-threshold cap
-    /// (`ZSTD_row_update_internal`, `zstd_lazy.c:922-940`): when the span
-    /// exceeds `SKIP_THRESHOLD` positions only the first `MAX_START` and last
-    /// `MAX_END` are chained, the interior is skipped. Indexing every interior
-    /// byte of a long match is O(matchlen) and dominates HashChain (lazy)
-    /// encode time on periodic inputs where one match can span a whole block;
-    /// upstream zstd's hash-chain finder chains nothing in the interior at all, so the
-    /// 96 + 32 cap is a conservative (ratio-preserving) mirror that still keeps
-    /// boundary anchors for the following search.
-    pub(crate) fn insert_match_span(&mut self, start: usize, end: usize) {
-        const SKIP_THRESHOLD: usize = 384;
-        const MAX_START: usize = 96;
-        const MAX_END: usize = 32;
-        if end.saturating_sub(start) > SKIP_THRESHOLD {
-            // Raw arithmetic is correct by design here, NOT masked with
-            // `saturating_*`. `start` / `end` are absolute stream
-            // positions, and `check_stream_abs_headroom` guarantees
-            // `abs_pos + STREAM_ABS_HEADROOM (= 4112) <= usize::MAX` for
-            // every position in the frame, so `start + MAX_START` (96)
-            // cannot overflow even on a 32-bit target. In this branch
-            // `end - start > SKIP_THRESHOLD (384)`, so `end > 384 >
-            // MAX_END (32)` and `end - MAX_END` cannot underflow.
-            self.insert_positions(start, start + MAX_START);
-            self.insert_positions(end - MAX_END, end);
-        } else {
-            self.insert_positions(start, end);
-        }
-    }
-
-    /// Tight hash/chain fill for `[start, end)` when the caller has already
-    /// proven every position is `(rel + 1)`-representable (so no rebase can
-    /// occur). Equivalent to looping
-    /// [`Self::insert_position_no_rebase`], but with the table base pointers
-    /// and config hoisted out of the loop and the relative position derived
-    /// by a raw subtraction instead of the checked `relative_position`
-    /// arithmetic. Upstream zstd parity: the unchecked `ZSTD_insertAndFindFirstIndex`
-    /// fill body.
-    #[inline]
-    fn fill_hash_chain_positions(&mut self, start: usize, end: usize) {
-        let history_abs_start = self.history_abs_start;
-        let position_base = self.position_base;
-        let index_shift = self.index_shift;
-        let hash_log = self.hash_log;
-        let chain_mask = (1usize << self.chain_log) - 1;
-        // Borrowed-aware source: `live_history()` is the borrowed input window
-        // in no-copy mode (owned mirror empty) and `history[history_start..]`
-        // otherwise. Reading `self.history` directly would hash the empty
-        // mirror on the borrowed HC lazy/greedy path. The raw ptr is copied
-        // out so it holds no borrow across the `hash_table` / `chain_table`
-        // mutations below; the window stays valid for the loop (borrowed input
-        // is live by contract, owned `history` is not realloc'd mid-fill).
-        let (concat_ptr, concat_len) = {
-            let live = self.live_history();
-            (live.as_ptr(), live.len())
-        };
-        debug_assert!(self.chain_off == 1usize << hash_log);
-        debug_assert!(self.hash3_off - self.chain_off == 1usize << self.chain_log);
-        // Base pointers into the one buffer, hoisted before the loop below.
-        // SAFETY: `chain_off` is in bounds (one past the hash region is the
-        // first chain slot), asserted just above.
-        let hash_ptr = self.tables.as_mut_ptr();
-        let chain_ptr = unsafe { hash_ptr.add(self.chain_off) };
-        // The last `< 4` bytes of the live window can't be hashed. Compute
-        // the hashable upper bound once instead of branching per position: a
-        // position `pos` is hashable iff `pos - history_abs_start + 4 <=
-        // concat_len`, i.e. `pos < history_abs_start + (concat_len - 3)`.
-        let hashable_end = end.min(history_abs_start + concat_len.saturating_sub(3));
-        if start >= hashable_end {
-            return;
-        }
-        // Hoist the source pointer and relative index out of the loop and
-        // advance both by one per iteration, mirroring the upstream zstd's
-        // `ip++ / idx++` fill rather than recomputing them from `pos`.
-        let mut src = unsafe { concat_ptr.add(start - history_abs_start) };
-        // `rel` cannot reach `u32::MAX` because the caller proved
-        // `!needs_rebase(end - 1)`, and the `wrapping_add` below keeps the
-        // overflow branch off this per-byte hot loop. The distance from the
-        // floor comes first so the sum stays in range on a 32-bit word.
-        let mut rel = (start - position_base + index_shift) as u32;
-        for _ in start..hashable_end {
-            // SAFETY: every `src` in `[start, hashable_end)` is at least 4
-            // bytes from the end of `history`, so the unaligned 4-byte read is
-            // in range. `hash` is masked to `hash_log` bits and `chain_idx` to
-            // `chain_log` bits, both within the table lengths asserted above.
-            unsafe {
-                let value = Self::read_le_u32_ptr(src);
-                let hash = Self::hash_value_with_mls(value, hash_log, 4);
-                let chain_idx = (rel as usize) & chain_mask;
-                let prev = *hash_ptr.add(hash);
-                *chain_ptr.add(chain_idx) = prev;
-                *hash_ptr.add(hash) = rel + 1;
-                src = src.add(1);
-            }
-            rel = rel.wrapping_add(1);
-        }
-    }
-
-    /// Insert every `step`-th position in `[start, end)` — the sparse
-    /// counterpart to [`Self::insert_positions`]. Skipped positions are
-    /// *not* advanced through `next_to_update3` (the upstream zstd's behaviour
-    /// for the "incompressible block" skip path).
-    pub(crate) fn insert_positions_with_step(&mut self, start: usize, end: usize, step: usize) {
-        if step == 0 {
-            return;
-        }
-        let mut pos = start;
-        while pos < end {
-            self.insert_position(pos);
-            let next = pos.saturating_add(step);
-            if next <= pos {
-                break;
-            }
-            pos = next;
-        }
-    }
-
     /// Backfill the last `< 4` bytes of the previous slice (which couldn't
-    /// be hashed at the time because `insert_position` needs 4 bytes of
-    /// lookahead) before the next slice's matching pass.
+    /// be hashed at the time, a position needs 4 bytes of lookahead) before
+    /// the next slice's matching pass.
     pub(crate) fn backfill_boundary_positions<K: EncodeTier>(
         &mut self,
         current_abs_start: usize,
@@ -2341,11 +1969,7 @@ impl MatchTable {
             .saturating_sub(3)
             .max(self.history_abs_start);
         if backfill_start < current_abs_start {
-            if self.uses_bt {
-                self.bt_update_tree_until::<K>(current_abs_start, current_abs_end);
-            } else {
-                self.insert_positions(backfill_start, current_abs_start);
-            }
+            self.bt_update_tree_until::<K>(current_abs_start, current_abs_end);
         }
     }
 
@@ -2353,16 +1977,13 @@ impl MatchTable {
     /// stretch of `skip_insert_until_abs`. Cap the gap at 384 to bound
     /// the worst-case BT tree update on the next match search.
     pub(crate) fn apply_limited_update_after_long_match(&mut self, current_abs_start: usize) {
-        if !self.uses_bt {
-            return;
-        }
         let gap = current_abs_start.saturating_sub(self.skip_insert_until_abs);
         if gap > 384 {
             self.skip_insert_until_abs = current_abs_start - (gap - 384).min(192);
         }
     }
 
-    /// BT-mode counterpart of the HC sparse skip path. Inserts every
+    /// Sparse skip of an incompressible block. Inserts every
     /// `INCOMPRESSIBLE_SKIP_STEP`-th position through the BT walker
     /// (which threads the binary tree) and then densely inserts the
     /// final `HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP` positions so
@@ -2402,9 +2023,6 @@ impl MatchTable {
         self.next_to_update3 = self.next_to_update3.max(current_abs_end);
     }
 
-    /// `skip_matching` body — backfill the slice boundary and then walk
-    /// the current slice in either dense or sparse mode (driven by the
-    /// `incompressible_hint`). BT and HC modes branch via `uses_bt`.
     /// Dict-priming for BT / optimal levels (upstream zstd `ZSTD_dictMatchState`):
     /// the dictionary content stays in `history` (so the dms chain can read it
     /// and offsets are computed across the dict→input boundary) but is NOT
@@ -2450,28 +2068,16 @@ impl MatchTable {
         self.uncommitted_len += len;
     }
 
-    /// Index the last committed block as the body of a long-distance match on
-    /// the lazy chain: only its tail, which is what upstream's lazy search
-    /// catches up on after one (`ZSTD_ldm_limitTableUpdate` moves
-    /// `nextToUpdate` to it), since the match itself is never searched.
+    /// Index the last committed block as the body of a long-distance match.
+    /// The tree gets here only behind a producer, which parses in place of the
+    /// optimal parser: it resumes near the body's end, as after a long match
+    /// of its own (`ZSTD_ldm_limitTableUpdate`).
     #[cfg(feature = "ldm")]
-    pub(crate) fn skip_long_match<K: EncodeTier>(&mut self) {
+    pub(crate) fn skip_long_match(&mut self) {
         self.ensure_tables();
         let (start, len) = self.current_block_range();
-        let end = start + len;
-        if self.uses_bt {
-            // The tree gets here only behind a producer, which parses in place
-            // of the optimal parser: it resumes near the body's end, as after
-            // a long match of its own.
-            self.apply_limited_update_after_long_match(end);
-            self.next_to_update3 = self.next_to_update3.max(self.skip_insert_until_abs);
-            return;
-        }
-        self.backfill_boundary_positions::<K>(start, end);
-        self.insert_positions(
-            end - len.min(crate::encoding::ldm::LONG_MATCH_INDEXED_TAIL),
-            end,
-        );
+        self.apply_limited_update_after_long_match(start + len);
+        self.next_to_update3 = self.next_to_update3.max(self.skip_insert_until_abs);
     }
 
     /// Carry a long-distance match the driver emitted into the repeat
@@ -2494,33 +2100,11 @@ impl MatchTable {
         let floor = (self.history_abs_start + self.dict_index_floor).min(current_abs_end);
         let current_abs_start = current_abs_start.max(floor);
         self.backfill_boundary_positions::<K>(current_abs_start, current_abs_end);
-        if self.uses_bt {
-            if incompressible_hint == Some(true) {
-                self.bt_insert_sparse_incompressible_block::<K>(current_abs_start, current_abs_end);
-                return;
-            }
-            self.bt_update_tree_until::<K>(current_abs_end, current_abs_end);
+        if incompressible_hint == Some(true) {
+            self.bt_insert_sparse_incompressible_block::<K>(current_abs_start, current_abs_end);
             return;
         }
-        if incompressible_hint == Some(true) {
-            self.insert_positions_with_step(
-                current_abs_start,
-                current_abs_end,
-                INCOMPRESSIBLE_SKIP_STEP,
-            );
-            let dense_tail = HC_MIN_MATCH_LEN + INCOMPRESSIBLE_SKIP_STEP;
-            let tail_start = current_abs_end
-                .saturating_sub(dense_tail)
-                .max(self.history_abs_start);
-            let tail_start = tail_start.max(current_abs_start);
-            for pos in tail_start..current_abs_end {
-                if !(pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
-                    self.insert_position(pos);
-                }
-            }
-        } else {
-            self.insert_positions(current_abs_start, current_abs_end);
-        }
+        self.bt_update_tree_until::<K>(current_abs_end, current_abs_end);
     }
 
     /// Reset the rebase-derived bookkeeping (rolling `position_base` /
@@ -2534,17 +2118,6 @@ impl MatchTable {
         self.index_shift = 0;
         // One buffer holds all three regions, so one fill clears them.
         self.tables.fill(HC_EMPTY);
-    }
-
-    /// HC-side history replay after [`Self::begin_rebase`]. Re-inserts every
-    /// position from `history_start` (inclusive) to `abs_pos`
-    /// (exclusive) into the HC chain/hash tables without re-checking
-    /// the rebase guard — the caller has just rebased, so positions
-    /// are by construction representable.
-    pub(crate) fn replay_history_for_rebase_hc(&mut self, history_start: usize, abs_pos: usize) {
-        for pos in history_start..abs_pos {
-            self.insert_position_no_rebase(pos);
-        }
     }
 
     /// Upstream zstd parity: replay an optimal-parser plan into the consumer's

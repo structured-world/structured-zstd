@@ -389,13 +389,13 @@ benefits.
 |-------------|----------|---------|
 | 1-2         | `Fast`     | `Simple` matcher |
 | 3-4         | `Dfast`    | `Dfast` two-tier hash |
-| 5-12        | `Greedy` / `Lazy` / `Lazy2` | `Row` lazy parse (`lazy_depth=0/1/2`): row match-finder above a 2^14 window, hash chain at or below it |
+| 5-12        | `Greedy` / `Lazy` / `Lazy2` | `Row` lazy parse (`lazy_depth=0/1/2`): row match-finder above a 2^14 window, hash chain at or below it, unless `RowMatchFinderMode` forces one |
 | 13-15       | `Btlazy2`  | `Row` lazy parse over the lazily-sorted binary tree |
-| 16-17       | `BtOpt`    | `HashChain` candidates + `btopt` price parser |
-| 18          | `BtUltra`  | `HashChain` candidates + `btultra` price parser |
-| 19-22       | `BtUltra2` | `HashChain` candidates + `btultra2` dual-profile parse |
+| 16-17       | `BtOpt`    | binary-tree candidates + `btopt` price parser |
+| 18          | `BtUltra`  | binary-tree candidates + `btultra` price parser |
+| 19-22       | `BtUltra2` | binary-tree candidates + `btultra2` dual-profile parse |
 
-The level → strategy column matches upstream zstd `ZSTD_defaultCParameters[0]` at `zstd/lib/compress/clevels.h:25-50` (srcSize > 256 KiB tier); smaller sources shift the row per upstream's size tiers. The whole greedy..btlazy2 band runs upstream's `ZSTD_compressBlock_lazy_generic` parse on the `Row` backend over the three upstream match finders (rows / hash chain per `ZSTD_resolveRowMatchFinderMode`, lazily-sorted binary tree for `btlazy2`).
+The level → strategy column matches upstream zstd `ZSTD_defaultCParameters[0]` at `zstd/lib/compress/clevels.h:25-50` (srcSize > 256 KiB tier); smaller sources shift the row per upstream's size tiers. The whole greedy..btlazy2 band runs upstream's `ZSTD_compressBlock_lazy_generic` parse on the `Row` backend over the three upstream match finders (rows / hash chain per `ZSTD_resolveRowMatchFinderMode`, which `CompressionParametersBuilder::row_match_finder` and `ZSTD_c_useRowMatchFinder` override; lazily-sorted binary tree for `btlazy2`).
 
 </details>
 

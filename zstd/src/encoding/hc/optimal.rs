@@ -39,7 +39,7 @@ use crate::encoding::{
     },
     hc::HC_MIN_MATCH_LEN,
     levels::config::HcConfig,
-    match_generator::{HC_OPT_MIN_MATCH_LEN, HC_SEARCH_DEPTH, HC_TARGET_LEN, HcBackend},
+    match_generator::{HC_OPT_MIN_MATCH_LEN, HC_SEARCH_DEPTH, HC_TARGET_LEN},
     match_table::storage::HC3_HASH_LOG,
     opt::ldm::{HcOptLdmState, HcRawSeqStore},
     opt::types::{
@@ -279,7 +279,7 @@ macro_rules! build_optimal_plan_impl_body {
                 seq_store: HcRawSeqStore {
                     pos: 0,
                     pos_in_sequence: 0,
-                    size: $self.backend.bt_mut().ldm_sequences.len(),
+                    size: $self.bt.ldm_sequences.len(),
                 },
                 ..HcOptLdmState::default()
             }
@@ -300,13 +300,11 @@ macro_rules! build_optimal_plan_impl_body {
             // matches that copy the wrong bytes (undecodable frame).
             if ldm_block_offset > 0 {
                 $self
-                    .backend
-                    .bt_mut()
+                    .bt
                     .ldm_skip_raw_seq_store_bytes(&mut opt_ldm.seq_store, ldm_block_offset);
             }
             $self
-                .backend
-                .bt_mut()
+                .bt
                 .ldm_get_next_match_and_update_seq_store(&mut opt_ldm, 0, $current_len);
         }
 
@@ -314,7 +312,7 @@ macro_rules! build_optimal_plan_impl_body {
         // at current position before entering the generic forward DP loop.
         if $current_len >= min_match_len {
             let seed_ldm = if HAS_LDM {
-                $self.backend.bt_mut().ldm_process_match_candidate(
+                $self.bt.ldm_process_match_candidate(
                     &mut opt_ldm,
                     0,
                     $current_len,
@@ -367,15 +365,15 @@ macro_rules! build_optimal_plan_impl_body {
                         HC_OPT_PRICE_STRIDE,
                     )
                 };
-                $self.backend.bt_mut().opt_ll_price_stamp =
-                    $self.backend.bt_mut().opt_ll_price_stamp.wrapping_add(1).max(1);
-                ll_price_stamp = $self.backend.bt_mut().opt_ll_price_stamp;
-                $self.backend.bt_mut().opt_lit_price_stamp =
-                    $self.backend.bt_mut().opt_lit_price_stamp.wrapping_add(1).max(1);
-                lit_price_stamp = $self.backend.bt_mut().opt_lit_price_stamp;
-                $self.backend.bt_mut().opt_ml_price_stamp =
-                    $self.backend.bt_mut().opt_ml_price_stamp.wrapping_add(1).max(1);
-                ml_price_stamp = $self.backend.bt_mut().opt_ml_price_stamp;
+                $self.bt.opt_ll_price_stamp =
+                    $self.bt.opt_ll_price_stamp.wrapping_add(1).max(1);
+                ll_price_stamp = $self.bt.opt_ll_price_stamp;
+                $self.bt.opt_lit_price_stamp =
+                    $self.bt.opt_lit_price_stamp.wrapping_add(1).max(1);
+                lit_price_stamp = $self.bt.opt_lit_price_stamp;
+                $self.bt.opt_ml_price_stamp =
+                    $self.bt.opt_ml_price_stamp.wrapping_add(1).max(1);
+                ml_price_stamp = $self.bt.opt_ml_price_stamp;
                 // Deferred base/seed prices: only reached on a matched seed (see
                 // the declarations above). Assign before the forward DP / seed
                 // paths below read them.
@@ -543,7 +541,7 @@ macro_rules! build_optimal_plan_impl_body {
                 let prev_node = unsafe { *nodes.add(pos - 1) };
                 let lit_len = prev_node.litlen as usize + 1;
                 let lit_price = {
-                    let bt = $self.backend.bt_mut();
+                    let bt = &mut *$self.bt;
                     BtMatcher::cached_literal_price::<ACCURATE_PRICE>(
                         profile,
                         $stats,
@@ -594,7 +592,7 @@ macro_rules! build_optimal_plan_impl_body {
                     {
                         if ll1_price < ll0_price {
                             let next_lit_price = {
-                                let bt = $self.backend.bt_mut();
+                                let bt = &mut *$self.bt;
                                 BtMatcher::cached_literal_price::<ACCURATE_PRICE>(
                                     profile,
                                     $stats,
@@ -740,7 +738,7 @@ macro_rules! build_optimal_plan_impl_body {
                 // Upstream `ZSTD_optLdm_processMatchCandidate`: the producer
                 // advances past this position and its candidate joins after
                 // the search.
-                if let Some(ldm) = $self.backend.bt_mut().ldm_process_match_candidate(
+                if let Some(ldm) = $self.bt.ldm_process_match_candidate(
                     &mut opt_ldm,
                     pos,
                     $current_len - pos,
@@ -1312,8 +1310,6 @@ impl HcMatchGenerator {
         mut handle_sequence: impl FnMut(Sequence),
     ) {
         self.table.ensure_tables();
-        // Borrowed-aware: owned → last committed chunk; borrowed → staged
-        // in-place block range.
         let (current_abs_start, current_len) = self.table.current_block_range();
         if current_len == 0 {
             return;
@@ -1369,16 +1365,15 @@ impl HcMatchGenerator {
         // The DP bodies read the strategy's `FAVOR_SMALL_OFFSETS` const directly;
         // verify the runtime profile (built from the same strategy) agrees.
         debug_assert_eq!(profile.favor_small_offsets, S::FAVOR_SMALL_OFFSETS);
-        let mut opt_state =
-            core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
+        let mut opt_state = core::mem::replace(&mut self.bt.opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, S::ACCURATE_PRICE);
-        let mut best_plan = core::mem::take(&mut self.backend.bt_mut().opt_segment_plan_scratch);
+        let mut best_plan = core::mem::take(&mut self.bt.opt_segment_plan_scratch);
         best_plan.clear();
         let plan_reps = self.table.offset_hist;
         let (cursor, plan_litlen) = self.table.opt_start_cursor_and_litlen(current_abs_start);
         // Frame-constant LDM presence, resolved once per block (not per segment
         // and not in the DP hot loop): drives the HAS_LDM const-generic dispatch.
-        let has_ldm = !self.backend.bt_mut().ldm_sequences.is_empty();
+        let has_ldm = !self.bt.ldm_sequences.is_empty();
         // Resolve the SIMD tier ONCE here: the whole block then runs under one
         // kernel-monomorphized pass (`run_optimal_block_<kernel>`) instead of
         // hitting select_kernel()'s OnceLock atomic + a CPU-tier match per
@@ -1543,12 +1538,9 @@ impl HcMatchGenerator {
         self.table
             .emit_optimal_plan(current_len, &best_plan, &mut handle_sequence);
         best_plan.clear();
-        self.backend.bt_mut().opt_segment_plan_scratch = best_plan;
-        let _ = self
-            .backend
-            .bt_mut()
-            .finish_optimal_plan(plan_buffers, (0, [0; 3], 0, 0));
-        self.backend.bt_mut().opt_state = opt_state;
+        self.bt.opt_segment_plan_scratch = best_plan;
+        let _ = self.bt.finish_optimal_plan(plan_buffers, (0, [0; 3], 0, 0));
+        self.bt.opt_state = opt_state;
     }
 
     // The scalar arm of `run_seed_loop!` wraps a safe call in `unsafe`.
@@ -1573,14 +1565,13 @@ impl HcMatchGenerator {
         // Same per-block clamp the main pass does; the DP body expects it done.
         seed_profile.sufficient_match_len = self.hc.sufficient_match_len_for_pass(seed_profile);
         debug_assert_eq!(seed_profile.favor_small_offsets, S::FAVOR_SMALL_OFFSETS);
-        let mut opt_state =
-            core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
+        let mut opt_state = core::mem::replace(&mut self.bt.opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, S::ACCURATE_PRICE);
         let seed_reps = self.table.offset_hist;
         let (cursor, seed_litlen) = self.table.opt_start_cursor_and_litlen(current_abs_start);
-        let mut seed_plan = core::mem::take(&mut self.backend.bt_mut().opt_seed_plan_scratch);
+        let mut seed_plan = core::mem::take(&mut self.bt.opt_seed_plan_scratch);
         seed_plan.clear();
-        let has_ldm = !self.backend.bt_mut().ldm_sequences.is_empty();
+        let has_ldm = !self.bt.ldm_sequences.is_empty();
         // SIMD tier resolved ONCE (see start_matching_optimal): the seed pass
         // runs as one kernel-monomorphized block pass. It keeps the statistics
         // and drops the plan (`KEEP_PLAN = false`).
@@ -1741,11 +1732,11 @@ impl HcMatchGenerator {
             run_seed_loop!(run_optimal_block_scalar);
         }
         seed_plan.clear();
-        self.backend.bt_mut().opt_seed_plan_scratch = seed_plan;
+        self.bt.opt_seed_plan_scratch = seed_plan;
         // The DP scratch buffers are owned by the caller (start_matching_optimal)
         // and shared across both passes, so the seed pass leaves them in place
         // (`plan_buffers` is a borrow) instead of restoring them here.
-        self.backend.bt_mut().opt_state = opt_state;
+        self.bt.opt_state = opt_state;
 
         // Upstream zstd initStats_ultra keeps the collected entropy statistics but
         // invalidates the first-pass matchfinder history before the real pass.
@@ -1773,7 +1764,7 @@ impl HcMatchGenerator {
     /// literal). Restore with [`BtMatcher::finish_optimal_plan`] after the
     /// per-segment loop.
     fn take_optimal_plan_buffers(&mut self) -> HcOptimalPlanBuffers {
-        let bt = self.backend.bt_mut();
+        let bt = &mut *self.bt;
         let mut nodes = core::mem::take(&mut bt.opt_nodes_scratch);
         let mut node_prices = core::mem::take(&mut bt.opt_node_prices_scratch);
         let mut candidates = core::mem::take(&mut bt.opt_candidates_scratch);

@@ -70,6 +70,7 @@ pub(crate) mod bt;
 pub(crate) mod cost_model;
 pub(crate) mod dfast;
 pub(crate) mod hc;
+#[cfg(test)]
 pub(crate) mod lazy_parse;
 // LDM hashes each `min_match_length` window with XXH64 (upstream zstd
 // `zstd_ldm.c:315`), so the `ldm` feature implies `hash` and the
@@ -111,7 +112,7 @@ pub use levels::config::{
 pub use match_generator::MatchGeneratorDriver;
 pub use parameters::{
     Bounds, CParameter, CompressionParameters, CompressionParametersBuilder, LevelParameters,
-    LiteralCompressionMode, ParameterError, Strategy,
+    LiteralCompressionMode, ParameterError, RowMatchFinderMode, Strategy,
 };
 pub use streaming_encoder::{CompressionContext, StreamingEncoder};
 pub use workspace::HistoryBuf;

@@ -1,19 +1,13 @@
-//! Shared, C-faithful lazy-parse decision logic.
+//! The lazy-parse decision as a standalone macro, for the unit tests that probe
+//! the row search outside the lazy body.
 //!
 //! Upstream zstd has a SINGLE lazy parser — `ZSTD_compressBlock_lazy_generic`
 //! (`lib/compress/zstd_lazy.c`) — parameterized by the search method
-//! (hash-chain / binary-tree / row-hash) and the lookahead `depth`. The match
-//! finders differ per strategy; the PARSE DECISION (how a candidate at the
-//! current position is weighed against one a byte or two ahead) is identical
-//! across all of them.
-//!
-//! This module hosts that one decision so the per-strategy matchers
-//! (HC / Row / dfast) share it instead of each carrying a divergent copy. The
-//! register-hungry part is the search kernel, which stays specialized per
-//! strategy and is injected here as a closure — the decision itself is a
-//! handful of comparisons per position, so sharing it adds no spill pressure.
+//! (hash-chain / binary-tree / row-hash) and the lookahead `depth`; the PARSE
+//! DECISION (how a candidate at the current position is weighed against one a
+//! byte or two ahead) is identical across all of them.
 
-/// C-faithful lazy commit/defer decision, ONE source for every strategy.
+/// C-faithful lazy commit/defer decision.
 ///
 /// Expanded INLINE at the call site (like upstream's single
 /// `FORCE_INLINE_TEMPLATE ZSTD_compressBlock_lazy_generic`, zstd_lazy.c:1516):

@@ -154,6 +154,35 @@ pub enum LiteralCompressionMode {
     Disable,
 }
 
+/// Which finder the greedy, lazy and lazy2 strategies search, the drop-in
+/// equivalent of C zstd's `ZSTD_c_useRowMatchFinder` (`ZSTD_ps_auto` /
+/// `ZSTD_ps_enable` / `ZSTD_ps_disable`). The other strategies have a finder
+/// of their own and ignore it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum RowMatchFinderMode {
+    /// Rows above a 16 KiB window, a hash chain at or below it, where the rows
+    /// cost more to set up than they save (upstream
+    /// `ZSTD_resolveRowMatchFinderMode`, zstd_compress.c:246).
+    #[default]
+    Auto,
+    /// Search rows at every window size.
+    Enable,
+    /// Search a hash chain at every window size.
+    Disable,
+}
+
+impl RowMatchFinderMode {
+    /// Whether a greedy / lazy / lazy2 frame with a `window`-byte window
+    /// searches rows.
+    pub(crate) const fn searches_rows(self, window: usize) -> bool {
+        match self {
+            Self::Auto => window > (1 << 14),
+            Self::Enable => true,
+            Self::Disable => false,
+        }
+    }
+}
+
 /// One tunable compression parameter — the analogue of a C zstd
 /// `ZSTD_cParameter`. Used to query bounds via [`CParameter::bounds`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -435,6 +464,8 @@ pub(crate) struct ParamOverrides {
     pub(crate) ldm: Option<LdmOverride>,
     /// Whether literals are entropy-coded; `Auto` leaves it to the level.
     pub(crate) literal_compression: LiteralCompressionMode,
+    /// The greedy / lazy band's finder; `Auto` leaves it to the window.
+    pub(crate) row_match_finder: RowMatchFinderMode,
 }
 
 impl ParamOverrides {
@@ -451,6 +482,7 @@ impl ParamOverrides {
             && self.strategy.is_none()
             && self.ldm.is_none()
             && self.literal_compression == LiteralCompressionMode::Auto
+            && self.row_match_finder == RowMatchFinderMode::Auto
     }
 }
 
@@ -483,6 +515,7 @@ impl CompressionParameters {
             enable_ldm: false,
             ldm: LdmOverride::default(),
             literal_compression: LiteralCompressionMode::Auto,
+            row_match_finder: RowMatchFinderMode::Auto,
         }
     }
 
@@ -499,6 +532,11 @@ impl CompressionParameters {
     /// How literals are entropy-coded (see [`LiteralCompressionMode`]).
     pub fn literal_compression_mode(&self) -> LiteralCompressionMode {
         self.overrides.literal_compression
+    }
+
+    /// Which finder the greedy / lazy band searches (see [`RowMatchFinderMode`]).
+    pub fn row_match_finder_mode(&self) -> RowMatchFinderMode {
+        self.overrides.row_match_finder
     }
 
     /// The window, `log2`, the encoder gives a frame of `source_size` bytes
@@ -580,9 +618,37 @@ pub struct CompressionParametersBuilder {
     enable_ldm: bool,
     ldm: LdmOverride,
     literal_compression: LiteralCompressionMode,
+    row_match_finder: RowMatchFinderMode,
 }
 
 impl CompressionParametersBuilder {
+    /// Choose the finder the greedy, lazy and lazy2 strategies search instead
+    /// of leaving it to the window size. C `ZSTD_c_useRowMatchFinder`.
+    ///
+    /// ```rust
+    /// use structured_zstd::encoding::{
+    ///     compress_with_parameters, CompressionLevel, CompressionParameters,
+    ///     RowMatchFinderMode,
+    /// };
+    /// use structured_zstd::decoding::FrameDecoder;
+    ///
+    /// let data = b"a row or a chain, the frame decodes the same ".repeat(2000);
+    /// let chain = CompressionParameters::builder(CompressionLevel::Level(7))
+    ///     .row_match_finder(RowMatchFinderMode::Disable)
+    ///     .build()
+    ///     .unwrap();
+    /// let frame = compress_with_parameters(&data[..], &chain);
+    /// let mut decoded = Vec::with_capacity(data.len());
+    /// FrameDecoder::new()
+    ///     .decode_all_to_vec(&frame, &mut decoded)
+    ///     .unwrap();
+    /// assert_eq!(decoded, data);
+    /// ```
+    pub fn row_match_finder(mut self, mode: RowMatchFinderMode) -> Self {
+        self.row_match_finder = mode;
+        self
+    }
+
     /// Decide whether literals are entropy-coded, overriding the level's own
     /// choice. C `ZSTD_c_literalCompressionMode`.
     ///
@@ -741,6 +807,7 @@ impl CompressionParametersBuilder {
                 strategy: self.strategy,
                 ldm,
                 literal_compression: self.literal_compression,
+                row_match_finder: self.row_match_finder,
             },
         })
     }

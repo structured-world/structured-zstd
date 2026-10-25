@@ -119,7 +119,7 @@ impl MatchGeneratorDriver {
             }
             let gap_literals = gap.expect("the gap sink only ever writes Some");
             self.storage.commit_piece(seq.match_length);
-            self.storage.skip_long_match::<K>();
+            self.storage.skip_long_match();
             handle_sequence(Sequence::Triple {
                 literal_len: gap_literals,
                 offset: seq.offset,

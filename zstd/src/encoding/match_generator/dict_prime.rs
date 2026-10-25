@@ -301,7 +301,7 @@ impl MatchGeneratorDriver {
                 .saturating_add(granted_retained_budget);
         }
         if self.active_backend() == super::super::strategy::BackendTag::HashChain {
-            // Recompute the lazy-HC attach decision made per-chunk in
+            // Recompute the attach decision made per-chunk in
             // `skip_matching_for_dictionary_priming` (stable across the prime —
             // `reset_size_log` does not change here).
             //
@@ -310,12 +310,12 @@ impl MatchGeneratorDriver {
             // table whose dimensions differ from the copy-mode live table, so a
             // cross-mode restore would install mismatched table geometry and the
             // encoder could search past the frame window (undecodable). The two
-            // HC modes share identical window geometry: `max_window_size` and the
+            // modes share identical window geometry: `max_window_size` and the
             // dictionary limit are both set ABOVE this branch (the same value in
-            // either mode), and the live chain table dimensions come from the
+            // either mode), and the live tree dimensions come from the
             // resolved `params` the key already pins. The modes differ only in
-            // WHERE the committed dict lives — a single-link `dms` (attach) vs
-            // merged into the live chain (copy) — both producing valid matches at
+            // WHERE the committed dict lives — a separate `dms` tree (attach) vs
+            // merged into the live tree (copy) — both producing valid matches at
             // in-window offsets. Upstream zstd makes the same observation: attach
             // (`ZSTD_resetCCtx_byAttachingCDict`) and copy
             // (`ZSTD_resetCCtx_byCopyingCDict`) both keep the caller's
@@ -336,19 +336,16 @@ impl MatchGeneratorDriver {
             let attach = self.hc_dict_attach_mode();
             let table = &mut self.hc_matcher_mut().table;
             table.set_dictionary_limit_from_primed_bytes(committed_dict_budget);
-            // Build the dictMatchState over the committed dict (front of history)
-            // so `find_best_match` dual-probes it with its own compare budget —
-            // but ONLY in ATTACH mode. BT/optimal attach → DUBT dms; lazy-HC
-            // attach → single-link hash-chain dms. COPY mode (large known source,
-            // both BT and lazy-HC) already merged the dict into the live tree /
-            // chain in `skip_matching_for_dictionary_priming`, so it carries no
-            // separate dms — drop any stale one.
-            if !attach {
-                table.dms.invalidate();
-            } else if table.uses_bt {
+            // Build the dictMatchState tree over the committed dict (front of
+            // history) so the search dual-probes it with its own compare budget —
+            // but ONLY in ATTACH mode. COPY mode (large known source) already
+            // merged the dict into the live tree in
+            // `skip_matching_for_dictionary_priming`, so it carries no separate
+            // dms — drop any stale one.
+            if attach {
                 table.prime_dms_bt(committed_dict_budget);
             } else {
-                table.prime_dms_hc(committed_dict_budget);
+                table.dms.invalidate();
             }
         }
         // CDict-equivalent: now that every dict chunk is indexed, mark the
@@ -416,23 +413,6 @@ impl MatchGeneratorDriver {
             // allocation + copy + drop cycle.
             (MatcherStorage::Simple(live), MatcherStorage::Simple(snap)) => {
                 live.clone_from(snap);
-            }
-            // Same-variant HC lazy/greedy restore (non-BT): the snapshot keeps
-            // the full primed hash/chain tables (capture's non-BT full clone),
-            // so `clone_from` reuses the live history/hash/chain/dms buffers in
-            // place — upstream zstd reuses the CDict tables rather than reallocating
-            // them. This is the per-frame allocate+copy+drop that dominated
-            // small `compress-dict` HC frames (5-7x vs C). BT (`uses_bt`)
-            // snapshots drop their live tables, so they stay on the realloc
-            // path below.
-            (MatcherStorage::HashChain(live), MatcherStorage::HashChain(snap))
-                if !snap.table.uses_bt =>
-            {
-                live.table.clone_from(&snap.table);
-                live.hc.clone_from(&snap.hc);
-                live.strategy_tag = snap.strategy_tag;
-                // backend is `HcBackend::Hc` (zero-sized) for non-BT levels;
-                // the live one is already correct for this resolved key.
             }
             // Binary tree: the history and, in COPY mode, the tree land in the
             // rooms the reset laid out in the workspace. An ATTACH-mode
@@ -510,17 +490,13 @@ impl MatchGeneratorDriver {
         // clone only the dict-state (history + `dms` + window/offset/dict-limit),
         // then move the live tables back — the snapshot keeps just what upstream zstd's
         // CDict keeps, and `restore_primed_dictionary` re-allocates the zeroed
-        // live tables. Every other case keeps the dict reachable through the live
-        // structure, so the snapshot must retain the full tables (full clone):
-        // lazy-HC attach (it DOES prime a hash-chain `dms`, but the live chain is
-        // still the search structure, so the tables must travel) and COPY mode for
-        // BOTH BT and lazy-HC (`dms` invalidated, dict merged into the live tree /
-        // chain). `uses_bt && dms.is_primed()` is therefore the exact "decoupled"
-        // signal — true only for the BT attach prime; lazy-HC attach primes `dms`
-        // too but is intentionally NOT decoupled.
+        // live tables. COPY mode keeps the dict reachable through the live tree
+        // (`dms` invalidated, dict merged in), so its snapshot must retain the
+        // full tables (full clone). `dms.is_primed()` is therefore the exact
+        // "decoupled" signal.
         let bt_decoupled = matches!(
             &self.storage,
-            MatcherStorage::HashChain(hc) if hc.table.uses_bt && hc.table.dms.is_primed()
+            MatcherStorage::HashChain(hc) if hc.table.dms.is_primed()
         );
         if bt_decoupled {
             let MatcherStorage::HashChain(hc) = &mut self.storage else {

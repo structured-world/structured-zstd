@@ -2785,16 +2785,17 @@ impl RowMatchGenerator {
         self.row_hash_mls = self.mls.clamp(4, 6) as u32;
         // A btlazy2 level (its own or the CDict's strategy) searches the
         // binary tree. Otherwise upstream `ZSTD_resolveRowMatchFinderMode`:
-        // rows only above a 2^14 window; the window is source-size-adjusted,
-        // so inputs of 16 KiB or less search the hash chain. A dictionary
-        // frame inherits the CDict's decision (`ZSTD_resetCCtx_usingCDict`),
-        // and a copied dictionary brings the CDict's salt (0) with its tables.
+        // the mode the caller set, or rows only above a 2^14 window; the
+        // window is source-size-adjusted, so inputs of 16 KiB or less search
+        // the hash chain. A dictionary frame inherits the CDict's decision
+        // (`ZSTD_resetCCtx_usingCDict`), and a copied dictionary brings the
+        // CDict's salt (0) with its tables.
         self.finder = if config.bt {
             LazyFinder::Tree
         } else {
             let rows = match self.dict_plan {
                 Some(plan) => plan.use_row,
-                None => self.max_window_size > (1usize << 14),
+                None => config.searches_rows(self.max_window_size),
             };
             if rows {
                 LazyFinder::Rows

@@ -12,9 +12,7 @@
 //! Matcher::start_matching                       // 7-arm match on StrategyTag (per block)
 //!  └─ compress_block::<S>                       // S::BACKEND const match
 //!      ├─ Simple/Dfast/Row                      // backends without parse_mode
-//!      └─ HcMatchGenerator::start_matching_strategy::<S>
-//!          ├─ S::USE_BT == false → start_matching_lazy
-//!          └─ S::USE_BT == true  → start_matching_optimal::<S>
+//!      └─ HcMatchGenerator::start_matching_optimal::<S>
 //!              ├─ HcOptimalCostProfile::const_for_strategy::<S>()
 //!              ├─ should_run_btultra2_seed_pass::<S>          // const false unless S = BtUltra2
 //!              └─ select_kernel() once, then one pass over the block:
@@ -48,7 +46,7 @@ pub(crate) enum BackendTag {
     Dfast,
     /// `RowMatchGenerator` — level 4.
     Row,
-    /// `HcMatchGenerator` — levels 5-22.
+    /// `HcMatchGenerator` — the optimal parsers (btopt, btultra, btultra2).
     HashChain,
 }
 
@@ -93,19 +91,17 @@ impl ParseMode {
 }
 
 /// Search method — how match candidates are produced for a position.
-/// Orthogonal to [`ParseMode`] (upstream zstd `cParams.strategy` search half plus
-/// the `useRowMatchFinder` cParam that swaps `HashChain` for `RowHash` in
-/// the greedy/lazy band).
+/// Orthogonal to [`ParseMode`] (upstream zstd `cParams.strategy` search half).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SearchMethod {
     /// Single-table fast finder (upstream zstd `ZSTD_fast`).
     Fast,
     /// Two parallel hash tables (upstream zstd `ZSTD_dfast`).
     DoubleFast,
-    /// Row-hash SIMD-tag finder (upstream zstd row matchfinder).
+    /// The greedy / lazy / lazy2 finders: rows or the hash chain
+    /// (`ZSTD_RowFindBestMatch` / `ZSTD_HcFindBestMatch`, chosen by
+    /// `useRowMatchFinder`), searched by one lazy parse.
     RowHash,
-    /// Hash-chain finder (upstream zstd `ZSTD_HcFindBestMatch`).
-    HashChain,
     /// Binary-tree finder for the optimal parser (upstream zstd `ZSTD_BtGetAllMatches`).
     BinaryTree,
     /// Lazily-sorted binary-tree finder inside the lazy parse (upstream zstd
@@ -115,15 +111,14 @@ pub(crate) enum SearchMethod {
 
 impl SearchMethod {
     /// Storage backend (matcher variant) this search method runs in.
-    /// `BinaryTree` shares the `HashChain` storage (the BT scratch lives
-    /// inside the hash-chain matcher, gated by `uses_bt`); `BinaryTreeLazy`
-    /// is the third finder of the lazy (Row) backend.
+    /// `BinaryTree` runs in the `HashChain` storage, whose tables hold the
+    /// tree; `BinaryTreeLazy` is the third finder of the lazy (Row) backend.
     pub(crate) const fn backend(self) -> BackendTag {
         match self {
             Self::Fast => BackendTag::Simple,
             Self::DoubleFast => BackendTag::Dfast,
             Self::RowHash | Self::BinaryTreeLazy => BackendTag::Row,
-            Self::HashChain | Self::BinaryTree => BackendTag::HashChain,
+            Self::BinaryTree => BackendTag::HashChain,
         }
     }
 }
