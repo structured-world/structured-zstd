@@ -308,67 +308,267 @@ fn detect_kernel_uncached() -> FastpathKernel {
     FastpathKernel::Scalar
 }
 
-/// Public entry point for raw-pointer prefix-length scans (BT byte compare,
-/// repcode extend, etc.): resolves the tier via [`select_kernel`] on every
-/// call, so hot loops should cache the kernel and call
-/// [`dispatch_common_prefix_len_ptr_with_kernel`] instead.
-///
-/// # Safety
-/// `lhs` / `rhs` must each point to at least `max` initialized bytes.
-#[inline]
-pub(crate) unsafe fn dispatch_common_prefix_len_ptr(
-    lhs: *const u8,
-    rhs: *const u8,
-    max: usize,
-) -> usize {
-    // Cold-path shim: resolves the kernel via `select_kernel()` on every call.
-    // Hot match-finder loops resolve the kernel once per block and call
-    // [`dispatch_common_prefix_len_ptr_with_kernel`] directly.
-    unsafe { dispatch_common_prefix_len_ptr_with_kernel(select_kernel(), lhs, rhs, max) }
+/// A [`FastpathKernel`] tier as a type. The encoder chooses its tier once, in
+/// [`with_encode_tier`], and everything below that choice is compiled per tier:
+/// a leaf that runs a different kernel per tier picks it with [`tier_match`],
+/// which keeps the one kernel at monomorphisation, so no tier is asked at run
+/// time below the choice.
+pub(crate) trait EncodeTier {
+    /// The tier this type stands for.
+    const TIER: FastpathKernel;
+
+    /// Length of the common prefix of `lhs` and `rhs`, at most `max`, with this
+    /// tier's compare.
+    ///
+    /// # Safety
+    /// `lhs` / `rhs` must each point to at least `max` initialized bytes, and
+    /// the CPU must support the tier, which holds for the tier the encoder
+    /// chose.
+    unsafe fn common_prefix_len_ptr(lhs: *const u8, rhs: *const u8, max: usize) -> usize;
 }
 
-/// Prefix-length scan against an already-resolved [`FastpathKernel`], so a hot
-/// loop pays the kernel-select once per block (caller-cached) instead of the
-/// `OnceLock` atomic + branch on every byte-compare.
+/// One tier type: the struct, its [`FastpathKernel`] and its compare kernel,
+/// under the cfg that builds the tier.
+macro_rules! encode_tier {
+    ($(#[$cfg:meta])* $name:ident, $tier:ident, $prefix:path) => {
+        #[doc = concat!("[`FastpathKernel::", stringify!($tier), "`] as a type.")]
+        $(#[$cfg])*
+        pub(crate) struct $name;
+        $(#[$cfg])*
+        impl EncodeTier for $name {
+            const TIER: FastpathKernel = FastpathKernel::$tier;
+
+            #[inline(always)]
+            unsafe fn common_prefix_len_ptr(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
+                // SAFETY: forwarded from the caller.
+                unsafe { $prefix(lhs, rhs, max) }
+            }
+        }
+    };
+}
+
+encode_tier!(ScalarTier, Scalar, scalar::common_prefix_len_ptr);
+encode_tier!(
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    ))]
+    NeonTier,
+    Neon,
+    neon::common_prefix_len_ptr
+);
+// Both SSE tiers compare with the same SSE2 kernel; only the optimal parser's
+// price set differs between them.
+encode_tier!(
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
+    Sse2Tier,
+    Sse2,
+    sse2::common_prefix_len_ptr
+);
+encode_tier!(
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
+    Sse42Tier,
+    Sse42,
+    sse2::common_prefix_len_ptr
+);
+encode_tier!(
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
+    Avx2Bmi2Tier,
+    Avx2Bmi2,
+    avx2_bmi2::common_prefix_len_ptr
+);
+encode_tier!(
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    Simd128Tier,
+    Simd128,
+    simd128::common_prefix_len_ptr
+);
+
+/// The encoder's one choice of tier: evaluate `$body` with `$k` naming the
+/// [`EncodeTier`] type of the tier `$tier` holds.
+macro_rules! with_encode_tier {
+    ($tier:expr, $k:ident => $body:expr) => {{
+        use $crate::encoding::fastpath as tiers;
+        match $tier {
+            tiers::FastpathKernel::Scalar => {
+                type $k = tiers::ScalarTier;
+                $body
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                feature = "kernel-neon"
+            ))]
+            tiers::FastpathKernel::Neon => {
+                type $k = tiers::NeonTier;
+                $body
+            }
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-sse"
+            ))]
+            tiers::FastpathKernel::Sse2 => {
+                type $k = tiers::Sse2Tier;
+                $body
+            }
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-sse"
+            ))]
+            tiers::FastpathKernel::Sse42 => {
+                type $k = tiers::Sse42Tier;
+                $body
+            }
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-avx2"
+            ))]
+            tiers::FastpathKernel::Avx2Bmi2 => {
+                type $k = tiers::Avx2Bmi2Tier;
+                $body
+            }
+            #[cfg(all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel-simd128"
+            ))]
+            tiers::FastpathKernel::Simd128 => {
+                type $k = tiers::Simd128Tier;
+                $body
+            }
+        }
+    }};
+}
+pub(crate) use with_encode_tier;
+
+/// A `match` on `$k`'s [`EncodeTier::TIER`] that instantiates only the arm of
+/// that tier.
 ///
-/// # Safety
-/// `lhs` / `rhs` must each point to at least `max` initialized bytes.
-#[inline(always)]
-pub(crate) unsafe fn dispatch_common_prefix_len_ptr_with_kernel(
-    kernel: FastpathKernel,
-    lhs: *const u8,
-    rhs: *const u8,
-    max: usize,
-) -> usize {
-    match kernel {
-        FastpathKernel::Scalar => unsafe { scalar::common_prefix_len_ptr(lhs, rhs, max) },
-        #[cfg(all(
-            target_arch = "aarch64",
-            target_endian = "little",
-            feature = "kernel-neon"
-        ))]
-        FastpathKernel::Neon => unsafe { neon::common_prefix_len_ptr(lhs, rhs, max) },
-        // Both x86 tiers share this kernel: it is SSE2 throughout, and only
-        // the optimal parser's price set differs between them.
-        #[cfg(all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel-sse"
-        ))]
-        FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-            sse2::common_prefix_len_ptr(lhs, rhs, max)
-        },
-        #[cfg(all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel-avx2"
-        ))]
-        FastpathKernel::Avx2Bmi2 => unsafe { avx2_bmi2::common_prefix_len_ptr(lhs, rhs, max) },
-        #[cfg(all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel-simd128"
-        ))]
-        FastpathKernel::Simd128 => unsafe { simd128::common_prefix_len_ptr(lhs, rhs, max) },
+/// A plain `match` on the constant folds in an optimised build, but an
+/// unoptimised one still instantiates every arm's callee for every tier, so
+/// each tier's monomorph would carry the kernels of all the others. Each arm
+/// here is an `if` on an inline `const`, whose untaken branch the compiler
+/// drops before code generation. The arms are checked for exhaustiveness as the
+/// `match` they stand for.
+macro_rules! tier_match {
+    ($k:ty { $( $(#[$attr:meta])* $pat:pat => $arm:expr ),+ $(,)? }) => {{
+        const {
+            match <$k as $crate::encoding::fastpath::EncodeTier>::TIER {
+                $( $(#[$attr])* $pat => (), )+
+            }
+        };
+        'tier: {
+            $(
+                $(#[$attr])*
+                if const {
+                    matches!(<$k as $crate::encoding::fastpath::EncodeTier>::TIER, $pat)
+                } {
+                    break 'tier ($arm);
+                }
+            )+
+            unreachable!()
+        }
+    }};
+}
+pub(crate) use tier_match;
+
+/// [`with_encode_tier!`] on this CPU's tier, the one the encoder picks: unit
+/// tests drive a backend directly through the kernels it would ship with.
+#[cfg(test)]
+macro_rules! with_host_tier {
+    ($k:ident => $body:expr) => {
+        $crate::encoding::fastpath::with_encode_tier!(
+            $crate::encoding::fastpath::select_kernel(),
+            $k => $body
+        )
+    };
+}
+#[cfg(test)]
+pub(crate) use with_host_tier;
+
+/// Every tier this CPU may execute, scalar first: each SIMD arm assumes its
+/// target feature is present, so a test forcing a tier takes it from here. A
+/// test comparing tiers checks the scalar fallback against every SIMD kernel
+/// the machine has, including the ones the detection leaves cold.
+#[cfg(test)]
+pub(crate) fn runnable_tiers() -> alloc::vec::Vec<FastpathKernel> {
+    #[allow(unused_mut)]
+    let mut tiers = alloc::vec![FastpathKernel::Scalar];
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
+    {
+        if std::is_x86_feature_detected!("sse2") {
+            tiers.push(FastpathKernel::Sse2);
+        }
+        if std::is_x86_feature_detected!("sse4.2") {
+            tiers.push(FastpathKernel::Sse42);
+        }
     }
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
+        tiers.push(FastpathKernel::Avx2Bmi2);
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    ))]
+    tiers.push(FastpathKernel::Neon);
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    tiers.push(FastpathKernel::Simd128);
+    tiers
+}
+
+/// `run` under every [`runnable_tiers`] tier, asserting they all agree, and
+/// the answer they agree on.
+#[cfg(test)]
+pub(crate) fn same_under_every_tier<R: PartialEq + core::fmt::Debug>(
+    run: impl Fn(FastpathKernel) -> R,
+) -> R {
+    let tiers = runnable_tiers();
+    let answer = run(tiers[0]);
+    for &tier in &tiers[1..] {
+        assert_eq!(
+            run(tier),
+            answer,
+            "tier {tier:?} disagrees with {:?}",
+            tiers[0]
+        );
+    }
+    answer
+}
+
+/// A test's sequence closure as the one sink type tests hand a backend, so
+/// each search is compiled once per tier for all of them rather than once per
+/// closure and tier.
+#[cfg(test)]
+pub(crate) fn dyn_sink(
+    sink: &mut impl FnMut(crate::encoding::Sequence),
+) -> &mut dyn FnMut(crate::encoding::Sequence) {
+    sink
 }
 
 #[cfg(test)]

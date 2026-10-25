@@ -3,6 +3,7 @@
 //! optimal round-trips, and dictionary-priming behaviour.
 
 use super::*;
+use crate::encoding::fastpath::{dyn_sink, with_host_tier};
 use crate::encoding::test_support::BlockReplay;
 use alloc::vec::Vec;
 
@@ -45,16 +46,10 @@ impl MatchGeneratorDriver {
         self.config_override = Some((search, parse));
     }
 
-    /// Test-only: reset `level` routed onto the lazy HashChain pairing.
-    /// The lazy band runs on the Row backend in production, so HC-specific
-    /// behaviour (live-chain dict prime, eviction budget accounting, seed
-    /// pass gates) is exercised through this override-backed reset.
-    pub(crate) fn reset_on_hc_lazy(&mut self, level: CompressionLevel) {
-        self.set_config_override(
-            super::super::strategy::SearchMethod::HashChain,
-            super::super::strategy::ParseMode::Lazy2,
-        );
-        self.reset(level);
+    /// Test-only: the tier the [`Matcher`] entry points run under, in place
+    /// of the one detected at construction.
+    pub(crate) fn set_tier(&mut self, tier: crate::encoding::fastpath::FastpathKernel) {
+        self.tier = tier;
     }
 }
 
@@ -90,10 +85,9 @@ fn drive_roundtrip_with_override(
     out
 }
 
-/// Phase 1 capability proof: parse and search are decoupled, so a level
-/// can run any parse mode on any non-opt search backend. Greedy-on-
-/// HashChain and Lazy2-on-RowHash are pairings the legacy `strategy_tag`
-/// could not express; both must reconstruct the input exactly.
+/// Parse and search are decoupled, so a level can run any parse mode on any
+/// non-opt search backend, including one its own row does not configure; the
+/// pairings must reconstruct the input exactly.
 #[test]
 fn parse_search_matrix_decoupled_roundtrips() {
     use super::super::strategy::{ParseMode, SearchMethod};
@@ -104,14 +98,14 @@ fn parse_search_matrix_decoupled_roundtrips() {
         data.extend_from_slice(&i.to_le_bytes());
     }
 
-    // Greedy parse on the HashChain search backend (legacy: Greedy was
-    // welded to RowHash).
+    // A dfast level on the rows: its row carries no row config, so the
+    // driver synthesizes one.
     let got = drive_roundtrip_with_override(
-        CompressionLevel::Level(5),
-        Some((SearchMethod::HashChain, ParseMode::Greedy)),
+        CompressionLevel::Level(3),
+        Some((SearchMethod::RowHash, ParseMode::Greedy)),
         &data,
     );
-    assert_eq!(got, data, "greedy-on-hashchain diverged");
+    assert_eq!(got, data, "greedy-on-rowhash from a dfast level diverged");
 
     // Lazy2 parse on the RowHash search backend (legacy: Lazy was welded
     // to HashChain).
@@ -137,8 +131,7 @@ fn parse_search_matrix_decoupled_roundtrips() {
 #[cfg(feature = "ldm")]
 #[test]
 fn hash_chain_lazy_takes_long_distance_matches() {
-    use super::super::parameters::CompressionParameters;
-    use super::super::strategy::{ParseMode, SearchMethod};
+    use super::super::parameters::{CompressionParameters, RowMatchFinderMode};
 
     // Six-bit symbols from an LCG's high bits: no repeat the chain finds.
     let mut state = 0x0569_C4A1u32;
@@ -162,15 +155,15 @@ fn hash_chain_lazy_takes_long_distance_matches() {
             .window_log(22)
             .hash_log(12)
             .chain_log(12)
+            .row_match_finder(RowMatchFinderMode::Disable)
             .enable_long_distance_matching(long)
             .build()
             .unwrap()
             .overrides();
         let mut driver = MatchGeneratorDriver::new(1 << 17, 8);
         driver.set_param_overrides(Some(overrides));
-        driver.set_config_override(SearchMethod::HashChain, ParseMode::Lazy2);
         driver.reset(CompressionLevel::Level(5));
-        assert_eq!(driver.search, SearchMethod::HashChain);
+        assert!(driver.row_matcher().uses_hash_chain());
         let mut out = Vec::with_capacity(data.len());
         let mut literals = 0usize;
         let mut consumed = 0usize;
@@ -230,12 +223,12 @@ fn row_mls_knob_gates_matches_and_roundtrips() {
         let mut out: Vec<u8> = Vec::with_capacity(data.len());
         let mut shortest_match = usize::MAX;
         let mut replay = BlockReplay::new(&data);
-        matcher.start_matching(|seq| {
+        with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
             if let Sequence::Triple { match_len, .. } = seq {
                 shortest_match = shortest_match.min(match_len);
             }
             replay.apply(&mut out, seq);
-        });
+        })));
 
         assert_eq!(out, data, "mls={mls} round-trip diverged");
         if shortest_match != usize::MAX {
@@ -719,49 +712,25 @@ fn btultra2_seed_pass_initializes_opt_state() {
     hc.table.commit_input(&data);
     hc.start_matching(|_| {});
     assert!(
-        hc.backend.bt_mut().opt_state.lit_length_sum > 0,
+        hc.bt.opt_state.lit_length_sum > 0,
         "btultra2 first block should seed non-zero sequence statistics"
     );
     assert!(
-        hc.backend.bt_mut().opt_state.off_code_sum > 0,
+        hc.bt.opt_state.off_code_sum > 0,
         "btultra2 first block should seed offset-code statistics"
     );
 }
 
-/// Every per-CPU kernel tier emits a bit-identical sequence stream. Forcing
-/// `table.kernel` runs each tier's monomorphized BT-collect / DP wrapper on
-/// one machine (only the runtime-selected tier would otherwise execute), which
-/// both pins the scalar-vs-SIMD bit-identity invariant and exercises the
-/// per-tier wrappers the runtime dispatch leaves cold. x86-only: the aarch64
-/// path dispatches NEON unconditionally, so the cached field is read only in
-/// the x86 `cfg` block.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// Every per-CPU kernel tier emits a bit-identical sequence stream. Running
+/// the search under each tier the CPU supports executes each monomorphized
+/// BT-collect / DP wrapper on one machine (only the detected tier would
+/// otherwise run), which pins the scalar-vs-SIMD bit-identity invariant.
 #[test]
 fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
     use crate::encoding::Sequence;
     use crate::encoding::fastpath::FastpathKernel;
 
-    // Tiers the running CPU can legally execute: each dispatch arm is `unsafe`
-    // and assumes the tier's target_feature is present. Scalar is always safe;
-    // the SIMD tiers gate on runtime detection so the test stays valid on any
-    // x86 box (including a CI runner without AVX2).
-    // Seeded with the always-present scalar tier; the SIMD entries below are
-    // feature-gated, so `mut` goes unused in a build with every kernel
-    // compiled out.
-    #[allow(unused_mut)]
-    let mut tiers = alloc::vec![FastpathKernel::Scalar];
-    #[cfg(feature = "kernel-sse")]
-    if std::is_x86_feature_detected!("sse2") {
-        tiers.push(FastpathKernel::Sse2);
-    }
-    #[cfg(feature = "kernel-sse")]
-    if std::is_x86_feature_detected!("sse4.2") {
-        tiers.push(FastpathKernel::Sse42);
-    }
-    #[cfg(feature = "kernel-avx2")]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
-        tiers.push(FastpathKernel::Avx2Bmi2);
-    }
+    let tiers = crate::encoding::fastpath::runnable_tiers();
 
     // Mixed-redundancy input so the BT walk, the rep-code probe, and the hash3
     // short-match probe all fire (a pure ramp would never exercise the rep path).
@@ -769,39 +738,44 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
         .map(|i| ((i * 7 + i / 13) % 67) as u8)
         .collect();
 
-    let run = |tier: FastpathKernel| -> Vec<(usize, usize, usize)> {
-        let mut hc = HcMatchGenerator::new(1 << 20);
-        hc.configure(
-            BTULTRA2_HC_CONFIG,
-            super::super::strategy::StrategyTag::BtUltra2,
-            26,
-        );
-        hc.table.commit_input(&data);
-        hc.table.kernel = tier;
-        let mut seqs = Vec::new();
-        hc.start_matching(|seq| match seq {
-            Sequence::Triple {
-                literal_len,
-                offset,
-                match_len,
-            } => seqs.push((literal_len, offset, match_len)),
-            Sequence::Literals { len } => seqs.push((len, 0, 0)),
-        });
-        seqs
-    };
+    use super::super::strategy::StrategyTag;
+    for strategy in [
+        StrategyTag::BtOpt,
+        StrategyTag::BtUltra,
+        StrategyTag::BtUltra2,
+    ] {
+        let run = |tier: FastpathKernel| -> Vec<(usize, usize, usize)> {
+            let mut hc = HcMatchGenerator::new(1 << 20);
+            hc.configure(BTULTRA2_HC_CONFIG, strategy, 26);
+            hc.table.commit_input(&data);
+            let mut seqs = Vec::new();
+            crate::encoding::fastpath::with_encode_tier!(
+                tier,
+                K => hc.start_matching_with::<K>(dyn_sink(&mut |seq| match seq {
+                    Sequence::Triple {
+                        literal_len,
+                        offset,
+                        match_len,
+                    } => seqs.push((literal_len, offset, match_len)),
+                    Sequence::Literals { len } => seqs.push((len, 0, 0)),
+                }))
+            );
+            seqs
+        };
 
-    let reference = run(tiers[0]);
-    assert!(
-        !reference.is_empty(),
-        "btultra2 should emit sequences on mixed-redundancy input"
-    );
-    for &tier in &tiers[1..] {
-        assert_eq!(
-            run(tier),
-            reference,
-            "kernel tier {tier:?} diverged from {:?}: scalar/SIMD bit-identity broken",
-            tiers[0],
+        let reference = run(tiers[0]);
+        assert!(
+            !reference.is_empty(),
+            "{strategy:?} should emit sequences on mixed-redundancy input"
         );
+        for &tier in &tiers[1..] {
+            assert_eq!(
+                run(tier),
+                reference,
+                "{strategy:?}: kernel tier {tier:?} diverged from {:?}: scalar/SIMD bit-identity broken",
+                tiers[0],
+            );
+        }
     }
 }
 
@@ -821,36 +795,7 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
 fn dfast_dictionary_all_kernel_tiers_emit_identical_sequences() {
     use crate::encoding::fastpath::FastpathKernel;
 
-    // Only tiers the running CPU may legally execute: each dispatch arm is
-    // `unsafe` and assumes its target feature is present.
-    #[allow(unused_mut)]
-    let mut tiers = alloc::vec![FastpathKernel::Scalar];
-    #[cfg(all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel-sse"
-    ))]
-    if std::is_x86_feature_detected!("sse2") {
-        tiers.push(FastpathKernel::Sse2);
-    }
-    #[cfg(all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel-avx2"
-    ))]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
-        tiers.push(FastpathKernel::Avx2Bmi2);
-    }
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_endian = "little",
-        feature = "kernel-neon"
-    ))]
-    tiers.push(FastpathKernel::Neon);
-    #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        feature = "kernel-simd128"
-    ))]
-    tiers.push(FastpathKernel::Simd128);
+    let tiers = crate::encoding::fastpath::runnable_tiers();
 
     let dict: Vec<u8> = (0..20 * 1024u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
@@ -870,22 +815,23 @@ fn dfast_dictionary_all_kernel_tiers_emit_identical_sequences() {
         driver.set_source_size_hint(block.len() as u64);
         driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
         driver.reset(CompressionLevel::Level(3));
-        driver.prime_with_dictionary(&dict, [1, 4, 8]);
-        assert_eq!(
-            driver.active_backend(),
-            super::super::strategy::BackendTag::Dfast,
-            "level 3 with a dictionary must run the dfast backend",
-        );
-        driver.dfast_matcher_mut().kernel = tier;
-        driver.commit_input(&block);
         let mut seqs = Vec::new();
-        driver.start_matching(|seq| match seq {
-            Sequence::Triple {
-                literal_len,
-                offset,
-                match_len,
-            } => seqs.push((literal_len, offset, match_len)),
-            Sequence::Literals { len } => seqs.push((len, 0, 0)),
+        crate::encoding::fastpath::with_encode_tier!(tier, K => {
+            driver.prime_with_dictionary_with::<K>(&dict, [1, 4, 8]);
+            assert_eq!(
+                driver.active_backend(),
+                super::super::strategy::BackendTag::Dfast,
+                "level 3 with a dictionary must run the dfast backend",
+            );
+            driver.commit_input(&block);
+            driver.start_matching_with::<K>(dyn_sink(&mut |seq| match seq {
+                Sequence::Triple {
+                    literal_len,
+                    offset,
+                    match_len,
+                } => seqs.push((literal_len, offset, match_len)),
+                Sequence::Literals { len } => seqs.push((len, 0, 0)),
+            }));
         });
         seqs
     };
@@ -1056,7 +1002,7 @@ fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
     let of = crate::fse::fse_encoder::default_of_table();
     hc.seed_dictionary_entropy(Some(&huff), Some(&*ll), Some(&*ml), Some(&*of));
 
-    hc.backend.bt_mut().opt_state.rescale_freqs(
+    hc.bt.opt_state.rescale_freqs(
         b"abcd",
         <super::super::strategy::BtUltra2 as super::super::strategy::Strategy>::ACCURATE_PRICE,
     );
@@ -1067,22 +1013,15 @@ fn dictionary_entropy_seed_initializes_opt_state_from_tables() {
     ];
 
     assert_ne!(
-        hc.backend.bt_mut().opt_state.lit_length_freq,
-        base_ll_freqs,
+        hc.bt.opt_state.lit_length_freq, base_ll_freqs,
         "dictionary entropy should override fallback LL bootstrap frequencies"
     );
     assert!(
-        hc.backend
-            .bt_mut()
-            .opt_state
-            .match_length_freq
-            .iter()
-            .any(|&v| v != 1),
+        hc.bt.opt_state.match_length_freq.iter().any(|&v| v != 1),
         "dictionary entropy should seed non-uniform ML frequencies"
     );
     assert_ne!(
-        hc.backend.bt_mut().opt_state.off_code_freq[0],
-        6,
+        hc.bt.opt_state.off_code_freq[0], 6,
         "dictionary entropy should override fallback OF bootstrap frequencies"
     );
 }
@@ -1101,7 +1040,7 @@ fn dictionary_fse_seed_applies_without_huffman_seed() {
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
     hc.seed_dictionary_entropy(None, Some(&*ll), Some(&*ml), Some(&*of));
-    hc.backend.bt_mut().opt_state.rescale_freqs(
+    hc.bt.opt_state.rescale_freqs(
         b"abcd",
         <super::super::strategy::BtUltra2 as super::super::strategy::Strategy>::ACCURATE_PRICE,
     );
@@ -1111,22 +1050,15 @@ fn dictionary_fse_seed_applies_without_huffman_seed() {
         1, 1, 1, 1, 1, 1,
     ];
     assert_ne!(
-        hc.backend.bt_mut().opt_state.lit_length_freq,
-        base_ll_freqs,
+        hc.bt.opt_state.lit_length_freq, base_ll_freqs,
         "FSE seed should still override LL bootstrap frequencies without huffman seed"
     );
     assert!(
-        hc.backend
-            .bt_mut()
-            .opt_state
-            .match_length_freq
-            .iter()
-            .any(|&v| v != 1),
+        hc.bt.opt_state.match_length_freq.iter().any(|&v| v != 1),
         "FSE seed should still seed non-uniform ML frequencies"
     );
     assert_ne!(
-        hc.backend.bt_mut().opt_state.off_code_freq[0],
-        6,
+        hc.bt.opt_state.off_code_freq[0], 6,
         "FSE seed should still override OF bootstrap frequencies without huffman seed"
     );
 }
@@ -1145,15 +1077,12 @@ fn dictionary_seed_overrides_predef_price_mode_on_tiny_input() {
     let ml = crate::fse::fse_encoder::default_ml_table();
     let of = crate::fse::fse_encoder::default_of_table();
     hc.seed_dictionary_entropy(None, Some(&*ll), Some(&*ml), Some(&*of));
-    hc.backend.bt_mut().opt_state.rescale_freqs(
+    hc.bt.opt_state.rescale_freqs(
         b"abc",
         <super::super::strategy::BtUltra2 as super::super::strategy::Strategy>::ACCURATE_PRICE,
     );
     assert!(
-        matches!(
-            hc.backend.bt_mut().opt_state.price_type,
-            HcOptPriceType::Dynamic
-        ),
+        matches!(hc.bt.opt_state.price_type, HcOptPriceType::Dynamic),
         "dictionary-seeded first block should stay in dynamic mode even for tiny src"
     );
 }
@@ -1257,7 +1186,7 @@ fn btultra2_seed_pass_disabled_after_stats_initialized() {
         super::super::strategy::StrategyTag::BtUltra2,
         26,
     );
-    hc.backend.bt_mut().opt_state.lit_length_sum = 1;
+    hc.bt.opt_state.lit_length_sum = 1;
     assert!(
         !hc.should_run_btultra2_seed_pass::<super::super::strategy::BtUltra2>(
             HC_PREDEF_THRESHOLD + 32
@@ -1304,7 +1233,7 @@ fn btultra2_seed_pass_runs_alongside_ldm_candidates() {
     let block_len = HC_PREDEF_THRESHOLD + 64;
     hc.table.window_size = block_len;
     hc.table.chunk_lens.push_back(block_len);
-    hc.backend.bt_mut().ldm_sequences.push(HcRawSeq {
+    hc.bt.ldm_sequences.push(HcRawSeq {
         lit_length: 8,
         offset: 16,
         match_length: 32,
@@ -1383,48 +1312,45 @@ fn dictionary_huffman_seed_ignored_when_literals_uncompressed() {
     );
 }
 
+/// The optimal search probes the repeat offsets in their literal-length order
+/// (upstream `ZSTD_insertBtAndGetAllMatches`, zstd_opt.c:657): after a literal
+/// `rep[0]` is the first repeat, while at a literal length of zero it is not a
+/// repeat at all and `rep[0] - 1` takes its place.
 #[test]
 fn hc_repcode_candidates_respect_litlen_dependent_rep_order() {
-    let mut hc = HcMatchGenerator::new(64);
-    hc.table.history = b"xxxxxxABCDEFABCDEF".to_vec().into();
-    hc.table.history_start = 0;
-    hc.table.history_abs_start = 0;
-
-    let abs_pos = 12usize; // points at second "ABCDEF"
-    let current_abs_end = hc.table.history.len();
-    let reps = [6u32, 3u32, 9u32];
-
-    let mut lit_pos_candidates = Vec::new();
-    hc.hc.for_each_repcode_candidate_with_reps(
-        &hc.table,
-        abs_pos,
-        1,
-        reps,
-        current_abs_end,
-        HC_OPT_MIN_MATCH_LEN,
-        |c| {
-            lit_pos_candidates.push(c.offset);
-        },
-    );
+    let candidates = |lit_len: usize| {
+        let mut hc = HcMatchGenerator::new(64);
+        hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
+        // Only the repeats: no tree compare.
+        hc.hc.search_depth = 0;
+        hc.table.search_depth = 0;
+        // Eight bytes past the searched position, as the parser leaves every
+        // position it searches.
+        hc.table.history = b"xxxxxxABCDEFABCDEFzzzzzzzz".to_vec().into();
+        hc.table.history_start = 0;
+        hc.table.history_abs_start = 0;
+        let abs_pos = 12usize; // the second "ABCDEF"
+        let current_abs_end = hc.table.history.len();
+        let mut out = Vec::new();
+        with_host_tier!(K => hc.collect_optimal_candidates::<K>(
+            abs_pos,
+            current_abs_end,
+            usize::MAX / 2,
+            HcCandidateQuery {
+                reps: [6, 3, 9],
+                lit_len,
+                ldm_candidate: None,
+            },
+            &mut out,
+        ));
+        out.iter().map(|c| c.offset).collect::<Vec<_>>()
+    };
     assert!(
-        lit_pos_candidates.contains(&6),
+        candidates(1).contains(&6),
         "when lit_len>0, rep0 should be considered and match"
     );
-
-    let mut ll0_candidates = Vec::new();
-    hc.hc.for_each_repcode_candidate_with_reps(
-        &hc.table,
-        abs_pos,
-        0,
-        reps,
-        current_abs_end,
-        HC_OPT_MIN_MATCH_LEN,
-        |c| {
-            ll0_candidates.push(c.offset);
-        },
-    );
     assert!(
-        !ll0_candidates.contains(&6),
+        !candidates(0).contains(&6),
         "when lit_len==0, rep0 is not directly eligible (ll0 semantics)"
     );
 }
@@ -1451,7 +1377,7 @@ fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
     let abs_pos = 6usize;
     let current_abs_end = hc.table.history.len();
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         current_abs_end,
         usize::MAX / 2,
@@ -1461,7 +1387,7 @@ fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
             ldm_candidate: None,
         },
         &mut out,
-    );
+    ));
     assert!(
         !out.is_empty(),
         "rep candidates should remain available even when chain depth is zero"
@@ -1485,7 +1411,7 @@ fn hc_collect_optimal_candidates_panics_for_non_bt_strategy() {
     hc.table.history_abs_start = 0;
     hc.table.ensure_tables();
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    hc.collect_optimal_candidates::<crate::encoding::fastpath::ScalarTier>(
         6,
         hc.table.history.len(),
         usize::MAX / 2,
@@ -1500,7 +1426,7 @@ fn hc_collect_optimal_candidates_panics_for_non_bt_strategy() {
 
 #[test]
 fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
-    use crate::encoding::fastpath::FastpathKernel;
+    use crate::encoding::fastpath::ScalarTier;
     use crate::encoding::strategy::StrategyTag;
     // The public dispatcher must route every BT strategy tag to the collector
     // AND to the specialization carrying that tag's consts — not just survive.
@@ -1518,7 +1444,6 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
     ] {
         let mut hc = HcMatchGenerator::new(64);
         hc.strategy_tag = tag;
-        hc.table.kernel = FastpathKernel::Scalar;
         hc.table.history = b"abcQ00000000abcZ00000000".to_vec().into();
         hc.table.history_start = 0;
         hc.table.history_abs_start = 0;
@@ -1529,7 +1454,7 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
         hc.table.search_depth = 8;
         let abs_pos = 12usize;
         let mut out = Vec::new();
-        hc.collect_optimal_candidates(
+        hc.collect_optimal_candidates::<ScalarTier>(
             abs_pos,
             hc.table.history.len(),
             usize::MAX / 2,
@@ -1556,30 +1481,13 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
 /// CPU can run finds the same candidates at every position of a block: the
 /// scalar fallback and the SIMD kernels agree on the search itself, not only on
 /// the sequences the parser builds from it. Forcing the tier runs the arms the
-/// runtime detection leaves cold on this machine. x86 only, where the tier is a
-/// runtime choice.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// runtime detection leaves cold on this machine.
 #[test]
 fn hc_collect_optimal_candidates_agree_across_kernel_tiers() {
     use crate::encoding::fastpath::FastpathKernel;
     use crate::encoding::strategy::StrategyTag;
 
-    // Only tiers the running CPU may execute: each dispatch arm assumes its
-    // target feature is present.
-    #[allow(unused_mut)]
-    let mut tiers = alloc::vec![FastpathKernel::Scalar];
-    #[cfg(feature = "kernel-sse")]
-    if std::is_x86_feature_detected!("sse2") {
-        tiers.push(FastpathKernel::Sse2);
-    }
-    #[cfg(feature = "kernel-sse")]
-    if std::is_x86_feature_detected!("sse4.2") {
-        tiers.push(FastpathKernel::Sse42);
-    }
-    #[cfg(feature = "kernel-avx2")]
-    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
-        tiers.push(FastpathKernel::Avx2Bmi2);
-    }
+    let tiers = crate::encoding::fastpath::runnable_tiers();
 
     // Mixed redundancy, so the repeat, hash3 and tree probes all find matches.
     let data: Vec<u8> = (0..4096usize)
@@ -1589,20 +1497,22 @@ fn hc_collect_optimal_candidates_agree_across_kernel_tiers() {
         let mut hc = HcMatchGenerator::new(1 << 20);
         hc.configure(BTULTRA2_HC_CONFIG, StrategyTag::BtUltra2, 26);
         hc.table.commit_input(&data);
-        hc.table.kernel = tier;
         let mut out = Vec::new();
         (0..data.len() - 8)
             .map(|pos| {
-                hc.collect_optimal_candidates(
-                    pos,
-                    data.len(),
-                    usize::MAX / 2,
-                    HcCandidateQuery {
-                        reps: [1, 4, 8],
-                        lit_len: 1,
-                        ldm_candidate: None,
-                    },
-                    &mut out,
+                crate::encoding::fastpath::with_encode_tier!(
+                    tier,
+                    K => hc.collect_optimal_candidates::<K>(
+                        pos,
+                        data.len(),
+                        usize::MAX / 2,
+                        HcCandidateQuery {
+                            reps: [1, 4, 8],
+                            lit_len: 1,
+                            ldm_candidate: None,
+                        },
+                        &mut out,
+                    )
                 );
                 out.iter().map(|c| (c.offset, c.match_len)).collect()
             })
@@ -1635,11 +1545,12 @@ fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
     hc.hc.search_depth = 32;
     let abs_pos = 6usize;
     hc.table.ensure_tables();
-    hc.table.insert_positions(0, abs_pos);
-
     hc.table.search_depth = 32;
+    let end = hc.table.history.len();
+    with_host_tier!(K => hc.table.bt_update_tree_until::<K>(abs_pos, end));
+
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         hc.table.history.len(),
         usize::MAX / 2,
@@ -1649,7 +1560,7 @@ fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
             ldm_candidate: None,
         },
         &mut out,
-    );
+    ));
 
     assert!(
         out.iter()
@@ -1669,12 +1580,13 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
     hc.hc.search_depth = 32;
     let abs_pos = 9usize;
     hc.table.ensure_tables();
-    hc.table.insert_positions(0, abs_pos);
+    hc.table.search_depth = 32;
+    let end = hc.table.history.len();
+    with_host_tier!(K => hc.table.bt_update_tree_until::<K>(abs_pos, end));
     hc.table.skip_insert_until_abs = 0;
 
-    hc.table.search_depth = 32;
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         hc.table.history.len(),
         usize::MAX / 2,
@@ -1684,7 +1596,7 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
             ldm_candidate: None,
         },
         &mut out,
-    );
+    ));
 
     assert!(
         hc.table.skip_insert_until_abs > abs_pos,
@@ -1707,7 +1619,7 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
     hc.table.skip_insert_until_abs = 0;
     hc.table.search_depth = 0;
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         hc.table.history.len(),
         usize::MAX / 2,
@@ -1717,7 +1629,7 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
             ldm_candidate: None,
         },
         &mut out,
-    );
+    ));
 
     assert_eq!(
         hc.table.skip_insert_until_abs,
@@ -1759,7 +1671,7 @@ fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
 
     hc.table.search_depth = 0;
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         current_abs_end,
         usize::MAX / 2,
@@ -1769,7 +1681,7 @@ fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
             ldm_candidate: Some(ldm),
         },
         &mut out,
-    );
+    ));
     assert!(
         out.iter().any(
             |candidate| candidate.offset == ldm.offset && candidate.match_len == ldm.match_len
@@ -1800,7 +1712,7 @@ fn hc_ldm_candidate_survives_the_search_early_exit() {
         match_len: 12,
     };
     let mut out = Vec::new();
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         hc.table.history.len(),
         // Below the repeat match's length, so the repeat probe ends the search.
@@ -1811,7 +1723,7 @@ fn hc_ldm_candidate_survives_the_search_early_exit() {
             ldm_candidate: Some(ldm),
         },
         &mut out,
-    );
+    ));
     assert!(
         out.iter().any(|c| c.offset == 10 && c.match_len == 5),
         "the repeat match that ends the search is kept"
@@ -1826,8 +1738,8 @@ fn hc_ldm_candidate_survives_the_search_early_exit() {
 #[test]
 fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     // Routes the BtUltra2 / BtUltra fixture through the production
-    // `configure()` path so derived state (`hash3_log`, `is_btultra2`,
-    // `uses_bt`, `backend`) stays consistent — manually flipping the
+    // `configure()` path so derived state (`hash3_log`, `is_btultra2`)
+    // stays consistent — manually flipping the
     // strategy flags here used to leave `hash3_log` / `hash3_table` in
     // the previous mode's shape and trip the
     // `Strategy::USE_HASH3 ⇒ hash3_log != 0` debug invariant inside
@@ -1858,8 +1770,8 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
         hc.table.history_abs_start = 0;
         hc.table.position_base = 0;
         hc.table.ensure_tables();
-        hc.table.insert_positions(0, abs_pos);
         hc.table.dictionary_limit_abs = Some(64);
+        // The search threads the tree from here up to `abs_pos` itself.
         hc.table.skip_insert_until_abs = 0;
     };
 
@@ -1869,7 +1781,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     let mut hc = HcMatchGenerator::new(256);
     hc.configure(test_config, StrategyTag::BtUltra2, window_log);
     prepare_history(&mut hc, abs_pos);
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         160,
         usize::MAX / 2,
@@ -1879,7 +1791,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
             ldm_candidate: None,
         },
         &mut out,
-    );
+    ));
     assert!(
         out.iter().any(|candidate| candidate.offset >= 32),
         "btultra2 should retain dictionary candidates on upstream zstd-parity path"
@@ -1888,7 +1800,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     let mut hc = HcMatchGenerator::new(256);
     hc.configure(test_config, StrategyTag::BtUltra, window_log);
     prepare_history(&mut hc, abs_pos);
-    hc.collect_optimal_candidates(
+    with_host_tier!(K => hc.collect_optimal_candidates::<K>(
         abs_pos,
         160,
         usize::MAX / 2,
@@ -1898,7 +1810,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
             ldm_candidate: None,
         },
         &mut out,
-    );
+    ));
     assert!(
         out.iter().any(|candidate| candidate.offset >= 32),
         "btultra should retain dictionary candidates"
@@ -2412,6 +2324,38 @@ fn driver_rows_frame_releases_the_tree_buffer_capacity() {
     );
 }
 
+/// A block skipped through the plain [`Matcher::skip_matching`] is indexed as
+/// one skipped with no hint: the next block finds the same matches into it.
+#[test]
+fn a_plain_skip_indexes_the_block_as_a_skip_without_a_hint() {
+    let first = b"tenant=demo table=orders region=eu-west payload=".repeat(20);
+    let run = |plain: bool| {
+        let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+        driver.set_source_size_hint(4 * first.len() as u64);
+        driver.reset(CompressionLevel::Level(3));
+        driver.commit_input(&first);
+        if plain {
+            driver.skip_matching();
+        } else {
+            driver.skip_matching_with_hint(None);
+        }
+        driver.commit_input(&first);
+        let mut seqs = Vec::new();
+        driver.start_matching(|seq| seqs.push(seq));
+        seqs
+    };
+    let reference = run(false);
+    // From its first byte the block can only match into the skipped one.
+    assert!(
+        matches!(
+            reference.first(),
+            Some(Sequence::Triple { literal_len: 0, .. })
+        ),
+        "fixture precondition: the second block must match into the skipped one",
+    );
+    assert_eq!(run(true), reference);
+}
+
 #[test]
 fn driver_rows_reset_releases_the_tree_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
@@ -2511,9 +2455,9 @@ fn driver_dictionary_frame_runs_a_strategy_override() {
 
 #[test]
 fn driver_chain_log_override_survives_row_to_hc_fallback() {
-    // Regression: when a RowHash level is forced onto the HashChain backend
-    // (resolved window <= 14, upstream `ZSTD_resolveRowMatchFinderMode`), the
-    // synthesised HC chain table must honour an explicit `chain_log` override.
+    // Regression: when a RowHash level searches the hash chain (resolved
+    // window <= 14, upstream `ZSTD_resolveRowMatchFinderMode`), the chain
+    // table must honour an explicit `chain_log` override.
     // The RowHash override arm drops `chain_log` (Row has no chain table), so
     // the synthesis previously replaced the caller's `chain_log` with the upstream zstd
     // `hashLog - 1`, silently ignoring it on small-window frames.
@@ -2595,6 +2539,70 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     );
 }
 
+/// `RowMatchFinderMode` replaces the window rule for the greedy / lazy band:
+/// `Disable` searches the chain under a wide window, `Enable` the rows under a
+/// narrow one, and a btlazy2 level keeps its tree under either (upstream
+/// `ZSTD_rowMatchFinderSupported` covers greedy..lazy2 only).
+#[test]
+fn row_match_finder_mode_picks_the_lazy_finder() {
+    use crate::encoding::RowMatchFinderMode;
+    let finder = |level: i32, hint: u64, mode: RowMatchFinderMode| {
+        let mut driver = MatchGeneratorDriver::new(32, 2);
+        driver.set_source_size_hint(hint);
+        driver.set_param_overrides(Some(super::super::parameters::ParamOverrides {
+            row_match_finder: mode,
+            ..Default::default()
+        }));
+        driver.reset(CompressionLevel::Level(level));
+        let row = driver.row_matcher();
+        (row.uses_hash_chain(), row.uses_binary_tree())
+    };
+    let wide = 1 << 20;
+    let narrow = 1 << 12;
+    for level in [5, 7] {
+        assert_eq!(
+            finder(level, wide, RowMatchFinderMode::Auto),
+            (false, false)
+        );
+        assert_eq!(
+            finder(level, wide, RowMatchFinderMode::Disable),
+            (true, false)
+        );
+        assert_eq!(
+            finder(level, narrow, RowMatchFinderMode::Auto),
+            (true, false)
+        );
+        assert_eq!(
+            finder(level, narrow, RowMatchFinderMode::Enable),
+            (false, false)
+        );
+    }
+    assert_eq!(finder(13, wide, RowMatchFinderMode::Disable), (false, true));
+    assert_eq!(finder(13, wide, RowMatchFinderMode::Enable), (false, true));
+}
+
+/// A dictionary frame searches what its dictionary resolved, under the
+/// dictionary's mode (upstream `ZSTD_resetCCtx_usingCDict` takes
+/// `cdict->useRowMatchFinder`): a dictionary that forces the chain keeps it on
+/// a source wide enough for rows.
+#[test]
+fn row_match_finder_mode_reaches_a_dictionary_frame() {
+    use crate::encoding::RowMatchFinderMode;
+    let finder = |mode: RowMatchFinderMode| {
+        let mut driver = MatchGeneratorDriver::new(32, 2);
+        driver.set_source_size_hint(1 << 20);
+        driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(1 << 16));
+        driver.set_param_overrides(Some(super::super::parameters::ParamOverrides {
+            row_match_finder: mode,
+            ..Default::default()
+        }));
+        driver.reset(CompressionLevel::Level(7));
+        driver.row_matcher().uses_hash_chain()
+    };
+    assert!(!finder(RowMatchFinderMode::Auto));
+    assert!(finder(RowMatchFinderMode::Disable));
+}
+
 /// btlazy2 levels run on the lazy (Row) backend with the binary-tree finder,
 /// wherever the source-size tier puts strategy 6: L13 at tier 0, L10 at the
 /// <= 16 KiB tier (where L11 is already btopt, an optimal level on the
@@ -2643,13 +2651,13 @@ fn row_matches_roundtrip_multi_block_pattern() {
     matcher.commit_input(&first_block);
     let mut history = Vec::new();
     let mut replay = BlockReplay::new(&first_block);
-    matcher.start_matching(|seq| replay.apply(&mut history, seq));
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| replay.apply(&mut history, seq))));
     assert_eq!(history, first_block);
 
     matcher.commit_input(&second_block);
     let prefix_len = history.len();
     let mut replay = BlockReplay::new(&second_block);
-    matcher.start_matching(|seq| replay.apply(&mut history, seq));
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| replay.apply(&mut history, seq))));
 
     assert_eq!(&history[prefix_len..], second_block.as_slice());
 
@@ -2658,7 +2666,7 @@ fn row_matches_roundtrip_multi_block_pattern() {
     matcher.commit_input(&third_block);
     let third_prefix = history.len();
     let mut replay = BlockReplay::new(&third_block);
-    matcher.start_matching(|seq| replay.apply(&mut history, seq));
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| replay.apply(&mut history, seq))));
     assert_eq!(&history[third_prefix..], third_block.as_slice());
 }
 
@@ -2672,10 +2680,10 @@ fn row_short_block_emits_literals_only() {
     let mut saw_triple = false;
     let mut reconstructed = Vec::new();
     let mut replay = BlockReplay::new(b"abcde");
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         saw_triple |= matches!(seq, Sequence::Triple { .. });
         replay.apply(&mut reconstructed, seq);
-    });
+    })));
 
     assert!(
         !saw_triple,
@@ -2688,11 +2696,11 @@ fn row_short_block_emits_literals_only() {
     // searches (upstream zstd `lazy_generic` `ilimit`).
     saw_triple = false;
     matcher.commit_input(b"abcdeabcdeabcdeabcde-padding-past-ilimit");
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         if let Sequence::Triple { .. } = seq {
             saw_triple = true;
         }
-    });
+    })));
     assert!(
         saw_triple,
         "row backend should emit triples on repeated data"
@@ -2739,14 +2747,14 @@ fn row_backfills_previous_block_tail_for_cross_boundary_match() {
     matcher.commit_input(&first_block);
     let mut reconstructed = Vec::new();
     let mut replay = BlockReplay::new(&first_block);
-    matcher.start_matching(|seq| replay.apply(&mut reconstructed, seq));
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| replay.apply(&mut reconstructed, seq))));
     assert_eq!(reconstructed, first_block);
 
     matcher.commit_input(&second_block);
     let mut saw_cross_boundary = false;
     let prefix_len = reconstructed.len();
     let mut replay = BlockReplay::new(&second_block);
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         if let Sequence::Triple {
             literal_len: 0,
             offset: 3,
@@ -2757,7 +2765,7 @@ fn row_backfills_previous_block_tail_for_cross_boundary_match() {
             saw_cross_boundary = true;
         }
         replay.apply(&mut reconstructed, seq);
-    });
+    })));
 
     assert!(
         saw_cross_boundary,
@@ -2893,12 +2901,13 @@ fn source_hint_clamps_driver_slice_size_to_window() {
 fn driver_best_to_fastest_releases_oversized_hc_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
-    // Initialize at Best routed onto HashChain via the test-only override
-    // (production `Best` sits on level 13, whose native backend differs) —
-    // allocates large HC tables (4M hash, 2M chain) so the swap below
-    // exercises the HC drain path this test pins.
-    driver.reset_on_hc_lazy(CompressionLevel::Best);
-    assert_eq!(driver.window_size(), (1u64 << 22));
+    // An optimal level allocates large tables on the HashChain backend, so the
+    // swap below exercises the drain path this test pins.
+    driver.reset(CompressionLevel::Level(19));
+    assert_eq!(
+        driver.active_backend(),
+        super::super::strategy::BackendTag::HashChain
+    );
 
     // Feed data so tables are actually allocated via ensure_tables().
     driver.commit_input(b"abcabcabcabc");
@@ -2973,7 +2982,7 @@ fn prime_with_dictionary_applies_offset_history_even_when_content_is_empty() {
 #[test]
 fn hc_prime_with_empty_dictionary_disables_btultra2_seed_pass() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset_on_hc_lazy(CompressionLevel::Better);
+    driver.reset(CompressionLevel::Level(19));
 
     driver.prime_with_dictionary(&[], [11, 7, 3]);
 
@@ -3095,7 +3104,7 @@ fn a_btultra2_seed_pass_near_the_top_of_the_address_space_parses_like_a_fresh_on
 #[test]
 fn hc_prime_with_dictionary_disables_btultra2_seed_pass() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset_on_hc_lazy(CompressionLevel::Better);
+    driver.reset(CompressionLevel::Level(19));
 
     driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
 
@@ -3719,7 +3728,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
             let a = &base[start..];
             let b = a.to_vec();
             assert_eq!(
-                common_prefix_len(a, &b),
+                with_host_tier!(K => common_prefix_len::<K>(a, &b)),
                 scalar_reference(a, &b),
                 "equal slices total_len={total_len} start={start}"
             );
@@ -3732,7 +3741,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
                 let mut altered = b.clone();
                 altered[mismatch] ^= 0x5A;
                 assert_eq!(
-                    common_prefix_len(a, &altered),
+                    with_host_tier!(K => common_prefix_len::<K>(a, &altered)),
                     scalar_reference(a, &altered),
                     "total_len={total_len} start={start} mismatch={mismatch}"
                 );
@@ -3743,7 +3752,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
                 let mut altered = b.clone();
                 altered[mismatch] ^= 0xA5;
                 assert_eq!(
-                    common_prefix_len(a, &altered),
+                    with_host_tier!(K => common_prefix_len::<K>(a, &altered)),
                     scalar_reference(a, &altered),
                     "tail mismatch total_len={total_len} start={start} mismatch={mismatch}"
                 );
@@ -3754,7 +3763,7 @@ fn common_prefix_len_matches_scalar_reference_across_offsets() {
     let long = alloc::vec![0xAB; 320];
     let shorter = alloc::vec![0xAB; 137];
     assert_eq!(
-        common_prefix_len(&long, &shorter),
+        with_host_tier!(K => common_prefix_len::<K>(&long, &shorter)),
         scalar_reference(&long, &shorter)
     );
 }
@@ -3897,7 +3906,7 @@ fn row_repcode_skips_candidate_before_history_start() {
     matcher.history_abs_start = 10;
     matcher.offset_hist = [3, 0, 0];
 
-    assert!(matcher.repcode_candidate(12, 1).is_none());
+    assert!(with_host_tier!(K => matcher.repcode_candidate::<K>(12, 1)).is_none());
 }
 
 #[test]
@@ -3909,7 +3918,7 @@ fn row_repcode_returns_none_when_position_too_close_to_history_end() {
     matcher.history_abs_start = 0;
     matcher.offset_hist = [1, 0, 0];
 
-    assert!(matcher.repcode_candidate(4, 1).is_none());
+    assert!(with_host_tier!(K => matcher.repcode_candidate::<K>(4, 1)).is_none());
 }
 
 #[test]
@@ -3921,16 +3930,6 @@ fn hc_hash3_position_matches_hash3_formula() {
         super::super::match_table::storage::MatchTable::hash3_position(&bytes, HC3_HASH_LOG),
         expected
     );
-}
-
-#[test]
-fn hc_hash_position_matches_hash4_formula() {
-    let mut hc = HcMatchGenerator::new(1 << 20);
-    hc.configure(HC_CONFIG, super::super::strategy::StrategyTag::Lazy, 22);
-    let bytes = *b"abcd";
-    let read32 = u32::from_le_bytes(bytes);
-    let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.table.hash_log)) as usize;
-    assert_eq!(hc.table.hash_position(&bytes), expected);
 }
 
 #[test]
@@ -3973,8 +3972,9 @@ fn hc_reset_advances_floor_past_prior_frame_entries() {
     let mut hc = HcMatchGenerator::new(32);
     hc.table.commit_input(b"abcdeabcde");
     hc.table.ensure_tables();
-    // Populate real hash / chain entries for the first frame's positions.
-    hc.table.insert_positions(0, 6);
+    hc.table.search_depth = 4;
+    // Populate real hash / tree entries for the first frame's positions.
+    with_host_tier!(K => hc.table.bt_update_tree_until::<K>(6, 10));
     let prev_end = hc.table.history_abs_end();
     assert_eq!(prev_end, 10);
     assert!(hc.table.hash_table().iter().any(|&v| v != HC_EMPTY));
@@ -4044,52 +4044,6 @@ fn deterministic_high_entropy_bytes(seed: u64, len: usize) -> Vec<u8> {
 }
 
 #[test]
-fn hc_sparse_skip_matching_preserves_tail_cross_block_match() {
-    let mut matcher = HcMatchGenerator::new(1 << 22);
-    let tail = b"Qz9kLm2Rp";
-    let mut first = deterministic_high_entropy_bytes(0xD1B5_4A32_9C77_0E19, 4096);
-    let tail_start = first.len() - tail.len();
-    first[tail_start..].copy_from_slice(tail);
-    matcher.table.commit_input(&first);
-    matcher.skip_matching(Some(true));
-
-    let mut second = tail.to_vec();
-    second.extend_from_slice(b"after-tail-literals");
-    matcher.table.commit_input(&second);
-
-    let mut first_sequence = None;
-    matcher.start_matching(|seq| {
-        if first_sequence.is_some() {
-            return;
-        }
-        first_sequence = Some(match seq {
-            Sequence::Literals { len } => (len, 0usize, 0usize),
-            Sequence::Triple {
-                literal_len,
-                offset,
-                match_len,
-            } => (literal_len, offset, match_len),
-        });
-    });
-
-    let (literals_len, offset, match_len) =
-        first_sequence.expect("expected at least one sequence after sparse skip");
-    assert_eq!(
-        literals_len, 0,
-        "first sequence should start at block boundary"
-    );
-    assert_eq!(
-        offset,
-        tail.len(),
-        "first match should reference previous tail"
-    );
-    assert!(
-        match_len >= tail.len(),
-        "tail-aligned cross-block match must be preserved"
-    );
-}
-
-#[test]
 fn btultra2_sparse_skip_matching_preserves_tail_cross_block_match() {
     let mut matcher = HcMatchGenerator::new(1 << 20);
     matcher.configure(
@@ -4102,7 +4056,7 @@ fn btultra2_sparse_skip_matching_preserves_tail_cross_block_match() {
     let tail_start = first.len() - tail.len();
     first[tail_start..].copy_from_slice(tail);
     matcher.table.commit_input(&first);
-    matcher.skip_matching(Some(true));
+    with_host_tier!(K => matcher.skip_matching::<K>(Some(true)));
 
     let mut second = tail.to_vec();
     second.extend_from_slice(b"after-tail-literals");
@@ -4145,7 +4099,7 @@ fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
     let mut matcher = HcMatchGenerator::new(1 << 22);
     let first = deterministic_high_entropy_bytes(0xC2B2_AE3D_27D4_EB4F, 4096);
     matcher.table.commit_input(&first);
-    matcher.skip_matching(Some(true));
+    with_host_tier!(K => matcher.skip_matching::<K>(Some(true)));
 
     let current_len = first.len();
     let current_abs_start =
@@ -4184,58 +4138,6 @@ fn hc_compact_history_drains_when_threshold_crossed() {
 }
 
 #[test]
-fn hc_insert_position_no_rebase_returns_when_relative_pos_unavailable() {
-    let mut hc = HcMatchGenerator::new(32);
-    hc.table.history = b"abcdefghijklmnop".to_vec().into();
-    hc.table.history_abs_start = 0;
-    hc.table.position_base = 1;
-    hc.table.ensure_tables();
-    let before_hash = hc.table.hash_table().to_vec();
-    let before_chain = hc.table.chain_table().to_vec();
-
-    hc.table.insert_position_no_rebase(0);
-
-    assert_eq!(hc.table.hash_table(), before_hash);
-    assert_eq!(hc.table.chain_table(), before_chain);
-}
-
-#[test]
-fn hc_insert_positions_advances_next_to_update3_for_contiguous_range() {
-    let mut hc = HcMatchGenerator::new(64);
-    hc.table.history = b"abcdefghijklmnopqrstuvwxyz".to_vec().into();
-    hc.table.history_start = 0;
-    hc.table.history_abs_start = 0;
-    hc.table.position_base = 0;
-    hc.table.ensure_tables();
-    hc.table.next_to_update3 = 0;
-
-    hc.table.insert_positions(0, 9);
-
-    assert_eq!(
-        hc.table.next_to_update3, 9,
-        "contiguous insert_positions should advance hash3 update cursor"
-    );
-}
-
-#[test]
-fn hc_insert_positions_with_step_keeps_next_to_update3_cursor_for_sparse_ranges() {
-    let mut hc = HcMatchGenerator::new(64);
-    hc.table.history = b"abcdefghijklmnopqrstuvwxyz".to_vec().into();
-    hc.table.history_start = 0;
-    hc.table.history_abs_start = 0;
-    hc.table.position_base = 0;
-    hc.table.ensure_tables();
-    hc.table.next_to_update3 = 0;
-
-    hc.table.insert_positions_with_step(0, 16, 4);
-
-    assert_eq!(
-        hc.table.next_to_update3, 0,
-        "sparse insert_positions_with_step must not mark skipped positions as hash3-updated"
-    );
-}
-
-#[test]
 fn prime_with_dictionary_budget_shrinks_after_dfast_eviction() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Level(3));
@@ -4266,25 +4168,29 @@ fn prime_with_dictionary_budget_shrinks_after_dfast_eviction() {
 
 #[test]
 fn hc_prime_with_dictionary_preserves_history_for_first_full_block() {
-    let mut driver = MatchGeneratorDriver::new(8, 1);
-    // Route onto HashChain explicitly — `Better` resolves to the Row
-    // backend in production, and this test pins HC dict-prime behaviour.
-    driver.reset_on_hc_lazy(CompressionLevel::Better);
+    let mut driver = MatchGeneratorDriver::new(64, 1);
+    driver.reset(CompressionLevel::Level(19));
 
-    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
+    let dict = b"abcdefghijklmnopqrstuvwxyz012345";
+    driver.prime_with_dictionary(dict, [1, 4, 8]);
 
-    // Repeat the dictionary content so the HC matcher can find it.
-    // HC_MIN_MATCH_LEN is 5, so an 8-byte match is well above threshold.
-    driver.commit_input(b"abcdefgh");
+    // Repeat the dictionary content so the search can find it, a block long
+    // enough for the optimal parser to search.
+    driver.commit_input(dict);
 
+    // The parse starts one byte into the block: the attached dictionary leaves
+    // the prefix starting at the frame's first byte, which the optimal parser
+    // never searches (upstream zstd_opt.c:1116, `ip += (ip==prefixStart)`).
     let mut saw_match = false;
     driver.start_matching(|seq| {
         if let Sequence::Triple {
-            literal_len: 0,
-            offset: 8,
+            literal_len,
+            offset,
             match_len,
         } = seq
-            && match_len >= HC_MIN_MATCH_LEN
+            && literal_len <= 1
+            && offset == dict.len()
+            && literal_len + match_len == dict.len()
         {
             saw_match = true;
         }
@@ -4292,14 +4198,14 @@ fn hc_prime_with_dictionary_preserves_history_for_first_full_block() {
 
     assert!(
         saw_match,
-        "hash-chain backend should match dictionary-primed history in first full block"
+        "the optimal backend should match dictionary-primed history in first full block"
     );
 }
 
 #[test]
 fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset_on_hc_lazy(CompressionLevel::Better);
+    driver.reset(CompressionLevel::Level(19));
     // Use a small live window so dictionary-primed slices are evicted quickly.
     driver.hc_matcher_mut().table.max_window_size = 8;
     driver.reported_window_size = 8;
@@ -4337,7 +4243,7 @@ fn resident_reapply_restores_retained_dictionary_budget() {
     let mut driver = MatchGeneratorDriver::new(1 << 16, 1);
     let dict = b"abcdefghABCDEFGHijklmnopqrstuvwxyz0123456789";
     driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
-    driver.reset_on_hc_lazy(CompressionLevel::Better);
+    driver.reset(CompressionLevel::Level(19));
     driver.prime_with_dictionary(dict, [1, 4, 8]);
     let base = driver.reported_window_size;
     assert!(
@@ -4347,7 +4253,7 @@ fn resident_reapply_restores_retained_dictionary_budget() {
 
     // Second frame: the reset detects the resident dict and re-borrows it.
     driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
-    driver.reset_on_hc_lazy(CompressionLevel::Better);
+    driver.reset(CompressionLevel::Level(19));
     assert!(
         driver.dictionary_is_resident(),
         "the second frame must re-borrow the resident dictionary"
@@ -4379,7 +4285,7 @@ fn hc_commit_without_eviction_retires_no_dictionary_budget() {
     // would prematurely retire dictionary budget even when the window is
     // nowhere near full.
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset_on_hc_lazy(CompressionLevel::Better);
+    driver.reset(CompressionLevel::Level(19));
     // A large live window so a small committed block evicts nothing.
     driver.hc_matcher_mut().table.max_window_size = 1 << 20;
     driver.reported_window_size = 1 << 20;
@@ -4440,7 +4346,7 @@ fn hc_rebases_positions_after_u32_boundary() {
     // Simulate a long-running stream where absolute history positions crossed
     // the u32 range. Before #51 this disabled HC inserts entirely.
     matcher.table.history_abs_start = history_abs_start;
-    matcher.skip_matching(None);
+    with_host_tier!(K => matcher.skip_matching::<K>(None));
     assert_eq!(
         matcher.table.position_base, matcher.table.history_abs_start,
         "rebase should anchor to the oldest live absolute position"
@@ -4499,6 +4405,7 @@ fn hc_rebase_rebuilds_only_inserted_prefix() {
     let mut matcher = HcMatchGenerator::new(64);
     matcher.table.commit_input(b"abcdeabcdeabcde");
     matcher.table.ensure_tables();
+    matcher.table.search_depth = 4;
     matcher.table.position_base = 0;
     let history_abs_start: usize = match (u64::from(u32::MAX) + 64).try_into() {
         Ok(value) => value,
@@ -4507,15 +4414,20 @@ fn hc_rebase_rebuilds_only_inserted_prefix() {
     matcher.table.history_abs_start = history_abs_start;
     let abs_pos = matcher.table.history_abs_start + 6;
 
+    // The tree a walk from the rebased origin builds up to `abs_pos`, with the
+    // compare the rebase replays on.
     let mut expected = HcMatchGenerator::new(64);
     expected.table.commit_input(b"abcdeabcdeabcde");
     expected.table.ensure_tables();
+    expected.table.search_depth = 4;
     expected.table.history_abs_start = history_abs_start;
     expected.table.position_base = expected.table.history_abs_start;
+    expected.table.skip_insert_until_abs = history_abs_start;
     expected.table.tables.fill(HC_EMPTY);
-    for pos in expected.table.history_abs_start..abs_pos {
-        expected.table.insert_position_no_rebase(pos);
-    }
+    let end = history_abs_start + expected.table.window_size;
+    expected
+        .table
+        .bt_update_tree_until::<crate::encoding::fastpath::ScalarTier>(abs_pos, end);
 
     matcher.table.maybe_rebase_positions(abs_pos);
 
@@ -4531,7 +4443,7 @@ fn hc_rebase_rebuilds_only_inserted_prefix() {
     assert_eq!(
         matcher.table.chain_table(),
         expected.table.chain_table(),
-        "future positions must not be pre-seeded into HC chains during rebase"
+        "future positions must not be pre-seeded into the tree during rebase"
     );
 }
 
@@ -4567,7 +4479,7 @@ fn dfast_skip_matching_handles_window_eviction() {
 
     let mut reconstructed = alloc::vec![7, 8, 9, 10, 11, 12];
     let mut replay = BlockReplay::new(&[7, 8, 9, 10, 11, 12]);
-    matcher.start_matching(|seq| replay.apply(&mut reconstructed, seq));
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| replay.apply(&mut reconstructed, seq))));
 
     assert_eq!(reconstructed, [7, 8, 9, 10, 11, 12, 7, 8, 9, 10, 11, 12]);
 }
@@ -4687,18 +4599,18 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
     matcher.commit_input(b"012345bcdea");
     let mut history = Vec::new();
     let mut replay = BlockReplay::new(b"012345bcdea");
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         assert!(
             matches!(seq, Sequence::Literals { .. }),
             "first block should not match history"
         );
         replay.apply(&mut history, seq);
-    });
+    })));
     assert_eq!(history, b"012345bcdea");
 
     matcher.commit_input(b"bcdeabcdeab");
     let mut saw_first_sequence = false;
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         assert!(!saw_first_sequence, "expected a single cross-block match");
         saw_first_sequence = true;
         match seq {
@@ -4720,7 +4632,7 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
                 }
             }
         }
-    });
+    })));
 
     assert!(
         saw_first_sequence,
@@ -4729,53 +4641,53 @@ fn dfast_inserts_tail_positions_for_next_block_matching() {
     assert_eq!(history, b"012345bcdeabcdeabcdeab");
 }
 
-/// Regression for #49 — locks down `MatchTable::backfill_boundary_positions`
-/// for the [`HcMatchGenerator`] lazy path. `backfill_boundary_positions`
-/// seeds ONLY the last `< 4` bytes of the previous slice (positions in
-/// `[current_abs_start - 3, current_abs_start)`) — the bytes that
-/// `insert_position` could not hash at the time because hashing needs
-/// 4 bytes of lookahead. The existing 8 MiB window roundtrip test
-/// exercises cross-slice behaviour end-to-end, but does not isolate
-/// the backfill of those final 1-3 unhashable bytes.
+/// Regression for #49 — locks down the boundary backfill of the lazy
+/// hash-chain search (the Row backend's chain finder). It seeds the last
+/// `< 4` bytes of the previous slice (positions in
+/// `[current_abs_start - 3, current_abs_start)`) — the bytes that could not be
+/// hashed at the time because hashing needs 4 bytes of lookahead. The
+/// existing 8 MiB window roundtrip test exercises cross-slice behaviour
+/// end-to-end, but does not isolate the backfill of those final 1-3
+/// unhashable bytes.
 ///
 /// Fixture is built so the cross-block match's candidate position
 /// MUST lie in `[block_1_end - 3, block_1_end)`:
 ///
-/// - Block 1 = `b"PQRSTBCD"` (8 bytes). Block 1's `start_matching`
-///   hashes positions 0..=4 (each has 4 bytes of forward context);
-///   positions 5/6/7 are the unhashable tail.
+/// - Block 1 = `b"PQRSTBCD"` (8 bytes). Block 1's parse hashes positions
+///   0..=4 (each has 4 bytes of forward context); positions 5/6/7 are the
+///   unhashable tail.
 /// - Block 2 = `b"BCDBCDBCDB"` (10 bytes). At absolute position 8
 ///   (block 2 start) the 4-byte window is `b"BCDB"`. The ONLY place
 ///   `b"BCDB"` was inserted in the hash + chain tables is position 5
-///   — via `backfill_boundary_positions` on the next-slice entry
-///   (the 4-byte window at position 5 is `data[5..9] = b"BCD" +
-///   block_2[0] = b"BCDB"`).
+///   — via the backfill on the next-slice entry (the 4-byte window at
+///   position 5 is `data[5..9] = b"BCD" + block_2[0] = b"BCDB"`).
 ///
-/// If `backfill_boundary_positions` regresses, position 5 is never
-/// hashed, position 8's lookup misses, and the lazy parser falls
-/// through to a leading literals run — `offset == 3, match_len >= 4`
-/// would no longer hold.
+/// If the backfill regresses, position 5 is never hashed, position 8's
+/// lookup misses, and the lazy parser falls through to a leading literals
+/// run — `offset == 3, match_len >= 4` would no longer hold.
 #[test]
 fn hashchain_inserts_tail_positions_for_next_block_matching() {
-    let mut matcher = HcMatchGenerator::new(1 << 22);
-    matcher.configure(HC_CONFIG, super::super::strategy::StrategyTag::Lazy, 22);
+    // A window of 2^14 searches the hash chain.
+    let mut matcher = RowMatchGenerator::new(1 << 14);
+    matcher.configure(ROW_CONFIG);
+    assert!(matcher.uses_hash_chain());
 
-    matcher.table.commit_input(b"PQRSTBCD");
+    matcher.commit_input(b"PQRSTBCD");
     let mut history = alloc::vec::Vec::new();
     let mut replay = BlockReplay::new(b"PQRSTBCD");
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         assert!(
             matches!(seq, Sequence::Literals { .. }),
             "first block has no internal repeats"
         );
         replay.apply(&mut history, seq);
-    });
+    })));
     assert_eq!(history, b"PQRSTBCD");
 
-    matcher.table.commit_input(b"BCDBCDBCDB");
+    matcher.commit_input(b"BCDBCDBCDB");
     let mut first_sequence_offset: Option<usize> = None;
     let mut first_sequence_match_len: Option<usize> = None;
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         if first_sequence_offset.is_some() {
             return;
         }
@@ -4783,7 +4695,7 @@ fn hashchain_inserts_tail_positions_for_next_block_matching() {
             Sequence::Literals { .. } => {
                 panic!(
                     "expected tail-anchored cross-block match before any literals — \
-                     backfill_boundary_positions did not seed positions 5/6/7"
+                     the boundary backfill did not seed positions 5/6/7"
                 )
             }
             Sequence::Triple {
@@ -4796,16 +4708,15 @@ fn hashchain_inserts_tail_positions_for_next_block_matching() {
                 first_sequence_match_len = Some(match_len);
             }
         }
-    });
+    })));
 
-    let offset = first_sequence_offset.expect(
-        "expected tail-anchored cross-block match emitted from backfill_boundary_positions",
-    );
+    let offset = first_sequence_offset
+        .expect("expected tail-anchored cross-block match emitted from the boundary backfill");
     assert!(
         (1..=3).contains(&offset),
         "boundary match offset {offset} must point into the unhashable tail \
          (positions 5/6/7 of an 8-byte block 1) so the test specifically \
-         locks down backfill_boundary_positions",
+         locks down the boundary backfill",
     );
     assert_eq!(
         offset, 3,
@@ -4833,7 +4744,7 @@ fn dfast_dense_skip_matching_backfills_previous_tail_for_next_block() {
     matcher.commit_input(&second);
 
     let mut first_sequence = None;
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         if first_sequence.is_some() {
             return;
         }
@@ -4845,7 +4756,7 @@ fn dfast_dense_skip_matching_backfills_previous_tail_for_next_block() {
                 match_len,
             } => (literal_len, offset, match_len),
         });
-    });
+    })));
 
     let (lit_len, offset, match_len) = first_sequence.expect("expected at least one sequence");
     assert_eq!(
@@ -4879,7 +4790,7 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
     matcher.commit_input(&second);
 
     let mut first_sequence = None;
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         if first_sequence.is_some() {
             return;
         }
@@ -4891,7 +4802,7 @@ fn dfast_sparse_skip_matching_preserves_tail_cross_block_match() {
                 match_len,
             } => (literal_len, offset, match_len),
         });
-    });
+    })));
 
     let (lit_len, offset, match_len) = first_sequence.expect("expected at least one sequence");
     assert_eq!(
@@ -5104,7 +5015,7 @@ fn dfast_sparse_skip_matching_backfills_previous_tail_for_consecutive_sparse_blo
     matcher.commit_input(&third);
 
     let mut first_sequence = None;
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         if first_sequence.is_some() {
             return;
         }
@@ -5116,7 +5027,7 @@ fn dfast_sparse_skip_matching_backfills_previous_tail_for_consecutive_sparse_blo
                 match_len,
             } => (literal_len, offset, match_len),
         });
-    });
+    })));
 
     let (lit_len, offset, match_len) = first_sequence.expect("expected at least one sequence");
     assert_eq!(

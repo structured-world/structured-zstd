@@ -4800,3 +4800,95 @@ fn estimated_heap_size_bounds_every_prepared_form() {
         );
     }
 }
+
+/// The frames one compressor writes for `input` under `tier` through each of
+/// its entry points, and through a matcher reaching the built-in driver only
+/// by the trait.
+fn frames_under_tier(
+    tier: crate::encoding::fastpath::FastpathKernel,
+    level: super::CompressionLevel,
+    input: &[u8],
+    dict: bool,
+) -> Vec<Vec<u8>> {
+    use crate::encoding::test_support::{TraitDriver, tier_dictionary};
+    let builtin = || {
+        let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>> = FrameCompressor::new(level);
+        compressor.state.copy_kernel = tier;
+        if dict {
+            compressor.set_dictionary(tier_dictionary()).unwrap();
+        }
+        compressor
+    };
+    let mut frames = Vec::new();
+
+    let mut read = Vec::new();
+    let mut compressor = builtin();
+    compressor.set_source(input);
+    compressor.set_drain(&mut read);
+    compressor.compress();
+    drop(compressor);
+    frames.push(read);
+
+    let mut one_shot = Vec::new();
+    builtin().compress_independent_frame_into(input, &mut one_shot);
+    frames.push(one_shot);
+
+    #[cfg(feature = "dict-builder")]
+    {
+        let mut known = Vec::new();
+        let mut compressor = builtin();
+        compressor.set_source(input);
+        compressor.compress_known_into(input.len() as u64, &mut known);
+        frames.push(known);
+    }
+
+    let mut through_trait = Vec::new();
+    let mut compressor = FrameCompressor::new_with_matcher(TraitDriver::new(tier), level);
+    compressor.state.copy_kernel = tier;
+    if dict {
+        compressor.set_dictionary(tier_dictionary()).unwrap();
+    }
+    compressor.set_source(input);
+    compressor.set_drain(&mut through_trait);
+    compressor.compress();
+    drop(compressor);
+    frames.push(through_trait);
+    frames
+}
+
+/// Every tier the CPU can run writes the same frames, with and without a
+/// dictionary, at a level of each backend, and every frame decodes to its
+/// input. The scalar tier is what a CPU without the extended instructions
+/// runs, and the detection never picks it on one that has them, so this is
+/// where the fallback is checked end to end against the SIMD kernels.
+#[test]
+fn every_tier_writes_the_same_frames() {
+    use crate::encoding::test_support::{TIER_LEVELS, tier_dictionary, tier_fixture};
+    let input = tier_fixture();
+    let tiers = crate::encoding::fastpath::runnable_tiers();
+    for level in TIER_LEVELS {
+        let level = super::CompressionLevel::Level(level);
+        for dict in [false, true] {
+            let reference = frames_under_tier(tiers[0], level, &input, dict);
+            for frame in &reference {
+                let mut decoder = FrameDecoder::new();
+                if dict {
+                    decoder.add_dict(tier_dictionary()).unwrap();
+                }
+                let mut decoded = Vec::with_capacity(input.len());
+                decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+                assert!(
+                    decoded == input,
+                    "{level:?} dict {dict}: a frame does not decode to its input"
+                );
+            }
+            for &tier in &tiers[1..] {
+                assert!(
+                    frames_under_tier(tier, level, &input, dict) == reference,
+                    "{level:?} dict {dict}: tier {tier:?} wrote other frames than {:?}",
+                    tiers[0],
+                );
+            }
+        }
+    }
+}

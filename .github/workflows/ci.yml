@@ -211,6 +211,29 @@ jobs:
             echo "::error::bench-only instrumentation symbols leaked into zstd/src/"
             exit 1
           fi
+      - name: Gate — one search per tier in the debug build
+        # Below the encoder's one tier choice, code is compiled per tier. A
+        # plain `match` on `K::TIER` instantiates every arm's kernel for every
+        # tier in an unoptimised build (`tier_match!` does not), and a test
+        # closure handed straight to a search compiles that search again per
+        # closure (`dyn_sink` does not). Either one multiplies the test build's
+        # IR until the compiler no longer fits on a hosted runner.
+        # `fastpath/mod.rs` defines `tier_match!` itself, whose exhaustiveness
+        # check is the one `match` on the constant that belongs there.
+        run: |
+          found=$(rg -n --no-heading -g '!zstd/src/encoding/fastpath/mod.rs' \
+              -e 'match\s+[A-Za-z_]+::TIER\b' \
+              -e 'match\s+<[^>]+>::TIER\b' \
+              -e '::TIER\s*[=!]=' \
+              zstd/src/ || true)
+          found+=$(rg -n --no-heading -g '*tests*.rs' \
+              -e 'start_matching\w*::<K>\(\s*\|' \
+              zstd/src/ || true)
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::per-tier code must pick its kernel with tier_match! and take test sinks through dyn_sink"
+            exit 1
+          fi
 
   c-abi:
     # Builds the libzstd-compatible C ABI front end and verifies it is a real

@@ -15,7 +15,7 @@
 //! change is `pub(crate)` visibility on the moved items.
 
 use super::super::opt::types::MatchCandidate;
-use crate::encoding::fastpath::FastpathKernel;
+use crate::encoding::fastpath::EncodeTier;
 
 /// Minimum match length emitted by the Simple / level-1 matcher (and the
 /// upstream zstd `ZSTD_fast.c` baseline). Lives here so every matcher and the
@@ -67,36 +67,15 @@ pub(crate) const INCOMPRESSIBLE_SKIP_STEP: usize =
     crate::encoding::incompressible::RAW_SKIP_INDEX_STEP;
 
 /// Length of the common prefix of two byte slices, capped at
-/// `min(a.len(), b.len())`. Hot path on every match finder; dispatches to
-/// the per-CPU `common_prefix_len_ptr` kernel (NEON / SSE4.2 / AVX2+BMI2 /
-/// scalar) so the SIMD/CRC heavy lifting lives in one place. See
-/// [`crate::encoding::fastpath`] for the per-CPU implementations.
+/// `min(a.len(), b.len())`, with the compare kernel of the encoder tier `K`.
+/// See [`crate::encoding::fastpath`] for the per-tier implementations.
 #[inline(always)]
-pub(crate) fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+pub(crate) fn common_prefix_len<K: EncodeTier>(a: &[u8], b: &[u8]) -> usize {
     let max = a.len().min(b.len());
     // SAFETY: slice `a` / `b` guarantee at least their `len()` initialized
     // bytes; `max` is the minimum so both pointers are valid for `max`
-    // bytes.
-    unsafe {
-        crate::encoding::fastpath::dispatch_common_prefix_len_ptr(a.as_ptr(), b.as_ptr(), max)
-    }
-}
-
-/// As [`common_prefix_len`] but against an already-resolved [`FastpathKernel`].
-/// Hot match-finder loops resolve the kernel once per block and pass it in,
-/// so each byte-compare skips the per-call `select_kernel()` `OnceLock` atomic.
-#[inline(always)]
-pub(crate) fn common_prefix_len_with_kernel(kernel: FastpathKernel, a: &[u8], b: &[u8]) -> usize {
-    let max = a.len().min(b.len());
-    // SAFETY: as `common_prefix_len` — both pointers are valid for `max` bytes.
-    unsafe {
-        crate::encoding::fastpath::dispatch_common_prefix_len_ptr_with_kernel(
-            kernel,
-            a.as_ptr(),
-            b.as_ptr(),
-            max,
-        )
-    }
+    // bytes. The tier is the one the encoder chose for the running CPU.
+    unsafe { K::common_prefix_len_ptr(a.as_ptr(), b.as_ptr(), max) }
 }
 
 /// Pick the better of two candidate matches: longer wins, ties go to
@@ -166,8 +145,7 @@ pub(crate) fn extend_backwards_shared(
 /// invoked once per encoded byte on lazy / Dfast / Row matchers
 /// (~10% exclusive on the default-level profile).
 #[inline(always)]
-pub(crate) fn repcode_candidate_shared(
-    kernel: FastpathKernel,
+pub(crate) fn repcode_candidate_shared<K: EncodeTier>(
     concat: &[u8],
     history_abs_start: usize,
     offset_hist: [u32; 3],
@@ -233,8 +211,7 @@ pub(crate) fn repcode_candidate_shared(
                             == core::ptr::read_unaligned(base.add(current_idx).cast::<u32>())
                     };
                     if gate {
-                        let match_len = common_prefix_len_with_kernel(
-                            kernel,
+                        let match_len = common_prefix_len::<K>(
                             &concat[candidate_idx..],
                             &concat[current_idx..],
                         );

@@ -328,11 +328,15 @@ pub(crate) fn copy_cparams(cdict: CParams, window_log: u32) -> CParams {
     cp
 }
 
-/// `ZSTD_resolveRowMatchFinderMode(ZSTD_ps_auto, cp)`: the greedy / lazy /
-/// lazy2 strategies search rows only above a 2^14 window. A CDict resolves
-/// this from its own cParams and the frame inherits the answer.
-pub(crate) fn uses_row_match_finder(cp: &CParams) -> bool {
-    (3..=5).contains(&cp.strategy) && cp.window_log > 14
+/// `ZSTD_resolveRowMatchFinderMode(mode, cp)` + `ZSTD_rowMatchFinderUsed`
+/// (zstd_compress.c:240-261): whether the greedy / lazy / lazy2 strategies
+/// search rows. A CDict resolves this from its own cParams and mode, and the
+/// frame inherits the answer.
+pub(crate) fn uses_row_match_finder(
+    cp: &CParams,
+    mode: crate::encoding::parameters::RowMatchFinderMode,
+) -> bool {
+    (3..=5).contains(&cp.strategy) && mode.searches_rows(1usize << cp.window_log)
 }
 
 /// `ZSTD_shouldAttachDict`: the CDict tables are referenced in place

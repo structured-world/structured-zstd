@@ -6,6 +6,7 @@ use crate::encoding::CompressionLevel;
 use crate::encoding::Matcher;
 #[cfg(test)]
 use crate::encoding::dfast::DfastMatchGenerator;
+use crate::encoding::fastpath::{dyn_sink, with_host_tier};
 #[cfg(test)]
 use crate::encoding::match_generator::MatchGeneratorDriver;
 use crate::encoding::test_support::BlockReplay;
@@ -22,13 +23,13 @@ fn dfast_matches_roundtrip_multi_block_pattern() {
     matcher.commit_input(&first_block);
     let mut history = Vec::new();
     let mut replay = BlockReplay::new(&first_block);
-    matcher.start_matching(|seq| replay.apply(&mut history, seq));
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| replay.apply(&mut history, seq))));
     assert_eq!(history, first_block);
 
     matcher.commit_input(&second_block);
     let prefix_len = history.len();
     let mut replay = BlockReplay::new(&second_block);
-    matcher.start_matching(|seq| replay.apply(&mut history, seq));
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| replay.apply(&mut history, seq))));
 
     assert_eq!(&history[prefix_len..], second_block.as_slice());
 }
@@ -82,7 +83,7 @@ fn dfast_accepts_exact_five_byte_match() {
 
     let mut saw_five_byte_match = false;
     let mut saw_longer_match = false;
-    matcher.start_matching(|seq| {
+    with_host_tier!(K => matcher.start_matching::<K>(dyn_sink(&mut |seq| {
         if let Sequence::Triple {
             offset, match_len, ..
         } = seq
@@ -93,7 +94,7 @@ fn dfast_accepts_exact_five_byte_match() {
                 saw_longer_match = true;
             }
         }
-    });
+    })));
 
     assert!(
         saw_five_byte_match,

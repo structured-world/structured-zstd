@@ -49,7 +49,10 @@ fn build_huf4x_block(data: &[u8]) -> (LiteralsSection, Vec<u8>) {
     {
         let mut writer = BitWriter::from(&mut source);
         let mut encoder = HuffmanEncoder::new(&table, &mut writer);
-        encoder.encode4x(data, true);
+        crate::encoding::fastpath::with_encode_tier!(
+            crate::encoding::fastpath::select_kernel(),
+            K => encoder.encode4x::<K>(data, true)
+        );
         writer.flush();
     }
     let section = LiteralsSection {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::encoding::fastpath::with_host_tier;
 
 /// `LdmParams::adjust_for` must derive a representative
 /// upstream zstd-btultra2 parameter set at window_log=27. Checked via
@@ -45,7 +46,7 @@ fn clear_resets_rolling_hash_state() {
     let mut out = Vec::new();
     // Feed a non-empty chunk so the rolling hash advances.
     let data = [0xAAu8; 256];
-    producer.generate_into(&data, 0, 0, data.len(), &mut out);
+    with_host_tier!(K => producer.generate_into::<K>(&data, 0, 0, data.len(), &mut out));
     let advanced = producer.hash_state.rolling;
     assert_ne!(
         advanced,
@@ -106,7 +107,7 @@ fn generate_into_emits_long_range_match_on_repeated_payload() {
     history.extend_from_slice(&payload);
 
     let mut out = Vec::new();
-    producer.generate_into(&history, 0, 0, history.len(), &mut out);
+    with_host_tier!(K => producer.generate_into::<K>(&history, 0, 0, history.len(), &mut out));
 
     assert!(
         !out.is_empty(),
@@ -199,7 +200,7 @@ fn generate_into_preserves_bucket_entries_across_history_slide() {
     // populates with absolute offsets inside payload #1.
     let mut out1 = Vec::new();
     let split_at = PAYLOAD + GAP_A;
-    producer.generate_into(&frame[..split_at], 0, 0, split_at, &mut out1);
+    with_host_tier!(K => producer.generate_into::<K>(&frame[..split_at], 0, 0, split_at, &mut out1));
 
     // Call 2: simulate a window slide. The encoder retired
     // the leading `eviction` bytes from the live history;
@@ -215,13 +216,13 @@ fn generate_into_preserves_bucket_entries_across_history_slide() {
     let block_end_abs = block_start_abs + PAYLOAD;
 
     let mut out2 = Vec::new();
-    producer.generate_into(
+    with_host_tier!(K => producer.generate_into::<K>(
         live,
         history_abs_start,
         block_start_abs,
         block_end_abs,
         &mut out2,
-    );
+    ));
 
     // The long-range match must still fire — entries from
     // call 1 in the surviving tail of payload #1
@@ -288,7 +289,7 @@ fn generate_into_empty_range_is_noop() {
     let mut out = Vec::new();
     let data = [0u8; 128];
     let pre = producer.hash_state.rolling;
-    producer.generate_into(&data, 0, 64, 64, &mut out);
+    with_host_tier!(K => producer.generate_into::<K>(&data, 0, 64, 64, &mut out));
     assert!(out.is_empty());
     assert_eq!(producer.hash_state.rolling, pre);
 }

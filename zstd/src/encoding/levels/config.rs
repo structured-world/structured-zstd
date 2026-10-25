@@ -56,6 +56,16 @@ pub(crate) struct RowConfig {
     /// Upstream `ZSTD_btlazy2`: the lazy parse searches the lazily-sorted
     /// binary tree (`ZSTD_BtFindBestMatch`) instead of rows / the chain.
     pub(crate) bt: bool,
+    /// Rows or the hash chain, when not the tree (`ZSTD_c_useRowMatchFinder`).
+    pub(crate) match_finder: crate::encoding::parameters::RowMatchFinderMode,
+}
+
+impl RowConfig {
+    /// Whether a frame without a dictionary searches rows with a `window`-byte
+    /// window (a dictionary frame takes its dictionary's answer).
+    pub(crate) const fn searches_rows(&self, window: usize) -> bool {
+        !self.bt && self.match_finder.searches_rows(window)
+    }
 }
 
 // Only used as the default HashChain config when the test-only parse×search
@@ -93,6 +103,7 @@ pub(crate) const ROW_CONFIG: RowConfig = RowConfig {
     mls: ROW_MIN_MATCH_LEN,
     chain_log: ROW_HASH_BITS,
     bt: false,
+    match_finder: crate::encoding::parameters::RowMatchFinderMode::Auto,
 };
 
 // Level-5 greedy is the ONLY strategy routed to the Row backend
@@ -119,6 +130,7 @@ pub(crate) const ROW_L5: RowConfig = RowConfig {
     mls: ROW_MIN_MATCH_LEN,
     chain_log: 18,
     bt: false,
+    match_finder: crate::encoding::parameters::RowMatchFinderMode::Auto,
 };
 
 /// Per-level Double-Fast hash sizing, mirroring the upstream zstd `clevels.h` columns
@@ -242,9 +254,7 @@ impl LevelParams {
             SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => {
                 self.row.map(|row| (row.hash_bits, row.chain_log))
             }
-            SearchMethod::HashChain | SearchMethod::BinaryTree => {
-                self.hc.map(|hc| (hc.hash_log, hc.chain_log))
-            }
+            SearchMethod::BinaryTree => self.hc.map(|hc| (hc.hash_log, hc.chain_log)),
         };
         // The reset synthesises the active config when a row lacks it, so a
         // missing one only means a table-less level: nothing to index.
@@ -264,7 +274,6 @@ impl LevelParams {
             SearchMethod::Fast => self.fast.map(|fast| fast.mls as usize),
             SearchMethod::DoubleFast => Some(crate::encoding::match_generator::DFAST_MIN_MATCH_LEN),
             SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => self.row.map(|row| row.mls),
-            SearchMethod::HashChain => Some(crate::encoding::hc::HC_MIN_MATCH_LEN),
             SearchMethod::BinaryTree => self.hc.map(|hc| hc.search_mls),
         };
         configured.unwrap_or(crate::encoding::cost_model::HC_FORMAT_MINMATCH)
@@ -347,7 +356,7 @@ pub(crate) fn apply_param_overrides(
             let row = params.row.get_or_insert(ROW_L5);
             row.bt = matches!(params.search, SearchMethod::BinaryTreeLazy);
         }
-        SearchMethod::HashChain | SearchMethod::BinaryTree => {
+        SearchMethod::BinaryTree => {
             params.hc.get_or_insert(HC_OVERRIDE_DEFAULT);
         }
     }
@@ -416,9 +425,10 @@ pub(crate) fn apply_param_overrides(
                 if let Some(min_match) = ov.min_match {
                     row.mls = min_match as usize;
                 }
+                row.match_finder = ov.row_match_finder;
             }
         }
-        SearchMethod::HashChain | SearchMethod::BinaryTree => {
+        SearchMethod::BinaryTree => {
             if let Some(hc) = params.hc.as_mut() {
                 if let Some(hash_log) = ov.hash_log {
                     hc.hash_log = hash_log as usize;
@@ -571,13 +581,6 @@ pub(crate) const MAX_FAST_ATTACH_DICT_REGION: usize = 1 << 24;
 /// fast-loop levels (L3 / Default / L0) carry the dual-probe.
 pub(crate) const DFAST_ATTACH_DICT_CUTOFF_LOG: u8 = 14;
 
-/// 32 KiB (`2^15`, upstream zstd `attachDictSizeCutoffs[ZSTD_lazy2]`): small /
-/// unknown-size inputs ATTACH the dict as a separate hash-chain dms (the dual
-/// search in `find_best_match` walks the live input chain + the dms), larger
-/// known-size inputs dense-COPY (merge the dict into the live chain and search
-/// the one combined chain).
-pub(crate) const HC_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
-
 /// BT/optimal attach cutoff for `btlazy2` + `btopt`: 32 KiB (`2^15`, upstream
 /// zstd `attachDictSizeCutoffs[ZSTD_btlazy2]` == `[ZSTD_btopt]`). Small /
 /// unknown-size inputs ATTACH the dict as a separate DUBT dms; larger known-size
@@ -663,6 +666,7 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
         chain_log: cp.chain_log as usize,
         // Upstream `ZSTD_btlazy2` (strategy 6).
         bt: cp.strategy == 6,
+        match_finder: crate::encoding::parameters::RowMatchFinderMode::Auto,
     };
     let bt = |tag| LevelParams {
         strategy_tag: tag,
@@ -1137,17 +1141,17 @@ fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
             table_bytes(4, usize::from(d.long_hash_log))
                 .saturating_add(table_bytes(4, usize::from(d.short_hash_log)))
         }),
-        // The lazy backend's chain / tree finders (window <= 2^14, or a
-        // btlazy2 level) use a plain hash table (`4 << hash_bits`) plus the
-        // chain / tree table (`4 << chain_log`) instead of the row tables.
+        // The lazy backend's chain / tree finders use a plain hash table
+        // (`4 << hash_bits`) plus the chain / tree table (`4 << chain_log`)
+        // instead of the row tables.
         SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => params.row.map_or(0, |r| {
-            if r.bt || params.window_log <= 14 {
+            if !r.searches_rows(window) {
                 table_bytes(4, r.hash_bits).saturating_add(table_bytes(4, r.chain_log))
             } else {
                 table_bytes(4, r.hash_bits).saturating_add(table_bytes(2, r.hash_bits))
             }
         }),
-        SearchMethod::HashChain | SearchMethod::BinaryTree => params.hc.map_or(0, |h| {
+        SearchMethod::BinaryTree => params.hc.map_or(0, |h| {
             let hash3 = if wants_hash3 {
                 table_bytes(
                     4,
@@ -1397,7 +1401,7 @@ pub(crate) fn resolve_level_params_with_dict(
         params,
         Some(RowDictPlan {
             attach,
-            use_row: uses_row_match_finder(&cdict),
+            use_row: uses_row_match_finder(&cdict, overrides.row_match_finder),
             cdict,
         }),
     )

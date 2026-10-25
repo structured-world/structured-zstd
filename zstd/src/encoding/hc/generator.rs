@@ -1,61 +1,29 @@
-//! HashChain / binary-tree match generator (`HcMatchGenerator`).
+//! Binary-tree match generator (`HcMatchGenerator`) of the optimal parsers.
 //!
-//! The HC chain matcher plus the BT-backed optimal-parse machinery the lazy /
-//! btopt / btultra strategies run on: the `HcBackend` discriminator, the
-//! `HcMatchGenerator` storage + methods, the `btlazy2` cost helpers, the
-//! optimal-plan body macros, and the `build_optimal_plan` driver. Moved
-//! verbatim from `match_generator.rs` (no behaviour change); encoding-level
-//! paths are absolute (`crate::encoding::…`) for the deeper module.
+//! The BT-backed optimal-parse machinery the btopt / btultra / btultra2
+//! strategies run on: the `HcMatchGenerator` storage + methods, the
+//! optimal-plan body macros, and the `build_optimal_plan` driver;
+//! encoding-level paths are absolute (`crate::encoding::…`) for the deeper
+//! module.
 
+#[cfg(test)]
 use crate::encoding::Sequence;
-use crate::encoding::blocks::encode_offset_with_history;
 use crate::encoding::cost_model::HC_PREDEF_THRESHOLD;
-use crate::encoding::hc::{HC_MIN_MATCH_LEN, HcMatch, MAX_HC_SEARCH_DEPTH};
+use crate::encoding::fastpath::EncodeTier;
 use crate::encoding::levels::config::HcConfig;
-use crate::encoding::match_generator::{HC_SEARCH_DEPTH, HC_TARGET_LEN, HcBackend};
+use crate::encoding::match_generator::{HC_SEARCH_DEPTH, HC_TARGET_LEN};
 use crate::encoding::match_table::storage::HC3_HASH_LOG;
-
-impl HcBackend {
-    /// Heap bytes held by the backend. `Hc` is zero-sized; `Bt` boxes a
-    /// `BtMatcher`, so count the boxed payload plus its own scratch heap.
-    pub(crate) fn heap_size(&self) -> usize {
-        match self {
-            Self::Hc => 0,
-            Self::Bt(bt) => core::mem::size_of::<crate::encoding::bt::BtMatcher>() + bt.heap_size(),
-        }
-    }
-
-    /// Mutable accessor on the BT matcher; panics if the active
-    /// backend is `Hc`. The HC-or-Bt branches in orchestrator code use
-    /// `let HcBackend::Bt(bt) = &self.backend` directly for readonly
-    /// access — this helper exists so macro bodies that already drive
-    /// a mutable BT update through the optimal parser can write
-    /// `$self.backend.bt_mut().X` without an outer `match` ladder.
-    #[inline(always)]
-    pub(crate) fn bt_mut(&mut self) -> &mut crate::encoding::bt::BtMatcher {
-        match self {
-            Self::Bt(bt) => bt,
-            Self::Hc => unreachable!("BT-only accessor called in HC mode"),
-        }
-    }
-}
 
 #[derive(Clone)]
 pub(crate) struct HcMatchGenerator {
-    /// Shared match-finder storage (window, history, hash / chain /
-    /// hash3 tables, dictionary-priming flags). Used identically by HC
-    /// and BT modes; backend-specific table interpretation lives in the
-    /// matcher methods on this struct.
+    /// Shared match-finder storage (window, history, hash / tree /
+    /// hash3 tables, dictionary-priming flags).
     pub(crate) table: crate::encoding::match_table::storage::MatchTable,
-    /// HC runtime knobs (lazy_depth, search_depth, target_len). Always
-    /// present — BT modes still consult `hc.search_depth` for repcode
-    /// probing and chain candidate enumeration.
+    /// Search knobs (search_depth, target_len).
     pub(crate) hc: crate::encoding::hc::HcMatcher,
-    /// Backend discriminator. [`HcBackend::Hc`] is zero-sized for the
-    /// lazy / lazy2 path so HC-only generators don't carry the BT
-    /// optimal-parser scratch buffers. [`HcBackend::Bt`] holds the
-    /// `BtMatcher` when an optimal mode is configured.
-    pub(crate) backend: HcBackend,
+    /// The optimal parser's per-frame state: cost model, scratch arenas and
+    /// long-distance candidates. Boxed so the generator stays small.
+    pub(crate) bt: alloc::boxed::Box<crate::encoding::bt::BtMatcher>,
     /// Compile-time strategy tag mirrored from
     /// [`MatchGeneratorDriver::strategy_tag`](crate::encoding::match_generator::MatchGeneratorDriver::strategy_tag)
     /// during `configure()`.
@@ -66,8 +34,7 @@ pub(crate) struct HcMatchGenerator {
     /// const-generic optimal parser (BtOpt vs BtUltra vs BtUltra2).
     /// Without this field the test path would have to collapse
     /// `BtOpt` and `BtUltra` onto the same monomorphisation since
-    /// `table.uses_bt` / `table.is_btultra2` alone can't tell them
-    /// apart.
+    /// `table.is_btultra2` alone can't tell them apart.
     pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
 }
 
@@ -95,10 +62,9 @@ pub(crate) struct HcMatchGenerator {
 /// re-exported only inside this crate via `pub(crate) use` below.
 macro_rules! bt_insert_range_body {
     ($table:expr, $search_depth:expr, $from:ident, $stop:ident, $current_abs_end:ident, $target_abs:ident, $cmf:path) => {{
-        // Borrowed-aware live region (owned: `history[history_start..]`;
-        // borrowed: the in-place input `[0, block_end)`). Reborrow-then-raw-ptr
-        // so the slice holds NO borrow and coexists with the `&mut $table`
-        // binary-tree writes below. Owned is byte-identical (same bytes).
+        // The live region `history[history_start..]`, reborrowed as a raw
+        // slice so it holds NO borrow and coexists with the `&mut $table`
+        // binary-tree writes below.
         let concat: &[u8] = unsafe {
             let lh = $table.live_history();
             core::slice::from_raw_parts(lh.as_ptr(), lh.len())
@@ -343,161 +309,6 @@ macro_rules! bt_insert_range_body {
     }};
 }
 pub(crate) use bt_insert_range_body;
-
-/// `hash3_candidate` body parameterized over the per-CPU
-/// `common_prefix_len_ptr` symbol. The hash3 probe checks one candidate per
-/// position when invoked, so the per-call ABI savings compound across the
-/// segment. Crate-private (see `bt_insert_range_body!`).
-macro_rules! hash3_candidate_body {
-    (
-        $table:expr,
-        $abs_pos:ident,
-        $current_abs_end:ident,
-        $min_match_len:ident,
-        $cpl:path $(,)?
-    ) => {{
-        if $table.hash3_log == 0 {
-            return None;
-        }
-        let idx = $abs_pos.checked_sub($table.history_abs_start)?;
-        let concat = $table.live_history();
-        if idx + 4 > concat.len() {
-            return None;
-        }
-        let hash3 = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
-            concat,
-            idx,
-            $table.hash3_log,
-            3,
-        );
-        let entry = $table
-            .hash3_table()
-            .get(hash3)
-            .copied()
-            .unwrap_or($crate::encoding::match_table::storage::HC_EMPTY);
-        let candidate_abs =
-            $crate::encoding::match_table::storage::MatchTable::stored_abs_position_fast(
-                entry,
-                $table.position_base,
-                $table.index_shift,
-            )?;
-        if candidate_abs < $table.history_abs_start || candidate_abs >= $abs_pos {
-            return None;
-        }
-        let offset = $abs_pos - candidate_abs;
-        if offset >= $crate::encoding::bt::HC3_MAX_OFFSET {
-            return None;
-        }
-        let candidate_idx = candidate_abs - $table.history_abs_start;
-        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
-        let base = concat.as_ptr();
-        // SAFETY: candidate/idx are within history range; tail_limit
-        // bounds the scan within `concat`.
-        let match_len = unsafe { $cpl(base.add(candidate_idx), base.add(idx), tail_limit) };
-        (match_len >= $min_match_len).then_some($crate::encoding::opt::types::MatchCandidate {
-            start: $abs_pos,
-            offset,
-            match_len,
-        })
-    }};
-}
-pub(crate) use hash3_candidate_body;
-
-/// `for_each_repcode_candidate_with_reps` body parameterized over the per-CPU
-/// `common_prefix_len_ptr` symbol so the per-rep prefix probe inlines under
-/// the wrapper's `target_feature` umbrella instead of crossing the ABI
-/// boundary through the dispatcher. Three rep probes per encoded position →
-/// thousands per segment, so the per-call barrier was non-trivial.
-///
-/// The callback `f` runs in the wrapper's umbrella context too, so closures
-/// that capture mutable state still work (FnMut). Crate-private
-/// (see `bt_insert_range_body!`).
-macro_rules! for_each_repcode_candidate_body {
-    (
-        $table:expr,
-        $abs_pos:ident,
-        $lit_len:ident,
-        $reps:ident,
-        $current_abs_end:ident,
-        $min_match_len:ident,
-        $f:ident,
-        $cpl:path $(,)?
-    ) => {{
-        let rep_offsets: [Option<usize>; 3] = if $lit_len == 0 {
-            [
-                Some($reps[1] as usize),
-                Some($reps[2] as usize),
-                ($reps[0] > 1).then_some(($reps[0] - 1) as usize),
-            ]
-        } else {
-            [
-                Some($reps[0] as usize),
-                Some($reps[1] as usize),
-                Some($reps[2] as usize),
-            ]
-        };
-        let concat = $table.live_history();
-        let current_idx = $abs_pos - $table.history_abs_start;
-        if current_idx + 4 > concat.len() {
-            return;
-        }
-        let tail_limit = $current_abs_end.saturating_sub($abs_pos);
-        let base = concat.as_ptr();
-        let concat_len = concat.len();
-        for rep in rep_offsets.into_iter().flatten() {
-            if rep == 0 || rep > $abs_pos {
-                continue;
-            }
-            let candidate_pos = $abs_pos - rep;
-            if candidate_pos < $table.history_abs_start {
-                continue;
-            }
-            let candidate_idx = candidate_pos - $table.history_abs_start;
-            // Upstream zstd `ZSTD_readMINMATCH` gate (zstd_opt.c:657-674): a
-            // 4-byte (3-byte when min_match_len == 3) equality probe
-            // before the full prefix scan. Equivalent filtering — a
-            // mismatch here means `match_len < min_match_len`, which
-            // the post-scan check rejects anyway — but it skips the
-            // prefix-kernel call for the common no-match case (rep
-            // offsets rarely hit on low-redundancy input).
-            //
-            // SAFETY: `current_idx + 4 <= concat_len` (early return
-            // above) and `candidate_idx < current_idx` (rep >= 1), so
-            // both 4-byte reads stay inside `concat`.
-            let gate_matches = unsafe {
-                let cand = base.add(candidate_idx).cast::<u32>().read_unaligned();
-                let cur = base.add(current_idx).cast::<u32>().read_unaligned();
-                if $min_match_len == 3 {
-                    // Compare the low-address 3 bytes regardless of
-                    // endianness: byte-shift on LE, mask via to_le.
-                    (cand.to_le() & 0x00FF_FFFF) == (cur.to_le() & 0x00FF_FFFF)
-                } else {
-                    cand == cur
-                }
-            };
-            if !gate_matches {
-                continue;
-            }
-            // SAFETY: `candidate_idx ≤ current_idx < concat_len` (since
-            // candidate_pos ≤ abs_pos and we early-returned on
-            // `current_idx + 4 > concat_len`). `max` clamps to the shorter
-            // remaining run so neither pointer overruns `concat`.
-            let max = (concat_len - candidate_idx)
-                .min(concat_len - current_idx)
-                .min(tail_limit);
-            let match_len = unsafe { $cpl(base.add(candidate_idx), base.add(current_idx), max) };
-            if match_len < $min_match_len {
-                continue;
-            }
-            $f(MatchCandidate {
-                start: $abs_pos,
-                offset: rep,
-                match_len,
-            });
-        }
-    }};
-}
-pub(crate) use for_each_repcode_candidate_body;
 
 /// Common prefix of `$a` and `$b`, capped at `$limit`, with the first eight
 /// bytes settled in place: `$cpl` is called only when they all match. Most
@@ -1358,10 +1169,12 @@ macro_rules! bt_insert_and_collect_matches_body {
 pub(crate) use bt_insert_and_collect_matches_body;
 
 impl HcMatchGenerator {
-    /// Heap bytes this generator owns: the shared match table plus the BT
-    /// backend's optimal-parser / LDM scratch (the HC knobs are inline).
+    /// Heap bytes this generator owns: the shared match table plus the boxed
+    /// optimal-parser / LDM state and its scratch (the knobs are inline).
     pub(crate) fn heap_size(&self) -> usize {
-        self.table.heap_size() + self.backend.heap_size()
+        self.table.heap_size()
+            + core::mem::size_of::<crate::encoding::bt::BtMatcher>()
+            + self.bt.heap_size()
     }
 
     pub(crate) fn should_run_btultra2_seed_pass<S: crate::encoding::strategy::Strategy>(
@@ -1376,9 +1189,7 @@ impl HcMatchGenerator {
         if !S::TWO_PASS_SEED {
             return false;
         }
-        let HcBackend::Bt(bt) = &self.backend else {
-            return false;
-        };
+        let bt = &self.bt;
         // The frame's first block, whatever absolute position the frame starts
         // at (upstream `curr == ms->window.dictLimit`): the window holding
         // only this block says so. A reused compressor starts each frame at
@@ -1401,17 +1212,11 @@ impl HcMatchGenerator {
     pub(crate) fn new(max_window_size: usize) -> Self {
         Self {
             table: crate::encoding::match_table::storage::MatchTable::new(max_window_size),
-            hc: crate::encoding::hc::HcMatcher::new(2, HC_SEARCH_DEPTH, HC_TARGET_LEN),
-            // Default to the zero-sized HC backend; `configure()` swaps
-            // in a `BtMatcher` only when an optimal strategy lands.
-            backend: HcBackend::Hc,
-            // Lazy is the per-construct default — every production
-            // caller calls `configure()` before the first encode and
-            // overwrites this. Tests that drive `HcMatchGenerator`
-            // without calling `configure()` end up in the
-            // `start_matching_lazy` arm of the test dispatcher, which
-            // matches the previous default behaviour.
-            strategy_tag: crate::encoding::strategy::StrategyTag::Lazy,
+            hc: crate::encoding::hc::HcMatcher::new(HC_SEARCH_DEPTH, HC_TARGET_LEN),
+            bt: alloc::boxed::Box::new(crate::encoding::bt::BtMatcher::new()),
+            // Every caller runs `configure()` before the first encode, which
+            // overwrites this.
+            strategy_tag: crate::encoding::strategy::StrategyTag::BtOpt,
         }
     }
 
@@ -1426,11 +1231,14 @@ impl HcMatchGenerator {
         // `#[cfg(test)] start_matching` dispatcher can route
         // BtOpt / BtUltra / BtUltra2 to distinct monomorphisations.
         self.strategy_tag = tag;
-        let is_btultra2 = tag == StrategyTag::BtUltra2;
-        let uses_bt = matches!(
-            tag,
-            StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
+        debug_assert!(
+            matches!(
+                tag,
+                StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
+            ),
+            "only the optimal strategies run on this backend, got {tag:?}"
         );
+        let is_btultra2 = tag == StrategyTag::BtUltra2;
         // btultra and btultra2 both run the mls=3 hash3 short-match probe
         // (clevels.h minMatch 3). The `is_btultra2` flag below stays
         // exclusive to btultra2 because it tweaks the BT rebase boundary,
@@ -1444,60 +1252,38 @@ impl HcMatchGenerator {
         let resize = self.table.hash_log != config.hash_log
             || self.table.chain_log != config.chain_log
             || self.table.hash3_log != next_hash3_log;
-        // Capture the layout flip BEFORE `uses_bt` is overwritten below — it
-        // feeds the dms invalidation (the dms is keyed by layout too).
-        let uses_bt_changed = self.table.uses_bt != uses_bt;
         self.table.hash_log = config.hash_log;
         self.table.chain_log = config.chain_log;
         self.table.hash3_log = next_hash3_log;
-        self.hc.search_depth = if uses_bt {
-            config.search_depth
-        } else {
-            config.search_depth.min(MAX_HC_SEARCH_DEPTH)
-        };
+        self.hc.search_depth = config.search_depth;
         self.hc.target_len = config.target_len;
-        // Mirror strategy-derived flags + HC search depth onto MatchTable
-        // so the BT walker and rebase machinery can read them directly
-        // without dispatching back through HcMatchGenerator.
+        // Mirror strategy-derived flags + search depth onto MatchTable so the
+        // BT walker and rebase machinery can read them directly without
+        // dispatching back through HcMatchGenerator.
         self.table.search_depth = self.hc.search_depth;
         self.table.is_btultra2 = is_btultra2;
-        self.table.uses_bt = uses_bt;
         // BT finder hash width, upstream zstd `mls = BOUNDED(4, cParams.minMatch, 6)`,
         // carried explicitly in the level config so a `target_length` override
-        // cannot silently flip the finder between 5- and 4-byte hashing. Only
-        // the BT body reads it; HC/lazy levels leave it at 4. clevels.h
-        // (srcSize > 256 KiB tier): btlazy2 L13-15 + btopt L16 are minMatch=5,
-        // btopt L17 is minMatch=4, btultra/btultra2 are minMatch=3 (4-byte main
-        // hash + the hash3 short-match probe).
+        // cannot silently flip the finder between 5- and 4-byte hashing.
+        // clevels.h (srcSize > 256 KiB tier): btopt L16 is minMatch=5, btopt
+        // L17 is minMatch=4, btultra/btultra2 are minMatch=3 (4-byte main hash
+        // + the hash3 short-match probe).
         // The cached dms is keyed by the full (region, layout, mls, hash_log)
         // shape that `build_dms!` validates on the normal prime path, but the
         // reborrow fast path in `MatchTable::reset` reuses it on `dms.is_primed()`
-        // ALONE. A reused-compressor level switch can change the search mls (e.g.
-        // btlazy2 -> lazy), the table geometry (hash_log / chain_log / hash3,
-        // captured in `resize`), OR the HC<->BT layout (`uses_bt_changed`)
-        // independently of each other, and any of them leaves the dms hashed for
-        // a different shape. Invalidate on ANY so the next dict frame re-primes at
-        // the new shape (configure runs before reset) instead of probing a
-        // mismatched dms and silently degrading match quality. Over-invalidation
-        // only costs a re-prime, which a real shape change needs anyway.
+        // ALONE. A reused-compressor level switch can change the search mls or
+        // the table geometry (hash_log / chain_log / hash3, captured in
+        // `resize`) independently of each other, and either leaves the dms
+        // hashed for a different shape. Invalidate on ANY so the next dict frame
+        // re-primes at the new shape (configure runs before reset) instead of
+        // probing a mismatched dms and silently degrading match quality.
+        // Over-invalidation only costs a re-prime, which a real shape change
+        // needs anyway.
         let mls_changed = self.table.search_mls != config.search_mls;
-        if resize || mls_changed || uses_bt_changed {
+        if resize || mls_changed {
             self.table.dms.invalidate();
         }
         self.table.search_mls = config.search_mls;
-        // Stage D: promote the backend discriminator. HC modes drop the
-        // BT scratch buffers entirely; switching back into a BT mode
-        // allocates a fresh `BtMatcher` on demand.
-        match (&self.backend, self.table.uses_bt) {
-            (HcBackend::Hc, true) => {
-                self.backend =
-                    HcBackend::Bt(alloc::boxed::Box::new(crate::encoding::bt::BtMatcher::new()));
-            }
-            (HcBackend::Bt(_), false) => {
-                self.backend = HcBackend::Hc;
-            }
-            _ => {}
-        }
         if resize && !self.table.tables.is_empty() {
             // Drop the tables so they are laid out (or allocated) again at the
             // new widths. The seams go with the buffer.
@@ -1514,303 +1300,59 @@ impl HcMatchGenerator {
         ml: Option<&crate::fse::fse_encoder::FSETable>,
         of: Option<&crate::fse::fse_encoder::FSETable>,
     ) {
-        if let HcBackend::Bt(bt) = &mut self.backend {
-            bt.opt_state.seed_dictionary_entropy(huff, ll, ml, of);
-        }
+        self.bt.opt_state.seed_dictionary_entropy(huff, ll, ml, of);
     }
 
     pub(crate) fn reset(&mut self) {
         self.table.reset();
-        if let HcBackend::Bt(bt) = &mut self.backend {
-            bt.reset();
-        }
+        self.bt.reset();
     }
 
-    /// Backfill positions from the tail of the previous slice that couldn't be
-    /// hashed at the time (insert_position needs 4 bytes of lookahead).
-    pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
-        self.table.skip_matching(incompressible_hint);
+    /// Index the last committed block without searching it.
+    pub(crate) fn skip_matching<K: EncodeTier>(&mut self, incompressible_hint: Option<bool>) {
+        self.table.skip_matching::<K>(incompressible_hint);
     }
 
     /// Runtime-dispatched entry kept only for in-crate tests. Production
-    /// callers reach the inner loops through
-    /// [`Self::start_matching_strategy`] / [`MatchGeneratorDriver::compress_block`]
-    /// which pick the lazy / optimal arm from `S::USE_BT` at
-    /// monomorphisation time.
+    /// callers reach the optimal parser through
+    /// [`MatchGeneratorDriver::compress_block`], monomorphised per strategy.
     #[cfg(test)]
-    pub(crate) fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
+    pub(crate) fn start_matching(&mut self, handle_sequence: impl FnMut(Sequence)) {
+        crate::encoding::fastpath::with_encode_tier!(
+            crate::encoding::fastpath::select_kernel(),
+            K => self.start_matching_with::<K>(handle_sequence)
+        )
+    }
+
+    /// [`Self::start_matching`] compiled for the tier `K`.
+    #[cfg(test)]
+    pub(crate) fn start_matching_with<K: EncodeTier>(
+        &mut self,
+        mut handle_sequence: impl FnMut(Sequence),
+    ) {
         use crate::encoding::strategy::{self, StrategyTag};
         // Dispatch on the mirrored `strategy_tag` so each test runs
         // under the same monomorphisation production would pick.
         // `BtOpt` / `BtUltra` / `BtUltra2` remain distinct here even
-        // though `table.uses_bt` / `is_btultra2` alone can't separate
-        // BtOpt from BtUltra.
+        // though `is_btultra2` alone can't separate BtOpt from BtUltra.
         match self.strategy_tag {
-            StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
-                self.start_matching_lazy(&mut handle_sequence)
+            StrategyTag::Fast
+            | StrategyTag::Dfast
+            | StrategyTag::Greedy
+            | StrategyTag::Lazy
+            | StrategyTag::Btlazy2 => {
+                unreachable!("only the optimal strategies run on this backend")
             }
-            StrategyTag::Btlazy2 => unreachable!("btlazy2 runs on the lazy (Row) backend"),
             StrategyTag::BtOpt => {
-                self.start_matching_optimal::<strategy::BtOpt>(&mut handle_sequence)
+                self.start_matching_optimal::<strategy::BtOpt, K>(&mut handle_sequence)
             }
             StrategyTag::BtUltra => {
-                self.start_matching_optimal::<strategy::BtUltra>(&mut handle_sequence)
+                self.start_matching_optimal::<strategy::BtUltra, K>(&mut handle_sequence)
             }
             StrategyTag::BtUltra2 => {
-                self.start_matching_optimal::<strategy::BtUltra2>(&mut handle_sequence)
+                self.start_matching_optimal::<strategy::BtUltra2, K>(&mut handle_sequence)
             }
         }
-    }
-
-    /// Strategy-aware entry point used by
-    /// [`MatchGeneratorDriver::compress_block`](crate::encoding::match_generator::MatchGeneratorDriver::compress_block).
-    /// Branches on `S::USE_BT` — a compile-time `const` — so each
-    /// monomorphisation keeps exactly one arm: `Lazy` /
-    /// `Fast` / `Dfast` / `Greedy` see only `start_matching_lazy`,
-    /// `BtOpt` / `BtUltra` / `BtUltra2` see only
-    /// `start_matching_optimal`. The inherent test-only
-    /// `HcMatchGenerator::start_matching` reaches the same arms by
-    /// runtime-matching on `self.strategy_tag` (the parse-mode field
-    /// has been removed); production never invokes that path.
-    pub(crate) fn start_matching_strategy<S: crate::encoding::strategy::Strategy>(
-        &mut self,
-        handle_sequence: &mut impl FnMut(Sequence),
-    ) {
-        debug_assert_eq!(
-            self.table.uses_bt,
-            S::USE_BT,
-            "Strategy::USE_BT disagrees with runtime table.uses_bt at HC dispatch"
-        );
-        if S::USE_BT {
-            self.start_matching_optimal::<S>(handle_sequence)
-        } else {
-            self.start_matching_lazy(handle_sequence)
-        }
-    }
-
-    /// Dispatcher: pick the dict-aware monomorph when a separate dms is primed
-    /// (attach-mode dictionary), else the no-dict monomorph. Mirrors upstream's
-    /// compile-time `dictMode` split — the `DICT = false` body carries no dms
-    /// code at all, so the no-dict hot path is unaffected by the dict search.
-    pub(crate) fn start_matching_lazy(&mut self, handle_sequence: impl FnMut(Sequence)) {
-        if self.table.dms.is_primed() {
-            self.start_matching_lazy_impl::<true>(handle_sequence);
-        } else {
-            self.start_matching_lazy_impl::<false>(handle_sequence);
-        }
-    }
-
-    pub(crate) fn start_matching_lazy_impl<const DICT: bool>(
-        &mut self,
-        mut handle_sequence: impl FnMut(Sequence),
-    ) {
-        self.table.ensure_tables();
-
-        // `current_block_range()` is borrowed-aware: owned → last committed
-        // chunk; borrowed → the staged in-place block range.
-        let (current_abs_start, current_len) = self.table.current_block_range();
-        if current_len == 0 {
-            return;
-        }
-        // Full live history (dict + committed blocks + current block), hoisted
-        // ONCE for the whole position scan and threaded into every
-        // `find_best_match` / `pick_lazy_match` call. `live_history()` is
-        // loop-invariant here (the scan mutates the hash/chain tables +
-        // `offset_hist` but never the history bytes or length), so re-fetching
-        // it per find — inside `hash_chain_candidate` + the rep probe, plus
-        // again for each lazy lookahead at pos+1 / pos+2 — was pure
-        // per-position overhead. Detached as a raw slice so the loop's
-        // `&mut self.table` inserts coexist with this `&[u8]`; the scan never
-        // reallocates the history.
-        let concat: &[u8] = {
-            let lh = self.table.live_history();
-            unsafe { core::slice::from_raw_parts(lh.as_ptr(), lh.len()) }
-        };
-        // Dict-match-state primed flag, hoisted ONCE for the scan: it is
-        // block-invariant (the dict is primed before the block) and lives on the
-        // cold `dms` cacheline, so the per-find `dms.is_primed()` load was a
-        // measurable hot-path cost (~8% of `hash_chain_candidate` on the
-        // dict-over-random fixture). The `DICT = false` monomorph ignores it.
-        let dms_primed = self.table.dms.is_primed();
-
-        let current_abs_end = current_abs_start + current_len;
-        self.table
-            .backfill_boundary_positions(current_abs_start, current_abs_end);
-
-        let mut pos = 0usize;
-        let mut literals_start = 0usize;
-        // Lookahead carry (upstream's lazy depth loop searches each position
-        // ONCE): when the lookahead defers to `abs_pos + 1`, its already-computed
-        // match is carried here and reused next iteration instead of re-searched.
-        // `None` means search this position fresh.
-        let mut carried: Option<HcMatch> = None;
-        // Set when the previous position deferred WITHOUT a carry (depth-2:
-        // `abs_pos + 2` won but `abs_pos + 1` was cold). If this position then
-        // misses, the no-match skip below must advance by exactly ONE so it
-        // cannot hop over the already-proven `abs_pos + 2` winner.
-        let mut deferred_without_carry = false;
-        while pos + HC_MIN_MATCH_LEN <= current_len {
-            let abs_pos = current_abs_start + pos;
-            let lit_len = pos - literals_start;
-            let forced_single_step = core::mem::take(&mut deferred_without_carry);
-
-            // Reuse the carried lookahead match (searched WITH the previous
-            // position already inserted, so its offset-1 candidate is visible)
-            // or search this position fresh. `find_best_match` returns the
-            // forward `(offset, length)` in registers (`HcMatch`, 16 bytes).
-            let best = match carried.take() {
-                Some(m) => m,
-                None => self.hc.find_best_match::<DICT>(
-                    concat,
-                    dms_primed,
-                    &self.table,
-                    abs_pos,
-                    lit_len,
-                ),
-            };
-            if best.is_match() {
-                // Insert `abs_pos` BEFORE the lookahead so the `abs_pos + 1`
-                // probe sees it at offset 1 — upstream inserts the searched
-                // position during its own search, before the depth loop probes
-                // the next one.
-                self.table.insert_position(abs_pos);
-                if let Some(carry) = self.hc.lazy_decide_carry::<DICT>(
-                    concat,
-                    dms_primed,
-                    &self.table,
-                    abs_pos,
-                    lit_len,
-                    best,
-                ) {
-                    // DEFER: the lazy lookahead found a better match one (or two)
-                    // bytes ahead. Advance exactly ONE byte. Reuse the lookahead
-                    // match when it is real (so it is not re-searched — upstream
-                    // searches each position once); the `NONE` sentinel is the
-                    // depth-2 defer-without-carry case (`abs_pos + 2` won but
-                    // `abs_pos + 1` had no match), so search the next fresh and
-                    // pin the following advance to one byte (below) so the skip
-                    // heuristic cannot hop over that `abs_pos + 2` winner.
-                    carried = carry.is_match().then_some(carry);
-                    deferred_without_carry = carried.is_none();
-                    pos += 1;
-                    continue;
-                }
-                // COMMIT `best`. Backward-extend over the literal run (upstream
-                // `zstd_lazy.c` after rep-vs-chain selection) through the shared
-                // raw-pointer helper the Row / Dfast probes use — one
-                // back-extension source, no per-step slice bounds checks.
-                // `abs_pos` is already inserted above, so the forward span fill
-                // starts at `abs_pos + 1`.
-                let ext = crate::encoding::match_table::helpers::extend_backwards_shared(
-                    concat,
-                    self.table.history_abs_start,
-                    abs_pos - best.offset,
-                    abs_pos,
-                    best.match_len,
-                    lit_len,
-                );
-                let match_len = ext.match_len;
-                self.table
-                    .insert_match_span(abs_pos + 1, ext.start + match_len);
-                // The backward extension stops at the literal run's start.
-                let start = ext.start - current_abs_start;
-                debug_assert!(start >= literals_start);
-                let literal_len = start - literals_start;
-                handle_sequence(Sequence::Triple {
-                    literal_len,
-                    offset: best.offset,
-                    match_len,
-                });
-                let _ = encode_offset_with_history(
-                    best.offset as u32,
-                    literal_len as u32,
-                    &mut self.table.offset_hist,
-                );
-                pos = start + match_len;
-                literals_start = pos;
-                continue;
-            }
-            // No match found.
-            self.table.insert_position(abs_pos);
-            // Lazy skipping (upstream zstd `ZSTD_compressBlock_lazy_generic`,
-            // zstd_lazy.c:1614): advance faster over runs with no match.
-            // `step = ((ip - anchor) >> kSearchStrength) + 1` with
-            // kSearchStrength = 8, where `ip - anchor` is the current
-            // literal-run length. On compressible input the run stays short
-            // (step == 1, identical to a 1-byte advance); on incompressible
-            // / dict-over-random input the run grows so the parser skips
-            // ahead (one search per `step` positions) instead of searching
-            // every byte. Skipped positions are not inserted, mirroring
-            // upstream (it inserts only searched positions during a no-match
-            // run). Ratio follows upstream (not byte-identical).
-            // A miss one byte after a depth-2 defer-without-carry must advance by
-            // exactly one so the skip cannot pass the proven `abs_pos + 2` match.
-            let step = if forced_single_step {
-                1
-            } else {
-                ((pos - literals_start) >> 8) + 1
-            };
-            pos += step;
-            // No clamp needed before the tail loop: the search bound and the
-            // hashable bound are both `pos + HC_MIN_MATCH_LEN <= current_len`
-            // (HC_MIN_MATCH_LEN == 4 == the insert width), so there is no
-            // non-searchable-but-hashable anchor to miss. Positions the skip
-            // jumps over inside the searchable region are intentionally not
-            // inserted — same as upstream zstd, which advances past them via
-            // the identical `ip += step` and never hashes them either.
-        }
-
-        // Insert remaining hashable positions in the tail (the matching loop
-        // stops at HC_MIN_MATCH_LEN but insert_position only needs 4 bytes).
-        while pos + 4 <= current_len {
-            self.table.insert_position(current_abs_start + pos);
-            pos += 1;
-        }
-
-        if literals_start < current_len {
-            handle_sequence(Sequence::Literals {
-                len: current_len - literals_start,
-            });
-        }
-    }
-
-    /// Register the borrowed input window for the no-copy one-shot path.
-    /// # Safety
-    /// `buffer` must outlive the borrowed scans (see `MatchTable`).
-    pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
-        // SAFETY: forwarded liveness contract.
-        unsafe { self.table.set_borrowed_window(buffer) };
-    }
-
-    pub(crate) fn clear_borrowed_window(&mut self) {
-        self.table.clear_borrowed_window();
-    }
-
-    /// Borrowed (no-copy) equivalent of [`Self::start_matching_lazy`]: stage
-    /// the in-place block range, then run the same lazy chain parse. The
-    /// parse reads its range via `current_block_range()` and its bytes via
-    /// `get_last_space()` / `live_history()`, all borrowed-aware, so the block
-    /// is scanned in place with the per-position window_low offset cap.
-    pub(crate) fn start_matching_lazy_borrowed(
-        &mut self,
-        block_start: usize,
-        block_end: usize,
-        handle_sequence: impl FnMut(Sequence),
-    ) {
-        self.table.stage_borrowed_block(block_start, block_end);
-        self.start_matching_lazy(handle_sequence);
-    }
-
-    /// Borrowed (no-copy) equivalent of the lazy `skip_matching`: stage the
-    /// in-place block, then seed positions without an owned-history append.
-    pub(crate) fn skip_matching_borrowed(
-        &mut self,
-        block_start: usize,
-        block_end: usize,
-        incompressible_hint: Option<bool>,
-    ) {
-        self.table.stage_borrowed_block(block_start, block_end);
-        self.table.skip_matching(incompressible_hint);
     }
 }
 

@@ -9,8 +9,8 @@ use core::hash::Hasher;
 
 use super::{
     CompressionLevel, LiteralCompressionMode, Matcher, block_header::BlockHeader,
-    frame_header::FrameHeader, levels::*, match_generator::MatchGeneratorDriver,
-    workspace::IngestBuffer,
+    fastpath::EncodeTier, frame_header::FrameHeader, levels::*,
+    match_generator::MatchGeneratorDriver, workspace::IngestBuffer,
 };
 use crate::common::MAX_BLOCK_SIZE;
 use crate::fse::fse_encoder::{FSETable, default_ll_table, default_ml_table, default_of_table};
@@ -1207,7 +1207,7 @@ pub(crate) fn optimal_block_size_with(
 /// again would commit it into the window a second time. Otherwise it is
 /// primed, or restored from the matcher's copy-mode snapshot when the source
 /// is past the strategy's attach cutoff.
-pub(crate) fn load_frame_dictionary<M: Matcher>(
+pub(crate) fn load_frame_dictionary<M: Matcher, K: EncodeTier>(
     state: &mut CompressState<M>,
     level: CompressionLevel,
     dict: &EncoderDictionary,
@@ -1265,9 +1265,14 @@ pub(crate) fn load_frame_dictionary<M: Matcher>(
     );
     let restored = prefer_copy_snapshot && state.matcher.restore_primed_dictionary(level);
     if !restored {
-        state
-            .matcher
-            .prime_with_dictionary(dict.inner.dict_content.as_slice(), dict.inner.offset_hist);
+        let content = dict.inner.dict_content.as_slice();
+        // The built-in matcher indexes the dictionary under the frame's tier.
+        match state.matcher.builtin_driver() {
+            Some(driver) => driver.prime_with_dictionary_with::<K>(content, dict.inner.offset_hist),
+            None => state
+                .matcher
+                .prime_with_dictionary(content, dict.inner.offset_hist),
+        }
         if prefer_copy_snapshot {
             state.matcher.capture_primed_dictionary(level);
         }
@@ -2010,8 +2015,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             return attached;
         }
         // The borrowed (no-copy, in-place over-window) scan exists for the
-        // Simple (Fast), Dfast, and Row backends, and for the HashChain
-        // backend's lazy CHAIN parser; BT/optimal (BinaryTree search) stay on
+        // Simple (Fast), Dfast, and Row backends; the optimal parsers stay on
         // the owned path. Every borrowed scan applies the per-position
         // `window_low = abs_ip - advertised_window` offset cap so over-window
         // inputs are matched in place (no input->history copy), matching C's
@@ -2026,7 +2030,12 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// an in-place `&[u8]` cursor. Returns `total_uncompressed`; the caller
     /// emits the frame header (before this call, when the content size is
     /// known) or the drain tail.
-    fn run_one_frame(&mut self, input: &[u8], prep: &FramePrep, out: &mut Vec<u8>) -> u64 {
+    fn run_one_frame<K: EncodeTier>(
+        &mut self,
+        input: &[u8],
+        prep: &FramePrep,
+        out: &mut Vec<u8>,
+    ) -> u64 {
         if self.borrowed_eligible(input.len(), prep) {
             // A reused Dfast matcher's tables hold earlier frames, which its
             // borrowed kernel (numbering this input from zero) would read as
@@ -2041,10 +2050,10 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if !self.state.matcher.borrowed_frame_is_independent() {
                 self.state.matcher.forget_earlier_frames();
             }
-            self.run_borrowed_block_loop(input, out)
+            self.run_borrowed_block_loop::<K>(input, out)
         } else {
             let mut cursor: &[u8] = input;
-            self.run_owned_block_loop(&mut cursor, prep.initial_size_hint, true, out)
+            self.run_owned_block_loop::<_, K>(&mut cursor, prep.initial_size_hint, true, out)
         }
     }
 
@@ -2092,11 +2101,23 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// Panics on encoder error, matching [`Self::compress`] and
     /// [`compress_slice_to_vec`](crate::encoding::compress_slice_to_vec).
     pub fn compress_independent_frame_into(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        // The frame's one choice of kernel tier: its setup, every block's cut,
+        // search and entropy stage run compiled for it.
+        crate::encoding::fastpath::with_encode_tier!(
+            self.state.copy_kernel,
+            K => self.compress_independent_frame_with::<K>(input, out)
+        )
+    }
+
+    /// [`Self::compress_independent_frame_into`] compiled for the kernel tier
+    /// `K`.
+    fn compress_independent_frame_with<K: EncodeTier>(&mut self, input: &[u8], out: &mut Vec<u8>) {
         // Size the next frame from the actual payload, not a stale hint a
         // previous call may have left behind (a wrong hint would change the
         // resolved window/header and could flip borrowed eligibility).
         self.source_size_hint = Some(input.len() as u64);
-        let prep = self.prepare_frame(crate::encoding::workspace::IngestPlan::Slice(input.len()));
+        let prep =
+            self.prepare_frame::<K>(crate::encoding::workspace::IngestPlan::Slice(input.len()));
         // Content size is known up front (one-shot), so write the frame
         // header FIRST and emit blocks STRAIGHT into `out` — no separate
         // `all_blocks` accumulator and no header+blocks copy (which was the
@@ -2120,7 +2141,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         out.reserve(18 + first_block_bound + checksum_len);
         self.append_frame_header(total_uncompressed, &prep, out);
         let header_len = out.len();
-        let _ = self.run_one_frame(input, &prep, out);
+        let _ = self.run_one_frame::<K>(input, &prep, out);
         #[cfg(feature = "hash")]
         if self.content_checksum {
             out.extend_from_slice(&(self.hasher.finish() as u32).to_le_bytes());
@@ -2161,7 +2182,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// total_uncompressed)`. Caller guarantees Fast backend + no
     /// dictionary; over-window inputs are fine (matches are bounded by
     /// `window_low` exactly as the owned evicting path).
-    fn run_borrowed_block_loop(&mut self, input: &[u8], out: &mut Vec<u8>) -> u64 {
+    fn run_borrowed_block_loop<K: EncodeTier>(&mut self, input: &[u8], out: &mut Vec<u8>) -> u64 {
         // Blocks are appended to `out` starting here. `out` may already hold
         // the frame header (the one-shot compress-into-Vec path writes it
         // first, since the content size is known up front, and the loop
@@ -2235,16 +2256,19 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             let savings = start as i64 - (out.len() - blocks_start) as i64;
             // Borrowed path only: warm the pre-split window before the
             // cache-cold strided fingerprint read. Gated to exactly the
-            // conditions under which `optimal_block_size` reads `block`
-            // (a pre-split level, a full 128 KiB block remaining, the
-            // block-size cap admits a full block, and `savings >= 3` so the
-            // splitter actually runs) — so non-pre-split levels, the first
-            // block, and the trailing partial block pay nothing. See
-            // `warm_presplit_window`.
+            // conditions under which `optimal_block_size` reads the whole
+            // window (a sampling pre-split level, a full 128 KiB block
+            // remaining, the block-size cap admits a full block, and
+            // `savings >= 3` so the splitter actually runs) — so other
+            // levels, the first block, and the trailing partial block pay
+            // nothing. Level 0 reads three 512-byte segments
+            // (`ZSTD_splitBlock_fromBorders`, `zstd_preSplit.c:198-226`), not
+            // the window, so warming 128 KiB for it was 2048 loads a block
+            // for 1.5 KiB read. See `warm_presplit_window`.
             if savings >= 3
                 && input.len() - start >= MAX_BLOCK_SIZE as usize
                 && block_capacity >= MAX_BLOCK_SIZE as usize
-                && pre_split.is_some()
+                && pre_split.is_some_and(|split_level| split_level != 0)
             {
                 warm_presplit_window(&input[start..start + MAX_BLOCK_SIZE as usize]);
             }
@@ -2262,7 +2286,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if self.content_checksum {
                 self.hasher.write(block);
             }
-            crate::encoding::levels::compress_block_encoded_borrowed(
+            crate::encoding::levels::compress_block_encoded_borrowed::<K>(
                 &mut *guard.0,
                 self.compression_level,
                 last_block,
@@ -2693,10 +2717,20 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
     /// To avoid endlessly encoding from a potentially endless source (like a network socket) you can use the
     /// [Read::take] function.
     pub fn compress(&mut self) {
+        // The frame's one choice of kernel tier, as in
+        // `compress_independent_frame_into`.
+        crate::encoding::fastpath::with_encode_tier!(
+            self.state.copy_kernel,
+            K => self.compress_with::<K>()
+        )
+    }
+
+    /// [`Self::compress`] compiled for the kernel tier `K`.
+    fn compress_with<K: EncodeTier>(&mut self) {
         // `prepare_frame` / `finish_frame` are shared with the borrowed
         // one-shot path, so both run the same reset / dict-prime /
         // entropy-seed setup and frame tail.
-        let prep = self.prepare_frame(crate::encoding::workspace::IngestPlan::Stream);
+        let prep = self.prepare_frame::<K>(crate::encoding::workspace::IngestPlan::Stream);
         // Take the reader out so `run_owned_block_loop` can borrow it
         // mutably alongside `&mut self` (the rest of the loop touches
         // `self.state` / `self.hasher`, disjoint from the reader). Restored
@@ -2722,7 +2756,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
             self.block_capacity(),
         ));
         let mut block_source = ReaderBlockSource::new(&mut source);
-        let total_uncompressed = self.run_owned_block_loop(
+        let total_uncompressed = self.run_owned_block_loop::<_, K>(
             &mut block_source,
             prep.initial_size_hint,
             false,
@@ -2746,7 +2780,16 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
     /// `compress` writes for the same source, hint and settings.
     #[cfg(feature = "dict-builder")]
     pub(crate) fn compress_known_into(&mut self, total: u64, out: &mut Vec<u8>) {
-        let prep = self.prepare_frame(crate::encoding::workspace::IngestPlan::Stream);
+        crate::encoding::fastpath::with_encode_tier!(
+            self.state.copy_kernel,
+            K => self.compress_known_into_with::<K>(total, out)
+        )
+    }
+
+    /// [`Self::compress_known_into`] compiled for the kernel tier `K`.
+    #[cfg(feature = "dict-builder")]
+    fn compress_known_into_with<K: EncodeTier>(&mut self, total: u64, out: &mut Vec<u8>) {
+        let prep = self.prepare_frame::<K>(crate::encoding::workspace::IngestPlan::Stream);
         let mut source = self
             .uncompressed_data
             .take()
@@ -2755,7 +2798,12 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
         self.append_frame_header(total, &prep, out);
         let header_len = out.len();
         let mut block_source = ReaderBlockSource::new(&mut source);
-        let read = self.run_owned_block_loop(&mut block_source, prep.initial_size_hint, false, out);
+        let read = self.run_owned_block_loop::<_, K>(
+            &mut block_source,
+            prep.initial_size_hint,
+            false,
+            out,
+        );
         self.uncompressed_data = Some(source);
         assert_eq!(
             read, total,
@@ -2777,7 +2825,10 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
 
     /// Resets the compressor for the next frame, whose input reaches the
     /// match finder as `ingest` says.
-    fn prepare_frame(&mut self, ingest: crate::encoding::workspace::IngestPlan) -> FramePrep {
+    fn prepare_frame<K: EncodeTier>(
+        &mut self,
+        ingest: crate::encoding::workspace::IngestPlan,
+    ) -> FramePrep {
         // The raw-skip's memory of what this frame has already emitted. Frames
         // are independent, so carrying it over would let one frame's content
         // hold the skip off for the next; the allocation is kept.
@@ -2878,7 +2929,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
             // This state drives sequence encoding, while matcher priming below updates
             // the match generator's internal repeat-offset history for match finding.
             self.state.offset_hist = dict.inner.offset_hist;
-            load_frame_dictionary(
+            load_frame_dictionary::<M, K>(
                 &mut self.state,
                 self.compression_level,
                 dict,
@@ -2976,7 +3027,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
     /// (`compress_oneshot_borrowed`, `compress_independent_frame`) feed an
     /// in-place `&[u8]` cursor without baking its lifetime into the
     /// compressor type.
-    fn run_owned_block_loop<S: OwnedBlockSource>(
+    fn run_owned_block_loop<S: OwnedBlockSource, K: EncodeTier>(
         &mut self,
         source: &mut S,
         initial_size_hint: Option<u64>,
@@ -3061,7 +3112,10 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
                 // The splitter sees byte statistics only; a cut it proposes
                 // inside a match the matcher already knows of is moved out.
                 let split_at = if split_at < available {
-                    self.state.matcher.settle_block_cut(available, split_at)
+                    match self.state.matcher.builtin_driver() {
+                        Some(driver) => driver.settle_block_cut_with::<K>(available, split_at),
+                        None => self.state.matcher.settle_block_cut(available, split_at),
+                    }
                 } else {
                     split_at
                 };
@@ -3147,7 +3201,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
             // A block the matcher laid out stays one physical block.
             let post_split = self.state.post_split_allowed;
             self.state.post_split_allowed = post_split && fixed_len.is_none();
-            compress_block_encoded(
+            compress_block_encoded::<M, K>(
                 &mut self.state,
                 self.compression_level,
                 last_block,

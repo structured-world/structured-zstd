@@ -45,6 +45,7 @@ const FORCE_MAX_WINDOW: c_int = 1000;
 const FORCE_ATTACH_DICT: c_int = 1001;
 const LITERAL_COMPRESSION_MODE: c_int = 1002;
 const SRC_SIZE_HINT: c_int = 1004;
+const USE_ROW_MATCH_FINDER: c_int = 1011;
 const MAX_BLOCK_SIZE: c_int = 1015;
 const BLOCK_SPLITTER_LEVEL: c_int = 1017;
 
@@ -419,6 +420,60 @@ fn literal_compression_mode_reaches_the_encoder() {
     unsafe { ZSTD_freeCCtx(cctx) };
     assert!(raw.len() > auto.len(), "{} <= {}", raw.len(), auto.len());
     assert_eq!(decompress(&raw, text.len()), text);
+}
+
+/// `ZSTD_c_useRowMatchFinder` picks the greedy / lazy band's finder: `enable`
+/// writes what `auto` writes on a source wide enough for rows and `disable`
+/// what `auto` writes on one of 16 KiB or less (upstream
+/// `ZSTD_resolveRowMatchFinderMode`), the forced choice differs from the
+/// window's, and every frame decodes. A value past the switch is refused.
+#[test]
+fn use_row_match_finder_reaches_the_encoder() {
+    let text = |lines: u32| -> Vec<u8> {
+        let mut state = 0x9E37_79B9u32;
+        let mut out = Vec::new();
+        for i in 0..lines {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.extend_from_slice(
+                format!(
+                    "{i:06} level=info shard={} took={}ms\n",
+                    state % 13,
+                    state >> 22
+                )
+                .as_bytes(),
+            );
+        }
+        out
+    };
+    let frame = |input: &[u8], mode: c_int| {
+        let cctx = ZSTD_createCCtx();
+        unsafe {
+            assert_eq!(ZSTD_CCtx_setParameter(cctx, LEVEL, 7), 0);
+            assert_eq!(ZSTD_CCtx_setParameter(cctx, USE_ROW_MATCH_FINDER, mode), 0);
+            assert_eq!(get_cctx(cctx, USE_ROW_MATCH_FINDER), mode);
+        }
+        let out = compress2(cctx, input);
+        unsafe { ZSTD_freeCCtx(cctx) };
+        assert_eq!(decompress(&out, input.len()), input, "mode {mode}");
+        out
+    };
+    let (auto, enable, disable) = (0, 1, 2);
+    let wide = text(6000);
+    assert_eq!(frame(&wide, enable), frame(&wide, auto));
+    assert_ne!(frame(&wide, disable), frame(&wide, auto));
+    let narrow = text(200);
+    assert!(narrow.len() <= 1 << 14);
+    assert_eq!(frame(&narrow, disable), frame(&narrow, auto));
+    assert_ne!(frame(&narrow, enable), frame(&narrow, auto));
+
+    let cctx = ZSTD_createCCtx();
+    unsafe {
+        assert_eq!(
+            code(ZSTD_CCtx_setParameter(cctx, USE_ROW_MATCH_FINDER, 3)),
+            ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound
+        );
+        ZSTD_freeCCtx(cctx);
+    }
 }
 
 /// A size hint stays for every streamed frame and can be cleared again.

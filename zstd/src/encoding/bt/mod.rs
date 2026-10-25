@@ -27,9 +27,7 @@ use super::opt::types::{HcOptimalNode, HcOptimalPlanBuffers, HcOptimalSequence, 
 
 /// Maximum offset reachable by the HC3 short-match probe. Upstream zstd
 /// parity: keeps the 3-byte side table from emitting offsets that
-/// the main BT/HC paths would address more efficiently. Used inside
-/// the `hash3_candidate_body!` macro that the kernel-specific
-/// variants below expand.
+/// the main BT/HC paths would address more efficiently.
 pub(crate) const HC3_MAX_OFFSET: usize = 1 << 18;
 
 /// Binary-tree matcher state used by the `BtOpt` / `BtUltra` /
