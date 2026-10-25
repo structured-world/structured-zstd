@@ -135,11 +135,12 @@ macro_rules! huf_flush {
     ($bc:ident, $bp:ident, $cursor:ident, $overflow:ident, $out_base:ident, $end_ptr:ident, $fast:expr) => {{
         let nb_bits = ($bp & 0xFF) as usize;
         let nb_bytes = nb_bits >> 3;
-        let chunk = if nb_bits == 0 {
-            0
-        } else {
-            $bc >> (HUF_BITS_IN_CONTAINER - nb_bits)
-        };
+        // Upstream's `bitContainer >> (64 - nbBits)`, one masked shift: with no
+        // bits pending the shift wraps to 0 and the store writes the container
+        // as is, but the cursor does not move, so the next flush overwrites
+        // those bytes and none of them is committed. A zero test here sat on
+        // the store's data path.
+        let chunk = $bc.wrapping_shr((HUF_BITS_IN_CONTAINER - nb_bits) as u32);
         $bp &= 7;
         let bytes = chunk.to_le_bytes();
         unsafe {
@@ -301,14 +302,12 @@ impl<'a> HufCStream<'a> {
     pub(crate) fn flush_bits<const FAST: bool>(&mut self) {
         let nb_bits = (self.bit_pos[0] & 0xFF) as usize;
         let nb_bytes = nb_bits >> 3;
-        // Top `nb_bits` of the container become the next bytes.
-        // Upstream zstd uses `bitContainer >> (HUF_BITS_IN_CONTAINER - nb_bits)`.
-        // Guard the shift: `nb_bits == 0` would shift by 64 (UB in Rust).
-        let bit_container = if nb_bits == 0 {
-            0
-        } else {
-            self.bit_container[0] >> (HUF_BITS_IN_CONTAINER - nb_bits)
-        };
+        // Top `nb_bits` of the container become the next bytes, as upstream's
+        // `bitContainer >> (HUF_BITS_IN_CONTAINER - nb_bits)`. With no bits
+        // pending the masked shift leaves the container whole; the cursor does
+        // not move, so those bytes are never committed (see `huf_flush!`).
+        let bit_container =
+            self.bit_container[0].wrapping_shr((HUF_BITS_IN_CONTAINER - nb_bits) as u32);
         // Mask `bit_pos` to keep the leftover < 8 bits in the low 3 bits.
         self.bit_pos[0] &= 7;
         // 8-byte LE write at `cursor`. Bytes at [cursor+nb_bytes..cursor+8]
