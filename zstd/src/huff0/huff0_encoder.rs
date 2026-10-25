@@ -1564,14 +1564,15 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
         node_nb += 1;
     }
 
-    for leaf_idx in 0..leaf_count {
-        let mut depth = 0u8;
-        let mut parent = nodes[leaf_idx].parent;
-        while parent != NO_PARENT {
-            depth += 1;
-            parent = nodes[parent as usize].parent;
-        }
-        nodes[leaf_idx].nb_bits = depth;
+    // Depths top-down in one pass, as upstream's `HUF_buildTree`: every node's
+    // parent was built after it, so it sits at a higher index and is already
+    // done when the descending walk reaches the child. Walking each leaf up to
+    // the root instead was a chain of dependent loads per leaf.
+    nodes[node_root].nb_bits = 0;
+    for n in (0..node_root).rev() {
+        let parent = nodes[n].parent as usize;
+        debug_assert!(parent > n && parent <= node_root);
+        nodes[n].nb_bits = nodes[parent].nb_bits + 1;
     }
 
     // The leaves keep their (count desc, symbol asc) order: the tree build
