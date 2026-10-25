@@ -731,8 +731,45 @@ fn builtin_block_sequences<K: EncodeTier>(
     code_offsets: bool,
     hist: &mut [u32; 3],
 ) {
-    driver
-        .start_matching_with::<K>(|seq| record_sequence(seq, tail, sequences, code_offsets, hist));
+    driver.start_matching_with::<K>(|seq| {
+        record_builtin_sequence(seq, tail, sequences, code_offsets, hist)
+    });
+}
+
+/// [`record_sequence`] for the built-in matcher, whose reports need no
+/// checking: it reports the block's trailing literals last, and a block of at
+/// most 128 KiB bounds every length far below 32 bits. Both hold by
+/// construction of the driver and are asserted in debug builds; a custom
+/// matcher's reports go through the checked path.
+#[inline(always)]
+fn record_builtin_sequence(
+    seq: Sequence,
+    tail: &mut usize,
+    sequences: &mut RegionVec<RawSequence>,
+    code_offsets: bool,
+    hist: &mut [u32; 3],
+) {
+    match seq {
+        Sequence::Literals { len } => *tail += len,
+        Sequence::Triple {
+            literal_len,
+            offset,
+            match_len,
+        } => {
+            debug_assert_eq!(*tail, 0, "literals reported before a sequence");
+            debug_assert!((literal_len | match_len | offset) <= u32::MAX as usize);
+            let off_base = if code_offsets {
+                encode_offset_with_history_fast(offset as u32, literal_len as u32, hist)
+            } else {
+                offset as u32
+            };
+            sequences.push(RawSequence {
+                ll: literal_len as u32,
+                ml: match_len as u32,
+                off_base,
+            });
+        }
+    }
 }
 
 /// Append a block's parse to `capture` as external sequences with plain

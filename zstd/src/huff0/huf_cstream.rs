@@ -196,30 +196,29 @@ macro_rules! encode_unrolled_body {
         }
         debug_assert!(n.is_multiple_of(2 * $ku));
 
-        // Phase 3: dual-container main loop.
-        while n > 0 {
+        // Phase 3: dual-container main loop over `data[..n]` from the end,
+        // `2 * K_UNROLL` symbols at a time. A chunk of constant length lets
+        // every symbol load go unchecked, as upstream's `ip[n - u]` does.
+        for chunk in $data[..n].rchunks_exact(2 * $ku) {
             for u in 1..$ku {
-                huf_add!(bc0, bp0, $table[$data[n - u] as usize], true);
+                huf_add!(bc0, bp0, $table[chunk[2 * $ku - u] as usize], true);
             }
-            huf_add!(bc0, bp0, $table[$data[n - $ku] as usize], $klf);
+            huf_add!(bc0, bp0, $table[chunk[$ku] as usize], $klf);
             huf_flush!(bc0, bp0, cursor, overflow, out_base, end_ptr, $kff);
 
             bc1 = 0;
             bp1 = 0;
             for u in 1..$ku {
-                huf_add!(bc1, bp1, $table[$data[n - $ku - u] as usize], true);
+                huf_add!(bc1, bp1, $table[chunk[$ku - u] as usize], true);
             }
-            huf_add!(bc1, bp1, $table[$data[n - $ku - $ku] as usize], $klf);
+            huf_add!(bc1, bp1, $table[chunk[0] as usize], $klf);
             // merge_index1: fold container 1 into container 0.
             let nb_bits_1 = bp1 & 0xFF;
             bc0 >>= nb_bits_1;
             bc0 |= bc1;
             bp0 = bp0.wrapping_add(bp1);
             huf_flush!(bc0, bp0, cursor, overflow, out_base, end_ptr, $kff);
-
-            n -= 2 * $ku;
         }
-        debug_assert_eq!(n, 0);
 
         // Write the hoisted state back so `close()` sees the final values.
         $self.bit_container[0] = bc0;
@@ -363,7 +362,7 @@ impl<'a> HufCStream<'a> {
         const K_LAST_FAST: bool,
     >(
         &mut self,
-        table: &[u64],
+        table: &[u64; 256],
         data: &[u8],
     ) {
         crate::encoding::fastpath::tier_match!(K {
@@ -390,7 +389,7 @@ impl<'a> HufCStream<'a> {
         const K_LAST_FAST: bool,
     >(
         &mut self,
-        table: &[u64],
+        table: &[u64; 256],
         data: &[u8],
     ) {
         encode_unrolled_body!(self, table, data, K_UNROLL, K_FAST_FLUSH, K_LAST_FAST);
@@ -413,7 +412,7 @@ impl<'a> HufCStream<'a> {
         const K_LAST_FAST: bool,
     >(
         &mut self,
-        table: &[u64],
+        table: &[u64; 256],
         data: &[u8],
     ) {
         encode_unrolled_body!(self, table, data, K_UNROLL, K_FAST_FLUSH, K_LAST_FAST);

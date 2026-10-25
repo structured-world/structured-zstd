@@ -253,7 +253,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     /// `kLastFast` matching upstream zstd's 64-bit branch in
     /// `huf_compress.c:1092-1110`.
     fn encode_one_stream<K: EncodeTier>(
-        table: &[u64],
+        table: &[u64; 256],
         bit_c: &mut super::huf_cstream::HufCStream<'_>,
         data: &[u8],
         table_log: u32,
@@ -308,7 +308,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         const K_FAST_FLUSH: bool,
         const K_LAST_FAST: bool,
     >(
-        table: &[u64],
+        table: &[u64; 256],
         bit_c: &mut super::huf_cstream::HufCStream<'_>,
         data: &[u8],
     ) {
@@ -539,6 +539,7 @@ pub struct HuffmanTable {
     /// dual-container [`super::huf_cstream::HufCStream`] can index
     /// symbols with a single u64 load (no per-symbol shift+combine).
     /// See `huf_compress.c:208-221` for the upstream zstd format.
+    /// Always 256 entries, absent symbols zero (see [`Self::packed_codes`]).
     packed_codes: Vec<u64>,
     /// Active Huffman table-log (1..=12). Stored explicitly so
     /// `encode4x_reference` can dispatch to the correct `kUnroll`
@@ -1077,8 +1078,8 @@ impl HuffmanTable {
                 spare.codes.reserve_exact(weights.len());
                 spare.codes.resize(weights.len(), (0, 0));
                 spare.packed_codes.clear();
-                spare.packed_codes.reserve_exact(weights.len());
-                spare.packed_codes.resize(weights.len(), 0u64);
+                spare.packed_codes.reserve_exact(256);
+                spare.packed_codes.resize(256, 0u64);
                 spare.table_log = table_log as u32;
                 #[cfg(feature = "std")]
                 {
@@ -1091,7 +1092,7 @@ impl HuffmanTable {
             }
             None => HuffmanTable {
                 codes: alloc::vec![(0, 0); weights.len()],
-                packed_codes: alloc::vec![0u64; weights.len()],
+                packed_codes: alloc::vec![0u64; 256],
                 table_log: table_log as u32,
                 #[cfg(feature = "std")]
                 cached_encoded_weight_description: WeightDescription::default(),
@@ -1126,11 +1127,15 @@ impl HuffmanTable {
     }
 
     /// Upstream zstd-format packed code table for the hot encode loop.
-    /// One `HUF_CElt` (`u64`) per symbol — see
-    /// `huf_compress.c:208-221` for the layout.
+    /// One `HUF_CElt` (`u64`) per byte value, absent symbols zero — see
+    /// `huf_compress.c:208-221` for the layout. A full 256 entries, as
+    /// upstream's `CTable`, so a symbol byte indexes it without a check.
     #[inline(always)]
-    pub(crate) fn packed_codes(&self) -> &[u64] {
-        &self.packed_codes
+    pub(crate) fn packed_codes(&self) -> &[u64; 256] {
+        self.packed_codes
+            .as_slice()
+            .try_into()
+            .expect("the packed code table is built with 256 entries")
     }
 
     /// Active Huffman table-log (1..=12) — drives the `kUnroll`
