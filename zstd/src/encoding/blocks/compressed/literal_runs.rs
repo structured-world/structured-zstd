@@ -92,21 +92,29 @@ macro_rules! gather_body {
         let out = unsafe { dst.as_mut_ptr().add(start) };
         let mut written = 0usize;
         let mut pos = 0usize;
+        // A run's length is a `u32`, but the tail is a matcher's unchecked sum;
+        // bounding it by the block keeps the single-compare room test below
+        // from wrapping. Once per block.
+        assert!(
+            $tail <= src_len,
+            "sequences reach past the block they describe"
+        );
         macro_rules! copy_run {
             ($len:expr) => {{
                 let len = $len;
-                // `pos <= src_len` holds on every iteration.
-                let room = src_len - pos;
                 // SAFETY (both arms): `written <= pos`, and the capacity check in
                 // `gather_literals` gives the buffer `src_len` bytes past
                 // `start`. The chunked arm reads and writes at most
-                // `max($chunk, len + $chunk - 1) <= len + WILDCOPY_SLACK <= room`
-                // bytes from `pos` / `written` (`$chunk <= WILDCOPY_SLACK`); the
-                // exact arm, `len <= room` bytes.
+                // `max($chunk, len + $chunk - 1) <= len + WILDCOPY_SLACK` bytes
+                // from `pos` / `written` (`$chunk <= WILDCOPY_SLACK`), inside the
+                // block by its guard; the exact arm, `len <= src_len - pos`.
                 unsafe {
                     let s = src.add(pos);
                     let d = out.add(written);
-                    if room >= WILDCOPY_SLACK && len <= room - WILDCOPY_SLACK {
+                    // One compare in 64 bits, where no operand can overflow
+                    // (a run is a `u32`, `pos` and the tail are bounded by the
+                    // block), rather than a room test and a length test.
+                    if pos as u64 + len as u64 + WILDCOPY_SLACK as u64 <= src_len as u64 {
                         // Upstream's shape (`ZSTD_wildcopy`): one chunk
                         // unconditionally, which is the whole run for most of
                         // them, and a loop only for the rest of a longer one.
@@ -126,7 +134,11 @@ macro_rules! gather_body {
                             core::ptr::copy_nonoverlapping(s, d, len);
                         }
                     } else {
-                        assert!(len <= room, "sequences reach past the block they describe");
+                        // `pos <= src_len` holds on every iteration.
+                        assert!(
+                            len <= src_len - pos,
+                            "sequences reach past the block they describe"
+                        );
                         if len <= 32 {
                             if len != 0 {
                                 simd_copy::copy_exact_small(s, d, len);

@@ -1246,6 +1246,21 @@ fn sequences_past_the_block_are_refused() {
     );
 }
 
+/// A trailing literal count past the block is refused before any copy, however
+/// large: a custom matcher reports it unchecked, and near `usize::MAX` the
+/// chunked copy's room test would wrap and let a copy of that length through.
+#[test]
+#[should_panic(expected = "sequences reach past the block they describe")]
+fn a_tail_past_the_block_is_refused_before_the_copy() {
+    let (_ws, mut literals) = literals_buffer(64);
+    super::literal_runs::gather_literals::<crate::encoding::fastpath::ScalarTier>(
+        &[0x5A; 64],
+        &[],
+        usize::MAX - 16,
+        &mut literals,
+    );
+}
+
 /// Every literal-gather tier this CPU can run, not only the one it selects, so
 /// a narrower tier's path is exercised on a wider machine.
 fn runnable_fastpath_kernels() -> Vec<crate::encoding::fastpath::FastpathKernel> {

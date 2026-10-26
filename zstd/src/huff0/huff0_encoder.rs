@@ -1057,11 +1057,15 @@ impl HuffmanTable {
     /// probes, per split candidate; most are measured and thrown away, so
     /// handing the last one back turns two allocations per build into none.
     pub(crate) fn build_from_weights_reusing(weights: &[usize], spare: Option<Self>) -> Self {
-        let weight_sum = weights
-            .iter()
-            .copied()
-            .filter(|&weight| weight > 0)
-            .map(|weight| 1 << (weight - 1))
+        // Symbols per weight. Everything below needs only these thirteen
+        // counts: the weight sum that gives the table log, and the symbols
+        // per code length that give each length's first code.
+        let mut per_weight = [0u16; 13];
+        for &weight in weights {
+            per_weight[weight] += 1;
+        }
+        let weight_sum = (1..per_weight.len())
+            .map(|weight| usize::from(per_weight[weight]) << (weight - 1))
             .sum::<usize>();
         if !weight_sum.is_power_of_two() {
             panic!("This is an internal error");
@@ -1069,17 +1073,19 @@ impl HuffmanTable {
         let table_log = highest_bit_set(weight_sum) - 1;
         let mut table = match spare {
             Some(mut spare) => {
-                // Both buffers are overwritten in full below, so the recycled
-                // contents do not survive; only their allocations do.
-                // Exact reservations: an amortised `resize` would double a
-                // buffer grown one symbol at a time past the 256 entries any
-                // table holds, beyond what `max_heap_size` budgets.
+                // Both buffers are overwritten below, so the recycled contents
+                // do not survive; only their allocations do. Exact
+                // reservation: an amortised one would double a buffer grown
+                // one symbol at a time past the 256 entries any table holds,
+                // beyond what `max_heap_size` budgets.
+                // The fill below writes the first `weights.len()` packed codes,
+                // absent symbols as zero; past them only the previous table's
+                // symbols can be non-zero.
+                let stale = spare.codes.len().max(weights.len());
+                debug_assert_eq!(spare.packed_codes.len(), 256);
+                spare.packed_codes[weights.len()..stale].fill(0);
                 spare.codes.clear();
                 spare.codes.reserve_exact(weights.len());
-                spare.codes.resize(weights.len(), (0, 0));
-                spare.packed_codes.clear();
-                spare.packed_codes.reserve_exact(256);
-                spare.packed_codes.resize(256, 0u64);
                 spare.table_log = table_log as u32;
                 #[cfg(feature = "std")]
                 {
@@ -1091,37 +1097,35 @@ impl HuffmanTable {
                 spare
             }
             None => HuffmanTable {
-                codes: alloc::vec![(0, 0); weights.len()],
+                codes: Vec::with_capacity(weights.len()),
                 packed_codes: alloc::vec![0u64; 256],
                 table_log: table_log as u32,
                 #[cfg(feature = "std")]
                 cached_encoded_weight_description: WeightDescription::default(),
             },
         };
-        let mut nb_per_rank = [0u16; 13];
-        for &weight in weights {
-            if weight > 0 {
-                let nb_bits = table_log + 1 - weight;
-                nb_per_rank[nb_bits] += 1;
-            }
-        }
+        // A code of `nb_bits` bits has weight `table_log + 1 - nb_bits`.
         let mut val_per_rank = [0u16; 13];
         let mut min = 0u16;
         for nb_bits in (1..=table_log).rev() {
             val_per_rank[nb_bits] = min;
-            min = min.wrapping_add(nb_per_rank[nb_bits]) >> 1;
+            min = min.wrapping_add(per_weight[table_log + 1 - nb_bits]) >> 1;
         }
-        for (symbol, &weight) in weights.iter().enumerate() {
-            if weight == 0 {
-                continue;
-            }
-            let nb_bits = table_log + 1 - weight;
-            let value = val_per_rank[nb_bits];
-            val_per_rank[nb_bits] += 1;
-            table.codes[symbol] = (value as u32, nb_bits as u8);
-            table.packed_codes[symbol] =
-                super::huf_cstream::pack_huf_celt(value as u32, nb_bits as u8);
-        }
+        let packed_codes = &mut table.packed_codes;
+        table
+            .codes
+            .extend(weights.iter().enumerate().map(|(symbol, &weight)| {
+                if weight == 0 {
+                    packed_codes[symbol] = 0;
+                    return (0, 0);
+                }
+                let nb_bits = table_log + 1 - weight;
+                let value = val_per_rank[nb_bits];
+                val_per_rank[nb_bits] += 1;
+                packed_codes[symbol] =
+                    super::huf_cstream::pack_huf_celt(value as u32, nb_bits as u8);
+                (value as u32, nb_bits as u8)
+            }));
 
         table
     }
@@ -1564,14 +1568,15 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
         node_nb += 1;
     }
 
-    for leaf_idx in 0..leaf_count {
-        let mut depth = 0u8;
-        let mut parent = nodes[leaf_idx].parent;
-        while parent != NO_PARENT {
-            depth += 1;
-            parent = nodes[parent as usize].parent;
-        }
-        nodes[leaf_idx].nb_bits = depth;
+    // Depths top-down in one pass, as upstream's `HUF_buildTree`: every node's
+    // parent was built after it, so it sits at a higher index and is already
+    // done when the descending walk reaches the child. Walking each leaf up to
+    // the root instead was a chain of dependent loads per leaf.
+    nodes[node_root].nb_bits = 0;
+    for n in (0..node_root).rev() {
+        let parent = nodes[n].parent as usize;
+        debug_assert!(parent > n && parent <= node_root);
+        nodes[n].nb_bits = nodes[parent].nb_bits + 1;
     }
 
     // The leaves keep their (count desc, symbol asc) order: the tree build

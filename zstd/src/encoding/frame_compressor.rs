@@ -889,7 +889,9 @@ fn presplit_record_fingerprint(
 /// 2-byte hashing for `hashLog >= 9`; this helper exists so the borders
 /// heuristic doesn't pay for that wider hash on its 512-byte windows.
 fn presplit_record_byte_histogram(fp: &mut PreSplitFingerprint, src: &[u8]) {
-    fp.events.fill(0);
+    // Only the byte slots: a `hash_log == 8` fingerprint is recorded, compared
+    // and read in those alone.
+    fp.events[..256].fill(0);
     for &b in src {
         fp.events[b as usize] += 1;
     }
