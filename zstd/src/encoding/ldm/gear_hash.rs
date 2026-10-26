@@ -128,6 +128,35 @@ impl GearHashState {
     }
 }
 
+/// One byte through the rolling hash: `(hash << 1) + GEAR_TAB[byte]`.
+#[inline(always)]
+fn gear_step(hash: u64, byte: u8) -> u64 {
+    let entry = GEAR_TAB[byte as usize];
+    #[cfg(target_arch = "x86_64")]
+    {
+        // One `lea`, a single cycle on the hash's dependency chain, as
+        // upstream's compiled `ZSTD_ldm_gear_feed` has it. Written plainly,
+        // the table load folds into an `add` behind `add hash, hash`: two
+        // cycles a byte on the chain the whole scan waits on.
+        let mut hash = hash;
+        // SAFETY: register arithmetic only; no memory, stack or flags.
+        unsafe {
+            core::arch::asm!(
+                "lea {h}, [{e} + {h}*2]",
+                h = inout(reg) hash,
+                e = in(reg) entry,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        hash
+    }
+    // Elsewhere the shift folds into the add (aarch64 `add x, t, h, lsl #1`).
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (hash << 1).wrapping_add(entry)
+    }
+}
+
 /// Feed `min_match_length` bytes through the rolling hash WITHOUT
 /// emitting any splits.
 ///
@@ -148,14 +177,14 @@ pub(crate) fn reset(state: &mut GearHashState, data: &[u8]) {
     // arithmetic monomorphises to the same instruction sequence on
     // every backend.
     while n + 3 < data.len() {
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n + 1] as usize]);
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n + 2] as usize]);
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n + 3] as usize]);
+        hash = gear_step(hash, data[n]);
+        hash = gear_step(hash, data[n + 1]);
+        hash = gear_step(hash, data[n + 2]);
+        hash = gear_step(hash, data[n + 3]);
         n += 4;
     }
     while n < data.len() {
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
+        hash = gear_step(hash, data[n]);
         n += 1;
     }
     state.rolling = hash;
@@ -198,7 +227,7 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
     // matches `splits[*numSplits] = n` in upstream zstd (n already
     // incremented).
     while n + 3 < data.len() {
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
+        hash = gear_step(hash, data[n]);
         n += 1;
         if hash & mask == 0 {
             splits[num_splits] = n;
@@ -208,7 +237,7 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
                 return (n, num_splits);
             }
         }
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
+        hash = gear_step(hash, data[n]);
         n += 1;
         if hash & mask == 0 {
             splits[num_splits] = n;
@@ -218,7 +247,7 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
                 return (n, num_splits);
             }
         }
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
+        hash = gear_step(hash, data[n]);
         n += 1;
         if hash & mask == 0 {
             splits[num_splits] = n;
@@ -228,7 +257,7 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
                 return (n, num_splits);
             }
         }
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
+        hash = gear_step(hash, data[n]);
         n += 1;
         if hash & mask == 0 {
             splits[num_splits] = n;
@@ -241,7 +270,7 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
     }
     // Tail loop for the remaining 0..3 bytes. Upstream zstd `zstd_ldm.c:124-126`.
     while n < data.len() {
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
+        hash = gear_step(hash, data[n]);
         n += 1;
         if hash & mask == 0 {
             splits[num_splits] = n;
