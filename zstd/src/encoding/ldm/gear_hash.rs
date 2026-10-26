@@ -218,71 +218,46 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
     );
     let mut hash = state.rolling;
     let mask = state.stop_mask;
-    let mut n: usize = 0;
     let mut num_splits: usize = 0;
 
-    // 4-wide unrolled head. Upstream zstd `zstd_ldm.c:118-123`. Each iteration
-    // increments `n` first, then tests the post-update hash so the
-    // split index points to the byte AFTER the matched window — this
-    // matches `splits[*numSplits] = n` in upstream zstd (n already
-    // incremented).
-    while n + 3 < data.len() {
-        hash = gear_step(hash, data[n]);
-        n += 1;
-        if hash & mask == 0 {
-            splits[num_splits] = n;
-            num_splits += 1;
-            if num_splits == LDM_BATCH_SIZE {
-                state.rolling = hash;
-                return (n, num_splits);
+    // One byte at `$at`: the split index is the count of bytes consumed,
+    // `$at + 1`, the byte AFTER the matched window, as upstream's
+    // `splits[*numSplits] = n` with `n` already incremented. Positions are
+    // derived only here, on the rare split, so the scan carries a pointer
+    // and nothing else.
+    macro_rules! step {
+        ($byte:expr, $at:expr) => {{
+            hash = gear_step(hash, $byte);
+            if hash & mask == 0 {
+                let consumed = $at + 1;
+                splits[num_splits] = consumed;
+                num_splits += 1;
+                if num_splits == LDM_BATCH_SIZE {
+                    state.rolling = hash;
+                    return (consumed, num_splits);
+                }
             }
-        }
-        hash = gear_step(hash, data[n]);
-        n += 1;
-        if hash & mask == 0 {
-            splits[num_splits] = n;
-            num_splits += 1;
-            if num_splits == LDM_BATCH_SIZE {
-                state.rolling = hash;
-                return (n, num_splits);
-            }
-        }
-        hash = gear_step(hash, data[n]);
-        n += 1;
-        if hash & mask == 0 {
-            splits[num_splits] = n;
-            num_splits += 1;
-            if num_splits == LDM_BATCH_SIZE {
-                state.rolling = hash;
-                return (n, num_splits);
-            }
-        }
-        hash = gear_step(hash, data[n]);
-        n += 1;
-        if hash & mask == 0 {
-            splits[num_splits] = n;
-            num_splits += 1;
-            if num_splits == LDM_BATCH_SIZE {
-                state.rolling = hash;
-                return (n, num_splits);
-            }
-        }
+        }};
     }
-    // Tail loop for the remaining 0..3 bytes. Upstream zstd `zstd_ldm.c:124-126`.
-    while n < data.len() {
-        hash = gear_step(hash, data[n]);
-        n += 1;
-        if hash & mask == 0 {
-            splits[num_splits] = n;
-            num_splits += 1;
-            if num_splits == LDM_BATCH_SIZE {
-                state.rolling = hash;
-                return (n, num_splits);
-            }
-        }
+    // Four bytes a round, upstream zstd `zstd_ldm.c:118-123`; a chunk's length
+    // is known, so its loads carry no bounds check, and the loop's only
+    // counter is the chunk pointer, as upstream's is its index.
+    let base = data.as_ptr() as usize;
+    let mut quads = data.chunks_exact(4);
+    for quad in &mut quads {
+        let at = quad.as_ptr() as usize - base;
+        step!(quad[0], at);
+        step!(quad[1], at + 1);
+        step!(quad[2], at + 2);
+        step!(quad[3], at + 3);
+    }
+    // The remaining 0..3 bytes, upstream zstd `zstd_ldm.c:124-126`.
+    let tail_at = data.len() - quads.remainder().len();
+    for (i, &byte) in quads.remainder().iter().enumerate() {
+        step!(byte, tail_at + i);
     }
     state.rolling = hash;
-    (n, num_splits)
+    (data.len(), num_splits)
 }
 
 /// 256-entry random-permutation table from upstream zstd
