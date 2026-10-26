@@ -258,6 +258,16 @@ impl MatcherStorage {
         }
     }
 
+    /// The whole input of a frame scanned in place, which only the Fast
+    /// backend does under long-distance matching.
+    #[cfg(feature = "ldm")]
+    fn borrowed_window(&self) -> Option<&[u8]> {
+        match self {
+            Self::Simple(m) => m.borrowed_window(),
+            Self::Dfast(_) | Self::Row(_) | Self::HashChain(_) => None,
+        }
+    }
+
     /// The committed window followed by the input read but not committed.
     #[cfg(feature = "ldm")]
     fn window_with_pending(&self) -> &[u8] {
@@ -973,8 +983,12 @@ impl MatchGeneratorDriver {
     /// path. Checked AFTER priming, so `is_attached()` reflects the resolved
     /// attach-vs-copy decision.
     pub(crate) fn borrowed_dict_supported(&self) -> bool {
-        // As in `borrowed_supported`: a producer reads the committed block.
+        // As in `borrowed_supported`: a producer reads the committed block. A
+        // long-distance search counts the dictionary ahead of the input, which
+        // only the owned history lays out, so the reset keeps such a frame
+        // owned and this must agree.
         self.producer.is_none()
+            && !self.matches_beyond_window_tables()
             && matches!(
                 &self.storage,
                 MatcherStorage::Simple(m) if m.dict_is_attached()
@@ -1044,6 +1058,15 @@ impl MatchGeneratorDriver {
             "borrowed block range must satisfy start <= end (start={block_start} end={block_end})",
         );
         self.borrowed_pending = Some((block_start, block_end));
+        // The long-distance search tracks the stream end the way
+        // `commit_filled` does for an owned block; a frame scanned in place has
+        // no dictionary ahead of it, so stream positions are input offsets.
+        #[cfg(feature = "ldm")]
+        if self.ldm.is_some() {
+            debug_assert_eq!(self.ldm_committed_end, block_start);
+            self.ldm_committed_end = block_end;
+            self.ldm_split_block = None;
+        }
         // Make the range visible to `get_last_space()` immediately: the
         // emit pipeline reads `get_last_space().len()` in
         // `collect_block_parts` BEFORE `start_matching` consumes the
@@ -1697,16 +1720,21 @@ impl Matcher for MatchGeneratorDriver {
         // taking it again. The kernels keep positions in `u32`, counting a
         // dictionary ahead of the slice, so a longer one is copied.
         let dict_len = dict_hint.map_or(0, |sizes| sizes.content);
-        // The long-distance matcher splits a block into pieces through the
-        // owned history, so its frames keep the input there.
+        // The long-distance matcher matches a block in pieces. The Fast backend
+        // scans those pieces in place (`start_matching_long_distance_borrowed`),
+        // as upstream's one-shot frame reads its input where it lies; the other
+        // backends, and a dictionary frame, split the block through the owned
+        // history, so their frames keep the input there.
         #[cfg(feature = "ldm")]
         let long_distance = self.param_overrides.is_some_and(|ov| ov.ldm.is_some());
         #[cfg(not(feature = "ldm"))]
         let long_distance = false;
+        let long_distance_in_place =
+            matches!(next_backend, super::strategy::BackendTag::Simple) && dict_hint.is_none();
         self.frame_in_place = match workspace.ingest() {
             crate::encoding::workspace::IngestPlan::Slice(len) => {
                 (dict_hint.is_none() || fast_attach)
-                    && !long_distance
+                    && (!long_distance || long_distance_in_place)
                     && self.borrowed_supported()
                     && len
                         .checked_add(dict_len)
@@ -2283,6 +2311,12 @@ impl MatchGeneratorDriver {
         // hashes on the dict-priming hint) with no owned-history append
         // and nothing to recycle. Stage is consumed.
         if let Some((block_start, block_end)) = self.borrowed_pending.take() {
+            // As below for an owned block: the long-distance store moves past
+            // this block, keeping what was searched ahead of it.
+            #[cfg(feature = "ldm")]
+            if self.ldm.is_some() {
+                self.take_long_distance_block::<K>();
+            }
             match self.active_backend() {
                 super::strategy::BackendTag::Simple => self.simple_mut().skip_matching_borrowed(
                     block_start,
@@ -2379,6 +2413,19 @@ impl MatchGeneratorDriver {
         // the Simple backend is instrumented (the gate guarantees it),
         // and the stage is consumed so the next block re-stages.
         if let Some((block_start, block_end)) = self.borrowed_pending.take() {
+            // Long-distance matches are taken outright below the optimal
+            // parser; only the Fast backend reaches here with them (the reset
+            // keeps every other backend's long-distance frame owned).
+            #[cfg(feature = "ldm")]
+            if self.ldm.is_some()
+                && self.start_matching_long_distance_borrowed::<K>(
+                    block_start,
+                    block_end,
+                    &mut handle_sequence,
+                )
+            {
+                return;
+            }
             // The borrowed scans share their kernels with the owned ones, so
             // they report through the same sink type.
             let mut forward = None;

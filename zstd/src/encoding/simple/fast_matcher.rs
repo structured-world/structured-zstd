@@ -1687,6 +1687,23 @@ impl FastKernelMatcher {
         self.prime_hash_table_for_range_stepped(from, FILL_STEP);
     }
 
+    /// [`Self::skip_long_match`] for a match body `[start, end)` of the
+    /// borrowed window: the same tail, indexed only up to the match's end, as
+    /// the owned window ends there when the body is committed.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn skip_long_match_borrowed(&mut self, start: usize, end: usize) {
+        const FILL_STEP: usize = 3;
+        self.table_pos_high_water = self.table_pos_high_water.max(end);
+        let from = end - (end - start).min(crate::encoding::ldm::LONG_MATCH_INDEXED_TAIL);
+        self.prime_hash_table_for_range_borrowed(from, end, FILL_STEP);
+    }
+
+    /// The registered borrowed window, when the frame is scanned in place.
+    #[cfg(feature = "ldm")]
+    pub(crate) fn borrowed_window(&self) -> Option<&[u8]> {
+        self.borrowed.map(|_| self.history_bytes())
+    }
+
     /// Carry a long-distance match the driver emitted into the repeat
     /// offsets: the kernel's pair shifts it in as the newest (upstream
     /// `ZSTD_ldm_blockCompress`), the encoder-side history takes it as the

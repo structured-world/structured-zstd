@@ -2281,6 +2281,17 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 block_capacity,
                 savings,
             );
+            // A cut the splitter proposes inside a long match is moved out of
+            // it, as the owned loop does for the full block it has read.
+            let available = (input.len() - start).min(block_capacity);
+            let block_len = if block_len < available && available == block_capacity {
+                guard
+                    .0
+                    .matcher
+                    .settle_block_cut_with::<K>(available, block_len)
+            } else {
+                block_len
+            };
             let end = (start + block_len).min(input.len());
             let block = &input[start..end];
             let last_block = end == input.len();

@@ -22,10 +22,14 @@ fn main() {
     let iters: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50_000);
     let mode: &str = args.get(3).map(|s| s.as_str()).unwrap_or("rust");
     let corpus_path: Option<&str> = args.get(4).map(|s| s.as_str());
-    // 6th arg: "checksum" → encode with content_checksum_flag = 1 so the
-    // decode loop exercises the post-decode XXH64 verify pass. Lets us
-    // isolate the checksum cost (flag-on vs flag-off) in one harness.
-    let checksum: bool = args.get(5).map(|s| s == "checksum").unwrap_or(false);
+    // 6th arg, comma-separated encode options: "checksum" sets
+    // content_checksum_flag = 1 so the decode loop exercises the post-decode
+    // XXH64 verify pass; "ldm" turns on long-distance matching. The
+    // benchmark's `level_<N>_*_ldm` decode cells read frames with both, so
+    // reproduce one with `checksum,ldm`.
+    let options: Vec<&str> = args.get(5).map_or(Vec::new(), |s| s.split(',').collect());
+    let checksum = options.contains(&"checksum");
+    let ldm = options.contains(&"ldm");
 
     // Source resolution. This example is named after the `z000033` corpus,
     // so an explicit path or the in-tree corpus is the contract. The LCG
@@ -94,8 +98,8 @@ fn main() {
     // FFI encode once at requested level.
     let dst_cap = unsafe { zstd_sys::ZSTD_compressBound(src.len()) };
     let mut compressed: Vec<u8> = vec![0u8; dst_cap];
-    let written = if checksum {
-        // ZSTD_compress2 honours CCtx params, including the checksum flag.
+    let written = if checksum || ldm {
+        // ZSTD_compress2 honours CCtx params, the checksum and LDM flags.
         let cctx = unsafe { zstd_sys::ZSTD_createCCtx() };
         assert!(!cctx.is_null(), "ZSTD_createCCtx failed");
         unsafe {
@@ -107,7 +111,12 @@ fn main() {
             zstd_sys::ZSTD_CCtx_setParameter(
                 cctx,
                 zstd_sys::ZSTD_cParameter::ZSTD_c_checksumFlag,
-                1,
+                i32::from(checksum),
+            );
+            zstd_sys::ZSTD_CCtx_setParameter(
+                cctx,
+                zstd_sys::ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching,
+                i32::from(ldm),
             );
         }
         let w = unsafe {

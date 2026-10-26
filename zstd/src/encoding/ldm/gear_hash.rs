@@ -128,6 +128,35 @@ impl GearHashState {
     }
 }
 
+/// One byte through the rolling hash: `(hash << 1) + GEAR_TAB[byte]`.
+#[inline(always)]
+fn gear_step(hash: u64, byte: u8) -> u64 {
+    let entry = GEAR_TAB[byte as usize];
+    #[cfg(target_arch = "x86_64")]
+    {
+        // One `lea`, a single cycle on the hash's dependency chain, as
+        // upstream's compiled `ZSTD_ldm_gear_feed` has it. Written plainly,
+        // the table load folds into an `add` behind `add hash, hash`: two
+        // cycles a byte on the chain the whole scan waits on.
+        let mut hash = hash;
+        // SAFETY: register arithmetic only; no memory, stack or flags.
+        unsafe {
+            core::arch::asm!(
+                "lea {h}, [{e} + {h}*2]",
+                h = inout(reg) hash,
+                e = in(reg) entry,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        hash
+    }
+    // Elsewhere the shift folds into the add (aarch64 `add x, t, h, lsl #1`).
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (hash << 1).wrapping_add(entry)
+    }
+}
+
 /// Feed `min_match_length` bytes through the rolling hash WITHOUT
 /// emitting any splits.
 ///
@@ -148,14 +177,14 @@ pub(crate) fn reset(state: &mut GearHashState, data: &[u8]) {
     // arithmetic monomorphises to the same instruction sequence on
     // every backend.
     while n + 3 < data.len() {
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n + 1] as usize]);
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n + 2] as usize]);
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n + 3] as usize]);
+        hash = gear_step(hash, data[n]);
+        hash = gear_step(hash, data[n + 1]);
+        hash = gear_step(hash, data[n + 2]);
+        hash = gear_step(hash, data[n + 3]);
         n += 4;
     }
     while n < data.len() {
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
+        hash = gear_step(hash, data[n]);
         n += 1;
     }
     state.rolling = hash;
@@ -189,71 +218,58 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
     );
     let mut hash = state.rolling;
     let mask = state.stop_mask;
-    let mut n: usize = 0;
     let mut num_splits: usize = 0;
 
-    // 4-wide unrolled head. Upstream zstd `zstd_ldm.c:118-123`. Each iteration
-    // increments `n` first, then tests the post-update hash so the
-    // split index points to the byte AFTER the matched window — this
-    // matches `splits[*numSplits] = n` in upstream zstd (n already
-    // incremented).
-    while n + 3 < data.len() {
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
-        n += 1;
-        if hash & mask == 0 {
-            splits[num_splits] = n;
-            num_splits += 1;
-            if num_splits == LDM_BATCH_SIZE {
-                state.rolling = hash;
-                return (n, num_splits);
+    // One byte at `$at`: the split index is the count of bytes consumed,
+    // `$at + 1`, the byte AFTER the matched window, as upstream's
+    // `splits[*numSplits] = n` with `n` already incremented. Positions are
+    // derived only here, on the rare split, so the scan carries a pointer
+    // and nothing else.
+    macro_rules! step {
+        ($byte:expr, $at:expr) => {{
+            hash = gear_step(hash, $byte);
+            if hash & mask == 0 {
+                let consumed = $at + 1;
+                if push_split(splits, &mut num_splits, consumed) {
+                    state.rolling = hash;
+                    return (consumed, num_splits);
+                }
             }
-        }
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
-        n += 1;
-        if hash & mask == 0 {
-            splits[num_splits] = n;
-            num_splits += 1;
-            if num_splits == LDM_BATCH_SIZE {
-                state.rolling = hash;
-                return (n, num_splits);
-            }
-        }
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
-        n += 1;
-        if hash & mask == 0 {
-            splits[num_splits] = n;
-            num_splits += 1;
-            if num_splits == LDM_BATCH_SIZE {
-                state.rolling = hash;
-                return (n, num_splits);
-            }
-        }
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
-        n += 1;
-        if hash & mask == 0 {
-            splits[num_splits] = n;
-            num_splits += 1;
-            if num_splits == LDM_BATCH_SIZE {
-                state.rolling = hash;
-                return (n, num_splits);
-            }
-        }
+        }};
     }
-    // Tail loop for the remaining 0..3 bytes. Upstream zstd `zstd_ldm.c:124-126`.
-    while n < data.len() {
-        hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
-        n += 1;
-        if hash & mask == 0 {
-            splits[num_splits] = n;
-            num_splits += 1;
-            if num_splits == LDM_BATCH_SIZE {
-                state.rolling = hash;
-                return (n, num_splits);
-            }
-        }
+    // Four bytes a round, upstream zstd `zstd_ldm.c:118-123`; a chunk's length
+    // is known, so its loads carry no bounds check, and the loop's only
+    // counter is the chunk pointer, as upstream's is its index.
+    let base = data.as_ptr() as usize;
+    let (quads, rest) = data.as_chunks::<4>();
+    for quad in quads {
+        let at = quad.as_ptr() as usize - base;
+        step!(quad[0], at);
+        step!(quad[1], at + 1);
+        step!(quad[2], at + 2);
+        step!(quad[3], at + 3);
+    }
+    // The remaining 0..3 bytes, upstream zstd `zstd_ldm.c:124-126`.
+    let tail_at = data.len() - rest.len();
+    for (i, &byte) in rest.iter().enumerate() {
+        step!(byte, tail_at + i);
     }
     state.rolling = hash;
-    (n, num_splits)
+    (data.len(), num_splits)
+}
+
+/// Record a split at `consumed`; whether the batch is now full.
+///
+/// Out of line and cold: a split comes about once per `2 ^ hash_rate_log`
+/// bytes, and without the hint the record was laid out on the fall-through
+/// path, so every other byte took a branch around it. Upstream's compiled
+/// loop branches out to its record, as this one now does.
+#[cold]
+#[inline(never)]
+fn push_split(splits: &mut [usize], num_splits: &mut usize, consumed: usize) -> bool {
+    splits[*num_splits] = consumed;
+    *num_splits += 1;
+    *num_splits == LDM_BATCH_SIZE
 }
 
 /// 256-entry random-permutation table from upstream zstd

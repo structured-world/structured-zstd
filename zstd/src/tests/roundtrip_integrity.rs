@@ -1036,3 +1036,144 @@ fn borrowed_oneshot_matches_owned_and_roundtrips() {
         }
     }
 }
+
+/// A Fast-level long-distance frame scanned in place must be the frame the
+/// owned loop writes, which re-commits each block in pieces around its long
+/// matches. The input repeats random runs far apart so the long-distance
+/// search finds matches inside blocks, across blocks, and past a block cut;
+/// the 3 MiB case runs past the window. Strategies that keep the owned loop
+/// under long-distance matching are compared too, as a no-op.
+#[test]
+fn a_long_distance_frame_scanned_in_place_is_the_owned_frame() {
+    fn far_repeats(seed: u64, len: usize) -> Vec<u8> {
+        let a = generate_data(seed, 70_000);
+        let b = generate_data(seed + 1, 50_000);
+        let mut data = Vec::with_capacity(len);
+        let mut turn = 0u64;
+        while data.len() < len {
+            match turn % 4 {
+                0 | 2 => data.extend_from_slice(&a),
+                1 => data.extend_from_slice(&b),
+                _ => data.extend_from_slice(&generate_compressible(seed + turn, 9_000)),
+            }
+            turn += 1;
+        }
+        data.truncate(len);
+        data
+    }
+
+    for level in [
+        CompressionLevel::Level(1),
+        CompressionLevel::Level(-5),
+        CompressionLevel::Default,
+        CompressionLevel::Level(5),
+    ] {
+        for &(seed, len) in &[(1u64, 400_000usize), (2, 131_072), (3, 3_000_000)] {
+            assert_one_shot_long_distance_is_owned(level, &far_repeats(seed, len), None);
+        }
+    }
+}
+
+/// A long-distance frame with a block written out unsearched (one byte
+/// repeated over a whole block) must still be the owned frame: the owned loop
+/// searches that block for long matches and takes them past, so the in-place
+/// loop has to as well, or the matches searched ahead of the block and the
+/// block's own entries in the long-distance table are lost to it. A later
+/// block repeats the run in part, so it reads those entries.
+#[test]
+fn a_long_distance_frame_with_an_unsearched_block_is_the_owned_frame() {
+    // A compressible lead-in so the block splitter runs, a random run seen
+    // twice so the search ahead of a cut block finds a long match, then whole
+    // blocks of one byte right after the repeat.
+    for (seed, run) in [(21u64, 3 * 131_072), (22, 200_000), (23, 131_072 + 40_000)] {
+        let r = generate_data(seed, 60_000);
+        let mut data = generate_compressible(seed, 300_000);
+        data.extend_from_slice(&r);
+        data.extend_from_slice(&generate_compressible(seed + 100, 150_000));
+        data.extend_from_slice(&r);
+        data.extend(core::iter::repeat_n(0xAB, run));
+        data.extend_from_slice(&generate_data(seed + 200, 50_000));
+        data.extend_from_slice(&r);
+        for level in [CompressionLevel::Level(1), CompressionLevel::Level(-5)] {
+            assert_one_shot_long_distance_is_owned(level, &data, None);
+        }
+    }
+}
+
+/// A Fast-level long-distance frame with an attached dictionary keeps the
+/// owned history, and the one-shot entry must take the owned loop for it too,
+/// not the in-place dictionary scan: the long-distance search counts the
+/// dictionary ahead of the input.
+#[test]
+fn a_long_distance_dictionary_frame_is_the_owned_frame() {
+    let dict_raw = include_bytes!("../../dict_tests/dictionary");
+    let dict = crate::encoding::EncoderDictionary::from_bytes(dict_raw).unwrap();
+    // Small enough that the Fast backend attaches the dictionary.
+    let mut data =
+        b"tenant=demo table=orders op=put key=1 value=aaaaabbbbbcccccdddddeeeee\n".repeat(20);
+    data.extend_from_slice(&generate_data(31, 1_500));
+    data.extend_from_slice(&data.clone());
+    assert_one_shot_long_distance_is_owned(CompressionLevel::Level(1), &data, Some(&dict));
+}
+
+/// Compress `data` with long-distance matching at `level` (and `dict`) through
+/// the one-shot entry and through the owned block loop; the frames must be
+/// the same bytes, and the one-shot frame must round-trip.
+fn assert_one_shot_long_distance_is_owned(
+    level: CompressionLevel,
+    data: &[u8],
+    dict: Option<&crate::encoding::EncoderDictionary>,
+) {
+    let params = crate::encoding::CompressionParameters::builder(level)
+        .enable_long_distance_matching(true)
+        .build()
+        .unwrap();
+    let borrowed = {
+        let mut fc: FrameCompressor = FrameCompressor::new(level);
+        if let Some(dict) = dict {
+            fc.set_encoder_dictionary(dict.clone()).unwrap();
+        }
+        fc.set_parameters(&params);
+        fc.compress_independent_frame(data)
+    };
+    let owned = {
+        let mut out = Vec::new();
+        let mut fc = FrameCompressor::new(level);
+        if let Some(dict) = dict {
+            fc.set_encoder_dictionary(dict.clone()).unwrap();
+        }
+        fc.set_parameters(&params);
+        fc.set_source_size_hint(data.len() as u64);
+        fc.set_source(data);
+        fc.set_drain(&mut out);
+        fc.compress();
+        out
+    };
+    // The first differing byte, not the frames: they run to megabytes.
+    let first_difference = borrowed.iter().zip(&owned).position(|(b, o)| b != o);
+    assert!(
+        borrowed.len() == owned.len() && first_difference.is_none(),
+        "long-distance frame scanned in place differs from owned at {level:?} len={}: \
+         {} vs {} bytes, first difference at {first_difference:?}",
+        data.len(),
+        borrowed.len(),
+        owned.len(),
+    );
+    let mut decoder = match dict {
+        Some(_) => {
+            let raw = include_bytes!("../../dict_tests/dictionary");
+            let mut decoder = crate::decoding::FrameDecoder::new();
+            decoder
+                .add_dict(crate::decoding::Dictionary::decode_dict(raw).unwrap())
+                .unwrap();
+            StreamingDecoder::new_with_decoder(borrowed.as_slice(), decoder)
+        }
+        None => StreamingDecoder::new(borrowed.as_slice()),
+    };
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).unwrap();
+    assert!(
+        result == data,
+        "long-distance roundtrip mismatch at {level:?}"
+    );
+}
