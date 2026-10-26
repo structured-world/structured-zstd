@@ -243,8 +243,8 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
     // is known, so its loads carry no bounds check, and the loop's only
     // counter is the chunk pointer, as upstream's is its index.
     let base = data.as_ptr() as usize;
-    let mut quads = data.chunks_exact(4);
-    for quad in &mut quads {
+    let (quads, rest) = data.as_chunks::<4>();
+    for quad in quads {
         let at = quad.as_ptr() as usize - base;
         step!(quad[0], at);
         step!(quad[1], at + 1);
@@ -252,8 +252,8 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
         step!(quad[3], at + 3);
     }
     // The remaining 0..3 bytes, upstream zstd `zstd_ldm.c:124-126`.
-    let tail_at = data.len() - quads.remainder().len();
-    for (i, &byte) in quads.remainder().iter().enumerate() {
+    let tail_at = data.len() - rest.len();
+    for (i, &byte) in rest.iter().enumerate() {
         step!(byte, tail_at + i);
     }
     state.rolling = hash;
