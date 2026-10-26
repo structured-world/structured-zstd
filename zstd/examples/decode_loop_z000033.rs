@@ -24,8 +24,9 @@ fn main() {
     let corpus_path: Option<&str> = args.get(4).map(|s| s.as_str());
     // 6th arg, comma-separated encode options: "checksum" sets
     // content_checksum_flag = 1 so the decode loop exercises the post-decode
-    // XXH64 verify pass; "ldm" turns on long-distance matching, the frames the
-    // benchmark's `level_<N>_*_ldm` decode cells read.
+    // XXH64 verify pass; "ldm" turns on long-distance matching. The
+    // benchmark's `level_<N>_*_ldm` decode cells read frames with both, so
+    // reproduce one with `checksum,ldm`.
     let options: Vec<&str> = args.get(5).map_or(Vec::new(), |s| s.split(',').collect());
     let checksum = options.contains(&"checksum");
     let ldm = options.contains(&"ldm");

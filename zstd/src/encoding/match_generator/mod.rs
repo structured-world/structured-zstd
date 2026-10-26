@@ -983,8 +983,12 @@ impl MatchGeneratorDriver {
     /// path. Checked AFTER priming, so `is_attached()` reflects the resolved
     /// attach-vs-copy decision.
     pub(crate) fn borrowed_dict_supported(&self) -> bool {
-        // As in `borrowed_supported`: a producer reads the committed block.
+        // As in `borrowed_supported`: a producer reads the committed block. A
+        // long-distance search counts the dictionary ahead of the input, which
+        // only the owned history lays out, so the reset keeps such a frame
+        // owned and this must agree.
         self.producer.is_none()
+            && !self.matches_beyond_window_tables()
             && matches!(
                 &self.storage,
                 MatcherStorage::Simple(m) if m.dict_is_attached()
@@ -2307,6 +2311,12 @@ impl MatchGeneratorDriver {
         // hashes on the dict-priming hint) with no owned-history append
         // and nothing to recycle. Stage is consumed.
         if let Some((block_start, block_end)) = self.borrowed_pending.take() {
+            // As below for an owned block: the long-distance store moves past
+            // this block, keeping what was searched ahead of it.
+            #[cfg(feature = "ldm")]
+            if self.ldm.is_some() {
+                self.take_long_distance_block::<K>();
+            }
             match self.active_backend() {
                 super::strategy::BackendTag::Simple => self.simple_mut().skip_matching_borrowed(
                     block_start,
