@@ -1036,3 +1036,77 @@ fn borrowed_oneshot_matches_owned_and_roundtrips() {
         }
     }
 }
+
+/// A Fast-level long-distance frame scanned in place must be the frame the
+/// owned loop writes, which re-commits each block in pieces around its long
+/// matches. The input repeats random runs far apart so the long-distance
+/// search finds matches inside blocks, across blocks, and past a block cut;
+/// the 3 MiB case runs past the window. Strategies that keep the owned loop
+/// under long-distance matching are compared too, as a no-op.
+#[test]
+fn a_long_distance_frame_scanned_in_place_is_the_owned_frame() {
+    use crate::encoding::CompressionParameters;
+
+    fn far_repeats(seed: u64, len: usize) -> Vec<u8> {
+        let a = generate_data(seed, 70_000);
+        let b = generate_data(seed + 1, 50_000);
+        let mut data = Vec::with_capacity(len);
+        let mut turn = 0u64;
+        while data.len() < len {
+            match turn % 4 {
+                0 | 2 => data.extend_from_slice(&a),
+                1 => data.extend_from_slice(&b),
+                _ => data.extend_from_slice(&generate_compressible(seed + turn, 9_000)),
+            }
+            turn += 1;
+        }
+        data.truncate(len);
+        data
+    }
+
+    for level in [
+        CompressionLevel::Level(1),
+        CompressionLevel::Level(-5),
+        CompressionLevel::Default,
+        CompressionLevel::Level(5),
+    ] {
+        let params = CompressionParameters::builder(level)
+            .enable_long_distance_matching(true)
+            .build()
+            .unwrap();
+        for &(seed, len) in &[(1u64, 400_000usize), (2, 131_072), (3, 3_000_000)] {
+            let data = far_repeats(seed, len);
+            let borrowed = {
+                let mut fc: FrameCompressor = FrameCompressor::new(level);
+                fc.set_parameters(&params);
+                fc.compress_independent_frame(&data)
+            };
+            let owned = {
+                let mut out = Vec::new();
+                let mut fc = FrameCompressor::new(level);
+                fc.set_parameters(&params);
+                fc.set_source_size_hint(data.len() as u64);
+                fc.set_source(data.as_slice());
+                fc.set_drain(&mut out);
+                fc.compress();
+                out
+            };
+            // The first differing byte, not the frames: they run to megabytes.
+            let first_difference = borrowed.iter().zip(&owned).position(|(b, o)| b != o);
+            assert!(
+                borrowed.len() == owned.len() && first_difference.is_none(),
+                "long-distance frame scanned in place differs from owned at {level:?} \
+                 seed={seed} len={len}: {} vs {} bytes, first difference at {first_difference:?}",
+                borrowed.len(),
+                owned.len(),
+            );
+            let mut decoder = StreamingDecoder::new(borrowed.as_slice());
+            let mut result = Vec::new();
+            decoder.read_to_end(&mut result).unwrap();
+            assert!(
+                result == data,
+                "long-distance roundtrip mismatch at {level:?}"
+            );
+        }
+    }
+}

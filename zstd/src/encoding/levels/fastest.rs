@@ -358,9 +358,10 @@ pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
     // incompressible.
     let is_rle = !block.is_empty() && block.iter().all(|x| block[0].eq(x));
     let window_size = state.matcher.window_size();
-    // As on the owned path: an attached dictionary keeps the block on the
-    // search rather than trusting a sample to say the dictionary is irrelevant.
-    let dict_rejects_raw = dict_active;
+    // As on the owned path: an attached dictionary, or long-distance matching,
+    // keeps the block on the search rather than trusting a sample to say
+    // matches from outside the block are irrelevant.
+    let dict_rejects_raw = dict_active || state.matcher.matches_beyond_window_tables();
     // As on the owned path: where no block may go out raw, the grid has nothing
     // to answer and is left alone.
     let raw_skip_reachable = compression_level_allows_raw_fast_path(compression_level, window_size);

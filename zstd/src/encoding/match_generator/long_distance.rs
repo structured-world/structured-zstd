@@ -32,8 +32,15 @@ impl MatchGeneratorDriver {
         } else {
             to.saturating_sub(window)
         };
-        let live_start = self.ldm_committed_end - self.storage.committed_window().len();
-        let live = self.storage.window_with_pending();
+        // A frame scanned in place holds the whole input from stream position
+        // 0; an owned history holds the window and the read-ahead behind it.
+        let (live, live_start) = match self.storage.borrowed_window() {
+            Some(input) => (input, 0),
+            None => (
+                self.storage.window_with_pending(),
+                self.ldm_committed_end - self.storage.committed_window().len(),
+            ),
+        };
         let floor = reach_floor.max(live_start);
         debug_assert!(floor <= from, "a search range wider than the window");
         self.ldm_found.clear();
@@ -136,6 +143,63 @@ impl MatchGeneratorDriver {
         }
         self.ldm_block = sequences;
         self.ldm_split_block = Some(block_len);
+        true
+    }
+
+    /// [`Self::start_matching_long_distance`] for the Fast backend scanning the
+    /// frame in place: the block `[block_start, block_end)` is never copied,
+    /// each gap between long matches is scanned where it lies, ending where
+    /// the owned history would end once the gap is committed, and each match
+    /// body's tail is indexed up to the match's end. The frame it writes is
+    /// the owned one's.
+    pub(super) fn start_matching_long_distance_borrowed<K: EncodeTier>(
+        &mut self,
+        block_start: usize,
+        block_end: usize,
+        handle_sequence: &mut impl FnMut(Sequence),
+    ) -> bool {
+        let block_len = self.take_long_distance_block::<K>();
+        debug_assert_eq!(block_len, block_end - block_start);
+        if self.ldm_block.is_empty() {
+            return false;
+        }
+        let sequences = core::mem::take(&mut self.ldm_block);
+        let simple = self.simple_mut();
+        let mut pos = block_start;
+        for seq in &sequences {
+            // The gap's trailing literals become the long match's own.
+            let mut gap = Some(0usize);
+            if seq.lit_length != 0 {
+                let gap_end = pos + seq.lit_length;
+                simple.start_matching_borrowed(
+                    pos,
+                    gap_end,
+                    &mut owned_sink(handle_sequence, &mut gap),
+                );
+                pos = gap_end;
+            }
+            let gap_literals = gap.expect("the gap sink only ever writes Some");
+            simple.skip_long_match_borrowed(pos, pos + seq.match_length);
+            pos += seq.match_length;
+            handle_sequence(Sequence::Triple {
+                literal_len: gap_literals,
+                offset: seq.offset,
+                match_len: seq.match_length,
+            });
+            simple.note_long_match(seq.offset, gap_literals);
+        }
+        if pos != block_end {
+            let mut forward = None;
+            simple.start_matching_borrowed(
+                pos,
+                block_end,
+                &mut owned_sink(handle_sequence, &mut forward),
+            );
+        }
+        // The pieces leave the last one as the block the encoder reads back;
+        // it is the whole block.
+        simple.stage_borrowed_block(block_start, block_end);
+        self.ldm_block = sequences;
         true
     }
 
