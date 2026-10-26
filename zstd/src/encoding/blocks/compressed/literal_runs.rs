@@ -92,6 +92,13 @@ macro_rules! gather_body {
         let out = unsafe { dst.as_mut_ptr().add(start) };
         let mut written = 0usize;
         let mut pos = 0usize;
+        // A run's length is a `u32`, but the tail is a matcher's unchecked sum;
+        // bounding it by the block keeps the single-compare room test below
+        // from wrapping. Once per block.
+        assert!(
+            $tail <= src_len,
+            "sequences reach past the block they describe"
+        );
         macro_rules! copy_run {
             ($len:expr) => {{
                 let len = $len;
@@ -105,8 +112,8 @@ macro_rules! gather_body {
                     let s = src.add(pos);
                     let d = out.add(written);
                     // One compare in 64 bits, where no operand can overflow
-                    // (each is under 2^32), rather than a room test and a
-                    // length test.
+                    // (a run is a `u32`, `pos` and the tail are bounded by the
+                    // block), rather than a room test and a length test.
                     if pos as u64 + len as u64 + WILDCOPY_SLACK as u64 <= src_len as u64 {
                         // Upstream's shape (`ZSTD_wildcopy`): one chunk
                         // unconditionally, which is the whole run for most of
