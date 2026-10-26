@@ -230,9 +230,7 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
             hash = gear_step(hash, $byte);
             if hash & mask == 0 {
                 let consumed = $at + 1;
-                splits[num_splits] = consumed;
-                num_splits += 1;
-                if num_splits == LDM_BATCH_SIZE {
+                if push_split(splits, &mut num_splits, consumed) {
                     state.rolling = hash;
                     return (consumed, num_splits);
                 }
@@ -258,6 +256,20 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
     }
     state.rolling = hash;
     (data.len(), num_splits)
+}
+
+/// Record a split at `consumed`; whether the batch is now full.
+///
+/// Out of line and cold: a split comes about once per `2 ^ hash_rate_log`
+/// bytes, and without the hint the record was laid out on the fall-through
+/// path, so every other byte took a branch around it. Upstream's compiled
+/// loop branches out to its record, as this one now does.
+#[cold]
+#[inline(never)]
+fn push_split(splits: &mut [usize], num_splits: &mut usize, consumed: usize) -> bool {
+    splits[*num_splits] = consumed;
+    *num_splits += 1;
+    *num_splits == LDM_BATCH_SIZE
 }
 
 /// 256-entry random-permutation table from upstream zstd
