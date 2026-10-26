@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/structured-world/structured-zstd/compare/v0.2.5...v0.2.6) - 2026-10-26
+
+### Added
+
+- *(encode)* faster entropy stage and a lazy match-finder switch ([#626](https://github.com/structured-world/structured-zstd/pull/626))
+
+### Performance
+
+- *(ldm)* close the level-1 long-distance gap to libzstd ([#632](https://github.com/structured-world/structured-zstd/pull/632))
+- *(encode)* keep the level-1 bit writers' flushes and FSE states off the critical path ([#630](https://github.com/structured-world/structured-zstd/pull/630))
+- *(encode)* bring the level-1 entropy stage to libzstd's pace ([#628](https://github.com/structured-world/structured-zstd/pull/628))
+
 ## [0.2.5](https://github.com/structured-world/structured-zstd/compare/v0.2.4...v0.2.5) - 2026-10-22
 
 ### Fixed
