@@ -2000,10 +2000,10 @@ fn fill_and_count<const OFFSETS_CODED: bool>(
         );
         // SAFETY: the codes are at most 35 (LL), 52 (ML) and 31 (OF), under the
         // histogram's `SEQUENCE_CODE_SLOTS`. The LL and ML bounds hold in release
-        // because `encode_literal_length` and `encode_match_len` index
-        // `LL_EXTRA_BITS` (36 entries) and `ML_EXTRA_BITS` (53) with a bounds
-        // check, so a larger code panics there before reaching this write; the
-        // OF code is `ilog2` of a `u32`. Those lookups must stay checked.
+        // because `encode_literal_length` and `encode_match_len` assert the
+        // length below 2^17 before deriving a code from its high bit, so a larger
+        // code panics there before reaching this write; the OF code is `ilog2`
+        // of a `u32`. Those asserts must stay.
         unsafe {
             *ll_counts.get_unchecked_mut(usize::from(ll_code)) += 1;
             *ml_counts.get_unchecked_mut(usize::from(ml_code)) += 1;
@@ -3191,6 +3191,20 @@ const ML_EXTRA_BITS: [u8; 53] = [
     1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 ];
 
+/// A short length's code in the low byte and its extra-bit width in the high
+/// byte, so one load answers both.
+const fn fuse_code_bits<const N: usize>(codes: &[u8; N], bits: &[u8]) -> [u16; N] {
+    let mut fused = [0u16; N];
+    let mut i = 0;
+    while i < N {
+        fused[i] = codes[i] as u16 | (bits[codes[i] as usize] as u16) << 8;
+        i += 1;
+    }
+    fused
+}
+const LL_CODE_BITS: [u16; 64] = fuse_code_bits(&LL_CODE, &LL_EXTRA_BITS);
+const ML_CODE_BITS: [u16; 128] = fuse_code_bits(&ML_CODE, &ML_EXTRA_BITS);
+
 /// Split a literal-length into its FSE symbol, the extra bits to append, and
 /// how many of them (upstream `ZSTD_LLcode` plus the `LL_bits` lookup its
 /// caller does).
@@ -3199,15 +3213,22 @@ const ML_EXTRA_BITS: [u8; 53] = [
 /// compiled to a chain of comparisons; upstream reaches the same answer with a
 /// table index. Every code's baseline is a multiple of its own extra-bit width,
 /// so masking off those bits is the same subtraction the ranges spelled out.
+/// From 64 up a code carries exactly `ilog2(len)` extra bits, so that branch
+/// needs no table at all.
 #[inline]
 pub(crate) fn encode_literal_length(len: u32) -> (u8, u32, usize) {
-    debug_assert!(len < 131_072, "literal length {len} out of encodable range");
-    let code = if len < 64 {
-        LL_CODE[len as usize]
+    let (code, bits) = if len < 64 {
+        let fused = LL_CODE_BITS[len as usize];
+        (fused as u8, (fused >> 8) as usize)
     } else {
-        (len.ilog2() + LL_DELTA_CODE) as u8
+        // RFC 8878 3.1.1.3.2.1.1: literal-length code 35 is the last, its
+        // baseline 65536 with 16 extra bits.
+        // No value in the message: formatting it keeps `len` on the stack
+        // across the whole calling loop.
+        assert!(len < 131_072, "literal length out of encodable range");
+        let log = len.ilog2();
+        ((log + LL_DELTA_CODE) as u8, log as usize)
     };
-    let bits = LL_EXTRA_BITS[code as usize] as usize;
     (code, len & ((1u32 << bits) - 1), bits)
 }
 
@@ -3218,17 +3239,18 @@ pub(crate) fn encode_literal_length(len: u32) -> (u8, u32, usize) {
 /// Table-driven for the same reason as [`encode_literal_length`].
 #[inline]
 pub(crate) fn encode_match_len(len: u32) -> (u8, u32, usize) {
-    debug_assert!(
-        (3..131_075).contains(&len),
-        "match length {len} out of encodable range",
-    );
+    debug_assert!(len >= 3, "match length {len} out of encodable range");
     let base = len - 3;
-    let code = if base < 128 {
-        ML_CODE[base as usize]
+    let (code, bits) = if base < 128 {
+        let fused = ML_CODE_BITS[base as usize];
+        (fused as u8, (fused >> 8) as usize)
     } else {
-        (base.ilog2() + ML_DELTA_CODE) as u8
+        // RFC 8878 3.1.1.3.2.1.1: match-length code 52 is the last, its
+        // baseline 65539 with 16 extra bits.
+        assert!(base < 131_072, "match length out of encodable range");
+        let log = base.ilog2();
+        ((log + ML_DELTA_CODE) as u8, log as usize)
     };
-    let bits = ML_EXTRA_BITS[code as usize] as usize;
     (code, base & ((1u32 << bits) - 1), bits)
 }
 
