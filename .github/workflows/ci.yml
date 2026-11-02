@@ -121,6 +121,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/mold
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -251,6 +252,7 @@ jobs:
           # Build + test + header-diff job (no push); don't leave the token
           # in the checkout's git config.
           persist-credentials: false
+      - uses: ./.github/actions/mold
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -383,6 +385,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         if: needs.changes.outputs.code == 'true'
+      - uses: ./.github/actions/mold
+        if: needs.changes.outputs.code == 'true' && runner.os == 'Linux'
       - uses: dtolnay/rust-toolchain@stable
         if: needs.changes.outputs.code == 'true'
       - name: Prepend toolchain bin to PATH (macos shim workaround)
@@ -460,6 +464,8 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         with:
           persist-credentials: false
+      - uses: ./.github/actions/mold
+        if: needs.changes.outputs.code == 'true' && runner.os == 'Linux'
       - uses: dtolnay/rust-toolchain@stable
         if: needs.changes.outputs.code == 'true'
       - name: Prepend toolchain bin to PATH (macos shim workaround)
@@ -494,6 +500,8 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         with:
           persist-credentials: false
+      - uses: ./.github/actions/mold
+        if: needs.changes.outputs.code == 'true'
       - uses: dtolnay/rust-toolchain@stable
         if: needs.changes.outputs.code == 'true'
       - uses: Swatinem/rust-cache@v2
@@ -539,6 +547,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/mold
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.92.0"
@@ -565,6 +574,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/mold
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -854,6 +864,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+      - uses: ./.github/actions/mold
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -1255,6 +1266,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/mold
       - uses: dtolnay/rust-toolchain@stable
       - name: Install benchmark target
         run: rustup target add ${{ matrix.bench.target_triple }}
@@ -1290,7 +1302,10 @@ jobs:
           # decompress/level_-1_fast/decodecorpus-z000033/c_stream on
           # i9-9900K; the win comes from _bzhi_u64-backed
           # mask_lower_bits in the FSE state-update hot path.
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v3"
+          #
+          # The gnu target also keeps the job's mold link flags, which this
+          # step's own value would otherwise replace.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v3 ${{ env.MOLD_RUSTFLAGS }}"
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C target-cpu=x86-64-v3"
         run: |
           # `--no-run` builds without executing; `--message-format=json`
