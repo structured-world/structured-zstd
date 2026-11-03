@@ -3,7 +3,7 @@ description: >
   Install mold and link this job's x86_64 Linux Rust builds with it in place
   of the bundled rust-lld: fewer threads and less random writing. C builds keep
   the system linker. MOLD_RUSTFLAGS carries the flags for a step that sets the
-  target's rustflags itself.
+  target's rustflags itself or builds through RUSTFLAGS, which overrides them.
 runs:
   using: composite
   steps:
