@@ -1,0 +1,17 @@
+name: Link with mold
+description: >
+  Install mold and link this job's x86_64 Linux Rust builds with it in place
+  of the bundled rust-lld: fewer threads and less random writing. C builds keep
+  the system linker. MOLD_RUSTFLAGS carries the flags for a step that sets the
+  target's rustflags itself or builds through RUSTFLAGS, which overrides them.
+runs:
+  using: composite
+  steps:
+    - uses: rui314/setup-mold@v1
+      with:
+        make-default: false
+    - shell: bash
+      run: |
+        flags="-C linker-features=-lld -C link-arg=-fuse-ld=mold"
+        echo "MOLD_RUSTFLAGS=$flags" >> "$GITHUB_ENV"
+        echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=$flags" >> "$GITHUB_ENV"
