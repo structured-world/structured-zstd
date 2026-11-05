@@ -394,6 +394,7 @@ impl CompressionLevel {
 /// assert_eq!(sizes.serialized, sizes.content);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DictionarySizes {
     /// Bytes of dictionary content the matcher indexes.
     pub content: usize,
