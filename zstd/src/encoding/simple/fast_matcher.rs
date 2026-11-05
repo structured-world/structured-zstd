@@ -1221,28 +1221,7 @@ impl FastKernelMatcher {
     /// `_ =>` arm is unreachable because `validate_params` in
     /// [`FastHashTable::new`] rejects mls outside 4..=8 at
     /// construction.
-    pub(crate) fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
-        self.scan_owned(&mut handle_sequence);
-    }
-
-    /// The block [`Self::scan_owned`] will scan, as its address and length.
-    pub(crate) fn owned_block(&self) -> Option<(*const u8, usize)> {
-        if self.borrowed.is_some() {
-            return None;
-        }
-        let len = self.staged_block?;
-        let end = self.committed_len();
-        Some((self.history[end - len..end].as_ptr(), len))
-    }
-
-    /// [`Self::start_matching`] reporting to any [`KernelSink`], such as a
-    /// store that records the block's sequences and literals.
-    ///
-    /// [`KernelSink`]: super::fast_kernel::kernel::KernelSink
-    pub(crate) fn scan_owned(
-        &mut self,
-        handle_sequence: &mut impl super::fast_kernel::kernel::KernelSink,
-    ) {
+    pub(crate) fn start_matching(&mut self, handle_sequence: impl FnMut(Sequence)) {
         // Owned scan path. A borrowed one-shot window (set via
         // `set_borrowed_window`) is mutually exclusive with this path:
         // a committed block lives in `self.history` and `block_start`
@@ -1350,10 +1329,6 @@ impl FastKernelMatcher {
                 .dict
                 .table()
                 .expect("use_dict implies dict_table is Some");
-            // The dictionary kernel reports plain sequences; their runs follow
-            // each other from the block's start, so the sink is handed each
-            // run's address by walking them.
-            let mut at = history[block_start..].as_ptr();
             run_fast_kernel_block_dict(
                 history,
                 block_start,
@@ -1365,17 +1340,7 @@ impl FastKernelMatcher {
                 step_size,
                 mls,
                 use_cmov,
-                |seq| match seq {
-                    Sequence::Triple {
-                        literal_len,
-                        offset,
-                        match_len,
-                    } => {
-                        handle_sequence.triple(at, literal_len, offset, match_len);
-                        at = at.wrapping_add(literal_len + match_len);
-                    }
-                    Sequence::Literals { len } => handle_sequence.tail(at, len),
-                },
+                handle_sequence,
             )
         } else {
             // Owned scan reads `self.history` directly (the guard above
@@ -1422,29 +1387,7 @@ impl FastKernelMatcher {
         &mut self,
         block_start: usize,
         block_end: usize,
-        mut handle_sequence: impl FnMut(Sequence),
-    ) {
-        self.scan_borrowed(block_start, block_end, &mut handle_sequence);
-    }
-
-    /// Address of `block_start` in the registered borrowed window.
-    pub(crate) fn borrowed_block_ptr(&self, block_start: usize) -> *const u8 {
-        let (ptr, total_len) = self
-            .borrowed
-            .expect("a borrowed block requires a registered borrowed window");
-        assert!(block_start <= total_len, "borrowed block past its window");
-        ptr.wrapping_add(block_start)
-    }
-
-    /// [`Self::start_matching_borrowed`] reporting to any [`KernelSink`],
-    /// such as a store that records the block's sequences and literals.
-    ///
-    /// [`KernelSink`]: super::fast_kernel::kernel::KernelSink
-    pub(crate) fn scan_borrowed(
-        &mut self,
-        block_start: usize,
-        block_end: usize,
-        handle_sequence: &mut impl super::fast_kernel::kernel::KernelSink,
+        handle_sequence: impl FnMut(Sequence),
     ) {
         let (ptr, total_len) = self
             .borrowed
@@ -2552,7 +2495,7 @@ fn run_fast_kernel_block(
     step_size: usize,
     mls: u32,
     use_cmov: bool,
-    handle_sequence: &mut impl super::fast_kernel::kernel::KernelSink,
+    mut handle_sequence: impl FnMut(Sequence),
 ) -> [u32; 2] {
     use super::fast_kernel::kernel::PrefixBounds;
 
@@ -2576,7 +2519,7 @@ fn run_fast_kernel_block(
                 hash_table,
                 rep_in,
                 step_size,
-                handle_sequence,
+                &mut handle_sequence,
             )
         };
     }
@@ -2604,8 +2547,9 @@ fn run_fast_kernel_block(
 
     // Emit terminal literals if the kernel left a tail.
     if result.tail_literals_len > 0 {
-        let at = history.len() - result.tail_literals_len;
-        handle_sequence.tail(history[at..].as_ptr(), result.tail_literals_len);
+        handle_sequence(Sequence::Literals {
+            len: result.tail_literals_len,
+        });
     }
 
     result.rep

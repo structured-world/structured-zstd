@@ -12,39 +12,6 @@ use super::count::{count_forward, count_forward_dict_2segment};
 use super::hash_table::{FastHashTable, TAG_BITS, TAG_MASK, TAGGED_POSITION_LIMIT, hash_ptr_raw};
 use crate::encoding::Sequence;
 
-/// Where [`compress_block_fast`] reports what it matched. A closure takes the
-/// sequences as [`Sequence`]s; a store of the block's sequences and literals
-/// takes each one with the address of its literal run, so it can copy the run
-/// as it records the sequence (upstream zstd `ZSTD_storeSeq`).
-pub(crate) trait KernelSink {
-    /// A sequence whose `literal_len` literals start at `literals`.
-    fn triple(&mut self, literals: *const u8, literal_len: usize, offset: usize, match_len: usize);
-    /// The block's `len` trailing literals, starting at `literals`.
-    fn tail(&mut self, literals: *const u8, len: usize);
-}
-
-impl<F: FnMut(Sequence)> KernelSink for F {
-    #[inline(always)]
-    fn triple(
-        &mut self,
-        _literals: *const u8,
-        literal_len: usize,
-        offset: usize,
-        match_len: usize,
-    ) {
-        self(Sequence::Triple {
-            literal_len,
-            offset,
-            match_len,
-        });
-    }
-
-    #[inline(always)]
-    fn tail(&mut self, _literals: *const u8, len: usize) {
-        self(Sequence::Literals { len });
-    }
-}
-
 /// Bits a slot's position is shifted by: [`TAG_BITS`] in a tagged table.
 #[inline(always)]
 const fn tag_shift<const TAGGED: bool>() -> u32 {
@@ -516,7 +483,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
     hash_table: &mut FastHashTable,
     rep: [u32; 2],
     step_size: usize,
-    handle_sequence: &mut impl KernelSink,
+    mut handle_sequence: impl FnMut(Sequence),
 ) -> FastBlockResult {
     // Everything below counts in upstream's index: a position of `data` plus
     // the table's bias, so what earlier frames stored lies under the floor and
@@ -1068,7 +1035,11 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
 
         // Emit. The backward-extension loop above stops at `match_ip ==
         // anchor` (or a byte mismatch), so `anchor <= match_ip`.
-        handle_sequence.triple(base.add(anchor), match_ip - anchor, offset, m_len);
+        handle_sequence(Sequence::Triple {
+            literal_len: match_ip - anchor,
+            offset,
+            match_len: m_len,
+        });
 
         ip0 = match_ip + m_len;
         anchor = ip0;
@@ -1141,7 +1112,11 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
                 // Emit a lit_len=0 rep1 sequence: this branch runs with
                 // `anchor == ip0`, set by the emit before it.
                 debug_assert_eq!(anchor, ip0);
-                handle_sequence.triple(base.add(ip0), 0, r_off, r_len);
+                handle_sequence(Sequence::Triple {
+                    literal_len: 0,
+                    offset: r_off,
+                    match_len: r_len,
+                });
 
                 ip0 += r_len;
                 anchor = ip0;

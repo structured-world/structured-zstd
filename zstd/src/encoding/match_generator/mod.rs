@@ -2389,44 +2389,6 @@ fn owned_sink<'a, F: FnMut(Sequence)>(
 }
 
 impl MatchGeneratorDriver {
-    /// The block the Fast backend matches next, as its address and length,
-    /// when no dictionary, long-distance matching or producer takes part: the
-    /// block [`Self::store_fast_block`] scans. The dictionary kernels keep the
-    /// closure: their two-cursor loop pays more for the inlined copy than the
-    /// gather pass costs.
-    pub(crate) fn direct_fast_block(&mut self) -> Option<(*const u8, usize)> {
-        #[cfg(feature = "ldm")]
-        if self.ldm.is_some() {
-            return None;
-        }
-        if self.producer.is_some()
-            || !matches!(self.active_backend(), super::strategy::BackendTag::Simple)
-            || self.simple_mut().dict_is_attached()
-        {
-            return None;
-        }
-        match self.borrowed_pending {
-            Some((block_start, block_end)) => Some((
-                self.simple_mut().borrowed_block_ptr(block_start),
-                block_end - block_start,
-            )),
-            None => self.simple_mut().owned_block(),
-        }
-    }
-
-    /// Scan the block [`Self::direct_fast_block`] named into `sink`.
-    pub(crate) fn store_fast_block<K: EncodeTier>(
-        &mut self,
-        sink: &mut impl crate::encoding::simple::fast_kernel::kernel::KernelSink,
-    ) {
-        let pending = self.borrowed_pending.take();
-        let m = self.simple_mut();
-        match pending {
-            Some((block_start, block_end)) => m.scan_borrowed(block_start, block_end, sink),
-            None => m.scan_owned(sink),
-        }
-    }
-
     /// [`Matcher::start_matching`] compiled for the kernel tier `K`, the one
     /// the encoder chose for the frame. Nothing below asks for a tier.
     pub(crate) fn start_matching_with<K: EncodeTier>(

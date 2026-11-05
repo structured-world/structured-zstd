@@ -681,40 +681,6 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
     // every matcher's scan, where two would compile each backend twice, and the
     // flag is fixed for the block, so its test at each emit site predicts.
     let code_offsets = uses_fast_offset_codes(state.strategy_tag);
-    // The Fast kernel records straight into the block's buffers, upstream's
-    // `ZSTD_storeSeq` shape, so no gather pass follows. The dictionary and
-    // double-fast loops keep the closure: inlined there, the copy costs more
-    // than the gather.
-    if code_offsets
-        && state.sequence_capture.is_none()
-        && let Some(driver) = state.matcher.builtin_driver()
-        && let Some((block, block_len)) = driver.direct_fast_block()
-    {
-        if parts.literals.capacity() < block_len {
-            crate::encoding::workspace::capacity_exhausted();
-        }
-        let seq_base = parts.sequences.as_mut_ptr();
-        let lit_base = parts.literals.as_mut_ptr();
-        let mut store = DirectStore {
-            seq: seq_base,
-            lit: lit_base,
-            wild_limit: (block as usize + block_len).wrapping_sub(DIRECT_WILDCOPY_SLACK),
-            hist: state.offset_hist,
-        };
-        driver.store_fast_block::<K>(&mut store);
-        // SAFETY: the store wrote every sequence and literal below its cursors,
-        // inside the buffers sized for the largest block.
-        unsafe {
-            parts
-                .sequences
-                .set_len(store.seq.offset_from(seq_base) as usize);
-            parts
-                .literals
-                .set_len(store.lit.offset_from(lit_base) as usize);
-        }
-        state.offset_hist = store.hist;
-        return;
-    }
     let block_start_hist = state.offset_hist;
     let mut hist = state.offset_hist;
     // The built-in matcher searches compiled for the frame's tier; a matcher
@@ -771,66 +737,6 @@ fn builtin_block_sequences<K: EncodeTier>(
     driver.start_matching_with::<K>(move |seq| {
         record_builtin_sequence(seq, tail, sequences, code_offsets, hist)
     });
-}
-
-/// Bytes of the block that must remain past a run for [`DirectStore`] to copy
-/// it in whole 16-byte chunks: one chunk past the run's end, plus the margin
-/// the literals buffer keeps over the block.
-const DIRECT_WILDCOPY_SLACK: usize = 32;
-
-/// A block's sequences and literals, written as the Fast kernel finds them
-/// (upstream zstd `ZSTD_storeSeq`): each literal run is copied as its sequence
-/// is recorded, and the offset coded against `hist`, the history the decoder
-/// will hold.
-struct DirectStore {
-    seq: *mut RawSequence,
-    lit: *mut u8,
-    /// The last address a run may end at to be copied in whole chunks.
-    wild_limit: usize,
-    hist: [u32; 3],
-}
-
-impl crate::encoding::simple::fast_kernel::kernel::KernelSink for DirectStore {
-    #[inline(always)]
-    fn triple(&mut self, literals: *const u8, literal_len: usize, offset: usize, match_len: usize) {
-        debug_assert!(match_len >= FORMAT_MIN_MATCH);
-        let off_base =
-            encode_offset_with_history_fast(offset as u32, literal_len as u32, &mut self.hist);
-        // SAFETY: a run lies inside the block, and the literals written so far
-        // are no more than the bytes of the block before it, so the buffer,
-        // sized for the block, has room for the run and for the chunk the wide
-        // copy writes past it when the block has `DIRECT_WILDCOPY_SLACK` bytes
-        // after the run. The sequences buffer holds the block's most.
-        unsafe {
-            if literals as usize + literal_len <= self.wild_limit {
-                // Upstream `ZSTD_copy16`, then `ZSTD_wildcopy` for the rest.
-                core::ptr::copy_nonoverlapping(literals, self.lit, 16);
-                let mut done = 16;
-                while done < literal_len {
-                    core::ptr::copy_nonoverlapping(literals.add(done), self.lit.add(done), 16);
-                    done += 16;
-                }
-            } else {
-                core::ptr::copy_nonoverlapping(literals, self.lit, literal_len);
-            }
-            self.seq.write(RawSequence {
-                ll: literal_len as u32,
-                ml: match_len as u32,
-                off_base,
-            });
-            self.seq = self.seq.add(1);
-            self.lit = self.lit.add(literal_len);
-        }
-    }
-
-    #[inline(always)]
-    fn tail(&mut self, literals: *const u8, len: usize) {
-        // SAFETY: as `triple`'s exact copy.
-        unsafe {
-            core::ptr::copy_nonoverlapping(literals, self.lit, len);
-            self.lit = self.lit.add(len);
-        }
-    }
 }
 
 /// [`record_sequence`] for the built-in matcher, whose reports need no
