@@ -160,12 +160,20 @@ const FAST_TAG_MIN_FILL: (u128, u128) = (3, 2);
 #[cfg(target_arch = "x86")]
 const FAST_TAG_MIN_FILL: (u128, u128) = (5, 4);
 
+/// Positions a bare table keeps free above its epoch bias: the eviction band,
+/// two windows at the `window_log <= 30` ceiling.
+const MAX_EPOCH_HEADROOM: usize = 1 << 31;
+
 /// What a reset does with a hash table that continues the previous frame's
 /// (a new table always starts empty).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TableCarry {
-    /// Empty it, so the raw-slice no-dict kernels see a bias-0 table.
+    /// Empty it: a copied dictionary is indexed into it next.
     Clear,
+    /// A frame with no dictionary: advance the epoch bias past everything the
+    /// previous frames stored, as upstream's index runs on through
+    /// `ZSTD_window_clear` with the tables left as they are.
+    Continue,
     /// The frame re-primes the same dictionary in attach mode: advance the
     /// epoch bias past everything the previous frames stored instead of a
     /// full-table memset (upstream zstd `ZSTD_continueCCtx`), provided the
@@ -732,7 +740,7 @@ impl FastKernelMatcher {
             // its hashes stay valid and the per-frame re-hash is skipped
             // (CDict-equivalent).
             let span = u32::try_from(self.table_pos_high_water).unwrap_or(u32::MAX);
-            self.hash_table.advance_epoch(span);
+            self.hash_table.advance_epoch(span, MAX_EPOCH_HEADROOM);
             // Re-borrow: the dictionary bytes from the previous frame are still
             // resident at the front of history (`[0, region)`), so keep them in
             // place instead of clearing + re-committing — the per-frame dict
@@ -744,12 +752,23 @@ impl FastKernelMatcher {
             if region > 0 && self.history.len() >= region {
                 reborrow_region = Some(region);
             }
+        } else if carry == TableCarry::Continue {
+            // What the frame can store: its window's history when owned, which
+            // `set_borrowed_window` checks again against a longer slice.
+            let headroom = if tagged {
+                primed_window
+                    .saturating_mul(2)
+                    .saturating_add(crate::common::MAX_BLOCK_SIZE as usize)
+            } else {
+                MAX_EPOCH_HEADROOM
+            };
+            let span = u32::try_from(self.table_pos_high_water).unwrap_or(u32::MAX);
+            self.hash_table.advance_epoch(span, headroom);
         } else {
             // Same shape — keep the allocation, zero the entries via
-            // `memset` (ZSTD_window_clear cadence). A primed dict table
-            // is retained (see the epoch branch above for why that is
-            // sound); a copy-mode frame drops it when it primes, which is
-            // the only case that must not keep it.
+            // `memset`. A primed dict table is retained (see the epoch branch
+            // above for why that is sound); a copy-mode frame drops it when
+            // it primes, which is the only case that must not keep it.
             self.hash_table.clear();
         }
         self.table_pos_high_water = 0;
@@ -894,10 +913,13 @@ impl FastKernelMatcher {
             "set_borrowed_window called without a preceding reset()/clear_borrowed_window",
         );
         // A borrowed scan stores absolute input positions, up to the whole
-        // buffer; past what a tagged slot holds, the frame runs untagged. The
-        // reset that precedes this left the table empty.
-        if self.hash_table.is_tagged() && buffer.len() > TAGGED_POSITION_LIMIT {
-            self.hash_table.untag_empty();
+        // buffer; past what a tagged slot holds, the frame runs untagged.
+        let biased_end = buffer.len().saturating_add(self.hash_table.bias() as usize);
+        if self.hash_table.is_tagged() && biased_end > TAGGED_POSITION_LIMIT {
+            self.hash_table.clear();
+            if buffer.len() > TAGGED_POSITION_LIMIT {
+                self.hash_table.untag_empty();
+            }
         }
         self.borrowed = Some((buffer.as_ptr(), buffer.len()));
         self.last_borrowed_block = None;
@@ -1199,7 +1221,28 @@ impl FastKernelMatcher {
     /// `_ =>` arm is unreachable because `validate_params` in
     /// [`FastHashTable::new`] rejects mls outside 4..=8 at
     /// construction.
-    pub(crate) fn start_matching(&mut self, handle_sequence: impl FnMut(Sequence)) {
+    pub(crate) fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
+        self.scan_owned(&mut handle_sequence);
+    }
+
+    /// The block [`Self::scan_owned`] will scan, as its address and length.
+    pub(crate) fn owned_block(&self) -> Option<(*const u8, usize)> {
+        if self.borrowed.is_some() {
+            return None;
+        }
+        let len = self.staged_block?;
+        let end = self.committed_len();
+        Some((self.history[end - len..end].as_ptr(), len))
+    }
+
+    /// [`Self::start_matching`] reporting to any [`KernelSink`], such as a
+    /// store that records the block's sequences and literals.
+    ///
+    /// [`KernelSink`]: super::fast_kernel::kernel::KernelSink
+    pub(crate) fn scan_owned(
+        &mut self,
+        handle_sequence: &mut impl super::fast_kernel::kernel::KernelSink,
+    ) {
         // Owned scan path. A borrowed one-shot window (set via
         // `set_borrowed_window`) is mutually exclusive with this path:
         // a committed block lives in `self.history` and `block_start`
@@ -1307,6 +1350,10 @@ impl FastKernelMatcher {
                 .dict
                 .table()
                 .expect("use_dict implies dict_table is Some");
+            // The dictionary kernel reports plain sequences; their runs follow
+            // each other from the block's start, so the sink is handed each
+            // run's address by walking them.
+            let mut at = history[block_start..].as_ptr();
             run_fast_kernel_block_dict(
                 history,
                 block_start,
@@ -1318,7 +1365,17 @@ impl FastKernelMatcher {
                 step_size,
                 mls,
                 use_cmov,
-                handle_sequence,
+                |seq| match seq {
+                    Sequence::Triple {
+                        literal_len,
+                        offset,
+                        match_len,
+                    } => {
+                        handle_sequence.triple(at, literal_len, offset, match_len);
+                        at = at.wrapping_add(literal_len + match_len);
+                    }
+                    Sequence::Literals { len } => handle_sequence.tail(at, len),
+                },
             )
         } else {
             // Owned scan reads `self.history` directly (the guard above
@@ -1365,7 +1422,29 @@ impl FastKernelMatcher {
         &mut self,
         block_start: usize,
         block_end: usize,
-        handle_sequence: impl FnMut(Sequence),
+        mut handle_sequence: impl FnMut(Sequence),
+    ) {
+        self.scan_borrowed(block_start, block_end, &mut handle_sequence);
+    }
+
+    /// Address of `block_start` in the registered borrowed window.
+    pub(crate) fn borrowed_block_ptr(&self, block_start: usize) -> *const u8 {
+        let (ptr, total_len) = self
+            .borrowed
+            .expect("a borrowed block requires a registered borrowed window");
+        assert!(block_start <= total_len, "borrowed block past its window");
+        ptr.wrapping_add(block_start)
+    }
+
+    /// [`Self::start_matching_borrowed`] reporting to any [`KernelSink`],
+    /// such as a store that records the block's sequences and literals.
+    ///
+    /// [`KernelSink`]: super::fast_kernel::kernel::KernelSink
+    pub(crate) fn scan_borrowed(
+        &mut self,
+        block_start: usize,
+        block_end: usize,
+        handle_sequence: &mut impl super::fast_kernel::kernel::KernelSink,
     ) {
         let (ptr, total_len) = self
             .borrowed
@@ -1379,12 +1458,8 @@ impl FastKernelMatcher {
             block_start <= block_end && block_end <= total_len,
             "borrowed block bounds out of range: start={block_start} end={block_end} total={total_len}",
         );
-        // Borrowed scans store raw (bias-0) positions up to `block_end`
-        // through the table's hot-state slice; record them for `reset`'s
-        // epoch-advance span. (A borrowed window never coexists with a
-        // primed dict, so the table bias is 0 here — see `hot_state` —
-        // but the high-water must still cover these positions in case a
-        // dictionary is attached on a later frame.)
+        // Borrowed scans store positions up to `block_end`; record them for
+        // `reset`'s epoch-advance span.
         self.table_pos_high_water = self.table_pos_high_water.max(block_end);
         // Same window math as the owned path, but against the absolute
         // block end in the borrowed buffer rather than the accumulated
@@ -2477,7 +2552,7 @@ fn run_fast_kernel_block(
     step_size: usize,
     mls: u32,
     use_cmov: bool,
-    mut handle_sequence: impl FnMut(Sequence),
+    handle_sequence: &mut impl super::fast_kernel::kernel::KernelSink,
 ) -> [u32; 2] {
     use super::fast_kernel::kernel::PrefixBounds;
 
@@ -2501,7 +2576,7 @@ fn run_fast_kernel_block(
                 hash_table,
                 rep_in,
                 step_size,
-                &mut handle_sequence,
+                handle_sequence,
             )
         };
     }
@@ -2529,9 +2604,8 @@ fn run_fast_kernel_block(
 
     // Emit terminal literals if the kernel left a tail.
     if result.tail_literals_len > 0 {
-        handle_sequence(Sequence::Literals {
-            len: result.tail_literals_len,
-        });
+        let at = history.len() - result.tail_literals_len;
+        handle_sequence.tail(history[at..].as_ptr(), result.tail_literals_len);
     }
 
     result.rep

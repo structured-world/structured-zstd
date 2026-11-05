@@ -28,10 +28,11 @@ fn test_dict_parsing() {
     ];
     raw.extend(&raw_tables[..]);
 
-    //offset history 3,10,0x00ABCDEF
+    // Offset history 3, 10, 23: each within the 25 content bytes below, as a
+    // dictionary's repeat offsets must be.
     raw.extend(vec![3, 0, 0, 0]);
     raw.extend(vec![10, 0, 0, 0]);
-    raw.extend(vec![0xEF, 0xCD, 0xAB, 0]);
+    raw.extend(vec![23, 0, 0, 0]);
 
     //just some random bytes
     let raw_content = vec![
@@ -55,11 +56,11 @@ fn test_dict_parsing() {
         );
     }
 
-    if !dict.offset_hist.eq(&[3, 10, 0x00ABCDEF]) {
+    if !dict.offset_hist.eq(&[3, 10, 23]) {
         panic!(
             "offset history did not get parsed correctly. Is: {:?}, Should be: {:?}",
             dict.offset_hist,
-            [3, 10, 0x00ABCDEF]
+            [3, 10, 23]
         );
     }
 

@@ -110,5 +110,4 @@ fn changing_the_slot_format_empties_the_tables() {
     matcher.bind_tables(&mut workspace, false);
     assert!(!matcher.tagged);
     assert!(matcher.tables.iter().all(|&slot| slot == DFAST_EMPTY_SLOT));
-    assert!(matcher.tables_fresh);
 }

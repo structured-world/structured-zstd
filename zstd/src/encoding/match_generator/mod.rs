@@ -49,10 +49,6 @@ use super::simple::fast_matcher::{
 use super::workspace::HistoryBuf;
 
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
-// Bytes the dfast short hash reads (upstream zstd `mls = 5`). Seeding / lookahead
-// guards use it so a position is only short-hashed once its full 5-byte key
-// is in range.
-pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 5;
 pub(crate) const ROW_MIN_MATCH_LEN: usize = 5;
 // Upstream zstd `clevels.h:31` at level 3 large-input bucket sets
 // `hashLog = 17` (the long-hash table) and `chainLog = 16` (the
@@ -72,10 +68,6 @@ pub(crate) const ROW_MIN_MATCH_LEN: usize = 5;
 // `best_match`). Earlier revisions kept a
 // 4-slot bucket per hash position; that paid 4× the upstream zstd memory
 // without measurable ratio gain once the retry was in place.
-//
-// `dfast_hash_bits_for_window` still clamps the runtime long-hash
-// value to `[MIN_WINDOW_LOG, DFAST_HASH_BITS]`, so this const is the
-// upper bound rather than a fixed default.
 pub(crate) const DFAST_HASH_BITS: usize = 17;
 /// Difference between `long_hash_bits` and `short_hash_bits` —
 /// upstream zstd `hashLog - chainLog` is 1 at every dfast level (`clevels.h`
@@ -438,6 +430,9 @@ pub struct MatchGeneratorDriver {
     /// takes the CDict's tables (`ZSTD_loadDictionaryContent`). `None`
     /// without a dictionary.
     dict_reach_log: Option<u32>,
+    /// The last dictionary frame's resolved params, which the next frame of
+    /// the same dictionary and source size reuses.
+    dict_params: crate::encoding::levels::config::DictParamsMemo,
     // One-shot borrowed block range `[start, end)` staged by the borrowed
     // Fast frame path (`set_borrowed_block`) for the NEXT
     // `start_matching` / `skip_matching_with_hint`. `Some` routes that
@@ -780,6 +775,7 @@ impl MatchGeneratorDriver {
             reset_dict_attach_ok: true,
             reset_shape: None,
             dict_reach_log: None,
+            dict_params: Default::default(),
             dictionary_retained_budget: 0,
             source_size_hint: None,
             dictionary_size_hint: None,
@@ -953,35 +949,13 @@ impl MatchGeneratorDriver {
         self.frame_in_place
     }
 
-    /// Whether a borrowed scan starting now sees nothing of an earlier frame,
-    /// so the frame is the one a fresh matcher writes. Asked once per frame,
-    /// after `reset`; [`Self::borrowed_supported`] stays the per-block
-    /// invariant. Only the Dfast kernel numbers a borrowed frame's input from
-    /// zero regardless of what its tables hold; the others advance their
-    /// floor past the previous frame, borrowed or not.
-    pub(crate) fn borrowed_frame_is_independent(&self) -> bool {
-        match &self.storage {
-            MatcherStorage::Dfast(d) => !d.tables_hold_earlier_frames,
-            _ => true,
-        }
-    }
-
-    /// Make [`Self::borrowed_frame_is_independent`] hold by emptying the
-    /// tables of earlier frames.
-    pub(crate) fn forget_earlier_frames(&mut self) {
-        if let MatcherStorage::Dfast(d) = &mut self.storage {
-            d.forget_earlier_frames();
-        }
-    }
-
     /// Whether a DICTIONARY frame can take the borrowed (no input copy) path.
-    /// Only the Simple (Fast) backend with the dictionary ATTACHED (not the
-    /// copy/merge regime) has a borrowed dict scan — `start_matching_borrowed_dict`
-    /// reads live matches from the borrowed input in place and dict matches
-    /// from the committed dict prefix via the 2-segment counter. Every other
-    /// backend, and copy-mode (large-input) dict frames, stay on the owned
-    /// path. Checked AFTER priming, so `is_attached()` reflects the resolved
-    /// attach-vs-copy decision.
+    /// The Simple (Fast) and Dfast backends with the dictionary ATTACHED (not
+    /// the copy/merge regime) have a borrowed dict scan: live matches read the
+    /// borrowed input in place and dict matches the committed dict prefix via
+    /// the 2-segment counter. Every other backend, and copy-mode (large-input)
+    /// dict frames, stay on the owned path. Checked AFTER priming, so
+    /// `is_attached()` reflects the resolved attach-vs-copy decision.
     pub(crate) fn borrowed_dict_supported(&self) -> bool {
         // As in `borrowed_supported`: a producer reads the committed block. A
         // long-distance search counts the dictionary ahead of the input, which
@@ -989,10 +963,13 @@ impl MatchGeneratorDriver {
         // owned and this must agree.
         self.producer.is_none()
             && !self.matches_beyond_window_tables()
-            && matches!(
-                &self.storage,
-                MatcherStorage::Simple(m) if m.dict_is_attached()
-            )
+            && match &self.storage {
+                MatcherStorage::Simple(m) => m.dict_is_attached(),
+                // The reset also asked that the input fit the window, so that
+                // no block evicts the dictionary the scan reads.
+                MatcherStorage::Dfast(d) => d.dict.is_attached() && self.frame_in_place,
+                _ => false,
+            }
     }
 
     fn simple_mut(&mut self) -> &mut FastKernelMatcher {
@@ -1465,8 +1442,12 @@ impl Matcher for MatchGeneratorDriver {
         // A dictionary too large for the tagged attach position field falls back
         // to copy mode. Captured here (from the load-set size hint = actual dict
         // length) so the prime decision and the snapshot-key / epoch bits agree.
-        self.reset_dict_attach_ok =
-            dict_hint.is_none_or(|sizes| sizes.content <= MAX_FAST_ATTACH_DICT_REGION);
+        // A dictionary loaded into the frame's tables is never searched in
+        // place: there is no separate set of tables to search.
+        self.reset_dict_attach_ok = dict_hint.is_none_or(|sizes| {
+            !crate::encoding::levels::config::dictionary_loads_into_frame(sizes, hint)
+                && sizes.content <= MAX_FAST_ATTACH_DICT_REGION
+        });
         let hinted = hint.is_some();
         // A dictionary frame takes its cParams and match-finder from the
         // CDict's cParams (upstream `ZSTD_resetCCtx_usingCDict`), whose tier
@@ -1474,51 +1455,34 @@ impl Matcher for MatchGeneratorDriver {
         // carries `dict_plan` to the Row backend. The dictionary is prepared
         // under the caller's parameters, so they are part of those cParams.
         let overrides = self.param_overrides.unwrap_or_default();
+        // A dictionary prepared for a level of its own stops describing a frame
+        // that outgrows it: the cParams row is the source's and the dictionary
+        // goes into those tables (`dictionary_loads_into_frame`).
+        let loaded_into_frame = dict_hint.is_some_and(|sizes| {
+            crate::encoding::levels::config::dictionary_loads_into_frame(sizes, hint)
+        });
         // Upstream indexes the last `1 << max(hashLog + 3, chainLog + 1)`
-        // bytes of a dictionary into its CDict, at the CDict's cParams
-        // (`ZSTD_loadDictionaryContent`).
+        // bytes of a dictionary into the tables it is loaded into, at their
+        // cParams (`ZSTD_loadDictionaryContent`, zstd_compress.c:4987).
         self.dict_reach_log = dict_hint.map(|sizes| {
-            let cd = crate::encoding::cparams::get_cdict_cparams(
-                crate::encoding::levels::config::numeric_level(level),
-                sizes.serialized,
-                &overrides,
-            );
+            let cd = if loaded_into_frame {
+                crate::encoding::cparams::get_frame_cparams(
+                    crate::encoding::levels::config::numeric_level(level),
+                    hint.unwrap_or(crate::encoding::cparams::CONTENTSIZE_UNKNOWN),
+                    sizes.content,
+                    &overrides,
+                )
+            } else {
+                crate::encoding::cparams::get_cdict_cparams(
+                    crate::encoding::levels::config::numeric_level(level),
+                    sizes.serialized,
+                    &overrides,
+                )
+            };
             (cd.hash_log + 3).max(cd.chain_log + 1).min(31)
         });
-        // A dictionary frame runs the shape the dictionary was prepared with,
-        // whatever the source size. Upstream stops doing that once the source
-        // outgrows the dictionary and resolves the frame's own instead
-        // (zstd_compress.c:5264). That alternative was implemented and measured
-        // against this one and against the reference, in one session with the
-        // arms interleaved, over five levels and two dictionary shapes, and it
-        // loses on every row where the two differ. Time per frame over a 1 MiB
-        // source, ours / the alternative / the reference:
-        //
-        //   3 KB dictionary        110 KB dictionary
-        //   L1  1.13 / 1.13 / 0.73  1.14 / 1.15 / 0.79 ms
-        //   L3  0.24 / 0.30 / 0.27  0.26 / 0.32 / 0.42 ms
-        //   L5  0.52 / 2.69 / 0.38  0.43 / 2.77 / 1.16 ms
-        //   L9  0.50 / 5.36 / 1.37  0.71 / 5.58 / 2.28 ms
-        //   L12 0.87 / 5.56 / 1.87  1.60 / 5.58 / 3.08 ms
-        //
-        // Three to eight times the time for bytes that match to within a
-        // percent, and under the larger dictionary this shape also beats the
-        // reference on BOTH axes from L3 up (at L9, 0.71 ms and 243 bytes
-        // against 2.28 ms and 1241), which the alternative would have given
-        // away. A control arm at 64 KiB, under the size where the alternative
-        // can run at all, stayed within 2.4% with identical output.
-        //
-        // The bench host is a VMware guest with no PMU passthrough, so cycles
-        // and instructions are unavailable there (`perf stat -e cycles` reports
-        // the event as unsupported); the figures above are `task-clock`, and at
-        // this margin an instruction count would not be what decides it.
-        //
-        // See `dictionary_describes_frame`, which the C ABI still reads for a
-        // question the codec cannot answer.
         let (params, dict_plan) = match dict_hint {
-            Some(sizes) => crate::encoding::levels::config::resolve_level_params_with_dict(
-                level, hint, sizes, &overrides,
-            ),
+            Some(sizes) => self.dict_params.resolve(level, hint, sizes, &overrides),
             None => (Self::level_params(level, hint), None),
         };
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -1561,7 +1525,12 @@ impl Matcher for MatchGeneratorDriver {
         // all-`None` case is skipped so default level geometry stays
         // byte-identical to plain level-based compression. Shared with the
         // workspace estimate, which has to build what this builds.
-        if let Some(ov) = self.param_overrides {
+        // Not for a dictionary loaded into the frame: that resolution applied
+        // them itself, in the order that lets the adjustment bound them. Re-
+        // applying the raw values here would put each knob back past its cap.
+        if let Some(ov) = self.param_overrides
+            && !loaded_into_frame
+        {
             crate::encoding::levels::config::apply_frame_overrides(
                 &mut params,
                 &ov,
@@ -1731,9 +1700,26 @@ impl Matcher for MatchGeneratorDriver {
         let long_distance = false;
         let long_distance_in_place =
             matches!(next_backend, super::strategy::BackendTag::Simple) && dict_hint.is_none();
+        // The prime makes the same decision through the same helper, so the
+        // layout chosen here is the one the dictionary is primed into.
+        let dfast_attach_next =
+            dict_hint.is_some_and(|sizes| self.dfast_attaches_dictionary(sizes.content));
+        // The dfast backend reads an attached dictionary in place as well, once
+        // it has tables: a dictionary shorter than a short key indexes nothing
+        // and stays unattached. The input has to fit the window too, or a
+        // later block would evict the dictionary the scan reads in front of it.
+        let dfast_key_len = params
+            .dfast
+            .map_or(0, |d| crate::encoding::dfast::dfast_key_len(d.min_match));
+        let dfast_dict_in_place = |len: usize| {
+            matches!(next_backend, super::strategy::BackendTag::Dfast)
+                && dfast_attach_next
+                && dict_len >= dfast_key_len
+                && len <= max_window_size
+        };
         self.frame_in_place = match workspace.ingest() {
             crate::encoding::workspace::IngestPlan::Slice(len) => {
-                (dict_hint.is_none() || fast_attach)
+                (dict_hint.is_none() || fast_attach || dfast_dict_in_place(len))
                     && (!long_distance || long_distance_in_place)
                     && self.borrowed_supported()
                     && len
@@ -1761,10 +1747,6 @@ impl Matcher for MatchGeneratorDriver {
         // below; HC/Fast leave it `0` because their widths live in `params`
         // (`hc.{hash,chain}_log` / `fast_hash_log`) — already part of the key.
         let mut resolved_table_bits: usize = 0;
-        // The prime makes the same decision through the same helper, so the
-        // layout chosen here is the one the dictionary is primed into.
-        let dfast_attach_next =
-            dict_hint.is_some_and(|sizes| self.dfast_attaches_dictionary(sizes.content));
         match &mut self.storage {
             MatcherStorage::Simple(m) => {
                 // Per-level Fast cParams threaded from
@@ -1773,9 +1755,8 @@ impl Matcher for MatchGeneratorDriver {
                 let fast = params.fast.expect("Fast level row carries a FastConfig");
                 // Same attach/copy split the dict-prime dispatch applies
                 // below (`prime_with_dictionary`): only attach-mode dict
-                // frames may keep the main table across the reset via an
-                // epoch advance — copy-mode and no-dict frames must memset
-                // it back to bias 0 for the raw-slice kernels.
+                // frames may keep the dictionary across the reset via an
+                // epoch advance; a copy-mode frame re-primes its table.
                 let dict_attach_epoch = dict_hint.is_some()
                     && self.reset_dict_attach_ok
                     && self
@@ -1820,6 +1801,8 @@ impl Matcher for MatchGeneratorDriver {
                     TableCarry::OverwrittenByRestore { tagged }
                 } else if dict_attach_epoch {
                     TableCarry::AdvanceEpoch
+                } else if dict_hint.is_none() {
+                    TableCarry::Continue
                 } else {
                     TableCarry::Clear
                 };
@@ -1843,13 +1826,19 @@ impl Matcher for MatchGeneratorDriver {
                 // UNKNOWN, dictSize)` adjusted for a `minSrcSize` source), not
                 // the source-capped main width: a small source must not
                 // shrink the table a large dictionary was sized for.
+                // A dictionary loaded into the frame's tables is indexed at the
+                // frame's own width: there is no separately-sized set.
                 m.set_dict_table_hash_log(dict_hint.map(|sizes| {
-                    crate::encoding::cparams::get_cdict_cparams(
-                        crate::encoding::levels::config::numeric_level(level),
-                        sizes.serialized,
-                        &overrides,
-                    )
-                    .hash_log
+                    if loaded_into_frame {
+                        hash_log
+                    } else {
+                        crate::encoding::cparams::get_cdict_cparams(
+                            crate::encoding::levels::config::numeric_level(level),
+                            sizes.serialized,
+                            &overrides,
+                        )
+                        .hash_log
+                    }
                 }));
                 let tables =
                     crate::encoding::simple::fast_kernel::hash_table::FastHashTable::workspace_bytes(
@@ -1882,25 +1871,24 @@ impl Matcher for MatchGeneratorDriver {
                 let dcfg = params
                     .dfast
                     .expect("Dfast level row must carry a DfastConfig");
-                // Upstream zstd `cParams.hashLog`/`chainLog`, capped by the
-                // source-size window when hinted so tiny inputs don't
-                // over-allocate.
-                let long_bits = if hinted {
-                    dfast_hash_bits_for_window(table_window_size).min(dcfg.long_hash_log as usize)
-                } else {
-                    dcfg.long_hash_log as usize
-                };
-                let short_bits = if hinted {
-                    dfast_hash_bits_for_window(table_window_size).min(dcfg.short_hash_log as usize)
-                } else {
-                    dcfg.short_hash_log as usize
-                };
+                // Upstream zstd `cParams.hashLog`/`chainLog` as resolved: every
+                // path that produces them (the level, a dictionary's CDict, the
+                // parameter overrides) has already down-sized them for the
+                // source the way `ZSTD_adjustCParams_internal` does, `hashLog`
+                // to the source's log plus one and `chainLog` to the log.
+                let long_bits = dcfg.long_hash_log as usize;
+                let short_bits = dcfg.short_hash_log as usize;
                 resolved_table_bits = long_bits;
                 dfast.set_hash_bits(long_bits, short_bits);
+                dfast.set_min_match(dcfg.min_match);
                 // The attached dictionary tables take the CDict's geometry
                 // (upstream hashes the dictMatchState tables with
                 // `dictCParams`), not the source-capped live widths.
                 dfast.set_dict_table_bits(dict_hint.map(|sizes| {
+                    // Loaded into the frame's tables: the frame's own widths.
+                    if loaded_into_frame {
+                        return (long_bits, short_bits);
+                    }
                     let cd = crate::encoding::cparams::get_cdict_cparams(
                         crate::encoding::levels::config::numeric_level(level),
                         sizes.serialized,
@@ -2401,6 +2389,44 @@ fn owned_sink<'a, F: FnMut(Sequence)>(
 }
 
 impl MatchGeneratorDriver {
+    /// The block the Fast backend matches next, as its address and length,
+    /// when no dictionary, long-distance matching or producer takes part: the
+    /// block [`Self::store_fast_block`] scans. The dictionary kernels keep the
+    /// closure: their two-cursor loop pays more for the inlined copy than the
+    /// gather pass costs.
+    pub(crate) fn direct_fast_block(&mut self) -> Option<(*const u8, usize)> {
+        #[cfg(feature = "ldm")]
+        if self.ldm.is_some() {
+            return None;
+        }
+        if self.producer.is_some()
+            || !matches!(self.active_backend(), super::strategy::BackendTag::Simple)
+            || self.simple_mut().dict_is_attached()
+        {
+            return None;
+        }
+        match self.borrowed_pending {
+            Some((block_start, block_end)) => Some((
+                self.simple_mut().borrowed_block_ptr(block_start),
+                block_end - block_start,
+            )),
+            None => self.simple_mut().owned_block(),
+        }
+    }
+
+    /// Scan the block [`Self::direct_fast_block`] named into `sink`.
+    pub(crate) fn store_fast_block<K: EncodeTier>(
+        &mut self,
+        sink: &mut impl crate::encoding::simple::fast_kernel::kernel::KernelSink,
+    ) {
+        let pending = self.borrowed_pending.take();
+        let m = self.simple_mut();
+        match pending {
+            Some((block_start, block_end)) => m.scan_borrowed(block_start, block_end, sink),
+            None => m.scan_owned(sink),
+        }
+    }
+
     /// [`Matcher::start_matching`] compiled for the kernel tier `K`, the one
     /// the encoder chose for the frame. Nothing below asks for a tier.
     pub(crate) fn start_matching_with<K: EncodeTier>(

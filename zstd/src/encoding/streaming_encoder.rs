@@ -115,7 +115,13 @@ pub struct CompressionContext<M: Matcher = MatchGeneratorDriver> {
     /// bytes produced so far in this frame; the block pre-splitter only cuts
     /// full blocks once the frame has saved enough.
     savings: i64,
+    /// Whether the frame has written a compressed-path block yet: its first
+    /// is never rewritten as RLE once searched (upstream `isFirstBlock`).
+    block_written: bool,
     tuning: FrameTuning,
+    /// The last dictionary frame's resolved params, which the next frame of
+    /// the same dictionary and source size reuses.
+    dict_params: crate::encoding::levels::config::DictParamsMemo,
     /// `ZSTD_f_zstd1_magicless` — omit the 4-byte magic number prefix.
     /// Default false. See [`Self::set_magicless`].
     magicless: bool,
@@ -375,7 +381,7 @@ impl CompressionContext<MatchGeneratorDriver> {
         let overrides = params.overrides();
         // Persist the strategy override so `ensure_frame_started`'s level-based
         // resync does not discard it (matching `FrameCompressor::set_parameters`).
-        self.tuning = FrameTuning::from_overrides(&overrides);
+        self.tuning = FrameTuning::from_parameters(params);
         self.state.strategy_tag = self.tuning.strategy.map_or_else(
             || {
                 crate::encoding::strategy::StrategyTag::for_compression_level(
@@ -457,7 +463,9 @@ impl<M: Matcher> CompressionContext<M> {
             content_size_flag: true,
             bytes_consumed: 0,
             savings: 0,
+            block_written: false,
             tuning: FrameTuning::default(),
+            dict_params: Default::default(),
             magicless: false,
             content_checksum: false,
             dictionary: None,
@@ -1125,6 +1133,7 @@ impl<M: Matcher> CompressionContext<M> {
         // byte-equivalent.
         let hint = self.pledged_content_size.or(self.source_size_hint);
         let params = crate::encoding::frame_compressor::resolve_frame_params(
+            &mut self.dict_params,
             self.compression_level,
             hint,
             self.dictionary.as_ref().filter(|_| use_dictionary_state),
@@ -1206,6 +1215,7 @@ impl<M: Matcher> CompressionContext<M> {
             self.state.fse_tables.of_previous = None;
         }
         self.savings = 0;
+        self.block_written = false;
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
@@ -1420,6 +1430,8 @@ impl<M: Matcher> CompressionContext<M> {
             block_len,
             &mut self.encoded_scratch,
             dict_active,
+            !self.tuning.raw_skip_disabled,
+            !self.block_written,
             // No FrameEmitInfo on the streaming encoder path: it does not
             // surface per-block layout, so no sidecar.
             #[cfg(feature = "lsm")]
@@ -1427,6 +1439,7 @@ impl<M: Matcher> CompressionContext<M> {
             #[cfg(all(feature = "lsm", feature = "hash"))]
             None,
         );
+        self.block_written = true;
         // The block is committed to the match finder whether or not the drain
         // takes it; a drain that fails leaves the context failed.
         drain.write_all(&self.encoded_scratch)?;

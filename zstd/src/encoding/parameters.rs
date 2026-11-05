@@ -497,6 +497,7 @@ impl ParamOverrides {
 pub struct CompressionParameters {
     level: CompressionLevel,
     overrides: ParamOverrides,
+    raw_skip: bool,
 }
 
 impl CompressionParameters {
@@ -516,12 +517,19 @@ impl CompressionParameters {
             ldm: LdmOverride::default(),
             literal_compression: LiteralCompressionMode::Auto,
             row_match_finder: RowMatchFinderMode::Auto,
+            raw_skip: true,
         }
     }
 
     /// The base compression level these parameters override.
     pub fn level(&self) -> CompressionLevel {
         self.level
+    }
+
+    /// Whether a block that samples as incompressible may go out raw without
+    /// being searched (see [`CompressionParametersBuilder::raw_skip`]).
+    pub fn raw_skip_enabled(&self) -> bool {
+        self.raw_skip
     }
 
     /// Whether long-distance matching is enabled.
@@ -554,10 +562,7 @@ impl CompressionParameters {
     /// assert!(params.window_log_for(Some(1000), 0) < 23);
     /// ```
     pub fn window_log_for(&self, source_size: Option<u64>, dictionary_size: usize) -> u32 {
-        let sizes = crate::encoding::DictionarySizes {
-            content: dictionary_size,
-            serialized: dictionary_size,
-        };
+        let sizes = crate::encoding::DictionarySizes::raw_content(dictionary_size);
         let params =
             crate::encoding::levels::config::frame_level_params(self, source_size, Some(sizes));
         u32::from(params.window_log)
@@ -619,9 +624,42 @@ pub struct CompressionParametersBuilder {
     ldm: LdmOverride,
     literal_compression: LiteralCompressionMode,
     row_match_finder: RowMatchFinderMode,
+    raw_skip: bool,
 }
 
 impl CompressionParametersBuilder {
+    /// Let a block whose sample reads as incompressible go out raw, and a
+    /// block of one repeated byte go out as RLE, without being searched: on by
+    /// default. A repeat of earlier content still keeps such a block on the
+    /// search. With it off every block is searched, as upstream zstd searches
+    /// every block: only a block the search fails to shrink goes out raw, and
+    /// a repeated byte becomes RLE after its search, never in a frame's first
+    /// block. No upstream parameter matches it.
+    ///
+    /// ```rust
+    /// use structured_zstd::encoding::{
+    ///     compress_with_parameters, CompressionLevel, CompressionParameters,
+    /// };
+    /// use structured_zstd::decoding::FrameDecoder;
+    ///
+    /// let data: Vec<u8> = (0..65536u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    /// let searched = CompressionParameters::builder(CompressionLevel::Level(3))
+    ///     .raw_skip(false)
+    ///     .build()
+    ///     .unwrap();
+    /// assert!(!searched.raw_skip_enabled());
+    /// let frame = compress_with_parameters(&data[..], &searched);
+    /// let mut decoded = Vec::with_capacity(data.len());
+    /// FrameDecoder::new()
+    ///     .decode_all_to_vec(&frame, &mut decoded)
+    ///     .unwrap();
+    /// assert_eq!(decoded, data);
+    /// ```
+    pub fn raw_skip(mut self, enabled: bool) -> Self {
+        self.raw_skip = enabled;
+        self
+    }
+
     /// Choose the finder the greedy, lazy and lazy2 strategies search instead
     /// of leaving it to the window size. C `ZSTD_c_useRowMatchFinder`.
     ///
@@ -809,6 +847,7 @@ impl CompressionParametersBuilder {
                 literal_compression: self.literal_compression,
                 row_match_finder: self.row_match_finder,
             },
+            raw_skip: self.raw_skip,
         })
     }
 }

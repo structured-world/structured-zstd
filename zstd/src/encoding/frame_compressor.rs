@@ -48,6 +48,9 @@ pub struct EncoderDictionary {
     /// already parsed ([`Self::from_dictionary`]) — exact for raw-content
     /// dictionaries, a close lower bound otherwise.
     serialized_len: usize,
+    /// Prepared for a compression level of its own
+    /// ([`Self::prepared_at_level`]).
+    prepared_at_level: bool,
 }
 
 /// What an [`EncoderDictionary`] shares between its clones: the parsed
@@ -84,7 +87,33 @@ impl EncoderDictionary {
                 entropy,
             }),
             serialized_len,
+            prepared_at_level: false,
         }
+    }
+
+    /// Mark this dictionary as prepared for compression at `level`, as upstream
+    /// `ZSTD_createCDict(dict, size, level)` prepares one. A frame whose source
+    /// outgrows such a dictionary (see
+    /// [`dictionary_describes_frame`](crate::encoding::dictionary_describes_frame))
+    /// resolves the parameters for its own size and indexes the dictionary into
+    /// those tables (zstd_compress.c:5278). A dictionary left unmarked, the way
+    /// a compressor loads one, gives every frame the shape it is prepared with,
+    /// as upstream does for a dictionary loaded into a context or prepared with
+    /// explicit parameters. Level 0 marks nothing, as upstream reads it as no
+    /// level of its own.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::EncoderDictionary;
+    ///
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(b"raw content")
+    ///     .unwrap()
+    ///     .prepared_at_level(3);
+    /// # let _ = dictionary;
+    /// ```
+    pub fn prepared_at_level(mut self, level: i32) -> Self {
+        self.prepared_at_level = level != 0;
+        self
     }
 
     /// Wrap an already-parsed [`Dictionary`](crate::decoding::Dictionary) for
@@ -252,6 +281,7 @@ impl EncoderDictionary {
         crate::encoding::DictionarySizes {
             content: self.inner.dict_content.len(),
             serialized: self.serialized_len,
+            prepared_at_level: self.prepared_at_level,
         }
     }
 
@@ -394,6 +424,9 @@ pub struct FrameCompressor<
     /// requires). Set via `set_pre_split_disabled` (a `bench-internals`
     /// diagnostic); default `false`.
     pre_split_disabled: bool,
+    /// The last dictionary frame's resolved params, which the next frame of
+    /// the same dictionary and source size reuses.
+    dict_params: crate::encoding::levels::config::DictParamsMemo,
     /// Whether to record `Frame_Content_Size` in the frame header when the
     /// total size is known (semantics of upstream `ZSTD_c_contentSizeFlag`).
     /// Default `true`, matching upstream. With the flag off the header
@@ -468,15 +501,20 @@ pub(crate) struct FrameTuning {
     /// `ZSTD_c_literalCompressionMode`), kept for the same per-frame
     /// recomputation of the raw-literals gate.
     pub(crate) literal_compression: LiteralCompressionMode,
+    /// Every block is searched: the raw skip is off
+    /// ([`CompressionParametersBuilder::raw_skip`](crate::encoding::CompressionParametersBuilder::raw_skip)).
+    pub(crate) raw_skip_disabled: bool,
 }
 
 impl FrameTuning {
-    /// The tuning `overrides` asks for.
-    pub(crate) fn from_overrides(overrides: &crate::encoding::parameters::ParamOverrides) -> Self {
+    /// The tuning `params` asks for.
+    pub(crate) fn from_parameters(params: &crate::encoding::CompressionParameters) -> Self {
+        let overrides = params.overrides();
         Self {
             strategy: overrides.strategy.map(|s| (s.tag(), s.lazy_depth())),
             target_length: overrides.target_length,
             literal_compression: overrides.literal_compression,
+            raw_skip_disabled: !params.raw_skip_enabled(),
         }
     }
 }
@@ -1105,32 +1143,6 @@ pub(crate) fn block_splitter_decision_for_bench(block: &[u8], split_level: usize
     }
 }
 
-/// Pull a pre-split window into cache with one bandwidth-bound sequential
-/// pass before the strided fingerprint histogram + match scan read it.
-///
-/// The borrowed (no-copy) over-window path matches in place on the caller's
-/// input, so the pre-split fingerprint is the FIRST touch of that 128 KiB
-/// region — a cache-cold read. `presplit_record_fingerprint` reads it with a
-/// `sampling_rate` stride and interleaved random writes into the 1 KiB events
-/// table, a latency-bound pattern that pays full DRAM miss latency per line
-/// (measured ~3x the cost of an ERMS streaming read of the same bytes). The
-/// owned path never hits this because its history-mirror copy already warmed
-/// the bytes; this restores that warmth without the copy's write half. One
-/// dependent load per 64-byte line (the i9 line size) streams under the
-/// hardware prefetcher, so the cold read is paid once at memory bandwidth and
-/// every subsequent strided sample lands in L1/L2. `black_box` keeps the loop
-/// from being optimized away as a dead read.
-#[inline]
-fn warm_presplit_window(window: &[u8]) {
-    let mut acc = 0u8;
-    let mut i = 0usize;
-    while i < window.len() {
-        acc ^= window[i];
-        i += 64;
-    }
-    core::hint::black_box(acc);
-}
-
 /// [`optimal_block_size_with`] at a level's default pre-split tier; the
 /// frame loop resolves the tier itself, so only tests and the
 /// `bench-internals` block-boundary probe read this form.
@@ -1338,6 +1350,33 @@ pub(crate) fn literal_compression_disabled(
     }
 }
 
+/// The level params the matcher's reset resolves for a frame: through the
+/// dictionary's CDict tier when a dictionary is in play, else by source size.
+/// Resolved without the caller's knobs: the frame gates read only the
+/// strategy from these, and a strategy override replaces it
+/// ([`sync_effective_strategy`]) on a dictionary frame as on any other.
+/// `memo` holds the last dictionary answer, which a reused compressor's next
+/// frame of the same dictionary takes back.
+pub(crate) fn resolve_frame_params(
+    memo: &mut crate::encoding::levels::config::DictParamsMemo,
+    level: CompressionLevel,
+    hint: Option<u64>,
+    dictionary: Option<&EncoderDictionary>,
+) -> crate::encoding::levels::config::LevelParams {
+    match dictionary {
+        Some(dict) if !dict.inner.dict_content.is_empty() => {
+            memo.resolve(
+                level,
+                hint,
+                dict.sizes(),
+                &crate::encoding::parameters::ParamOverrides::default(),
+            )
+            .0
+        }
+        _ => crate::encoding::levels::config::resolve_level_params(level, hint),
+    }
+}
+
 /// The `target_length` the raw-literals gate reads for a frame: the caller's,
 /// else, for a dictionary frame a strategy knob moves onto the fast strategy,
 /// the CDict row's, which the fast matcher runs as its step (upstream
@@ -1365,30 +1404,6 @@ pub(crate) fn gate_target_length(
             )
         }
         _ => None,
-    }
-}
-
-/// The level params the matcher's reset resolves for a frame: through the
-/// dictionary's CDict tier when a dictionary is in play, else by source size.
-/// Resolved without the caller's knobs: the frame gates read only the
-/// strategy from these, and a strategy override replaces it
-/// ([`sync_effective_strategy`]) on a dictionary frame as on any other.
-pub(crate) fn resolve_frame_params(
-    level: CompressionLevel,
-    hint: Option<u64>,
-    dictionary: Option<&EncoderDictionary>,
-) -> crate::encoding::levels::config::LevelParams {
-    match dictionary {
-        Some(dict) if !dict.inner.dict_content.is_empty() => {
-            crate::encoding::levels::config::resolve_level_params_with_dict(
-                level,
-                hint,
-                dict.sizes(),
-                &crate::encoding::parameters::ParamOverrides::default(),
-            )
-            .0
-        }
-        _ => crate::encoding::levels::config::resolve_level_params(level, hint),
     }
 }
 
@@ -1865,6 +1880,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             magicless: false,
             content_checksum: false,
             pre_split_disabled: false,
+            dict_params: Default::default(),
             content_size_flag: true,
             dict_id_flag: true,
             target_block_size: None,
@@ -1927,7 +1943,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     pub fn set_parameters(&mut self, params: &crate::encoding::CompressionParameters) {
         self.compression_level = params.level();
         let overrides = params.overrides();
-        self.tuning = FrameTuning::from_overrides(&overrides);
+        self.tuning = FrameTuning::from_parameters(params);
         // Keep `state.strategy_tag` consistent immediately so the borrowed
         // one-shot eligibility gate (`borrowed_eligible`) and literal gates
         // are correct even before the next `compress()` re-sync. Resolve it
@@ -2039,19 +2055,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         out: &mut Vec<u8>,
     ) -> u64 {
         if self.borrowed_eligible(input.len(), prep) {
-            // A reused Dfast matcher's tables hold earlier frames, which its
-            // borrowed kernel (numbering this input from zero) would read as
-            // its own: emptied, the frame is the one a fresh matcher writes
-            // (upstream: first and later uses of a context compress the
-            // same). Measured cheaper than the owned path, which retires them
-            // by moving the floor but copies the input and runs slower: level 3
-            // on a reused ZSTD_compress2 context, the owned path costs 3.5% at
-            // 1 KiB frames, 4.1% at 4 KiB and 10.8% at 1 MiB, and gains at most
-            // 1% below 256 bytes, within noise. The emptied tables are sized
-            // from the frame's own source, so a tiny frame clears a tiny table.
-            if !self.state.matcher.borrowed_frame_is_independent() {
-                self.state.matcher.forget_earlier_frames();
-            }
+            // Earlier frames are below this one's floor whichever path wrote
+            // them, so a reused matcher writes the frame a fresh one does.
             self.run_borrowed_block_loop::<K>(input, out)
         } else {
             let mut cursor: &[u8] = input;
@@ -2256,24 +2261,6 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             // already spans the whole input, so a smaller block is just a
             // narrower `(block_start, block_end)` range into it.
             let savings = start as i64 - (out.len() - blocks_start) as i64;
-            // Borrowed path only: warm the pre-split window before the
-            // cache-cold strided fingerprint read. Gated to exactly the
-            // conditions under which `optimal_block_size` reads the whole
-            // window (a sampling pre-split level, a full 128 KiB block
-            // remaining, the block-size cap admits a full block, and
-            // `savings >= 3` so the splitter actually runs) — so other
-            // levels, the first block, and the trailing partial block pay
-            // nothing. Level 0 reads three 512-byte segments
-            // (`ZSTD_splitBlock_fromBorders`, `zstd_preSplit.c:198-226`), not
-            // the window, so warming 128 KiB for it was 2048 loads a block
-            // for 1.5 KiB read. See `warm_presplit_window`.
-            if savings >= 3
-                && input.len() - start >= MAX_BLOCK_SIZE as usize
-                && block_capacity >= MAX_BLOCK_SIZE as usize
-                && pre_split.is_some_and(|split_level| split_level != 0)
-            {
-                warm_presplit_window(&input[start..start + MAX_BLOCK_SIZE as usize]);
-            }
             let block_len = optimal_block_size_with(
                 pre_split,
                 &input[start..],
@@ -2308,6 +2295,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 end,
                 out,
                 dict_active,
+                !self.tuning.raw_skip_disabled,
+                start == 0,
                 #[cfg(feature = "lsm")]
                 Some(&mut self.block_decompressed_sizes),
                 #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -2449,6 +2438,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
             magicless: false,
             content_checksum: false,
             pre_split_disabled: false,
+            dict_params: Default::default(),
             content_size_flag: true,
             dict_id_flag: true,
             target_block_size: None,
@@ -2637,11 +2627,12 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
     /// The level params the matcher's reset resolves for the next frame
     /// (dictionary-aware when a dictionary will be used).
     fn resolve_frame_params(
-        &self,
+        &mut self,
         hint: Option<u64>,
         with_dictionary: bool,
     ) -> crate::encoding::levels::config::LevelParams {
         resolve_frame_params(
+            &mut self.dict_params,
             self.compression_level,
             hint,
             attached(&self.dictionary).filter(|_| with_dictionary),
@@ -3221,6 +3212,8 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
                 block_len,
                 out,
                 dict_active,
+                !self.tuning.raw_skip_disabled,
+                emitted == 0,
                 #[cfg(feature = "lsm")]
                 Some(&mut self.block_decompressed_sizes),
                 #[cfg(all(feature = "lsm", feature = "hash"))]

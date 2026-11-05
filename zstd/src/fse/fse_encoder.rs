@@ -1,5 +1,7 @@
+use crate::bit_io::BitBurst;
 use crate::bit_io::BitWriter;
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 
 /// Encodes a stream with a table the caller holds, so a table built into
 /// reusable storage is never moved into the encoder.
@@ -55,65 +57,97 @@ impl<'table, 'output, V: AsMut<Vec<u8>>> FSEEncoder<'table, 'output, V> {
         let mut state_1;
         let mut state_2;
 
+        // The stream goes through a burst, upstream's local `BIT_CStream_t`
+        // (`FSE_compress_usingCTable_generic`, fse_compress.c): a checked
+        // write per symbol reloaded and stored the writer's state each time.
+        // A transition emits at most `acc_log <= 9` bits (`to_encoder_table`
+        // caps the log), so four of them beside the under 8 bits a flush
+        // leaves stay under 64, which is upstream's four-symbol step on a
+        // 64-bit container. The room is what the stream can commit: `acc_log`
+        // bits a symbol and for each final state, the end mark, and the up to
+        // 7 bytes of the table description the burst drains as it starts. Kept
+        // tight on purpose: the Huffman weight description reuses one buffer
+        // sized for the widest description, and a looser room would grow it.
+        let table = self.table;
+        let acc_log = table.acc_log() as usize;
+        debug_assert!(acc_log <= 9, "an FSE accuracy log of {acc_log}");
+        let stream_bits = (data.len() + 2) * acc_log + 8;
+        let mut burst = self.writer.burst(stream_bits.div_ceil(8) + 7);
+        let step = |burst: &mut BitBurst<'_, V>, state: usize, symbol: u8| {
+            let next = table.next_state(symbol, state);
+            let diff = transition_bits(state, next.num_bits);
+            // SAFETY: at most five transitions of `<= 9` bits run between
+            // flushes (an odd stream's first symbol joins the first step),
+            // 45 bits beside the `<= 7` a flush leaves, and a
+            // transition's bits are `state & mask`, clean above its width.
+            unsafe { burst.add(diff as u64, next.num_bits as usize) };
+            next.index
+        };
+
         if data.len() & 1 != 0 {
             ip -= 1;
-            state_1 = self.table.start_state(data[ip]).index;
+            state_1 = table.start_state(data[ip]).index;
             ip -= 1;
-            state_2 = self.table.start_state(data[ip]).index;
+            state_2 = table.start_state(data[ip]).index;
             ip -= 1;
-            state_1 = self.encode_symbol_with_state(state_1, data[ip]);
+            state_1 = step(&mut burst, state_1, data[ip]);
         } else {
             ip -= 1;
-            state_2 = self.table.start_state(data[ip]).index;
+            state_2 = table.start_state(data[ip]).index;
             ip -= 1;
-            state_1 = self.table.start_state(data[ip]).index;
+            state_1 = table.start_state(data[ip]).index;
         }
 
         let remaining_after_init = data.len() - 2;
         if remaining_after_init & 2 != 0 {
             ip -= 1;
-            state_2 = self.encode_symbol_with_state(state_2, data[ip]);
+            state_2 = step(&mut burst, state_2, data[ip]);
             ip -= 1;
-            state_1 = self.encode_symbol_with_state(state_1, data[ip]);
+            state_1 = step(&mut burst, state_1, data[ip]);
+            // SAFETY: the room covers every bit the stream commits (above).
+            unsafe { burst.flush() };
         }
 
         while ip > 0 {
             ip -= 1;
-            state_2 = self.encode_symbol_with_state(state_2, data[ip]);
+            state_2 = step(&mut burst, state_2, data[ip]);
             ip -= 1;
-            state_1 = self.encode_symbol_with_state(state_1, data[ip]);
+            state_1 = step(&mut burst, state_1, data[ip]);
             if ip > 0 {
                 ip -= 1;
-                state_2 = self.encode_symbol_with_state(state_2, data[ip]);
+                state_2 = step(&mut burst, state_2, data[ip]);
                 ip -= 1;
-                state_1 = self.encode_symbol_with_state(state_1, data[ip]);
+                state_1 = step(&mut burst, state_1, data[ip]);
             }
+            // SAFETY: as above.
+            unsafe { burst.flush() };
         }
 
-        self.writer
-            .write_bits(state_2 as u64, self.acc_log() as usize);
-        self.writer
-            .write_bits(state_1 as u64, self.acc_log() as usize);
-
-        let bits_to_fill = self.writer.misaligned();
-        if bits_to_fill == 0 {
-            self.writer.write_bits(1u32, 8);
-        } else {
-            self.writer.write_bits(1u32, bits_to_fill);
+        // SAFETY: two states of `acc_log <= 9` bits beside `<= 7` held, then
+        // a flush, then at most 8 bits of end mark beside `<= 7`; the room
+        // counts both.
+        unsafe {
+            burst.add(state_2 as u64, acc_log);
+            burst.add(state_1 as u64, acc_log);
+            burst.flush();
         }
-    }
-
-    fn encode_symbol_with_state(&mut self, state_index: usize, symbol: u8) -> usize {
-        let next = self.table.next_state(symbol, state_index);
-        let diff = transition_bits(state_index, next.num_bits);
-        self.writer.write_bits(diff as u64, next.num_bits as usize);
-        next.index
+        let bits_to_fill = match burst.misaligned() {
+            0 => 8,
+            fill => fill,
+        };
+        // SAFETY: as above.
+        unsafe {
+            burst.add(1, bits_to_fill);
+            burst.flush();
+        }
+        burst.finish();
     }
 
     fn write_table(&mut self) {
         self.table.write_table(self.writer);
     }
 
+    #[cfg(any(test, feature = "fuzz-exports"))]
     pub(super) fn acc_log(&self) -> u8 {
         self.table.acc_log()
     }
@@ -162,8 +196,12 @@ pub(super) const MAX_FSE_TABLE_SIZE: usize = 1 << 9;
 
 #[derive(Debug, Clone)]
 pub struct FSETable {
-    /// Indexed by symbol
-    pub(super) states: [SymbolStates; 256],
+    /// Each symbol's normalized probability (`0` absent, `-1` less than one),
+    /// what the table header describes. A symbol's start state and widest
+    /// transition follow from [`Self::symbol_tt`] and [`Self::state_table_flat`],
+    /// and are derived when asked for, as upstream derives them
+    /// (`FSE_initCState2`, `FSE_getMaxNbBits`), rather than per symbol per build.
+    pub(super) probabilities: [i32; 256],
     /// Sum of all states.states.len()
     pub(crate) table_size: usize,
     /// Upstream zstd-parity flat next-state table — `state_table_flat[i]` is the
@@ -180,7 +218,7 @@ pub struct FSETable {
     pub(super) state_table_flat: [u16; MAX_FSE_TABLE_SIZE],
     /// Per-symbol upstream zstd-parity coding transform — see [`SymbolTT`].
     pub(super) symbol_tt: [SymbolTT; 256],
-    /// How many leading entries of `states` / `symbol_tt` may hold a non-default
+    /// How many leading entries of `probabilities` / `symbol_tt` may hold a non-default
     /// value; everything past it is default. Lets a rebuild clear only what the
     /// previous build wrote beyond the new alphabet instead of the whole array.
     live_symbols: usize,
@@ -193,7 +231,7 @@ impl FSETable {
     /// point rather than a meaningful state; `table_size == 0` says as much.
     pub(crate) fn blank() -> Self {
         Self {
-            states: core::array::from_fn(|_| SymbolStates::default()),
+            probabilities: [0; 256],
             table_size: 0,
             state_table_flat: [0u16; MAX_FSE_TABLE_SIZE],
             symbol_tt: [SymbolTT::default(); 256],
@@ -202,7 +240,7 @@ impl FSETable {
     }
 
     /// Heap bytes this table holds beyond its inline struct: none. Every array
-    /// it carries — `states`, `symbol_tt` and the flat state-transition table —
+    /// it carries — `probabilities`, `symbol_tt` and the flat state-transition table —
     /// is fixed-size and inline, so the owner's `size_of` accounts for all of
     /// it. Kept as a method so callers summing a footprint read one rule.
     pub(crate) fn heap_size(&self) -> usize {
@@ -257,23 +295,31 @@ impl FSETable {
         }
     }
 
-    /// First-state lookup for the encode-init of a new FSE stream.
-    /// Stays on the `Vec<State>` storage because (a) it is called once
-    /// per stream (not on the hot per-sequence path), and (b) the
-    /// upstream zstd flat-table arithmetic for the start state would require
-    /// an extra special-case for the `1 << acc_log` "virtual" current
-    /// state. Returning by value matches the new [`Self::next_state`]
-    /// return shape so callers can store `State` directly without
-    /// juggling lifetimes.
+    /// First-state lookup for the encode-init of a new FSE stream, upstream
+    /// zstd `FSE_initCState2`. Called once per stream, so it is derived here
+    /// rather than stored for every symbol of every build.
     pub(crate) fn start_state(&self, symbol: u8) -> State {
-        let index = self.states[symbol as usize]
-            .start_state
-            .expect("symbol must be present in the FSE table");
-        // Callers consume only `index` (audited across the encoder + sequence
-        // emit paths). Upstream zstd `FSE_initCState2` likewise stores just the
-        // start state value; `num_bits` is a property of a transition, not of
-        // the initial state, so it has no meaningful value here and is zeroed.
-        State { num_bits: 0, index }
+        assert!(
+            self.probabilities[symbol as usize] != 0,
+            "symbol must be present in the FSE table"
+        );
+        let tt = self.symbol_tt[symbol as usize];
+        let nb_bits_out = (tt.delta_nb_bits + (1 << 15)) >> 16;
+        let value = (nb_bits_out << 16).saturating_sub(tt.delta_nb_bits);
+        let slot = (value >> nb_bits_out) as i32 + tt.delta_find_state;
+        // In `0..table_size` by construction (upstream `FSE_initCState2`):
+        // `delta_find_state` is bounded by `total - probability`, and
+        // `value >> nb_bits_out` by `2 * probability - 1`.
+        debug_assert!(
+            (0..self.table_size as i32).contains(&slot),
+            "FSE start-state slot {slot} for symbol {symbol} outside the table"
+        );
+        // Callers consume only `index`; `num_bits` is a property of a
+        // transition, not of the initial state, so it is zeroed.
+        State {
+            num_bits: 0,
+            index: self.state_table_flat[slot as usize] as usize,
+        }
     }
 
     pub fn acc_log(&self) -> u8 {
@@ -282,11 +328,18 @@ impl FSETable {
 
     /// Get the probability assigned to a symbol (0 means absent, -1 means less-than-1).
     pub(crate) fn symbol_probability(&self, symbol: u8) -> i32 {
-        self.states[symbol as usize].probability
+        self.probabilities[symbol as usize]
     }
 
+    /// The widest transition [`Self::next_state`] takes on `symbol`, from the
+    /// last state (`index = table_size - 1`); `None` for an absent symbol.
     pub(crate) fn max_num_bits_for_symbol(&self, symbol: u8) -> Option<u8> {
-        self.states[symbol as usize].max_num_bits
+        if self.probabilities[symbol as usize] == 0 {
+            return None;
+        }
+        let max_value =
+            (2 * self.table_size as u32 - 1) + self.symbol_tt[symbol as usize].delta_nb_bits;
+        Some((max_value >> 16) as u8)
     }
 
     /// Compute the exact serialized size (in bits) of the FSE table header,
@@ -300,15 +353,15 @@ impl FSETable {
         // single source of truth shared with the pre-build cost estimate in
         // `fse_header_bits_for_counts` (the table-mode selector prices a
         // candidate table from its normalized counts without building it).
-        let states = &self.states;
-        ncount_header_bits(states.len(), |i| states[i].probability, self.acc_log())
+        let probabilities = &self.probabilities;
+        ncount_header_bits(probabilities.len(), |i| probabilities[i], self.acc_log())
     }
 
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
-        let states = &self.states;
+        let probabilities = &self.probabilities;
         write_ncount(
-            states.len(),
-            |i| states[i].probability,
+            probabilities.len(),
+            |i| probabilities[i],
             self.acc_log(),
             writer,
         );
@@ -327,38 +380,90 @@ const SEQUENCE_CODE_SYMBOLS: usize = 64;
 /// transitions write nothing, as upstream's `FSE_buildCTable_rle`.
 pub(crate) struct SequenceStateTables {
     symbol_tt: [[SymbolTT; SEQUENCE_CODE_SYMBOLS]; 3],
-    next: [[u16; MAX_FSE_TABLE_SIZE]; 3],
+    /// Written only up to each stream's table size, the only part read.
+    next: [[MaybeUninit<u16>; MAX_FSE_TABLE_SIZE]; 3],
     table_size: [usize; 3],
 }
 
 impl SequenceStateTables {
-    pub(crate) fn new() -> Self {
-        Self {
-            symbol_tt: [[SymbolTT::default(); SEQUENCE_CODE_SYMBOLS]; 3],
-            next: [[0; MAX_FSE_TABLE_SIZE]; 3],
-            table_size: [0; 3],
+    /// Build the view in `storage` from the LL / ML / OF tables, `None` for a
+    /// stream in RLE mode. Each stream is written once, straight from its
+    /// table, with nothing cleared first.
+    #[inline(always)]
+    pub(crate) fn init<'view>(
+        storage: &'view mut MaybeUninit<Self>,
+        tables: [Option<&FSETable>; 3],
+    ) -> &'view Self {
+        let view = storage.as_mut_ptr();
+        // SAFETY: `view` is the storage's own pointer and the streams are
+        // `0..3`. The three calls write every transform and every size, so
+        // what is left unwritten lies in `next` past each size, which is
+        // `MaybeUninit`.
+        unsafe {
+            Self::write_stream(view, 0, tables[0]);
+            Self::write_stream(view, 1, tables[1]);
+            Self::write_stream(view, 2, tables[2]);
+            storage.assume_init_ref()
         }
     }
 
-    /// Take stream `stream`'s parts from `table`, or an RLE stream's
+    /// Write stream `stream`'s parts from `table`, or an RLE stream's
     /// one-state table for `None`.
-    pub(crate) fn set(&mut self, stream: usize, table: Option<&FSETable>) {
-        match table {
+    ///
+    /// # Safety
+    /// `view` points at storage for a view, valid for writes, and `stream < 3`.
+    #[inline(always)]
+    unsafe fn write_stream(view: *mut Self, stream: usize, table: Option<&FSETable>) {
+        debug_assert!(stream < 3);
+        // SAFETY: the caller's contract puts both rows inside the storage.
+        let (tt, next) = unsafe {
+            (
+                (&raw mut (*view).symbol_tt)
+                    .cast::<[SymbolTT; SEQUENCE_CODE_SYMBOLS]>()
+                    .add(stream),
+                (&raw mut (*view).next)
+                    .cast::<[MaybeUninit<u16>; MAX_FSE_TABLE_SIZE]>()
+                    .add(stream)
+                    .cast::<u16>(),
+            )
+        };
+        let size = match table {
             Some(table) => {
-                self.symbol_tt[stream].copy_from_slice(&table.symbol_tt[..SEQUENCE_CODE_SYMBOLS]);
+                let transforms = &table.symbol_tt[..SEQUENCE_CODE_SYMBOLS];
                 let size = table.table_size;
-                self.next[stream][..size].copy_from_slice(&table.state_table_flat[..size]);
-                self.table_size[stream] = size;
+                let states = &table.state_table_flat[..size];
+                debug_assert!(size <= MAX_FSE_TABLE_SIZE);
+                // SAFETY: a row holds `SEQUENCE_CODE_SYMBOLS` transforms and
+                // `MAX_FSE_TABLE_SIZE >= size` states; the table is a
+                // different allocation.
+                unsafe {
+                    tt.cast::<SymbolTT>()
+                        .copy_from_nonoverlapping(transforms.as_ptr(), SEQUENCE_CODE_SYMBOLS);
+                    next.copy_from_nonoverlapping(states.as_ptr(), size);
+                }
+                size
             }
             None => {
                 // One state: `nb_bits = (1 + 0) >> 16 = 0`, slot `1 - 1 = 0`.
-                self.symbol_tt[stream] = [SymbolTT {
-                    delta_nb_bits: 0,
-                    delta_find_state: -1,
-                }; SEQUENCE_CODE_SYMBOLS];
-                self.next[stream][0] = 0;
-                self.table_size[stream] = 1;
+                // SAFETY: inside the rows, as above.
+                unsafe {
+                    tt.write(
+                        [SymbolTT {
+                            delta_nb_bits: 0,
+                            delta_find_state: -1,
+                        }; SEQUENCE_CODE_SYMBOLS],
+                    );
+                    next.write(0);
+                }
+                1
             }
+        };
+        // SAFETY: `stream < 3`, inside the sizes.
+        unsafe {
+            (&raw mut (*view).table_size)
+                .cast::<usize>()
+                .add(stream)
+                .write(size);
         }
     }
 
@@ -378,8 +483,9 @@ impl SequenceStateTables {
         State {
             num_bits: nb_bits as u8,
             // SAFETY: `slot < table_size <= MAX_FSE_TABLE_SIZE` (asserted
-            // above, held by the build that filled this stream).
-            index: unsafe { *self.next[S].get_unchecked(slot) } as usize,
+            // above, held by the build that filled this stream), and the
+            // view wrote every state below its table size.
+            index: unsafe { self.next[S].get_unchecked(slot).assume_init() } as usize,
         }
     }
 }
@@ -400,7 +506,27 @@ fn write_ncount<V: AsMut<Vec<u8>>>(
     );
     #[cfg(debug_assertions)]
     let start_idx = writer.index();
-    writer.write_bits(acc_log - 5, 4);
+    // The description goes through a burst, upstream's local bit container
+    // (`FSE_writeNCount_generic`): a checked write per field reloaded and
+    // stored the writer's state each time. A field is at most `acc_log + 1
+    // <= 13` bits and every add is flushed, so the container never holds more
+    // than 7 + 13 bits. A field costs at most `acc_log + 1` bits plus 2
+    // closing a zero run. At most `1 << acc_log` fields carry a probability,
+    // and a zero field opens a run that swallows the zeros after it, so zero
+    // fields number at most one more; a zero inside a run costs 2/3 of a bit.
+    // With the 4-bit log and the pad, that bounds what is committed without
+    // sizing it by the whole alphabet.
+    debug_assert!(acc_log <= 12, "an FSE accuracy log of {acc_log}");
+    let fields = len.min(2 * (1 << acc_log) + 1);
+    let room = (4 + fields * (acc_log as usize + 3) + len).div_ceil(8) + 1;
+    let mut burst = writer.burst(room);
+    // SAFETY (every add and flush below): fields fit beside the at most 7
+    // bits a flush leaves, are clean above their width, and the room covers
+    // every committed byte, as counted above.
+    unsafe {
+        burst.add(u64::from(acc_log - 5), 4);
+        burst.flush();
+    }
     let mut probability_counter = 0usize;
     let probability_sum = 1 << acc_log;
 
@@ -414,12 +540,16 @@ fn write_ncount<V: AsMut<Vec<u8>>>(
         let p = prob(prob_idx);
         prob_idx += 1;
         let value = (p + 1) as u32;
-        if value < low_threshold as u32 {
-            writer.write_bits(value, bits_to_write as usize - 1);
+        let (field, width) = if value < low_threshold as u32 {
+            (value, bits_to_write as usize - 1)
         } else if value > mask {
-            writer.write_bits(value + low_threshold as u32, bits_to_write as usize);
+            (value + low_threshold as u32, bits_to_write as usize)
         } else {
-            writer.write_bits(value, bits_to_write as usize);
+            (value, bits_to_write as usize)
+        };
+        unsafe {
+            burst.add(u64::from(field), width);
+            burst.flush();
         }
 
         if p == -1 {
@@ -427,19 +557,30 @@ fn write_ncount<V: AsMut<Vec<u8>>>(
         } else if p > 0 {
             probability_counter += p as usize;
         } else {
-            let mut zeros = 0u8;
+            let mut zeros = 0u64;
             while prob_idx < len && prob(prob_idx) == 0 {
                 zeros += 1;
                 prob_idx += 1;
                 if zeros == 3 {
-                    writer.write_bits(3u8, 2);
+                    unsafe {
+                        burst.add(3, 2);
+                        burst.flush();
+                    }
                     zeros = 0;
                 }
             }
-            writer.write_bits(zeros, 2);
+            unsafe {
+                burst.add(zeros, 2);
+                burst.flush();
+            }
         }
     }
-    writer.write_bits(0u8, writer.misaligned());
+    let pad = burst.misaligned();
+    unsafe {
+        burst.add(0, pad);
+        burst.flush();
+    }
+    burst.finish();
     #[cfg(debug_assertions)]
     {
         let written_bits = writer.index() - start_idx;
@@ -450,36 +591,6 @@ fn write_ncount<V: AsMut<Vec<u8>>>(
         );
     }
 }
-
-#[derive(Debug, Clone, Default)]
-pub(super) struct SymbolStates {
-    /// Upstream zstd-encoder start-state slot (`FSE_initCState2` result, in
-    /// `0..table_size`). `None` when `probability == 0`. Callers
-    /// consume only the `index` field of the [`State`] returned from
-    /// [`FSETable::start_state`] (see line-by-line audit on the
-    /// `encode` / `encode_interleaved` / compressed-block sequence
-    /// paths) — so the other [`State`] fields stay zeroed on the
-    /// returned value.
-    pub(super) start_state: Option<usize>,
-    /// Probability assigned to this symbol (`0` absent, `-1` less-than-one).
-    pub(super) probability: i32,
-    /// Max `num_bits` emitted by [`FSETable::next_state`] across all input
-    /// states for this symbol. `None` when `probability == 0`. Computed via
-    /// upstream zstd arithmetic at build time (`(2*table_size-1 + delta_nb_bits) >> 16`)
-    /// so [`FSETable::max_num_bits_for_symbol`] is a single array load
-    /// instead of a `Vec<State>` scan.
-    pub(super) max_num_bits: Option<u8>,
-}
-
-// SymbolStates::get (the old linear-scan next-state lookup) was
-// replaced by [`FSETable::next_state`]'s O(1) upstream zstd arithmetic in
-// #164. The legacy per-symbol `Vec<State>` storage was dropped in
-// #110: production no longer materializes any per-state vector; upstream zstd
-// `FSE_buildCTable_wksp` only ever stores `nextStateTable` (here
-// [`FSETable::state_table_flat`]) + `symbolTT` (here
-// [`FSETable::symbol_tt`]). Everything else — start state,
-// max-nb-bits, probability — is precomputed once per symbol via the
-// upstream zstd arithmetic and held in [`SymbolStates`].
 
 /// A transition's outcome: how many bits the encoder must emit for it, and
 /// where the state lands.
@@ -571,7 +682,8 @@ pub(crate) fn build_seq_ctable_into(
     // Derived from the full nbSeq, matching upstream (the adjustment touches only
     // the normalized distribution, never the table-log).
     let table_log = optimal_table_log(max_log, total, max_symbol, 2);
-    let mut probs = [0i32; 256];
+    let mut probs_buf = [MaybeUninit::<i32>::uninit(); 256];
+    let probs = zeroed_prefix(&mut probs_buf, max_symbol + 1);
     // Borrow the caller's histogram and drop the last sequence's symbol in place
     // for the normalize, then put it back — no per-table copy. `normalize_counts`
     // only re-borrows `counts` immutably, so it sees the decrement, and the
@@ -587,7 +699,7 @@ pub(crate) fn build_seq_ctable_into(
     }
     let norm_total = if adjust { total - 1 } else { total };
     normalize_counts(
-        &mut probs[..=max_symbol],
+        probs,
         table_log,
         &counts[..=max_symbol],
         norm_total,
@@ -597,7 +709,18 @@ pub(crate) fn build_seq_ctable_into(
     if adjust {
         counts[last_code] += 1;
     }
-    build_table_from_probabilities_into(&probs[..=max_symbol], table_log, out);
+    build_table_from_probabilities_into(probs, table_log, out);
+}
+
+/// The first `len` slots of a stack buffer, zeroed. A build touches its own
+/// alphabet: a clear of the whole buffer pulls a kibibyte of cold stack into
+/// the cache on a path that runs several times a frame.
+fn zeroed_prefix(buf: &mut [MaybeUninit<i32>; 256], len: usize) -> &mut [i32] {
+    let live = &mut buf[..len];
+    live.fill(MaybeUninit::new(0));
+    // SAFETY: every slot of `live` was written just above, and `MaybeUninit<i32>`
+    // has the layout of `i32`.
+    unsafe { core::slice::from_raw_parts_mut(live.as_mut_ptr().cast::<i32>(), len) }
 }
 
 /// Write the description of `counts` normalized at exactly `table_log`, with
@@ -658,16 +781,10 @@ pub(crate) fn build_table_from_counts_into(
         .rposition(|&count| count > 0)
         .unwrap_or_default();
     let table_log = optimal_table_log(max_log, total, max_symbol, 2);
-    let mut probs = [0i32; 256];
-    normalize_counts(
-        &mut probs[..counts.len()],
-        table_log,
-        counts,
-        total,
-        max_symbol,
-        avoid_0_numbit,
-    );
-    build_table_from_probabilities_into(&probs[..counts.len()], table_log, out);
+    let mut probs_buf = [MaybeUninit::<i32>::uninit(); 256];
+    let probs = zeroed_prefix(&mut probs_buf, counts.len());
+    normalize_counts(probs, table_log, counts, total, max_symbol, avoid_0_numbit);
+    build_table_from_probabilities_into(probs, table_log, out);
 }
 
 /// Bit size of the serialized FSE NCount table header for the normalized
@@ -751,15 +868,9 @@ pub(crate) fn fse_header_bits_for_counts(
         .rposition(|&count| count > 0)
         .unwrap_or_default();
     let table_log = optimal_table_log(max_log, total, max_symbol, 2);
-    let mut probs = [0i32; 256];
-    normalize_counts(
-        &mut probs[..counts.len()],
-        table_log,
-        counts,
-        total,
-        max_symbol,
-        avoid_0_numbit,
-    );
+    let mut probs_buf = [MaybeUninit::<i32>::uninit(); 256];
+    let probs = zeroed_prefix(&mut probs_buf, counts.len());
+    normalize_counts(probs, table_log, counts, total, max_symbol, avoid_0_numbit);
     ncount_header_bits(counts.len(), |i| probs[i], table_log)
 }
 
@@ -815,12 +926,18 @@ fn normalize_counts(
     let mut largest = 0usize;
     let mut largest_probability = 0i32;
 
-    for symbol in 0..=max_symbol {
-        let count = counts[symbol];
+    // Both cut to the live symbols once, so the loop tests no index against
+    // either length and keeps neither length live.
+    let live = max_symbol + 1;
+    for (symbol, (slot, &count)) in normalized[..live]
+        .iter_mut()
+        .zip(&counts[..live])
+        .enumerate()
+    {
         if count == 0 {
-            normalized[symbol] = 0;
+            *slot = 0;
         } else if count <= low_threshold {
-            normalized[symbol] = low_prob_count;
+            *slot = low_prob_count;
             still_to_distribute -= 1;
         } else {
             let product = count as u64 * step;
@@ -834,7 +951,7 @@ fn normalize_counts(
                 largest_probability = probability;
                 largest = symbol;
             }
-            normalized[symbol] = probability;
+            *slot = probability;
             still_to_distribute -= probability;
         }
     }
@@ -973,7 +1090,7 @@ pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, ou
     // while reading the per-symbol accounting.
     let FSETable {
         table_size: out_table_size,
-        states: symbol_states,
+        probabilities,
         state_table_flat,
         symbol_tt,
         live_symbols,
@@ -982,14 +1099,15 @@ pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, ou
     // The destination may be a table from an earlier block: reset what the
     // build below does not overwrite in full. `state_table_flat` needs none of
     // it, the scatter fills every slot under `table_size` and nothing reads
-    // past it; `symbol_tt` and `states` are written only for `probs.len()`
-    // symbols, so what an earlier build wrote above that has to be cleared
-    // rather than inherited. Past `live_symbols` the arrays are already
-    // default, so the clear stops there.
+    // past it; `symbol_tt` and `probabilities` are written only for
+    // `probs.len()` symbols, so what an earlier build wrote above that has to
+    // be cleared rather than inherited. Past `live_symbols` the arrays are
+    // already default, so the clear stops there.
     if *live_symbols > probs.len() {
-        symbol_states[probs.len()..*live_symbols].fill_with(SymbolStates::default);
+        probabilities[probs.len()..*live_symbols].fill(0);
         symbol_tt[probs.len()..*live_symbols].fill(SymbolTT::default());
     }
+    probabilities[..probs.len()].copy_from_slice(probs);
     *live_symbols = probs.len();
 
     // Upstream zstd `FSE_buildCTable_wksp` (lib/compress/fse_compress.c) — build
@@ -1022,8 +1140,8 @@ pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, ou
         "FSE table_size {table_size} exceeds the {MAX_FSE_TABLE_SIZE}-byte encoder \
          scratch (accuracy_log must be <= 9)"
     );
-    let mut table_symbol_buf = [0u8; MAX_FSE_TABLE_SIZE];
-    let table_symbol = &mut table_symbol_buf[..table_size];
+    let mut table_symbol_buf = [MaybeUninit::<u8>::uninit(); MAX_FSE_TABLE_SIZE];
+    let table_symbol = table_symbol_buf.as_mut_ptr().cast::<u8>();
     let mut high_threshold = (table_size - 1) as isize;
     // `cumul` / running prefix-sum holds slot counts up to `table_size`.
     // Decoder accepts `accuracy_log` up to `ENTRY_MAX_ACCURACY_LOG = 16`
@@ -1034,18 +1152,35 @@ pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, ou
     // `acc_log`. Slot indices written into `state_table_flat` stay in
     // `0..table_size-1` (≤ u16::MAX) and remain `u16` — only the
     // running cursor needs the wider type.
-    let mut cumul = [0u32; 257];
+    //
+    // Written only for this alphabet and walked in place by the scatter below:
+    // sequence tables have a few dozen symbols, and a zeroed copy of all 257
+    // entries is two kibibytes of cold stack per build.
+    let mut cumul = [MaybeUninit::<u32>::uninit(); 257];
+    let mut cumul_total = 0u32;
+    cumul[0].write(0);
     for (symbol, &prob) in probs.iter().enumerate() {
         let bump: u32 = match prob {
             -1 => {
-                table_symbol[high_threshold as usize] = symbol as u8;
+                assert!(
+                    high_threshold >= 0,
+                    "FSE low-probability symbols overflow the table"
+                );
+                // SAFETY: `0 <= high_threshold < table_size`, which the assert
+                // above bounds by the buffer's length.
+                unsafe {
+                    table_symbol
+                        .add(high_threshold as usize)
+                        .write(symbol as u8)
+                };
                 high_threshold -= 1;
                 1
             }
             p if p > 0 => p as u32,
             _ => 0,
         };
-        cumul[symbol + 1] = cumul[symbol] + bump;
+        cumul_total += bump;
+        cumul[symbol + 1].write(cumul_total);
     }
 
     // Phase 2 — spread positive-probability symbols across the
@@ -1053,35 +1188,92 @@ pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, ou
     let step = (table_size >> 1) + (table_size >> 3) + 3;
     let table_mask = table_size - 1;
     let mut position: usize = 0;
-    for (symbol, &prob) in probs.iter().enumerate() {
-        if prob <= 0 {
-            continue;
+    if high_threshold == (table_size - 1) as isize && table_size >= 2 {
+        // No low-probability symbol, so no slot to skip: lay the symbols out in
+        // order, eight bytes at a time, and read them across in a loop with no
+        // per-symbol count to mispredict (upstream `FSE_buildCTable_wksp`,
+        // fse_compress.c:116-153).
+        let mut spread = [core::mem::MaybeUninit::<u8>::uninit(); MAX_FSE_TABLE_SIZE + 8];
+        let spread_ptr = spread.as_mut_ptr().cast::<u8>();
+        let mut laid_out = 0usize;
+        let mut run = 0u64;
+        for &prob in probs {
+            debug_assert!(prob >= 0);
+            let count = prob as usize;
+            assert!(
+                laid_out + count <= table_size,
+                "FSE probabilities must sum to the table size"
+            );
+            // SAFETY: the assert keeps this run inside `table_size`, and each
+            // write ends within the eight spare bytes past it.
+            unsafe {
+                spread_ptr.add(laid_out).cast::<u64>().write_unaligned(run);
+                let mut written = 8;
+                while written < count {
+                    spread_ptr
+                        .add(laid_out + written)
+                        .cast::<u64>()
+                        .write_unaligned(run);
+                    written += 8;
+                }
+            }
+            laid_out += count;
+            run = run.wrapping_add(0x0101_0101_0101_0101);
         }
-        for _ in 0..prob {
-            table_symbol[position] = symbol as u8;
-            position = (position + step) & table_mask;
-            while (position as isize) > high_threshold {
+        assert_eq!(
+            laid_out, table_size,
+            "FSE probabilities must sum to the table size"
+        );
+        let mut slot = 0;
+        while slot < table_size {
+            // SAFETY: `slot + 1 < table_size`, the size being even, and every
+            // byte below `table_size` was written above; masked positions are
+            // below `table_size`, within `table_symbol_buf`.
+            unsafe {
+                table_symbol
+                    .add(position)
+                    .write(spread_ptr.add(slot).read());
+                table_symbol
+                    .add((position + step) & table_mask)
+                    .write(spread_ptr.add(slot + 1).read());
+            }
+            position = (position + 2 * step) & table_mask;
+            slot += 2;
+        }
+    } else {
+        for (symbol, &prob) in probs.iter().enumerate() {
+            if prob <= 0 {
+                continue;
+            }
+            for _ in 0..prob {
+                // SAFETY: `position` is masked below `table_size`.
+                unsafe { table_symbol.add(position).write(symbol as u8) };
                 position = (position + step) & table_mask;
+                while (position as isize) > high_threshold {
+                    position = (position + step) & table_mask;
+                }
             }
         }
     }
     // These two invariants are the SAFETY contract for the uninitialized
-    // `state_table_flat` built below: the scatter-write loop fills every index
-    // in `[0, table_size)` exactly once only if (a) the spread cycled exactly
-    // once through the table (so each symbol got exactly its `cumul`-width run
-    // of slots) and (b) the `cumul` cursors sum to `table_size` (so the runs
-    // partition the whole table). They are asserted in ALL build profiles
-    // (not `debug_assert`) so a regression in probability normalization panics
+    // `table_symbol_buf` read below: the spread wrote every index in
+    // `[0, table_size)` exactly once only if (a) it cycled exactly once through
+    // the table (so each symbol got exactly its `cumul`-width run of slots) and
+    // (b) the `cumul` cursors sum to `table_size` (so the runs partition the
+    // whole table). They are asserted in ALL build profiles (not
+    // `debug_assert`) so a regression in probability normalization panics
     // loudly here instead of leaving uninitialized slots that read as UB.
     assert_eq!(
         position, 0,
         "FSE spread must cycle exactly once through tableSize positions"
     );
     assert_eq!(
-        cumul[probs.len()] as usize,
-        table_size,
+        cumul_total as usize, table_size,
         "FSE cumul cursors must sum to table_size before building nextStateTable"
     );
+    // SAFETY: the asserts above establish that the first `table_size` bytes are
+    // written, and `table_size <= MAX_FSE_TABLE_SIZE`.
+    let table_symbol = unsafe { core::slice::from_raw_parts(table_symbol, table_size) };
 
     // Phase 3 — emit `state_table_flat` (upstream zstd `nextStateTable`)
     // ordered by `(symbol, slot)`. Walk every table slot `u`, look up
@@ -1099,28 +1291,23 @@ pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, ou
     // — so the tail keeps whatever the zero-init left and costs nothing to
     // carry. The table lives inline in [`FSETable`], so this build allocates
     // nothing at all.
-    let mut cursor = cumul;
     for (u, &symbol_at_slot) in table_symbol.iter().enumerate() {
-        let s = symbol_at_slot as usize;
+        // SAFETY: a slot holds a symbol below `probs.len()`, and `cumul` was
+        // written for every index up to `probs.len()`.
+        let cursor = unsafe { cumul[symbol_at_slot as usize].assume_init_mut() };
         // The Rust convention here keeps `state_table_flat[i]` as the
         // raw slot (`0..table_size`); upstream zstd stores `table_size + u`
         // and subtracts on read. `next_state` arithmetic ([`FSETable::next_state`])
         // matches the Rust convention — store the slot directly.
-        state_table_flat[cursor[s] as usize] = u as u16;
-        cursor[s] += 1;
+        state_table_flat[*cursor as usize] = u as u16;
+        *cursor += 1;
     }
 
-    // Phase 4 — `symbolTT[]` (delta_nb_bits, delta_find_state) plus
-    // precomputed `start_state` and `max_num_bits` per symbol. All via
-    // upstream zstd 16.16 fixed-point arithmetic; no per-state enumeration.
+    // Phase 4 — `symbolTT[]` (delta_nb_bits, delta_find_state), upstream zstd
+    // 16.16 fixed-point arithmetic; no per-state enumeration.
     let mut total: usize = 0;
     for (symbol, &prob) in probs.iter().enumerate() {
-        symbol_states[symbol].probability = prob;
         if prob == 0 {
-            // A slot reused from an earlier build may still hold that build's
-            // start state and bit width for this symbol; an absent one has none.
-            symbol_states[symbol].start_state = None;
-            symbol_states[symbol].max_num_bits = None;
             // Upstream zstd fills `symbolTT` for prob==0 too, so `FSE_getMaxNbBits`
             // still works (returns `acc_log + 1` for absent symbols).
             // We don't expose that path, but mirror the value for parity.
@@ -1153,36 +1340,6 @@ pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, ou
             delta_find_state,
         };
         total += prob.unsigned_abs() as usize;
-
-        // Upstream zstd `FSE_initCState2`: start_state =
-        //   stateTable[(((nbBitsOut<<16) - deltaNbBits) >> nbBitsOut) + deltaFindState]
-        // where `nbBitsOut = (deltaNbBits + (1<<15)) >> 16`.
-        let init_nb_bits_out = (delta_nb_bits + (1 << 15)) >> 16;
-        let init_value = (init_nb_bits_out << 16).saturating_sub(delta_nb_bits);
-        let state_table_index = (init_value >> init_nb_bits_out) as i32 + delta_find_state;
-        // Upstream zstd `FSE_initCState2` guarantees this index is in
-        // `0..table_size` by construction (`delta_find_state` is bounded
-        // by `total - probability`, and `(value >> nb_bits_out)` is
-        // bounded by `2 * probability - 1`). The `debug_assert` makes
-        // the invariant explicit so a future regression in the upstream zstd
-        // arithmetic surfaces in dev builds before the silent
-        // `as usize` wraparound.
-        debug_assert!(
-            state_table_index >= 0,
-            "FSE start_state index must be non-negative (got {state_table_index} for symbol {symbol})"
-        );
-        let start_index = state_table_flat[state_table_index as usize] as usize;
-
-        // Max nb_bits across all input states `0..table_size`. Upstream zstd
-        // `next_state` arithmetic: `nb_bits = (value + delta_nb_bits) >> 16`
-        // with `value = table_size + idx`, `idx ∈ 0..table_size`. The
-        // maximum is at `idx = table_size - 1`. Single op vs the prior
-        // `Vec<State>::iter().map(|s|s.num_bits).max()` linear scan.
-        let max_value = (2 * table_size as u32 - 1) + delta_nb_bits;
-        let max_num_bits = (max_value >> 16) as u8;
-
-        symbol_states[symbol].start_state = Some(start_index);
-        symbol_states[symbol].max_num_bits = Some(max_num_bits);
     }
 }
 

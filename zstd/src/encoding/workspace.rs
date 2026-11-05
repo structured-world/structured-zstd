@@ -1189,6 +1189,19 @@ impl<T: Copy> RegionVec<T> {
         self.len += 1;
     }
 
+    /// [`Self::push`] without the capacity test.
+    ///
+    /// # Safety
+    ///
+    /// The buffer must not be full.
+    #[inline(always)]
+    pub(crate) unsafe fn push_within_capacity(&mut self, value: T) {
+        debug_assert!(self.len < self.region.len);
+        // SAFETY: the caller keeps `len < capacity`.
+        unsafe { self.region.as_mut_ptr().add(self.len).write(value) };
+        self.len += 1;
+    }
+
     /// Pointer to the first value, for writes past the length that
     /// [`Self::set_len`] then claims.
     pub(crate) fn as_mut_ptr(&mut self) -> *mut T {

@@ -8,6 +8,11 @@
 //! Build: cargo build --profile flamegraph -p structured-zstd
 //!          --example ffi_loop_dict --features dict-builder
 //! Run:   ./target/flamegraph/examples/ffi_loop_dict <level> <iters> logs<N> <dict_path>
+//!
+//! `ffi_loop_dict train <input> <dict_path>` instead writes the dictionary the
+//! benchmark's `compress-dict` cells train for that input: libzstd's trainer
+//! over the input cut into `len / 16` chunks (256..=8192 bytes), asking for
+//! `len / 8` bytes (256..=16 KiB).
 
 use std::env;
 
@@ -45,8 +50,31 @@ fn resolve_input(spec: &str) -> Vec<u8> {
     }
 }
 
+/// The benchmark's dictionary for `src`: its training samples and size.
+fn train(src: &[u8], dict_path: &str) {
+    let sample_size = src.len().div_ceil(16).clamp(256, 8192);
+    let samples: Vec<&[u8]> = src.chunks(sample_size).collect();
+    let dict_size = src
+        .len()
+        .div_ceil(8)
+        .clamp(256, 16 * 1024)
+        .min(src.len() - 64);
+    let dict = zstd::dict::from_samples(&samples, dict_size).expect("dictionary training");
+    std::fs::write(dict_path, &dict).expect("write dict file");
+    eprintln!(
+        "trained {} bytes from {} samples into {dict_path}",
+        dict.len(),
+        samples.len()
+    );
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some("train") {
+        let input = args.get(2).expect("input");
+        let dict_path = args.get(3).expect("dict path");
+        return train(&resolve_input(input), dict_path);
+    }
     let level: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(6);
     let iters: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(300_000);
     let input_spec: &str = args.get(3).map(|s| s.as_str()).unwrap_or("logs4096");

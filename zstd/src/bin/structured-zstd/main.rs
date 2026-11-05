@@ -343,6 +343,9 @@ struct Options {
     literals: LiteralCompressionMode,
     /// The greedy / lazy band's finder (`--[no-]row-match-finder`).
     row_match_finder: RowMatchFinderMode,
+    /// Whether an incompressible-looking block may go out raw unsearched
+    /// (`--[no-]raw-skip`).
+    raw_skip: bool,
     /// Reference file for `--patch-from`: raw-content dictionary compression
     /// with the window sized to the input, so the whole reference is
     /// reachable.
@@ -1501,6 +1504,7 @@ fn parse_args_into(
         advanced: AdvancedParams::default(),
         literals: LiteralCompressionMode::Auto,
         row_match_finder: RowMatchFinderMode::Auto,
+        raw_skip: true,
         patch_from: None,
         show_default_cparams: false,
         trainer: Trainer::FastCover,
@@ -1642,6 +1646,8 @@ fn parse_args_into(
                 "no-compress-literals" => opts.literals = LiteralCompressionMode::Disable,
                 "row-match-finder" => opts.row_match_finder = RowMatchFinderMode::Enable,
                 "no-row-match-finder" => opts.row_match_finder = RowMatchFinderMode::Disable,
+                "raw-skip" => opts.raw_skip = true,
+                "no-raw-skip" => opts.raw_skip = false,
                 _ => {
                     if long == "fast" {
                         // `--fast` is the level -1 alias.
@@ -2311,6 +2317,8 @@ Advanced compression options:
   --[no-]compress-literals      Force (un)compressed literals.
   --[no-]row-match-finder       Explicitly enable/disable the fast, row-based matchfinder for
                                 the 'greedy', 'lazy', and 'lazy2' strategies.
+  --[no-]raw-skip               Store a block that samples as incompressible without searching
+                                it; disabled, every block is searched. [Default: Enabled]
 
   --format=zstd                 Compress files to the `.zst` format. [Default]
 
@@ -6293,6 +6301,9 @@ struct FrameSettings {
     literals: LiteralCompressionMode,
     /// The greedy / lazy band's finder (`--[no-]row-match-finder`).
     row_match_finder: RowMatchFinderMode,
+    /// Whether an incompressible-looking block may go out raw unsearched
+    /// (`--[no-]raw-skip`).
+    raw_skip: bool,
 }
 
 impl Default for FrameSettings {
@@ -6313,6 +6324,7 @@ impl Default for FrameSettings {
             advanced: AdvancedParams::default(),
             literals: LiteralCompressionMode::Auto,
             row_match_finder: RowMatchFinderMode::Auto,
+            raw_skip: true,
         }
     }
 }
@@ -6334,14 +6346,15 @@ impl FrameSettings {
             advanced: opts.advanced,
             literals: opts.literals,
             row_match_finder: opts.row_match_finder,
+            raw_skip: opts.raw_skip,
         }
     }
 }
 
 /// The fine-grained parameters a frame runs under, or `None` when nothing
 /// overrides the level: `--zstd=` knobs, `--long` (whose window yields to a
-/// `--zstd=wlog=`, as the reference command has it), and the literal and
-/// match-finder modes. The long-distance knobs from `--zstd=` reach the
+/// `--zstd=wlog=`, as the reference command has it), the literal and
+/// match-finder modes, and the raw skip. The long-distance knobs from `--zstd=` reach the
 /// encoder only with `--long`, since there they tune a matcher that otherwise
 /// does not run.
 fn frame_parameters(
@@ -6353,6 +6366,7 @@ fn frame_parameters(
         && advanced.is_default()
         && settings.literals == LiteralCompressionMode::Auto
         && settings.row_match_finder == RowMatchFinderMode::Auto
+        && settings.raw_skip
     {
         return Ok(None);
     }
@@ -6398,7 +6412,8 @@ fn frame_parameters(
     }
     builder = builder
         .literal_compression(settings.literals)
-        .row_match_finder(settings.row_match_finder);
+        .row_match_finder(settings.row_match_finder)
+        .raw_skip(settings.raw_skip);
     builder
         .build()
         .map(Some)

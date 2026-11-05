@@ -23,19 +23,14 @@ fn rebasing_leaves_the_cursors_and_tags_alone() {
     for (i, slot) in matcher.row_positions_mut().iter_mut().enumerate() {
         *slot = (floor + i) as u32;
     }
-    matcher.row_heads_mut().fill(3);
     matcher.row_tags_mut().fill(0x5A);
     matcher.history_abs_start = floor;
 
     matcher.rebase_positions();
 
     assert!(
-        matcher.row_heads().iter().all(|&h| h == 3),
-        "the slot cursors are not positions and must survive the rebase"
-    );
-    assert!(
         matcher.row_tags().iter().all(|&t| t == 0x5A),
-        "the hash tags are not positions and must survive the rebase"
+        "the hash tags and the cursors among them are not positions and must survive the rebase"
     );
     assert_eq!(
         matcher.row_positions()[0],

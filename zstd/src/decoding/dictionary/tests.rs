@@ -86,6 +86,37 @@ fn decode_dict_rejects_zero_repeat_offsets() {
     ));
 }
 
+/// A repeat offset reaching past the dictionary's content names no byte a
+/// frame could repeat from, and upstream refuses the dictionary for it on both
+/// sides (`zstd_compress.c:5142-5146`, `zstd_decompress.c:1528-1532`). An
+/// offset of exactly the content's length reaches its first byte and stays
+/// valid.
+#[test]
+fn decode_dict_rejects_repeat_offsets_beyond_the_content() {
+    let reference = include_bytes!("../../../dict_tests/dictionary").to_vec();
+    let offset_start = offset_history_start(&reference);
+    let content_len = reference.len() - (offset_start + 12);
+    let rep2 = offset_start + 8;
+
+    let mut raw = reference.clone();
+    raw[rep2..rep2 + 4].copy_from_slice(&(content_len as u32 + 1).to_le_bytes());
+    let refused = Dictionary::decode_dict(&raw).err();
+    assert!(
+        matches!(
+            refused,
+            Some(DictionaryDecodeError::RepeatOffsetBeyondContent { index: 2, offset, content_len: len })
+                if offset as usize == content_len + 1 && len == content_len
+        ),
+        "a repeat offset past the content must be refused, got {refused:?}"
+    );
+
+    let mut raw = reference;
+    raw[rep2..rep2 + 4].copy_from_slice(&(content_len as u32).to_le_bytes());
+    let decoded =
+        Dictionary::decode_dict(&raw).expect("an offset reaching the first byte is valid");
+    assert_eq!(decoded.offset_hist[2] as usize, content_len);
+}
+
 #[test]
 fn from_raw_content_rejects_empty_dictionary_content() {
     let result = Dictionary::from_raw_content(1, Vec::new());

@@ -137,19 +137,22 @@ pub(crate) const ROW_L5: RowConfig = RowConfig {
 /// (config-driven, not a hardcoded constant): `long_hash_log` =
 /// `cParams.hashLog` (the long 8-byte hash table), `short_hash_log` =
 /// `cParams.chainLog` (the short hash table dfast repurposes as its
-/// secondary index). Only the Dfast backend reads it, so non-dfast level
-/// rows carry `dfast: None`. `minMatch` stays the upstream zstd-fixed `5`
-/// (`DFAST_MIN_MATCH_LEN`, used in const contexts).
+/// secondary index), `min_match` = `cParams.minMatch` (the short table's key
+/// width). Only the Dfast backend reads it, so non-dfast level rows carry
+/// `dfast: None`.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(crate) struct DfastConfig {
     pub(crate) long_hash_log: u8,
     pub(crate) short_hash_log: u8,
+    pub(crate) min_match: u8,
 }
 
-// Upstream zstd clevels.h default row (srcSize > 256 KB): L3 {hashLog 17, chainLog 16}.
+// Upstream zstd clevels.h default row (srcSize > 256 KB): L3 {hashLog 17,
+// chainLog 16, minMatch 5}.
 pub(crate) const DFAST_L3: DfastConfig = DfastConfig {
     long_hash_log: 17,
     short_hash_log: 16,
+    min_match: 5,
 };
 
 /// Per-level Fast-strategy tuning, only consumed by the `FastKernelMatcher`
@@ -397,6 +400,11 @@ pub(crate) fn apply_param_overrides(
                 if let Some(chain_log) = ov.chain_log {
                     dfast.short_hash_log = chain_log as u8;
                 }
+                // minMatch -> the short table's key width; bounds-checked
+                // 3..=7, so the cast is lossless.
+                if let Some(min_match) = ov.min_match {
+                    dfast.min_match = min_match as u8;
+                }
             }
         }
         SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => {
@@ -594,14 +602,6 @@ pub(crate) const BT_OPT_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
 /// `btopt` tier, matching upstream's per-strategy cutoff table.
 pub(crate) const BT_ULTRA_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
 
-// Source-size cap for the dfast hash bits when a size hint is present: a tiny
-// input needs no larger hash than its window. The upstream zstd `cParams.hashLog` /
-// `chainLog` (from `DfastConfig`) caps it from above at the call site.
-pub(crate) fn dfast_hash_bits_for_window(max_window_size: usize) -> usize {
-    let window_log = (usize::BITS - 1 - max_window_size.leading_zeros()) as usize;
-    window_log.max(MIN_WINDOW_LOG as usize)
-}
-
 pub(crate) fn row_hash_bits_for_window(max_window_size: usize) -> usize {
     // Upstream zstd `ZSTD_adjustCParams_internal` cap: `hashLog <= windowLog + 1`.
     // The `+ 1` is load-bearing for L12, whose upstream zstd hashLog (23) exceeds
@@ -713,6 +713,7 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
             dfast: Some(DfastConfig {
                 long_hash_log: cp.hash_log as u8,
                 short_hash_log: cp.chain_log as u8,
+                min_match: cp.min_match as u8,
             }),
             hc: None,
             row: None,
@@ -738,15 +739,13 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
 /// moves off the native level row, and this re-applies the source-size cap
 /// C-faithfully — the SAME adjuster the `get_cparams` main path uses, so the
 /// override path and the level path now down-size identically (no extra hinted
-/// 16 KiB window floor, no per-backend headroom that diverged from C). The
-/// Dfast backend self-sizes its tables in `reset`, so only its window is capped.
+/// 16 KiB window floor, no per-backend headroom that diverged from C).
 pub(crate) fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> LevelParams {
     use crate::encoding::cparams::{CParams, adjust_cparams};
     use crate::encoding::strategy::{BackendTag, StrategyTag};
 
     let backend = params.backend();
-    // Lift the active backend's source-cappable logs into a flat CParams. Dfast
-    // contributes none (window-only); its table widths self-size in `reset`.
+    // Lift the active backend's source-cappable logs into a flat CParams.
     let (hash_log, chain_log): (u32, u32) = match backend {
         BackendTag::Simple => (params.fast.as_ref().map_or(0, |f| f.hash_log), 0),
         BackendTag::HashChain => params
@@ -757,7 +756,9 @@ pub(crate) fn adjust_params_for_source_size(mut params: LevelParams, src_size: u
             .row
             .as_ref()
             .map_or((0, 0), |r| (r.hash_bits as u32, r.chain_log as u32)),
-        BackendTag::Dfast => (0, 0),
+        BackendTag::Dfast => params.dfast.as_ref().map_or((0, 0), |d| {
+            (u32::from(d.long_hash_log), u32::from(d.short_hash_log))
+        }),
     };
     // `adjust_cparams` reads the strategy for the chain cap (`ZSTD_cycleLog`,
     // btlazy2 and up) and for the row-hash cap (greedy to lazy2, with the
@@ -818,7 +819,13 @@ pub(crate) fn adjust_params_for_source_size(mut params: LevelParams, src_size: u
                 r.chain_log = adj.chain_log as usize;
             }
         }
-        BackendTag::Dfast => {}
+        BackendTag::Dfast => {
+            if let Some(d) = params.dfast.as_mut() {
+                // Both bounded by the logs they came in as, so they fit `u8`.
+                d.long_hash_log = adj.hash_log as u8;
+                d.short_hash_log = adj.chain_log as u8;
+            }
+        }
     }
     params
 }
@@ -1036,7 +1043,11 @@ pub(crate) fn frame_level_params(
         Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes, &overrides).0,
         None => resolve_level_params(level, src_size_hint),
     };
-    apply_frame_overrides(&mut params, &overrides, dictionary.is_some(), src_size_hint);
+    // A dictionary loaded into the frame had the knobs applied by its own
+    // resolution, in the order that lets the adjustment bound them.
+    if !dictionary.is_some_and(|sizes| dictionary_loads_into_frame(sizes, src_size_hint)) {
+        apply_frame_overrides(&mut params, &overrides, dictionary.is_some(), src_size_hint);
+    }
     params
 }
 
@@ -1320,6 +1331,19 @@ pub(crate) fn numeric_level(level: CompressionLevel) -> i32 {
     }
 }
 
+/// Whether a frame over `source_size` bytes (`None` = unknown) loads the
+/// dictionary into tables resolved for its own size instead of running the
+/// dictionary's: only a dictionary prepared for a level of its own does that,
+/// and only once the source outgrows it (upstream `ZSTD_compressBegin_internal`,
+/// zstd_compress.c:5278, where `compressionLevel == 0` keeps the CDict's).
+pub(crate) fn dictionary_loads_into_frame(
+    sizes: crate::encoding::DictionarySizes,
+    source_size: Option<u64>,
+) -> bool {
+    sizes.prepared_at_level
+        && !crate::encoding::dictionary_describes_frame(sizes.content, source_size)
+}
+
 /// How a greedy / lazy frame compressed with a dictionary takes its
 /// match-finder from the dictionary's own cParams (upstream
 /// `ZSTD_resetCCtx_usingCDict`).
@@ -1357,11 +1381,14 @@ pub(crate) fn resolve_level_params_with_dict(
         CONTENTSIZE_UNKNOWN, attach_cparams, copy_cparams, get_cdict_cparams, should_attach_dict,
         uses_row_match_finder,
     };
-    let base = resolve_level_params(level, source_size);
     // A raw frame searches nothing, so a dictionary has no tier to give it.
     if sizes.content == 0 || matches!(level, CompressionLevel::Uncompressed) {
-        return (base, None);
+        return (resolve_level_params(level, source_size), None);
     }
+    if dictionary_loads_into_frame(sizes, source_size) {
+        return resolve_level_params_for_loaded_dict(level, source_size, sizes, overrides);
+    }
+    let base = resolve_level_params(level, source_size);
     // The CDict's cParams decide the frame's strategy REGARDLESS of the
     // backend family the plain level resolved to for this source size
     // (upstream takes them unconditionally): L13 on a 4 KiB source is
@@ -1403,6 +1430,101 @@ pub(crate) fn resolve_level_params_with_dict(
             attach,
             use_row: uses_row_match_finder(&cdict, overrides.row_match_finder),
             cdict,
+        }),
+    )
+}
+
+/// The last [`resolve_level_params_with_dict`] answer, for a caller that asks
+/// it again for every frame of the same dictionary: upstream resolves a CDict's
+/// cParams once, when it builds the CDict, and a frame only adjusts them to its
+/// source (`ZSTD_resetCCtx_usingCDict`).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DictParamsMemo(Option<(DictParamsKey, (LevelParams, Option<RowDictPlan>))>);
+
+/// Everything [`resolve_level_params_with_dict`] reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DictParamsKey {
+    level: CompressionLevel,
+    source_size: Option<u64>,
+    sizes: crate::encoding::DictionarySizes,
+    overrides: crate::encoding::parameters::ParamOverrides,
+}
+
+impl DictParamsMemo {
+    /// [`resolve_level_params_with_dict`], answered from the last call when it
+    /// asked the same.
+    pub(crate) fn resolve(
+        &mut self,
+        level: CompressionLevel,
+        source_size: Option<u64>,
+        sizes: crate::encoding::DictionarySizes,
+        overrides: &crate::encoding::parameters::ParamOverrides,
+    ) -> (LevelParams, Option<RowDictPlan>) {
+        let key = DictParamsKey {
+            level,
+            source_size,
+            sizes,
+            overrides: *overrides,
+        };
+        if let Some((last, answer)) = &self.0
+            && *last == key
+        {
+            return *answer;
+        }
+        let answer = resolve_level_params_with_dict(level, source_size, sizes, overrides);
+        self.0 = Some((key, answer));
+        answer
+    }
+}
+
+/// [`resolve_level_params`] for a frame whose dictionary is loaded into tables
+/// the frame resolved for its own source
+/// ([`DictionaryGeometry::LoadedIntoFrame`]).
+///
+/// The dictionary's own preparation does not enter this: upstream resets the
+/// context from the requested parameters for the real source, counting the
+/// dictionary only as extra content the window has to cover
+/// (`ZSTD_getCParams(level, srcSize, dictContentSize)`, zstd_compress.c:5839),
+/// and then loads the dictionary into the tables that came out. So the tier is
+/// the source's, not the dictionary's.
+///
+/// The caller's knobs are applied HERE rather than afterwards, because the
+/// adjustment that bounds them has to run last: a `hashLog` the caller asks for
+/// is capped at `dictAndWindowLog + 1`, and a cap applied before the knob it
+/// bounds does nothing. Measured on the i9 with the cap out of order, a 1 KiB
+/// window under an 18 KiB dictionary built a table of 807 KB and paid 832M
+/// cycles over a 4 MiB source where the same frame without the dictionary pays
+/// 178M: the window slides every kilobyte and each slide walks the whole table.
+///
+/// [`DictionaryGeometry::LoadedIntoFrame`]: crate::encoding::DictionaryGeometry::LoadedIntoFrame
+pub(crate) fn resolve_level_params_for_loaded_dict(
+    level: CompressionLevel,
+    source_size: Option<u64>,
+    sizes: crate::encoding::DictionarySizes,
+    overrides: &crate::encoding::parameters::ParamOverrides,
+) -> (LevelParams, Option<RowDictPlan>) {
+    use crate::encoding::cparams::{CONTENTSIZE_UNKNOWN, uses_row_match_finder};
+    if sizes.content == 0 || matches!(level, CompressionLevel::Uncompressed) {
+        return (resolve_level_params(level, source_size), None);
+    }
+    let frame = crate::encoding::cparams::get_frame_cparams(
+        numeric_level(level),
+        source_size.unwrap_or(CONTENTSIZE_UNKNOWN),
+        sizes.content,
+        overrides,
+    );
+    let params = level_params_from_cparams(frame);
+    if !(3..=6).contains(&frame.strategy) {
+        return (params, None);
+    }
+    (
+        params,
+        Some(RowDictPlan {
+            // The dictionary lives in the frame's own tables, so there is no
+            // separate set to search in place.
+            attach: false,
+            use_row: uses_row_match_finder(&frame, overrides.row_match_finder),
+            cdict: frame,
         }),
     )
 }

@@ -7530,6 +7530,36 @@ fn row_match_finder_flags_reach_the_frame() {
     assert_eq!(decoded(&chain).unwrap(), payload);
 }
 
+/// `--[no-]raw-skip` reaches the frame's parameters: off, the frame is built
+/// with the skip disabled; on, which is the default, it needs no parameters.
+#[test]
+fn raw_skip_flags_reach_the_frame_parameters() {
+    assert!(!parse(&["--no-raw-skip", "f"]).unwrap().raw_skip);
+    assert!(
+        parse(&["--no-raw-skip", "--raw-skip", "f"])
+            .unwrap()
+            .raw_skip
+    );
+    assert!(parse(&["f"]).unwrap().raw_skip);
+
+    let level = CompressionLevel::from_level(3);
+    let searched = frame_parameters(
+        level,
+        &FrameSettings {
+            raw_skip: false,
+            ..FrameSettings::default()
+        },
+    )
+    .unwrap()
+    .expect("a disabled raw skip is a parameter of its own");
+    assert!(!searched.raw_skip_enabled());
+    assert!(
+        frame_parameters(level, &FrameSettings::default())
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// The trainer flags take their tuning the way the reference command reads
 /// it, and the options built from it follow the reference's rules: a value
 /// the trainer cannot take is refused, `shrink` defaults its bound to 1%, and

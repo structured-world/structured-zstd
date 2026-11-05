@@ -681,6 +681,40 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
     // every matcher's scan, where two would compile each backend twice, and the
     // flag is fixed for the block, so its test at each emit site predicts.
     let code_offsets = uses_fast_offset_codes(state.strategy_tag);
+    // The Fast kernel records straight into the block's buffers, upstream's
+    // `ZSTD_storeSeq` shape, so no gather pass follows. The dictionary and
+    // double-fast loops keep the closure: inlined there, the copy costs more
+    // than the gather.
+    if code_offsets
+        && state.sequence_capture.is_none()
+        && let Some(driver) = state.matcher.builtin_driver()
+        && let Some((block, block_len)) = driver.direct_fast_block()
+    {
+        if parts.literals.capacity() < block_len {
+            crate::encoding::workspace::capacity_exhausted();
+        }
+        let seq_base = parts.sequences.as_mut_ptr();
+        let lit_base = parts.literals.as_mut_ptr();
+        let mut store = DirectStore {
+            seq: seq_base,
+            lit: lit_base,
+            wild_limit: (block as usize + block_len).wrapping_sub(DIRECT_WILDCOPY_SLACK),
+            hist: state.offset_hist,
+        };
+        driver.store_fast_block::<K>(&mut store);
+        // SAFETY: the store wrote every sequence and literal below its cursors,
+        // inside the buffers sized for the largest block.
+        unsafe {
+            parts
+                .sequences
+                .set_len(store.seq.offset_from(seq_base) as usize);
+            parts
+                .literals
+                .set_len(store.lit.offset_from(lit_base) as usize);
+        }
+        state.offset_hist = store.hist;
+        return;
+    }
     let block_start_hist = state.offset_hist;
     let mut hist = state.offset_hist;
     // The built-in matcher searches compiled for the frame's tier; a matcher
@@ -731,9 +765,72 @@ fn builtin_block_sequences<K: EncodeTier>(
     code_offsets: bool,
     hist: &mut [u32; 3],
 ) {
-    driver.start_matching_with::<K>(|seq| {
+    // `move`: the flag rides in the closure by value. Borrowed, every
+    // sequence read it through the closure and the reference it holds, one
+    // more load behind the sink's own.
+    driver.start_matching_with::<K>(move |seq| {
         record_builtin_sequence(seq, tail, sequences, code_offsets, hist)
     });
+}
+
+/// Bytes of the block that must remain past a run for [`DirectStore`] to copy
+/// it in whole 16-byte chunks: one chunk past the run's end, plus the margin
+/// the literals buffer keeps over the block.
+const DIRECT_WILDCOPY_SLACK: usize = 32;
+
+/// A block's sequences and literals, written as the Fast kernel finds them
+/// (upstream zstd `ZSTD_storeSeq`): each literal run is copied as its sequence
+/// is recorded, and the offset coded against `hist`, the history the decoder
+/// will hold.
+struct DirectStore {
+    seq: *mut RawSequence,
+    lit: *mut u8,
+    /// The last address a run may end at to be copied in whole chunks.
+    wild_limit: usize,
+    hist: [u32; 3],
+}
+
+impl crate::encoding::simple::fast_kernel::kernel::KernelSink for DirectStore {
+    #[inline(always)]
+    fn triple(&mut self, literals: *const u8, literal_len: usize, offset: usize, match_len: usize) {
+        debug_assert!(match_len >= FORMAT_MIN_MATCH);
+        let off_base =
+            encode_offset_with_history_fast(offset as u32, literal_len as u32, &mut self.hist);
+        // SAFETY: a run lies inside the block, and the literals written so far
+        // are no more than the bytes of the block before it, so the buffer,
+        // sized for the block, has room for the run and for the chunk the wide
+        // copy writes past it when the block has `DIRECT_WILDCOPY_SLACK` bytes
+        // after the run. The sequences buffer holds the block's most.
+        unsafe {
+            if literals as usize + literal_len <= self.wild_limit {
+                // Upstream `ZSTD_copy16`, then `ZSTD_wildcopy` for the rest.
+                core::ptr::copy_nonoverlapping(literals, self.lit, 16);
+                let mut done = 16;
+                while done < literal_len {
+                    core::ptr::copy_nonoverlapping(literals.add(done), self.lit.add(done), 16);
+                    done += 16;
+                }
+            } else {
+                core::ptr::copy_nonoverlapping(literals, self.lit, literal_len);
+            }
+            self.seq.write(RawSequence {
+                ll: literal_len as u32,
+                ml: match_len as u32,
+                off_base,
+            });
+            self.seq = self.seq.add(1);
+            self.lit = self.lit.add(literal_len);
+        }
+    }
+
+    #[inline(always)]
+    fn tail(&mut self, literals: *const u8, len: usize) {
+        // SAFETY: as `triple`'s exact copy.
+        unsafe {
+            core::ptr::copy_nonoverlapping(literals, self.lit, len);
+            self.lit = self.lit.add(len);
+        }
+    }
 }
 
 /// [`record_sequence`] for the built-in matcher, whose reports need no
@@ -758,16 +855,22 @@ fn record_builtin_sequence(
         } => {
             debug_assert_eq!(*tail, 0, "literals reported before a sequence");
             debug_assert!((literal_len | match_len | offset) <= u32::MAX as usize);
+            debug_assert!(match_len >= FORMAT_MIN_MATCH);
             let off_base = if code_offsets {
                 encode_offset_with_history_fast(offset as u32, literal_len as u32, hist)
             } else {
                 offset as u32
             };
-            sequences.push(RawSequence {
-                ll: literal_len as u32,
-                ml: match_len as u32,
-                off_base,
-            });
+            // SAFETY: the buffer holds `max_sequences` of the largest block, and
+            // the built-in matcher's every sequence covers `FORMAT_MIN_MATCH`
+            // bytes of the block, so it cannot fill up.
+            unsafe {
+                sequences.push_within_capacity(RawSequence {
+                    ll: literal_len as u32,
+                    ml: match_len as u32,
+                    off_base,
+                })
+            };
         }
     }
 }
@@ -1344,7 +1447,7 @@ fn estimate_literals_section_bytes(
     // it a section with flat ends and a biased interior costs as
     // Huffman-compressed here and is emitted raw there, and the splitter picks
     // a partition on a price the emitter cannot produce.
-    if suspected_incompressible && end_samples_look_flat(literals, counts) {
+    if suspected_incompressible && end_samples_look_flat(literals) {
         return raw();
     }
 
@@ -1359,6 +1462,7 @@ fn estimate_literals_section_bytes(
     // into the table's own buffer, so the emitter that follows reads it.
     let mut new_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
         &counts[..=max_sym],
+        literals.len(),
         huf_search,
         weight_scratch,
     );
@@ -2565,6 +2669,37 @@ fn choose_table_from_counts<'a>(
 
     let use_low_prob_count = total >= 2048;
 
+    // Below lazy upstream prices nothing (`ZSTD_selectEncodingType`,
+    // zstd_compress_sequences.c:179-204): the default table when the block has
+    // few sequences or no dominant code, a new table otherwise. Pricing all
+    // three normalizes the counts a second time on every block.
+    let cheap_strategy_rank = match strategy {
+        crate::encoding::strategy::StrategyTag::Fast => Some(1usize),
+        crate::encoding::strategy::StrategyTag::Dfast => Some(2),
+        crate::encoding::strategy::StrategyTag::Greedy => Some(3),
+        _ => None,
+    };
+    if let Some(rank) = cheap_strategy_rank {
+        if default_table.symbol_probability(max_symbol as u8) != 0 {
+            let default_log = default_table.acc_log() as usize;
+            let min_for_new_table = ((1usize << default_log) * (10 - rank)) >> 3;
+            let most_frequent = counts[..=max_symbol].iter().copied().max().unwrap_or(0);
+            if total < min_for_new_table || most_frequent < (total >> (default_log - 1)) {
+                return FseTableMode::Predefined(default_table);
+            }
+        }
+        build_into_slot(next, |dest| match last_code {
+            Some(lc) => build_seq_ctable_into(&mut counts[..=max_symbol], max_log, lc, dest),
+            None => build_table_from_symbol_counts_into(
+                &counts[..=max_symbol],
+                max_log,
+                use_low_prob_count,
+                dest,
+            ),
+        });
+        return FseTableMode::Encoded(slot_table(next));
+    }
+
     // Mirror upstream zstd `ZSTD_selectEncodingType()`: compare default
     // cross-entropy, repeat-table FSE bit cost, and the custom compressed
     // table (header + entropy-bound payload). The custom table's header is
@@ -2895,12 +3030,12 @@ macro_rules! encode_sequences_body {
             // register, and the loop keeps two of the three states in
             // registers. Held behind a pointer the same loop spilled one state
             // more, +0.4..0.6% instructions at level 1 against the per-block
-            // clearing this costs.
-            let mut view = crate::fse::fse_encoder::SequenceStateTables::new();
-            view.set(0, ll_table);
-            view.set(1, ml_table);
-            view.set(2, of_table);
-            let view = &view;
+            // copy this costs.
+            let mut view = core::mem::MaybeUninit::uninit();
+            let view = crate::fse::fse_encoder::SequenceStateTables::init(
+                &mut view,
+                [ll_table, ml_table, of_table],
+            );
             // At most 63 bits a sequence leave as whole bytes, under 8 bytes;
             // 12 a sequence and 64 over covers that and the up to 7 bytes the
             // burst drains from the init-state writes above as it starts,
@@ -3326,9 +3461,16 @@ pub(crate) fn encode_offset_with_history(
 /// Whether blocks at `strategy` code offsets with
 /// [`encode_offset_with_history_fast`] rather than the full repeat search of
 /// [`encode_offset_with_history`].
+///
+/// Both bands store what upstream's matchers store: a repeat-1 hit as
+/// `REPCODE1_TO_OFFBASE` and every hashed match as `OFFSET_TO_OFFBASE`, with
+/// no search of the deeper repeats (`zstd_fast.c`; `zstd_double_fast.c:193`,
+/// `:290`, `:316`). Neither band post-splits, so the offsets are coded as
+/// collected.
 #[inline]
 pub(crate) fn uses_fast_offset_codes(strategy: crate::encoding::strategy::StrategyTag) -> bool {
-    matches!(strategy, crate::encoding::strategy::StrategyTag::Fast)
+    use crate::encoding::strategy::StrategyTag;
+    matches!(strategy, StrategyTag::Fast | StrategyTag::Dfast)
 }
 
 /// Fast-matcher offset→offBase conversion, mirroring upstream zstd's
@@ -3511,20 +3653,20 @@ pub(crate) fn literals_suspected_incompressible(
 /// nobody can produce.
 ///
 /// Both ends, not one: a section that is random at the front and structured at
-/// the back must not be judged on the front alone. `counts` is cleared between
-/// the probes so each reports its own most frequent symbol, which is what the
-/// summed threshold is scaled for, and again on the way out so the caller
-/// receives it zeroed either way.
-fn end_samples_look_flat(literals: &[u8], counts: &mut [usize; 256]) -> bool {
+/// the back must not be judged on the front alone. Each probe counts afresh, so
+/// each reports its own most frequent symbol, which is what the summed
+/// threshold is scaled for.
+fn end_samples_look_flat(literals: &[u8]) -> bool {
     if literals.len() < SUSPECT_SAMPLE_SIZE * SUSPECT_SAMPLE_RATIO {
         return false;
     }
-    counts.fill(0);
-    let (_, head_largest) = crate::histogram::count_bytes(&literals[..SUSPECT_SAMPLE_SIZE], counts);
-    counts.fill(0);
-    let (_, tail_largest) =
-        crate::histogram::count_bytes(&literals[literals.len() - SUSPECT_SAMPLE_SIZE..], counts);
-    counts.fill(0);
+    let mut counts = core::mem::MaybeUninit::uninit();
+    let (_, _, head_largest) =
+        crate::histogram::count_bytes_uninit(&literals[..SUSPECT_SAMPLE_SIZE], &mut counts);
+    let (_, _, tail_largest) = crate::histogram::count_bytes_uninit(
+        &literals[literals.len() - SUSPECT_SAMPLE_SIZE..],
+        &mut counts,
+    );
     head_largest + tail_largest <= ((2 * SUSPECT_SAMPLE_SIZE) >> 7) + 4
 }
 
@@ -3556,20 +3698,20 @@ fn compress_literals<K: EncodeTier>(
         return emit_reuse_literals::<K>(literals, prev, writer, reset_idx, strategy);
     }
 
-    let mut counts = [0usize; 256];
-
     // Sample before committing to the full histogram (upstream
     // `huf_compress.c:1367`). The histogram spans the whole section, and for a
     // block the search found nothing in that section is the entire block — a
     // megabyte of random input costs a megabyte of counting only to be thrown
     // away by the flatness gate below. Two 4 KiB probes answer the same
     // question for 8 KiB of counting.
-    if suspected_incompressible && end_samples_look_flat(literals, &mut counts) {
+    if suspected_incompressible && end_samples_look_flat(literals) {
         raw_literals(literals, writer);
         return HuffmanTableUpdate::Cleared;
     }
 
-    let (max_symbol, largest_count) = crate::histogram::count_bytes(literals, &mut counts);
+    let mut counts = core::mem::MaybeUninit::uninit();
+    let (counts, max_symbol, largest_count) =
+        crate::histogram::count_bytes_uninit(literals, &mut counts);
     // Upstream zstd pre-build incompressibility gate (`huf_compress.c`,
     // `HUF_compress_internal`): a histogram this flat
     // (`largest <= (srcSize >> 7) + 4`) is heuristically not worth
@@ -3590,6 +3732,7 @@ fn compress_literals<K: EncodeTier>(
     // the encode.
     let mut new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
         &counts[..=max_symbol],
+        literals.len(),
         huf_search,
         weight_scratch,
     );
@@ -3610,7 +3753,7 @@ fn compress_literals<K: EncodeTier>(
         last_table,
         new_table_description_size,
         literals,
-        &counts,
+        counts,
         strategy,
     );
     let encoder_table = if new_table {

@@ -271,8 +271,9 @@ fn a_block_mixing_text_and_noise_is_counted() {
 /// Offset codes are counted with the repeat policy the frame's blocks used.
 /// Two tokens alternating behind short varied gaps make an offset often equal
 /// the one before last: the full search writes it as repeat 2 or 3 (offset
-/// code 1), which the fast strategy never emits, so at level 1 that code keeps
-/// its floor of one while at level 3 it is counted.
+/// code 1), which the fast and double-fast strategies never emit, so at level 1
+/// that code keeps its floor of one while at level 5, the first level that
+/// searches the deeper repeats, it is counted.
 #[test]
 fn offset_codes_follow_the_frames_repeat_policy() {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
@@ -318,7 +319,8 @@ fn offset_codes_follow_the_frames_repeat_policy() {
         .unwrap();
         counts.offset_codes[1]
     };
-    assert!(offset_code_one(3) > 1, "the input exercises deeper repeats");
+    assert!(offset_code_one(5) > 1, "the input exercises deeper repeats");
+    assert_eq!(offset_code_one(3), 1);
     assert_eq!(offset_code_one(1), 1);
 }
 

@@ -2542,6 +2542,41 @@ fn an_attached_dictionary_frame_lays_out_only_the_dictionary() {
     assert_eq!(decoded, payload);
 }
 
+/// The dfast levels read a small slice under an attached dictionary in place
+/// too, and a reused context retires each frame's positions by moving the
+/// floor rather than emptying its tables: every frame of a run must decode,
+/// whatever the frames before it wrote.
+#[test]
+fn dfast_dictionary_frames_scanned_in_place_decode_across_a_reused_context() {
+    let dict_content = generate_data(7, 3 * 1024);
+    let dict = || {
+        crate::decoding::Dictionary::from_raw_content(0xABCD_0044, dict_content.clone())
+            .expect("raw dictionary should be valid")
+    };
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(3));
+    compressor
+        .set_dictionary(dict())
+        .expect("dictionary should attach");
+    let mut decoder = FrameDecoder::new();
+    decoder.add_dict(dict()).unwrap();
+    let mut out = Vec::new();
+    for frame in 0..6u64 {
+        // Frames that quote the dictionary and each other's shape, of varying
+        // length, so stale positions from an earlier frame would land in range.
+        let mut payload = generate_data(20 + frame, 600 + 700 * frame as usize);
+        payload.extend_from_slice(&dict_content[(frame as usize) * 300..][..400]);
+        payload.extend_from_slice(&generate_data(40 + frame, 500));
+        compressor.compress_independent_frame_into(&payload, &mut out);
+        assert!(
+            compressor.state.matcher.borrowed_dict_supported(),
+            "fixture: frame {frame} is scanned in place"
+        );
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&out, &mut decoded).unwrap();
+        assert_eq!(decoded, payload, "frame {frame} must decode");
+    }
+}
+
 /// A custom matcher holds nothing in the compressor's workspace, so replacing
 /// it hands back the matcher that ran, and the compressor goes on with the new
 /// one.
@@ -3185,10 +3220,18 @@ fn set_compression_level_forgets_the_literal_compression_mode() {
     use super::CompressionLevel;
     use crate::encoding::{CompressionParameters, LiteralCompressionMode};
 
-    // Literal-heavy input: 32 symbols with nothing for the match finder, so
-    // whether the literals are Huffman-coded decides the frame size.
-    let text: Vec<u8> = (0..8192u32)
-        .map(|i| b'a' + (i.wrapping_mul(2_654_435_761) >> 27) as u8)
+    // Literal-heavy input: 32 pseudo-random symbols with nothing for the match
+    // finder, so whether the literals are Huffman-coded decides the frame
+    // size. A rotation sequence would not do: it repeats every short factor,
+    // and a 4-byte short key finds them all.
+    let mut state = 0x9E37_79B9u32;
+    let text: Vec<u8> = (0..8192)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            b'a' + (state >> 27) as u8
+        })
         .collect();
     let level = CompressionLevel::Level(3);
     let raw_literals = CompressionParameters::builder(level)
@@ -3512,6 +3555,35 @@ fn a_kept_compressor_writes_each_small_piece_as_a_fresh_one() {
         }
     }
     assert!(diverged.is_empty(), "{diverged:#?}");
+}
+
+/// A fast-band frame leaves its table in place and moves the index past it, so
+/// what the previous frames stored must never reach the next one: on a reused
+/// compressor every frame comes out as it does on a fresh one, including a
+/// frame identical to the last, which would match every stale slot.
+#[test]
+fn a_reused_compressor_encodes_each_frame_as_a_fresh_one_does() {
+    use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+    let text: Vec<u8> = (0..20_000u32)
+        .flat_map(|i| (i % 257).wrapping_mul(2_654_435_761).to_le_bytes())
+        .collect();
+    let frames: [&[u8]; 6] = [
+        &text[..10_240],
+        &text[..10_240],
+        &text[5_000..9_096],
+        &text[..80_000],
+        &text[3..1_027],
+        &text[..10_240],
+    ];
+    for level in [-1, 1, 2] {
+        let level = CompressionLevel::from_level(level);
+        let mut cctx: FrameCompressor = FrameCompressor::new(level);
+        let mut out = Vec::new();
+        for frame in frames {
+            cctx.compress_independent_frame_into(frame, &mut out);
+            assert_eq!(out, compress_slice_to_vec(frame, level));
+        }
+    }
 }
 
 /// `compress_independent_frame_into` must replace (not append to) the

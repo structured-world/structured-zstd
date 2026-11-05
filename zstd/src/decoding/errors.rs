@@ -629,10 +629,23 @@ impl core::fmt::Display for DecodeBufferError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DictionaryDecodeError {
-    BadMagicNum { got: [u8; 4] },
-    DictionaryTooSmall { got: usize, need: usize },
+    BadMagicNum {
+        got: [u8; 4],
+    },
+    DictionaryTooSmall {
+        got: usize,
+        need: usize,
+    },
     ZeroDictionaryId,
-    ZeroRepeatOffsetInDictionary { index: u8 },
+    ZeroRepeatOffsetInDictionary {
+        index: u8,
+    },
+    /// A repeat offset of the dictionary reaches past its content.
+    RepeatOffsetBeyondContent {
+        index: u8,
+        offset: u32,
+        content_len: usize,
+    },
     FSETableError(FSETableError),
     HuffmanTableError(HuffmanTableError),
 }
@@ -670,6 +683,16 @@ impl core::fmt::Display for DictionaryDecodeError {
             }
             DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index } => {
                 write!(f, "Dictionary repeat offset rep{index} must be non-zero")
+            }
+            DictionaryDecodeError::RepeatOffsetBeyondContent {
+                index,
+                offset,
+                content_len,
+            } => {
+                write!(
+                    f,
+                    "Dictionary repeat offset rep{index} = {offset} reaches past its {content_len}-byte content"
+                )
             }
             DictionaryDecodeError::FSETableError(e) => write!(f, "{e:?}"),
             DictionaryDecodeError::HuffmanTableError(e) => write!(f, "{e:?}"),

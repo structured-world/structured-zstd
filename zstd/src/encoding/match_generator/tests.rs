@@ -1844,10 +1844,11 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     // The window is now sized the C-faithful way: `get_cparams` clamps it to
     // the raw 1 KiB source (`window_log = ceil_log2(1024) = 10 = MIN_WINDOW_LOG`),
     // dropping the old MIN_HINTED_WINDOW_LOG 16 KiB interop floor (verified safe:
-    // such small-window frames decode in the C reference). Both dfast tables
-    // follow at that window.
+    // such small-window frames decode in the C reference). The dfast tables
+    // follow `ZSTD_adjustCParams_internal` at that window: `hashLog` down to
+    // the window log plus one, `chainLog` down to the window log.
     assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
-    assert_eq!(hinted_long, 1 << MIN_WINDOW_LOG);
+    assert_eq!(hinted_long, 1 << (MIN_WINDOW_LOG + 1));
     assert_eq!(hinted_short, 1 << MIN_WINDOW_LOG);
     assert!(
         hinted_long < full_long && hinted_short < full_short,
@@ -2495,7 +2496,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     driver.reset(CompressionLevel::Level(5));
     driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
-    let full_rows = driver.row_matcher().row_heads().len();
+    let full_rows = driver.row_matcher().row_count();
     // Level 5 uses the upstream row_log (clamp(searchLog=3, 4, 6) = 4) and the
     // upstream L5 hashLog (`ZSTD_getCParams(5,..).hashLog` = 19), so the row
     // count is 1 << (ROW_L5.hash_bits - ROW_L5.row_log).
@@ -2515,7 +2516,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
         super::super::strategy::BackendTag::Row,
         "windowLog > 14 keeps the upstream row matchfinder"
     );
-    let hinted_rows = driver.row_matcher().row_heads().len();
+    let hinted_rows = driver.row_matcher().row_count();
     assert!(
         hinted_rows < full_rows,
         "a window>14 source hint should reduce the row hash table footprint"
@@ -3392,6 +3393,85 @@ fn fast_dict_attach_follows_the_source_size_cutoff() {
             driver.borrowed_dict_supported(),
             attaches,
             "Fast dict frame with hint {hint} resolved the wrong dictionary mode",
+        );
+    }
+}
+
+#[test]
+fn dfast_geometry_follows_the_reference_cparams() {
+    // The double-fast short table keys on `cParams.minMatch` bytes, as upstream
+    // templates its loops on `mls`, and the level-3 rows of `clevels.h` do not
+    // agree on it: 4 for sources up to 16 KiB, 5 up to 128 KiB, 4 up to 256 KiB
+    // and 5 beyond. A matcher that keyed every tier on 5 bytes searched small
+    // frames with a different hash than the reference.
+    let level = CompressionLevel::Level(3);
+    for (hint, mls) in [
+        (4u64 * 1024, 4),
+        (64 * 1024, 5),
+        (200 * 1024, 4),
+        (1 << 20, 5),
+    ] {
+        let mut driver = MatchGeneratorDriver::new(8, 1);
+        driver.set_source_size_hint(hint);
+        driver.reset(level);
+        let dfast = driver.dfast_matcher_mut();
+        assert_eq!(
+            dfast.mls, mls,
+            "level 3 with a {hint}-byte source keys its short table on the wrong width",
+        );
+        // And the tables take the widths the reference resolves, down-sized for
+        // the source as `ZSTD_adjustCParams_internal` does (`hashLog` to the
+        // source log plus one), with nothing cut further.
+        let cp = crate::encoding::cparams::get_cparams(3, hint, 0);
+        assert_eq!(
+            (dfast.long_hash_bits, dfast.short_hash_bits),
+            (cp.hash_log as usize, cp.chain_log as usize),
+            "level 3 with a {hint}-byte source sizes its tables off the reference",
+        );
+    }
+}
+
+#[test]
+fn a_source_past_a_levelled_dictionary_takes_its_own_cparams_row() {
+    // Upstream keeps a CDict's cParams while the source is under 128 KiB or six
+    // times the dictionary, and always when the CDict has no level of its own
+    // (a dictionary loaded into a context); past that a levelled CDict's frame
+    // picks the row by source plus dictionary (zstd_compress.c:5278, :5858).
+    // A 437-byte dictionary prepares on the smallest row, whose tables are far
+    // too narrow for a megabyte.
+    let level = CompressionLevel::Level(3);
+    let loaded = crate::encoding::DictionarySizes::raw_content(437);
+    let levelled = crate::encoding::DictionarySizes {
+        prepared_at_level: true,
+        ..loaded
+    };
+    let overrides = crate::encoding::parameters::ParamOverrides::default();
+    let cdict = crate::encoding::cparams::get_cdict_cparams(3, 437, &overrides);
+    let own = crate::encoding::cparams::get_frame_cparams(3, 1 << 20, 437, &overrides);
+    assert_ne!(
+        (cdict.hash_log, cdict.min_match),
+        (own.hash_log, own.min_match),
+        "the two rows must differ for this test to tell them apart",
+    );
+    for (sizes, hint, expected) in [
+        (levelled, 64u64 * 1024, cdict),
+        (levelled, 1 << 20, own),
+        (loaded, 64 * 1024, cdict),
+        (loaded, 1 << 20, cdict),
+    ] {
+        let mut driver = MatchGeneratorDriver::new(8, 1);
+        driver.set_source_size_hint(hint);
+        driver.set_dictionary_size_hint(sizes);
+        driver.reset(level);
+        let dfast = driver.dfast_matcher_mut();
+        assert_eq!(
+            (dfast.long_hash_bits, dfast.short_hash_bits, dfast.mls),
+            (
+                expected.hash_log as usize,
+                expected.chain_log as usize,
+                crate::encoding::dfast::dfast_key_len(expected.min_match as u8),
+            ),
+            "a {hint}-byte source under {sizes:?} took the wrong cParams row",
         );
     }
 }

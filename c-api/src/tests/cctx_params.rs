@@ -407,8 +407,17 @@ fn max_block_size_caps_every_block() {
 /// bytes on text and still decodes.
 #[test]
 fn literal_compression_mode_reaches_the_encoder() {
-    let text: Vec<u8> = (0..8192u32)
-        .map(|i| b'a' + (i.wrapping_mul(2_654_435_761) >> 27) as u8)
+    // 32 pseudo-random symbols with no repeats for the match finder, so only
+    // literal entropy coding can shrink the frame. A rotation sequence repeats
+    // every short factor, and a 4-byte short key finds them all.
+    let mut state = 0x9E37_79B9u32;
+    let text: Vec<u8> = (0..8192)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            b'a' + (state >> 27) as u8
+        })
         .collect();
     let cctx = ZSTD_createCCtx();
     let auto = compress2(cctx, &text);

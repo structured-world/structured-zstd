@@ -84,13 +84,11 @@ pub(crate) struct FastHashTable {
     /// ([`Self::advance_epoch`]) therefore invalidates the whole table
     /// without the per-frame full-table memset of [`Self::clear`].
     ///
-    /// Always `0` on paths that access the table storage directly
-    /// ([`Self::hot_state`] — the no-dict kernels) and on cached dict
-    /// tables; only the dict-attach main table advances it.
+    /// The no-dict kernel adds it to its own coordinates, as upstream's index
+    /// runs on through `base` from frame to frame. Always `0` on cached dict
+    /// tables.
     bias: u32,
     /// `TAG_BITS` when slots are tagged, `0` when they hold bare positions.
-    /// A tagged table is never biased: the bias needs the position range the
-    /// tag takes.
     tag_bits: u32,
 }
 
@@ -319,10 +317,9 @@ impl FastHashTable {
         // A tagged slot is `position << TAG_BITS | tag`: subtracting the shifted
         // count moves the position and keeps the tag, and a position at or
         // under the count floors to a slot that is empty or names position 0,
-        // which the kernels' `prefix_start_index >= 1` rejects. A tagged table
-        // is never biased, and its positions stay under `TAGGED_POSITION_LIMIT`,
-        // so the shift cannot overflow.
-        debug_assert!(self.tag_bits == 0 || self.bias == 0);
+        // which the kernels' `prefix_start_index >= 1` rejects. A tagged table's
+        // biased positions stay under `TAGGED_POSITION_LIMIT`, so the shift
+        // cannot overflow.
         let correction = (self.bias + drop_n) << self.tag_bits;
         for slot in self.table.iter_mut() {
             *slot = slot.saturating_sub(correction);
@@ -335,20 +332,21 @@ impl FastHashTable {
     /// previous frame stored, so all of them read back as the empty
     /// sentinel via [`Self::get`]'s epoch filter — no full-table memset.
     ///
-    /// `span` must be strictly greater than the largest unbiased position
-    /// stored since the last clear/advance (the caller passes its history
-    /// high-water mark). Falls back to a real [`Self::clear`] when the
-    /// biased position space would no longer fit `u32`.
-    pub(crate) fn advance_epoch(&mut self, span: u32) {
-        // Stored positions are bounded by the eviction band (2 * max
-        // window = 2^31, see the matcher's `window_log <= 30` ceiling),
-        // so a bias at or below `u32::MAX - 2^31` can never overflow in
-        // `put`.
-        const POSITION_CEILING: u32 = 1 << 31;
-        debug_assert!(!self.is_tagged(), "a tagged table is never biased");
-        match self.bias.checked_add(span) {
-            Some(new_bias) if new_bias <= u32::MAX - POSITION_CEILING => self.bias = new_bias,
-            _ => self.clear(),
+    /// `span` must be at least the largest unbiased position stored since the
+    /// last clear/advance (the caller passes its history high-water mark), and
+    /// `headroom` bound what the coming frame can store. Falls back to a real
+    /// [`Self::clear`] when those positions would no longer fit a slot.
+    pub(crate) fn advance_epoch(&mut self, span: u32, headroom: usize) {
+        let limit = if self.is_tagged() {
+            TAGGED_POSITION_LIMIT as u64
+        } else {
+            u64::from(u32::MAX)
+        };
+        let advanced = u64::from(self.bias) + u64::from(span);
+        if advanced + headroom as u64 <= limit {
+            self.bias = advanced as u32;
+        } else {
+            self.clear();
         }
     }
 
@@ -402,16 +400,18 @@ impl FastHashTable {
     /// `Vec` header on every access — the optimiser otherwise conservatively
     /// re-reads it through `&mut FastHashTable` after each interior write
     /// (the "chases the Vec" reload). Pair with [`hash_ptr_raw`] so the loop
-    /// never touches `self` and stays reload-free.
+    /// never touches `self` and stays reload-free. The caller works in biased
+    /// positions (see [`Self::bias`]); the slot format (tagged or not) is its
+    /// monomorph, read from [`Self::is_tagged`].
     #[inline(always)]
     pub(crate) fn hot_state(&mut self) -> (&mut [u32], u32) {
-        // The raw-slice consumers (no-dict kernels) store and read
-        // UNBIASED positions; they may only run on a bias-0 table (the
-        // matcher clears — rather than epoch-advances — whenever the next
-        // frame is not a dict-attach frame). The slot format (tagged or not)
-        // is the caller's monomorph, read from [`Self::is_tagged`].
-        debug_assert_eq!(self.bias, 0, "hot_state requires an unbiased table");
         (self.table.as_mut_slice(), self.hash_log)
+    }
+
+    /// What a stored value adds to a position in this epoch.
+    #[inline(always)]
+    pub(crate) fn bias(&self) -> u32 {
+        self.bias
     }
 
     /// Like [`Self::hot_state`] but also exposes the epoch `bias`, so a hot
@@ -456,7 +456,7 @@ impl FastHashTable {
         if self.tag_bits != 0 {
             let tag_mask = (1 << self.tag_bits) - 1;
             return if (raw ^ hash) & tag_mask == 0 {
-                raw >> self.tag_bits
+                (raw >> self.tag_bits).saturating_sub(self.bias)
             } else {
                 0
             };
@@ -478,7 +478,7 @@ impl FastHashTable {
     /// As [`Self::get`].
     #[inline(always)]
     pub(crate) unsafe fn slot_is_empty(&self, hash: u32) -> bool {
-        unsafe { self.slot(hash) }.saturating_sub(self.bias) == 0
+        (unsafe { self.slot(hash) } >> self.tag_bits).saturating_sub(self.bias) == 0
     }
 
     /// Direct table write of `pos` under `hash`. Same bounds reasoning as
@@ -491,11 +491,9 @@ impl FastHashTable {
     pub(crate) unsafe fn put(&mut self, hash: u32, pos: u32) {
         let index = (hash >> self.tag_bits) as usize;
         debug_assert!(index < self.table.len());
-        // Cannot overflow: `advance_epoch` caps the bias at
-        // `u32::MAX - 2^31` and `pos` is bounded by the eviction band; a
-        // tagged table is unbiased and its positions stay under
-        // `TAGGED_POSITION_LIMIT`.
-        debug_assert!(self.tag_bits == 0 || (pos as usize) < TAGGED_POSITION_LIMIT);
+        // Cannot overflow: `advance_epoch` leaves room for the frame's
+        // positions, under `TAGGED_POSITION_LIMIT` in a tagged table.
+        debug_assert!(self.tag_bits == 0 || ((pos + self.bias) as usize) < TAGGED_POSITION_LIMIT);
         let tag_mask = (1u32 << self.tag_bits) - 1;
         let stored = ((pos + self.bias) << self.tag_bits) | (hash & tag_mask);
         // SAFETY: see method-level doc.

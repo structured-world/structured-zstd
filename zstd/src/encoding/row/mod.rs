@@ -42,8 +42,6 @@ const ROW_HASH_CACHE_SIZE: usize = 8;
 const ROW_UPDATE_SKIP_THRESHOLD: usize = 384;
 const ROW_UPDATE_MAX_START: usize = 96;
 const ROW_UPDATE_MAX_END: usize = 32;
-/// Hash-cache sentinel for a position too close to the end to hash.
-const ROW_CACHE_NONE: u32 = u32::MAX;
 
 /// Upstream zstd hash multipliers per key width (`zstd_compress_internal.h`
 /// `prime4bytes` / `prime5bytes` / `prime6bytes`): `ZSTD_hash4` multiplies
@@ -175,6 +173,133 @@ impl<const MLS: u32> RowScan<MLS> {
             self.low_limit.max(pos.saturating_sub(self.search_window))
         }
     }
+}
+
+/// The hash-chain search's tables and limits, read once per block as upstream
+/// resolves them above its search (zstd_lazy.c:673-689 and 739-747): every
+/// position otherwise pays a reload of each through `&mut self`, a bounds
+/// check per table access and a walk through the dictionary's `Option`. The
+/// tables are neither moved nor resized while a block is parsed.
+#[derive(Clone, Copy)]
+struct ChainScan {
+    hash: *mut u32,
+    chain: *mut u32,
+    hash_bits: usize,
+    chain_mask: usize,
+    search_depth: usize,
+    /// The attached dictionary's chain form; null without one.
+    dict_hash: *const u32,
+    dict_chain: *const u32,
+    dict_hash_bits: usize,
+    dict_chain_mask: usize,
+    dict_end: usize,
+    dict_min_chain: usize,
+}
+
+/// The row search's tables and limits, read once per block for the reason
+/// [`ChainScan`] gives: the rows, cursors and tags share one buffer, so each
+/// accessor otherwise rebuilds its slice from the matcher's fields, several
+/// times per position. Its methods are the matcher's of the same name.
+#[derive(Clone, Copy)]
+struct RowTables {
+    positions: *mut u32,
+    /// Each row's tags; its first byte is the row's cursor.
+    tags: *mut u8,
+    /// `rowHashLog + ROW_TAG_BITS`.
+    hash_bits: usize,
+    row_count_mask: usize,
+    search_depth: usize,
+    /// The attached dictionary's row form; null without one.
+    dict_positions: *const u32,
+    dict_heads: *const u8,
+    dict_tags: *const u8,
+    dict_row_hash_log: usize,
+}
+
+impl RowTables {
+    /// Row and tag of `abs_pos`, packed as upstream packs them in its hash
+    /// cache. The parse stops 16 bytes short of the block's end, so every
+    /// position it reaches, and the one a cache's width ahead of it, has its
+    /// full 8 bytes: neither that bound nor a short key is tested per position.
+    #[inline(always)]
+    fn packed_hash_at<const MLS: u32>(&self, ctx: RowScan<MLS>, abs_pos: usize) -> u32 {
+        let idx = abs_pos - ctx.hist_start;
+        debug_assert!(idx + 8 <= ctx.len);
+        // SAFETY: as above, and `ctx` views the live history. The length only
+        // chooses the key, so it is passed as unbounded to choose the full one.
+        unsafe {
+            RowMatchGenerator::key_hash_raw(
+                ctx.base,
+                usize::MAX,
+                idx,
+                ctx.key_mls(),
+                self.hash_bits,
+                ctx.salt,
+            ) as u32
+        }
+    }
+
+    /// The row of a packed hash.
+    #[inline(always)]
+    fn row_of(&self, packed: u32) -> usize {
+        ((packed >> ROW_TAG_BITS) as usize) & self.row_count_mask
+    }
+
+    /// Prefetch a row's tag bytes and position words into L1 ahead of the
+    /// next iteration's probe (no-op on targets without a prefetch hint).
+    #[inline(always)]
+    fn prefetch_row<const ROW_LOG: usize>(&self, row: usize) {
+        let row_base = row << ROW_LOG;
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            #[cfg(target_arch = "x86")]
+            use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+            #[cfg(target_arch = "x86_64")]
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            // SAFETY: prefetch is a hint and never faults; `row` is masked to
+            // the table's rows.
+            unsafe {
+                _mm_prefetch(self.tags.add(row_base).cast(), _MM_HINT_T0);
+                _mm_prefetch(self.positions.add(row_base).cast(), _MM_HINT_T0);
+                // Upstream zstd `ZSTD_row_prefetch` (zstd_lazy.c:816): rows of
+                // >= 32 entries span several 64-byte lines of positions; the
+                // second line is fetched too.
+                if ROW_LOG >= 5 {
+                    _mm_prefetch(self.positions.add(row_base + 16).cast(), _MM_HINT_T0);
+                }
+            }
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            let _ = row_base;
+        }
+    }
+
+    /// See [`RowMatchGenerator::insert_at`].
+    #[inline(always)]
+    fn insert_at<const ROW_LOG: usize>(&self, abs_pos: usize, row: usize, tag: u8) {
+        let row_mask = (1usize << ROW_LOG) - 1;
+        let row_base = row << ROW_LOG;
+        // SAFETY: `row` is masked to the table's rows and `next <= row_mask`,
+        // so each index is in bounds of its table.
+        unsafe {
+            let head = *self.tags.add(row_base) as usize;
+            let next = next_row_slot(head, row_mask);
+            *self.tags.add(row_base) = next as u8;
+            *self.tags.add(row_base + next) = tag;
+            *self.positions.add(row_base + next) = abs_pos as u32;
+        }
+    }
+}
+
+/// Upstream `ZSTD_row_nextIndex` (zstd_lazy.c:798): slot 0 holds the cursor, so
+/// it cycles over `1..=row_mask`. The wrap is arithmetic because it falls on an
+/// unpredictable insert of each row, and written as a branch it was the search's
+/// most mispredicted one.
+#[inline(always)]
+fn next_row_slot(head: usize, row_mask: usize) -> usize {
+    let next = head.wrapping_sub(1) & row_mask;
+    next + (usize::from(next == 0).wrapping_neg() & row_mask)
 }
 
 /// Upstream zstd `ZSTD_highbit32(offBase)` term of the lazy gain formula:
@@ -541,7 +666,7 @@ macro_rules! dispatch_tag_kernel {
 /// means nothing found (upstream's `ml = 4-1`), `offset` is the distance.
 /// Leftover attempts fund the dictionary row (upstream `dictMatchState`).
 macro_rules! row_find_best_match {
-    ($m:expr, $ctx:ident, $abs_pos:expr, $row:expr, $tag:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+    ($m:expr, $ctx:ident, $t:ident, $abs_pos:expr, $row:expr, $tag:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         let hist_start = $ctx.hist_start;
         let cur_idx = $abs_pos - hist_start;
         // SAFETY: the parse searches only positions >= 16 bytes before the
@@ -551,15 +676,17 @@ macro_rules! row_find_best_match {
         let row_entries = 1usize << $rl;
         let row_mask = row_entries - 1;
         let row_base = $row << $rl;
-        // SAFETY (table indexing below): `$row < row_heads.len()` and
+        // SAFETY (table indexing below):
         // `row_base + row_entries <= row_tags.len() == row_positions.len()`
         // by the `ensure_tables` sizing (`row` is masked to `row_hash_log`
         // bits, `row_log == $rl`), the same argument as `insert_at`.
         debug_assert_eq!($rl, $m.row_log);
         debug_assert!(row_base + row_entries <= $m.row_positions().len());
-        let head = unsafe { *$m.row_heads().get_unchecked($row) } as usize;
-        let window_low = $ctx.window_low($abs_pos);
-        let budget = $m.search_depth.min(row_entries);
+        let head = unsafe { *$t.tags.add(row_base) } as usize;
+        // One test for the floor and the empty slot, which wraps to 0.
+        // Positions fit a slot, so the floor does too.
+        let slot_floor = $ctx.window_low($abs_pos) as u32;
+        let budget = $t.search_depth.min(row_entries);
         let mut attempts = budget;
         let mut ml = 3usize;
         let mut best_off = 0usize;
@@ -576,15 +703,14 @@ macro_rules! row_find_best_match {
             #[allow(unused_mut)]
             let mut pending: u64 = if $use_mask {
                 // SAFETY: see the table-indexing note above.
-                let tags = unsafe {
-                    core::slice::from_raw_parts($m.row_tags().as_ptr().add(row_base), row_entries)
-                };
+                let tags =
+                    unsafe { core::slice::from_raw_parts($t.tags.add(row_base), row_entries) };
                 let m = $maskmac!(tags, $tag) & entries_bits;
-                if head == 0 {
-                    m
-                } else {
-                    ((m >> head) | (m << (row_entries - head))) & entries_bits
-                }
+                // Rotated by the head, as upstream does without a test for a
+                // zero head: there the left shift is the row's width, which
+                // the mask clears, or a whole word, which the `& 63` makes
+                // a repeat of `m`.
+                ((m >> head) | (m << ((row_entries - head) & 63))) & entries_bits
             } else {
                 0
             };
@@ -604,7 +730,8 @@ macro_rules! row_find_best_match {
                     while scan < row_entries {
                         let s = (head + scan) & row_mask;
                         scan += 1;
-                        if $m.row_tags()[row_base + s] == $tag {
+                        // SAFETY: `s < row_entries`; see the table-indexing note.
+                        if unsafe { *$t.tags.add(row_base + s) } == $tag {
                             found = Some(s);
                             break;
                         }
@@ -619,15 +746,16 @@ macro_rules! row_find_best_match {
                     continue;
                 }
                 // SAFETY: `slot < row_entries`; see the table-indexing note.
-                let raw = unsafe { *$m.row_positions().get_unchecked(row_base + slot) };
+                let raw = unsafe { *$t.positions.add(row_base + slot) };
                 // Newest-first order: the first empty / below-floor entry ends
                 // the walk (upstream `if (matchIndex < lowLimit) break`).
-                if raw == ROW_EMPTY_SLOT || (raw as usize) < window_low {
+                if raw.wrapping_add(1) <= slot_floor {
                     break;
                 }
-                if (raw as usize) >= $abs_pos {
-                    continue;
-                }
+                // The floor advances past every indexed position between
+                // frames, so an entry never names the position or one after it
+                // (upstream asserts the same, zstd_lazy.c:1257).
+                debug_assert!((raw as usize) < $abs_pos);
                 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                 {
                     #[cfg(target_arch = "x86")]
@@ -650,9 +778,9 @@ macro_rules! row_find_best_match {
         // are gated at the match head (`MEM_read32(match) == MEM_read32(ip)`)
         // instead of at the current best length.
         let prefix_start = $ctx.prefix_start;
-        for slot in &buf[..n] {
+        for i in 0..n {
             // SAFETY: the first `n` entries were written above.
-            let raw = unsafe { slot.assume_init() };
+            let raw = unsafe { buf.get_unchecked(i).assume_init() };
             let cand_idx = raw as usize - hist_start;
             // SAFETY: `cand_idx < cur_idx`; the gate reads 4 bytes at
             // `+ ml - 3` where `ml + 1 <= limit` (the count breaks out of the
@@ -683,16 +811,9 @@ macro_rules! row_find_best_match {
         // left (`nbAttempts` is shared), each entry gated by a 4-byte compare
         // at the match head. `dict.shape.row_log == $rl` (the frame keeps the
         // CDict's `searchLog`).
-        if ml < limit
-            && attempts > 0
-            && $ctx.attached
-            && let Some(dict) = $m.dict.table()
-            && dict.shape.use_row
-        {
-            debug_assert_eq!(dict.shape.row_log, $rl);
+        if ml < limit && attempts > 0 && !$t.dict_positions.is_null() {
             let mut dattempts = attempts;
-            let dict_end = $m.dict.region_len();
-            let dict_row_hash_log = dict.shape.hash_log - $rl;
+            let dict_row_hash_log = $t.dict_row_hash_log;
             // SAFETY: `cur_idx + 16 <= $ctx.len`.
             let dcombined = unsafe {
                 RowMatchGenerator::key_hash_raw(
@@ -707,16 +828,16 @@ macro_rules! row_find_best_match {
             let drow = ((dcombined >> ROW_TAG_BITS) as usize) & ((1usize << dict_row_hash_log) - 1);
             let dtag = dcombined as u8;
             let drow_base = drow << $rl;
-            let dhead = dict.heads[drow] as usize;
+            // SAFETY: `drow` is masked to the dictionary's rows.
+            let dhead = unsafe { *$t.dict_heads.add(drow) } as usize;
             #[allow(unused_mut)]
             let mut dpending: u64 = if $use_mask {
-                let m =
-                    $maskmac!(&dict.tags[drow_base..drow_base + row_entries], dtag) & entries_bits;
-                if dhead == 0 {
-                    m
-                } else {
-                    ((m >> dhead) | (m << (row_entries - dhead))) & entries_bits
-                }
+                // SAFETY: as above; a row is `row_entries` tags.
+                let dtags = unsafe {
+                    core::slice::from_raw_parts($t.dict_tags.add(drow_base), row_entries)
+                };
+                let m = $maskmac!(dtags, dtag) & entries_bits;
+                ((m >> dhead) | (m << ((row_entries - dhead) & 63))) & entries_bits
             } else {
                 0
             };
@@ -736,7 +857,8 @@ macro_rules! row_find_best_match {
                     while dscan < row_entries {
                         let s = (dhead + dscan) & row_mask;
                         dscan += 1;
-                        if dict.tags[drow_base + s] == dtag {
+                        // SAFETY: `s < row_entries`.
+                        if unsafe { *$t.dict_tags.add(drow_base + s) } == dtag {
                             found = Some(s);
                             break;
                         }
@@ -747,13 +869,14 @@ macro_rules! row_find_best_match {
                 if slot == 0 {
                     continue;
                 }
-                let dp = dict.positions[drow_base + slot];
+                // SAFETY: `slot < row_entries`.
+                let dp = unsafe { *$t.dict_positions.add(drow_base + slot) };
                 if dp == ROW_EMPTY_SLOT {
                     break;
                 }
                 dattempts -= 1;
                 let dp = dp as usize;
-                debug_assert!(dp + 8 <= dict_end);
+                debug_assert!(dp + 8 <= $m.dict.region_len());
                 // SAFETY: `dp + 8 <= dict_end <= cur_idx`, `cur_idx + 4 <= $ctx.len`.
                 unsafe {
                     let dptr = $ctx.base.add(dp);
@@ -779,42 +902,38 @@ macro_rules! row_find_best_match {
 /// its 96 head + 32 tail positions), search `$p`, then index `$p` itself.
 /// `$ntu` is the parse's `nextToUpdate` local, `$skip` its `lazySkipping`.
 macro_rules! lazy_search_at {
-    ($m:expr, $ctx:ident, $p:expr, $ntu:ident, $skip:ident, $cache:ident, $rl:expr, $finder:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+    ($m:expr, $ctx:ident, $chain:ident, $t:ident, $p:expr, $ntu:ident, $skip:ident, $cache:ident, $rl:expr, $finder:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         let p = $p;
         if $finder == FINDER_TREE {
             dubt_find_best_match!($m, $ctx, p, $ntu, $cpl)
         } else if $finder == FINDER_CHAIN {
-            hc_find_best_match!($m, $ctx, p, $ntu, $skip, $cpl)
+            hc_find_best_match!($ctx, $chain, p, $ntu, $skip, $cpl)
         } else {
-            let (row, tag) = if $skip {
+            let packed = if $skip {
                 // Lazy skipping: the skipped-over gap is not indexed and the cache
                 // is not maintained; the position is hashed directly.
-                row_cache_hash!($m, $ctx, $rl, p)
+                row_cache_hash!($t, $ctx, $rl, p)
             } else {
                 if p - $ntu > ROW_UPDATE_SKIP_THRESHOLD {
                     row_cache_insert_range!(
-                        $m,
+                        $t,
                         $ctx,
                         $cache,
                         $rl,
                         $ntu,
                         $ntu + ROW_UPDATE_MAX_START
                     );
-                    row_cache_fill!($m, $ctx, $cache, $rl, p - ROW_UPDATE_MAX_END);
-                    row_cache_insert_range!($m, $ctx, $cache, $rl, p - ROW_UPDATE_MAX_END, p);
+                    row_cache_fill!($t, $ctx, $cache, $rl, p - ROW_UPDATE_MAX_END);
+                    row_cache_insert_range!($t, $ctx, $cache, $rl, p - ROW_UPDATE_MAX_END, p);
                 } else {
-                    row_cache_insert_range!($m, $ctx, $cache, $rl, $ntu, p);
+                    row_cache_insert_range!($t, $ctx, $cache, $rl, $ntu, p);
                 }
-                row_cache_next!($m, $ctx, $cache, $rl, p)
+                row_cache_next!($t, $ctx, $cache, $rl, p)
             };
-            let r = if row != ROW_CACHE_NONE {
-                let row = row as usize;
-                let r = row_find_best_match!($m, $ctx, p, row, tag, $rl, $use_mask, $maskmac, $cpl);
-                $m.insert_at::<$rl>(p, row, tag);
-                r
-            } else {
-                (3usize, 0usize)
-            };
+            let row = $t.row_of(packed);
+            let tag = packed as u8;
+            let r = row_find_best_match!($m, $ctx, $t, p, row, tag, $rl, $use_mask, $maskmac, $cpl);
+            $t.insert_at::<$rl>(p, row, tag);
             $ntu = p + 1;
             r
         }
@@ -830,24 +949,42 @@ macro_rules! lazy_search_at {
 /// search's gap, as upstream. Evaluates to `(ml, offset)` like
 /// `row_find_best_match!`.
 macro_rules! hc_find_best_match {
-    ($m:expr, $ctx:ident, $p:expr, $ntu:ident, $skip:ident, $cpl:path) => {{
+    ($ctx:ident, $chain:ident, $p:expr, $ntu:ident, $skip:ident, $cpl:path) => {{
         let p = $p;
         let hist_start = $ctx.hist_start;
-        let chain_mask = (1usize << $m.hc_chain_log) - 1;
+        let chain_mask = $chain.chain_mask;
         let cur_idx = p - hist_start;
         // SAFETY: the parse searches only positions >= 16 bytes before the
         // block end.
         let cur_ptr = unsafe { $ctx.base.add(cur_idx) };
         let limit = $ctx.len - cur_idx;
+        // The caller keeps at least `ROW_HASH_KEY_LEN` bytes after a chained
+        // position, and the hash fits `hash_bits`.
+        let bucket = |idx: usize| -> *mut u32 {
+            debug_assert!(idx + ROW_HASH_KEY_LEN <= $ctx.len);
+            // SAFETY: as above.
+            unsafe {
+                let key = RowMatchGenerator::key_hash_raw(
+                    $ctx.base,
+                    $ctx.len,
+                    idx,
+                    $ctx.key_mls(),
+                    $chain.hash_bits,
+                    0,
+                );
+                $chain.hash.add(key as usize)
+            }
+        };
         {
             let mut idx = $ntu;
             while idx < p {
-                let h = $m.hc_hash_at($ctx, idx);
-                // Split per iteration so the hash helper can borrow again on
-                // the next one; the two halves come from one buffer.
-                let (hash, chain) = $m.hc_tables_mut();
-                chain[idx & chain_mask] = hash[h];
-                hash[h] = idx as u32;
+                let slot = bucket(idx - hist_start);
+                // SAFETY: the slot is in the hash table and the link is masked
+                // to the chain's length.
+                unsafe {
+                    *$chain.chain.add(idx & chain_mask) = *slot;
+                    *slot = idx as u32;
+                }
                 idx += 1;
                 if $skip {
                     break;
@@ -857,19 +994,20 @@ macro_rules! hc_find_best_match {
         }
         let window_low = $ctx.window_low(p);
         let min_chain = p.saturating_sub(chain_mask + 1);
-        let mut attempts = $m.search_depth;
+        let mut attempts = $chain.search_depth;
         let mut ml = 3usize;
         let mut best_off = 0usize;
         // A copied dictionary is upstream's `extDict` segment: its candidates
         // are gated at the match head instead of at the current best length.
         let prefix_start = $ctx.prefix_start;
-        // Shared views of the two halves for the walk below, which only reads
-        // them; taken once so the chain hop is a plain index.
-        let hc_hash = $m.hc_hash();
-        let hc_chain = $m.hc_chain();
-        let mut match_index = hc_hash[$m.hc_hash_at($ctx, p)];
-        while match_index != ROW_EMPTY_SLOT && (match_index as usize) >= window_low && attempts > 0
-        {
+        // SAFETY: the slot is in the hash table.
+        let mut match_index = unsafe { *bucket(cur_idx) };
+        // One test for the floor and the empty slot, which wraps to 0, and no
+        // branch of its own for the attempts (upstream `(matchIndex>=lowLimit)
+        // & (nbAttempts>0)`, zstd_lazy.c:708). Positions fit a slot, so the
+        // floor does too.
+        let slot_floor = window_low as u32;
+        while (match_index.wrapping_add(1) > slot_floor) & (attempts > 0) {
             let cand = match_index as usize;
             // The floor advances past every indexed position between frames,
             // so a link never points at or past the searched position.
@@ -897,7 +1035,8 @@ macro_rules! hc_find_best_match {
             if cand <= min_chain {
                 break;
             }
-            match_index = hc_chain[cand & chain_mask];
+            // SAFETY: the link is masked to the chain's length.
+            match_index = unsafe { *$chain.chain.add(cand & chain_mask) };
             attempts -= 1;
         }
         // Attached dictionary (upstream `dictMatchState`): the CDict's own
@@ -905,29 +1044,23 @@ macro_rules! hc_find_best_match {
         // the frame's key width), walked with the remaining attempts, each
         // link gated by a 4-byte compare at the match head and never past
         // `dictSize - chainSize`.
-        if ml < limit
-            && attempts > 0
-            && $ctx.attached
-            && let Some(dict) = $m.dict.table()
-            && !dict.shape.use_row
-            && !dict.shape.use_bt
-        {
-            let dict_end = $m.dict.region_len();
-            let dchain_mask = (1usize << dict.shape.chain_log) - 1;
-            let dmin_chain = dict_end.saturating_sub(dchain_mask + 1);
-            // SAFETY: `cur_idx + 16 <= $ctx.len`.
-            let dh = unsafe {
-                RowMatchGenerator::key_hash_raw(
+        if ml < limit && attempts > 0 && !$chain.dict_hash.is_null() {
+            let dict_end = $chain.dict_end;
+            let dchain_mask = $chain.dict_chain_mask;
+            let dmin_chain = $chain.dict_min_chain;
+            // SAFETY: `cur_idx + 16 <= $ctx.len`, and the hash fits the
+            // dictionary's table.
+            let mut dmi = unsafe {
+                *$chain.dict_hash.add(RowMatchGenerator::key_hash_raw(
                     $ctx.base,
                     $ctx.len,
                     cur_idx,
                     $ctx.key_mls(),
-                    dict.shape.hash_log,
+                    $chain.dict_hash_bits,
                     0,
-                )
-            } as usize;
-            let mut dmi = dict.hc_hash[dh];
-            while dmi != ROW_EMPTY_SLOT && attempts > 0 {
+                ) as usize)
+            };
+            while (dmi != ROW_EMPTY_SLOT) & (attempts > 0) {
                 let dp = dmi as usize;
                 debug_assert!(dp + 8 <= dict_end);
                 // SAFETY: `dp + 8 <= dict_end <= cur_idx`, `cur_idx + 4 <= $ctx.len`.
@@ -947,7 +1080,8 @@ macro_rules! hc_find_best_match {
                 if dp <= dmin_chain {
                     break;
                 }
-                dmi = dict.hc_chain[dp & dchain_mask];
+                // SAFETY: the link is masked to the chain's length.
+                dmi = unsafe { *$chain.dict_chain.add(dp & dchain_mask) };
                 attempts -= 1;
             }
         }
@@ -1318,27 +1452,27 @@ macro_rules! dubt_find_best_match {
 }
 
 /// Hash one position for the row cache and prefetch its row (upstream zstd
-/// `ZSTD_row_fillHashCache` / `ZSTD_row_nextCachedHash` body): `(row, tag)`
-/// with `row == ROW_CACHE_NONE` past the hashable end.
+/// `ZSTD_row_fillHashCache` / `ZSTD_row_nextCachedHash` body).
 macro_rules! row_cache_hash {
-    ($m:expr, $ctx:ident, $rl:expr, $pos:expr) => {{
-        match $m.row_hash_at($ctx, $pos) {
-            Some((row, tag)) => {
-                $m.prefetch_row::<$rl>(row);
-                (row as u32, tag)
-            }
-            None => (ROW_CACHE_NONE, 0u8),
-        }
+    ($t:expr, $ctx:ident, $rl:expr, $pos:expr) => {{
+        let packed = $t.packed_hash_at($ctx, $pos);
+        $t.prefetch_row::<$rl>($t.row_of(packed));
+        packed
     }};
 }
 
 /// Upstream zstd `ZSTD_row_fillHashCache`: (re)load the cache for the
-/// positions `$from .. $from + ROW_HASH_CACHE_SIZE`.
+/// positions `$from .. $from + ROW_HASH_CACHE_SIZE`, which may pass the last
+/// one the parse will search. Those it stops at (upstream's `lim`), and their
+/// slots are never read.
 macro_rules! row_cache_fill {
-    ($m:expr, $ctx:ident, $cache:ident, $rl:expr, $from:expr) => {{
+    ($t:expr, $ctx:ident, $cache:ident, $rl:expr, $from:expr) => {{
         let from = $from;
         for pos in from..from + ROW_HASH_CACHE_SIZE {
-            $cache[pos & (ROW_HASH_CACHE_SIZE - 1)] = row_cache_hash!($m, $ctx, $rl, pos);
+            if pos - $ctx.hist_start + 8 > $ctx.len {
+                break;
+            }
+            $cache[pos & (ROW_HASH_CACHE_SIZE - 1)] = row_cache_hash!($t, $ctx, $rl, pos);
         }
     }};
 }
@@ -1362,10 +1496,8 @@ macro_rules! row_cache_next {
 macro_rules! row_cache_insert_range {
     ($m:expr, $ctx:ident, $cache:ident, $rl:expr, $from:expr, $to:expr) => {{
         for pos in $from..$to {
-            let (row, tag) = row_cache_next!($m, $ctx, $cache, $rl, pos);
-            if row != ROW_CACHE_NONE {
-                $m.insert_at::<$rl>(pos, row as usize, tag);
-            }
+            let packed = row_cache_next!($m, $ctx, $cache, $rl, pos);
+            $m.insert_at::<$rl>(pos, $m.row_of(packed), packed as u8);
         }
     }};
 }
@@ -1400,6 +1532,8 @@ macro_rules! lazy_parse_body {
             let block_end = current_abs_start + current_len;
             $m.enter_block(current_abs_start, block_end);
             let scan = $m.scan_ctx_with::<$mls>();
+            let chain_scan = $m.chain_scan(scan.attached);
+            let row_tables = $m.row_tables(scan.attached);
             let hist_start = scan.hist_start;
             let depth = $m.lazy_depth;
             // Upstream `ilimit`: `iend - 8 - ZSTD_ROW_HASH_CACHE_SIZE` for the
@@ -1437,9 +1571,9 @@ macro_rules! lazy_parse_body {
             }
             let mut lazy_skipping = false;
             // Upstream `ZSTD_row_fillHashCache(ms, base, rowLog, mls, nextToUpdate, ilimit)`.
-            let mut hash_cache = [(ROW_CACHE_NONE, 0u8); ROW_HASH_CACHE_SIZE];
+            let mut hash_cache = [0u32; ROW_HASH_CACHE_SIZE];
             if $finder == FINDER_ROWS {
-                row_cache_fill!($m, scan, hash_cache, $rl, next_to_update);
+                row_cache_fill!(row_tables, scan, hash_cache, $rl, next_to_update);
             }
             // Upstream `rep[0..2]` entering the block: carried from the
             // previous lazy block, else the frame / dictionary history.
@@ -1463,24 +1597,25 @@ macro_rules! lazy_parse_body {
             let attached = scan.attached;
             let prefix_start = scan.prefix_start;
             let search_window = scan.search_window;
+            // The floor is the block's one constant in every mode. Plain, the
+            // block-start clamp below keeps every carried rep in-window for
+            // the whole block (the window floor never advances faster than the
+            // position) and searched offsets are in-window by construction,
+            // so only a disabled rep fails, and nothing lies in the seam. The
+            // first test takes a zero offset, wrapped, with the floor, so
+            // neither the frame's mode nor a third compare is paid per
+            // position.
+            let rep_floor = if attached {
+                hist_start
+            } else if dict_frame {
+                scan.low_limit
+            } else {
+                0
+            };
             let rep_ok = |pos: usize, off: usize| -> bool {
-                if !dict_frame {
-                    // The block-start clamp below keeps every carried rep
-                    // in-window for the whole block (the window floor never
-                    // advances faster than the position) and searched
-                    // offsets are in-window by construction.
-                    return off != 0;
-                }
-                if off == 0 || off > pos {
-                    return false;
-                }
-                let cand = pos - off;
-                let floor = if attached {
-                    hist_start
-                } else {
-                    scan.window_low(pos)
-                };
-                cand >= floor && !(cand < prefix_start && cand + 3 >= prefix_start)
+                debug_assert!(dict_frame || off == 0 || pos - off >= prefix_start);
+                off.wrapping_sub(1) < pos - rep_floor
+                    && prefix_start.wrapping_sub(1).wrapping_sub(pos - off) >= 3
             };
             let mut offset_1 = rep_in_1;
             let mut offset_2 = rep_in_2;
@@ -1523,6 +1658,8 @@ macro_rules! lazy_parse_body {
                     let (ml2, off2) = lazy_search_at!(
                         $m,
                         scan,
+                        chain_scan,
+                        row_tables,
                         ip,
                         next_to_update,
                         lazy_skipping,
@@ -1582,6 +1719,8 @@ macro_rules! lazy_parse_body {
                             let (ml2, off2) = lazy_search_at!(
                                 $m,
                                 scan,
+                                chain_scan,
+                                row_tables,
                                 ip,
                                 next_to_update,
                                 lazy_skipping,
@@ -1630,6 +1769,8 @@ macro_rules! lazy_parse_body {
                                 let (ml2, off2) = lazy_search_at!(
                                     $m,
                                     scan,
+                                    chain_scan,
+                                    row_tables,
                                     ip,
                                     next_to_update,
                                     lazy_skipping,
@@ -1658,15 +1799,19 @@ macro_rules! lazy_parse_body {
                     // never past `anchor` nor below the match's segment start
                     // (upstream `mStart`: the prefix start for a prefix match,
                     // the dictionary start for a dictionary match).
-                    let concat = $m.live_history();
                     let m_start = if start - off >= prefix_start {
                         prefix_start
                     } else {
                         hist_start
                     };
+                    // SAFETY: `start - 1 >= anchor` and `start - off - 1 >=
+                    // m_start >= hist_start`, both before the block's end.
                     while start > anchor
                         && start - off > m_start
-                        && concat[start - 1 - hist_start] == concat[start - 1 - off - hist_start]
+                        && unsafe {
+                            *scan.base.add(start - 1 - hist_start)
+                                == *scan.base.add(start - 1 - off - hist_start)
+                        }
                     {
                         start -= 1;
                         match_length += 1;
@@ -1707,7 +1852,7 @@ macro_rules! lazy_parse_body {
                 if lazy_skipping {
                     // A match ends lazy skipping; the row cache is stale, refill it.
                     if $finder == FINDER_ROWS {
-                        row_cache_fill!($m, scan, hash_cache, $rl, next_to_update);
+                        row_cache_fill!(row_tables, scan, hash_cache, $rl, next_to_update);
                     }
                     lazy_skipping = false;
                 }
@@ -2037,7 +2182,7 @@ macro_rules! row_probe_body {
             let row_entries = 1usize << $rl;
             let row_mask = row_entries - 1;
             let row_base = row << $rl;
-            let head = $m.row_heads()[row] as usize;
+            let head = $m.row_tags()[row_base] as usize;
             let max_walk = $m.search_depth.min(row_entries);
 
             // Prefetch the dict row before the live scan (upstream zstd
@@ -2507,26 +2652,24 @@ pub(crate) struct RowMatchGenerator {
     tables_fresh: bool,
     /// Start of the chain / tree table inside [`Self::tables`]; the hash table
     /// occupies everything before it. Zero in row mode, where the buffer holds
-    /// row positions followed by the two byte tables.
+    /// row positions followed by the tags.
     hc_split: usize,
-    /// Row positions occupy `tables[..rows_len]`; the slot cursors and hash
-    /// tags share the bytes of `tables[rows_len..]`. Zero in chain / tree mode,
-    /// where the buffer holds no rows. Carrying the seam explicitly keeps the
-    /// three regions in ONE allocation: a fresh compressor that took them
-    /// separately handed the allocator three size classes per frame, and the
-    /// pages of all three went back to the kernel between frames as a result.
+    /// Row positions occupy `tables[..rows_len]`; the hash tags fill the bytes
+    /// of `tables[rows_len..]`. Zero in chain / tree mode, where the buffer
+    /// holds no rows. Carrying the seam explicitly keeps the regions in ONE
+    /// allocation: a fresh compressor that took them separately handed the
+    /// allocator a size class each per frame, and the pages of all of them
+    /// went back to the kernel between frames as a result.
     rows_len: usize,
-    /// Byte length of the slot-cursor region, and of the tag region that
-    /// follows it, inside the tail of [`Self::tables`]. Kept as fields rather
-    /// than recomputed from the logs: the row search reads them per candidate,
-    /// and deriving them there cost more than the allocation churn the shared
-    /// buffer removed. Both are zero whenever the buffer is not laid out for
-    /// rows, which is what makes the accessors branchless.
+    /// Byte length of the tag region, the tail of [`Self::tables`]. Slot 0 of
+    /// each row holds no entry, so its tag byte is the row's cursor, as in
+    /// upstream (`ZSTD_row_nextIndex`, zstd_lazy.c:798): a cursor of its own
+    /// would be one more line to fetch per position. Zero whenever the buffer
+    /// is not laid out for rows, which is what makes the accessors branchless.
     ///
     /// Invariant, established by [`Self::ensure_tables`] and preserved by every
-    /// path that clears the buffer: `rows_len * 4 + heads_len + tags_len` is at
-    /// most `tables.len() * 4`.
-    heads_len: usize,
+    /// path that clears the buffer: `rows_len * 4 + tags_len` is at most
+    /// `tables.len() * 4`.
     tags_len: usize,
     // Absolute match positions, one per row slot. Stored as `u32` (not
     // `usize`): this is the largest match-finder array, and `u32` halves its
@@ -2613,7 +2756,6 @@ impl RowMatchGenerator {
             dict_index_floor: 0,
             lazy_depth: 1,
             rows_len: 0,
-            heads_len: 0,
             tags_len: 0,
             dict: DictAttach::new(),
             dict_keep: DictKeep::new(),
@@ -2754,13 +2896,11 @@ impl RowMatchGenerator {
         let row_hash_log = clamped.saturating_sub(self.row_log);
         if self.row_hash_log != row_hash_log {
             self.row_hash_log = row_hash_log;
-            // One buffer carries the positions and the two byte tables, so
-            // dropping it drops all three; they are laid out again at the new
-            // width.
+            // One buffer carries the positions and the tags, so dropping it
+            // drops both; they are laid out again at the new width.
             self.tables = Table::empty();
             self.hc_split = 0;
             self.rows_len = 0;
-            self.heads_len = 0;
             self.tags_len = 0;
             // NOTE: do NOT invalidate the dict here. `set_hash_bits` is called
             // twice per frame during level setup (once from `configure` with
@@ -3426,10 +3566,9 @@ impl RowMatchGenerator {
     pub(crate) fn release_tables(&mut self) {
         self.tables = Table::empty();
         self.hc_split = 0;
-        // The cursors and tags lived in the same buffer, so releasing it
-        // releases them; their lengths have to say so.
+        // The tags lived in the same buffer, so releasing it releases them;
+        // their lengths have to say so.
         self.rows_len = 0;
-        self.heads_len = 0;
         self.tags_len = 0;
     }
 
@@ -3445,13 +3584,13 @@ impl RowMatchGenerator {
         &mut self.tables[..self.rows_len]
     }
 
-    /// The byte tail of [`Self::tables`], holding the slot cursors followed by
-    /// the hash tags. Reinterpreting the `u32` tail as bytes is always
+    /// The byte tail of [`Self::tables`], holding the hash tags and the row
+    /// cursors among them. Reinterpreting the `u32` tail as bytes is always
     /// alignment-sound (a 4-byte-aligned pointer is 1-byte-aligned), and the
-    /// region is sized for both tables by [`Self::ensure_tables`].
+    /// region is sized for it by [`Self::ensure_tables`].
     #[inline(always)]
     fn tail_bytes_mut(&mut self) -> &mut [u8] {
-        let bytes = self.heads_len + self.tags_len;
+        let bytes = self.tags_len;
         debug_assert!(self.rows_len * 4 + bytes <= self.tables.len() * 4);
         // SAFETY: the field invariant keeps the region inside the buffer, and
         // reinterpreting `[u32]` as `[u8]` is always alignment-sound. When the
@@ -3467,46 +3606,23 @@ impl RowMatchGenerator {
         }
     }
 
-    /// Per-row slot cursor, one byte per row. Empty until the row layout is
-    /// established, as the separate vector this replaced was: callers reach
-    /// for it between a width change and the `ensure_tables` that acts on it.
+    /// Rows laid out in the buffer; none until the layout is established.
+    #[cfg(test)]
+    pub(crate) fn row_count(&self) -> usize {
+        self.tags_len >> self.row_log
+    }
+
+    /// Hash tag per row slot, laid out like [`Self::row_positions`], with each
+    /// row's cursor in its slot 0. Empty until the row layout is established:
+    /// callers reach for it between a width change and the `ensure_tables`
+    /// that acts on it.
     #[inline(always)]
-    pub(crate) fn row_heads(&self) -> &[u8] {
-        // SAFETY: `heads_len` bytes from the tail base, inside the region
-        // the field invariant bounds.
+    pub(crate) fn row_tags(&self) -> &[u8] {
+        // SAFETY: `tags_len` bytes from the tail base, inside the region the
+        // field invariant bounds.
         unsafe {
             core::slice::from_raw_parts(
                 self.tables.as_ptr().add(self.rows_len).cast::<u8>(),
-                self.heads_len,
-            )
-        }
-    }
-
-    /// Mutable form of [`Self::row_heads`].
-    #[inline(always)]
-    pub(crate) fn row_heads_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as in `row_heads`, with the exclusive borrow of `tables`.
-        unsafe {
-            core::slice::from_raw_parts_mut(
-                self.tables.as_mut_ptr().add(self.rows_len).cast::<u8>(),
-                self.heads_len,
-            )
-        }
-    }
-
-    /// Hash tag per row slot, laid out like [`Self::row_positions`]. Empty
-    /// under the same condition as [`Self::row_heads`].
-    #[inline(always)]
-    pub(crate) fn row_tags(&self) -> &[u8] {
-        // SAFETY: the tag region follows the cursors inside the same bounded
-        // tail bounded by the field invariant.
-        unsafe {
-            core::slice::from_raw_parts(
-                self.tables
-                    .as_ptr()
-                    .add(self.rows_len)
-                    .cast::<u8>()
-                    .add(self.heads_len),
                 self.tags_len,
             )
         }
@@ -3518,17 +3634,14 @@ impl RowMatchGenerator {
         // SAFETY: as in `row_tags`, with the exclusive borrow of `tables`.
         unsafe {
             core::slice::from_raw_parts_mut(
-                self.tables
-                    .as_mut_ptr()
-                    .add(self.rows_len)
-                    .cast::<u8>()
-                    .add(self.heads_len),
+                self.tables.as_mut_ptr().add(self.rows_len).cast::<u8>(),
                 self.tags_len,
             )
         }
     }
 
     /// Chain / tree hash table: the region before [`Self::hc_split`].
+    #[cfg(test)]
     #[inline(always)]
     pub(crate) fn hc_hash(&self) -> &[u32] {
         &self.tables[..self.hc_split]
@@ -3538,6 +3651,7 @@ impl RowMatchGenerator {
     /// empty in row mode — a zero split means the buffer holds row positions,
     /// not a hash table of length zero (the hash is never smaller than two
     /// slots), so the tail must not be reported as chain links.
+    #[cfg(test)]
     #[inline(always)]
     pub(crate) fn hc_chain(&self) -> &[u32] {
         if self.hc_split == 0 {
@@ -3568,7 +3682,7 @@ impl RowMatchGenerator {
         if self.finder == LazyFinder::Rows {
             let row_count = 1usize << self.row_hash_log;
             let total = row_count << self.row_log;
-            (total + (row_count + total).div_ceil(4), ROW_EMPTY_SLOT)
+            (total + total.div_ceil(4), ROW_EMPTY_SLOT)
         } else {
             let hash_len = 1usize << (self.row_hash_log + self.row_log);
             (
@@ -3587,15 +3701,13 @@ impl RowMatchGenerator {
             let total = row_count << self.row_log;
             self.hc_split = 0;
             self.rows_len = total;
-            self.heads_len = row_count;
             self.tags_len = total;
-            // The positions want the empty sentinel, the byte tables want
-            // zeroes, and one fill cannot give both: the tail is zeroed after
-            // the buffer-wide fill.
+            // The positions want the empty sentinel, the tags want zeroes, and
+            // one fill cannot give both: the tail is zeroed after the
+            // buffer-wide fill.
             self.tail_bytes_mut().fill(0);
         } else {
             self.rows_len = 0;
-            self.heads_len = 0;
             self.tags_len = 0;
             self.hc_split = 1usize << (self.row_hash_log + self.row_log);
             self.hc_layout = self.finder;
@@ -3901,6 +4013,78 @@ impl RowMatchGenerator {
             dict_frame,
             attached: dict_frame && self.dict_plan.is_some_and(|p| p.attach),
             mls: self.row_hash_mls,
+        }
+    }
+
+    /// The chain search's [`ChainScan`] for one block; `attached` as in
+    /// [`RowScan`]. Unused, and harmless, under the other finders.
+    #[inline(always)]
+    fn chain_scan(&mut self, attached: bool) -> ChainScan {
+        let hash_bits = self.row_hash_log + self.row_log;
+        let chain_mask = (1usize << self.hc_chain_log) - 1;
+        let search_depth = self.search_depth;
+        let dict_end = self.dict.region_len();
+        let dict_form = self
+            .dict
+            .table()
+            .filter(|d| attached && !d.shape.use_row && !d.shape.use_bt)
+            .map(|d| {
+                (
+                    d.hc_hash.as_ptr(),
+                    d.hc_chain.as_ptr(),
+                    d.shape.hash_log,
+                    (1usize << d.shape.chain_log) - 1,
+                )
+            });
+        let (dict_hash, dict_chain, dict_hash_bits, dict_chain_mask) =
+            dict_form.unwrap_or((core::ptr::null(), core::ptr::null(), 0, 0));
+        let (hash, chain) = self.hc_tables_mut();
+        ChainScan {
+            hash: hash.as_mut_ptr(),
+            chain: chain.as_mut_ptr(),
+            hash_bits,
+            chain_mask,
+            search_depth,
+            dict_hash,
+            dict_chain,
+            dict_hash_bits,
+            dict_chain_mask,
+            dict_end,
+            dict_min_chain: dict_end.saturating_sub(dict_chain_mask + 1),
+        }
+    }
+
+    /// The row search's [`RowTables`] for one block; `attached` as in
+    /// [`RowScan`]. Unused, and never dereferenced, under the other finders,
+    /// whose buffer has no rows.
+    #[inline(always)]
+    fn row_tables(&mut self, attached: bool) -> RowTables {
+        let dict_form = self
+            .dict
+            .table()
+            .filter(|d| attached && d.shape.use_row)
+            .map(|d| {
+                debug_assert_eq!(d.shape.row_log, self.row_log);
+                (
+                    d.positions.as_ptr(),
+                    d.heads.as_ptr(),
+                    d.tags.as_ptr(),
+                    d.shape.hash_log - d.shape.row_log,
+                )
+            });
+        let (dict_positions, dict_heads, dict_tags, dict_row_hash_log) =
+            dict_form.unwrap_or((core::ptr::null(), core::ptr::null(), core::ptr::null(), 0));
+        let positions = self.tables.as_mut_ptr();
+        RowTables {
+            positions,
+            tags: positions.wrapping_add(self.rows_len).cast::<u8>(),
+            hash_bits: self.row_hash_log + ROW_TAG_BITS,
+            row_count_mask: (1usize << self.row_hash_log) - 1,
+            search_depth: self.search_depth,
+            dict_positions,
+            dict_heads,
+            dict_tags,
+            dict_row_hash_log,
         }
     }
 
@@ -4385,43 +4569,6 @@ impl RowMatchGenerator {
         self.insert_at::<ROW_LOG>(abs_pos, row, tag);
     }
 
-    /// Prefetch a row's tag bytes and position words into L1 ahead of the
-    /// next iteration's probe (no-op on targets without a prefetch hint).
-    #[inline]
-    fn prefetch_row<const ROW_LOG: usize>(&self, row: usize) {
-        let row_base = row << ROW_LOG;
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            #[cfg(target_arch = "x86")]
-            use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
-            #[cfg(target_arch = "x86_64")]
-            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            // SAFETY: prefetch is a hint and never faults; the indexes are in
-            // bounds by the same `ensure_tables` sizing as `insert_at`.
-            unsafe {
-                _mm_prefetch(self.row_heads().as_ptr().add(row).cast(), _MM_HINT_T0);
-                _mm_prefetch(self.row_tags().as_ptr().add(row_base).cast(), _MM_HINT_T0);
-                _mm_prefetch(
-                    self.row_positions().as_ptr().add(row_base).cast(),
-                    _MM_HINT_T0,
-                );
-                // Upstream zstd `ZSTD_row_prefetch` (zstd_lazy.c:816): rows of
-                // >= 32 entries span several 64-byte lines of positions; the
-                // second line is fetched too.
-                if ROW_LOG >= 5 {
-                    _mm_prefetch(
-                        self.row_positions().as_ptr().add(row_base + 16).cast(),
-                        _MM_HINT_T0,
-                    );
-                }
-            }
-        }
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        {
-            let _ = row_base;
-        }
-    }
-
     /// [`Self::insert_position`] with the (row, tag) pair already computed —
     /// the greedy miss path reuses the probe's hash instead of re-hashing
     /// the same position.
@@ -4434,25 +4581,17 @@ impl RowMatchGenerator {
         let row_entries = 1usize << ROW_LOG;
         let row_mask = row_entries - 1;
         let row_base = row << ROW_LOG;
-        // SAFETY: `hash_and_row` masks `row` to `row_hash_log` bits and
-        // `row_heads.len() == 1 << row_hash_log` by `ensure_tables`.
+        // SAFETY: `hash_and_row` masks `row` to `row_hash_log` bits,
         // `row_base = row << row_log = row * row_entries` and
         // `next < row_entries`, so `row_base + next < row_count *
         // row_entries == row_positions.len() == row_tags.len()`. Both
         // index pairs are provably in bounds; per-byte hot path on
         // fast/dfast/row levels saves ~6 instructions and 3 branches.
-        debug_assert!(row < self.row_heads().len());
         debug_assert!(row_base + row_entries <= self.row_positions().len());
         unsafe {
-            let head = *self.row_heads().get_unchecked(row) as usize;
-            // Upstream `ZSTD_row_nextIndex`: slot 0 is never written (it
-            // holds the head byte in upstream's tag row), so the cursor
-            // cycles over `1..=row_mask`.
-            let next = match head.wrapping_sub(1) & row_mask {
-                0 => row_mask,
-                n => n,
-            };
-            *self.row_heads_mut().get_unchecked_mut(row) = next as u8;
+            let head = *self.row_tags().get_unchecked(row_base) as usize;
+            let next = next_row_slot(head, row_mask);
+            *self.row_tags_mut().get_unchecked_mut(row_base) = next as u8;
             *self.row_tags_mut().get_unchecked_mut(row_base + next) = tag;
             // `abs_pos < u32::MAX` holds: `commit_block` caps a Row frame's
             // absolute cursor below `u32::MAX`, so the cast is lossless and

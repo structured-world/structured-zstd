@@ -425,6 +425,14 @@ impl<V: AsMut<Vec<u8>>> BitBurst<'_, V> {
         self.bits_in_partial &= 7;
     }
 
+    /// Bits missing to the next byte boundary, as [`BitWriter::misaligned`].
+    /// The cursor only ever advances by whole bytes, so the held bits alone
+    /// decide it.
+    #[inline(always)]
+    pub(crate) fn misaligned(&self) -> usize {
+        (8 - (self.bits_in_partial & 7)) & 7
+    }
+
     /// Commit the bytes written and hand the bits still held back to the
     /// writer.
     pub(crate) fn finish(self) {
