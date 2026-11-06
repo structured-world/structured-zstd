@@ -335,8 +335,7 @@ fn search_log_override_keeps_the_full_depth_for_chain_and_tree() {
         search_log: Some(7),
         ..Default::default()
     };
-    let mut params = resolve_level_params(CompressionLevel::Level(15), Some(1 << 20));
-    super::apply_param_overrides(&mut params, &ov);
+    let params = super::resolve_frame_params(CompressionLevel::Level(15), Some(1 << 20), &ov);
     let row = params.row.expect("btlazy2 carries a row config");
     assert_eq!(row.row_log, 6, "rowLog clamps to 4..=6");
     assert_eq!(
@@ -358,8 +357,7 @@ fn a_target_length_override_sets_the_fast_step() {
             target_length: Some(target_length),
             ..Default::default()
         };
-        let mut params = resolve_level_params(CompressionLevel::Level(1), Some(1 << 20));
-        super::apply_param_overrides(&mut params, &ov);
+        let params = super::resolve_frame_params(CompressionLevel::Level(1), Some(1 << 20), &ov);
         assert_eq!(
             params.fast.expect("level 1 is a Fast row").step_size,
             step,
@@ -370,8 +368,10 @@ fn a_target_length_override_sets_the_fast_step() {
 
 /// A strategy override moves a frame onto another matcher backend, and only
 /// that backend's tables are built: level 22 run as Fast holds the Fast table,
-/// not the hash-chain tables its own row sized. Its estimate is therefore
-/// level 1's at the same window, not the two added together.
+/// not the hash-chain tables its own row sized. The override swaps the strategy
+/// alone and keeps the row's window and `hashLog` (upstream
+/// `ZSTD_overrideCParams`), so its estimate is level 1's at that window and
+/// hash width, not the two backends added together.
 #[test]
 fn a_strategy_override_counts_only_the_backend_it_selects() {
     use crate::encoding::{CompressionParameters, Strategy};
@@ -381,6 +381,7 @@ fn a_strategy_override_counts_only_the_backend_it_selects() {
         .unwrap();
     let level_one = CompressionParameters::builder(CompressionLevel::Level(1))
         .window_log(27)
+        .hash_log(25)
         .build()
         .unwrap();
     let estimate = |p: &CompressionParameters| {

@@ -894,11 +894,14 @@ pub(crate) fn optimal_table_log(
     max_symbol: usize,
     minus: u8,
 ) -> u8 {
-    let max_bits_src = (total - 1).ilog2().saturating_sub(minus as u32) as u8;
     let min_bits = min_table_log(total, max_symbol);
     let mut table_log = max_table_log;
-    if max_bits_src < table_log {
-        table_log = max_bits_src;
+    // Upstream subtracts in unsigned arithmetic: a source too small for the
+    // reduction wraps to a huge bound, so it reduces nothing.
+    if let Some(max_bits_src) = (total - 1).ilog2().checked_sub(u32::from(minus))
+        && max_bits_src < u32::from(table_log)
+    {
+        table_log = max_bits_src as u8;
     }
     if min_bits > table_log {
         table_log = min_bits;

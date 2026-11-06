@@ -95,20 +95,20 @@ impl BtMatcher {
     /// lookahead slack), the SoA node-price companion (`HC_OPT_NODE_LEN`
     /// `u32`s), the consolidated price arena (`HC_OPT_PRICE_ARENA_LEN`
     /// `[price, generation]` pairs, LL and ML regions), the per-segment plan
-    /// buffers, and the candidate ladder (`MAX_HC_SEARCH_DEPTH`). LDM is
+    /// buffers, and the candidate ladder (`HC_OPT_CANDIDATE_CAPACITY`). LDM is
     /// opt-in and excluded (`ldm_sequences` stays empty on every level
     /// preset). Kept next to the struct so the estimator and the real
     /// retained layout evolve together.
     pub(crate) fn estimated_workspace_bytes() -> usize {
         use super::cost_model::{HC_OPT_NODE_LEN, HC_OPT_NUM, HC_OPT_PRICE_ARENA_LEN};
-        use super::hc::MAX_HC_SEARCH_DEPTH;
+        use super::hc::HC_OPT_CANDIDATE_CAPACITY;
         let frontier = HC_OPT_NUM + 1;
         core::mem::size_of::<Self>()
             + 2 * HC_OPT_NODE_LEN * core::mem::size_of::<HcOptimalNode>()
             + HC_OPT_NODE_LEN * core::mem::size_of::<u32>()
             + HC_OPT_PRICE_ARENA_LEN * core::mem::size_of::<[u32; 2]>()
             + 2 * frontier * core::mem::size_of::<HcOptimalSequence>()
-            + MAX_HC_SEARCH_DEPTH * core::mem::size_of::<MatchCandidate>()
+            + HC_OPT_CANDIDATE_CAPACITY * core::mem::size_of::<MatchCandidate>()
     }
 
     /// Append `candidate` to `out` if it's strictly longer than the

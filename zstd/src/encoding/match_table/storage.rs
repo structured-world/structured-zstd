@@ -589,6 +589,25 @@ impl MatchTable {
             .is_none_or(|relative| relative >= u32::MAX - 1)
     }
 
+    /// Upstream's optimal-search template `mls = BOUNDED(3, minMatch, 6)`
+    /// (`ZSTD_selectBtGetAllMatches`): the tree key width, or 3 for a frame with
+    /// a hash3 table, which keys the tree on four bytes.
+    #[inline(always)]
+    pub(crate) fn opt_search_mls(&self) -> usize {
+        if self.hash3_log != 0 {
+            3
+        } else {
+            self.search_mls
+        }
+    }
+
+    /// The shortest match the optimal parser accepts and prices (zstd_opt.c:
+    /// `minMatch = (cParams->minMatch == 3) ? 3 : 4`).
+    #[inline(always)]
+    pub(crate) fn opt_min_match(&self) -> usize {
+        if self.hash3_log != 0 { 3 } else { 4 }
+    }
+
     /// Insert a position into the HC3 short-match side table without
     /// running the rebase check. Caller is responsible for ensuring
     /// the position is already representable (or that the rebase

@@ -387,7 +387,13 @@ impl LevelParameters {
             strategy: self.strategy.ordinal(),
         };
         let size = source_size.unwrap_or(crate::encoding::cparams::CONTENTSIZE_UNKNOWN);
-        let cp = crate::encoding::cparams::adjust_cparams(cp, size, dictionary_size, false);
+        let cp = crate::encoding::cparams::adjust_cparams(
+            cp,
+            size,
+            dictionary_size,
+            false,
+            RowMatchFinderMode::Auto,
+        );
         Self {
             window_log: cp.window_log,
             chain_log: cp.chain_log,

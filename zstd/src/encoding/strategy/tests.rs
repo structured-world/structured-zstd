@@ -101,19 +101,9 @@ const _USE_BT_LAYOUT: () = {
     assert!(BtUltra2::USE_BT);
 };
 
-// hash3 short-match probe: active for btultra + btultra2 (clevels.h
-// minMatch 3); btopt and below do not search it. The in-block
-// two-pass dynamic-stats seed is btultra2-only.
-const _USE_HASH3_LAYOUT: () = {
-    assert!(!Fast::USE_HASH3);
-    assert!(!Dfast::USE_HASH3);
-    assert!(!Greedy::USE_HASH3);
-    assert!(!Lazy::USE_HASH3);
-    assert!(!Btlazy2::USE_HASH3);
+// The in-block two-pass dynamic-stats seed is btultra2-only.
+const _TWO_PASS_SEED_LAYOUT: () = {
     assert!(!Btlazy2::TWO_PASS_SEED);
-    assert!(!BtOpt::USE_HASH3);
-    assert!(BtUltra::USE_HASH3);
-    assert!(BtUltra2::USE_HASH3);
     assert!(!BtOpt::TWO_PASS_SEED);
     assert!(!BtUltra::TWO_PASS_SEED);
     assert!(BtUltra2::TWO_PASS_SEED);
@@ -121,17 +111,12 @@ const _USE_HASH3_LAYOUT: () = {
 
 // Mirror the per-strategy fields the optimal-parser cost profile
 // is built from, so the layout (accurate / favor_small_offsets /
-// max_chain_depth / sufficient_match_len) cannot regress
-// silently.
+// sufficient_match_len) cannot regress silently.
 const _COST_MODEL_LAYOUT: () = {
     assert!(!Lazy::ACCURATE_PRICE && Lazy::FAVOR_SMALL_OFFSETS);
     assert!(!BtOpt::ACCURATE_PRICE && BtOpt::FAVOR_SMALL_OFFSETS);
     assert!(BtUltra::ACCURATE_PRICE && !BtUltra::FAVOR_SMALL_OFFSETS);
     assert!(BtUltra2::ACCURATE_PRICE && !BtUltra2::FAVOR_SMALL_OFFSETS);
-    assert!(BtOpt::MAX_CHAIN_DEPTH == 32);
-    // 1 << searchLog for clevels.h level 18 (searchLog = 6).
-    assert!(BtUltra::MAX_CHAIN_DEPTH == 64);
-    assert!(BtUltra2::MAX_CHAIN_DEPTH == 512);
     assert!(BtOpt::SUFFICIENT_MATCH_LEN == usize::MAX);
     assert!(BtUltra::SUFFICIENT_MATCH_LEN == usize::MAX);
     assert!(BtUltra2::SUFFICIENT_MATCH_LEN == usize::MAX);

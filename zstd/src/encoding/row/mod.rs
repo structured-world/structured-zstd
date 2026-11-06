@@ -2829,10 +2829,9 @@ impl RowMatchGenerator {
     }
 
     /// Effective row hash width currently configured (`row_hash_log +
-    /// row_log`). The primed-snapshot key records THIS value — the
-    /// configured request may exceed the [`ROW_HASH_BITS`] cap below, and
-    /// keying on the request while the tables use the clamped width forces
-    /// needless dictionary re-primes.
+    /// row_log`). The primed-snapshot key records THIS value — the request
+    /// is raised to at least one row bit, and keying on the request while the
+    /// tables use the raised width forces needless dictionary re-primes.
     pub(crate) fn hash_bits(&self) -> usize {
         self.row_hash_log + self.row_log
     }
@@ -2881,19 +2880,12 @@ impl RowMatchGenerator {
     }
 
     pub(crate) fn set_hash_bits(&mut self, bits: usize) {
-        // The level's source-size-adjusted hashLog, held to a width that stays
-        // resident in cache.
-        //
-        // Upstream carries 21 to 23 bits through the lazy band, and taking that
-        // literally makes a frame allocate and fill tens of megabytes of rows:
-        // at level 12 on eight mebibytes of repeated log lines that was 19.6 ms
-        // against 2.2 ms at 20 bits, two thirds of it faulting and zeroing the
-        // table. What the extra width buys is 142 bytes of 484 KiB on the
-        // decode corpus (0.03%), and on the log stream it does not buy even
-        // that: the wider table compressed to 910 bytes where the narrow one
-        // reached 848.
-        let clamped = bits.clamp(self.row_log + 1, ROW_HASH_BITS);
-        let row_hash_log = clamped.saturating_sub(self.row_log);
+        // The resolved `hashLog`: upstream bounds it by the source and, for
+        // rows, by the 32-bit hash the row and tag come from
+        // (`ZSTD_adjustCParams_internal`), and nothing narrows it further.
+        // `rowHashLog = hashLog - rowLog` (`ZSTD_reset_matchState`), at least
+        // one row bit.
+        let row_hash_log = bits.max(self.row_log + 1) - self.row_log;
         if self.row_hash_log != row_hash_log {
             self.row_hash_log = row_hash_log;
             // One buffer carries the positions and the tags, so dropping it

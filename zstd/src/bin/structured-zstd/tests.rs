@@ -12,11 +12,25 @@ fn no_dict() -> Codecs {
 /// these tests probe, spelled the way the run spells it so the two cannot
 /// drift apart.
 fn benchmark_budget(input_len: u64, levels: std::ops::RangeInclusive<i32>) -> u64 {
+    benchmark_budget_with(input_len, levels, None)
+}
+
+/// [`benchmark_budget`] for a run against a `dictionary_len`-byte dictionary,
+/// whose geometry the match finder takes (a dictionary copied into the frame
+/// widens the window to cover both).
+fn benchmark_budget_with(
+    input_len: u64,
+    levels: std::ops::RangeInclusive<i32>,
+    dictionary_len: Option<usize>,
+) -> u64 {
     let encoder = levels
         .map(|level| {
-            structured_zstd::encoding::estimated_compression_workspace_bytes_for_source(
+            structured_zstd::encoding::estimated_compression_workspace_bytes_for_run(
                 structured_zstd::encoding::CompressionLevel::Level(level),
                 Some(input_len),
+                None,
+                false,
+                dictionary_len.map(structured_zstd::encoding::DictionarySizes::raw_content),
             ) as u64
         })
         .max()
@@ -5221,7 +5235,7 @@ fn the_memory_limit_counts_every_copy_of_the_dictionary() {
     fs::write(&input, vec![0u8; 32 * 1024]).unwrap();
     let dictionary = vec![0u8; 32 * 1024];
 
-    let buffers = benchmark_budget(32 * 1024, 3..=3);
+    let buffers = benchmark_budget_with(32 * 1024, 3..=3, Some(dictionary.len()));
 
     let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![input.clone()];

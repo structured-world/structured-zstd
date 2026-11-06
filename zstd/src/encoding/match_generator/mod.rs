@@ -12,7 +12,6 @@ use alloc::vec::Vec;
 use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
-use super::cost_model::HC_FORMAT_MINMATCH;
 #[cfg(test)]
 use super::cost_model::HC_MAX_LIT;
 #[cfg(test)]
@@ -132,12 +131,8 @@ use super::match_table::storage::{HC_PRIME3BYTES, HC_PRIME4BYTES};
 #[cfg(test)]
 use super::match_table::storage::HC_EMPTY;
 pub(crate) const HC_SEARCH_DEPTH: usize = 16;
-// HC_MIN_MATCH_LEN moved to encoding::hc; re-imported here so
-// existing references compile unchanged.
-pub(crate) const HC_OPT_MIN_MATCH_LEN: usize = HC_FORMAT_MINMATCH;
 pub(crate) const HC_TARGET_LEN: usize = 48;
 
-// MAX_HC_SEARCH_DEPTH moved to encoding::hc alongside chain_candidates.
 // Per-level tuning config (the config structs + `LEVEL_TABLE` + the
 // level→params resolution chain) lives in `levels::config`; the driver imports
 // that resolution API here.
@@ -907,10 +902,6 @@ impl MatchGeneratorDriver {
         true
     }
 
-    fn level_params(level: CompressionLevel, source_size: Option<u64>) -> LevelParams {
-        resolve_level_params(level, source_size)
-    }
-
     /// Install the public-parameter per-knob overrides (#27) applied at
     /// the next [`Matcher::reset`]. `None` (or an all-`None` set) restores
     /// plain level-based geometry. Persists across resets until changed.
@@ -1454,7 +1445,6 @@ impl Matcher for MatchGeneratorDriver {
             !crate::encoding::levels::config::dictionary_loads_into_frame(sizes, hint)
                 && sizes.content <= MAX_FAST_ATTACH_DICT_REGION
         });
-        let hinted = hint.is_some();
         // A dictionary frame takes its cParams and match-finder from the
         // CDict's cParams (upstream `ZSTD_resetCCtx_usingCDict`), whose tier
         // is keyed by the serialized dictionary size; a lazy-band CDict also
@@ -1489,7 +1479,10 @@ impl Matcher for MatchGeneratorDriver {
         });
         let (params, dict_plan) = match dict_hint {
             Some(sizes) => self.dict_params.resolve(level, hint, sizes, &overrides),
-            None => (Self::level_params(level, hint), None),
+            None => (
+                crate::encoding::levels::config::resolve_frame_params(level, hint, &overrides),
+                None,
+            ),
         };
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut params = params;
@@ -1524,25 +1517,6 @@ impl Matcher for MatchGeneratorDriver {
                     params.hc.get_or_insert(HC_CONFIG);
                 }
             }
-        }
-        // Public-parameter overrides (#27): apply the per-knob set on top
-        // of the level-resolved params. A strategy override re-routes the
-        // backend, so this must precede `next_backend` selection. The
-        // all-`None` case is skipped so default level geometry stays
-        // byte-identical to plain level-based compression. Shared with the
-        // workspace estimate, which has to build what this builds.
-        // Not for a dictionary loaded into the frame: that resolution applied
-        // them itself, in the order that lets the adjustment bound them. Re-
-        // applying the raw values here would put each knob back past its cap.
-        if let Some(ov) = self.param_overrides
-            && !loaded_into_frame
-        {
-            crate::encoding::levels::config::apply_frame_overrides(
-                &mut params,
-                &ov,
-                dict_hint.is_some(),
-                hint,
-            );
         }
         // The long-distance matcher's parameters for the frame, `None` without one.
         #[cfg(feature = "ldm")]
@@ -1663,25 +1637,6 @@ impl Matcher for MatchGeneratorDriver {
         self.slice_size = self.base_slice_size.min(max_window_size);
         self.reported_window_size = max_window_size;
         let strategy_tag = self.strategy_tag;
-        // Source-proportional table window for the backends whose hash-table
-        // widths are recomputed here (Dfast / Row). Like the HC / Fast caps
-        // in `adjust_params_for_source_size`, this sizes the internal tables
-        // from the RAW source log (not the wire `window_log` floor) so a
-        // small frame zeroes a small table; it never exceeds the real window.
-        let table_window_size = match hint {
-            Some(h) => {
-                let raw_log = source_size_ceil_log(h);
-                // Clamp the shift below the pointer width before `1usize <<`:
-                // an oversized hint (>= 2^63 + 1, and on 32-bit usize any hint
-                // >= 2^32) drives `raw_log` to 64 / >= 32, and the shift would
-                // overflow (panic in debug, wrap to 0 in release) before the
-                // `.min(max_window_size)` cap below could bound it. The min cap
-                // still provides the real semantic window bound.
-                let shift = raw_log.max(MIN_WINDOW_LOG).min(usize::BITS as u8 - 1);
-                (1usize << shift).min(max_window_size)
-            }
-            None => max_window_size,
-        };
         // The Fast backend's dictionary mode, which `prime_with_dictionary`
         // takes from the same `reset_size_log`: attached, the dictionary goes
         // into a table of its own and the input is scanned in place.
@@ -1813,21 +1768,9 @@ impl Matcher for MatchGeneratorDriver {
                 } else {
                     TableCarry::Clear
                 };
-                // Cap `hash_log <= window_log + 1` (upstream zstd
-                // `ZSTD_adjustCParams_internal`): once `window_log` is resized
-                // down for a small source, a level-default `1 << hash_log`
-                // table is mostly wasted address space whose per-frame memset
-                // dominates the compress cost on tiny frames (a 4 KB frame at
-                // window_log 12 still zero-fills the 64 KiB hash_log-14 table).
-                // Gated to no-dict frames: the dict-attach path shares one
-                // hash_log between the main and dict tables (so one hash keys
-                // both), and shrinking only the main table would break that
-                // invariant and the small-frame dict ratio.
-                let hash_log = if dict_hint.is_some() {
-                    fast.hash_log
-                } else {
-                    fast.hash_log.min(params.window_log as u32 + 1)
-                };
+                // The resolved `hashLog`, already bounded by the source in
+                // `ZSTD_adjustCParams_internal` (`<= dictAndWindowLog + 1`).
+                let hash_log = fast.hash_log;
                 // The attached dictionary table takes the CDict's `hashLog`
                 // (upstream `ZSTD_createCDict`: `ZSTD_getCParams(level,
                 // UNKNOWN, dictSize)` adjusted for a `minSrcSize` source), not
@@ -1881,17 +1824,8 @@ impl Matcher for MatchGeneratorDriver {
                 // parameter overrides) has already down-sized them for the
                 // source the way `ZSTD_adjustCParams_internal` does, `hashLog`
                 // to the source's log plus one and `chainLog` to the log.
-                // A hinted frame then caps both at its table window's log: on
-                // a small frame the long table's extra bit doubles what is
-                // cleared per frame (a fresh 10 KiB level-3 frame ran 36%
-                // slower) for a few bytes per megabyte of output.
-                let window_bits = if hinted {
-                    table_window_size.ilog2() as usize
-                } else {
-                    usize::MAX
-                };
-                let long_bits = (dcfg.long_hash_log as usize).min(window_bits);
-                let short_bits = (dcfg.short_hash_log as usize).min(window_bits);
+                let long_bits = dcfg.long_hash_log as usize;
+                let short_bits = dcfg.short_hash_log as usize;
                 resolved_table_bits = long_bits;
                 dfast.set_hash_bits(long_bits, short_bits);
                 dfast.set_min_match(dcfg.min_match);
@@ -1961,27 +1895,9 @@ impl Matcher for MatchGeneratorDriver {
                 row.max_window_size = max_window_size;
                 row.lazy_depth = params.lazy_depth;
                 row.set_dict_plan(dict_plan);
-                let mut row_cfg = params.row.expect("Row level row carries a RowConfig");
-                // A dictionary frame's widths already come from the CDict's
-                // cParams (adjusted to the source when attached); only a plain
-                // hinted frame caps them by the window here.
-                if hinted && dict_plan.is_none() {
-                    // Clamp the configured hash width by the hinted window
-                    // (upstream zstd `ZSTD_adjustCParams` caps hashLog by windowLog) —
-                    // `min`, not replace, so an explicit `hash_log` param
-                    // override (`row_cfg.hash_bits`) survives the hinted path
-                    // instead of being overwritten by the window value.
-                    //
-                    // Clamp BEFORE `configure` so the backend sees ONE width
-                    // per frame. Configuring with the unclamped level width
-                    // and then re-clamping made `row_hash_log` oscillate on
-                    // every hinted frame, and each width change clears the
-                    // row tables — `ensure_tables` then re-filled all three
-                    // every frame in a reused compressor.
-                    row_cfg.hash_bits = row_cfg
-                        .hash_bits
-                        .min(row_hash_bits_for_window(table_window_size));
-                }
+                // The resolved widths, already bounded by the source (or taken
+                // from the CDict's cParams for a dictionary frame).
+                let row_cfg = params.row.expect("Row level row carries a RowConfig");
                 row.configure(row_cfg);
                 // Key the primed snapshot on the width the backend ACTUALLY
                 // applied (`set_hash_bits` clamps the request): recording the
@@ -2004,26 +1920,9 @@ impl Matcher for MatchGeneratorDriver {
             }
             MatcherStorage::HashChain(hc) => {
                 hc.table.max_window_size = max_window_size;
-                let mut hc_cfg = params.hc.expect("HashChain level row carries an HcConfig");
-                // Cap the hash / tree table logs by the hinted window so a small
-                // input doesn't allocate the full level's tables (the upstream zstd
-                // `ZSTD_adjustCParams_internal` clamp: `hashLog <= windowLog + 1`,
-                // and `cycleLog <= windowLog` with `cycleLog == chainLog - 1` for
-                // the BT pair table, so `chainLog <= windowLog + 1`).
-                // Ratio-neutral: a hinted window of `2^wlog` bytes holds at most
-                // `2^wlog` positions, so the slots beyond that are never
-                // populated — capping only sheds unused allocation. Only applied
-                // when hinted; an unknown-size stream keeps the full level tables.
-                // Skip for dictionary frames: their `hc_cfg.{hash,chain}_log`
-                // are the CDict's (verbatim when the dictionary is copied
-                // into the live tables, source-adjusted when it is attached);
-                // re-applying the source-window cap would collapse a copied
-                // dictionary's tables to the small hinted source.
-                if hinted && dict_hint.is_none() {
-                    let wlog = hc_hash_bits_for_window(table_window_size);
-                    hc_cfg.hash_log = hc_cfg.hash_log.min(wlog + 1);
-                    hc_cfg.chain_log = hc_cfg.chain_log.min(wlog + 1);
-                }
+                // The resolved widths, already bounded by the source (or taken
+                // from the CDict's cParams for a dictionary frame).
+                let hc_cfg = params.hc.expect("HashChain level row carries an HcConfig");
                 hc.configure(hc_cfg, strategy_tag, params.window_log);
                 // A copy-mode frame merges the dictionary into the live tables,
                 // so the previous attach frame's dms must not be re-borrowed

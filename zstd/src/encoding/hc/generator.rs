@@ -463,7 +463,6 @@ macro_rules! bt_insert_and_collect_matches_body {
         $abs_pos:ident,
         $current_abs_end:ident,
         $sufficient_len:expr,
-        $max_chain_depth:expr,
         $min_match_len:ident,
         $best_len_for_skip:ident,
         $out:ident,
@@ -885,15 +884,9 @@ macro_rules! bt_insert_and_collect_matches_body {
         // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
         // cap in `MatchTable::fill_uncommitted`.
         let mut match_end_abs = $abs_pos + 9;
-        // Both of these are associated consts of the strategy the caller is
-        // monomorphized for, so they arrive as literals rather than as fields
-        // of a 24-byte profile the caller had to marshal through memory on
-        // every position: System V passes a struct that size in memory, and the
-        // prologue was copying it into the frame with a vector move before any
-        // work started. Upstream reads the same values off `cParams` through a
-        // pointer it already holds, and its finder is inlined into the parser
-        // loop, so it never marshals anything per position either.
-        let mut compares_left = ($max_chain_depth).min($search_depth);
+        // Upstream `nbCompares = 1U << cParams->searchLog` (zstd_opt.c:599),
+        // the whole budget whatever the strategy.
+        let mut compares_left = $search_depth;
         let mut common_length_smaller = 0usize;
         let mut common_length_larger = 0usize;
         // `bt_pair_index_for_abs(abs_pos)`: `stored + bt_bias` is
@@ -1239,12 +1232,11 @@ impl HcMatchGenerator {
             "only the optimal strategies run on this backend, got {tag:?}"
         );
         let is_btultra2 = tag == StrategyTag::BtUltra2;
-        // btultra and btultra2 both run the mls=3 hash3 short-match probe
-        // (clevels.h minMatch 3). The `is_btultra2` flag below stays
-        // exclusive to btultra2 because it tweaks the BT rebase boundary,
-        // not match finding.
-        let wants_hash3 = matches!(tag, StrategyTag::BtUltra | StrategyTag::BtUltra2);
-        let next_hash3_log = if wants_hash3 {
+        // The hash3 short-match probe runs for a `minMatch` of 3, whatever the
+        // optimal strategy (`ZSTD_reset_matchState`: `hashLog3 = minMatch == 3
+        // ? MIN(17, windowLog) : 0`). The `is_btultra2` flag stays exclusive to
+        // btultra2 because it tweaks the BT rebase boundary, not match finding.
+        let next_hash3_log = if config.searches_hash3() {
             HC3_HASH_LOG.min(window_log as usize)
         } else {
             0

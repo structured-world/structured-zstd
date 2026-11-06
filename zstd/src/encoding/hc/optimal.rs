@@ -39,7 +39,7 @@ use crate::encoding::{
     },
     hc::HC_MIN_MATCH_LEN,
     levels::config::HcConfig,
-    match_generator::{HC_OPT_MIN_MATCH_LEN, HC_SEARCH_DEPTH, HC_TARGET_LEN},
+    match_generator::{HC_SEARCH_DEPTH, HC_TARGET_LEN},
     match_table::storage::HC3_HASH_LOG,
     opt::ldm::{HcOptLdmState, HcRawSeqStore},
     opt::types::{
@@ -87,7 +87,7 @@ macro_rules! build_optimal_plan_impl_body {
         $seg:lifetime $(,)?
     ) => {{
         let current_abs_end = $current_abs_start + $current_len;
-        let min_match_len = HC_OPT_MIN_MATCH_LEN;
+        let min_match_len = $self.table.opt_min_match();
         // `HC_OPT_NUM > 0` by const definition, so `HC_OPT_NUM - 1` is safe.
         let frontier_limit = $current_len.min(HC_OPT_NUM - 1);
         let initial_reps = $initial_state.reps;
@@ -1128,12 +1128,12 @@ macro_rules! optimal_block_body {
         // for it is chosen once here and every position calls it directly, as
         // upstream picks `ZSTD_btGetAllMatches_<dictMode>_<mls>` per block
         // (`ZSTD_selectBtGetAllMatches`).
-        let collect: OptimalCollectFn = match $self.table.search_mls {
+        let collect: OptimalCollectFn = match $self.table.opt_search_mls() {
             3 => HcMatchGenerator::$collect::<$strategy_ty, 3>,
             5 => HcMatchGenerator::$collect::<$strategy_ty, 5>,
             6 => HcMatchGenerator::$collect::<$strategy_ty, 6>,
             mls => {
-                debug_assert_eq!(mls, 4, "the binary tree keys on three to six bytes");
+                debug_assert_eq!(mls, 4, "the binary tree searches with mls three to six");
                 HcMatchGenerator::$collect::<$strategy_ty, 4>
             }
         };
@@ -1212,27 +1212,28 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $cpl:path,
         $cmf:path $(,)?
     ) => {{
+        // `$mls` is upstream's template `BOUNDED(3, minMatch, 6)`
+        // (`ZSTD_selectBtGetAllMatches`): a 3 keys the tree on four bytes, as
+        // `ZSTD_hashPtr` has no 3-byte case, takes the 3-byte matches from the
+        // hash3 table and accepts them (`minMatch = (mls == 3) ? 3 : 4`,
+        // zstd_opt.c); a wider key accepts four bytes and up. Both are consts
+        // of the search the block chose, so the other monomorphs drop the
+        // hash3 lookup at codegen time.
+        let use_hash3: bool = $mls == 3;
+        let key_mls: usize = if use_hash3 { 4 } else { $mls };
         debug_assert_eq!(
-            $mls, $self.table.search_mls,
+            key_mls, $self.table.search_mls,
             "the block chose the search for its key width"
         );
-        // Per-strategy compile-time const: only BtUltra2 drives the
-        // hash3 short-match table. All other monomorphisations drop
-        // the entire hash3 lookup block at codegen time. The relaxed
-        // implication enforces only the direction we depend on:
-        // if the strategy declares hash3, the table must be live.
-        // The reverse (`hash3_log != 0` without `USE_HASH3`) is OK —
-        // a future caller may pre-allocate hash3 storage without
-        // wiring the BtUltra2 path through.
-        let use_hash3: bool = <$strategy_ty as crate::encoding::strategy::Strategy>::USE_HASH3;
+        debug_assert_eq!(
+            use_hash3,
+            $self.table.hash3_log != 0,
+            "the block chose the search for its hash3 table"
+        );
         debug_assert!(!$self.table.hash_table().is_empty());
         debug_assert!($self.table.hash3_log == 0 || !$self.table.hash3_table().is_empty());
-        debug_assert!(
-            !use_hash3 || $self.table.hash3_log != 0,
-            "Strategy::USE_HASH3 = true but runtime hash3_log is 0 — call configure() first",
-        );
         debug_assert!(!$self.table.chain_table().is_empty());
-        let min_match_len = HC_OPT_MIN_MATCH_LEN;
+        let min_match_len = if use_hash3 { 3 } else { 4 };
         $out.clear();
         if $abs_pos < $self.table.skip_insert_until_abs {
             return;
@@ -1284,17 +1285,15 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 $current_abs_end,
                 // Not a strategy const: the pass adjusts it (btultra2's seed
                 // pass runs a different sufficient length from its main pass),
-                // so it arrives as a scalar. The chain depth beside it IS the
-                // strategy's own const and needs no argument at all.
+                // so it arrives as a scalar.
                 $sufficient_match_len,
-                <$strategy_ty as crate::encoding::strategy::Strategy>::MAX_CHAIN_DEPTH,
                 min_match_len,
                 best_len_ref,
                 $out,
                 $reps,
                 $ll0,
                 use_hash3,
-                $mls,
+                key_mls,
                 $cpl,
                 $cmf,
             );
@@ -2111,7 +2110,7 @@ impl HcMatchGenerator {
         // The key width picks the search the way the block's pass picks it.
         macro_rules! search {
             ($strategy:ty) => {
-                match self.table.search_mls {
+                match self.table.opt_search_mls() {
                     3 => self.collect_optimal_candidates_initialized::<$strategy, K, 3>(
                         abs_pos,
                         current_abs_end,
@@ -2166,7 +2165,7 @@ impl HcMatchGenerator {
             }
         }
         if let Some(ldm) = query.ldm_candidate {
-            BtMatcher::push_ldm_candidate(out, ldm, HC_OPT_MIN_MATCH_LEN);
+            BtMatcher::push_ldm_candidate(out, ldm, self.table.opt_min_match());
         }
     }
 
