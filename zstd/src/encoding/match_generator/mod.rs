@@ -1846,11 +1846,9 @@ impl Matcher for MatchGeneratorDriver {
                     );
                 // The history keeps only what the reset will, as on the dfast arm.
                 m.retire_history();
-                workspace.open_for_match_finder(
+                workspace.open(
                     tables + m.history_workspace_bytes(history_bytes),
-                    tables,
                     max_window_size,
-                    expected_input,
                 );
                 // The history binds first, carrying its bytes out from under
                 // where the table may now land.
@@ -1916,11 +1914,9 @@ impl Matcher for MatchGeneratorDriver {
                 // carried over at its full length, a long stream's window would
                 // be moved into room the next frame never reads.
                 dfast.retire_history();
-                workspace.open_for_match_finder(
+                workspace.open(
                     tables + dfast.history.workspace_bytes(history_bytes),
-                    tables,
                     max_window_size,
-                    expected_input,
                 );
                 dfast.history.bind(workspace, history_bytes);
                 // Tagged slots unless the dictionary is attached (its loop reads
@@ -1982,11 +1978,9 @@ impl Matcher for MatchGeneratorDriver {
                 // the last frame's. The history keeps only what the reset can,
                 // as on the dfast arm.
                 row.retire_history();
-                workspace.open_for_match_finder(
+                workspace.open(
                     row.tables_workspace_bytes() + row.history.workspace_bytes(history_bytes),
-                    row.zero_table_bytes(),
                     max_window_size,
-                    expected_input,
                 );
                 row.history.bind(workspace, history_bytes);
                 row.bind_tables(workspace);
@@ -2028,11 +2022,9 @@ impl Matcher for MatchGeneratorDriver {
                 let tables = hc.table.tables_workspace_bytes();
                 // The history keeps only what the reset will, as on the dfast arm.
                 hc.table.retire_history();
-                workspace.open_for_match_finder(
+                workspace.open(
                     tables + hc.table.history.workspace_bytes(history_bytes),
-                    tables,
                     max_window_size,
-                    expected_input,
                 );
                 hc.table.history.bind(workspace, history_bytes);
                 hc.table.bind_tables(workspace);

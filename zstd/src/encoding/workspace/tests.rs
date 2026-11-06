@@ -70,76 +70,61 @@ fn a_new_table_starts_filled() {
     assert!(table.as_slice().iter().all(|&v| v == 0x1234));
 }
 
+fn buffers_up_to_fresh_pages(_block: usize) -> usize {
+    FRESH_PAGES_FROM
+}
+
 // A table of zeros is left unwritten only in the layout that made the (zeroed)
 // allocation. A later layout carving it over bytes another holder wrote still
 // empties it: the zeros it relies on are gone by then.
 #[test]
 fn a_zero_table_over_written_bytes_still_starts_empty() {
-    let sparse = |ws: &mut Workspace| {
-        ws.begin_layout(0, no_trailing, IngestPlan::Stream);
-        let table = region_bytes::<u32>(64);
-        ws.open_for_match_finder(table, table, usize::MAX, 0);
+    let table = region_bytes::<u32>(64);
+    let on_fresh_pages = |ws: &mut Workspace| {
+        ws.begin_layout(
+            1 << 17,
+            buffers_up_to_fresh_pages,
+            IngestPlan::Slice(1 << 17),
+        );
+        ws.open(table, 1 << 14);
     };
     let mut ws = Workspace::new();
-    sparse(&mut ws);
+    on_fresh_pages(&mut ws);
+    assert!(ws.zeroed);
     let fresh = ws.table::<u32>(64, 0);
     assert!(fresh.as_slice().iter().all(|&v| v == 0));
     let mut other: Table<u32> = Table::empty();
-    lay_out(&mut ws, region_bytes::<u32>(64), 0);
+    ws.begin_layout(
+        1 << 17,
+        buffers_up_to_fresh_pages,
+        IngestPlan::Slice(1 << 17),
+    );
+    ws.open(table, 1 << 14);
     other.bind(&mut ws, 64, 7);
     assert!(other.iter().all(|&v| v == 7));
-    sparse(&mut ws);
+    on_fresh_pages(&mut ws);
     let later = ws.table::<u32>(64, 0);
     assert!(later.as_slice().iter().all(|&v| v == 0));
 }
 
-// A zeroed allocation is worth taking only when the zero tables are most of it.
-// An allocator that serves it from memory it has handed out before zeroes the
-// whole of it, the buffers behind the tables included, so a small frame whose
-// per-block buffers outweigh its tables would pay several times the fill it
-// saves on every fresh context.
+// Below the size the system allocator serves with fresh pages, a zeroed
+// allocation lands on recycled memory and zeroes the history and buffers with
+// the tables, so the workspace is never taken zeroed there, however much of it
+// the tables are: a context built per frame would pay that memset every frame.
+// Its zero tables are filled instead.
 #[test]
-fn only_tables_that_fill_the_workspace_take_it_zeroed() {
-    fn buffers_thrice_the_table(_block: usize) -> usize {
-        3 * region_bytes::<u32>(64)
-    }
+fn a_workspace_below_fresh_pages_fills_its_tables() {
     let table = region_bytes::<u32>(64);
-
-    let mut ws = Workspace::new();
-    ws.begin_layout(
-        1 << 17,
-        buffers_thrice_the_table,
-        IngestPlan::Slice(1 << 17),
-    );
-    ws.open_for_match_finder(table, table, 1 << 14, 0);
-    assert!(
-        !ws.zeroed,
-        "tables a quarter of the workspace must be filled, not the workspace zeroed",
-    );
-
-    // Just over half, the share a 10 KiB frame's tables have at level 1:
-    // zeroing the rest still costs more than the fill saves.
-    fn buffers_four_fifths_of_the_table(_block: usize) -> usize {
-        4 * region_bytes::<u32>(64) / 5
-    }
-    let mut ws = Workspace::new();
-    ws.begin_layout(
-        1 << 17,
-        buffers_four_fifths_of_the_table,
-        IngestPlan::Slice(1 << 17),
-    );
-    ws.open_for_match_finder(table, table, 1 << 14, 0);
-    assert!(!ws.zeroed, "tables just over half the workspace are filled");
-
     let mut ws = Workspace::new();
     ws.begin_layout(1 << 17, no_trailing, IngestPlan::Slice(1 << 17));
-    ws.open_for_match_finder(table, table, 1 << 14, 0);
+    ws.open(table, 1 << 14);
     assert!(
-        ws.zeroed,
-        "tables that are the whole workspace take it zeroed"
+        !ws.zeroed,
+        "tables that are the whole workspace are still filled below the fresh-page size",
     );
-    let fresh = ws.table::<u32>(64, 0);
-    assert!(fresh.as_slice().iter().all(|&v| v == 0));
+    assert!(!ws.on_fresh_pages());
+    let filled = ws.table::<u32>(64, 0);
+    assert!(filled.as_slice().iter().all(|&v| v == 0));
 }
 
 // Heap accounting reports what was allocated, not what can be carved: the
@@ -156,9 +141,6 @@ fn heap_bytes_count_the_alignment_padding() {
 // there, and filling the tables would fault in pages the frame never indexes.
 #[test]
 fn a_workspace_on_fresh_pages_is_taken_zeroed() {
-    fn buffers_up_to_fresh_pages(_block: usize) -> usize {
-        FRESH_PAGES_FROM
-    }
     let table = region_bytes::<u32>(64);
     let mut ws = Workspace::new();
     ws.begin_layout(
@@ -166,8 +148,7 @@ fn a_workspace_on_fresh_pages_is_taken_zeroed() {
         buffers_up_to_fresh_pages,
         IngestPlan::Slice(1 << 17),
     );
-    // The tables are not even sparse: the input is expected to fill them.
-    ws.open_for_match_finder(table, table, 1 << 14, usize::MAX);
+    ws.open(table, 1 << 14);
     assert!(ws.zeroed, "a workspace past the fresh-page size is zeroed");
     assert!(ws.on_fresh_pages());
     let zeros = ws.table::<u32>(64, 0);
@@ -178,7 +159,7 @@ fn a_workspace_on_fresh_pages_is_taken_zeroed() {
         buffers_up_to_fresh_pages,
         IngestPlan::Slice(1 << 17),
     );
-    ws.open_for_match_finder(table, table, 1 << 14, usize::MAX);
+    ws.open(table, 1 << 14);
     assert!(!ws.on_fresh_pages());
 }
 
