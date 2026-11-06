@@ -1,4 +1,5 @@
 use super::*;
+use alloc::vec::Vec;
 
 fn count(a: &[u8], b: &[u8]) -> usize {
     let min_len = a.len().min(b.len());
@@ -91,6 +92,27 @@ fn long_match_thousand_bytes() {
     let a = [0x5Au8; 1024];
     let b = [0x5Au8; 1024];
     assert_eq!(count(&a, &b), 1024);
+}
+
+/// Every length across a few chunks, with the first mismatch at every position
+/// or none: the chunk loop, its bound and each tail agree with a byte-by-byte
+/// count, including a range that ends one byte short of a whole chunk.
+#[test]
+fn every_length_and_mismatch_counts_as_bytes_do() {
+    for len in 0..40usize {
+        for mismatch in 0..=len {
+            let a: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let mut b = a.clone();
+            if mismatch < len {
+                b[mismatch] ^= 0xFF;
+            }
+            assert_eq!(
+                count(&a, &b),
+                mismatch,
+                "length {len}, mismatch at {mismatch}"
+            );
+        }
+    }
 }
 
 #[test]

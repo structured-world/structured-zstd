@@ -57,116 +57,84 @@
 /// future cross-check against the C reference can be byte-identical.
 #[inline(always)]
 pub(crate) unsafe fn count_forward(ip: *const u8, match_ptr: *const u8, iend: *const u8) -> usize {
-    let p_start = ip;
-    let mut ip = ip;
-    let mut m = match_ptr;
+    // The bytes left before `iend`, as a `usize` difference rather than
+    // `offset_from`, whose `isize` result is UB past `isize::MAX` (a buffer
+    // over 2 GiB on a 32-bit host). Everything below counts in one index `i`
+    // from both starts, so the loop advances a single register and compares it
+    // against one bound computed here, as upstream compares `pIn` against its
+    // `pInLoopLimit`. Stepping the two pointers separately and recomputing
+    // `ip + CHUNK_SIZE` per chunk cost the loop two more operations and a
+    // bound reloaded from the stack.
+    let len = (iend as usize) - (ip as usize);
+    let mut i = 0usize;
 
     // `usize`-sized chunk loop matching upstream zstd's `MEM_readST` cadence.
-    // CHUNK_SIZE = 8 on 64-bit targets, 4 on 32-bit. The bound check
-    // `(ip as usize) + CHUNK_SIZE <= (iend as usize)` ensures every
-    // chunked read stays inside the caller's `[ip, iend)` source range.
+    // CHUNK_SIZE = 8 on 64-bit targets, 4 on 32-bit. `i < loop_limit` is
+    // `i + CHUNK_SIZE <= len`, so every chunked read stays inside the caller's
+    // `[ip, iend)` source range.
     const CHUNK_SIZE: usize = core::mem::size_of::<usize>();
-    while (ip as usize) + CHUNK_SIZE <= (iend as usize) {
-        // SAFETY: CHUNK_SIZE readable bytes at both pointers per the
-        // function contract; pointers are not const-aligned, so
-        // `read_unaligned`.
-        let a = unsafe { core::ptr::read_unaligned(ip.cast::<usize>()) };
-        let b = unsafe { core::ptr::read_unaligned(m.cast::<usize>()) };
-        let diff = a ^ b;
-        if diff != 0 {
-            // Upstream zstd's `ZSTD_NbCommonBytes` picks `__builtin_ctzll`
-            // (or `ctzl` on 32-bit) on little-endian and `clzll`/`clzl`
-            // on big-endian. Native-endian XOR loads place the first
-            // byte of the input in the LOW byte of the chunk on LE
-            // and the HIGH byte on BE, so "how many common low-order
-            // bytes" translates to `ctz/8` on LE and `clz/8` on BE.
-            // Without the cfg gate, BE targets would report the
-            // common-bytes count from the wrong end of `diff` and
-            // produce wrong match lengths.
-            #[cfg(target_endian = "little")]
-            let common = (diff.trailing_zeros() / 8) as usize;
-            #[cfg(target_endian = "big")]
-            let common = (diff.leading_zeros() / 8) as usize;
-            // SAFETY: `common < CHUNK_SIZE` (otherwise `diff == 0`),
-            // and the caller's source range covers ≥ `common` more
-            // bytes (we already verified the chunk fits).
-            //
-            // Length computed via `as usize` arithmetic instead of
-            // `offset_from`: the latter returns `isize` and is UB
-            // when the byte distance exceeds `isize::MAX`. On 32-bit
-            // hosts a buffer spanning >2 GiB would trigger that
-            // exact case (`data.len() <= u32::MAX` is 4 GiB, larger
-            // than `isize::MAX = 2 GiB - 1`). Subtracting raw
-            // addresses as `usize` is well-defined arithmetic with
-            // no UB regardless of distance.
-            // SAFETY: same as above — the pointer arithmetic is
-            // in-bounds, the `usize` cast of a pointer is always
-            // well-defined.
-            return unsafe { (ip.add(common) as usize) - (p_start as usize) };
-        }
-        // SAFETY: pointer arithmetic stays within `[p_start, iend)`
-        // because we just consumed a CHUNK_SIZE chunk that fit in range.
-        unsafe {
-            ip = ip.add(CHUNK_SIZE);
-            m = m.add(CHUNK_SIZE);
+    if len >= CHUNK_SIZE {
+        let loop_limit = len - (CHUNK_SIZE - 1);
+        while i < loop_limit {
+            // SAFETY: CHUNK_SIZE readable bytes at both pointers past `i` per the
+            // function contract; pointers are not const-aligned, so
+            // `read_unaligned`.
+            let a = unsafe { core::ptr::read_unaligned(ip.add(i).cast::<usize>()) };
+            let b = unsafe { core::ptr::read_unaligned(match_ptr.add(i).cast::<usize>()) };
+            let diff = a ^ b;
+            if diff != 0 {
+                // Upstream zstd's `ZSTD_NbCommonBytes` picks `__builtin_ctzll`
+                // (or `ctzl` on 32-bit) on little-endian and `clzll`/`clzl`
+                // on big-endian. Native-endian XOR loads place the first
+                // byte of the input in the LOW byte of the chunk on LE
+                // and the HIGH byte on BE, so "how many common low-order
+                // bytes" translates to `ctz/8` on LE and `clz/8` on BE.
+                // Without the cfg gate, BE targets would report the
+                // common-bytes count from the wrong end of `diff` and
+                // produce wrong match lengths.
+                #[cfg(target_endian = "little")]
+                let common = (diff.trailing_zeros() / 8) as usize;
+                #[cfg(target_endian = "big")]
+                let common = (diff.leading_zeros() / 8) as usize;
+                return i + common;
+            }
+            i += CHUNK_SIZE;
         }
     }
 
     // 4-byte tail. On 32-bit targets the chunk loop above already
     // operates in 4-byte strides, so the chunk's bounds invariant
-    // (`+ CHUNK_SIZE <= iend` failed → at most 3 bytes left) makes
-    // this branch's `+ 4 <= iend` always false — guarding the block
+    // (`i + CHUNK_SIZE <= len` failed → at most 3 bytes left) makes
+    // this branch's `i + 4 <= len` always false — guarding the block
     // with `cfg(target_pointer_width = "64")` mirrors upstream zstd's
     // `MEM_64bits()` gate and lets the optimiser drop the dead check
     // on 32-bit builds.
     //
-    // SAFETY: bounds check `+ 4 <= iend` before the read; both ptrs
-    // have at least `iend - ip` readable bytes by contract.
+    // SAFETY (all three tails): each read is bounds-checked against `len`
+    // first, and both pointers have at least `len` readable bytes by contract.
     #[cfg(target_pointer_width = "64")]
-    if (ip as usize) + 4 <= (iend as usize) {
-        let a = unsafe { core::ptr::read_unaligned(ip.cast::<u32>()) };
-        let b = unsafe { core::ptr::read_unaligned(m.cast::<u32>()) };
+    if i + 4 <= len {
+        let a = unsafe { core::ptr::read_unaligned(ip.add(i).cast::<u32>()) };
+        let b = unsafe { core::ptr::read_unaligned(match_ptr.add(i).cast::<u32>()) };
         if a == b {
-            // SAFETY: just verified 4 readable bytes; pointer add by 4
-            // keeps the pointer ≤ iend.
-            unsafe {
-                ip = ip.add(4);
-                m = m.add(4);
-            }
+            i += 4;
         }
     }
 
     // 2-byte tail.
-    if (ip as usize) + 2 <= (iend as usize) {
-        let a = unsafe { core::ptr::read_unaligned(ip.cast::<u16>()) };
-        let b = unsafe { core::ptr::read_unaligned(m.cast::<u16>()) };
+    if i + 2 <= len {
+        let a = unsafe { core::ptr::read_unaligned(ip.add(i).cast::<u16>()) };
+        let b = unsafe { core::ptr::read_unaligned(match_ptr.add(i).cast::<u16>()) };
         if a == b {
-            // SAFETY: 2 readable bytes verified.
-            unsafe {
-                ip = ip.add(2);
-                m = m.add(2);
-            }
+            i += 2;
         }
     }
 
     // 1-byte tail.
-    if (ip as usize) < (iend as usize) {
-        // SAFETY: 1 readable byte verified.
-        let a = unsafe { *ip };
-        let b = unsafe { *m };
-        if a == b {
-            // SAFETY: 1 readable byte verified; pointer add by 1 keeps
-            // ip ≤ iend.
-            unsafe {
-                ip = ip.add(1);
-            }
-        }
+    if i < len && unsafe { *ip.add(i) == *match_ptr.add(i) } {
+        i += 1;
     }
-
-    // Length computed via `as usize` arithmetic (not `offset_from`)
-    // to avoid UB when the byte distance exceeds `isize::MAX` on
-    // 32-bit hosts; see the in-loop return for the full reasoning.
-    (ip as usize) - (p_start as usize)
+    i
 }
 
 /// Forward match length for a candidate whose bytes begin in the dictionary
