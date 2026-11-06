@@ -1874,8 +1874,17 @@ impl Matcher for MatchGeneratorDriver {
                 // parameter overrides) has already down-sized them for the
                 // source the way `ZSTD_adjustCParams_internal` does, `hashLog`
                 // to the source's log plus one and `chainLog` to the log.
-                let long_bits = dcfg.long_hash_log as usize;
-                let short_bits = dcfg.short_hash_log as usize;
+                // A hinted frame then caps both at its table window's log: on
+                // a small frame the long table's extra bit doubles what is
+                // cleared per frame (a fresh 10 KiB level-3 frame ran 36%
+                // slower) for a few bytes per megabyte of output.
+                let window_bits = if hinted {
+                    table_window_size.ilog2() as usize
+                } else {
+                    usize::MAX
+                };
+                let long_bits = (dcfg.long_hash_log as usize).min(window_bits);
+                let short_bits = (dcfg.short_hash_log as usize).min(window_bits);
                 resolved_table_bits = long_bits;
                 dfast.set_hash_bits(long_bits, short_bits);
                 dfast.set_min_match(dcfg.min_match);

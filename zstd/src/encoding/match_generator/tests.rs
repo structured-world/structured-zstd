@@ -1844,11 +1844,12 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     // The window is now sized the C-faithful way: `get_cparams` clamps it to
     // the raw 1 KiB source (`window_log = ceil_log2(1024) = 10 = MIN_WINDOW_LOG`),
     // dropping the old MIN_HINTED_WINDOW_LOG 16 KiB interop floor (verified safe:
-    // such small-window frames decode in the C reference). The dfast tables
-    // follow `ZSTD_adjustCParams_internal` at that window: `hashLog` down to
-    // the window log plus one, `chainLog` down to the window log.
+    // such small-window frames decode in the C reference). Both dfast tables
+    // then take the hinted window's log, one under the `hashLog` that
+    // `ZSTD_adjustCParams_internal` resolves for the long table, so a small
+    // frame clears no table larger than its window.
     assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
-    assert_eq!(hinted_long, 1 << (MIN_WINDOW_LOG + 1));
+    assert_eq!(hinted_long, 1 << MIN_WINDOW_LOG);
     assert_eq!(hinted_short, 1 << MIN_WINDOW_LOG);
     assert!(
         hinted_long < full_long && hinted_short < full_short,
@@ -3420,12 +3421,17 @@ fn dfast_geometry_follows_the_reference_cparams() {
             "level 3 with a {hint}-byte source keys its short table on the wrong width",
         );
         // And the tables take the widths the reference resolves, down-sized for
-        // the source as `ZSTD_adjustCParams_internal` does (`hashLog` to the
-        // source log plus one), with nothing cut further.
+        // the source as `ZSTD_adjustCParams_internal` does, then capped at the
+        // hinted source's log: the long table's `hashLog` of the source log
+        // plus one only doubles what a small frame clears.
         let cp = crate::encoding::cparams::get_cparams(3, hint, 0);
+        let source_log = hint.next_power_of_two().ilog2() as usize;
         assert_eq!(
             (dfast.long_hash_bits, dfast.short_hash_bits),
-            (cp.hash_log as usize, cp.chain_log as usize),
+            (
+                (cp.hash_log as usize).min(source_log),
+                (cp.chain_log as usize).min(source_log)
+            ),
             "level 3 with a {hint}-byte source sizes its tables off the reference",
         );
     }
