@@ -48,6 +48,6 @@ jobs:
               - exclude:
                   id: rust/hard-coded-cryptographic-value
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@f3c49fd1ef3281abc41069b3dd22807a60c963f6 # v4
+        uses: github/codeql-action/analyze@0911ee96d2d6c8def97122c36c5cadd93829a4b4 # v4
         with:
           category: /language:${{ matrix.language }}
