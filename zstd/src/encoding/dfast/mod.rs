@@ -497,6 +497,18 @@ impl DfastMatchGenerator {
         1usize << self.short_hash_bits
     }
 
+    /// Slots of both tables that hold a position.
+    #[cfg(test)]
+    pub(crate) fn occupied_slots(&self) -> usize {
+        let len = self.long_len() + self.short_len();
+        // SAFETY: the two tables are `long_len + short_len` contiguous slots.
+        let slots = unsafe { core::slice::from_raw_parts(self.long_ptr(), len) };
+        slots
+            .iter()
+            .filter(|&&slot| slot != DFAST_EMPTY_SLOT)
+            .count()
+    }
+
     /// Base const-pointer to the long table region.
     #[inline(always)]
     fn long_ptr(&self) -> *const u32 {

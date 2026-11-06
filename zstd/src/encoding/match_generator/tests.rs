@@ -3399,6 +3399,39 @@ fn fast_dict_attach_follows_the_source_size_cutoff() {
 }
 
 #[test]
+fn an_unsearched_last_block_of_a_borrowed_frame_is_not_indexed() {
+    // A frame scanned in place is the whole input, so its last block has no
+    // later block to match into it and the next frame does not continue its
+    // positions. Written off unsearched, that block is only staged; an earlier
+    // one is still indexed for the blocks after it.
+    let mut state = 0x9e37_79b9_u32;
+    let input: Vec<u8> = (0..4096)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let half = input.len() / 2;
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.set_source_size_hint(input.len() as u64);
+    driver.reset(CompressionLevel::Level(3));
+    // SAFETY: `input` outlives the window, cleared before it drops.
+    unsafe { driver.set_borrowed_window(&input) };
+    driver.set_borrowed_block(0, half);
+    driver.skip_matching_with_hint(Some(true));
+    let indexed = driver.dfast_matcher_mut().occupied_slots();
+    assert!(indexed > 0, "a block with blocks after it is indexed");
+    driver.set_borrowed_block(half, input.len());
+    driver.skip_matching_with_hint(Some(true));
+    assert_eq!(
+        driver.dfast_matcher_mut().occupied_slots(),
+        indexed,
+        "the frame's last block was indexed with nothing left to read it",
+    );
+    driver.clear_borrowed_window();
+}
+
+#[test]
 fn dfast_geometry_follows_the_reference_cparams() {
     // The double-fast short table keys on `cParams.minMatch` bytes, as upstream
     // templates its loops on `mls`, and the level-3 rows of `clevels.h` do not

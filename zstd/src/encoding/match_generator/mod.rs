@@ -440,6 +440,9 @@ pub struct MatchGeneratorDriver {
     // committed-block path; consumed (reset to `None`) by the routed
     // call. Always `None` on the owned streaming path.
     borrowed_pending: Option<(usize, usize)>,
+    /// Length of the borrowed one-shot input, the whole frame's, while it is
+    /// registered; 0 otherwise.
+    borrowed_len: usize,
     /// CDict-equivalent: snapshot of the post-prime matcher state taken
     /// once after the first dictionary prime — the backend `storage`
     /// (hash tables + dictionary history + offset history + window) plus
@@ -780,6 +783,7 @@ impl MatchGeneratorDriver {
             source_size_hint: None,
             dictionary_size_hint: None,
             borrowed_pending: None,
+            borrowed_len: 0,
             primed: None,
             primed_spare: None,
             own_workspace: crate::encoding::workspace::Workspace::new(),
@@ -989,6 +993,7 @@ impl MatchGeneratorDriver {
     /// and must be cleared before the buffer is dropped or the matcher is
     /// reused for another frame.
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
+        self.borrowed_len = buffer.len();
         // SAFETY: forwarded contract — caller upholds liveness/clear.
         match self.active_backend() {
             super::strategy::BackendTag::Simple => unsafe {
@@ -1016,6 +1021,7 @@ impl MatchGeneratorDriver {
             super::strategy::BackendTag::HashChain => {}
         }
         self.borrowed_pending = None;
+        self.borrowed_len = 0;
     }
 
     /// Stage the borrowed block range `[block_start, block_end)` for the
@@ -1563,6 +1569,7 @@ impl Matcher for MatchGeneratorDriver {
         // Drop any frame-local borrowed staging so it can't leak across a
         // reset and misroute the next start/skip into borrowed dispatch.
         self.borrowed_pending = None;
+        self.borrowed_len = 0;
         if self.active_backend() != next_backend {
             // Drain the outgoing backend's allocations into the shared
             // pool. The `match &mut self.storage { ... }` block runs to
@@ -2306,6 +2313,15 @@ impl MatchGeneratorDriver {
             if self.ldm.is_some() {
                 self.take_long_distance_block::<K>();
             }
+            // The input is the whole frame, so nothing reads what its last
+            // block would index: no later block follows, and the next frame
+            // starts a window past it or, behind a dictionary, verifies every
+            // candidate it takes. Unsearched, that block is then only staged.
+            let incompressible_hint = if block_end == self.borrowed_len {
+                None
+            } else {
+                incompressible_hint
+            };
             match self.active_backend() {
                 super::strategy::BackendTag::Simple => self.simple_mut().skip_matching_borrowed(
                     block_start,
