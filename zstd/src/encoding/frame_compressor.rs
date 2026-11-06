@@ -522,6 +522,8 @@ impl FrameTuning {
 #[derive(Clone, Default)]
 pub(crate) struct CachedDictionaryEntropy {
     pub(crate) huff: Option<crate::huff0::huff0_encoder::HuffmanTable>,
+    /// Whether `huff` codes every byte value: upstream's `HUF_repeat_valid`.
+    pub(crate) huff_valid: bool,
     pub(crate) ll_previous: Option<PreviousFseTable>,
     pub(crate) ml_previous: Option<PreviousFseTable>,
     pub(crate) of_previous: Option<PreviousFseTable>,
@@ -529,12 +531,14 @@ pub(crate) struct CachedDictionaryEntropy {
 
 impl CachedDictionaryEntropy {
     /// Heap bytes the cached dictionary entropy holds: the literals Huffman
-    /// table plus any `Custom` LL/ML/OF FSE tables (the `Arc`-boxed `FSETable`
+    /// table plus any custom LL/ML/OF FSE tables (the `Arc`-boxed `FSETable`
     /// payload and its flat state array). `Default` / `Rle` variants own no heap.
     pub(crate) fn heap_size(&self) -> usize {
         let mut total = self.huff.as_ref().map_or(0, |h| h.heap_size());
         for prev in [&self.ll_previous, &self.ml_previous, &self.of_previous] {
-            if let Some(PreviousFseTable::Custom(table)) = prev {
+            if let Some(PreviousFseTable::Custom(table) | PreviousFseTable::Dictionary(table)) =
+                prev
+            {
                 total +=
                     core::mem::size_of::<crate::fse::fse_encoder::FSETable>() + table.heap_size();
             }
@@ -547,24 +551,43 @@ impl CachedDictionaryEntropy {
     /// Huffman table plus the literal-length / match-length / offset FSE
     /// "previous" tables. Shared by [`FrameCompressor`] and
     /// [`crate::encoding::StreamingEncoder`] so both seed identically.
+    ///
+    /// Each table is marked valid, so a block may repeat it unchecked, exactly
+    /// where upstream's `ZSTD_loadCEntropy` marks it so: a literal table coding
+    /// every byte value, and an FSE table giving a non-zero count to every
+    /// symbol its stream can carry (`ZSTD_dictNCountRepeat`), the offset codes
+    /// up to `highbit(dictContentSize + 128 KiB)`.
     pub(crate) fn from_dictionary(dictionary: &crate::decoding::Dictionary) -> Self {
+        // Upstream `MaxLL` / `MaxML` / `MaxOff`.
+        const MAX_LL: u32 = 35;
+        const MAX_ML: u32 = 52;
+        const MAX_OFF: u32 = 31;
+        let previous = |table: Option<crate::fse::fse_encoder::FSETable>, max_symbol: u32| {
+            table.map(|table| {
+                let valid = (0..=max_symbol).all(|s| table.symbol_probability(s as u8) != 0);
+                let table = SharedFseTable::new(table);
+                if valid {
+                    PreviousFseTable::Dictionary(table)
+                } else {
+                    PreviousFseTable::Custom(table)
+                }
+            })
+        };
+        // `dictContentSize + 128 KiB` reaches past `u32` only beyond any
+        // offset the format codes, where upstream keeps `MaxOff`.
+        let offcode_max = u32::try_from(dictionary.dict_content.len())
+            .ok()
+            .and_then(|len| len.checked_add(128 * 1024))
+            .map_or(MAX_OFF, |max_offset| max_offset.ilog2().min(MAX_OFF));
+        let huff = dictionary.huf.table.to_encoder_table();
         Self {
-            huff: dictionary.huf.table.to_encoder_table(),
-            ll_previous: dictionary
-                .fse
-                .literal_lengths
-                .to_encoder_table()
-                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
-            ml_previous: dictionary
-                .fse
-                .match_lengths
-                .to_encoder_table()
-                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
-            of_previous: dictionary
-                .fse
-                .offsets
-                .to_encoder_table()
-                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
+            huff_valid: huff
+                .as_ref()
+                .is_some_and(crate::huff0::huff0_encoder::HuffmanTable::codes_every_byte),
+            huff,
+            ll_previous: previous(dictionary.fse.literal_lengths.to_encoder_table(), MAX_LL),
+            ml_previous: previous(dictionary.fse.match_lengths.to_encoder_table(), MAX_ML),
+            of_previous: previous(dictionary.fse.offsets.to_encoder_table(), offcode_max),
         }
     }
 }
@@ -601,6 +624,11 @@ pub(crate) enum PreviousFseTable {
     // builds a new table swaps in a fresh `SharedFseTable`), never mutated in
     // place, so sharing is sound.
     Custom(SharedFseTable),
+    /// A dictionary's table that covers every symbol its stream can carry:
+    /// upstream's `FSE_repeat_valid`, which a fast-band block repeats without
+    /// pricing it. It stays valid while blocks repeat it; the offset table
+    /// only for the frame's first block ([`FseTables::end_block`]).
+    Dictionary(SharedFseTable),
     Rle(u8),
 }
 
@@ -608,8 +636,22 @@ impl PreviousFseTable {
     pub(crate) fn as_table<'a>(&'a self, default: &'a FSETable) -> Option<&'a FSETable> {
         match self {
             Self::Default => Some(default),
-            Self::Custom(table) => Some(table),
+            Self::Custom(table) | Self::Dictionary(table) => Some(table),
             Self::Rle(_) => None,
+        }
+    }
+
+    /// Whether a block may repeat this table without pricing it.
+    pub(crate) fn is_valid(&self) -> bool {
+        matches!(self, Self::Dictionary(_))
+    }
+
+    /// The table itself when it is a distribution of its own, not the
+    /// predefined one or a single symbol.
+    pub(crate) fn distribution(&self) -> Option<&FSETable> {
+        match self {
+            Self::Custom(table) | Self::Dictionary(table) => Some(table),
+            Self::Default | Self::Rle(_) => None,
         }
     }
 }
@@ -651,6 +693,17 @@ pub(crate) struct FseTables {
 }
 
 impl FseTables {
+    /// Close a block, written or not: a dictionary's offset table stops being
+    /// valid after the frame's first block, as the offsets the next blocks
+    /// reach can outgrow the codes it was checked for (upstream
+    /// `ZSTD_compressBlock_internal`, zstd_compress.c:4444).
+    pub(crate) fn end_block(&mut self) {
+        self.of_previous = match self.of_previous.take() {
+            Some(PreviousFseTable::Dictionary(table)) => Some(PreviousFseTable::Custom(table)),
+            other => other,
+        };
+    }
+
     /// Keep the frame's tables as buffers before the next frame overwrites
     /// them.
     ///
@@ -1420,6 +1473,12 @@ pub(crate) struct CompressState<M: Matcher> {
     /// compressor is built and dispatched on once per block.
     pub(crate) copy_kernel: crate::encoding::fastpath::FastpathKernel,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
+    /// Whether `last_huff_table` is a dictionary's table coding every byte
+    /// value, untouched by this frame: upstream's `HUF_repeat_valid`, which
+    /// lowers the literal floor to 6 and lets a small fast-band section repeat
+    /// it without a histogram. A table a block built is upstream's
+    /// `HUF_repeat_check`.
+    pub(crate) huf_repeat_valid: bool,
     /// Recycled `HuffmanTable` buffers: when a block clears or replaces
     /// `last_huff_table`, the old table parks here instead of dropping, so
     /// the next frame's dictionary entropy seed `clone_from`s into existing
@@ -1586,15 +1645,18 @@ impl<M: Matcher> CompressState<M> {
     /// `huff_table_spare` for reuse instead of dropping them.
     #[inline]
     pub(crate) fn clear_huff_table(&mut self) {
+        self.huf_repeat_valid = false;
         if let Some(table) = self.last_huff_table.take() {
             self.park_huff_table(table);
         }
     }
 
-    /// Replaces `last_huff_table` with `table`, parking any displaced table
-    /// in `huff_table_spare` for reuse.
+    /// Replaces `last_huff_table` with a table a block built, parking any
+    /// displaced table in `huff_table_spare` for reuse. A built table is never
+    /// valid (upstream sets `HUF_repeat_check`).
     #[inline]
     pub(crate) fn replace_huff_table(&mut self, table: crate::huff0::huff0_encoder::HuffmanTable) {
+        self.huf_repeat_valid = false;
         if let Some(old) = self.last_huff_table.replace(table) {
             self.park_huff_table(old);
         }
@@ -1858,6 +1920,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
+                huf_repeat_valid: false,
                 huff_table_spare: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),
@@ -2415,6 +2478,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
                 sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
+                huf_repeat_valid: false,
                 huff_table_spare: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),
@@ -2956,6 +3020,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
                         Some(dst) => dst.clone_from(src),
                         slot => *slot = Some(src.clone()),
                     }
+                    self.state.huf_repeat_valid = cache.huff_valid;
                 }
                 None => self.state.clear_huff_table(),
             }
@@ -2987,18 +3052,15 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
             self.state.fse_tables.ml_previous = None;
             self.state.fse_tables.of_previous = None;
         }
-        let ll_entropy = cached_entropy.and_then(|cache| match cache.ll_previous.as_ref() {
-            Some(PreviousFseTable::Custom(table)) => Some(table.as_ref()),
-            _ => None,
-        });
-        let ml_entropy = cached_entropy.and_then(|cache| match cache.ml_previous.as_ref() {
-            Some(PreviousFseTable::Custom(table)) => Some(table.as_ref()),
-            _ => None,
-        });
-        let of_entropy = cached_entropy.and_then(|cache| match cache.of_previous.as_ref() {
-            Some(PreviousFseTable::Custom(table)) => Some(table.as_ref()),
-            _ => None,
-        });
+        let ll_entropy = cached_entropy
+            .and_then(|cache| cache.ll_previous.as_ref())
+            .and_then(PreviousFseTable::distribution);
+        let ml_entropy = cached_entropy
+            .and_then(|cache| cache.ml_previous.as_ref())
+            .and_then(PreviousFseTable::distribution);
+        let of_entropy = cached_entropy
+            .and_then(|cache| cache.of_previous.as_ref())
+            .and_then(PreviousFseTable::distribution);
         self.state.matcher.seed_dictionary_entropy(
             self.state.last_huff_table.as_ref(),
             ll_entropy,

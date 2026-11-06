@@ -647,6 +647,13 @@ impl HuffmanTable {
             + cached
     }
 
+    /// Whether every byte value has a code. Upstream marks a dictionary's
+    /// literal table `HUF_repeat_valid` only then (`ZSTD_loadCEntropy`), and a
+    /// block may repeat a valid table without checking it against its literals.
+    pub(crate) fn codes_every_byte(&self) -> bool {
+        self.codes.len() == 256 && self.codes.iter().all(|&(_, bits)| bits != 0)
+    }
+
     /// The most heap one table holds: a code and a packed code for each of the
     /// 256 byte values, and room for the longest weight description (a header
     /// byte and 255 four-bit weights, in a buffer grown to the next power of

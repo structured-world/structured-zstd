@@ -40,13 +40,17 @@ const MAX_NB_BLOCK_SPLITS: usize = 196;
 /// all pin `shift = MIN(9 - strat, 3) = 3`, so both `Lazy` and `Btlazy2` land
 /// on the 64-byte floor. No aggressiveness gradient within this band to
 /// preserve (the gradient only starts at btopt).
+///
+/// The floor drops to 6 only for a valid previous table (upstream
+/// `huf_repeat == HUF_repeat_valid`): a dictionary's table coding every byte,
+/// not one a block built.
 #[inline]
 fn min_literals_to_compress(
     strategy: crate::encoding::strategy::StrategyTag,
-    has_huf_table: bool,
+    repeat_valid: bool,
 ) -> usize {
     use crate::encoding::strategy::StrategyTag;
-    if has_huf_table {
+    if repeat_valid {
         return 6;
     }
     let shift: u32 = match strategy {
@@ -73,15 +77,8 @@ fn min_literals_to_compress(
 /// - btultra (strat 8): minlog=7 → ~0.78% margin + 2 bytes
 /// - btultra2 (strat 9): minlog=8 → ~0.39% margin + 2 bytes
 ///
-/// **Current usage in this crate:** wired into the literal-section
-/// raw-fallback gate (`compress_literals` +
-/// `estimate_literals_section_bytes`) only — those sites previously
-/// had no margin at all (bare `>= raw_section_bytes`).
-/// **Not yet wired into** the block-level emit/probe paths
-/// (`emit_single_sequence_block`, `SplitEstimator::estimate_subblock_size`),
-/// which still use a uniform `(source_len >> 8) + 2` calculation
-/// (the btultra2 value applied across all strategies). Migrating
-/// those sites is a separate cleanup.
+/// Wired into the literal-section raw fallback ([`use_raw_literal_fallback`])
+/// and the block-level one ([`keeps_compressed_block`]).
 #[inline]
 fn min_gain(src_size: usize, strategy: crate::encoding::strategy::StrategyTag) -> usize {
     use crate::encoding::strategy::StrategyTag;
@@ -91,6 +88,33 @@ fn min_gain(src_size: usize, strategy: crate::encoding::strategy::StrategyTag) -
         _ => 6,
     };
     (src_size >> minlog) + 2
+}
+
+/// Whether a block whose `src_size` bytes compressed to a `payload`-byte
+/// section is written compressed rather than raw: upstream keeps it only when
+/// it saves `minGain` (`ZSTD_entropyCompressSeqStore`, zstd_compress.c:2967:
+/// `cSize >= srcSize - minGain` returns 0, a raw block). Shared by every path
+/// that writes or prices a block, so they agree on which blocks go out raw.
+#[inline]
+pub(crate) fn keeps_compressed_block(
+    payload: usize,
+    src_size: usize,
+    strategy: crate::encoding::strategy::StrategyTag,
+) -> bool {
+    // Upstream never compresses a block under seven bytes
+    // (`ZSTD_buildSeqStore` returns `ZSTDbss_noCompress` below
+    // `MIN_CBLOCK_SIZE + ZSTD_blockHeaderSize + 1 + 1`), which also keeps the
+    // subtraction below from underflowing.
+    const MIN_COMPRESSED_SOURCE: usize = 2 + 3 + 1 + 1;
+    src_size >= MIN_COMPRESSED_SOURCE && payload < src_size - min_gain(src_size, strategy)
+}
+
+/// Whether a literals section is coded as one Huffman stream rather than four:
+/// below 256 bytes, or below 1 KiB when the previous table is valid (upstream
+/// `ZSTD_compressLiterals`, zstd_compress_literals.c:142 and :171).
+#[inline]
+fn single_literal_stream(len: usize, repeat_valid: bool) -> bool {
+    len < 256 || (repeat_valid && len < 1024)
 }
 
 /// Upstream zstd `compress_literals` raw-fallback gate
@@ -385,12 +409,6 @@ struct RawSequence {
 
 struct EntropyOnlyMatcher;
 
-enum HuffmanTableUpdate {
-    New(huff0_encoder::HuffmanTable),
-    Reused,
-    Cleared,
-}
-
 impl Matcher for EntropyOnlyMatcher {
     fn get_last_space(&mut self) -> &[u8] {
         unreachable!("entropy estimator never reads source bytes")
@@ -523,6 +541,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher, K: EncodeTier>(
             offset_hist: state.offset_hist,
         },
         entry_huff: state.last_huff_table.as_ref(),
+        entry_huff_valid: state.huf_repeat_valid,
         built_huff,
         scratch_state: CompressState {
             matcher: EntropyOnlyMatcher,
@@ -536,6 +555,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher, K: EncodeTier>(
             // Probes read the table they repeat from `entry_huff` /
             // `built_huff`; this slot stays empty.
             last_huff_table: None,
+            huf_repeat_valid: false,
             huff_table_spare: None,
             // Lent, not created: the estimator builds a table per split
             // candidate, and a fresh scratch here would take its buffers again
@@ -883,8 +903,7 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
     // (see `min_literals_to_compress`). With huf reuse available the
     // floor drops to 6 since there is no per-block huf-header overhead.
     let strategy = state.strategy_tag;
-    let has_huf_table = state.last_huff_table.is_some();
-    let min_lits = min_literals_to_compress(strategy, has_huf_table);
+    let min_lits = min_literals_to_compress(strategy, state.huf_repeat_valid);
     // RLE pre-check: upstream zstd `compress_literals` reaches RLE only through
     // the `cLitSize == 1` branch (`zstd_compress_literals.c:192-201`)
     // after passing the `min_lits` gate and running a full HUF compress —
@@ -913,7 +932,10 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
     // `compress_block_encoded`, not in this literals path.
     // What the section does to the Huffman table is returned, not applied: the
     // table the block started from stays in place until the caller keeps the
-    // block, so a block that loses to a raw one has nothing to put back.
+    // block, so a block that loses to a raw one has nothing to put back. A raw
+    // or RLE section leaves it in place for the next block to repeat, as
+    // upstream copies `prevHuf` into `nextHuf` on those paths
+    // (zstd_compress_literals.c:152, :189, :199).
     let huff = if state.literal_compression_disabled {
         // Upstream zstd `ZSTD_literalsCompressionIsDisabled` (auto mode:
         // `strategy == ZSTD_fast && targetLength > 0`, i.e. the negative levels):
@@ -922,27 +944,27 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
         // C's negative-band frames byte-for-byte (the literals section there is
         // Raw, not Compressed/RLE).
         raw_literals(literals_vec, &mut writer);
-        HuffOutcome::Clear
+        HuffOutcome::Keep
     } else if !literals_vec.is_empty() && all_bytes_identical(literals_vec) {
         rle_literals(literals_vec, &mut writer);
-        HuffOutcome::Clear
+        HuffOutcome::Keep
     } else if literals_vec.len() >= min_lits {
         match compress_literals::<K>(
             literals_vec,
             state.last_huff_table.as_ref(),
+            state.huf_repeat_valid,
             &mut writer,
             strategy,
             state.huf_optimal_search,
             &mut state.huff_weights,
             literals_suspected_incompressible(literals_vec.len(), raw_sequences.len()),
         ) {
-            HuffmanTableUpdate::New(table) => HuffOutcome::New(table),
-            HuffmanTableUpdate::Reused => HuffOutcome::Keep,
-            HuffmanTableUpdate::Cleared => HuffOutcome::Clear,
+            Some(table) => HuffOutcome::New(table),
+            None => HuffOutcome::Keep,
         }
     } else {
         raw_literals(literals_vec, &mut writer);
-        HuffOutcome::Clear
+        HuffOutcome::Keep
     };
 
     // sequences section
@@ -1089,9 +1111,9 @@ pub(crate) fn commit_block_tables<M: Matcher>(state: &mut CompressState<M>, tabl
     remember_last_used_tables(&mut state.fse_tables, tables.fse);
     match tables.huff {
         HuffOutcome::Keep => {}
-        HuffOutcome::Clear => state.clear_huff_table(),
         HuffOutcome::New(table) => state.replace_huff_table(table),
     }
+    state.fse_tables.end_block();
 }
 
 /// Drop a discarded block's tables, keeping a Huffman table it built as a
@@ -1101,6 +1123,7 @@ pub(crate) fn discard_block_tables<M: Matcher>(state: &mut CompressState<M>, tab
     if let HuffOutcome::New(table) = tables.huff {
         state.park_huff_table(table);
     }
+    state.fse_tables.end_block();
 }
 
 /// Workspace shared across estimator probes so per-probe cost computation never
@@ -1186,9 +1209,11 @@ fn estimate_block_parts_size<M: Matcher>(
         tables.ml_previous.take(),
         tables.of_previous.take(),
     ];
+    let previous_valid = state.huf_repeat_valid;
     let (bytes, outcome, decisions) = estimate_block_parts_size_with(
         state,
         previous.as_ref(),
+        previous_valid,
         [
             previous_fse[0].as_ref(),
             previous_fse[1].as_ref(),
@@ -1201,8 +1226,10 @@ fn estimate_block_parts_size<M: Matcher>(
     );
     state.last_huff_table = match outcome {
         HuffOutcome::Keep => previous,
-        HuffOutcome::Clear => None,
-        HuffOutcome::New(table) => Some(table),
+        HuffOutcome::New(table) => {
+            state.huf_repeat_valid = false;
+            Some(table)
+        }
     };
     let [ll, ml, of] = previous_fse;
     let tables = &mut state.fse_tables;
@@ -1223,12 +1250,12 @@ fn estimate_block_parts_size<M: Matcher>(
 }
 
 /// What pricing a literals section did to the Huffman table the next section
-/// may repeat: keep the one it was given, drop it, or take a new one. A probe
-/// reads the previous table and reports this, rather than rewriting a copy of
-/// it, so the table it starts from is borrowed.
+/// may repeat: keep the one it was given (a repeat, a raw or an RLE section all
+/// leave it in place, upstream's `nextHuf = prevHuf`), or take a new one. A
+/// probe reads the previous table and reports this, rather than rewriting a
+/// copy of it, so the table it starts from is borrowed.
 enum HuffOutcome {
     Keep,
-    Clear,
     New(huff0_encoder::HuffmanTable),
 }
 
@@ -1238,9 +1265,13 @@ enum HuffOutcome {
 /// and the FSE tables as `previous_fse`, and what the section does with each is
 /// returned beside the size, a built FSE table in its `*_next` slot of
 /// `state.fse_tables`; the offset history is advanced in `state`.
+// One argument over the lint's threshold: each is a part of the state the
+// section is priced from, mirroring what the emitter reads.
+#[allow(clippy::too_many_arguments)]
 fn estimate_block_parts_size_with<M: Matcher>(
     state: &mut CompressState<M>,
     previous: Option<&huff0_encoder::HuffmanTable>,
+    previous_valid: bool,
     previous_fse: [Option<&PreviousFseTable>; 3],
     literals_vec: &[u8],
     raw_sequences: &[RawSequence],
@@ -1250,6 +1281,7 @@ fn estimate_block_parts_size_with<M: Matcher>(
     let (lit_bytes, outcome) = estimate_literals_section_bytes(
         literals_vec,
         previous,
+        previous_valid,
         &mut workspace.lit_counts,
         state.strategy_tag,
         state.huf_optimal_search,
@@ -1284,6 +1316,7 @@ fn estimate_block_parts_size_with<M: Matcher>(
 fn estimate_literals_section_bytes(
     literals: &[u8],
     last_huff: Option<&huff0_encoder::HuffmanTable>,
+    repeat_valid: bool,
     counts: &mut [usize; 256],
     strategy: crate::encoding::strategy::StrategyTag,
     huf_search: bool,
@@ -1294,7 +1327,7 @@ fn estimate_literals_section_bytes(
     let raw = || {
         (
             uncompressed_literals_header_bytes(literals.len()) + literals.len(),
-            HuffOutcome::Clear,
+            HuffOutcome::Keep,
         )
     };
     // Mirror `encode_block_parts` literal-mode branches
@@ -1314,39 +1347,35 @@ fn estimate_literals_section_bytes(
     if !literals.is_empty() && all_bytes_identical(literals) {
         return (
             uncompressed_literals_header_bytes(literals.len()) + 1,
-            HuffOutcome::Clear,
+            HuffOutcome::Keep,
         );
     }
-    let min_lits = min_literals_to_compress(strategy, last_huff.is_some());
+    let min_lits = min_literals_to_compress(strategy, repeat_valid);
     if literals.len() < min_lits {
         return raw();
     }
-
-    // Upstream zstd preferRepeat fast-path: skip the histogram +
-    // `build_from_counts` cost. Mirrors upstream zstd's
-    // `huf_compress.c:1360-1364` policy — when the prior table
-    // is valid for the input, REUSE unconditionally regardless
-    // of whether a freshly-built table would compress better.
-    // This is a deliberate CPU-avoidance bias on fast-band tiny
-    // sections; see `decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band`
-    // test which seeds a fixture where size-comparison would
-    // pick new and asserts the override still picks reuse.
-    // Mirrors `compress_literals` so both code paths agree
-    // byte-for-byte. The prev-table validation
-    // (`estimate_compressed_size` returns Some) gates the
-    // short-circuit so we still fall through to rebuild when the
-    // prior table can't encode the current literals.
-    if prefer_repeat_eligible(strategy, literals.len())
-        && let Some(prev) = last_huff
-        && let Some(reuse_payload) = estimate_huff_payload_bytes_checked(prev, literals)
-    {
-        let compressed_header = compressed_literals_header_bytes(literals.len());
-        let total = compressed_header + reuse_payload; // no tree_desc on reuse
-        let huf_section_size = total - compressed_header;
-        if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
-            return raw();
+    let single_stream = single_literal_stream(literals.len(), repeat_valid);
+    // The section repeating the previous table, priced as the emitter writes
+    // it: no description, raw when it does not save `minGain`.
+    let repeat = |prev: &huff0_encoder::HuffmanTable| {
+        let reuse_payload = estimate_huff_payload_bytes_checked(prev, literals, single_stream)
+            .expect("a repeated table codes the section");
+        if use_raw_literal_fallback(reuse_payload, literals.len(), strategy) {
+            raw()
+        } else {
+            (
+                compressed_literals_header_bytes(literals.len()) + reuse_payload,
+                HuffOutcome::Keep,
+            )
         }
-        return (total, HuffOutcome::Keep);
+    };
+
+    // preferRepeat with a valid table, before any histogram, as the emitter.
+    if prefer_repeat_eligible(strategy, literals.len())
+        && repeat_valid
+        && let Some(prev) = last_huff
+    {
+        return repeat(prev);
     }
 
     // Mirror the emitter's end-sample shortcut, in the same position. Without
@@ -1363,6 +1392,16 @@ fn estimate_literals_section_bytes(
     // splitter probe costs match what the emitter writes.
     if largest_count <= (literals.len() >> 7) + 4 {
         return raw();
+    }
+
+    // preferRepeat with a table that has to be checked, as the emitter.
+    if prefer_repeat_eligible(strategy, literals.len())
+        && let Some(prev) = last_huff
+        && prev
+            .estimate_compressed_size_from_counts_checked(counts)
+            .is_some()
+    {
+        return repeat(prev);
     }
     // Mutable because the size query is what encodes the weight description
     // into the table's own buffer, so the emitter that follows reads it.
@@ -1381,35 +1420,29 @@ fn estimate_literals_section_bytes(
         weight_scratch.recycle(new_table);
         return raw();
     };
-    // For lit_size ≥ 256, upstream zstd `compress_literals` calls `encoder.encode4x`
-    // which splits the data in 4 streams with a 6-byte jumptable and per-stream
-    // byte-aligned padding. Bare `estimate_compressed_size_from_counts` would
-    // model a single stream and undercount by ~6–10 bytes per section, biasing
-    // splitter probes. We reuse `estimate_compressed_size` on each quarter so
-    // the cost matches the actual wire format.
-    let new_payload = estimate_huff_payload_bytes(&new_table, literals, counts);
-
     // Mirror `compress_literals` reuse-vs-new decision **byte-for-byte**.
     // The real encoder compares single-stream `estimate_compressed_size` for
     // both new and old tables (see `compress_literals` below); the actual
-    // wire output is the 4-stream `encode4x` layout once the table is chosen.
-    // Using the 4-stream `estimate_huff_payload_bytes_checked` here would
-    // disagree with the encoder and bias the splitter to pick a different
-    // table than the encoder ultimately emits.
+    // wire output is the stream layout `single_stream` picks once the table is
+    // chosen.
     let use_new =
-        decide_huff_reuse_like_encoder(&new_table, last_huff, new_desc, literals, counts, strategy);
-    let reuse_payload = if !use_new {
-        // Safe to recompute with 4-stream model now that the table is chosen:
-        // the chosen-table path always returns the actual wire cost.
-        last_huff.and_then(|t| estimate_huff_payload_bytes_checked(t, literals))
-    } else {
-        None
-    };
-
+        match decide_huff_reuse_like_encoder(&new_table, last_huff, new_desc, literals, counts) {
+            HuffChoice::Raw => {
+                weight_scratch.recycle(new_table);
+                return raw();
+            }
+            HuffChoice::New => true,
+            HuffChoice::Repeat => false,
+        };
+    // The four-stream layout carries a 6-byte jumptable and per-stream padding,
+    // which a single-stream estimate would undercount by ~6–10 bytes and bias
+    // the splitter's probes; each quarter is estimated on its own instead.
     let payload: usize = if use_new {
-        new_payload
+        estimate_huff_payload_bytes(&new_table, literals, counts, single_stream)
     } else {
-        reuse_payload.unwrap_or(literals.len())
+        last_huff
+            .and_then(|t| estimate_huff_payload_bytes_checked(t, literals, single_stream))
+            .unwrap_or(literals.len())
     };
     let tree_desc = if use_new { new_desc } else { 0 };
     let compressed_header = compressed_literals_header_bytes(literals.len());
@@ -1428,11 +1461,10 @@ fn estimate_literals_section_bytes(
     // the RHS) skews the threshold by `compressed_header - raw_header`
     // bytes and rejects compressed sections that upstream zstd would keep,
     // losing ratio. Mirror upstream zstd's payload-vs-srcSize form here.
-    let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
     let huf_section_size = total - compressed_header; // tree_desc + payload, no lhSize
     if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
         weight_scratch.recycle(new_table);
-        return (raw_section_bytes, HuffOutcome::Clear);
+        return raw();
     }
 
     if use_new {
@@ -1689,16 +1721,35 @@ fn prefer_repeat_eligible(
     ) && literals_len <= 1024
 }
 
+/// Which table a literals section is coded with once the new one is built
+/// (upstream `HUF_compress_internal`, huf_compress.c:1415-1425).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HuffChoice {
+    /// The previous table: it costs no more than the new one with its
+    /// description, or the description alone eats the section.
+    Repeat,
+    /// The table just built.
+    New,
+    /// Neither: with no usable previous table, the description plus the
+    /// 12-byte margin reaches the section size.
+    Raw,
+}
+
 fn decide_huff_reuse_like_encoder(
     new_table: &huff0_encoder::HuffmanTable,
     last_table: Option<&huff0_encoder::HuffmanTable>,
     new_desc: usize,
     literals: &[u8],
     counts: &[usize; 256],
-    strategy: crate::encoding::strategy::StrategyTag,
-) -> bool {
+) -> HuffChoice {
+    // `hSize + 12 >= srcSize`: the new table is not worth its description.
+    let new_or_raw = if new_desc + 12 >= literals.len() {
+        HuffChoice::Raw
+    } else {
+        HuffChoice::New
+    };
     let Some(prev) = last_table else {
-        return true;
+        return new_or_raw;
     };
     // Off the histogram, not the literals: the same sum over at most 256
     // symbols instead of over every byte of the section, which is where
@@ -1720,28 +1771,23 @@ fn decide_huff_reuse_like_encoder(
     // to 1.68x and from 1.90x to 1.36x. On input the literal stage writes off
     // as incompressible the decision never runs, and the change measures as
     // nothing there (instructions 4.8813 G against 4.8843 G) — as expected.
+    // A previous table that cannot code this section is upstream's
+    // `HUF_repeat_none` after `HUF_validateCTable`.
     let Some(old_estimate) = prev.estimate_compressed_size_from_counts_checked(counts) else {
-        return true;
+        return new_or_raw;
     };
-    // Late-stage `HUF_flags_preferRepeat` mirror — kept here for
-    // any caller that bypasses the early fast-path in
-    // `compress_literals` / `estimate_literals_section_bytes`.
-    // The early fast-paths short-circuit BEFORE `build_from_data`
-    // / `build_from_counts` to skip wasted tree-build work; this
-    // late gate covers the (currently unreachable) shape where the
-    // new table is built first and the decision still wants to
-    // reuse.
-    if prefer_repeat_eligible(strategy, literals.len()) {
-        return false;
-    }
     let new_estimate = new_table
         .estimate_compressed_size_from_counts_checked(counts)
         .unwrap_or(literals.len());
-    !(old_estimate <= new_desc + new_estimate || new_desc + 12 >= literals.len())
+    if old_estimate <= new_desc + new_estimate || new_desc + 12 >= literals.len() {
+        HuffChoice::Repeat
+    } else {
+        HuffChoice::New
+    }
 }
 
-/// Mirrors `compress_literals` choice: lit_size < 256 → single huff0 stream
-/// (`encode`), else → 4-stream layout (`encode4x`) with a 6-byte jumptable and
+/// Mirrors `compress_literals` choice: one stream ([`single_literal_stream`],
+/// `encode`), else the 4-stream layout (`encode4x`) with a 6-byte jumptable and
 /// per-stream byte-aligned padding. Returns the exact wire-format byte cost of
 /// the Huffman-encoded payload, excluding the literals section header and the
 /// Huffman tree description.
@@ -1749,8 +1795,9 @@ fn estimate_huff_payload_bytes(
     table: &huff0_encoder::HuffmanTable,
     literals: &[u8],
     counts: &[usize; 256],
+    single_stream: bool,
 ) -> usize {
-    if literals.len() < 256 {
+    if single_stream {
         table.estimate_compressed_size_from_counts(counts)
     } else {
         let split_size = literals.len().div_ceil(4);
@@ -1775,8 +1822,9 @@ fn estimate_huff_payload_bytes(
 fn estimate_huff_payload_bytes_checked(
     table: &huff0_encoder::HuffmanTable,
     literals: &[u8],
+    single_stream: bool,
 ) -> Option<usize> {
-    if literals.len() < 256 {
+    if single_stream {
         table.estimate_compressed_size(literals)
     } else {
         let split_size = literals.len().div_ceil(4);
@@ -1836,8 +1884,7 @@ fn emit_single_sequence_block<M: Matcher, K: EncodeTier>(
         buffers.codes,
         buffers.compressed,
     );
-    let min_gain = (source_len >> 8) + 2;
-    if buffers.compressed.len() >= source_len.saturating_sub(min_gain) {
+    if !keeps_compressed_block(buffers.compressed.len(), source_len, state.strategy_tag) {
         state.offset_hist = saved_offset_hist;
         discard_block_tables(state, tables);
         let header = BlockHeader {
@@ -2150,6 +2197,9 @@ struct SplitEstimator<'a> {
     block_entry: ProbeEntryState,
     /// The table the block starts from, borrowed.
     entry_huff: Option<&'a huff0_encoder::HuffmanTable>,
+    /// Whether `entry_huff` is valid (a dictionary's, untouched): only that
+    /// table is, a probe's own builds never are.
+    entry_huff_valid: bool,
     /// Every table a probe built, addressed by [`HuffRef::Built`].
     built_huff: Vec<huff0_encoder::HuffmanTable>,
     scratch_state: CompressState<EntropyOnlyMatcher>,
@@ -2193,14 +2243,15 @@ impl SplitEstimator<'_> {
             }
         }
         self.scratch_state.offset_hist = entry.offset_hist;
-        let previous = match entry.huff {
-            HuffRef::None => None,
-            HuffRef::BlockEntry => self.entry_huff,
-            HuffRef::Built(at) => Some(&self.built_huff[at]),
+        let (previous, previous_valid) = match entry.huff {
+            HuffRef::None => (None, false),
+            HuffRef::BlockEntry => (self.entry_huff, self.entry_huff_valid),
+            HuffRef::Built(at) => (Some(&self.built_huff[at]), false),
         };
         let (emitted_payload, outcome, decisions) = estimate_block_parts_size_with(
             &mut self.scratch_state,
             previous,
+            previous_valid,
             [
                 entry.ll_previous.as_ref(),
                 entry.ml_previous.as_ref(),
@@ -2212,8 +2263,8 @@ impl SplitEstimator<'_> {
             &mut self.workspace,
         );
         let source_len = (lit_end - lit_start) + match_len;
-        let min_gain = (source_len >> 8) + 2;
-        let raw_fallback = emitted_payload >= source_len.saturating_sub(min_gain);
+        let raw_fallback =
+            !keeps_compressed_block(emitted_payload, source_len, self.scratch_state.strategy_tag);
         let cost = if raw_fallback {
             source_len
         } else {
@@ -2230,7 +2281,6 @@ impl SplitEstimator<'_> {
         } else {
             let huff = match outcome {
                 HuffOutcome::Keep => entry.huff,
-                HuffOutcome::Clear => HuffRef::None,
                 HuffOutcome::New(table) => {
                     self.built_huff.push(table);
                     HuffRef::Built(self.built_huff.len() - 1)
@@ -2275,19 +2325,17 @@ impl SplitEstimator<'_> {
         // `ZSTD_compressSubBlock_multi` (`zstd_compress_superblock.c:530-532`)
         // bails when `estBlockSize > srcSize` (strict). Our trigger is
         // the `raw_fallback` flag from `estimate_subblock_size`, which
-        // fires on the **stricter** `emitted_payload >= source_len -
-        // min_gain` condition (where `min_gain = (source_len >> 8) + 2`,
-        // ≈0.4% margin — see the `min_gain` computation inside
-        // `estimate_subblock_size` above). So we bail in a narrow band
+        // fires on the **stricter** [`keeps_compressed_block`] condition
+        // (`emitted_payload >= source_len - minGain`, upstream's per-strategy
+        // block margin). So we bail in a narrow band
         // `[source_len - min_gain, source_len + 3]` where upstream zstd would
         // still recurse and *might* find a compressible split.
         //
         // Why this is safe ratio-wise:
         // - The bail-out routes to `compress_block_with_post_split`'s
         //   single-partition path → `emit_single_sequence_block`,
-        //   which applies the SAME `min_gain` expansion fallback (its
-        //   `buffers.compressed.len() >= source_len - min_gain` check
-        //   right before deciding raw-fallback). So for the
+        //   which applies the SAME [`keeps_compressed_block`] fallback
+        //   right before deciding raw-fallback. So for the
         //   single-partition path specifically, any block we bail on
         //   here would also raw-fallback there by the same threshold —
         //   no wire-output drift from this bail-out vs the "let the
@@ -2552,27 +2600,6 @@ fn choose_table_from_counts<'a>(
         return FseTableMode::Rle(symbol);
     }
 
-    // Fast-band preferRepeat (upstream zstd `ZSTD_selectEncodingType`,
-    // `zstd_compress_sequences.c:179-204`): for fast/dfast/greedy with a
-    // valid previous table and `< 1000` sequences, reuse it without building
-    // a new one. Trades a negligible ratio loss for skipping the per-block
-    // FSE table build + header descriptor — the dominant per-sub-block cost
-    // when these cheap-match strategies split a block. The validity probe
-    // (`fse_bit_cost` is finite) guarantees the previous table covers every
-    // symbol in this block, so the reuse can never produce an invalid stream.
-    if matches!(
-        strategy,
-        crate::encoding::strategy::StrategyTag::Fast
-            | crate::encoding::strategy::StrategyTag::Dfast
-            | crate::encoding::strategy::StrategyTag::Greedy
-    ) && total < 1000
-        && let Some(prev) = previous
-        && let Some(table) = prev.as_table(default_table)
-        && fse_bit_cost(counts, max_symbol, table).is_some()
-    {
-        return FseTableMode::RepeatLast(prev);
-    }
-
     let use_low_prob_count = total >= 2048;
 
     // Below lazy upstream prices nothing (`ZSTD_selectEncodingType`,
@@ -2586,7 +2613,23 @@ fn choose_table_from_counts<'a>(
         _ => None,
     };
     if let Some(rank) = cheap_strategy_rank {
+        // `isDefaultAllowed`: the predefined table codes this stream's symbols.
         if default_table.symbol_probability(max_symbol as u8) != 0 {
+            // A VALID previous table and fewer than 1000 sequences: repeat it
+            // unpriced (zstd_compress_sequences.c:187-191). Valid is a
+            // dictionary's table covering every symbol its stream can carry
+            // (`FSE_repeat_valid`); a table a block built is only `check`,
+            // which this band never repeats. The coverage holds by
+            // construction, and the cost probe checks it anyway: a repeat can
+            // never produce an invalid stream.
+            if total < 1000
+                && let Some(prev) = previous
+                && prev.is_valid()
+                && let Some(table) = prev.as_table(default_table)
+                && fse_bit_cost(counts, max_symbol, table).is_some()
+            {
+                return FseTableMode::RepeatLast(prev);
+            }
             let default_log = default_table.acc_log() as usize;
             let min_for_new_table = ((1usize << default_log) * (10 - rank)) >> 3;
             let most_frequent = counts[..=max_symbol].iter().copied().max().unwrap_or(0);
@@ -2635,27 +2678,25 @@ fn choose_table_from_counts<'a>(
         New,
     }
 
-    let mut best: Option<(usize, Choice)> = None;
+    // Upstream's order of preference on ties (zstd_compress_sequences.c:219-230):
+    // the predefined table when it costs no more than either other, then the
+    // previous table when it costs no more than a new one, else a new one. An
+    // unavailable option costs nothing it could win with.
+    let unavailable = usize::MAX;
+    let basic = predefined_cost.unwrap_or(unavailable);
+    let repeat = previous_cost.unwrap_or(unavailable);
+    let compressed = new_total_cost.unwrap_or(unavailable);
+    let best = if predefined_cost.is_some() && basic <= repeat && basic <= compressed {
+        Some(Choice::Predefined)
+    } else if previous_cost.is_some() && repeat <= compressed {
+        Some(Choice::Previous)
+    } else if new_total_cost.is_some() {
+        Some(Choice::New)
+    } else {
+        None
+    };
 
-    if let Some(cost) = previous_cost {
-        best = Some((cost, Choice::Previous));
-    }
-
-    if let Some(cost) = predefined_cost {
-        match best {
-            Some((best_cost, _)) if best_cost <= cost => {}
-            _ => best = Some((cost, Choice::Predefined)),
-        }
-    }
-
-    if let Some(cost) = new_total_cost {
-        match best {
-            Some((best_cost, _)) if best_cost <= cost => {}
-            _ => best = Some((cost, Choice::New)),
-        }
-    }
-
-    match best.map(|(_, choice)| choice) {
+    match best {
         Some(Choice::Previous) => previous
             .map(FseTableMode::RepeatLast)
             .unwrap_or(FseTableMode::Predefined(default_table)),
@@ -2839,7 +2880,8 @@ fn into_last_used_table(mode: FseTableMode<'_>) -> LastUsedTable {
 /// just built into, and it is the fresher of the two.
 fn park_displaced_handle(displaced: Option<PreviousFseTable>, next: &mut Option<SharedFseTable>) {
     if next.is_none()
-        && let Some(PreviousFseTable::Custom(handle)) = displaced
+        && let Some(PreviousFseTable::Custom(handle) | PreviousFseTable::Dictionary(handle)) =
+            displaced
     {
         *next = Some(handle);
     }
@@ -2869,7 +2911,9 @@ fn commit_last_used_table(
             // build fills it rather than a blank being made here for a block
             // that may not need one.
             let outgoing = match previous.take() {
-                Some(PreviousFseTable::Custom(old)) => Some(old),
+                Some(PreviousFseTable::Custom(old) | PreviousFseTable::Dictionary(old)) => {
+                    Some(old)
+                }
                 _ => None,
             };
             let built = core::mem::replace(next, outgoing)
@@ -3479,31 +3523,29 @@ fn rle_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
 /// `compress_literals` byte-for-byte (same size_format ladder, same
 /// min_gain raw-fallback gate) so the wire output is identical to
 /// the size-comparison reuse path when both would pick reuse.
+/// Write `literals` with the previous table (a treeless section), or raw when
+/// that does not save `minGain`. The previous table stays in place either way.
 fn emit_reuse_literals<K: EncodeTier>(
     literals: &[u8],
     last_table: &huff0_encoder::HuffmanTable,
+    single_stream: bool,
     writer: &mut BitWriter<&mut Vec<u8>>,
     reset_idx: usize,
     strategy: crate::encoding::strategy::StrategyTag,
-) -> HuffmanTableUpdate {
+) {
     writer.write_bits(3u8, 2); // treeless compressed literals type
     assert!(
         literals.len() <= 262_143,
         "literals exceed RFC 8878 18-bit size limit (262143)"
     );
-    let (size_format, size_bits) = match literals.len() {
-        0..256 => (0b00u8, 10),
-        256..1024 => (0b01, 10),
-        1024..16384 => (0b10, 14),
-        _ => (0b11, 18),
-    };
+    let (size_format, size_bits) = literal_size_format(literals.len(), single_stream);
     writer.write_bits(size_format, 2);
     writer.write_bits(literals.len() as u32, size_bits);
     let size_index = writer.index();
     writer.write_bits(0u32, size_bits);
     let index_before = writer.index();
     let mut encoder = huff0_encoder::HuffmanEncoder::new(last_table, writer);
-    if size_format == 0 {
+    if single_stream {
         encoder.encode(literals, false);
     } else {
         encoder.encode4x::<K>(literals, false);
@@ -3517,9 +3559,6 @@ fn emit_reuse_literals<K: EncodeTier>(
     if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
         writer.reset_to(reset_idx);
         raw_literals(literals, writer);
-        HuffmanTableUpdate::Cleared
-    } else {
-        HuffmanTableUpdate::Reused
     }
 }
 
@@ -3576,32 +3615,34 @@ fn end_samples_look_flat(literals: &[u8]) -> bool {
     head_largest + tail_largest <= ((2 * SUSPECT_SAMPLE_SIZE) >> 7) + 4
 }
 
+/// Write `literals` as a Huffman-coded section (or raw, when coding does not
+/// pay), in the order of upstream `HUF_compress_internal`. Returns the table a
+/// block built and used, which becomes the previous table once the block is
+/// kept; `None` when the section repeated the previous table or went out raw,
+/// either of which leaves the previous table in place.
+#[allow(clippy::too_many_arguments)]
 fn compress_literals<K: EncodeTier>(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
+    repeat_valid: bool,
     writer: &mut BitWriter<&mut Vec<u8>>,
     strategy: crate::encoding::strategy::StrategyTag,
     huf_search: bool,
     weight_scratch: &mut huff0_encoder::WeightScratch,
     suspected_incompressible: bool,
-) -> HuffmanTableUpdate {
+) -> Option<huff0_encoder::HuffmanTable> {
     let reset_idx = writer.index();
+    let single_stream = single_literal_stream(literals.len(), repeat_valid);
 
-    // Upstream zstd preferRepeat fast-path: when Fast/Dfast/Greedy on
-    // <=1024-byte literals AND the prior table can encode this
-    // input (`estimate_compressed_size` returns Some), skip the
-    // expensive `HuffmanTable::build_from_data` and route the
-    // emit straight through the reuse path. Mirrors upstream zstd's
-    // HUF_compress shape: `huf_compress.c:1360-1364` checks the
-    // flag BEFORE the histogram + tree-build, so the rebuild cost
-    // is avoided on fast-band tiny sections. Without this gate,
-    // we paid `build_from_data` then short-circuited at the
-    // decide-helper — wasted CPU on the hot fast-level path.
+    // preferRepeat with a valid table (`huf_compress.c:1359`): repeat it before
+    // any histogram. A valid table codes every byte value, so it needs no check.
     if prefer_repeat_eligible(strategy, literals.len())
+        && repeat_valid
         && let Some(prev) = last_table
-        && prev.estimate_compressed_size(literals).is_some()
     {
-        return emit_reuse_literals::<K>(literals, prev, writer, reset_idx, strategy);
+        debug_assert!(prev.codes_every_byte());
+        emit_reuse_literals::<K>(literals, prev, single_stream, writer, reset_idx, strategy);
+        return None;
     }
 
     // Sample before committing to the full histogram (upstream
@@ -3612,25 +3653,33 @@ fn compress_literals<K: EncodeTier>(
     // question for 8 KiB of counting.
     if suspected_incompressible && end_samples_look_flat(literals) {
         raw_literals(literals, writer);
-        return HuffmanTableUpdate::Cleared;
+        return None;
     }
 
     let mut counts = core::mem::MaybeUninit::uninit();
     let (counts, max_symbol, largest_count) =
         crate::histogram::count_bytes_uninit(literals, &mut counts);
-    // Upstream zstd pre-build incompressibility gate (`huf_compress.c`,
-    // `HUF_compress_internal`): a histogram this flat
-    // (`largest <= (srcSize >> 7) + 4`) is heuristically not worth
-    // compressing — bail to raw BEFORE the tree build and the full
-    // `encode4x` pass. Without it, near-random literals paid histogram +
-    // sort + tree + a full encode of the section only for the post-hoc
-    // `use_raw_literal_fallback` below to throw it all away (~65% of
-    // frame time on the random-payload dict scenarios). The single-symbol
-    // case (`largest == srcSize`) never reaches here: the block emitter
-    // routes all-identical sections to RLE first.
+    // Upstream zstd pre-build incompressibility gate (`huf_compress.c:1384`):
+    // a histogram this flat (`largest <= (srcSize >> 7) + 4`) is heuristically
+    // not worth compressing — bail to raw BEFORE the tree build and the full
+    // `encode4x` pass. The single-symbol case (`largest == srcSize`) never
+    // reaches here: the block emitter routes all-identical sections to RLE
+    // first.
     if largest_count <= (literals.len() >> 7) + 4 {
         raw_literals(literals, writer);
-        return HuffmanTableUpdate::Cleared;
+        return None;
+    }
+
+    // preferRepeat with a table that has to be checked (`huf_compress.c:1389-1398`):
+    // repeat it when it codes this section, before any tree build.
+    if prefer_repeat_eligible(strategy, literals.len())
+        && let Some(prev) = last_table
+        && prev
+            .estimate_compressed_size_from_counts_checked(counts)
+            .is_some()
+    {
+        emit_reuse_literals::<K>(literals, prev, single_stream, writer, reset_idx, strategy);
+        return None;
     }
 
     // Mutable because the size query encodes the weight description into the
@@ -3648,20 +3697,28 @@ fn compress_literals<K: EncodeTier>(
     else {
         raw_literals(literals, writer);
         weight_scratch.recycle(new_encoder_table);
-        return HuffmanTableUpdate::Cleared;
+        return None;
     };
     // Shared with the splitter cost estimator
     // (`estimate_literals_section_bytes`) so both code paths agree on which
     // table they would pick for a given `(new_table, last_table, literals)`
     // input.
-    let new_table = decide_huff_reuse_like_encoder(
+    let choice = decide_huff_reuse_like_encoder(
         &new_encoder_table,
         last_table,
         new_table_description_size,
         literals,
         counts,
-        strategy,
     );
+    let new_table = match choice {
+        HuffChoice::Raw => {
+            raw_literals(literals, writer);
+            weight_scratch.recycle(new_encoder_table);
+            return None;
+        }
+        HuffChoice::New => true,
+        HuffChoice::Repeat => false,
+    };
     let encoder_table = if new_table {
         &new_encoder_table
     } else {
@@ -3684,12 +3741,7 @@ fn compress_literals<K: EncodeTier>(
         literals.len() <= 262_143,
         "literals exceed RFC 8878 18-bit size limit (262143)"
     );
-    let (size_format, size_bits) = match literals.len() {
-        0..256 => (0b00u8, 10),
-        256..1024 => (0b01, 10),
-        1024..16384 => (0b10, 14),
-        _ => (0b11, 18),
-    };
+    let (size_format, size_bits) = literal_size_format(literals.len(), single_stream);
 
     writer.write_bits(size_format, 2);
     writer.write_bits(literals.len() as u32, size_bits);
@@ -3697,7 +3749,7 @@ fn compress_literals<K: EncodeTier>(
     writer.write_bits(0u32, size_bits);
     let index_before = writer.index();
     let mut encoder = huff0_encoder::HuffmanEncoder::new(encoder_table, writer);
-    if size_format == 0 {
+    if single_stream {
         encoder.encode(literals, new_table)
     } else {
         encoder.encode4x::<K>(literals, new_table)
@@ -3732,13 +3784,27 @@ fn compress_literals<K: EncodeTier>(
         // The section goes out raw, so the table just built is dead; hand its
         // buffers to the next build instead of dropping them.
         weight_scratch.recycle(new_encoder_table);
-        HuffmanTableUpdate::Cleared
+        None
     } else if new_table {
-        HuffmanTableUpdate::New(new_encoder_table)
+        Some(new_encoder_table)
     } else {
         // The previous table was kept, so this one is dead — same as above.
         weight_scratch.recycle(new_encoder_table);
-        HuffmanTableUpdate::Reused
+        None
+    }
+}
+
+/// The literals section's `Size_Format` and the width of its two size fields
+/// (RFC 8878 §3.1.1.3.1.1): one stream takes `0b00` with 10-bit sizes, which
+/// holds up to 1023 bytes either way.
+#[inline]
+fn literal_size_format(len: usize, single_stream: bool) -> (u8, usize) {
+    debug_assert!(!single_stream || len < 1024);
+    match len {
+        _ if single_stream => (0b00, 10),
+        0..1024 => (0b01, 10),
+        1024..16384 => (0b10, 14),
+        _ => (0b11, 18),
     }
 }
 

@@ -432,6 +432,7 @@ impl<M: Matcher> CompressionContext<M> {
                 sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: None,
+                huf_repeat_valid: false,
                 huff_table_spare: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),
@@ -1178,6 +1179,7 @@ impl<M: Matcher> CompressionContext<M> {
         if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
             let cache = &dict.inner.entropy;
             self.state.last_huff_table.clone_from(&cache.huff);
+            self.state.huf_repeat_valid = cache.huff_valid;
             self.state
                 .fse_tables
                 .ll_previous
@@ -1190,26 +1192,24 @@ impl<M: Matcher> CompressionContext<M> {
                 .fse_tables
                 .of_previous
                 .clone_from(&cache.of_previous);
-            let ll_entropy = match cache.ll_previous.as_ref() {
-                Some(PreviousFseTable::Custom(table)) => Some(table.as_ref()),
-                _ => None,
-            };
-            let ml_entropy = match cache.ml_previous.as_ref() {
-                Some(PreviousFseTable::Custom(table)) => Some(table.as_ref()),
-                _ => None,
-            };
-            let of_entropy = match cache.of_previous.as_ref() {
-                Some(PreviousFseTable::Custom(table)) => Some(table.as_ref()),
-                _ => None,
-            };
             self.state.matcher.seed_dictionary_entropy(
                 self.state.last_huff_table.as_ref(),
-                ll_entropy,
-                ml_entropy,
-                of_entropy,
+                cache
+                    .ll_previous
+                    .as_ref()
+                    .and_then(PreviousFseTable::distribution),
+                cache
+                    .ml_previous
+                    .as_ref()
+                    .and_then(PreviousFseTable::distribution),
+                cache
+                    .of_previous
+                    .as_ref()
+                    .and_then(PreviousFseTable::distribution),
             );
         } else {
             self.state.last_huff_table = None;
+            self.state.huf_repeat_valid = false;
             self.state.fse_tables.ll_previous = None;
             self.state.fse_tables.ml_previous = None;
             self.state.fse_tables.of_previous = None;
