@@ -50,17 +50,26 @@ pub(crate) struct LevelConfig {
     pub(crate) dict: bool,
 }
 
-/// Resolve the LDM-enabled [`CompressionParameters`] for a variant, or `None`
-/// for the plain numeric levels (`ldm = false`). Shared by both bench
-/// binaries (`compare_ffi` timing/ratio + `compare_ffi_memory`) so the Rust
-/// LDM encode path is wired identically in each. LDM-only parameters set no
-/// bounds-checked knobs, so `build()` cannot fail.
+/// Resolve the [`CompressionParameters`] a variant needs, or `None` when the
+/// level alone describes it. Shared by both bench binaries (`compare_ffi`
+/// timing/ratio + `compare_ffi_memory`) so the Rust encode path is wired
+/// identically in each. Two knobs: LDM for the `*_ldm*` variants, and
+/// `RAW_SKIP=0` in the environment turns the raw skip off, so every block is
+/// searched the way libzstd searches it. Neither is bounds-checked, so
+/// `build()` cannot fail.
 pub(crate) fn ldm_parameters(level: &LevelConfig) -> Option<CompressionParameters> {
-    level.ldm.then(|| {
-        CompressionParameters::builder(level.rust_level)
-            .enable_long_distance_matching(true)
+    let skip_off = env::var("RAW_SKIP").is_ok_and(|v| v == "0");
+    (level.ldm || skip_off).then(|| {
+        let mut builder = CompressionParameters::builder(level.rust_level);
+        if level.ldm {
+            builder = builder.enable_long_distance_matching(true);
+        }
+        if skip_off {
+            builder = builder.raw_skip(false);
+        }
+        builder
             .build()
-            .expect("LDM-only parameters set no bounds-checked knobs, build cannot fail")
+            .expect("LDM and raw-skip parameters set no bounds-checked knobs, build cannot fail")
     })
 }
 
