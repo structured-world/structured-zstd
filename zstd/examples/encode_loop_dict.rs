@@ -98,11 +98,14 @@ fn main() {
     // One reused compressor: matcher tables + any dictionary parse happen
     // once here, mirroring a consumer that reuses a context across N
     // independent per-block frames.
-    let mut cctx: FrameCompressor = FrameCompressor::new(CompressionLevel::from_level(level));
+    // `Level(n)`, as the benchmark builds it: the named presets `from_level`
+    // returns for some levels take paths of their own.
+    let compression_level = CompressionLevel::Level(level);
+    let mut cctx: FrameCompressor = FrameCompressor::new(compression_level);
     // `RAW_SKIP=0` searches every block, as libzstd does, so the encode does
     // the same work as `ffi_loop_dict` on input that looks incompressible.
     if env::var("RAW_SKIP").is_ok_and(|v| v == "0") {
-        let params = CompressionParameters::builder(CompressionLevel::from_level(level))
+        let params = CompressionParameters::builder(compression_level)
             .raw_skip(false)
             .build()
             .expect("a level and the raw skip are always valid parameters");
