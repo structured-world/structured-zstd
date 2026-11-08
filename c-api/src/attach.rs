@@ -227,8 +227,8 @@ impl ZSTD_CCtx {
             };
             let cdict = unsafe { &**cdict };
             // The raw skip is the context's to set, not the dictionary's: a
-            // CDict carries no such parameter upstream, so the context's
-            // `ZSTD_c_rawSkip` still reaches a frame the CDict drives.
+            // CDict carries no such switch upstream, so the context's
+            // (`ZSTD_CCtx_setRawSkip`) still reaches a frame the CDict drives.
             // A CDict built from a parameter set stores that set's choice among
             // its parameters, which the context's replaces.
             let raw_skip = self.params.raw_skip != crate::cctx_params::ParamSwitch::Disable;

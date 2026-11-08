@@ -756,9 +756,11 @@ impl FastKernelMatcher {
             // What the frame can store: its window's history when owned, which
             // `set_borrowed_window` checks again against a longer slice.
             let headroom = if tagged {
-                primed_window
-                    .saturating_mul(2)
-                    .saturating_add(crate::common::MAX_BLOCK_SIZE as usize)
+                // `primed_window <= MAX_PRIMED_WINDOW_SIZE`, which is
+                // `(u32::MAX - MAX_BLOCK_SIZE) / 2`, so this stays within `u32`
+                // and so within `usize` on every target.
+                debug_assert!(primed_window <= MAX_PRIMED_WINDOW_SIZE);
+                2 * primed_window + crate::common::MAX_BLOCK_SIZE as usize
             } else {
                 MAX_EPOCH_HEADROOM
             };

@@ -108,7 +108,7 @@ pub(crate) struct CCtxParams {
     pub(crate) literal_compression: LiteralCompressionMode,
     /// `ZSTD_c_useRowMatchFinder`.
     pub(crate) row_match_finder: RowMatchFinderMode,
-    /// `ZSTD_c_rawSkip`: only `Disable` turns the codec's raw skip off.
+    /// `ZSTD_CCtx_setRawSkip`: only `Disable` turns the codec's raw skip off.
     pub(crate) raw_skip: ParamSwitch,
     /// `ZSTD_c_srcSizeHint`; 0 = none.
     pub(crate) src_size_hint: c_int,
@@ -317,10 +317,6 @@ impl CCtxParams {
                     _ => RowMatchFinderMode::Auto,
                 };
             }
-            ZSTD_C_RAW_SKIP => {
-                self.raw_skip = ParamSwitch::from_c(within(value)?)
-                    .ok_or(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound)?;
-            }
             // Clamped into range as upstream's multi-threaded build stores them
             // (zstd_compress.c:866-908); frames are still built on the calling
             // thread, which a worker count only permits, never requires.
@@ -348,6 +344,13 @@ impl CCtxParams {
                 self.store_advisory(param, value);
             }
         }
+        Ok(())
+    }
+
+    /// Store this library's raw-skip switch, a `ZSTD_ParamSwitch_e` value.
+    pub(crate) fn set_raw_skip(&mut self, value: c_int) -> Result<(), ZSTD_ErrorCode> {
+        self.raw_skip =
+            ParamSwitch::from_c(value).ok_or(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound)?;
         Ok(())
     }
 
@@ -396,7 +399,6 @@ impl CCtxParams {
                 RowMatchFinderMode::Enable => ParamSwitch::Enable.to_c(),
                 RowMatchFinderMode::Disable => ParamSwitch::Disable.to_c(),
             },
-            ZSTD_C_RAW_SKIP => self.raw_skip.to_c(),
             _ => match advisory_slot(param) {
                 Some(slot) => self.advisory[slot],
                 None => return Err(ZSTD_ErrorCode::ZSTD_error_parameter_unsupported),
@@ -551,6 +553,80 @@ pub unsafe extern "C" fn ZSTD_CCtxParams_getParameter(
         }
         Err(code) => encode(code),
     }
+}
+
+/// `size_t ZSTD_CCtx_setRawSkip(ZSTD_CCtx* cctx, int value)`, this library's
+/// own (`structured_zstd.h`): whether a block that samples as incompressible
+/// may go out raw without being searched. `value` is a `ZSTD_ParamSwitch_e`;
+/// only `ZSTD_ps_disable` (2) turns the skip off. A function rather than a
+/// `ZSTD_cParameter`, whose numbers are upstream's to assign. Refused while a
+/// frame streams, as a parameter is.
+///
+/// # Safety
+/// `cctx` must be live, or `NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_setRawSkip(cctx: *mut ZSTD_CCtx, value: c_int) -> usize {
+    let Some(cctx) = (unsafe { cctx.as_mut() }) else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    };
+    if cctx.stream_in_progress() {
+        return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
+    }
+    match cctx.params.set_raw_skip(value) {
+        Ok(()) => 0,
+        Err(code) => encode(code),
+    }
+}
+
+/// `size_t ZSTD_CCtx_getRawSkip(const ZSTD_CCtx* cctx, int* value)`: the
+/// context's raw-skip switch, as [`ZSTD_CCtx_setRawSkip`] stored it.
+///
+/// # Safety
+/// `cctx` must be live or `NULL`; `value` writable or `NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtx_getRawSkip(cctx: *const ZSTD_CCtx, value: *mut c_int) -> usize {
+    let (Some(cctx), Some(value)) = (unsafe { cctx.as_ref() }, unsafe { value.as_mut() }) else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    };
+    *value = cctx.params.raw_skip.to_c();
+    0
+}
+
+/// `size_t ZSTD_CCtxParams_setRawSkip(ZSTD_CCtx_params* params, int value)`:
+/// [`ZSTD_CCtx_setRawSkip`] on a free-standing parameter set.
+///
+/// # Safety
+/// `params` must be a live parameter set, or `NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtxParams_setRawSkip(
+    params: *mut ZSTD_CCtx_params,
+    value: c_int,
+) -> usize {
+    let Some(target) = (unsafe { params.as_mut() }) else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    };
+    match target.params.set_raw_skip(value) {
+        Ok(()) => 0,
+        Err(code) => encode(code),
+    }
+}
+
+/// `size_t ZSTD_CCtxParams_getRawSkip(const ZSTD_CCtx_params* params, int*
+/// value)`: the set's raw-skip switch.
+///
+/// # Safety
+/// `params` must be a live parameter set or `NULL`; `value` writable or `NULL`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_CCtxParams_getRawSkip(
+    params: *const ZSTD_CCtx_params,
+    value: *mut c_int,
+) -> usize {
+    let (Some(source), Some(value)) = (unsafe { params.as_ref() }, unsafe { value.as_mut() })
+    else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    };
+    *value = source.params.raw_skip.to_c();
+    0
 }
 
 /// `size_t ZSTD_CCtx_setParametersUsingCCtxParams(ZSTD_CCtx* cctx, const

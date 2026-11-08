@@ -61,11 +61,6 @@ pub(crate) const ZSTD_C_ENABLE_SEQ_PRODUCER_FALLBACK: c_int = 1014;
 pub(crate) const ZSTD_C_MAX_BLOCK_SIZE: c_int = 1015;
 pub(crate) const ZSTD_C_REPCODE_RESOLUTION: c_int = 1016;
 pub(crate) const ZSTD_C_BLOCK_SPLITTER_LEVEL: c_int = 1017;
-// This library's own `ZSTD_cParameter` discriminants, declared in
-// `structured_zstd.h` past upstream's experimental range.
-/// `ZSTD_c_rawSkip`: whether a block that samples as incompressible may go out
-/// raw without being searched (`CompressionParametersBuilder::raw_skip`).
-pub(crate) const ZSTD_C_RAW_SKIP: c_int = 2000;
 
 // Upstream's worker-pool limits (zstdmt_compress.h:29-36).
 #[cfg(target_pointer_width = "32")]
@@ -172,8 +167,7 @@ pub(crate) fn c_param_bounds(param: c_int) -> Option<(c_int, c_int)> {
         | ZSTD_C_SPLIT_AFTER_SEQUENCES
         | ZSTD_C_USE_ROW_MATCH_FINDER
         | ZSTD_C_PREFETCH_CDICT_TABLES
-        | ZSTD_C_REPCODE_RESOLUTION
-        | ZSTD_C_RAW_SKIP => (0, 2),
+        | ZSTD_C_REPCODE_RESOLUTION => (0, 2),
         ZSTD_C_LDM_HASH_LOG => from_codec(CParameter::LdmHashLog),
         ZSTD_C_LDM_MIN_MATCH => from_codec(CParameter::LdmMinMatch),
         ZSTD_C_LDM_BUCKET_SIZE_LOG => from_codec(CParameter::LdmBucketSizeLog),
