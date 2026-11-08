@@ -31,7 +31,9 @@
 
 use std::env;
 
-use structured_zstd::encoding::{CompressionLevel, CompressionParameters, FrameCompressor};
+use structured_zstd::encoding::{
+    CompressionLevel, CompressionParameters, DictionaryAttachMode, FrameCompressor,
+};
 
 // With `--features dhat-heap`, route every allocation through the dhat heap
 // profiler (same pattern as `encode_loop_reuse_z000033`) so the run records
@@ -111,11 +113,22 @@ fn main() {
     let mut cctx: FrameCompressor = FrameCompressor::new(compression_level);
     // `RAW_SKIP=0` searches every block, as libzstd does, so the encode does
     // the same work as `ffi_loop_dict` on input that looks incompressible.
-    if env::var("RAW_SKIP").is_ok_and(|v| v == "0") {
+    let raw_skip_off = env::var("RAW_SKIP").is_ok_and(|v| v == "0");
+    // `ATTACH=attach|copy|load` forces how the dictionary is used, as the same
+    // variable does in `ffi_loop_dict`.
+    let attach = match env::var("ATTACH").as_deref() {
+        Ok("attach") => Some(DictionaryAttachMode::Attach),
+        Ok("copy") => Some(DictionaryAttachMode::Copy),
+        Ok("load") => Some(DictionaryAttachMode::Load),
+        Ok(other) => panic!("ATTACH={other}: expected attach, copy or load"),
+        Err(_) => None,
+    };
+    if raw_skip_off || attach.is_some() {
         let params = CompressionParameters::builder(compression_level)
-            .raw_skip(false)
+            .raw_skip(!raw_skip_off)
+            .dictionary_attach(attach.unwrap_or_default())
             .build()
-            .expect("a level and the raw skip are always valid parameters");
+            .expect("a level, the raw skip and the attach mode are always valid parameters");
         cctx.set_parameters(&params);
     }
     if let Some(path) = dict_path {

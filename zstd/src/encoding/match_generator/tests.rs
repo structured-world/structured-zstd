@@ -3432,11 +3432,13 @@ fn fast_dict_attach_follows_the_source_size_cutoff() {
     // `fast_attach_cutoff_keeps_virtual_positions_within_u32` (source) and
     // `oversized_dict_hint_routes_fast_to_copy_mode` (dict size).
     let level = CompressionLevel::Level(1);
+    let dict = b"abcdefghABCDEFGHijklmnop";
     for (hint, attaches) in [(8192u64, true), (8193, false), (1 << 20, false)] {
         let mut driver = MatchGeneratorDriver::new(8, 1);
         driver.set_source_size_hint(hint);
+        driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
         driver.reset(level);
-        driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+        driver.prime_with_dictionary(dict, [1, 4, 8]);
         assert_eq!(
             driver.borrowed_dict_supported(),
             attaches,
@@ -3562,24 +3564,39 @@ fn a_source_past_a_levelled_dictionary_takes_its_own_cparams_row() {
 }
 
 #[test]
-fn fast_attach_cutoff_keeps_virtual_positions_within_u32() {
-    // Two independent bounds meet on this constant. The upstream one decides it:
-    // the Fast strategy copies above 8 KiB (`attachDictSizeCutoffs[ZSTD_fast]`),
-    // and the ratio measurements behind the constant say the same. The second is
-    // a hard ceiling from our own borrowed kernel, which stores virtual positions
-    // as `u32` (`cur_abs as u32`): the largest attached source plus the dict
-    // prefix has to stay under `u32::MAX`, so a future "just attach everything"
-    // change cannot raise the cutoff past 31 without widening that type first.
-    assert_eq!(
-        FAST_ATTACH_DICT_CUTOFF_LOG, 13,
-        "the Fast attach cutoff is upstream's 8 KiB source size",
-    );
-    let max_attached: u64 = 1u64 << FAST_ATTACH_DICT_CUTOFF_LOG;
-    assert!(
-        max_attached <= u32::MAX as u64,
-        "the largest attached source 2^{FAST_ATTACH_DICT_CUTOFF_LOG} must fit u32 \
-         virtual positions",
-    );
+fn every_strategy_attaches_up_to_the_upstream_cutoff() {
+    // `attachDictSizeCutoffs` (zstd_compress.c): fast 8 KiB, dfast 16 KiB,
+    // greedy through btopt 32 KiB, btultra and btultra2 8 KiB. Under `Auto` a
+    // source at the cutoff attaches, one byte past it copies, and a source of
+    // unknown size attaches; the fast row's measurements are on
+    // `should_attach_dict`.
+    use crate::encoding::DictionaryAttachMode;
+    for (strategy, cutoff) in [
+        (1u32, 8u64 << 10),
+        (2, 16 << 10),
+        (3, 32 << 10),
+        (6, 32 << 10),
+        (7, 32 << 10),
+        (8, 8 << 10),
+        (9, 8 << 10),
+    ] {
+        let cdict = crate::encoding::cparams::CParams {
+            strategy,
+            ..crate::encoding::cparams::get_cparams(3, 0, 0)
+        };
+        let attaches = |size| {
+            crate::encoding::cparams::should_attach_dict(&cdict, size, DictionaryAttachMode::Auto)
+        };
+        assert!(
+            attaches(Some(cutoff)),
+            "strategy {strategy} copies at its cutoff"
+        );
+        assert!(
+            !attaches(Some(cutoff + 1)),
+            "strategy {strategy} attaches past it"
+        );
+        assert!(attaches(None), "strategy {strategy} copies an unknown size");
+    }
 }
 
 #[test]
@@ -3600,6 +3617,58 @@ fn oversized_dict_hint_routes_fast_to_copy_mode() {
         !driver.borrowed_dict_supported(),
         "an oversized dict must use copy mode, not the tagged attach fill"
     );
+}
+
+/// The caller's attach preference overrides the source-size cutoff in every
+/// backend family (fast, dfast, rows, binary tree), as upstream's
+/// `ZSTD_c_forceAttachDict` does. What tells the modes apart in a backend is
+/// what the next frame of the same dictionary finds: an attached dictionary
+/// keeps its own tables and stays resident across the reset, one copied or
+/// loaded into the frame's tables has to be put there again.
+#[test]
+fn dictionary_attach_preference_reaches_every_backend() {
+    use crate::encoding::DictionaryAttachMode as Mode;
+    use crate::encoding::levels::config::DictUse;
+    let dict: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    for level in [1, 3, 6, 13, 19] {
+        for (mode, source, expected) in [
+            (Mode::Auto, 4096u64, DictUse::Attach),
+            (Mode::Auto, 1 << 20, DictUse::Copy),
+            (Mode::Attach, 1 << 20, DictUse::Attach),
+            (Mode::Copy, 4096, DictUse::Copy),
+            (Mode::Load, 4096, DictUse::Load),
+        ] {
+            let mut driver = MatchGeneratorDriver::new(8, 1);
+            driver.set_param_overrides(Some(super::super::parameters::ParamOverrides {
+                dictionary_attach: mode,
+                ..Default::default()
+            }));
+            let frame = |driver: &mut MatchGeneratorDriver| {
+                driver.set_source_size_hint(source);
+                driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(
+                    dict.len(),
+                ));
+                driver.reset(CompressionLevel::Level(level));
+            };
+            frame(&mut driver);
+            assert_eq!(
+                driver.reset_dict_use,
+                Some(expected),
+                "level {level} under {mode:?} with a {source}-byte source resolved the wrong use",
+            );
+            driver.prime_with_dictionary(&dict, [1, 4, 8]);
+            frame(&mut driver);
+            assert_eq!(
+                driver.dictionary_is_resident(),
+                expected == DictUse::Attach,
+                "level {level} under {mode:?} with a {source}-byte source: the {:?} backend \
+                 did not use the dictionary as resolved ({expected:?})",
+                driver.active_backend(),
+            );
+        }
+    }
 }
 
 #[test]

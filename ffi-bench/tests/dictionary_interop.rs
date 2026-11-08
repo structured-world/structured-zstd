@@ -235,6 +235,53 @@ raw_dictionary_tests! {
     raw_128_kib_plus_4: 128 * 1024, 4;
 }
 
+/// Every attach preference at every strategy, on a one-shot frame and on frames
+/// that reuse the context's dictionary: forcing a backend to attach a
+/// dictionary its cutoff would copy, or to copy or load one it would attach,
+/// still has to place every dictionary byte where the decoder does.
+#[test]
+fn every_attach_preference_interoperates() {
+    use structured_zstd::encoding::{CompressionParameters, DictionaryAttachMode};
+    let dict = bytes(0xA77A, 16 * 1024 + 3);
+    let dictionary = EncoderDictionary::from_serialized_or_raw_content(&dict).unwrap();
+    let mut failures = Vec::new();
+    for mode in [
+        DictionaryAttachMode::Attach,
+        DictionaryAttachMode::Copy,
+        DictionaryAttachMode::Load,
+    ] {
+        for level in LEVELS {
+            let params = CompressionParameters::builder(CompressionLevel::from_level(level))
+                .dictionary_attach(mode)
+                .build()
+                .unwrap();
+            for (input, data) in inputs(&dict) {
+                let mut compressor: FrameCompressor =
+                    FrameCompressor::new(CompressionLevel::from_level(level));
+                compressor.set_parameters(&params);
+                compressor
+                    .set_encoder_dictionary(dictionary.clone())
+                    .unwrap();
+                let mut frames = vec![compressor.compress_independent_frame(&data)];
+                let mut context = CompressionContext::new(CompressionLevel::from_level(level));
+                context.set_parameters(&params).unwrap();
+                context.set_encoder_dictionary(dictionary.clone()).unwrap();
+                for pledge in [true, true, false] {
+                    frames.push(stream_frame(&mut context, &data, pledge));
+                }
+                for (frame_no, frame) in frames.iter().enumerate() {
+                    if let Some(why) = check(frame, &dict, &data) {
+                        failures.push(format!(
+                            "{mode:?} {input} level {level} frame {frame_no}: {why}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert_clean(failures);
+}
+
 /// A dictionary libzstd trained, so its content length is whatever training
 /// left, with entropy tables and repeat offsets of its own.
 #[test]

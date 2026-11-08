@@ -385,20 +385,52 @@ pub(crate) fn uses_row_match_finder(
     (3..=5).contains(&cp.strategy) && mode.searches_rows(1usize << cp.window_log)
 }
 
-/// `ZSTD_shouldAttachDict`: the CDict tables are referenced in place
-/// (`dictMatchState`) for sources up to the strategy's cutoff or of unknown
-/// size, and copied into the frame's tables above it.
-pub(crate) fn should_attach_dict(cdict: &CParams, src_size: Option<u64>) -> bool {
+/// `ZSTD_shouldAttachDict` (zstd_compress.c): under `Auto` the CDict tables
+/// are referenced in place (`dictMatchState`) for sources up to the strategy's
+/// cutoff or of unknown size, and copied into the frame's tables above it;
+/// `Attach` and `Copy` override the cutoff. `Load` never reaches here: such a
+/// frame takes no CDict tables at all.
+///
+/// The cutoffs are upstream's `attachDictSizeCutoffs`: fast 8 KiB, dfast
+/// 16 KiB, greedy through btopt 32 KiB, btultra and btultra2 8 KiB. The fast
+/// one was once raised to attach every source, on speed alone, and the bytes
+/// showed why upstream copies above it: a copied dictionary sits in the table
+/// the scan runs over, so ordinary near matches improve everywhere, while an
+/// attached one is reached only through its own exact table. `z000033`
+/// (1,022,035 B) and its leading 10 KiB, a 16 KiB dictionary trained over its
+/// 10 KiB chunks, on the i9 (prebuilt binaries and libzstd interleaved,
+/// `perf stat -r 3`, three rounds, ranges disjoint):
+///
+/// | case | bytes attach | bytes copy | reference | cycles attach | cycles copy |
+/// |---|---|---|---|---|---|
+/// | 10 KiB, L1 | 6,976 | 7,122 | 7,122 | 236,355 (1.95x) | 169,116 (1.39x) |
+/// | 10 KiB, L-5 | 9,660 | 9,124 | 9,130 | 51,678 (1.22x) | 56,444 (1.33x) |
+/// | 1 MiB, L1 | 550,810 | 551,584 | 570,765 | 19.84M (1.76x) | 16.21M (1.44x) |
+/// | 1 MiB, L-5 | 689,127 | 647,735 | 669,826 | 8.80M (1.46x) | 10.67M (1.77x) |
+///
+/// At the positive levels copy is better on both axes; at the ultra-fast ones
+/// it buys 5-6% fewer bytes with 9-21% more cycles, which is the trade the
+/// cutoff makes.
+pub(crate) fn should_attach_dict(
+    cdict: &CParams,
+    src_size: Option<u64>,
+    preference: crate::encoding::parameters::DictionaryAttachMode,
+) -> bool {
+    use crate::encoding::parameters::DictionaryAttachMode;
     const KB: u64 = 1024;
-    // `attachDictSizeCutoffs[strategy]`: fast 8 KB, dfast 16 KB, greedy /
-    // lazy / lazy2 / btlazy2 / btopt 32 KB, btultra / btultra2 8 KB.
     let cutoff = match cdict.strategy {
         1 => 8 * KB,
         2 => 16 * KB,
         3..=7 => 32 * KB,
         _ => 8 * KB,
     };
-    src_size.is_none_or(|s| s <= cutoff)
+    match preference {
+        DictionaryAttachMode::Attach => true,
+        DictionaryAttachMode::Copy => false,
+        DictionaryAttachMode::Auto | DictionaryAttachMode::Load => {
+            src_size.is_none_or(|s| s <= cutoff)
+        }
+    }
 }
 
 /// `ZSTD_getCParams_internal` with the `ZSTD_cpm_createCDict` switch.

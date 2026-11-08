@@ -122,6 +122,21 @@ fn main() {
         );
     };
     set(zstd_sys::ZSTD_cParameter::ZSTD_c_compressionLevel, level);
+    // `ATTACH=attach|copy|load`: `ZSTD_c_forceAttachDict`, the same variable
+    // `encode_loop_dict` reads.
+    let attach = match env::var("ATTACH").as_deref() {
+        Ok("attach") => Some(1),
+        Ok("copy") => Some(2),
+        Ok("load") => Some(3),
+        Ok(other) => panic!("ATTACH={other}: expected attach, copy or load"),
+        Err(_) => None,
+    };
+    if let Some(preference) = attach {
+        set(
+            zstd_sys::ZSTD_cParameter::ZSTD_c_experimentalParam4,
+            preference,
+        );
+    }
     // Loaded ONCE and kept by the context across frames (mirrors our reused
     // dictionary).
     if let Some(path) = dict_path {

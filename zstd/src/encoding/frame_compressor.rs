@@ -505,6 +505,10 @@ pub(crate) struct FrameTuning {
     /// Every block is searched: the raw skip is off
     /// ([`CompressionParametersBuilder::raw_skip`](crate::encoding::CompressionParametersBuilder::raw_skip)).
     pub(crate) raw_skip_disabled: bool,
+    /// The overrides the matcher was handed, so a dictionary frame resolves
+    /// here what the matcher's reset resolves: the dictionary's tier and how
+    /// the frame uses it.
+    pub(crate) overrides: crate::encoding::parameters::ParamOverrides,
 }
 
 impl FrameTuning {
@@ -516,6 +520,7 @@ impl FrameTuning {
             target_length: overrides.target_length,
             literal_compression: overrides.literal_compression,
             raw_skip_disabled: !params.raw_skip_enabled(),
+            overrides,
         }
     }
 }
@@ -1266,58 +1271,23 @@ pub(crate) fn optimal_block_size_with(
 }
 
 /// Load `dict` into the matcher for the frame about to start, `size_hint`
-/// bytes long when known, once `state.strategy_tag` holds the strategy the
-/// frame runs. Shared by the frame compressor and the streaming context so a
-/// reused one of either loads its dictionary the same way.
+/// bytes long when known, the way `frame` resolved it. Shared by the frame
+/// compressor and the streaming context so a reused one of either loads its
+/// dictionary the same way.
 ///
 /// A dictionary a reused matcher kept resident across the reset (its bytes
 /// and index still in place) only gets its offset history back: priming it
 /// again would commit it into the window a second time. Otherwise it is
-/// primed, or restored from the matcher's copy-mode snapshot when the source
-/// is past the strategy's attach cutoff.
+/// primed, or, in a frame whose tables hold it, restored from the matcher's
+/// snapshot of the first prime, the table copy upstream makes per frame
+/// (`ZSTD_resetCCtx_byCopyingCDict`).
 pub(crate) fn load_frame_dictionary<M: Matcher, K: EncodeTier>(
     state: &mut CompressState<M>,
     level: CompressionLevel,
     dict: &EncoderDictionary,
+    frame: &crate::encoding::levels::config::FrameParams,
     size_hint: Option<u64>,
 ) {
-    // Upstream zstd `ZSTD_shouldAttachDict` (`zstd_compress.c`): a
-    // precomputed-dictionary table is COPIED into the working context
-    // only when the source is larger than a per-strategy cutoff; at or
-    // below it (and for unknown size) the upstream zstd ATTACHES the dictionary
-    // tables by reference (no per-frame table touch at all). We don't
-    // have an attach-by-reference path yet, so:
-    //   - large source (> cutoff): reuse the captured prime snapshot
-    //     (a table copy) instead of re-hashing the dictionary — the
-    //     upstream zstd COPY regime, where the copy is cheaper than re-priming;
-    //   - small / unknown source: re-prime (the snapshot copy of the
-    //     whole table would cost MORE than the sparse re-prime here,
-    //     which is exactly why the upstream zstd attaches by reference instead).
-    // `attachDictSizeCutoffs` per strategy: fast 8K, dfast 16K,
-    // greedy/lazy/btopt 32K, btultra/btultra2 8K. Expressed as the
-    // ceil-log bucket (8K = 2^13, 16K = 2^14, 32K = 2^15) so the
-    // decision uses the SAME bucketed representation as the driver's
-    // attach/copy gate (`reset_size_log`) — comparing
-    // `source_size_ceil_log(hint)` on the full u64 avoids the `as usize`
-    // truncation that could diverge from the driver on 32-bit targets.
-    // For a power-of-two cutoff `2^k`, `ceil_log2(hint) > k` is exactly
-    // `hint > 2^k`, so this is identical to the raw `hint > cutoff` on
-    // 64-bit.
-    let cutoff_log = match state.strategy_tag {
-        // Keep the copy-snapshot gate in sync with the matcher's own
-        // attach cutoff, so Fast never captures or restores a snapshot
-        // for a mode it did not resolve.
-        crate::encoding::strategy::StrategyTag::Fast => {
-            crate::encoding::levels::config::FAST_ATTACH_DICT_CUTOFF_LOG
-        }
-        crate::encoding::strategy::StrategyTag::BtUltra
-        | crate::encoding::strategy::StrategyTag::BtUltra2 => 13,
-        crate::encoding::strategy::StrategyTag::Dfast => 14,
-        crate::encoding::strategy::StrategyTag::Greedy
-        | crate::encoding::strategy::StrategyTag::Lazy
-        | crate::encoding::strategy::StrategyTag::Btlazy2
-        | crate::encoding::strategy::StrategyTag::BtOpt => 15,
-    };
     if state.matcher.dictionary_is_resident() {
         // Re-borrow fast path: the previous frame's reset kept this
         // dict's bytes + cached index resident, so skip the re-commit /
@@ -1327,10 +1297,8 @@ pub(crate) fn load_frame_dictionary<M: Matcher, K: EncodeTier>(
             .reapply_resident_dictionary(dict.inner.offset_hist);
         return;
     }
-    let prefer_copy_snapshot = crate::encoding::levels::config::restores_primed_snapshot(
-        size_hint.map(crate::encoding::levels::config::source_size_ceil_log),
-        cutoff_log,
-    );
+    let prefer_copy_snapshot =
+        crate::encoding::levels::config::restores_primed_snapshot(frame.dict_use, size_hint);
     let restored = prefer_copy_snapshot && state.matcher.restore_primed_dictionary(level);
     if !restored {
         let content = dict.inner.dict_content.as_slice();
@@ -1422,19 +1390,18 @@ pub(crate) fn resolve_frame_params(
     level: CompressionLevel,
     hint: Option<u64>,
     dictionary: Option<&EncoderDictionary>,
+    overrides: &crate::encoding::parameters::ParamOverrides,
 ) -> crate::encoding::levels::config::FrameParams {
     match dictionary {
-        Some(dict) if !dict.inner.dict_content.is_empty() => memo.resolve(
-            level,
-            hint,
-            dict.sizes(),
-            &crate::encoding::parameters::ParamOverrides::default(),
-        ),
+        Some(dict) if !dict.inner.dict_content.is_empty() => {
+            memo.resolve(level, hint, dict.sizes(), overrides)
+        }
         _ => {
             let params = crate::encoding::levels::config::resolve_level_params(level, hint);
             crate::encoding::levels::config::FrameParams {
                 params,
                 row_plan: None,
+                dict_use: None,
                 split_strategy: params.strategy_tag,
             }
         }
@@ -2724,6 +2691,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
             self.compression_level,
             hint,
             attached(&self.dictionary).filter(|_| with_dictionary),
+            &self.tuning.overrides,
         )
     }
 
@@ -3025,6 +2993,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
                 &mut self.state,
                 self.compression_level,
                 dict,
+                &params,
                 initial_size_hint,
             );
         }

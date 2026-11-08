@@ -114,8 +114,8 @@ pub use levels::config::{
 };
 pub use match_generator::MatchGeneratorDriver;
 pub use parameters::{
-    Bounds, CParameter, CompressionParameters, CompressionParametersBuilder, LevelParameters,
-    LiteralCompressionMode, ParameterError, RowMatchFinderMode, Strategy,
+    Bounds, CParameter, CompressionParameters, CompressionParametersBuilder, DictionaryAttachMode,
+    LevelParameters, LiteralCompressionMode, ParameterError, RowMatchFinderMode, Strategy,
 };
 pub use streaming_encoder::{CompressionContext, StreamingEncoder};
 pub use workspace::HistoryBuf;
