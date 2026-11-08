@@ -146,12 +146,25 @@ fn the_attach_preference_decides_the_dictionary_use() {
             Some(DictUse::Attach),
             "level {level}"
         );
-        let (small_load, own) = resolve(level, 4096, 32 * 1024, Mode::Load);
-        assert_eq!(small_load.dict_use, Some(DictUse::Load), "level {level}");
-        assert!(
-            small_load.params == own.params,
-            "level {level}: a forced load ran parameters other than the frame's own",
-        );
+        // A forced load is sized for the source, the dictionary counted in
+        // the tier only where its tables would be copied, not attached
+        // (`ZSTD_getCParamMode`): left out at 4 KiB, counted at 1 MiB.
+        let overrides = crate::encoding::parameters::ParamOverrides {
+            dictionary_attach: Mode::Load,
+            ..Default::default()
+        };
+        for (source, counted) in [(4096u64, 0usize), (1 << 20, 32 * 1024)] {
+            let (load, own) = resolve(level, source, 32 * 1024, Mode::Load);
+            assert_eq!(load.dict_use, Some(DictUse::Load), "level {level}");
+            let expected = super::level_params_from_cparams(
+                crate::encoding::cparams::get_frame_cparams(level, source, counted, &overrides),
+            );
+            assert!(
+                load.params == expected && own.params == expected,
+                "level {level}: a forced load over {source} bytes ran other parameters \
+                 than the frame's own",
+            );
+        }
     }
     // Past 16 MiB of content the fast and double-fast attached tables cannot
     // position a dictionary entry, so those strategies copy it.

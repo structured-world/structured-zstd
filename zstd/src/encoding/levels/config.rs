@@ -1125,6 +1125,37 @@ impl DictParamsMemo {
     }
 }
 
+/// The cParams of a frame that loads its dictionary into tables of its own:
+/// the level's for the source, with the dictionary counted in the tier only
+/// when the dictionary's own tables would be copied rather than attached at
+/// this size (upstream `ZSTD_getCParamMode` in
+/// `ZSTD_CCtx_init_compressStream2`: an attaching size takes
+/// `ZSTD_cpm_attachDict`, which leaves the dictionary out). A load the caller
+/// forces on a small frame is therefore sized for the frame alone.
+pub(crate) fn loaded_dict_frame_cparams(
+    level: CompressionLevel,
+    source_size: Option<u64>,
+    sizes: crate::encoding::DictionarySizes,
+    overrides: &crate::encoding::parameters::ParamOverrides,
+) -> crate::encoding::cparams::CParams {
+    use crate::encoding::cparams::{
+        CONTENTSIZE_UNKNOWN, get_cdict_cparams, get_frame_cparams, should_attach_dict,
+    };
+    let source_size = source_size.filter(|&size| size != CONTENTSIZE_UNKNOWN);
+    let cdict = get_cdict_cparams(numeric_level(level), sizes.serialized, overrides);
+    let counted = if should_attach_dict(&cdict, source_size, overrides.dictionary_attach) {
+        0
+    } else {
+        sizes.content
+    };
+    get_frame_cparams(
+        numeric_level(level),
+        source_size.unwrap_or(CONTENTSIZE_UNKNOWN),
+        counted,
+        overrides,
+    )
+}
+
 /// [`resolve_level_params`] for a frame whose dictionary is loaded into tables
 /// the frame resolved for its own source, rather than attached or copied from
 /// the dictionary's own.
@@ -1149,16 +1180,11 @@ pub(crate) fn resolve_level_params_for_loaded_dict(
     sizes: crate::encoding::DictionarySizes,
     overrides: &crate::encoding::parameters::ParamOverrides,
 ) -> FrameParams {
-    use crate::encoding::cparams::{CONTENTSIZE_UNKNOWN, uses_row_match_finder};
+    use crate::encoding::cparams::uses_row_match_finder;
     // `resolve_level_params_with_dict`, the one caller, answers an empty
     // dictionary and a raw frame before it asks this.
     debug_assert!(sizes.content != 0 && !matches!(level, CompressionLevel::Uncompressed));
-    let frame = crate::encoding::cparams::get_frame_cparams(
-        numeric_level(level),
-        source_size.unwrap_or(CONTENTSIZE_UNKNOWN),
-        sizes.content,
-        overrides,
-    );
+    let frame = loaded_dict_frame_cparams(level, source_size, sizes, overrides);
     let params = level_params_from_cparams(frame);
     let row_plan = (3..=6).contains(&frame.strategy).then(|| RowDictPlan {
         // The dictionary lives in the frame's own tables, so there is no

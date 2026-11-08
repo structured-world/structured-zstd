@@ -1410,11 +1410,8 @@ impl Matcher for MatchGeneratorDriver {
         // cParams (`ZSTD_loadDictionaryContent`, zstd_compress.c:4987).
         self.dict_reach_log = dict_hint.map(|sizes| {
             let cd = if loaded_into_frame {
-                crate::encoding::cparams::get_frame_cparams(
-                    crate::encoding::levels::config::numeric_level(level),
-                    hint.unwrap_or(crate::encoding::cparams::CONTENTSIZE_UNKNOWN),
-                    sizes.content,
-                    &overrides,
+                crate::encoding::levels::config::loaded_dict_frame_cparams(
+                    level, hint, sizes, &overrides,
                 )
             } else {
                 crate::encoding::cparams::get_cdict_cparams(
