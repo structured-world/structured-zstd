@@ -77,6 +77,13 @@ fn main() {
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();
 
+    // `STRUCTURED_ZSTD_CPU=<level>` caps the kernel tiers, as in the benchmark.
+    if let Ok(value) = env::var("STRUCTURED_ZSTD_CPU") {
+        let level = value
+            .parse()
+            .expect("STRUCTURED_ZSTD_CPU names a CPU level");
+        structured_zstd::set_cpu_ceiling(level).expect("the CPU ceiling applies");
+    }
     let args: Vec<String> = env::args().collect();
     let level: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(22);
     let iters: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);

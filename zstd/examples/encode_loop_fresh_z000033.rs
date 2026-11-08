@@ -18,6 +18,13 @@ use std::fs;
 use structured_zstd::encoding::{CompressionLevel, CompressionParameters, FrameCompressor};
 
 fn main() {
+    // `STRUCTURED_ZSTD_CPU=<level>` caps the kernel tiers, as in the benchmark.
+    if let Ok(value) = env::var("STRUCTURED_ZSTD_CPU") {
+        let level = value
+            .parse()
+            .expect("STRUCTURED_ZSTD_CPU names a CPU level");
+        structured_zstd::set_cpu_ceiling(level).expect("the CPU ceiling applies");
+    }
     let level: i32 = env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     let iters: usize = env::args()
         .nth(2)
