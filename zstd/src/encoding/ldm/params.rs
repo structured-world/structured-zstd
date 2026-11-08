@@ -7,7 +7,7 @@
 //! Upstream zstd flow:
 //!
 //! 1. Caller starts with a zeroed `ldmParams_t` (all auto-derive).
-//! 2. [`LdmParams::adjust_for`] fills the zero-valued knobs from
+//! 2. [`LdmParams::derive`] fills the zero-valued knobs from
 //!    `windowLog` / `strategy` using the same `BOUNDED` clamps as
 //!    upstream zstd.
 //! 3. The returned struct then feeds [`super::gear_hash::GearHashState::new`]
@@ -38,7 +38,7 @@ pub(crate) const STRATEGY_BTULTRA: u32 = 8;
 /// bucket hash table. Field semantics mirror upstream zstd `ldmParams_t`.
 ///
 /// All-zero `LdmParams::default()` is the upstream zstd sentinel for
-/// "auto-derive every knob"; [`Self::adjust_for`] performs that
+/// "auto-derive every knob"; [`Self::derive`] performs that
 /// derivation.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LdmParams {

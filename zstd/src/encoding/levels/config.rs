@@ -331,7 +331,7 @@ fn fast_key_len(min_match: u32) -> u32 {
 }
 
 /// Map the resolved runtime strategy to the upstream zstd LDM strategy ordinal
-/// (1..=9) that [`crate::encoding::ldm::params::LdmParams::adjust_for`] expects.
+/// (1..=9) that [`crate::encoding::ldm::params::LdmParams::derive`] expects.
 /// The collapsed `Lazy` tag splits on `lazy_depth` (lazy = 4, lazy2 = 5).
 #[cfg(feature = "ldm")]
 pub(crate) fn ldm_strategy_ordinal(
@@ -1158,8 +1158,8 @@ impl DictParamsMemo {
 }
 
 /// [`resolve_level_params`] for a frame whose dictionary is loaded into tables
-/// the frame resolved for its own source
-/// ([`DictionaryGeometry::LoadedIntoFrame`]).
+/// the frame resolved for its own source, rather than attached or copied from
+/// the dictionary's own.
 ///
 /// The dictionary's own preparation does not enter this: upstream resets the
 /// context from the requested parameters for the real source, counting the
@@ -1175,8 +1175,6 @@ impl DictParamsMemo {
 /// window under an 18 KiB dictionary built a table of 807 KB and paid 832M
 /// cycles over a 4 MiB source where the same frame without the dictionary pays
 /// 178M: the window slides every kilobyte and each slide walks the whole table.
-///
-/// [`DictionaryGeometry::LoadedIntoFrame`]: crate::encoding::DictionaryGeometry::LoadedIntoFrame
 pub(crate) fn resolve_level_params_for_loaded_dict(
     level: CompressionLevel,
     source_size: Option<u64>,
