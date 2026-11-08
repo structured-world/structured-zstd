@@ -61,8 +61,8 @@ pub(crate) const ZSTD_C_ENABLE_SEQ_PRODUCER_FALLBACK: c_int = 1014;
 pub(crate) const ZSTD_C_MAX_BLOCK_SIZE: c_int = 1015;
 pub(crate) const ZSTD_C_REPCODE_RESOLUTION: c_int = 1016;
 pub(crate) const ZSTD_C_BLOCK_SPLITTER_LEVEL: c_int = 1017;
-// This library's own `ZSTD_cParameter` discriminants, declared in its
-// `zstd.h` past upstream's experimental range.
+// This library's own `ZSTD_cParameter` discriminants, declared in
+// `structured_zstd.h` past upstream's experimental range.
 /// `ZSTD_c_rawSkip`: whether a block that samples as incompressible may go out
 /// raw without being searched (`CompressionParametersBuilder::raw_skip`).
 pub(crate) const ZSTD_C_RAW_SKIP: c_int = 2000;

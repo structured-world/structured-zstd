@@ -5029,13 +5029,14 @@ fn a_searched_frames_tiny_uniform_last_block_goes_out_raw() {
     }
 }
 
-/// A dictionary prepared at level 0 is prepared at the default level, as
-/// upstream `ZSTD_createCDict` stores it, so a frame it no longer describes
-/// takes parameters of its own like any other levelled dictionary.
+/// A dictionary marked with a level of its own tells the frame so, whatever
+/// level a C caller named (`ZSTD_createCDict` at 0 means the default level),
+/// so a frame it no longer describes takes parameters of its own; an unmarked
+/// one does not.
 #[test]
-fn a_dictionary_prepared_at_level_zero_has_a_level_of_its_own() {
+fn a_dictionary_with_a_level_of_its_own_says_so() {
     let dictionary =
         super::EncoderDictionary::from_serialized_or_raw_content(b"some shared history").unwrap();
     assert!(!dictionary.clone().sizes().prepared_at_level);
-    assert!(dictionary.prepared_at_level(0).sizes().prepared_at_level);
+    assert!(dictionary.with_level_of_its_own().sizes().prepared_at_level);
 }

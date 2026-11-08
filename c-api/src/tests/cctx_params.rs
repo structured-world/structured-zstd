@@ -864,6 +864,7 @@ fn raw_skip_parameter_reaches_every_frame() {
     let dict = b"a dictionary the frame is primed with ".repeat(40);
     unsafe {
         let cctx = ZSTD_createCCtx();
+        assert!(!cctx.is_null(), "a context is allocated");
         let mut value = -1;
         assert_eq!(ZSTD_CCtx_getParameter(cctx, RAW_SKIP, &mut value), 0);
         assert_eq!(value, 0, "auto by default");
@@ -903,6 +904,35 @@ fn raw_skip_parameter_reaches_every_frame() {
 
         ZSTD_freeCCtx(cctx);
         ZSTD_freeCDict(cdict);
+    }
+}
+
+/// A CDict built from a parameter set keeps that set's raw skip among its
+/// parameters, but the frame it drives runs the context's: the context turns
+/// the skip back on over a CDict built with it off.
+#[test]
+fn the_contexts_raw_skip_overrides_an_advanced_cdicts() {
+    const RAW_SKIP: c_int = 2000;
+    let dict = b"a dictionary the frame is primed with ".repeat(40);
+    unsafe {
+        let params = ZSTD_createCCtxParams();
+        assert!(!params.is_null(), "a parameter set is allocated");
+        assert_eq!(ZSTD_CCtxParams_setParameter(params, RAW_SKIP, 2), 0);
+        let cdict =
+            ZSTD_createCDict_advanced2(dict.as_ptr(), dict.len(), 0, 0, params, NO_CUSTOM_MEM);
+        assert!(!cdict.is_null(), "the CDict is built");
+        let cctx = ZSTD_createCCtx();
+        assert!(!cctx.is_null(), "a context is allocated");
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, RAW_SKIP, 1), 0);
+        assert_eq!(crate::attach::ZSTD_CCtx_refCDict(cctx, cdict), 0);
+        let driven = (*cctx).frame_parameters(Some(1024)).unwrap();
+        assert!(
+            driven.is_none_or(|params| params.raw_skip_enabled()),
+            "the CDict's frame runs with the context's raw skip"
+        );
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeCDict(cdict);
+        ZSTD_freeCCtxParams(params);
     }
 }
 

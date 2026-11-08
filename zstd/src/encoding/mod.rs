@@ -402,7 +402,7 @@ pub struct DictionarySizes {
     /// to `content` for a raw-content dictionary.
     pub serialized: usize,
     /// The dictionary was prepared for a compression level of its own (see
-    /// [`EncoderDictionary::prepared_at_level`]), so a frame that outgrows it
+    /// [`EncoderDictionary::with_level_of_its_own`]), so a frame that outgrows it
     /// resolves its own parameters (see [`dictionary_describes_frame`]).
     pub prepared_at_level: bool,
 }

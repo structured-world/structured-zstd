@@ -2355,18 +2355,6 @@ ZSTDLIB_STATIC_API size_t ZSTD_CCtx_refPrefix_advanced(ZSTD_CCtx* cctx, const vo
 #define ZSTD_c_repcodeResolution ZSTD_c_experimentalParam19
 #define ZSTD_c_searchForExternalRepcodes ZSTD_c_experimentalParam19 /* older name */
 
-/* ZSTD_c_rawSkip
- * Not an upstream parameter: an extension of this library, outside the range
- * upstream numbers its own.
- *
- * Controls whether a block whose sample reads as incompressible may go out
- * raw, and a block of one repeated byte as RLE, without being searched.
- * ZSTD_ps_auto (the default) and ZSTD_ps_enable allow it; ZSTD_ps_disable
- * searches every block, as upstream does, and only a block the search fails
- * to shrink goes out raw. It also reaches a frame a referenced CDict drives.
- */
-#define ZSTD_c_rawSkip ((ZSTD_cParameter)2000)
-
 
 /*! ZSTD_CCtx_getParameter() :
  *  Get the requested compression parameter value, selected by enum ZSTD_cParameter,

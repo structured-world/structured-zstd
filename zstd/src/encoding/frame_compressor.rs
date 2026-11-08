@@ -91,17 +91,17 @@ impl EncoderDictionary {
         }
     }
 
-    /// Mark this dictionary as prepared for compression at `level`, as upstream
-    /// `ZSTD_createCDict(dict, size, level)` prepares one. A frame whose source
-    /// outgrows such a dictionary (see
+    /// Mark this dictionary as prepared at a level of its own, as upstream
+    /// `ZSTD_createCDict(dict, size, level)` prepares one at any level (0 there
+    /// is the default level). A frame whose source outgrows such a dictionary
+    /// (see
     /// [`dictionary_describes_frame`](crate::encoding::dictionary_describes_frame))
-    /// resolves the parameters for its own size and indexes the dictionary into
-    /// those tables (zstd_compress.c:5278). A dictionary left unmarked, the way
-    /// a compressor loads one, gives every frame the shape it is prepared with,
-    /// as upstream does for a dictionary loaded into a context or prepared with
-    /// explicit parameters. Level 0 is the default level, as upstream
-    /// `ZSTD_createCDict` stores it; only a dictionary prepared from explicit
-    /// parameters has no level of its own.
+    /// resolves the parameters for its own size and level and indexes the
+    /// dictionary into those tables (zstd_compress.c:5278). A dictionary left
+    /// unmarked, the way a compressor loads one, gives every frame the shape it
+    /// is prepared with, as upstream does for a dictionary loaded into a
+    /// context or prepared from explicit parameters. Which level does not
+    /// matter here: the frame's own level is the one it resolves.
     ///
     /// # Examples
     /// ```
@@ -109,10 +109,10 @@ impl EncoderDictionary {
     ///
     /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(b"raw content")
     ///     .unwrap()
-    ///     .prepared_at_level(3);
+    ///     .with_level_of_its_own();
     /// # let _ = dictionary;
     /// ```
-    pub fn prepared_at_level(mut self, _level: i32) -> Self {
+    pub fn with_level_of_its_own(mut self) -> Self {
         self.prepared_at_level = true;
         self
     }
