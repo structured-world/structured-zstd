@@ -851,6 +851,61 @@ fn a_cdict_window_is_raised_toward_the_source() {
     }
 }
 
+/// `ZSTD_c_rawSkip`, this library's own parameter, takes the three
+/// `ZSTD_ParamSwitch_e` values, reads back as set, and turns the codec's raw
+/// skip off only at `ZSTD_ps_disable`, on a frame the context drives and on one
+/// a referenced CDict drives alike: the CDict carries no such parameter.
+#[test]
+fn raw_skip_parameter_reaches_every_frame() {
+    const RAW_SKIP: c_int = 2000;
+    let bounds = ZSTD_cParam_getBounds(RAW_SKIP);
+    assert_eq!(bounds.error, 0);
+    assert_eq!((bounds.lowerBound, bounds.upperBound), (0, 2));
+    let dict = b"a dictionary the frame is primed with ".repeat(40);
+    unsafe {
+        let cctx = ZSTD_createCCtx();
+        let mut value = -1;
+        assert_eq!(ZSTD_CCtx_getParameter(cctx, RAW_SKIP, &mut value), 0);
+        assert_eq!(value, 0, "auto by default");
+        assert!(
+            (*cctx)
+                .frame_parameters(Some(1024))
+                .unwrap()
+                .unwrap()
+                .raw_skip_enabled()
+        );
+
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, RAW_SKIP, 2), 0);
+        assert_eq!(ZSTD_CCtx_getParameter(cctx, RAW_SKIP, &mut value), 0);
+        assert_eq!(value, 2);
+        assert!(
+            !(*cctx)
+                .frame_parameters(Some(1024))
+                .unwrap()
+                .unwrap()
+                .raw_skip_enabled()
+        );
+        assert_eq!(
+            code(ZSTD_CCtx_setParameter(cctx, RAW_SKIP, 3)),
+            ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound
+        );
+
+        let cdict = crate::cdict::ZSTD_createCDict(dict.as_ptr().cast(), dict.len(), 19);
+        assert_eq!(crate::attach::ZSTD_CCtx_refCDict(cctx, cdict), 0);
+        let driven = (*cctx).frame_parameters(Some(1024)).unwrap().unwrap();
+        assert!(
+            !driven.raw_skip_enabled(),
+            "the CDict's frame keeps the context's choice"
+        );
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, RAW_SKIP, 1), 0);
+        let driven = (*cctx).frame_parameters(Some(1024)).unwrap();
+        assert!(driven.is_none_or(|params| params.raw_skip_enabled()));
+
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeCDict(cdict);
+    }
+}
+
 /// The estimates read the set: a wider window costs more, and the streaming
 /// budget covers the one-shot one.
 #[test]

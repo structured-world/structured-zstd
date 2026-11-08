@@ -538,6 +538,23 @@ impl CompressionParameters {
         self.raw_skip
     }
 
+    /// These parameters with the raw skip turned on or off, as
+    /// [`CompressionParametersBuilder::raw_skip`] sets it, for a caller that
+    /// holds a built set, such as a prepared dictionary's.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{CompressionLevel, CompressionParameters};
+    ///
+    /// let params = CompressionParameters::builder(CompressionLevel::Level(19))
+    ///     .build()
+    ///     .unwrap();
+    /// assert!(!params.with_raw_skip(false).raw_skip_enabled());
+    /// ```
+    pub fn with_raw_skip(mut self, enabled: bool) -> Self {
+        self.raw_skip = enabled;
+        self
+    }
+
     /// Whether long-distance matching is enabled.
     pub fn long_distance_matching_enabled(&self) -> bool {
         self.overrides.ldm.is_some()

@@ -108,6 +108,8 @@ pub(crate) struct CCtxParams {
     pub(crate) literal_compression: LiteralCompressionMode,
     /// `ZSTD_c_useRowMatchFinder`.
     pub(crate) row_match_finder: RowMatchFinderMode,
+    /// `ZSTD_c_rawSkip`: only `Disable` turns the codec's raw skip off.
+    pub(crate) raw_skip: ParamSwitch,
     /// `ZSTD_c_srcSizeHint`; 0 = none.
     pub(crate) src_size_hint: c_int,
     /// The [`ADVISORY`] parameters, in that order.
@@ -151,6 +153,7 @@ impl CCtxParams {
             magicless: false,
             literal_compression: LiteralCompressionMode::Auto,
             row_match_finder: RowMatchFinderMode::Auto,
+            raw_skip: ParamSwitch::Auto,
             src_size_hint: 0,
             advisory: [0; ADVISORY.len()],
             pledged_src_size: CONTENTSIZE_UNKNOWN,
@@ -184,7 +187,8 @@ impl CCtxParams {
     pub(crate) fn resolve(&self) -> Option<CompressionParameters> {
         let mut builder = CompressionParameters::builder(CompressionLevel::from_level(self.level))
             .literal_compression(self.literal_compression)
-            .row_match_finder(self.row_match_finder);
+            .row_match_finder(self.row_match_finder)
+            .raw_skip(self.raw_skip != ParamSwitch::Disable);
         if let Some(v) = self.window_log {
             builder = builder.window_log(v);
         }
@@ -313,6 +317,10 @@ impl CCtxParams {
                     _ => RowMatchFinderMode::Auto,
                 };
             }
+            ZSTD_C_RAW_SKIP => {
+                self.raw_skip = ParamSwitch::from_c(within(value)?)
+                    .ok_or(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound)?;
+            }
             // Clamped into range as upstream's multi-threaded build stores them
             // (zstd_compress.c:866-908); frames are still built on the calling
             // thread, which a worker count only permits, never requires.
@@ -388,6 +396,7 @@ impl CCtxParams {
                 RowMatchFinderMode::Enable => ParamSwitch::Enable.to_c(),
                 RowMatchFinderMode::Disable => ParamSwitch::Disable.to_c(),
             },
+            ZSTD_C_RAW_SKIP => self.raw_skip.to_c(),
             _ => match advisory_slot(param) {
                 Some(slot) => self.advisory[slot],
                 None => return Err(ZSTD_ErrorCode::ZSTD_error_parameter_unsupported),
