@@ -133,7 +133,6 @@ pub(crate) struct HcOptimalPlanBuffers {
     /// [`BtMatcher::reset_opt_node_prices`]: crate::encoding::bt::BtMatcher::reset_opt_node_prices
     pub(crate) node_prices: Box<[MaybeUninit<u32>]>,
     pub(crate) candidates: Vec<MatchCandidate>,
-    pub(crate) store: Vec<HcOptimalNode>,
     /// Single backing allocation for the LL/ML price caches as `[price,
     /// generation]` pairs, laid out as two fixed-stride `HC_OPT_NUM + 1`
     /// regions (LL pairs, ML pairs). One base pointer + fixed offsets,

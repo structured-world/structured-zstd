@@ -569,6 +569,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher, K: EncodeTier>(
             workspace: crate::encoding::workspace::Workspace::new(),
             offset_hist: state.offset_hist,
             strategy_tag: state.strategy_tag,
+            split_strategy: state.split_strategy,
             pre_split: state.pre_split,
             huf_optimal_search: state.huf_optimal_search,
             literal_compression_disabled: state.literal_compression_disabled,

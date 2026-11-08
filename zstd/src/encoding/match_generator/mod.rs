@@ -1478,7 +1478,10 @@ impl Matcher for MatchGeneratorDriver {
             (cd.hash_log + 3).max(cd.chain_log + 1).min(31)
         });
         let (params, dict_plan) = match dict_hint {
-            Some(sizes) => self.dict_params.resolve(level, hint, sizes, &overrides),
+            Some(sizes) => {
+                let resolved = self.dict_params.resolve(level, hint, sizes, &overrides);
+                (resolved.params, resolved.row_plan)
+            }
             None => (
                 crate::encoding::levels::config::resolve_frame_params(level, hint, &overrides),
                 None,
@@ -1824,8 +1827,18 @@ impl Matcher for MatchGeneratorDriver {
                 // parameter overrides) has already down-sized them for the
                 // source the way `ZSTD_adjustCParams_internal` does, `hashLog`
                 // to the source's log plus one and `chainLog` to the log.
-                let long_bits = dcfg.long_hash_log as usize;
-                let short_bits = dcfg.short_hash_log as usize;
+                //
+                // A hinted frame then caps both at the source's own log,
+                // deliberately one bit under upstream's `hashLog`: the long
+                // table's extra bit doubles what a small frame clears (a fresh
+                // 10 KiB level-3 frame ran 36% slower) for a few bytes per
+                // megabyte of output.
+                let window_bits = self.reset_size_log.map_or(usize::MAX, |log| {
+                    let log = log.max(crate::encoding::levels::config::MIN_WINDOW_LOG) as usize;
+                    log.min(max_window_size.ilog2() as usize)
+                });
+                let long_bits = (dcfg.long_hash_log as usize).min(window_bits);
+                let short_bits = (dcfg.short_hash_log as usize).min(window_bits);
                 resolved_table_bits = long_bits;
                 dfast.set_hash_bits(long_bits, short_bits);
                 dfast.set_min_match(dcfg.min_match);

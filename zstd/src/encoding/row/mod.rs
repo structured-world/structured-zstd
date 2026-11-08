@@ -2880,12 +2880,16 @@ impl RowMatchGenerator {
     }
 
     pub(crate) fn set_hash_bits(&mut self, bits: usize) {
-        // The resolved `hashLog`: upstream bounds it by the source and, for
-        // rows, by the 32-bit hash the row and tag come from
-        // (`ZSTD_adjustCParams_internal`), and nothing narrows it further.
-        // `rowHashLog = hashLog - rowLog` (`ZSTD_reset_matchState`), at least
+        // The resolved `hashLog`, held to [`ROW_HASH_BITS`]; `rowHashLog =
+        // hashLog - rowLog` (upstream zstd `ZSTD_reset_matchState`), at least
         // one row bit.
-        let row_hash_log = bits.max(self.row_log + 1) - self.row_log;
+        //
+        // Deliberately narrower than upstream, which carries 21 to 23 bits
+        // through the lazy band: at level 12 on eight mebibytes of repeated
+        // log lines the full width took 19.6 ms against 2.2 ms at 20 bits,
+        // two thirds of it faulting and zeroing the table, and bought 0.03%
+        // on the decode corpus and nothing on the log stream.
+        let row_hash_log = bits.clamp(self.row_log + 1, ROW_HASH_BITS) - self.row_log;
         if self.row_hash_log != row_hash_log {
             self.row_hash_log = row_hash_log;
             // One buffer carries the positions and the tags, so dropping it

@@ -21,13 +21,21 @@ fn a_loaded_dictionary_resolves_the_frames_own_shape() {
     let sizes = crate::encoding::DictionarySizes::raw_content(64 * 1024);
     let source = 4 * 1024 * 1024u64;
 
-    let (prepared, prepared_plan) = super::resolve_level_params_with_dict(
+    let super::FrameParams {
+        params: prepared,
+        row_plan: prepared_plan,
+        ..
+    } = super::resolve_level_params_with_dict(
         level,
         Some(source),
         sizes,
         &crate::encoding::parameters::ParamOverrides::default(),
     );
-    let (loaded, loaded_plan) = super::resolve_level_params_for_loaded_dict(
+    let super::FrameParams {
+        params: loaded,
+        row_plan: loaded_plan,
+        ..
+    } = super::resolve_level_params_for_loaded_dict(
         level,
         Some(source),
         sizes,
@@ -58,6 +66,34 @@ fn a_loaded_dictionary_resolves_the_frames_own_shape() {
     assert!(loaded_plan.is_none_or(|plan| !plan.attach));
 }
 
+/// A frame that runs a dictionary's cParams keeps the post-split decision of
+/// its own: upstream resolves `postBlockSplitter` from the level's cParams for
+/// the frame before the CDict's replace them. Level 14 over 1 MiB is btlazy2,
+/// which never post-splits, while a 16 KiB dictionary's CDict is btopt; taking
+/// the splitter from the CDict ran a pass upstream skips on every such frame.
+#[test]
+fn a_dictionary_frame_splits_by_its_own_strategy() {
+    let sizes = crate::encoding::DictionarySizes::raw_content(16 * 1024);
+    let frame = super::resolve_level_params_with_dict(
+        CompressionLevel::Level(14),
+        Some(1 << 20),
+        sizes,
+        &crate::encoding::parameters::ParamOverrides::default(),
+    );
+    assert_eq!(frame.params.strategy_tag, StrategyTag::BtOpt);
+    assert_eq!(frame.split_strategy, StrategyTag::Btlazy2);
+
+    // Where the level resolves an optimal strategy for the frame too, the
+    // splitter stays on.
+    let frame = super::resolve_level_params_with_dict(
+        CompressionLevel::Level(22),
+        Some(10 * 1024),
+        sizes,
+        &crate::encoding::parameters::ParamOverrides::default(),
+    );
+    assert_eq!(frame.split_strategy, StrategyTag::BtUltra2);
+}
+
 /// A width the caller asks for is still bounded by what it will index.
 ///
 /// The bound is `dictAndWindowLog + 1`, and it only bites if it runs AFTER the
@@ -78,8 +114,8 @@ fn a_requested_hash_log_is_bounded_by_what_it_indexes() {
         ..Default::default()
     };
 
-    let (params, _) =
-        super::resolve_level_params_for_loaded_dict(level, Some(source), sizes, &overrides);
+    let params =
+        super::resolve_level_params_for_loaded_dict(level, Some(source), sizes, &overrides).params;
 
     // The window is the caller's, and the table is bounded by the window plus
     // the dictionary it indexes, not by the 20 that was asked for.
@@ -289,12 +325,13 @@ fn oversized_attach_dictionary_resolves_the_copy_geometry() {
     use crate::encoding::cparams::{copy_cparams, get_cdict_cparams};
     let sizes = DictionarySizes::raw_content(17 * 1024 * 1024);
     for level in [1, 3] {
-        let (params, _plan) = super::resolve_level_params_with_dict(
+        let params = super::resolve_level_params_with_dict(
             CompressionLevel::Level(level),
             Some(4096),
             sizes,
             &Default::default(),
-        );
+        )
+        .params;
         let cdict = get_cdict_cparams(level, sizes.serialized, &Default::default());
         let copy = copy_cparams(
             cdict,

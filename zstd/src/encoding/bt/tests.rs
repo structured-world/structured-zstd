@@ -15,7 +15,6 @@ fn estimated_workspace_bytes_matches_retained_scratch_at_growth_bounds() {
     bt.opt_nodes_scratch = Box::new_uninit_slice(HC_OPT_NODE_LEN);
     bt.opt_node_prices_scratch = Box::new_uninit_slice(HC_OPT_NODE_LEN);
     bt.opt_candidates_scratch = Vec::with_capacity(HC_OPT_CANDIDATE_CAPACITY);
-    bt.opt_store_scratch = Vec::with_capacity(HC_OPT_NODE_LEN);
     bt.opt_segment_plan_scratch = Vec::with_capacity(frontier);
     bt.opt_seed_plan_scratch = Vec::with_capacity(frontier);
     bt.opt_price_arena = alloc::vec![[0u32; 2]; HC_OPT_PRICE_ARENA_LEN].into_boxed_slice();

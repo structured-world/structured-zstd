@@ -704,6 +704,27 @@ fn level22_small_source_uses_window_bounded_hash3_log() {
     assert_eq!(hc.table.hash3_log, HC3_HASH_LOG);
 }
 
+/// A 1 KiB frame at level 19 lays its tables out at the widths upstream
+/// resolves for that source (`ZSTD_getCParams(19, 1024, 0)`: windowLog 10,
+/// hashLog 11, chainLog 11, and hashLog3 = MIN(17, windowLog) = 10), not at
+/// the level's full widths: a wider table is memory every small frame clears
+/// and then misses in.
+#[test]
+fn level19_one_kib_frame_takes_the_source_sized_widths() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+    driver.set_source_size_hint(1024);
+    let mut context = Workspace::new();
+    context.begin_layout(1024, no_trailing, IngestPlan::Stream);
+    driver.reset_in_workspace(CompressionLevel::Level(19), &mut context);
+    let hc = driver.hc_matcher();
+    assert_eq!(
+        (hc.table.hash_log, hc.table.chain_log, hc.table.hash3_log),
+        (11, 11, 10),
+        "hash, chain and hash3 logs of a 1 KiB level-19 frame",
+    );
+}
+
 #[test]
 fn btultra2_seed_pass_initializes_opt_state() {
     let mut hc = HcMatchGenerator::new(1 << 20);
@@ -1599,8 +1620,9 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
     let abs_pos = 9usize;
     hc.table.ensure_tables();
     hc.table.search_depth = 32;
-    let end = hc.table.history.len();
-    with_host_tier!(K => hc.table.bt_update_tree_until::<K>(abs_pos, end));
+    // The search's own catch-up inserts `0..abs_pos` into the tree first: the
+    // insert cursor starts at the history and only moves forward, so no
+    // position is inserted twice.
     hc.table.skip_insert_until_abs = 0;
 
     let mut out = Vec::new();
@@ -1862,11 +1884,11 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     // The window is now sized the C-faithful way: `get_cparams` clamps it to
     // the raw 1 KiB source (`window_log = ceil_log2(1024) = 10 = MIN_WINDOW_LOG`),
     // dropping the old MIN_HINTED_WINDOW_LOG 16 KiB interop floor (verified safe:
-    // such small-window frames decode in the C reference). The dfast tables then
-    // take what `ZSTD_adjustCParams_internal` resolves: the long table's
-    // `hashLog` the window's log plus one, the short table's `chainLog` the log.
+    // such small-window frames decode in the C reference). Both dfast tables are
+    // then held to the source's log, one bit under the long table's resolved
+    // `hashLog`, so a small frame clears half the table.
     assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
-    assert_eq!(hinted_long, 1 << (MIN_WINDOW_LOG + 1));
+    assert_eq!(hinted_long, 1 << MIN_WINDOW_LOG);
     assert_eq!(hinted_short, 1 << MIN_WINDOW_LOG);
     assert!(
         hinted_long < full_long && hinted_short < full_short,
@@ -2084,9 +2106,13 @@ fn a_pledged_stream_lays_out_history_for_all_of_its_input() {
 /// on a 100 KiB source is dfast, but a 4 KiB CDict is fast.
 #[test]
 fn dictionary_frame_takes_the_cdict_strategy_across_backend_families() {
-    use crate::encoding::levels::config::resolve_level_params_with_dict;
+    use crate::encoding::levels::config::{FrameParams, resolve_level_params_with_dict};
     use crate::encoding::strategy::{BackendTag, StrategyTag};
-    let (params, plan) = resolve_level_params_with_dict(
+    let FrameParams {
+        params,
+        row_plan: plan,
+        ..
+    } = resolve_level_params_with_dict(
         CompressionLevel::Level(13),
         Some(4096),
         crate::encoding::DictionarySizes::raw_content(300 * 1024),
@@ -2096,7 +2122,11 @@ fn dictionary_frame_takes_the_cdict_strategy_across_backend_families() {
     assert_eq!(params.backend(), BackendTag::Row);
     assert!(plan.is_some(), "a lazy-band CDict carries a plan");
     assert!(params.row.is_some_and(|r| r.bt));
-    let (params, plan) = resolve_level_params_with_dict(
+    let FrameParams {
+        params,
+        row_plan: plan,
+        ..
+    } = resolve_level_params_with_dict(
         CompressionLevel::Level(2),
         Some(100 * 1024),
         crate::encoding::DictionarySizes::raw_content(4096),
@@ -3470,13 +3500,17 @@ fn dfast_geometry_follows_the_reference_cparams() {
             dfast.mls, mls,
             "level 3 with a {hint}-byte source keys its short table on the wrong width",
         );
-        // And the tables take exactly the widths the reference resolves,
-        // down-sized for the source by `ZSTD_adjustCParams_internal` alone:
-        // the long table's `hashLog` reaches the source log plus one.
+        // And the tables take the widths the reference resolves, held to the
+        // source's own log: the reference's long `hashLog` reaches one bit
+        // past it, which a small frame would only pay to clear.
         let cp = crate::encoding::cparams::get_cparams(3, hint, 0);
+        let source_log = (hint.next_power_of_two().ilog2() as usize).max(MIN_WINDOW_LOG as usize);
         assert_eq!(
             (dfast.long_hash_bits, dfast.short_hash_bits),
-            (cp.hash_log as usize, cp.chain_log as usize),
+            (
+                (cp.hash_log as usize).min(source_log),
+                (cp.chain_log as usize).min(source_log),
+            ),
             "level 3 with a {hint}-byte source sizes its tables off the reference",
         );
     }

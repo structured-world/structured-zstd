@@ -168,7 +168,7 @@ pub(crate) fn compress_block_encoded<M: Matcher, K: EncodeTier>(
     let post_split = state.post_split_allowed
         && state.sequence_capture.is_none()
         && searched_rle_byte.is_none()
-        && post_split_enabled(state.strategy_tag, window_size);
+        && post_split_enabled(state.split_strategy, window_size);
     #[cfg(all(feature = "lsm", feature = "hash"))]
     let post_split_path = rle_byte_opt.is_none() && !raw_fast_path && post_split;
     #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -572,11 +572,12 @@ pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
 }
 
 /// Whether a compressed block goes through the post-split pass, which may cut
-/// it into several blocks along its sequences. Decided by the strategy the
-/// frame runs, not by its level, as upstream zstd decides it
+/// it into several blocks along its sequences. Decided by the strategy of the
+/// frame's own cParams, not by its level, as upstream zstd decides it
 /// (`zstd_compress.c`, `ZSTD_resolveBlockSplitterMode`: `strategy >= btopt &&
 /// windowLog >= 17`), so a parameter set that moves the strategy moves the
-/// pass with it.
+/// pass with it. A frame running a dictionary's cParams keeps the decision its
+/// own cParams made (`CompressState::split_strategy`).
 ///
 /// Turning the pass off is not a speed lever. Gated by level it was skipped on
 /// the btopt / btultra frames of L13-15, which ran faster there only by paying

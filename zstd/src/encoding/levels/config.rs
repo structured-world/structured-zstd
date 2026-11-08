@@ -651,7 +651,9 @@ pub fn estimated_compression_workspace_bytes_for_run(
         ..Default::default()
     };
     let params = match dictionary.filter(|sizes| sizes.content != 0) {
-        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes, &overrides).0,
+        Some(sizes) => {
+            resolve_level_params_with_dict(level, src_size_hint, sizes, &overrides).params
+        }
         None => resolve_frame_params(level, src_size_hint, &overrides),
     };
     // The long-distance matcher's own table, sized from the window it searches
@@ -677,7 +679,9 @@ pub(crate) fn frame_level_params(
     let level = parameters.level();
     let overrides = parameters.overrides();
     match dictionary.filter(|sizes| sizes.content != 0) {
-        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes, &overrides).0,
+        Some(sizes) => {
+            resolve_level_params_with_dict(level, src_size_hint, sizes, &overrides).params
+        }
         None => resolve_frame_params(level, src_size_hint, &overrides),
     }
 }
@@ -1004,6 +1008,22 @@ pub(crate) struct RowDictPlan {
     pub(crate) cdict: crate::encoding::cparams::CParams,
 }
 
+/// What a frame runs: its match finder and the strategy its block splitter
+/// answers to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameParams {
+    /// The match finder's parameters.
+    pub(crate) params: LevelParams,
+    /// The lazy backend's plan for a dictionary, on a greedy..btlazy2 match
+    /// finder.
+    pub(crate) row_plan: Option<RowDictPlan>,
+    /// The strategy the level resolves to for this frame before a CDict's
+    /// cParams replace it. Upstream decides the post-block splitter from it
+    /// (`ZSTD_CCtx_init_compressStream2` resolves `postBlockSplitter` from the
+    /// frame's own cParams, and `ZSTD_resetCCtx_usingCDict` leaves it alone).
+    pub(crate) split_strategy: crate::encoding::strategy::StrategyTag,
+}
+
 /// [`resolve_level_params`] for a frame that compresses with a dictionary of
 /// `dict_size` bytes. Upstream builds the CDict with
 /// `ZSTD_getCParams(level, UNKNOWN, dictSize, createCDict)` and the frame
@@ -1021,14 +1041,19 @@ pub(crate) fn resolve_level_params_with_dict(
     source_size: Option<u64>,
     sizes: crate::encoding::DictionarySizes,
     overrides: &crate::encoding::parameters::ParamOverrides,
-) -> (LevelParams, Option<RowDictPlan>) {
+) -> FrameParams {
     use crate::encoding::cparams::{
         CONTENTSIZE_UNKNOWN, attach_cparams, copy_cparams, get_cdict_cparams, should_attach_dict,
         uses_row_match_finder,
     };
     // A raw frame searches nothing, so a dictionary has no tier to give it.
     if sizes.content == 0 || matches!(level, CompressionLevel::Uncompressed) {
-        return (resolve_level_params(level, source_size), None);
+        let params = resolve_level_params(level, source_size);
+        return FrameParams {
+            params,
+            row_plan: None,
+            split_strategy: params.strategy_tag,
+        };
     }
     // The pledged-size sentinel is an unknown size, which attaches the
     // dictionary (`ZSTD_shouldAttachDict`), not a huge one that copies it.
@@ -1062,32 +1087,31 @@ pub(crate) fn resolve_level_params_with_dict(
     // and `ZSTD_adjustCParams_internal`). A copied dictionary sits in the
     // window, so the window covers it.
     let src = source_size.unwrap_or(CONTENTSIZE_UNKNOWN);
-    let window_log = crate::encoding::cparams::get_frame_cparams(
+    let own = crate::encoding::cparams::get_frame_cparams(
         numeric_level(level),
         src,
         if attach { 0 } else { sizes.content },
         overrides,
-    )
-    .window_log;
+    );
+    let split_strategy = level_params_from_cparams(own).strategy_tag;
     let frame = if attach {
-        attach_cparams(cdict, src, window_log, overrides.row_match_finder)
+        attach_cparams(cdict, src, own.window_log, overrides.row_match_finder)
     } else {
-        copy_cparams(cdict, window_log)
+        copy_cparams(cdict, own.window_log)
     };
     let params = level_params_from_cparams(frame);
-    if !(3..=6).contains(&cdict.strategy) {
-        // Fast / dfast / optimal strategies: their backends prime the
-        // dictionary themselves; no lazy-backend plan.
-        return (params, None);
-    }
-    (
+    // Fast / dfast / optimal strategies: their backends prime the dictionary
+    // themselves; no lazy-backend plan.
+    let row_plan = (3..=6).contains(&cdict.strategy).then(|| RowDictPlan {
+        attach,
+        use_row: uses_row_match_finder(&cdict, overrides.row_match_finder),
+        cdict,
+    });
+    FrameParams {
         params,
-        Some(RowDictPlan {
-            attach,
-            use_row: uses_row_match_finder(&cdict, overrides.row_match_finder),
-            cdict,
-        }),
-    )
+        row_plan,
+        split_strategy,
+    }
 }
 
 /// The last [`resolve_level_params_with_dict`] answer, for a caller that asks
@@ -1095,7 +1119,7 @@ pub(crate) fn resolve_level_params_with_dict(
 /// cParams once, when it builds the CDict, and a frame only adjusts them to its
 /// source (`ZSTD_resetCCtx_usingCDict`).
 #[derive(Clone, Copy, Default)]
-pub(crate) struct DictParamsMemo(Option<(DictParamsKey, (LevelParams, Option<RowDictPlan>))>);
+pub(crate) struct DictParamsMemo(Option<(DictParamsKey, FrameParams)>);
 
 /// Everything [`resolve_level_params_with_dict`] reads.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1115,7 +1139,7 @@ impl DictParamsMemo {
         source_size: Option<u64>,
         sizes: crate::encoding::DictionarySizes,
         overrides: &crate::encoding::parameters::ParamOverrides,
-    ) -> (LevelParams, Option<RowDictPlan>) {
+    ) -> FrameParams {
         let key = DictParamsKey {
             level,
             source_size,
@@ -1158,10 +1182,15 @@ pub(crate) fn resolve_level_params_for_loaded_dict(
     source_size: Option<u64>,
     sizes: crate::encoding::DictionarySizes,
     overrides: &crate::encoding::parameters::ParamOverrides,
-) -> (LevelParams, Option<RowDictPlan>) {
+) -> FrameParams {
     use crate::encoding::cparams::{CONTENTSIZE_UNKNOWN, uses_row_match_finder};
     if sizes.content == 0 || matches!(level, CompressionLevel::Uncompressed) {
-        return (resolve_level_params(level, source_size), None);
+        let params = resolve_level_params(level, source_size);
+        return FrameParams {
+            params,
+            row_plan: None,
+            split_strategy: params.strategy_tag,
+        };
     }
     let frame = crate::encoding::cparams::get_frame_cparams(
         numeric_level(level),
@@ -1170,19 +1199,20 @@ pub(crate) fn resolve_level_params_for_loaded_dict(
         overrides,
     );
     let params = level_params_from_cparams(frame);
-    if !(3..=6).contains(&frame.strategy) {
-        return (params, None);
-    }
-    (
+    let row_plan = (3..=6).contains(&frame.strategy).then(|| RowDictPlan {
+        // The dictionary lives in the frame's own tables, so there is no
+        // separate set to search in place.
+        attach: false,
+        use_row: uses_row_match_finder(&frame, overrides.row_match_finder),
+        cdict: frame,
+    });
+    // The frame runs the cParams it resolved for itself, the splitter's
+    // strategy among them.
+    FrameParams {
         params,
-        Some(RowDictPlan {
-            // The dictionary lives in the frame's own tables, so there is no
-            // separate set to search in place.
-            attach: false,
-            use_row: uses_row_match_finder(&frame, overrides.row_match_finder),
-            cdict: frame,
-        }),
-    )
+        row_plan,
+        split_strategy: params.strategy_tag,
+    }
 }
 
 /// The cheap fingerprint pre-splitter level for a compression level (the

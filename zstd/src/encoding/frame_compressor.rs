@@ -1348,25 +1348,31 @@ pub(crate) fn load_frame_dictionary<M: Matcher, K: EncodeTier>(
 
 /// Record in `state` the strategy the matcher runs for the next frame (the
 /// honoured public override, else the size- and dictionary-adaptive
-/// resolution in `params`) and its pre-split tier; the literal gates and the
-/// block splitter read these, and upstream indexes `splitLevels` by the
-/// effective strategy too. Shared by the frame compressor and the streaming
-/// encoder so both entry points cut and gate blocks identically.
+/// resolution in `frame`), its pre-split tier and the strategy the post-split
+/// pass answers to; the literal gates and the block splitters read these, and
+/// upstream indexes `splitLevels` by the effective strategy too. Shared by the
+/// frame compressor and the streaming encoder so both entry points cut and gate
+/// blocks identically.
 pub(crate) fn sync_effective_strategy<M: Matcher>(
     state: &mut CompressState<M>,
     level: CompressionLevel,
-    params: &crate::encoding::levels::config::LevelParams,
+    frame: &crate::encoding::levels::config::FrameParams,
     strategy_override: Option<(crate::encoding::strategy::StrategyTag, u8)>,
 ) {
+    let params = &frame.params;
     match strategy_override {
         Some((tag, lazy_depth)) => {
             state.strategy_tag = tag;
+            // Upstream applies the override to the frame's cParams and the
+            // CDict's alike, so the splitter follows it as well.
+            state.split_strategy = tag;
             state.pre_split = Some(crate::encoding::levels::config::pre_split_for(
                 tag, lazy_depth,
             ));
         }
         None => {
             state.strategy_tag = params.strategy_tag;
+            state.split_strategy = frame.split_strategy;
             state.pre_split = if matches!(level, CompressionLevel::Uncompressed) {
                 None
             } else {
@@ -1415,18 +1421,22 @@ pub(crate) fn resolve_frame_params(
     level: CompressionLevel,
     hint: Option<u64>,
     dictionary: Option<&EncoderDictionary>,
-) -> crate::encoding::levels::config::LevelParams {
+) -> crate::encoding::levels::config::FrameParams {
     match dictionary {
-        Some(dict) if !dict.inner.dict_content.is_empty() => {
-            memo.resolve(
-                level,
-                hint,
-                dict.sizes(),
-                &crate::encoding::parameters::ParamOverrides::default(),
-            )
-            .0
+        Some(dict) if !dict.inner.dict_content.is_empty() => memo.resolve(
+            level,
+            hint,
+            dict.sizes(),
+            &crate::encoding::parameters::ParamOverrides::default(),
+        ),
+        _ => {
+            let params = crate::encoding::levels::config::resolve_level_params(level, hint);
+            crate::encoding::levels::config::FrameParams {
+                params,
+                row_plan: None,
+                split_strategy: params.strategy_tag,
+            }
         }
-        _ => crate::encoding::levels::config::resolve_level_params(level, hint),
     }
 }
 
@@ -1520,6 +1530,13 @@ pub(crate) struct CompressState<M: Matcher> {
     /// encoder constructor) plumb this explicitly. Tests that build
     /// `CompressState` by hand must also supply a value.
     pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
+    /// The strategy the post-split pass is decided by: `strategy_tag`, except
+    /// on a frame that runs a dictionary's cParams, where it is the strategy
+    /// the level resolves to for the frame itself
+    /// ([`FrameParams::split_strategy`]). Synced with `strategy_tag`.
+    ///
+    /// [`FrameParams::split_strategy`]: crate::encoding::levels::config::FrameParams::split_strategy
+    pub(crate) split_strategy: crate::encoding::strategy::StrategyTag,
     /// Pre-split tier of the effective strategy (upstream `splitLevels`),
     /// synced with `strategy_tag`; `None` never pre-splits (raw frames).
     pub(crate) pre_split: Option<u8>,
@@ -1929,6 +1946,9 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 workspace: crate::encoding::workspace::Workspace::new(),
                 offset_hist: [1, 4, 8],
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
+                    compression_level,
+                ),
+                split_strategy: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
                 ),
                 pre_split: crate::encoding::levels::config::level_pre_split(compression_level)
@@ -2489,6 +2509,9 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
                 ),
+                split_strategy: crate::encoding::strategy::StrategyTag::for_compression_level(
+                    compression_level,
+                ),
                 pre_split: crate::encoding::levels::config::level_pre_split(compression_level)
                     .map(|tier| tier as u8),
                 huf_optimal_search: true,
@@ -2694,7 +2717,7 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
         &mut self,
         hint: Option<u64>,
         with_dictionary: bool,
-    ) -> crate::encoding::levels::config::LevelParams {
+    ) -> crate::encoding::levels::config::FrameParams {
         resolve_frame_params(
             &mut self.dict_params,
             self.compression_level,
@@ -2708,11 +2731,11 @@ impl<R: Read, W: Write, M: Matcher, D: DictionaryHold> FrameCompressor<R, W, M, 
     /// resolution in `params`) and its pre-split tier: the literal gates and
     /// the block splitter read these, and upstream indexes `splitLevels` by
     /// the effective strategy too.
-    fn sync_effective_strategy(&mut self, params: &crate::encoding::levels::config::LevelParams) {
+    fn sync_effective_strategy(&mut self, frame: &crate::encoding::levels::config::FrameParams) {
         sync_effective_strategy(
             &mut self.state,
             self.compression_level,
-            params,
+            frame,
             self.tuning.strategy,
         );
     }

@@ -601,11 +601,12 @@ impl MatchTable {
         }
     }
 
-    /// The shortest match the optimal parser accepts and prices (zstd_opt.c:
-    /// `minMatch = (cParams->minMatch == 3) ? 3 : 4`).
+    /// The shortest match the optimal parser accepts and prices: three bytes
+    /// on every frame, where upstream accepts three only with a hash3 table
+    /// (zstd_opt.c: `minMatch = (cParams->minMatch == 3) ? 3 : 4`).
     #[inline(always)]
     pub(crate) fn opt_min_match(&self) -> usize {
-        if self.hash3_log != 0 { 3 } else { 4 }
+        3
     }
 
     /// Insert a position into the HC3 short-match side table without
@@ -1555,7 +1556,7 @@ impl MatchTable {
             feature = "kernel-neon"
         ))]
         unsafe {
-            self.bt_insert_range_neon(from, stop, current_abs_end, target_abs)
+            self.bt_insert_range_neon::<false>(from, stop, current_abs_end, target_abs)
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
@@ -1563,14 +1564,14 @@ impl MatchTable {
             crate::encoding::fastpath::tier_match!(K {
                 #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.bt_insert_range_avx2_bmi2(from, stop, current_abs_end, target_abs)
+                    self.bt_insert_range_avx2_bmi2::<false>(from, stop, current_abs_end, target_abs)
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    self.bt_insert_range_sse2(from, stop, current_abs_end, target_abs)
+                    self.bt_insert_range_sse2::<false>(from, stop, current_abs_end, target_abs)
                 },
                 FastpathKernel::Scalar => {
-                    self.bt_insert_range_scalar(from, stop, current_abs_end, target_abs)
+                    self.bt_insert_range_scalar::<false>(from, stop, current_abs_end, target_abs)
                 },
             })
         }
@@ -1584,7 +1585,7 @@ impl MatchTable {
         // SAFETY: the `cfg` above establishes `simd128` at compile time, which
         // is exactly the umbrella the callee declares.
         unsafe {
-            self.bt_insert_range_simd128(from, stop, current_abs_end, target_abs)
+            self.bt_insert_range_simd128::<false>(from, stop, current_abs_end, target_abs)
         }
         #[cfg(not(any(
             all(
@@ -1601,7 +1602,7 @@ impl MatchTable {
             )
         )))]
         {
-            self.bt_insert_range_scalar(from, stop, current_abs_end, target_abs)
+            self.bt_insert_range_scalar::<false>(from, stop, current_abs_end, target_abs)
         }
     }
 
@@ -1615,7 +1616,7 @@ impl MatchTable {
         feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
-    pub(crate) unsafe fn bt_insert_range_neon(
+    pub(crate) unsafe fn bt_insert_range_neon<const IN_BLOCK: bool>(
         &mut self,
         from: usize,
         stop: usize,
@@ -1630,7 +1631,7 @@ impl MatchTable {
             stop,
             current_abs_end,
             target_abs,
-            crate::encoding::fastpath::neon::count_match_from_indices
+            IN_BLOCK
         )
     }
 
@@ -1643,7 +1644,7 @@ impl MatchTable {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
-    pub(crate) unsafe fn bt_insert_range_sse2(
+    pub(crate) unsafe fn bt_insert_range_sse2<const IN_BLOCK: bool>(
         &mut self,
         from: usize,
         stop: usize,
@@ -1658,7 +1659,7 @@ impl MatchTable {
             stop,
             current_abs_end,
             target_abs,
-            crate::encoding::fastpath::sse2::count_match_from_indices
+            IN_BLOCK
         )
     }
 
@@ -1671,7 +1672,7 @@ impl MatchTable {
         feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
-    pub(crate) unsafe fn bt_insert_range_avx2_bmi2(
+    pub(crate) unsafe fn bt_insert_range_avx2_bmi2<const IN_BLOCK: bool>(
         &mut self,
         from: usize,
         stop: usize,
@@ -1686,7 +1687,7 @@ impl MatchTable {
             stop,
             current_abs_end,
             target_abs,
-            crate::encoding::fastpath::avx2_bmi2::count_match_from_indices
+            IN_BLOCK
         )
     }
 
@@ -1700,7 +1701,7 @@ impl MatchTable {
         feature = "kernel-simd128"
     ))]
     #[target_feature(enable = "simd128")]
-    pub(crate) unsafe fn bt_insert_range_simd128(
+    pub(crate) unsafe fn bt_insert_range_simd128<const IN_BLOCK: bool>(
         &mut self,
         from: usize,
         stop: usize,
@@ -1715,7 +1716,7 @@ impl MatchTable {
             stop,
             current_abs_end,
             target_abs,
-            crate::encoding::fastpath::simd128::count_match_from_indices
+            IN_BLOCK
         )
     }
 
@@ -1727,7 +1728,7 @@ impl MatchTable {
         target_endian = "little",
         feature = "kernel-neon"
     )))]
-    pub(crate) fn bt_insert_range_scalar(
+    pub(crate) fn bt_insert_range_scalar<const IN_BLOCK: bool>(
         &mut self,
         from: usize,
         stop: usize,
@@ -1742,7 +1743,7 @@ impl MatchTable {
             stop,
             current_abs_end,
             target_abs,
-            crate::encoding::fastpath::scalar::count_match_from_indices
+            IN_BLOCK
         )
     }
 
