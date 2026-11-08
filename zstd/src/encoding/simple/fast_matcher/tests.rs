@@ -118,6 +118,21 @@ fn a_borrowed_window_past_a_bare_tables_range_clears_it() {
     m.clear_borrowed_window();
 }
 
+/// A borrowed buffer longer than a tagged slot can position runs the frame
+/// untagged: the table is cleared and its slots go bare.
+#[test]
+fn a_borrowed_window_past_the_tagged_range_runs_untagged() {
+    let mut ws = Workspace::new();
+    let mut m = FastKernelMatcher::new();
+    reset_in(&mut m, &mut ws, (16, 14, 6, 2), TableCarry::Clear);
+    assert!(m.hash_table.is_tagged(), "precondition: a tagged table");
+    let external = alloc::vec![0u8; TAGGED_POSITION_LIMIT + 1];
+    // SAFETY: `external` outlives the window, cleared before it drops.
+    unsafe { m.set_borrowed_window(&external) };
+    assert!(!m.hash_table.is_tagged(), "the frame still runs tagged");
+    m.clear_borrowed_window();
+}
+
 /// The borrowed one-shot scan must emit the EXACT same sequence
 /// stream (and end with the same rep / offset_hist state) as the
 /// owned block-by-block path. This is the load-bearing correctness

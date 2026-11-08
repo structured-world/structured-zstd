@@ -1943,10 +1943,9 @@ fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) -> bool {
     // The leaves come count-descending, and the tree build merges the smallest
     // first, so the last leaf holds the longest code (upstream
     // `HUF_setMaxHeight` reads `huffNode[lastNonNull].nbBits` the same way).
-    let Some(last) = nodes.last() else {
-        return false;
-    };
-    let largest_bits = last.nb_bits as usize;
+    // `limit_leaves_in_place`, the one caller, holds at least two leaves.
+    debug_assert!(nodes.len() > 1);
+    let largest_bits = nodes[nodes.len() - 1].nb_bits as usize;
     debug_assert_eq!(
         Some(largest_bits),
         nodes.iter().map(|node| node.nb_bits as usize).max(),

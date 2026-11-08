@@ -5029,6 +5029,173 @@ fn a_searched_frames_tiny_uniform_last_block_goes_out_raw() {
     }
 }
 
+/// With every block searched, a later block of one repeated byte is searched
+/// first and then written as RLE, as upstream rewrites a searched block whose
+/// payload is short, on the one-shot path and on the buffered one alike.
+#[test]
+fn a_searched_uniform_block_goes_out_as_rle() {
+    let mut input = generate_data(0x0005_EA2C, 128 * 1024);
+    input.extend(core::iter::repeat_n(b'a', 1000));
+    let level = super::CompressionLevel::Level(1);
+    let params = crate::encoding::CompressionParameters::builder(level)
+        .raw_skip(false)
+        .build()
+        .unwrap();
+    let mut compressor: FrameCompressor = FrameCompressor::new(level);
+    compressor.set_parameters(&params);
+    let one_shot = compressor.compress_independent_frame(&input);
+    let mut buffered = Vec::new();
+    let mut compressor = FrameCompressor::new(level);
+    compressor.set_parameters(&params);
+    compressor.set_source(input.as_slice());
+    compressor.set_drain(&mut buffered);
+    compressor.compress();
+    for (path, frame) in [("one-shot", &one_shot), ("buffered", &buffered)] {
+        // The last block: a 3-byte header saying RLE of 1000 bytes, then the byte.
+        let tail = &frame[frame.len() - 4..];
+        let header = u32::from(tail[0]) | u32::from(tail[1]) << 8 | u32::from(tail[2]) << 16;
+        assert_eq!(header & 1, 1, "{path}: the uniform block is not the last");
+        assert_eq!((header >> 1) & 3, 1, "{path}: the uniform block is not RLE");
+        assert_eq!(
+            header >> 3,
+            1000,
+            "{path}: the RLE block has the wrong size"
+        );
+        assert_eq!(tail[3], b'a');
+        let mut decoded = Vec::with_capacity(input.len());
+        FrameDecoder::new()
+            .decode_all_to_vec(frame, &mut decoded)
+            .unwrap();
+        assert!(
+            decoded == input,
+            "{path}: a frame does not decode to its input"
+        );
+    }
+}
+
+/// Small frames stitched from dictionary slices (its tail included), repeats
+/// of their own earlier pieces and noise, compressed through the attached
+/// dictionary on the fast and double-fast levels, the latter also keyed on six
+/// and seven bytes: the repeat-offset and dictionary-tail paths of the
+/// in-place scans each meet candidates on both sides of the dictionary
+/// boundary, and every frame must decode to its input.
+#[test]
+fn attached_dictionary_frames_of_mixed_pieces_round_trip() {
+    let dict_bytes = generate_data(0xD1C7_7A11, 4096);
+    let dict_id = 0x7A11_0001;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    let mut configurations: Vec<crate::encoding::CompressionParameters> = [1, -3, 2, 3, 4]
+        .into_iter()
+        .map(|level| {
+            crate::encoding::CompressionParameters::builder(super::CompressionLevel::Level(level))
+                .build()
+                .unwrap()
+        })
+        .collect();
+    for min_match in [6, 7] {
+        configurations.push(
+            crate::encoding::CompressionParameters::builder(super::CompressionLevel::Level(3))
+                .min_match(min_match)
+                .build()
+                .unwrap(),
+        );
+    }
+    for params in &configurations {
+        let level = params.level();
+        let mut compressor: FrameCompressor = FrameCompressor::new(level);
+        compressor.set_parameters(params);
+        compressor
+            .set_dictionary(
+                crate::decoding::Dictionary::from_raw_content(dict_id, dict_bytes.clone()).unwrap(),
+            )
+            .unwrap();
+        for _ in 0..200 {
+            let target = 1024 + next(5 * 1024);
+            let mut frame_input: Vec<u8> = Vec::with_capacity(target + 64);
+            while frame_input.len() < target {
+                match next(4) {
+                    0 => {
+                        // A slice of the dictionary, often its very end.
+                        let len = 4 + next(60);
+                        let start = if next(2) == 0 {
+                            dict_bytes.len() - len.min(dict_bytes.len())
+                        } else {
+                            next(dict_bytes.len() - len)
+                        };
+                        frame_input.extend_from_slice(&dict_bytes[start..start + len]);
+                    }
+                    1 if frame_input.len() > 16 => {
+                        // A repeat of an earlier piece of the frame.
+                        let len = 4 + next(28).min(frame_input.len() - 4);
+                        let start = next(frame_input.len() - len + 1);
+                        frame_input.extend_from_within(start..start + len);
+                    }
+                    _ => {
+                        let len = 1 + next(24);
+                        frame_input.extend((0..len).map(|_| next(256) as u8));
+                    }
+                }
+            }
+            let frame = compressor.compress_independent_frame(&frame_input);
+            let mut decoder = FrameDecoder::new();
+            decoder
+                .add_dict(
+                    crate::decoding::Dictionary::from_raw_content(dict_id, dict_bytes.clone())
+                        .unwrap(),
+                )
+                .unwrap();
+            let mut decoded = Vec::with_capacity(frame_input.len());
+            decoder.decode_all_to_vec(&frame, &mut decoded).unwrap();
+            assert!(
+                decoded == frame_input,
+                "{level:?}: a frame does not decode to its input"
+            );
+        }
+    }
+}
+
+/// Only a table built from a distribution has one to give back: the
+/// predefined table and a single repeated symbol do not.
+#[test]
+fn only_a_built_previous_table_has_a_distribution() {
+    use super::PreviousFseTable;
+    assert!(PreviousFseTable::Default.distribution().is_none());
+    assert!(PreviousFseTable::Rle(3).distribution().is_none());
+}
+
+/// A dictionary with a level of its own that a fast frame outgrows is loaded
+/// into the frame's own tables at their width, and the frame decodes.
+#[test]
+fn a_fast_frame_loads_a_dictionary_it_outgrows() {
+    let dict_bytes = generate_data(0x10AD_D1C7, 8 * 1024);
+    let dict_id = 0x10AD_0001;
+    let mut input = generate_data(0x10AD_0002, 1 << 20);
+    for chunk in input.chunks_mut(4096) {
+        chunk[..512].copy_from_slice(&dict_bytes[..512]);
+    }
+    let dictionary = super::EncoderDictionary::from_dictionary(
+        crate::decoding::Dictionary::from_raw_content(dict_id, dict_bytes.clone()).unwrap(),
+    )
+    .with_level_of_its_own();
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    compressor.set_encoder_dictionary(dictionary).unwrap();
+    let frame = compressor.compress_independent_frame(&input);
+    assert!(frame.len() < input.len(), "the repeats were not found");
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .add_dict(crate::decoding::Dictionary::from_raw_content(dict_id, dict_bytes).unwrap())
+        .unwrap();
+    let mut decoded = Vec::with_capacity(input.len());
+    decoder.decode_all_to_vec(&frame, &mut decoded).unwrap();
+    assert!(decoded == input, "the frame does not decode to its input");
+}
+
 /// A dictionary marked with a level of its own tells the frame so, whatever
 /// level a C caller named (`ZSTD_createCDict` at 0 means the default level),
 /// so a frame it no longer describes takes parameters of its own; an unmarked

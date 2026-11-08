@@ -896,3 +896,45 @@ fn build_from_counts_accepts_the_largest_section_the_encoder_can_produce() {
     assert!(table.codes[b'a' as usize].1 < table.codes[b'b' as usize].1);
     assert_eq!(table.codes[b'b' as usize].1, table.codes[b'c' as usize].1);
 }
+
+/// Every route of the gated build gives a table that codes its histogram: the
+/// searched build (the plain one), the cheap build over limited leaves, the
+/// weight route a single symbol takes, and the weight route a code the leaf
+/// limiter cannot complete falls back to (Fibonacci counts, the worst case for
+/// Huffman depth).
+#[test]
+fn every_route_of_the_gated_build_codes_its_histogram() {
+    let mut skewed = [0usize; 256];
+    for (i, count) in skewed.iter_mut().take(40).enumerate() {
+        *count = 1 + i * i;
+    }
+    let mut single = [0usize; 256];
+    single[b'x' as usize] = 500;
+    let mut fibonacci = [0usize; 256];
+    let (mut a, mut b) = (1usize, 1usize);
+    for count in fibonacci.iter_mut().take(24) {
+        *count = a;
+        (a, b) = (b, a + b);
+    }
+    let searched = HuffmanTable::build_from_counts_gated(&skewed, true);
+    assert!(
+        searched.codes == HuffmanTable::build_from_counts(&skewed).codes,
+        "the searched route is the plain build"
+    );
+    for (name, counts) in [("skewed", &skewed), ("fibonacci", &fibonacci)] {
+        let table = HuffmanTable::build_from_counts_gated(counts, false);
+        assert!(
+            table
+                .estimate_compressed_size_from_counts_checked(counts)
+                .is_some(),
+            "the {name} table does not code its histogram"
+        );
+    }
+    // One symbol has no Huffman code (the encoder writes such a section as
+    // RLE first); the cheap route gives it what the plain builder does.
+    assert!(
+        HuffmanTable::build_from_counts_gated(&single, false).codes
+            == HuffmanTable::build_from_counts(&single).codes,
+        "the single-symbol route differs from the plain build"
+    );
+}

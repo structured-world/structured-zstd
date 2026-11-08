@@ -2658,12 +2658,14 @@ fn choose_table_from_counts<'a>(
     // runs in the `Choice::New` arm below, when the custom table actually
     // wins. The estimate equals the built table's `table_header_bits()`
     // exactly, so the selection is byte-identical.
-    let new_total_cost = (distinct_symbols > 1).then(|| {
-        // Plain `+`: both are bit-cost estimates bounded by the block size
-        // (<= MAX_BLOCK_SIZE * 8 bits), far under the integer's range.
+    // A single-symbol stream returned above, so the histogram has the two
+    // symbols a custom table needs. Plain `+`: both are bit-cost estimates
+    // bounded by the block size (<= MAX_BLOCK_SIZE * 8 bits), far under the
+    // integer's range.
+    debug_assert!(distinct_symbols > 1);
+    let compressed =
         fse_header_bits_for_counts(&counts[..=max_symbol], max_log, use_low_prob_count)
-            + entropy_cost(counts, max_symbol, total)
-    });
+            + entropy_cost(counts, max_symbol, total);
 
     let predefined_cost = cross_entropy_cost(counts, max_symbol, default_table);
 
@@ -2686,29 +2688,23 @@ fn choose_table_from_counts<'a>(
     let unavailable = usize::MAX;
     let basic = predefined_cost.unwrap_or(unavailable);
     let repeat = previous_cost.unwrap_or(unavailable);
-    let compressed = new_total_cost.unwrap_or(unavailable);
     let best = if predefined_cost.is_some() && basic <= repeat && basic <= compressed {
-        Some(Choice::Predefined)
+        Choice::Predefined
     } else if previous_cost.is_some() && repeat <= compressed {
-        Some(Choice::Previous)
-    } else if new_total_cost.is_some() {
-        Some(Choice::New)
+        Choice::Previous
     } else {
-        None
+        Choice::New
     };
 
     match best {
-        Some(Choice::Previous) => previous
+        Choice::Previous => previous
             .map(FseTableMode::RepeatLast)
             .unwrap_or(FseTableMode::Predefined(default_table)),
-        Some(Choice::Predefined) => FseTableMode::Predefined(default_table),
-        // The custom table won the cost comparison — build it now (the only
-        // place the state tables are constructed). `distinct_symbols > 1`
-        // held when `new_total_cost` was computed, so the histogram has the
-        // two-sample minimum `build_table_from_symbol_counts` requires.
-        // The custom table won the cost comparison, so build it into the slot
-        // it will occupy rather than on the stack.
-        Some(Choice::New) => {
+        Choice::Predefined => FseTableMode::Predefined(default_table),
+        // The custom table won the cost comparison, so build it now (the only
+        // place the state tables are constructed), into the slot it will
+        // occupy rather than on the stack.
+        Choice::New => {
             build_into_slot(next, |dest| match last_code {
                 Some(lc) => build_seq_ctable_into(&mut counts[..=max_symbol], max_log, lc, dest),
                 None => build_table_from_symbol_counts_into(
@@ -2717,29 +2713,6 @@ fn choose_table_from_counts<'a>(
                     use_low_prob_count,
                     dest,
                 ),
-            });
-            FseTableMode::Encoded(slot_table(next))
-        }
-        None => {
-            let fallback_counts = [counts[0], 0];
-            build_into_slot(next, |dest| {
-                if max_symbol == 0 {
-                    // The builder needs at least two entries, so single-symbol
-                    // streams use a phantom zero-count second slot here.
-                    build_table_from_symbol_counts_into(
-                        &fallback_counts,
-                        max_log,
-                        use_low_prob_count,
-                        dest,
-                    );
-                } else {
-                    build_table_from_symbol_counts_into(
-                        &counts[..=max_symbol],
-                        max_log,
-                        use_low_prob_count,
-                        dest,
-                    );
-                }
             });
             FseTableMode::Encoded(slot_table(next))
         }

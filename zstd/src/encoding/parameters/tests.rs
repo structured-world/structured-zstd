@@ -8,6 +8,21 @@ fn bounds_clamp_to_the_nearest_end() {
     assert_eq!(bounds.clamp(20), 20);
 }
 
+/// A built parameter set takes the raw skip either way and keeps every other
+/// knob it was built with.
+#[test]
+fn with_raw_skip_changes_only_the_raw_skip() {
+    let params = CompressionParameters::builder(CompressionLevel::Level(19))
+        .window_log(20)
+        .build()
+        .unwrap();
+    assert!(params.raw_skip_enabled());
+    let off = params.with_raw_skip(false);
+    assert!(!off.raw_skip_enabled());
+    assert_eq!(off.overrides(), params.overrides());
+    assert!(off.with_raw_skip(true).raw_skip_enabled());
+}
+
 /// Fitting parameters to a small source brings the window and tables down;
 /// an unknown size leaves them alone; a dictionary keeps room for itself.
 #[test]

@@ -465,6 +465,149 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
     }
 }
 
+/// The fast, double-fast and greedy strategies prefer the previous Huffman
+/// table on a section of at most 1 KiB (upstream `preferRepeat`): taken
+/// unchecked when it is known valid, checked against the histogram when not,
+/// and priced raw when the repeat does not save the minimum gain. The
+/// estimator walks those branches in the emitter's order, so its price is the
+/// size the emitter writes for each; with no table to repeat, a compressible
+/// section builds a new one.
+#[test]
+fn the_preferred_repeat_costs_what_the_emitter_writes() {
+    use super::{
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, encode_block_parts,
+        estimate_block_parts_size,
+    };
+    // Every byte value present, so the table codes any section.
+    let seed = {
+        let mut counts = [1usize; 256];
+        counts[b'a' as usize] = 200;
+        counts[b'b' as usize] = 100;
+        huff0_encoder::HuffmanTable::build_from_counts(&counts)
+    };
+    let skewed: Vec<u8> = (0..600u32)
+        .map(|i| match i % 7 {
+            0..=3 => b'a',
+            4 | 5 => b'b',
+            _ => b'c',
+        })
+        .collect();
+    let flat: Vec<u8> = (0..=255u8).collect();
+    for strat in [StrategyTag::Fast, StrategyTag::Dfast, StrategyTag::Greedy] {
+        for (literals, seeded, valid) in [
+            (&skewed, true, true),
+            (&skewed, true, false),
+            (&flat, true, true),
+            (&skewed, false, false),
+        ] {
+            let make_state = || CompressState::<EntropyOnlyMatcher> {
+                matcher: EntropyOnlyMatcher,
+                sequence_capture: None,
+                copy_kernel: crate::encoding::fastpath::select_kernel(),
+                last_huff_table: seeded.then(|| seed.clone()),
+                huf_repeat_valid: valid,
+                huff_table_spare: None,
+                huff_weights: Default::default(),
+                seen_content: Default::default(),
+                fse_tables: FseTables::new(),
+                block_scratch: CompressedBlockScratch::new(),
+                workspace: Workspace::new(),
+                offset_hist: [1, 4, 8],
+                strategy_tag: strat,
+                split_strategy: strat,
+                pre_split: None,
+                huf_optimal_search: true,
+                literal_compression_disabled: false,
+                post_split_allowed: true,
+            };
+            let mut est_state = make_state();
+            let mut emit_state = make_state();
+            let mut workspace = EstimatorWorkspace::default();
+            let est = estimate_block_parts_size(&mut est_state, literals, &[], &mut workspace);
+            let mut emitted: Vec<u8> = Vec::new();
+            let mut codes_ws = Workspace::new();
+            crate::encoding::fastpath::with_encode_tier!(
+                emit_state.copy_kernel,
+                K => encode_block_parts::<_, K>(
+                    &mut emit_state,
+                    literals,
+                    &mut [],
+                    &mut code_buffer(&mut codes_ws, 0),
+                    &mut emitted,
+                )
+            );
+            assert_eq!(
+                est,
+                emitted.len(),
+                "{strat:?} seeded={seeded} valid={valid} len={}: the estimate is not what the \
+                 emitter writes",
+                literals.len(),
+            );
+        }
+    }
+}
+
+/// A short section whose new table would take nearly all it saves goes out
+/// raw (`hSize + 12 >= srcSize`), on the emitter's side and in the price the
+/// estimator gives it.
+#[test]
+fn a_table_not_worth_its_description_costs_a_raw_section() {
+    use super::{
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, encode_block_parts,
+        estimate_block_parts_size,
+    };
+    // Skewed past the flat-histogram gate, too short to carry a description.
+    let mut literals = alloc::vec![b'a'; 6];
+    literals.extend(b'b'..=b'k');
+    let make_state = || CompressState::<EntropyOnlyMatcher> {
+        matcher: EntropyOnlyMatcher,
+        sequence_capture: None,
+        copy_kernel: crate::encoding::fastpath::select_kernel(),
+        last_huff_table: None,
+        huf_repeat_valid: false,
+        huff_table_spare: None,
+        huff_weights: Default::default(),
+        seen_content: Default::default(),
+        fse_tables: FseTables::new(),
+        block_scratch: CompressedBlockScratch::new(),
+        workspace: Workspace::new(),
+        offset_hist: [1, 4, 8],
+        strategy_tag: StrategyTag::BtUltra2,
+        split_strategy: StrategyTag::BtUltra2,
+        pre_split: None,
+        huf_optimal_search: true,
+        literal_compression_disabled: false,
+        post_split_allowed: true,
+    };
+    let mut est_state = make_state();
+    let mut emit_state = make_state();
+    let mut workspace = EstimatorWorkspace::default();
+    let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
+    let mut emitted: Vec<u8> = Vec::new();
+    let mut codes_ws = Workspace::new();
+    crate::encoding::fastpath::with_encode_tier!(
+        emit_state.copy_kernel,
+        K => encode_block_parts::<_, K>(
+            &mut emit_state,
+            &literals,
+            &mut [],
+            &mut code_buffer(&mut codes_ws, 0),
+            &mut emitted,
+        )
+    );
+    // Raw literals: a one-byte header, the bytes, one byte of no sequences.
+    assert_eq!(
+        emitted.len(),
+        1 + literals.len() + 1,
+        "the section is not raw"
+    );
+    assert_eq!(
+        est,
+        emitted.len(),
+        "the estimate is not what the emitter writes"
+    );
+}
+
 #[test]
 fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
     use super::{
@@ -794,7 +937,13 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
 
     // Not the Fast band: it never post-splits, so it is never estimated, and
     // its sequences reach the emitter already coded.
-    for strat in [StrategyTag::Lazy, StrategyTag::BtUltra2] {
+    // Greedy is the one cheap strategy whose sequences reach the estimator
+    // uncoded; it chooses its tables without pricing them.
+    for strat in [
+        StrategyTag::Greedy,
+        StrategyTag::Lazy,
+        StrategyTag::BtUltra2,
+    ] {
         let make_state = || CompressState::<EntropyOnlyMatcher> {
             matcher: EntropyOnlyMatcher,
             sequence_capture: None,

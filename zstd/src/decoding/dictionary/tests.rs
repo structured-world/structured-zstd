@@ -109,6 +109,15 @@ fn decode_dict_rejects_repeat_offsets_beyond_the_content() {
         ),
         "a repeat offset past the content must be refused, got {refused:?}"
     );
+    // The message names the offset and what it reaches past.
+    let message = alloc::format!("{}", refused.unwrap());
+    assert_eq!(
+        message,
+        alloc::format!(
+            "Dictionary repeat offset rep2 = {} reaches past its {content_len}-byte content",
+            content_len + 1
+        )
+    );
 
     let mut raw = reference;
     raw[rep2..rep2 + 4].copy_from_slice(&(content_len as u32).to_le_bytes());

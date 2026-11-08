@@ -1182,14 +1182,9 @@ pub(crate) fn resolve_level_params_for_loaded_dict(
     overrides: &crate::encoding::parameters::ParamOverrides,
 ) -> FrameParams {
     use crate::encoding::cparams::{CONTENTSIZE_UNKNOWN, uses_row_match_finder};
-    if sizes.content == 0 || matches!(level, CompressionLevel::Uncompressed) {
-        let params = resolve_level_params(level, source_size);
-        return FrameParams {
-            params,
-            row_plan: None,
-            split_strategy: params.strategy_tag,
-        };
-    }
+    // `resolve_level_params_with_dict`, the one caller, answers an empty
+    // dictionary and a raw frame before it asks this.
+    debug_assert!(sizes.content != 0 && !matches!(level, CompressionLevel::Uncompressed));
     let frame = crate::encoding::cparams::get_frame_cparams(
         numeric_level(level),
         source_size.unwrap_or(CONTENTSIZE_UNKNOWN),

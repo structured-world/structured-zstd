@@ -66,6 +66,56 @@ fn a_loaded_dictionary_resolves_the_frames_own_shape() {
     assert!(loaded_plan.is_none_or(|plan| !plan.attach));
 }
 
+/// A greedy-to-btlazy2 frame that loads its dictionary still carries the lazy
+/// backend's plan, built from the frame's own cParams with nothing searched in
+/// place, since the dictionary is in the frame's tables.
+#[test]
+fn a_loaded_dictionary_gives_the_lazy_band_a_plan_of_its_own() {
+    let level = CompressionLevel::Level(6);
+    let sizes = crate::encoding::DictionarySizes::raw_content(64 * 1024);
+    let source = 4 * 1024 * 1024u64;
+    let overrides = crate::encoding::parameters::ParamOverrides::default();
+    let loaded =
+        super::resolve_level_params_for_loaded_dict(level, Some(source), sizes, &overrides);
+    let plan = loaded.row_plan.expect("level 6 is in the lazy band");
+    assert!(
+        !plan.attach,
+        "a loaded dictionary is never searched in place"
+    );
+    let own = crate::encoding::cparams::get_frame_cparams(6, source, sizes.content, &overrides);
+    assert_eq!(
+        plan.cdict, own,
+        "the plan is built from the frame's own cParams"
+    );
+}
+
+/// The optimal strategies keep their matcher's scratch beyond the tables, and
+/// a three-byte minimum match adds the short-match table, capped by the
+/// window; every other strategy keeps nothing extra.
+#[test]
+fn bt_strategy_extra_bytes_follow_the_strategy_and_key_width() {
+    use crate::encoding::estimated_bt_strategy_extra_bytes as extra;
+    for ordinal in [1, 2, 3, 4, 5, 6] {
+        assert_eq!(
+            extra(ordinal, 20, 3),
+            0,
+            "ordinal {ordinal} keeps nothing extra"
+        );
+    }
+    for ordinal in [7, 8, 9] {
+        let four = extra(ordinal, 20, 4);
+        assert!(four > 0, "ordinal {ordinal} keeps its matcher's scratch");
+        assert!(
+            extra(ordinal, 20, 3) > four,
+            "a three-byte key adds a table"
+        );
+        assert!(
+            extra(ordinal, 10, 3) < extra(ordinal, 20, 3),
+            "the short-match table is capped by the window"
+        );
+    }
+}
+
 /// A frame that runs a dictionary's cParams keeps the post-split decision of
 /// its own: upstream resolves `postBlockSplitter` from the level's cParams for
 /// the frame before the CDict's replace them. Level 14 over 1 MiB is btlazy2,
