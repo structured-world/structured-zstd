@@ -7,7 +7,7 @@
 //! Upstream zstd flow:
 //!
 //! 1. Caller starts with a zeroed `ldmParams_t` (all auto-derive).
-//! 2. [`LdmParams::adjust_for`] fills the zero-valued knobs from
+//! 2. [`LdmParams::derive`] fills the zero-valued knobs from
 //!    `windowLog` / `strategy` using the same `BOUNDED` clamps as
 //!    upstream zstd.
 //! 3. The returned struct then feeds [`super::gear_hash::GearHashState::new`]
@@ -23,6 +23,10 @@ pub(crate) const LDM_HASHLOG_MIN: u32 = 6;
 pub(crate) const LDM_HASHLOG_MAX: u32 = 30;
 /// Upstream zstd `ZSTD_LDM_BUCKETSIZELOG_MAX` (`zstd.h:1300`).
 pub(crate) const LDM_BUCKETSIZELOG_MAX: u32 = 8;
+/// The window a frame with long-distance matching starts from before the
+/// caller's knobs and the source-size adjustment (upstream
+/// `ZSTD_LDM_DEFAULT_WINDOW_LOG`, zstd_compress_internal.h).
+pub(crate) const LDM_DEFAULT_WINDOW_LOG: u32 = 27;
 
 /// Upstream zstd strategy ordinal for `ZSTD_btultra`. Triggers the
 /// `minMatchLength /= 2` step in `adjust_for`. Upstream zstd `zstd.h`
@@ -34,7 +38,7 @@ pub(crate) const STRATEGY_BTULTRA: u32 = 8;
 /// bucket hash table. Field semantics mirror upstream zstd `ldmParams_t`.
 ///
 /// All-zero `LdmParams::default()` is the upstream zstd sentinel for
-/// "auto-derive every knob"; [`Self::adjust_for`] performs that
+/// "auto-derive every knob"; [`Self::derive`] performs that
 /// derivation.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LdmParams {
@@ -64,7 +68,10 @@ impl LdmParams {
     /// (`zstd_ldm.c:135`). Strategy is the upstream zstd 1..=9 enum ordinal
     /// (fast=1 .. btultra2=9).
     ///
-    /// Returns a fully-initialised `LdmParams` with no zero fields.
+    /// Returns a fully-initialised `LdmParams` with no zero fields. The encoder
+    /// seeds the caller's knobs first and calls [`Self::derive`]; this is the
+    /// all-auto case the tests pin.
+    #[cfg(test)]
     pub(crate) fn adjust_for(window_log: u32, strategy: u32) -> Self {
         Self {
             window_log,

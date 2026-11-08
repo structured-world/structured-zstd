@@ -9,7 +9,17 @@ pub(crate) struct Scenario {
     pub(crate) label: String,
     pub(crate) bytes: Vec<u8>,
     pub(crate) class: ScenarioClass,
+    /// Further frames of the same size and shape as `bytes`, which the timed
+    /// loops visit in turn after it. A small frame compressed over and over
+    /// lets the branch predictor learn that one frame's outcomes, so the cell
+    /// would measure how well each binary's branches are memorized rather than
+    /// the codec. Empty where one frame is too large to be memorized.
+    more_frames: Vec<Vec<u8>>,
 }
+
+/// Distinct frames a small fixture cycles through: enough that their branch
+/// history is far beyond what a predictor holds.
+const DISTINCT_FRAMES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScenarioClass {
@@ -40,17 +50,26 @@ pub(crate) struct LevelConfig {
     pub(crate) dict: bool,
 }
 
-/// Resolve the LDM-enabled [`CompressionParameters`] for a variant, or `None`
-/// for the plain numeric levels (`ldm = false`). Shared by both bench
-/// binaries (`compare_ffi` timing/ratio + `compare_ffi_memory`) so the Rust
-/// LDM encode path is wired identically in each. LDM-only parameters set no
-/// bounds-checked knobs, so `build()` cannot fail.
+/// Resolve the [`CompressionParameters`] a variant needs, or `None` when the
+/// level alone describes it. Shared by both bench binaries (`compare_ffi`
+/// timing/ratio + `compare_ffi_memory`) so the Rust encode path is wired
+/// identically in each. Two knobs: LDM for the `*_ldm*` variants, and
+/// `RAW_SKIP=0` in the environment turns the raw skip off, so every block is
+/// searched the way libzstd searches it. Neither is bounds-checked, so
+/// `build()` cannot fail.
 pub(crate) fn ldm_parameters(level: &LevelConfig) -> Option<CompressionParameters> {
-    level.ldm.then(|| {
-        CompressionParameters::builder(level.rust_level)
-            .enable_long_distance_matching(true)
+    let skip_off = env::var("RAW_SKIP").is_ok_and(|v| v == "0");
+    (level.ldm || skip_off).then(|| {
+        let mut builder = CompressionParameters::builder(level.rust_level);
+        if level.ldm {
+            builder = builder.enable_long_distance_matching(true);
+        }
+        if skip_off {
+            builder = builder.raw_skip(false);
+        }
+        builder
             .build()
-            .expect("LDM-only parameters set no bounds-checked knobs, build cannot fail")
+            .expect("LDM and raw-skip parameters set no bounds-checked knobs, build cannot fail")
     })
 }
 
@@ -91,22 +110,22 @@ pub(crate) fn dictionary_size_for(input_len: usize) -> usize {
 
 pub(crate) fn benchmark_scenarios() -> Vec<Scenario> {
     let mut scenarios = vec![
-        Scenario::new(
+        Scenario::from_frames(
             "small-1k-random",
             "Small random payload (1 KiB)",
-            random_bytes(1024, 0x5EED_1000),
+            distinct_random_frames(1024, 0x5EED_1000),
             ScenarioClass::Small,
         ),
-        Scenario::new(
+        Scenario::from_frames(
             "small-10k-random",
             "Small random payload (10 KiB)",
-            random_bytes(10 * 1024, 0x0005_EED1_0000),
+            distinct_random_frames(10 * 1024, 0x0005_EED1_0000),
             ScenarioClass::Small,
         ),
-        Scenario::new(
+        Scenario::from_frames(
             "small-4k-log-lines",
             "Small structured log lines (4 KiB)",
-            repeated_log_lines(4 * 1024),
+            distinct_log_line_frames(4 * 1024),
             ScenarioClass::Small,
         ),
         load_decode_corpus_scenario(),
@@ -399,11 +418,45 @@ impl Scenario {
             label: label.into(),
             bytes,
             class,
+            more_frames: Vec::new(),
         }
+    }
+
+    /// A scenario whose timed loops cycle through `frames`, all of one length;
+    /// the first is its `bytes`.
+    fn from_frames(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        mut frames: Vec<Vec<u8>>,
+        class: ScenarioClass,
+    ) -> Self {
+        assert!(!frames.is_empty(), "a scenario needs at least one frame");
+        let first = frames.remove(0);
+        assert!(
+            frames.iter().all(|frame| frame.len() == first.len()),
+            "every frame of a scenario has the same length"
+        );
+        let mut scenario = Self::new(id, label, first, class);
+        scenario.more_frames = frames;
+        scenario
     }
 
     pub(crate) fn len(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// How many distinct frames the timed loops cycle through.
+    pub(crate) fn frame_count(&self) -> usize {
+        1 + self.more_frames.len()
+    }
+
+    /// The frame a timed loop compresses on its `index`-th call. Both arms of a
+    /// comparison count their own calls from zero, so they see one sequence.
+    pub(crate) fn frame(&self, index: usize) -> &[u8] {
+        match index % self.frame_count() {
+            0 => &self.bytes,
+            i => &self.more_frames[i - 1],
+        }
     }
 
     pub(crate) fn throughput_bytes(&self) -> u64 {
@@ -416,6 +469,27 @@ fn random_bytes(len: usize, seed: u64) -> Vec<u8> {
     let mut bytes = vec![0u8; len];
     rng.fill(&mut bytes[..]);
     bytes
+}
+
+/// `DISTINCT_FRAMES` random frames of `len` bytes; the first is the one
+/// `random_bytes(len, seed)` gives.
+fn distinct_random_frames(len: usize, seed: u64) -> Vec<Vec<u8>> {
+    (0..DISTINCT_FRAMES as u64)
+        .map(|i| random_bytes(len, seed.wrapping_add(i)))
+        .collect()
+}
+
+/// `DISTINCT_FRAMES` windows of `len` bytes over one log stream, each starting
+/// a few bytes further in, so every frame holds the same lines in a different
+/// alignment and compresses alike; the first is `repeated_log_lines(len)`.
+fn distinct_log_line_frames(len: usize) -> Vec<Vec<u8>> {
+    // A prime that does not divide the stream's period (the four lines, 380
+    // bytes), so no two of the windows coincide.
+    const STRIDE: usize = 37;
+    let stream = repeated_log_lines(len + STRIDE * (DISTINCT_FRAMES - 1));
+    (0..DISTINCT_FRAMES)
+        .map(|i| stream[i * STRIDE..i * STRIDE + len].to_vec())
+        .collect()
 }
 
 fn repeated_pattern_bytes(len: usize) -> Vec<u8> {

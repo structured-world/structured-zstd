@@ -132,15 +132,6 @@ pub(crate) trait Strategy: Copy + 'static {
     /// Match-finder backend this strategy runs on.
     const BACKEND: BackendTag;
 
-    /// Nominal minimum match length for this strategy, mirroring the
-    /// upstream `clevels.h` `searchLength` column (3 for btultra/btultra2,
-    /// where the mls=3 hash3 probe is active). Descriptive: the optimal
-    /// parser's actual acceptance floor is the crate-wide
-    /// `HC_OPT_MIN_MATCH_LEN` (= 3) and the row matcher uses
-    /// `ROW_MIN_MATCH_LEN`; this const documents the strategy's intent and
-    /// is not read on the hot path.
-    const MIN_MATCH: usize;
-
     /// `accurate` flag for [`crate::encoding::cost_model::HcOptimalCostProfile`]
     /// — enables refined statistics weighting (upstream zstd `ZSTD_btultra` and
     /// above).
@@ -150,16 +141,12 @@ pub(crate) trait Strategy: Copy + 'static {
     /// favour decompression speed; disabled for BtUltra / BtUltra2.
     const FAVOR_SMALL_OFFSETS: bool;
 
-    /// Compile-time gate for the `static (mls==3)` short-match probe.
-    /// Both btultra and btultra2 search the hash3 table (their
-    /// `clevels.h` minMatch is 3); btopt does not (minMatch >= 4).
-    const USE_HASH3: bool;
-
     /// Whether the optimal parser runs the in-block two-pass dynamic
     /// statistics seed (upstream `ZSTD_initStats_ultra`). Only btultra2
-    /// does this; btultra is single-pass even though it now shares the
-    /// hash3 short-match probe. Defaults to `false` so every other
-    /// strategy drops the seed-pass body at codegen time.
+    /// does this. Defaults to `false` so every other strategy drops the
+    /// seed-pass body at codegen time. The match geometry (key width, hash3,
+    /// compare budget) is not a strategy const: it comes from the frame's
+    /// cParams, as upstream reads it.
     const TWO_PASS_SEED: bool = false;
 
     /// Whether the optimal parser walks the BT — `false` for Lazy2,
@@ -170,10 +157,6 @@ pub(crate) trait Strategy: Copy + 'static {
     /// `opt_level >= 2` price-table refinement in
     /// `build_optimal_plan_impl_body!`.
     const OPT_LEVEL: u8;
-
-    /// Upstream zstd `max_chain_depth` for the optimal-parser cost profile.
-    /// Used by `HcOptimalCostProfile::const_for_strategy::<S>()`.
-    const MAX_CHAIN_DEPTH: usize;
 
     /// Upstream zstd `sufficient_match_len` — the BT walker bails out as soon
     /// as a candidate at or above this length is seen. `usize::MAX`
@@ -187,24 +170,20 @@ pub(crate) struct Fast;
 
 impl Strategy for Fast {
     const BACKEND: BackendTag = BackendTag::Simple;
-    const MIN_MATCH: usize = 4;
     const ACCURATE_PRICE: bool = false;
     const FAVOR_SMALL_OFFSETS: bool = true;
-    const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
-    // `MAX_CHAIN_DEPTH` / `SUFFICIENT_MATCH_LEN` are placeholder
-    // values for non-BT strategies — the trait associated consts
-    // must be total, but only the optimal parser reads them and
-    // it runs exclusively under `S::USE_BT == true`. The
+    // `SUFFICIENT_MATCH_LEN` is a placeholder for non-BT strategies — the
+    // trait associated consts must be total, but only the optimal parser
+    // reads it and it runs exclusively under `S::USE_BT == true`. The
     // `debug_assert!(<S>::USE_BT, …)` guard in
     // `HcOptimalCostProfile::const_for_strategy` plus the
     // `debug_assert!(<S>::USE_BT, …)` at the top of
     // `build_optimal_plan_impl_body!` make this unreachable in
     // debug builds. Future refactors that introduce a non-BT
-    // reader must add a fresh guard or replace these placeholders
-    // with real Fast values.
-    const MAX_CHAIN_DEPTH: usize = 8;
+    // reader must add a fresh guard or replace the placeholder
+    // with a real Fast value.
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
@@ -214,15 +193,12 @@ pub(crate) struct Dfast;
 
 impl Strategy for Dfast {
     const BACKEND: BackendTag = BackendTag::Dfast;
-    const MIN_MATCH: usize = 4;
     const ACCURATE_PRICE: bool = false;
     const FAVOR_SMALL_OFFSETS: bool = true;
-    const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
-    // Placeholder optimal-parser consts; see `Fast` for the
+    // Placeholder optimal-parser const; see `Fast` for the
     // unreachable-by-design contract.
-    const MAX_CHAIN_DEPTH: usize = 8;
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
@@ -232,15 +208,12 @@ pub(crate) struct Greedy;
 
 impl Strategy for Greedy {
     const BACKEND: BackendTag = BackendTag::Row;
-    const MIN_MATCH: usize = 4;
     const ACCURATE_PRICE: bool = false;
     const FAVOR_SMALL_OFFSETS: bool = true;
-    const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
-    // Placeholder optimal-parser consts; see `Fast` for the
+    // Placeholder optimal-parser const; see `Fast` for the
     // unreachable-by-design contract.
-    const MAX_CHAIN_DEPTH: usize = 8;
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
@@ -254,19 +227,13 @@ pub(crate) struct Lazy;
 
 impl Strategy for Lazy {
     const BACKEND: BackendTag = BackendTag::Row;
-    const MIN_MATCH: usize = 4;
     const ACCURATE_PRICE: bool = false;
     const FAVOR_SMALL_OFFSETS: bool = true;
-    const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
     // Lazy runs on the Row backend with `USE_BT == false`, so the
-    // optimal parser entry point is unreachable for this strategy.
-    // These values mirror the upstream zstd `lazy2` cost profile (would be
-    // the right defaults if a future caller did build a profile for
-    // the lazy path), but with no current reader the same
-    // unreachable-by-design contract from `Fast` applies.
-    const MAX_CHAIN_DEPTH: usize = 8;
+    // optimal parser entry point is unreachable for this strategy; the
+    // same unreachable-by-design contract from `Fast` applies.
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
@@ -279,15 +246,12 @@ pub(crate) struct Btlazy2;
 
 impl Strategy for Btlazy2 {
     const BACKEND: BackendTag = BackendTag::Row;
-    const MIN_MATCH: usize = 5;
     const ACCURATE_PRICE: bool = false;
     const FAVOR_SMALL_OFFSETS: bool = true;
-    const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
-    // Placeholder optimal-parser consts; see `Fast` for the
+    // Placeholder optimal-parser const; see `Fast` for the
     // unreachable-by-design contract.
-    const MAX_CHAIN_DEPTH: usize = 64;
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
@@ -298,55 +262,40 @@ pub(crate) struct BtOpt;
 
 impl Strategy for BtOpt {
     const BACKEND: BackendTag = BackendTag::HashChain;
-    const MIN_MATCH: usize = 4;
     const ACCURATE_PRICE: bool = false;
     const FAVOR_SMALL_OFFSETS: bool = true;
-    const USE_HASH3: bool = false;
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 0;
-    const MAX_CHAIN_DEPTH: usize = 32;
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
 /// Level 18 — upstream `ZSTD_btultra`. BT + opt with refined price
-/// tables and no small-offset bias; shares the mls=3 hash3 short-match
-/// probe but stays single-pass (no two-pass dynamic-stats seed).
+/// tables and no small-offset bias; single-pass (no two-pass dynamic-stats
+/// seed).
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct BtUltra;
 
 impl Strategy for BtUltra {
     const BACKEND: BackendTag = BackendTag::HashChain;
-    const MIN_MATCH: usize = 3;
     const ACCURATE_PRICE: bool = true;
     const FAVOR_SMALL_OFFSETS: bool = false;
-    // clevels.h level 18 minMatch = 3 → the hash3 short-match probe is
-    // active, same as btultra2. The two-pass seed stays btultra2-only
-    // (TWO_PASS_SEED defaults to false here).
-    const USE_HASH3: bool = true;
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 2;
-    // 1 << searchLog for level 18 (clevels.h searchLog = 6). The BT walk
-    // caps compares at min(MAX_CHAIN_DEPTH, hc.search_depth); both must be
-    // >= 64 for level 18 to reach upstream search depth.
-    const MAX_CHAIN_DEPTH: usize = 64;
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
 /// Levels 19-22 — upstream `ZSTD_btultra2`. BT + opt with the two-pass
-/// dynamic-statistics seed and the hash3 short-match table.
+/// dynamic-statistics seed.
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct BtUltra2;
 
 impl Strategy for BtUltra2 {
     const BACKEND: BackendTag = BackendTag::HashChain;
-    const MIN_MATCH: usize = 3;
     const ACCURATE_PRICE: bool = true;
     const FAVOR_SMALL_OFFSETS: bool = false;
-    const USE_HASH3: bool = true;
     const TWO_PASS_SEED: bool = true;
     const USE_BT: bool = true;
     const OPT_LEVEL: u8 = 2;
-    const MAX_CHAIN_DEPTH: usize = 512;
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 

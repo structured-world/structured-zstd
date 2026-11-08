@@ -38,11 +38,30 @@ fn a_row_strategy_hash_table_fits_one_hash() {
         target_length: 0,
         strategy,
     };
+    use crate::encoding::parameters::RowMatchFinderMode;
     for strategy in 3..=5 {
-        let cp = adjust_cparams(wide(strategy), CONTENTSIZE_UNKNOWN, 0, false);
-        assert_eq!(cp.hash_log, 32 - 8 + 4, "strategy {strategy}");
+        for rows in [RowMatchFinderMode::Auto, RowMatchFinderMode::Enable] {
+            let cp = adjust_cparams(wide(strategy), CONTENTSIZE_UNKNOWN, 0, false, rows);
+            assert_eq!(cp.hash_log, 32 - 8 + 4, "strategy {strategy} {rows:?}");
+        }
+        // Rows disabled outright: the chain searches the table, upstream skips
+        // the cap (zstd_compress.c:1591-1597).
+        let cp = adjust_cparams(
+            wide(strategy),
+            CONTENTSIZE_UNKNOWN,
+            0,
+            false,
+            RowMatchFinderMode::Disable,
+        );
+        assert_eq!(cp.hash_log, 30, "strategy {strategy} without rows");
     }
-    let cp = adjust_cparams(wide(6), CONTENTSIZE_UNKNOWN, 0, false);
+    let cp = adjust_cparams(
+        wide(6),
+        CONTENTSIZE_UNKNOWN,
+        0,
+        false,
+        RowMatchFinderMode::Auto,
+    );
     assert_eq!(cp.hash_log, 30);
 }
 

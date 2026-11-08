@@ -49,12 +49,11 @@ pub(crate) const HUF_TABLELOG_ABSOLUTEMAX: usize = 12;
 #[inline(always)]
 pub(crate) fn pack_huf_celt(value: u32, nb_bits: u8) -> u64 {
     debug_assert!((nb_bits as usize) <= HUF_TABLELOG_ABSOLUTEMAX);
-    if nb_bits == 0 {
-        return 0;
-    }
     let nb = nb_bits as u64;
     debug_assert!((value as u64) >> nb == 0, "value must fit in nb_bits");
-    nb | ((value as u64) << (HUF_BITS_IN_CONTAINER as u64 - nb))
+    // An empty code has value 0, so the shift by the whole container that
+    // `wrapping_shl` wraps to 0 still packs it to 0, with no branch on it.
+    nb | (value as u64).wrapping_shl((HUF_BITS_IN_CONTAINER - nb_bits as usize) as u32)
 }
 
 /// Dual-container bit packer matching upstream zstd `HUF_CStream_t`.

@@ -260,7 +260,11 @@ impl HcOptState {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9,
             10, 11, 12, 13, 14, 15, 16,
         ];
-        let ll = lit_len.min(131_071) as u32;
+        // A sequence's literals lie inside its block, so the length is below
+        // the block maximum, which `lit_length_price` prices on its own
+        // (upstream `ZSTD_LLcode` takes the same range unchecked).
+        debug_assert!(lit_len < HC_BLOCKSIZE_MAX);
+        let ll = lit_len as u32;
         if ll < 64 {
             let code = LL_CODE[ll as usize] as usize;
             (code, LL_BITS[code] as u32)
@@ -293,8 +297,10 @@ impl HcOptState {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
         ];
-        let ml = match_len.clamp(3, 131_074);
-        let ml_base = (ml - 3) as u32;
+        // A match is at least the format minimum and lies inside its block
+        // (upstream `ZSTD_MLcode` takes the same range unchecked).
+        debug_assert!((3..=HC_BLOCKSIZE_MAX + 2).contains(&match_len));
+        let ml_base = (match_len - 3) as u32;
         if ml_base < 128 {
             let code = ML_CODE[ml_base as usize] as usize;
             (code, ML_BITS[code] as u32)
@@ -515,8 +521,12 @@ impl HcOptimalCostProfile {
         }
         // ll_bits ≤ 16 ⇒ ll_bits * 256 ≤ 4096, sum no overflow.
         let (ll_code, ll_bits) = HcOptState::lit_code_and_bits(lit_len);
+        // The code of a length below the block maximum is at most `HC_MAX_LL`.
+        debug_assert!(ll_code <= HC_MAX_LL);
+        // SAFETY: `ll_code <= HC_MAX_LL`, the table's last index.
+        let freq = unsafe { *stats.lit_length_freq.get_unchecked(ll_code) };
         ll_bits * HC_BITCOST_MULTIPLIER + stats.lit_length_sum_base_price
-            - HcOptState::weight(stats.lit_length_freq[ll_code], ACCURATE)
+            - HcOptState::weight(freq, ACCURATE)
     }
 
     #[inline(always)]
@@ -554,9 +564,12 @@ impl HcOptimalCostProfile {
             return HcOptState::weight(ml_base as u32, ACCURATE);
         }
         let (ml_code, ml_bits) = HcOptState::ml_code_and_bits(match_len);
+        // The code of a length inside a block is at most `HC_MAX_ML`.
+        debug_assert!(ml_code <= HC_MAX_ML);
+        // SAFETY: `ml_code <= HC_MAX_ML`, the table's last index.
+        let freq = unsafe { *stats.match_length_freq.get_unchecked(ml_code) };
         ml_bits * HC_BITCOST_MULTIPLIER
-            + (stats.match_length_sum_base_price
-                - HcOptState::weight(stats.match_length_freq[ml_code], ACCURATE))
+            + (stats.match_length_sum_base_price - HcOptState::weight(freq, ACCURATE))
     }
 
     #[inline(always)]

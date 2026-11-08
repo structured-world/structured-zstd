@@ -31,10 +31,11 @@ fn main() {
     let include_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("include");
 
     // Stage the vendored headers next to the built library so downstream
-    // packaging can install them under /usr/include alongside the .so.
+    // packaging can install them under /usr/include alongside the .so, with
+    // the header that declares this library's own extensions.
     let include_dst = out_dir.join("include");
     fs::create_dir_all(&include_dst).expect("create OUT_DIR/include");
-    for header in ["zstd.h", "zdict.h", "zstd_errors.h"] {
+    for header in ["zstd.h", "zdict.h", "zstd_errors.h", "structured_zstd.h"] {
         fs::copy(include_src.join(header), include_dst.join(header))
             .unwrap_or_else(|e| panic!("copy vendored header {header}: {e}"));
         println!("cargo:rerun-if-changed=include/{header}");

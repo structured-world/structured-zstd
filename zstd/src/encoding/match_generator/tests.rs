@@ -17,6 +17,7 @@ const BTULTRA2_HC_CONFIG: HcConfig = HcConfig {
     search_depth: 512,
     target_len: 256,
     search_mls: 4,
+    min_match: 3,
 };
 const BTULTRA2_HC_CONFIG_L22: HcConfig = HcConfig {
     hash_log: 25,
@@ -24,6 +25,7 @@ const BTULTRA2_HC_CONFIG_L22: HcConfig = HcConfig {
     search_depth: 512,
     target_len: 999,
     search_mls: 4,
+    min_match: 3,
 };
 const BTULTRA2_HC_CONFIG_L22_16K: HcConfig = HcConfig {
     hash_log: 15,
@@ -31,6 +33,7 @@ const BTULTRA2_HC_CONFIG_L22_16K: HcConfig = HcConfig {
     search_depth: 1 << 10,
     target_len: 999,
     search_mls: 4,
+    min_match: 3,
 };
 
 #[cfg(test)]
@@ -648,7 +651,8 @@ fn level22_non_power_of_two_small_source_uses_tier3_params() {
     assert_eq!(hc.chain_log, 15);
     assert_eq!(hc.hash_log, 15);
     assert_eq!(hc.search_depth, 1 << 10);
-    assert_eq!(HC_OPT_MIN_MATCH_LEN, 3);
+    assert_eq!(hc.min_match, 3);
+    assert!(hc.searches_hash3());
     assert_eq!(hc.target_len, 999);
 }
 
@@ -698,6 +702,27 @@ fn level22_small_source_uses_window_bounded_hash3_log() {
         27,
     );
     assert_eq!(hc.table.hash3_log, HC3_HASH_LOG);
+}
+
+/// A 1 KiB frame at level 19 lays its tables out at the widths upstream
+/// resolves for that source (`ZSTD_getCParams(19, 1024, 0)`: windowLog 10,
+/// hashLog 11, chainLog 11, and hashLog3 = MIN(17, windowLog) = 10), not at
+/// the level's full widths: a wider table is memory every small frame clears
+/// and then misses in.
+#[test]
+fn level19_one_kib_frame_takes_the_source_sized_widths() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+    driver.set_source_size_hint(1024);
+    let mut context = Workspace::new();
+    context.begin_layout(1024, no_trailing, IngestPlan::Stream);
+    driver.reset_in_workspace(CompressionLevel::Level(19), &mut context);
+    let hc = driver.hc_matcher();
+    assert_eq!(
+        (hc.table.hash_log, hc.table.chain_log, hc.table.hash3_log),
+        (11, 11, 10),
+        "hash, chain and hash3 logs of a 1 KiB level-19 frame",
+    );
 }
 
 #[test]
@@ -930,22 +955,30 @@ fn btultra2_profile_disables_small_offset_handicap() {
     }
 }
 
+/// The optimal search spends `1 << searchLog` compares and builds hash3 for a
+/// `minMatch` of 3, whatever its strategy (`ZSTD_insertBtAndGetAllMatches`,
+/// `ZSTD_reset_matchState`). The small tiers are where a per-strategy cap would
+/// show: level 17 at 100 KiB is btultra with searchLog 8, level 22 at 200 KiB
+/// btultra2 with searchLog 13, level 14 at 200 KiB btopt with minMatch 3.
 #[test]
-fn btultra_keeps_search_depth_budget() {
-    assert_eq!(
-        <super::super::strategy::BtUltra as super::super::strategy::Strategy>::MAX_CHAIN_DEPTH,
-        64,
-        "btultra chain-depth budget must match clevels.h level 18 searchLog 6 (1 << 6 = 64)"
-    );
-}
-
-#[test]
-fn btopt_keeps_search_depth_budget() {
-    assert_eq!(
-        <super::super::strategy::BtOpt as super::super::strategy::Strategy>::MAX_CHAIN_DEPTH,
-        32,
-        "btopt should not cap chain depth below upstream zstd btopt search budget"
-    );
+fn the_optimal_search_takes_its_budget_and_hash3_from_the_cparams() {
+    for level in 1..=22 {
+        for source in [10 * 1024u64, 100 * 1024, 200 * 1024, 1 << 20] {
+            let cp = crate::encoding::cparams::get_cparams(level, source, 0);
+            let params = resolve_level_params(CompressionLevel::Level(level), Some(source));
+            let Some(hc) = params.hc else { continue };
+            assert_eq!(
+                hc.search_depth,
+                1 << cp.search_log,
+                "level {level}, {source} bytes"
+            );
+            assert_eq!(
+                hc.searches_hash3(),
+                cp.min_match == 3,
+                "level {level}, {source} bytes"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1321,9 +1354,11 @@ fn hc_repcode_candidates_respect_litlen_dependent_rep_order() {
     let candidates = |lit_len: usize| {
         let mut hc = HcMatchGenerator::new(64);
         hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
-        // Only the repeats: no tree compare.
+        // Only the repeats: no tree compare, and no hash3 table (a `minMatch`
+        // of 4), which would find the 3-byte `ABC` at offset 6 on its own.
         hc.hc.search_depth = 0;
         hc.table.search_depth = 0;
+        hc.table.hash3_log = 0;
         // Eight bytes past the searched position, as the parser leaves every
         // position it searches.
         hc.table.history = b"xxxxxxABCDEFABCDEFzzzzzzzz".to_vec().into();
@@ -1429,19 +1464,23 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
     use crate::encoding::fastpath::ScalarTier;
     use crate::encoding::strategy::StrategyTag;
     // The public dispatcher must route every BT strategy tag to the collector
-    // AND to the specialization carrying that tag's consts — not just survive.
-    // The observable dimension is `USE_HASH3` (BtUltra / BtUltra2 = true; BtOpt
-    // = false): only the hash3 specializations surface a 3-byte match that the
-    // 4-byte BT hash cannot find. Fixture: `abc` repeats at 0 and 12 with a
-    // differing 4th byte (`Q` vs `Z`), so hash3 finds a length-3 match at
-    // offset 12 while the 4-byte hash of `abcZ` misses `abcQ`. Run under the
-    // scalar kernel so the scalar dispatch arm is exercised too.
-    for tag in [
+    // AND to the search the frame's geometry selects — not just survive. The
+    // observable dimension is the hash3 table, which upstream builds for a
+    // `minMatch` of 3 whatever the optimal strategy (`ZSTD_reset_matchState`):
+    // only the mls-3 search surfaces a 3-byte match that the 4-byte BT hash
+    // cannot find. Fixture: `abc` repeats at 0 and 12 with a differing 4th byte
+    // (`Q` vs `Z`), so hash3 finds a length-3 match at offset 12 while the
+    // 4-byte hash of `abcZ` misses `abcQ`. Run under the scalar kernel so the
+    // scalar dispatch arm is exercised too.
+    for (tag, hash3_log) in [
         StrategyTag::Btlazy2,
         StrategyTag::BtOpt,
         StrategyTag::BtUltra,
         StrategyTag::BtUltra2,
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|tag| [(tag, 0), (tag, 8)])
+    {
         let mut hc = HcMatchGenerator::new(64);
         hc.strategy_tag = tag;
         hc.table.history = b"abcQ00000000abcZ00000000".to_vec().into();
@@ -1449,7 +1488,7 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
         hc.table.history_abs_start = 0;
         hc.table.hash_log = 8;
         hc.table.chain_log = 8;
-        hc.table.hash3_log = 8;
+        hc.table.hash3_log = hash3_log;
         hc.table.ensure_tables();
         hc.table.search_depth = 8;
         let abs_pos = 12usize;
@@ -1467,12 +1506,12 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
             },
             &mut out,
         );
-        let uses_hash3 = matches!(tag, StrategyTag::BtUltra | StrategyTag::BtUltra2);
         let found_hash3_match = out.iter().any(|c| c.offset == 12 && c.match_len == 3);
         assert_eq!(
-            found_hash3_match, uses_hash3,
-            "tag {tag:?}: presence of the hash3-only 3-byte match must equal USE_HASH3 \
-             (a cross-group dispatch mis-mapping would flip this)"
+            found_hash3_match,
+            hash3_log != 0,
+            "tag {tag:?}, hash3_log {hash3_log}: the hash3-only 3-byte match appears \
+             exactly when the frame has a hash3 table"
         );
     }
 }
@@ -1581,8 +1620,9 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
     let abs_pos = 9usize;
     hc.table.ensure_tables();
     hc.table.search_depth = 32;
-    let end = hc.table.history.len();
-    with_host_tier!(K => hc.table.bt_update_tree_until::<K>(abs_pos, end));
+    // The search's own catch-up inserts `0..abs_pos` into the tree first: the
+    // insert cursor starts at the history and only moves forward, so no
+    // position is inserted twice.
     hc.table.skip_insert_until_abs = 0;
 
     let mut out = Vec::new();
@@ -1741,8 +1781,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     // `configure()` path so derived state (`hash3_log`, `is_btultra2`)
     // stays consistent — manually flipping the
     // strategy flags here used to leave `hash3_log` / `hash3_table` in
-    // the previous mode's shape and trip the
-    // `Strategy::USE_HASH3 ⇒ hash3_log != 0` debug invariant inside
+    // the previous mode's shape and trip the search's hash3 invariant inside
     // `collect_optimal_candidates_initialized_body`.
     use super::super::strategy::StrategyTag;
 
@@ -1752,6 +1791,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
         search_depth: 32,
         target_len: 256,
         search_mls: 4,
+        min_match: 3,
     };
     let window_log = 20u8;
 
@@ -1844,8 +1884,9 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     // The window is now sized the C-faithful way: `get_cparams` clamps it to
     // the raw 1 KiB source (`window_log = ceil_log2(1024) = 10 = MIN_WINDOW_LOG`),
     // dropping the old MIN_HINTED_WINDOW_LOG 16 KiB interop floor (verified safe:
-    // such small-window frames decode in the C reference). Both dfast tables
-    // follow at that window.
+    // such small-window frames decode in the C reference). Both dfast tables are
+    // then held to the source's log, one bit under the long table's resolved
+    // `hashLog`, so a small frame clears half the table.
     assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
     assert_eq!(hinted_long, 1 << MIN_WINDOW_LOG);
     assert_eq!(hinted_short, 1 << MIN_WINDOW_LOG);
@@ -2065,9 +2106,13 @@ fn a_pledged_stream_lays_out_history_for_all_of_its_input() {
 /// on a 100 KiB source is dfast, but a 4 KiB CDict is fast.
 #[test]
 fn dictionary_frame_takes_the_cdict_strategy_across_backend_families() {
-    use crate::encoding::levels::config::resolve_level_params_with_dict;
+    use crate::encoding::levels::config::{FrameParams, resolve_level_params_with_dict};
     use crate::encoding::strategy::{BackendTag, StrategyTag};
-    let (params, plan) = resolve_level_params_with_dict(
+    let FrameParams {
+        params,
+        row_plan: plan,
+        ..
+    } = resolve_level_params_with_dict(
         CompressionLevel::Level(13),
         Some(4096),
         crate::encoding::DictionarySizes::raw_content(300 * 1024),
@@ -2077,7 +2122,11 @@ fn dictionary_frame_takes_the_cdict_strategy_across_backend_families() {
     assert_eq!(params.backend(), BackendTag::Row);
     assert!(plan.is_some(), "a lazy-band CDict carries a plan");
     assert!(params.row.is_some_and(|r| r.bt));
-    let (params, plan) = resolve_level_params_with_dict(
+    let FrameParams {
+        params,
+        row_plan: plan,
+        ..
+    } = resolve_level_params_with_dict(
         CompressionLevel::Level(2),
         Some(100 * 1024),
         crate::encoding::DictionarySizes::raw_content(4096),
@@ -2495,17 +2544,17 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     driver.reset(CompressionLevel::Level(5));
     driver.commit_input(b"abcabcabcabc");
     driver.skip_matching_with_hint(None);
-    let full_rows = driver.row_matcher().row_heads().len();
+    let full_rows = driver.row_matcher().row_count();
     // Level 5 uses the upstream row_log (clamp(searchLog=3, 4, 6) = 4) and the
     // upstream L5 hashLog (`ZSTD_getCParams(5,..).hashLog` = 19), so the row
-    // count is 1 << (ROW_L5.hash_bits - ROW_L5.row_log).
-    assert_eq!(full_rows, 1 << (ROW_L5.hash_bits - ROW_L5.row_log));
+    // count is 1 << (19 - 4).
+    assert_eq!(full_rows, 1 << (19 - 4));
 
     // A hint that keeps the resolved window > 14 STILL uses the Row finder
     // (upstream `ZSTD_resolveRowMatchFinderMode`: row mode on for windowLog > 14)
     // and shrinks the row hash table to the source-derived width. 64 KiB →
-    // raw source log 16, so `row_hash_bits_for_window(1 << 16)` < the level's
-    // full hash_bits (19) and the row count drops.
+    // source log 16, so `ZSTD_adjustCParams_internal` caps hashLog at 17, under
+    // the level's full 19, and the row count drops.
     driver.set_source_size_hint(1 << 16);
     driver.reset(CompressionLevel::Level(5));
     driver.commit_input(b"xyzxyzxyzxyz");
@@ -2515,7 +2564,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
         super::super::strategy::BackendTag::Row,
         "windowLog > 14 keeps the upstream row matchfinder"
     );
-    let hinted_rows = driver.row_matcher().row_heads().len();
+    let hinted_rows = driver.row_matcher().row_count();
     assert!(
         hinted_rows < full_rows,
         "a window>14 source hint should reduce the row hash table footprint"
@@ -3397,6 +3446,122 @@ fn fast_dict_attach_follows_the_source_size_cutoff() {
 }
 
 #[test]
+fn an_unsearched_last_block_of_a_borrowed_frame_is_not_indexed() {
+    // A frame scanned in place is the whole input, so its last block has no
+    // later block to match into it and the next frame does not continue its
+    // positions. Written off unsearched, that block is only staged; an earlier
+    // one is still indexed for the blocks after it.
+    let mut state = 0x9e37_79b9_u32;
+    let input: Vec<u8> = (0..4096)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let half = input.len() / 2;
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.set_source_size_hint(input.len() as u64);
+    driver.reset(CompressionLevel::Level(3));
+    // SAFETY: `input` outlives the window, cleared before it drops.
+    unsafe { driver.set_borrowed_window(&input) };
+    driver.set_borrowed_block(0, half);
+    driver.skip_matching_with_hint(Some(true));
+    let indexed = driver.dfast_matcher_mut().occupied_slots();
+    assert!(indexed > 0, "a block with blocks after it is indexed");
+    driver.set_borrowed_block(half, input.len());
+    driver.skip_matching_with_hint(Some(true));
+    assert_eq!(
+        driver.dfast_matcher_mut().occupied_slots(),
+        indexed,
+        "the frame's last block was indexed with nothing left to read it",
+    );
+    driver.clear_borrowed_window();
+}
+
+#[test]
+fn dfast_geometry_follows_the_reference_cparams() {
+    // The double-fast short table keys on `cParams.minMatch` bytes, as upstream
+    // templates its loops on `mls`, and the level-3 rows of `clevels.h` do not
+    // agree on it: 4 for sources up to 16 KiB, 5 up to 128 KiB, 4 up to 256 KiB
+    // and 5 beyond. A matcher that keyed every tier on 5 bytes searched small
+    // frames with a different hash than the reference.
+    let level = CompressionLevel::Level(3);
+    for (hint, mls) in [
+        (4u64 * 1024, 4),
+        (64 * 1024, 5),
+        (200 * 1024, 4),
+        (1 << 20, 5),
+    ] {
+        let mut driver = MatchGeneratorDriver::new(8, 1);
+        driver.set_source_size_hint(hint);
+        driver.reset(level);
+        let dfast = driver.dfast_matcher_mut();
+        assert_eq!(
+            dfast.mls, mls,
+            "level 3 with a {hint}-byte source keys its short table on the wrong width",
+        );
+        // And the tables take the widths the reference resolves, held to the
+        // source's own log: the reference's long `hashLog` reaches one bit
+        // past it, which a small frame would only pay to clear.
+        let cp = crate::encoding::cparams::get_cparams(3, hint, 0);
+        let source_log = (hint.next_power_of_two().ilog2() as usize).max(MIN_WINDOW_LOG as usize);
+        assert_eq!(
+            (dfast.long_hash_bits, dfast.short_hash_bits),
+            (
+                (cp.hash_log as usize).min(source_log),
+                (cp.chain_log as usize).min(source_log),
+            ),
+            "level 3 with a {hint}-byte source sizes its tables off the reference",
+        );
+    }
+}
+
+#[test]
+fn a_source_past_a_levelled_dictionary_takes_its_own_cparams_row() {
+    // Upstream keeps a CDict's cParams while the source is under 128 KiB or six
+    // times the dictionary, and always when the CDict has no level of its own
+    // (a dictionary loaded into a context); past that a levelled CDict's frame
+    // picks the row by source plus dictionary (zstd_compress.c:5278, :5858).
+    // A 437-byte dictionary prepares on the smallest row, whose tables are far
+    // too narrow for a megabyte.
+    let level = CompressionLevel::Level(3);
+    let loaded = crate::encoding::DictionarySizes::raw_content(437);
+    let levelled = crate::encoding::DictionarySizes {
+        prepared_at_level: true,
+        ..loaded
+    };
+    let overrides = crate::encoding::parameters::ParamOverrides::default();
+    let cdict = crate::encoding::cparams::get_cdict_cparams(3, 437, &overrides);
+    let own = crate::encoding::cparams::get_frame_cparams(3, 1 << 20, 437, &overrides);
+    assert_ne!(
+        (cdict.hash_log, cdict.min_match),
+        (own.hash_log, own.min_match),
+        "the two rows must differ for this test to tell them apart",
+    );
+    for (sizes, hint, expected) in [
+        (levelled, 64u64 * 1024, cdict),
+        (levelled, 1 << 20, own),
+        (loaded, 64 * 1024, cdict),
+        (loaded, 1 << 20, cdict),
+    ] {
+        let mut driver = MatchGeneratorDriver::new(8, 1);
+        driver.set_source_size_hint(hint);
+        driver.set_dictionary_size_hint(sizes);
+        driver.reset(level);
+        let dfast = driver.dfast_matcher_mut();
+        assert_eq!(
+            (dfast.long_hash_bits, dfast.short_hash_bits, dfast.mls),
+            (
+                expected.hash_log as usize,
+                expected.chain_log as usize,
+                crate::encoding::dfast::dfast_key_len(expected.min_match as u8),
+            ),
+            "a {hint}-byte source under {sizes:?} took the wrong cParams row",
+        );
+    }
+}
+
+#[test]
 fn fast_attach_cutoff_keeps_virtual_positions_within_u32() {
     // Two independent bounds meet on this constant. The upstream one decides it:
     // the Fast strategy copies above 8 KiB (`attachDictSizeCutoffs[ZSTD_fast]`),
@@ -3663,17 +3828,17 @@ fn row_get_last_space_then_reset_to_fastest_drops_row_variant() {
 }
 
 #[test]
-fn adjust_params_for_zero_source_size_clamps_window_to_absolute_min() {
+fn a_window_knob_over_an_empty_source_clamps_to_the_absolute_minimum() {
     // C `ZSTD_adjustCParams_internal` clamps the window straight to the source
     // size with NO extra hinted-window floor: a zero source size lands on
-    // `WINDOWLOG_ABSOLUTEMIN` (= MIN_WINDOW_LOG = 10), not the old project-only
-    // 16 KiB (`window_log` 14) floor. This pins the override re-cap to the same
-    // C-faithful adjuster (`cparams::adjust_cparams`) the `get_cparams` main
-    // path uses, so the two paths down-size identically.
-    let mut params = resolve_level_params(CompressionLevel::Level(4), None);
-    params.window_log = 22;
-    let adjusted = adjust_params_for_source_size(params, 0);
-    assert_eq!(adjusted.window_log, MIN_WINDOW_LOG);
+    // `WINDOWLOG_ABSOLUTEMIN` (= MIN_WINDOW_LOG = 10). The knob goes through
+    // the same adjustment the level's own row does.
+    let overrides = crate::encoding::parameters::ParamOverrides {
+        window_log: Some(22),
+        ..Default::default()
+    };
+    let params = resolve_frame_params(CompressionLevel::Level(4), Some(0), &overrides);
+    assert_eq!(params.window_log, MIN_WINDOW_LOG);
 }
 
 /// The row-hash cap reads the frame's real strategy and search log, as
@@ -3683,26 +3848,21 @@ fn adjust_params_for_zero_source_size_clamps_window_to_absolute_min() {
 #[test]
 fn source_size_adjustment_caps_row_hashes_by_the_real_strategy() {
     use super::super::strategy::BackendTag;
-    let big_source = 1u64 << 40;
+    let big_source = Some(1u64 << 40);
+    let wide = crate::encoding::parameters::ParamOverrides {
+        window_log: Some(30),
+        hash_log: Some(30),
+        search_log: Some(6),
+        ..Default::default()
+    };
 
-    let mut fast = resolve_level_params(CompressionLevel::Level(1), None);
+    let fast = resolve_frame_params(CompressionLevel::Level(1), big_source, &wide);
     assert_eq!(fast.backend(), BackendTag::Simple);
-    fast.window_log = 30;
-    fast.fast.as_mut().unwrap().hash_log = 30;
-    let adjusted = adjust_params_for_source_size(fast, big_source);
-    assert_eq!(adjusted.fast.as_ref().unwrap().hash_log, 30);
+    assert_eq!(fast.fast.as_ref().unwrap().hash_log, 30);
 
-    let mut row = (3..=12)
-        .map(|level| resolve_level_params(CompressionLevel::Level(level), None))
-        .find(|params| params.backend() == BackendTag::Row)
-        .expect("a level runs the row backend");
-    row.window_log = 30;
-    let config = row.row.as_mut().unwrap();
-    config.hash_bits = 30;
-    config.row_log = 6;
-    config.search_depth = 1 << 6;
-    let adjusted = adjust_params_for_source_size(row, big_source);
-    assert_eq!(adjusted.row.as_ref().unwrap().hash_bits, 30);
+    let row = resolve_frame_params(CompressionLevel::Level(5), big_source, &wide);
+    assert_eq!(row.backend(), BackendTag::Row);
+    assert_eq!(row.row.as_ref().unwrap().hash_bits, 30);
 }
 
 #[test]

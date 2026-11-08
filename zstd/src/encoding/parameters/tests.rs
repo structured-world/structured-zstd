@@ -8,6 +8,21 @@ fn bounds_clamp_to_the_nearest_end() {
     assert_eq!(bounds.clamp(20), 20);
 }
 
+/// A built parameter set takes the raw skip either way and keeps every other
+/// knob it was built with.
+#[test]
+fn with_raw_skip_changes_only_the_raw_skip() {
+    let params = CompressionParameters::builder(CompressionLevel::Level(19))
+        .window_log(20)
+        .build()
+        .unwrap();
+    assert!(params.raw_skip_enabled());
+    let off = params.with_raw_skip(false);
+    assert!(!off.raw_skip_enabled());
+    assert_eq!(off.overrides(), params.overrides());
+    assert!(off.with_raw_skip(true).raw_skip_enabled());
+}
+
 /// Fitting parameters to a small source brings the window and tables down;
 /// an unknown size leaves them alone; a dictionary keeps room for itself.
 #[test]
@@ -71,10 +86,7 @@ fn window_log_for_raw_frames_is_the_encoders() {
     assert_eq!(wide.window_log_for(None, 0), 20);
     // A dictionary does not send a raw frame into a dictionary tier.
     assert_eq!(raw.window_log_for(Some(5000), 4096), 17);
-    let sizes = crate::encoding::DictionarySizes {
-        content: 4096,
-        serialized: 4096,
-    };
+    let sizes = crate::encoding::DictionarySizes::raw_content(4096);
     assert!(
         crate::encoding::estimated_compression_workspace_bytes_for_parameters(
             &raw,
@@ -163,11 +175,19 @@ fn literal_compression_mode_changes_the_frame() {
     use crate::encoding::compress_with_parameters;
     use crate::io::Read;
 
-    // Literal-heavy input: 32 distinct symbols in a sequence with no repeats
-    // for the match finder, so the frame is all literals and only their
-    // entropy coding can shrink it (5 bits a symbol against 8 raw).
-    let text: alloc::vec::Vec<u8> = (0..8192u32)
-        .map(|i| b'a' + (i.wrapping_mul(2_654_435_761) >> 27) as u8)
+    // Literal-heavy input: 32 pseudo-random symbols with no repeats for the
+    // match finder, so the frame is all literals and only their entropy
+    // coding can shrink it (5 bits a symbol against 8 raw). A rotation
+    // sequence would not do: it repeats every short factor, and a 4-byte short
+    // key finds them all.
+    let mut state = 0x9E37_79B9u32;
+    let text: alloc::vec::Vec<u8> = (0..8192)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            b'a' + (state >> 27) as u8
+        })
         .collect();
     let frame_with = |level: i32, mode: LiteralCompressionMode| {
         let params = CompressionParameters::builder(CompressionLevel::Level(level))

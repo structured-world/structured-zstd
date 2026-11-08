@@ -39,7 +39,7 @@ use crate::encoding::{
     },
     hc::HC_MIN_MATCH_LEN,
     levels::config::HcConfig,
-    match_generator::{HC_OPT_MIN_MATCH_LEN, HC_SEARCH_DEPTH, HC_TARGET_LEN},
+    match_generator::{HC_SEARCH_DEPTH, HC_TARGET_LEN},
     match_table::storage::HC3_HASH_LOG,
     opt::ldm::{HcOptLdmState, HcRawSeqStore},
     opt::types::{
@@ -87,7 +87,7 @@ macro_rules! build_optimal_plan_impl_body {
         $seg:lifetime $(,)?
     ) => {{
         let current_abs_end = $current_abs_start + $current_len;
-        let min_match_len = HC_OPT_MIN_MATCH_LEN;
+        let min_match_len = $self.table.opt_min_match();
         // `HC_OPT_NUM > 0` by const definition, so `HC_OPT_NUM - 1` is safe.
         let frontier_limit = $current_len.min(HC_OPT_NUM - 1);
         let initial_reps = $initial_state.reps;
@@ -134,7 +134,6 @@ macro_rules! build_optimal_plan_impl_body {
             nodes,
             node_prices,
             candidates,
-            store,
             price_arena,
             candidates_searched_at: searched_at,
             pass,
@@ -160,7 +159,6 @@ macro_rules! build_optimal_plan_impl_body {
         if !carried_candidates {
             candidates.clear();
         }
-        store.clear();
         // Price-cache slices + monotonic stamps feed ONLY the priced paths (the
         // matched-seed block and the forward DP loop), both of which run only
         // when the seed found a candidate. On a no-match seed (the per-literal
@@ -217,10 +215,20 @@ macro_rules! build_optimal_plan_impl_body {
         // its instruction count is bit-identical between the two binaries
         // (71,276), and its cycles differ by 3.4%, which bounds what code layout
         // alone can account for. Output is byte-identical on both fixtures.
-        let mut skipped_literals = 0usize;
+        //
+        // The walk carries one value, the absolute position, and every way out
+        // returns on its own: an exit shared with the run's end, a counter
+        // added to a base, or a flag recomputed from the counter each kept a
+        // register copy on every position.
         let mut seed_candidates_ready = carried_candidates;
-        if !HAS_LDM && !seed_candidates_ready {
-            while $current_len - skipped_literals > 8 {
+        if !HAS_LDM && !seed_candidates_ready && $current_len > 8 {
+            let run_start = $current_abs_start;
+            // The caller's re-entry condition: more than 8 bytes remain.
+            let run_end = run_start + ($current_len - 8);
+            let mut abs_pos = run_start;
+            // No literal precedes the search only at the run's first position.
+            let mut no_literals_before = initial_litlen == 0;
+            loop {
                 candidates.clear();
                 // SAFETY: as the seed below — the wrapper shares the `$collect`
                 // kernel's target_feature umbrella, entered under the runtime
@@ -228,38 +236,39 @@ macro_rules! build_optimal_plan_impl_body {
                 unsafe {
                     $collect(
                         &mut *$self,
-                        $current_abs_start + skipped_literals,
+                        abs_pos,
                         current_abs_end,
                         profile.sufficient_match_len,
                         &initial_reps,
-                        initial_litlen + skipped_literals == 0,
+                        no_literals_before,
                         &mut *candidates,
                     )
                 };
                 if !candidates.is_empty() {
-                    if skipped_literals > 0 {
-                        // Hand the answer to the call that re-enters here.
-                        *searched_at = Some((
-                            $current_abs_start + skipped_literals,
-                            initial_litlen + skipped_literals,
-                        ));
-                    } else {
+                    if abs_pos == run_start {
                         seed_candidates_ready = true;
+                        break;
                     }
-                    break;
+                    let skipped_literals = abs_pos - run_start;
+                    // Hand the answer to the call that re-enters here.
+                    *searched_at = Some((abs_pos, initial_litlen + skipped_literals));
+                    // Literals only: no sequence was emitted and the repcodes
+                    // are untouched, exactly as the per-literal returns left
+                    // them. The price is discarded by the caller.
+                    break $seg (
+                        0u32,
+                        initial_reps,
+                        initial_litlen + skipped_literals,
+                        skipped_literals,
+                    );
                 }
-                skipped_literals += 1;
-            }
-            if skipped_literals > 0 {
-                // Literals only: no sequence was emitted and the repcodes are
-                // untouched, exactly as the per-literal returns left them. The
-                // price is discarded by the caller.
-                break $seg (
-                    0u32,
-                    initial_reps,
-                    initial_litlen + skipped_literals,
-                    skipped_literals,
-                );
+                abs_pos += 1;
+                no_literals_before = false;
+                if abs_pos == run_end {
+                    // Literals only, as above.
+                    let run_len = $current_len - 8;
+                    break $seg (0u32, initial_reps, initial_litlen + run_len, run_len);
+                }
             }
         }
         let mut pos = 1usize;
@@ -353,27 +362,32 @@ macro_rules! build_optimal_plan_impl_body {
                 // stamps stay valid across calls. price_arena is exactly
                 // HC_OPT_PRICE_ARENA_LEN = 2 * HC_OPT_PRICE_STRIDE pairs (sized by
                 // take_optimal_plan_buffers).
-                // SAFETY: the two STRIDE regions are in bounds and disjoint; the
-                // raw slices are confined to this priced path and never outlive
-                // `price_arena` (owned by the caller for the whole call).
-                let arena_base = price_arena.as_mut_ptr();
-                ll_cache =
-                    unsafe { core::slice::from_raw_parts_mut(arena_base, HC_OPT_PRICE_STRIDE) };
-                ml_cache = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        arena_base.add(HC_OPT_PRICE_STRIDE),
-                        HC_OPT_PRICE_STRIDE,
-                    )
-                };
-                $self.bt.opt_ll_price_stamp =
-                    $self.bt.opt_ll_price_stamp.wrapping_add(1).max(1);
-                ll_price_stamp = $self.bt.opt_ll_price_stamp;
-                $self.bt.opt_lit_price_stamp =
-                    $self.bt.opt_lit_price_stamp.wrapping_add(1).max(1);
-                lit_price_stamp = $self.bt.opt_lit_price_stamp;
-                $self.bt.opt_ml_price_stamp =
-                    $self.bt.opt_ml_price_stamp.wrapping_add(1).max(1);
-                ml_price_stamp = $self.bt.opt_ml_price_stamp;
+                // Only the fractional weight is cached: under the integer one
+                // every `cached_*` price is computed in place and never reads
+                // the arena or a stamp, so btopt skips the setup.
+                if ACCURATE_PRICE {
+                    // SAFETY: the two STRIDE regions are in bounds and disjoint;
+                    // the raw slices are confined to this priced path and never
+                    // outlive `price_arena` (owned by the caller for the whole
+                    // call).
+                    let arena_base = price_arena.as_mut_ptr();
+                    ll_cache = unsafe {
+                        core::slice::from_raw_parts_mut(arena_base, HC_OPT_PRICE_STRIDE)
+                    };
+                    ml_cache = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            arena_base.add(HC_OPT_PRICE_STRIDE),
+                            HC_OPT_PRICE_STRIDE,
+                        )
+                    };
+                    let bt = &mut *$self.bt;
+                    bt.opt_ll_price_stamp = bt.opt_ll_price_stamp.wrapping_add(1).max(1);
+                    ll_price_stamp = bt.opt_ll_price_stamp;
+                    bt.opt_lit_price_stamp = bt.opt_lit_price_stamp.wrapping_add(1).max(1);
+                    lit_price_stamp = bt.opt_lit_price_stamp;
+                    bt.opt_ml_price_stamp = bt.opt_ml_price_stamp.wrapping_add(1).max(1);
+                    ml_price_stamp = bt.opt_ml_price_stamp;
+                }
                 // Deferred base/seed prices: only reached on a matched seed (see
                 // the declarations above). Assign before the forward DP / seed
                 // paths below read them.
@@ -487,8 +501,17 @@ macro_rules! build_optimal_plan_impl_body {
                     );
                     let off_price = profile
                         .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
+                    // Everything but the length's own price is fixed for this
+                    // candidate, so it is summed once; the sum is affine in the
+                    // length price (see `priceset_vec_body`).
                     // SAFETY: cell 0 was written by the seed above.
-                    let nodes0_price = unsafe { *node_prices };
+                    let candidate_base = BtMatcher::add_prices(
+                        unsafe { *node_prices },
+                        BtMatcher::add_prices(
+                            ll0_price,
+                            profile.match_price_from_parts(off_price, 0, $stats),
+                        ),
+                    );
                     for match_len in (start_len..=max_match_len).rev() {
                         let ml_price = BtMatcher::cached_match_length_price::<ACCURATE_PRICE>(
                             profile,
@@ -497,11 +520,7 @@ macro_rules! build_optimal_plan_impl_body {
                             &mut ml_cache,
                             ml_price_stamp,
                         );
-                        let seq_cost = BtMatcher::add_prices(
-                            ll0_price,
-                            profile.match_price_from_parts(off_price, ml_price, $stats),
-                        );
-                        let next_cost = BtMatcher::add_prices(nodes0_price, seq_cost);
+                        let next_cost = BtMatcher::add_prices(candidate_base, ml_price);
                         // SAFETY: `match_len <= max_match_len`, a cell the seed or
                         // the reset above wrote.
                         let node_price = unsafe { *node_prices.add(match_len) };
@@ -790,25 +809,19 @@ macro_rules! build_optimal_plan_impl_body {
                     break;
                 }
             }
-            let mut prev_max_len = min_match_len - 1;
+            // Past the forced end above, the longest candidate ends below both
+            // `HC_OPT_NUM` and the segment's end, so every candidate fits the
+            // frontier as it stands; and the search's ladder is strictly
+            // increasing from the acceptance floor, so each one prices the
+            // lengths above its predecessor's. Upstream walks its matches the
+            // same way, with no clamp (zstd_opt.c, `for (mlen = lastML; mlen >=
+            // startML; mlen--)`).
+            debug_assert!(pos <= frontier_limit);
+            let mut start_len = min_match_len;
             for candidate in candidates.iter() {
-                // Outer loop guards `pos <= frontier_limit` (see the
-                // `while ... pos <= frontier_limit` condition); the
-                // subtraction below is therefore safe.
-                debug_assert!(pos <= frontier_limit);
-                let max_match_len = candidate
-                    .match_len
-                    .min($current_len - pos)
-                    .min(frontier_limit - pos);
-                let min_len = min_match_len;
-                if max_match_len < min_len {
-                    continue;
-                }
-                let start_len = (prev_max_len + 1).max(min_len);
-                if start_len > max_match_len {
-                    prev_max_len = prev_max_len.max(max_match_len);
-                    continue;
-                }
+                let max_match_len = candidate.match_len;
+                debug_assert!(max_match_len >= start_len, "the candidate ladder rises");
+                debug_assert!(pos + max_match_len <= frontier_limit);
                 let max_next = pos + max_match_len;
                 debug_assert!(max_next < frontier_buffer_size);
                 if max_next > last_pos {
@@ -827,7 +840,15 @@ macro_rules! build_optimal_plan_impl_body {
                 if abort_on_worse_match {
                     // btopt (OPT_LEVEL == 0): reverse-iterate with early break —
                     // once a longer match stops improving, shorter ones are
-                    // skipped. Order-dependent, stays scalar.
+                    // skipped. Order-dependent, stays scalar. The length's own
+                    // price is the only part that varies, as in the seed.
+                    let candidate_base = BtMatcher::add_prices(
+                        base_cost,
+                        BtMatcher::add_prices(
+                            ll0_price,
+                            profile.match_price_from_parts(off_price, 0, $stats),
+                        ),
+                    );
                     for match_len in (start_len..=max_match_len).rev() {
                         let next = pos + match_len;
                         let ml_price = BtMatcher::cached_match_length_price::<ACCURATE_PRICE>(
@@ -837,11 +858,7 @@ macro_rules! build_optimal_plan_impl_body {
                             &mut ml_cache,
                             ml_price_stamp,
                         );
-                        let seq_cost = BtMatcher::add_prices(
-                            ll0_price,
-                            profile.match_price_from_parts(off_price, ml_price, $stats),
-                        );
-                        let next_cost = BtMatcher::add_prices(base_cost, seq_cost);
+                        let next_cost = BtMatcher::add_prices(candidate_base, ml_price);
                         let node_next_price = unsafe { *node_prices.add(next) };
                         if next > last_pos || next_cost < node_next_price {
                             unsafe {
@@ -905,7 +922,7 @@ macro_rules! build_optimal_plan_impl_body {
                         });
                     }
                 }
-                prev_max_len = prev_max_len.max(max_match_len);
+                start_len = max_match_len + 1;
             }
 
             if last_pos + 1 < frontier_buffer_size {
@@ -986,54 +1003,40 @@ macro_rules! build_optimal_plan_impl_body {
             cur -= tail_literals;
             last_stretch.reps
         };
+        // The path goes back into the node arena itself, from `cur + 2` down,
+        // as upstream writes it over `opt[]` (zstd_opt.c, "Let's write the
+        // shortest path solution"). The write cursor starts two cells above
+        // the read cursor and falls by one per stretch while the read cursor
+        // falls by a whole stretch, at least one, so every cell is read
+        // before it can be overwritten.
         let store_end = cur + 2;
-        if store.len() <= store_end {
-            store.resize(store_end + 1, HcOptimalNode::default());
-        }
-        let mut store_start;
+        // `cur <= frontier_limit < HC_OPT_NUM`, and the arena holds
+        // `HC_OPT_NODE_LEN = HC_OPT_NUM + 2` cells.
+        debug_assert!(store_end < HC_OPT_NODE_LEN);
+        // SAFETY: `store_end` is inside the arena (above).
+        unsafe { *nodes.add(store_end) = last_stretch };
+        let mut store_start = store_end;
         let mut stretch_pos = cur;
-
-        if last_stretch.litlen > 0 {
-            store[store_end] = HcOptimalNode {
-                litlen: last_stretch.litlen,
-                mlen: 0,
-                ..HcOptimalNode::default()
-            };
-            store_start = store_end.saturating_sub(1);
-            store[store_start] = last_stretch;
-        }
-        store[store_end] = last_stretch;
-        store_start = store_end;
-
         loop {
-            debug_assert!(stretch_pos <= last_pos);
+            debug_assert!(stretch_pos <= last_pos && stretch_pos < store_start);
             debug_assert!(
                 unsafe { *node_prices.add(stretch_pos) } != u32::MAX,
                 "unreached node read"
             );
+            // SAFETY: both cursors are inside the arena and the read cell is
+            // below the written one (above).
             let next_stretch = unsafe { *nodes.add(stretch_pos) };
-            store[store_start].litlen = next_stretch.litlen;
+            unsafe { (*nodes.add(store_start)).litlen = next_stretch.litlen };
             if next_stretch.mlen == 0 {
                 break;
             }
-            if store_start == 0 {
-                break;
-            }
             store_start -= 1;
-            store[store_start] = next_stretch;
-            // Parser invariant: every emitted stretch is bounded by the
-            // current block, so `litlen + mlen <= current_len <=
-            // HC_BLOCKSIZE_MAX (128 KiB)`. The `as usize` widening + raw
-            // `+` is safe on 32-bit targets — two u32 values do NOT
-            // automatically fit in `usize` on i686, the block bound is
-            // what makes this addition safe.
-            let litlen = next_stretch.litlen as usize;
-            let mlen = next_stretch.mlen as usize;
-            debug_assert!(litlen + mlen <= $current_len);
-            let step = litlen + mlen;
-            if step == 0 || stretch_pos < step {
-                break;
-            }
+            unsafe { *nodes.add(store_start) = next_stretch };
+            // A stretch the DP made ends where it was stored, so it starts at
+            // or after the segment's first cell. Both lengths are bounded by
+            // the block (128 KiB), so the sum cannot overflow on 32-bit.
+            let step = next_stretch.litlen as usize + next_stretch.mlen as usize;
+            debug_assert!(step <= stretch_pos);
             stretch_pos -= step;
         }
 
@@ -1046,7 +1049,8 @@ macro_rules! build_optimal_plan_impl_body {
         let mut stats_reps = initial_reps;
         let mut recorded = false;
         while store_pos <= store_end {
-            let stretch = store[store_pos];
+            // SAFETY: `store_start..=store_end` were written just above.
+            let stretch = unsafe { *nodes.add(store_pos) };
             let llen = stretch.litlen as usize;
             let mlen = stretch.mlen as usize;
             if mlen == 0 {
@@ -1128,12 +1132,12 @@ macro_rules! optimal_block_body {
         // for it is chosen once here and every position calls it directly, as
         // upstream picks `ZSTD_btGetAllMatches_<dictMode>_<mls>` per block
         // (`ZSTD_selectBtGetAllMatches`).
-        let collect: OptimalCollectFn = match $self.table.search_mls {
+        let collect: OptimalCollectFn = match $self.table.opt_search_mls() {
             3 => HcMatchGenerator::$collect::<$strategy_ty, 3>,
             5 => HcMatchGenerator::$collect::<$strategy_ty, 5>,
             6 => HcMatchGenerator::$collect::<$strategy_ty, 6>,
             mls => {
-                debug_assert_eq!(mls, 4, "the binary tree keys on three to six bytes");
+                debug_assert_eq!(mls, 4, "the binary tree searches with mls three to six");
                 HcMatchGenerator::$collect::<$strategy_ty, 4>
             }
         };
@@ -1212,27 +1216,28 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $cpl:path,
         $cmf:path $(,)?
     ) => {{
+        // `$mls` is upstream's template `BOUNDED(3, minMatch, 6)`
+        // (`ZSTD_selectBtGetAllMatches`): a 3 keys the tree on four bytes, as
+        // `ZSTD_hashPtr` has no 3-byte case, takes the 3-byte matches from the
+        // hash3 table and accepts them (`minMatch = (mls == 3) ? 3 : 4`,
+        // zstd_opt.c); a wider key accepts four bytes and up. Both are consts
+        // of the search the block chose, so the other monomorphs drop the
+        // hash3 lookup at codegen time.
+        let use_hash3: bool = $mls == 3;
+        let key_mls: usize = if use_hash3 { 4 } else { $mls };
         debug_assert_eq!(
-            $mls, $self.table.search_mls,
+            key_mls, $self.table.search_mls,
             "the block chose the search for its key width"
         );
-        // Per-strategy compile-time const: only BtUltra2 drives the
-        // hash3 short-match table. All other monomorphisations drop
-        // the entire hash3 lookup block at codegen time. The relaxed
-        // implication enforces only the direction we depend on:
-        // if the strategy declares hash3, the table must be live.
-        // The reverse (`hash3_log != 0` without `USE_HASH3`) is OK —
-        // a future caller may pre-allocate hash3 storage without
-        // wiring the BtUltra2 path through.
-        let use_hash3: bool = <$strategy_ty as crate::encoding::strategy::Strategy>::USE_HASH3;
+        debug_assert_eq!(
+            use_hash3,
+            $self.table.hash3_log != 0,
+            "the block chose the search for its hash3 table"
+        );
         debug_assert!(!$self.table.hash_table().is_empty());
         debug_assert!($self.table.hash3_log == 0 || !$self.table.hash3_table().is_empty());
-        debug_assert!(
-            !use_hash3 || $self.table.hash3_log != 0,
-            "Strategy::USE_HASH3 = true but runtime hash3_log is 0 — call configure() first",
-        );
         debug_assert!(!$self.table.chain_table().is_empty());
-        let min_match_len = HC_OPT_MIN_MATCH_LEN;
+        let min_match_len = 3;
         $out.clear();
         if $abs_pos < $self.table.skip_insert_until_abs {
             return;
@@ -1254,9 +1259,12 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 // SAFETY: caller is in the same target_feature umbrella as
                 // `$bt_insert_range`; the runtime kernel detector gated entry.
                 let _ = unsafe {
-                    $self
-                        .table
-                        .$bt_insert_range(update_abs, $abs_pos, $current_abs_end, $abs_pos)
+                    $self.table.$bt_insert_range::<true>(
+                        update_abs,
+                        $abs_pos,
+                        $current_abs_end,
+                        $abs_pos,
+                    )
                 };
             }
             $self.table.skip_insert_until_abs = $abs_pos;
@@ -1284,17 +1292,15 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 $current_abs_end,
                 // Not a strategy const: the pass adjusts it (btultra2's seed
                 // pass runs a different sufficient length from its main pass),
-                // so it arrives as a scalar. The chain depth beside it IS the
-                // strategy's own const and needs no argument at all.
+                // so it arrives as a scalar.
                 $sufficient_match_len,
-                <$strategy_ty as crate::encoding::strategy::Strategy>::MAX_CHAIN_DEPTH,
                 min_match_len,
                 best_len_ref,
                 $out,
                 $reps,
                 $ll0,
                 use_hash3,
-                $mls,
+                key_mls,
                 $cpl,
                 $cmf,
             );
@@ -1768,7 +1774,6 @@ impl HcMatchGenerator {
         let mut nodes = core::mem::take(&mut bt.opt_nodes_scratch);
         let mut node_prices = core::mem::take(&mut bt.opt_node_prices_scratch);
         let mut candidates = core::mem::take(&mut bt.opt_candidates_scratch);
-        let store = core::mem::take(&mut bt.opt_store_scratch);
         let mut price_arena = core::mem::take(&mut bt.opt_price_arena);
         // Allocated, never filled: the DP reads only cells it wrote in the same
         // call, so a frame whose frontier stays short touches only what it
@@ -1788,7 +1793,6 @@ impl HcMatchGenerator {
             nodes,
             node_prices,
             candidates,
-            store,
             price_arena,
             // Nothing in the buffer answers a query yet: the block that filled
             // it is over, and the parser is about to start another.
@@ -2111,7 +2115,7 @@ impl HcMatchGenerator {
         // The key width picks the search the way the block's pass picks it.
         macro_rules! search {
             ($strategy:ty) => {
-                match self.table.search_mls {
+                match self.table.opt_search_mls() {
                     3 => self.collect_optimal_candidates_initialized::<$strategy, K, 3>(
                         abs_pos,
                         current_abs_end,
@@ -2166,7 +2170,7 @@ impl HcMatchGenerator {
             }
         }
         if let Some(ldm) = query.ldm_candidate {
-            BtMatcher::push_ldm_candidate(out, ldm, HC_OPT_MIN_MATCH_LEN);
+            BtMatcher::push_ldm_candidate(out, ldm, self.table.opt_min_match());
         }
     }
 

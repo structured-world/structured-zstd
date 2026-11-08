@@ -133,6 +133,31 @@ fn a_tagged_table_rejects_other_tags_and_slides_positions() {
     }
 }
 
+/// An epoch advance retires what is stored without touching it, on a tagged
+/// table too, and clears for real once the coming frame's positions would no
+/// longer fit a tagged slot.
+#[test]
+fn an_epoch_advance_retires_entries_and_clears_past_the_tagged_limit() {
+    let mut workspace = crate::encoding::workspace::Workspace::new();
+    let mut table = bound_table(&mut workspace, 10, true);
+    let data = *b"abcdefgh";
+    // SAFETY: 8 readable bytes.
+    let hash = unsafe { table.hash_ptr::<4>(data.as_ptr()) };
+    // SAFETY: every hash below came from this table's hash_ptr.
+    unsafe {
+        table.put(hash, 1000);
+        table.advance_epoch(1000, 4096);
+        assert_eq!(table.bias(), 1000);
+        assert_eq!(table.get(hash), 0, "the old position is under the bias");
+        table.put(hash, 7);
+        assert_eq!(table.get(hash), 7, "a new position reads back unbiased");
+
+        table.advance_epoch(TAGGED_POSITION_LIMIT as u32, 4096);
+        assert_eq!(table.bias(), 0, "past the limit the bias starts over");
+        assert_eq!(table.get(hash), 0, "and the table is empty");
+    }
+}
+
 /// Switching the slot format is a change of shape: a table laid out again
 /// in the other format does not continue the old one, and starts empty.
 #[test]

@@ -6,39 +6,180 @@ use crate::encoding::CompressionLevel;
 use crate::encoding::cparams::get_cparams;
 use crate::encoding::strategy::{SearchMethod, StrategyTag};
 
-/// A dictionary lends the frame its shape however large the source is.
+/// A dictionary prepared for itself and a dictionary loaded into the frame
+/// resolve different shapes, and the loaded one is the frame's own.
 ///
-/// Upstream stops doing that once the source outgrows the dictionary and
-/// resolves the frame's own instead (zstd_compress.c:5264). That was measured
-/// and rejected: on a 1 MiB source with a 3 KB dictionary, resolving the
-/// frame's own shape cost 5.30 ms at level 9 against 0.51 ms for the prepared
-/// shape, for the same 246 bytes out, while the reference itself takes 1.37 ms
-/// and 1243 bytes there. So the shape stays the dictionary's whatever the
-/// source, and this pins that a source far past upstream's cutoff still
-/// resolves through the same path as one under it.
+/// A dictionary's preparation assumes a source of a few hundred bytes, since it
+/// cannot know which frames will use it. That is the right guess while the
+/// frame is about the dictionary and badly wrong once the frame is megabytes of
+/// its own content: the tables come out sized for the dictionary and the window
+/// for almost nothing. Loaded into the frame, the shape is the one the source
+/// asks for, the dictionary counting only as content the window must cover.
 #[test]
-fn a_dictionary_lends_its_shape_whatever_the_source_size() {
-    let level = CompressionLevel::Level(9);
-    let sizes = crate::encoding::DictionarySizes::raw_content(4096);
-    let overrides = crate::encoding::parameters::ParamOverrides::default();
+fn a_loaded_dictionary_resolves_the_frames_own_shape() {
+    let level = CompressionLevel::Level(1);
+    let sizes = crate::encoding::DictionarySizes::raw_content(64 * 1024);
+    let source = 4 * 1024 * 1024u64;
 
-    // Either side of the size at which upstream would switch (128 KiB, or six
-    // times the dictionary).
-    let (small, _) =
-        super::resolve_level_params_with_dict(level, Some(8 * 1024), sizes, &overrides);
-    let (large, _) =
-        super::resolve_level_params_with_dict(level, Some(4 * 1024 * 1024), sizes, &overrides);
+    let super::FrameParams {
+        params: prepared,
+        row_plan: prepared_plan,
+        ..
+    } = super::resolve_level_params_with_dict(
+        level,
+        Some(source),
+        sizes,
+        &crate::encoding::parameters::ParamOverrides::default(),
+    );
+    let super::FrameParams {
+        params: loaded,
+        row_plan: loaded_plan,
+        ..
+    } = super::resolve_level_params_for_loaded_dict(
+        level,
+        Some(source),
+        sizes,
+        &crate::encoding::parameters::ParamOverrides::default(),
+    );
 
-    // Same dictionary, same shape: the source moves the window, never the
-    // strategy or the parse the dictionary was prepared with.
-    assert_eq!(small.strategy_tag, large.strategy_tag);
-    assert_eq!(small.search, large.search);
-    assert_eq!(small.lazy_depth, large.lazy_depth);
+    // The frame's own shape is what this level resolves for a source of this
+    // size with that much dictionary content in front of it.
+    let own = get_cparams(super::numeric_level(level), source, sizes.content);
+    assert_eq!(loaded.window_log, own.window_log as u8);
+    assert_eq!(
+        loaded.fast.expect("level 1 is a Fast row").hash_log,
+        own.hash_log
+    );
+
+    // And it is not the dictionary's, whose tables were sized for a source the
+    // frame dwarfs. The window is the frame's under either shape; the table
+    // widths are what a dictionary lends.
+    let prepared_hash = prepared.fast.expect("level 1 is a Fast row").hash_log;
     assert!(
-        large.window_log >= small.window_log,
-        "the window still follows the source: {} against {}",
-        large.window_log,
-        small.window_log
+        loaded.fast.expect("level 1 is a Fast row").hash_log > prepared_hash,
+        "a {source} byte source resolved hash log {} where its dictionary's shape gives {prepared_hash}",
+        loaded.fast.expect("level 1 is a Fast row").hash_log,
+    );
+
+    // Nothing is searched in place: the dictionary is in the frame's tables.
+    assert!(prepared_plan.is_none_or(|plan| !plan.attach) || loaded_plan.is_none());
+    assert!(loaded_plan.is_none_or(|plan| !plan.attach));
+}
+
+/// A greedy-to-btlazy2 frame that loads its dictionary still carries the lazy
+/// backend's plan, built from the frame's own cParams with nothing searched in
+/// place, since the dictionary is in the frame's tables.
+#[test]
+fn a_loaded_dictionary_gives_the_lazy_band_a_plan_of_its_own() {
+    let level = CompressionLevel::Level(6);
+    let sizes = crate::encoding::DictionarySizes::raw_content(64 * 1024);
+    let source = 4 * 1024 * 1024u64;
+    let overrides = crate::encoding::parameters::ParamOverrides::default();
+    let loaded =
+        super::resolve_level_params_for_loaded_dict(level, Some(source), sizes, &overrides);
+    let plan = loaded.row_plan.expect("level 6 is in the lazy band");
+    assert!(
+        !plan.attach,
+        "a loaded dictionary is never searched in place"
+    );
+    let own = crate::encoding::cparams::get_frame_cparams(6, source, sizes.content, &overrides);
+    assert_eq!(
+        plan.cdict, own,
+        "the plan is built from the frame's own cParams"
+    );
+}
+
+/// The optimal strategies keep their matcher's scratch beyond the tables, and
+/// a three-byte minimum match adds the short-match table, capped by the
+/// window; every other strategy keeps nothing extra.
+#[test]
+fn bt_strategy_extra_bytes_follow_the_strategy_and_key_width() {
+    use crate::encoding::estimated_bt_strategy_extra_bytes as extra;
+    for ordinal in [1, 2, 3, 4, 5, 6] {
+        assert_eq!(
+            extra(ordinal, 20, 3),
+            0,
+            "ordinal {ordinal} keeps nothing extra"
+        );
+    }
+    for ordinal in [7, 8, 9] {
+        let four = extra(ordinal, 20, 4);
+        assert!(four > 0, "ordinal {ordinal} keeps its matcher's scratch");
+        assert!(
+            extra(ordinal, 20, 3) > four,
+            "a three-byte key adds a table"
+        );
+        assert!(
+            extra(ordinal, 10, 3) < extra(ordinal, 20, 3),
+            "the short-match table is capped by the window"
+        );
+    }
+}
+
+/// A frame that runs a dictionary's cParams keeps the post-split decision of
+/// its own: upstream resolves `postBlockSplitter` from the level's cParams for
+/// the frame before the CDict's replace them. Level 14 over 1 MiB is btlazy2,
+/// which never post-splits, while a 16 KiB dictionary's CDict is btopt; taking
+/// the splitter from the CDict ran a pass upstream skips on every such frame.
+#[test]
+fn a_dictionary_frame_splits_by_its_own_strategy() {
+    let sizes = crate::encoding::DictionarySizes::raw_content(16 * 1024);
+    let frame = super::resolve_level_params_with_dict(
+        CompressionLevel::Level(14),
+        Some(1 << 20),
+        sizes,
+        &crate::encoding::parameters::ParamOverrides::default(),
+    );
+    assert_eq!(frame.params.strategy_tag, StrategyTag::BtOpt);
+    assert_eq!(frame.split_strategy, StrategyTag::Btlazy2);
+
+    // Where the level resolves an optimal strategy for the frame too, the
+    // splitter stays on.
+    let frame = super::resolve_level_params_with_dict(
+        CompressionLevel::Level(22),
+        Some(10 * 1024),
+        sizes,
+        &crate::encoding::parameters::ParamOverrides::default(),
+    );
+    assert_eq!(frame.split_strategy, StrategyTag::BtUltra2);
+}
+
+/// A width the caller asks for is still bounded by what it will index.
+///
+/// The bound is `dictAndWindowLog + 1`, and it only bites if it runs AFTER the
+/// knob it bounds (upstream `ZSTD_getCParamsFromCCtxParams`: override, then
+/// adjust). Run the other way round, a 1 KiB window under an 18 KiB dictionary
+/// takes a requested `hashLog` of 20 whole: on the i9 that table cost 832M
+/// cycles over a 4 MiB source against 178M for the same frame without the
+/// dictionary, because the window slides every kilobyte and each slide walks
+/// the table.
+#[test]
+fn a_requested_hash_log_is_bounded_by_what_it_indexes() {
+    let level = CompressionLevel::Level(1);
+    let sizes = crate::encoding::DictionarySizes::raw_content(18 * 1024);
+    let source = 4 * 1024 * 1024u64;
+    let overrides = crate::encoding::parameters::ParamOverrides {
+        window_log: Some(10),
+        hash_log: Some(20),
+        ..Default::default()
+    };
+
+    let params =
+        super::resolve_level_params_for_loaded_dict(level, Some(source), sizes, &overrides).params;
+
+    // The window is the caller's, and the table is bounded by the window plus
+    // the dictionary it indexes, not by the 20 that was asked for.
+    assert_eq!(params.window_log, 10);
+    let hash_log = params.fast.expect("level 1 is a Fast row").hash_log;
+    let bound = crate::encoding::cparams::dict_and_window_log(10, source, 18 * 1024) + 1;
+    assert!(
+        hash_log <= bound,
+        "a requested hash log of 20 resolved to {hash_log}, past the {bound} its window and \
+         dictionary can index"
+    );
+    assert!(
+        hash_log < 20,
+        "the request must be bounded, not taken whole"
     );
 }
 
@@ -234,12 +375,13 @@ fn oversized_attach_dictionary_resolves_the_copy_geometry() {
     use crate::encoding::cparams::{copy_cparams, get_cdict_cparams};
     let sizes = DictionarySizes::raw_content(17 * 1024 * 1024);
     for level in [1, 3] {
-        let (params, _plan) = super::resolve_level_params_with_dict(
+        let params = super::resolve_level_params_with_dict(
             CompressionLevel::Level(level),
             Some(4096),
             sizes,
             &Default::default(),
-        );
+        )
+        .params;
         let cdict = get_cdict_cparams(level, sizes.serialized, &Default::default());
         let copy = copy_cparams(
             cdict,
@@ -280,8 +422,7 @@ fn search_log_override_keeps_the_full_depth_for_chain_and_tree() {
         search_log: Some(7),
         ..Default::default()
     };
-    let mut params = resolve_level_params(CompressionLevel::Level(15), Some(1 << 20));
-    super::apply_param_overrides(&mut params, &ov);
+    let params = super::resolve_frame_params(CompressionLevel::Level(15), Some(1 << 20), &ov);
     let row = params.row.expect("btlazy2 carries a row config");
     assert_eq!(row.row_log, 6, "rowLog clamps to 4..=6");
     assert_eq!(
@@ -303,8 +444,7 @@ fn a_target_length_override_sets_the_fast_step() {
             target_length: Some(target_length),
             ..Default::default()
         };
-        let mut params = resolve_level_params(CompressionLevel::Level(1), Some(1 << 20));
-        super::apply_param_overrides(&mut params, &ov);
+        let params = super::resolve_frame_params(CompressionLevel::Level(1), Some(1 << 20), &ov);
         assert_eq!(
             params.fast.expect("level 1 is a Fast row").step_size,
             step,
@@ -315,8 +455,10 @@ fn a_target_length_override_sets_the_fast_step() {
 
 /// A strategy override moves a frame onto another matcher backend, and only
 /// that backend's tables are built: level 22 run as Fast holds the Fast table,
-/// not the hash-chain tables its own row sized. Its estimate is therefore
-/// level 1's at the same window, not the two added together.
+/// not the hash-chain tables its own row sized. The override swaps the strategy
+/// alone and keeps the row's window and `hashLog` (upstream
+/// `ZSTD_overrideCParams`), so its estimate is level 1's at that window and
+/// hash width, not the two backends added together.
 #[test]
 fn a_strategy_override_counts_only_the_backend_it_selects() {
     use crate::encoding::{CompressionParameters, Strategy};
@@ -326,6 +468,7 @@ fn a_strategy_override_counts_only_the_backend_it_selects() {
         .unwrap();
     let level_one = CompressionParameters::builder(CompressionLevel::Level(1))
         .window_log(27)
+        .hash_log(25)
         .build()
         .unwrap();
     let estimate = |p: &CompressionParameters| {

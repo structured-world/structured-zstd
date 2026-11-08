@@ -66,6 +66,9 @@ pub(crate) mod util;
 // <https://github.com/structured-world/structured-zstd/issues/111>;
 // per-phase boundaries are `perf/post-pr-110-baseline` (start),
 // `perf/post-pr-121-baseline` (post-Phase-2).
+#[cfg(feature = "kernel-trace")]
+#[doc(hidden)]
+pub mod branch_profile;
 pub(crate) mod bt;
 pub(crate) mod cost_model;
 pub(crate) mod dfast;
@@ -391,21 +394,27 @@ impl CompressionLevel {
 /// assert_eq!(sizes.serialized, sizes.content);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DictionarySizes {
     /// Bytes of dictionary content the matcher indexes.
     pub content: usize,
     /// Bytes of the serialized dictionary (the CDict cParams tier key); equal
     /// to `content` for a raw-content dictionary.
     pub serialized: usize,
+    /// The dictionary was prepared for a compression level of its own (see
+    /// [`EncoderDictionary::with_level_of_its_own`]), so a frame that outgrows it
+    /// resolves its own parameters (see [`dictionary_describes_frame`]).
+    pub prepared_at_level: bool,
 }
 
 impl DictionarySizes {
     /// Sizes of a raw-content dictionary: nothing but the content is
-    /// serialized.
+    /// serialized, and it carries no level of its own.
     pub const fn raw_content(len: usize) -> Self {
         Self {
             content: len,
             serialized: len,
+            prepared_at_level: false,
         }
     }
 }

@@ -72,6 +72,7 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         sequence_capture: None,
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
+        huf_repeat_valid: false,
         huff_table_spare: None,
         huff_weights: Default::default(),
         seen_content: Default::default(),
@@ -80,6 +81,7 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         workspace: crate::encoding::workspace::Workspace::new(),
         offset_hist: [1, 4, 8],
         strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
+        split_strategy: crate::encoding::strategy::StrategyTag::Fast,
         pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
@@ -99,6 +101,8 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         block.len(),
         &mut output,
         false,
+        true,
+        true,
         #[cfg(feature = "lsm")]
         None,
         #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -111,6 +115,132 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         vec![Some(false)],
         "RLE is already known compressible; skip_matching should bypass incompressible sampling"
     );
+}
+
+/// Parses a block of one repeated byte as one literal and a match at offset 1,
+/// counting the searches it runs.
+#[derive(Default)]
+struct UniformMatcher {
+    input: BlockInput,
+    searches: usize,
+    skip_hints: Vec<Option<bool>>,
+}
+
+impl Matcher for UniformMatcher {
+    fn get_last_space(&mut self) -> &[u8] {
+        self.input.last_block()
+    }
+
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool) {
+        self.input.fill(capacity, fill)
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        self.input.uncommitted()
+    }
+
+    fn commit_filled(&mut self, len: usize) {
+        self.input.commit(len);
+    }
+
+    fn skip_matching(&mut self) {
+        self.skip_hints.push(None);
+    }
+
+    fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
+        self.skip_hints.push(incompressible_hint);
+    }
+
+    fn start_matching(&mut self, mut handle_sequence: impl FnMut(Sequence)) {
+        self.searches += 1;
+        let len = self.input.last_block().len();
+        handle_sequence(Sequence::Triple {
+            literal_len: 1,
+            offset: 1,
+            match_len: len - 1,
+        });
+    }
+
+    fn reset(&mut self, _level: CompressionLevel) {}
+
+    fn window_size(&self) -> u64 {
+        128 * 1024
+    }
+}
+
+/// One block of a single repeated byte through the encoder with the raw skip
+/// off: the block type written and the matcher that saw it.
+fn uniform_block_with_raw_skip_off(first_block: bool) -> (BlockType, UniformMatcher) {
+    let mut state = CompressState {
+        matcher: UniformMatcher::default(),
+        sequence_capture: None,
+        copy_kernel: crate::encoding::fastpath::select_kernel(),
+        last_huff_table: None,
+        huf_repeat_valid: false,
+        huff_table_spare: None,
+        huff_weights: Default::default(),
+        seen_content: Default::default(),
+        fse_tables: FseTables::new(),
+        block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
+        workspace: crate::encoding::workspace::Workspace::new(),
+        offset_hist: [1, 4, 8],
+        strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
+        split_strategy: crate::encoding::strategy::StrategyTag::Fast,
+        pre_split: None,
+        huf_optimal_search: false,
+        literal_compression_disabled: false,
+        post_split_allowed: true,
+    };
+    let block = vec![0xAB; 4096];
+    state.reset_for_frame(
+        CompressionLevel::Fastest,
+        block.len(),
+        crate::encoding::workspace::IngestPlan::Stream,
+    );
+    state.finish_layout(block.len());
+    state.matcher.fill_in_place(block.len(), &mut |history| {
+        history.extend_from_slice(&block);
+        (block.len(), false)
+    });
+    let mut output = Vec::new();
+    let emitted = crate::encoding::fastpath::with_host_tier!(K => compress_block_encoded::<_, K>(
+        &mut state,
+        CompressionLevel::Fastest,
+        true,
+        block.len(),
+        &mut output,
+        false,
+        false,
+        first_block,
+        #[cfg(feature = "lsm")]
+        None,
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        None,
+    ));
+    (emitted, state.matcher)
+}
+
+/// With the raw skip off a block of one repeated byte is searched before it is
+/// written as RLE, as upstream writes it (`ZSTD_compressBlock_internal`).
+#[test]
+fn a_uniform_block_is_searched_before_rle_with_the_raw_skip_off() {
+    let (emitted, matcher) = uniform_block_with_raw_skip_off(false);
+    assert_eq!(emitted, BlockType::RLE);
+    assert_eq!(matcher.searches, 1, "the block is searched first");
+    assert!(matcher.skip_hints.is_empty(), "and not indexed unsearched");
+}
+
+/// Upstream never rewrites a frame's first block as RLE, so with the raw skip
+/// off a uniform first block stays the compressed block its search made.
+#[test]
+fn a_uniform_first_block_stays_compressed_with_the_raw_skip_off() {
+    let (emitted, matcher) = uniform_block_with_raw_skip_off(true);
+    assert_eq!(emitted, BlockType::Compressed);
+    assert_eq!(matcher.searches, 1);
 }
 
 /// A single-block frame of noise that copies its own content, the copy beginning

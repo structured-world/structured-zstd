@@ -6,14 +6,25 @@
 //! (`ffi_encode_loop_z000033`). The context's own construction and teardown
 //! are part of what is measured; the output buffer is not.
 //!
+//! `FRAME_CHUNK=<N>` compresses the input's consecutive N-byte pieces in turn,
+//! one per frame, as the benchmark walks a small fixture's distinct frames;
+//! without it every frame is the whole input.
+//!
 //! Run: `perf stat -e task-clock,page-faults ./encode_loop_fresh_z000033 <level> <iters> <corpus>`
 
 use std::env;
 use std::fs;
 
-use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+use structured_zstd::encoding::{CompressionLevel, CompressionParameters, FrameCompressor};
 
 fn main() {
+    // `STRUCTURED_ZSTD_CPU=<level>` caps the kernel tiers, as in the benchmark.
+    if let Ok(value) = env::var("STRUCTURED_ZSTD_CPU") {
+        let level = value
+            .parse()
+            .expect("STRUCTURED_ZSTD_CPU names a CPU level");
+        structured_zstd::set_cpu_ceiling(level).expect("the CPU ceiling applies");
+    }
     let level: i32 = env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     let iters: usize = env::args()
         .nth(2)
@@ -24,19 +35,38 @@ fn main() {
         .unwrap_or_else(|| "zstd/decodecorpus_files/z000033".to_string());
 
     let bytes = fs::read(&corpus_path).expect("read corpus");
+    let frames: Vec<&[u8]> = match env::var("FRAME_CHUNK").ok().and_then(|n| n.parse().ok()) {
+        Some(n) => bytes.chunks(n).collect(),
+        None => vec![&bytes[..]],
+    };
     let mut out: Vec<u8> = Vec::new();
-    let compression_level = CompressionLevel::from_level(level);
+    // `Level(n)`, as the benchmark builds it: the named presets `from_level`
+    // returns for some levels take paths of their own.
+    let compression_level = CompressionLevel::Level(level);
+    // `RAW_SKIP=0` searches every block, as libzstd does; the parameters are
+    // resolved once, and applying them is part of each fresh context's setup.
+    let params = env::var("RAW_SKIP").is_ok_and(|v| v == "0").then(|| {
+        CompressionParameters::builder(compression_level)
+            .raw_skip(false)
+            .build()
+            .expect("a level and the raw skip are always valid parameters")
+    });
 
     let mut sum = 0usize;
-    for _ in 0..iters {
+    for i in 0..iters {
         let mut enc: FrameCompressor = FrameCompressor::new(compression_level);
-        enc.compress_independent_frame_into(&bytes[..], &mut out);
+        if let Some(params) = &params {
+            enc.set_parameters(params);
+        }
+        enc.set_content_checksum(cfg!(feature = "hash"));
+        enc.compress_independent_frame_into(frames[i % frames.len()], &mut out);
         sum += out.len();
     }
 
     println!(
-        "encoded {} bytes x {} iters at level {}; last-out-sum={}",
+        "encoded {} bytes in {} frames x {} iters at level {}; last-out-sum={}",
         bytes.len(),
+        frames.len(),
         iters,
         level,
         sum

@@ -379,11 +379,24 @@ impl Dictionary {
             return Err(DictionaryDecodeError::ZeroRepeatOffsetInDictionary { index: 2 });
         }
 
+        let raw_content = &raw_tables[12..];
+        // A repeat offset must reach no further back than the content's first
+        // byte; upstream refuses the dictionary otherwise, on both sides
+        // (zstd_compress.c:5142-5146, zstd_decompress.c:1528-1532).
+        for (index, offset) in [offset1, offset2, offset3].into_iter().enumerate() {
+            if offset as usize > raw_content.len() {
+                return Err(DictionaryDecodeError::RepeatOffsetBeyondContent {
+                    index: index as u8,
+                    offset,
+                    content_len: raw_content.len(),
+                });
+            }
+        }
+
         new_dict.offset_hist[0] = offset1;
         new_dict.offset_hist[1] = offset2;
         new_dict.offset_hist[2] = offset3;
 
-        let raw_content = &raw_tables[12..];
         new_dict.dict_content.extend(raw_content);
 
         Ok(new_dict)

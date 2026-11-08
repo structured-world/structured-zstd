@@ -63,15 +63,18 @@ pub extern "C" fn ZSTD_estimateCCtxSize_usingCParams(cparams: ZSTD_compressionPa
     } else {
         4usize << cparams.chainLog
     };
-    // Binary-tree strategies retain the optimal-parser workspace (and, for
-    // btultra/btultra2, the HC3 side table) on top of the hash/chain tables.
+    // Binary-tree strategies retain the optimal-parser workspace (and, for a
+    // `minMatch` of 3, the HC3 side table) on top of the hash/chain tables.
     // No cast on purpose: this crate only targets platforms where C's
     // `unsigned int` is 32-bit (it emits the host `libzstd.so.1`), so
     // `c_uint == u32` here and clippy rejects a redundant conversion. On a
     // hypothetical 16-bit `c_uint` target this line fails to compile — a
     // loud signal beats a silent widening.
-    let bt =
-        codec::encoding::estimated_bt_strategy_extra_bytes(cparams.strategy, cparams.windowLog);
+    let bt = codec::encoding::estimated_bt_strategy_extra_bytes(
+        cparams.strategy,
+        cparams.windowLog,
+        cparams.minMatch,
+    );
     // The per-field bounds keep each TERM inside usize, but on a 32-bit
     // target the SUM can still wrap (e.g. windowLog 30 + hashLog 29 +
     // chainLog 29) — an under-reported budget is worse than an error for a

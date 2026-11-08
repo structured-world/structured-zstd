@@ -210,6 +210,20 @@ unsafe fn read32(ptr: *const u8) -> u32 {
 /// branch.
 const CMOV_DUMMY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
 
+/// Upstream's `base`: the address its index adds to, one epoch bias below the
+/// data, so its index runs on from frame to frame. It lies outside the data,
+/// which only a wrapping offset may start from.
+#[derive(Clone, Copy)]
+struct IndexBase(*const u8);
+
+impl IndexBase {
+    /// The byte at `index`, which is a position of the data plus the bias.
+    #[inline(always)]
+    fn add(self, index: usize) -> *const u8 {
+        self.0.wrapping_add(index)
+    }
+}
+
 /// Upstream zstd `ZSTD_match4Found_branch` / `ZSTD_match4Found_cmov`
 /// branchless dispatch via const generic.
 ///
@@ -286,31 +300,27 @@ unsafe fn match_found<const USE_CMOV: bool>(
         // `CMOV_DUMMY` (rare but reachable), the out-of-window
         // match would otherwise slip through.
         //
-        // Upstream zstd (`ZSTD_match4Found_cmov` lines 119-124) inserts an
-        // `__asm__("")` compiler barrier between the two checks to
-        // pin codegen order. We don't replicate that — Rust offers
-        // `core::sync::atomic::compiler_fence` if needed, but
-        // empirically LLVM's lowering here already orders the
-        // bytes_match comparison before the in_range AND without a
-        // barrier. Revisit only if profiling shows reordering hurt.
+        // The two tests end up as branches once this is inlined, so their
+        // order decides what is predicted: the bytes rarely match, and the
+        // floor is the unpredictable one on a frame reading a table the last
+        // frame filled. Upstream fences them apart for that reason
+        // (`ZSTD_match4Found_cmov`, zstd_fast.c:119-124); written as an AND,
+        // LLVM branched on the floor first and that was the scan's most
+        // mispredicted branch.
         // SAFETY: both candidate addresses have ≥ 4 readable bytes
         // (CMOV_DUMMY is exactly 4 bytes; base+match_pos has ≥ 4
         // by the bounds check above).
         let in_range = match_idx >= prefix_start_index;
         let mval_addr = if in_range {
-            unsafe { base.add(match_pos) }
+            base.wrapping_add(match_pos)
         } else {
             CMOV_DUMMY.as_ptr()
         };
-        let bytes_match = unsafe { read32(ip) == read32(mval_addr) };
-        // Bitwise AND (not `&&`) is INTENTIONAL — short-circuit
-        // would re-introduce a branch on `bytes_match`, defeating
-        // the cmov-branchless path. Upstream zstd enforces the same
-        // ordering with `__asm__("")` between its two checks
-        // (`ZSTD_match4Found_cmov` lines 119-124).
-        #[allow(clippy::needless_bitwise_bool)]
-        let r = bytes_match & in_range;
-        r
+        if unsafe { read32(ip) != read32(mval_addr) } {
+            return false;
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        in_range
     } else {
         // Upstream zstd branch variant (`ZSTD_match4Found_branch`): explicit
         // branch on the prefix filter. Faster when the branch is
@@ -320,7 +330,7 @@ unsafe fn match_found<const USE_CMOV: bool>(
         if match_idx < prefix_start_index {
             return false;
         }
-        unsafe { read32(ip) == read32(base.add(match_pos)) }
+        unsafe { read32(ip) == read32(base.wrapping_add(match_pos)) }
     }
 }
 
@@ -475,8 +485,12 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
     step_size: usize,
     mut handle_sequence: impl FnMut(Sequence),
 ) -> FastBlockResult {
-    let prefix_start_index = bounds.prefix_start_index;
-    let window_low = bounds.window_low;
+    // Everything below counts in upstream's index: a position of `data` plus
+    // the table's bias, so what earlier frames stored lies under the floor and
+    // a frame neither clears the table nor carries a second coordinate.
+    let bias = hash_table.bias() as usize;
+    let prefix_start_index = bounds.prefix_start_index + bias as u32;
+    let window_low = bounds.window_low + bias as u32;
     // Upstream zstd's `stepSize = targetLength + !(targetLength) + 1`
     // (min 2). Callers must pass >= 2; values larger than 2 drive
     // the kernel's acceleration gradient on negative levels.
@@ -539,8 +553,8 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
         data.len(),
     );
     assert!(
-        data.len() <= u32::MAX as usize,
-        "FastKernel does not support data.len() ({}) > u32::MAX ({}); \
+        data.len() + bias <= u32::MAX as usize,
+        "FastKernel does not support data.len() ({}) + bias ({bias}) > u32::MAX ({}); \
          the kernel stores absolute positions in a u32 hash table and \
          u32 offset codes, so larger inputs would silently truncate",
         data.len(),
@@ -554,8 +568,8 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
     // A tagged slot holds positions below `TAGGED_POSITION_LIMIT`, and every
     // position stored is below `data.len()`.
     assert!(
-        !TAGGED || data.len() <= TAGGED_POSITION_LIMIT,
-        "a tagged table cannot hold positions of a {}-byte window",
+        !TAGGED || data.len() + bias <= TAGGED_POSITION_LIMIT,
+        "a tagged table cannot hold positions of a {}-byte window at bias {bias}",
         data.len(),
     );
 
@@ -572,18 +586,15 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
         };
     }
 
-    let base = data.as_ptr();
-    let iend_addr = data.len();
+    let base = IndexBase(data.as_ptr().wrapping_sub(bias));
+    let iend_addr = data.len() + bias;
     let ilimit = iend_addr - HASH_READ_SIZE;
 
-    let mut anchor: usize = block_start;
-    let mut ip0: usize = block_start;
+    let mut anchor: usize = block_start + bias;
     // Upstream zstd: `ip0 += (ip0 == prefixStart);`. Equivalent in flat-buffer
     // terms is to ensure ip0 isn't at the absolute zero position
     // (where the sentinel could be confused with a valid match).
-    if ip0 == 0 {
-        ip0 = 1;
-    }
+    let mut ip0: usize = anchor + usize::from(block_start == 0);
 
     // The repcodes are carried as `usize`, the width they are used at, so the
     // scan holds one register per repcode rather than a `u32` for the zero
@@ -625,7 +636,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
     // `next_step` is the absolute position where step doubles next;
     // upstream zstd increments by `kStepIncr = 1 << (kSearchStrength - 1)`.
     let mut step: usize = step_size;
-    let mut next_step: usize = ip0.saturating_add(K_STEP_INCR);
+    let mut next_step: usize = ip0 + K_STEP_INCR;
 
     // 4-cursor upstream zstd port. Outer `'restart` loop matches upstream zstd's
     // `_start:` reentry: every emitted match `goto _start`s back
@@ -811,7 +822,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             if unsafe {
                 match_found::<USE_CMOV>(
                     base.add(ip0),
-                    base,
+                    base.0,
                     match_pos,
                     prefix_start_index,
                     tag_matches::<TAGGED>(match_idx, hash0),
@@ -863,7 +874,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             if unsafe {
                 match_found::<USE_CMOV>(
                     base.add(ip0),
-                    base,
+                    base.0,
                     match_pos,
                     prefix_start_index,
                     tag_matches::<TAGGED>(match_idx, hash0),
@@ -920,8 +931,8 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
                 // two. A prefetch never faults, and `wrapping_add` keeps an
                 // address past the buffer end a plain value, not a pointer
                 // offset out of bounds.
-                crate::decoding::prefetch::prefetch_l1_at(base.wrapping_add(ip0 + 1 + 64));
-                crate::decoding::prefetch::prefetch_l1_at(base.wrapping_add(ip0 + 1 + 128));
+                crate::decoding::prefetch::prefetch_l1_at(base.add(ip0 + 1 + 64));
+                crate::decoding::prefetch::prefetch_l1_at(base.add(ip0 + 1 + 128));
                 next_step += K_STEP_INCR;
             }
 
@@ -1047,44 +1058,32 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             // either makes the hash table sparser than upstream zstd's and
             // costs subsequent matches.
             //
-            // SAFETY: each `base.add(N - 2)` covers ≥ 8 readable
-            // bytes when N - 2 ≤ ilimit (ilimit = iend - 8).
-            // Non-overflowing bounds check: on 32-bit targets even
-            // the raw `current0 + 2` can wrap when `current0`
-            // approaches `usize::MAX`, producing a small value that
-            // would then pass the `+ HASH_READ_SIZE` check and call
-            // `hash_ptr` at the wrong position — out-of-bounds read
-            // under the surrounding `unsafe`. Chain the additions
-            // through `checked_add` so the slot is skipped if either
-            // step overflows.
-            let in_range_fwd = current0
-                .checked_add(2)
-                .and_then(|c| c.checked_add(HASH_READ_SIZE))
-                .is_some_and(|end| end <= iend_addr);
-            if in_range_fwd {
-                // Safe to compute the index here — `in_range_fwd`
-                // guarantees `current0 + 2 + HASH_READ_SIZE` fits in
-                // `usize`, so the `+ 2` cannot wrap.
-                let current0_plus_2 = current0 + 2;
-                let h_fwd = unsafe { hash_ptr_raw::<MLS>(base.add(current0_plus_2), hlog) };
-                unsafe {
-                    *table.get_unchecked_mut(slot_index::<TAGGED>(h_fwd)) =
-                        slot_value::<TAGGED>(current0_plus_2, h_fwd)
-                };
-            }
-            if ip0 >= 2 {
-                let h_back = unsafe { hash_ptr_raw::<MLS>(base.add(ip0 - 2), hlog) };
-                unsafe {
-                    *table.get_unchecked_mut(slot_index::<TAGGED>(h_back)) =
-                        slot_value::<TAGGED>(ip0 - 2, h_back)
-                };
-            }
+            // A match reaches past its trigger by at least four bytes, so with
+            // `ip0 <= ilimit` both positions lie below `ilimit` and neither
+            // needs a bound (upstream zstd tests none, zstd_fast.c:407-408).
+            debug_assert!(current0 + 4 <= ip0);
+            // SAFETY: each `base.add(N)` covers ≥ 8 readable bytes when
+            // N ≤ ilimit (ilimit = iend - 8).
+            let current0_plus_2 = current0 + 2;
+            let h_fwd = unsafe { hash_ptr_raw::<MLS>(base.add(current0_plus_2), hlog) };
+            unsafe {
+                *table.get_unchecked_mut(slot_index::<TAGGED>(h_fwd)) =
+                    slot_value::<TAGGED>(current0_plus_2, h_fwd)
+            };
+            let h_back = unsafe { hash_ptr_raw::<MLS>(base.add(ip0 - 2), hlog) };
+            unsafe {
+                *table.get_unchecked_mut(slot_index::<TAGGED>(h_back)) =
+                    slot_value::<TAGGED>(ip0 - 2, h_back)
+            };
 
             // Repcode-2 inner loop. Upstream zstd swaps rep1 / rep2 on each
             // hit so the just-found offset becomes the new rep1.
+            // A nonzero repcode reaches no further back than the window: the
+            // prologue zeroes one that does, and a matched offset starts inside
+            // it. Upstream tests no more than this (zstd_fast.c:410).
+            debug_assert!(rep_offset2 == 0 || ip0 - rep_offset2 >= window_low as usize);
             while rep_offset2 > 0
                 && ip0 <= ilimit
-                && ip0 >= rep_offset2
                 && unsafe { read32(base.add(ip0)) == read32(base.add(ip0 - rep_offset2)) }
             {
                 // 4-byte match guaranteed by the equality probe.
@@ -1124,15 +1123,11 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
             }
         }
 
-        // `goto _start` — restart the outer loop with fresh step
-        // (reset to the level-resolved initial step_size). The
-        // `saturating_add` here is symmetric with the inner loop's
-        // step-doubling site: ip0 is already < ilimit < data.len()
-        // <= u32::MAX, so the wrap would require an unrepresentable
-        // `K_STEP_INCR`, but staying defensive keeps the cursor math
-        // wrap-free on every cold reset of the outer state.
+        // `goto _start` — restart the outer loop with fresh step (reset to the
+        // level-resolved initial step_size). `ip0` is a position in the block,
+        // bounded by `u32::MAX`, so the addition cannot wrap.
         step = step_size;
-        next_step = ip0.saturating_add(K_STEP_INCR);
+        next_step = ip0 + K_STEP_INCR;
         continue 'restart;
     }
 
@@ -1160,7 +1155,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TA
 
     FastBlockResult {
         rep: final_rep,
-        tail_literals_len: data.len() - anchor,
+        tail_literals_len: iend_addr - anchor,
     }
 }
 
@@ -1338,38 +1333,39 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
             // the fallback". (Upstream zstd's `matchIndex <= prefixStartIndex` gate is
             // an if/else-if with no main fallthrough; our two-`if` structure
             // needs `<` here to stay consistent with `match_found`'s floor.)
-            if main_idx < prefix_start_index {
-                let dpos = dict_idx as usize;
-                if dict_idx >= 1
-                    && dpos < dict_end
-                    && dpos >= window_low
-                    && unsafe { read32(base.add(ip0)) == read32(base.add(dpos)) }
+            // Tested last, after the tag and the bytes, as upstream orders them
+            // (zstd_fast.c:576-583): the floor is the unpredictable one.
+            let dpos = dict_idx as usize;
+            if dict_idx >= 1
+                && dpos < dict_end
+                && dpos >= window_low
+                && unsafe { read32(base.add(ip0)) == read32(base.add(dpos)) }
+                && main_idx < prefix_start_index
+            {
+                let mut match_ip = ip0;
+                let mut match_pos = dpos;
+                let mut m_len = 4 + unsafe {
+                    count_forward(base.add(ip0 + 4), base.add(dpos + 4), base.add(iend_addr))
+                };
+                // Catch-up backward extension into the dict (upstream zstd 586-591).
+                while match_ip > anchor
+                    && match_pos > window_low
+                    && unsafe { *base.add(match_ip - 1) == *base.add(match_pos - 1) }
                 {
-                    let mut match_ip = ip0;
-                    let mut match_pos = dpos;
-                    let mut m_len = 4 + unsafe {
-                        count_forward(base.add(ip0 + 4), base.add(dpos + 4), base.add(iend_addr))
-                    };
-                    // Catch-up backward extension into the dict (upstream zstd 586-591).
-                    while match_ip > anchor
-                        && match_pos > window_low
-                        && unsafe { *base.add(match_ip - 1) == *base.add(match_pos - 1) }
-                    {
-                        match_ip -= 1;
-                        match_pos -= 1;
-                        m_len += 1;
-                    }
-                    if m_len >= MIN_DICT_MATCH_LEN {
-                        let offset = match_ip - match_pos;
-                        offset_2 = offset_1;
-                        offset_1 = offset as u32;
-                        break Some(DictMatch {
-                            lit_end: match_ip,
-                            offset,
-                            m_len,
-                            curr,
-                        });
-                    }
+                    match_ip -= 1;
+                    match_pos -= 1;
+                    m_len += 1;
+                }
+                if m_len >= MIN_DICT_MATCH_LEN {
+                    let offset = match_ip - match_pos;
+                    offset_2 = offset_1;
+                    offset_1 = offset as u32;
+                    break Some(DictMatch {
+                        lit_end: match_ip,
+                        offset,
+                        m_len,
+                        curr,
+                    });
                 }
             }
 
@@ -1437,17 +1433,14 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
         anchor = ip0;
 
         if ip0 <= ilimit {
-            // Post-match dense fills (upstream zstd 641-642).
-            if m.curr + 2 + HASH_READ_SIZE <= iend_addr {
-                let h = unsafe { hash_ptr_raw::<MLS>(base.add(m.curr + 2), main_hlog) };
-                unsafe {
-                    *main_tbl.get_unchecked_mut(h as usize) = (m.curr + 2) as u32 + main_bias
-                };
-            }
-            if ip0 >= 2 {
-                let h = unsafe { hash_ptr_raw::<MLS>(base.add(ip0 - 2), main_hlog) };
-                unsafe { *main_tbl.get_unchecked_mut(h as usize) = (ip0 - 2) as u32 + main_bias };
-            }
+            // Post-match dense fills (upstream zstd 641-642): a match reaches
+            // past `curr` by at least four bytes, so with `ip0 <= ilimit` both
+            // lie below `ilimit`.
+            debug_assert!(m.curr + 4 <= ip0);
+            let h = unsafe { hash_ptr_raw::<MLS>(base.add(m.curr + 2), main_hlog) };
+            unsafe { *main_tbl.get_unchecked_mut(h as usize) = (m.curr + 2) as u32 + main_bias };
+            let h = unsafe { hash_ptr_raw::<MLS>(base.add(ip0 - 2), main_hlog) };
+            unsafe { *main_tbl.get_unchecked_mut(h as usize) = (ip0 - 2) as u32 + main_bias };
             // Immediate repcode-2 loop (upstream zstd 644-663).
             while ip0 <= ilimit
                 && offset_2 > 0
@@ -1653,6 +1646,16 @@ fn compress_block_fast_dict_borrowed_impl<
 
     let mut offset_1: u32 = rep[0];
     let mut offset_2: u32 = rep[1];
+    // The lowest input offset a rep candidate may take. With the first input
+    // position a nonzero offset reaches into the window, `rep_floor + offset` is
+    // the one bound on the probe: at or past it, the candidate is in the input
+    // and in the window. A zero offset is disabled, so it never gets there.
+    let rep_floor = window_low.max(dict_end) - dict_end;
+    let mut rep1_from = if offset_1 == 0 {
+        usize::MAX
+    } else {
+        offset_1 as usize + rep_floor
+    };
 
     // Same tagged-lookup width guard as the owned kernel: `dict_lookup` hashes to
     // `dict_hash_log + DICT_TAG_BITS` bits, well-defined only while that fits 32
@@ -1664,11 +1667,16 @@ fn compress_block_fast_dict_borrowed_impl<
         "tagged Fast dict lookup requires dict hash_log <= {} (got {dict_hash_log})",
         32 - DICT_TAG_BITS,
     );
-    // Hoist the main table's backing slice + hash_log + epoch bias into locals so
-    // the hot loop avoids re-reading the `Vec` header / `hash_log` / `bias`
-    // through `&mut FastHashTable` on every access; bias is applied inline exactly
-    // as `get`/`put` do (matches the owned dict kernel).
+    // Hoist the main table's backing slice + hash_log into locals so the hot loop
+    // avoids re-reading the `Vec` header / `hash_log` through `&mut FastHashTable`
+    // on every access. A slot is read raw and held against a floor raised by the
+    // bias, as upstream holds `matchIndex` against `prefixStartIndex`: what an
+    // earlier frame stored lies under that floor with nothing subtracted per
+    // position. `input_index` is what an input offset adds to become a slot, the
+    // one constant between the two coordinates.
     let (main_tbl, main_hlog, main_bias) = main_table.hot_state_biased();
+    let prefix_start_index = prefix_start_index + main_bias;
+    let input_index = dict_end as u32 + main_bias;
     let dict_slots = dict_table.dict_slots();
 
     // Inner-loop result: literals end (input offset), raw match offset, match
@@ -1684,8 +1692,7 @@ fn compress_block_fast_dict_borrowed_impl<
     'outer: while ip1 <= ilimit {
         // SAFETY: ip0 < ip1 <= ilimit = block_end - 8 ⇒ ≥ 8 readable bytes at ip0.
         let mut hash0 = unsafe { hash_ptr_raw::<MLS>(inp_base.add(ip0), main_hlog) };
-        let mut main_idx =
-            unsafe { (*main_tbl.get_unchecked(hash0 as usize)).saturating_sub(main_bias) };
+        let mut main_idx = unsafe { *main_tbl.get_unchecked(hash0 as usize) };
         let mut dict_idx =
             unsafe { dict_lookup::<MLS>(dict_slots, inp_base.add(ip0), dict_hash_log) };
         let mut curr = ip0;
@@ -1699,13 +1706,36 @@ fn compress_block_fast_dict_borrowed_impl<
             // SAFETY: ip1 <= ilimit ⇒ ≥ 8 readable bytes at ip1.
             let hash1 = unsafe { hash_ptr_raw::<MLS>(inp_base.add(ip1), main_hlog) };
             let cur_abs = dict_end + curr;
-            // Insert current virtual position into the MAIN table.
-            unsafe { *main_tbl.get_unchecked_mut(hash0 as usize) = cur_abs as u32 + main_bias };
+            // Insert current position into the MAIN table.
+            unsafe { *main_tbl.get_unchecked_mut(hash0 as usize) = curr as u32 + input_index };
 
-            // Repcode probe for a match starting at curr + 1. The rep candidate
-            // may sit in the dict (offsets primed from the dictionary's
-            // repToConfirm) or in the input; `borrowed_candidate_len` routes it.
-            if offset_1 > 0 && cur_abs + 1 >= offset_1 as usize + window_low {
+            // Repcode probe for a match starting at curr + 1. One compare settles
+            // what upstream settles with its checked offsets (zstd_fast.c:535-538):
+            // past `rep1_from` the candidate is in the input and in the window.
+            let rep_off = curr + 1;
+            if rep_off >= rep1_from {
+                let cand_off = rep_off - offset_1 as usize;
+                // SAFETY: `curr < ip1 <= ilimit` leaves 8 readable bytes at
+                // `rep_off`, and `cand_off < rep_off`. `cpl` is bounded by
+                // `block_end - (rep_off + 4)` on the leading side.
+                if unsafe { read32(inp_base.add(rep_off)) == read32(inp_base.add(cand_off)) } {
+                    let m_len = 4 + unsafe {
+                        cpl(
+                            inp_base.add(rep_off + 4),
+                            inp_base.add(cand_off + 4),
+                            block_end - (rep_off + 4),
+                        )
+                    };
+                    break Some(DictMatch {
+                        lit_end: rep_off,
+                        offset: offset_1 as usize,
+                        m_len,
+                        curr,
+                    });
+                }
+            } else if offset_1 > 0 && cur_abs + 1 >= offset_1 as usize + window_low {
+                // The candidate sits in the dict (offsets primed from the
+                // dictionary's repToConfirm); `borrowed_candidate_len` routes it.
                 let rep_abs = cur_abs + 1 - offset_1 as usize;
                 let m_len = unsafe {
                     borrowed_candidate_len(
@@ -1731,8 +1761,12 @@ fn compress_block_fast_dict_borrowed_impl<
 
             // Dictionary match — taken ONLY when the main candidate is below the
             // window floor (exactly the indices the main probe rejects), keeping
-            // "recent input wins, dict is the fallback".
-            if main_idx < prefix_start_index {
+            // "recent input wins, dict is the fallback". The floor is tested
+            // last, after the tag and the bytes, as upstream orders them
+            // (zstd_fast.c:576-583): tested first it was the kernel's most
+            // mispredicted branch, by far, on a frame reading a table the last
+            // frame filled.
+            {
                 let dpos = dict_idx as usize;
                 if dict_idx >= 1 && dpos < dict_end && dpos >= window_low {
                     // Four bytes decide it before anything counts, the way
@@ -1774,15 +1808,17 @@ fn compress_block_fast_dict_borrowed_impl<
                         let (cand4, cur4) = unsafe {
                             (read32(dict.as_ptr().add(dpos)), read32(inp_base.add(curr)))
                         };
-                        if cand4 == cur4 {
+                        if cand4 == cur4 && main_idx < prefix_start_index {
                             // Those four are established, so the count resumes
                             // past them rather than re-reading them.
                             count_forward_dict_2segment(dict, dpos, inp, curr, 4)
                         } else {
                             0
                         }
-                    } else {
+                    } else if main_idx < prefix_start_index {
                         count_forward_dict_2segment(dict, dpos, inp, curr, 0)
+                    } else {
+                        0
                     };
                     if m0 >= 4 {
                         let mut match_ip = curr;
@@ -1802,6 +1838,7 @@ fn compress_block_fast_dict_borrowed_impl<
                             let offset = (dict_end + match_ip) - match_pos;
                             offset_2 = offset_1;
                             offset_1 = offset as u32;
+                            rep1_from = offset + rep_floor;
                             break Some(DictMatch {
                                 lit_end: match_ip,
                                 offset,
@@ -1813,45 +1850,48 @@ fn compress_block_fast_dict_borrowed_impl<
                 }
             }
 
-            // Main match (recent input) — `main_idx` is a virtual input position
-            // (`>= dict_end`); the candidate read is at input offset
-            // `main_idx - dict_end`.
-            // INVARIANT: every main-table entry is either the empty sentinel 0
-            // or a VIRTUAL input position `>= dict_end` — the scan stores
-            // `dict_end + off` and the borrowed priming rebases primed offsets by
-            // `dict_end` too (no raw offsets in `[1, dict_end)`). So
-            // `main_idx >= prefix_start_index` (which is `>= 1`) already implies
-            // `main_idx >= dict_end`, and `main_idx - dict_end` cannot underflow
-            // — no per-candidate range check is needed on the hot path.
+            // Main match (recent input) — `main_idx` is a slot; the candidate
+            // read is at input offset `main_idx - input_index`.
+            // INVARIANT: every main-table entry at or over the floor holds an
+            // input position of this epoch: the scan stores `off + input_index`
+            // and the borrowed priming rebases primed offsets the same way, and
+            // the floor is at or over `input_index`'s dictionary part plus the
+            // bias. So `main_idx >= prefix_start_index` already implies
+            // `main_idx >= input_index`, and the subtraction cannot underflow —
+            // no per-candidate range check is needed on the hot path.
             debug_assert!(
-                main_idx == 0 || main_idx as usize >= dict_end,
-                "main-table entry must be the sentinel or a virtual input position (>= dict_end): got {main_idx}, dict_end={dict_end}, bias={main_bias}",
+                main_idx < prefix_start_index || main_idx >= input_index,
+                "a live main-table entry must name an input position: got {main_idx}, input_index={input_index}, floor={prefix_start_index}",
             );
             let main_valid = if USE_CMOV {
                 let in_range = main_idx >= prefix_start_index;
-                // SAFETY: when `in_range`, `main_idx >= prefix_start_index >= 1`
-                // and (per the invariant) `>= dict_end`, so `main_idx - dict_end`
-                // is a valid input offset with ≥ 4 readable bytes; otherwise
+                // SAFETY: when `in_range`, `main_idx >= prefix_start_index` and
+                // (per the invariant) `>= input_index`, so the difference is a
+                // valid input offset with ≥ 4 readable bytes; otherwise
                 // `CMOV_DUMMY` (4 bytes) is read instead.
                 let mval_addr = if in_range {
-                    unsafe { inp_base.add(main_idx as usize - dict_end) }
+                    unsafe { inp_base.add((main_idx - input_index) as usize) }
                 } else {
                     CMOV_DUMMY.as_ptr()
                 };
-                let bytes_match = unsafe { read32(inp_base.add(ip0)) == read32(mval_addr) };
-                #[allow(clippy::needless_bitwise_bool)]
-                let r = bytes_match & in_range;
-                r
+                // The bytes first and the floor after them, fenced apart for the
+                // reason `match_found` gives.
+                if unsafe { read32(inp_base.add(ip0)) != read32(mval_addr) } {
+                    false
+                } else {
+                    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                    in_range
+                }
             } else {
                 main_idx >= prefix_start_index
                     && unsafe {
                         read32(inp_base.add(ip0))
-                            == read32(inp_base.add(main_idx as usize - dict_end))
+                            == read32(inp_base.add((main_idx - input_index) as usize))
                     }
             };
             if main_valid {
                 let mut match_ip = ip0;
-                let mut match_pos = main_idx as usize - dict_end;
+                let mut match_pos = (main_idx - input_index) as usize;
                 let mut m_len = 4 + unsafe {
                     cpl(
                         inp_base.add(ip0 + 4),
@@ -1871,6 +1911,7 @@ fn compress_block_fast_dict_borrowed_impl<
                 let offset = match_ip - match_pos;
                 offset_2 = offset_1;
                 offset_1 = offset as u32;
+                rep1_from = offset + rep_floor;
                 break Some(DictMatch {
                     lit_end: match_ip,
                     offset,
@@ -1881,8 +1922,7 @@ fn compress_block_fast_dict_borrowed_impl<
 
             // Prepare next iteration.
             dict_idx = unsafe { dict_lookup::<MLS>(dict_slots, inp_base.add(ip1), dict_hash_log) };
-            main_idx =
-                unsafe { (*main_tbl.get_unchecked(hash1 as usize)).saturating_sub(main_bias) };
+            main_idx = unsafe { *main_tbl.get_unchecked(hash1 as usize) };
             if ip1 >= next_step {
                 step += 1;
                 next_step += K_STEP_INCR_DICT;
@@ -1911,40 +1951,51 @@ fn compress_block_fast_dict_borrowed_impl<
         anchor = ip0;
 
         if ip0 <= ilimit {
-            // Post-match dense fills (virtual positions).
-            if m.curr + 2 + HASH_READ_SIZE <= block_end {
-                let h = unsafe { hash_ptr_raw::<MLS>(inp_base.add(m.curr + 2), main_hlog) };
-                unsafe {
-                    *main_tbl.get_unchecked_mut(h as usize) =
-                        (dict_end + m.curr + 2) as u32 + main_bias
-                };
-            }
-            if ip0 >= 2 {
-                let h = unsafe { hash_ptr_raw::<MLS>(inp_base.add(ip0 - 2), main_hlog) };
-                unsafe {
-                    *main_tbl.get_unchecked_mut(h as usize) =
-                        (dict_end + ip0 - 2) as u32 + main_bias
-                };
-            }
-            // Immediate repcode-2 loop. The rep candidate may straddle into the
-            // dict; `borrowed_candidate_len` routes it.
-            while ip0 <= ilimit && offset_2 > 0 && dict_end + ip0 >= offset_2 as usize + window_low
-            {
-                let rep_abs = dict_end + ip0 - offset_2 as usize;
-                let r_len = unsafe {
-                    borrowed_candidate_len(
-                        rep_abs, ip0, dict_end, dict, inp, inp_base, block_end, &cpl,
-                    )
-                };
-                if r_len < 4 {
-                    break;
-                }
+            // Post-match dense fills: a match reaches past `curr` by at least
+            // four bytes, so with `ip0 <= ilimit` both lie below `ilimit`.
+            debug_assert!(m.curr + 4 <= ip0);
+            let h = unsafe { hash_ptr_raw::<MLS>(inp_base.add(m.curr + 2), main_hlog) };
+            unsafe { *main_tbl.get_unchecked_mut(h as usize) = (m.curr + 2) as u32 + input_index };
+            let h = unsafe { hash_ptr_raw::<MLS>(inp_base.add(ip0 - 2), main_hlog) };
+            unsafe { *main_tbl.get_unchecked_mut(h as usize) = (ip0 - 2) as u32 + input_index };
+            // Immediate repcode-2 loop, with the bound of the probe above. Only a
+            // candidate under that bound can sit in the dict, where
+            // `borrowed_candidate_len` routes it.
+            while ip0 <= ilimit && offset_2 > 0 {
                 let r_off = offset_2 as usize;
-                core::mem::swap(&mut offset_1, &mut offset_2);
-                let h = unsafe { hash_ptr_raw::<MLS>(inp_base.add(ip0), main_hlog) };
-                unsafe {
-                    *main_tbl.get_unchecked_mut(h as usize) = (dict_end + ip0) as u32 + main_bias
+                let r_len = if ip0 >= r_off + rep_floor {
+                    let cand_off = ip0 - r_off;
+                    // SAFETY: `ip0 <= ilimit` leaves 8 readable bytes at `ip0`, and
+                    // `cand_off < ip0`. `cpl` is bounded by `block_end - (ip0 + 4)`
+                    // on the leading side.
+                    if unsafe { read32(inp_base.add(ip0)) != read32(inp_base.add(cand_off)) } {
+                        break;
+                    }
+                    4 + unsafe {
+                        cpl(
+                            inp_base.add(ip0 + 4),
+                            inp_base.add(cand_off + 4),
+                            block_end - (ip0 + 4),
+                        )
+                    }
+                } else if dict_end + ip0 >= r_off + window_low {
+                    let rep_abs = dict_end + ip0 - r_off;
+                    let r_len = unsafe {
+                        borrowed_candidate_len(
+                            rep_abs, ip0, dict_end, dict, inp, inp_base, block_end, &cpl,
+                        )
+                    };
+                    if r_len < 4 {
+                        break;
+                    }
+                    r_len
+                } else {
+                    break;
                 };
+                core::mem::swap(&mut offset_1, &mut offset_2);
+                rep1_from = r_off + rep_floor;
+                let h = unsafe { hash_ptr_raw::<MLS>(inp_base.add(ip0), main_hlog) };
+                unsafe { *main_tbl.get_unchecked_mut(h as usize) = ip0 as u32 + input_index };
                 // The emit before this loop set `anchor = ip0`.
                 debug_assert_eq!(anchor, ip0);
                 handle_sequence(Sequence::Triple {

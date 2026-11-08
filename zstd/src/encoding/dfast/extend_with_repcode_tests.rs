@@ -405,3 +405,86 @@ fn dfast_borrowed_window_matches_owned_sequence_stream() {
         "rep state must match after both scans",
     );
 }
+
+/// A dictionary frame scanned in place keeps the dictionary at the front of
+/// the history and reads the input where the caller holds it, so every match
+/// that touches the dictionary spans two buffers. It must still emit exactly
+/// what the owned path emits with the input copied in after the dictionary.
+/// The input is laid out to reach the dictionary every way the scan can: rep
+/// offsets primed into its tail, matches found in its tables that run on into
+/// the input, and input matches that extend backwards into it.
+#[test]
+fn dfast_borrowed_dictionary_frame_matches_owned_sequence_stream() {
+    let mut seed = 0x9E37_79B9u32;
+    let mut noise = |len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect()
+    };
+    let dict = noise(1500);
+    let head = noise(64);
+    let dict_tail = &dict[dict.len() - 40..];
+    let mut input = Vec::new();
+    // Continues the dictionary's last bytes at the primed rep offsets.
+    input.extend_from_slice(&dict[dict.len() - 8..]);
+    input.extend_from_slice(&head);
+    input.extend_from_slice(&noise(200));
+    // A dictionary run, from its tables.
+    input.extend_from_slice(&dict[300..420]);
+    input.extend_from_slice(&noise(150));
+    // The dictionary's tail followed by the input's head: found from either
+    // side, it runs across the boundary between the two buffers.
+    input.extend_from_slice(dict_tail);
+    input.extend_from_slice(&head);
+    input.extend_from_slice(&noise(300));
+    input.extend_from_slice(&dict[900..1000]);
+    input.extend_from_slice(&head[..40]);
+    input.extend_from_slice(&noise(100));
+    let split = input.len() / 2;
+    let window = 1usize << 16;
+
+    let primed = |matcher: &mut DfastMatchGenerator| {
+        matcher.ensure_hash_tables();
+        matcher.commit_input(&dict);
+        matcher.skip_matching_for_dict_attach();
+        matcher.mark_dict_primed();
+        matcher.offset_hist = [1, 4, 8];
+    };
+
+    let mut owned = DfastMatchGenerator::new(window);
+    primed(&mut owned);
+    let mut owned_seqs: Vec<CapturedSeq> = Vec::new();
+    for range in [0..split, split..input.len()] {
+        owned.commit_input(&input[range]);
+        let mut rec = record_seq(&mut owned_seqs);
+        with_host_tier!(K => owned.start_matching::<K>(&mut rec));
+    }
+
+    let mut borrowed = DfastMatchGenerator::new(window);
+    primed(&mut borrowed);
+    let mut borrowed_seqs: Vec<CapturedSeq> = Vec::new();
+    // SAFETY: `input` outlives the scans, and the window is cleared before
+    // either is dropped.
+    unsafe { borrowed.set_borrowed_window(&input) };
+    for (start, end) in [(0, split), (split, input.len())] {
+        let mut rec = record_seq(&mut borrowed_seqs);
+        with_host_tier!(K => borrowed.start_matching_borrowed::<K>(start, end, &mut rec));
+    }
+    borrowed.clear_borrowed_window();
+
+    assert!(
+        owned_seqs.iter().any(|seq| matches!(
+            seq,
+            CapturedSeq::Triple { offset, .. } if *offset > input.len()
+        )),
+        "fixture: some match reaches into the dictionary"
+    );
+    assert_eq!(
+        owned_seqs, borrowed_seqs,
+        "a dictionary frame scanned in place must emit the owned path's sequences",
+    );
+    assert_eq!(owned.offset_hist, borrowed.offset_hist);
+}

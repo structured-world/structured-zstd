@@ -113,14 +113,9 @@ pub struct Workspace {
     /// Consecutive layouts that found the allocation far larger than they
     /// need, for giving back one that has stayed so.
     oversized_layouts: u32,
-    /// Bytes of zero-start tables in this layout when they are larger than the
-    /// input expected to write them, else 0 (see [`Self::open_for_match_finder`]).
-    sparse_table_bytes: usize,
-    /// The open layout made the allocation, zeroed, so its regions hold
-    /// zeros until their holders write them.
+    /// The open layout made the allocation zeroed, on fresh pages, so its
+    /// regions hold zeros until their holders write them.
     zeroed: bool,
-    /// See [`Self::on_fresh_pages`].
-    fresh_pages: bool,
 }
 
 /// Upstream `ZSTD_WORKSPACETOOLARGE_FACTOR` / `_MAXDURATION`
@@ -183,9 +178,7 @@ impl Workspace {
             block_capacity: 0,
             open: false,
             oversized_layouts: 0,
-            sparse_table_bytes: 0,
             zeroed: false,
-            fresh_pages: false,
         }
     }
 
@@ -201,7 +194,7 @@ impl Workspace {
     /// than on a workspace kept from an earlier frame.
     /// Settled when the layout opens, so the per-block gate reads one field.
     pub(crate) fn on_fresh_pages(&self) -> bool {
-        self.fresh_pages
+        self.zeroed
     }
 
     /// Bytes the workspace has allocated, for heap accounting: its capacity
@@ -232,34 +225,7 @@ impl Workspace {
         self.block_target = block_target;
         self.trailing_for = trailing_for;
         self.ingest = ingest;
-        self.sparse_table_bytes = 0;
         self.open = false;
-    }
-
-    /// Opens the layout for a match finder, as [`Self::open`], whose tables
-    /// include `zero_tables` bytes of tables that start as zeros, for a frame
-    /// expected to bring `expected_input` bytes.
-    ///
-    /// Zero tables larger than that input keep most of their pages untouched,
-    /// so a new allocation that they make up most of is then taken zeroed and
-    /// those tables left as they are: only the pages the frame indexes are
-    /// ever faulted in. Otherwise a plain allocation that fills only the
-    /// tables costs less: the input writes dense tables anyway, and an
-    /// allocator zeroes a block it hands out again in full, the history and
-    /// buffers included, which for a small frame is several times its tables.
-    pub(crate) fn open_for_match_finder(
-        &mut self,
-        leading: usize,
-        zero_tables: usize,
-        window: usize,
-        expected_input: usize,
-    ) {
-        self.sparse_table_bytes = if zero_tables > expected_input {
-            zero_tables
-        } else {
-            0
-        };
-        self.open(leading, window);
     }
 
     /// Whether this layout has been opened.
@@ -335,14 +301,13 @@ impl Workspace {
         // At `FRESH_PAGES_FROM` and above the pages are fresh, so it is taken
         // whatever the tables: filling them there faults in pages the frame
         // never indexes, 36-42% of the encode at 1 MiB and level 3 on musl
-        // and i686, and 70% at 10 KiB on musl. Below it, where a context
-        // rebuilt per frame lands on recycled memory, it is taken only when
-        // the rest is at most a third of the sparse tables, which caps that
-        // case at a third over filling them. A small frame's tables sit
-        // beside buffers of their own size: at 10 KiB and level 1 they were
-        // 56% of the workspace, and zeroing it all measured 23% slower than
-        // filling them on glibc. A small input at a high level, where the
-        // tables are most of it, keeps its untouched pages (78% at level 13).
+        // and i686, and 70% at 10 KiB on musl. Below it a context rebuilt per
+        // frame lands on recycled memory, where a zeroed allocation is a
+        // memset of the history and buffers as well as the tables, so only
+        // the tables are filled, as upstream cleans only its tables
+        // (`ZSTD_cwksp_clean_tables`). On glibc that zeroed the whole
+        // workspace of a 10 KiB level-3 frame at 1.8x the cost of filling
+        // its tables.
         //
         // Carving the zero tables from a zeroed allocation of their own instead
         // hands the allocator that choice per table, and measured well on musl
@@ -351,18 +316,11 @@ impl Workspace {
         // (twice the largest chunk freed), so a context rebuilt per frame gave
         // its pages back and faulted them in again on every frame, 3.9x slower
         // at 1 MiB and level 3.
-        debug_assert!(
-            self.sparse_table_bytes <= leading,
-            "zero tables are part of the leading bytes"
-        );
-        let zero_all = (SYSTEM_ALLOCATOR && total >= FRESH_PAGES_FROM)
-            || (self.sparse_table_bytes > 0
-                && total - self.sparse_table_bytes <= self.sparse_table_bytes / 3);
+        let zero_all = SYSTEM_ALLOCATOR && total >= FRESH_PAGES_FROM;
         if reallocate {
             self.grow(total, zero_all);
         }
         self.zeroed = reallocate && zero_all;
-        self.fresh_pages = SYSTEM_ALLOCATOR && self.zeroed && self.capacity >= FRESH_PAGES_FROM;
         self.front = 0;
         self.leading = leading;
         self.history_front = leading;
@@ -1185,6 +1143,19 @@ impl<T: Copy> RegionVec<T> {
             capacity_exhausted();
         }
         // SAFETY: `len < capacity`, so the slot is inside the region.
+        unsafe { self.region.as_mut_ptr().add(self.len).write(value) };
+        self.len += 1;
+    }
+
+    /// [`Self::push`] without the capacity test.
+    ///
+    /// # Safety
+    ///
+    /// The buffer must not be full.
+    #[inline(always)]
+    pub(crate) unsafe fn push_within_capacity(&mut self, value: T) {
+        debug_assert!(self.len < self.region.len);
+        // SAFETY: the caller keeps `len < capacity`.
         unsafe { self.region.as_mut_ptr().add(self.len).write(value) };
         self.len += 1;
     }

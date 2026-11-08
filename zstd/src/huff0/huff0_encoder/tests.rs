@@ -794,7 +794,9 @@ fn reused_buffers_stay_within_their_maximums() {
     for width in 3..=256usize {
         let counts: alloc::vec::Vec<usize> =
             (0..width).map(|i| 1 + (i * 7 % 13) * (i % 5 + 1)).collect();
-        let mut table = HuffmanTable::build_from_counts_gated_with(&counts, false, &mut scratch);
+        let total = counts.iter().sum();
+        let mut table =
+            HuffmanTable::build_from_counts_gated_with(&counts, total, false, &mut scratch);
         let mut fse_table = fse_encoder::FSETable::blank();
         let _ = table.try_table_description_size(&mut fse_table);
         assert!(
@@ -819,6 +821,65 @@ fn reused_buffers_stay_within_their_maximums() {
     }
 }
 
+/// The single-build path reads its table off the limited leaves, and the
+/// weight route builds it from a weight per symbol; for the same code the two
+/// must give identical codes, packed codes and table log, or the literals the
+/// fast levels emit change. Covered: flat, skewed and sparse histograms, small
+/// and full alphabets, every table log the cheap path can pick, and a reused
+/// table whose previous alphabet was larger.
+#[test]
+fn a_table_read_off_limited_leaves_matches_the_weight_route() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut leaves_scratch = WeightScratch::default();
+    let mut spare_leaves: Option<HuffmanTable> = None;
+    let mut spare_weights: Option<HuffmanTable> = None;
+    for case in 0..2000 {
+        let alphabet = 2 + (next() % 255) as usize;
+        let mut counts = alloc::vec![0usize; alphabet];
+        for count in counts.iter_mut() {
+            *count = match case % 4 {
+                0 => (next() % 50) as usize,
+                1 => (1usize << (next() % 12)) - 1,
+                2 if next() % 3 == 0 => 0,
+                _ => (next() % 4000) as usize,
+            };
+        }
+        if counts.iter().filter(|&&c| c > 0).count() < 2 {
+            continue;
+        }
+        let table_log = 5 + (next() % 7) as usize;
+        build_huffman_leaf_depths_into(&counts, &mut leaves_scratch.leaves);
+        if !limit_leaves_in_place(&mut leaves_scratch.leaves, table_log) {
+            continue;
+        }
+        let mut weights = alloc::vec![0usize; alphabet];
+        for leaf in &leaves_scratch.leaves {
+            weights[leaf.symbol as usize] = table_log + 1 - leaf.nb_bits as usize;
+        }
+        let from_leaves = HuffmanTable::build_from_limited_leaves(
+            &leaves_scratch.leaves,
+            alphabet,
+            table_log,
+            spare_leaves.take(),
+        );
+        let from_weights = HuffmanTable::build_from_weights_reusing(&weights, spare_weights.take());
+        assert_eq!(from_leaves.codes, from_weights.codes, "case {case}");
+        assert_eq!(
+            from_leaves.packed_codes, from_weights.packed_codes,
+            "case {case}"
+        );
+        assert_eq!(from_leaves.table_log, from_weights.table_log, "case {case}");
+        spare_leaves = Some(from_leaves);
+        spare_weights = Some(from_weights);
+    }
+}
+
 /// The bound is on the SUM, and the largest histogram the encoder can produce
 /// has to stay well inside it: a full 128 KiB literals section over one symbol.
 #[test]
@@ -834,4 +895,46 @@ fn build_from_counts_accepts_the_largest_section_the_encoder_can_produce() {
     // than from truncated ones.
     assert!(table.codes[b'a' as usize].1 < table.codes[b'b' as usize].1);
     assert_eq!(table.codes[b'b' as usize].1, table.codes[b'c' as usize].1);
+}
+
+/// Every route of the gated build gives a table that codes its histogram: the
+/// searched build (the plain one), the cheap build over limited leaves, the
+/// weight route a single symbol takes, and the weight route a code the leaf
+/// limiter cannot complete falls back to (Fibonacci counts, the worst case for
+/// Huffman depth).
+#[test]
+fn every_route_of_the_gated_build_codes_its_histogram() {
+    let mut skewed = [0usize; 256];
+    for (i, count) in skewed.iter_mut().take(40).enumerate() {
+        *count = 1 + i * i;
+    }
+    let mut single = [0usize; 256];
+    single[b'x' as usize] = 500;
+    let mut fibonacci = [0usize; 256];
+    let (mut a, mut b) = (1usize, 1usize);
+    for count in fibonacci.iter_mut().take(24) {
+        *count = a;
+        (a, b) = (b, a + b);
+    }
+    let searched = HuffmanTable::build_from_counts_gated(&skewed, true);
+    assert!(
+        searched.codes == HuffmanTable::build_from_counts(&skewed).codes,
+        "the searched route is the plain build"
+    );
+    for (name, counts) in [("skewed", &skewed), ("fibonacci", &fibonacci)] {
+        let table = HuffmanTable::build_from_counts_gated(counts, false);
+        assert!(
+            table
+                .estimate_compressed_size_from_counts_checked(counts)
+                .is_some(),
+            "the {name} table does not code its histogram"
+        );
+    }
+    // One symbol has no Huffman code (the encoder writes such a section as
+    // RLE first); the cheap route gives it what the plain builder does.
+    assert!(
+        HuffmanTable::build_from_counts_gated(&single, false).codes
+            == HuffmanTable::build_from_counts(&single).codes,
+        "the single-symbol route differs from the plain build"
+    );
 }

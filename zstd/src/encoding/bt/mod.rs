@@ -53,8 +53,6 @@ pub(crate) struct BtMatcher {
     pub(crate) opt_node_prices_scratch: Box<[MaybeUninit<u32>]>,
     /// Per-frame scratch for collected match candidates.
     pub(crate) opt_candidates_scratch: Vec<MatchCandidate>,
-    /// Per-frame scratch for the final emitted node stream.
-    pub(crate) opt_store_scratch: Vec<HcOptimalNode>,
     /// Per-segment plan buffer (parse → encode hand-off).
     pub(crate) opt_segment_plan_scratch: Vec<HcOptimalSequence>,
     /// `btultra2` seed-pass plan buffer.
@@ -90,25 +88,25 @@ impl BtMatcher {
 
     /// Steady-state workspace budget for one boxed matcher: the inline
     /// payload (`HcOptState` cost tables, lit-price arrays) plus the
-    /// retained scratch arenas at their growth bounds — node frontier and
-    /// emitted store (`HC_OPT_NODE_LEN` nodes each, including the `+2`
-    /// lookahead slack), the SoA node-price companion (`HC_OPT_NODE_LEN`
+    /// retained scratch arenas at their growth bounds — the node frontier
+    /// (`HC_OPT_NODE_LEN` nodes, including the `+2` cells the traceback
+    /// writes the path into), the SoA node-price companion (`HC_OPT_NODE_LEN`
     /// `u32`s), the consolidated price arena (`HC_OPT_PRICE_ARENA_LEN`
     /// `[price, generation]` pairs, LL and ML regions), the per-segment plan
-    /// buffers, and the candidate ladder (`MAX_HC_SEARCH_DEPTH`). LDM is
+    /// buffers, and the candidate ladder (`HC_OPT_CANDIDATE_CAPACITY`). LDM is
     /// opt-in and excluded (`ldm_sequences` stays empty on every level
     /// preset). Kept next to the struct so the estimator and the real
     /// retained layout evolve together.
     pub(crate) fn estimated_workspace_bytes() -> usize {
         use super::cost_model::{HC_OPT_NODE_LEN, HC_OPT_NUM, HC_OPT_PRICE_ARENA_LEN};
-        use super::hc::MAX_HC_SEARCH_DEPTH;
+        use super::hc::HC_OPT_CANDIDATE_CAPACITY;
         let frontier = HC_OPT_NUM + 1;
         core::mem::size_of::<Self>()
-            + 2 * HC_OPT_NODE_LEN * core::mem::size_of::<HcOptimalNode>()
+            + HC_OPT_NODE_LEN * core::mem::size_of::<HcOptimalNode>()
             + HC_OPT_NODE_LEN * core::mem::size_of::<u32>()
             + HC_OPT_PRICE_ARENA_LEN * core::mem::size_of::<[u32; 2]>()
             + 2 * frontier * core::mem::size_of::<HcOptimalSequence>()
-            + MAX_HC_SEARCH_DEPTH * core::mem::size_of::<MatchCandidate>()
+            + HC_OPT_CANDIDATE_CAPACITY * core::mem::size_of::<MatchCandidate>()
     }
 
     /// Append `candidate` to `out` if it's strictly longer than the
@@ -157,7 +155,6 @@ impl BtMatcher {
             opt_nodes_scratch: Box::default(),
             opt_node_prices_scratch: Box::default(),
             opt_candidates_scratch: Vec::new(),
-            opt_store_scratch: Vec::new(),
             opt_segment_plan_scratch: Vec::new(),
             opt_seed_plan_scratch: Vec::new(),
             opt_price_arena: alloc::boxed::Box::default(),
@@ -177,7 +174,6 @@ impl BtMatcher {
         self.opt_nodes_scratch.len() * core::mem::size_of::<HcOptimalNode>()
             + self.opt_node_prices_scratch.len() * core::mem::size_of::<u32>()
             + self.opt_candidates_scratch.capacity() * core::mem::size_of::<MatchCandidate>()
-            + self.opt_store_scratch.capacity() * core::mem::size_of::<HcOptimalNode>()
             + (self.opt_segment_plan_scratch.capacity() + self.opt_seed_plan_scratch.capacity())
                 * core::mem::size_of::<HcOptimalSequence>()
             + self.opt_price_arena.len() * core::mem::size_of::<[u32; 2]>()
@@ -199,7 +195,6 @@ impl BtMatcher {
         // fresh value `1`. The inline lit price/generation arrays are
         // small and stay zeroed (self-consistent stamp reset).
         self.opt_candidates_scratch.clear();
-        self.opt_store_scratch.clear();
         self.opt_segment_plan_scratch.clear();
         self.opt_seed_plan_scratch.clear();
         self.opt_lit_price_scratch = [0; HC_MAX_LIT + 1];
@@ -357,7 +352,6 @@ impl BtMatcher {
             nodes,
             node_prices,
             mut candidates,
-            store,
             price_arena,
             candidates_searched_at: _,
             pass: _,
@@ -366,7 +360,6 @@ impl BtMatcher {
         self.opt_nodes_scratch = nodes;
         self.opt_node_prices_scratch = node_prices;
         self.opt_candidates_scratch = candidates;
-        self.opt_store_scratch = store;
         self.opt_price_arena = price_arena;
         result
     }
@@ -481,20 +474,15 @@ impl BtMatcher {
     ) {
         let lit_len = sequence.lit_len as usize;
         let match_len = sequence.match_len as usize;
-        // `checked_add` on both edges so a malformed sequence can't overflow
-        // `usize` arithmetic before the bounds guard fires. `saturating_add`
-        // would have masked overflow as "clamp to usize::MAX" which then
-        // bypasses the `> block.len()` check.
-        let Some(start) = literals_start.checked_add(lit_len) else {
-            return;
-        };
-        let Some(end) = start.checked_add(match_len) else {
-            return;
-        };
-        if end > block.len() {
-            return;
-        }
-        let literals = &block[*literals_start..start];
+        // The parser's sequences tile the block in order, so each one ends
+        // inside it (upstream zstd_opt.c asserts `anchor + llen <= iend` at
+        // the same point). Every length is bounded by the block (128 KiB),
+        // so the sums cannot overflow.
+        let start = *literals_start + lit_len;
+        let end = start + match_len;
+        debug_assert!(end <= block.len(), "a sequence past the block's end");
+        // SAFETY: `*literals_start <= start <= end <= block.len()` (above).
+        let literals = unsafe { block.get_unchecked(*literals_start..start) };
         let (off_base, next_reps) =
             Self::encode_offset_with_reps(sequence.offset, literals.len(), *reps);
         opt_state.update_stats(literals.len(), literals, off_base, match_len);
@@ -512,9 +500,13 @@ impl BtMatcher {
     /// `node_prices` points into an arena longer than `end`.
     #[inline(always)]
     pub(crate) unsafe fn reset_opt_node_prices(node_prices: *mut u32, start: usize, end: usize) {
+        // A store per cell, as upstream's frontier fill (zstd_opt.c, `while
+        // (last_pos < pos)`): the range is a cell or two, and as plain writes
+        // the loop became a libc `memset` call, which cost the parser a call,
+        // a `vzeroupper` and its vector constants reloaded on every extension.
         for i in start..=end {
             // SAFETY: `i <= end`, in bounds by the caller's contract.
-            unsafe { node_prices.add(i).write(u32::MAX) };
+            unsafe { node_prices.add(i).write_volatile(u32::MAX) };
         }
     }
 

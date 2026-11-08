@@ -183,21 +183,26 @@ pub(crate) fn adjusted_window_log(window_log: u32, src_size: u64, dict_size: usi
 
 /// `ZSTD_adjustCParams_internal` (zstd_compress.c): down-size `cp` for the
 /// given `(src_size, dict_size, mode)`. `src_size == CONTENTSIZE_UNKNOWN`
-/// means unknown; `src_size == 0` means literally zero.
+/// means unknown; `src_size == 0` means literally zero. `rows` is the frame's
+/// `useRowMatchFinder`: only an explicit `Disable` lifts the row cap.
 pub(crate) fn adjust_cparams(
     cp: CParams,
     src_size: u64,
     dict_size: usize,
     create_cdict: bool,
+    rows: crate::encoding::parameters::RowMatchFinderMode,
 ) -> CParams {
     let mut cp = adjust_table_logs(cp, src_size, dict_size, create_cdict);
     // The row finder hashes `hashLog - rowLog` row bits plus an 8-bit tag, all
     // from one 32-bit hash, so the table may not outgrow it. Upstream assumes
-    // rows for greedy / lazy / lazy2 at this point, whatever the window, since
-    // the switch to rows is only decided later. Callers pass the frame's real
-    // strategy and search log: a placeholder would cap tables that have no
-    // rows, or rows of the wrong width.
-    if (3..=5).contains(&cp.strategy) {
+    // rows for greedy / lazy / lazy2 at this point unless they are disabled
+    // outright, since the switch to rows is only decided later
+    // (zstd_compress.c:1591). Callers pass the frame's real strategy and
+    // search log: a placeholder would cap tables that have no rows, or rows of
+    // the wrong width.
+    if (3..=5).contains(&cp.strategy)
+        && rows != crate::encoding::parameters::RowMatchFinderMode::Disable
+    {
         let row_log = cp.search_log.clamp(4, 6);
         let max_hash_log = 32 - ROW_HASH_TAG_BITS + row_log;
         if cp.hash_log > max_hash_log {
@@ -280,13 +285,21 @@ pub(crate) fn get_cdict_cparams(
 ) -> CParams {
     let mut cp = get_cparams_mode(compression_level, CONTENTSIZE_UNKNOWN, dict_size, true);
     if apply_cparam_overrides(&mut cp, overrides) {
-        cp = adjust_cparams(cp, CONTENTSIZE_UNKNOWN, dict_size, true);
+        cp = adjust_cparams(
+            cp,
+            CONTENTSIZE_UNKNOWN,
+            dict_size,
+            true,
+            overrides.row_match_finder,
+        );
     }
     cp
 }
 
 /// Put each knob the caller set in place of the row's, reporting whether any
-/// landed. Upstream `ZSTD_overrideCParams`, whose every caller re-adjusts
+/// landed. Upstream `ZSTD_getCParamsFromCCtxParams` (zstd_compress.c:1646):
+/// long-distance matching first widens the window to 27, then
+/// `ZSTD_overrideCParams` lays the knobs over it, and every caller re-adjusts
 /// afterwards: a width the caller asked for is still bounded by the source and
 /// dictionary it will index.
 fn apply_cparam_overrides(
@@ -294,6 +307,11 @@ fn apply_cparam_overrides(
     overrides: &crate::encoding::parameters::ParamOverrides,
 ) -> bool {
     let mut overridden = false;
+    #[cfg(feature = "ldm")]
+    if overrides.ldm.is_some() {
+        cp.window_log = crate::encoding::ldm::params::LDM_DEFAULT_WINDOW_LOG;
+        overridden = true;
+    }
     let mut set = |field: &mut u32, value: Option<u32>| {
         if let Some(value) = value {
             *field = value;
@@ -310,12 +328,40 @@ fn apply_cparam_overrides(
     overridden
 }
 
+/// The cParams a frame resolves under the caller's own knobs for a source of
+/// `src_size` with `dict_size` bytes of dictionary in front of it: the level's
+/// row, the knobs on top, then the adjustment that bounds them
+/// (`ZSTD_getCParamsFromCCtxParams` with `ZSTD_cpm_unknown`).
+///
+/// The order is upstream's and it is what makes the bound bite: a `hashLog` the
+/// caller asks for is capped at `dictAndWindowLog + 1`, so a wide table cannot
+/// be built over a narrow window. Applied the other way round, the cap runs
+/// before the knob it is meant to bound and a small-window frame with a large
+/// dictionary builds a table many times its window.
+pub(crate) fn get_frame_cparams(
+    compression_level: i32,
+    src_size: u64,
+    dict_size: usize,
+    overrides: &crate::encoding::parameters::ParamOverrides,
+) -> CParams {
+    let mut cp = get_cparams_mode(compression_level, src_size, dict_size, false);
+    if apply_cparam_overrides(&mut cp, overrides) {
+        cp = adjust_cparams(cp, src_size, dict_size, false, overrides.row_match_finder);
+    }
+    cp
+}
+
 /// `ZSTD_resetCCtx_byAttachingCDict` cParams: the CDict's cParams re-adjusted
 /// for the frame's source alone (`ZSTD_cpm_attachDict` ignores the dictionary
 /// size, the dictionary keeps its own tables) with the frame's own
 /// `windowLog` kept.
-pub(crate) fn attach_cparams(cdict: CParams, src_size: u64, window_log: u32) -> CParams {
-    let mut cp = adjust_cparams(cdict, src_size, 0, false);
+pub(crate) fn attach_cparams(
+    cdict: CParams,
+    src_size: u64,
+    window_log: u32,
+    rows: crate::encoding::parameters::RowMatchFinderMode,
+) -> CParams {
+    let mut cp = adjust_cparams(cdict, src_size, 0, false, rows);
     cp.window_log = window_log;
     cp
 }
@@ -397,7 +443,13 @@ fn get_cparams_mode(
         cp.target_length = (-clamped) as u32;
     }
 
-    adjust_cparams(cp, src_size_hint, dict_size, create_cdict)
+    adjust_cparams(
+        cp,
+        src_size_hint,
+        dict_size,
+        create_cdict,
+        crate::encoding::parameters::RowMatchFinderMode::Auto,
+    )
 }
 
 /// The `(hash_log, chain_log)` a dictionary's prepared match-finder tables get

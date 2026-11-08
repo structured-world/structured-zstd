@@ -22,6 +22,21 @@ fn an_encoder_table_holds_nothing_on_the_heap() {
 }
 
 #[test]
+fn a_tiny_histogram_keeps_the_requested_table_log() {
+    // Upstream `FSE_optimalTableLog_internal` (fse_compress.c:357) computes
+    // `highbit(srcSize - 1) - minus` in unsigned arithmetic: for 2..=4 samples
+    // under the FSE `minus` of 2 that wraps, so no accuracy reduction applies
+    // and the requested log stands. A floor at 0 instead dropped a 3-sequence
+    // block's tables to log 5, a header and a stream upstream never writes.
+    assert_eq!(fse_encoder::optimal_table_log(9, 3, 2, 2), 9);
+    assert_eq!(fse_encoder::optimal_table_log(8, 4, 3, 2), 8);
+    assert_eq!(fse_encoder::optimal_table_log(6, 2, 1, 1), 6);
+    // Past the wrap the reduction applies as before: 5 samples give
+    // highbit(4) - 2 = 0, then the representability floor and the clamp to 5.
+    assert_eq!(fse_encoder::optimal_table_log(9, 5, 2, 2), 5);
+}
+
+#[test]
 fn rebuilding_a_used_table_matches_a_fresh_build() {
     // Block tables are rebuilt in place. A symbol the earlier build had and the
     // new one lacks, inside the new alphabet or past it, must read as absent:
@@ -82,6 +97,25 @@ fn a_description_written_from_counts_is_the_tables_own() {
     table.write_table(&mut writer);
     writer.flush();
     assert_eq!(again, buf);
+}
+
+/// A description written behind whole bytes the writer still holds: the burst
+/// that writes it drains them first, and the room it commits has to cover them
+/// beside the description itself.
+#[cfg(feature = "dict-builder")]
+#[test]
+fn a_description_behind_held_bytes_stays_in_its_room() {
+    let mut buf = alloc::vec::Vec::new();
+    let mut writer = crate::bit_io::BitWriter::from(&mut buf);
+    for byte in 1..=7u64 {
+        writer.write_bits(byte, 8);
+    }
+    fse_encoder::write_ncount_at_log(&[1, 1], 5, &mut writer);
+    writer.flush();
+    assert_eq!(buf[..7], [1, 2, 3, 4, 5, 6, 7]);
+    let mut dec_table = FSETable::new(255);
+    let read = dec_table.read_table_probabilities(&buf[7..], 5).unwrap();
+    assert_eq!(read, buf.len() - 7);
 }
 
 #[test]

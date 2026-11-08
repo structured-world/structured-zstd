@@ -2542,6 +2542,41 @@ fn an_attached_dictionary_frame_lays_out_only_the_dictionary() {
     assert_eq!(decoded, payload);
 }
 
+/// The dfast levels read a small slice under an attached dictionary in place
+/// too, and a reused context retires each frame's positions by moving the
+/// floor rather than emptying its tables: every frame of a run must decode,
+/// whatever the frames before it wrote.
+#[test]
+fn dfast_dictionary_frames_scanned_in_place_decode_across_a_reused_context() {
+    let dict_content = generate_data(7, 3 * 1024);
+    let dict = || {
+        crate::decoding::Dictionary::from_raw_content(0xABCD_0044, dict_content.clone())
+            .expect("raw dictionary should be valid")
+    };
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(3));
+    compressor
+        .set_dictionary(dict())
+        .expect("dictionary should attach");
+    let mut decoder = FrameDecoder::new();
+    decoder.add_dict(dict()).unwrap();
+    let mut out = Vec::new();
+    for frame in 0..6u64 {
+        // Frames that quote the dictionary and each other's shape, of varying
+        // length, so stale positions from an earlier frame would land in range.
+        let mut payload = generate_data(20 + frame, 600 + 700 * frame as usize);
+        payload.extend_from_slice(&dict_content[(frame as usize) * 300..][..400]);
+        payload.extend_from_slice(&generate_data(40 + frame, 500));
+        compressor.compress_independent_frame_into(&payload, &mut out);
+        assert!(
+            compressor.state.matcher.borrowed_dict_supported(),
+            "fixture: frame {frame} is scanned in place"
+        );
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(&out, &mut decoded).unwrap();
+        assert_eq!(decoded, payload, "frame {frame} must decode");
+    }
+}
+
 /// A custom matcher holds nothing in the compressor's workspace, so replacing
 /// it hands back the matcher that ran, and the compressor goes on with the new
 /// one.
@@ -3185,10 +3220,18 @@ fn set_compression_level_forgets_the_literal_compression_mode() {
     use super::CompressionLevel;
     use crate::encoding::{CompressionParameters, LiteralCompressionMode};
 
-    // Literal-heavy input: 32 symbols with nothing for the match finder, so
-    // whether the literals are Huffman-coded decides the frame size.
-    let text: Vec<u8> = (0..8192u32)
-        .map(|i| b'a' + (i.wrapping_mul(2_654_435_761) >> 27) as u8)
+    // Literal-heavy input: 32 pseudo-random symbols with nothing for the match
+    // finder, so whether the literals are Huffman-coded decides the frame
+    // size. A rotation sequence would not do: it repeats every short factor,
+    // and a 4-byte short key finds them all.
+    let mut state = 0x9E37_79B9u32;
+    let text: Vec<u8> = (0..8192)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            b'a' + (state >> 27) as u8
+        })
         .collect();
     let level = CompressionLevel::Level(3);
     let raw_literals = CompressionParameters::builder(level)
@@ -3512,6 +3555,35 @@ fn a_kept_compressor_writes_each_small_piece_as_a_fresh_one() {
         }
     }
     assert!(diverged.is_empty(), "{diverged:#?}");
+}
+
+/// A fast-band frame leaves its table in place and moves the index past it, so
+/// what the previous frames stored must never reach the next one: on a reused
+/// compressor every frame comes out as it does on a fresh one, including a
+/// frame identical to the last, which would match every stale slot.
+#[test]
+fn a_reused_compressor_encodes_each_frame_as_a_fresh_one_does() {
+    use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+    let text: Vec<u8> = (0..20_000u32)
+        .flat_map(|i| (i % 257).wrapping_mul(2_654_435_761).to_le_bytes())
+        .collect();
+    let frames: [&[u8]; 6] = [
+        &text[..10_240],
+        &text[..10_240],
+        &text[5_000..9_096],
+        &text[..80_000],
+        &text[3..1_027],
+        &text[..10_240],
+    ];
+    for level in [-1, 1, 2] {
+        let level = CompressionLevel::from_level(level);
+        let mut cctx: FrameCompressor = FrameCompressor::new(level);
+        let mut out = Vec::new();
+        for frame in frames {
+            cctx.compress_independent_frame_into(frame, &mut out);
+            assert_eq!(out, compress_slice_to_vec(frame, level));
+        }
+    }
 }
 
 /// `compress_independent_frame_into` must replace (not append to) the
@@ -4891,4 +4963,247 @@ fn every_tier_writes_the_same_frames() {
             }
         }
     }
+}
+
+/// Blocks a borrowed frame writes off as noise are still indexed, so the next
+/// frame on the same context must carry the table past them: the positions they
+/// left are the previous frame's, and a frame that takes them for its own reads
+/// a match that is not there (a kernel assertion in debug, a wrong offset in
+/// release). Here the second frame searches every block, so it reaches them.
+#[test]
+fn a_frame_after_raw_skipped_borrowed_blocks_ignores_their_positions() {
+    let input = generate_data(0x0B0B_B1E5, 256 * 1024);
+    let level = super::CompressionLevel::Level(1);
+    let mut compressor: FrameCompressor = FrameCompressor::new(level);
+    let first = compressor.compress_independent_frame(&input);
+    let params = crate::encoding::CompressionParameters::builder(level)
+        .raw_skip(false)
+        .build()
+        .unwrap();
+    compressor.set_parameters(&params);
+    let second = compressor.compress_independent_frame(&input);
+    for frame in [&first, &second] {
+        let mut decoded = Vec::with_capacity(input.len());
+        FrameDecoder::new()
+            .decode_all_to_vec(frame, &mut decoded)
+            .unwrap();
+        assert!(decoded == input, "a frame does not decode to its input");
+    }
+}
+
+/// With every block searched, a block under 7 bytes is not searched upstream
+/// and goes out raw, one repeated byte or not (`ZSTD_buildSeqStore` returns
+/// `ZSTDbss_noCompress` before the RLE rewrite), on the one-shot path and on
+/// the buffered one alike.
+#[test]
+fn a_searched_frames_tiny_uniform_last_block_goes_out_raw() {
+    let mut input = generate_data(0x7A11, 128 * 1024);
+    input.extend_from_slice(b"aaaaa");
+    let level = super::CompressionLevel::Level(1);
+    let params = crate::encoding::CompressionParameters::builder(level)
+        .raw_skip(false)
+        .build()
+        .unwrap();
+    let mut compressor: FrameCompressor = FrameCompressor::new(level);
+    compressor.set_parameters(&params);
+    let one_shot = compressor.compress_independent_frame(&input);
+    let mut buffered = Vec::new();
+    let mut compressor = FrameCompressor::new(level);
+    compressor.set_parameters(&params);
+    compressor.set_source(input.as_slice());
+    compressor.set_drain(&mut buffered);
+    compressor.compress();
+    for (path, frame) in [("one-shot", &one_shot), ("buffered", &buffered)] {
+        assert!(
+            frame.ends_with(b"aaaaa"),
+            "{path}: the 5-byte tail was not written raw"
+        );
+        let mut decoded = Vec::with_capacity(input.len());
+        FrameDecoder::new()
+            .decode_all_to_vec(frame, &mut decoded)
+            .unwrap();
+        assert!(
+            decoded == input,
+            "{path}: a frame does not decode to its input"
+        );
+    }
+}
+
+/// With every block searched, a later block of one repeated byte is searched
+/// first and then written as RLE, as upstream rewrites a searched block whose
+/// payload is short, on the one-shot path and on the buffered one alike.
+#[test]
+fn a_searched_uniform_block_goes_out_as_rle() {
+    let mut input = generate_data(0x0005_EA2C, 128 * 1024);
+    input.extend(core::iter::repeat_n(b'a', 1000));
+    let level = super::CompressionLevel::Level(1);
+    let params = crate::encoding::CompressionParameters::builder(level)
+        .raw_skip(false)
+        .build()
+        .unwrap();
+    let mut compressor: FrameCompressor = FrameCompressor::new(level);
+    compressor.set_parameters(&params);
+    let one_shot = compressor.compress_independent_frame(&input);
+    let mut buffered = Vec::new();
+    let mut compressor = FrameCompressor::new(level);
+    compressor.set_parameters(&params);
+    compressor.set_source(input.as_slice());
+    compressor.set_drain(&mut buffered);
+    compressor.compress();
+    for (path, frame) in [("one-shot", &one_shot), ("buffered", &buffered)] {
+        // The last block: a 3-byte header saying RLE of 1000 bytes, then the byte.
+        let tail = &frame[frame.len() - 4..];
+        let header = u32::from(tail[0]) | u32::from(tail[1]) << 8 | u32::from(tail[2]) << 16;
+        assert_eq!(header & 1, 1, "{path}: the uniform block is not the last");
+        assert_eq!((header >> 1) & 3, 1, "{path}: the uniform block is not RLE");
+        assert_eq!(
+            header >> 3,
+            1000,
+            "{path}: the RLE block has the wrong size"
+        );
+        assert_eq!(tail[3], b'a');
+        let mut decoded = Vec::with_capacity(input.len());
+        FrameDecoder::new()
+            .decode_all_to_vec(frame, &mut decoded)
+            .unwrap();
+        assert!(
+            decoded == input,
+            "{path}: a frame does not decode to its input"
+        );
+    }
+}
+
+/// Small frames stitched from dictionary slices (its tail included), repeats
+/// of their own earlier pieces and noise, compressed through the attached
+/// dictionary on the fast and double-fast levels, the latter also keyed on six
+/// and seven bytes: the repeat-offset and dictionary-tail paths of the
+/// in-place scans each meet candidates on both sides of the dictionary
+/// boundary, and every frame must decode to its input.
+#[test]
+fn attached_dictionary_frames_of_mixed_pieces_round_trip() {
+    let dict_bytes = generate_data(0xD1C7_7A11, 4096);
+    let dict_id = 0x7A11_0001;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    let mut configurations: Vec<crate::encoding::CompressionParameters> = [1, -3, 2, 3, 4]
+        .into_iter()
+        .map(|level| {
+            crate::encoding::CompressionParameters::builder(super::CompressionLevel::Level(level))
+                .build()
+                .unwrap()
+        })
+        .collect();
+    for min_match in [6, 7] {
+        configurations.push(
+            crate::encoding::CompressionParameters::builder(super::CompressionLevel::Level(3))
+                .min_match(min_match)
+                .build()
+                .unwrap(),
+        );
+    }
+    for params in &configurations {
+        let level = params.level();
+        let mut compressor: FrameCompressor = FrameCompressor::new(level);
+        compressor.set_parameters(params);
+        compressor
+            .set_dictionary(
+                crate::decoding::Dictionary::from_raw_content(dict_id, dict_bytes.clone()).unwrap(),
+            )
+            .unwrap();
+        for _ in 0..200 {
+            let target = 1024 + next(5 * 1024);
+            let mut frame_input: Vec<u8> = Vec::with_capacity(target + 64);
+            while frame_input.len() < target {
+                match next(4) {
+                    0 => {
+                        // A slice of the dictionary, often its very end.
+                        let len = 4 + next(60);
+                        let start = if next(2) == 0 {
+                            dict_bytes.len() - len.min(dict_bytes.len())
+                        } else {
+                            next(dict_bytes.len() - len)
+                        };
+                        frame_input.extend_from_slice(&dict_bytes[start..start + len]);
+                    }
+                    1 if frame_input.len() > 16 => {
+                        // A repeat of an earlier piece of the frame.
+                        let len = 4 + next(28).min(frame_input.len() - 4);
+                        let start = next(frame_input.len() - len + 1);
+                        frame_input.extend_from_within(start..start + len);
+                    }
+                    _ => {
+                        let len = 1 + next(24);
+                        frame_input.extend((0..len).map(|_| next(256) as u8));
+                    }
+                }
+            }
+            let frame = compressor.compress_independent_frame(&frame_input);
+            let mut decoder = FrameDecoder::new();
+            decoder
+                .add_dict(
+                    crate::decoding::Dictionary::from_raw_content(dict_id, dict_bytes.clone())
+                        .unwrap(),
+                )
+                .unwrap();
+            let mut decoded = Vec::with_capacity(frame_input.len());
+            decoder.decode_all_to_vec(&frame, &mut decoded).unwrap();
+            assert!(
+                decoded == frame_input,
+                "{level:?}: a frame does not decode to its input"
+            );
+        }
+    }
+}
+
+/// Only a table built from a distribution has one to give back: the
+/// predefined table and a single repeated symbol do not.
+#[test]
+fn only_a_built_previous_table_has_a_distribution() {
+    use super::PreviousFseTable;
+    assert!(PreviousFseTable::Default.distribution().is_none());
+    assert!(PreviousFseTable::Rle(3).distribution().is_none());
+}
+
+/// A dictionary with a level of its own that a fast frame outgrows is loaded
+/// into the frame's own tables at their width, and the frame decodes.
+#[test]
+fn a_fast_frame_loads_a_dictionary_it_outgrows() {
+    let dict_bytes = generate_data(0x10AD_D1C7, 8 * 1024);
+    let dict_id = 0x10AD_0001;
+    let mut input = generate_data(0x10AD_0002, 1 << 20);
+    for chunk in input.chunks_mut(4096) {
+        chunk[..512].copy_from_slice(&dict_bytes[..512]);
+    }
+    let dictionary = super::EncoderDictionary::from_dictionary(
+        crate::decoding::Dictionary::from_raw_content(dict_id, dict_bytes.clone()).unwrap(),
+    )
+    .with_level_of_its_own();
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    compressor.set_encoder_dictionary(dictionary).unwrap();
+    let frame = compressor.compress_independent_frame(&input);
+    assert!(frame.len() < input.len(), "the repeats were not found");
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .add_dict(crate::decoding::Dictionary::from_raw_content(dict_id, dict_bytes).unwrap())
+        .unwrap();
+    let mut decoded = Vec::with_capacity(input.len());
+    decoder.decode_all_to_vec(&frame, &mut decoded).unwrap();
+    assert!(decoded == input, "the frame does not decode to its input");
+}
+
+/// A dictionary marked with a level of its own tells the frame so, whatever
+/// level a C caller named (`ZSTD_createCDict` at 0 means the default level),
+/// so a frame it no longer describes takes parameters of its own; an unmarked
+/// one does not.
+#[test]
+fn a_dictionary_with_a_level_of_its_own_says_so() {
+    let dictionary =
+        super::EncoderDictionary::from_serialized_or_raw_content(b"some shared history").unwrap();
+    assert!(!dictionary.clone().sizes().prepared_at_level);
+    assert!(dictionary.with_level_of_its_own().sizes().prepared_at_level);
 }

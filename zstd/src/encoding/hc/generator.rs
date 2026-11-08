@@ -61,19 +61,35 @@ pub(crate) struct HcMatchGenerator {
 /// modules via `$crate::...`, so it is unusable downstream and is
 /// re-exported only inside this crate via `pub(crate) use` below.
 macro_rules! bt_insert_range_body {
-    ($table:expr, $search_depth:expr, $from:ident, $stop:ident, $current_abs_end:ident, $target_abs:ident, $cmf:path) => {{
-        // The live region `history[history_start..]`, reborrowed as a raw
-        // slice so it holds NO borrow and coexists with the `&mut $table`
-        // binary-tree writes below.
-        let concat: &[u8] = unsafe {
-            let lh = $table.live_history();
-            core::slice::from_raw_parts(lh.as_ptr(), lh.len())
-        };
+    ($table:expr, $search_depth:expr, $from:ident, $stop:ident, $current_abs_end:ident, $target_abs:ident, $in_block:expr) => {{
+        // The live region `history[history_start..]` and the tree's
+        // coordinates. Inside a block's parse (`$in_block`) both were taken
+        // when the pass began, and the search's catch-up, which calls this a
+        // position or two at a time, reads them from there instead of deriving
+        // them again. The slice holds no borrow, so it coexists with the
+        // `&mut $table` tree writes below.
+        let (concat, coords): (&[u8], $crate::encoding::match_table::storage::BtCoords) =
+            if $in_block {
+                debug_assert_eq!(
+                    $table.block_coords,
+                    $table.bt_coords(),
+                    "block coordinates are stale"
+                );
+                // SAFETY: called from the search, inside the pass that took
+                // them; nothing in the pass changes the history.
+                (unsafe { $table.block_live_history() }, $table.block_coords)
+            } else {
+                // SAFETY: a raw reborrow of the live history; the tree writes
+                // below never touch it.
+                let concat = unsafe {
+                    let lh = $table.live_history();
+                    core::slice::from_raw_parts(lh.as_ptr(), lh.len())
+                };
+                (concat, $table.bt_coords())
+            };
         let hist_start = $table.history_abs_start;
         let hash_log = $table.hash_log;
         let search_mls = $table.search_mls;
-        let position_base = $table.position_base;
-        let index_shift = $table.index_shift;
         let search_depth = $search_depth;
         // Upstream holds `U32* const hashTable = ms->hashTable` and the tree's
         // `bt` for the whole body (zstd_opt.c:449); the bases come from the
@@ -82,7 +98,7 @@ macro_rules! bt_insert_range_body {
         debug_assert_eq!($table.hash_table().len(), 1usize << hash_log);
         debug_assert_eq!($table.chain_table().len(), 2 << $table.bt_log());
         let (hash_ptr, chain_ptr, _) = $table.table_bases();
-        let bt_mask = $table.bt_mask();
+        let bt_mask = coords.bt_mask;
         let window_low = $table.window_low_abs_for_target($target_abs);
         // The walk carries one coordinate, the stored index, as the collect body
         // does and as upstream carries `matchIndex`: the window bound becomes one
@@ -91,10 +107,19 @@ macro_rules! bt_insert_range_body {
         // pair slot are each one add of a bias taken here, instead of reloading
         // `position_base` / `index_shift` / `history_abs_start` through the
         // table on every node. See the collect body for the derivation.
-        let abs_bias = position_base.wrapping_sub(1).wrapping_sub(index_shift);
-        let win_off = abs_bias.wrapping_sub(window_low);
-        let idx_bias = abs_bias.wrapping_sub(hist_start);
-        let bt_bias = position_base.wrapping_sub(1);
+        let abs_bias = coords.abs_bias;
+        let idx_bias = coords.idx_bias;
+        let bt_bias = coords.bt_bias;
+        // The window floor in stored space, fixed for the run: a node is in the
+        // window when its stored index is at or above it, one compare (upstream
+        // `matchIndex >= windowLow`). It is at least 1, so the empty slot 0
+        // fails it too. A position the floor lies past finds every node below
+        // it, as its own stored index is.
+        let win_low_stored = window_low.wrapping_sub(abs_bias);
+        debug_assert!(win_low_stored >= 1);
+        // A node's bytes sit at `cand_base + stored`; only nodes the window
+        // gate admits are read, and those lie inside the history.
+        let cand_base = concat.as_ptr().wrapping_add(idx_bias);
         let mut pos = $from;
         while pos < $stop {
             let forward: usize = 'insert: {
@@ -156,21 +181,25 @@ macro_rules! bt_insert_range_body {
                 // Total, not tested: the block was armed before the parse began
                 // (`MatchTable::relative_position_armed`, with its fields hoisted).
                 debug_assert!($table.can_skip_rebase_check(abs_pos));
-                let stored = ((abs_pos - position_base + index_shift) as u32) + 1;
+                // `relative_position_armed(abs_pos) + 1`, the index the tree stores.
+                let stored = abs_pos.wrapping_sub(abs_bias);
                 // `abs_pos < bt_mask` legitimately happens for the first BT walk of
                 // a fresh frame (bt_low effectively "no floor"). Saturating keeps
                 // the floor at 0 so the `candidate_abs <= bt_low` check never
                 // triggers early; raw subtraction would underflow into a huge
                 // sentinel that ALWAYS triggers.
                 let bt_low = abs_pos.saturating_sub(bt_mask);
-                // The window floor follows the tree update's target, which may lie past
-                // this position by more than the window; nothing is in range then, as
-                // upstream's `matchIndex >= windowLow` finds on its first test.
-                let win_range = if window_low < abs_pos {
-                    abs_pos - window_low
+                // The tree floor in stored space, so a node is tested without
+                // decoding it (upstream `matchIndex <= btLow`). A floor below the
+                // window is never reached; it sits one under the window instead of
+                // wrapping.
+                let bt_low_stored = if bt_low < window_low {
+                    win_low_stored - 1
                 } else {
-                    0
+                    bt_low.wrapping_sub(abs_bias)
                 };
+                // SAFETY: `idx + 8 <= concat.len()`, checked above.
+                let cur_ptr = unsafe { concat.as_ptr().add(idx) };
                 // `abs_pos + 9` is safe in raw form: `MatchTable::fill_uncommitted` caps
                 // total input at `usize::MAX - STREAM_ABS_HEADROOM` (where
                 // `STREAM_ABS_HEADROOM = HC_OPT_NUM + 16`), so every
@@ -184,50 +213,61 @@ macro_rules! bt_insert_range_body {
                 let mut compares_left = search_depth;
                 let mut common_length_smaller = 0usize;
                 let mut common_length_larger = 0usize;
-                // `MatchTable::bt_pair_index_for_abs` with the shift and mask hoisted.
-                let pair_idx = 2 * (abs_pos.wrapping_add(index_shift) & bt_mask);
-                let mut smaller_slot = pair_idx;
-                let mut larger_slot = pair_idx + 1;
+                // The two open sides of the tree, as pointers into the pair table
+                // (upstream `smallerPtr` / `largerPtr`). A side closed at the tree
+                // floor points at `closed_side`, so the final stores need no test
+                // (upstream `dummy32`).
+                let mut closed_side: u32 = 0;
+                // SAFETY: `2*((stored + bt_bias) & bt_mask) + 1 < chain_table.len()`
+                // (`stored + bt_bias == abs_pos + index_shift`, the pair index of
+                // `MatchTable::bt_pair_index_for_abs`).
+                let pair = unsafe { chain_ptr.add(2 * (stored.wrapping_add(bt_bias) & bt_mask)) };
+                let mut smaller_slot: *mut u32 = pair;
+                let mut larger_slot: *mut u32 = unsafe { pair.add(1) };
                 // SAFETY: `hash` is masked to `hash_log` bits and the table is
                 // `1 << hash_log` slots wide (both asserted at `hash_ptr`), so the slot
                 // is in range by construction. Upstream reads and writes the same slot
                 // through its own raw `hashTable`.
                 let mut match_stored = unsafe { *hash_ptr.add(hash) };
-                unsafe { *hash_ptr.add(hash) = stored };
+                unsafe { *hash_ptr.add(hash) = stored as u32 };
 
-                while compares_left > 0 && (match_stored as usize).wrapping_add(win_off) < win_range
-                {
+                while compares_left > 0 && match_stored as usize >= win_low_stored {
                     compares_left -= 1;
-                    let stored = match_stored as usize;
-                    // A slot written under an earlier encoding would sit below the
-                    // shift; the block was armed, and a rebase rewrites every slot, so
-                    // none reaches an in-window test.
-                    debug_assert!(stored > index_shift);
-                    let candidate_abs = stored.wrapping_add(abs_bias);
-                    debug_assert!(candidate_abs >= window_low && candidate_abs < abs_pos);
-                    // `2*((candidate_abs + index_shift) & bt_mask)`, with the shift
-                    // folded: `candidate_abs + index_shift == stored + bt_bias`.
-                    let next_pair_idx = 2 * (stored.wrapping_add(bt_bias) & bt_mask);
-                    // SAFETY: `next_pair_idx (+1)` = `2*(candidate_abs & bt_mask) (+1)`
-                    // ≤ `chain_table.len()-1`; `chain_ptr` is the hoisted live base,
-                    // table not realloc'd during the walk.
-                    let next_smaller = unsafe { *chain_ptr.add(next_pair_idx) };
-                    let next_larger = unsafe { *chain_ptr.add(next_pair_idx + 1) };
+                    let node_stored = match_stored as usize;
+                    // The tree holds only positions inserted before this one, and
+                    // the window gate admitted this node.
+                    debug_assert!(node_stored < stored);
+                    debug_assert_eq!(
+                        node_stored <= bt_low_stored,
+                        node_stored.wrapping_add(abs_bias) <= bt_low,
+                    );
+                    // SAFETY: the pair index is below `chain_table.len() - 1`;
+                    // `chain_ptr` is the hoisted live base, not reallocated during
+                    // the walk.
+                    let next_pair =
+                        unsafe { chain_ptr.add(2 * (node_stored.wrapping_add(bt_bias) & bt_mask)) };
                     let seed_len = common_length_smaller.min(common_length_larger);
-                    let candidate_idx = stored.wrapping_add(idx_bias);
-                    // SAFETY: BT walk invariant — `candidate_idx + tail_limit ≤
-                    // concat.len()` since the candidate is within
-                    // `[history_abs_start, abs_pos)` and `tail_limit ≤
-                    // current_abs_end - abs_pos`.
-                    let match_len =
-                        unsafe { $cmf(concat, idx, candidate_idx, tail_limit, seed_len) };
+                    // Each side's common length is a match the walk did not stop
+                    // at, so it is below the tail limit.
+                    debug_assert!(seed_len < tail_limit);
+                    let cand_ptr = cand_base.wrapping_add(node_stored);
+                    // SAFETY: BT walk invariant: the candidate and the current
+                    // position both have `tail_limit` readable bytes, `seed_len` of
+                    // them already known equal. Counted a word at a time, as
+                    // upstream's `ZSTD_count`: these compares part within a word or
+                    // two.
+                    let match_len = unsafe {
+                        $crate::encoding::fastpath::scalar::common_prefix_len_scalar_ptr(
+                            cand_ptr, cur_ptr, seed_len, tail_limit,
+                        )
+                    };
 
                     if match_len > best_len {
                         best_len = match_len;
                         // `candidate_abs + match_len <= current_abs_end` by BT walk
                         // invariant — `match_len <= tail_limit = current_abs_end -
                         // abs_pos` and `candidate_abs < abs_pos`.
-                        let candidate_end = candidate_abs + match_len;
+                        let candidate_end = node_stored.wrapping_add(abs_bias) + match_len;
                         if candidate_end > match_end_abs {
                             match_end_abs = candidate_end;
                         }
@@ -237,51 +277,38 @@ macro_rules! bt_insert_range_body {
                         break;
                     }
 
-                    let candidate_next = candidate_idx + match_len;
-                    let current_next = idx + match_len;
-                    // SAFETY: first-differing positions after a match_len-long prefix;
-                    // match_len < tail_limit (break above) + BT-walk bound
-                    // idx/candidate_idx + tail_limit <= concat.len() keep both in range.
-                    if unsafe {
-                        *concat.get_unchecked(candidate_next) < *concat.get_unchecked(current_next)
-                    } {
-                        // SAFETY: `smaller_slot` holds a valid pair index (init
-                        // `pair_idx`, updated to `next_pair_idx + 1`); the `usize::MAX`
-                        // sentinel is set only just before `break`, never written here.
-                        unsafe { *chain_ptr.add(smaller_slot) = match_stored };
+                    // SAFETY: the first differing bytes after a `match_len`-long
+                    // prefix; `match_len < tail_limit` (break above) keeps both in
+                    // range.
+                    if unsafe { *cand_ptr.add(match_len) < *cur_ptr.add(match_len) } {
+                        // SAFETY: an open side points at a pair slot (initial pair or
+                        // the descended node's), or at `closed_side`.
+                        unsafe { *smaller_slot = match_stored };
                         common_length_smaller = match_len;
-                        if candidate_abs <= bt_low {
-                            smaller_slot = usize::MAX;
+                        if node_stored <= bt_low_stored {
+                            smaller_slot = &raw mut closed_side;
                             break;
                         }
-                        smaller_slot = next_pair_idx + 1;
-                        match_stored = next_larger;
+                        // SAFETY: as for `next_pair`.
+                        smaller_slot = unsafe { next_pair.add(1) };
+                        match_stored = unsafe { *smaller_slot };
                     } else {
                         // SAFETY: as above for `larger_slot`.
-                        unsafe { *chain_ptr.add(larger_slot) = match_stored };
+                        unsafe { *larger_slot = match_stored };
                         common_length_larger = match_len;
-                        if candidate_abs <= bt_low {
-                            larger_slot = usize::MAX;
+                        if node_stored <= bt_low_stored {
+                            larger_slot = &raw mut closed_side;
                             break;
                         }
-                        larger_slot = next_pair_idx;
-                        match_stored = next_smaller;
+                        larger_slot = next_pair;
+                        match_stored = unsafe { *larger_slot };
                     }
                 }
 
-                // SAFETY: both slots, when not the `usize::MAX` sentinel, hold valid
-                // pair indices into the hoisted `chain_table` base.
-                if smaller_slot != usize::MAX {
-                    unsafe {
-                        *chain_ptr.add(smaller_slot) =
-                            $crate::encoding::match_table::storage::HC_EMPTY
-                    };
-                }
-                if larger_slot != usize::MAX {
-                    unsafe {
-                        *chain_ptr.add(larger_slot) =
-                            $crate::encoding::match_table::storage::HC_EMPTY
-                    };
+                // SAFETY: each side points at a pair slot or at `closed_side`.
+                unsafe {
+                    *smaller_slot = $crate::encoding::match_table::storage::HC_EMPTY;
+                    *larger_slot = $crate::encoding::match_table::storage::HC_EMPTY;
                 }
 
                 let speed_positions = if best_len > 384 {
@@ -463,7 +490,6 @@ macro_rules! bt_insert_and_collect_matches_body {
         $abs_pos:ident,
         $current_abs_end:ident,
         $sufficient_len:expr,
-        $max_chain_depth:expr,
         $min_match_len:ident,
         $best_len_for_skip:ident,
         $out:ident,
@@ -712,15 +738,25 @@ macro_rules! bt_insert_and_collect_matches_body {
                         // and 19 on 4 KiB logs, 10 KiB z000033, 10 KiB random
                         // with a dictionary and the 1 MiB corpus file, with
                         // output unchanged and the level 3 control flat.
-                        if entry as usize <= $table.index_shift {
-                            break 'h3 None;
-                        }
+                        //
+                        // The bound alone rejects an empty or stale entry: such an
+                        // entry (`<= index_shift`) decodes below `position_base`,
+                        // which never lies above the history's start, so its
+                        // offset exceeds `idx`. One branch, as upstream tests
+                        // `(matchIndex3 >= matchLow) & (curr - matchIndex3 <
+                        // (1<<18))` (zstd_opt.c): on small frames of
+                        // incompressible input whether the bucket holds an entry,
+                        // and whether that entry lies in this frame, are each a
+                        // coin toss, and a separate empty-entry branch
+                        // mispredicted as often as the bound.
+                        debug_assert!($table.position_base <= hist_start);
                         let off = ($abs_pos.wrapping_sub(abs_bias) as u32).wrapping_sub(entry) as usize;
                         if off.wrapping_sub(1)
                             >= idx.min($crate::encoding::bt::HC3_MAX_OFFSET - 1)
                         {
                             break 'h3 None;
                         }
+                        debug_assert!(entry as usize > $table.index_shift);
                         let cand_idx = idx - off;
                         debug_assert_eq!(
                             Some(hist_start + cand_idx),
@@ -885,15 +921,9 @@ macro_rules! bt_insert_and_collect_matches_body {
         // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
         // cap in `MatchTable::fill_uncommitted`.
         let mut match_end_abs = $abs_pos + 9;
-        // Both of these are associated consts of the strategy the caller is
-        // monomorphized for, so they arrive as literals rather than as fields
-        // of a 24-byte profile the caller had to marshal through memory on
-        // every position: System V passes a struct that size in memory, and the
-        // prologue was copying it into the frame with a vector move before any
-        // work started. Upstream reads the same values off `cParams` through a
-        // pointer it already holds, and its finder is inlined into the parser
-        // loop, so it never marshals anything per position either.
-        let mut compares_left = ($max_chain_depth).min($search_depth);
+        // Upstream `nbCompares = 1U << cParams->searchLog` (zstd_opt.c:599),
+        // the whole budget whatever the strategy.
+        let mut compares_left = $search_depth;
         let mut common_length_smaller = 0usize;
         let mut common_length_larger = 0usize;
         // `bt_pair_index_for_abs(abs_pos)`: `stored + bt_bias` is
@@ -1239,12 +1269,11 @@ impl HcMatchGenerator {
             "only the optimal strategies run on this backend, got {tag:?}"
         );
         let is_btultra2 = tag == StrategyTag::BtUltra2;
-        // btultra and btultra2 both run the mls=3 hash3 short-match probe
-        // (clevels.h minMatch 3). The `is_btultra2` flag below stays
-        // exclusive to btultra2 because it tweaks the BT rebase boundary,
-        // not match finding.
-        let wants_hash3 = matches!(tag, StrategyTag::BtUltra | StrategyTag::BtUltra2);
-        let next_hash3_log = if wants_hash3 {
+        // The hash3 short-match probe runs for a `minMatch` of 3, whatever the
+        // optimal strategy (`ZSTD_reset_matchState`: `hashLog3 = minMatch == 3
+        // ? MIN(17, windowLog) : 0`). The `is_btultra2` flag stays exclusive to
+        // btultra2 because it tweaks the BT rebase boundary, not match finding.
+        let next_hash3_log = if config.searches_hash3() {
             HC3_HASH_LOG.min(window_log as usize)
         } else {
             0

@@ -407,8 +407,17 @@ fn max_block_size_caps_every_block() {
 /// bytes on text and still decodes.
 #[test]
 fn literal_compression_mode_reaches_the_encoder() {
-    let text: Vec<u8> = (0..8192u32)
-        .map(|i| b'a' + (i.wrapping_mul(2_654_435_761) >> 27) as u8)
+    // 32 pseudo-random symbols with no repeats for the match finder, so only
+    // literal entropy coding can shrink the frame. A rotation sequence repeats
+    // every short factor, and a 4-byte short key finds them all.
+    let mut state = 0x9E37_79B9u32;
+    let text: Vec<u8> = (0..8192)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            b'a' + (state >> 27) as u8
+        })
         .collect();
     let cctx = ZSTD_createCCtx();
     let auto = compress2(cctx, &text);
@@ -838,6 +847,108 @@ fn a_cdict_window_is_raised_toward_the_source() {
         }
         ZSTD_freeCDict(cdict);
         ZSTD_freeCCtx(cctx);
+        ZSTD_freeCCtxParams(params);
+    }
+}
+
+/// The raw skip, this library's own switch (`structured_zstd.h`), takes the
+/// three `ZSTD_ParamSwitch_e` values, reads back as set, and turns the codec's
+/// raw skip off only at `ZSTD_ps_disable`, on a frame the context drives and on
+/// one a referenced CDict drives alike: the CDict carries no such switch. It is
+/// not a `ZSTD_cParameter`, whose numbers are upstream's.
+#[test]
+fn raw_skip_reaches_every_frame() {
+    use crate::cctx_params::{ZSTD_CCtx_getRawSkip, ZSTD_CCtx_setRawSkip};
+    assert_ne!(
+        ZSTD_cParam_getBounds(2000).error,
+        0,
+        "no parameter number is taken"
+    );
+    let dict = b"a dictionary the frame is primed with ".repeat(40);
+    unsafe {
+        let cctx = ZSTD_createCCtx();
+        let frame = |cctx: *mut ZSTD_CCtx| {
+            cctx.as_ref()
+                .expect("a context is allocated")
+                .frame_parameters(Some(1024))
+                .unwrap()
+        };
+        let mut value = -1;
+        assert_eq!(ZSTD_CCtx_getRawSkip(cctx, &mut value), 0);
+        assert_eq!(value, 0, "auto by default");
+        assert!(frame(cctx).unwrap().raw_skip_enabled());
+
+        assert_eq!(ZSTD_CCtx_setRawSkip(cctx, 2), 0);
+        assert_eq!(ZSTD_CCtx_getRawSkip(cctx, &mut value), 0);
+        assert_eq!(value, 2);
+        assert!(!frame(cctx).unwrap().raw_skip_enabled());
+        assert_eq!(
+            code(ZSTD_CCtx_setRawSkip(cctx, 3)),
+            ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound
+        );
+        assert_eq!(
+            code(ZSTD_CCtx_setRawSkip(core::ptr::null_mut(), 2)),
+            ZSTD_ErrorCode::ZSTD_error_GENERIC
+        );
+        assert_eq!(
+            code(ZSTD_CCtx_getRawSkip(cctx, core::ptr::null_mut())),
+            ZSTD_ErrorCode::ZSTD_error_GENERIC
+        );
+
+        let cdict = crate::cdict::ZSTD_createCDict(dict.as_ptr().cast(), dict.len(), 19);
+        assert_eq!(crate::attach::ZSTD_CCtx_refCDict(cctx, cdict), 0);
+        assert!(
+            !frame(cctx).unwrap().raw_skip_enabled(),
+            "the CDict's frame keeps the context's choice"
+        );
+        assert_eq!(ZSTD_CCtx_setRawSkip(cctx, 1), 0);
+        assert!(frame(cctx).is_none_or(|params| params.raw_skip_enabled()));
+
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeCDict(cdict);
+    }
+}
+
+/// A CDict built from a parameter set keeps that set's raw skip among its
+/// parameters, but the frame it drives runs the context's: the context turns
+/// the skip back on over a CDict built with it off.
+#[test]
+fn the_contexts_raw_skip_overrides_an_advanced_cdicts() {
+    use crate::cctx_params::{
+        ZSTD_CCtx_setRawSkip, ZSTD_CCtxParams_getRawSkip, ZSTD_CCtxParams_setRawSkip,
+    };
+    let dict = b"a dictionary the frame is primed with ".repeat(40);
+    unsafe {
+        let params = ZSTD_createCCtxParams();
+        assert_eq!(ZSTD_CCtxParams_setRawSkip(params, 2), 0);
+        let mut value = -1;
+        assert_eq!(ZSTD_CCtxParams_getRawSkip(params, &mut value), 0);
+        assert_eq!(value, 2);
+        assert_eq!(
+            code(ZSTD_CCtxParams_setRawSkip(params, -1)),
+            ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound
+        );
+        assert_eq!(
+            code(ZSTD_CCtxParams_getRawSkip(core::ptr::null(), &mut value)),
+            ZSTD_ErrorCode::ZSTD_error_GENERIC
+        );
+        let cdict =
+            ZSTD_createCDict_advanced2(dict.as_ptr(), dict.len(), 0, 0, params, NO_CUSTOM_MEM);
+        assert!(!cdict.is_null(), "the CDict is built");
+        let cctx = ZSTD_createCCtx();
+        assert_eq!(ZSTD_CCtx_setRawSkip(cctx, 1), 0);
+        assert_eq!(crate::attach::ZSTD_CCtx_refCDict(cctx, cdict), 0);
+        let driven = cctx
+            .as_ref()
+            .expect("a context is allocated")
+            .frame_parameters(Some(1024))
+            .unwrap();
+        assert!(
+            driven.is_none_or(|params| params.raw_skip_enabled()),
+            "the CDict's frame runs with the context's raw skip"
+        );
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeCDict(cdict);
         ZSTD_freeCCtxParams(params);
     }
 }

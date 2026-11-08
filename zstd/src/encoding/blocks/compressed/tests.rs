@@ -216,17 +216,17 @@ fn prefer_repeat_eligible_applies_gate() {
 
 #[test]
 fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
-    use super::{decide_huff_reuse_like_encoder, huff0_encoder};
+    use super::{HuffChoice, compress_literals, decide_huff_reuse_like_encoder, huff0_encoder};
+    use crate::bit_io::BitWriter;
     // Fixture chosen so size-comparison heuristic and the
     // preferRepeat short-circuit DISAGREE: `prev` is built
     // from a broad uniform sweep so it can encode any byte;
     // the literals payload is heavily skewed (240 zeros + 16
     // outliers) so a freshly-built `new_tbl` would compress
-    // strictly better than `prev`. Without preferRepeat, the
-    // heuristic picks `new` (returns true); WITH preferRepeat
-    // the fast-band gate forces reuse (returns false).
-    // Removing the short-circuit flips Fast/Dfast/Greedy to
-    // true and breaks this test — that's the regression gate.
+    // strictly better than `prev`. The size comparison picks the
+    // new table; preferRepeat, applied before any table is built
+    // (huf_compress.c:1389-1398), repeats the previous one for the fast
+    // band at up to 1024 literals.
     let prev_training: Vec<u8> = (0..1024u32).map(|i| (i % 256) as u8).collect();
     let prev = huff0_encoder::HuffmanTable::build_from_data(&prev_training);
     let mut skewed_literals: Vec<u8> = Vec::with_capacity(256);
@@ -248,59 +248,71 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
     };
     let skewed_counts = counts_of(&skewed_literals);
 
-    // Distinguishing precondition: WITHOUT preferRepeat the
-    // size comparison must prefer new (else the test isn't
-    // exercising the override). Verify by running with a
-    // strategy outside the eligible band: Lazy returns
-    // true (=new) on this fixture.
-    assert!(
+    // Distinguishing precondition: the size comparison prefers the new table
+    // (else the test isn't exercising the override).
+    assert_eq!(
         decide_huff_reuse_like_encoder(
             &new_tbl,
             Some(&prev),
             new_desc,
             &skewed_literals,
             &skewed_counts,
-            StrategyTag::Lazy,
         ),
-        "fixture precondition: size-comparison must prefer new for Lazy on skewed literals"
+        HuffChoice::New,
+        "fixture precondition: size-comparison must prefer new on skewed literals"
     );
 
-    // Eligible fast band: preferRepeat forces reuse (=false)
-    // despite size-comparison preferring new.
+    // Whether `compress_literals` built a table, and the section's type.
+    let section = |literals: &[u8], strategy: StrategyTag| {
+        let mut out = Vec::new();
+        let mut writer = BitWriter::from(&mut out);
+        let built = compress_literals::<crate::encoding::fastpath::ScalarTier>(
+            literals,
+            Some(&prev),
+            false,
+            &mut writer,
+            strategy,
+            false,
+            &mut huff0_encoder::WeightScratch::default(),
+            false,
+        );
+        writer.flush();
+        (built.is_some(), out[0] & 0b11)
+    };
+    // Eligible fast band: preferRepeat repeats the previous table despite the
+    // size comparison preferring new, and builds none. The uniform `prev`
+    // codes these skewed literals at eight bits apiece, which does not save
+    // `minGain`, so the repeated section goes out raw (type 0), as upstream's
+    // `cLitSize >= srcSize - minGain` sends it.
     for strategy in [StrategyTag::Fast, StrategyTag::Dfast, StrategyTag::Greedy] {
-        assert!(
-            !decide_huff_reuse_like_encoder(
-                &new_tbl,
-                Some(&prev),
-                new_desc,
-                &skewed_literals,
-                &skewed_counts,
-                strategy,
-            ),
-            "{strategy:?} <= 1024 must short-circuit to reuse despite size-comparison favouring new"
+        assert_eq!(
+            section(&skewed_literals, strategy),
+            (false, 0),
+            "{strategy:?} <= 1024 must repeat despite size-comparison favouring new"
         );
     }
+    // Outside the band the size comparison decides: a new table (type 2).
+    assert_eq!(section(&skewed_literals, StrategyTag::Lazy), (true, 2));
 
-    // Above the 1024-byte threshold the gate stays off even
-    // for Fast/Dfast/Greedy — falls through to the size
-    // heuristic, which on this fixture prefers new.
+    // Above the 1024-byte threshold the gate stays off even for the fast band,
+    // which falls through to the size comparison.
     let mut big_skewed = skewed_literals.clone();
     big_skewed.extend(core::iter::repeat_n(0u8, 1024));
     assert!(
         big_skewed.len() > 1024,
         "fixture must exceed 1024 to disable preferRepeat"
     );
-    assert!(
+    assert_eq!(
         decide_huff_reuse_like_encoder(
             &new_tbl,
             Some(&prev),
             new_desc,
             &big_skewed,
             &counts_of(&big_skewed),
-            StrategyTag::Fast,
         ),
-        "Fast at len > 1024 must NOT short-circuit (gate disabled), falls through to size heuristic"
+        HuffChoice::New,
     );
+    assert_eq!(section(&big_skewed, StrategyTag::Fast), (true, 2));
 }
 
 #[test]
@@ -389,6 +401,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: seed_table.clone(),
+                huf_repeat_valid: false,
                 huff_table_spare: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),
@@ -397,6 +410,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 workspace: Workspace::new(),
                 offset_hist: [1, 4, 8],
                 strategy_tag: *strat,
+                split_strategy: *strat,
                 pre_split: None,
                 huf_optimal_search: true,
                 literal_compression_disabled: false,
@@ -407,6 +421,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 sequence_capture: None,
                 copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: seed_table,
+                huf_repeat_valid: false,
                 huff_table_spare: None,
                 huff_weights: Default::default(),
                 seen_content: Default::default(),
@@ -415,6 +430,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 workspace: Workspace::new(),
                 offset_hist: [1, 4, 8],
                 strategy_tag: *strat,
+                split_strategy: *strat,
                 pre_split: None,
                 huf_optimal_search: true,
                 literal_compression_disabled: false,
@@ -449,6 +465,149 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
     }
 }
 
+/// The fast, double-fast and greedy strategies prefer the previous Huffman
+/// table on a section of at most 1 KiB (upstream `preferRepeat`): taken
+/// unchecked when it is known valid, checked against the histogram when not,
+/// and priced raw when the repeat does not save the minimum gain. The
+/// estimator walks those branches in the emitter's order, so its price is the
+/// size the emitter writes for each; with no table to repeat, a compressible
+/// section builds a new one.
+#[test]
+fn the_preferred_repeat_costs_what_the_emitter_writes() {
+    use super::{
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, encode_block_parts,
+        estimate_block_parts_size,
+    };
+    // Every byte value present, so the table codes any section.
+    let seed = {
+        let mut counts = [1usize; 256];
+        counts[b'a' as usize] = 200;
+        counts[b'b' as usize] = 100;
+        huff0_encoder::HuffmanTable::build_from_counts(&counts)
+    };
+    let skewed: Vec<u8> = (0..600u32)
+        .map(|i| match i % 7 {
+            0..=3 => b'a',
+            4 | 5 => b'b',
+            _ => b'c',
+        })
+        .collect();
+    let flat: Vec<u8> = (0..=255u8).collect();
+    for strat in [StrategyTag::Fast, StrategyTag::Dfast, StrategyTag::Greedy] {
+        for (literals, seeded, valid) in [
+            (&skewed, true, true),
+            (&skewed, true, false),
+            (&flat, true, true),
+            (&skewed, false, false),
+        ] {
+            let make_state = || CompressState::<EntropyOnlyMatcher> {
+                matcher: EntropyOnlyMatcher,
+                sequence_capture: None,
+                copy_kernel: crate::encoding::fastpath::select_kernel(),
+                last_huff_table: seeded.then(|| seed.clone()),
+                huf_repeat_valid: valid,
+                huff_table_spare: None,
+                huff_weights: Default::default(),
+                seen_content: Default::default(),
+                fse_tables: FseTables::new(),
+                block_scratch: CompressedBlockScratch::new(),
+                workspace: Workspace::new(),
+                offset_hist: [1, 4, 8],
+                strategy_tag: strat,
+                split_strategy: strat,
+                pre_split: None,
+                huf_optimal_search: true,
+                literal_compression_disabled: false,
+                post_split_allowed: true,
+            };
+            let mut est_state = make_state();
+            let mut emit_state = make_state();
+            let mut workspace = EstimatorWorkspace::default();
+            let est = estimate_block_parts_size(&mut est_state, literals, &[], &mut workspace);
+            let mut emitted: Vec<u8> = Vec::new();
+            let mut codes_ws = Workspace::new();
+            crate::encoding::fastpath::with_encode_tier!(
+                emit_state.copy_kernel,
+                K => encode_block_parts::<_, K>(
+                    &mut emit_state,
+                    literals,
+                    &mut [],
+                    &mut code_buffer(&mut codes_ws, 0),
+                    &mut emitted,
+                )
+            );
+            assert_eq!(
+                est,
+                emitted.len(),
+                "{strat:?} seeded={seeded} valid={valid} len={}: the estimate is not what the \
+                 emitter writes",
+                literals.len(),
+            );
+        }
+    }
+}
+
+/// A short section whose new table would take nearly all it saves goes out
+/// raw (`hSize + 12 >= srcSize`), on the emitter's side and in the price the
+/// estimator gives it.
+#[test]
+fn a_table_not_worth_its_description_costs_a_raw_section() {
+    use super::{
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace, encode_block_parts,
+        estimate_block_parts_size,
+    };
+    // Skewed past the flat-histogram gate, too short to carry a description.
+    let mut literals = alloc::vec![b'a'; 6];
+    literals.extend(b'b'..=b'k');
+    let make_state = || CompressState::<EntropyOnlyMatcher> {
+        matcher: EntropyOnlyMatcher,
+        sequence_capture: None,
+        copy_kernel: crate::encoding::fastpath::select_kernel(),
+        last_huff_table: None,
+        huf_repeat_valid: false,
+        huff_table_spare: None,
+        huff_weights: Default::default(),
+        seen_content: Default::default(),
+        fse_tables: FseTables::new(),
+        block_scratch: CompressedBlockScratch::new(),
+        workspace: Workspace::new(),
+        offset_hist: [1, 4, 8],
+        strategy_tag: StrategyTag::BtUltra2,
+        split_strategy: StrategyTag::BtUltra2,
+        pre_split: None,
+        huf_optimal_search: true,
+        literal_compression_disabled: false,
+        post_split_allowed: true,
+    };
+    let mut est_state = make_state();
+    let mut emit_state = make_state();
+    let mut workspace = EstimatorWorkspace::default();
+    let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
+    let mut emitted: Vec<u8> = Vec::new();
+    let mut codes_ws = Workspace::new();
+    crate::encoding::fastpath::with_encode_tier!(
+        emit_state.copy_kernel,
+        K => encode_block_parts::<_, K>(
+            &mut emit_state,
+            &literals,
+            &mut [],
+            &mut code_buffer(&mut codes_ws, 0),
+            &mut emitted,
+        )
+    );
+    // Raw literals: a one-byte header, the bytes, one byte of no sequences.
+    assert_eq!(
+        emitted.len(),
+        1 + literals.len() + 1,
+        "the section is not raw"
+    );
+    assert_eq!(
+        est,
+        emitted.len(),
+        "the estimate is not what the emitter writes"
+    );
+}
+
 #[test]
 fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
     use super::{
@@ -476,6 +635,7 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
         sequence_capture: None,
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
+        huf_repeat_valid: false,
         huff_table_spare: None,
         huff_weights: Default::default(),
         seen_content: Default::default(),
@@ -484,6 +644,7 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
         workspace: Workspace::new(),
         offset_hist: [1, 4, 8],
         strategy_tag: StrategyTag::Lazy,
+        split_strategy: StrategyTag::Lazy,
         pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
@@ -545,6 +706,7 @@ fn retained_heap_size_counts_the_block_buffers() {
         sequence_capture: None,
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
+        huf_repeat_valid: false,
         huff_table_spare: None,
         huff_weights: Default::default(),
         seen_content: Default::default(),
@@ -553,6 +715,7 @@ fn retained_heap_size_counts_the_block_buffers() {
         workspace: Workspace::new(),
         offset_hist: [1, 4, 8],
         strategy_tag: StrategyTag::Fast,
+        split_strategy: StrategyTag::Fast,
         pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
@@ -600,6 +763,7 @@ fn discarded_block_keeps_the_entry_tables() {
         sequence_capture: None,
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: Some(huff0_encoder::HuffmanTable::build_from_data(b"aaaabbc")),
+        huf_repeat_valid: false,
         huff_table_spare: None,
         huff_weights: Default::default(),
         seen_content: Default::default(),
@@ -608,6 +772,7 @@ fn discarded_block_keeps_the_entry_tables() {
         workspace: Workspace::new(),
         offset_hist: [1, 4, 8],
         strategy_tag: StrategyTag::Fast,
+        split_strategy: StrategyTag::Fast,
         pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
@@ -772,12 +937,19 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
 
     // Not the Fast band: it never post-splits, so it is never estimated, and
     // its sequences reach the emitter already coded.
-    for strat in [StrategyTag::Lazy, StrategyTag::BtUltra2] {
+    // Greedy is the one cheap strategy whose sequences reach the estimator
+    // uncoded; it chooses its tables without pricing them.
+    for strat in [
+        StrategyTag::Greedy,
+        StrategyTag::Lazy,
+        StrategyTag::BtUltra2,
+    ] {
         let make_state = || CompressState::<EntropyOnlyMatcher> {
             matcher: EntropyOnlyMatcher,
             sequence_capture: None,
             copy_kernel: crate::encoding::fastpath::select_kernel(),
             last_huff_table: None,
+            huf_repeat_valid: false,
             huff_table_spare: None,
             huff_weights: Default::default(),
             seen_content: Default::default(),
@@ -786,6 +958,7 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
             workspace: Workspace::new(),
             offset_hist: [1, 4, 8],
             strategy_tag: strat,
+            split_strategy: strat,
             pre_split: None,
             huf_optimal_search: true,
             literal_compression_disabled: false,
@@ -846,6 +1019,7 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         sequence_capture: None,
         copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
+        huf_repeat_valid: false,
         huff_table_spare: None,
         huff_weights: Default::default(),
         seen_content: Default::default(),
@@ -858,6 +1032,7 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         // at litLength 0 is `rep[1]`, which rotates) before the raw fallback
         // has to put it back.
         strategy_tag: crate::encoding::strategy::StrategyTag::BtUltra2,
+        split_strategy: crate::encoding::strategy::StrategyTag::BtUltra2,
         pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
@@ -1022,50 +1197,62 @@ fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
         &mut of_slot,
     );
 
-    assert!(matches!(ll_repeat, FseTableMode::RepeatLast(_)));
-    assert!(matches!(ml_repeat, FseTableMode::RepeatLast(_)));
-    assert!(matches!(of_repeat, FseTableMode::RepeatLast(_)));
+    // The predefined table repeated costs exactly what writing it again does,
+    // and upstream breaks that tie for the predefined table: after a
+    // predefined block its repeat mode is `none`, so repeating is not even an
+    // option (zstd_compress_sequences.c:201, :219).
+    assert!(matches!(ll_repeat, FseTableMode::Predefined(_)));
+    assert!(matches!(ml_repeat, FseTableMode::Predefined(_)));
+    assert!(matches!(of_repeat, FseTableMode::Predefined(_)));
 }
 
-/// Fast-band strategies (fast/dfast/greedy) reuse a covering previous FSE
-/// table without building a new one (upstream zstd `preferRepeat`), even on a
-/// fresh distribution where the cost-based path could pick a new table.
-/// A non-fast-band strategy on an identical distribution takes the
-/// cost-based path instead.
+/// Fast-band strategies (fast/dfast/greedy) repeat a VALID previous FSE table,
+/// a dictionary's that covers its stream, without building a new one, even on
+/// a fresh distribution where the cost-based path could pick a new table
+/// (upstream zstd `ZSTD_selectEncodingType`, zstd_compress_sequences.c:187).
+/// A table a block built is only `FSE_repeat_check`, which this band never
+/// repeats.
 #[test]
 fn fast_band_strategies_prefer_repeat_fse_table() {
+    use crate::encoding::frame_compressor::SharedFseTable;
     use crate::encoding::strategy::StrategyTag;
-    let prev = build_table_from_symbol_counts(&[8, 1], 9, false);
-    let previous =
-        PreviousFseTable::Custom(crate::encoding::frame_compressor::SharedFseTable::new(prev));
+    let prev = || build_table_from_symbol_counts(&[8, 1], 9, false);
     let fse_tables = FseTables::new();
-    // Distribution over symbols {0,1}, both covered by `previous`.
+    // Distribution over symbols {0,1}, both covered by the previous table.
     let mut counts: SequenceHistogram = [0; SEQUENCE_CODE_SLOTS];
     counts[0] = 4;
     counts[1] = 6;
     let total = 10;
 
-    // All fast-band strategies (Fast, Dfast, Greedy) unconditionally
-    // reuse the covering previous table; cover every eligible arm so an
-    // enum-arm regression in the implementation branch is caught.
-    for strategy in [StrategyTag::Fast, StrategyTag::Dfast, StrategyTag::Greedy] {
-        // A slot the reuse path must leave alone.
-        let mut slot = None;
-        let mode = super::choose_table_from_counts(
-            Some(&previous),
-            fse_tables.ll_default_ref(),
-            &mut counts,
-            total,
-            1, // highest non-zero code in {0,1}
-            9,
-            strategy,
-            None,
-            &mut slot,
-        );
-        assert!(
-            matches!(mode, FseTableMode::RepeatLast(_)),
-            "fast-band {strategy:?} must reuse the covering previous table",
-        );
+    for (previous, repeats) in [
+        (
+            PreviousFseTable::Dictionary(SharedFseTable::new(prev())),
+            true,
+        ),
+        (PreviousFseTable::Custom(SharedFseTable::new(prev())), false),
+    ] {
+        // Every fast-band arm, so an enum-arm regression in the implementation
+        // branch is caught.
+        for strategy in [StrategyTag::Fast, StrategyTag::Dfast, StrategyTag::Greedy] {
+            // A slot the reuse path must leave alone.
+            let mut slot = None;
+            let mode = super::choose_table_from_counts(
+                Some(&previous),
+                fse_tables.ll_default_ref(),
+                &mut counts,
+                total,
+                1, // highest non-zero code in {0,1}
+                9,
+                strategy,
+                None,
+                &mut slot,
+            );
+            assert_eq!(
+                matches!(mode, FseTableMode::RepeatLast(_)),
+                repeats,
+                "fast-band {strategy:?} repeats exactly a valid previous table",
+            );
+        }
     }
 }
 
@@ -1383,6 +1570,7 @@ fn every_tier_writes_the_block_the_scalar_tier_writes() {
             sequence_capture: None,
             copy_kernel: kernel,
             last_huff_table: None,
+            huf_repeat_valid: false,
             huff_table_spare: None,
             huff_weights: Default::default(),
             seen_content: Default::default(),
@@ -1391,6 +1579,7 @@ fn every_tier_writes_the_block_the_scalar_tier_writes() {
             workspace: Workspace::new(),
             offset_hist: [1, 4, 8],
             strategy_tag: StrategyTag::Lazy,
+            split_strategy: StrategyTag::Lazy,
             pre_split: None,
             huf_optimal_search: true,
             literal_compression_disabled: false,
@@ -1434,4 +1623,75 @@ fn choose_table_without_previous_does_not_unwrap_none() {
         &mut slot,
     );
     assert!(matches!(mode, FseTableMode::Encoded(_)));
+}
+
+/// A block stays compressed only when it saves upstream's `minGain`
+/// (`ZSTD_entropyCompressSeqStore`, zstd_compress.c:2967), whose margin depends
+/// on the strategy, and a block under seven bytes is never compressed
+/// (`ZSTD_buildSeqStore`). Keeping any saving at all kept blocks upstream
+/// writes raw, and their tables then seeded the blocks after them.
+#[test]
+fn a_block_is_kept_compressed_only_when_it_saves_min_gain() {
+    use crate::encoding::strategy::StrategyTag;
+    // Below btultra: (1000 >> 6) + 2 = 17.
+    assert!(super::keeps_compressed_block(982, 1000, StrategyTag::Lazy));
+    assert!(!super::keeps_compressed_block(983, 1000, StrategyTag::Lazy));
+    // btultra2: (1000 >> 8) + 2 = 5.
+    assert!(super::keeps_compressed_block(
+        994,
+        1000,
+        StrategyTag::BtUltra2
+    ));
+    assert!(!super::keeps_compressed_block(
+        995,
+        1000,
+        StrategyTag::BtUltra2
+    ));
+    assert!(!super::keeps_compressed_block(0, 6, StrategyTag::Fast));
+}
+
+/// Only a valid previous literal table (a dictionary's, coding every byte)
+/// lowers the literal floor to 6 and codes up to 1023 literals in one stream
+/// (zstd_compress_literals.c:123, :171); a table a block built does neither.
+#[test]
+fn only_a_valid_table_lowers_the_literal_floor_and_takes_one_stream() {
+    use crate::encoding::strategy::StrategyTag;
+    assert_eq!(super::min_literals_to_compress(StrategyTag::Fast, true), 6);
+    assert_eq!(
+        super::min_literals_to_compress(StrategyTag::Fast, false),
+        64
+    );
+    assert_eq!(
+        super::min_literals_to_compress(StrategyTag::BtUltra2, false),
+        8
+    );
+    assert!(super::single_literal_stream(255, false));
+    assert!(!super::single_literal_stream(256, false));
+    assert!(super::single_literal_stream(1023, true));
+    assert!(!super::single_literal_stream(1024, true));
+}
+
+/// A dictionary's offset table is valid for the frame's first block only: the
+/// offsets later blocks reach can outgrow the codes it was checked for
+/// (zstd_compress.c:4444). Its literal- and match-length tables stay valid.
+#[test]
+fn a_dictionary_offset_table_is_valid_for_the_first_block_only() {
+    use crate::encoding::frame_compressor::SharedFseTable;
+    let table = || build_table_from_symbol_counts(&[1, 1], 5, false);
+    let mut tables = FseTables::new();
+    tables.ll_previous = Some(PreviousFseTable::Dictionary(SharedFseTable::new(table())));
+    tables.of_previous = Some(PreviousFseTable::Dictionary(SharedFseTable::new(table())));
+    tables.end_block();
+    assert!(
+        tables
+            .ll_previous
+            .as_ref()
+            .is_some_and(PreviousFseTable::is_valid)
+    );
+    assert!(
+        tables
+            .of_previous
+            .as_ref()
+            .is_some_and(|previous| !previous.is_valid())
+    );
 }

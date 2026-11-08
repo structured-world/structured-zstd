@@ -160,12 +160,20 @@ const FAST_TAG_MIN_FILL: (u128, u128) = (3, 2);
 #[cfg(target_arch = "x86")]
 const FAST_TAG_MIN_FILL: (u128, u128) = (5, 4);
 
+/// Positions a bare table keeps free above its epoch bias: the eviction band,
+/// two windows at the `window_log <= 30` ceiling.
+const MAX_EPOCH_HEADROOM: usize = 1 << 31;
+
 /// What a reset does with a hash table that continues the previous frame's
 /// (a new table always starts empty).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TableCarry {
-    /// Empty it, so the raw-slice no-dict kernels see a bias-0 table.
+    /// Empty it: a copied dictionary is indexed into it next.
     Clear,
+    /// A frame with no dictionary: advance the epoch bias past everything the
+    /// previous frames stored, as upstream's index runs on through
+    /// `ZSTD_window_clear` with the tables left as they are.
+    Continue,
     /// The frame re-primes the same dictionary in attach mode: advance the
     /// epoch bias past everything the previous frames stored instead of a
     /// full-table memset (upstream zstd `ZSTD_continueCCtx`), provided the
@@ -732,7 +740,7 @@ impl FastKernelMatcher {
             // its hashes stay valid and the per-frame re-hash is skipped
             // (CDict-equivalent).
             let span = u32::try_from(self.table_pos_high_water).unwrap_or(u32::MAX);
-            self.hash_table.advance_epoch(span);
+            self.hash_table.advance_epoch(span, MAX_EPOCH_HEADROOM);
             // Re-borrow: the dictionary bytes from the previous frame are still
             // resident at the front of history (`[0, region)`), so keep them in
             // place instead of clearing + re-committing — the per-frame dict
@@ -744,12 +752,25 @@ impl FastKernelMatcher {
             if region > 0 && self.history.len() >= region {
                 reborrow_region = Some(region);
             }
+        } else if carry == TableCarry::Continue {
+            // What the frame can store: its window's history when owned, which
+            // `set_borrowed_window` checks again against a longer slice.
+            let headroom = if tagged {
+                // `primed_window <= MAX_PRIMED_WINDOW_SIZE`, which is
+                // `(u32::MAX - MAX_BLOCK_SIZE) / 2`, so this stays within `u32`
+                // and so within `usize` on every target.
+                debug_assert!(primed_window <= MAX_PRIMED_WINDOW_SIZE);
+                2 * primed_window + crate::common::MAX_BLOCK_SIZE as usize
+            } else {
+                MAX_EPOCH_HEADROOM
+            };
+            let span = u32::try_from(self.table_pos_high_water).unwrap_or(u32::MAX);
+            self.hash_table.advance_epoch(span, headroom);
         } else {
             // Same shape — keep the allocation, zero the entries via
-            // `memset` (ZSTD_window_clear cadence). A primed dict table
-            // is retained (see the epoch branch above for why that is
-            // sound); a copy-mode frame drops it when it primes, which is
-            // the only case that must not keep it.
+            // `memset`. A primed dict table is retained (see the epoch branch
+            // above for why that is sound); a copy-mode frame drops it when
+            // it primes, which is the only case that must not keep it.
             self.hash_table.clear();
         }
         self.table_pos_high_water = 0;
@@ -894,10 +915,20 @@ impl FastKernelMatcher {
             "set_borrowed_window called without a preceding reset()/clear_borrowed_window",
         );
         // A borrowed scan stores absolute input positions, up to the whole
-        // buffer; past what a tagged slot holds, the frame runs untagged. The
-        // reset that precedes this left the table empty.
-        if self.hash_table.is_tagged() && buffer.len() > TAGGED_POSITION_LIMIT {
-            self.hash_table.untag_empty();
+        // buffer, above the bias a carried table keeps. Past what a slot holds
+        // the table starts over, and past what a tagged slot holds at all the
+        // frame runs untagged.
+        let tagged = self.hash_table.is_tagged();
+        let slot_limit = if tagged {
+            TAGGED_POSITION_LIMIT as u64
+        } else {
+            u64::from(u32::MAX)
+        };
+        if buffer.len() as u64 + u64::from(self.hash_table.bias()) > slot_limit {
+            self.hash_table.clear();
+            if tagged && buffer.len() > TAGGED_POSITION_LIMIT {
+                self.hash_table.untag_empty();
+            }
         }
         self.borrowed = Some((buffer.as_ptr(), buffer.len()));
         self.last_borrowed_block = None;
@@ -1379,12 +1410,8 @@ impl FastKernelMatcher {
             block_start <= block_end && block_end <= total_len,
             "borrowed block bounds out of range: start={block_start} end={block_end} total={total_len}",
         );
-        // Borrowed scans store raw (bias-0) positions up to `block_end`
-        // through the table's hot-state slice; record them for `reset`'s
-        // epoch-advance span. (A borrowed window never coexists with a
-        // primed dict, so the table bias is 0 here — see `hot_state` —
-        // but the high-water must still cover these positions in case a
-        // dictionary is attached on a later frame.)
+        // Borrowed scans store positions up to `block_end`; record them for
+        // `reset`'s epoch-advance span.
         self.table_pos_high_water = self.table_pos_high_water.max(block_end);
         // Same window math as the owned path, but against the absolute
         // block end in the borrowed buffer rather than the accumulated
@@ -1840,6 +1867,9 @@ impl FastKernelMatcher {
                 .is_some_and(|v| v <= u32::MAX as usize),
             "virtual position overflow: dict.region_len()={base_offset} + block_end={block_end} exceeds u32",
         );
+        // These positions are in the table as surely as a searched block's, so
+        // the next frame's epoch advance has to pass them too.
+        self.table_pos_high_water = self.table_pos_high_water.max(base_offset + block_end);
         match self.hash_table.mls() {
             4 => self.prime_hash_table_stepped::<4>(
                 base,

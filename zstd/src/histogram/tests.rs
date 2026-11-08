@@ -1,4 +1,4 @@
-use super::{PARALLEL_COUNT_THRESHOLD, count_bytes, count_bytes_scalar, merge_lane_counts};
+use super::{PARALLEL_COUNT_THRESHOLD, count_bytes, count_bytes_scalar, count_bytes_uninit};
 
 fn make_data(len: usize, seed: u64) -> alloc::vec::Vec<u8> {
     let mut state = seed;
@@ -32,6 +32,24 @@ fn count_bytes_handles_empty_input() {
     assert!(counts.iter().all(|value| *value == 0));
 }
 
+/// The uninitialised-storage entry must ignore whatever the storage held, on
+/// both the scalar (increment) and the striped (overwrite) path: stale counts
+/// left in it would skew the Huffman table built from them.
+#[test]
+fn count_bytes_uninit_ignores_stale_storage() {
+    for len in [PARALLEL_COUNT_THRESHOLD - 1, PARALLEL_COUNT_THRESHOLD + 7] {
+        let data = make_data(len, 7);
+        let mut scalar = [0usize; 256];
+        let scalar_meta = count_bytes_scalar(&data, &mut scalar);
+
+        let mut storage = core::mem::MaybeUninit::new([0x5555usize; 256]);
+        let (counts, max_symbol, largest) = count_bytes_uninit(&data, &mut storage);
+
+        assert_eq!(*counts, scalar);
+        assert_eq!((max_symbol, largest), scalar_meta);
+    }
+}
+
 #[test]
 fn count_bytes_parallel_handles_tail() {
     let data = make_data(PARALLEL_COUNT_THRESHOLD + 7, 42);
@@ -43,12 +61,4 @@ fn count_bytes_parallel_handles_tail() {
 
     assert_eq!(fast, scalar);
     assert_eq!(fast_meta, scalar_meta);
-}
-
-#[test]
-fn merge_lane_counts_widens_before_sum() {
-    let lane = u32::MAX / 4;
-    let sum = merge_lane_counts(lane, lane, lane, lane);
-    let expected = 4u64 * (lane as u64);
-    assert_eq!(sum as u64, expected);
 }

@@ -162,7 +162,7 @@ pub unsafe extern "C" fn ZSTD_createCDict(
         return core::ptr::null_mut();
     };
     try_box(ZSTD_CDict {
-        dict: prepared,
+        dict: prepared.map(EncoderDictionary::with_level_of_its_own),
         id: dict_id_from_bytes(dict),
         level: compression_level,
         serial: next_dict_serial(),

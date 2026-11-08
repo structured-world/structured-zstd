@@ -115,17 +115,19 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bit_idx += data.len() * 8;
     }
 
-    /// Start a [`BitBurst`] that commits at most `max_bytes` bytes, counting the
-    /// up to 7 whole bytes it drains from the accumulator here so that it starts
-    /// with under 8 bits held.
+    /// Start a [`BitBurst`] that commits at most `max_bytes` bytes of its own,
+    /// beside the whole bytes the accumulator still holds, which it drains here
+    /// so that it starts with under 8 bits held.
     ///
     /// For a loop that knows its bit budget per step and flushes between
     /// steps itself, which is how upstream writes the sequence section.
     pub(crate) fn burst(&mut self, max_bytes: usize) -> BitBurst<'_, V> {
         // Room for every flush of the burst: each writes 8 bytes and keeps at
-        // most 7 of them, so `max_bytes` committed plus 8 past the last.
+        // most 7 of them, so the held bytes and `max_bytes` committed plus 8
+        // past the last.
+        let held = self.bits_in_partial / 8;
         let room = max_bytes
-            .checked_add(8)
+            .checked_add(held + 8)
             .expect("a burst larger than the address space");
         let output = self.output.as_mut();
         output.reserve(room);
@@ -423,6 +425,14 @@ impl<V: AsMut<Vec<u8>>> BitBurst<'_, V> {
         // and the shift is in range (upstream `BIT_flushBitsFast`, unguarded).
         self.partial >>= nb_bytes * 8;
         self.bits_in_partial &= 7;
+    }
+
+    /// Bits missing to the next byte boundary, as [`BitWriter::misaligned`].
+    /// The cursor only ever advances by whole bytes, so the held bits alone
+    /// decide it.
+    #[inline(always)]
+    pub(crate) fn misaligned(&self) -> usize {
+        (8 - (self.bits_in_partial & 7)) & 7
     }
 
     /// Commit the bytes written and hand the bits still held back to the

@@ -225,7 +225,23 @@ impl ZSTD_CCtx {
             let CCtxDictAttach::RefCDict { cdict, .. } = &self.attached_dict else {
                 unreachable!("only a referenced CDict drives a frame's parameters")
             };
-            return Ok(unsafe { &**cdict }.params);
+            let cdict = unsafe { &**cdict };
+            // The raw skip is the context's to set, not the dictionary's: a
+            // CDict carries no such switch upstream, so the context's
+            // (`ZSTD_CCtx_setRawSkip`) still reaches a frame the CDict drives.
+            // A CDict built from a parameter set stores that set's choice among
+            // its parameters, which the context's replaces.
+            let raw_skip = self.params.raw_skip != crate::cctx_params::ParamSwitch::Disable;
+            return match cdict.params {
+                Some(params) => Ok(Some(params.with_raw_skip(raw_skip))),
+                None if raw_skip => Ok(None),
+                None => CompressionParameters::builder(
+                    codec::encoding::CompressionLevel::from_level(cdict.level),
+                )
+                .build()
+                .map(|params| Some(params.with_raw_skip(false)))
+                .map_err(|_| ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported),
+            };
         }
         self.params
             .resolve()

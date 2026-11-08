@@ -1,12 +1,11 @@
 use crate::{
     blocks::block::BlockType,
-    common::MAX_BLOCK_SIZE,
     encoding::{
         CompressionLevel, Matcher,
         block_header::BlockHeader,
         blocks::{
             commit_block_tables, compress_block, compress_block_with_post_split,
-            discard_block_tables,
+            discard_block_tables, keeps_compressed_block,
         },
         fastpath::EncodeTier,
         frame_compressor::CompressState,
@@ -19,6 +18,17 @@ use crate::{
     },
 };
 use alloc::vec::Vec;
+
+/// Longest searched block payload upstream rewrites as RLE when the block is
+/// one repeated byte (`rleMaxLength`, zstd_compress.c,
+/// `ZSTD_compressBlock_internal`).
+const RLE_MAX_LENGTH: usize = 25;
+
+/// Shortest block upstream searches at all, and so the shortest it writes as
+/// RLE after a search: anything shorter goes out raw unsearched
+/// (`MIN_CBLOCK_SIZE + ZSTD_blockHeaderSize + 1 + 1` in `ZSTD_buildSeqStore`,
+/// zstd_compress.c).
+const SEARCHED_RLE_MIN_BLOCK: usize = 7;
 
 /// Compresses a single block using the shared compressed-block pipeline.
 ///
@@ -51,6 +61,12 @@ pub(crate) fn compress_block_encoded<M: Matcher, K: EncodeTier>(
     // not necessarily incompressible when one is, so the raw-skip below raises
     // its bar rather than trusting the block's own bytes.
     dict_active: bool,
+    // Whether the frame lets an incompressible-looking block go out raw
+    // unsearched at all; off, every block is searched.
+    raw_skip_enabled: bool,
+    // Whether this is the frame's first block, which upstream never writes as
+    // RLE once it has searched it.
+    first_block: bool,
     // Per-physical-block decompressed (regenerated) size sidecar, in
     // block-emit order — 1:1 with `FrameEmitInfo.blocks`, same cardinality
     // discipline as the XXH64 checksum sidecar. Captured under `lsm` alone
@@ -64,10 +80,16 @@ pub(crate) fn compress_block_encoded<M: Matcher, K: EncodeTier>(
     // here is read-only, so the borrow of the matcher's history coexists with
     // the `window_size()` probe.
     let bytes = &state.matcher.uncommitted_input()[..block_len];
-    let rle_byte_opt = bytes
+    let uniform_byte = bytes
         .first()
         .copied()
         .filter(|f| bytes.iter().all(|x| x == f));
+    // With the raw skip on, a block of one repeated byte goes out as RLE
+    // unsearched. Off, it is searched like any other and only then written as
+    // RLE, as upstream does (`searched_rle_byte`).
+    let rle_byte_opt = uniform_byte.filter(|_| raw_skip_enabled);
+    let searched_rle_byte = uniform_byte
+        .filter(|_| !raw_skip_enabled && !first_block && block_len >= SEARCHED_RLE_MIN_BLOCK);
     // Order is by cost, cheapest question first, because every one of these
     // runs on every block: an RLE block and a window that forbids the skip are
     // constants; the dict probe is a constant `true` for the conservative
@@ -97,7 +119,8 @@ pub(crate) fn compress_block_encoded<M: Matcher, K: EncodeTier>(
     // whether the grid is worth keeping at all: nothing it records can be acted
     // on where no block may go out raw, and recording there would take its
     // tables and hash a run of every block for an answer no one asks for.
-    let raw_skip_reachable = compression_level_allows_raw_fast_path(compression_level, window_size);
+    let raw_skip_reachable =
+        raw_skip_enabled && compression_level_allows_raw_fast_path(compression_level, window_size);
     let classifier_asked = raw_skip_worth_asking(
         state.literal_compression_disabled,
         state.workspace.on_fresh_pages(),
@@ -147,9 +170,12 @@ pub(crate) fn compress_block_encoded<M: Matcher, K: EncodeTier>(
     // physical blocks and records a checksum per partition of its own.
     // A captured parse is recorded per matched block, before any split, so
     // capturing keeps each block whole and its delimiter true.
+    // A block of one byte parses into a sequence or two, which upstream never
+    // splits (`ZSTD_compressBlock_splitBlock` takes `nbSeq <= 4` whole).
     let post_split = state.post_split_allowed
         && state.sequence_capture.is_none()
-        && post_split_enabled(state.strategy_tag, window_size);
+        && searched_rle_byte.is_none()
+        && post_split_enabled(state.split_strategy, window_size);
     #[cfg(all(feature = "lsm", feature = "hash"))]
     let post_split_path = rle_byte_opt.is_none() && !raw_fast_path && post_split;
     #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -252,17 +278,38 @@ pub(crate) fn compress_block_encoded<M: Matcher, K: EncodeTier>(
         let payload_off = output.len();
         let tables = compress_block::<M, K>(state, output);
         let payload_len = output.len() - payload_off;
-        // Fall back to a raw block when the compressed payload is not
-        // smaller than the source (`payload >= block_size`) or exceeds the
-        // maximum block size. A compressed block that did not shrink is never
-        // the right choice: it wastes bytes and, in a single-segment frame
-        // (window == content size), can reference past the declared window
-        // and fail to decode in a strict decoder. This mirrors the upstream
-        // post-hoc raw fallback and applies to every block, dictionary-primed
-        // or not — the pre-compression raw-fast-path only catches blocks that
-        // already look incompressible, so small inputs that slip past it but
-        // fail to shrink still need this post-hoc store-raw.
-        if payload_len >= MAX_BLOCK_SIZE as usize || payload_len >= block_size as usize {
+        // Upstream's entropy stage reports a block that does not save `minGain`
+        // as size 0, and the RLE test then reads that size
+        // (`ZSTD_compressBlock_internal`, zstd_compress.c:4415-4434).
+        let keeps_compressed = keeps_compressed_block(payload_len, block_len, state.strategy_tag);
+        let entropy_size = if keeps_compressed { payload_len } else { 0 };
+        if let Some(rle_byte) = searched_rle_byte.filter(|_| entropy_size < RLE_MAX_LENGTH) {
+            // Searched, then written as RLE: the block's tables and offsets
+            // are dropped as for a raw block (upstream confirms them only for
+            // a block longer than one byte).
+            output.truncate(hdr_off);
+            state.offset_hist = saved_offset_hist;
+            discard_block_tables(state, tables);
+            BlockHeader {
+                last_block,
+                block_type: BlockType::RLE,
+                block_size,
+            }
+            .serialize(output);
+            output.push(rle_byte);
+            return BlockType::RLE;
+        }
+        // Fall back to a raw block when the compressed payload does not save
+        // upstream's `minGain` (`keeps_compressed_block`), which also keeps
+        // it under the block size and so under the maximum. A compressed
+        // block that did not shrink is never the right choice: it wastes
+        // bytes and, in a single-segment frame (window == content size), can
+        // reference past the declared window and fail to decode in a strict
+        // decoder. This applies to every block, dictionary-primed or not —
+        // the pre-compression raw-fast-path only catches blocks that already
+        // look incompressible, so small inputs that slip past it but fail to
+        // shrink still need this post-hoc store-raw.
+        if !keeps_compressed {
             // Drop the payload + reserved header; the block's tables are not
             // committed, so the next block reads the ones this one started from.
             output.truncate(hdr_off);
@@ -303,7 +350,10 @@ fn skip_block<M: Matcher, K: EncodeTier>(state: &mut CompressState<M>, incompres
 }
 
 /// A block written out unsearched parses as literals alone: one delimiter
-/// carrying all of it, when the parse is being recorded.
+/// carrying all of it, when the parse is being recorded. It still ends a block
+/// for the entropy state the next one reads ([`FseTables::end_block`]).
+///
+/// [`FseTables::end_block`]: crate::encoding::frame_compressor::FseTables::end_block
 #[inline]
 fn record_unsearched_block<M: Matcher>(state: &mut CompressState<M>, block_size: u32) {
     if let Some(capture) = state.sequence_capture.as_mut() {
@@ -311,6 +361,7 @@ fn record_unsearched_block<M: Matcher>(state: &mut CompressState<M>, block_size:
             block_size,
         ));
     }
+    state.fse_tables.end_block();
 }
 
 /// Borrowed one-shot variant of [`compress_block_encoded`] for the Fast
@@ -337,6 +388,8 @@ pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
     block_end: usize,
     output: &mut Vec<u8>,
     dict_active: bool,
+    raw_skip_enabled: bool,
+    first_block: bool,
     #[cfg(feature = "lsm")] block_decompressed_sizes: Option<&mut Vec<u32>>,
     #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
 ) -> BlockType {
@@ -356,7 +409,12 @@ pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
     // Same order as the owned path, cheapest question first: the whole-block
     // grid is asked last and only about blocks the classifier already called
     // incompressible.
-    let is_rle = !block.is_empty() && block.iter().all(|x| block[0].eq(x));
+    let uniform = !block.is_empty() && block.iter().all(|x| block[0].eq(x));
+    // As on the owned path: RLE unsearched with the raw skip on, searched
+    // first with it off.
+    let is_rle = uniform && raw_skip_enabled;
+    let searched_rle =
+        uniform && !raw_skip_enabled && !first_block && block.len() >= SEARCHED_RLE_MIN_BLOCK;
     let window_size = state.matcher.window_size();
     // As on the owned path: an attached dictionary, or long-distance matching,
     // keeps the block on the search rather than trusting a sample to say
@@ -364,7 +422,8 @@ pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
     let dict_rejects_raw = dict_active || state.matcher.matches_beyond_window_tables();
     // As on the owned path: where no block may go out raw, the grid has nothing
     // to answer and is left alone.
-    let raw_skip_reachable = compression_level_allows_raw_fast_path(compression_level, window_size);
+    let raw_skip_reachable =
+        raw_skip_enabled && compression_level_allows_raw_fast_path(compression_level, window_size);
     let classifier_asked = raw_skip_worth_asking(
         state.literal_compression_disabled,
         state.workspace.on_fresh_pages(),
@@ -472,13 +531,30 @@ pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
         let payload_off = output.len();
         let tables = compress_block::<MatchGeneratorDriver, K>(state, output);
         let payload_len = output.len() - payload_off;
-        if payload_len >= MAX_BLOCK_SIZE as usize || payload_len >= block_size as usize {
-            // Incompressible (compressed payload not smaller than the source,
-            // or over the max block size): drop the payload + reserved header
-            // and the block's tables, then emit a stored Raw block. A
-            // non-shrinking compressed block wastes bytes and can reference
-            // past a single-segment frame's window (== content size); storing
-            // raw matches the upstream post-hoc fallback.
+        // As on the owned path: a block that does not save `minGain` reads as
+        // size 0 to the RLE test.
+        let keeps_compressed = keeps_compressed_block(payload_len, block.len(), state.strategy_tag);
+        let entropy_size = if keeps_compressed { payload_len } else { 0 };
+        if searched_rle && entropy_size < RLE_MAX_LENGTH {
+            // As on the owned path: searched, then written as RLE.
+            output.truncate(hdr_off);
+            state.offset_hist = saved_offset_hist;
+            discard_block_tables(state, tables);
+            BlockHeader {
+                last_block,
+                block_type: BlockType::RLE,
+                block_size,
+            }
+            .serialize(output);
+            output.push(block[0]);
+            return BlockType::RLE;
+        }
+        if !keeps_compressed {
+            // The payload does not save upstream's `minGain`: drop the payload
+            // + reserved header and the block's tables, then emit a stored Raw
+            // block. A non-shrinking compressed block wastes bytes and can
+            // reference past a single-segment frame's window (== content
+            // size); storing raw matches the upstream post-hoc fallback.
             output.truncate(hdr_off);
             state.offset_hist = saved_offset_hist;
             discard_block_tables(state, tables);
@@ -504,11 +580,12 @@ pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
 }
 
 /// Whether a compressed block goes through the post-split pass, which may cut
-/// it into several blocks along its sequences. Decided by the strategy the
-/// frame runs, not by its level, as upstream zstd decides it
+/// it into several blocks along its sequences. Decided by the strategy of the
+/// frame's own cParams, not by its level, as upstream zstd decides it
 /// (`zstd_compress.c`, `ZSTD_resolveBlockSplitterMode`: `strategy >= btopt &&
 /// windowLog >= 17`), so a parameter set that moves the strategy moves the
-/// pass with it.
+/// pass with it. A frame running a dictionary's cParams keeps the decision its
+/// own cParams made (`CompressState::split_strategy`).
 ///
 /// Turning the pass off is not a speed lever. Gated by level it was skipped on
 /// the btopt / btultra frames of L13-15, which ran faster there only by paying

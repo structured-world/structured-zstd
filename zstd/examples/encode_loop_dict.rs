@@ -31,7 +31,7 @@
 
 use std::env;
 
-use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+use structured_zstd::encoding::{CompressionLevel, CompressionParameters, FrameCompressor};
 
 // With `--features dhat-heap`, route every allocation through the dhat heap
 // profiler (same pattern as `encode_loop_reuse_z000033`) so the run records
@@ -77,6 +77,13 @@ fn main() {
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();
 
+    // `STRUCTURED_ZSTD_CPU=<level>` caps the kernel tiers, as in the benchmark.
+    if let Ok(value) = env::var("STRUCTURED_ZSTD_CPU") {
+        let level = value
+            .parse()
+            .expect("STRUCTURED_ZSTD_CPU names a CPU level");
+        structured_zstd::set_cpu_ceiling(level).expect("the CPU ceiling applies");
+    }
     let args: Vec<String> = env::args().collect();
     let level: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(22);
     let iters: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);
@@ -98,7 +105,19 @@ fn main() {
     // One reused compressor: matcher tables + any dictionary parse happen
     // once here, mirroring a consumer that reuses a context across N
     // independent per-block frames.
-    let mut cctx: FrameCompressor = FrameCompressor::new(CompressionLevel::from_level(level));
+    // `Level(n)`, as the benchmark builds it: the named presets `from_level`
+    // returns for some levels take paths of their own.
+    let compression_level = CompressionLevel::Level(level);
+    let mut cctx: FrameCompressor = FrameCompressor::new(compression_level);
+    // `RAW_SKIP=0` searches every block, as libzstd does, so the encode does
+    // the same work as `ffi_loop_dict` on input that looks incompressible.
+    if env::var("RAW_SKIP").is_ok_and(|v| v == "0") {
+        let params = CompressionParameters::builder(compression_level)
+            .raw_skip(false)
+            .build()
+            .expect("a level and the raw skip are always valid parameters");
+        cctx.set_parameters(&params);
+    }
     if let Some(path) = dict_path {
         let dict = std::fs::read(path).expect("read dict file");
         // Either kind, the way `zstd -D` takes it: a finalized dict carries
@@ -113,10 +132,19 @@ fn main() {
     // place by `compress_independent_frame_into`), so steady-state iters do
     // zero output allocation.
     let mut out: Vec<u8> = Vec::new();
+    // `FRAME_CHUNK=<N>` compresses the input's consecutive N-byte pieces in
+    // turn, one per frame, instead of the whole input every frame: frames that
+    // differ, as a store's records do, where a repeated frame lets the branch
+    // predictor learn its outcomes. Same variable as `ffi_loop_dict`.
+    let chunks: Option<Vec<&[u8]>> = env::var("FRAME_CHUNK")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .map(|n: usize| src.chunks(n).collect());
     let mut sink: usize = 0;
     for i in 0..iters {
-        let frame = match (&alt, i % 2) {
-            (Some(short), 1) => short.as_slice(),
+        let frame = match (&chunks, &alt, i % 2) {
+            (Some(chunks), ..) => chunks[i as usize % chunks.len()],
+            (None, Some(short), 1) => short.as_slice(),
             _ => src.as_slice(),
         };
         cctx.compress_independent_frame_into(frame, &mut out);
@@ -124,16 +152,20 @@ fn main() {
         core::hint::black_box(&out);
     }
 
-    // Under `alt<N>` the frames are not all `src.len()` long, so the total is
-    // counted from the schedule rather than multiplied out. Odd iterations take
-    // the short frame, which is `iters / 2` of them. Counting it here instead of
+    // Under `FRAME_CHUNK` or `alt<N>` the frames are not all `src.len()` long,
+    // so the total is counted from the schedule rather than multiplied out. Odd
+    // iterations take the short frame, which is `iters / 2` of them. Counting it
+    // here instead of
     // accumulating inside the loop keeps the timed body exactly as it is
     // measured.
     let short_frames = (iters / 2) as usize;
     let long_frames = iters as usize - short_frames;
-    let input_bytes = match &alt {
-        Some(short) => long_frames * src.len() + short_frames * short.len(),
-        None => iters as usize * src.len(),
+    let input_bytes = match (&chunks, &alt) {
+        (Some(chunks), _) => (0..iters as usize)
+            .map(|i| chunks[i % chunks.len()].len())
+            .sum(),
+        (None, Some(short)) => long_frames * src.len() + short_frames * short.len(),
+        (None, None) => iters as usize * src.len(),
     };
 
     eprintln!(

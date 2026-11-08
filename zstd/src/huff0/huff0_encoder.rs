@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
+use core::mem::MaybeUninit;
 
 /// Cache primitive for `HuffmanTable::cached_encoded_weight_description`,
 /// std-only. `std::sync::OnceLock` is `Sync` (atomic-init), so wrapping
@@ -341,7 +342,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 
     /// Per-symbol weights into a caller's buffer; see
     /// [`HuffmanTable::weights_into`].
-    fn weights_into<'b>(&self, buf: &'b mut [u8; MAX_HUFFMAN_ALPHABET]) -> &'b [u8] {
+    fn weights_into<'b>(&self, buf: &'b mut [MaybeUninit<u8>; MAX_HUFFMAN_ALPHABET]) -> &'b [u8] {
         self.table.weights_into(buf)
     }
 
@@ -349,7 +350,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     /// as a value. Production paths use the buffer form: this allocates.
     #[cfg(test)]
     pub(super) fn weights(&self) -> Vec<u8> {
-        let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+        let mut buf = [MaybeUninit::uninit(); MAX_HUFFMAN_ALPHABET];
         self.weights_into(&mut buf).to_vec()
     }
 
@@ -369,7 +370,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
                     return;
                 }
                 DescriptionState::NotEncodable => {
-                    let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+                    let mut buf = [MaybeUninit::uninit(); MAX_HUFFMAN_ALPHABET];
                     let weights = self.weights_into(&mut buf);
                     let weights = &weights[..weights.len() - 1];
                     Self::write_raw_weight_description(self.writer, weights);
@@ -383,7 +384,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             // it; `weights` is computed once and shared between the FSE encode
             // and the raw fallback, which would otherwise recompute the slice
             // (a measurable hotspot for small / low-cardinality tables).
-            let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+            let mut buf = [MaybeUninit::uninit(); MAX_HUFFMAN_ALPHABET];
             let weights = self.weights_into(&mut buf);
             let weights = &weights[..weights.len() - 1];
             let mut encoded = Vec::new();
@@ -399,10 +400,9 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         {
             // no_std: no cache field, no shared state — single weight
             // computation, branch on FSE-vs-raw based on direct encoder call.
-            let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+            let mut buf = [MaybeUninit::uninit(); MAX_HUFFMAN_ALPHABET];
             let weights = self.weights_into(&mut buf);
-            let len = weights.len();
-            let weights = &buf[..len - 1];
+            let weights = &weights[..weights.len() - 1];
             let mut encoded = Vec::new();
             let mut fse_table = fse_encoder::FSETable::blank();
             if Self::encode_weight_description_into(weights, &mut encoded, &mut fse_table) {
@@ -443,9 +443,26 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         // these cases avoids producing a stream the decoder would reject (the
         // failure the former decode round-trip existed to catch) — the
         // single-distinct-weight case is the common uniform-literal frame.
+        // Four striped tables, merged after: neighbouring symbols share a
+        // weight (a gap in the alphabet is a run of zeros), and in one table
+        // every increment would wait on the store of the one before it.
+        let mut stripes = [[0u16; 13]; 4];
+        let (quads, remainder) = weights.as_chunks::<4>();
+        for quad in quads {
+            stripes[0][quad[0] as usize] += 1;
+            stripes[1][quad[1] as usize] += 1;
+            stripes[2][quad[2] as usize] += 1;
+            stripes[3][quad[3] as usize] += 1;
+        }
+        for &weight in remainder {
+            stripes[0][weight as usize] += 1;
+        }
         let mut counts = [0usize; 13];
-        for &weight in weights {
-            counts[weight as usize] += 1;
+        for (weight, count) in counts.iter_mut().enumerate() {
+            *count = stripes
+                .iter()
+                .map(|stripe| usize::from(stripe[weight]))
+                .sum();
         }
         let max_count = counts.iter().copied().max().unwrap_or(0);
         if max_count == weights.len() || max_count <= 1 {
@@ -630,6 +647,13 @@ impl HuffmanTable {
             + cached
     }
 
+    /// Whether every byte value has a code. Upstream marks a dictionary's
+    /// literal table `HUF_repeat_valid` only then (`ZSTD_loadCEntropy`), and a
+    /// block may repeat a valid table without checking it against its literals.
+    pub(crate) fn codes_every_byte(&self) -> bool {
+        self.codes.len() == 256 && self.codes.iter().all(|&(_, bits)| bits != 0)
+    }
+
     /// The most heap one table holds: a code and a packed code for each of the
     /// 256 byte values, and room for the longest weight description (a header
     /// byte and 255 four-bit weights, in a buffer grown to the next power of
@@ -651,16 +675,22 @@ impl HuffmanTable {
     /// strategy and source size (see `CompressState::huf_optimal_search`).
     pub fn build_from_counts_gated(counts: &[usize], use_search: bool) -> Self {
         let mut scratch = WeightScratch::default();
-        Self::build_from_counts_gated_with(counts, use_search, &mut scratch)
+        if use_search {
+            return Self::build_from_counts(counts);
+        }
+        let total = assert_histogram_fits_nodes::<false>(counts).total;
+        Self::build_from_counts_gated_with(counts, total, false, &mut scratch)
     }
 
-    /// [`Self::build_from_counts_gated`] reusing caller-owned scratch. The
-    /// cheap path builds a tree and two weight buffers per call, and a
-    /// compressor calls it once per block — and once per split candidate where
-    /// the block splitter probes — so taking them fresh every time was the
-    /// single largest source of per-frame allocations.
+    /// [`Self::build_from_counts_gated`] for the encoder's own histogram, whose
+    /// `total` the caller knows (the section it counted), and reusing
+    /// caller-owned scratch. The cheap path builds a tree and two weight buffers
+    /// per call, and a compressor calls it once per block — and once per split
+    /// candidate where the block splitter probes — so taking them fresh every
+    /// time was the single largest source of per-frame allocations.
     pub(crate) fn build_from_counts_gated_with(
         counts: &[usize],
+        total: usize,
         use_search: bool,
         scratch: &mut WeightScratch,
     ) -> Self {
@@ -670,12 +700,27 @@ impl HuffmanTable {
             // every searched build, including each splitter candidate.
             Self::build_from_counts(counts)
         } else {
-            let total = assert_histogram_fits_nodes::<false>(counts).total;
+            // A section of a block is far under what a node holds, so this
+            // histogram needs no walk to prove it.
+            debug_assert!(counts.len() <= MAX_HUFFMAN_ALPHABET);
+            debug_assert!(total < u32::MAX as usize);
             // Match upstream's cheap path: tableLog = FSE_optimalTableLog(11,
             // srcSize, maxSV, minus=1) (huf_compress.c:1286), height-limit to it,
             // not the raw natural height (11) which can cost a few bytes vs C.
-            build_limited_weights_into(counts, cheap_huf_table_log(counts, total), scratch);
+            let table_log = cheap_huf_table_log(counts, total);
+            build_huffman_leaf_depths_into(counts, &mut scratch.leaves);
             let spare = scratch.spare_table.take();
+            if scratch.leaves.len() > 1 && limit_leaves_in_place(&mut scratch.leaves, table_log) {
+                return Self::build_from_limited_leaves(
+                    &scratch.leaves,
+                    counts.len(),
+                    table_log,
+                    spare,
+                );
+            }
+            // A single symbol, or a code the limiter could not complete, takes
+            // the weight route and its fallback.
+            build_limited_weights_into(counts, table_log, scratch);
             Self::build_from_weights_reusing(&scratch.weights, spare)
         }
     }
@@ -870,10 +915,9 @@ impl HuffmanTable {
         }
         #[cfg(not(feature = "std"))]
         {
-            let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+            let mut buf = [MaybeUninit::uninit(); MAX_HUFFMAN_ALPHABET];
             let weights = self.weights_into(&mut buf);
-            let len = weights.len();
-            let weights = &buf[..len - 1];
+            let weights = &weights[..weights.len() - 1];
             let mut encoded = Vec::new();
             if HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(
                 weights,
@@ -902,7 +946,7 @@ impl HuffmanTable {
     /// as a value. Production paths use the buffer form: this allocates.
     #[cfg(test)]
     fn weights(&self) -> Vec<u8> {
-        let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+        let mut buf = [MaybeUninit::uninit(); MAX_HUFFMAN_ALPHABET];
         self.weights_into(&mut buf).to_vec()
     }
 
@@ -910,12 +954,25 @@ impl HuffmanTable {
     /// most 256 symbols, so a stack buffer covers every table — and this runs
     /// once per built table, which is once per block and once per split
     /// candidate, so a `Vec` here was an allocation on that whole path.
-    fn weights_into<'b>(&self, buf: &'b mut [u8; MAX_HUFFMAN_ALPHABET]) -> &'b [u8] {
-        let max = *self.codes.iter().map(|(_, nb)| nb).max().unwrap();
+    /// The buffer is left uninitialised past the alphabet: clearing all of it
+    /// once per table would write bytes nothing reads.
+    fn weights_into<'b>(&self, buf: &'b mut [MaybeUninit<u8>; MAX_HUFFMAN_ALPHABET]) -> &'b [u8] {
+        // Code lengths follow no order a predictor can learn, so neither step
+        // branches on one: the longest is the top bit of the set of lengths, and
+        // a mask zeroes the weight of an absent symbol.
+        debug_assert!(self.codes.iter().all(|&(_, nb)| nb < 32));
+        debug_assert!(self.codes.len() <= MAX_HUFFMAN_ALPHABET);
+        let lengths = self
+            .codes
+            .iter()
+            .fold(0u32, |seen, &(_, nb)| seen | (1 << nb));
+        let max = lengths.ilog2() as u8;
         for (slot, &(_, nb)) in buf.iter_mut().zip(self.codes.iter()) {
-            *slot = if nb == 0 { 0 } else { max - nb + 1 };
+            slot.write((max + 1 - nb) & 0u8.wrapping_sub(u8::from(nb != 0)));
         }
-        &buf[..self.codes.len()]
+        let len = self.codes.len().min(MAX_HUFFMAN_ALPHABET);
+        // SAFETY: the loop above wrote the first `len` slots, one per code.
+        unsafe { core::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), len) }
     }
 
     /// Encode the description if it has not been encoded for these contents
@@ -952,12 +1009,11 @@ impl HuffmanTable {
         if self.cached_encoded_weight_description.state != DescriptionState::NotComputed {
             return;
         }
-        let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+        let mut buf = [MaybeUninit::uninit(); MAX_HUFFMAN_ALPHABET];
         // The returned slice borrows `buf`, not `self`, so the shared borrow
         // ends here and the fill below can take `&mut self`.
         let weights = self.weights_into(&mut buf);
-        let len = weights.len();
-        let weights = &buf[..len - 1];
+        let weights = &weights[..weights.len() - 1];
         self.fill_weight_description(weights, fse_table);
     }
 
@@ -1003,16 +1059,18 @@ impl HuffmanTable {
         &self,
         counts: &[usize],
     ) -> Option<usize> {
+        // Which symbols occur follows no order a predictor can learn, so the walk
+        // does not branch on it: an absent symbol adds nothing to `bits`, and
+        // `missing` collects the count of any symbol the table has no code for.
+        let (coded, past_table) = counts.split_at(counts.len().min(self.codes.len()));
         let mut bits = 0usize;
-        for (symbol, &count) in counts.iter().enumerate() {
-            if count == 0 {
-                continue;
-            }
-            let (_, num_bits) = *self.codes.get(symbol)?;
-            if num_bits == 0 {
-                return None;
-            }
+        let mut missing = past_table.iter().fold(0usize, |seen, &count| seen | count);
+        for (&count, &(_, num_bits)) in coded.iter().zip(self.codes.iter()) {
             bits += num_bits as usize * count;
+            missing |= count & usize::from(num_bits == 0).wrapping_neg();
+        }
+        if missing != 0 {
+            return None;
         }
         Some(bits.div_ceil(8) + usize::from(bits.is_multiple_of(8)))
     }
@@ -1071,39 +1129,7 @@ impl HuffmanTable {
             panic!("This is an internal error");
         }
         let table_log = highest_bit_set(weight_sum) - 1;
-        let mut table = match spare {
-            Some(mut spare) => {
-                // Both buffers are overwritten below, so the recycled contents
-                // do not survive; only their allocations do. Exact
-                // reservation: an amortised one would double a buffer grown
-                // one symbol at a time past the 256 entries any table holds,
-                // beyond what `max_heap_size` budgets.
-                // The fill below writes the first `weights.len()` packed codes,
-                // absent symbols as zero; past them only the previous table's
-                // symbols can be non-zero.
-                let stale = spare.codes.len().max(weights.len());
-                debug_assert_eq!(spare.packed_codes.len(), 256);
-                spare.packed_codes[weights.len()..stale].fill(0);
-                spare.codes.clear();
-                spare.codes.reserve_exact(weights.len());
-                spare.table_log = table_log as u32;
-                #[cfg(feature = "std")]
-                {
-                    // The contents describe the old codes and are stale, but
-                    // the buffer they sat in is exactly what this path exists
-                    // to keep: reset the state, not the allocation.
-                    spare.cached_encoded_weight_description.state = DescriptionState::NotComputed;
-                }
-                spare
-            }
-            None => HuffmanTable {
-                codes: Vec::with_capacity(weights.len()),
-                packed_codes: alloc::vec![0u64; 256],
-                table_log: table_log as u32,
-                #[cfg(feature = "std")]
-                cached_encoded_weight_description: WeightDescription::default(),
-            },
-        };
+        let mut table = Self::emptied(spare, weights.len(), table_log);
         // A code of `nb_bits` bits has weight `table_log + 1 - nb_bits`.
         let mut val_per_rank = [0u16; 13];
         let mut min = 0u16;
@@ -1128,6 +1154,93 @@ impl HuffmanTable {
             }));
 
         table
+    }
+
+    /// The table of a code limited to `table_log` bits, read off its `leaves`
+    /// (the symbols that occur, more than one, with their code lengths) the way
+    /// upstream builds its table from the tree (`HUF_buildCTableFromTree`),
+    /// rather than through a weight per symbol. `alphabet_len` is the histogram's
+    /// length. The codes are those [`Self::build_from_weights_reusing`] gives
+    /// the same code's weights.
+    fn build_from_limited_leaves(
+        leaves: &[HuffNode],
+        alphabet_len: usize,
+        table_log: usize,
+        spare: Option<Self>,
+    ) -> Self {
+        debug_assert!(leaves.len() > 1 && alphabet_len <= MAX_HUFFMAN_ALPHABET);
+        let mut nb_bits_of = [0u8; MAX_HUFFMAN_ALPHABET];
+        let mut per_nb_bits = [0u16; 13];
+        for leaf in leaves {
+            debug_assert!((1..=table_log).contains(&(leaf.nb_bits as usize)));
+            nb_bits_of[leaf.symbol as usize] = leaf.nb_bits;
+            per_nb_bits[leaf.nb_bits as usize] += 1;
+        }
+        let mut table = Self::emptied(spare, alphabet_len, table_log);
+        let mut val_per_rank = [0u16; 13];
+        let mut min = 0u16;
+        for nb_bits in (1..=table_log).rev() {
+            val_per_rank[nb_bits] = min;
+            min = min.wrapping_add(per_nb_bits[nb_bits]) >> 1;
+        }
+        let packed_codes = &mut table.packed_codes;
+        table
+            .codes
+            .extend(
+                nb_bits_of[..alphabet_len]
+                    .iter()
+                    .enumerate()
+                    .map(|(symbol, &nb_bits)| {
+                        // Rank 0 is the absent symbols': it stays at zero, which
+                        // leaves them the empty code with no branch on presence
+                        // (upstream zstd `HUF_buildCTableFromTree` walks every
+                        // symbol through `valPerRank` the same way).
+                        let value = val_per_rank[nb_bits as usize];
+                        val_per_rank[nb_bits as usize] += u16::from(nb_bits != 0);
+                        packed_codes[symbol] =
+                            super::huf_cstream::pack_huf_celt(value as u32, nb_bits);
+                        (value as u32, nb_bits)
+                    }),
+            );
+        table
+    }
+
+    /// `spare`'s buffers, or new ones, emptied for a table of `alphabet_len`
+    /// symbols at `table_log`.
+    fn emptied(spare: Option<Self>, alphabet_len: usize, table_log: usize) -> Self {
+        match spare {
+            Some(mut spare) => {
+                // Both buffers are overwritten by the caller, so the recycled
+                // contents do not survive; only their allocations do. Exact
+                // reservation: an amortised one would double a buffer grown
+                // one symbol at a time past the 256 entries any table holds,
+                // beyond what `max_heap_size` budgets.
+                // The caller's fill writes the first `alphabet_len` packed
+                // codes, absent symbols as zero; past them only the previous
+                // table's symbols can be non-zero.
+                let stale = spare.codes.len().max(alphabet_len);
+                debug_assert_eq!(spare.packed_codes.len(), 256);
+                spare.packed_codes[alphabet_len..stale].fill(0);
+                spare.codes.clear();
+                spare.codes.reserve_exact(alphabet_len);
+                spare.table_log = table_log as u32;
+                #[cfg(feature = "std")]
+                {
+                    // The contents describe the old codes and are stale, but
+                    // the buffer they sat in is exactly what this path exists
+                    // to keep: reset the state, not the allocation.
+                    spare.cached_encoded_weight_description.state = DescriptionState::NotComputed;
+                }
+                spare
+            }
+            None => HuffmanTable {
+                codes: Vec::with_capacity(alphabet_len),
+                packed_codes: alloc::vec![0u64; 256],
+                table_log: table_log as u32,
+                #[cfg(feature = "std")]
+                cached_encoded_weight_description: WeightDescription::default(),
+            },
+        }
     }
 
     /// Upstream zstd-format packed code table for the hot encode loop.
@@ -1295,7 +1408,8 @@ fn huffman_weight_sum_is_power_of_two(weights: &[usize]) -> bool {
 /// `nodeElt`: the table is `2 * leaf_count - 1` entries and is walked several
 /// times per block, so its width is what decides whether it stays in L1
 /// alongside the histogram. In `usize` fields it was forty bytes a node,
-/// twenty kilobytes for a full alphabet.
+/// twenty kilobytes for a full alphabet. At eight bytes a leaf is one store
+/// and a node's address one shift.
 ///
 /// Every field's range is bounded by the block: counts sum to the literal
 /// count, symbols index a 256-entry alphabet, and node indices reach
@@ -1303,10 +1417,14 @@ fn huffman_weight_sum_is_power_of_two(weights: &[usize]) -> bool {
 #[derive(Clone, Copy)]
 struct HuffNode {
     count: u32,
-    symbol: u16,
     parent: u16,
+    symbol: u8,
     nb_bits: u8,
 }
+
+// A symbol indexes the alphabet, so the alphabet must fit `HuffNode::symbol`.
+const _: () = assert!(MAX_HUFFMAN_ALPHABET <= 1 << u8::BITS);
+const _: () = assert!(core::mem::size_of::<HuffNode>() == 8);
 
 /// `parent` of a node with no parent yet, and of the root once the tree is
 /// built. Out of range for a real node index, which is under `2 * 256 - 1`.
@@ -1400,29 +1518,6 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
         counts.iter().map(|&count| count as u64).sum::<u64>() < u32::MAX as u64,
         "histogram reached the tree builder without passing the entry check",
     );
-    let leaf_count = counts.iter().filter(|&&count| count > 0).count();
-    // Pre-size to the final node count (`2 * leaf_count - 1`) so the tree
-    // build's resize never reallocates.
-    nodes.clear();
-    // Exact, as the buffer is reused: an amortised reserve doubles a buffer
-    // grown block by block past the 512 nodes `WeightScratch::max_heap_size`
-    // budgets.
-    nodes.reserve_exact((2 * leaf_count).max(1));
-
-    if leaf_count == 0 {
-        return;
-    }
-    if leaf_count == 1 {
-        let (symbol, &count) = counts.iter().enumerate().find(|&(_, &c)| c > 0).unwrap();
-        nodes.push(HuffNode {
-            count: count as u32,
-            symbol: symbol as u16,
-            parent: NO_PARENT,
-            nb_bits: 0,
-        });
-        return;
-    }
-
     // Bucketed sort (upstream zstd `HUF_sort`, huf_compress.c): an O(n)
     // counting pass bucketed by the count magnitude. Counts below
     // `DISTINCT_CUTOFF` each get a dedicated bucket, so they land strictly
@@ -1443,128 +1538,167 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
             (highest_bit_set(count) - 1) + LOG_BUCKETS_BEGIN
         }
     };
+    // The leaves are counted in the bucket pass, which reads every count anyway.
     let mut bucket_size = [0u32; BUCKETS];
+    let mut leaf_count = 0usize;
+    // Absent symbols take bucket 0 rather than a test: a literal alphabet is full
+    // of gaps, so the test is unpredictable on every symbol (upstream `HUF_sort`
+    // has none). Bucket 0 sorts last, past the leaves.
     for &count in counts {
-        if count > 0 {
-            bucket_size[bucket_of(count)] += 1;
-        }
+        bucket_size[bucket_of(count)] += 1;
+        leaf_count += usize::from(count > 0);
     }
-    // Output start index per bucket: higher buckets (higher counts) come
-    // first, so the leaves end up count-descending.
-    let mut start = [0u32; BUCKETS];
-    let mut acc = 0u32;
-    for bucket in (0..BUCKETS).rev() {
-        start[bucket] = acc;
-        acc += bucket_size[bucket];
+    // Pre-size to the final node count (`2 * leaf_count - 1`), or the alphabet
+    // the bucket pass lays out if larger: the tree is written into this room
+    // directly.
+    nodes.clear();
+    // Exact, as the buffer is reused: an amortised reserve doubles a buffer
+    // grown block by block past the 512 nodes `WeightScratch::max_heap_size`
+    // budgets.
+    nodes.reserve_exact((2 * leaf_count).max(counts.len()).max(1));
+
+    if leaf_count == 0 {
+        return;
     }
-    let mut cursor = start;
-    nodes.resize(
-        leaf_count,
-        HuffNode {
-            count: 0,
-            symbol: 0,
+    if leaf_count == 1 {
+        let (symbol, &count) = counts.iter().enumerate().find(|&(_, &c)| c > 0).unwrap();
+        nodes.push(HuffNode {
+            count: count as u32,
+            symbol: symbol as u8,
             parent: NO_PARENT,
             nb_bits: 0,
-        },
-    );
+        });
+        return;
+    }
+
+    // Output start index per bucket, turned into its cursor in place: higher
+    // buckets (higher counts) come first, so the leaves end up
+    // count-descending. Only the log2 buckets' starts are read again, by
+    // their sort.
+    let cursor = &mut bucket_size;
+    let mut acc = 0u32;
+    for bucket in (0..BUCKETS).rev() {
+        let size = cursor[bucket];
+        cursor[bucket] = acc;
+        acc += size;
+    }
+    let mut log_start = [0u32; BUCKETS - DISTINCT_CUTOFF];
+    log_start.copy_from_slice(&cursor[DISTINCT_CUTOFF..]);
+    // Every node is written once, whole, into the reserved room before the
+    // length covers it, as upstream fills its node table (`HUF_sort`, then
+    // `HUF_buildTree` setting only the internal counts): filling the table
+    // first and then overwriting each node was most of its stores.
+    let node_len = (2 * leaf_count - 1).max(counts.len());
+    let out = nodes.as_mut_ptr();
     for (symbol, &count) in counts.iter().enumerate() {
-        if count == 0 {
-            continue;
-        }
         let bucket = bucket_of(count);
         let pos = cursor[bucket] as usize;
         cursor[bucket] += 1;
-        nodes[pos] = HuffNode {
-            count: count as u32,
-            symbol: symbol as u16,
-            parent: NO_PARENT,
-            nb_bits: 0,
-        };
+        debug_assert!(pos < counts.len());
+        // SAFETY: the buckets' sizes sum to `counts.len()` and each cursor
+        // starts at its bucket's place among them, so `pos < counts.len()`,
+        // inside the room reserved above. The positions are distinct, so this
+        // writes each of `[0, counts.len())` once.
+        unsafe {
+            out.add(pos).write(HuffNode {
+                count: count as u32,
+                symbol: symbol as u8,
+                parent: NO_PARENT,
+                nb_bits: 0,
+            });
+        }
     }
-    // Only the log2 buckets mix distinct counts; sort them stably by
-    // `(count desc, symbol asc)` so the order matches the old full sort.
+    // Past the leaves every node is an unbuilt internal one: the merge loop
+    // never selects it, because a count no real subtree can reach keeps it out
+    // of the comparison of the next leaf against the next built node. Absent
+    // symbols were laid over some of these.
+    for n in leaf_count..2 * leaf_count - 1 {
+        // SAFETY: `n < 2 * leaf_count - 1 <= node_len`, inside the reserved room.
+        unsafe {
+            out.add(n).write(HuffNode {
+                count: u32::MAX,
+                symbol: u8::MAX,
+                parent: NO_PARENT,
+                nb_bits: 0,
+            });
+        }
+    }
+    // SAFETY: the two loops wrote `[0, counts.len())` and
+    // `[leaf_count, 2 * leaf_count - 1)`, whose union is `[0, node_len)`
+    // since `leaf_count <= counts.len()`; the room was reserved above.
+    unsafe { nodes.set_len(node_len) };
+    // Only the log2 buckets mix distinct counts; sort them by
+    // `(count desc, symbol asc)` so the order matches the old full sort. The
+    // key is unique (a symbol occurs once), so an unstable sort gives the same
+    // order, in place, as upstream sorts its buckets (`HUF_simpleQuickSort`);
+    // the stable sort takes a buffer for any bucket past twenty symbols, and a
+    // full literals section puts most of the alphabet in these buckets.
     for bucket in DISTINCT_CUTOFF..BUCKETS {
-        let lo = start[bucket] as usize;
+        let lo = log_start[bucket - DISTINCT_CUTOFF] as usize;
         let hi = cursor[bucket] as usize;
         if hi - lo > 1 {
-            nodes[lo..hi].sort_by(|left, right| match right.count.cmp(&left.count) {
+            nodes[lo..hi].sort_unstable_by(|left, right| match right.count.cmp(&left.count) {
                 Ordering::Equal => left.symbol.cmp(&right.symbol),
                 other => other,
             });
         }
     }
 
-    // The unbuilt internal nodes start at the maximum count so the merge loop
-    // below never selects one: it always takes the smaller of the next leaf and
-    // the next built node, and a count no real subtree can reach is what keeps
-    // an unbuilt slot out of that comparison.
-    nodes.resize(
-        2 * leaf_count - 1,
-        HuffNode {
-            count: u32::MAX,
-            symbol: u16::MAX,
-            parent: NO_PARENT,
-            nb_bits: 0,
-        },
-    );
-
     let mut low_s = leaf_count as isize - 1;
     let mut low_n = leaf_count;
     let node_root = leaf_count + (leaf_count - 1) - 1;
     let mut node_nb = leaf_count;
 
-    // Plain `+`: node counts are symbol frequencies whose tree-wide sum is the
-    // block's symbol count (<= MAX_BLOCK_SIZE), so a merged parent count cannot
-    // overflow u32. Saturation would only mask a corrupt frequency table.
-    nodes[node_nb].count = nodes[low_s as usize].count + nodes[(low_s - 1) as usize].count;
-    nodes[node_nb].symbol = nodes[(low_s - 1) as usize]
-        .symbol
-        .min(nodes[low_s as usize].symbol);
-    nodes[low_s as usize].parent = node_nb as u16;
-    nodes[(low_s - 1) as usize].parent = node_nb as u16;
+    // Internal nodes carry a count and a parent only: they are dropped once the
+    // depths are known, so nothing reads their `symbol`.
+    //
+    // Raw pointer, as upstream merges (`HUF_buildTree`): every index below is
+    // a leaf at or above 0, a built node at or below `node_nb`, or the next
+    // node to build, all under `2 * leaf_count - 1`, the length just resized
+    // to. `low_s` reaches -1 only once the leaves run out, and is not read
+    // then.
+    let p = nodes.as_mut_ptr();
+    // SAFETY: see above; `low_s >= 1` here since `leaf_count >= 2`.
+    unsafe {
+        // Plain `+`: node counts are symbol frequencies whose tree-wide sum is
+        // the block's symbol count (<= MAX_BLOCK_SIZE), so a merged parent count
+        // cannot overflow u32. Saturation would only mask a corrupt frequency
+        // table.
+        (*p.add(node_nb)).count =
+            (*p.add(low_s as usize)).count + (*p.add((low_s - 1) as usize)).count;
+        (*p.add(low_s as usize)).parent = node_nb as u16;
+        (*p.add((low_s - 1) as usize)).parent = node_nb as u16;
+    }
     node_nb += 1;
     low_s -= 2;
 
+    // The smaller of the next leaf and the next built node, leaves winning
+    // only strictly, and the cursor it came from advanced.
+    let take = |low_s: &mut isize, low_n: &mut usize| -> usize {
+        debug_assert!(*low_n < 2 * leaf_count - 1);
+        // SAFETY: as above.
+        let node_count = unsafe { (*p.add(*low_n)).count };
+        if *low_s >= 0 && unsafe { (*p.add(*low_s as usize)).count } < node_count {
+            let idx = *low_s as usize;
+            *low_s -= 1;
+            idx
+        } else {
+            let idx = *low_n;
+            *low_n += 1;
+            idx
+        }
+    };
     while node_nb <= node_root {
-        let first = {
-            let leaf_count = if low_s >= 0 {
-                nodes[low_s as usize].count
-            } else {
-                u32::MAX
-            };
-            let node_count = nodes[low_n].count;
-            if leaf_count < node_count {
-                let idx = low_s as usize;
-                low_s -= 1;
-                idx
-            } else {
-                let idx = low_n;
-                low_n += 1;
-                idx
-            }
-        };
-        let second = {
-            let leaf_count = if low_s >= 0 {
-                nodes[low_s as usize].count
-            } else {
-                u32::MAX
-            };
-            let node_count = nodes[low_n].count;
-            if leaf_count < node_count {
-                let idx = low_s as usize;
-                low_s -= 1;
-                idx
-            } else {
-                let idx = low_n;
-                low_n += 1;
-                idx
-            }
-        };
-        // Plain `+`: see the leaf-merge above — counts sum to <= MAX_BLOCK_SIZE.
-        nodes[node_nb].count = nodes[first].count + nodes[second].count;
-        nodes[node_nb].symbol = nodes[first].symbol.min(nodes[second].symbol);
-        nodes[first].parent = node_nb as u16;
-        nodes[second].parent = node_nb as u16;
+        let first = take(&mut low_s, &mut low_n);
+        let second = take(&mut low_s, &mut low_n);
+        debug_assert!(first < node_nb && second < node_nb && node_nb < 2 * leaf_count - 1);
+        // SAFETY: as above.
+        unsafe {
+            // Plain `+`: see the leaf-merge above — counts sum to <= MAX_BLOCK_SIZE.
+            (*p.add(node_nb)).count = (*p.add(first)).count + (*p.add(second)).count;
+            (*p.add(first)).parent = node_nb as u16;
+            (*p.add(second)).parent = node_nb as u16;
+        }
         node_nb += 1;
     }
 
@@ -1572,11 +1706,15 @@ fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
     // parent was built after it, so it sits at a higher index and is already
     // done when the descending walk reaches the child. Walking each leaf up to
     // the root instead was a chain of dependent loads per leaf.
-    nodes[node_root].nb_bits = 0;
-    for n in (0..node_root).rev() {
-        let parent = nodes[n].parent as usize;
-        debug_assert!(parent > n && parent <= node_root);
-        nodes[n].nb_bits = nodes[parent].nb_bits + 1;
+    // SAFETY: `node_root` is the last of the `2 * leaf_count - 1` nodes, and a
+    // parent index is above its child and at most `node_root`, asserted below.
+    unsafe {
+        (*p.add(node_root)).nb_bits = 0;
+        for n in (0..node_root).rev() {
+            let parent = (*p.add(n)).parent as usize;
+            debug_assert!(parent > n && parent <= node_root);
+            (*p.add(n)).nb_bits = (*p.add(parent)).nb_bits + 1;
+        }
     }
 
     // The leaves keep their (count desc, symbol asc) order: the tree build
@@ -1619,7 +1757,49 @@ fn limited_weights_into(
     work.clear();
     work.reserve_exact(leaves.len());
     work.extend_from_slice(leaves);
-    enforce_max_height(work, max_nb_bits);
+    limited_weights_in_place(work, max_nb_bits, out)
+}
+
+/// [`limited_weights_into`] limiting `leaves` themselves, for a caller that
+/// has no use for their natural depths after. `out` holds a zero per symbol on
+/// entry and is written only when the limited code is valid.
+fn limited_weights_in_place(
+    leaves: &mut [HuffNode],
+    max_nb_bits: usize,
+    out: &mut [usize],
+) -> bool {
+    if !limit_leaves_in_place(leaves, max_nb_bits) {
+        return false;
+    }
+    for leaf in leaves.iter() {
+        out[leaf.symbol as usize] = max_nb_bits + 1 - leaf.nb_bits as usize;
+    }
+    true
+}
+
+/// Limit `leaves` (more than one) to codes of at most `max_nb_bits`, as
+/// upstream limits its tree in place (`HUF_setMaxHeight`), and report whether
+/// the result is a full code at exactly that limit.
+fn limit_leaves_in_place(leaves: &mut [HuffNode], max_nb_bits: usize) -> bool {
+    debug_assert!(leaves.len() > 1);
+    let kraft_of = |leaves: &[HuffNode]| -> (bool, usize) {
+        leaves
+            .iter()
+            .fold((false, 0usize), |(too_long, sum), leaf| {
+                let nb_bits = leaf.nb_bits as usize;
+                // Wrapping: a code past the limit fails `too_long` whatever this adds.
+                (
+                    too_long | (nb_bits > max_nb_bits),
+                    sum.wrapping_add(1usize.wrapping_shl(max_nb_bits.wrapping_sub(nb_bits) as u32)),
+                )
+            })
+    };
+    if !enforce_max_height(leaves, max_nb_bits) {
+        // Untouched, the leaves are the natural tree's, and the leaves of a
+        // full binary tree make a full code at any limit their depths fit.
+        debug_assert_eq!(kraft_of(leaves), (false, 1usize << max_nb_bits));
+        return true;
+    }
     // The height limiter restores a full, canonical code in one pass (matching
     // upstream `HUF_setMaxHeight`): the Kraft sum `Σ 2^(max_nb_bits - nb_bits)`
     // lands exactly on `2^max_nb_bits`. A degenerate distribution can stop the
@@ -1627,21 +1807,7 @@ fn limited_weights_into(
     // upstream), leaving the code under- or over-full, which projects to a
     // non-power-of-two weight sum the table builder rejects; detect that here
     // and fall back to the distributed-weight construction.
-    if work.iter().any(|leaf| leaf.nb_bits as usize > max_nb_bits) {
-        return false;
-    }
-    let kraft_sum = work
-        .iter()
-        .map(|leaf| 1usize << (max_nb_bits - leaf.nb_bits as usize))
-        .sum::<usize>();
-    if kraft_sum != 1usize << max_nb_bits {
-        return false;
-    }
-
-    for leaf in work.iter() {
-        out[leaf.symbol as usize] = max_nb_bits - leaf.nb_bits as usize + 1;
-    }
-    true
+    kraft_of(leaves) == (false, 1usize << max_nb_bits)
 }
 
 /// Upstream HUF cheap/fast-path tableLog (`HUF_optimalTableLog`,
@@ -1666,15 +1832,14 @@ fn build_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {
     core::mem::take(&mut scratch.weights)
 }
 
-/// The three buffers a weight build needs, owned by the caller so a compressor
+/// The two buffers a weight build needs, owned by the caller so a compressor
 /// that builds a table per block — and, where the block splitter probes, per
-/// split candidate — reuses them instead of taking three fresh allocations
-/// every time. The table-log SEARCH path already reused its scratch; this is
-/// the same for the cheap single-build path.
+/// split candidate — reuses them instead of taking fresh allocations every
+/// time. The table-log SEARCH path already reused its scratch; this is the
+/// same for the cheap single-build path.
 #[derive(Default)]
 pub(crate) struct WeightScratch {
     leaves: Vec<HuffNode>,
-    work: Vec<HuffNode>,
     weights: Vec<usize>,
     /// The last table the caller built and threw away, handed back so the next
     /// build fills its buffers instead of taking new ones.
@@ -1691,11 +1856,10 @@ impl WeightScratch {
     /// to be told about them.
     ///
     /// A parked table contributes its own heap bytes only: the table object
-    /// sits inline here, as the three buffers' headers do, and none of them
+    /// sits inline here, as the two buffers' headers do, and none of them
     /// are an allocation of this scratch's making.
     pub(crate) fn heap_size(&self) -> usize {
         self.leaves.capacity() * core::mem::size_of::<HuffNode>()
-            + self.work.capacity() * core::mem::size_of::<HuffNode>()
             + self.weights.capacity() * core::mem::size_of::<usize>()
             + self.spare_table.as_ref().map_or(0, HuffmanTable::heap_size)
             + self
@@ -1704,11 +1868,11 @@ impl WeightScratch {
                 .map_or(0, |_| core::mem::size_of::<fse_encoder::FSETable>())
     }
 
-    /// The most heap this scratch keeps: a leaf per byte value and a node array
-    /// for the tree over them, each at most twice the 256 values, a weight per
-    /// value, a parked table, and the FSE table weight descriptions build into.
+    /// The most heap this scratch keeps: the tree over the byte values, at most
+    /// twice the 256 values, a weight per value, a parked table, and the FSE
+    /// table weight descriptions build into.
     pub(crate) const fn max_heap_size() -> usize {
-        2 * 512 * core::mem::size_of::<HuffNode>()
+        512 * core::mem::size_of::<HuffNode>()
             + 256 * core::mem::size_of::<usize>()
             + HuffmanTable::max_heap_size()
             + core::mem::size_of::<fse_encoder::FSETable>()
@@ -1730,13 +1894,22 @@ impl WeightScratch {
 /// `scratch.weights`.
 fn build_limited_weights_into(counts: &[usize], max_nb_bits: usize, scratch: &mut WeightScratch) {
     build_huffman_leaf_depths_into(counts, &mut scratch.leaves);
-    if !limited_weights_into(
-        &scratch.leaves,
-        counts.len(),
-        max_nb_bits,
-        &mut scratch.work,
-        &mut scratch.weights,
-    ) {
+    // One table is built from these leaves, so they are limited where they lie
+    // rather than copied first, as upstream limits its tree in place
+    // (`HUF_setMaxHeight`).
+    let weights = &mut scratch.weights;
+    weights.clear();
+    weights.reserve_exact(counts.len());
+    weights.resize(counts.len(), 0);
+    let limited = match scratch.leaves.as_mut_slice() {
+        [] => true,
+        [leaf] => {
+            weights[leaf.symbol as usize] = 1;
+            true
+        }
+        leaves => limited_weights_in_place(leaves, max_nb_bits, weights),
+    };
+    if !limited {
         // The fallback builds its own; hand its result to the same slot so the
         // caller reads one place either way.
         scratch.weights = legacy_distributed_weights(counts);
@@ -1764,12 +1937,22 @@ fn legacy_distributed_weights(counts: &[usize]) -> Vec<usize> {
     weights_distributed
 }
 
-fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
-    let Some(largest_bits) = nodes.iter().map(|node| node.nb_bits as usize).max() else {
-        return;
-    };
+/// Limit the count-descending leaves' codes to `target_nb_bits`; `false` when
+/// no code was longer, so the leaves still hold the full natural code.
+fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) -> bool {
+    // The leaves come count-descending, and the tree build merges the smallest
+    // first, so the last leaf holds the longest code (upstream
+    // `HUF_setMaxHeight` reads `huffNode[lastNonNull].nbBits` the same way).
+    // `limit_leaves_in_place`, the one caller, holds at least two leaves.
+    debug_assert!(nodes.len() > 1);
+    let largest_bits = nodes[nodes.len() - 1].nb_bits as usize;
+    debug_assert_eq!(
+        Some(largest_bits),
+        nodes.iter().map(|node| node.nb_bits as usize).max(),
+        "the last leaf does not hold the longest code",
+    );
     if largest_bits <= target_nb_bits {
-        return;
+        return false;
     }
 
     // The shift is bounded by the input, not by anything checked here, so pin
@@ -1840,7 +2023,7 @@ fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
             bits_to_decrease += 1;
         }
         if bits_to_decrease > target_nb_bits {
-            return;
+            return true;
         }
         let pos = rank_last[bits_to_decrease];
         total_cost -= 1isize << (bits_to_decrease - 1);
@@ -1897,6 +2080,7 @@ fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
         rank_last[1] += 1;
         total_cost += 1;
     }
+    true
 }
 
 /// Assert that the provided value is greater than zero, and returns index of the first set bit
@@ -2020,7 +2204,7 @@ fn redistribute_weights(weights: &mut [usize], max_num_bits: usize) {
 #[cfg(feature = "bench-internals")]
 pub(crate) fn huf_weight_description_for_test(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let table = HuffmanTable::build_from_data(data);
-    let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+    let mut buf = [MaybeUninit::uninit(); MAX_HUFFMAN_ALPHABET];
     let mut weights = table.weights_into(&mut buf).to_vec();
     weights.pop();
     let mut encoded = Vec::new();
