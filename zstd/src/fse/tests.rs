@@ -99,6 +99,25 @@ fn a_description_written_from_counts_is_the_tables_own() {
     assert_eq!(again, buf);
 }
 
+/// A description written behind whole bytes the writer still holds: the burst
+/// that writes it drains them first, and the room it commits has to cover them
+/// beside the description itself.
+#[cfg(feature = "dict-builder")]
+#[test]
+fn a_description_behind_held_bytes_stays_in_its_room() {
+    let mut buf = alloc::vec::Vec::new();
+    let mut writer = crate::bit_io::BitWriter::from(&mut buf);
+    for byte in 1..=7u64 {
+        writer.write_bits(byte, 8);
+    }
+    fse_encoder::write_ncount_at_log(&[1, 1], 5, &mut writer);
+    writer.flush();
+    assert_eq!(buf[..7], [1, 2, 3, 4, 5, 6, 7]);
+    let mut dec_table = FSETable::new(255);
+    let read = dec_table.read_table_probabilities(&buf[7..], 5).unwrap();
+    assert_eq!(read, buf.len() - 7);
+}
+
 #[test]
 fn decoder_entry_layout_is_four_bytes_for_huffman_weights() {
     assert_eq!(core::mem::size_of::<fse_decoder::Entry>(), 4);

@@ -1832,11 +1832,18 @@ impl Matcher for MatchGeneratorDriver {
                 // deliberately one bit under upstream's `hashLog`: the long
                 // table's extra bit doubles what a small frame clears (a fresh
                 // 10 KiB level-3 frame ran 36% slower) for a few bytes per
-                // megabyte of output.
-                let window_bits = self.reset_size_log.map_or(usize::MAX, |log| {
-                    let log = log.max(crate::encoding::levels::config::MIN_WINDOW_LOG) as usize;
-                    log.min(max_window_size.ilog2() as usize)
-                });
+                // megabyte of output. Only tables holding the input alone are
+                // capped: a copied dictionary sits in the live tables too, which
+                // keep the CDict's widths as upstream's copy does.
+                let input_only = dict_hint.is_none() || dfast_attach_next;
+                let window_bits =
+                    self.reset_size_log
+                        .filter(|_| input_only)
+                        .map_or(usize::MAX, |log| {
+                            let log =
+                                log.max(crate::encoding::levels::config::MIN_WINDOW_LOG) as usize;
+                            log.min(max_window_size.ilog2() as usize)
+                        });
                 let long_bits = (dcfg.long_hash_log as usize).min(window_bits);
                 let short_bits = (dcfg.short_hash_log as usize).min(window_bits);
                 resolved_table_bits = long_bits;

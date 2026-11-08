@@ -59,10 +59,25 @@ fn resolve_input(spec: &str) -> Vec<u8> {
     }
 }
 
-/// The benchmark's dictionary for `src`: its training samples and size.
+/// The benchmark's dictionary for `src`: its training samples and size, by
+/// the rule of the benchmark's `build_training_samples`.
 fn train(src: &[u8], dict_path: &str) {
     let sample_size = src.len().div_ceil(16).clamp(256, 8192);
-    let samples: Vec<&[u8]> = src.chunks(sample_size).collect();
+    let samples: Vec<&[u8]> = src
+        .chunks(sample_size)
+        .take(64)
+        .filter(|chunk| chunk.len() >= 64)
+        .collect();
+    let samples = if samples.len() >= 2 {
+        samples
+    } else {
+        let (left, right) = src.split_at(src.len() / 2);
+        if left.len() >= 64 && right.len() >= 64 {
+            vec![left, right]
+        } else {
+            vec![src]
+        }
+    };
     let dict_size = src
         .len()
         .div_ceil(8)

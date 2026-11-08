@@ -913,11 +913,18 @@ impl FastKernelMatcher {
             "set_borrowed_window called without a preceding reset()/clear_borrowed_window",
         );
         // A borrowed scan stores absolute input positions, up to the whole
-        // buffer; past what a tagged slot holds, the frame runs untagged.
-        let biased_end = buffer.len().saturating_add(self.hash_table.bias() as usize);
-        if self.hash_table.is_tagged() && biased_end > TAGGED_POSITION_LIMIT {
+        // buffer, above the bias a carried table keeps. Past what a slot holds
+        // the table starts over, and past what a tagged slot holds at all the
+        // frame runs untagged.
+        let tagged = self.hash_table.is_tagged();
+        let slot_limit = if tagged {
+            TAGGED_POSITION_LIMIT as u64
+        } else {
+            u64::from(u32::MAX)
+        };
+        if buffer.len() as u64 + u64::from(self.hash_table.bias()) > slot_limit {
             self.hash_table.clear();
-            if buffer.len() > TAGGED_POSITION_LIMIT {
+            if tagged && buffer.len() > TAGGED_POSITION_LIMIT {
                 self.hash_table.untag_empty();
             }
         }
@@ -1858,6 +1865,9 @@ impl FastKernelMatcher {
                 .is_some_and(|v| v <= u32::MAX as usize),
             "virtual position overflow: dict.region_len()={base_offset} + block_end={block_end} exceeds u32",
         );
+        // These positions are in the table as surely as a searched block's, so
+        // the next frame's epoch advance has to pass them too.
+        self.table_pos_high_water = self.table_pos_high_water.max(base_offset + block_end);
         match self.hash_table.mls() {
             4 => self.prime_hash_table_stepped::<4>(
                 base,

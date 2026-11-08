@@ -99,8 +99,9 @@ impl EncoderDictionary {
     /// those tables (zstd_compress.c:5278). A dictionary left unmarked, the way
     /// a compressor loads one, gives every frame the shape it is prepared with,
     /// as upstream does for a dictionary loaded into a context or prepared with
-    /// explicit parameters. Level 0 marks nothing, as upstream reads it as no
-    /// level of its own.
+    /// explicit parameters. Level 0 is the default level, as upstream
+    /// `ZSTD_createCDict` stores it; only a dictionary prepared from explicit
+    /// parameters has no level of its own.
     ///
     /// # Examples
     /// ```
@@ -111,8 +112,8 @@ impl EncoderDictionary {
     ///     .prepared_at_level(3);
     /// # let _ = dictionary;
     /// ```
-    pub fn prepared_at_level(mut self, level: i32) -> Self {
-        self.prepared_at_level = level != 0;
+    pub fn prepared_at_level(mut self, _level: i32) -> Self {
+        self.prepared_at_level = true;
         self
     }
 

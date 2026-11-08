@@ -96,6 +96,28 @@ fn reset_clears_borrowed_window() {
     assert_eq!(m.history_bytes().len(), HISTORY_DRAIN_BASE);
 }
 
+/// A bare table carried across frames keeps its epoch bias, and a borrowed
+/// buffer stores positions from the bias up; one too long for the range left
+/// would wrap them, so the table starts over instead, as a tagged one does.
+#[test]
+fn a_borrowed_window_past_a_bare_tables_range_clears_it() {
+    let mut ws = Workspace::new();
+    let mut m = FastKernelMatcher::new();
+    reset_in(&mut m, &mut ws, LEVEL_1_SHAPE, TableCarry::Clear);
+    assert!(!m.hash_table.is_tagged(), "precondition: a bare table");
+    m.hash_table.advance_epoch(u32::MAX - 1000, 0);
+    assert_ne!(m.hash_table.bias(), 0, "precondition: a carried bias");
+    let external = alloc::vec![0u8; 4096];
+    // SAFETY: `external` outlives the window, cleared before it drops.
+    unsafe { m.set_borrowed_window(&external) };
+    assert_eq!(
+        m.hash_table.bias(),
+        0,
+        "positions past u32::MAX would wrap onto live ones"
+    );
+    m.clear_borrowed_window();
+}
+
 /// The borrowed one-shot scan must emit the EXACT same sequence
 /// stream (and end with the same rep / offset_hist state) as the
 /// owned block-by-block path. This is the load-bearing correctness

@@ -4964,3 +4964,78 @@ fn every_tier_writes_the_same_frames() {
         }
     }
 }
+
+/// Blocks a borrowed frame writes off as noise are still indexed, so the next
+/// frame on the same context must carry the table past them: the positions they
+/// left are the previous frame's, and a frame that takes them for its own reads
+/// a match that is not there (a kernel assertion in debug, a wrong offset in
+/// release). Here the second frame searches every block, so it reaches them.
+#[test]
+fn a_frame_after_raw_skipped_borrowed_blocks_ignores_their_positions() {
+    let input = generate_data(0x0B0B_B1E5, 256 * 1024);
+    let level = super::CompressionLevel::Level(1);
+    let mut compressor: FrameCompressor = FrameCompressor::new(level);
+    let first = compressor.compress_independent_frame(&input);
+    let params = crate::encoding::CompressionParameters::builder(level)
+        .raw_skip(false)
+        .build()
+        .unwrap();
+    compressor.set_parameters(&params);
+    let second = compressor.compress_independent_frame(&input);
+    for frame in [&first, &second] {
+        let mut decoded = Vec::with_capacity(input.len());
+        FrameDecoder::new()
+            .decode_all_to_vec(frame, &mut decoded)
+            .unwrap();
+        assert!(decoded == input, "a frame does not decode to its input");
+    }
+}
+
+/// With every block searched, a block under 7 bytes is not searched upstream
+/// and goes out raw, one repeated byte or not (`ZSTD_buildSeqStore` returns
+/// `ZSTDbss_noCompress` before the RLE rewrite), on the one-shot path and on
+/// the buffered one alike.
+#[test]
+fn a_searched_frames_tiny_uniform_last_block_goes_out_raw() {
+    let mut input = generate_data(0x7A11, 128 * 1024);
+    input.extend_from_slice(b"aaaaa");
+    let level = super::CompressionLevel::Level(1);
+    let params = crate::encoding::CompressionParameters::builder(level)
+        .raw_skip(false)
+        .build()
+        .unwrap();
+    let mut compressor: FrameCompressor = FrameCompressor::new(level);
+    compressor.set_parameters(&params);
+    let one_shot = compressor.compress_independent_frame(&input);
+    let mut buffered = Vec::new();
+    let mut compressor = FrameCompressor::new(level);
+    compressor.set_parameters(&params);
+    compressor.set_source(input.as_slice());
+    compressor.set_drain(&mut buffered);
+    compressor.compress();
+    for (path, frame) in [("one-shot", &one_shot), ("buffered", &buffered)] {
+        assert!(
+            frame.ends_with(b"aaaaa"),
+            "{path}: the 5-byte tail was not written raw"
+        );
+        let mut decoded = Vec::with_capacity(input.len());
+        FrameDecoder::new()
+            .decode_all_to_vec(frame, &mut decoded)
+            .unwrap();
+        assert!(
+            decoded == input,
+            "{path}: a frame does not decode to its input"
+        );
+    }
+}
+
+/// A dictionary prepared at level 0 is prepared at the default level, as
+/// upstream `ZSTD_createCDict` stores it, so a frame it no longer describes
+/// takes parameters of its own like any other levelled dictionary.
+#[test]
+fn a_dictionary_prepared_at_level_zero_has_a_level_of_its_own() {
+    let dictionary =
+        super::EncoderDictionary::from_serialized_or_raw_content(b"some shared history").unwrap();
+    assert!(!dictionary.clone().sizes().prepared_at_level);
+    assert!(dictionary.prepared_at_level(0).sizes().prepared_at_level);
+}

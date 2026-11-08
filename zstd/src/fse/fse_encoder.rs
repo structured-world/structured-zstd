@@ -64,15 +64,16 @@ impl<'table, 'output, V: AsMut<Vec<u8>>> FSEEncoder<'table, 'output, V> {
         // caps the log), so four of them beside the under 8 bits a flush
         // leaves stay under 64, which is upstream's four-symbol step on a
         // 64-bit container. The room is what the stream can commit: `acc_log`
-        // bits a symbol and for each final state, the end mark, and the up to
-        // 7 bytes of the table description the burst drains as it starts. Kept
-        // tight on purpose: the Huffman weight description reuses one buffer
-        // sized for the widest description, and a looser room would grow it.
+        // bits a symbol and for each final state and the end mark; the burst
+        // counts the bytes of the table description it drains as it starts.
+        // Kept tight on purpose: the Huffman weight description reuses one
+        // buffer sized for the widest description, and a looser room would
+        // grow it.
         let table = self.table;
         let acc_log = table.acc_log() as usize;
         debug_assert!(acc_log <= 9, "an FSE accuracy log of {acc_log}");
         let stream_bits = (data.len() + 2) * acc_log + 8;
-        let mut burst = self.writer.burst(stream_bits.div_ceil(8) + 7);
+        let mut burst = self.writer.burst(stream_bits.div_ceil(8));
         let step = |burst: &mut BitBurst<'_, V>, state: usize, symbol: u8| {
             let next = table.next_state(symbol, state);
             let diff = transition_bits(state, next.num_bits);
@@ -305,7 +306,15 @@ impl FSETable {
         );
         let tt = self.symbol_tt[symbol as usize];
         let nb_bits_out = (tt.delta_nb_bits + (1 << 15)) >> 16;
-        let value = (nb_bits_out << 16).saturating_sub(tt.delta_nb_bits);
+        // `delta_nb_bits` is `(max_bits_out << 16) - min_state_plus` with
+        // `0 < min_state_plus <= table_size < 1 << 15`, so `nb_bits_out` is
+        // `max_bits_out` and the difference is `min_state_plus`
+        // (upstream `FSE_initCState2` subtracts unchecked as well).
+        debug_assert!(
+            (nb_bits_out << 16) > tt.delta_nb_bits,
+            "FSE start state of symbol {symbol} below zero"
+        );
+        let value = (nb_bits_out << 16) - tt.delta_nb_bits;
         let slot = (value >> nb_bits_out) as i32 + tt.delta_find_state;
         // In `0..table_size` by construction (upstream `FSE_initCState2`):
         // `delta_find_state` is bounded by `total - probability`, and

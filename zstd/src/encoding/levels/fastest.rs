@@ -24,6 +24,12 @@ use alloc::vec::Vec;
 /// `ZSTD_compressBlock_internal`).
 const RLE_MAX_LENGTH: usize = 25;
 
+/// Shortest block upstream searches at all, and so the shortest it writes as
+/// RLE after a search: anything shorter goes out raw unsearched
+/// (`MIN_CBLOCK_SIZE + ZSTD_blockHeaderSize + 1 + 1` in `ZSTD_buildSeqStore`,
+/// zstd_compress.c).
+const SEARCHED_RLE_MIN_BLOCK: usize = 7;
+
 /// Compresses a single block using the shared compressed-block pipeline.
 ///
 /// Used by all compressed levels (Fastest, Default, Better, Best, and numeric levels). The actual
@@ -82,7 +88,8 @@ pub(crate) fn compress_block_encoded<M: Matcher, K: EncodeTier>(
     // unsearched. Off, it is searched like any other and only then written as
     // RLE, as upstream does (`searched_rle_byte`).
     let rle_byte_opt = uniform_byte.filter(|_| raw_skip_enabled);
-    let searched_rle_byte = uniform_byte.filter(|_| !raw_skip_enabled && !first_block);
+    let searched_rle_byte = uniform_byte
+        .filter(|_| !raw_skip_enabled && !first_block && block_len >= SEARCHED_RLE_MIN_BLOCK);
     // Order is by cost, cheapest question first, because every one of these
     // runs on every block: an RLE block and a window that forbids the skip are
     // constants; the dict probe is a constant `true` for the conservative
@@ -406,7 +413,8 @@ pub(crate) fn compress_block_encoded_borrowed<K: EncodeTier>(
     // As on the owned path: RLE unsearched with the raw skip on, searched
     // first with it off.
     let is_rle = uniform && raw_skip_enabled;
-    let searched_rle = uniform && !raw_skip_enabled && !first_block;
+    let searched_rle =
+        uniform && !raw_skip_enabled && !first_block && block.len() >= SEARCHED_RLE_MIN_BLOCK;
     let window_size = state.matcher.window_size();
     // As on the owned path: an attached dictionary, or long-distance matching,
     // keeps the block on the search rather than trusting a sample to say
