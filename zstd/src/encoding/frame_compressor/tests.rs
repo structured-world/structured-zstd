@@ -5240,6 +5240,15 @@ fn an_encoder_dictionary_over_the_callers_buffer_compresses_as_a_copy() {
             super::EncoderDictionary::exclusive_heap_size([&over_shared]),
             over_shared.heap_size() - content_bytes
         );
+        // A second dictionary over the same buffer, the caller's reference
+        // gone: the pair owns it and counts it once.
+        let second =
+            super::EncoderDictionary::from_serialized_or_raw_bytes(DictionaryBytes::shared(shared))
+                .unwrap();
+        assert_eq!(
+            super::EncoderDictionary::exclusive_heap_size([&over_shared, &second]),
+            over_shared.heap_size() + second.heap_size() - content_bytes
+        );
         assert_eq!(over_shared.content(), copied.content());
         assert_eq!(over_shared.id(), copied.id());
         for level in [1, 3, 9, 19] {

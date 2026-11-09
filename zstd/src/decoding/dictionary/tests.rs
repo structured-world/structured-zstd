@@ -389,6 +389,104 @@ fn a_shared_buffer_counts_in_the_footprint_of_what_keeps_it_alive() {
     );
 }
 
+/// Every holder reads as its bytes and says which holder it is; a clone keeps
+/// the holder, and the parsers over held bytes take each kind of dictionary
+/// the slice parsers take, refusing what they refuse.
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn dictionary_bytes_read_alike_in_every_holder() {
+    let raw: &[u8] = include_bytes!("../../../dict_tests/dictionary");
+    let owned = DictionaryBytes::from(raw.to_vec());
+    let shared = DictionaryBytes::from(Arc::<[u8]>::from(raw));
+    // SAFETY: `raw` is a static and never changes.
+    let referenced = unsafe { DictionaryBytes::referenced(raw) };
+    for (bytes, holder) in [
+        (&owned, "owned"),
+        (&shared, "shared"),
+        (&referenced, "referenced"),
+    ] {
+        assert_eq!(bytes.as_ref(), raw);
+        assert_eq!(bytes.is_owned(), holder == "owned");
+        let debug = alloc::format!("{bytes:?}");
+        assert!(debug.contains(holder) && debug.contains(&alloc::format!("len: {}", raw.len())));
+        let clone = bytes.clone();
+        assert_eq!(&clone, bytes);
+        assert_eq!(clone.is_owned(), bytes.is_owned());
+    }
+    // A referenced clone points at the same bytes.
+    assert_eq!(referenced.clone().as_ptr(), raw.as_ptr());
+
+    let copied = Dictionary::decode_dict(raw).unwrap();
+    for bytes in [owned.clone(), shared.clone(), referenced.clone()] {
+        let parsed = Dictionary::from_serialized_or_raw_bytes(bytes.clone()).unwrap();
+        assert_eq!(parsed.id, copied.id);
+        assert_eq!(parsed.dict_content, copied.dict_content);
+        assert_eq!(parsed.offset_hist, copied.offset_hist);
+        let handle = DictionaryHandle::from_serialized_or_raw_bytes(bytes).unwrap();
+        assert_eq!(handle.id(), copied.id);
+        assert_eq!(handle.as_dict().dict_content, copied.dict_content);
+    }
+
+    // Corrupt bytes are refused through held bytes as through a slice.
+    let mut corrupt = raw[..raw.len() / 64].to_vec();
+    corrupt[4..8].copy_from_slice(&0u32.to_le_bytes());
+    assert!(matches!(
+        Dictionary::decode_dict_bytes(DictionaryBytes::owned(corrupt.clone())),
+        Err(DictionaryDecodeError::ZeroDictionaryId)
+    ));
+    assert!(matches!(
+        DictionaryHandle::decode_dict_bytes(DictionaryBytes::owned(corrupt)),
+        Err(DictionaryDecodeError::ZeroDictionaryId)
+    ));
+}
+
+/// A v0.5 or v0.6 dictionary handed over as held bytes is taken whole as raw
+/// content, as the slice parser takes it, without a copy.
+#[cfg(all(feature = "legacy", target_has_atomic = "ptr"))]
+#[test]
+fn an_older_dictionary_over_held_bytes_is_whole_content() {
+    // The v0.6 dictionary magic number.
+    let mut older = 0xEC30_A436u32.to_le_bytes().to_vec();
+    older.extend_from_slice(b"an older dictionary's tables and content");
+    let shared: Arc<[u8]> = Arc::from(older.as_slice());
+    let handle =
+        DictionaryHandle::decode_dict_bytes(DictionaryBytes::shared(shared.clone())).unwrap();
+    assert_eq!(handle.id(), 0);
+    assert_eq!(handle.as_dict().dict_content.as_ptr(), shared.as_ptr());
+    assert_eq!(&*handle.as_dict().dict_content, older.as_slice());
+}
+
+/// Two dictionaries parsed from one shared buffer the caller let go of: the
+/// set of both is its only owner, so the set counts the buffer, once.
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn a_buffer_shared_by_the_whole_set_counts_once() {
+    let raw: &[u8] = include_bytes!("../../../dict_tests/dictionary");
+    let shared: Arc<[u8]> = Arc::from(raw);
+    let first =
+        DictionaryHandle::decode_dict_bytes(DictionaryBytes::shared(shared.clone())).unwrap();
+    let second =
+        DictionaryHandle::decode_dict_bytes(DictionaryBytes::shared(shared.clone())).unwrap();
+    let buffer = first.as_dict().dict_content.heap_bytes();
+    let both = first.heap_size() + second.heap_size() - buffer;
+
+    // The caller still holds it: neither the set nor one handle owns it.
+    assert_eq!(
+        DictionaryHandle::exclusive_heap_size([&first, &second]),
+        both - buffer
+    );
+    drop(shared);
+    assert_eq!(
+        DictionaryHandle::exclusive_heap_size([&first, &second]),
+        both
+    );
+    // One handle alone still shares it with the other.
+    assert_eq!(
+        DictionaryHandle::exclusive_heap_size([&first]),
+        first.heap_size() - buffer
+    );
+}
+
 /// Raw content handed over shared or by reference stays where it is too, and
 /// the empty buffer still loads as no dictionary.
 #[cfg(target_has_atomic = "ptr")]

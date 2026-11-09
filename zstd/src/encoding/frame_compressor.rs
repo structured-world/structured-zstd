@@ -284,6 +284,9 @@ impl EncoderDictionary {
     {
         let handles = handles.into_iter();
         let mut total = 0;
+        // The content of each dictionary counted, whose shared buffers are
+        // counted once, below, by who else holds them.
+        let mut contents = Vec::new();
         for (position, handle) in handles.clone().enumerate() {
             let same = |other: &&EncoderDictionary| {
                 SharedEncoderDictionary::ptr_eq(&handle.inner, &other.inner)
@@ -305,16 +308,12 @@ impl EncoderDictionary {
                 })
                 .count();
             if SharedEncoderDictionary::strong_count(&handle.inner) == held_here {
-                total += handle.heap_size();
-                // A shared buffer someone else also holds is not these
-                // handles' alone, though the dictionary keeps it alive too.
                 let content = &handle.inner.dict_content;
-                if content.held_elsewhere() {
-                    total -= content.heap_bytes();
-                }
+                total += handle.heap_size() - content.shared_heap_bytes();
+                contents.push(content);
             }
         }
-        total
+        total + crate::decoding::dictionary::exclusive_shared_heap_bytes(&contents)
     }
 
     /// The content and serialized sizes the encoder's matcher is hinted with.

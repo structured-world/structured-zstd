@@ -181,16 +181,59 @@ impl DictionaryBytes {
         }
     }
 
-    /// Whether a holder other than this value keeps the bytes alive: a shared
-    /// buffer with another reference to it.
-    pub(crate) fn held_elsewhere(&self) -> bool {
+    /// [`Self::heap_bytes`] of a shared buffer, zero for any other holder.
+    pub(crate) fn shared_heap_bytes(&self) -> usize {
         match &self.holder {
             #[cfg(target_has_atomic = "ptr")]
-            BytesHolder::Shared(bytes) => Arc::strong_count(bytes) > 1,
-            _ => false,
+            BytesHolder::Shared(_) => self.heap_bytes(),
+            _ => 0,
         }
     }
 
+    /// The shared buffer behind these bytes, if any.
+    #[cfg(target_has_atomic = "ptr")]
+    fn shared_buffer(&self) -> Option<&Arc<[u8]>> {
+        match &self.holder {
+            BytesHolder::Shared(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+}
+
+/// Heap bytes of the shared buffers that `contents` alone keep alive: each
+/// distinct buffer once, and only when every reference to it is one of
+/// `contents`. Each entry stands for one holder.
+pub(crate) fn exclusive_shared_heap_bytes(contents: &[&DictionaryBytes]) -> usize {
+    #[cfg(target_has_atomic = "ptr")]
+    {
+        let mut total = 0;
+        for (position, content) in contents.iter().enumerate() {
+            let Some(buffer) = content.shared_buffer() else {
+                continue;
+            };
+            let same = |other: &&&DictionaryBytes| {
+                other
+                    .shared_buffer()
+                    .is_some_and(|theirs| Arc::ptr_eq(buffer, theirs))
+            };
+            // The first holder of a buffer speaks for all of them.
+            if contents[..position].iter().any(|other| same(&other)) {
+                continue;
+            }
+            if Arc::strong_count(buffer) == contents.iter().filter(same).count() {
+                total += content.heap_bytes();
+            }
+        }
+        total
+    }
+    #[cfg(not(target_has_atomic = "ptr"))]
+    {
+        let _ = contents;
+        0
+    }
+}
+
+impl DictionaryBytes {
     /// The bytes from `start` on, in the same holder.
     ///
     /// # Panics
@@ -780,6 +823,9 @@ impl DictionaryHandle {
     {
         let handles = handles.into_iter();
         let mut total = 0;
+        // The content of each dictionary counted, whose shared buffers are
+        // counted once, below, by who else holds them.
+        let mut contents = Vec::new();
         for (position, handle) in handles.clone().enumerate() {
             let same =
                 |other: &&DictionaryHandle| SharedDictionary::ptr_eq(&handle.inner, &other.inner);
@@ -800,16 +846,12 @@ impl DictionaryHandle {
                 })
                 .count();
             if SharedDictionary::strong_count(&handle.inner) == held_here {
-                total += handle.heap_size();
-                // A shared buffer someone else also holds is not these
-                // handles' alone, though the dictionary keeps it alive too.
                 let content = &handle.inner.dict.dict_content;
-                if content.held_elsewhere() {
-                    total -= content.heap_bytes();
-                }
+                total += handle.heap_size() - content.shared_heap_bytes();
+                contents.push(content);
             }
         }
-        total
+        total + exclusive_shared_heap_bytes(&contents)
     }
 
     /// Bytes of the shared allocation itself: `Arc` and `Rc` both place two

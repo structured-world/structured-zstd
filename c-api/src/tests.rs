@@ -2981,14 +2981,40 @@ fn by_reference_dictionaries_keep_the_callers_buffer() {
         unsafe { ZSTD_createDDict_advanced(dict.as_ptr(), dict.len(), 1, 0, default_mem) };
     let cdict_copy = unsafe { ZSTD_createCDict(dict.as_ptr(), dict.len(), 3) };
     let cdict_ref = unsafe { ZSTD_createCDict_byReference(dict.as_ptr(), dict.len(), 3) };
+    let zero_cparams = ZSTD_compressionParameters {
+        windowLog: 0,
+        chainLog: 0,
+        hashLog: 0,
+        searchLog: 0,
+        minMatch: 0,
+        targetLength: 0,
+        strategy: 0,
+    };
+    let cdict_adv = unsafe {
+        ZSTD_createCDict_advanced(dict.as_ptr(), dict.len(), 1, 0, zero_cparams, default_mem)
+    };
+    // The content lies in the caller's buffer, not in a copy of it: a copy
+    // would produce the same frames, so only the address tells them apart.
+    let in_dict = |content: &[u8]| dict.as_ptr_range().contains(&content.as_ptr());
     for ddict in [ddict_ref, ddict_adv] {
         assert!(!ddict.is_null());
+        let held = unsafe { &*ddict }.prepared.as_ref().unwrap();
+        assert!(in_dict(&held.as_dict().dict_content));
         assert_eq!(
             unsafe { ZSTD_sizeof_DDict(ddict) } + content_len,
             unsafe { ZSTD_sizeof_DDict(ddict_copy) },
             "a referenced DDict must not count the caller's content"
         );
     }
+    for cdict in [cdict_ref, cdict_adv] {
+        assert!(!cdict.is_null());
+        assert!(in_dict(unsafe { &*cdict }.dict.as_ref().unwrap().content()));
+    }
+    let copied = unsafe { &*ddict_copy }.prepared.as_ref().unwrap();
+    assert!(!in_dict(&copied.as_dict().dict_content));
+    assert!(!in_dict(
+        unsafe { &*cdict_copy }.dict.as_ref().unwrap().content()
+    ));
 
     let cctx = ZSTD_createCCtx();
     let dctx = ZSTD_createDCtx();
@@ -3051,6 +3077,7 @@ fn by_reference_dictionaries_keep_the_callers_buffer() {
         ZSTD_freeDDict(ddict_adv);
         ZSTD_freeCDict(cdict_copy);
         ZSTD_freeCDict(cdict_ref);
+        ZSTD_freeCDict(cdict_adv);
         ZSTD_freeDCtx(dctx);
         ZSTD_freeCCtx(cctx);
     }
