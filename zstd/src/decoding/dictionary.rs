@@ -43,12 +43,294 @@ pub struct Dictionary {
     /// dictionary, even parts of the dictionary with offsets larger than Window_Size.
     /// After the total output has surpassed Window_Size however,
     /// this is no longer allowed and the dictionary is no longer accessible
-    pub dict_content: Vec<u8>,
+    ///
+    /// Held where the caller chose: a copy of its own, a range of a shared
+    /// buffer, or the caller's buffer by reference (see [`DictionaryBytes`]).
+    pub dict_content: DictionaryBytes,
     /// The 3 most recent offsets are stored so that they can be used
     /// during sequence execution, see
     /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#repeat-offsets>
     /// for more.
     pub offset_hist: [u32; 3],
+}
+
+/// Dictionary bytes held where the caller chose, read as one byte slice.
+///
+/// The same type carries a serialized dictionary into a parser
+/// ([`Dictionary::decode_dict_bytes`], [`DictionaryHandle::decode_dict_bytes`])
+/// and the content of the parsed [`Dictionary`]; parsing narrows the range to
+/// the content and keeps the holder, so no byte is copied. The holder is one of:
+/// - a `Vec` of its own ([`Self::owned`]);
+/// - an `Arc<[u8]>` the caller keeps as well ([`Self::shared`]), so the bytes
+///   exist once however many dictionaries, handles and threads read them;
+/// - the caller's buffer by reference ([`Self::referenced`]), as upstream
+///   zstd's `ZSTD_createDDict_byReference` holds it.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use structured_zstd::decoding::{DictionaryBytes, DictionaryHandle};
+///
+/// let blob: Arc<[u8]> = Arc::from(&b"history the frames refer back to"[..]);
+/// let handle =
+///     DictionaryHandle::from_serialized_or_raw_bytes(DictionaryBytes::shared(blob.clone()))
+///         .unwrap();
+/// // The content is the caller's buffer, not a copy of it.
+/// assert_eq!(handle.as_dict().dict_content.as_ptr(), blob.as_ptr());
+/// ```
+pub struct DictionaryBytes {
+    /// Start and length of the bytes inside the holder, so a read is one
+    /// slice built from them with no branch on the holder.
+    ptr: core::ptr::NonNull<u8>,
+    len: usize,
+    /// What keeps the bytes alive. Never mutated after construction, so
+    /// `ptr` stays valid: a `Vec`'s or an `Arc`'s heap block does not move
+    /// with the value that holds it.
+    holder: BytesHolder,
+}
+
+enum BytesHolder {
+    Owned(Vec<u8>),
+    #[cfg(target_has_atomic = "ptr")]
+    Shared(Arc<[u8]>),
+    /// The caller's bytes; the `unsafe` constructor carries the contract that
+    /// they outlive every holder of this value and stay unchanged.
+    Referenced,
+}
+
+// SAFETY: the bytes are only ever read. `Owned` is a `Vec<u8>` and `Shared` an
+// `Arc<[u8]>`, both `Send + Sync`; `Referenced` points at bytes whose
+// constructor (`unsafe`) requires the caller to keep them alive and unmodified
+// for as long as any holder exists, the contract upstream zstd puts on a
+// by-reference dictionary shared between threads.
+unsafe impl Send for DictionaryBytes {}
+// SAFETY: as for `Send`: shared access only ever reads.
+unsafe impl Sync for DictionaryBytes {}
+
+impl DictionaryBytes {
+    /// Bytes held in a `Vec` of their own.
+    pub fn owned(bytes: Vec<u8>) -> Self {
+        Self {
+            ptr: non_null_start(&bytes),
+            len: bytes.len(),
+            holder: BytesHolder::Owned(bytes),
+        }
+    }
+
+    /// Bytes shared with whoever else holds `bytes`: a dictionary parsed from
+    /// these keeps a reference count on them instead of a copy.
+    #[cfg(target_has_atomic = "ptr")]
+    pub fn shared(bytes: Arc<[u8]>) -> Self {
+        Self {
+            ptr: non_null_start(&bytes),
+            len: bytes.len(),
+            holder: BytesHolder::Shared(bytes),
+        }
+    }
+
+    /// The caller's `bytes`, held by reference: a dictionary parsed from these
+    /// points into them.
+    ///
+    /// # Safety
+    /// `bytes` must stay alive and unmodified for as long as this value or any
+    /// dictionary, handle or decoder built from it exists: the contract of
+    /// upstream zstd's `ZSTD_createDDict_byReference`.
+    pub unsafe fn referenced(bytes: &[u8]) -> Self {
+        Self {
+            ptr: non_null_start(bytes),
+            len: bytes.len(),
+            holder: BytesHolder::Referenced,
+        }
+    }
+
+    /// The bytes as a slice.
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr..ptr+len` lies in the holder's bytes: a `Vec` or `Arc`
+        // this value holds and never mutates, or the caller's buffer the
+        // `unsafe` constructor requires to stay alive and unchanged meanwhile.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// Whether the bytes are a `Vec` of their own rather than a buffer the
+    /// caller holds too.
+    pub fn is_owned(&self) -> bool {
+        matches!(self.holder, BytesHolder::Owned(_))
+    }
+
+    /// Heap bytes this value keeps alive: its `Vec`'s capacity, or the whole
+    /// shared allocation, which its reference holds alive whoever else holds
+    /// one too; nothing for a referenced buffer, which the caller owns
+    /// (upstream zstd's `ZSTD_sizeof_DDict` leaves a by-reference buffer out
+    /// too). [`DictionaryHandle::exclusive_heap_size`] leaves a shared buffer
+    /// out while something else still holds it.
+    pub fn heap_bytes(&self) -> usize {
+        match &self.holder {
+            BytesHolder::Owned(bytes) => bytes.capacity(),
+            #[cfg(target_has_atomic = "ptr")]
+            BytesHolder::Shared(bytes) => core::alloc::Layout::new::<[usize; 2]>()
+                .extend(
+                    core::alloc::Layout::array::<u8>(bytes.len()).expect("a live slice's layout"),
+                )
+                .expect("a live allocation's layout")
+                .0
+                .pad_to_align()
+                .size(),
+            BytesHolder::Referenced => 0,
+        }
+    }
+
+    /// [`Self::heap_bytes`] of a shared buffer, zero for any other holder.
+    pub(crate) fn shared_heap_bytes(&self) -> usize {
+        match &self.holder {
+            #[cfg(target_has_atomic = "ptr")]
+            BytesHolder::Shared(_) => self.heap_bytes(),
+            _ => 0,
+        }
+    }
+
+    /// The shared buffer behind these bytes, if any.
+    #[cfg(target_has_atomic = "ptr")]
+    fn shared_buffer(&self) -> Option<&Arc<[u8]>> {
+        match &self.holder {
+            BytesHolder::Shared(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+}
+
+/// Heap bytes of the shared buffers that `contents` alone keep alive: each
+/// distinct buffer once, and only when every reference to it is one of
+/// `contents`. Each entry stands for one holder.
+pub(crate) fn exclusive_shared_heap_bytes(contents: &[&DictionaryBytes]) -> usize {
+    #[cfg(target_has_atomic = "ptr")]
+    {
+        let mut total = 0;
+        for (position, content) in contents.iter().enumerate() {
+            let Some(buffer) = content.shared_buffer() else {
+                continue;
+            };
+            let same = |other: &&&DictionaryBytes| {
+                other
+                    .shared_buffer()
+                    .is_some_and(|theirs| Arc::ptr_eq(buffer, theirs))
+            };
+            // The first holder of a buffer speaks for all of them.
+            if contents[..position].iter().any(|other| same(&other)) {
+                continue;
+            }
+            if Arc::strong_count(buffer) == contents.iter().filter(same).count() {
+                total += content.heap_bytes();
+            }
+        }
+        total
+    }
+    #[cfg(not(target_has_atomic = "ptr"))]
+    {
+        let _ = contents;
+        0
+    }
+}
+
+impl DictionaryBytes {
+    /// The bytes from `start` on, in the same holder.
+    ///
+    /// # Panics
+    /// When `start` is past the end.
+    pub(crate) fn tail(mut self, start: usize) -> Self {
+        let tail = &self.as_slice()[start..];
+        let (ptr, len) = (non_null_start(tail), tail.len());
+        self.ptr = ptr;
+        self.len = len;
+        self
+    }
+}
+
+/// The start of `bytes` as a non-null pointer; dangling, never read, for an
+/// empty slice.
+fn non_null_start(bytes: &[u8]) -> core::ptr::NonNull<u8> {
+    core::ptr::NonNull::from(bytes).cast()
+}
+
+impl Clone for DictionaryBytes {
+    fn clone(&self) -> Self {
+        match &self.holder {
+            // A `Vec` of its own is copied, and the range follows the copy.
+            BytesHolder::Owned(bytes) => {
+                let start = self.ptr.as_ptr() as usize - bytes.as_ptr() as usize;
+                Self::owned(bytes.clone()).tail(start)
+            }
+            #[cfg(target_has_atomic = "ptr")]
+            BytesHolder::Shared(bytes) => Self {
+                ptr: self.ptr,
+                len: self.len,
+                holder: BytesHolder::Shared(bytes.clone()),
+            },
+            BytesHolder::Referenced => Self {
+                ptr: self.ptr,
+                len: self.len,
+                holder: BytesHolder::Referenced,
+            },
+        }
+    }
+}
+
+impl Default for DictionaryBytes {
+    fn default() -> Self {
+        Self::owned(Vec::new())
+    }
+}
+
+impl core::ops::Deref for DictionaryBytes {
+    type Target = [u8];
+
+    #[inline(always)]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for DictionaryBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for DictionaryBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::owned(bytes)
+    }
+}
+
+#[cfg(target_has_atomic = "ptr")]
+impl From<Arc<[u8]>> for DictionaryBytes {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        Self::shared(bytes)
+    }
+}
+
+impl PartialEq for DictionaryBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for DictionaryBytes {}
+
+impl core::fmt::Debug for DictionaryBytes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let holder = match self.holder {
+            BytesHolder::Owned(_) => "owned",
+            #[cfg(target_has_atomic = "ptr")]
+            BytesHolder::Shared(_) => "shared",
+            BytesHolder::Referenced => "referenced",
+        };
+        f.debug_struct("DictionaryBytes")
+            .field("holder", &holder)
+            .field("len", &self.len)
+            .finish()
+    }
 }
 
 /// What a [`DictionaryHandle`] shares: the parsed dictionary and, for one
@@ -85,7 +367,6 @@ pub const MAGIC_NUM: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 /// content: magic number and ID, a Huffman description (its size byte and at
 /// most 127 more), the three FSE descriptions at their largest, and the
 /// repeat offsets.
-#[cfg(feature = "legacy")]
 const MAX_SERIALIZED_HEADER_LEN: usize = 8
     + 128
     + max_fse_description_len(
@@ -102,10 +383,13 @@ const MAX_SERIALIZED_HEADER_LEN: usize = 8
     )
     + 12;
 
+/// Most bytes a shared buffer's allocation adds to its bytes: the two
+/// word-sized counts ahead of them, and padding to word alignment.
+const MAX_SHARED_BYTES_OVERHEAD: usize = 3 * core::mem::size_of::<usize>();
+
 /// Most bytes an FSE description of symbols `0..=max_symbol` at accuracy log
 /// `max_log` takes: the 4-bit log, then per symbol a count of at most
 /// `max_log + 1` bits and, amortized, at most 2 bits of zero-run flags.
-#[cfg(feature = "legacy")]
 const fn max_fse_description_len(max_symbol: u8, max_log: u8) -> usize {
     (4 + (max_symbol as usize + 1) * (max_log as usize + 3)).div_ceil(8)
 }
@@ -117,7 +401,7 @@ impl Dictionary {
     /// charge that `size_of` here so a caller budgeting against the reported
     /// figure sees them.
     pub fn heap_bytes(&self) -> usize {
-        self.dict_content.capacity()
+        self.dict_content.heap_bytes()
             + core::mem::size_of::<FSEScratch>()
             + self.fse.heap_bytes()
             + self.huf.heap_bytes()
@@ -125,7 +409,10 @@ impl Dictionary {
 
     /// Most [`heap_bytes`](Self::heap_bytes) a dictionary holding
     /// `content_len` bytes of content can report, so a caller can budget for
-    /// one before parsing it.
+    /// one before parsing it. It covers content held in the dictionary's own
+    /// copy, or in a shared buffer the dictionary was parsed from, which also
+    /// carries the serialized tables in front of the content and the shared
+    /// allocation's counts.
     ///
     /// # Examples
     ///
@@ -137,6 +424,8 @@ impl Dictionary {
     /// ```
     pub const fn max_heap_bytes(content_len: usize) -> usize {
         content_len
+            + MAX_SERIALIZED_HEADER_LEN
+            + MAX_SHARED_BYTES_OVERHEAD
             + core::mem::size_of::<FSEScratch>()
             + FSEScratch::max_heap_bytes()
             + HuffmanScratch::max_heap_bytes()
@@ -154,10 +443,15 @@ impl Dictionary {
     /// ([`FrameDecoder::add_dict`](crate::decoding::FrameDecoder::add_dict))
     /// still requires a non-zero one, since the ID is the key it is stored
     /// under.
+    ///
+    /// The content stays where `dict_content` holds it: a `Vec` is taken as
+    /// is, and [`DictionaryBytes::shared`] or [`DictionaryBytes::referenced`]
+    /// keep the caller's buffer without a copy.
     pub fn from_raw_content(
         id: u32,
-        dict_content: Vec<u8>,
+        dict_content: impl Into<DictionaryBytes>,
     ) -> Result<Dictionary, DictionaryDecodeError> {
+        let dict_content = dict_content.into();
         if dict_content.is_empty() {
             return Err(DictionaryDecodeError::DictionaryTooSmall { got: 0, need: 1 });
         }
@@ -173,9 +467,33 @@ impl Dictionary {
 
     /// Parses the dictionary from `raw`, initializes its tables,
     /// and returns a fully constructed [`Dictionary`] whose `id` can be
-    /// checked against the frame's `dict_id`.
+    /// checked against the frame's `dict_id`. The content is copied; see
+    /// [`Self::decode_dict_bytes`] to keep it in the caller's buffer.
     pub fn decode_dict(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
-        Self::decode_dict_inner(raw, true)
+        let (mut dict, content_start) = Self::decode_dict_inner(raw, true)?;
+        dict.dict_content = DictionaryBytes::owned(raw[content_start..].to_vec());
+        Ok(dict)
+    }
+
+    /// [`Self::decode_dict`] over bytes held where the caller chose: the
+    /// content is the tail of `raw` in the same holder, not a copy, as
+    /// upstream zstd's `ZSTD_createDDict_byReference` builds a dictionary.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_zstd::decoding::{Dictionary, DictionaryBytes};
+    ///
+    /// let blob: Vec<u8> = std::fs::read("dict_tests/dictionary").unwrap();
+    /// // SAFETY: `blob` outlives `dict` and is not modified meanwhile.
+    /// let dict = Dictionary::decode_dict_bytes(unsafe { DictionaryBytes::referenced(&blob) })
+    ///     .unwrap();
+    /// assert!(blob.as_ptr_range().contains(&dict.dict_content.as_ptr()));
+    /// ```
+    pub fn decode_dict_bytes(raw: DictionaryBytes) -> Result<Dictionary, DictionaryDecodeError> {
+        let (mut dict, content_start) = Self::decode_dict_inner(&raw, true)?;
+        dict.dict_content = raw.tail(content_start);
+        Ok(dict)
     }
 
     /// Whether `raw` is a serialized dictionary rather than raw content: it
@@ -209,15 +527,36 @@ impl Dictionary {
             // says "no dictionary". [`Self::from_raw_content`] still refuses
             // it, because naming raw content and handing over none is the
             // caller asking for a dictionary that cannot exist.
-            Ok(Dictionary {
-                id: 0,
-                fse: Box::new(FSEScratch::new()),
-                huf: HuffmanScratch::new(),
-                dict_content: Vec::new(),
-                offset_hist: [1, 4, 8],
-            })
+            Ok(Self::empty())
         } else {
             Self::from_raw_content(0, raw.to_vec())
+        }
+    }
+
+    /// [`Self::from_serialized_or_raw_content`] over bytes held where the
+    /// caller chose; the content stays in that holder (see
+    /// [`Self::decode_dict_bytes`]).
+    pub fn from_serialized_or_raw_bytes(
+        raw: DictionaryBytes,
+    ) -> Result<Dictionary, DictionaryDecodeError> {
+        if Self::is_serialized(&raw) {
+            Self::decode_dict_bytes(raw)
+        } else if raw.is_empty() {
+            Ok(Self::empty())
+        } else {
+            Self::from_raw_content(0, raw)
+        }
+    }
+
+    /// A dictionary with no tables and no content: what an empty buffer
+    /// loads as (see [`Self::from_serialized_or_raw_content`]).
+    fn empty() -> Dictionary {
+        Dictionary {
+            id: 0,
+            fse: Box::new(FSEScratch::new()),
+            huf: HuffmanScratch::new(),
+            dict_content: DictionaryBytes::default(),
+            offset_hist: [1, 4, 8],
         }
     }
 
@@ -239,21 +578,25 @@ impl Dictionary {
     /// encoder-only `EncoderDictionary` type (no decode path), so this
     /// incomplete dictionary can never escape to the decode side. Keeping
     /// this `pub(crate)` keeps it off the public `Dictionary` API entirely.
+    ///
+    /// Returns the dictionary without its content and where in `raw` the
+    /// content starts, for the caller to hold the content as it holds `raw`.
     pub(crate) fn decode_dict_for_encoding(
         raw: &[u8],
-    ) -> Result<Dictionary, DictionaryDecodeError> {
+    ) -> Result<(Dictionary, usize), DictionaryDecodeError> {
         Self::decode_dict_inner(raw, false)
     }
 
-    /// Shared dictionary parser. `build_decode_tables` selects whether the
-    /// FSE/HUF tables get their full decoding tables (FSE decode table +
-    /// `enrich_*`, HUF `packed_decode`; decoder path) or only the
+    /// Shared dictionary parser: the dictionary without its content, and
+    /// where in `raw` the content starts. `build_decode_tables` selects
+    /// whether the FSE/HUF tables get their full decoding tables (FSE decode
+    /// table + `enrich_*`, HUF `packed_decode`; decoder path) or only the
     /// probability/weight parse (encoder path — see
     /// [`Self::decode_dict_for_encoding`]).
     fn decode_dict_inner(
         raw: &[u8],
         build_decode_tables: bool,
-    ) -> Result<Dictionary, DictionaryDecodeError> {
+    ) -> Result<(Dictionary, usize), DictionaryDecodeError> {
         const MIN_MAGIC_AND_ID_LEN: usize = 8;
         const OFFSET_HISTORY_LEN: usize = 12;
 
@@ -264,13 +607,7 @@ impl Dictionary {
             });
         }
 
-        let mut new_dict = Dictionary {
-            id: 0,
-            fse: Box::new(FSEScratch::new()),
-            huf: HuffmanScratch::new(),
-            dict_content: Vec::new(),
-            offset_hist: [1, 4, 8],
-        };
+        let mut new_dict = Self::empty();
 
         let magic_num: [u8; 4] = raw[..4].try_into().expect("optimized away");
         if magic_num != MAGIC_NUM {
@@ -397,9 +734,7 @@ impl Dictionary {
         new_dict.offset_hist[1] = offset2;
         new_dict.offset_hist[2] = offset3;
 
-        new_dict.dict_content.extend(raw_content);
-
-        Ok(new_dict)
+        Ok((new_dict, raw.len() - raw_content.len()))
     }
 
     /// Convert this parsed dictionary into a reusable shared handle.
@@ -488,6 +823,9 @@ impl DictionaryHandle {
     {
         let handles = handles.into_iter();
         let mut total = 0;
+        // The content of each dictionary counted, whose shared buffers are
+        // counted once, below, by who else holds them.
+        let mut contents = Vec::new();
         for (position, handle) in handles.clone().enumerate() {
             let same =
                 |other: &&DictionaryHandle| SharedDictionary::ptr_eq(&handle.inner, &other.inner);
@@ -508,10 +846,12 @@ impl DictionaryHandle {
                 })
                 .count();
             if SharedDictionary::strong_count(&handle.inner) == held_here {
-                total += handle.heap_size();
+                let content = &handle.inner.dict.dict_content;
+                total += handle.heap_size() - content.shared_heap_bytes();
+                contents.push(content);
             }
         }
-        total
+        total + exclusive_shared_heap_bytes(&contents)
     }
 
     /// Bytes of the shared allocation itself: `Arc` and `Rc` both place two
@@ -535,19 +875,56 @@ impl DictionaryHandle {
         if crate::decoding::legacy::is_older_dictionary(raw) {
             return Dictionary::from_raw_content(0, raw.to_vec()).map(Self::from_dictionary);
         }
-        let dict = Dictionary::decode_dict(raw)?;
-        // The content is the tail of the serialized bytes.
+        let (mut dict, content_start) = Dictionary::decode_dict_inner(raw, true)?;
+        dict.dict_content = DictionaryBytes::owned(raw[content_start..].to_vec());
+        Ok(Self::with_header(dict, &raw[..content_start]))
+    }
+
+    /// [`Self::decode_dict`] over bytes held where the caller chose: the
+    /// content stays in that holder, as upstream zstd's
+    /// `ZSTD_createDDict_byReference` builds a `DDict` (see
+    /// [`Dictionary::decode_dict_bytes`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use structured_zstd::decoding::{DictionaryBytes, DictionaryHandle};
+    ///
+    /// let blob: Arc<[u8]> = std::fs::read("dict_tests/dictionary").unwrap().into();
+    /// let handle = DictionaryHandle::decode_dict_bytes(DictionaryBytes::shared(blob.clone()))
+    ///     .unwrap();
+    /// assert!(blob.as_ptr_range().contains(&handle.as_dict().dict_content.as_ptr()));
+    /// ```
+    pub fn decode_dict_bytes(raw: DictionaryBytes) -> Result<Self, DictionaryDecodeError> {
         #[cfg(feature = "legacy")]
-        let serialized_header = raw[..raw.len() - dict.dict_content.len()].to_vec();
+        if crate::decoding::legacy::is_older_dictionary(&raw) {
+            return Dictionary::from_raw_content(0, raw).map(Self::from_dictionary);
+        }
+        let (dict, content_start) = Dictionary::decode_dict_inner(&raw, true)?;
+        let mut handle = Self::with_header(dict, &raw[..content_start]);
+        SharedDictionary::get_mut(&mut handle.inner)
+            .expect("a handle just built is the only holder")
+            .dict
+            .dict_content = raw.tail(content_start);
+        Ok(handle)
+    }
+
+    /// A handle over `dict`, parsed from serialized bytes whose part in front
+    /// of the content is `header`.
+    fn with_header(
+        dict: Dictionary,
+        #[cfg_attr(not(feature = "legacy"), expect(unused_variables))] header: &[u8],
+    ) -> Self {
         #[cfg(feature = "legacy")]
-        debug_assert!(serialized_header.capacity() <= MAX_SERIALIZED_HEADER_LEN);
-        Ok(Self {
+        debug_assert!(header.len() <= MAX_SERIALIZED_HEADER_LEN);
+        Self {
             inner: SharedDictionary::new(HeldDictionary {
                 dict,
                 #[cfg(feature = "legacy")]
-                serialized_header,
+                serialized_header: header.to_vec(),
             }),
-        })
+        }
     }
 
     /// Load whichever kind of dictionary `raw` holds, as `ZSTD_createDDict`
@@ -559,6 +936,19 @@ impl DictionaryHandle {
             Self::decode_dict(raw)
         } else {
             Dictionary::from_serialized_or_raw_content(raw).map(Self::from_dictionary)
+        }
+    }
+
+    /// [`Self::from_serialized_or_raw_content`] over bytes held where the
+    /// caller chose; the content stays in that holder, as upstream zstd's
+    /// `ZSTD_createDDict_byReference` keeps it.
+    pub fn from_serialized_or_raw_bytes(
+        raw: DictionaryBytes,
+    ) -> Result<Self, DictionaryDecodeError> {
+        if Dictionary::is_serialized(&raw) {
+            Self::decode_dict_bytes(raw)
+        } else {
+            Dictionary::from_serialized_or_raw_bytes(raw).map(Self::from_dictionary)
         }
     }
 

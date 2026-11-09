@@ -376,9 +376,12 @@ fn estimate_dstream_size_from_frame_header() {
 
 /// A dictionary a context keeps for itself is part of its size, however it
 /// came to keep it: a buffer-less begin holds one beside the frame it opened,
-/// and a decoder keeps the dictionary of the last frame it decoded.
+/// and a decoder keeps the dictionary of the last frame it decoded. On the
+/// decode side those dictionaries refer to the caller's content, as upstream's
+/// `ZSTD_refDictContent` does, so only their tables are the context's.
 #[test]
 fn context_sizes_count_the_dictionaries_they_keep() {
+    let tables = core::mem::size_of::<codec::decoding::Dictionary>();
     use crate::bufferless::{
         ZSTD_compressBegin, ZSTD_compressBegin_usingDict, ZSTD_decompressBegin,
         ZSTD_decompressBegin_usingDict,
@@ -406,7 +409,10 @@ fn context_sizes_count_the_dictionaries_they_keep() {
             0
         );
         let kept = ZSTD_sizeof_DCtx(primed) - ZSTD_sizeof_DCtx(plain);
-        assert!(kept >= dict.len(), "a begun dictionary adds {kept} bytes");
+        assert!(
+            kept >= tables && kept < dict.len(),
+            "a begun dictionary adds {kept} bytes"
+        );
         ZSTD_freeDCtx(plain);
         ZSTD_freeDCtx(primed);
 
@@ -441,7 +447,7 @@ fn context_sizes_count_the_dictionaries_they_keep() {
         assert_eq!(m, input.len());
         let kept = ZSTD_sizeof_DCtx(dctx) - before;
         assert!(
-            kept >= dict.len(),
+            kept >= tables && kept < dict.len(),
             "a one-shot's dictionary adds {kept} bytes"
         );
         ZSTD_freeDCtx(dctx);
