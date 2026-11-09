@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794193948603,
+  "lastUpdate": 1794257969713,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -20046,6 +20046,240 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.187,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dfa75fd1b5ad5d1bc0e997bfb5a3f219611e6c7d",
+          "message": "feat(decoding)!: hold dictionary content in the caller's buffer (#649)\n\n## Summary\n- A dictionary can keep its content in the caller's buffer instead of a\ncopy: shared as a `SharedBytes` buffer (`Arc<[u8]>`, `Rc<[u8]>` without\npointer atomics), or referenced as upstream's\n`ZSTD_createDDict_byReference` does.\n- The C ABI's by-reference entry points and load methods now reference\nthe caller's buffer, as upstream's do.\n\n## Changes\n- `DictionaryBytes`: dictionary bytes in a `Vec` of their own, a\n`SharedBytes` buffer shared with the caller, or the caller's buffer\n(`unsafe`, the upstream by-reference contract). It is the input of the\nnew parsers and the type of `Dictionary::dict_content`; parsing narrows\nit to the content without copying.\n- `FrameDecoder::release_dictionaries` lets go of every dictionary\nhandle the decoder holds, registered ones included, so a dictionary over\nthe caller's buffer has no holder left once the caller stops using it; a\nframe in progress that decodes with one is abandoned with it.\n- Heap sizes: a shared buffer counts in the footprint of the\ndictionaries holding it (their reference keeps it alive), and\n`exclusive_heap_size` counts each shared buffer once, only when every\nreference to it belongs to the given set; a referenced buffer is never\ncounted.\n- `Dictionary::decode_dict_bytes` / `from_serialized_or_raw_bytes`,\n`DictionaryHandle::decode_dict_bytes` / `from_serialized_or_raw_bytes`,\n`EncoderDictionary::from_serialized_or_raw_bytes`;\n`Dictionary::from_raw_content` takes any `Into<DictionaryBytes>`.\n- C ABI: `ZSTD_createDDict_byReference`, `ZSTD_createCDict_byReference`,\n`ZSTD_CCtx_loadDictionary_byReference`,\n`ZSTD_DCtx_loadDictionary_byReference` and `ZSTD_dlm_byRef` in\n`ZSTD_createDDict_advanced`, `ZSTD_createCDict_advanced`,\n`ZSTD_createCDict_advanced2`, `ZSTD_CCtx_loadDictionary_advanced`,\n`ZSTD_DCtx_loadDictionary_advanced` reference the buffer.\n`ZSTD_CCtx_refPrefix*`, `ZSTD_DCtx_refPrefix*`,\n`ZSTD_decompress_usingDict` and `ZSTD_decompressBegin_usingDict` refer\nto the content rather than copy it per call; a one-shot spends an\nattached prefix whatever its outcome, as upstream's does. The context's\ndecoder keeps a referenced dictionary only while it is in use: it lets\ngo after a one-shot, after a prefix frame, and when the attached\ndictionary changes or the session resets. A referenced buffer is left\nout of `ZSTD_sizeof_DDict` and `ZSTD_sizeof_DCtx`, as upstream leaves it\nout.\n\n## Testing\nFrames decode identically with owned, shared and referenced\ndictionaries, and compress identically with shared and copied encoder\ndictionaries, at levels 1/3/9/19; the C ABI tests cover every\nby-reference entry point and the reported sizes. Crate and C ABI suites,\nClippy, rustdoc, formatting and the no-std check pass locally; CI runs\nthe full matrix.\n\nReplaces #648 (and #647 before it).\n\nBREAKING CHANGE: `Dictionary::dict_content` is a `DictionaryBytes`\ninstead of a `Vec<u8>`; it dereferences to `[u8]`.\n\nCloses #646\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Dictionary loading now supports copied and by-reference modes across\ncompression and decompression APIs. Referenced data must remain\navailable and unchanged for the required lifetime.\n* Dictionary content can be shared or referenced to avoid unnecessary\ncopies.\n* **Bug Fixes**\n* Improved dictionary and prefix cleanup after completed or failed\ndecoding, while preserving dictionaries needed for active buffer-less\ndecoding.\n* Invalid dictionary data is reported as corrupted; invalid content-type\nselections continue to return an out-of-range parameter error.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-11-09T21:54:47+02:00",
+          "tree_id": "c656ab5e70256e2622c2c41d61cad8b51c0e15da",
+          "url": "https://github.com/structured-world/structured-zstd/commit/dfa75fd1b5ad5d1bc0e997bfb5a3f219611e6c7d"
+        },
+        "date": 1794257938199,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.056,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust_raw_skip",
+            "value": 0.056,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 140.305,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_raw_skip",
+            "value": 140.443,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 238.838,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.635,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust_raw_skip",
+            "value": 0.58,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.268,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.391,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.936,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.422,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.964,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust_raw_skip",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 5.677,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_raw_skip",
+            "value": 5.711,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.722,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.076,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust_raw_skip",
+            "value": 0.078,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.211,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.52,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.275,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.518,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.273,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.024,
             "unit": "ms"
           },
           {
