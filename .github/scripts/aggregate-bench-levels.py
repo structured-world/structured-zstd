@@ -72,7 +72,8 @@ def merge_delta_json(target):
 def merge_relative_json(target):
     """Each shard has the same top-level metadata (target, reference_band,
     commit_sha, generated_at) — keep the first shard's metadata and
-    concatenate `records`. Drop duplicates by (metric, key, level)."""
+    concatenate `records`. Drop duplicates by (metric, key, level,
+    rust_variant): one cell holds a record per configuration of ours."""
     payload = None
     seen = set()
     records = []
@@ -89,7 +90,7 @@ def merge_relative_json(target):
                 machine_sigs.add(sig)
                 machines.append(machine)
         for rec in shard.get("records", []):
-            sig = (rec.get("metric"), rec.get("key"), rec.get("level"))
+            sig = (rec.get("metric"), rec.get("key"), rec.get("level"), rec.get("rust_variant"))
             if sig in seen:
                 continue
             seen.add(sig)

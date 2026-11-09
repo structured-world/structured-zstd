@@ -157,16 +157,26 @@ from collections import defaultdict
 from pathlib import Path
 
 BENCH_RE = re.compile(r"test (\S+)\s+\.\.\. bench:\s+([\d,]+) ns/iter")
+# Every figure of ours names the configuration of our encoder it came from
+# (`rust_variant`): `searched` (the raw skip off, every block searched as
+# libzstd searches it), `raw_skip` (the library default), or `any` where no
+# encoder setting reaches the work (decoding libzstd's frames) or every
+# configuration gave the same figure, so it is stored once for all of them.
 REPORT_RE = re.compile(
-    r'^REPORT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) input_bytes=(\d+) rust_bytes=(\d+) ffi_bytes=(\d+) rust_ratio=([0-9.]+) ffi_ratio=([0-9.]+)$'
+    r'^REPORT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) rust_variant=(\S+) input_bytes=(\d+) rust_bytes=(\d+) ffi_bytes=(\d+) rust_ratio=([0-9.]+) ffi_ratio=([0-9.]+)$'
 )
 MEM_RE = re.compile(
-    r'^REPORT_MEM scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) stage=(\S+) rust_peak_alloc_bytes=(\d+) ffi_peak_alloc_bytes=(\d+)$'
+    r'^REPORT_MEM scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) stage=(\S+) rust_variant=(\S+) rust_peak_alloc_bytes=(\d+) ffi_peak_alloc_bytes=(\d+)$'
 )
 DICT_RE = re.compile(
     r'^REPORT_DICT scenario=(\S+) label="((?:[^"\\]|\\.)+)" level=(\S+) dict_bytes=(\d+) train_ms=([0-9.]+) ffi_no_dict_bytes=(\d+) ffi_with_dict_bytes=(\d+) ffi_no_dict_ratio=([0-9.]+) ffi_with_dict_ratio=([0-9.]+)'
-    r'(?: rust_with_dict_bytes=(\d+) rust_with_dict_ratio=([0-9.]+))?$'
+    r' rust_variant=(\S+) rust_with_dict_bytes=(\d+) rust_with_dict_ratio=([0-9.]+)$'
 )
+# A plain decompress cell where every configuration of ours wrote the same
+# frames: the bench decoded them once, under the `rust_stream` source, and that
+# figure stands for every configuration.
+SAME_FRAMES_RE = re.compile(r'^REPORT_SAME_FRAMES scenario=(\S+) level=(\S+)$')
+VARIANT_ANY = "any"
 DICT_TRAIN_RE = re.compile(
     r'^REPORT_DICT_TRAIN scenario=(\S+) label="((?:[^"\\]|\\.)+)" training_bytes=(\d+) dict_bytes_requested=(\d+) rust_train_ms=([0-9.]+) ffi_train_ms=([0-9.]+) rust_dict_bytes=(\d+) ffi_dict_bytes=(\d+) rust_k=(\d+)$'
 )
@@ -188,7 +198,7 @@ KERNEL_RE = re.compile(
 # between implementations that was not there. A ratio formed per sample from
 # alternating batches scales with the machine and cancels it.
 PAIR_RE = re.compile(
-    r'^REPORT_PAIR stage=(\S+) scenario=(\S+) level=(\S+) source=(\S+) '
+    r'^REPORT_PAIR stage=(\S+) scenario=(\S+) level=(\S+) source=(\S+) rust_variant=(\S+) '
     r'speedup_median=([0-9.eE+-]+) speedup_min=([0-9.eE+-]+) speedup_max=([0-9.eE+-]+) '
     r'rust_min_ns=([0-9.eE+-]+) ffi_min_ns=([0-9.eE+-]+) samples=(\d+) '
     r'rust_iters=(\d+) ffi_iters=(\d+)$'
@@ -519,23 +529,57 @@ def canonical_key(stage, scenario, level, source):
         params.append(f"source={source}")
     return f"{scenario} + {', '.join(params)}"
 
+# Our criterion arms, by the configuration of ours each ran. The dictionary
+# arms collapse to the same (rust, ffi) shape as the rest so a dict stage row
+# produces a comparable ratio/speed pair.
+RUST_IMPL_VARIANTS = {
+    "pure_rust": "searched",
+    "pure_rust_raw_skip": "raw_skip",
+    "pure_rust_with_dict": "searched",
+    "pure_rust_raw_skip_with_dict": "raw_skip",
+}
+FFI_IMPLS = {"c_ffi", "c_ffi_with_dict"}
+# A plain decompress source over our frames, by the configuration that wrote
+# them. Both spell the dashboard's one `rust_stream` source.
+RUST_SOURCE_VARIANTS = {"rust_stream": "searched", "rust_raw_skip_stream": "raw_skip"}
+
+
 def normalize_impl(impl):
-    if impl == "pure_rust":
+    if impl in RUST_IMPL_VARIANTS:
         return "rust"
-    if impl == "c_ffi":
-        return "ffi"
-    # Dict-bench implementations: collapse the with-dict pair to the same
-    # (rust, ffi) key shape the rest of the dashboard uses so the dict
-    # stage row produces a comparable ratio/speed pair.
-    # `c_ffi_without_dict` keeps its raw name as a third series: the
-    # current aggregation loop only computes rust-vs-ffi deltas, so it's
-    # carried through for visual inspection / future use rather than
-    # entering a ratio.
-    if impl == "pure_rust_with_dict":
-        return "rust"
-    if impl == "c_ffi_with_dict":
+    if impl in FFI_IMPLS:
         return "ffi"
     return impl
+
+
+def normalize_source(source):
+    """The dashboard's source axis: our frames are `rust_stream` whatever
+    configuration wrote them, which `rust_variant` says."""
+    return "rust_stream" if source in RUST_SOURCE_VARIANTS else source
+
+
+def row_variant(parsed, same_frames):
+    """The configuration of ours a criterion row belongs to, or None for a
+    libzstd arm every configuration of ours in its group is compared with.
+
+    Only the encode stages run our encoder: there the variant is the arm's
+    own. A plain decompress group decodes one source's frames on both sides,
+    so the source decides it for both arms. Dictionary decoding reads frames
+    libzstd wrote and training runs no encoder, so no setting of ours reaches
+    either.
+    """
+    stage = parsed["stage"]
+    impl = parsed["implementation"]
+    if stage in ("compress", "compress-dict"):
+        if impl in FFI_IMPLS:
+            return None
+        return RUST_IMPL_VARIANTS.get(impl, VARIANT_ANY)
+    if stage == "decompress":
+        source = parsed["source"]
+        if source == "rust_stream" and (parsed["scenario"], parsed["level"]) in same_frames:
+            return VARIANT_ANY
+        return RUST_SOURCE_VARIANTS.get(source, VARIANT_ANY)
+    return VARIANT_ANY
 
 def include_in_regression_set(parsed_name, regression_levels):
     return (
@@ -630,6 +674,7 @@ if pairs_path and Path(pairs_path).is_file():
                 scenario,
                 level,
                 source,
+                rust_variant,
                 speedup_median,
                 speedup_min,
                 speedup_max,
@@ -641,14 +686,15 @@ if pairs_path and Path(pairs_path).is_file():
             ) = pair_match.groups()
             # `na` is how the bench spells "this stage has no such axis"; the
             # key builder wants the absence itself.
-            source_key = None if source == "na" else source
+            source_key = None if source == "na" else normalize_source(source)
             # The same normalisation every timing row gets. The bench names a
             # dictionary level `..._dict` and `parse_benchmark_name` strips that
             # suffix, so a key built from the raw level here matches nothing:
             # every `*_ldm_dict` cell silently published the unpaired figure
             # while its paired samples were taken and thrown away.
             level_key = strip_dict_level_suffix(level)
-            paired_rounds[canonical_key(stage, scenario, level_key, source_key)].append({
+            cell_key = canonical_key(stage, scenario, level_key, source_key)
+            paired_rounds[(cell_key, rust_variant)].append({
                 "speedup_median": float(speedup_median),
                 "speedup_min": float(speedup_min),
                 "speedup_max": float(speedup_max),
@@ -658,6 +704,16 @@ if pairs_path and Path(pairs_path).is_file():
                 "rust_iters": int(pair_rust_iters),
                 "ffi_iters": int(pair_ffi_iters),
             })
+
+# Read before the timing rows, which need it to tell which configuration of
+# ours a `rust_stream` decompress row stands for.
+same_frames = set()
+with open(raw_path) as f:
+    for raw_line in f:
+        same_match = SAME_FRAMES_RE.match(raw_line.strip())
+        if same_match:
+            scenario, level = same_match.groups()
+            same_frames.add((scenario, strip_dict_level_suffix(level)))
 
 with open(raw_path) as f:
     for raw_line in f:
@@ -687,7 +743,8 @@ with open(raw_path) as f:
                 "stage": parsed["stage"],
                 "level": parsed["level"],
                 "scenario": parsed["scenario"],
-                "source": parsed["source"],
+                "source": normalize_source(parsed["source"]) if parsed["source"] else None,
+                "rust_variant": row_variant(parsed, same_frames),
                 "implementation": normalize_impl(parsed["implementation"]),
                 "target": bench_target_id,
                 "ms_per_iter": ms,
@@ -708,12 +765,23 @@ with open(raw_path) as f:
 
         report_match = REPORT_RE.match(line)
         if report_match:
-            scenario, label, level, input_bytes, rust_bytes, ffi_bytes, rust_ratio, ffi_ratio = report_match.groups()
+            (
+                scenario,
+                label,
+                level,
+                rust_variant,
+                input_bytes,
+                rust_bytes,
+                ffi_bytes,
+                rust_ratio,
+                ffi_ratio,
+            ) = report_match.groups()
             label = unescape_report_label(label)
             ratios.append({
                 "scenario": scenario,
                 "label": label,
                 "level": level,
+                "rust_variant": rust_variant,
                 "input_bytes": int(input_bytes),
                 "rust_bytes": int(rust_bytes),
                 "ffi_bytes": int(ffi_bytes),
@@ -730,6 +798,7 @@ with open(raw_path) as f:
                 label,
                 level,
                 stage,
+                rust_variant,
                 rust_peak_alloc_bytes,
                 ffi_peak_alloc_bytes,
             ) = mem_match.groups()
@@ -746,6 +815,7 @@ with open(raw_path) as f:
                 "label": label,
                 "level": level,
                 "stage": stage,
+                "rust_variant": rust_variant,
                 "rust_peak_alloc_bytes": int(rust_peak_alloc_bytes),
                 "ffi_peak_alloc_bytes": int(ffi_peak_alloc_bytes),
             })
@@ -763,20 +833,15 @@ with open(raw_path) as f:
                 ffi_with_dict_bytes,
                 ffi_no_dict_ratio,
                 ffi_with_dict_ratio,
+                rust_variant,
                 rust_with_dict_bytes,
                 rust_with_dict_ratio,
             ) = dict_match.groups()
             label = unescape_report_label(label)
-            # rust_with_dict_* are optional trailing fields (older bench logs
-            # omit them). A reported 0 means the Rust dict path was
-            # unavailable for this (scenario, level) — treat as "no rust dict
-            # ratio" so no misleading compress-dict ratio series is emitted.
-            rust_with_dict_bytes_val = (
-                int(rust_with_dict_bytes) if rust_with_dict_bytes is not None else 0
-            )
-            rust_with_dict_ratio_val = (
-                float(rust_with_dict_ratio) if rust_with_dict_ratio is not None else 0.0
-            )
+            # A reported 0 means the Rust dict path was unavailable for this
+            # (scenario, level) — treat as "no rust dict ratio" so no
+            # misleading compress-dict ratio series is emitted. The bench then
+            # reports one line, under `any`.
             dictionary_rows.append({
                 "scenario": scenario,
                 "label": label,
@@ -787,8 +852,9 @@ with open(raw_path) as f:
                 "ffi_with_dict_bytes": int(ffi_with_dict_bytes),
                 "ffi_no_dict_ratio": float(ffi_no_dict_ratio),
                 "ffi_with_dict_ratio": float(ffi_with_dict_ratio),
-                "rust_with_dict_bytes": rust_with_dict_bytes_val,
-                "rust_with_dict_ratio": rust_with_dict_ratio_val,
+                "rust_variant": rust_variant,
+                "rust_with_dict_bytes": int(rust_with_dict_bytes),
+                "rust_with_dict_ratio": float(rust_with_dict_ratio),
             })
             continue
 
@@ -939,13 +1005,17 @@ if not dictionary_training_rows:
 with open("benchmark-results.json", "w") as f:
     json.dump(benchmark_results, f, indent=2)
 
+# Every index below is keyed by (cell key, configuration of ours): a cell holds
+# one row per configuration that gave its own figure, and one `any` row where
+# they all gave the same. The cell key stays the series identity, so the
+# dashboard follows one cell across snapshots whichever configuration it shows.
 ratio_index = {}
 for row in ratios:
     key = canonical_key("compress", row["scenario"], row["level"], None)
     ratio_delta = None
     if row["ffi_ratio"] > 0.0:
         ratio_delta = row["rust_ratio"] / row["ffi_ratio"]
-    ratio_index[key] = {
+    ratio_index[(key, row["rust_variant"])] = {
         "meta": {
             "stage": "compress",
             "scenario": row["scenario"],
@@ -959,6 +1029,9 @@ for row in ratios:
     }
 
 speed_index = defaultdict(dict)
+# A group's libzstd arm, which every configuration of ours in that group is
+# compared with.
+shared_ffi_rows = {}
 key_meta = {}
 for row in timing_rows:
     key = canonical_key(row["stage"], row["scenario"], row["level"], row["source"])
@@ -968,18 +1041,24 @@ for row in timing_rows:
         "level": row["level"],
         "source": row["source"],
     }
-    impl = row["implementation"]
-    speed_index[key][impl] = {
+    entry = {
         "name": row["name"],
         "ms_per_iter": row["ms_per_iter"],
         "sample_ns": row["sample_ns"],
     }
+    if row["rust_variant"] is None:
+        shared_ffi_rows[key] = entry
+    else:
+        speed_index[(key, row["rust_variant"])][row["implementation"]] = entry
+for (key, _), impls in speed_index.items():
+    if "ffi" not in impls and key in shared_ffi_rows:
+        impls["ffi"] = shared_ffi_rows[key]
 
 delta_rows = []
-all_keys = sorted(set(key_meta.keys()) | set(ratio_index.keys()))
-for key in all_keys:
+all_cells = sorted(set(speed_index.keys()) | set(ratio_index.keys()))
+for key, rust_variant in all_cells:
     ratio_pack = ratio_index.get(
-        key,
+        (key, rust_variant),
         {
             "meta": None,
             "rust_ratio": None,
@@ -999,7 +1078,7 @@ for key in all_keys:
         input_bytes = scenario_input_bytes.get(scenario)
 
     speed_series = {}
-    for impl_name, impl_row in speed_index.get(key, {}).items():
+    for impl_name, impl_row in speed_index.get((key, rust_variant), {}).items():
         ms_value = impl_row["ms_per_iter"]
         bps_value = None
         if input_bytes is not None and ms_value is not None and ms_value > 0.0:
@@ -1026,7 +1105,7 @@ for key in all_keys:
     # absolute per-implementation series, but a delta formed by dividing one
     # arm's minimum by the other's pairs two moments that can be seconds apart,
     # and on a shared runner that has manufactured differences of 1.3x and more.
-    paired = summarize_paired_rounds(paired_rounds.get(key))
+    paired = summarize_paired_rounds(paired_rounds.get((key, rust_variant)))
     unpaired_speed_delta = (
         rust_bps / ffi_bps
         if (rust_bps is not None and ffi_bps is not None and ffi_bps > 0.0)
@@ -1061,6 +1140,7 @@ for key in all_keys:
     delta_rows.append(
         {
             "key": key,
+            "rust_variant": rust_variant,
             "scenario": scenario,
             "params": {
                 "stage": stage,
@@ -1123,6 +1203,7 @@ for row in delta_rows:
         "level": params["level"],
         "source": params["source"],
         "key": row["key"],
+        "rust_variant": row["rust_variant"],
         "commit_sha": row["meta"]["commit_sha"],
         "commit_message": row["meta"].get("commit_message"),
         "generated_at": row["meta"]["generated_at"],
@@ -1226,6 +1307,7 @@ for row in memory_rows:
             "level": level,
             "source": source,
             "key": canonical_key(stage, row["scenario"], level, source),
+            "rust_variant": row["rust_variant"],
             "commit_sha": commit_sha,
             "commit_message": commit_message,
             "generated_at": generated_at,
@@ -1274,6 +1356,7 @@ for row in dictionary_rows:
             "level": level,
             "source": None,
             "key": canonical_key("compress-dict", row["scenario"], level, None),
+            "rust_variant": row["rust_variant"],
             "commit_sha": commit_sha,
             "commit_message": commit_message,
             "generated_at": generated_at,
@@ -1332,14 +1415,17 @@ lines = [
     "",
     "## Compression Ratios",
     "",
-    "| Scenario | Label | Level | Input bytes | Rust bytes | C bytes | Rust ratio | C ratio |",
-    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+    "Rust variant: `searched` has the raw skip off, `raw_skip` on (the library "
+    "default), `any` is a frame both wrote identically.",
+    "",
+    "| Scenario | Label | Level | Rust variant | Input bytes | Rust bytes | C bytes | Rust ratio | C ratio |",
+    "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
 ]
 
-for row in sorted(ratios, key=lambda item: (item["scenario"], item["level"])):
+for row in sorted(ratios, key=lambda item: (item["scenario"], item["level"], item["rust_variant"])):
     label = markdown_table_escape(row["label"])
     lines.append(
-        f'| {row["scenario"]} | {label} | {row["level"]} | {row["input_bytes"]} | {row["rust_bytes"]} | {row["ffi_bytes"]} | {row["rust_ratio"]:.4f} | {row["ffi_ratio"]:.4f} |'
+        f'| {row["scenario"]} | {label} | {row["level"]} | {row["rust_variant"]} | {row["input_bytes"]} | {row["rust_bytes"]} | {row["ffi_bytes"]} | {row["rust_ratio"]:.4f} | {row["ffi_ratio"]:.4f} |'
     )
 
 # Skip the entire memory section on PR shards (no memory bench ran,
@@ -1359,14 +1445,17 @@ if memory_rows:
         "counters with the libzstd-requested size only. Byte counts "
         "are directly comparable cross-side.",
         "",
-        "| Scenario | Label | Level | Stage | Rust peak alloc | C peak alloc |",
-        "| --- | --- | --- | --- | ---: | ---: |",
+        "| Scenario | Label | Level | Stage | Rust variant | Rust peak alloc | C peak alloc |",
+        "| --- | --- | --- | --- | --- | ---: | ---: |",
     ])
 
-    for row in sorted(memory_rows, key=lambda item: (item["scenario"], item["level"], item["stage"])):
+    for row in sorted(
+        memory_rows,
+        key=lambda item: (item["scenario"], item["level"], item["stage"], item["rust_variant"]),
+    ):
         label = markdown_table_escape(row["label"])
         lines.append(
-            f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_peak_alloc_bytes"]} | {row["ffi_peak_alloc_bytes"]} |'
+            f'| {row["scenario"]} | {label} | {row["level"]} | {row["stage"]} | {row["rust_variant"]} | {row["rust_peak_alloc_bytes"]} | {row["ffi_peak_alloc_bytes"]} |'
         )
 
 lines.extend([
@@ -1377,7 +1466,14 @@ lines.extend([
     "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
 ])
 
+# libzstd's columns only: one row per cell, however many configurations of ours
+# were reported against it.
+ffi_dictionary_cells = set()
 for row in sorted(dictionary_rows, key=lambda item: (item["scenario"], item["level"])):
+    cell = (row["scenario"], row["level"])
+    if cell in ffi_dictionary_cells:
+        continue
+    ffi_dictionary_cells.add(cell)
     label = markdown_table_escape(row["label"])
     lines.append(
         f'| {row["scenario"]} | {label} | {row["level"]} | {row["dict_bytes"]} | {row["train_ms"]:.3f} | {row["ffi_no_dict_bytes"]} | {row["ffi_with_dict_bytes"]} | {row["ffi_no_dict_ratio"]:.4f} | {row["ffi_with_dict_ratio"]:.4f} |'
@@ -1444,8 +1540,13 @@ delta_lines = [
 def format_ratio(value):
     return f"{value:.6g}"
 
+def delta_row_label(row):
+    """A cell's key with the configuration of ours its figures came from: one
+    cell can hold a row per configuration."""
+    return f'{row["key"]}, rust={row["rust_variant"]}'
+
 for row in delta_rows:
-    key = markdown_table_escape(row["key"])
+    key = markdown_table_escape(delta_row_label(row))
     rust_ratio = row["ratio"]["rust"]
     if rust_ratio is None:
         continue
@@ -1462,7 +1563,7 @@ delta_lines.extend(
 )
 
 for row in delta_rows:
-    key = markdown_table_escape(row["key"])
+    key = markdown_table_escape(delta_row_label(row))
     ffi_ratio = row["ratio"]["ffi"]
     if ffi_ratio is None:
         continue
@@ -1481,7 +1582,7 @@ delta_lines.extend(
 )
 
 for row in delta_rows:
-    key = markdown_table_escape(row["key"])
+    key = markdown_table_escape(delta_row_label(row))
     delta = row["ratio"]["delta_rust_over_ffi"]
     if delta is None:
         continue
@@ -1503,7 +1604,7 @@ delta_lines.extend(
 )
 
 for row in delta_rows:
-    key = markdown_table_escape(row["key"])
+    key = markdown_table_escape(delta_row_label(row))
     bps = row["speed"]["rust_bytes_per_sec"]
     ms = row["speed"]["rust_ms_per_iter"]
     if bps is None or ms is None:
@@ -1521,7 +1622,7 @@ delta_lines.extend(
 )
 
 for row in delta_rows:
-    key = markdown_table_escape(row["key"])
+    key = markdown_table_escape(delta_row_label(row))
     bps = row["speed"]["ffi_bytes_per_sec"]
     ms = row["speed"]["ffi_ms_per_iter"]
     if bps is None or ms is None:
@@ -1541,7 +1642,7 @@ delta_lines.extend(
 )
 
 for row in delta_rows:
-    key = markdown_table_escape(row["key"])
+    key = markdown_table_escape(delta_row_label(row))
     delta = row["speed"]["delta_rust_over_ffi"]
     if delta is None:
         continue

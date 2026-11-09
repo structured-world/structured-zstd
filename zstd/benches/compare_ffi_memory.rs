@@ -38,9 +38,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use structured_zstd::decoding::{DictionaryHandle, FrameDecoder};
 use structured_zstd::encoding::FrameCompressor;
 use support::{
-    LevelConfig, Scenario, ScenarioClass, apply_cpu_ceiling_from_env, benchmark_scenarios,
-    build_training_samples, dictionary_size_for, kernel_report_line, ldm_parameters,
-    supported_levels_filtered,
+    ANY_VARIANT, LevelConfig, RustVariant, Scenario, ScenarioClass, apply_cpu_ceiling_from_env,
+    benchmark_scenarios, build_training_samples, dictionary_size_for, encoder_parameters,
+    kernel_report_line, label_variants, rust_variants, supported_levels_filtered,
 };
 
 /// Process-wide byte tracker. Two allocation paths feed the SAME
@@ -441,18 +441,63 @@ fn escape_report_label(label: &str) -> String {
     label.replace('\\', "\\\\").replace('\"', "\\\"")
 }
 
+/// One peak pair, ours under `rust_variant`: a [`RustVariant::label`], or
+/// [`ANY_VARIANT`] where every variant gave the same figure or no encoder
+/// setting reaches the work (decoding libzstd's frames).
 fn emit_report(
     scenario: &Scenario,
     level: LevelConfig,
     stage: &str,
+    rust_variant: &str,
     rust_peak: usize,
     ffi_peak: usize,
 ) {
     let escaped = escape_report_label(&scenario.label);
     println!(
-        "REPORT_MEM scenario={} label=\"{}\" level={} stage={} rust_peak_alloc_bytes={} ffi_peak_alloc_bytes={}",
-        scenario.id, escaped, level.name, stage, rust_peak, ffi_peak
+        "REPORT_MEM scenario={} label=\"{}\" level={} stage={} rust_variant={} rust_peak_alloc_bytes={} ffi_peak_alloc_bytes={}",
+        scenario.id, escaped, level.name, stage, rust_variant, rust_peak, ffi_peak
     );
+}
+
+/// Our encode under every variant this run measures, each with its peak.
+fn rust_encodes(encode: impl Fn(RustVariant) -> Vec<u8>) -> Vec<(RustVariant, (Vec<u8>, usize))> {
+    rust_variants()
+        .iter()
+        .map(|&variant| (variant, measure_peak(|| encode(variant))))
+        .collect()
+}
+
+/// Emit the compress peaks of `encodes`, one line per distinct figure, and
+/// hand back the frames, labelled by variant the same way (identical frames
+/// decode identically, so they are decoded once).
+fn emit_compress_peaks(
+    scenario: &Scenario,
+    level: LevelConfig,
+    encodes: Vec<(RustVariant, (Vec<u8>, usize))>,
+    ffi_peak: usize,
+) -> Vec<(&'static str, Vec<u8>)> {
+    let peaks = encodes
+        .iter()
+        .map(|(variant, (_, peak))| (*variant, *peak))
+        .collect();
+    for (_, rust_variant, rust_peak) in label_variants(peaks) {
+        emit_report(
+            scenario,
+            level,
+            "compress",
+            rust_variant,
+            rust_peak,
+            ffi_peak,
+        );
+    }
+    let frames = encodes
+        .into_iter()
+        .map(|(variant, (frame, _))| (variant, frame))
+        .collect();
+    label_variants(frames)
+        .into_iter()
+        .map(|(_, rust_variant, frame)| (rust_variant, frame))
+        .collect()
 }
 
 /// Train the canonical FastCOVER dictionary bytes both bench sides apply for
@@ -483,7 +528,6 @@ fn main() {
     let scenarios = benchmark_scenarios();
     for scenario in &scenarios {
         for level in supported_levels_filtered() {
-            let ldm_params = ldm_parameters(&level);
             let expected_len = scenario.len();
 
             // The LDM+dict variants (`*_ldm_dict`) carry a trained dictionary
@@ -506,13 +550,13 @@ fn main() {
                     continue;
                 };
 
-                let (rust_compressed, rust_peak) = measure_peak(|| {
+                let encodes = rust_encodes(|variant| {
                     let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
                     // Params before the checksum flag — same ordering as
                     // `rust_encode_to_vec` so every bench arm configures the
                     // compressor identically.
-                    if let Some(params) = &ldm_params {
-                        compressor.set_parameters(params);
+                    if let Some(params) = encoder_parameters(&level, variant) {
+                        compressor.set_parameters(&params);
                     }
                     // Full feature gate: checksum on, matching the FFI arm.
                     compressor.set_content_checksum(cfg!(feature = "hash"));
@@ -526,12 +570,14 @@ fn main() {
                 let (ffi_compressed, ffi_peak) = measure_peak(|| {
                     ffi_encode(&scenario.bytes[..], level.ffi_level, level.ldm, Some(&dict))
                 });
-                emit_report(scenario, level, "compress", rust_peak, ffi_peak);
+                let mut sources: Vec<(&str, &str, Vec<u8>)> =
+                    emit_compress_peaks(scenario, level, encodes, ffi_peak)
+                        .into_iter()
+                        .map(|(rust_variant, frame)| ("rust_stream", rust_variant, frame))
+                        .collect();
+                sources.push(("c_stream", ANY_VARIANT, ffi_compressed));
 
-                for (source, compressed) in [
-                    ("rust_stream", &rust_compressed),
-                    ("c_stream", &ffi_compressed),
-                ] {
+                for (source, rust_variant, compressed) in &sources {
                     let (_, rust_decode_peak) = measure_peak(|| {
                         // Parse the dictionary handle inside the window so the
                         // Rust peak covers it, mirroring the FFI side where
@@ -558,6 +604,7 @@ fn main() {
                         scenario,
                         level,
                         &format!("decompress-{source}"),
+                        rust_variant,
                         rust_decode_peak,
                         ffi_decode_peak,
                     );
@@ -567,28 +614,29 @@ fn main() {
 
             // Compress (no dictionary; LDM wired on both sides when set).
             // Full feature gate: checksum on, matching the FFI arm.
-            let (rust_compressed, rust_peak) = measure_peak(|| {
+            let encodes = rust_encodes(|variant| {
                 let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
                 // Params before the checksum flag — same ordering as
                 // `rust_encode_to_vec`.
-                if let Some(params) = &ldm_params {
-                    compressor.set_parameters(params);
+                if let Some(params) = encoder_parameters(&level, variant) {
+                    compressor.set_parameters(&params);
                 }
                 compressor.set_content_checksum(cfg!(feature = "hash"));
                 compressor.compress_independent_frame(&scenario.bytes[..])
             });
             let (ffi_compressed, ffi_peak) =
                 measure_peak(|| ffi_encode(&scenario.bytes[..], level.ffi_level, level.ldm, None));
-            emit_report(scenario, level, "compress", rust_peak, ffi_peak);
 
-            // Decode the Rust-encoded frame on both sides for the
-            // `rust_stream` decode stage; mirror with the FFI-encoded
-            // frame for `c_stream`. Matches the timing bench's two
-            // decode source variants.
-            for (source, compressed) in [
-                ("rust_stream", &rust_compressed),
-                ("c_stream", &ffi_compressed),
-            ] {
+            // Decode our frames on both sides for the `rust_stream` decode
+            // stage, once per distinct frame; mirror with the FFI-encoded frame
+            // for `c_stream`. Matches the timing bench's decode sources.
+            let mut sources: Vec<(&str, &str, Vec<u8>)> =
+                emit_compress_peaks(scenario, level, encodes, ffi_peak)
+                    .into_iter()
+                    .map(|(rust_variant, frame)| ("rust_stream", rust_variant, frame))
+                    .collect();
+            sources.push(("c_stream", ANY_VARIANT, ffi_compressed));
+            for (source, rust_variant, compressed) in &sources {
                 let (_, rust_decode_peak) = measure_peak(|| {
                     let mut target = vec![0u8; expected_len];
                     let mut decoder = FrameDecoder::new();
@@ -604,6 +652,7 @@ fn main() {
                     scenario,
                     level,
                     &format!("decompress-{source}"),
+                    rust_variant,
                     rust_decode_peak,
                     ffi_decode_peak,
                 );

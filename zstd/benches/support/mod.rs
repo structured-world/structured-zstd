@@ -50,15 +50,72 @@ pub(crate) struct LevelConfig {
     pub(crate) dict: bool,
 }
 
-/// Resolve the [`CompressionParameters`] a variant needs, or `None` when the
-/// level alone describes it. Shared by both bench binaries (`compare_ffi`
+/// One configuration of our encoder that the matrix measures against libzstd.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RustVariant {
+    /// The raw skip off: every block is searched, as libzstd searches it.
+    Searched,
+    /// The raw skip on, as the library ships by default: a block whose sample
+    /// reads as incompressible goes out raw without being searched.
+    RawSkip,
+}
+
+impl RustVariant {
+    /// The name every report line and the dashboard carry for this variant.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            RustVariant::Searched => "searched",
+            RustVariant::RawSkip => "raw_skip",
+        }
+    }
+}
+
+/// The variant label of a figure every configuration of ours shares: a
+/// measurement no encoder setting reaches (our decoder on libzstd's frames),
+/// or one where every variant produced the same bytes, so the figure is stored
+/// once for all of them.
+pub(crate) const ANY_VARIANT: &str = "any";
+
+/// Label each variant's result, or one [`ANY_VARIANT`] result when more than
+/// one variant ran and every one produced the same. Each entry keeps the
+/// variant that produced it (the first one for a shared result).
+pub(crate) fn label_variants<T: PartialEq>(
+    results: Vec<(RustVariant, T)>,
+) -> Vec<(RustVariant, &'static str, T)> {
+    let shared = results.len() > 1 && results.windows(2).all(|pair| pair[0].1 == pair[1].1);
+    if shared {
+        let (variant, value) = results.into_iter().next().expect("more than one result");
+        return vec![(variant, ANY_VARIANT, value)];
+    }
+    results
+        .into_iter()
+        .map(|(variant, value)| (variant, variant.label(), value))
+        .collect()
+}
+
+/// The variants this run measures. `RAW_SKIP=0` keeps the searched one only
+/// and `RAW_SKIP=1` the raw-skip one only, for a local run that needs one;
+/// unset (the CI matrix) measures both, searched first.
+pub(crate) fn rust_variants() -> &'static [RustVariant] {
+    match env::var("RAW_SKIP").as_deref() {
+        Ok("0") => &[RustVariant::Searched],
+        Ok("1") => &[RustVariant::RawSkip],
+        Ok(other) => panic!("RAW_SKIP={other}: expected 0 (searched) or 1 (raw skip)"),
+        Err(_) => &[RustVariant::Searched, RustVariant::RawSkip],
+    }
+}
+
+/// Resolve the [`CompressionParameters`] a matrix cell needs, or `None` when
+/// the level alone describes it. Shared by both bench binaries (`compare_ffi`
 /// timing/ratio + `compare_ffi_memory`) so the Rust encode path is wired
-/// identically in each. Two knobs: LDM for the `*_ldm*` variants, and
-/// `RAW_SKIP=0` in the environment turns the raw skip off, so every block is
-/// searched the way libzstd searches it. Neither is bounds-checked, so
+/// identically in each. Two knobs: LDM for the `*_ldm*` levels, and the raw
+/// skip off for [`RustVariant::Searched`]. Neither is bounds-checked, so
 /// `build()` cannot fail.
-pub(crate) fn ldm_parameters(level: &LevelConfig) -> Option<CompressionParameters> {
-    let skip_off = env::var("RAW_SKIP").is_ok_and(|v| v == "0");
+pub(crate) fn encoder_parameters(
+    level: &LevelConfig,
+    variant: RustVariant,
+) -> Option<CompressionParameters> {
+    let skip_off = variant == RustVariant::Searched;
     (level.ldm || skip_off).then(|| {
         let mut builder = CompressionParameters::builder(level.rust_level);
         if level.ldm {
