@@ -2995,11 +2995,23 @@ fn by_reference_dictionaries_keep_the_callers_buffer() {
     };
     // The content lies in the caller's buffer, not in a copy of it: a copy
     // would produce the same frames, so only the address tells them apart.
-    let in_dict = |content: &[u8]| dict.as_ptr_range().contains(&content.as_ptr());
+    // `as_ref` refuses a NULL constructor result before anything is read.
+    let ddict_content = |ddict: *mut crate::cdict::ZSTD_DDict| {
+        let ddict = unsafe { ddict.as_ref() }.expect("the DDict was created");
+        ddict
+            .prepared
+            .as_ref()
+            .unwrap()
+            .as_dict()
+            .dict_content
+            .as_ptr()
+    };
+    let cdict_content = |cdict: *mut crate::cdict::ZSTD_CDict| {
+        let cdict = unsafe { cdict.as_ref() }.expect("the CDict was created");
+        cdict.dict.as_ref().unwrap().content().as_ptr()
+    };
     for ddict in [ddict_ref, ddict_adv] {
-        assert!(!ddict.is_null());
-        let held = unsafe { &*ddict }.prepared.as_ref().unwrap();
-        assert!(in_dict(&held.as_dict().dict_content));
+        assert!(dict.as_ptr_range().contains(&ddict_content(ddict)));
         assert_eq!(
             unsafe { ZSTD_sizeof_DDict(ddict) } + content_len,
             unsafe { ZSTD_sizeof_DDict(ddict_copy) },
@@ -3007,14 +3019,10 @@ fn by_reference_dictionaries_keep_the_callers_buffer() {
         );
     }
     for cdict in [cdict_ref, cdict_adv] {
-        assert!(!cdict.is_null());
-        assert!(in_dict(unsafe { &*cdict }.dict.as_ref().unwrap().content()));
+        assert!(dict.as_ptr_range().contains(&cdict_content(cdict)));
     }
-    let copied = unsafe { &*ddict_copy }.prepared.as_ref().unwrap();
-    assert!(!in_dict(&copied.as_dict().dict_content));
-    assert!(!in_dict(
-        unsafe { &*cdict_copy }.dict.as_ref().unwrap().content()
-    ));
+    assert!(!dict.as_ptr_range().contains(&ddict_content(ddict_copy)));
+    assert!(!dict.as_ptr_range().contains(&cdict_content(cdict_copy)));
 
     let cctx = ZSTD_createCCtx();
     let dctx = ZSTD_createDCtx();
