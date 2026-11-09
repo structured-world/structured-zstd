@@ -3413,31 +3413,6 @@ fn dctx_ref_prefix_is_spent_by_a_one_shot_that_used_it_and_failed() {
     unsafe { ZSTD_freeCCtx(cctx) };
 }
 
-/// A buffer-less run begun with a dictionary keeps decoding through a session
-/// or parameter reset, as upstream leaves a begun run alone: the run holds its
-/// dictionary, so a reset does not take it from the decoder.
-#[test]
-fn a_reset_leaves_a_dictionary_run_decoding() {
-    use crate::bufferless::{ZSTD_decompressBegin_usingDict, ZSTD_insertBlock};
-    use crate::params::ZSTD_DCtx_reset;
-    let dict = trained_dictionary();
-    for reset in [1, 2, 3] {
-        let dctx = ZSTD_createDCtx();
-        assert_eq!(
-            unsafe { ZSTD_decompressBegin_usingDict(dctx, dict.as_ptr(), dict.len()) },
-            0
-        );
-        assert_eq!(ZSTD_isError(unsafe { ZSTD_DCtx_reset(dctx, reset) }), 0);
-        let block = b"stored block the run keeps as history";
-        assert_eq!(
-            unsafe { ZSTD_insertBlock(dctx, block.as_ptr(), block.len()) },
-            block.len(),
-            "reset {reset} ended the begun run"
-        );
-        unsafe { ZSTD_freeDCtx(dctx) };
-    }
-}
-
 #[test]
 fn creation_time_validation_rejects_bad_fastcover_and_full_dict_inputs() {
     // Plain (non-optimizing) fastCover training requires explicit k and d:

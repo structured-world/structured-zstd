@@ -718,6 +718,64 @@ fn decompress_begin_with_dictionaries_and_copy() {
     }
 }
 
+/// A buffer-less run begun with a dictionary keeps decoding with it through a
+/// session or parameter reset, as upstream leaves a begun run alone: the run
+/// holds its dictionary, so a reset does not take it from the decoder. A
+/// block carries no frame header to re-attach the dictionary from, so a block
+/// that refers into it decodes only while the decoder still holds it.
+#[test]
+fn a_reset_leaves_a_dictionary_run_decoding() {
+    use crate::params::ZSTD_DCtx_reset;
+    let input = DICT[DICT.len() - 3000..].to_vec();
+    let mut block = vec![0u8; 8192];
+    let block_len = unsafe {
+        let cctx = ZSTD_createCCtx();
+        assert_eq!(
+            ZSTD_compressBegin_usingDict(cctx, DICT.as_ptr(), DICT.len(), 3),
+            0
+        );
+        let n = ZSTD_compressBlock(
+            cctx,
+            block.as_mut_ptr(),
+            block.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        ZSTD_freeCCtx(cctx);
+        n
+    };
+    assert_eq!(ZSTD_isError(block_len), 0, "{:?}", code(block_len));
+    assert!(block_len > 0 && block_len < input.len() / 4);
+    let block = &block[..block_len];
+    let dctx = ZSTD_createDCtx();
+    let mut out = vec![0u8; input.len()];
+    let decode = |dctx, out: &mut [u8]| unsafe {
+        ZSTD_decompressBlock(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            block.as_ptr(),
+            block.len(),
+        )
+    };
+    // The block refers into the dictionary: without it, it does not decode.
+    assert_eq!(unsafe { ZSTD_decompressBegin(dctx) }, 0);
+    let n = decode(dctx, &mut out);
+    assert!(ZSTD_isError(n) != 0 || out != input);
+    for reset in [1, 2, 3] {
+        out.fill(0);
+        assert_eq!(
+            unsafe { ZSTD_decompressBegin_usingDict(dctx, DICT.as_ptr(), DICT.len()) },
+            0
+        );
+        assert_eq!(ZSTD_isError(unsafe { ZSTD_DCtx_reset(dctx, reset) }), 0);
+        let n = decode(dctx, &mut out);
+        assert_eq!(n, input.len(), "reset {reset}: {:?}", code(n));
+        assert_eq!(out, input, "reset {reset} took the run's dictionary");
+    }
+    unsafe { ZSTD_freeDCtx(dctx) };
+}
+
 /// A parameter reset between `ZSTD_decompressBegin` and the input leaves the
 /// begun run as it was begun: a magicless run still asks for one byte and
 /// decodes a magicless frame. The reset applies to the next run.

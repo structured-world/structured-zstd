@@ -40,7 +40,7 @@ mod streaming_decoder;
 pub mod workspace;
 
 pub use dictionary::{
-    Dictionary, DictionaryBytes, DictionaryHandle, MAGIC_NUM as DICTIONARY_MAGIC,
+    Dictionary, DictionaryBytes, DictionaryHandle, MAGIC_NUM as DICTIONARY_MAGIC, SharedBytes,
 };
 pub use frame_decoder::{BlockDecodingStrategy, ContentChecksum, FrameDecoder};
 #[cfg(feature = "legacy")]

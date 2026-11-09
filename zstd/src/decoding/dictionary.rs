@@ -61,7 +61,7 @@ pub struct Dictionary {
 /// and the content of the parsed [`Dictionary`]; parsing narrows the range to
 /// the content and keeps the holder, so no byte is copied. The holder is one of:
 /// - a `Vec` of its own ([`Self::owned`]);
-/// - an `Arc<[u8]>` the caller keeps as well ([`Self::shared`]), so the bytes
+/// - a [`SharedBytes`] buffer the caller keeps as well ([`Self::shared`]), so the bytes
 ///   exist once however many dictionaries, handles and threads read them;
 /// - the caller's buffer by reference ([`Self::referenced`]), as upstream
 ///   zstd's `ZSTD_createDDict_byReference` holds it.
@@ -90,22 +90,34 @@ pub struct DictionaryBytes {
     holder: BytesHolder,
 }
 
+/// A buffer shared between dictionaries and the caller: `Arc` where atomics
+/// exist, `Rc` where they do not, as a [`DictionaryHandle`] is shared.
+#[cfg(target_has_atomic = "ptr")]
+pub type SharedBytes = Arc<[u8]>;
+/// A buffer shared between dictionaries and the caller: `Arc` where atomics
+/// exist, `Rc` where they do not, as a [`DictionaryHandle`] is shared.
+#[cfg(not(target_has_atomic = "ptr"))]
+pub type SharedBytes = Rc<[u8]>;
+
 enum BytesHolder {
     Owned(Vec<u8>),
-    #[cfg(target_has_atomic = "ptr")]
-    Shared(Arc<[u8]>),
+    Shared(SharedBytes),
     /// The caller's bytes; the `unsafe` constructor carries the contract that
     /// they outlive every holder of this value and stay unchanged.
     Referenced,
 }
 
 // SAFETY: the bytes are only ever read. `Owned` is a `Vec<u8>` and `Shared` an
-// `Arc<[u8]>`, both `Send + Sync`; `Referenced` points at bytes whose
-// constructor (`unsafe`) requires the caller to keep them alive and unmodified
-// for as long as any holder exists, the contract upstream zstd puts on a
-// by-reference dictionary shared between threads.
+// `Arc<[u8]>` on these targets, both `Send + Sync`; `Referenced` points at
+// bytes whose constructor (`unsafe`) requires the caller to keep them alive
+// and unmodified for as long as any holder exists, the contract upstream zstd
+// puts on a by-reference dictionary shared between threads. Without pointer
+// atomics `Shared` is an `Rc`, so the value stays on its thread, as a
+// `DictionaryHandle` does there.
+#[cfg(target_has_atomic = "ptr")]
 unsafe impl Send for DictionaryBytes {}
 // SAFETY: as for `Send`: shared access only ever reads.
+#[cfg(target_has_atomic = "ptr")]
 unsafe impl Sync for DictionaryBytes {}
 
 impl DictionaryBytes {
@@ -120,8 +132,7 @@ impl DictionaryBytes {
 
     /// Bytes shared with whoever else holds `bytes`: a dictionary parsed from
     /// these keeps a reference count on them instead of a copy.
-    #[cfg(target_has_atomic = "ptr")]
-    pub fn shared(bytes: Arc<[u8]>) -> Self {
+    pub fn shared(bytes: SharedBytes) -> Self {
         Self {
             ptr: non_null_start(&bytes),
             len: bytes.len(),
@@ -168,7 +179,8 @@ impl DictionaryBytes {
     pub fn heap_bytes(&self) -> usize {
         match &self.holder {
             BytesHolder::Owned(bytes) => bytes.capacity(),
-            #[cfg(target_has_atomic = "ptr")]
+            // Strong and weak counts in front of the bytes, in `Arc` and `Rc`
+            // alike.
             BytesHolder::Shared(bytes) => core::alloc::Layout::new::<[usize; 2]>()
                 .extend(
                     core::alloc::Layout::array::<u8>(bytes.len()).expect("a live slice's layout"),
@@ -184,15 +196,13 @@ impl DictionaryBytes {
     /// [`Self::heap_bytes`] of a shared buffer, zero for any other holder.
     pub(crate) fn shared_heap_bytes(&self) -> usize {
         match &self.holder {
-            #[cfg(target_has_atomic = "ptr")]
             BytesHolder::Shared(_) => self.heap_bytes(),
             _ => 0,
         }
     }
 
     /// The shared buffer behind these bytes, if any.
-    #[cfg(target_has_atomic = "ptr")]
-    fn shared_buffer(&self) -> Option<&Arc<[u8]>> {
+    fn shared_buffer(&self) -> Option<&SharedBytes> {
         match &self.holder {
             BytesHolder::Shared(bytes) => Some(bytes),
             _ => None,
@@ -204,33 +214,25 @@ impl DictionaryBytes {
 /// distinct buffer once, and only when every reference to it is one of
 /// `contents`. Each entry stands for one holder.
 pub(crate) fn exclusive_shared_heap_bytes(contents: &[&DictionaryBytes]) -> usize {
-    #[cfg(target_has_atomic = "ptr")]
-    {
-        let mut total = 0;
-        for (position, content) in contents.iter().enumerate() {
-            let Some(buffer) = content.shared_buffer() else {
-                continue;
-            };
-            let same = |other: &&&DictionaryBytes| {
-                other
-                    .shared_buffer()
-                    .is_some_and(|theirs| Arc::ptr_eq(buffer, theirs))
-            };
-            // The first holder of a buffer speaks for all of them.
-            if contents[..position].iter().any(|other| same(&other)) {
-                continue;
-            }
-            if Arc::strong_count(buffer) == contents.iter().filter(same).count() {
-                total += content.heap_bytes();
-            }
+    let mut total = 0;
+    for (position, content) in contents.iter().enumerate() {
+        let Some(buffer) = content.shared_buffer() else {
+            continue;
+        };
+        let same = |other: &&&DictionaryBytes| {
+            other
+                .shared_buffer()
+                .is_some_and(|theirs| SharedBytes::ptr_eq(buffer, theirs))
+        };
+        // The first holder of a buffer speaks for all of them.
+        if contents[..position].iter().any(|other| same(&other)) {
+            continue;
         }
-        total
+        if SharedBytes::strong_count(buffer) == contents.iter().filter(same).count() {
+            total += content.heap_bytes();
+        }
     }
-    #[cfg(not(target_has_atomic = "ptr"))]
-    {
-        let _ = contents;
-        0
-    }
+    total
 }
 
 impl DictionaryBytes {
@@ -261,7 +263,6 @@ impl Clone for DictionaryBytes {
                 let start = self.ptr.as_ptr() as usize - bytes.as_ptr() as usize;
                 Self::owned(bytes.clone()).tail(start)
             }
-            #[cfg(target_has_atomic = "ptr")]
             BytesHolder::Shared(bytes) => Self {
                 ptr: self.ptr,
                 len: self.len,
@@ -303,9 +304,8 @@ impl From<Vec<u8>> for DictionaryBytes {
     }
 }
 
-#[cfg(target_has_atomic = "ptr")]
-impl From<Arc<[u8]>> for DictionaryBytes {
-    fn from(bytes: Arc<[u8]>) -> Self {
+impl From<SharedBytes> for DictionaryBytes {
+    fn from(bytes: SharedBytes) -> Self {
         Self::shared(bytes)
     }
 }
@@ -322,7 +322,6 @@ impl core::fmt::Debug for DictionaryBytes {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let holder = match self.holder {
             BytesHolder::Owned(_) => "owned",
-            #[cfg(target_has_atomic = "ptr")]
             BytesHolder::Shared(_) => "shared",
             BytesHolder::Referenced => "referenced",
         };
