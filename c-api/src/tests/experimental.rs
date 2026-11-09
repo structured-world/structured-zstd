@@ -443,8 +443,10 @@ fn context_sizes_count_the_dictionaries_they_keep() {
             dict.len(),
         );
         assert_eq!(m, input.len());
+        // `as_ref` refuses a NULL context before anything is read.
+        let decoder = &dctx.as_ref().expect("the DCtx was created").decoder;
         assert_eq!(
-            (*dctx).decoder.dictionaries().count(),
+            decoder.dictionaries().count(),
             0,
             "a one-shot keeps a reference to the caller's dictionary"
         );
