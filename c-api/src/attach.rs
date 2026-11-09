@@ -419,13 +419,44 @@ impl ZSTD_DCtx {
     /// caller's buffer may have no holder once the caller stops using it.
     pub(crate) fn set_attached_ddict(&mut self, attach: DCtxDictAttach) {
         self.attached_ddict = attach;
-        self.decoder.release_dictionaries();
+        self.release_decoder_dictionaries();
     }
 
     /// A frame ended: with no dictionary attached any more (a prefix applies
     /// to one frame), the decoder keeps none of the frame's either.
     pub(crate) fn frame_ended(&mut self) {
         if matches!(self.attached_ddict, DCtxDictAttach::None) {
+            self.release_decoder_dictionaries();
+        }
+    }
+
+    /// A one-shot over the attached dictionaries failed. A prefix a frame
+    /// started with is spent all the same, as the caller may release it once
+    /// the call returns; one no frame started with stays for the retry.
+    pub(crate) fn one_shot_failed(&mut self) {
+        let DCtxDictAttach::Prefix { handle } = &self.attached_ddict else {
+            return;
+        };
+        let used = self
+            .decoder
+            .dictionaries()
+            .any(|held| core::ptr::eq(held.as_dict(), handle.as_dict()));
+        if used {
+            self.attached_ddict = DCtxDictAttach::None;
+            self.release_decoder_dictionaries();
+        }
+    }
+
+    /// Let the decoder go of the dictionaries it holds, except the one a begun
+    /// buffer-less run decodes with: that run holds it until the next begin,
+    /// as upstream's begun run keeps its dictionary through a reset.
+    fn release_decoder_dictionaries(&mut self) {
+        let run_dictionary = self.bufferless.dictionary().is_some_and(|run| {
+            self.decoder
+                .dictionaries()
+                .any(|held| core::ptr::eq(held.as_dict(), run.as_dict()))
+        });
+        if !run_dictionary {
             self.decoder.release_dictionaries();
         }
     }

@@ -3358,6 +3358,86 @@ fn dctx_ref_prefix_survives_a_failed_one_shot() {
     unsafe { ZSTD_freeCCtx(cctx) };
 }
 
+/// A one-shot that starts a frame with the referenced prefix and then fails
+/// on input after it has used the prefix: the caller may release the prefix
+/// once the call returns, so neither the context nor its decoder keeps it.
+#[test]
+fn dctx_ref_prefix_is_spent_by_a_one_shot_that_used_it_and_failed() {
+    let prefix = dict_payload();
+    let mut payload = prefix[..1024].to_vec();
+    payload.extend_from_slice(b"prefix spent tail 0123456789");
+    let cctx = ZSTD_createCCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    frame.truncate(written);
+    // The prefix frame, then input that is no frame at all.
+    let mut input = frame.clone();
+    input.extend_from_slice(&[0u8; 24]);
+
+    let dctx = ZSTD_createDCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_refPrefix(dctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let mut out = vec![0u8; payload.len() + 64];
+    let failed = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            input.as_ptr(),
+            input.len(),
+        )
+    };
+    assert_ne!(ZSTD_isError(failed), 0, "the trailing garbage must fail");
+    let context = unsafe { dctx.as_ref() }.expect("the DCtx was created");
+    assert!(
+        matches!(context.attached_ddict, crate::attach::DCtxDictAttach::None),
+        "a prefix a frame used stays attached after the call"
+    );
+    assert_eq!(context.decoder.dictionaries().count(), 0);
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
+
+/// A buffer-less run begun with a dictionary keeps decoding through a session
+/// or parameter reset, as upstream leaves a begun run alone: the run holds its
+/// dictionary, so a reset does not take it from the decoder.
+#[test]
+fn a_reset_leaves_a_dictionary_run_decoding() {
+    use crate::bufferless::{ZSTD_decompressBegin_usingDict, ZSTD_insertBlock};
+    use crate::params::ZSTD_DCtx_reset;
+    let dict = trained_dictionary();
+    for reset in [1, 2, 3] {
+        let dctx = ZSTD_createDCtx();
+        assert_eq!(
+            unsafe { ZSTD_decompressBegin_usingDict(dctx, dict.as_ptr(), dict.len()) },
+            0
+        );
+        assert_eq!(ZSTD_isError(unsafe { ZSTD_DCtx_reset(dctx, reset) }), 0);
+        let block = b"stored block the run keeps as history";
+        assert_eq!(
+            unsafe { ZSTD_insertBlock(dctx, block.as_ptr(), block.len()) },
+            block.len(),
+            "reset {reset} ended the begun run"
+        );
+        unsafe { ZSTD_freeDCtx(dctx) };
+    }
+}
+
 #[test]
 fn creation_time_validation_rejects_bad_fastcover_and_full_dict_inputs() {
     // Plain (non-optimizing) fastCover training requires explicit k and d:

@@ -783,6 +783,7 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
             // full replacement is reserved for the panic arm where the
             // state may be torn mid-unwind.
             dctx.stream_frame_done = true;
+            dctx.one_shot_failed();
             encode(code_for_decoder_error(&err))
         }
         Err(_) => {
