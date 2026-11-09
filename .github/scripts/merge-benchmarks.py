@@ -33,7 +33,9 @@ report_bodies = {}
 delta_md_bodies = {}
 targets_meta = {}
 RELATIVE_RETENTION_DAYS = 180
-RELATIVE_MAX_RECORDS = 20000
+# About four snapshots of the full matrix: three targets, each cell up to one
+# record per configuration of ours.
+RELATIVE_MAX_RECORDS = 36000
 
 
 def register_target(target, target_meta=None):
@@ -197,11 +199,14 @@ if existing_relative_path.exists():
         register_target(target_id, target_meta)
 
 def record_key(row):
+    # `rust_variant` is the configuration of ours a record measured: one cell
+    # holds a record per configuration under the same series `key`.
     return (
         row.get("commit_sha"),
         row.get("target"),
         row.get("metric"),
         row.get("key"),
+        row.get("rust_variant"),
         row.get("generated_at"),
     )
 
@@ -216,6 +221,7 @@ merged_values = sorted(
         row.get("target") or "",
         row.get("metric") or "",
         row.get("key") or "",
+        row.get("rust_variant") or "",
     ),
 )
 for row in merged_values:

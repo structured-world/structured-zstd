@@ -24,6 +24,19 @@ For decompression, each scenario/level pair is benchmarked against two frame sou
 
 This keeps Rust-vs-C decoder comparisons symmetric and catches format/interop drift sooner.
 
+Every cell measures two configurations of our encoder against the same C `zstd` reference:
+
+- `searched` (criterion arm `pure_rust`): the raw skip off, so every block is searched as C
+  `zstd` searches it;
+- `raw_skip` (criterion arm `pure_rust_raw_skip`): the raw skip on, as the library ships by
+  default, so a block whose sample reads as incompressible goes out raw without being searched.
+
+Each gets its own paired measurement against C `zstd`, its own size report and, where its frames
+differ from the searched ones, its own decompress source (`rust_raw_skip_stream`). Where both write
+byte-identical frames, the size and the decode are reported once, under `any`. `RAW_SKIP=0` limits a
+local run to `searched` and `RAW_SKIP=1` to `raw_skip`; unset runs both. The dashboard switches
+between them with one checkbox.
+
 The local default for the large scenario is `100 MiB`. In GitHub Actions, when
 `STRUCTURED_ZSTD_BENCH_LARGE_BYTES` is unset, `.github/scripts/run-benchmarks.sh` defaults it to
 `16 MiB` to keep CI regression runs bounded while still exercising the same code path.
@@ -121,7 +134,8 @@ bash scripts/bench-flamegraph.sh decompress/default/decodecorpus-z000033/rust_st
   - Ratio pack: Rust ratio, FFI ratio, Rust/FFI ratio delta
   - Speed pack: Rust speed, FFI speed, Rust/FFI speed delta
 - `benchmark-relative.json` with normalized relative rows:
-  - dimensions: `target`, `stage`, `scenario`, `level`, optional `source`
+  - dimensions: `target`, `stage`, `scenario`, `level`, optional `source`, and `rust_variant`
+    (`searched`, `raw_skip`, or `any` for a figure both configurations share)
   - metrics: `rust_value`, `ffi_value`, `delta_ratio`, `delta_percent`, `status_band`
   - metric kinds: `compression_ratio`, `throughput_bytes_per_sec`
 

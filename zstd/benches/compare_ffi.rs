@@ -32,9 +32,9 @@ use structured_zstd::dictionary::{
 };
 use structured_zstd::encoding::{EncoderDictionary, FrameCompressor};
 use support::{
-    LevelConfig, Scenario, ScenarioClass, apply_cpu_ceiling_from_env, benchmark_scenarios,
-    build_training_samples, dictionary_size_for, kernel_report_line, ldm_parameters,
-    supported_levels_filtered,
+    ANY_VARIANT, LevelConfig, RustVariant, Scenario, ScenarioClass, apply_cpu_ceiling_from_env,
+    benchmark_scenarios, build_training_samples, dictionary_size_for, encoder_parameters,
+    kernel_report_line, label_variants, rust_variants, supported_levels_filtered,
 };
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
@@ -68,9 +68,9 @@ fn configure_ffi_bulk_compressor(compressor: &mut zstd::bulk::Compressor<'_>, le
 /// upstream library default, OFF) just as `ffi_encode_to_vec` and
 /// `configure_ffi_bulk_compressor` enable `ZSTD_c_checksumFlag`, all under
 /// the same `hash` feature.
-fn rust_encode_to_vec(input: &[u8], level: &LevelConfig) -> Vec<u8> {
+fn rust_encode_to_vec(input: &[u8], level: &LevelConfig, variant: RustVariant) -> Vec<u8> {
     let mut output = Vec::new();
-    rust_encode_into(input, level, &mut output);
+    rust_encode_into(input, level, variant, &mut output);
     output
 }
 
@@ -83,13 +83,41 @@ fn rust_encode_to_vec(input: &[u8], level: &LevelConfig) -> Vec<u8> {
 /// of the encoder — on a fresh heap the allocator maps and unmaps it, which
 /// measured as four times the encode on incompressible input and made the
 /// comparison against upstream a comparison of allocator behaviour.
-fn rust_encode_into(input: &[u8], level: &LevelConfig, output: &mut Vec<u8>) {
+fn rust_encode_into(input: &[u8], level: &LevelConfig, variant: RustVariant, output: &mut Vec<u8>) {
     let mut enc: FrameCompressor = FrameCompressor::new(level.rust_level);
-    if let Some(params) = ldm_parameters(level) {
+    if let Some(params) = encoder_parameters(level, variant) {
         enc.set_parameters(&params);
     }
     enc.set_content_checksum(cfg!(feature = "hash"));
     enc.compress_independent_frame_into(input, output);
+}
+
+/// Our dictionary compressor for one cell, as both the timing arms and the
+/// paired measurement run it: the variant's parameters, the checksum on (as
+/// the FFI arms have it), and the prepared dictionary attached once, so each
+/// frame pays only the steady-state cost.
+fn rust_dict_compressor(
+    level: &LevelConfig,
+    variant: RustVariant,
+    dictionary: &[u8],
+) -> FrameCompressor {
+    // `compress_independent_frame_into` reads input in place and takes the
+    // output buffer per call, so neither the source `R` nor drain `W` generic
+    // is ever bound by a `set_source`/`set_drain` call — the defaults stand.
+    let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
+    // Parameters before the dictionary: `set_parameters` resets the base level
+    // and installs the overrides; the attach is independent and survives it.
+    if let Some(params) = encoder_parameters(level, variant) {
+        compressor.set_parameters(&params);
+    }
+    compressor.set_content_checksum(cfg!(feature = "hash"));
+    compressor
+        .set_encoder_dictionary(
+            EncoderDictionary::from_bytes(dictionary)
+                .expect("dictionary parse checked before registration"),
+        )
+        .expect("prepared dictionary should attach");
+    compressor
 }
 
 /// FFI encode helper used by criterion's timing loop: one-shot
@@ -298,14 +326,27 @@ fn bench_compress(c: &mut Criterion) {
                 continue;
             }
             if emit_reports {
-                let rust_compressed = rust_encode_to_vec(&scenario.bytes[..], &level);
                 let ffi_compressed =
                     ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level, level.ldm);
-                emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
-                emit_frame_header_report(scenario, level, "rust", &rust_compressed);
+                let rust_compressed: Vec<(RustVariant, Vec<u8>)> = rust_variants()
+                    .iter()
+                    .map(|&variant| {
+                        (
+                            variant,
+                            rust_encode_to_vec(&scenario.bytes[..], &level, variant),
+                        )
+                    })
+                    .collect();
+                for (variant, compressed) in &rust_compressed {
+                    let encoder = rust_encoder_label(*variant);
+                    emit_frame_header_report(scenario, level, encoder, compressed);
+                    emit_block_structure_report(scenario, level, encoder, compressed);
+                }
                 emit_frame_header_report(scenario, level, "ffi", &ffi_compressed);
-                emit_block_structure_report(scenario, level, "rust", &rust_compressed);
                 emit_block_structure_report(scenario, level, "ffi", &ffi_compressed);
+                for (_, rust_variant, compressed) in label_variants(rust_compressed) {
+                    emit_report_line(scenario, level, rust_variant, &compressed, &ffi_compressed);
+                }
             }
 
             let benchmark_name = format!("compress/{}/{}/{}", level.name, scenario.id, "matrix");
@@ -313,48 +354,67 @@ fn bench_compress(c: &mut Criterion) {
             configure_group(&mut group, scenario, BenchOp::Compress);
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
-            // The paired comparison, which is what the dashboard reports. It
-            // runs before the criterion arms so neither arm's own measurement
-            // colours it, over the same buffers and the same per-frame shape.
-            // Each side counts its own calls, so both walk the scenario's
-            // frames in one order.
+            // The paired comparisons, which are what the dashboard reports: one
+            // per configuration of ours, each against libzstd in its own
+            // window. They run before the criterion arms so neither arm's own
+            // measurement colours them, over the same buffers and the same
+            // per-frame shape. Each side counts its own calls, so both walk the
+            // scenario's frames in one order.
             if emit_reports {
-                let paired = ARENA.with_borrow_mut(|arena| {
-                    let mut outputs = arena.appended_slots();
-                    let mut calls = [0usize; 2];
-                    measure_pair(|arm, slot| {
-                        let output = &mut *outputs[slot];
-                        let input = scenario.frame(calls[arm.side()]);
-                        calls[arm.side()] += 1;
-                        match arm {
-                            Arm::Rust => rust_encode_into(input, &level, output),
-                            Arm::Ffi => ffi_encode_into(input, level.ffi_level, level.ldm, output),
-                        }
-                        black_box(&output);
-                    })
-                });
-                emit_pair_report("compress", scenario, level.name, "na", paired);
+                for &variant in rust_variants() {
+                    let paired = ARENA.with_borrow_mut(|arena| {
+                        let mut outputs = arena.appended_slots();
+                        let mut calls = [0usize; 2];
+                        measure_pair(|arm, slot| {
+                            let output = &mut *outputs[slot];
+                            let input = scenario.frame(calls[arm.side()]);
+                            calls[arm.side()] += 1;
+                            match arm {
+                                Arm::Rust => rust_encode_into(input, &level, variant, output),
+                                Arm::Ffi => {
+                                    ffi_encode_into(input, level.ffi_level, level.ldm, output)
+                                }
+                            }
+                            black_box(&output);
+                        })
+                    });
+                    emit_pair_report(
+                        "compress",
+                        scenario,
+                        level.name,
+                        "na",
+                        variant.label(),
+                        paired,
+                    );
+                }
             }
 
             // One output buffer per arm for the whole sample (the C caller's
             // `dst`; see `ffi_encode_into`), from the process-wide arena so
-            // neither arm's pages depend on what ran before this group.
-            bench_arm_pair(
-                &mut group,
-                "pure_rust",
-                |b| {
-                    ARENA.with_borrow_mut(|arena| {
-                        let output = arena.appended(Arm::Rust);
-                        let mut call = 0usize;
-                        b.iter(|| {
-                            rust_encode_into(scenario.frame(call), &level, output);
-                            call += 1;
-                            black_box(&output);
-                        })
-                    })
-                },
-                "c_ffi",
-                |b| {
+            // neither arm's pages depend on what ran before this group. Our
+            // variants run one after the other, so they share our slot.
+            let mut arms: Vec<BenchArm<'_, _>> = rust_variants()
+                .iter()
+                .map(|&variant| -> BenchArm<'_, _> {
+                    (
+                        rust_arm_name(variant, ""),
+                        Box::new(move |b: &mut criterion::Bencher<'_, _>| {
+                            ARENA.with_borrow_mut(|arena| {
+                                let output = arena.appended(Arm::Rust);
+                                let mut call = 0usize;
+                                b.iter(|| {
+                                    rust_encode_into(scenario.frame(call), &level, variant, output);
+                                    call += 1;
+                                    black_box(&output);
+                                })
+                            })
+                        }),
+                    )
+                })
+                .collect();
+            arms.push((
+                "c_ffi".to_owned(),
+                Box::new(|b: &mut criterion::Bencher<'_, _>| {
                     ARENA.with_borrow_mut(|arena| {
                         let output = arena.appended(Arm::Ffi);
                         let mut call = 0usize;
@@ -369,8 +429,9 @@ fn bench_compress(c: &mut Criterion) {
                             black_box(&output);
                         })
                     })
-                },
-            );
+                }),
+            ));
+            bench_arms(&mut group, arms);
 
             group.finish();
         }
@@ -394,17 +455,117 @@ fn bench_decompress(c: &mut Criterion) {
                 continue;
             }
             let expected_len = scenario.len();
-            bench_decompress_source(
-                c,
-                scenario,
-                level,
-                "rust_stream",
-                expected_len,
-                emit_reports,
-            );
-            bench_decompress_source(c, scenario, level, "c_stream", expected_len, emit_reports);
+            for source in decode_sources(scenario, &level, emit_reports) {
+                bench_decompress_source(c, scenario, level, source, expected_len, emit_reports);
+            }
         }
     }
+}
+
+/// Where a decompress group's frames come from.
+enum FrameSupply {
+    /// Encoded and checked before the group was set up.
+    Ready(Vec<Vec<u8>>),
+    /// Encoded when an arm first needs them.
+    Lazy(FrameEncoder),
+}
+
+/// The encoder that writes a decompress group's frames.
+#[derive(Clone, Copy)]
+enum FrameEncoder {
+    /// Ours under one variant.
+    Rust(RustVariant),
+    /// libzstd's.
+    C,
+}
+
+/// One decompress group of a cell: the frames both decoders read.
+struct DecodeSource {
+    /// The bench-id segment: `rust_stream`, `rust_raw_skip_stream`, `c_stream`.
+    name: &'static str,
+    /// The configuration of ours that wrote the frames, as the reports file
+    /// it: [`ANY_VARIANT`] for libzstd's frames and for ours where every
+    /// variant wrote the same ones.
+    rust_variant: &'static str,
+    frames: FrameSupply,
+}
+
+/// The bench-id segment of a decompress group over our frames.
+fn rust_source_name(variant: RustVariant) -> &'static str {
+    match variant {
+        RustVariant::Searched => "rust_stream",
+        RustVariant::RawSkip => "rust_raw_skip_stream",
+    }
+}
+
+/// Encode every frame of `scenario` with `encode` and check that both decoders
+/// give each one back.
+fn encode_frames(scenario: &Scenario, encode: impl Fn(&[u8]) -> Vec<u8>) -> Vec<Vec<u8>> {
+    (0..scenario.frame_count())
+        .map(|index| {
+            let original = scenario.frame(index);
+            let bytes = encode(original);
+            assert_decompress_matches_reference(original, &bytes, scenario.len());
+            bytes
+        })
+        .collect()
+}
+
+/// The decompress groups of one cell: one per configuration of ours whose
+/// frames differ, then libzstd's frames.
+///
+/// Where every variant writes byte-identical frames the decode is the same work
+/// on the same bytes, so it is measured once and filed for every variant
+/// (`REPORT_SAME_FRAMES` tells the parser so). Finding that out encodes every
+/// frame under every variant before the group is set up; the reporting run
+/// encodes them anyway, while a run without reports (a profile filtered to one
+/// cell) would pay it for every cell it skips, so it keeps one lazy group per
+/// variant instead.
+fn decode_sources(
+    scenario: &Scenario,
+    level: &LevelConfig,
+    emit_reports: bool,
+) -> Vec<DecodeSource> {
+    let variants = rust_variants();
+    let mut sources = Vec::with_capacity(variants.len() + 1);
+    if emit_reports && variants.len() > 1 {
+        let encoded: Vec<(RustVariant, Vec<Vec<u8>>)> = variants
+            .iter()
+            .map(|&variant| {
+                (
+                    variant,
+                    encode_frames(scenario, |frame| rust_encode_to_vec(frame, level, variant)),
+                )
+            })
+            .collect();
+        for (variant, rust_variant, frames) in label_variants(encoded) {
+            if rust_variant == ANY_VARIANT {
+                println!(
+                    "REPORT_SAME_FRAMES scenario={} level={}",
+                    scenario.id, level.name
+                );
+            }
+            sources.push(DecodeSource {
+                name: rust_source_name(variant),
+                rust_variant,
+                frames: FrameSupply::Ready(frames),
+            });
+        }
+    } else {
+        for &variant in variants {
+            sources.push(DecodeSource {
+                name: rust_source_name(variant),
+                rust_variant: variant.label(),
+                frames: FrameSupply::Lazy(FrameEncoder::Rust(variant)),
+            });
+        }
+    }
+    sources.push(DecodeSource {
+        name: "c_stream",
+        rust_variant: ANY_VARIANT,
+        frames: FrameSupply::Lazy(FrameEncoder::C),
+    });
+    sources
 }
 
 /// Force every page of `buf` into the process's resident set with one
@@ -448,22 +609,43 @@ fn reverse_arm_order() -> bool {
     })
 }
 
-/// Register the two arms of a comparison in this round's order.
+/// One criterion arm of a group: its name and the routine criterion times. The
+/// box is called once per registration, outside the timed loop it sets up.
+type BenchArm<'a, M> = (String, Box<dyn FnMut(&mut criterion::Bencher<'_, M>) + 'a>);
+
+/// Register the arms of a comparison in this round's order: as declared on odd
+/// rounds, reversed on even ones.
 ///
-/// Both are registered either way; only which one Criterion runs first moves.
-fn bench_arm_pair<M: criterion::measurement::Measurement>(
+/// Every arm is registered either way; only the order Criterion runs them in
+/// moves, so no arm holds one position for the life of the dashboard.
+fn bench_arms<M: criterion::measurement::Measurement>(
     group: &mut criterion::BenchmarkGroup<'_, M>,
-    rust_name: &str,
-    rust_arm: impl FnMut(&mut criterion::Bencher<'_, M>),
-    ffi_name: &str,
-    ffi_arm: impl FnMut(&mut criterion::Bencher<'_, M>),
+    mut arms: Vec<BenchArm<'_, M>>,
 ) {
     if reverse_arm_order() {
-        group.bench_function(ffi_name, ffi_arm);
-        group.bench_function(rust_name, rust_arm);
-    } else {
-        group.bench_function(rust_name, rust_arm);
-        group.bench_function(ffi_name, ffi_arm);
+        arms.reverse();
+    }
+    for (name, arm) in arms {
+        group.bench_function(name, arm);
+    }
+}
+
+/// The criterion arm name of our side under `variant`: `pure_rust` for the
+/// searched encoder and `pure_rust_raw_skip` for the raw-skip one, with the
+/// group's `suffix` (`_with_dict`) after it.
+fn rust_arm_name(variant: RustVariant, suffix: &str) -> String {
+    match variant {
+        RustVariant::Searched => format!("pure_rust{suffix}"),
+        RustVariant::RawSkip => format!("pure_rust_raw_skip{suffix}"),
+    }
+}
+
+/// The encoder label our frames carry in the `REPORT_HDR` / `REPORT_HEX` /
+/// `REPORT_BLK` diagnostics.
+fn rust_encoder_label(variant: RustVariant) -> &'static str {
+    match variant {
+        RustVariant::Searched => "rust",
+        RustVariant::RawSkip => "rust_raw_skip",
     }
 }
 
@@ -782,22 +964,28 @@ fn measure_pair(mut run: impl FnMut(Arm, usize)) -> Option<PairedMeasurement> {
 /// Emit one paired comparison in the shape the benchmark parser reads. A cell
 /// too slow to be measured this way emits nothing, and the parser falls back
 /// to the criterion arms for it.
+///
+/// `rust_variant` is the configuration of ours the Rust side ran: a
+/// [`RustVariant::label`], or [`ANY_VARIANT`] where no configuration of the
+/// encoder reaches the measured work.
 fn emit_pair_report(
     stage: &str,
     scenario: &Scenario,
     level_name: &str,
     source: &str,
+    rust_variant: &str,
     paired: Option<PairedMeasurement>,
 ) {
     let Some(paired) = paired else {
         eprintln!(
-            "BENCH_WARN no paired measurement for {stage}/{level_name}/{}/{source}: one visit does not fit its time cap",
+            "BENCH_WARN no paired measurement for {stage}/{level_name}/{}/{source}/{rust_variant}: one visit does not fit its time cap",
             scenario.id
         );
         return;
     };
     println!(
         "REPORT_PAIR stage={stage} scenario={} level={level_name} source={source} \
+         rust_variant={rust_variant} \
          speedup_median={:.6} speedup_min={:.6} speedup_max={:.6} \
          rust_min_ns={:.3} ffi_min_ns={:.3} samples={} rust_iters={} ffi_iters={}",
         scenario.id,
@@ -1016,10 +1204,15 @@ fn bench_decompress_source(
     c: &mut Criterion,
     scenario: &Scenario,
     level: LevelConfig,
-    source: &'static str,
+    source: DecodeSource,
     expected_len: usize,
     emit_reports: bool,
 ) {
+    let DecodeSource {
+        name: source,
+        rust_variant,
+        frames: supply,
+    } = source;
     let benchmark_name = format!(
         "decompress/{}/{}/{}/matrix",
         level.name, scenario.id, source
@@ -1034,24 +1227,30 @@ fn bench_decompress_source(
     // — without this, `cargo bench -- --profile-time` with a tight filter
     // still paid the cost of compressing every (scenario, level, source)
     // combo upfront, swamping samply profiles with encode CPU samples and
-    // hiding the decode hot path we actually wanted to inspect.
+    // hiding the decode hot path we actually wanted to inspect. Frames the
+    // caller already encoded go in as they are.
     // One compressed frame per scenario frame, decoded in turn by both arms.
     let compressed = std::cell::OnceCell::<Vec<Vec<u8>>>::new();
+    let lazy_encoder = match supply {
+        FrameSupply::Ready(frames) => {
+            compressed
+                .set(frames)
+                .expect("a fresh cell takes the ready frames");
+            None
+        }
+        FrameSupply::Lazy(encoder) => Some(encoder),
+    };
     let materialize = || -> &[Vec<u8>] {
         compressed
             .get_or_init(|| {
-                (0..scenario.frame_count())
-                    .map(|index| {
-                        let original = scenario.frame(index);
-                        let bytes = match source {
-                            "rust_stream" => rust_encode_to_vec(original, &level),
-                            "c_stream" => ffi_encode_to_vec(original, level.ffi_level, level.ldm),
-                            other => panic!("bench_decompress_source: unknown source {other}"),
-                        };
-                        assert_decompress_matches_reference(original, &bytes, expected_len);
-                        bytes
-                    })
-                    .collect()
+                match lazy_encoder.expect("ready frames fill the cell before any arm runs") {
+                    FrameEncoder::Rust(variant) => {
+                        encode_frames(scenario, |frame| rust_encode_to_vec(frame, &level, variant))
+                    }
+                    FrameEncoder::C => encode_frames(scenario, |frame| {
+                        ffi_encode_to_vec(frame, level.ffi_level, level.ldm)
+                    }),
+                }
             })
             .as_slice()
     };
@@ -1091,52 +1290,61 @@ fn bench_decompress_source(
                 })
             })
         });
-        emit_pair_report("decompress", scenario, level.name, source, paired);
+        emit_pair_report(
+            "decompress",
+            scenario,
+            level.name,
+            source,
+            rust_variant,
+            paired,
+        );
     }
 
-    bench_arm_pair(
+    let rust_arm = |b: &mut criterion::Bencher<'_, _>| {
+        let frames = materialize();
+        DECODERS.with_borrow_mut(|decoders| {
+            ARENA.with_borrow_mut(|arena| {
+                let target = arena.written(Arm::Rust, destination_len);
+                let mut call = 0usize;
+                b.iter(|| {
+                    let compressed = &frames[call % frames.len()][..];
+                    call += 1;
+                    let written = decoders
+                        .rust
+                        .decode_all(black_box(compressed), target)
+                        .unwrap();
+                    black_box(&target[..written]);
+                    assert_eq!(written, expected_len);
+                })
+            })
+        })
+    };
+    // The DCtx is reused across iterations, as the other arm reuses its
+    // decoder: a fresh one per iteration would dominate sub-millisecond
+    // samples. Both are held for the process, so neither arm's working memory
+    // is placed by what the matrix did before this cell.
+    let ffi_arm = |b: &mut criterion::Bencher<'_, _>| {
+        let frames = materialize();
+        DECODERS.with_borrow_mut(|decoders| {
+            ARENA.with_borrow_mut(|arena| {
+                let target = arena.written(Arm::Ffi, destination_len);
+                let mut call = 0usize;
+                b.iter(|| {
+                    let compressed = &frames[call % frames.len()][..];
+                    call += 1;
+                    let written = decoders.ffi.decompress_into(black_box(compressed), target);
+                    assert_eq!(written, expected_len);
+                    black_box(&target[..written]);
+                })
+            })
+        })
+    };
+    bench_arms(
         &mut group,
-        "pure_rust",
-        |b| {
-            let frames = materialize();
-            DECODERS.with_borrow_mut(|decoders| {
-                ARENA.with_borrow_mut(|arena| {
-                    let target = arena.written(Arm::Rust, destination_len);
-                    let mut call = 0usize;
-                    b.iter(|| {
-                        let compressed = &frames[call % frames.len()][..];
-                        call += 1;
-                        let written = decoders
-                            .rust
-                            .decode_all(black_box(compressed), target)
-                            .unwrap();
-                        black_box(&target[..written]);
-                        assert_eq!(written, expected_len);
-                    })
-                })
-            })
-        },
-        "c_ffi",
-        |b| {
-            let frames = materialize();
-            // The DCtx is reused across iterations, as the other arm reuses its
-            // decoder: a fresh one per iteration would dominate sub-millisecond
-            // samples. Both are held for the process, so neither arm's working
-            // memory is placed by what the matrix did before this cell.
-            DECODERS.with_borrow_mut(|decoders| {
-                ARENA.with_borrow_mut(|arena| {
-                    let target = arena.written(Arm::Ffi, destination_len);
-                    let mut call = 0usize;
-                    b.iter(|| {
-                        let compressed = &frames[call % frames.len()][..];
-                        call += 1;
-                        let written = decoders.ffi.decompress_into(black_box(compressed), target);
-                        assert_eq!(written, expected_len);
-                        black_box(&target[..written]);
-                    })
-                })
-            })
-        },
+        vec![
+            ("pure_rust".to_owned(), Box::new(rust_arm)),
+            ("c_ffi".to_owned(), Box::new(ffi_arm)),
+        ],
     );
 
     group.finish();
@@ -1307,30 +1515,32 @@ fn bench_dictionary(c: &mut Criterion) {
                     );
                 }
             });
-            emit_pair_report("dict-train", scenario, "na", "na", paired);
+            emit_pair_report("dict-train", scenario, "na", "na", ANY_VARIANT, paired);
         }
 
-        bench_arm_pair(
+        let rust_train_arm = |b: &mut criterion::Bencher<'_, _>| {
+            release_freed_memory();
+            b.iter(|| {
+                let (dict, chosen) = train_rust().expect("fastcover training should succeed");
+                black_box((dict.len(), chosen.cover.k));
+            })
+        };
+        let ffi_train_arm = |b: &mut criterion::Bencher<'_, _>| {
+            release_freed_memory();
+            b.iter(|| {
+                black_box(
+                    zstd::dict::from_samples(&ffi_samples, dict_size)
+                        .expect("ffi dictionary training should succeed")
+                        .len(),
+                )
+            })
+        };
+        bench_arms(
             &mut group,
-            "pure_rust",
-            |b| {
-                release_freed_memory();
-                b.iter(|| {
-                    let (dict, chosen) = train_rust().expect("fastcover training should succeed");
-                    black_box((dict.len(), chosen.cover.k));
-                })
-            },
-            "c_ffi",
-            |b| {
-                release_freed_memory();
-                b.iter(|| {
-                    black_box(
-                        zstd::dict::from_samples(&ffi_samples, dict_size)
-                            .expect("ffi dictionary training should succeed")
-                            .len(),
-                    )
-                })
-            },
+            vec![
+                ("pure_rust".to_owned(), Box::new(rust_train_arm)),
+                ("c_ffi".to_owned(), Box::new(ffi_train_arm)),
+            ],
         );
 
         group.finish();
@@ -1392,46 +1602,64 @@ fn bench_dictionary(c: &mut Criterion) {
                 }
             }
 
-            // Rust dict-compressed output size, for the compress-dict
-            // compression-ratio report (rust vs FFI). Only computable when the
-            // dictionary parsed into a Rust handle; mirrors the gate the
-            // `pure_rust_with_dict` timing arm uses below. Reused as the
-            // timing-loop preallocation hint so we compress once, not twice.
-            let rust_with_dict_len: Option<usize> = if rust_dict_handle.is_some() {
-                let mut warmup_compressor = FrameCompressor::new(level.rust_level);
-                // Enable LDM before attaching the dictionary — `set_parameters`
-                // resets the base level + installs the LDM override; the dict
-                // attach below is independent and survives it.
-                if let Some(params) = ldm_parameters(&level) {
-                    warmup_compressor.set_parameters(&params);
-                }
-                // Full feature gate: checksum on, matching the FFI arms.
-                warmup_compressor.set_content_checksum(cfg!(feature = "hash"));
-                warmup_compressor
-                    .set_dictionary_from_bytes(&ffi_dictionary)
-                    .expect("dictionary should attach");
-                warmup_compressor.set_source_size_hint(scenario.bytes.len() as u64);
-                warmup_compressor.set_source(scenario.bytes.as_slice());
-                let mut warmup_output = Vec::new();
-                warmup_compressor.set_drain(&mut warmup_output);
-                warmup_compressor.compress();
-                Some(warmup_output.len())
-            } else {
-                None
-            };
+            // Rust dict-compressed output, per configuration of ours, for the
+            // compress-dict compression-ratio report (rust vs FFI). Only
+            // computable when the dictionary parsed into a Rust handle; mirrors
+            // the gate the `pure_rust*_with_dict` timing arms use below.
+            let rust_with_dict_outputs: Option<Vec<(RustVariant, Vec<u8>)>> =
+                rust_dict_handle.is_some().then(|| {
+                    rust_variants()
+                        .iter()
+                        .map(|&variant| {
+                            let mut warmup_compressor = FrameCompressor::new(level.rust_level);
+                            // Parameters before attaching the dictionary —
+                            // `set_parameters` resets the base level and installs
+                            // the LDM / raw-skip overrides; the dict attach below
+                            // is independent and survives it.
+                            if let Some(params) = encoder_parameters(&level, variant) {
+                                warmup_compressor.set_parameters(&params);
+                            }
+                            // Full feature gate: checksum on, matching the FFI arms.
+                            warmup_compressor.set_content_checksum(cfg!(feature = "hash"));
+                            warmup_compressor
+                                .set_dictionary_from_bytes(&ffi_dictionary)
+                                .expect("dictionary should attach");
+                            warmup_compressor.set_source_size_hint(scenario.bytes.len() as u64);
+                            warmup_compressor.set_source(scenario.bytes.as_slice());
+                            let mut warmup_output = Vec::new();
+                            warmup_compressor.set_drain(&mut warmup_output);
+                            warmup_compressor.compress();
+                            (variant, warmup_output)
+                        })
+                        .collect()
+                });
 
+            let rust_dict_encoded = rust_with_dict_outputs.is_some();
             if emit_reports {
-                emit_dictionary_report(
-                    scenario,
-                    level,
-                    ffi_dictionary.len(),
-                    ffi_train_ms,
-                    &no_dict_bytes,
-                    with_dict_bytes,
+                let rust_sizes = match rust_with_dict_outputs {
+                    Some(outputs) => label_variants(outputs)
+                        .into_iter()
+                        .map(|(_, rust_variant, output)| (rust_variant, output.len()))
+                        .collect(),
                     // When the Rust dict path is unavailable, report 0 (the
                     // CI parser treats a 0 rust size as "no rust dict ratio").
-                    rust_with_dict_len.unwrap_or(0),
-                );
+                    None => vec![(ANY_VARIANT, 0)],
+                };
+                let ffi_sizes = FfiDictSizes {
+                    dict_bytes: ffi_dictionary.len(),
+                    train_ms: ffi_train_ms,
+                    no_dict: &no_dict_bytes,
+                    with_dict: with_dict_bytes,
+                };
+                for (rust_variant, rust_with_dict_len) in rust_sizes {
+                    emit_dictionary_report(
+                        scenario,
+                        level,
+                        &ffi_sizes,
+                        rust_variant,
+                        rust_with_dict_len,
+                    );
+                }
             }
 
             let benchmark_name =
@@ -1495,31 +1723,15 @@ fn bench_dictionary(c: &mut Criterion) {
                         })
                     })
                 };
-            let rust_dict_arm =
-                |b: &mut criterion::Bencher<'_, criterion::measurement::WallTime>| {
-                    // `compress_independent_frame_into` reads input in place +
-                    // takes the output buffer per call, so neither the source `R`
-                    // nor drain `W` generic is ever bound by a
-                    // `set_source`/`set_drain` call — pin them to the defaults so
-                    // inference has a concrete type.
-                    let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
-                    // Enable LDM before attaching the dictionary (see the warmup
-                    // compressor above for why the order is safe).
-                    if let Some(params) = ldm_parameters(&level) {
-                        compressor.set_parameters(&params);
-                    }
-                    // Full feature gate: checksum on, matching the FFI arms.
-                    compressor.set_content_checksum(cfg!(feature = "hash"));
-                    compressor
-                        .set_encoder_dictionary(
-                            EncoderDictionary::from_bytes(&ffi_dictionary)
-                                .expect("dictionary parse checked before registration"),
-                        )
-                        .expect("prepared dictionary should attach");
+            let dictionary = ffi_dictionary.as_slice();
+            let rust_dict_arm = |variant: RustVariant| {
+                move |b: &mut criterion::Bencher<'_, criterion::measurement::WallTime>| {
+                    let mut compressor = rust_dict_compressor(&level, variant, dictionary);
                     // Reuse one output buffer across iterations (the
                     // CCtx-equivalent caller-owned `dst`), from the same arena the
                     // C arm draws from, so neither reallocates and neither depends
-                    // on what ran before it.
+                    // on what ran before it. Our variants run one after the
+                    // other, so they share our slot.
                     ARENA.with_borrow_mut(|arena| {
                         let compressed = arena.appended(Arm::Rust);
                         let mut call = 0usize;
@@ -1530,64 +1742,67 @@ fn bench_dictionary(c: &mut Criterion) {
                             black_box(&compressed);
                         })
                     })
-                };
+                }
+            };
 
-            let rust_dict_available = rust_with_dict_len.is_some()
-                && EncoderDictionary::from_bytes(&ffi_dictionary).is_ok();
+            let rust_dict_available =
+                rust_dict_encoded && EncoderDictionary::from_bytes(&ffi_dictionary).is_ok();
 
-            // The paired comparison, which is what the dashboard reports. Only
-            // possible when both sides have a dictionary to compress with.
+            // The paired comparisons, which are what the dashboard reports: one
+            // per configuration of ours, each against libzstd in its own
+            // window. Only possible when both sides have a dictionary to
+            // compress with.
             if emit_reports && rust_dict_available {
                 let mut ffi_compressor =
                     zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
                         .unwrap();
                 configure_ffi_bulk_compressor(&mut ffi_compressor, &level);
-                let mut rust_compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
-                if let Some(params) = ldm_parameters(&level) {
-                    rust_compressor.set_parameters(&params);
+                for &variant in rust_variants() {
+                    let mut rust_compressor =
+                        rust_dict_compressor(&level, variant, &ffi_dictionary);
+                    let paired = ARENA.with_borrow_mut(|arena| {
+                        let mut outputs = arena.appended_slots();
+                        let mut calls = [0usize; 2];
+                        measure_pair(|arm, slot| {
+                            let output = &mut *outputs[slot];
+                            let input = scenario.frame(calls[arm.side()]);
+                            calls[arm.side()] += 1;
+                            match arm {
+                                Arm::Rust => {
+                                    rust_compressor.compress_independent_frame_into(input, output)
+                                }
+                                Arm::Ffi => {
+                                    output.clear();
+                                    ffi_compressor
+                                        .compress_to_buffer(input, output)
+                                        .expect("dictionary compression should succeed");
+                                }
+                            }
+                            black_box(&output);
+                        })
+                    });
+                    emit_pair_report(
+                        "compress-dict",
+                        scenario,
+                        level.name,
+                        "na",
+                        variant.label(),
+                        paired,
+                    );
                 }
-                rust_compressor.set_content_checksum(cfg!(feature = "hash"));
-                rust_compressor
-                    .set_encoder_dictionary(
-                        EncoderDictionary::from_bytes(&ffi_dictionary)
-                            .expect("dictionary parse checked above"),
-                    )
-                    .expect("prepared dictionary should attach");
-                let paired = ARENA.with_borrow_mut(|arena| {
-                    let mut outputs = arena.appended_slots();
-                    let mut calls = [0usize; 2];
-                    measure_pair(|arm, slot| {
-                        let output = &mut *outputs[slot];
-                        let input = scenario.frame(calls[arm.side()]);
-                        calls[arm.side()] += 1;
-                        match arm {
-                            Arm::Rust => {
-                                rust_compressor.compress_independent_frame_into(input, output)
-                            }
-                            Arm::Ffi => {
-                                output.clear();
-                                ffi_compressor
-                                    .compress_to_buffer(input, output)
-                                    .expect("dictionary compression should succeed");
-                            }
-                        }
-                        black_box(&output);
-                    })
-                });
-                emit_pair_report("compress-dict", scenario, level.name, "na", paired);
             }
 
+            let mut arms: Vec<BenchArm<'_, _>> = Vec::new();
             if rust_dict_available {
-                bench_arm_pair(
-                    &mut group,
-                    "pure_rust_with_dict",
-                    rust_dict_arm,
-                    "c_ffi_with_dict",
-                    ffi_dict_arm,
-                );
-            } else {
-                group.bench_function("c_ffi_with_dict", ffi_dict_arm);
+                for &variant in rust_variants() {
+                    arms.push((
+                        rust_arm_name(variant, "_with_dict"),
+                        Box::new(rust_dict_arm(variant)),
+                    ));
+                }
             }
+            arms.push(("c_ffi_with_dict".to_owned(), Box::new(ffi_dict_arm)));
+            bench_arms(&mut group, arms);
 
             group.finish();
 
@@ -1704,52 +1919,63 @@ fn bench_dictionary(c: &mut Criterion) {
                         black_box(&output[..n]);
                     })
                 });
-                emit_pair_report("decompress-dict", scenario, level.name, "na", paired);
+                // libzstd wrote these frames, so no configuration of ours
+                // reaches the work.
+                emit_pair_report(
+                    "decompress-dict",
+                    scenario,
+                    level.name,
+                    "na",
+                    ANY_VARIANT,
+                    paired,
+                );
             }
 
             // Outputs from the arena, like every other group: an arm that takes
             // its own gets pages from a heap the other arm never saw.
-            bench_arm_pair(
+            let rust_decode_arm = |b: &mut criterion::Bencher<'_, _>| {
+                let mut decoder = FrameDecoder::new();
+                ARENA.with_borrow_mut(|arena| {
+                    let output = arena.written(Arm::Rust, expected_len);
+                    let mut call = 0usize;
+                    b.iter(|| {
+                        let payload = &with_dict_frames[call % with_dict_frames.len()][..];
+                        call += 1;
+                        let n = decoder
+                            .decode_all_with_dict_handle(
+                                black_box(payload),
+                                output,
+                                rust_dict_handle,
+                            )
+                            .expect("rust decode-with-dict must succeed");
+                        assert_eq!(n, expected_len, "rust decode wrote a partial output");
+                        black_box(&output[..n]);
+                    })
+                })
+            };
+            let ffi_decode_arm = |b: &mut criterion::Bencher<'_, _>| {
+                let mut decompressor =
+                    zstd::bulk::Decompressor::with_dictionary(&ffi_dictionary).unwrap();
+                ARENA.with_borrow_mut(|arena| {
+                    let output = arena.written(Arm::Ffi, expected_len);
+                    let mut call = 0usize;
+                    b.iter(|| {
+                        let payload = &with_dict_frames[call % with_dict_frames.len()][..];
+                        call += 1;
+                        let n = decompressor
+                            .decompress_to_buffer(black_box(payload), output)
+                            .expect("ffi decode-with-dict must succeed");
+                        assert_eq!(n, expected_len, "ffi decode wrote a partial output");
+                        black_box(&output[..n]);
+                    })
+                })
+            };
+            bench_arms(
                 &mut group,
-                "pure_rust_with_dict",
-                |b| {
-                    let mut decoder = FrameDecoder::new();
-                    ARENA.with_borrow_mut(|arena| {
-                        let output = arena.written(Arm::Rust, expected_len);
-                        let mut call = 0usize;
-                        b.iter(|| {
-                            let payload = &with_dict_frames[call % with_dict_frames.len()][..];
-                            call += 1;
-                            let n = decoder
-                                .decode_all_with_dict_handle(
-                                    black_box(payload),
-                                    output,
-                                    rust_dict_handle,
-                                )
-                                .expect("rust decode-with-dict must succeed");
-                            assert_eq!(n, expected_len, "rust decode wrote a partial output");
-                            black_box(&output[..n]);
-                        })
-                    })
-                },
-                "c_ffi_with_dict",
-                |b| {
-                    let mut decompressor =
-                        zstd::bulk::Decompressor::with_dictionary(&ffi_dictionary).unwrap();
-                    ARENA.with_borrow_mut(|arena| {
-                        let output = arena.written(Arm::Ffi, expected_len);
-                        let mut call = 0usize;
-                        b.iter(|| {
-                            let payload = &with_dict_frames[call % with_dict_frames.len()][..];
-                            call += 1;
-                            let n = decompressor
-                                .decompress_to_buffer(black_box(payload), output)
-                                .expect("ffi decode-with-dict must succeed");
-                            assert_eq!(n, expected_len, "ffi decode wrote a partial output");
-                            black_box(&output[..n]);
-                        })
-                    })
-                },
+                vec![
+                    ("pure_rust_with_dict".to_owned(), Box::new(rust_decode_arm)),
+                    ("c_ffi_with_dict".to_owned(), Box::new(ffi_decode_arm)),
+                ],
             );
 
             group.finish();
@@ -2086,9 +2312,13 @@ fn emit_block_structure_report(
     );
 }
 
+/// The compressed sizes of one cell, ours under `rust_variant` (a
+/// [`RustVariant::label`], or [`ANY_VARIANT`] when every variant wrote the
+/// same frame) beside libzstd's.
 fn emit_report_line(
     scenario: &Scenario,
     level: LevelConfig,
+    rust_variant: &str,
     rust_compressed: &[u8],
     ffi_compressed: &[u8],
 ) {
@@ -2103,10 +2333,11 @@ fn emit_report_line(
         (0.0, 0.0)
     };
     println!(
-        "REPORT scenario={} label=\"{}\" level={} input_bytes={} rust_bytes={} ffi_bytes={} rust_ratio={:.6} ffi_ratio={:.6}",
+        "REPORT scenario={} label=\"{}\" level={} rust_variant={} input_bytes={} rust_bytes={} ffi_bytes={} rust_ratio={:.6} ffi_ratio={:.6}",
         scenario.id,
         escaped_label,
         level.name,
+        rust_variant,
         scenario.len(),
         rust_compressed.len(),
         ffi_compressed.len(),
@@ -2115,41 +2346,48 @@ fn emit_report_line(
     );
 }
 
+/// libzstd's side of a compress-dict size report, shared by every
+/// configuration of ours reported against it.
+struct FfiDictSizes<'a> {
+    dict_bytes: usize,
+    train_ms: f64,
+    no_dict: &'a [u8],
+    with_dict: &'a [u8],
+}
+
 fn emit_dictionary_report(
     scenario: &Scenario,
     level: LevelConfig,
-    dict_bytes: usize,
-    train_ms: f64,
-    no_dict_bytes: &[u8],
-    with_dict_bytes: &[u8],
+    ffi: &FfiDictSizes<'_>,
+    rust_variant: &str,
     rust_with_dict_len: usize,
 ) {
     let input_len = scenario.len() as f64;
     let escaped_label = escape_report_label(&scenario.label);
     let (no_dict_ratio, with_dict_ratio, rust_with_dict_ratio) = if input_len > 0.0 {
         (
-            no_dict_bytes.len() as f64 / input_len,
-            with_dict_bytes.len() as f64 / input_len,
+            ffi.no_dict.len() as f64 / input_len,
+            ffi.with_dict.len() as f64 / input_len,
             rust_with_dict_len as f64 / input_len,
         )
     } else {
         (0.0, 0.0, 0.0)
     };
-    // `rust_with_dict_bytes` / `rust_with_dict_ratio` are appended after the
-    // FFI fields so existing parsers that only read the leading columns keep
-    // working; the CI report parser's REPORT_DICT regex captures the two new
-    // trailing fields to emit a compress-dict compression-ratio series.
+    // Ours trails the FFI fields; the CI report parser's REPORT_DICT regex
+    // captures it to emit a compress-dict compression-ratio series per
+    // configuration of ours.
     println!(
-        "REPORT_DICT scenario={} label=\"{}\" level={} dict_bytes={} train_ms={:.3} ffi_no_dict_bytes={} ffi_with_dict_bytes={} ffi_no_dict_ratio={:.6} ffi_with_dict_ratio={:.6} rust_with_dict_bytes={} rust_with_dict_ratio={:.6}",
+        "REPORT_DICT scenario={} label=\"{}\" level={} dict_bytes={} train_ms={:.3} ffi_no_dict_bytes={} ffi_with_dict_bytes={} ffi_no_dict_ratio={:.6} ffi_with_dict_ratio={:.6} rust_variant={} rust_with_dict_bytes={} rust_with_dict_ratio={:.6}",
         scenario.id,
         escaped_label,
         level.name,
-        dict_bytes,
-        train_ms,
-        no_dict_bytes.len(),
-        with_dict_bytes.len(),
+        ffi.dict_bytes,
+        ffi.train_ms,
+        ffi.no_dict.len(),
+        ffi.with_dict.len(),
         no_dict_ratio,
         with_dict_ratio,
+        rust_variant,
         rust_with_dict_len,
         rust_with_dict_ratio
     );
