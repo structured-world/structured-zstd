@@ -374,11 +374,13 @@ fn estimate_dstream_size_from_frame_header() {
     }
 }
 
-/// A dictionary a context keeps for itself is part of its size, however it
-/// came to keep it: a buffer-less begin holds one beside the frame it opened,
-/// and a decoder keeps the dictionary of the last frame it decoded.
+/// A dictionary a context keeps for itself is part of its size: a buffer-less
+/// begin holds one beside the frame it opened. On the decode side it refers to
+/// the caller's content, as upstream's `ZSTD_refDictContent` does, so only its
+/// tables are the context's; a one-shot's dictionary is not kept at all.
 #[test]
 fn context_sizes_count_the_dictionaries_they_keep() {
+    let tables = core::mem::size_of::<codec::decoding::Dictionary>();
     use crate::bufferless::{
         ZSTD_compressBegin, ZSTD_compressBegin_usingDict, ZSTD_decompressBegin,
         ZSTD_decompressBegin_usingDict,
@@ -406,11 +408,14 @@ fn context_sizes_count_the_dictionaries_they_keep() {
             0
         );
         let kept = ZSTD_sizeof_DCtx(primed) - ZSTD_sizeof_DCtx(plain);
-        assert!(kept >= dict.len(), "a begun dictionary adds {kept} bytes");
+        assert!(
+            kept >= tables && kept < dict.len(),
+            "a begun dictionary adds {kept} bytes"
+        );
         ZSTD_freeDCtx(plain);
         ZSTD_freeDCtx(primed);
 
-        // A one-shot leaves its dictionary with the decoder.
+        // A one-shot's dictionary is the caller's for the call only.
         let input = b"decoded once with a dictionary ".repeat(20);
         let cctx = ZSTD_createCCtx();
         let mut frame = vec![0u8; ZSTD_compressBound(input.len())];
@@ -427,7 +432,6 @@ fn context_sizes_count_the_dictionaries_they_keep() {
         assert_eq!(ZSTD_isError(n), 0);
         ZSTD_freeCCtx(cctx);
         let dctx = ZSTD_createDCtx();
-        let before = ZSTD_sizeof_DCtx(dctx);
         let mut out = vec![0u8; input.len()];
         let m = crate::attach::ZSTD_decompress_usingDict(
             dctx,
@@ -439,10 +443,12 @@ fn context_sizes_count_the_dictionaries_they_keep() {
             dict.len(),
         );
         assert_eq!(m, input.len());
-        let kept = ZSTD_sizeof_DCtx(dctx) - before;
-        assert!(
-            kept >= dict.len(),
-            "a one-shot's dictionary adds {kept} bytes"
+        // `as_ref` refuses a NULL context before anything is read.
+        let decoder = &dctx.as_ref().expect("the DCtx was created").decoder;
+        assert_eq!(
+            decoder.dictionaries().count(),
+            0,
+            "a one-shot keeps a reference to the caller's dictionary"
         );
         ZSTD_freeDCtx(dctx);
     }

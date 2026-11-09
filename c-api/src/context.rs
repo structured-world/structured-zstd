@@ -608,6 +608,8 @@ impl ZSTD_DCtx {
         self.stream_frame_done = true;
         self.stream_no_progress = 0;
         self.stream_hostage = false;
+        // An abandoned frame may have taken a prefix; it is not kept.
+        self.frame_ended();
     }
 
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
@@ -625,7 +627,7 @@ impl ZSTD_DCtx {
         self.apply_max_block_size();
         self.stable_out_buffer = false;
         self.disable_huffman_assembly = false;
-        self.attached_ddict = crate::attach::DCtxDictAttach::None;
+        self.set_attached_ddict(crate::attach::DCtxDictAttach::None);
     }
 
     /// Hand `ZSTD_d_maxBlockSize` to the decoder, which holds every frame it
@@ -748,19 +750,21 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     // buffer, so there is no allocation for the parameter to limit.
     dctx.decoder.set_content_checksum(dctx.content_checksum);
     // Context-attached dictionary (`ZSTD_DCtx_loadDictionary` / `refDDict` /
-    // `refPrefix`) applies to the frames of this one-shot. A prefix is
-    // single-use, but "use" means a frame actually started with it — the
-    // streaming path consumes it only after a successful reset, so the
-    // one-shot consumes it only on success (a garbage input must not eat
-    // the prefix out from under the retry).
+    // `refPrefix`) applies to the frames of this one-shot. A prefix is spent
+    // by the call whatever its outcome, as upstream's `ZSTD_getDDict` takes a
+    // single-use prefix before decoding (zstd_decompress.c:1191): the caller
+    // may release it once the call returns, and a failed call cannot tell
+    // whether a frame had read it (a v0.5-v0.7 frame holds no handle until
+    // it ends).
     let decoder = &mut dctx.decoder;
     let attached = dctx.attached_ddict.handles();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         decoder.decode_all_with_dict_handles(src, dst, attached)
     }));
+    dctx.consume_prefix();
     match outcome {
         Ok(Ok(written)) => {
-            dctx.consume_prefix();
+            dctx.frame_ended();
             // The one-shot consumed whole frames; the context sits at a
             // frame boundary again. Without this, a context abandoned
             // mid-stream earlier would make the next
@@ -780,6 +784,7 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
             // full replacement is reserved for the panic arm where the
             // state may be torn mid-unwind.
             dctx.stream_frame_done = true;
+            dctx.frame_ended();
             encode(code_for_decoder_error(&err))
         }
         Err(_) => {

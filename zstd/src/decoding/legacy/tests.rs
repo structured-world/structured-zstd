@@ -2457,6 +2457,29 @@ fn a_dictionary_table_past_its_format_is_refused() {
     }
 }
 
+/// Letting go of the decoder's dictionaries leaves a v0.5-v0.7 frame begun
+/// without one decoding, as an RFC 8878 frame begun without one goes on.
+#[cfg(feature = "std")]
+#[test]
+fn a_frame_without_a_dictionary_survives_letting_go_of_dictionaries() {
+    use crate::decoding::{BlockDecodingStrategy, FrameDecoder};
+    let frame = one_block_frame(LegacyVersion::V07, &[0x83, b'a', b'b', b'c', 0x00]);
+    let decode = |release: bool| {
+        let mut decoder = FrameDecoder::new();
+        let mut source = &frame[..];
+        decoder.reset(&mut source).unwrap();
+        if release {
+            decoder.release_dictionaries();
+        }
+        decoder
+            .decode_blocks(&mut source, BlockDecodingStrategy::All)
+            .unwrap();
+        decoder.collect()
+    };
+    assert_eq!(decode(true), decode(false));
+    assert!(decode(true).is_some_and(|out| !out.is_empty()));
+}
+
 /// A parsed dictionary a v0.7 frame cannot use, its offset table larger
 /// than the format's or a repeat offset of 0, is refused when the frame
 /// starts, on the whole-buffer path and the stream alike.
