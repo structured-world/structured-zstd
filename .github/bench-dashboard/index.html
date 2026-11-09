@@ -2243,6 +2243,12 @@
 
         state.allRecords = payload.records || [];
         if (!state.allRecords.length) throw new Error("benchmark-relative.json has no records");
+        // A payload measured with the raw skip only (a `RAW_SKIP=1` run) holds
+        // no searched figures, so it opens on the configuration it does hold.
+        const holds = (variant) => state.allRecords.some((record) => record.rust_variant === variant);
+        if (!holds("searched") && holds("raw_skip")) {
+          el("f-raw-skip").checked = true;
+        }
         applyRustVariant();
 
         // Map each snapshot (its `generated_at` key) to the commit subject,

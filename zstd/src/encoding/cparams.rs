@@ -394,10 +394,11 @@ pub(crate) fn uses_row_match_finder(
 ///
 /// The cutoffs are upstream's `attachDictSizeCutoffs`: fast 8 KiB, dfast
 /// 16 KiB, greedy through btopt 32 KiB, btultra and btultra2 8 KiB. The fast
-/// one was once raised to attach every source, on speed alone, and the bytes
-/// showed why upstream copies above it: a copied dictionary sits in the table
-/// the scan runs over, so ordinary near matches improve everywhere, while an
-/// attached one is reached only through its own exact table. `z000033`
+/// one was once raised to attach every source, on speed alone; measured, copy
+/// above the cutoff is the better trade at both ends of the band. A copied
+/// dictionary sits in the table the scan runs over, so ordinary near matches
+/// reach it, while an attached one is reached only through its own exact
+/// table. `z000033`
 /// (1,022,035 B) and its leading 10 KiB, a 16 KiB dictionary trained over its
 /// 10 KiB chunks, on the i9 (prebuilt binaries and libzstd interleaved,
 /// `perf stat -r 3`, three rounds, ranges disjoint):
@@ -409,9 +410,10 @@ pub(crate) fn uses_row_match_finder(
 /// | 1 MiB, L1 | 550,810 | 551,584 | 570,765 | 19.84M (1.76x) | 16.21M (1.44x) |
 /// | 1 MiB, L-5 | 689,127 | 647,735 | 669,826 | 8.80M (1.46x) | 10.67M (1.77x) |
 ///
-/// At the positive levels copy is better on both axes; at the ultra-fast ones
-/// it buys 5-6% fewer bytes with 9-21% more cycles, which is the trade the
-/// cutoff makes.
+/// At level 1 copy writes 0.1-2.1% more bytes than attach in 18-28% fewer
+/// cycles; at level -5 it writes 5.5-6.0% fewer bytes in 9-21% more cycles.
+/// Either way copy gives up a little on one axis for more on the other, which
+/// is the trade the cutoff makes.
 pub(crate) fn should_attach_dict(
     cdict: &CParams,
     src_size: Option<u64>,
