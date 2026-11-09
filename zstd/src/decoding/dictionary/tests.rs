@@ -281,3 +281,108 @@ fn dictionary_handle_clones_share_inner() {
     assert_eq!(handle.id(), clone.id());
     assert!(SharedDictionary::ptr_eq(&handle.inner, &clone.inner));
 }
+
+/// Frames compressed with the reference dictionary, at a level of each matcher
+/// family, over content the dictionary covers.
+#[cfg(target_has_atomic = "ptr")]
+fn frames_with_the_reference_dictionary(raw: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    let content = Dictionary::decode_dict(raw).unwrap().dict_content;
+    let mut payload = Vec::new();
+    for chunk in content.chunks(700).take(12) {
+        payload.extend_from_slice(chunk);
+        payload.extend_from_slice(b"; a few bytes of the frame's own");
+    }
+    [1, 3, 9, 19]
+        .into_iter()
+        .map(|level| {
+            let mut compressor: FrameCompressor =
+                FrameCompressor::new(CompressionLevel::Level(level));
+            compressor.set_dictionary_from_bytes(raw).unwrap();
+            (
+                compressor.compress_independent_frame(&payload),
+                payload.clone(),
+            )
+        })
+        .collect()
+}
+
+/// A dictionary parsed over a shared or a referenced buffer keeps its content
+/// in that buffer, owns none of it, and decodes every frame as the copying
+/// parse does: this is what `ZSTD_createDDict_byReference` builds upstream.
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn a_dictionary_over_the_callers_buffer_decodes_without_a_copy() {
+    let raw: &[u8] = include_bytes!("../../../dict_tests/dictionary");
+    let shared: Arc<[u8]> = Arc::from(raw);
+    let copied = DictionaryHandle::decode_dict(raw).unwrap();
+    let over_shared =
+        DictionaryHandle::decode_dict_bytes(DictionaryBytes::shared(shared.clone())).unwrap();
+    // SAFETY: `raw` is a static and never changes.
+    let over_reference =
+        DictionaryHandle::decode_dict_bytes(unsafe { DictionaryBytes::referenced(raw) }).unwrap();
+
+    let content_start = raw.len() - copied.as_dict().dict_content.len();
+    assert_eq!(
+        over_shared.as_dict().dict_content.as_ptr(),
+        shared[content_start..].as_ptr()
+    );
+    assert_eq!(
+        over_reference.as_dict().dict_content.as_ptr(),
+        raw[content_start..].as_ptr()
+    );
+    for handle in [&over_shared, &over_reference] {
+        assert_eq!(handle.as_dict().dict_content, copied.as_dict().dict_content);
+        assert_eq!(handle.as_dict().dict_content.heap_bytes(), 0);
+        // The content is the caller's, so the handle reports it out, as
+        // upstream's `ZSTD_sizeof_DDict` leaves a referenced buffer out.
+        assert_eq!(
+            handle.heap_size() + copied.as_dict().dict_content.heap_bytes(),
+            copied.heap_size()
+        );
+    }
+
+    for (frame, payload) in frames_with_the_reference_dictionary(raw) {
+        for handle in [&copied, &over_shared, &over_reference] {
+            let mut decoder = crate::decoding::FrameDecoder::new();
+            let mut out = vec![0u8; payload.len()];
+            let written = decoder
+                .decode_all_with_dict_handle(&frame, &mut out, handle)
+                .unwrap();
+            assert_eq!(&out[..written], payload.as_slice());
+        }
+    }
+}
+
+/// Raw content handed over shared or by reference stays where it is too, and
+/// the empty buffer still loads as no dictionary.
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn raw_content_over_the_callers_buffer_is_not_copied() {
+    let shared: Arc<[u8]> = Arc::from(&b"raw content a frame refers back to"[..]);
+    let handle =
+        DictionaryHandle::from_serialized_or_raw_bytes(DictionaryBytes::shared(shared.clone()))
+            .unwrap();
+    assert_eq!(handle.as_dict().dict_content.as_ptr(), shared.as_ptr());
+    assert_eq!(handle.id(), 0);
+
+    let empty = Dictionary::from_serialized_or_raw_bytes(DictionaryBytes::default()).unwrap();
+    assert!(empty.dict_content.is_empty());
+    assert!(Dictionary::from_raw_content(1, DictionaryBytes::shared(Arc::from(&[][..]))).is_err());
+}
+
+/// A clone of owned bytes narrowed to a tail copies the buffer and keeps the
+/// same range of the copy; a shared clone points at the same bytes.
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn dictionary_bytes_clones_keep_their_range() {
+    let owned = DictionaryBytes::owned(b"header|content".to_vec()).tail(7);
+    let clone = owned.clone();
+    assert_eq!(&*clone, b"content");
+    assert_ne!(clone.as_ptr(), owned.as_ptr());
+
+    let shared = DictionaryBytes::shared(Arc::from(&b"header|content"[..])).tail(7);
+    let clone = shared.clone();
+    assert_eq!(&*clone, b"content");
+    assert_eq!(clone.as_ptr(), shared.as_ptr());
+}

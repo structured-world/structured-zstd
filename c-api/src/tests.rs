@@ -2953,6 +2953,109 @@ fn dict_compressor_cache_drops_stale_target_block_size() {
     unsafe { ZSTD_freeCCtx(cctx) };
 }
 
+/// A by-reference DDict or CDict keeps its content in the caller's buffer:
+/// `ZSTD_sizeof_DDict` leaves the content out, as upstream's does, and every
+/// frame compresses and decodes exactly as with the copying constructors. The
+/// load method of the `_advanced` constructors selects the same.
+#[test]
+fn by_reference_dictionaries_keep_the_callers_buffer() {
+    use crate::cdict::{
+        ZSTD_compress_usingCDict, ZSTD_createCDict, ZSTD_createCDict_byReference, ZSTD_createDDict,
+        ZSTD_createDDict_byReference, ZSTD_decompress_usingDDict, ZSTD_freeCDict, ZSTD_freeDDict,
+        ZSTD_sizeof_DDict,
+    };
+    let default_mem = ZSTD_customMem {
+        customAlloc: core::ptr::null(),
+        customFree: core::ptr::null(),
+        opaque: core::ptr::null(),
+    };
+    let dict = trained_dictionary();
+    let payload = dict_payload();
+    let content_len = codec::decoding::Dictionary::decode_dict(&dict)
+        .unwrap()
+        .dict_content
+        .len();
+    let ddict_copy = unsafe { ZSTD_createDDict(dict.as_ptr(), dict.len()) };
+    let ddict_ref = unsafe { ZSTD_createDDict_byReference(dict.as_ptr(), dict.len()) };
+    let ddict_adv =
+        unsafe { ZSTD_createDDict_advanced(dict.as_ptr(), dict.len(), 1, 0, default_mem) };
+    let cdict_copy = unsafe { ZSTD_createCDict(dict.as_ptr(), dict.len(), 3) };
+    let cdict_ref = unsafe { ZSTD_createCDict_byReference(dict.as_ptr(), dict.len(), 3) };
+    for ddict in [ddict_ref, ddict_adv] {
+        assert!(!ddict.is_null());
+        assert_eq!(
+            unsafe { ZSTD_sizeof_DDict(ddict) } + content_len,
+            unsafe { ZSTD_sizeof_DDict(ddict_copy) },
+            "a referenced DDict must not count the caller's content"
+        );
+    }
+
+    let cctx = ZSTD_createCCtx();
+    let dctx = ZSTD_createDCtx();
+    let compress = |cdict| {
+        let mut frame = vec![0u8; payload.len() + 512];
+        let written = unsafe {
+            ZSTD_compress_usingCDict(
+                cctx,
+                frame.as_mut_ptr(),
+                frame.len(),
+                payload.as_ptr(),
+                payload.len(),
+                cdict,
+            )
+        };
+        assert_eq!(ZSTD_isError(written), 0);
+        frame.truncate(written);
+        frame
+    };
+    let frame = compress(cdict_ref);
+    assert_eq!(frame, compress(cdict_copy));
+    for ddict in [ddict_copy, ddict_ref, ddict_adv] {
+        let mut out = vec![0u8; payload.len()];
+        let read = unsafe {
+            ZSTD_decompress_usingDDict(
+                dctx,
+                out.as_mut_ptr(),
+                out.len(),
+                frame.as_ptr(),
+                frame.len(),
+                ddict,
+            )
+        };
+        assert_eq!(ZSTD_isError(read), 0);
+        assert_eq!(&out[..read], payload.as_slice());
+    }
+
+    // The contexts' by-reference loads through the load method.
+    assert_eq!(
+        ZSTD_isError(unsafe {
+            ZSTD_DCtx_loadDictionary_advanced(dctx, dict.as_ptr(), dict.len(), 1, 0)
+        }),
+        0
+    );
+    let mut out = vec![0u8; payload.len()];
+    let read = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+        )
+    };
+    assert_eq!(&out[..read], payload.as_slice());
+
+    unsafe {
+        ZSTD_freeDDict(ddict_copy);
+        ZSTD_freeDDict(ddict_ref);
+        ZSTD_freeDDict(ddict_adv);
+        ZSTD_freeCDict(cdict_copy);
+        ZSTD_freeCDict(cdict_ref);
+        ZSTD_freeDCtx(dctx);
+        ZSTD_freeCCtx(cctx);
+    }
+}
+
 #[test]
 fn by_reference_and_advanced_attach_variants_roundtrip() {
     // The byReference / _advanced wrappers share the load body; exercise

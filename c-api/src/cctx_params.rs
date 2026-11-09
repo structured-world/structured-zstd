@@ -727,16 +727,17 @@ pub unsafe extern "C" fn ZSTD_compress_advanced(
 /// ZSTD_dictLoadMethod_e dictLoadMethod, ZSTD_dictContentType_e
 /// dictContentType, const ZSTD_CCtx_params* cctxParams, ZSTD_customMem
 /// customMem)` — a CDict that compresses under the parameters of
-/// `cctxParams`. The bytes are always copied; custom allocators are not
-/// supported (`customMem` must be all-`NULL`).
+/// `cctxParams`; `ZSTD_dlm_byRef` keeps the content in the caller's buffer.
+/// Custom allocators are not supported (`customMem` must be all-`NULL`).
 ///
 /// # Safety
-/// `dict` must be valid for `dict_size` bytes; `cctx_params` live or `NULL`.
+/// `dict` must be valid for `dict_size` bytes, and by reference stay alive and
+/// unchanged for the `CDict`'s lifetime; `cctx_params` live or `NULL`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_createCDict_advanced2(
     dict: *const u8,
     dict_size: usize,
-    _dict_load_method: c_int,
+    dict_load_method: c_int,
     dict_content_type: c_int,
     cctx_params: *const ZSTD_CCtx_params,
     custom_mem: crate::cdict::ZSTD_customMem,
@@ -745,7 +746,16 @@ pub unsafe extern "C" fn ZSTD_createCDict_advanced2(
         return core::ptr::null_mut();
     };
     let dict = unsafe { crate::ffi::in_slice(dict, dict_size) };
-    crate::cdict::create_cdict_with_params(dict, dict_content_type, &source.params, &custom_mem)
+    // SAFETY: the caller's contract, passed on.
+    unsafe {
+        crate::cdict::create_cdict_with_params(
+            dict,
+            crate::attach::DictLoad::from_method(dict_load_method),
+            dict_content_type,
+            &source.params,
+            &custom_mem,
+        )
+    }
 }
 
 /// The workspace `params` asks for, before the context's own struct.
