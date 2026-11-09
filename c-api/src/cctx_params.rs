@@ -5,7 +5,8 @@
 use core::ffi::c_int;
 
 use codec::encoding::{
-    CompressionLevel, CompressionParameters, LiteralCompressionMode, RowMatchFinderMode, Strategy,
+    CompressionLevel, CompressionParameters, DictionaryAttachMode, LiteralCompressionMode,
+    RowMatchFinderMode, Strategy,
 };
 
 use crate::cdict::ZSTD_compressionParameters;
@@ -48,13 +49,12 @@ impl ParamSwitch {
 /// searches, schedules or checks its work, with no counterpart in this
 /// encoder: stored as set so they read back, without effect on the frames.
 /// The sequence-format ones are read by the sequence entry points.
-const ADVISORY: [c_int; 17] = [
+const ADVISORY: [c_int; 16] = [
     ZSTD_C_NB_WORKERS,
     ZSTD_C_JOB_SIZE,
     ZSTD_C_OVERLAP_LOG,
     ZSTD_C_RSYNCABLE,
     ZSTD_C_FORCE_MAX_WINDOW,
-    ZSTD_C_FORCE_ATTACH_DICT,
     ZSTD_C_ENABLE_DEDICATED_DICT_SEARCH,
     ZSTD_C_STABLE_IN_BUFFER,
     ZSTD_C_STABLE_OUT_BUFFER,
@@ -110,6 +110,8 @@ pub(crate) struct CCtxParams {
     pub(crate) row_match_finder: RowMatchFinderMode,
     /// `ZSTD_CCtx_setRawSkip`: only `Disable` turns the codec's raw skip off.
     pub(crate) raw_skip: ParamSwitch,
+    /// `ZSTD_c_forceAttachDict`.
+    pub(crate) dictionary_attach: DictionaryAttachMode,
     /// `ZSTD_c_srcSizeHint`; 0 = none.
     pub(crate) src_size_hint: c_int,
     /// The [`ADVISORY`] parameters, in that order.
@@ -154,6 +156,7 @@ impl CCtxParams {
             literal_compression: LiteralCompressionMode::Auto,
             row_match_finder: RowMatchFinderMode::Auto,
             raw_skip: ParamSwitch::Auto,
+            dictionary_attach: DictionaryAttachMode::Auto,
             src_size_hint: 0,
             advisory: [0; ADVISORY.len()],
             pledged_src_size: CONTENTSIZE_UNKNOWN,
@@ -188,7 +191,8 @@ impl CCtxParams {
         let mut builder = CompressionParameters::builder(CompressionLevel::from_level(self.level))
             .literal_compression(self.literal_compression)
             .row_match_finder(self.row_match_finder)
-            .raw_skip(self.raw_skip != ParamSwitch::Disable);
+            .raw_skip(self.raw_skip != ParamSwitch::Disable)
+            .dictionary_attach(self.dictionary_attach);
         if let Some(v) = self.window_log {
             builder = builder.window_log(v);
         }
@@ -317,6 +321,16 @@ impl CCtxParams {
                     _ => RowMatchFinderMode::Auto,
                 };
             }
+            // `ZSTD_dictAttachPref_e`: default, force attach, force copy,
+            // force load.
+            ZSTD_C_FORCE_ATTACH_DICT => {
+                self.dictionary_attach = match within(value)? {
+                    1 => DictionaryAttachMode::Attach,
+                    2 => DictionaryAttachMode::Copy,
+                    3 => DictionaryAttachMode::Load,
+                    _ => DictionaryAttachMode::Auto,
+                };
+            }
             // Clamped into range as upstream's multi-threaded build stores them
             // (zstd_compress.c:866-908); frames are still built on the calling
             // thread, which a worker count only permits, never requires.
@@ -398,6 +412,12 @@ impl CCtxParams {
                 RowMatchFinderMode::Auto => ParamSwitch::Auto.to_c(),
                 RowMatchFinderMode::Enable => ParamSwitch::Enable.to_c(),
                 RowMatchFinderMode::Disable => ParamSwitch::Disable.to_c(),
+            },
+            ZSTD_C_FORCE_ATTACH_DICT => match self.dictionary_attach {
+                DictionaryAttachMode::Auto => 0,
+                DictionaryAttachMode::Attach => 1,
+                DictionaryAttachMode::Copy => 2,
+                DictionaryAttachMode::Load => 3,
             },
             _ => match advisory_slot(param) {
                 Some(slot) => self.advisory[slot],

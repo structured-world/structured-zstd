@@ -77,7 +77,13 @@ impl BufferlessBegin {
         params.dict_id_flag = fparams.noDictIDFlag == 0;
         params.pledged_src_size = pledged;
         let src_size = (pledged != CONTENTSIZE_UNKNOWN).then_some(pledged);
-        let frame_params = if crate::attach::cdict_params_describe_frame(cdict, src_size) {
+        // Upstream builds this frame's parameters afresh from the CDict, with
+        // the default attach preference (`ZSTD_compressBegin_usingCDict_internal`).
+        let frame_params = if crate::attach::cdict_params_describe_frame(
+            cdict,
+            src_size,
+            codec::encoding::DictionaryAttachMode::Auto,
+        ) {
             crate::cdict::cdict_frame_parameters(cdict, src_size)
         } else {
             None

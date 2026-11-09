@@ -953,6 +953,97 @@ fn the_contexts_raw_skip_overrides_an_advanced_cdicts() {
     }
 }
 
+/// `ZSTD_c_forceAttachDict` takes the four `ZSTD_dictAttachPref_e` values,
+/// reads back as set and reaches the codec on a frame the context drives and
+/// on one a referenced CDict drives, since the CDict carries no preference of
+/// its own (`ZSTD_shouldAttachDict` reads the context's). A forced load hands
+/// the frame to the context's parameters even where the CDict's would drive
+/// it (`ZSTD_compressBegin_internal`). Every frame decodes.
+#[test]
+fn force_attach_dict_reaches_every_frame() {
+    use codec::encoding::DictionaryAttachMode as Mode;
+    let dict = b"a dictionary the frame is primed with, line after line\n".repeat(80);
+    let input = b"a dictionary the frame is primed with, and then some\n".repeat(30);
+    unsafe {
+        let cctx = ZSTD_createCCtx();
+        assert!(!cctx.is_null(), "a context is allocated");
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, LEVEL, 3), 0);
+        let cdict = crate::cdict::ZSTD_createCDict(dict.as_ptr().cast(), dict.len(), 19);
+        assert!(!cdict.is_null(), "the CDict is built");
+        let dctx = ZSTD_createDCtx();
+        assert!(!dctx.is_null(), "a decompression context is allocated");
+        for (value, mode) in [
+            (0, Mode::Auto),
+            (1, Mode::Attach),
+            (2, Mode::Copy),
+            (3, Mode::Load),
+        ] {
+            assert_eq!(ZSTD_CCtx_setParameter(cctx, FORCE_ATTACH_DICT, value), 0);
+            let mut read = -1;
+            assert_eq!(
+                ZSTD_CCtx_getParameter(cctx, FORCE_ATTACH_DICT, &mut read),
+                0
+            );
+            assert_eq!(read, value);
+
+            assert_eq!(
+                crate::attach::ZSTD_CCtx_refCDict(cctx, core::ptr::null()),
+                0
+            );
+            let context = |cctx: *mut ZSTD_CCtx| cctx.as_ref().expect("a context is allocated");
+            let own = context(cctx)
+                .frame_parameters(Some(1 << 20))
+                .unwrap()
+                .unwrap();
+            assert_eq!(own.dictionary_attach_mode(), mode, "the context's frame");
+
+            assert_eq!(crate::attach::ZSTD_CCtx_refCDict(cctx, cdict), 0);
+            let driven = context(cctx)
+                .frame_parameters(Some(input.len() as u64))
+                .unwrap();
+            assert_eq!(
+                driven.map_or(Mode::Auto, |params| params.dictionary_attach_mode()),
+                mode,
+                "the CDict's frame keeps the context's preference",
+            );
+            assert_eq!(
+                context(cctx).attach_level(Some(input.len() as u64)),
+                if mode == Mode::Load { 3 } else { 19 },
+                "under {mode:?} the frame runs the wrong parameter set",
+            );
+
+            let mut frame = vec![0u8; ZSTD_compressBound(input.len())];
+            let n = ZSTD_compress2(
+                cctx,
+                frame.as_mut_ptr().cast(),
+                frame.len(),
+                input.as_ptr().cast(),
+                input.len(),
+            );
+            assert_eq!(ZSTD_isError(n), 0, "{mode:?}: {:?}", code(n));
+            let mut out = vec![0u8; input.len()];
+            let m = crate::attach::ZSTD_decompress_usingDict(
+                dctx,
+                out.as_mut_ptr().cast(),
+                out.len(),
+                frame.as_ptr().cast(),
+                n,
+                dict.as_ptr().cast(),
+                dict.len(),
+            );
+            assert_eq!(ZSTD_isError(m), 0, "{mode:?}: {:?}", code(m));
+            assert_eq!(&out[..m], &input[..], "{mode:?}");
+        }
+        assert_eq!(
+            code(ZSTD_CCtx_setParameter(cctx, FORCE_ATTACH_DICT, 4)),
+            ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound
+        );
+        ZSTD_freeDCtx(dctx);
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeCDict(cdict);
+    }
+}
+
 /// The estimates read the set: a wider window costs more, and the streaming
 /// budget covers the one-shot one.
 #[test]

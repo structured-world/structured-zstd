@@ -116,6 +116,65 @@ fn bt_strategy_extra_bytes_follow_the_strategy_and_key_width() {
     }
 }
 
+/// The caller's preference decides how a dictionary frame uses its dictionary,
+/// over the size cutoff, as upstream's `ZSTD_c_forceAttachDict` does; a forced
+/// load takes the parameters `resolve_level_params_for_loaded_dict` gives the
+/// frame at any source size, and a forced attach falls back to a copy where
+/// the backend's attached tables cannot index the dictionary.
+#[test]
+fn the_attach_preference_decides_the_dictionary_use() {
+    use super::DictUse;
+    use crate::encoding::DictionaryAttachMode as Mode;
+    let resolve = |level: i32, source: u64, content: usize, mode: Mode| {
+        let overrides = crate::encoding::parameters::ParamOverrides {
+            dictionary_attach: mode,
+            ..Default::default()
+        };
+        let sizes = crate::encoding::DictionarySizes::raw_content(content);
+        let level = CompressionLevel::Level(level);
+        (
+            super::resolve_level_params_with_dict(level, Some(source), sizes, &overrides),
+            super::resolve_level_params_for_loaded_dict(level, Some(source), sizes, &overrides),
+        )
+    };
+    for level in [1, 3, 6, 13, 19] {
+        let (small_copy, _) = resolve(level, 4096, 32 * 1024, Mode::Copy);
+        assert_eq!(small_copy.dict_use, Some(DictUse::Copy), "level {level}");
+        let (large_attach, _) = resolve(level, 1 << 20, 32 * 1024, Mode::Attach);
+        assert_eq!(
+            large_attach.dict_use,
+            Some(DictUse::Attach),
+            "level {level}"
+        );
+        // A forced load is sized for the source, the dictionary counted in
+        // the tier only where its tables would be copied, not attached
+        // (`ZSTD_getCParamMode`): left out at 4 KiB, counted at 1 MiB.
+        let overrides = crate::encoding::parameters::ParamOverrides {
+            dictionary_attach: Mode::Load,
+            ..Default::default()
+        };
+        for (source, counted) in [(4096u64, 0usize), (1 << 20, 32 * 1024)] {
+            let (load, own) = resolve(level, source, 32 * 1024, Mode::Load);
+            assert_eq!(load.dict_use, Some(DictUse::Load), "level {level}");
+            let expected = super::level_params_from_cparams(
+                crate::encoding::cparams::get_frame_cparams(level, source, counted, &overrides),
+            );
+            assert!(
+                load.params == expected && own.params == expected,
+                "level {level}: a forced load over {source} bytes ran other parameters \
+                 than the frame's own",
+            );
+        }
+    }
+    // Past 16 MiB of content the fast and double-fast attached tables cannot
+    // position a dictionary entry, so those strategies copy it.
+    let oversized = super::MAX_FAST_ATTACH_DICT_REGION + 1;
+    for level in [1, 3] {
+        let (frame, _) = resolve(level, 4096, oversized, Mode::Attach);
+        assert_eq!(frame.dict_use, Some(DictUse::Copy), "level {level}");
+    }
+}
+
 /// A frame that runs a dictionary's cParams keeps the post-split decision of
 /// its own: upstream resolves `postBlockSplitter` from the level's cParams for
 /// the frame before the CDict's replace them. Level 14 over 1 MiB is btlazy2,

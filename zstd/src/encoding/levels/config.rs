@@ -375,63 +375,6 @@ pub(crate) fn source_size_ceil_log(size: u64) -> u8 {
     }
 }
 
-/// Attach-vs-copy cutoff for the Fast strategy, as a ceil-log bucket: a hint at
-/// or below `2^this` (or unknown, `None`) ATTACHES the dictionary (a separate
-/// immutable table scanned in place via the borrowed dual-base kernel); a larger
-/// hint would COPY it into the live table.
-///
-/// `13` is upstream zstd's Fast cutoff (`attachDictSizeCutoffs[ZSTD_fast]` is
-/// 8 KB, zstd_compress.c:2296; `ZSTD_shouldAttachDict`, :2309). Above it the
-/// dictionary is COPIED, and the copy is what makes the dictionary pay on a
-/// larger source: the scan then runs over a table already holding the
-/// dictionary's positions, so ordinary NEAR matches improve everywhere. Attach
-/// mode starts with an empty table and reaches the dictionary only through the
-/// separate exact table, at the positions the step happens to land on.
-///
-/// This was `31` (attach every source up to 2 GiB) on a speed argument alone,
-/// and the missing byte column is where it went wrong. Per frame, `z000033`
-/// (1,022,035 B) and its leading 10 KiB, with a 16 KiB dictionary trained over
-/// its 10 KiB chunks, on the i9: two prebuilt binaries and libzstd alternated
-/// in one session, `perf stat -r 3`, three rounds, ranges non-overlapping.
-///
-/// | case | bytes attach | bytes copy | reference | cycles attach | cycles copy | insn attach | insn copy |
-/// |---|---|---|---|---|---|---|---|
-/// | 10 KiB, L1 | 6,976 | 7,122 | 7,122 | 236,355 (1.95x) | 169,116 (1.39x) | 633,127 (1.78x) | 478,066 (1.34x) |
-/// | 10 KiB, L-5 | 9,660 | 9,124 | 9,130 | 51,678 (1.22x) | 56,444 (1.33x) | 152,281 (1.14x) | 153,369 (1.15x) |
-/// | 1 MiB, L1 | 550,810 | 551,584 | 570,765 | 19.84M (1.76x) | 16.21M (1.44x) | 54.01M (1.91x) | 39.60M (1.40x) |
-/// | 1 MiB, L-5 | 689,127 | 647,735 | 669,826 | 8.80M (1.46x) | 10.67M (1.77x) | 21.62M (1.54x) | 22.81M (1.63x) |
-///
-/// Copy is the better arm on both axes at the positive levels: it takes 18-28%
-/// fewer cycles and 22-27% fewer instructions, and its bytes are the
-/// reference's exactly on the small frame and 3.4% under the reference on the
-/// large one. At the ultra-fast levels it buys ratio with time: 21% more cycles
-/// on the 1 MiB frame for 6.0% fewer bytes, 9% more on the small one for 5.5%
-/// fewer. That trade is what the cutoff is for. Attach put us 2.9% ABOVE the
-/// reference on the 1 MiB ultra-fast frame — the dictionary made our frame
-/// bigger than our own no-dict frame there, while it made the reference's
-/// smaller — because it found 21,897 sequences where the reference finds
-/// 27,546. Copy puts us 3.3% under it.
-///
-/// The remaining gap is now a same-mode one: the reference does this copy in
-/// 1.0x where we take 1.3-1.8x, which is a target with an apples-to-apples
-/// reference rather than a mode the reference never runs.
-///
-/// The borrowed attach kernel stores virtual positions as `u32`
-/// (`cur_abs as u32`), so it could not attach past bucket `31` regardless; that
-/// ceiling is now far above the cutoff and no longer the binding constraint.
-/// Shared by `reset` (records the mode in the primed-snapshot key) and
-/// `prime_with_dictionary` (acts on it).
-pub(crate) const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
-
-/// Whether a dictionary frame in size bucket `size_log` reuses the captured
-/// primed snapshot rather than re-priming: only a known size above the
-/// strategy's attach cutoff `cutoff_log`, the upstream zstd copy regime
-/// (`ZSTD_shouldAttachDict`). The frame compressor restores on this and the
-/// Fast reset keeps its table only on it, so the two cannot disagree.
-pub(crate) fn restores_primed_snapshot(size_log: Option<u8>, cutoff_log: u8) -> bool {
-    size_log.is_some_and(|log| log > cutoff_log)
-}
-
 /// Largest dictionary region (bytes) the Fast attach path can index. The tagged
 /// dict table packs each position into `32 - DICT_TAG_BITS` (= 24) bits, so a
 /// region past `2^24` (16 MiB) would overflow the packed position. Dictionaries
@@ -440,29 +383,6 @@ pub(crate) fn restores_primed_snapshot(size_log: Option<u8>, cutoff_log: u8) -> 
 /// dict content length, so the attach-vs-copy decision (and the matching
 /// snapshot-key / epoch bits) can gate on it consistently at reset time.
 pub(crate) const MAX_FAST_ATTACH_DICT_REGION: usize = 1 << 24;
-
-/// Dfast counterpart of [`FAST_ATTACH_DICT_CUTOFF_LOG`]: upstream zstd
-/// `ZSTD_dictMatchState` attach cutoff for the double-fast strategy is 16 KiB
-/// (`2^14`), so small / unknown-size inputs ATTACH (separate immutable dict
-/// long+short tables + dual-probe in `start_matching_fast_loop`) and larger
-/// known-size inputs COPY (re-prime the dict into the live tables, where the
-/// dense scan matches it as window history). The attach build also self-gates
-/// on `use_fast_loop` inside `skip_matching_for_dict_attach` — only the
-/// fast-loop levels (L3 / Default / L0) carry the dual-probe.
-pub(crate) const DFAST_ATTACH_DICT_CUTOFF_LOG: u8 = 14;
-
-/// BT/optimal attach cutoff for `btlazy2` + `btopt`: 32 KiB (`2^15`, upstream
-/// zstd `attachDictSizeCutoffs[ZSTD_btlazy2]` == `[ZSTD_btopt]`). Small /
-/// unknown-size inputs ATTACH the dict as a separate DUBT dms; larger known-size
-/// inputs COPY the dict into the LIVE binary tree (upstream zstd
-/// `ZSTD_resetCCtx_byCopyingCDict`).
-pub(crate) const BT_OPT_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
-
-/// BT/optimal attach cutoff for `btultra` + `btultra2`: 8 KiB (`2^13`, upstream
-/// zstd `attachDictSizeCutoffs[ZSTD_btultra]` == `[ZSTD_btultra2]`). The deepest
-/// parses copy the dict into the live tree past a much smaller source than the
-/// `btopt` tier, matching upstream's per-strategy cutoff table.
-pub(crate) const BT_ULTRA_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
 
 /// Smallest window_log the encoder will use regardless of source size.
 pub(crate) const MIN_WINDOW_LOG: u8 = 10;
@@ -982,15 +902,54 @@ pub(crate) fn numeric_level(level: CompressionLevel) -> i32 {
 
 /// Whether a frame over `source_size` bytes (`None` = unknown) loads the
 /// dictionary into tables resolved for its own size instead of running the
-/// dictionary's: only a dictionary prepared for a level of its own does that,
-/// and only once the source outgrows it (upstream `ZSTD_compressBegin_internal`,
-/// zstd_compress.c:5278, where `compressionLevel == 0` keeps the CDict's).
-pub(crate) fn dictionary_loads_into_frame(
+/// dictionary's: always when the caller asks for it, otherwise only a
+/// dictionary prepared for a level of its own, once the source outgrows it
+/// (upstream `ZSTD_compressBegin_internal`, zstd_compress.c, where
+/// `compressionLevel == 0` keeps the CDict's and `ZSTD_dictForceLoad` loads).
+fn dictionary_loads_into_frame(
     sizes: crate::encoding::DictionarySizes,
     source_size: Option<u64>,
+    preference: crate::encoding::parameters::DictionaryAttachMode,
 ) -> bool {
-    sizes.prepared_at_level
-        && !crate::encoding::dictionary_describes_frame(sizes.content, source_size)
+    preference == crate::encoding::parameters::DictionaryAttachMode::Load
+        || (sizes.prepared_at_level
+            && !crate::encoding::dictionary_describes_frame(sizes.content, source_size))
+}
+
+/// How a frame's dictionary enters its match finder, decided once per frame
+/// in [`resolve_level_params_with_dict`] and followed by every backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DictUse {
+    /// Searched in place in tables of its own, beside the frame's
+    /// (`ZSTD_resetCCtx_byAttachingCDict`).
+    Attach,
+    /// Merged into the frame's tables, which take the dictionary's geometry
+    /// (`ZSTD_resetCCtx_byCopyingCDict`).
+    Copy,
+    /// Indexed into tables resolved for the frame's own source
+    /// (`ZSTD_resetCCtx_internal` + `ZSTD_compress_insertDictionary`).
+    Load,
+}
+
+impl DictUse {
+    /// Whether the dictionary is searched in its own tables.
+    pub(crate) fn attaches(self) -> bool {
+        self == Self::Attach
+    }
+}
+
+/// Whether a dictionary frame takes the matcher state captured after its
+/// dictionary's first prime instead of priming it again: a frame of known size
+/// whose tables hold the dictionary, the table copy upstream makes per frame
+/// (`ZSTD_resetCCtx_byCopyingCDict`). An attached dictionary stays resident in
+/// tables of its own instead. The frame compressor restores on this and the
+/// Fast reset keeps its table only on it, so the two cannot disagree.
+pub(crate) fn restores_primed_snapshot(
+    dict_use: Option<DictUse>,
+    source_size: Option<u64>,
+) -> bool {
+    source_size.is_some_and(|size| size != crate::encoding::cparams::CONTENTSIZE_UNKNOWN)
+        && matches!(dict_use, Some(DictUse::Copy | DictUse::Load))
 }
 
 /// How a greedy / lazy frame compressed with a dictionary takes its
@@ -1017,6 +976,8 @@ pub(crate) struct FrameParams {
     /// The lazy backend's plan for a dictionary, on a greedy..btlazy2 match
     /// finder.
     pub(crate) row_plan: Option<RowDictPlan>,
+    /// How the frame's dictionary enters the match finder; `None` without one.
+    pub(crate) dict_use: Option<DictUse>,
     /// The strategy the level resolves to for this frame before a CDict's
     /// cParams replace it. Upstream decides the post-block splitter from it
     /// (`ZSTD_CCtx_init_compressStream2` resolves `postBlockSplitter` from the
@@ -1052,13 +1013,14 @@ pub(crate) fn resolve_level_params_with_dict(
         return FrameParams {
             params,
             row_plan: None,
+            dict_use: None,
             split_strategy: params.strategy_tag,
         };
     }
     // The pledged-size sentinel is an unknown size, which attaches the
     // dictionary (`ZSTD_shouldAttachDict`), not a huge one that copies it.
     let source_size = source_size.filter(|&size| size != CONTENTSIZE_UNKNOWN);
-    if dictionary_loads_into_frame(sizes, source_size) {
+    if dictionary_loads_into_frame(sizes, source_size, overrides.dictionary_attach) {
         return resolve_level_params_for_loaded_dict(level, source_size, sizes, overrides);
     }
     // The CDict's cParams decide the frame's strategy REGARDLESS of the
@@ -1079,7 +1041,8 @@ pub(crate) fn resolve_level_params_with_dict(
         2 => sizes.content <= crate::encoding::dfast::DFAST_ATTACH_DICT_MAX_LEN,
         _ => true,
     };
-    let attach = should_attach_dict(&cdict, source_size) && attach_fits;
+    let attach =
+        should_attach_dict(&cdict, source_size, overrides.dictionary_attach) && attach_fits;
     // The frame's own window: its level row and knobs for the source, with the
     // dictionary counted in the tier and the source log only when it is copied
     // (`ZSTD_getCParamMode`: `ZSTD_cpm_attachDict` drops the dictionary size,
@@ -1110,6 +1073,11 @@ pub(crate) fn resolve_level_params_with_dict(
     FrameParams {
         params,
         row_plan,
+        dict_use: Some(if attach {
+            DictUse::Attach
+        } else {
+            DictUse::Copy
+        }),
         split_strategy,
     }
 }
@@ -1157,6 +1125,37 @@ impl DictParamsMemo {
     }
 }
 
+/// The cParams of a frame that loads its dictionary into tables of its own:
+/// the level's for the source, with the dictionary counted in the tier only
+/// when the dictionary's own tables would be copied rather than attached at
+/// this size (upstream `ZSTD_getCParamMode` in
+/// `ZSTD_CCtx_init_compressStream2`: an attaching size takes
+/// `ZSTD_cpm_attachDict`, which leaves the dictionary out). A load the caller
+/// forces on a small frame is therefore sized for the frame alone.
+pub(crate) fn loaded_dict_frame_cparams(
+    level: CompressionLevel,
+    source_size: Option<u64>,
+    sizes: crate::encoding::DictionarySizes,
+    overrides: &crate::encoding::parameters::ParamOverrides,
+) -> crate::encoding::cparams::CParams {
+    use crate::encoding::cparams::{
+        CONTENTSIZE_UNKNOWN, get_cdict_cparams, get_frame_cparams, should_attach_dict,
+    };
+    let source_size = source_size.filter(|&size| size != CONTENTSIZE_UNKNOWN);
+    let cdict = get_cdict_cparams(numeric_level(level), sizes.serialized, overrides);
+    let counted = if should_attach_dict(&cdict, source_size, overrides.dictionary_attach) {
+        0
+    } else {
+        sizes.content
+    };
+    get_frame_cparams(
+        numeric_level(level),
+        source_size.unwrap_or(CONTENTSIZE_UNKNOWN),
+        counted,
+        overrides,
+    )
+}
+
 /// [`resolve_level_params`] for a frame whose dictionary is loaded into tables
 /// the frame resolved for its own source, rather than attached or copied from
 /// the dictionary's own.
@@ -1181,16 +1180,11 @@ pub(crate) fn resolve_level_params_for_loaded_dict(
     sizes: crate::encoding::DictionarySizes,
     overrides: &crate::encoding::parameters::ParamOverrides,
 ) -> FrameParams {
-    use crate::encoding::cparams::{CONTENTSIZE_UNKNOWN, uses_row_match_finder};
+    use crate::encoding::cparams::uses_row_match_finder;
     // `resolve_level_params_with_dict`, the one caller, answers an empty
     // dictionary and a raw frame before it asks this.
     debug_assert!(sizes.content != 0 && !matches!(level, CompressionLevel::Uncompressed));
-    let frame = crate::encoding::cparams::get_frame_cparams(
-        numeric_level(level),
-        source_size.unwrap_or(CONTENTSIZE_UNKNOWN),
-        sizes.content,
-        overrides,
-    );
+    let frame = loaded_dict_frame_cparams(level, source_size, sizes, overrides);
     let params = level_params_from_cparams(frame);
     let row_plan = (3..=6).contains(&frame.strategy).then(|| RowDictPlan {
         // The dictionary lives in the frame's own tables, so there is no
@@ -1204,6 +1198,7 @@ pub(crate) fn resolve_level_params_for_loaded_dict(
     FrameParams {
         params,
         row_plan,
+        dict_use: Some(DictUse::Load),
         split_strategy: params.strategy_tag,
     }
 }

@@ -168,23 +168,31 @@ pub(crate) fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<boo
 }
 
 /// Whether `cdict`'s own compression parameters still describe a frame over
-/// `src_size` bytes (`None` = not yet known), and so drive it.
+/// `src_size` bytes (`None` = not yet known), and so drive it, under the
+/// context's attach `preference`.
 ///
 /// The size question is the codec's
 /// ([`codec::encoding::dictionary_describes_frame`]); this only adds what the
 /// codec cannot see, that a `CDict` built through the advanced constructor
 /// carries explicit parameters rather than a level of its own and so always
 /// drives the frame (upstream marks it `ZSTD_NO_CLEVEL`, zstd_compress.c:5636,
-/// and reads it back at :5254 and :5837).
-pub(crate) fn cdict_params_describe_frame(cdict: &ZSTD_CDict, src_size: Option<u64>) -> bool {
-    cdict.params.is_some()
-        || codec::encoding::dictionary_describes_frame(
-            cdict
-                .dict
-                .as_ref()
-                .map_or(0, codec::encoding::EncoderDictionary::content_size),
-            src_size,
-        )
+/// and reads it back at :5254 and :5837). A forced load never runs a CDict's
+/// parameters: the frame is reset from the context's and the dictionary loaded
+/// into its tables (`ZSTD_dictForceLoad`, `ZSTD_compressBegin_internal`).
+pub(crate) fn cdict_params_describe_frame(
+    cdict: &ZSTD_CDict,
+    src_size: Option<u64>,
+    preference: codec::encoding::DictionaryAttachMode,
+) -> bool {
+    preference != codec::encoding::DictionaryAttachMode::Load
+        && (cdict.params.is_some()
+            || codec::encoding::dictionary_describes_frame(
+                cdict
+                    .dict
+                    .as_ref()
+                    .map_or(0, codec::encoding::EncoderDictionary::content_size),
+                src_size,
+            ))
 }
 
 impl ZSTD_CCtx {
@@ -207,7 +215,7 @@ impl ZSTD_CCtx {
             return false;
         };
         // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
-        cdict_params_describe_frame(unsafe { &**cdict }, src_size)
+        cdict_params_describe_frame(unsafe { &**cdict }, src_size, self.params.dictionary_attach)
     }
 
     /// The explicit parameters the next frame over `src_size` bytes runs under,
@@ -226,22 +234,30 @@ impl ZSTD_CCtx {
                 unreachable!("only a referenced CDict drives a frame's parameters")
             };
             let cdict = unsafe { &**cdict };
-            // The raw skip is the context's to set, not the dictionary's: a
-            // CDict carries no such switch upstream, so the context's
-            // (`ZSTD_CCtx_setRawSkip`) still reaches a frame the CDict drives.
-            // A CDict built from a parameter set stores that set's choice among
-            // its parameters, which the context's replaces.
+            // The raw skip and the attach preference are the context's to set,
+            // not the dictionary's: a CDict carries neither upstream
+            // (`ZSTD_shouldAttachDict` reads the context's `attachDictPref`), so
+            // the context's (`ZSTD_CCtx_setRawSkip`, `ZSTD_c_forceAttachDict`)
+            // reach a frame the CDict drives. A CDict built from a parameter set
+            // stores that set's choices among its parameters, which the
+            // context's replace.
             let raw_skip = self.params.raw_skip != crate::cctx_params::ParamSwitch::Disable;
-            return match cdict.params {
-                Some(params) => Ok(Some(params.with_raw_skip(raw_skip))),
-                None if raw_skip => Ok(None),
+            let preference = self.params.dictionary_attach;
+            let defaults = raw_skip && preference == codec::encoding::DictionaryAttachMode::Auto;
+            let params = match cdict.params {
+                Some(params) => params,
+                None if defaults => return Ok(None),
                 None => CompressionParameters::builder(
                     codec::encoding::CompressionLevel::from_level(cdict.level),
                 )
                 .build()
-                .map(|params| Some(params.with_raw_skip(false)))
-                .map_err(|_| ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported),
+                .map_err(|_| ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported)?,
             };
+            return Ok(Some(
+                params
+                    .with_raw_skip(raw_skip)
+                    .with_dictionary_attach(preference),
+            ));
         }
         self.params
             .resolve()

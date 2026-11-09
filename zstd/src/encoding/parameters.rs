@@ -183,6 +183,30 @@ impl RowMatchFinderMode {
     }
 }
 
+/// How a frame uses a dictionary prepared for it, the drop-in equivalent of C
+/// zstd's `ZSTD_c_forceAttachDict` (`ZSTD_dictAttachPref_e`). A frame without a
+/// dictionary ignores it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum DictionaryAttachMode {
+    /// Attach up to the strategy's source-size cutoff and for a source of
+    /// unknown size, copy above it (upstream `ZSTD_dictDefaultAttach`): fast
+    /// 8 KiB, double-fast 16 KiB, greedy through btopt 32 KiB, btultra and
+    /// btultra2 8 KiB.
+    #[default]
+    Auto,
+    /// Search the dictionary's tables in place, at every source size
+    /// (`ZSTD_dictForceAttach`). The fast and double-fast strategies copy a
+    /// dictionary past 16 MiB, which their attached tables cannot index.
+    Attach,
+    /// Copy the dictionary's tables into the frame's, at every source size
+    /// (`ZSTD_dictForceCopy`).
+    Copy,
+    /// Load the dictionary into tables the frame resolves for its own source,
+    /// rather than running the dictionary's parameters
+    /// (`ZSTD_dictForceLoad`).
+    Load,
+}
+
 /// One tunable compression parameter — the analogue of a C zstd
 /// `ZSTD_cParameter`. Used to query bounds via [`CParameter::bounds`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -472,6 +496,9 @@ pub(crate) struct ParamOverrides {
     pub(crate) literal_compression: LiteralCompressionMode,
     /// The greedy / lazy band's finder; `Auto` leaves it to the window.
     pub(crate) row_match_finder: RowMatchFinderMode,
+    /// How a dictionary frame uses its dictionary; `Auto` leaves it to the
+    /// source size.
+    pub(crate) dictionary_attach: DictionaryAttachMode,
 }
 
 impl ParamOverrides {
@@ -489,6 +516,7 @@ impl ParamOverrides {
             && self.ldm.is_none()
             && self.literal_compression == LiteralCompressionMode::Auto
             && self.row_match_finder == RowMatchFinderMode::Auto
+            && self.dictionary_attach == DictionaryAttachMode::Auto
     }
 }
 
@@ -523,6 +551,7 @@ impl CompressionParameters {
             ldm: LdmOverride::default(),
             literal_compression: LiteralCompressionMode::Auto,
             row_match_finder: RowMatchFinderMode::Auto,
+            dictionary_attach: DictionaryAttachMode::Auto,
             raw_skip: true,
         }
     }
@@ -555,6 +584,26 @@ impl CompressionParameters {
         self
     }
 
+    /// These parameters with the dictionary used as `mode` says, as
+    /// [`CompressionParametersBuilder::dictionary_attach`] sets it, for a
+    /// caller that holds a built set, such as a prepared dictionary's.
+    ///
+    /// ```
+    /// use structured_zstd::encoding::{
+    ///     CompressionLevel, CompressionParameters, DictionaryAttachMode,
+    /// };
+    ///
+    /// let params = CompressionParameters::builder(CompressionLevel::Level(19))
+    ///     .build()
+    ///     .unwrap()
+    ///     .with_dictionary_attach(DictionaryAttachMode::Copy);
+    /// assert_eq!(params.dictionary_attach_mode(), DictionaryAttachMode::Copy);
+    /// ```
+    pub fn with_dictionary_attach(mut self, mode: DictionaryAttachMode) -> Self {
+        self.overrides.dictionary_attach = mode;
+        self
+    }
+
     /// Whether long-distance matching is enabled.
     pub fn long_distance_matching_enabled(&self) -> bool {
         self.overrides.ldm.is_some()
@@ -568,6 +617,12 @@ impl CompressionParameters {
     /// Which finder the greedy / lazy band searches (see [`RowMatchFinderMode`]).
     pub fn row_match_finder_mode(&self) -> RowMatchFinderMode {
         self.overrides.row_match_finder
+    }
+
+    /// How a dictionary frame uses its dictionary (see
+    /// [`DictionaryAttachMode`]).
+    pub fn dictionary_attach_mode(&self) -> DictionaryAttachMode {
+        self.overrides.dictionary_attach
     }
 
     /// The window, `log2`, the encoder gives a frame of `source_size` bytes
@@ -647,10 +702,48 @@ pub struct CompressionParametersBuilder {
     ldm: LdmOverride,
     literal_compression: LiteralCompressionMode,
     row_match_finder: RowMatchFinderMode,
+    dictionary_attach: DictionaryAttachMode,
     raw_skip: bool,
 }
 
 impl CompressionParametersBuilder {
+    /// Choose how a frame uses a dictionary prepared for it instead of leaving
+    /// it to the source size. C `ZSTD_c_forceAttachDict`.
+    ///
+    /// ```rust
+    /// use structured_zstd::decoding::FrameDecoder;
+    /// use structured_zstd::encoding::{
+    ///     CompressionLevel, CompressionParameters, DictionaryAttachMode, EncoderDictionary,
+    ///     FrameCompressor,
+    /// };
+    ///
+    /// let dictionary = b"tenant=demo table=orders region=eu-west level=INFO ".repeat(64);
+    /// let block = b"tenant=demo table=orders region=eu-west level=WARN ".repeat(512);
+    /// let params = CompressionParameters::builder(CompressionLevel::Level(19))
+    ///     .dictionary_attach(DictionaryAttachMode::Attach)
+    ///     .build()
+    ///     .unwrap();
+    /// let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(19));
+    /// compressor.set_parameters(&params);
+    /// let prepared = structured_zstd::decoding::Dictionary::from_raw_content(7, dictionary.clone())
+    ///     .map(EncoderDictionary::from_dictionary)
+    ///     .unwrap();
+    /// compressor.set_encoder_dictionary(prepared).unwrap();
+    /// let frame = compressor.compress_independent_frame(&block);
+    ///
+    /// let mut decoder = FrameDecoder::new();
+    /// decoder
+    ///     .add_dict(structured_zstd::decoding::Dictionary::from_raw_content(7, dictionary).unwrap())
+    ///     .unwrap();
+    /// let mut decoded = Vec::with_capacity(block.len());
+    /// decoder.decode_all_to_vec(&frame, &mut decoded).unwrap();
+    /// assert_eq!(decoded, block);
+    /// ```
+    pub fn dictionary_attach(mut self, mode: DictionaryAttachMode) -> Self {
+        self.dictionary_attach = mode;
+        self
+    }
+
     /// Let a block whose sample reads as incompressible go out raw, and a
     /// block of one repeated byte go out as RLE, without being searched: on by
     /// default. A repeat of earlier content still keeps such a block on the
@@ -869,6 +962,7 @@ impl CompressionParametersBuilder {
                 ldm,
                 literal_compression: self.literal_compression,
                 row_match_finder: self.row_match_finder,
+                dictionary_attach: self.dictionary_attach,
             },
             raw_skip: self.raw_skip,
         })

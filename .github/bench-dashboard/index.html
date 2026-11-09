@@ -246,7 +246,7 @@
             being searched. Off, every block is searched, as libzstd searches
             it. Switches every chart on the page; libzstd is the same
             reference either way. Snapshots taken before both were measured
-            ran ours with the raw skip on, so they show only here.
+            (ours then ran with the raw skip on) show under either setting.
           </span>
         </label>
         <div class="filters">
@@ -707,9 +707,10 @@
       // `searched` (the raw skip off), `raw_skip` (the library default), or
       // `any` where no setting of ours reaches the work or both gave the same
       // figure, which then stands for both. Records written before both were
-      // measured carry none; the matrix then ran ours with the raw skip on.
+      // measured carry none: they are the only figure their snapshot has, so
+      // they show whichever configuration is selected, and the history stays
+      // whole. The checkbox splits only the snapshots that measured both.
       const RUST_VARIANT_ANY = "any";
-      const RUST_VARIANT_UNLABELLED = "raw_skip";
 
       function selectedRustVariant() {
         return el("f-raw-skip").checked ? "raw_skip" : "searched";
@@ -718,8 +719,8 @@
       function applyRustVariant() {
         const wanted = selectedRustVariant();
         state.records = state.allRecords.filter((record) => {
-          const variant = record.rust_variant || RUST_VARIANT_UNLABELLED;
-          return variant === RUST_VARIANT_ANY || variant === wanted;
+          const variant = record.rust_variant;
+          return !variant || variant === RUST_VARIANT_ANY || variant === wanted;
         });
       }
 
@@ -2242,6 +2243,12 @@
 
         state.allRecords = payload.records || [];
         if (!state.allRecords.length) throw new Error("benchmark-relative.json has no records");
+        // A payload measured with the raw skip only (a `RAW_SKIP=1` run) holds
+        // no searched figures, so it opens on the configuration it does hold.
+        const holds = (variant) => state.allRecords.some((record) => record.rust_variant === variant);
+        if (!holds("searched") && holds("raw_skip")) {
+          el("f-raw-skip").checked = true;
+        }
         applyRustVariant();
 
         // Map each snapshot (its `generated_at` key) to the commit subject,

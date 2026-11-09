@@ -124,9 +124,7 @@ impl MatchGeneratorDriver {
         // the tables built for it, so a compressor alternating small and large
         // frames builds them once per dictionary, as upstream builds a CDict.
         match self.active_backend() {
-            super::super::strategy::BackendTag::Dfast
-                if self.dfast_attaches_dictionary(dict_content.len()) =>
-            {
+            super::super::strategy::BackendTag::Dfast if self.dict_attached() => {
                 self.dfast_matcher_mut()
                     .revive_dict_cache(dict_content.len());
             }
@@ -301,9 +299,8 @@ impl MatchGeneratorDriver {
                 .saturating_add(granted_retained_budget);
         }
         if self.active_backend() == super::super::strategy::BackendTag::HashChain {
-            // Recompute the attach decision made per-chunk in
-            // `skip_matching_for_dictionary_priming` (stable across the prime —
-            // `reset_size_log` does not change here).
+            // The attach decision `skip_matching_for_dictionary_priming` read
+            // per chunk, from the field the reset set.
             //
             // The HC attach/copy mode is deliberately NOT folded into `PrimedKey`
             // (unlike Fast `fast_attach`). Fast attach builds a separate dict
@@ -333,7 +330,7 @@ impl MatchGeneratorDriver {
             // that same-mode reuse decodes; the driver-level cross-mode restore is
             // accepted (not refused) per
             // `primed_snapshot_fast_attach_does_not_over_key_non_simple_backends`.
-            let attach = self.hc_dict_attach_mode();
+            let attach = self.dict_attached();
             let table = &mut self.hc_matcher_mut().table;
             table.set_dictionary_limit_from_primed_bytes(committed_dict_budget);
             // Build the dictMatchState tree over the committed dict (front of

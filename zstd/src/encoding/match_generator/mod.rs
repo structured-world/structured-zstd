@@ -397,21 +397,14 @@ pub struct MatchGeneratorDriver {
     dictionary_size_hint: Option<super::DictionarySizes>,
     // Normalized `ceil_log2` bucket of the frame's source-size hint, captured at
     // `reset` (where `source_size_hint` is consumed) via [`source_size_ceil_log`].
-    // `None` means the frame was unhinted. Drives `prime_with_dictionary`'s upstream zstd
-    // `ZSTD_shouldAttachDict` mode for the Simple/Fast backend: `None` (unknown)
-    // or `<= FAST_ATTACH_DICT_CUTOFF_LOG` → attach (separate dict table, 2-cursor
-    // `compress_block_fast_dict`); larger → copy (dictionary primed into the live
-    // table, 4-cursor `compress_block_fast`). The primed-snapshot key is the
-    // resolved shape ([`reset_shape`](Self::reset_shape)), not this bucket.
+    // `None` means the frame was unhinted. Bounds the dfast table widths; the
+    // primed-snapshot key is the resolved shape ([`reset_shape`](Self::reset_shape)),
+    // not this bucket.
     reset_size_log: Option<u8>,
-    // Whether the loaded dictionary fits the Fast attach path's tagged position
-    // field (`<= MAX_FAST_ATTACH_DICT_REGION`). Captured at `reset` from the
-    // dict-size hint (which equals the actual dict length on load) so the Fast
-    // attach decision, the attach-epoch reset bit, and the primed-snapshot
-    // `fast_attach` bit all gate on it consistently. `true` when there is no
-    // dictionary (the attach path is then unused). A dict too large to tag falls
-    // back to copy mode instead of overflowing the packed position.
-    reset_dict_attach_ok: bool,
+    /// How the frame the last reset prepared uses its dictionary, `None`
+    /// without one: resolved with the frame's parameters, and read by every
+    /// backend's layout and prime.
+    reset_dict_use: Option<crate::encoding::levels::config::DictUse>,
     // Hint-resolved matcher shape from the last `reset`: the [`LevelParams`], the
     // active backend's applied Dfast/Row hash-table width (`0` for HC/Fast), the
     // Fast attach-vs-copy mode and the Fast slot format. Combined with the
@@ -536,14 +529,14 @@ struct ProducerSlot {
 /// byte-identical `params`. Without `level` a snapshot captured at L3 could be
 /// restored into an L4 reset, installing the wrong `use_fast_loop`.
 ///
-/// `fast_attach` records the Fast backend's attach-vs-copy mode
-/// ([`FAST_ATTACH_DICT_CUTOFF_LOG`]) because that cutoff (8 KiB) falls INSIDE a
-/// single resolved shape: an 8192- and an 8193-byte Level 1 hint both clamp to
-/// window_log 14 with identical `params`/`table_bits`, yet 8192 attaches (a
-/// separate dict table) while 8193 copies into the live table — two different
-/// `storage` shapes. The frame compressor only captures/restores snapshots on
-/// the copy path today, but keying on the mode keeps the snapshot identity
-/// self-sufficient rather than relying on that external gate.
+/// `fast_attach` records the Fast backend's attach-vs-copy mode because the
+/// mode is not a function of the resolved shape: the 8 KiB cutoff falls inside
+/// one (an 8192- and an 8193-byte Level 1 hint both clamp to window_log 14
+/// with identical `params`/`table_bits`, yet 8192 attaches into a separate
+/// dict table while 8193 copies into the live table), and a caller's
+/// preference can force either at any size. The frame compressor only
+/// captures/restores snapshots on the copy path, but keying on the mode keeps
+/// the snapshot identity self-sufficient rather than relying on that gate.
 ///
 /// Restoring a snapshot whose key differs would reinstate the old `storage`
 /// (and its `max_window_size` / table dimensions / parse params / dict-table
@@ -560,18 +553,6 @@ struct PrimedKey {
     /// frame from how full the input will leave the table, so two frames of one
     /// geometry can differ in it; a restore carries the snapshot's format in.
     fast_tagged: bool,
-}
-
-/// Whether a configured HashChain matcher attaches the dictionary for a frame
-/// of `size_log` (see [`MatchGeneratorDriver::hc_dict_attach_mode`]).
-fn hc_attaches_dictionary(hc: &HcMatchGenerator, size_log: Option<u8>) -> bool {
-    let cutoff = match hc.strategy_tag {
-        super::strategy::StrategyTag::BtUltra | super::strategy::StrategyTag::BtUltra2 => {
-            BT_ULTRA_ATTACH_DICT_CUTOFF_LOG
-        }
-        _ => BT_OPT_ATTACH_DICT_CUTOFF_LOG,
-    };
-    size_log.is_none_or(|log| log <= cutoff)
 }
 
 /// History bytes a frame lays out: the dictionary primed at its head and the
@@ -770,7 +751,7 @@ impl MatchGeneratorDriver {
             // resolved LevelParams.
             reported_window_size: next_pow2,
             reset_size_log: None,
-            reset_dict_attach_ok: true,
+            reset_dict_use: None,
             reset_shape: None,
             dict_reach_log: None,
             dict_params: Default::default(),
@@ -1224,74 +1205,42 @@ impl MatchGeneratorDriver {
         }
     }
 
-    /// ATTACH (`true`) vs COPY (`false`) decision for the dms-bearing HashChain
-    /// backend (lazy hash-chain AND binary-tree/optimal levels), mirroring
-    /// upstream `ZSTD_shouldAttachDict` and its per-strategy `attachDictSizeCutoffs`:
-    /// a small / unknown source ATTACHES the dict as a separate dms (hash-chain
-    /// dms for lazy, DUBT dms for BT); a large known source COPIES it into the
-    /// live chain / tree. The cutoff is the lazy/lazy2 value for HC, the
-    /// btlazy2/btopt value for Bt{Opt}, and the smaller btultra/btultra2 value for
-    /// the deepest parses. Both `skip_matching_for_dictionary_priming` (which
-    /// stages the dict) and `prime_with_dictionary` (which builds-or-drops the
-    /// dms) read this so the two stay in lock-step.
-    fn hc_dict_attach_mode(&self) -> bool {
-        // Only the HashChain backend (lazy hash-chain + BT/optimal) routes here;
-        // a non-HashChain storage has no dms decision, so default to attach.
-        let MatcherStorage::HashChain(hc) = &self.storage else {
-            return true;
-        };
-        hc_attaches_dictionary(hc, self.reset_size_log)
-    }
-
-    /// Whether the dfast backend attaches a dictionary of `dict_len` bytes to
-    /// the frame the last reset prepared, rather than copying it into the
-    /// live tables.
-    fn dfast_attaches_dictionary(&self, dict_len: usize) -> bool {
-        dict_len <= crate::encoding::dfast::DFAST_ATTACH_DICT_MAX_LEN
-            && self
-                .reset_size_log
-                .is_none_or(|log| log <= DFAST_ATTACH_DICT_CUTOFF_LOG)
+    /// Whether the frame the last reset prepared searches its dictionary in
+    /// tables of its own rather than holding it in the frame's
+    /// ([`DictUse`], resolved once
+    /// per frame). The reset lays the tables out by it and the prime fills
+    /// them by it, so the two cannot disagree.
+    fn dict_attached(&self) -> bool {
+        self.reset_dict_use
+            .is_some_and(crate::encoding::levels::config::DictUse::attaches)
     }
 
     fn skip_matching_for_dictionary_priming<K: EncodeTier>(&mut self, dict_len: usize) {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
-                // Upstream zstd `ZSTD_shouldAttachDict` mode selection for the Fast
-                // strategy (cutoff 8 KB): small / unknown-size inputs ATTACH
-                // (index dict positions into a SEPARATE immutable table; the
-                // dual-probe 2-cursor `compress_block_fast_dict` then prefers
-                // recent-input matches and falls back to the dict — the path
-                // that wins small/unknown). Large known-size inputs COPY (prime
-                // dict into the live table; the 4-cursor `compress_block_fast`
-                // matches against it as window history — the path that already
-                // matches/beats the upstream zstd on large corpora). The dispatch in
-                // `start_matching` keys off `dict_table.is_some()`, which only
-                // the attach path populates. See [`FAST_ATTACH_DICT_CUTOFF_LOG`].
-                let attach = self.reset_dict_attach_ok
-                    && self
-                        .reset_size_log
-                        .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
-                if attach {
+                // Attached, the dictionary's positions go into a SEPARATE
+                // immutable table, which the dual-probe 2-cursor
+                // `compress_block_fast_dict` falls back to after recent input;
+                // copied or loaded, into the live table, where the 4-cursor
+                // `compress_block_fast` matches it as window history. The
+                // dispatch in `start_matching` keys off `dict_table.is_some()`,
+                // which only the attach path populates.
+                if self.dict_attached() {
                     self.simple_mut().skip_matching_for_dict_prime(dict_len);
                 } else {
                     self.simple_mut().skip_matching_for_dict_copy();
                 }
             }
             super::strategy::BackendTag::Dfast => {
-                // Upstream zstd `ZSTD_dictMatchState` mode selection for dfast (cutoff
-                // 16 KiB): small / unknown-size inputs ATTACH (build the
-                // separate immutable dict long+short tables; the dual-probe
-                // `start_matching_fast_loop` searches live + dict, the path that
-                // avoids the per-frame dict re-prime that dominates small
-                // `compress-dict`). Larger known-size inputs COPY (re-prime the
-                // dict into the live tables via `skip_matching_dense`, where the
-                // dense scan matches it as window history). `skip_matching_for_dict_attach`
-                // self-gates on `use_fast_loop` (only fast-loop levels carry the
-                // dual-probe; general-path levels fall back to the dense copy).
-                // The tagged dictionary slots index at most
-                // `DFAST_ATTACH_DICT_MAX_LEN` bytes; a larger dictionary is
-                // copied into the live tables instead.
-                if self.dfast_attaches_dictionary(dict_len) {
+                // Attached, the dictionary gets separate immutable long+short
+                // tables, which the dual-probe `start_matching_fast_loop`
+                // searches beside the live ones; copied or loaded, it is primed
+                // into the live tables via `skip_matching_dense`, where the
+                // dense scan matches it as window history.
+                // `skip_matching_for_dict_attach` self-gates on `use_fast_loop`
+                // (only fast-loop levels carry the dual-probe; general-path
+                // levels fall back to the dense copy).
+                if self.dict_attached() {
                     self.dfast_matcher_mut().skip_matching_for_dict_attach();
                 } else {
                     self.dfast_matcher_mut().park_dict_cache();
@@ -1311,14 +1260,12 @@ impl MatchGeneratorDriver {
                 self.row_matcher_mut().prime_dictionary_current_block();
             }
             super::strategy::BackendTag::HashChain => {
-                // Upstream zstd `ZSTD_shouldAttachDict` per strategy: ATTACH (a
-                // separate DUBT dms) for small / unknown inputs, COPY (merge the
-                // dict into the live tree) for large known inputs. ATTACH keeps
-                // the dict in history but out of the live tree via
-                // `skip_matching_dict_bt`; COPY routes through the normal
-                // `skip_matching`, which fills the live tree. The dms is
-                // built-or-dropped to match in `prime_with_dictionary`.
-                if self.hc_dict_attach_mode() {
+                // Attached, the dictionary stays in history but out of the
+                // live tree (`skip_matching_dict_bt`) and gets a DUBT dms of its
+                // own; copied or loaded, the normal `skip_matching` merges it
+                // into the live tree. The dms is built-or-dropped to match in
+                // `prime_with_dictionary`.
+                if self.dict_attached() {
                     self.hc_matcher_mut().table.skip_matching_dict_bt();
                 } else {
                     self.hc_matcher_mut().skip_matching::<K>(Some(false));
@@ -1337,6 +1284,8 @@ impl Matcher for MatchGeneratorDriver {
         self.source_size_hint = Some(size);
     }
 
+    /// Announcing the dictionary is what lets the reset lay the frame out to
+    /// attach it; one primed without this goes into the frame's own tables.
     fn set_dictionary_size_hint(&mut self, sizes: super::DictionarySizes) {
         self.dictionary_size_hint = Some(sizes);
     }
@@ -1430,43 +1379,39 @@ impl Matcher for MatchGeneratorDriver {
         if dict_hint.is_none() {
             self.primed_spare = None;
         }
-        // Snapshot the hint's normalized ceil-log bucket for the primed-snapshot
-        // key and prime_with_dictionary's attach/copy mode decision (the hint is
-        // consumed here, but priming happens just after reset). Storing the
-        // bucket rather than the raw bytes means two hints that resolve to the
-        // same matcher shape share one snapshot instead of each re-priming.
+        // The hint's normalized ceil-log bucket, which bounds the dfast table
+        // widths below.
         self.reset_size_log = hint.map(source_size_ceil_log);
-        // A dictionary too large for the tagged attach position field falls back
-        // to copy mode. Captured here (from the load-set size hint = actual dict
-        // length) so the prime decision and the snapshot-key / epoch bits agree.
-        // A dictionary loaded into the frame's tables is never searched in
-        // place: there is no separate set of tables to search.
-        self.reset_dict_attach_ok = dict_hint.is_none_or(|sizes| {
-            !crate::encoding::levels::config::dictionary_loads_into_frame(sizes, hint)
-                && sizes.content <= MAX_FAST_ATTACH_DICT_REGION
-        });
         // A dictionary frame takes its cParams and match-finder from the
         // CDict's cParams (upstream `ZSTD_resetCCtx_usingCDict`), whose tier
         // is keyed by the serialized dictionary size; a lazy-band CDict also
         // carries `dict_plan` to the Row backend. The dictionary is prepared
         // under the caller's parameters, so they are part of those cParams.
         let overrides = self.param_overrides.unwrap_or_default();
-        // A dictionary prepared for a level of its own stops describing a frame
-        // that outgrows it: the cParams row is the source's and the dictionary
-        // goes into those tables (`dictionary_loads_into_frame`).
-        let loaded_into_frame = dict_hint.is_some_and(|sizes| {
-            crate::encoding::levels::config::dictionary_loads_into_frame(sizes, hint)
-        });
+        let (params, dict_plan, dict_use) = match dict_hint {
+            Some(sizes) => {
+                let resolved = self.dict_params.resolve(level, hint, sizes, &overrides);
+                (resolved.params, resolved.row_plan, resolved.dict_use)
+            }
+            None => (
+                crate::encoding::levels::config::resolve_frame_params(level, hint, &overrides),
+                None,
+                None,
+            ),
+        };
+        // Every backend attaches, copies or loads the dictionary as this
+        // resolution says; the prime that follows reads the same field.
+        self.reset_dict_use = dict_use;
+        // A dictionary loaded into the frame's tables is indexed at the frame's
+        // own cParams: there is no separate set of tables sized for it.
+        let loaded_into_frame = dict_use == Some(crate::encoding::levels::config::DictUse::Load);
         // Upstream indexes the last `1 << max(hashLog + 3, chainLog + 1)`
         // bytes of a dictionary into the tables it is loaded into, at their
         // cParams (`ZSTD_loadDictionaryContent`, zstd_compress.c:4987).
         self.dict_reach_log = dict_hint.map(|sizes| {
             let cd = if loaded_into_frame {
-                crate::encoding::cparams::get_frame_cparams(
-                    crate::encoding::levels::config::numeric_level(level),
-                    hint.unwrap_or(crate::encoding::cparams::CONTENTSIZE_UNKNOWN),
-                    sizes.content,
-                    &overrides,
+                crate::encoding::levels::config::loaded_dict_frame_cparams(
+                    level, hint, sizes, &overrides,
                 )
             } else {
                 crate::encoding::cparams::get_cdict_cparams(
@@ -1477,16 +1422,6 @@ impl Matcher for MatchGeneratorDriver {
             };
             (cd.hash_log + 3).max(cd.chain_log + 1).min(31)
         });
-        let (params, dict_plan) = match dict_hint {
-            Some(sizes) => {
-                let resolved = self.dict_params.resolve(level, hint, sizes, &overrides);
-                (resolved.params, resolved.row_plan)
-            }
-            None => (
-                crate::encoding::levels::config::resolve_frame_params(level, hint, &overrides),
-                None,
-            ),
-        };
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut params = params;
         // Test-only: apply a parse×search override so the matrix can be
@@ -1641,13 +1576,10 @@ impl Matcher for MatchGeneratorDriver {
         self.reported_window_size = max_window_size;
         let strategy_tag = self.strategy_tag;
         // The Fast backend's dictionary mode, which `prime_with_dictionary`
-        // takes from the same `reset_size_log`: attached, the dictionary goes
-        // into a table of its own and the input is scanned in place.
-        let fast_attach = matches!(next_backend, super::strategy::BackendTag::Simple)
-            && self.reset_dict_attach_ok
-            && self
-                .reset_size_log
-                .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
+        // reads from the same field: attached, the dictionary goes into a
+        // table of its own and the input is scanned in place.
+        let fast_attach =
+            matches!(next_backend, super::strategy::BackendTag::Simple) && self.dict_attached();
         // A slice on a backend that can scan it in place never enters the
         // history, with no dictionary or one the Fast backend attaches; the frame
         // loop reads this decision back (`frame_scans_in_place`) instead of
@@ -1665,10 +1597,9 @@ impl Matcher for MatchGeneratorDriver {
         let long_distance = false;
         let long_distance_in_place =
             matches!(next_backend, super::strategy::BackendTag::Simple) && dict_hint.is_none();
-        // The prime makes the same decision through the same helper, so the
-        // layout chosen here is the one the dictionary is primed into.
-        let dfast_attach_next =
-            dict_hint.is_some_and(|sizes| self.dfast_attaches_dictionary(sizes.content));
+        // The prime reads the same field, so the layout chosen here is the one
+        // the dictionary is primed into.
+        let dict_attaches = self.dict_attached();
         // The dfast backend reads an attached dictionary in place as well, once
         // it has tables: a dictionary shorter than a short key indexes nothing
         // and stays unattached. The input has to fit the window too, or a
@@ -1678,7 +1609,7 @@ impl Matcher for MatchGeneratorDriver {
             .map_or(0, |d| crate::encoding::dfast::dfast_key_len(d.min_match));
         let dfast_dict_in_place = |len: usize| {
             matches!(next_backend, super::strategy::BackendTag::Dfast)
-                && dfast_attach_next
+                && dict_attaches
                 && dict_len >= dfast_key_len
                 && len <= max_window_size
         };
@@ -1722,16 +1653,11 @@ impl Matcher for MatchGeneratorDriver {
                 // below (`prime_with_dictionary`): only attach-mode dict
                 // frames may keep the dictionary across the reset via an
                 // epoch advance; a copy-mode frame re-primes its table.
-                let dict_attach_epoch = dict_hint.is_some()
-                    && self.reset_dict_attach_ok
-                    && self
-                        .reset_size_log
-                        .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
+                let dict_attach_epoch = fast_attach;
                 // Dictionary frame the caller will restore the primed snapshot
                 // into (the same `restores_primed_snapshot` rule on the same
-                // size bucket; a dictionary too large to attach is in copy
-                // mode at every size, but only these frames are restored) and
-                // whose snapshot matches this exact resolved shape:
+                // mode and size) and whose snapshot matches this exact
+                // resolved shape:
                 // `restore_primed_dictionary`, called right after this reset,
                 // will `clone_from` the snapshot over this matcher, replacing
                 // the table contents and bias wholesale, so the reset's
@@ -1747,11 +1673,7 @@ impl Matcher for MatchGeneratorDriver {
                     .primed
                     .as_ref()
                     .filter(|(_, _, captured)| {
-                        dict_hint.is_some()
-                            && restores_primed_snapshot(
-                                self.reset_size_log,
-                                FAST_ATTACH_DICT_CUTOFF_LOG,
-                            )
+                        restores_primed_snapshot(self.reset_dict_use, hint)
                             && *captured
                                 == PrimedKey {
                                     level,
@@ -1833,9 +1755,9 @@ impl Matcher for MatchGeneratorDriver {
                 // table's extra bit doubles what a small frame clears (a fresh
                 // 10 KiB level-3 frame ran 36% slower) for a few bytes per
                 // megabyte of output. Only tables holding the input alone are
-                // capped: a copied dictionary sits in the live tables too, which
-                // keep the CDict's widths as upstream's copy does.
-                let input_only = dict_hint.is_none() || dfast_attach_next;
+                // capped: a copied or loaded dictionary sits in the live tables
+                // too, which keep the widths resolved for it.
+                let input_only = dict_hint.is_none() || dict_attaches;
                 let window_bits =
                     self.reset_size_log
                         .filter(|_| input_only)
@@ -1872,7 +1794,7 @@ impl Matcher for MatchGeneratorDriver {
                 // unhinted attach frame followed by a large hinted one whose
                 // live widths coincide at the level's full widths. Parked, the
                 // tables serve the next frame that attaches this dictionary.
-                if dict_hint.is_some() && !dfast_attach_next {
+                if dict_hint.is_some() && !dict_attaches {
                     dfast.park_dict_cache();
                 }
                 // The widths are settled, so the tables can be laid out; the
@@ -1901,7 +1823,7 @@ impl Matcher for MatchGeneratorDriver {
                         crate::encoding::workspace::IngestPlan::Slice(len)
                             if len <= crate::encoding::dfast::DFAST_TAGGED_MAX_REL
                     );
-                let tagged = !dfast_attach_next
+                let tagged = !dict_attaches
                     && in_place_fits
                     && max_window_size.checked_add(dict_len).is_some_and(|window| {
                         (crate::encoding::dfast::DFAST_TAGGED_WINDOW_FLOOR
@@ -1948,7 +1870,7 @@ impl Matcher for MatchGeneratorDriver {
                 // so the previous attach frame's dms must not be re-borrowed
                 // under it (the same decision the prime makes, taken here
                 // because the reset below re-borrows on a primed dms alone).
-                if dict_hint.is_some() && !hc_attaches_dictionary(hc, self.reset_size_log) {
+                if dict_hint.is_some() && !dict_attaches {
                     hc.table.dms.invalidate();
                 }
                 // The widths are settled by `configure`, so the tables can be

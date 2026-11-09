@@ -1141,6 +1141,7 @@ impl<M: Matcher> CompressionContext<M> {
             self.compression_level,
             hint,
             self.dictionary.as_ref().filter(|_| use_dictionary_state),
+            &self.tuning.overrides,
         );
         crate::encoding::frame_compressor::sync_effective_strategy(
             &mut self.state,
@@ -1174,6 +1175,7 @@ impl<M: Matcher> CompressionContext<M> {
                 &mut self.state,
                 self.compression_level,
                 dict,
+                &params,
                 hint,
             );
         }

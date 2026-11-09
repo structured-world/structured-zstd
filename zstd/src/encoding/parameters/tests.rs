@@ -8,6 +8,41 @@ fn bounds_clamp_to_the_nearest_end() {
     assert_eq!(bounds.clamp(20), 20);
 }
 
+/// The attach preference reaches a set from the builder and from
+/// `with_dictionary_attach`, reads back as set, and only `Auto` leaves the
+/// overrides empty: a forced mode must survive `set_parameters`, which skips an
+/// empty override set.
+#[test]
+fn dictionary_attach_mode_reads_back_and_marks_the_set_overridden() {
+    let plain = CompressionParameters::builder(CompressionLevel::Level(19))
+        .build()
+        .unwrap();
+    assert_eq!(plain.dictionary_attach_mode(), DictionaryAttachMode::Auto);
+    assert!(plain.overrides.is_empty());
+    for mode in [
+        DictionaryAttachMode::Attach,
+        DictionaryAttachMode::Copy,
+        DictionaryAttachMode::Load,
+    ] {
+        let built = CompressionParameters::builder(CompressionLevel::Level(19))
+            .dictionary_attach(mode)
+            .build()
+            .unwrap();
+        assert_eq!(built.dictionary_attach_mode(), mode);
+        assert!(!built.overrides.is_empty(), "{mode:?} is an override");
+        let applied = plain.with_dictionary_attach(mode);
+        assert_eq!(applied.dictionary_attach_mode(), mode);
+        assert!(!applied.overrides.is_empty(), "{mode:?} is an override");
+    }
+    assert_eq!(
+        plain
+            .with_dictionary_attach(DictionaryAttachMode::Copy)
+            .with_dictionary_attach(DictionaryAttachMode::Auto)
+            .dictionary_attach_mode(),
+        DictionaryAttachMode::Auto
+    );
+}
+
 /// A built parameter set takes the raw skip either way and keeps every other
 /// knob it was built with.
 #[test]
