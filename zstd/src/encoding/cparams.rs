@@ -388,8 +388,9 @@ pub(crate) fn uses_row_match_finder(
 /// `ZSTD_shouldAttachDict` (zstd_compress.c): under `Auto` the CDict tables
 /// are referenced in place (`dictMatchState`) for sources up to the strategy's
 /// cutoff or of unknown size, and copied into the frame's tables above it;
-/// `Attach` and `Copy` override the cutoff. `Load` never reaches here: such a
-/// frame takes no CDict tables at all.
+/// `Attach` and `Copy` override the cutoff. `Load` keeps it: such a frame takes
+/// no CDict tables, but whether they would have attached at this size decides
+/// whether the dictionary counts in the frame's tier (`ZSTD_getCParamMode`).
 ///
 /// The cutoffs are upstream's `attachDictSizeCutoffs`: fast 8 KiB, dfast
 /// 16 KiB, greedy through btopt 32 KiB, btultra and btultra2 8 KiB. The fast
