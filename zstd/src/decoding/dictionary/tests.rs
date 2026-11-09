@@ -481,6 +481,19 @@ fn a_decoder_lets_go_of_its_dictionaries() {
         .unwrap();
     assert_eq!(&out[..written], payload.as_slice());
 
+    // A registered dictionary is let go of too: a frame naming it is no longer
+    // resolved from the registry.
+    let mut registry = crate::decoding::FrameDecoder::new();
+    registry.add_dict_handle(handle.clone()).unwrap();
+    let written = registry.decode_all(&frame, &mut out).unwrap();
+    assert_eq!(&out[..written], payload.as_slice());
+    registry.release_dictionaries();
+    assert!(matches!(
+        registry.decode_all(&frame, &mut out),
+        Err(crate::decoding::errors::FrameDecoderError::DictNotProvided { .. })
+    ));
+    registry.add_dict_handle(handle.clone()).unwrap();
+
     // Begun with the dictionary, not decoded yet: abandoned.
     decoder.reset_with_dict_handle(&frame[..], &handle).unwrap();
     decoder.release_dictionaries();

@@ -1336,10 +1336,13 @@ impl LegacyStream {
         self.dict.as_ref()
     }
 
-    /// Let go of the dictionary. A frame in progress reads it per block, so it
-    /// is left as well: the stream needs a new frame started.
+    /// Let go of the dictionary. A frame in progress that decodes with it
+    /// reads it per block, so it is left as well and the stream needs a new
+    /// frame started; one begun without a dictionary goes on.
     pub(crate) fn release_dict(&mut self) {
-        if self.frame.is_some() && !self.finished {
+        // `start` and `decode_whole` keep exactly the frame's dictionary, none
+        // for a frame without one, so a held one is the frame's.
+        if self.dict.is_some() && self.frame.is_some() && !self.finished {
             self.end();
         }
         self.dict = None;

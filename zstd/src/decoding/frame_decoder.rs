@@ -2958,7 +2958,9 @@ impl FrameDecoder {
     }
 
     /// Let go of every dictionary handle the decoder holds
-    /// ([`Self::dictionaries`]), so none outlives the caller's use of it: a
+    /// ([`Self::dictionaries`], and those registered with
+    /// [`Self::add_dict`] or [`Self::add_dict_handle`], which a frame naming
+    /// them then no longer finds), so none outlives the caller's use of it: a
     /// dictionary over the caller's buffer
     /// ([`DictionaryBytes::referenced`](crate::decoding::DictionaryBytes::referenced))
     /// must have no holder left once that buffer goes. Between frames, or in a
@@ -2988,6 +2990,9 @@ impl FrameDecoder {
     /// ```
     pub fn release_dictionaries(&mut self) {
         self.armed_dict = None;
+        self.owned_dicts.clear();
+        #[cfg(target_has_atomic = "ptr")]
+        self.shared_dicts.clear();
         #[cfg(feature = "legacy")]
         if let Some(stream) = self.legacy.as_deref_mut() {
             stream.release_dict();
