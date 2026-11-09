@@ -152,6 +152,20 @@
       .profile-toggles input[type="checkbox"] {
         margin: 0;
       }
+      .variant-toggle {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        font-size: 0.9rem;
+        color: var(--muted);
+        cursor: pointer;
+      }
+      .variant-toggle input[type="checkbox"] {
+        margin: 3px 0 0;
+      }
+      .variant-toggle strong {
+        color: var(--ink);
+      }
       #status {
         margin-top: 8px;
         font-size: 0.88rem;
@@ -224,6 +238,17 @@
       </section>
 
       <section class="card" style="margin-top: 14px">
+        <label class="variant-toggle">
+          <input type="checkbox" id="f-raw-skip" />
+          <span>
+            <strong>Rust with the raw skip</strong> (the library default): a
+            block whose sample reads as incompressible goes out raw without
+            being searched. Off, every block is searched, as libzstd searches
+            it. Switches every chart on the page; libzstd is the same
+            reference either way. Snapshots taken before both were measured
+            ran ours with the raw skip on, so they show only here.
+          </span>
+        </label>
         <div class="filters">
           <label>Target
             <select id="f-target"></select>
@@ -461,6 +486,9 @@
       const ALWAYS = "__all__";
 
       const state = {
+        // Every record the payload holds, and the ones the selected
+        // configuration of ours shows (what every chart reads).
+        allRecords: [],
         records: [],
         chart: null,
         profileChart: null,
@@ -673,6 +701,26 @@
           fragment.appendChild(option);
         }
         select.replaceChildren(fragment);
+      }
+
+      // Each record names the configuration of our encoder it measured:
+      // `searched` (the raw skip off), `raw_skip` (the library default), or
+      // `any` where no setting of ours reaches the work or both gave the same
+      // figure, which then stands for both. Records written before both were
+      // measured carry none; the matrix then ran ours with the raw skip on.
+      const RUST_VARIANT_ANY = "any";
+      const RUST_VARIANT_UNLABELLED = "raw_skip";
+
+      function selectedRustVariant() {
+        return el("f-raw-skip").checked ? "raw_skip" : "searched";
+      }
+
+      function applyRustVariant() {
+        const wanted = selectedRustVariant();
+        state.records = state.allRecords.filter((record) => {
+          const variant = record.rust_variant || RUST_VARIANT_UNLABELLED;
+          return variant === RUST_VARIANT_ANY || variant === wanted;
+        });
       }
 
       function matchesCoreFilters(record, filter) {
@@ -2113,6 +2161,14 @@
             }
           });
         }
+        // The configuration of ours changes the records under every chart.
+        el("f-raw-skip").addEventListener("change", () => {
+          applyRustVariant();
+          rerender();
+          repopulateSnapshotOptions();
+          renderProfileChart();
+          renderAggregateChart();
+        });
       }
 
       function renderRawSummary() {
@@ -2180,30 +2236,34 @@
           BAND_HIGH = band.delta_high;
         }
         el("intro-copy").textContent =
-          "Default view tracks Rust/FFI relative deltas by target and scenario, each measured against libzstd within the same run. " +
+          "Default view tracks Rust/FFI relative deltas by target and scenario, each measured against libzstd within the same run, with ours searching every block; the checkbox below switches ours to the raw skip. " +
           "Timings are the fastest of that run's samples; hover a point for the spread behind it. " +
           `Parity band is ${BAND_LOW.toFixed(2)}..${BAND_HIGH.toFixed(2)}.`;
 
-        state.records = payload.records || [];
-        if (!state.records.length) throw new Error("benchmark-relative.json has no records");
+        state.allRecords = payload.records || [];
+        if (!state.allRecords.length) throw new Error("benchmark-relative.json has no records");
+        applyRustVariant();
 
         // Map each snapshot (its `generated_at` key) to the commit subject,
         // so the snapshot selectors + history table show WHAT changed, not
         // just when — picking a run by timestamp alone is hard. Every record
         // from one run carries the same message; first non-empty wins.
+        // The page-wide facts below (snapshots, targets, kernels, the
+        // selectors' values) come from every record, so switching the
+        // configuration of ours narrows the charts without changing them.
         state.snapshotMessages = new Map();
-        for (const r of state.records) {
+        for (const r of state.allRecords) {
           const key = snapshotLabel(r);
           if (r.commit_message && !state.snapshotMessages.has(key)) {
             state.snapshotMessages.set(key, r.commit_message);
           }
         }
 
-        const targets = uniq(state.records.map((r) => r.target));
-        const latest = latestRecord(state.records);
+        const targets = uniq(state.allRecords.map((r) => r.target));
+        const latest = latestRecord(state.allRecords);
         if (!latest) throw new Error("Unable to determine latest benchmark snapshot");
 
-        el("stat-records").textContent = String(state.records.length);
+        el("stat-records").textContent = String(state.allRecords.length);
         const targetsContainer = el("stat-targets");
         targetsContainer.replaceChildren();
         // Map each target to the CPU kernel tier that produced its numbers.
@@ -2216,7 +2276,7 @@
         // one carrying a `generated_at` timestamp.
         const kernelByTarget = {};
         const kernelRowByTarget = {};
-        for (const r of state.records) {
+        for (const r of state.allRecords) {
           if (!(r.kernel && r.kernel.kernel && r.target)) continue;
           const prev = kernelRowByTarget[r.target];
           if (!prev || compareSnapshotIdentity(r, prev) > 0) {
@@ -2241,12 +2301,12 @@
         el("stat-snapshot").textContent = latest.generated_at || "n/a";
 
         renderOptions(selectors.target, targets);
-        const metricValues = uniq(state.records.map((r) => r.metric).filter((value) => value));
+        const metricValues = uniq(state.allRecords.map((r) => r.metric).filter((value) => value));
         renderOptions(selectors.metric, metricValues);
-        renderOptions(selectors.stage, uniq(state.records.map((r) => r.stage)));
-        renderOptions(selectors.scenario, uniq(state.records.map((r) => r.scenario)));
-        renderLevelOptions(selectors.level, uniq(state.records.map((r) => r.level)));
-        renderOptions(selectors.source, uniq(state.records.map((r) => r.source || "none")));
+        renderOptions(selectors.stage, uniq(state.allRecords.map((r) => r.stage)));
+        renderOptions(selectors.scenario, uniq(state.allRecords.map((r) => r.scenario)));
+        renderLevelOptions(selectors.level, uniq(state.allRecords.map((r) => r.level)));
+        renderOptions(selectors.source, uniq(state.allRecords.map((r) => r.source || "none")));
 
         const defaultMetric = "throughput_bytes_per_sec";
         const availableMetrics = metricValues.map((value) => String(value));
