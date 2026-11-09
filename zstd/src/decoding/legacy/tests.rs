@@ -2480,6 +2480,36 @@ fn a_frame_without_a_dictionary_survives_letting_go_of_dictionaries() {
     assert!(decode(true).is_some_and(|out| !out.is_empty()));
 }
 
+/// A v0.5-v0.7 frame begun with a dictionary reads it per block, so letting
+/// go of the dictionaries abandons the frame with them: it decodes no more,
+/// and the next frame starts afresh.
+#[cfg(feature = "std")]
+#[test]
+fn a_frame_with_a_dictionary_is_left_with_it() {
+    use crate::decoding::{BlockDecodingStrategy, DictionaryHandle, FrameDecoder};
+    let raw = include_bytes!("../../../dict_tests/dictionary");
+    let handle = DictionaryHandle::decode_dict(raw).unwrap();
+    let frame = one_block_frame(LegacyVersion::V07, &[0x83, b'a', b'b', b'c', 0x00]);
+    let mut decoder = FrameDecoder::new();
+    let mut source = &frame[..];
+    decoder
+        .reset_with_dict_handle(&mut source, &handle)
+        .unwrap();
+    decoder.release_dictionaries();
+    assert_eq!(decoder.dictionaries().count(), 0);
+    assert!(
+        decoder
+            .decode_blocks(&mut source, BlockDecodingStrategy::All)
+            .is_err()
+    );
+    let mut source = &frame[..];
+    decoder.reset(&mut source).unwrap();
+    decoder
+        .decode_blocks(&mut source, BlockDecodingStrategy::All)
+        .unwrap();
+    assert_eq!(decoder.collect().as_deref(), Some(&b"abc"[..]));
+}
+
 /// A parsed dictionary a v0.7 frame cannot use, its offset table larger
 /// than the format's or a repeat offset of 0, is refused when the frame
 /// starts, on the whole-buffer path and the stream alike.
