@@ -3044,6 +3044,16 @@ fn by_reference_dictionaries_keep_the_callers_buffer() {
     };
     let frame = compress(cdict_ref);
     assert_eq!(frame, compress(cdict_copy));
+    // Dictionaries the context's decoder still holds. A referenced one may be
+    // held only while the context uses it: the call that took it, the frame a
+    // prefix applies to, or as long as it stays attached.
+    let held = || {
+        unsafe { dctx.as_ref() }
+            .expect("the DCtx was created")
+            .decoder
+            .dictionaries()
+            .count()
+    };
     for ddict in [ddict_copy, ddict_ref, ddict_adv] {
         let mut out = vec![0u8; payload.len()];
         let read = unsafe {
@@ -3058,7 +3068,30 @@ fn by_reference_dictionaries_keep_the_callers_buffer() {
         };
         assert_eq!(ZSTD_isError(read), 0);
         assert_eq!(&out[..read], payload.as_slice());
+        // A DDict with its own copy may stay with the decoder; one over the
+        // caller's buffer may not outlive the call.
+        if ddict != ddict_copy {
+            assert_eq!(held(), 0, "a referenced DDict is held past the call");
+        }
     }
+
+    // A prefix applies to one frame and is not held after it.
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_refPrefix_advanced(dctx, dict.as_ptr(), dict.len(), 0) }),
+        0
+    );
+    let mut out = vec![0u8; payload.len()];
+    let read = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+        )
+    };
+    assert_eq!(&out[..read], payload.as_slice());
+    assert_eq!(held(), 0, "a prefix is held past its frame");
 
     // The contexts' by-reference loads through the load method.
     assert_eq!(
@@ -3078,6 +3111,12 @@ fn by_reference_dictionaries_keep_the_callers_buffer() {
         )
     };
     assert_eq!(&out[..read], payload.as_slice());
+    // Held while attached, let go once it is not.
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_loadDictionary(dctx, core::ptr::null(), 0) }),
+        0
+    );
+    assert_eq!(held(), 0, "a detached dictionary is still held");
 
     unsafe {
         ZSTD_freeDDict(ddict_copy);

@@ -1342,6 +1342,9 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
                 dctx.stream_hostage = true;
             }
             dctx.stream_frame_done = finished;
+            if finished {
+                dctx.frame_ended();
+            }
             // A caller looping on a frame that can never finish is stopped,
             // with the reason, rather than handed hints forever (upstream
             // counts the same calls, zstd_decompress.c:2356). Calls that only

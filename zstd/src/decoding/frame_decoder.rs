@@ -2957,6 +2957,60 @@ impl FrameDecoder {
         frame.into_iter().chain(legacy).chain(&self.armed_dict)
     }
 
+    /// Let go of every dictionary handle the decoder holds
+    /// ([`Self::dictionaries`]), so none outlives the caller's use of it: a
+    /// dictionary over the caller's buffer
+    /// ([`DictionaryBytes::referenced`](crate::decoding::DictionaryBytes::referenced))
+    /// must have no holder left once that buffer goes. Between frames, or in a
+    /// frame started without a dictionary, this costs nothing but the handles;
+    /// a frame in progress that decodes with one is abandoned with it, so the
+    /// decoder needs a new frame started (and gives up the frame's buffers,
+    /// which the next frame allocates again). The next frame is handed its
+    /// dictionary again, as every `*_with_dict_handle` entry point does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use structured_zstd::decoding::{Dictionary, DictionaryHandle, FrameDecoder};
+    ///
+    /// let dict = DictionaryHandle::from_dictionary(
+    ///     Dictionary::from_raw_content(7, b"shared dictionary content".to_vec()).unwrap(),
+    /// );
+    /// let frame = structured_zstd::encoding::compress_to_vec(
+    ///     &b"payload"[..],
+    ///     structured_zstd::encoding::CompressionLevel::Fastest,
+    /// );
+    /// let mut decoder = FrameDecoder::new();
+    /// let mut out = [0u8; 7];
+    /// decoder.decode_all_with_dict_handle(&frame, &mut out, &dict).unwrap();
+    /// decoder.release_dictionaries();
+    /// assert_eq!(decoder.dictionaries().count(), 0);
+    /// ```
+    pub fn release_dictionaries(&mut self) {
+        self.armed_dict = None;
+        #[cfg(feature = "legacy")]
+        if let Some(stream) = self.legacy.as_deref_mut() {
+            stream.release_dict();
+        }
+        let reads_dictionary = !self.is_finished()
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.using_dict.is_some());
+        if reads_dictionary {
+            // Its entropy tables may read the dictionary in place, so the
+            // frame cannot go on without it: the state goes with it.
+            self.state = None;
+            return;
+        }
+        // A frame started without the dictionary never reads the handle kept
+        // from an earlier one (see `reset_with_parsed_header`).
+        if let Some(state) = self.state.as_mut() {
+            state.active_dict = None;
+            state.using_dict = None;
+        }
+    }
+
     /// Whether the current frames last block has been decoded yet
     /// If this returns true you can call the drain* functions to get all content
     /// (the read() function will drain automatically if this returns true)

@@ -406,10 +406,27 @@ impl DCtxDictAttach {
 }
 
 impl ZSTD_DCtx {
-    /// Drop a single-use prefix after the frame that consumed it started.
+    /// Drop a single-use prefix after the frame that consumed it started. The
+    /// decoder keeps it until that frame ends ([`Self::frame_ended`]).
     pub(crate) fn consume_prefix(&mut self) {
         if matches!(self.attached_ddict, DCtxDictAttach::Prefix { .. }) {
             self.attached_ddict = DCtxDictAttach::None;
+        }
+    }
+
+    /// Attach `attach` in place of the context's dictionary. The decoder lets
+    /// go of what it kept from the one replaced: a dictionary over the
+    /// caller's buffer may have no holder once the caller stops using it.
+    pub(crate) fn set_attached_ddict(&mut self, attach: DCtxDictAttach) {
+        self.attached_ddict = attach;
+        self.decoder.release_dictionaries();
+    }
+
+    /// A frame ended: with no dictionary attached any more (a prefix applies
+    /// to one frame), the decoder keeps none of the frame's either.
+    pub(crate) fn frame_ended(&mut self) {
+        if matches!(self.attached_ddict, DCtxDictAttach::None) {
+            self.decoder.release_dictionaries();
         }
     }
 }
@@ -632,7 +649,7 @@ unsafe fn dctx_load_dictionary(
     }
     let dict = unsafe { in_slice(dict, dict_size) };
     if dict.is_empty() {
-        dctx.attached_ddict = DCtxDictAttach::None;
+        dctx.set_attached_ddict(DCtxDictAttach::None);
         return 0;
     }
     // SAFETY: the caller's contract, passed on.
@@ -641,7 +658,7 @@ unsafe fn dctx_load_dictionary(
     }));
     match parsed {
         Ok(Ok(handle)) => {
-            dctx.attached_ddict = DCtxDictAttach::Load { handle };
+            dctx.set_attached_ddict(DCtxDictAttach::Load { handle });
             0
         }
         Ok(Err(code)) => encode(code),
@@ -715,18 +732,18 @@ pub unsafe extern "C" fn ZSTD_DCtx_refDDict(
         return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
     }
     if ddict.is_null() {
-        dctx.attached_ddict = DCtxDictAttach::None;
+        dctx.set_attached_ddict(DCtxDictAttach::None);
         return 0;
     }
     // The DDict was prepared at creation; an empty one references nothing.
     let Some(handle) = &unsafe { &*ddict }.prepared else {
-        dctx.attached_ddict = DCtxDictAttach::None;
+        dctx.set_attached_ddict(DCtxDictAttach::None);
         return 0;
     };
     if !dctx.ref_multiple_ddicts {
-        dctx.attached_ddict = DCtxDictAttach::RefDDict {
+        dctx.set_attached_ddict(DCtxDictAttach::RefDDict {
             handle: handle.clone(),
-        };
+        });
         return 0;
     }
     // Added to the DDicts referenced so far, replacing one of the same ID as
@@ -739,7 +756,7 @@ pub unsafe extern "C" fn ZSTD_DCtx_refDDict(
     };
     handles.retain(|held| held.id() != handle.id());
     handles.push(handle.clone());
-    dctx.attached_ddict = DCtxDictAttach::RefDDicts { handles };
+    dctx.set_attached_ddict(DCtxDictAttach::RefDDicts { handles });
     0
 }
 
@@ -779,7 +796,7 @@ unsafe fn dctx_ref_prefix(
     }
     let prefix = unsafe { in_slice(prefix, prefix_size) };
     if prefix.is_empty() {
-        dctx.attached_ddict = DCtxDictAttach::None;
+        dctx.set_attached_ddict(DCtxDictAttach::None);
         return 0;
     }
     // Referenced, never copied: upstream's prefix is the caller's buffer, which
@@ -791,7 +808,7 @@ unsafe fn dctx_ref_prefix(
     }));
     match parsed {
         Ok(Ok(handle)) => {
-            dctx.attached_ddict = DCtxDictAttach::Prefix { handle };
+            dctx.set_attached_ddict(DCtxDictAttach::Prefix { handle });
             0
         }
         Ok(Err(code)) => encode(code),
@@ -960,17 +977,17 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
                 .map_err(|err| code_for_decoder_error(&err))
         } else {
             // Referenced, as upstream's `ZSTD_decompress_usingDict` refers to the
-            // content (`ZSTD_refDictContent`) rather than copy it per call. The
-            // decoder may keep the handle past the call, but only reads it for
-            // a frame started with it again (`using_dict` gates every read).
-            // SAFETY: `dict` is valid for this call, the only frames that read
-            // it.
+            // content (`ZSTD_refDictContent`) rather than copy it per call.
+            // SAFETY: `dict` is valid for this call, and the decoder lets go of
+            // it before the call returns, whatever the outcome.
             let handle = unsafe { parse_decode_dict_as(dict, ZSTD_DCT_AUTO, DictLoad::Reference) }?;
             dctx.decoder
                 .decode_all_with_dict_handle(src, dst, &handle)
                 .map_err(|err| code_for_decoder_error(&err))
         }
     }));
+    // The dictionary was this call's: the decoder keeps none of it.
+    dctx.decoder.release_dictionaries();
     match outcome {
         Ok(Ok(written)) => {
             dctx.stream_frame_done = true;

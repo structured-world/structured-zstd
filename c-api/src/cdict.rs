@@ -741,6 +741,13 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
         Some(handle) => dctx.decoder.decode_all_with_dict_handle(src, dst, handle),
         None => dctx.decoder.decode_all(src, dst),
     }));
+    // The DDict is this call's: one built over the caller's buffer may go,
+    // with that buffer, once the call returns, so the decoder keeps none of
+    // it. One holding its own copy stays with the decoder, so the next call
+    // with it touches no reference count.
+    if prepared.is_some_and(|handle| !handle.as_dict().dict_content.is_owned()) {
+        dctx.decoder.release_dictionaries();
+    }
     match outcome {
         Ok(Ok(written)) => {
             // One-shot consumed whole frames: the context is back at a

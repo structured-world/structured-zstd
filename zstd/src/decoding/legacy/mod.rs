@@ -1336,6 +1336,15 @@ impl LegacyStream {
         self.dict.as_ref()
     }
 
+    /// Let go of the dictionary. A frame in progress reads it per block, so it
+    /// is left as well: the stream needs a new frame started.
+    pub(crate) fn release_dict(&mut self) {
+        if self.frame.is_some() && !self.finished {
+            self.end();
+        }
+        self.dict = None;
+    }
+
     /// The frame's per-block digests so far, when they were asked for.
     #[cfg(all(feature = "lsm", feature = "hash"))]
     pub(crate) fn block_digests(&self) -> &[u32] {

@@ -608,6 +608,8 @@ impl ZSTD_DCtx {
         self.stream_frame_done = true;
         self.stream_no_progress = 0;
         self.stream_hostage = false;
+        // An abandoned frame may have taken a prefix; it is not kept.
+        self.frame_ended();
     }
 
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
@@ -625,7 +627,7 @@ impl ZSTD_DCtx {
         self.apply_max_block_size();
         self.stable_out_buffer = false;
         self.disable_huffman_assembly = false;
-        self.attached_ddict = crate::attach::DCtxDictAttach::None;
+        self.set_attached_ddict(crate::attach::DCtxDictAttach::None);
     }
 
     /// Hand `ZSTD_d_maxBlockSize` to the decoder, which holds every frame it
@@ -761,6 +763,7 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     match outcome {
         Ok(Ok(written)) => {
             dctx.consume_prefix();
+            dctx.frame_ended();
             // The one-shot consumed whole frames; the context sits at a
             // frame boundary again. Without this, a context abandoned
             // mid-stream earlier would make the next

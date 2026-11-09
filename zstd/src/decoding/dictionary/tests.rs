@@ -456,6 +456,42 @@ fn an_older_dictionary_over_held_bytes_is_whole_content() {
     assert_eq!(&*handle.as_dict().dict_content, older.as_slice());
 }
 
+/// A decoder lets go of every dictionary it holds: between frames it keeps
+/// decoding with the next one handed in, and a frame begun with the
+/// dictionary is abandoned rather than left to read what was let go.
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn a_decoder_lets_go_of_its_dictionaries() {
+    let raw: &[u8] = include_bytes!("../../../dict_tests/dictionary");
+    let handle = DictionaryHandle::decode_dict(raw).unwrap();
+    let (frame, payload) = frames_with_the_reference_dictionary(raw)
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut decoder = crate::decoding::FrameDecoder::new();
+    let mut out = vec![0u8; payload.len()];
+    decoder
+        .decode_all_with_dict_handle(&frame, &mut out, &handle)
+        .unwrap();
+    assert_eq!(decoder.dictionaries().count(), 1);
+    decoder.release_dictionaries();
+    assert_eq!(decoder.dictionaries().count(), 0);
+    let written = decoder
+        .decode_all_with_dict_handle(&frame, &mut out, &handle)
+        .unwrap();
+    assert_eq!(&out[..written], payload.as_slice());
+
+    // Begun with the dictionary, not decoded yet: abandoned.
+    decoder.reset_with_dict_handle(&frame[..], &handle).unwrap();
+    decoder.release_dictionaries();
+    assert_eq!(decoder.dictionaries().count(), 0);
+    assert!(
+        decoder
+            .decode_blocks(&frame[..], crate::decoding::BlockDecodingStrategy::All)
+            .is_err()
+    );
+}
+
 /// Two dictionaries parsed from one shared buffer the caller let go of: the
 /// set of both is its only owner, so the set counts the buffer, once.
 #[cfg(target_has_atomic = "ptr")]

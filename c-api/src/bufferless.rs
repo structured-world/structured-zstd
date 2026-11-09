@@ -575,7 +575,13 @@ fn begin_decode(dctx: &mut ZSTD_DCtx, dictionary: Option<DictionaryHandle>) -> u
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         dctx.decoder
             .set_max_window_size(codec::decoding::MAX_DECODER_WINDOW_SIZE)?;
-        dctx.decoder.begin_blocks(dictionary.as_ref())
+        dctx.decoder.begin_blocks(dictionary.as_ref())?;
+        // A run without a dictionary keeps none of an earlier run's: the
+        // caller's buffer behind it is the earlier run's only.
+        if dictionary.is_none() {
+            dctx.decoder.release_dictionaries();
+        }
+        Ok(())
     }));
     match outcome {
         Ok(Ok(())) => {}
@@ -958,7 +964,7 @@ pub unsafe extern "C" fn ZSTD_copyDCtx(dctx: *mut ZSTD_DCtx, prepared_dctx: *con
     dst.apply_max_block_size();
     dst.stable_out_buffer = src.stable_out_buffer;
     dst.disable_huffman_assembly = src.disable_huffman_assembly;
-    dst.attached_ddict = src.attached_ddict.clone();
+    dst.set_attached_ddict(src.attached_ddict.clone());
     let dictionary = src.bufferless.dictionary.clone();
     // `begin_decode` leaves `dst` at the start of a run with the same
     // dictionary, the documented copy. A copy cannot fail, so a begin that
