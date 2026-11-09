@@ -18,6 +18,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use codec::encoding::{CompressionParameters, EncoderDictionary};
 
+use crate::attach::DictLoad;
 use crate::context::{
     ZSTD_CCtx, ZSTD_DCtx, free_boxed, kept_compressor, set_frame_parameters, try_box,
 };
@@ -84,7 +85,10 @@ pub struct ZSTD_DDict {
 /// `ZSTD_createDDict_advanced` fails: a selector it does not know, fullDict
 /// over bytes that are not a dictionary (nothing included), or a serialized
 /// dictionary whose tables do not parse (`ZSTD_loadEntropy_intoDDict`).
-fn create_ddict(dict: &[u8], content_type: c_int) -> *mut ZSTD_DDict {
+///
+/// # Safety
+/// As [`DictLoad::hold`].
+unsafe fn create_ddict(dict: &[u8], load: DictLoad, content_type: c_int) -> *mut ZSTD_DDict {
     let prepared = if dict.is_empty() {
         if content_type != crate::attach::ZSTD_DCT_AUTO
             && content_type != crate::attach::ZSTD_DCT_RAW_CONTENT
@@ -93,8 +97,9 @@ fn create_ddict(dict: &[u8], content_type: c_int) -> *mut ZSTD_DDict {
         }
         None
     } else {
-        let parsed = catch_unwind(AssertUnwindSafe(|| {
-            crate::attach::parse_decode_dict(dict, content_type)
+        // SAFETY: the caller's contract, passed on.
+        let parsed = catch_unwind(AssertUnwindSafe(|| unsafe {
+            crate::attach::parse_decode_dict_as(dict, content_type, load)
         }));
         match parsed {
             Ok(Ok(handle)) => Some(handle),
@@ -116,13 +121,36 @@ pub(crate) fn prepare_compression_dictionary(
     dict: &[u8],
     raw_content: bool,
 ) -> Option<EncoderDictionary> {
+    // SAFETY: a copy keeps nothing of `dict` past the call.
+    unsafe { prepare_compression_dictionary_as(dict, raw_content, DictLoad::Copy) }
+}
+
+/// [`prepare_compression_dictionary`] holding the bytes as `load` says.
+///
+/// # Safety
+/// As [`DictLoad::hold`].
+pub(crate) unsafe fn prepare_compression_dictionary_as(
+    dict: &[u8],
+    raw_content: bool,
+    load: DictLoad,
+) -> Option<EncoderDictionary> {
     let prepared = catch_unwind(AssertUnwindSafe(|| {
         if raw_content {
-            codec::decoding::Dictionary::from_raw_content(u32::MAX, dict.to_vec())
+            // SAFETY: the caller's contract, passed on.
+            codec::decoding::Dictionary::from_raw_content(u32::MAX, unsafe { load.hold(dict) })
                 .ok()
                 .map(EncoderDictionary::from_dictionary)
         } else {
-            EncoderDictionary::from_bytes(dict).ok()
+            match load {
+                // Only the content is copied, not the tables in front of it.
+                DictLoad::Copy => EncoderDictionary::from_bytes(dict).ok(),
+                // `raw_content` is false only for a serialized dictionary, so
+                // this parses it rather than taking it as raw content.
+                // SAFETY: the caller's contract, passed on.
+                DictLoad::Reference => {
+                    EncoderDictionary::from_serialized_or_raw_bytes(unsafe { load.hold(dict) }).ok()
+                }
+            }
         }
     }));
     prepared.ok().flatten()
@@ -131,11 +159,19 @@ pub(crate) fn prepare_compression_dictionary(
 /// What a CDict holds of `dict`: nothing for no bytes, which upstream takes as
 /// a CDict of parameters alone (zstd_compress.c:5562-5598), else the prepared
 /// dictionary. `Err` when the bytes cannot be prepared.
-fn prepare_cdict_content(dict: &[u8], raw_content: bool) -> Result<Option<EncoderDictionary>, ()> {
+///
+/// # Safety
+/// As [`DictLoad::hold`].
+unsafe fn prepare_cdict_content(
+    dict: &[u8],
+    raw_content: bool,
+    load: DictLoad,
+) -> Result<Option<EncoderDictionary>, ()> {
     if dict.is_empty() {
         return Ok(None);
     }
-    prepare_compression_dictionary(dict, raw_content)
+    // SAFETY: the caller's contract, passed on.
+    unsafe { prepare_compression_dictionary_as(dict, raw_content, load) }
         .map(Some)
         .ok_or(())
 }
@@ -154,11 +190,27 @@ pub unsafe extern "C" fn ZSTD_createCDict(
     dict_size: usize,
     compression_level: c_int,
 ) -> *mut ZSTD_CDict {
+    // SAFETY: a copy keeps nothing of the buffer past the call.
+    unsafe { create_cdict(dict_buffer, dict_size, compression_level, DictLoad::Copy) }
+}
+
+/// The body of `ZSTD_createCDict` and `ZSTD_createCDict_byReference`.
+///
+/// # Safety
+/// `dict_buffer` valid for `dict_size` bytes (or `NULL` with 0); with
+/// [`DictLoad::Reference`], as [`DictLoad::hold`].
+unsafe fn create_cdict(
+    dict_buffer: *const u8,
+    dict_size: usize,
+    compression_level: c_int,
+    load: DictLoad,
+) -> *mut ZSTD_CDict {
     let dict = unsafe { in_slice(dict_buffer, dict_size) };
     // Auto content type (upstream createCDict): a serialized dictionary must
     // parse for encoding, anything else is a raw-content dictionary.
     let raw_content = !codec::decoding::Dictionary::is_serialized(dict);
-    let Ok(prepared) = prepare_cdict_content(dict, raw_content) else {
+    // SAFETY: the caller's contract, passed on.
+    let Ok(prepared) = (unsafe { prepare_cdict_content(dict, raw_content, load) }) else {
         return core::ptr::null_mut();
     };
     try_box(ZSTD_CDict {
@@ -172,20 +224,27 @@ pub unsafe extern "C" fn ZSTD_createCDict(
 }
 
 /// `ZSTD_CDict* ZSTD_createCDict_byReference(const void* dictBuffer, size_t
-/// dictSize, int compressionLevel)` (static API). We always copy the dictionary
-/// bytes into the `CDict`, so by-reference creation is identical to
-/// [`ZSTD_createCDict`] from the caller's perspective (the caller's buffer need
-/// not outlive the `CDict`).
+/// dictSize, int compressionLevel)` (static API) — [`ZSTD_createCDict`] whose
+/// content stays in the caller's buffer instead of a copy.
 ///
 /// # Safety
-/// Same as [`ZSTD_createCDict`].
+/// As [`ZSTD_createCDict`], and the buffer must stay alive and unchanged for
+/// the `CDict`'s lifetime (upstream contract).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_createCDict_byReference(
     dict_buffer: *const u8,
     dict_size: usize,
     compression_level: c_int,
 ) -> *mut ZSTD_CDict {
-    unsafe { ZSTD_createCDict(dict_buffer, dict_size, compression_level) }
+    // SAFETY: the caller's contract, passed on.
+    unsafe {
+        create_cdict(
+            dict_buffer,
+            dict_size,
+            compression_level,
+            DictLoad::Reference,
+        )
+    }
 }
 
 /// `ZSTD_compressionParameters` — ABI mirror of the upstream struct
@@ -280,17 +339,18 @@ fn cctx_params_from_cparams(
 /// `ZSTD_CDict* ZSTD_createCDict_advanced(const void* dictBuffer, size_t
 /// dictSize, ZSTD_dictLoadMethod_e dictLoadMethod, ZSTD_dictContentType_e
 /// dictContentType, ZSTD_compressionParameters cParams, ZSTD_customMem
-/// customMem)` — explicit content type + compression parameters. The load
-/// method is ignored (bytes are always copied); custom allocators are not
-/// supported (`customMem` must be all-`NULL`).
+/// customMem)` — explicit load method, content type and compression
+/// parameters; `ZSTD_dlm_byRef` keeps the content in the caller's buffer.
+/// Custom allocators are not supported (`customMem` must be all-`NULL`).
 ///
 /// # Safety
-/// `dict_buffer` must be valid for `dict_size` bytes (or `NULL` with 0).
+/// `dict_buffer` must be valid for `dict_size` bytes (or `NULL` with 0); by
+/// reference, it must stay alive and unchanged for the `CDict`'s lifetime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_createCDict_advanced(
     dict_buffer: *const u8,
     dict_size: usize,
-    _dict_load_method: c_int,
+    dict_load_method: c_int,
     dict_content_type: c_int,
     cparams: ZSTD_compressionParameters,
     custom_mem: ZSTD_customMem,
@@ -302,14 +362,27 @@ pub unsafe extern "C" fn ZSTD_createCDict_advanced(
         return core::ptr::null_mut();
     };
     let dict = unsafe { in_slice(dict_buffer, dict_size) };
-    create_cdict_with_params(dict, dict_content_type, &params, &custom_mem)
+    // SAFETY: the caller's contract, passed on.
+    unsafe {
+        create_cdict_with_params(
+            dict,
+            DictLoad::from_method(dict_load_method),
+            dict_content_type,
+            &params,
+            &custom_mem,
+        )
+    }
 }
 
 /// The body of `ZSTD_createCDict_advanced` and `_advanced2`: a CDict that
 /// compresses under the explicit `params`, `NULL` when the dictionary, the
 /// content type, the parameters or the allocator are refused.
-pub(crate) fn create_cdict_with_params(
+///
+/// # Safety
+/// As [`DictLoad::hold`].
+pub(crate) unsafe fn create_cdict_with_params(
     dict: &[u8],
+    load: DictLoad,
     dict_content_type: c_int,
     params: &crate::cctx_params::CCtxParams,
     custom_mem: &ZSTD_customMem,
@@ -323,7 +396,8 @@ pub(crate) fn create_cdict_with_params(
     let Some(resolved) = params.resolve() else {
         return core::ptr::null_mut();
     };
-    let Ok(prepared) = prepare_cdict_content(dict, raw_content) else {
+    // SAFETY: the caller's contract, passed on.
+    let Ok(prepared) = (unsafe { prepare_cdict_content(dict, raw_content, load) }) else {
         return core::ptr::null_mut();
     };
     try_box(ZSTD_CDict {
@@ -342,17 +416,18 @@ pub(crate) fn create_cdict_with_params(
 
 /// `ZSTD_DDict* ZSTD_createDDict_advanced(const void* dictBuffer, size_t
 /// dictSize, ZSTD_dictLoadMethod_e dictLoadMethod, ZSTD_dictContentType_e
-/// dictContentType, ZSTD_customMem customMem)` — explicit content type. The
-/// load method is ignored (bytes are always copied); custom allocators are
-/// not supported.
+/// dictContentType, ZSTD_customMem customMem)` — explicit load method and
+/// content type; `ZSTD_dlm_byRef` keeps the content in the caller's buffer.
+/// Custom allocators are not supported.
 ///
 /// # Safety
-/// `dict_buffer` must be valid for `dict_size` bytes (or `NULL` with 0).
+/// `dict_buffer` must be valid for `dict_size` bytes (or `NULL` with 0); by
+/// reference, it must stay alive and unchanged for the `DDict`'s lifetime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_createDDict_advanced(
     dict_buffer: *const u8,
     dict_size: usize,
-    _dict_load_method: c_int,
+    dict_load_method: c_int,
     dict_content_type: c_int,
     custom_mem: ZSTD_customMem,
 ) -> *mut ZSTD_DDict {
@@ -360,7 +435,14 @@ pub unsafe extern "C" fn ZSTD_createDDict_advanced(
         return core::ptr::null_mut();
     }
     let dict = unsafe { in_slice(dict_buffer, dict_size) };
-    create_ddict(dict, dict_content_type)
+    // SAFETY: the caller's contract, passed on.
+    unsafe {
+        create_ddict(
+            dict,
+            DictLoad::from_method(dict_load_method),
+            dict_content_type,
+        )
+    }
 }
 
 /// `size_t ZSTD_freeCDict(ZSTD_CDict* CDict)` — free the dictionary; `NULL` is a
@@ -557,21 +639,26 @@ pub unsafe extern "C" fn ZSTD_createDDict(
     dict_size: usize,
 ) -> *mut ZSTD_DDict {
     let dict = unsafe { in_slice(dict_buffer, dict_size) };
-    create_ddict(dict, crate::attach::ZSTD_DCT_AUTO)
+    // SAFETY: a copy keeps nothing of the buffer past the call.
+    unsafe { create_ddict(dict, DictLoad::Copy, crate::attach::ZSTD_DCT_AUTO) }
 }
 
 /// `ZSTD_DDict* ZSTD_createDDict_byReference(const void* dictBuffer, size_t
-/// dictSize)` (static API) — identical to [`ZSTD_createDDict`]; we copy the
-/// bytes so the caller's buffer need not outlive the `DDict`.
+/// dictSize)` (static API) — [`ZSTD_createDDict`] whose content stays in the
+/// caller's buffer instead of a copy; [`ZSTD_sizeof_DDict`] leaves that buffer
+/// out, as upstream does.
 ///
 /// # Safety
-/// Same as [`ZSTD_createDDict`].
+/// As [`ZSTD_createDDict`], and the buffer must stay alive and unchanged for
+/// the `DDict`'s lifetime (upstream contract).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_createDDict_byReference(
     dict_buffer: *const u8,
     dict_size: usize,
 ) -> *mut ZSTD_DDict {
-    unsafe { ZSTD_createDDict(dict_buffer, dict_size) }
+    let dict = unsafe { in_slice(dict_buffer, dict_size) };
+    // SAFETY: the caller's contract, passed on.
+    unsafe { create_ddict(dict, DictLoad::Reference, crate::attach::ZSTD_DCT_AUTO) }
 }
 
 /// `size_t ZSTD_freeDDict(ZSTD_DDict* ddict)` — free the dictionary; `NULL` is a
@@ -654,6 +741,13 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
         Some(handle) => dctx.decoder.decode_all_with_dict_handle(src, dst, handle),
         None => dctx.decoder.decode_all(src, dst),
     }));
+    // The DDict is this call's: one built over the caller's buffer may go,
+    // with that buffer, once the call returns, so the decoder keeps none of
+    // it. One holding its own copy stays with the decoder, so the next call
+    // with it touches no reference count.
+    if prepared.is_some_and(|handle| !handle.as_dict().dict_content.is_owned()) {
+        dctx.decoder.release_dictionaries();
+    }
     match outcome {
         Ok(Ok(written)) => {
             // One-shot consumed whole frames: the context is back at a

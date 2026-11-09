@@ -135,10 +135,44 @@ impl EncoderDictionary {
     pub fn from_bytes(
         raw_dictionary: &[u8],
     ) -> Result<Self, crate::decoding::errors::DictionaryDecodeError> {
-        Ok(Self::prepared(
-            crate::decoding::Dictionary::decode_dict_for_encoding(raw_dictionary)?,
-            raw_dictionary.len(),
-        ))
+        let (mut dictionary, content_start) =
+            crate::decoding::Dictionary::decode_dict_for_encoding(raw_dictionary)?;
+        dictionary.dict_content =
+            crate::decoding::DictionaryBytes::owned(raw_dictionary[content_start..].to_vec());
+        Ok(Self::prepared(dictionary, raw_dictionary.len()))
+    }
+
+    /// [`Self::from_serialized_or_raw_content`] over bytes held where the
+    /// caller chose: the content stays in that holder rather than being
+    /// copied, as upstream zstd's `ZSTD_createCDict_byReference` builds a
+    /// `CDict`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use structured_zstd::decoding::DictionaryBytes;
+    /// use structured_zstd::encoding::EncoderDictionary;
+    ///
+    /// let blob: Arc<[u8]> = Arc::from(&b"history the frames refer back to"[..]);
+    /// let dictionary =
+    ///     EncoderDictionary::from_serialized_or_raw_bytes(DictionaryBytes::shared(blob.clone()))
+    ///         .unwrap();
+    /// assert_eq!(dictionary.content().as_ptr(), blob.as_ptr());
+    /// ```
+    pub fn from_serialized_or_raw_bytes(
+        raw_dictionary: crate::decoding::DictionaryBytes,
+    ) -> Result<Self, crate::decoding::errors::DictionaryDecodeError> {
+        let serialized_len = raw_dictionary.len();
+        let dictionary = if crate::decoding::Dictionary::is_serialized(&raw_dictionary) {
+            let (mut dictionary, content_start) =
+                crate::decoding::Dictionary::decode_dict_for_encoding(&raw_dictionary)?;
+            dictionary.dict_content = raw_dictionary.tail(content_start);
+            dictionary
+        } else {
+            crate::decoding::Dictionary::from_raw_content(0, raw_dictionary)?
+        };
+        Ok(Self::prepared(dictionary, serialized_len))
     }
 
     /// Load whichever kind of dictionary `raw_dictionary` holds, the way
@@ -250,6 +284,9 @@ impl EncoderDictionary {
     {
         let handles = handles.into_iter();
         let mut total = 0;
+        // The content of each dictionary counted, whose shared buffers are
+        // counted once, below, by who else holds them.
+        let mut contents = Vec::new();
         for (position, handle) in handles.clone().enumerate() {
             let same = |other: &&EncoderDictionary| {
                 SharedEncoderDictionary::ptr_eq(&handle.inner, &other.inner)
@@ -271,10 +308,12 @@ impl EncoderDictionary {
                 })
                 .count();
             if SharedEncoderDictionary::strong_count(&handle.inner) == held_here {
-                total += handle.heap_size();
+                let content = &handle.inner.dict_content;
+                total += handle.heap_size() - content.shared_heap_bytes();
+                contents.push(content);
             }
         }
-        total
+        total + crate::decoding::dictionary::exclusive_shared_heap_bytes(&contents)
     }
 
     /// The content and serialized sizes the encoder's matcher is hinted with.

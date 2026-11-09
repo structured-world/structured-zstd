@@ -17,10 +17,13 @@
 use core::ffi::{c_int, c_uint};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use codec::decoding::{Dictionary, DictionaryHandle};
+use codec::decoding::{Dictionary, DictionaryBytes, DictionaryHandle};
 use codec::encoding::{CompressionParameters, EncoderDictionary};
 
-use crate::cdict::{ZSTD_CDict, ZSTD_DDict, next_dict_serial, prepare_compression_dictionary};
+use crate::cdict::{
+    ZSTD_CDict, ZSTD_DDict, next_dict_serial, prepare_compression_dictionary,
+    prepare_compression_dictionary_as,
+};
 use crate::context::{ZSTD_CCtx, ZSTD_DCtx, kept_compressor};
 use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
 use crate::ffi::{in_slice, out_slice};
@@ -118,11 +121,54 @@ pub(crate) enum DCtxDictAttach {
     },
 }
 
+/// `ZSTD_dictLoadMethod_e`'s `ZSTD_dlm_byRef` (`zstd.h`); every other value
+/// copies, as upstream reads it (`ZSTD_initDDict_internal`,
+/// `ZSTD_CCtx_loadDictionary_advanced`).
+const ZSTD_DLM_BY_REF: c_int = 1;
+
+/// How a dictionary holds the caller's bytes (`ZSTD_dictLoadMethod_e`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DictLoad {
+    /// A copy of its own: the caller's buffer may go right after the call.
+    Copy,
+    /// The caller's buffer itself, which must outlive every user of the
+    /// dictionary and stay unchanged (the `*_byReference` contract).
+    Reference,
+}
+
+impl DictLoad {
+    /// The load a `ZSTD_dictLoadMethod_e` value selects.
+    pub(crate) fn from_method(method: c_int) -> Self {
+        if method == ZSTD_DLM_BY_REF {
+            DictLoad::Reference
+        } else {
+            DictLoad::Copy
+        }
+    }
+
+    /// `dict` held the way this load holds it.
+    ///
+    /// # Safety
+    /// With [`DictLoad::Reference`], `dict` must stay alive and unchanged for
+    /// as long as anything built from the result exists (C contract).
+    pub(crate) unsafe fn hold(self, dict: &[u8]) -> DictionaryBytes {
+        match self {
+            DictLoad::Copy => DictionaryBytes::owned(dict.to_vec()),
+            // SAFETY: the caller's contract, passed on.
+            DictLoad::Reference => unsafe { DictionaryBytes::referenced(dict) },
+        }
+    }
+}
+
 /// Parse caller bytes into a decode-side [`DictionaryHandle`] honouring the
-/// `ZSTD_dictContentType_e` selection.
-pub(crate) fn parse_decode_dict(
+/// `ZSTD_dictContentType_e` selection, holding them as `load` says.
+///
+/// # Safety
+/// As [`DictLoad::hold`].
+pub(crate) unsafe fn parse_decode_dict_as(
     dict: &[u8],
     content_type: c_int,
+    load: DictLoad,
 ) -> Result<DictionaryHandle, ZSTD_ErrorCode> {
     let has_magic = Dictionary::is_serialized(dict);
     let full = match content_type {
@@ -137,10 +183,16 @@ pub(crate) fn parse_decode_dict(
         _ => return Err(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound),
     };
     if full {
-        return DictionaryHandle::decode_dict(dict)
-            .map_err(|_| ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted);
+        let parsed = match load {
+            // Only the content is copied, not the tables in front of it.
+            DictLoad::Copy => DictionaryHandle::decode_dict(dict),
+            // SAFETY: the caller's contract, passed on.
+            DictLoad::Reference => DictionaryHandle::decode_dict_bytes(unsafe { load.hold(dict) }),
+        };
+        return parsed.map_err(|_| ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted);
     }
-    let parsed = Dictionary::from_raw_content(RAW_CONTENT_DICT_ID, dict.to_vec())
+    // SAFETY: the caller's contract, passed on.
+    let parsed = Dictionary::from_raw_content(RAW_CONTENT_DICT_ID, unsafe { load.hold(dict) })
         .map_err(|_| ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted)?;
     Ok(DictionaryHandle::from_dictionary(parsed))
 }
@@ -158,7 +210,7 @@ pub(crate) fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<boo
                 // having named the wrong kind (`ZSTD_compress_insertDictionary`,
                 // zstd_compress.c:5223). The decode side answers `corrupted`
                 // for the same bytes (`ZSTD_loadEntropy_intoDDict`,
-                // zstd_ddict.c:105) — see `parse_decode_dict`.
+                // zstd_ddict.c:105) — see `parse_decode_dict_as`.
                 return Err(ZSTD_ErrorCode::ZSTD_error_dictionary_wrong);
             }
             Ok(false)
@@ -354,10 +406,41 @@ impl DCtxDictAttach {
 }
 
 impl ZSTD_DCtx {
-    /// Drop a single-use prefix after the frame that consumed it started.
+    /// Drop a single-use prefix after the frame that consumed it started. The
+    /// decoder keeps it until that frame ends ([`Self::frame_ended`]).
     pub(crate) fn consume_prefix(&mut self) {
         if matches!(self.attached_ddict, DCtxDictAttach::Prefix { .. }) {
             self.attached_ddict = DCtxDictAttach::None;
+        }
+    }
+
+    /// Attach `attach` in place of the context's dictionary. The decoder lets
+    /// go of what it kept from the one replaced: a dictionary over the
+    /// caller's buffer may have no holder once the caller stops using it.
+    pub(crate) fn set_attached_ddict(&mut self, attach: DCtxDictAttach) {
+        self.attached_ddict = attach;
+        self.release_decoder_dictionaries();
+    }
+
+    /// A frame ended: with no dictionary attached any more (a prefix applies
+    /// to one frame), the decoder keeps none of the frame's either.
+    pub(crate) fn frame_ended(&mut self) {
+        if matches!(self.attached_ddict, DCtxDictAttach::None) {
+            self.release_decoder_dictionaries();
+        }
+    }
+
+    /// Let the decoder go of the dictionaries it holds, except the one a begun
+    /// buffer-less run decodes with: that run holds it until the next begin,
+    /// as upstream's begun run keeps its dictionary through a reset.
+    fn release_decoder_dictionaries(&mut self) {
+        let run_dictionary = self.bufferless.dictionary().is_some_and(|run| {
+            self.decoder
+                .dictionaries()
+                .any(|held| core::ptr::eq(held.as_dict(), run.as_dict()))
+        });
+        if !run_dictionary {
+            self.decoder.release_dictionaries();
         }
     }
 }
@@ -365,11 +448,13 @@ impl ZSTD_DCtx {
 /// Shared body of the `ZSTD_CCtx_loadDictionary*` family.
 ///
 /// # Safety
-/// `dict` valid for `dict_size` bytes (or `NULL` + 0); `cctx` live.
+/// `dict` valid for `dict_size` bytes (or `NULL` + 0); `cctx` live; with
+/// [`DictLoad::Reference`], as [`DictLoad::hold`].
 unsafe fn cctx_load_dictionary(
     cctx: *mut ZSTD_CCtx,
     dict: *const u8,
     dict_size: usize,
+    load: DictLoad,
     content_type: c_int,
 ) -> usize {
     if cctx.is_null() {
@@ -391,7 +476,9 @@ unsafe fn cctx_load_dictionary(
     };
     // Prepared here, once: a corrupt dictionary errors now rather than at the
     // next compression (upstream parity), and every frame after attaches it.
-    let Some(prepared) = prepare_compression_dictionary(dict, raw_content) else {
+    // SAFETY: the caller's contract, passed on.
+    let Some(prepared) = (unsafe { prepare_compression_dictionary_as(dict, raw_content, load) })
+    else {
         return encode(ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted);
     };
     cctx.replace_attached_dict(CCtxDictAttach::Load {
@@ -414,38 +501,39 @@ pub unsafe extern "C" fn ZSTD_CCtx_loadDictionary(
     dict: *const u8,
     dict_size: usize,
 ) -> usize {
-    unsafe { cctx_load_dictionary(cctx, dict, dict_size, ZSTD_DCT_AUTO) }
+    unsafe { cctx_load_dictionary(cctx, dict, dict_size, DictLoad::Copy, ZSTD_DCT_AUTO) }
 }
 
-/// `ZSTD_CCtx_loadDictionary_byReference` — we always copy the bytes, so this
-/// is behaviourally identical to [`ZSTD_CCtx_loadDictionary`] (the caller's
-/// buffer need not outlive the context).
+/// `ZSTD_CCtx_loadDictionary_byReference` — [`ZSTD_CCtx_loadDictionary`]
+/// whose content stays in the caller's buffer instead of a copy.
 ///
 /// # Safety
-/// Same as [`ZSTD_CCtx_loadDictionary`].
+/// As [`ZSTD_CCtx_loadDictionary`], and the buffer must stay alive and
+/// unchanged while the context uses the dictionary (upstream contract).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_CCtx_loadDictionary_byReference(
     cctx: *mut ZSTD_CCtx,
     dict: *const u8,
     dict_size: usize,
 ) -> usize {
-    unsafe { cctx_load_dictionary(cctx, dict, dict_size, ZSTD_DCT_AUTO) }
+    unsafe { cctx_load_dictionary(cctx, dict, dict_size, DictLoad::Reference, ZSTD_DCT_AUTO) }
 }
 
 /// `ZSTD_CCtx_loadDictionary_advanced` — explicit load method + content type.
-/// The load method is accepted and ignored (bytes are always copied).
 ///
 /// # Safety
-/// Same as [`ZSTD_CCtx_loadDictionary`].
+/// As [`ZSTD_CCtx_loadDictionary`]; by reference, as
+/// [`ZSTD_CCtx_loadDictionary_byReference`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_CCtx_loadDictionary_advanced(
     cctx: *mut ZSTD_CCtx,
     dict: *const u8,
     dict_size: usize,
-    _load_method: c_int,
+    load_method: c_int,
     content_type: c_int,
 ) -> usize {
-    unsafe { cctx_load_dictionary(cctx, dict, dict_size, content_type) }
+    let load = DictLoad::from_method(load_method);
+    unsafe { cctx_load_dictionary(cctx, dict, dict_size, load, content_type) }
 }
 
 /// `size_t ZSTD_CCtx_refCDict(ZSTD_CCtx* cctx, const ZSTD_CDict* cdict)` —
@@ -508,7 +596,13 @@ unsafe fn cctx_ref_prefix(
         Ok(v) => v,
         Err(code) => return encode(code),
     };
-    let Some(prepared) = prepare_compression_dictionary(prefix, raw_content) else {
+    // Referenced, never copied: upstream's prefix is the caller's buffer, which
+    // must stay unchanged until the frame using it is done (`zstd.h`,
+    // `ZSTD_CCtx_refPrefix`).
+    // SAFETY: that contract, passed on.
+    let Some(prepared) =
+        (unsafe { prepare_compression_dictionary_as(prefix, raw_content, DictLoad::Reference) })
+    else {
         return encode(ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted);
     };
     cctx.replace_attached_dict(CCtxDictAttach::Prefix {
@@ -551,11 +645,13 @@ pub unsafe extern "C" fn ZSTD_CCtx_refPrefix_advanced(
 /// Shared body of the `ZSTD_DCtx_loadDictionary*` family.
 ///
 /// # Safety
-/// `dict` valid for `dict_size` bytes (or `NULL` + 0); `dctx` live.
+/// `dict` valid for `dict_size` bytes (or `NULL` + 0); `dctx` live; with
+/// [`DictLoad::Reference`], as [`DictLoad::hold`].
 unsafe fn dctx_load_dictionary(
     dctx: *mut ZSTD_DCtx,
     dict: *const u8,
     dict_size: usize,
+    load: DictLoad,
     content_type: c_int,
 ) -> usize {
     if dctx.is_null() {
@@ -567,13 +663,16 @@ unsafe fn dctx_load_dictionary(
     }
     let dict = unsafe { in_slice(dict, dict_size) };
     if dict.is_empty() {
-        dctx.attached_ddict = DCtxDictAttach::None;
+        dctx.set_attached_ddict(DCtxDictAttach::None);
         return 0;
     }
-    let parsed = catch_unwind(AssertUnwindSafe(|| parse_decode_dict(dict, content_type)));
+    // SAFETY: the caller's contract, passed on.
+    let parsed = catch_unwind(AssertUnwindSafe(|| unsafe {
+        parse_decode_dict_as(dict, content_type, load)
+    }));
     match parsed {
         Ok(Ok(handle)) => {
-            dctx.attached_ddict = DCtxDictAttach::Load { handle };
+            dctx.set_attached_ddict(DCtxDictAttach::Load { handle });
             0
         }
         Ok(Err(code)) => encode(code),
@@ -593,37 +692,39 @@ pub unsafe extern "C" fn ZSTD_DCtx_loadDictionary(
     dict: *const u8,
     dict_size: usize,
 ) -> usize {
-    unsafe { dctx_load_dictionary(dctx, dict, dict_size, ZSTD_DCT_AUTO) }
+    unsafe { dctx_load_dictionary(dctx, dict, dict_size, DictLoad::Copy, ZSTD_DCT_AUTO) }
 }
 
-/// `ZSTD_DCtx_loadDictionary_byReference` — identical to
-/// [`ZSTD_DCtx_loadDictionary`]; the bytes are always copied.
+/// `ZSTD_DCtx_loadDictionary_byReference` — [`ZSTD_DCtx_loadDictionary`]
+/// whose content stays in the caller's buffer instead of a copy.
 ///
 /// # Safety
-/// Same as [`ZSTD_DCtx_loadDictionary`].
+/// As [`ZSTD_DCtx_loadDictionary`], and the buffer must stay alive and
+/// unchanged while the context uses the dictionary (upstream contract).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_DCtx_loadDictionary_byReference(
     dctx: *mut ZSTD_DCtx,
     dict: *const u8,
     dict_size: usize,
 ) -> usize {
-    unsafe { dctx_load_dictionary(dctx, dict, dict_size, ZSTD_DCT_AUTO) }
+    unsafe { dctx_load_dictionary(dctx, dict, dict_size, DictLoad::Reference, ZSTD_DCT_AUTO) }
 }
 
-/// `ZSTD_DCtx_loadDictionary_advanced` — explicit load method (ignored; bytes
-/// are copied) + content type.
+/// `ZSTD_DCtx_loadDictionary_advanced` — explicit load method + content type.
 ///
 /// # Safety
-/// Same as [`ZSTD_DCtx_loadDictionary`].
+/// As [`ZSTD_DCtx_loadDictionary`]; by reference, as
+/// [`ZSTD_DCtx_loadDictionary_byReference`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_DCtx_loadDictionary_advanced(
     dctx: *mut ZSTD_DCtx,
     dict: *const u8,
     dict_size: usize,
-    _load_method: c_int,
+    load_method: c_int,
     content_type: c_int,
 ) -> usize {
-    unsafe { dctx_load_dictionary(dctx, dict, dict_size, content_type) }
+    let load = DictLoad::from_method(load_method);
+    unsafe { dctx_load_dictionary(dctx, dict, dict_size, load, content_type) }
 }
 
 /// `size_t ZSTD_DCtx_refDDict(ZSTD_DCtx* dctx, const ZSTD_DDict* ddict)` —
@@ -645,18 +746,18 @@ pub unsafe extern "C" fn ZSTD_DCtx_refDDict(
         return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
     }
     if ddict.is_null() {
-        dctx.attached_ddict = DCtxDictAttach::None;
+        dctx.set_attached_ddict(DCtxDictAttach::None);
         return 0;
     }
     // The DDict was prepared at creation; an empty one references nothing.
     let Some(handle) = &unsafe { &*ddict }.prepared else {
-        dctx.attached_ddict = DCtxDictAttach::None;
+        dctx.set_attached_ddict(DCtxDictAttach::None);
         return 0;
     };
     if !dctx.ref_multiple_ddicts {
-        dctx.attached_ddict = DCtxDictAttach::RefDDict {
+        dctx.set_attached_ddict(DCtxDictAttach::RefDDict {
             handle: handle.clone(),
-        };
+        });
         return 0;
     }
     // Added to the DDicts referenced so far, replacing one of the same ID as
@@ -669,7 +770,7 @@ pub unsafe extern "C" fn ZSTD_DCtx_refDDict(
     };
     handles.retain(|held| held.id() != handle.id());
     handles.push(handle.clone());
-    dctx.attached_ddict = DCtxDictAttach::RefDDicts { handles };
+    dctx.set_attached_ddict(DCtxDictAttach::RefDDicts { handles });
     0
 }
 
@@ -709,13 +810,19 @@ unsafe fn dctx_ref_prefix(
     }
     let prefix = unsafe { in_slice(prefix, prefix_size) };
     if prefix.is_empty() {
-        dctx.attached_ddict = DCtxDictAttach::None;
+        dctx.set_attached_ddict(DCtxDictAttach::None);
         return 0;
     }
-    let parsed = catch_unwind(AssertUnwindSafe(|| parse_decode_dict(prefix, content_type)));
+    // Referenced, never copied: upstream's prefix is the caller's buffer, which
+    // must stay unchanged until the frame using it is decoded (`zstd.h`,
+    // `ZSTD_DCtx_refPrefix`).
+    // SAFETY: that contract, passed on.
+    let parsed = catch_unwind(AssertUnwindSafe(|| unsafe {
+        parse_decode_dict_as(prefix, content_type, DictLoad::Reference)
+    }));
     match parsed {
         Ok(Ok(handle)) => {
-            dctx.attached_ddict = DCtxDictAttach::Prefix { handle };
+            dctx.set_attached_ddict(DCtxDictAttach::Prefix { handle });
             0
         }
         Ok(Err(code)) => encode(code),
@@ -883,12 +990,18 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
                 .decode_all(src, dst)
                 .map_err(|err| code_for_decoder_error(&err))
         } else {
-            let handle = parse_decode_dict(dict, ZSTD_DCT_AUTO)?;
+            // Referenced, as upstream's `ZSTD_decompress_usingDict` refers to the
+            // content (`ZSTD_refDictContent`) rather than copy it per call.
+            // SAFETY: `dict` is valid for this call, and the decoder lets go of
+            // it before the call returns, whatever the outcome.
+            let handle = unsafe { parse_decode_dict_as(dict, ZSTD_DCT_AUTO, DictLoad::Reference) }?;
             dctx.decoder
                 .decode_all_with_dict_handle(src, dst, &handle)
                 .map_err(|err| code_for_decoder_error(&err))
         }
     }));
+    // The dictionary was this call's: the decoder keeps none of it.
+    dctx.decoder.release_dictionaries();
     match outcome {
         Ok(Ok(written)) => {
             dctx.stream_frame_done = true;

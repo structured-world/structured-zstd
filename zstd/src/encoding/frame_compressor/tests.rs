@@ -1758,7 +1758,7 @@ fn set_dictionary_accepts_a_dictionary_without_an_id() {
         id: 0,
         fse: alloc::boxed::Box::new(crate::decoding::scratch::FSEScratch::new()),
         huf: crate::decoding::scratch::HuffmanScratch::new(),
-        dict_content: vec![1, 2, 3],
+        dict_content: vec![1, 2, 3].into(),
         offset_hist: [1, 4, 8],
     };
 
@@ -1776,7 +1776,7 @@ fn set_dictionary_accepts_a_dictionary_without_an_id() {
         id: 0,
         fse: alloc::boxed::Box::new(crate::decoding::scratch::FSEScratch::new()),
         huf: crate::decoding::scratch::HuffmanScratch::new(),
-        dict_content: vec![1, 2, 3],
+        dict_content: vec![1, 2, 3].into(),
         offset_hist: [1, 4, 8],
     });
     assert!(
@@ -1919,7 +1919,7 @@ fn set_dictionary_rejects_zero_repeat_offsets() {
         id: 1,
         fse: alloc::boxed::Box::new(crate::decoding::scratch::FSEScratch::new()),
         huf: crate::decoding::scratch::HuffmanScratch::new(),
-        dict_content: vec![1, 2, 3],
+        dict_content: vec![1, 2, 3].into(),
         offset_hist: [0, 4, 8],
     };
 
@@ -5206,4 +5206,61 @@ fn a_dictionary_with_a_level_of_its_own_says_so() {
         super::EncoderDictionary::from_serialized_or_raw_content(b"some shared history").unwrap();
     assert!(!dictionary.clone().sizes().prepared_at_level);
     assert!(dictionary.with_level_of_its_own().sizes().prepared_at_level);
+}
+
+/// An encoder dictionary prepared over the caller's buffer keeps its content
+/// there, as `ZSTD_createCDict_byReference` does, and compresses every frame
+/// exactly as the copying constructor's does, serialized or raw.
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn an_encoder_dictionary_over_the_callers_buffer_compresses_as_a_copy() {
+    use crate::decoding::DictionaryBytes;
+    use crate::encoding::CompressionLevel;
+    let serialized: &[u8] = include_bytes!("../../../dict_tests/dictionary");
+    let raw_content: &[u8] = &serialized[serialized.len() - 4096..];
+    let mut payload = Vec::new();
+    for chunk in raw_content.chunks(512) {
+        payload.extend_from_slice(chunk);
+        payload.extend_from_slice(b"; the frame's own bytes");
+    }
+    for blob in [serialized, raw_content] {
+        let shared: alloc::sync::Arc<[u8]> = alloc::sync::Arc::from(blob);
+        let copied = super::EncoderDictionary::from_serialized_or_raw_content(blob).unwrap();
+        let over_shared = super::EncoderDictionary::from_serialized_or_raw_bytes(
+            DictionaryBytes::shared(shared.clone()),
+        )
+        .unwrap();
+        let start = blob.len() - copied.content().len();
+        assert_eq!(over_shared.content().as_ptr(), shared[start..].as_ptr());
+        // The buffer counts in what keeps it alive, and is the set's alone
+        // only once the caller let go of it.
+        let content_bytes = over_shared.inner.dict_content.heap_bytes();
+        assert!(content_bytes > blob.len());
+        assert_eq!(
+            super::EncoderDictionary::exclusive_heap_size([&over_shared]),
+            over_shared.heap_size() - content_bytes
+        );
+        // A second dictionary over the same buffer, the caller's reference
+        // gone: the pair owns it and counts it once.
+        let second =
+            super::EncoderDictionary::from_serialized_or_raw_bytes(DictionaryBytes::shared(shared))
+                .unwrap();
+        assert_eq!(
+            super::EncoderDictionary::exclusive_heap_size([&over_shared, &second]),
+            over_shared.heap_size() + second.heap_size() - content_bytes
+        );
+        assert_eq!(over_shared.content(), copied.content());
+        assert_eq!(over_shared.id(), copied.id());
+        for level in [1, 3, 9, 19] {
+            let compress = |dictionary: &super::EncoderDictionary| {
+                let mut compressor: FrameCompressor =
+                    FrameCompressor::new(CompressionLevel::Level(level));
+                compressor
+                    .set_encoder_dictionary(dictionary.clone())
+                    .unwrap();
+                compressor.compress_independent_frame(&payload)
+            };
+            assert_eq!(compress(&over_shared), compress(&copied), "level {level}");
+        }
+    }
 }

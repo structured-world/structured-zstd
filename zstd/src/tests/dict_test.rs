@@ -49,7 +49,7 @@ fn test_dict_parsing() {
         );
     }
 
-    if !dict.dict_content.eq(&raw_content) {
+    if *dict.dict_content != *raw_content {
         panic!(
             "dict content did not get parsed correctly. Is: {:?}, Should be: {:?}",
             dict.dict_content, raw_content

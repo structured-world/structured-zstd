@@ -575,7 +575,13 @@ fn begin_decode(dctx: &mut ZSTD_DCtx, dictionary: Option<DictionaryHandle>) -> u
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         dctx.decoder
             .set_max_window_size(codec::decoding::MAX_DECODER_WINDOW_SIZE)?;
-        dctx.decoder.begin_blocks(dictionary.as_ref())
+        dctx.decoder.begin_blocks(dictionary.as_ref())?;
+        // A run without a dictionary keeps none of an earlier run's: the
+        // caller's buffer behind it is the earlier run's only.
+        if dictionary.is_none() {
+            dctx.decoder.release_dictionaries();
+        }
+        Ok(())
     }));
     match outcome {
         Ok(Ok(())) => {}
@@ -611,10 +617,12 @@ pub unsafe extern "C" fn ZSTD_decompressBegin(dctx: *mut ZSTD_DCtx) -> usize {
 
 /// `size_t ZSTD_decompressBegin_usingDict(ZSTD_DCtx* dctx, const void* dict,
 /// size_t dictSize)` — begin a buffer-less run with a dictionary (none when
-/// empty).
+/// empty). The content is referenced, not copied, as upstream's
+/// `ZSTD_refDictContent` refers to it.
 ///
 /// # Safety
-/// `dctx` live or `NULL`; `dict` valid for `dict_size` bytes.
+/// `dctx` live or `NULL`; `dict` valid for `dict_size` bytes and unchanged
+/// until the run is decoded (upstream contract).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_decompressBegin_usingDict(
     dctx: *mut ZSTD_DCtx,
@@ -628,8 +636,13 @@ pub unsafe extern "C" fn ZSTD_decompressBegin_usingDict(
     if dict.is_empty() {
         return begin_decode(dctx, None);
     }
-    let parsed = catch_unwind(AssertUnwindSafe(|| {
-        crate::attach::parse_decode_dict(dict, crate::attach::ZSTD_DCT_AUTO)
+    // SAFETY: the caller's contract, passed on.
+    let parsed = catch_unwind(AssertUnwindSafe(|| unsafe {
+        crate::attach::parse_decode_dict_as(
+            dict,
+            crate::attach::ZSTD_DCT_AUTO,
+            crate::attach::DictLoad::Reference,
+        )
     }));
     match parsed {
         Ok(Ok(handle)) => begin_decode(dctx, Some(handle)),
@@ -951,7 +964,7 @@ pub unsafe extern "C" fn ZSTD_copyDCtx(dctx: *mut ZSTD_DCtx, prepared_dctx: *con
     dst.apply_max_block_size();
     dst.stable_out_buffer = src.stable_out_buffer;
     dst.disable_huffman_assembly = src.disable_huffman_assembly;
-    dst.attached_ddict = src.attached_ddict.clone();
+    dst.set_attached_ddict(src.attached_ddict.clone());
     let dictionary = src.bufferless.dictionary.clone();
     // `begin_decode` leaves `dst` at the start of a run with the same
     // dictionary, the documented copy. A copy cannot fail, so a begin that

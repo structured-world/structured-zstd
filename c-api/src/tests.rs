@@ -2953,6 +2953,183 @@ fn dict_compressor_cache_drops_stale_target_block_size() {
     unsafe { ZSTD_freeCCtx(cctx) };
 }
 
+/// A by-reference DDict or CDict keeps its content in the caller's buffer:
+/// `ZSTD_sizeof_DDict` leaves the content out, as upstream's does, and every
+/// frame compresses and decodes exactly as with the copying constructors. The
+/// load method of the `_advanced` constructors selects the same.
+#[test]
+fn by_reference_dictionaries_keep_the_callers_buffer() {
+    use crate::cdict::{
+        ZSTD_compress_usingCDict, ZSTD_createCDict, ZSTD_createCDict_byReference, ZSTD_createDDict,
+        ZSTD_createDDict_byReference, ZSTD_decompress_usingDDict, ZSTD_freeCDict, ZSTD_freeDDict,
+        ZSTD_sizeof_DDict,
+    };
+    let default_mem = ZSTD_customMem {
+        customAlloc: core::ptr::null(),
+        customFree: core::ptr::null(),
+        opaque: core::ptr::null(),
+    };
+    let dict = trained_dictionary();
+    let payload = dict_payload();
+    let content_len = codec::decoding::Dictionary::decode_dict(&dict)
+        .unwrap()
+        .dict_content
+        .len();
+    let ddict_copy = unsafe { ZSTD_createDDict(dict.as_ptr(), dict.len()) };
+    let ddict_ref = unsafe { ZSTD_createDDict_byReference(dict.as_ptr(), dict.len()) };
+    let ddict_adv =
+        unsafe { ZSTD_createDDict_advanced(dict.as_ptr(), dict.len(), 1, 0, default_mem) };
+    let cdict_copy = unsafe { ZSTD_createCDict(dict.as_ptr(), dict.len(), 3) };
+    let cdict_ref = unsafe { ZSTD_createCDict_byReference(dict.as_ptr(), dict.len(), 3) };
+    let zero_cparams = ZSTD_compressionParameters {
+        windowLog: 0,
+        chainLog: 0,
+        hashLog: 0,
+        searchLog: 0,
+        minMatch: 0,
+        targetLength: 0,
+        strategy: 0,
+    };
+    let cdict_adv = unsafe {
+        ZSTD_createCDict_advanced(dict.as_ptr(), dict.len(), 1, 0, zero_cparams, default_mem)
+    };
+    // The content lies in the caller's buffer, not in a copy of it: a copy
+    // would produce the same frames, so only the address tells them apart.
+    // `as_ref` refuses a NULL constructor result before anything is read.
+    let ddict_content = |ddict: *mut crate::cdict::ZSTD_DDict| {
+        let ddict = unsafe { ddict.as_ref() }.expect("the DDict was created");
+        ddict
+            .prepared
+            .as_ref()
+            .unwrap()
+            .as_dict()
+            .dict_content
+            .as_ptr()
+    };
+    let cdict_content = |cdict: *mut crate::cdict::ZSTD_CDict| {
+        let cdict = unsafe { cdict.as_ref() }.expect("the CDict was created");
+        cdict.dict.as_ref().unwrap().content().as_ptr()
+    };
+    for ddict in [ddict_ref, ddict_adv] {
+        assert!(dict.as_ptr_range().contains(&ddict_content(ddict)));
+        assert_eq!(
+            unsafe { ZSTD_sizeof_DDict(ddict) } + content_len,
+            unsafe { ZSTD_sizeof_DDict(ddict_copy) },
+            "a referenced DDict must not count the caller's content"
+        );
+    }
+    for cdict in [cdict_ref, cdict_adv] {
+        assert!(dict.as_ptr_range().contains(&cdict_content(cdict)));
+    }
+    assert!(!dict.as_ptr_range().contains(&ddict_content(ddict_copy)));
+    assert!(!dict.as_ptr_range().contains(&cdict_content(cdict_copy)));
+
+    let cctx = ZSTD_createCCtx();
+    let dctx = ZSTD_createDCtx();
+    let compress = |cdict| {
+        let mut frame = vec![0u8; payload.len() + 512];
+        let written = unsafe {
+            ZSTD_compress_usingCDict(
+                cctx,
+                frame.as_mut_ptr(),
+                frame.len(),
+                payload.as_ptr(),
+                payload.len(),
+                cdict,
+            )
+        };
+        assert_eq!(ZSTD_isError(written), 0);
+        frame.truncate(written);
+        frame
+    };
+    let frame = compress(cdict_ref);
+    assert_eq!(frame, compress(cdict_copy));
+    // Dictionaries the context's decoder still holds. A referenced one may be
+    // held only while the context uses it: the call that took it, the frame a
+    // prefix applies to, or as long as it stays attached.
+    let held = || {
+        unsafe { dctx.as_ref() }
+            .expect("the DCtx was created")
+            .decoder
+            .dictionaries()
+            .count()
+    };
+    for ddict in [ddict_copy, ddict_ref, ddict_adv] {
+        let mut out = vec![0u8; payload.len()];
+        let read = unsafe {
+            ZSTD_decompress_usingDDict(
+                dctx,
+                out.as_mut_ptr(),
+                out.len(),
+                frame.as_ptr(),
+                frame.len(),
+                ddict,
+            )
+        };
+        assert_eq!(ZSTD_isError(read), 0);
+        assert_eq!(&out[..read], payload.as_slice());
+        // A DDict with its own copy may stay with the decoder; one over the
+        // caller's buffer may not outlive the call.
+        if ddict != ddict_copy {
+            assert_eq!(held(), 0, "a referenced DDict is held past the call");
+        }
+    }
+
+    // A prefix applies to one frame and is not held after it.
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_refPrefix_advanced(dctx, dict.as_ptr(), dict.len(), 0) }),
+        0
+    );
+    let mut out = vec![0u8; payload.len()];
+    let read = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+        )
+    };
+    assert_eq!(&out[..read], payload.as_slice());
+    assert_eq!(held(), 0, "a prefix is held past its frame");
+
+    // The contexts' by-reference loads through the load method.
+    assert_eq!(
+        ZSTD_isError(unsafe {
+            ZSTD_DCtx_loadDictionary_advanced(dctx, dict.as_ptr(), dict.len(), 1, 0)
+        }),
+        0
+    );
+    let mut out = vec![0u8; payload.len()];
+    let read = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+        )
+    };
+    assert_eq!(&out[..read], payload.as_slice());
+    // Held while attached, let go once it is not.
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_loadDictionary(dctx, core::ptr::null(), 0) }),
+        0
+    );
+    assert_eq!(held(), 0, "a detached dictionary is still held");
+
+    unsafe {
+        ZSTD_freeDDict(ddict_copy);
+        ZSTD_freeDDict(ddict_ref);
+        ZSTD_freeDDict(ddict_adv);
+        ZSTD_freeCDict(cdict_copy);
+        ZSTD_freeCDict(cdict_ref);
+        ZSTD_freeCDict(cdict_adv);
+        ZSTD_freeDCtx(dctx);
+        ZSTD_freeCCtx(cctx);
+    }
+}
+
 #[test]
 fn by_reference_and_advanced_attach_variants_roundtrip() {
     // The byReference / _advanced wrappers share the load body; exercise
@@ -3124,13 +3301,13 @@ fn by_reference_and_advanced_attach_variants_roundtrip() {
     unsafe { ZSTD_freeCCtx(cctx) };
 }
 
+/// A referenced prefix is spent by the one-shot it is used for, whatever its
+/// outcome, as upstream's `ZSTD_decompressDCtx` takes it (`ZSTD_getDDict`)
+/// before decoding: the caller may release it once the call returns, and the
+/// call cannot tell it whether a frame had started reading it (a v0.5-v0.7
+/// frame holds no handle until it ends).
 #[test]
-fn dctx_ref_prefix_survives_a_failed_one_shot() {
-    // A referenced prefix is single-use, but "use" means a frame actually
-    // started with it — the streaming path consumes it only after a
-    // successful reset. A one-shot that fails before any frame starts
-    // (garbage input here) must leave the prefix attached so the retry
-    // with the real frame still decodes.
+fn dctx_ref_prefix_is_spent_by_a_failed_one_shot() {
     let prefix = dict_payload();
     let mut payload = prefix[..1024].to_vec();
     payload.extend_from_slice(b"prefix retry tail 0123456789");
@@ -3169,14 +3346,71 @@ fn dctx_ref_prefix_survives_a_failed_one_shot() {
         )
     };
     assert_ne!(ZSTD_isError(failed), 0, "garbage must fail to decode");
+    let context = unsafe { dctx.as_ref() }.expect("the DCtx was created");
+    assert!(
+        matches!(context.attached_ddict, crate::attach::DCtxDictAttach::None),
+        "the prefix stays attached after the failed call"
+    );
+    assert_eq!(context.decoder.dictionaries().count(), 0);
+    // The frame refers into the prefix, so without it it does not decode.
     let read =
         unsafe { ZSTD_decompressDCtx(dctx, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
+    assert!(ZSTD_isError(read) != 0 || out[..read] != payload[..]);
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
+
+/// A one-shot that starts a frame with the referenced prefix and then fails
+/// on input after it has used the prefix: the caller may release the prefix
+/// once the call returns, so neither the context nor its decoder keeps it.
+#[test]
+fn dctx_ref_prefix_is_spent_by_a_one_shot_that_used_it_and_failed() {
+    let prefix = dict_payload();
+    let mut payload = prefix[..1024].to_vec();
+    payload.extend_from_slice(b"prefix spent tail 0123456789");
+    let cctx = ZSTD_createCCtx();
     assert_eq!(
-        ZSTD_isError(read),
-        0,
-        "the prefix must survive the failed one-shot"
+        ZSTD_isError(unsafe { ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr(), prefix.len()) }),
+        0
     );
-    assert_eq!(&out[..read], payload.as_slice());
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    frame.truncate(written);
+    // The prefix frame, then input that is no frame at all.
+    let mut input = frame.clone();
+    input.extend_from_slice(&[0u8; 24]);
+
+    let dctx = ZSTD_createDCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_refPrefix(dctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let mut out = vec![0u8; payload.len() + 64];
+    let failed = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            input.as_ptr(),
+            input.len(),
+        )
+    };
+    assert_ne!(ZSTD_isError(failed), 0, "the trailing garbage must fail");
+    let context = unsafe { dctx.as_ref() }.expect("the DCtx was created");
+    assert!(
+        matches!(context.attached_ddict, crate::attach::DCtxDictAttach::None),
+        "a prefix a frame used stays attached after the call"
+    );
+    assert_eq!(context.decoder.dictionaries().count(), 0);
     unsafe { ZSTD_freeDCtx(dctx) };
     unsafe { ZSTD_freeCCtx(cctx) };
 }

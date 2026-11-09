@@ -39,7 +39,9 @@ mod streaming_decoder;
 #[cfg_attr(docsrs, doc(cfg(feature = "caller-workspace")))]
 pub mod workspace;
 
-pub use dictionary::{Dictionary, DictionaryHandle, MAGIC_NUM as DICTIONARY_MAGIC};
+pub use dictionary::{
+    Dictionary, DictionaryBytes, DictionaryHandle, MAGIC_NUM as DICTIONARY_MAGIC, SharedBytes,
+};
 pub use frame_decoder::{BlockDecodingStrategy, ContentChecksum, FrameDecoder};
 #[cfg(feature = "legacy")]
 #[cfg_attr(docsrs, doc(cfg(feature = "legacy")))]
