@@ -306,6 +306,12 @@ impl EncoderDictionary {
                 .count();
             if SharedEncoderDictionary::strong_count(&handle.inner) == held_here {
                 total += handle.heap_size();
+                // A shared buffer someone else also holds is not these
+                // handles' alone, though the dictionary keeps it alive too.
+                let content = &handle.inner.dict_content;
+                if content.held_elsewhere() {
+                    total -= content.heap_bytes();
+                }
             }
         }
         total

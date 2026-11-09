@@ -159,15 +159,35 @@ impl DictionaryBytes {
         matches!(self.holder, BytesHolder::Owned(_))
     }
 
-    /// Heap bytes this value owns: its `Vec`'s capacity, nothing for a shared
-    /// or referenced buffer, which is the caller's (upstream zstd's
-    /// `ZSTD_sizeof_DDict` leaves a by-reference buffer out too).
+    /// Heap bytes this value keeps alive: its `Vec`'s capacity, or the whole
+    /// shared allocation, which its reference holds alive whoever else holds
+    /// one too; nothing for a referenced buffer, which the caller owns
+    /// (upstream zstd's `ZSTD_sizeof_DDict` leaves a by-reference buffer out
+    /// too). [`DictionaryHandle::exclusive_heap_size`] leaves a shared buffer
+    /// out while something else still holds it.
     pub fn heap_bytes(&self) -> usize {
         match &self.holder {
             BytesHolder::Owned(bytes) => bytes.capacity(),
             #[cfg(target_has_atomic = "ptr")]
-            BytesHolder::Shared(_) => 0,
+            BytesHolder::Shared(bytes) => core::alloc::Layout::new::<[usize; 2]>()
+                .extend(
+                    core::alloc::Layout::array::<u8>(bytes.len()).expect("a live slice's layout"),
+                )
+                .expect("a live allocation's layout")
+                .0
+                .pad_to_align()
+                .size(),
             BytesHolder::Referenced => 0,
+        }
+    }
+
+    /// Whether a holder other than this value keeps the bytes alive: a shared
+    /// buffer with another reference to it.
+    pub(crate) fn held_elsewhere(&self) -> bool {
+        match &self.holder {
+            #[cfg(target_has_atomic = "ptr")]
+            BytesHolder::Shared(bytes) => Arc::strong_count(bytes) > 1,
+            _ => false,
         }
     }
 
@@ -304,7 +324,6 @@ pub const MAGIC_NUM: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 /// content: magic number and ID, a Huffman description (its size byte and at
 /// most 127 more), the three FSE descriptions at their largest, and the
 /// repeat offsets.
-#[cfg(feature = "legacy")]
 const MAX_SERIALIZED_HEADER_LEN: usize = 8
     + 128
     + max_fse_description_len(
@@ -321,10 +340,13 @@ const MAX_SERIALIZED_HEADER_LEN: usize = 8
     )
     + 12;
 
+/// Most bytes a shared buffer's allocation adds to its bytes: the two
+/// word-sized counts ahead of them, and padding to word alignment.
+const MAX_SHARED_BYTES_OVERHEAD: usize = 3 * core::mem::size_of::<usize>();
+
 /// Most bytes an FSE description of symbols `0..=max_symbol` at accuracy log
 /// `max_log` takes: the 4-bit log, then per symbol a count of at most
 /// `max_log + 1` bits and, amortized, at most 2 bits of zero-run flags.
-#[cfg(feature = "legacy")]
 const fn max_fse_description_len(max_symbol: u8, max_log: u8) -> usize {
     (4 + (max_symbol as usize + 1) * (max_log as usize + 3)).div_ceil(8)
 }
@@ -344,7 +366,10 @@ impl Dictionary {
 
     /// Most [`heap_bytes`](Self::heap_bytes) a dictionary holding
     /// `content_len` bytes of content can report, so a caller can budget for
-    /// one before parsing it.
+    /// one before parsing it. It covers content held in the dictionary's own
+    /// copy, or in a shared buffer the dictionary was parsed from, which also
+    /// carries the serialized tables in front of the content and the shared
+    /// allocation's counts.
     ///
     /// # Examples
     ///
@@ -356,6 +381,8 @@ impl Dictionary {
     /// ```
     pub const fn max_heap_bytes(content_len: usize) -> usize {
         content_len
+            + MAX_SERIALIZED_HEADER_LEN
+            + MAX_SHARED_BYTES_OVERHEAD
             + core::mem::size_of::<FSEScratch>()
             + FSEScratch::max_heap_bytes()
             + HuffmanScratch::max_heap_bytes()
@@ -774,6 +801,12 @@ impl DictionaryHandle {
                 .count();
             if SharedDictionary::strong_count(&handle.inner) == held_here {
                 total += handle.heap_size();
+                // A shared buffer someone else also holds is not these
+                // handles' alone, though the dictionary keeps it alive too.
+                let content = &handle.inner.dict.dict_content;
+                if content.held_elsewhere() {
+                    total -= content.heap_bytes();
+                }
             }
         }
         total

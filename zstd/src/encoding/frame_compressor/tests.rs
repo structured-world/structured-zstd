@@ -5232,6 +5232,14 @@ fn an_encoder_dictionary_over_the_callers_buffer_compresses_as_a_copy() {
         .unwrap();
         let start = blob.len() - copied.content().len();
         assert_eq!(over_shared.content().as_ptr(), shared[start..].as_ptr());
+        // The buffer counts in what keeps it alive, and is the set's alone
+        // only once the caller let go of it.
+        let content_bytes = over_shared.inner.dict_content.heap_bytes();
+        assert!(content_bytes > blob.len());
+        assert_eq!(
+            super::EncoderDictionary::exclusive_heap_size([&over_shared]),
+            over_shared.heap_size() - content_bytes
+        );
         assert_eq!(over_shared.content(), copied.content());
         assert_eq!(over_shared.id(), copied.id());
         for level in [1, 3, 9, 19] {

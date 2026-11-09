@@ -333,14 +333,14 @@ fn a_dictionary_over_the_callers_buffer_decodes_without_a_copy() {
     );
     for handle in [&over_shared, &over_reference] {
         assert_eq!(handle.as_dict().dict_content, copied.as_dict().dict_content);
-        assert_eq!(handle.as_dict().dict_content.heap_bytes(), 0);
-        // The content is the caller's, so the handle reports it out, as
-        // upstream's `ZSTD_sizeof_DDict` leaves a referenced buffer out.
-        assert_eq!(
-            handle.heap_size() + copied.as_dict().dict_content.heap_bytes(),
-            copied.heap_size()
-        );
     }
+    // A referenced buffer is the caller's, so the handle reports it out, as
+    // upstream's `ZSTD_sizeof_DDict` leaves a referenced buffer out.
+    assert_eq!(over_reference.as_dict().dict_content.heap_bytes(), 0);
+    assert_eq!(
+        over_reference.heap_size() + copied.as_dict().dict_content.heap_bytes(),
+        copied.heap_size()
+    );
 
     for (frame, payload) in frames_with_the_reference_dictionary(raw) {
         for handle in [&copied, &over_shared, &over_reference] {
@@ -352,6 +352,41 @@ fn a_dictionary_over_the_callers_buffer_decodes_without_a_copy() {
             assert_eq!(&out[..written], payload.as_slice());
         }
     }
+}
+
+/// A shared buffer is held alive by the dictionary that holds it, so its
+/// allocation counts in the handle's footprint even after the caller dropped
+/// its own reference; and a set of handles counts it as theirs alone only while
+/// nothing outside them holds the buffer.
+#[cfg(target_has_atomic = "ptr")]
+#[test]
+fn a_shared_buffer_counts_in_the_footprint_of_what_keeps_it_alive() {
+    let raw: &[u8] = include_bytes!("../../../dict_tests/dictionary");
+    let shared: Arc<[u8]> = Arc::from(raw);
+    let handle =
+        DictionaryHandle::decode_dict_bytes(DictionaryBytes::shared(shared.clone())).unwrap();
+    let held = handle.as_dict().dict_content.heap_bytes();
+    assert!(
+        held > raw.len(),
+        "the shared allocation is {held} bytes, the buffer {}",
+        raw.len()
+    );
+    // The bound callers budget by before parsing still holds.
+    let content_len = handle.as_dict().dict_content.len();
+    assert!(handle.heap_size() <= DictionaryHandle::max_heap_size(content_len));
+    assert!(handle.as_dict().heap_bytes() <= Dictionary::max_heap_bytes(content_len));
+
+    // The caller still holds the buffer: it is not this handle's alone.
+    assert_eq!(
+        DictionaryHandle::exclusive_heap_size([&handle]),
+        handle.heap_size() - held
+    );
+    // Dropped: the handle is what keeps it alive.
+    drop(shared);
+    assert_eq!(
+        DictionaryHandle::exclusive_heap_size([&handle]),
+        handle.heap_size()
+    );
 }
 
 /// Raw content handed over shared or by reference stays where it is too, and
