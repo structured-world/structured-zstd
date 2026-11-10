@@ -390,11 +390,16 @@ impl SequencePrefixSums {
 /// early because the code depends on a repeat-offset history that must not
 /// advance across a partition the emitter ends up writing raw.
 ///
-/// The packed [`SequenceCode`] lives in the bits of `ll` and `ml` above their
-/// lengths, written by [`fill_and_count`] and read by the bitstream writer, so
-/// a block needs no buffer of codes beside its sequences. A block's lengths
-/// stay under 2^17 (the literal length) and at most 2^17 (the match length),
-/// which leaves 15 and 14 free bits for the code's 27.
+/// Each length carries its own code and extra-bit width in the bits above it,
+/// written by [`fill_and_count`] and read by the bitstream writer, so a block
+/// needs no buffer of codes beside its sequences. A block's lengths stay under
+/// 2^17 (the literal length) and at most 2^17 (the match length), which leaves
+/// 15 and 14 free bits for the 11 each needs. The offset code is not stored:
+/// it is the high bit of `off_base`, one instruction away. The length codes
+/// are kept because recomputing them in the writer costs two table lookups, a
+/// bit scan and the branches between the small-value tables and the
+/// logarithmic form; upstream likewise keeps its codes between the same two
+/// passes (`ZSTD_seqToCodes`).
 #[derive(Clone, Copy)]
 struct RawSequence {
     ll: u32,
@@ -402,26 +407,49 @@ struct RawSequence {
     off_base: u32,
 }
 
-/// Where the code's low [`CODE_BITS_IN_LL`] bits start in `ll`.
+/// Where the literal-length code starts in `ll`; its extra-bit width follows
+/// six bits higher.
 const LL_CODE_SHIFT: u32 = 17;
-/// Where the code's remaining bits start in `ml`.
+/// Where the match-length code starts in `ml`; its width follows likewise.
 const ML_CODE_SHIFT: u32 = 18;
-const CODE_BITS_IN_LL: u32 = 32 - LL_CODE_SHIFT;
 
 impl RawSequence {
-    /// Stores the packed code of the sequence above its lengths.
+    /// Stores each length's code and extra-bit width above the length.
     #[inline(always)]
-    fn set_code(&mut self, code: u32) {
-        debug_assert!(code < 1 << 27);
+    fn set_codes(&mut self, ll_code: u8, ll_bits: usize, ml_code: u8, ml_bits: usize) {
+        debug_assert!(ll_code < 64 && ml_code < 64 && ll_bits < 32 && ml_bits < 32);
         debug_assert!(self.ll >> LL_CODE_SHIFT == 0 && self.ml >> ML_CODE_SHIFT == 0);
-        self.ll |= code << LL_CODE_SHIFT;
-        self.ml |= (code >> CODE_BITS_IN_LL) << ML_CODE_SHIFT;
+        self.ll |= (ll_code as u32 | (ll_bits as u32) << 6) << LL_CODE_SHIFT;
+        self.ml |= (ml_code as u32 | (ml_bits as u32) << 6) << ML_CODE_SHIFT;
     }
 
-    /// The packed code [`Self::set_code`] stored.
     #[inline(always)]
-    fn code(&self) -> SequenceCode {
-        SequenceCode((self.ll >> LL_CODE_SHIFT) | ((self.ml >> ML_CODE_SHIFT) << CODE_BITS_IN_LL))
+    fn ll_code(&self) -> u8 {
+        (self.ll >> LL_CODE_SHIFT & 63) as u8
+    }
+
+    #[inline(always)]
+    fn ll_bits(&self) -> usize {
+        (self.ll >> (LL_CODE_SHIFT + 6)) as usize
+    }
+
+    #[inline(always)]
+    fn ml_code(&self) -> u8 {
+        (self.ml >> ML_CODE_SHIFT & 63) as u8
+    }
+
+    #[inline(always)]
+    fn ml_bits(&self) -> usize {
+        (self.ml >> (ML_CODE_SHIFT + 6)) as usize
+    }
+
+    /// The offset code, which is also its extra-bit width (upstream's
+    /// `ofBits = ofCode`).
+    #[inline(always)]
+    fn of_code(&self) -> u8 {
+        // An offset value is at least 1 (a repeat code), so the high bit exists.
+        debug_assert!(self.off_base != 0);
+        (31 - self.off_base.leading_zeros()) as u8
     }
 }
 
@@ -1032,11 +1060,10 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
         // from the emitted table's histogram (see `build_seq_ctable`). `Some`
         // here because these modes are written to the frame.
         let (last_ll, last_ml, last_of) = raw_sequences.last().map_or((0, 0, 0), |seq| {
-            let code = seq.code();
             (
-                code.ll_code() as usize,
-                code.ml_code() as usize,
-                code.of_code() as usize,
+                seq.ll_code() as usize,
+                seq.ml_code() as usize,
+                seq.of_code() as usize,
             )
         });
 
@@ -1929,67 +1956,6 @@ fn emit_single_sequence_block<M: Matcher, K: EncodeTier>(
     }
 }
 
-/// One sequence's three FSE symbols and the two extra-bit widths that are not
-/// derivable from a symbol alone, packed into a word.
-///
-/// The derivation pass has all five in hand, and the bit writer needs all five
-/// again a moment later; recomputing them there costs two table lookups with
-/// their bounds checks, a bit scan and the branches that pick between the
-/// small-value tables and the logarithmic form. Upstream keeps the same values
-/// between the same two passes, as the three byte arrays `ZSTD_seqToCodes`
-/// writes.
-///
-/// The offset code is its own extra-bit width, so only two widths are stored.
-/// Layout, low bits first: ll code 6, ml code 6, of code 5, ll bits 5, ml bits
-/// 5 — 27 bits, and every field's range is fixed by the sequence-section
-/// format.
-struct SequenceCode(u32);
-
-impl SequenceCode {
-    #[inline(always)]
-    fn pack(ll_code: u8, ml_code: u8, of_code: u8, ll_bits: usize, ml_bits: usize) -> u32 {
-        debug_assert!(ll_code < 64 && ml_code < 64 && of_code < 32);
-        debug_assert!(ll_bits < 32 && ml_bits < 32);
-        ll_code as u32
-            | (ml_code as u32) << 6
-            | (of_code as u32) << 12
-            | (ll_bits as u32) << 17
-            | (ml_bits as u32) << 22
-    }
-
-    #[inline(always)]
-    fn ll_code(&self) -> u8 {
-        (self.0 & 63) as u8
-    }
-
-    #[inline(always)]
-    fn ml_code(&self) -> u8 {
-        (self.0 >> 6 & 63) as u8
-    }
-
-    #[inline(always)]
-    fn of_code(&self) -> u8 {
-        (self.0 >> 12 & 31) as u8
-    }
-
-    #[inline(always)]
-    fn ll_bits(&self) -> usize {
-        (self.0 >> 17 & 31) as usize
-    }
-
-    #[inline(always)]
-    fn ml_bits(&self) -> usize {
-        (self.0 >> 22 & 31) as usize
-    }
-
-    /// The offset code doubles as its own extra-bit width (upstream's
-    /// `ofBits = ofCode`).
-    #[inline(always)]
-    fn of_bits(&self) -> usize {
-        self.of_code() as usize
-    }
-}
-
 /// Slots in a sequence-code histogram: enough for the widest of the three
 /// alphabets, the 53 match-length codes (RFC 8878 3.1.1.3.2.1.1). Upstream's
 /// `HIST_countFast_wksp` likewise clears and counts only up to the last code;
@@ -2058,9 +2024,7 @@ fn fill_and_count<const OFFSETS_CODED: bool>(
         let (ll_code, _, ll_bits) = encode_literal_length(seq.ll);
         let (ml_code, _, ml_bits) = encode_match_len(seq.ml);
         let (of_code, _, _) = encode_offset(off_base);
-        seq.set_code(SequenceCode::pack(
-            ll_code, ml_code, of_code, ll_bits, ml_bits,
-        ));
+        seq.set_codes(ll_code, ll_bits, ml_code, ml_bits);
         debug_assert!(
             usize::from(ll_code.max(ml_code).max(of_code)) < SEQUENCE_CODE_SLOTS,
             "the code functions stay inside their alphabets",
@@ -2091,10 +2055,9 @@ fn fill_and_count<const OFFSETS_CODED: bool>(
     if raw_sequences.len() <= SHORT_SLICE_SEQUENCES {
         let (mut ll, mut ml, mut of) = (0u8, 0u8, 0u8);
         for seq in raw_sequences.iter() {
-            let code = seq.code();
-            ll = ll.max(code.ll_code());
-            ml = ml.max(code.ml_code());
-            of = of.max(code.of_code());
+            ll = ll.max(seq.ll_code());
+            ml = ml.max(seq.ml_code());
+            of = of.max(seq.of_code());
         }
         return (ll as usize, ml as usize, of as usize);
     }
@@ -2912,10 +2875,10 @@ macro_rules! encode_sequences_body {
         let [ll_default, ml_default, of_default]: [&FSETable; 3] = $defaults;
 
         let sequence = sequences[sequences.len() - 1];
-        let code = sequence.code();
-        let (ll_code, ll_num_bits) = (code.ll_code(), code.ll_bits());
-        let (ml_code, ml_num_bits) = (code.ml_code(), code.ml_bits());
-        let (of_code, of_num_bits) = (code.of_code(), code.of_bits());
+        let (ll_code, ll_num_bits) = (sequence.ll_code(), sequence.ll_bits());
+        let (ml_code, ml_num_bits) = (sequence.ml_code(), sequence.ml_bits());
+        let of_code = sequence.of_code();
+        let of_num_bits = of_code as usize;
         let ll_add_bits = low_bits(sequence.ll, ll_num_bits);
         let ml_add_bits = low_bits(sequence.ml - 3, ml_num_bits);
         let of_add_bits = low_bits(sequence.off_base, of_num_bits);
@@ -2973,11 +2936,11 @@ macro_rules! encode_sequences_body {
             // init states above, so it is not in this range.
             for &sequence in sequences[..sequences.len() - 1].iter().rev() {
                 // The extra bits below are the low bits of `ll` and `ml - 3`;
-                // the code above them is never under the mask.
-                let code = sequence.code();
-                let (ll_code, ll_num_bits) = (code.ll_code(), code.ll_bits());
-                let (ml_code, ml_num_bits) = (code.ml_code(), code.ml_bits());
-                let (of_code, of_num_bits) = (code.of_code(), code.of_bits());
+                // the codes above them are never under the mask.
+                let (ll_code, ll_num_bits) = (sequence.ll_code(), sequence.ll_bits());
+                let (ml_code, ml_num_bits) = (sequence.ml_code(), sequence.ml_bits());
+                let of_code = sequence.of_code();
+                let of_num_bits = of_code as usize;
                 let ll_add_bits = low_bits(sequence.ll, ll_num_bits);
                 let ml_add_bits = low_bits(sequence.ml - 3, ml_num_bits);
                 let of_add_bits = low_bits(sequence.off_base, of_num_bits);
@@ -3146,8 +3109,8 @@ macro_rules! encode_sequences_body {
 /// register, where the base x86 shifts take it only in `CL` and stall on the
 /// flags they leave. The bytes written are the same on every tier.
 fn encode_sequences<K: EncodeTier>(
-    // Each carrying its packed [`SequenceCode`] from the pass that derived the
-    // offset codes.
+    // Each carrying its length codes from the pass that derived the offset
+    // codes.
     sequences: &[RawSequence],
     writer: &mut BitWriter<&mut Vec<u8>>,
     modes: [&FseTableMode<'_>; 3],

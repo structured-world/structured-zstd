@@ -1643,30 +1643,40 @@ fn only_a_valid_table_lowers_the_literal_floor_and_takes_one_stream() {
     assert!(!super::single_literal_stream(1024, true));
 }
 
-/// A sequence's packed code rides in the spare high bits of its lengths: it must
-/// read back whole, and the lengths, the extra bits the writer emits, must stay
-/// as they were, at the widest values a 128 KiB block allows.
+/// Each length's code and extra-bit width ride in the spare high bits of the
+/// length: they must read back whole, and the lengths, whose low bits the
+/// writer emits, must stay as they were, at the widest values a 128 KiB block
+/// allows. The offset code is the high bit of the offset value.
 #[test]
-fn a_sequence_code_rides_in_its_lengths_without_touching_them() {
+fn sequence_codes_ride_in_their_lengths_without_touching_them() {
     let ll = (1u32 << super::LL_CODE_SHIFT) - 1;
     let ml = 1u32 << 17;
-    for code in [
-        0,
-        (1 << 27) - 1,
-        super::SequenceCode::pack(35, 52, 31, 16, 16),
-        super::SequenceCode::pack(1, 0, 2, 0, 1),
+    for (ll_code, ll_bits, ml_code, ml_bits) in [
+        (0, 0, 0, 0),
+        (63, 31, 63, 31),
+        (35, 16, 52, 16),
+        (1, 0, 0, 1),
     ] {
         let mut seq = RawSequence {
             ll,
             ml,
-            off_base: 7,
+            off_base: u32::MAX,
         };
-        seq.set_code(code);
-        assert_eq!(seq.code().0, code);
+        seq.set_codes(ll_code, ll_bits, ml_code, ml_bits);
+        assert_eq!(
+            (seq.ll_code(), seq.ll_bits(), seq.ml_code(), seq.ml_bits()),
+            (ll_code, ll_bits, ml_code, ml_bits)
+        );
         assert_eq!(seq.ll & ((1 << super::LL_CODE_SHIFT) - 1), ll);
         assert_eq!(seq.ml & ((1 << super::ML_CODE_SHIFT) - 1), ml);
-        assert_eq!(seq.off_base, 7);
+        assert_eq!(seq.of_code(), 31);
     }
+    let one = RawSequence {
+        ll: 0,
+        ml: 3,
+        off_base: 1,
+    };
+    assert_eq!(one.of_code(), 0);
 }
 
 /// A dictionary's offset table is valid for the frame's first block only: the
