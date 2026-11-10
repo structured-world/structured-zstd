@@ -439,14 +439,12 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             let mut workspace = EstimatorWorkspace::default();
             let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
             let mut emitted: Vec<u8> = Vec::new();
-            let mut codes_ws = Workspace::new();
             crate::encoding::fastpath::with_encode_tier!(
                 emit_state.copy_kernel,
                 K => encode_block_parts::<_, K>(
                     &mut emit_state,
                     &literals,
                     &mut [],
-                    &mut code_buffer(&mut codes_ws, 0),
                     &mut emitted,
                 )
             );
@@ -525,14 +523,12 @@ fn the_preferred_repeat_costs_what_the_emitter_writes() {
             let mut workspace = EstimatorWorkspace::default();
             let est = estimate_block_parts_size(&mut est_state, literals, &[], &mut workspace);
             let mut emitted: Vec<u8> = Vec::new();
-            let mut codes_ws = Workspace::new();
             crate::encoding::fastpath::with_encode_tier!(
                 emit_state.copy_kernel,
                 K => encode_block_parts::<_, K>(
                     &mut emit_state,
                     literals,
                     &mut [],
-                    &mut code_buffer(&mut codes_ws, 0),
                     &mut emitted,
                 )
             );
@@ -584,14 +580,12 @@ fn a_table_not_worth_its_description_costs_a_raw_section() {
     let mut workspace = EstimatorWorkspace::default();
     let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
     let mut emitted: Vec<u8> = Vec::new();
-    let mut codes_ws = Workspace::new();
     crate::encoding::fastpath::with_encode_tier!(
         emit_state.copy_kernel,
         K => encode_block_parts::<_, K>(
             &mut emit_state,
             &literals,
             &mut [],
-            &mut code_buffer(&mut codes_ws, 0),
             &mut emitted,
         )
     );
@@ -656,14 +650,12 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
     let mut workspace = EstimatorWorkspace::default();
     let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
     let mut emitted: Vec<u8> = Vec::new();
-    let mut codes_ws = Workspace::new();
     crate::encoding::fastpath::with_encode_tier!(
         emit_state.copy_kernel,
         K => encode_block_parts::<_, K>(
             &mut emit_state,
             &literals,
             &mut [],
-            &mut code_buffer(&mut codes_ws, 0),
             &mut emitted,
         )
     );
@@ -824,18 +816,6 @@ fn discarded_block_keeps_the_entry_tables() {
     }
 }
 
-/// A buffer for `count` sequence codes, carved from `ws`, which must outlive it.
-fn code_buffer(ws: &mut Workspace, count: usize) -> RegionVec<u32> {
-    // The block target stands for the trailing part's size in bytes.
-    ws.begin_layout(
-        region_bytes::<u32>(count),
-        |bytes, _| bytes,
-        crate::encoding::workspace::IngestPlan::Stream,
-    );
-    ws.open(0, usize::MAX);
-    ws.buffer(count)
-}
-
 /// The Fast band codes offsets as the sequences are collected. The codes and
 /// the final history must be what the fast derivation gives over the raw
 /// offsets in order, including the explicit offset that equals `rep[0]`
@@ -973,15 +953,12 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
 
         let mut emitted: Vec<u8> = Vec::new();
         let mut to_emit = sequences.clone();
-        let mut codes_ws = Workspace::new();
-        let mut codes = code_buffer(&mut codes_ws, to_emit.len());
         crate::encoding::fastpath::with_encode_tier!(
             emit_state.copy_kernel,
             K => encode_block_parts::<_, K>(
                 &mut emit_state,
                 &literals,
                 &mut to_emit,
-                &mut codes,
                 &mut emitted,
             )
         );
@@ -1048,12 +1025,9 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
     let mut output = Vec::new();
     let mut compressed_scratch = Vec::new();
 
-    let mut codes_ws = Workspace::new();
-    let mut code_scratch = code_buffer(&mut codes_ws, sequences.len());
     let mut emit_buffers = super::SingleSequenceEmitBuffers {
         output: &mut output,
         compressed: &mut compressed_scratch,
-        codes: &mut code_scratch,
     };
     let emitted_raw = crate::encoding::fastpath::with_encode_tier!(
         state.copy_kernel,
@@ -1588,15 +1562,12 @@ fn every_tier_writes_the_block_the_scalar_tier_writes() {
         };
         let mut emitted = Vec::new();
         let mut to_emit = sequences.clone();
-        let mut codes_ws = Workspace::new();
-        let mut codes = code_buffer(&mut codes_ws, to_emit.len());
         crate::encoding::fastpath::with_encode_tier!(
             kernel,
             K => encode_block_parts::<_, K>(
                 &mut state,
                 &literals,
                 &mut to_emit,
-                &mut codes,
                 &mut emitted,
             )
         );
@@ -1670,6 +1641,32 @@ fn only_a_valid_table_lowers_the_literal_floor_and_takes_one_stream() {
     assert!(!super::single_literal_stream(256, false));
     assert!(super::single_literal_stream(1023, true));
     assert!(!super::single_literal_stream(1024, true));
+}
+
+/// A sequence's packed code rides in the spare high bits of its lengths: it must
+/// read back whole, and the lengths, the extra bits the writer emits, must stay
+/// as they were, at the widest values a 128 KiB block allows.
+#[test]
+fn a_sequence_code_rides_in_its_lengths_without_touching_them() {
+    let ll = (1u32 << super::LL_CODE_SHIFT) - 1;
+    let ml = 1u32 << 17;
+    for code in [
+        0,
+        (1 << 27) - 1,
+        super::SequenceCode::pack(35, 52, 31, 16, 16),
+        super::SequenceCode::pack(1, 0, 2, 0, 1),
+    ] {
+        let mut seq = RawSequence {
+            ll,
+            ml,
+            off_base: 7,
+        };
+        seq.set_code(code);
+        assert_eq!(seq.code().0, code);
+        assert_eq!(seq.ll & ((1 << super::LL_CODE_SHIFT) - 1), ll);
+        assert_eq!(seq.ml & ((1 << super::ML_CODE_SHIFT) - 1), ml);
+        assert_eq!(seq.off_base, 7);
+    }
 }
 
 /// A dictionary's offset table is valid for the frame's first block only: the
