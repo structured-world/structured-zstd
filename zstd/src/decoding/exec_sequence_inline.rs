@@ -176,19 +176,30 @@ macro_rules! exec_sequence_avx2_inline_at {
                 // match.
                 if offset_v >= 16 {
                     wildcopy_no_overlap(op_match, match_src, match_length_v);
-                } else if tail + lit_length_v >= 16 {
+                } else {
                     // Sixteen bytes of written output before the match, which
                     // the shuffle reads its period from; only the first few
                     // bytes of a buffer lack them.
-                    $crate::decoding::exec_sequence_inline::overlap_match_shuffle!(
-                        op_match,
-                        offset_v,
-                        match_length_v
-                    );
-                } else {
-                    let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
-                    if match_length_v > 8 {
-                        wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 8);
+                    #[cfg(any(feature = "std", target_feature = "ssse3"))]
+                    let shuffle = tail + lit_length_v >= 16;
+                    // Without std this tier runs only on a build with AVX2
+                    // enabled at compile time, so a build without SSSE3 never
+                    // reaches it; there the shuffle is left out rather than
+                    // compiled for a target that cannot lower it (soft-float).
+                    #[cfg(not(any(feature = "std", target_feature = "ssse3")))]
+                    let shuffle = false;
+                    if shuffle {
+                        #[cfg(any(feature = "std", target_feature = "ssse3"))]
+                        $crate::decoding::exec_sequence_inline::overlap_match_shuffle!(
+                            op_match,
+                            offset_v,
+                            match_length_v
+                        );
+                    } else {
+                        let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
+                        if match_length_v > 8 {
+                            wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 8);
+                        }
                     }
                 }
             }
@@ -215,7 +226,11 @@ pub(crate) use exec_sequence_avx2_inline_at;
 /// `1 <= offset < 16`, the 16 bytes before `dst` are initialized output (so
 /// `offset` of them are the match's source), `dst` is writable for `length`
 /// rounded up to 16, and the enclosing function enables SSSE3 or a superset.
-#[cfg(all(target_arch = "x86_64", any(feature = "kernel-avx2", test)))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "kernel-avx2", test),
+    any(feature = "std", target_feature = "ssse3")
+))]
 macro_rules! overlap_match_shuffle {
     ($dst:expr, $offset:expr, $length:expr) => {{
         use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128};
@@ -240,7 +255,11 @@ macro_rules! overlap_match_shuffle {
         }
     }};
 }
-#[cfg(all(target_arch = "x86_64", any(feature = "kernel-avx2", test)))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "kernel-avx2", test),
+    any(feature = "std", target_feature = "ssse3")
+))]
 pub(crate) use overlap_match_shuffle;
 
 /// AVX2-tier body for a sequence whose match lies wholly inside dictionary
@@ -344,7 +363,10 @@ pub(crate) mod x86 {
     /// with this mask spreads the LAST `offset` bytes of a vector over all
     /// sixteen lanes. `static`, not `const`, so a debug build reads it in place
     /// instead of copying it onto the stack at every use.
-    #[cfg(any(feature = "kernel-avx2", test))]
+    #[cfg(all(
+        any(feature = "kernel-avx2", test),
+        any(feature = "std", target_feature = "ssse3")
+    ))]
     pub(crate) static PERIOD: [[u8; 16]; 16] = {
         let mut table = [[0u8; 16]; 16];
         let mut offset = 1;
@@ -361,7 +383,10 @@ pub(crate) mod x86 {
 
     /// `ROTATE[offset][lane] = (lane + 16) % offset`: turns one 16-byte chunk
     /// of a period-`offset` run into the next one.
-    #[cfg(any(feature = "kernel-avx2", test))]
+    #[cfg(all(
+        any(feature = "kernel-avx2", test),
+        any(feature = "std", target_feature = "ssse3")
+    ))]
     pub(crate) static ROTATE: [[u8; 16]; 16] = {
         let mut table = [[0u8; 16]; 16];
         let mut offset = 1;
