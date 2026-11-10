@@ -254,8 +254,10 @@ pub(crate) fn read_frame_header_from_slice(
         let dict_id = match b {
             [b0] => u32::from(*b0),
             [b0, b1] => u32::from(u16::from_le_bytes([*b0, *b1])),
-            [b0, b1, b2, b3] => u32::from_le_bytes([*b0, *b1, *b2, *b3]),
-            _ => unreachable!("Dictionary_ID_flag selects 0, 1, 2 or 4 bytes"),
+            four => u32::from_le_bytes(
+                four.try_into()
+                    .expect("Dictionary_ID_flag selects 0, 1, 2 or 4 bytes"),
+            ),
         };
         if dict_id != 0 {
             frame_header.dict_id = Some(dict_id);
@@ -271,10 +273,11 @@ pub(crate) fn read_frame_header_from_slice(
             // RFC 8878 3.1.1.1.4: the 2-byte field is offset by 256.
             [b0, b1] => u64::from(u16::from_le_bytes([*b0, *b1])) + 256,
             [b0, b1, b2, b3] => u64::from(u32::from_le_bytes([*b0, *b1, *b2, *b3])),
-            [b0, b1, b2, b3, b4, b5, b6, b7] => {
-                u64::from_le_bytes([*b0, *b1, *b2, *b3, *b4, *b5, *b6, *b7])
-            }
-            _ => unreachable!("Frame_Content_Size_flag selects 0, 1, 2, 4 or 8 bytes"),
+            eight => u64::from_le_bytes(
+                eight
+                    .try_into()
+                    .expect("Frame_Content_Size_flag selects 0, 1, 2, 4 or 8 bytes"),
+            ),
         };
     }
 

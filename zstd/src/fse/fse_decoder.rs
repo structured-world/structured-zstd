@@ -862,7 +862,9 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // The sequence meta is chosen once per table, so each variant runs its
         // own copy of the per-state pass instead of matching on it per state.
         // The spread holds only symbols below `nb_symbols` (both passes write
-        // `0..nb_symbols`), so a meta source covering that many reads in place.
+        // `0..nb_symbols`), and each sequence table is built with the meta of
+        // its own alphabet (`max_symbol + 1` codes, which bounds `nb_symbols`
+        // above), so the meta covers every symbol the pass meets.
         match meta {
             SeqMeta::None => fill_decode_entries(
                 decode,
@@ -871,51 +873,33 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                 accuracy_log,
                 |_, entry| entry,
             ),
-            SeqMeta::Packed(packed) if packed.len() >= nb_symbols => {
+            SeqMeta::Packed(packed) => {
+                // One bounds check per table; a meta shorter than the alphabet
+                // is a caller bug and panics here.
+                let packed = &packed[..nb_symbols];
                 fill_decode_entries(
                     decode,
                     spread,
                     &mut symbol_next,
                     accuracy_log,
                     |symbol, entry: E| {
-                        // SAFETY: `symbol < nb_symbols <= packed.len()`, see above.
+                        // SAFETY: `symbol < nb_symbols == packed.len()`, see above.
                         let m = unsafe { *packed.get_unchecked(symbol as usize) };
                         entry.with_seq_meta(m & 0x00FF_FFFF, (m >> 24) as u8)
                     },
                 )
             }
-            SeqMeta::Packed(packed) => fill_decode_entries(
-                decode,
-                spread,
-                &mut symbol_next,
-                accuracy_log,
-                |symbol, entry: E| {
-                    let m = packed.get(symbol as usize).copied().unwrap_or(0);
-                    entry.with_seq_meta(m & 0x00FF_FFFF, (m >> 24) as u8)
-                },
-            ),
-            // Offset codes stop at 31, so a table of at most 32 symbols takes
-            // the closed form for every state without asking per state.
-            SeqMeta::Offsets if nb_symbols <= 32 => fill_decode_entries(
-                decode,
-                spread,
-                &mut symbol_next,
-                accuracy_log,
-                |symbol, entry: E| entry.with_seq_meta(1u32 << symbol, symbol),
-            ),
-            SeqMeta::Offsets => fill_decode_entries(
-                decode,
-                spread,
-                &mut symbol_next,
-                accuracy_log,
-                |symbol, entry: E| {
-                    if symbol < 32 {
-                        entry.with_seq_meta(1u32 << symbol, symbol)
-                    } else {
-                        entry
-                    }
-                },
-            ),
+            SeqMeta::Offsets => {
+                // Offset codes stop at 31 (the offset table's `max_symbol`).
+                assert!(nb_symbols <= 32, "offset table with {nb_symbols} codes");
+                fill_decode_entries(
+                    decode,
+                    spread,
+                    &mut symbol_next,
+                    accuracy_log,
+                    |symbol, entry: E| entry.with_seq_meta(1u32 << symbol, symbol),
+                )
+            }
         }
 
         // Commit the live span: the pass wrote every state.

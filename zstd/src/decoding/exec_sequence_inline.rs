@@ -288,8 +288,10 @@ pub(crate) use exec_sequence_avx2_dict_inline;
 // so the legacy chain handles non-x86_64 targets.
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86 {
+    #[cfg(any(feature = "kernel-avx2", test))]
+    use core::arch::x86_64::_mm_shuffle_epi8;
     use core::arch::x86_64::{
-        __m128i, __m256i, _mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128, _mm256_loadu_si256,
+        __m128i, __m256i, _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256,
         _mm256_storeu_si256,
     };
 
@@ -297,6 +299,7 @@ pub(crate) mod x86 {
     /// with this mask spreads the LAST `offset` bytes of a vector over all
     /// sixteen lanes. `static`, not `const`, so a debug build reads it in place
     /// instead of copying it onto the stack at every use.
+    #[cfg(any(feature = "kernel-avx2", test))]
     static PERIOD: [[u8; 16]; 16] = {
         let mut table = [[0u8; 16]; 16];
         let mut offset = 1;
@@ -313,6 +316,7 @@ pub(crate) mod x86 {
 
     /// `ROTATE[offset][lane] = (lane + 16) % offset`: turns one 16-byte chunk
     /// of a period-`offset` run into the next one.
+    #[cfg(any(feature = "kernel-avx2", test))]
     static ROTATE: [[u8; 16]; 16] = {
         let mut table = [[0u8; 16]; 16];
         let mut offset = 1;
@@ -341,6 +345,7 @@ pub(crate) mod x86 {
     /// (so `offset` of them are the match's source), `dst` is writable for
     /// `length` rounded up to 16, and the caller is in an SSSE3
     /// `target_feature` scope.
+    #[cfg(any(feature = "kernel-avx2", test))]
     #[inline(always)]
     pub(crate) unsafe fn overlap_match_shuffle(dst: *mut u8, offset: usize, length: usize) {
         debug_assert!((1..16).contains(&offset));

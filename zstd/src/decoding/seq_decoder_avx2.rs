@@ -393,7 +393,7 @@ macro_rules! execute_one_body {
 /// # Safety
 /// Caller must have verified that the runtime CPU advertises BMI2 + AVX2.
 /// The dispatcher in `decode_and_execute_sequences` gates this on
-/// `detect_cpu_kernel() == Avx2`.
+/// `detect_cpu_kernel() == Avx2`. The section holds at least one sequence.
 #[target_feature(enable = "bmi2,avx2")]
 #[allow(clippy::too_many_lines)]
 // The block's inputs, each already a scalar or a borrow the caller holds.
@@ -638,11 +638,10 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             }};
         }
         // The last sequence leaves the states alone; running it after the loop
-        // keeps that question out of every other iteration.
+        // keeps that question out of every other iteration. The block decoder
+        // calls in only for a section with sequences.
+        debug_assert!(num_sequences > 0, "sequence section without sequences");
         'short: {
-            if num_sequences == 0 {
-                break 'short;
-            }
             for _ in 1..num_sequences {
                 short_step!(true, 'short);
             }

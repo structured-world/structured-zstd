@@ -344,6 +344,40 @@ fn frame_decompressed_bound_errors_on_garbage_header() {
     assert!(frame_decompressed_bound(&[0xAB; 16]).is_err());
 }
 
+/// The slice header parser reads every width of Dictionary_ID and
+/// Frame_Content_Size (RFC 8878 3.1.1.1.3, 3.1.1.1.4) little-endian, with the
+/// 2-byte content size offset by 256, and consumes exactly the header.
+#[test]
+fn slice_header_parser_reads_every_field_width() {
+    use crate::decoding::frame::read_frame_header_from_slice;
+    let dict_ids: [(u8, &[u8], Option<u32>); 3] = [
+        (1, &[0xAB], Some(0xAB)),
+        (2, &[0x34, 0x12], Some(0x1234)),
+        (3, &[0x01, 0x02, 0x03, 0x04], Some(0x0403_0201)),
+    ];
+    let content_sizes: [(u8, &[u8], u64); 4] = [
+        (0, &[], 0),
+        (1, &[0x10, 0x01], 0x0110 + 256),
+        (2, &[0x01, 0x02, 0x03, 0x04], 0x0403_0201),
+        (3, &[1, 2, 3, 4, 5, 6, 7, 8], 0x0807_0605_0403_0201),
+    ];
+    for (dict_flag, dict_bytes, dict_id) in dict_ids {
+        for (fcs_flag, fcs_bytes, fcs) in content_sizes {
+            // Not single-segment, so a Window_Descriptor follows the descriptor.
+            let mut header = alloc::vec![0x28, 0xB5, 0x2F, 0xFD, (fcs_flag << 6) | dict_flag, 0x00];
+            header.extend_from_slice(dict_bytes);
+            header.extend_from_slice(fcs_bytes);
+            let mut input = &header[..];
+            let (parsed, bytes_read) = read_frame_header_from_slice(&mut input, false)
+                .unwrap_or_else(|e| panic!("dict flag {dict_flag} fcs flag {fcs_flag}: {e:?}"));
+            assert_eq!(parsed.dictionary_id(), dict_id, "dict flag {dict_flag}");
+            assert_eq!(parsed.frame_content_size(), fcs, "fcs flag {fcs_flag}");
+            assert_eq!(usize::from(bytes_read), header.len());
+            assert!(input.is_empty());
+        }
+    }
+}
+
 /// [`no_fcs_frame`] with `bits` set in its Frame_Header_Descriptor.
 fn no_fcs_frame_with_descriptor_bits(bits: u8) -> Vec<u8> {
     let mut f = no_fcs_frame();
