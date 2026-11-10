@@ -163,6 +163,33 @@ fn a_workspace_on_fresh_pages_is_taken_zeroed() {
     assert!(!ws.on_fresh_pages());
 }
 
+// A zero table on fresh pages is written before use when the frame's known
+// length covers every page of it (left demand-zero, each page would fault
+// twice: the probe's read maps the zero page, the store faults again), and left
+// alone when the length is too short or unknown, so a stream does not clear a
+// large table for a few bytes.
+#[test]
+fn a_frame_covering_a_table_writes_it_and_a_stream_does_not() {
+    let pages = 4;
+    let bytes = pages * PAGE_BYTES;
+    let layout = |ingest| {
+        let mut ws = Workspace::new();
+        ws.begin_layout(1 << 17, buffers_up_to_fresh_pages, ingest);
+        ws.open(bytes, 1 << 14);
+        assert!(ws.zeroed);
+        ws
+    };
+    let covering = INPUT_PER_TABLE_PAGE * pages;
+    assert!(layout(IngestPlan::Slice(covering)).frame_touches_every_page(bytes));
+    assert!(layout(IngestPlan::PledgedStream(covering)).frame_touches_every_page(bytes));
+    assert!(!layout(IngestPlan::Slice(covering - 1)).frame_touches_every_page(bytes));
+    assert!(!layout(IngestPlan::Stream).frame_touches_every_page(bytes));
+    // Either way the table reads as zeros.
+    let mut ws = layout(IngestPlan::Slice(covering));
+    let zeros = ws.table::<u32>(bytes / 4, 0);
+    assert!(zeros.as_slice().iter().all(|&v| v == 0));
+}
+
 // A region whose byte size fits but whose alignment padding does not is refused
 // loudly, as the multiplication overflow is, rather than wrapping to a small size.
 #[test]
