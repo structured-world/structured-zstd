@@ -10,7 +10,7 @@ use crate::decoding::simd_copy;
 use crate::encoding::fastpath::EncodeTier;
 use crate::encoding::workspace::RegionVec;
 
-use super::{LongLengths, RawSequence};
+use super::RawSequence;
 
 /// Run length at or above which a run is handed to `memcpy`: the copy is
 /// bandwidth-bound there and ERMS `rep movsb` beats a vector loop. Below it the
@@ -26,7 +26,6 @@ const LITERAL_INLINE_COPY_MAX: usize = 2048;
 pub(super) fn gather_literals<K: EncodeTier>(
     block: &[u8],
     sequences: &[RawSequence],
-    long: LongLengths,
     tail: usize,
     dst: &mut RegionVec<u8>,
 ) {
@@ -43,7 +42,7 @@ pub(super) fn gather_literals<K: EncodeTier>(
         ))]
         // SAFETY: the tier is only selected after confirming AVX2 (and BMI2).
         crate::encoding::fastpath::FastpathKernel::Avx2Bmi2 => unsafe {
-            gather_avx2(block, sequences, long, tail, dst)
+            gather_avx2(block, sequences, tail, dst)
         },
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
@@ -52,25 +51,23 @@ pub(super) fn gather_literals<K: EncodeTier>(
         // SAFETY: both tiers are only selected after confirming SSE2.
         crate::encoding::fastpath::FastpathKernel::Sse2
         | crate::encoding::fastpath::FastpathKernel::Sse42 => unsafe {
-            gather_sse2(block, sequences, long, tail, dst)
+            gather_sse2(block, sequences, tail, dst)
         },
         #[cfg(all(
             target_arch = "aarch64",
             target_endian = "little",
             feature = "kernel-neon"
         ))]
-        crate::encoding::fastpath::FastpathKernel::Neon => {
-            gather_neon(block, sequences, long, tail, dst)
-        },
+        crate::encoding::fastpath::FastpathKernel::Neon => gather_neon(block, sequences, tail, dst),
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
             feature = "kernel-simd128"
         ))]
         crate::encoding::fastpath::FastpathKernel::Simd128 => {
-            gather_simd128(block, sequences, long, tail, dst)
+            gather_simd128(block, sequences, tail, dst)
         },
-        _ => gather_scalar(block, sequences, long, tail, dst),
+        _ => gather_scalar(block, sequences, tail, dst),
     })
 }
 
@@ -86,9 +83,8 @@ const WILDCOPY_SLACK: usize = 32;
 /// `$medium` for `33..2048` bytes. A macro so each tier's loop is compiled
 /// inside its own `#[target_feature]` function and its kernels inline into it.
 macro_rules! gather_body {
-    ($block:expr, $sequences:expr, $long:expr, $tail:expr, $dst:expr, $medium:path, $wild:path, $chunk:expr) => {{
+    ($block:expr, $sequences:expr, $tail:expr, $dst:expr, $medium:path, $wild:path, $chunk:expr) => {{
         let block: &[u8] = $block;
-        let long: LongLengths = $long;
         let dst: &mut RegionVec<u8> = $dst;
         let src = block.as_ptr();
         let src_len = block.len();
@@ -157,34 +153,18 @@ macro_rules! gather_body {
                 written += len;
             }};
         }
-        macro_rules! step {
-            ($ll:expr, $ml:expr) => {{
-                let ll: usize = $ll;
-                copy_run!(ll);
-                pos += ll;
-                // The next run is read at `pos`, so the match is held to the
-                // block as the literals are; `pos <= src_len` holds on every
-                // iteration.
-                let ml: usize = $ml;
-                assert!(
-                    ml <= src_len - pos,
-                    "sequences reach past the block they describe"
-                );
-                pos += ml;
-            }};
-        }
-        // Up to the block's long sequence the fields are the lengths; from it
-        // on they are read with the bit it lacks, a walk only a block with a
-        // long length takes.
-        let sequences: &[RawSequence] = $sequences;
-        let split = long.split(sequences.len());
-        let (head, tail) = sequences.split_at(split);
-        for seq in head {
-            step!(seq.short_ll(), seq.short_ml());
-        }
-        for (k, seq) in tail.iter().enumerate() {
-            let i = split + k;
-            step!(long.ll(i, seq) as usize, long.ml(i, seq) as usize);
+        for seq in $sequences {
+            let ll = seq.ll as usize;
+            copy_run!(ll);
+            pos += ll;
+            // The next run is read at `pos`, so the match is held to the block
+            // as the literals are; `pos <= src_len` holds on every iteration.
+            let ml = seq.ml as usize;
+            assert!(
+                ml <= src_len - pos,
+                "sequences reach past the block they describe"
+            );
+            pos += ml;
         }
         copy_run!($tail);
         // Once per block, in every build: a custom matcher that stops short
@@ -203,14 +183,12 @@ macro_rules! gather_body {
 unsafe fn gather_avx2(
     block: &[u8],
     sequences: &[RawSequence],
-    long: LongLengths,
     tail: usize,
     dst: &mut RegionVec<u8>,
 ) {
     gather_body!(
         block,
         sequences,
-        long,
         tail,
         dst,
         simd_copy::copy_exact_avx2,
@@ -227,14 +205,12 @@ unsafe fn gather_avx2(
 unsafe fn gather_sse2(
     block: &[u8],
     sequences: &[RawSequence],
-    long: LongLengths,
     tail: usize,
     dst: &mut RegionVec<u8>,
 ) {
     gather_body!(
         block,
         sequences,
-        long,
         tail,
         dst,
         simd_copy::copy_exact_sse2,
@@ -248,18 +224,11 @@ unsafe fn gather_sse2(
     target_endian = "little",
     feature = "kernel-neon"
 ))]
-fn gather_neon(
-    block: &[u8],
-    sequences: &[RawSequence],
-    long: LongLengths,
-    tail: usize,
-    dst: &mut RegionVec<u8>,
-) {
+fn gather_neon(block: &[u8], sequences: &[RawSequence], tail: usize, dst: &mut RegionVec<u8>) {
     #[cfg(target_feature = "neon")]
     gather_body!(
         block,
         sequences,
-        long,
         tail,
         dst,
         simd_copy::copy_exact_neon,
@@ -270,7 +239,6 @@ fn gather_neon(
     gather_body!(
         block,
         sequences,
-        long,
         tail,
         dst,
         simd_copy::copy_exact_u64,
@@ -287,17 +255,10 @@ fn gather_neon(
     target_feature = "simd128",
     feature = "kernel-simd128"
 ))]
-fn gather_simd128(
-    block: &[u8],
-    sequences: &[RawSequence],
-    long: LongLengths,
-    tail: usize,
-    dst: &mut RegionVec<u8>,
-) {
+fn gather_simd128(block: &[u8], sequences: &[RawSequence], tail: usize, dst: &mut RegionVec<u8>) {
     gather_body!(
         block,
         sequences,
-        long,
         tail,
         dst,
         simd_copy::copy_exact_simd128,
@@ -306,17 +267,10 @@ fn gather_simd128(
     )
 }
 
-fn gather_scalar(
-    block: &[u8],
-    sequences: &[RawSequence],
-    long: LongLengths,
-    tail: usize,
-    dst: &mut RegionVec<u8>,
-) {
+fn gather_scalar(block: &[u8], sequences: &[RawSequence], tail: usize, dst: &mut RegionVec<u8>) {
     gather_body!(
         block,
         sequences,
-        long,
         tail,
         dst,
         simd_copy::copy_exact_u64,

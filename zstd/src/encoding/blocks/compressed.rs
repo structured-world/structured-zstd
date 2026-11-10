@@ -164,9 +164,6 @@ const _: () = assert!(crate::common::MAX_BLOCK_SIZE <= 262_143);
 struct EncodedBlockParts {
     literals: RegionVec<u8>,
     sequences: RegionVec<RawSequence>,
-    /// The lengths too long for a sequence's 16-bit fields, at most one per
-    /// block (see [`LongLengths`]).
-    long: LongLengths,
 }
 
 #[derive(Default)]
@@ -338,7 +335,7 @@ impl SequencePrefixSums {
         }
     }
 
-    fn rebuild(&mut self, sequences: &[RawSequence], long: LongLengths) {
+    fn rebuild(&mut self, sequences: &[RawSequence]) {
         self.ll_code.clear();
         self.ml_code.clear();
         self.length_bits.clear();
@@ -347,11 +344,9 @@ impl SequencePrefixSums {
         self.length_bits.reserve(sequences.len() + 1);
         let mut bits = 0usize;
         self.length_bits.push(0);
-        // The fields are the lengths of every sequence but a block's long one,
-        // whose codes and running sums are put right after the walk.
         for seq in sequences {
-            let (ll, _, ll_bits) = encode_literal_length(seq.short_ll() as u32);
-            let (ml, _, ml_bits) = encode_match_len(seq.short_ml() as u32);
+            let (ll, _, ll_bits) = encode_literal_length(seq.ll);
+            let (ml, _, ml_bits) = encode_match_len(seq.ml);
             self.ll_code.push(ll);
             self.ml_code.push(ml);
             bits += ll_bits + ml_bits;
@@ -376,29 +371,9 @@ impl SequencePrefixSums {
         self.ml.push(0);
         for seq in sequences {
             self.lit
-                .push(*self.lit.last().unwrap_or(&0) + seq.short_ll());
-            self.ml.push(*self.ml.last().unwrap_or(&0) + seq.short_ml());
-        }
-        let long_bit = LongLengths::LONG as usize;
-        if let Some(seq) = sequences.get(long.literal_at) {
-            let at = long.literal_at;
-            let (code, _, full_bits) = encode_literal_length(long.ll(at, seq));
-            let (_, _, short_bits) = encode_literal_length(seq.short_ll() as u32);
-            self.ll_code[at] = code;
-            for k in at + 1..=sequences.len() {
-                self.length_bits[k] += full_bits - short_bits;
-                self.lit[k] += long_bit;
-            }
-        }
-        if let Some(seq) = sequences.get(long.match_at) {
-            let at = long.match_at;
-            let (code, _, full_bits) = encode_match_len(long.ml(at, seq));
-            let (_, _, short_bits) = encode_match_len(seq.short_ml() as u32);
-            self.ml_code[at] = code;
-            for k in at + 1..=sequences.len() {
-                self.length_bits[k] += full_bits - short_bits;
-                self.ml[k] += long_bit;
-            }
+                .push(*self.lit.last().unwrap_or(&0) + seq.ll as usize);
+            self.ml
+                .push(*self.ml.last().unwrap_or(&0) + seq.ml as usize);
         }
     }
 
@@ -422,135 +397,11 @@ impl SequencePrefixSums {
 /// (`SeqDef::offBase`, written by `ZSTD_storeSeq`); ours cannot be filled that
 /// early because the code depends on a repeat-offset history that must not
 /// advance across a partition the emitter ends up writing raw.
-///
-/// The lengths keep their low 16 bits, the match length less the format's
-/// minimum of 3, so a sequence is 8 bytes as upstream's `SeqDef` is. A length
-/// of 2^16 or more loses its top bit there, and the block's [`LongLengths`]
-/// records which sequence it was (upstream `longLengthType` /
-/// `longLengthPos`): the literal and match lengths of a block add up to at
-/// most its 128 KiB, so a block has at most one. The low 16 bits are exactly a
-/// long length's extra bits, the baseline of its code (LL 35, ML 52) being
-/// 2^16, so the bitstream writer reads the fields as they are.
 #[derive(Clone, Copy)]
 struct RawSequence {
+    ll: u32,
+    ml: u32,
     off_base: u32,
-    ll: u16,
-    ml_base: u16,
-}
-
-impl RawSequence {
-    /// The literal length, for a sequence that is not the block's long one.
-    #[inline(always)]
-    fn short_ll(&self) -> usize {
-        usize::from(self.ll)
-    }
-
-    /// The match length, for a sequence that is not the block's long one.
-    #[inline(always)]
-    fn short_ml(&self) -> usize {
-        usize::from(self.ml_base) + FORMAT_MIN_MATCH
-    }
-}
-
-/// Which sequence of a run carries a literal or match length of 2^16 or more,
-/// whose field holds only its low 16 bits; [`Self::NONE`] where none does.
-///
-/// A pass that needs whole lengths walks the run up to [`Self::split`] reading
-/// the fields as the lengths, with no test per sequence, and only from there
-/// adds the missing bit (see [`Self::ll`]). A block has at most one such
-/// sequence, so in almost every block the walk never leaves its first part.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct LongLengths {
-    literal_at: usize,
-    match_at: usize,
-}
-
-impl Default for LongLengths {
-    fn default() -> Self {
-        Self::NONE
-    }
-}
-
-impl LongLengths {
-    const NONE: Self = Self {
-        literal_at: usize::MAX,
-        match_at: usize::MAX,
-    };
-    /// The bit a long length's field lacks.
-    const LONG: u32 = 1 << 16;
-
-    /// The sequence at `index` of the run, with lengths `ll` and `ml`: one
-    /// test for both lengths, which holds for at most one sequence of a block.
-    #[inline(always)]
-    fn sequence(&mut self, index: usize, ll: usize, ml: usize, off_base: u32) -> RawSequence {
-        debug_assert!(ml >= FORMAT_MIN_MATCH);
-        let ml_base = ml - FORMAT_MIN_MATCH;
-        if (ll | ml_base) >= Self::LONG as usize {
-            self.mark(index, ll, ml_base);
-        }
-        RawSequence {
-            off_base,
-            ll: ll as u16,
-            ml_base: ml_base as u16,
-        }
-    }
-
-    /// Records the sequence at `index` as the block's long one.
-    #[cold]
-    #[inline(never)]
-    fn mark(&mut self, index: usize, ll: usize, ml_base: usize) {
-        if ll >= Self::LONG as usize {
-            self.literal_at = index;
-        }
-        if ml_base >= Self::LONG as usize {
-            self.match_at = index;
-        }
-    }
-
-    /// The first position of a run of `len` sequences whose lengths are not
-    /// its fields as they stand; `len` when there is none.
-    #[inline(always)]
-    fn split(self, len: usize) -> usize {
-        self.literal_at.min(self.match_at).min(len)
-    }
-
-    /// The literal length of `seq`, the sequence at `index`.
-    #[inline(always)]
-    fn ll(self, index: usize, seq: &RawSequence) -> u32 {
-        u32::from(seq.ll)
-            + if index == self.literal_at {
-                Self::LONG
-            } else {
-                0
-            }
-    }
-
-    /// The match length of `seq`, the sequence at `index`.
-    #[inline(always)]
-    fn ml(self, index: usize, seq: &RawSequence) -> u32 {
-        u32::from(seq.ml_base)
-            + FORMAT_MIN_MATCH as u32
-            + if index == self.match_at {
-                Self::LONG
-            } else {
-                0
-            }
-    }
-
-    /// These positions for the run of sequences `start..end` of the block.
-    fn within(self, start: usize, end: usize) -> Self {
-        let rebase = |at: usize| {
-            if (start..end).contains(&at) {
-                at - start
-            } else {
-                usize::MAX
-            }
-        };
-        Self {
-            literal_at: rebase(self.literal_at),
-            match_at: rebase(self.match_at),
-        }
-    }
 }
 
 struct EntropyOnlyMatcher;
@@ -605,7 +456,6 @@ pub(crate) fn compress_block<M: Matcher, K: EncodeTier>(
         state,
         &scratch.parts.literals,
         &mut scratch.parts.sequences,
-        scratch.parts.long,
         &mut scratch.sequence_codes,
         output,
     );
@@ -652,7 +502,6 @@ pub(crate) fn compress_block_with_post_split<M: Matcher, K: EncodeTier>(
             source_len,
             &scratch.parts.literals,
             &mut scratch.parts.sequences,
-            scratch.parts.long,
             &mut emit_buffers,
         );
         if emitted_raw {
@@ -663,9 +512,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher, K: EncodeTier>(
     }
 
     scratch.partitions.clear();
-    scratch
-        .prefix_sums
-        .rebuild(&scratch.parts.sequences, scratch.parts.long);
+    scratch.prefix_sums.rebuild(&scratch.parts.sequences);
     let mut workspace = scratch.estimator_workspace.take().unwrap_or_default();
     let built_huff = core::mem::take(&mut workspace.built_huff);
     // Reuse the estimator's inner scratch across frames instead of
@@ -803,7 +650,6 @@ pub(crate) fn compress_block_with_post_split<M: Matcher, K: EncodeTier>(
             src_size,
             &scratch.parts.literals[lit_start..lit_end],
             &mut scratch.parts.sequences[seq_start..seq_end],
-            scratch.parts.long.within(seq_start, seq_end),
             &mut emit_buffers,
         );
         if emitted_raw {
@@ -832,10 +678,10 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
 ) {
     parts.literals.clear();
     parts.sequences.clear();
-    parts.long = LongLengths::default();
     // Trailing literals, reported after the last sequence; the runs are read
     // back by position, so no sequence may follow them.
     let mut tail = 0usize;
+    let sequences = &mut parts.sequences;
     // The Fast band codes each offset as it is emitted, against the history the
     // block starts from. Upstream decides the offBase at the store
     // (`ZSTD_storeSeq` in `zstd_fast.c`); here the derivation is inlined at
@@ -858,32 +704,19 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
     // The built-in matcher searches compiled for the frame's tier; a matcher
     // from outside the crate knows nothing of tiers. The branch folds per
     // matcher type.
+    let sequence_floor = state.workspace.sequence_floor();
     match state.matcher.builtin_driver() {
-        Some(driver) => {
-            builtin_block_sequences::<K>(driver, &mut tail, parts, code_offsets, &mut hist);
-            // The unchecked push rests on every built-in sequence covering the
-            // frame's sequence floor; checked here, after the search, so the
-            // record inlined in the match loop carries nothing for it.
-            #[cfg(debug_assertions)]
-            {
-                let floor = state.workspace.sequence_floor();
-                for (i, seq) in parts.sequences.iter().enumerate() {
-                    let ml = parts.long.ml(i, seq) as usize;
-                    debug_assert!(
-                        ml >= floor,
-                        "a {ml}-byte match under a sequence floor of {floor}"
-                    );
-                }
-            }
-        }
-        None => {
-            let EncodedBlockParts {
-                sequences, long, ..
-            } = parts;
-            state.matcher.start_matching(|seq| {
-                record_sequence(seq, &mut tail, sequences, long, code_offsets, &mut hist)
-            })
-        }
+        Some(driver) => builtin_block_sequences::<K>(
+            driver,
+            &mut tail,
+            sequences,
+            code_offsets,
+            &mut hist,
+            sequence_floor,
+        ),
+        None => state.matcher.start_matching(|seq| {
+            record_sequence(seq, &mut tail, sequences, code_offsets, &mut hist)
+        }),
     }
     if code_offsets {
         state.offset_hist = hist;
@@ -896,7 +729,6 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
         record_block_parse(
             capture,
             &parts.sequences,
-            parts.long,
             tail,
             code_offsets,
             block_start_hist,
@@ -905,7 +737,6 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
     literal_runs::gather_literals::<K>(
         state.matcher.get_last_space(),
         &parts.sequences,
-        parts.long,
         tail,
         &mut parts.literals,
     );
@@ -920,17 +751,16 @@ fn collect_block_parts<M: Matcher, K: EncodeTier>(
 fn builtin_block_sequences<K: EncodeTier>(
     driver: &mut crate::encoding::match_generator::MatchGeneratorDriver,
     tail: &mut usize,
-    parts: &mut EncodedBlockParts,
+    sequences: &mut RegionVec<RawSequence>,
     code_offsets: bool,
     hist: &mut [u32; 3],
+    sequence_floor: usize,
 ) {
     // `move`: the flag rides in the closure by value. Borrowed, every
     // sequence read it through the closure and the reference it holds, one
-    // more load behind the sink's own. The buffer and the long-length marks
-    // ride behind the one `parts` pointer, so the match loop keeps no more
-    // values live than it did for the buffer alone.
+    // more load behind the sink's own.
     driver.start_matching_with::<K>(move |seq| {
-        record_builtin_sequence(seq, tail, parts, code_offsets, hist)
+        record_builtin_sequence(seq, tail, sequences, code_offsets, hist, sequence_floor)
     });
 }
 
@@ -943,9 +773,10 @@ fn builtin_block_sequences<K: EncodeTier>(
 fn record_builtin_sequence(
     seq: Sequence,
     tail: &mut usize,
-    parts: &mut EncodedBlockParts,
+    sequences: &mut RegionVec<RawSequence>,
     code_offsets: bool,
     hist: &mut [u32; 3],
+    sequence_floor: usize,
 ) {
     match seq {
         Sequence::Literals { len } => *tail += len,
@@ -956,19 +787,26 @@ fn record_builtin_sequence(
         } => {
             debug_assert_eq!(*tail, 0, "literals reported before a sequence");
             debug_assert!((literal_len | match_len | offset) <= u32::MAX as usize);
+            debug_assert!(
+                match_len >= sequence_floor,
+                "a {match_len}-byte match under a sequence floor of {sequence_floor}"
+            );
             let off_base = if code_offsets {
                 encode_offset_with_history_fast(offset as u32, literal_len as u32, hist)
             } else {
                 offset as u32
             };
-            let index = parts.sequences.len();
-            let sequence = parts.long.sequence(index, literal_len, match_len, off_base);
             // SAFETY: the buffer holds `max_sequences` of the largest block at
             // the frame's sequence floor (`LevelParams::sequence_floor`), and
             // every sequence of the built-in matcher covers at least that many
-            // bytes of the block (checked after the search in debug builds), so
-            // it cannot fill up.
-            unsafe { parts.sequences.push_within_capacity(sequence) };
+            // bytes of the block, so it cannot fill up.
+            unsafe {
+                sequences.push_within_capacity(RawSequence {
+                    ll: literal_len as u32,
+                    ml: match_len as u32,
+                    off_base,
+                })
+            };
         }
     }
 }
@@ -981,27 +819,25 @@ fn record_builtin_sequence(
 fn record_block_parse(
     capture: &mut Vec<crate::encoding::sequences::ExternalSequence>,
     sequences: &[RawSequence],
-    long: LongLengths,
     tail: usize,
     code_offsets: bool,
     mut history: [u32; 3],
 ) {
     use crate::encoding::sequences::ExternalSequence;
-    for (index, sequence) in sequences.iter().enumerate() {
-        let ll = long.ll(index, sequence);
+    for sequence in sequences {
         let (offset, code) = if code_offsets {
             let code = sequence.off_base;
-            let offset = crate::encoding::sequences::plain_offset(code, ll, &mut history);
+            let offset = crate::encoding::sequences::plain_offset(code, sequence.ll, &mut history);
             (offset, code)
         } else {
             let offset = sequence.off_base;
-            let code = encode_offset_with_history(offset, ll, &mut history);
+            let code = encode_offset_with_history(offset, sequence.ll, &mut history);
             (offset, code)
         };
         capture.push(ExternalSequence {
             offset,
-            lit_len: ll,
-            match_len: long.ml(index, sequence),
+            lit_len: sequence.ll,
+            match_len: sequence.ml,
             // Codes 1..=3 are the repeat offsets (RFC 8878 3.1.1.5).
             rep: if code <= 3 { code } else { 0 },
         });
@@ -1018,7 +854,6 @@ fn record_sequence(
     seq: Sequence,
     tail: &mut usize,
     sequences: &mut RegionVec<RawSequence>,
-    long: &mut LongLengths,
     code_offsets: bool,
     hist: &mut [u32; 3],
 ) {
@@ -1029,12 +864,6 @@ fn record_sequence(
             offset,
             match_len,
         } => {
-            // RFC 8878 3.1.1.3.2.1.1: a match is at least 3 bytes, the
-            // baseline of `Match_Length_Code` 0.
-            assert!(
-                match_len >= FORMAT_MIN_MATCH,
-                "a match is at least {FORMAT_MIN_MATCH} bytes"
-            );
             // A custom matcher's order is checked in every build: literals out
             // of order would be copied from the wrong place without an error.
             assert_eq!(*tail, 0, "literals reported before a sequence");
@@ -1051,8 +880,11 @@ fn record_sequence(
             } else {
                 offset as u32
             };
-            let index = sequences.len();
-            sequences.push(long.sequence(index, literal_len, match_len, off_base));
+            sequences.push(RawSequence {
+                ll: literal_len as u32,
+                ml: match_len as u32,
+                off_base,
+            });
         }
     }
 }
@@ -1061,7 +893,6 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
     state: &mut CompressState<M>,
     literals_vec: &[u8],
     raw_sequences: &mut [RawSequence],
-    long: LongLengths,
     // Scratch for the packed per-sequence codes, carried by the caller so it is
     // allocated once rather than per block.
     codes: &mut RegionVec<u32>,
@@ -1171,9 +1002,9 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
             of: &mut of_counts,
         };
         let (ll_max, ml_max, of_max) = if uses_fast_offset_codes(state.strategy_tag) {
-            fill_and_count::<true>(raw_sequences, long, &mut state.offset_hist, counts, codes)
+            fill_and_count::<true>(raw_sequences, &mut state.offset_hist, counts, codes)
         } else {
-            fill_and_count::<false>(raw_sequences, long, &mut state.offset_hist, counts, codes)
+            fill_and_count::<false>(raw_sequences, &mut state.offset_hist, counts, codes)
         };
         let raw_sequences: &[RawSequence] = raw_sequences;
         let codes: &[u32] = codes;
@@ -1184,10 +1015,9 @@ fn encode_block_parts<M: Matcher, K: EncodeTier>(
         // from the emitted table's histogram (see `build_seq_ctable`). `Some`
         // here because these modes are written to the frame.
         let (last_ll, last_ml, last_of) = raw_sequences.last().map_or((0, 0, 0), |seq| {
-            let last = raw_sequences.len() - 1;
             (
-                encode_literal_length(long.ll(last, seq)).0 as usize,
-                encode_match_len(long.ml(last, seq)).0 as usize,
+                encode_literal_length(seq.ll).0 as usize,
+                encode_match_len(seq.ml).0 as usize,
                 encode_offset(seq.off_base).0 as usize,
             )
         });
@@ -1378,11 +1208,10 @@ fn estimate_block_parts_size<M: Matcher>(
     state: &mut CompressState<M>,
     literals_vec: &[u8],
     raw_sequences: &[RawSequence],
-    long: LongLengths,
     workspace: &mut EstimatorWorkspace,
 ) -> usize {
     let mut sums = SequencePrefixSums::default();
-    sums.rebuild(raw_sequences, long);
+    sums.rebuild(raw_sequences);
     let previous = state.last_huff_table.take();
     let tables = &mut state.fse_tables;
     let previous_fse = [
@@ -1712,15 +1541,8 @@ fn estimate_sequences_section_bytes(
     // Only post-split strategies are estimated, and the Fast band, whose
     // sequences arrive already coded, never post-splits.
     debug_assert!(!uses_fast_offset_codes(strategy));
-    for (seq, &ll_code) in sequences.iter().zip(codes.ll) {
-        // The repeat-offset coding asks only whether the literal length is
-        // zero, which its code answers whole (LL code 0 is length 0 alone,
-        // RFC 8878 3.1.1.3.2.1.1); the field of a long length can read zero.
-        count_offset(encode_offset_with_history(
-            seq.off_base,
-            u32::from(ll_code),
-            &mut hist,
-        ));
+    for seq in sequences {
+        count_offset(encode_offset_with_history(seq.off_base, seq.ll, &mut hist));
     }
     *offset_hist = hist;
     let extra_bits = codes.bits + of_bits;
@@ -2059,7 +1881,6 @@ fn emit_single_sequence_block<M: Matcher, K: EncodeTier>(
     source_len: usize,
     literals: &[u8],
     sequences: &mut [RawSequence],
-    long: LongLengths,
     buffers: &mut SingleSequenceEmitBuffers<'_>,
 ) -> bool {
     let saved_offset_hist = state.offset_hist;
@@ -2070,7 +1891,6 @@ fn emit_single_sequence_block<M: Matcher, K: EncodeTier>(
         state,
         literals,
         sequences,
-        long,
         buffers.codes,
         buffers.compressed,
     );
@@ -2203,7 +2023,6 @@ struct SequenceCodeCounts<'a> {
 /// encoded, is what keeps that true.
 fn fill_and_count<const OFFSETS_CODED: bool>(
     raw_sequences: &mut [RawSequence],
-    long: LongLengths,
     offset_hist: &mut [u32; 3],
     counts: SequenceCodeCounts<'_>,
     codes: &mut RegionVec<u32>,
@@ -2225,55 +2044,38 @@ fn fill_and_count<const OFFSETS_CODED: bool>(
     // optimiser would not keep the array in registers across that. A local copy
     // written back once is the same three words, moved once.
     let mut hist = *offset_hist;
-    macro_rules! fill_one {
-        ($i:expr, $seq:expr, $ll:expr, $ml:expr) => {{
-            let (i, seq, ll, ml): (usize, &mut RawSequence, u32, u32) = ($i, $seq, $ll, $ml);
-            let off_base = if OFFSETS_CODED {
-                seq.off_base
-            } else {
-                let off_base = encode_offset_with_history(seq.off_base, ll, &mut hist);
-                seq.off_base = off_base;
-                off_base
-            };
-            let (ll_code, _, ll_bits) = encode_literal_length(ll);
-            let (ml_code, _, ml_bits) = encode_match_len(ml);
-            let (of_code, _, _) = encode_offset(off_base);
-            // SAFETY: `i < raw_sequences.len() <= capacity`, asserted above.
-            unsafe {
-                code_base.add(i).write(SequenceCode::pack(
-                    ll_code, ml_code, of_code, ll_bits, ml_bits,
-                ));
-            }
-            debug_assert!(
-                usize::from(ll_code.max(ml_code).max(of_code)) < SEQUENCE_CODE_SLOTS,
-                "the code functions stay inside their alphabets",
-            );
-            // SAFETY: the codes are at most 35 (LL), 52 (ML) and 31 (OF), under
-            // the histogram's `SEQUENCE_CODE_SLOTS`. The LL and ML bounds hold in
-            // release because `encode_literal_length` and `encode_match_len`
-            // assert the length below 2^17 before deriving a code from its high
-            // bit, so a larger code panics there before reaching this write; the
-            // OF code is `ilog2` of a `u32`. Those asserts must stay.
-            unsafe {
-                *ll_counts.get_unchecked_mut(usize::from(ll_code)) += 1;
-                *ml_counts.get_unchecked_mut(usize::from(ml_code)) += 1;
-                *of_counts.get_unchecked_mut(usize::from(of_code)) += 1;
-            }
-        }};
-    }
-    // Up to the block's long sequence the fields are the lengths; from it on
-    // they are read with the bit it lacks, a walk only a block with a long
-    // length takes.
-    let split = long.split(raw_sequences.len());
-    let (head, tail) = raw_sequences.split_at_mut(split);
-    for (i, seq) in head.iter_mut().enumerate() {
-        let (ll, ml) = (seq.short_ll() as u32, seq.short_ml() as u32);
-        fill_one!(i, seq, ll, ml);
-    }
-    for (k, seq) in tail.iter_mut().enumerate() {
-        let i = split + k;
-        let (ll, ml) = (long.ll(i, seq), long.ml(i, seq));
-        fill_one!(i, seq, ll, ml);
+    for (i, seq) in raw_sequences.iter_mut().enumerate() {
+        let off_base = if OFFSETS_CODED {
+            seq.off_base
+        } else {
+            let off_base = encode_offset_with_history(seq.off_base, seq.ll, &mut hist);
+            seq.off_base = off_base;
+            off_base
+        };
+        let (ll_code, _, ll_bits) = encode_literal_length(seq.ll);
+        let (ml_code, _, ml_bits) = encode_match_len(seq.ml);
+        let (of_code, _, _) = encode_offset(off_base);
+        // SAFETY: `i < raw_sequences.len() <= capacity`, asserted above.
+        unsafe {
+            code_base.add(i).write(SequenceCode::pack(
+                ll_code, ml_code, of_code, ll_bits, ml_bits,
+            ));
+        }
+        debug_assert!(
+            usize::from(ll_code.max(ml_code).max(of_code)) < SEQUENCE_CODE_SLOTS,
+            "the code functions stay inside their alphabets",
+        );
+        // SAFETY: the codes are at most 35 (LL), 52 (ML) and 31 (OF), under the
+        // histogram's `SEQUENCE_CODE_SLOTS`. The LL and ML bounds hold in release
+        // because `encode_literal_length` and `encode_match_len` assert the
+        // length below 2^17 before deriving a code from its high bit, so a larger
+        // code panics there before reaching this write; the OF code is `ilog2`
+        // of a `u32`. Those asserts must stay.
+        unsafe {
+            *ll_counts.get_unchecked_mut(usize::from(ll_code)) += 1;
+            *ml_counts.get_unchecked_mut(usize::from(ml_code)) += 1;
+            *of_counts.get_unchecked_mut(usize::from(of_code)) += 1;
+        }
     }
     if !OFFSETS_CODED {
         *offset_hist = hist;
@@ -3121,10 +2923,8 @@ macro_rules! encode_sequences_body {
         let (ll_code, ll_num_bits) = (code.ll_code(), code.ll_bits());
         let (ml_code, ml_num_bits) = (code.ml_code(), code.ml_bits());
         let (of_code, of_num_bits) = (code.of_code(), code.of_bits());
-        // The fields are the low 16 bits, which are a long length's extra bits
-        // too (see `RawSequence`).
-        let ll_add_bits = low_bits(u32::from(sequence.ll), ll_num_bits);
-        let ml_add_bits = low_bits(u32::from(sequence.ml_base), ml_num_bits);
+        let ll_add_bits = low_bits(sequence.ll, ll_num_bits);
+        let ml_add_bits = low_bits(sequence.ml - 3, ml_num_bits);
         let of_add_bits = low_bits(sequence.off_base, of_num_bits);
         let ll_table = ll_mode.as_table(ll_default);
         let ml_table = ml_mode.as_table(ml_default);
@@ -3187,8 +2987,8 @@ macro_rules! encode_sequences_body {
                 let (ll_code, ll_num_bits) = (code.ll_code(), code.ll_bits());
                 let (ml_code, ml_num_bits) = (code.ml_code(), code.ml_bits());
                 let (of_code, of_num_bits) = (code.of_code(), code.of_bits());
-                let ll_add_bits = low_bits(u32::from(sequence.ll), ll_num_bits);
-                let ml_add_bits = low_bits(u32::from(sequence.ml_base), ml_num_bits);
+                let ll_add_bits = low_bits(sequence.ll, ll_num_bits);
+                let ml_add_bits = low_bits(sequence.ml - 3, ml_num_bits);
                 let of_add_bits = low_bits(sequence.off_base, of_num_bits);
 
                 // State diffs burst: max 30 bits (10+10+9 worst case for
