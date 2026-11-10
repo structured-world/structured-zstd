@@ -932,7 +932,8 @@ fn collected_fast_band_sequences_carry_the_fast_derivation() {
         }
         let lengths: Vec<(u32, u32)> = sequences
             .iter()
-            .map(|seq| (long.ll(seq), long.ml(seq)))
+            .enumerate()
+            .map(|(i, seq)| (long.ll(i, seq), long.ml(i, seq)))
             .collect();
         let reported_lengths: Vec<(u32, u32)> = reported
             .iter()
@@ -969,7 +970,7 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
     let literals: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
     let mut long = LongLengths::default();
     let sequences: Vec<RawSequence> = (0..64usize)
-        .map(|i| long.sequence(i % 8, 4 + i % 13, 1 + (i as u32 % 5) * 7))
+        .map(|i| long.sequence(i, i % 8, 4 + i % 13, 1 + (i as u32 % 5) * 7))
         .collect();
 
     // Not the Fast band: it never post-splits, so it is never estimated, and
@@ -1079,7 +1080,7 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
     };
     let source = [0xA5; 8];
     let mut long = LongLengths::default();
-    let mut sequences = [long.sequence(0, 5, 20)];
+    let mut sequences = [long.sequence(0, 0, 5, 20)];
     let mut output = Vec::new();
     let mut compressed_scratch = Vec::new();
 
@@ -1422,26 +1423,46 @@ fn match_length_coding_agrees_with_the_ranges_over_every_length() {
     }
 }
 
-/// A sequence keeps its lengths in 16-bit fields and the one length of a block
-/// that does not fit in the block's `LongLengths`: every length reads back as
-/// written on both sides of the 16-bit boundary, the match length counting the
-/// 3 its field leaves out, and the format's longest block fits.
+/// A sequence keeps the low 16 bits of its lengths and the block's
+/// `LongLengths` which one lost its top bit: every length reads back as
+/// written on both sides of the 16-bit boundary (the match length counting the
+/// 3 its field leaves out), a short sequence's fields are its lengths, and a
+/// run of the block finds the long one at its own position or not at all.
 #[test]
 fn sequence_lengths_read_back_across_the_16_bit_boundary() {
     for (ll, ml) in [
         (0usize, 3usize),
-        (65_534, 65_537),
-        (65_535, 65_538),
-        (65_536, 65_539),
-        (131_072, 131_072),
+        (65_535, 3),
+        (65_536, 3),
+        (131_069, 3),
+        (3, 65_538),
+        (3, 65_539),
+        (0, 131_072),
     ] {
         let mut long = LongLengths::default();
-        let seq = long.sequence(ll, ml, 7);
-        assert_eq!(long.ll(&seq), ll as u32, "literal length {ll}");
-        assert_eq!(long.ml(&seq), ml as u32, "match length {ml}");
+        let seq = long.sequence(0, ll, ml, 7);
+        assert_eq!(long.ll(0, &seq), ll as u32, "literal length {ll}");
+        assert_eq!(long.ml(0, &seq), ml as u32, "match length {ml}");
         assert_eq!(seq.off_base, 7);
+        if long == LongLengths::NONE {
+            assert_eq!((seq.short_ll(), seq.short_ml()), (ll, ml));
+        }
     }
     assert_eq!(core::mem::size_of::<RawSequence>(), 8);
+
+    let mut long = LongLengths::default();
+    let run: Vec<RawSequence> = [(5usize, 9usize), (1, 4), (70_000, 4), (2, 6), (0, 3)]
+        .iter()
+        .enumerate()
+        .map(|(i, &(ll, ml))| long.sequence(i, ll, ml, 1))
+        .collect();
+    assert_eq!(long.split(run.len()), 2);
+    assert_eq!(long.ll(2, &run[2]), 70_000);
+    assert_eq!(long.ll(3, &run[3]), 2);
+    let inner = long.within(1, 4);
+    assert_eq!(inner.split(3), 1);
+    assert_eq!(inner.ll(1, &run[2]), 70_000);
+    assert_eq!(long.within(3, 5), LongLengths::NONE);
 }
 
 /// A literals buffer holding `capacity` bytes, laid out the way a frame lays
@@ -1481,7 +1502,7 @@ fn literals_past_the_buffer_stop_instead_of_overflowing() {
 fn sequences_past_the_block_are_refused() {
     let (_ws, mut literals) = literals_buffer(64);
     let mut long = LongLengths::default();
-    let sequences = [long.sequence(4, 60, 1)];
+    let sequences = [long.sequence(0, 4, 60, 1)];
     super::literal_runs::gather_literals::<crate::encoding::fastpath::ScalarTier>(
         &[0x5A; 32],
         &sequences,
@@ -1555,13 +1576,19 @@ fn runnable_fastpath_kernels() -> Vec<crate::encoding::fastpath::FastpathKernel>
 fn gathered_literals_are_the_runs_in_order() {
     let lengths = [
         0usize, 1, 7, 8, 9, 16, 17, 31, 32, 33, 47, 64, 65, 127, 128, 129, 800, 2047, 2048, 3000,
+        // A run of 2^16 or more, whose field keeps only its low bits.
+        70_000, 3, 1,
     ];
     let block_len: usize = lengths.iter().map(|&ll| ll + 5).sum::<usize>() + 13;
     let block: Vec<u8> = (0..block_len as u32)
         .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
         .collect();
     let mut long = LongLengths::default();
-    let sequences: Vec<RawSequence> = lengths.iter().map(|&ll| long.sequence(ll, 5, 1)).collect();
+    let sequences: Vec<RawSequence> = lengths
+        .iter()
+        .enumerate()
+        .map(|(i, &ll)| long.sequence(i, ll, 5, 1))
+        .collect();
     let mut expected = Vec::new();
     let mut pos = 0;
     for &ll in &lengths {
@@ -1598,20 +1625,23 @@ fn every_tier_writes_the_block_the_scalar_tier_writes() {
         .collect();
     // Lengths and offsets across their extra-bit ranges, so the field widths
     // the loop shifts by vary from one sequence to the next. One sequence
-    // carries wide extras for each conditional flush of the loop: 16 + 16 + 24
-    // = 56 extra bits takes the one before the extras (31 or more) alone, and
-    // 16 + 16 + 30 = 62 takes the one before the offset (more than 56) too. The
-    // first values with 16 extra bits are literal length 65536 and match length
-    // 65539; a block holds one such sequence, so each width gets a block.
+    // carries wide extras for each conditional flush of the loop: a literal
+    // length of 65536 (16 extra bits, its field holding only the low ones), a
+    // match length of 40003 (15) and an offset of 24 bits make 55, which takes
+    // the flush before the extras (31 or more) alone; with a 30-bit offset, 61
+    // takes the one before the offset (more than 56) too. A block's lengths
+    // add up to 128 KiB at most, so no sequence has two 16-bit lengths, and
+    // each width gets a block.
     for wide_offset in [1u32 << 24, 1u32 << 30] {
         let mut long = LongLengths::default();
-        let sequences: Vec<RawSequence> = (0..4_000u32)
+        let sequences: Vec<RawSequence> = (0..4_000usize)
             .map(|i| {
                 if i == 97 {
-                    return long.sequence(65_536, 65_539, wide_offset);
+                    return long.sequence(i, 65_536, 40_003, wide_offset);
                 }
-                let mix = i.wrapping_mul(0x9E37_79B9);
+                let mix = (i as u32).wrapping_mul(0x9E37_79B9);
                 long.sequence(
+                    i,
                     ((mix >> 7) % 70) as usize,
                     (3 + (mix >> 13) % 300) as usize,
                     1 + (mix >> 3) % 100_000,

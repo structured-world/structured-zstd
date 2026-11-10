@@ -157,18 +157,34 @@ macro_rules! gather_body {
                 written += len;
             }};
         }
-        for seq in $sequences {
-            let ll = long.ll(seq) as usize;
-            copy_run!(ll);
-            pos += ll;
-            // The next run is read at `pos`, so the match is held to the block
-            // as the literals are; `pos <= src_len` holds on every iteration.
-            let ml = long.ml(seq) as usize;
-            assert!(
-                ml <= src_len - pos,
-                "sequences reach past the block they describe"
-            );
-            pos += ml;
+        macro_rules! step {
+            ($ll:expr, $ml:expr) => {{
+                let ll: usize = $ll;
+                copy_run!(ll);
+                pos += ll;
+                // The next run is read at `pos`, so the match is held to the
+                // block as the literals are; `pos <= src_len` holds on every
+                // iteration.
+                let ml: usize = $ml;
+                assert!(
+                    ml <= src_len - pos,
+                    "sequences reach past the block they describe"
+                );
+                pos += ml;
+            }};
+        }
+        // Up to the block's long sequence the fields are the lengths; from it
+        // on they are read with the bit it lacks, a walk only a block with a
+        // long length takes.
+        let sequences: &[RawSequence] = $sequences;
+        let split = long.split(sequences.len());
+        let (head, tail) = sequences.split_at(split);
+        for seq in head {
+            step!(seq.short_ll(), seq.short_ml());
+        }
+        for (k, seq) in tail.iter().enumerate() {
+            let i = split + k;
+            step!(long.ll(i, seq) as usize, long.ml(i, seq) as usize);
         }
         copy_run!($tail);
         // Once per block, in every build: a custom matcher that stops short
