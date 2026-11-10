@@ -238,9 +238,11 @@ impl LevelParams {
     /// bounds how many sequences a block can hold (upstream `ZSTD_maxNbSeq`,
     /// zstd_compress.c, divides by 3 for `minMatch == 3` and by 4 otherwise).
     /// Every search but the optimal parser confirms a match, repeat or not, on
-    /// four bytes. The optimal parser prices and takes three-byte matches at
-    /// any `minMatch`, where upstream's stops at four unless `minMatch` is 3,
-    /// so its frames keep the format's floor.
+    /// four bytes. The optimal parser takes the three-byte matches its tree
+    /// walk reports at any `minMatch` (upstream stops at four unless
+    /// `minMatch` is 3, lacking a source for them without hash3); pricing them
+    /// keeps its output under upstream's at levels 16 and 17. Its frames keep
+    /// the format's floor.
     pub(crate) fn sequence_floor(&self) -> usize {
         use crate::encoding::strategy::SearchMethod;
         match self.search {
